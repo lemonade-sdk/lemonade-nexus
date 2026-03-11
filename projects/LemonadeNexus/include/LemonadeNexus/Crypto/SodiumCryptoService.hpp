@@ -3,6 +3,9 @@
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/Crypto/ICryptoProvider.hpp>
 
+#include <optional>
+#include <vector>
+
 namespace nexus::crypto {
 
 /// Concrete libsodium-backed crypto service.

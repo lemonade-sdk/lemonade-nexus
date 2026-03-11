@@ -23,9 +23,6 @@ jobs:
           - os: macos-14
             platform: darwin-arm64
             binary_ext: ""
-          - os: macos-13
-            platform: darwin-x86_64
-            binary_ext: ""
           - os: windows-latest
             platform: windows-x86_64
             binary_ext: ".exe"
@@ -43,10 +40,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev
 
-      - name: Install dependencies (macOS)
+      - name: Set OpenSSL path (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake ninja openssl@3
+          echo "OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3" >> "$GITHUB_ENV"
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -402,20 +399,17 @@ jobs:
             lemonade-nexus-linux-x86_64-rpm/*
             lemonade-nexus-linux-x86_64-arch/*
             lemonade-nexus-darwin-arm64/*
-            lemonade-nexus-darwin-x86_64/*
             lemonade-nexus-windows-x86_64/*
             lemonade-nexus-linux-x86_64-deb-pkg/*
             lemonade-nexus-linux-x86_64-rpm-pkg/*
             lemonade-nexus-linux-x86_64-arch-pkg/*
             lemonade-nexus-darwin-arm64-pkg/*
-            lemonade-nexus-darwin-x86_64-pkg/*
             lemonade-nexus-windows-x86_64-installer/*
             manifest-linux-x86_64/*
             manifest-linux-x86_64-deb/*
             manifest-linux-x86_64-rpm/*
             manifest-linux-x86_64-arch/*
             manifest-darwin-arm64/*
-            manifest-darwin-x86_64/*
             manifest-windows-x86_64/*
           generate_release_notes: true
           body: |
@@ -429,7 +423,6 @@ jobs:
             | Linux x86_64 (Fedora) | `lemonade-nexus-linux-x86_64-rpm` | `manifest-linux-x86_64-rpm.json` |
             | Linux x86_64 (Arch) | `lemonade-nexus-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
             | macOS ARM64 | `lemonade-nexus-darwin-arm64` | `manifest-darwin-arm64.json` |
-            | macOS x86_64 | `lemonade-nexus-darwin-x86_64` | `manifest-darwin-x86_64.json` |
             | Windows x86_64 | `lemonade-nexus-windows-x86_64` | `manifest-windows-x86_64.json` |
 
             ### Install

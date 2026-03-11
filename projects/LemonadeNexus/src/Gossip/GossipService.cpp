@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <memory>
 
 namespace nexus::gossip {
 

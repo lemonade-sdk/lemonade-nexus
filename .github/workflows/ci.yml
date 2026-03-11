@@ -19,8 +19,6 @@ jobs:
             platform: linux-x86_64
           - os: macos-14
             platform: darwin-arm64
-          - os: macos-13
-            platform: darwin-x86_64
           - os: windows-latest
             platform: windows-x86_64
 
@@ -35,10 +33,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev
 
-      - name: Install dependencies (macOS)
+      - name: Set OpenSSL path (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake ninja openssl@3
+          echo "OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3" >> "$GITHUB_ENV"
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'

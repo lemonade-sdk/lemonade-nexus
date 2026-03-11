@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Relay/RelayTypes.hpp>
 
 #include <concepts>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>

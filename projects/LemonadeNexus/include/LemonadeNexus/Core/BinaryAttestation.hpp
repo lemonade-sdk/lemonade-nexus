@@ -7,6 +7,7 @@
 #include <asio.hpp>
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>

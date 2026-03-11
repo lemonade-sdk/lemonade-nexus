@@ -10,6 +10,7 @@
 #include <arpa/inet.h>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <sstream>
 

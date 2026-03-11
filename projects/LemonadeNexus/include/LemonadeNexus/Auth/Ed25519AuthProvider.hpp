@@ -5,6 +5,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <string_view>

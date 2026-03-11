@@ -9,8 +9,11 @@
 #include <asio.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>

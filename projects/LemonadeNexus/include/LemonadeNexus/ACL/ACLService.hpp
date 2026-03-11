@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string_view>
 
 struct sqlite3;  // forward-declare (C handle)

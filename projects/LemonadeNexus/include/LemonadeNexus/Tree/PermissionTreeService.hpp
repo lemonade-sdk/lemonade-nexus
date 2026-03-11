@@ -6,6 +6,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 

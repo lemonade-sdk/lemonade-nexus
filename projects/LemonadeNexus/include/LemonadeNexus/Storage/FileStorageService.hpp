@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #include <string>
 
 namespace nexus::storage {
