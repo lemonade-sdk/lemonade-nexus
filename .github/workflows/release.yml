@@ -1,0 +1,463 @@
+name: Build, Sign & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # =========================================================================
+  # Native platform builds (macOS, Windows)
+  # =========================================================================
+  build-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            binary_ext: ""
+          - os: macos-14
+            platform: darwin-arm64
+            binary_ext: ""
+          - os: macos-13
+            platform: darwin-x86_64
+            binary_ext: ""
+          - os: windows-latest
+            platform: windows-x86_64
+            binary_ext: ".exe"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja openssl@3
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ninja -y
+          vcpkg install openssl:x64-windows
+
+      - name: Configure CMake (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF
+
+      - name: Configure CMake (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake -B build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
+            -DBUILD_TESTING=OFF `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Compute binary SHA-256 (Unix)
+        if: runner.os != 'Windows'
+        id: hash
+        run: |
+          BINARY_PATH="build/projects/LemonadeNexus/LemonadeNexusApp"
+          if [ ! -f "$BINARY_PATH" ]; then
+            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/LemonadeNexusApp"
+          fi
+          HASH=$(shasum -a 256 "$BINARY_PATH" | awk '{print $1}')
+          echo "binary_hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "binary_path=$BINARY_PATH" >> "$GITHUB_OUTPUT"
+          echo "Binary SHA-256: $HASH"
+
+      - name: Compute binary SHA-256 (Windows)
+        if: runner.os == 'Windows'
+        id: hash-win
+        shell: pwsh
+        run: |
+          $binaryPath = "build/projects/LemonadeNexus/LemonadeNexusApp.exe"
+          if (-not (Test-Path $binaryPath)) {
+            $binaryPath = "build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/LemonadeNexusApp.exe"
+          }
+          $hash = (Get-FileHash -Path $binaryPath -Algorithm SHA256).Hash.ToLower()
+          "binary_hash=$hash" >> $env:GITHUB_OUTPUT
+          "binary_path=$binaryPath" >> $env:GITHUB_OUTPUT
+          Write-Host "Binary SHA-256: $hash"
+
+      - name: Set hash output
+        id: hash-final
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            echo "binary_hash=${{ steps.hash-win.outputs.binary_hash }}" >> "$GITHUB_OUTPUT"
+            echo "binary_path=${{ steps.hash-win.outputs.binary_path }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "binary_hash=${{ steps.hash.outputs.binary_hash }}" >> "$GITHUB_OUTPUT"
+            echo "binary_path=${{ steps.hash.outputs.binary_path }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release manifest
+        id: manifest
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          COMMIT="${GITHUB_SHA}"
+          TIMESTAMP=$(date +%s)
+          PLATFORM="${{ matrix.platform }}"
+          HASH="${{ steps.hash-final.outputs.binary_hash }}"
+
+          # Create the canonical JSON (fields sorted alphabetically by nlohmann::json)
+          # This MUST match canonical_manifest_json() in BinaryAttestation.cpp
+          CANONICAL="{\"binary_sha256\":\"${HASH}\",\"commit_sha\":\"${COMMIT}\",\"platform\":\"${PLATFORM}\",\"signer_pubkey\":\"${RELEASE_SIGNING_PUBKEY}\",\"timestamp\":${TIMESTAMP},\"version\":\"${VERSION}\"}"
+          echo "canonical=$CANONICAL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_SIGNING_PUBKEY: ${{ vars.RELEASE_SIGNING_PUBKEY }}
+
+      - name: Install Python signing dependencies
+        run: pip3 install pynacl
+
+      - name: Sign manifest with Ed25519
+        id: sign
+        shell: bash
+        run: |
+          python3 <<'PYEOF'
+          import nacl.signing
+          import nacl.encoding
+          import os
+
+          signing_key_b64 = os.environ["RELEASE_SIGNING_KEY"]
+          signing_key_bytes = nacl.encoding.Base64Encoder.decode(signing_key_b64)
+          signing_key = nacl.signing.SigningKey(signing_key_bytes)
+
+          verify_key = signing_key.verify_key
+          pubkey_b64 = verify_key.encode(nacl.encoding.Base64Encoder).decode()
+
+          canonical = os.environ["CANONICAL"]
+          signature = signing_key.sign(canonical.encode(), encoder=nacl.encoding.RawEncoder)
+          sig_b64 = nacl.encoding.Base64Encoder.encode(signature.signature).decode()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"signature={sig_b64}\n")
+              f.write(f"pubkey={pubkey_b64}\n")
+          PYEOF
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          CANONICAL: ${{ steps.manifest.outputs.canonical }}
+
+      - name: Write signed manifest JSON
+        shell: bash
+        run: |
+          cat > manifest-${{ matrix.platform }}.json <<EOF
+          {
+            "version": "${{ steps.manifest.outputs.version }}",
+            "commit_sha": "${GITHUB_SHA}",
+            "platform": "${{ matrix.platform }}",
+            "binary_sha256": "${{ steps.hash-final.outputs.binary_hash }}",
+            "timestamp": ${{ steps.manifest.outputs.timestamp }},
+            "signer_pubkey": "${{ steps.sign.outputs.pubkey }}",
+            "signature": "${{ steps.sign.outputs.signature }}"
+          }
+          EOF
+
+          echo "--- Signed manifest ---"
+          cat manifest-${{ matrix.platform }}.json
+
+      - name: Build packages (macOS .pkg)
+        if: runner.os == 'macOS'
+        run: cpack --config build/CPackConfig.cmake -G productbuild -B build/packages
+
+      - name: Build packages (Windows NSIS)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cpack --config build/CPackConfig.cmake -G NSIS -B build/packages
+        continue-on-error: true
+
+      - name: Build packages (Windows ZIP)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cpack --config build/CPackConfig.cmake -G ZIP -B build/packages
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-${{ matrix.platform }}
+          path: ${{ steps.hash-final.outputs.binary_path }}
+
+      - name: Upload .pkg artifact (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-${{ matrix.platform }}-pkg
+          path: build/packages/*.pkg
+
+      - name: Upload installer artifact (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-${{ matrix.platform }}-installer
+          path: |
+            build/packages/*.exe
+            build/packages/*.zip
+          if-no-files-found: ignore
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.platform }}
+          path: manifest-${{ matrix.platform }}.json
+
+  # =========================================================================
+  # Linux distro builds (Debian, Fedora, Arch)
+  # =========================================================================
+  build-linux-distros:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - container: debian:bookworm
+            platform: linux-x86_64-deb
+            cpack_generators: "DEB"
+            install_cmd: >-
+              apt-get update &&
+              apt-get install -y cmake ninja-build g++ libssl-dev git ca-certificates
+              python3 python3-pip python3-venv dpkg-dev
+          - container: fedora:40
+            platform: linux-x86_64-rpm
+            cpack_generators: "RPM"
+            install_cmd: >-
+              dnf install -y cmake ninja-build gcc-c++ openssl-devel git
+              python3 python3-pip rpm-build
+          - container: archlinux:latest
+            platform: linux-x86_64-arch
+            cpack_generators: "TGZ"
+            install_cmd: >-
+              pacman -Syu --noconfirm cmake ninja gcc openssl git
+              python python-pip python-pynacl
+
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+
+    steps:
+      - name: Install dependencies
+        run: ${{ matrix.install_cmd }}
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF
+
+      - name: Build
+        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+
+      - name: Compute binary SHA-256
+        id: hash
+        run: |
+          BINARY_PATH="build/projects/LemonadeNexus/LemonadeNexusApp"
+          if [ ! -f "$BINARY_PATH" ]; then
+            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/LemonadeNexusApp"
+          fi
+          HASH=$(sha256sum "$BINARY_PATH" | awk '{print $1}')
+          echo "binary_hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "binary_path=$BINARY_PATH" >> "$GITHUB_OUTPUT"
+          echo "Binary SHA-256: $HASH"
+
+      - name: Create release manifest
+        id: manifest
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          COMMIT="${GITHUB_SHA}"
+          TIMESTAMP=$(date +%s)
+          PLATFORM="${{ matrix.platform }}"
+          HASH="${{ steps.hash.outputs.binary_hash }}"
+
+          CANONICAL="{\"binary_sha256\":\"${HASH}\",\"commit_sha\":\"${COMMIT}\",\"platform\":\"${PLATFORM}\",\"signer_pubkey\":\"${RELEASE_SIGNING_PUBKEY}\",\"timestamp\":${TIMESTAMP},\"version\":\"${VERSION}\"}"
+          echo "canonical=$CANONICAL" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_SIGNING_PUBKEY: ${{ vars.RELEASE_SIGNING_PUBKEY }}
+
+      - name: Install PyNaCl
+        run: pip3 install pynacl --break-system-packages || pip3 install pynacl
+
+      - name: Sign manifest with Ed25519
+        id: sign
+        run: |
+          python3 <<'PYEOF'
+          import nacl.signing
+          import nacl.encoding
+          import os
+
+          signing_key_b64 = os.environ["RELEASE_SIGNING_KEY"]
+          signing_key_bytes = nacl.encoding.Base64Encoder.decode(signing_key_b64)
+          signing_key = nacl.signing.SigningKey(signing_key_bytes)
+
+          verify_key = signing_key.verify_key
+          pubkey_b64 = verify_key.encode(nacl.encoding.Base64Encoder).decode()
+
+          canonical = os.environ["CANONICAL"]
+          signature = signing_key.sign(canonical.encode(), encoder=nacl.encoding.RawEncoder)
+          sig_b64 = nacl.encoding.Base64Encoder.encode(signature.signature).decode()
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"signature={sig_b64}\n")
+              f.write(f"pubkey={pubkey_b64}\n")
+          PYEOF
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          CANONICAL: ${{ steps.manifest.outputs.canonical }}
+
+      - name: Write signed manifest JSON
+        run: |
+          cat > manifest-${{ matrix.platform }}.json <<EOF
+          {
+            "version": "${{ steps.manifest.outputs.version }}",
+            "commit_sha": "${GITHUB_SHA}",
+            "platform": "${{ matrix.platform }}",
+            "binary_sha256": "${{ steps.hash.outputs.binary_hash }}",
+            "timestamp": ${{ steps.manifest.outputs.timestamp }},
+            "signer_pubkey": "${{ steps.sign.outputs.pubkey }}",
+            "signature": "${{ steps.sign.outputs.signature }}"
+          }
+          EOF
+
+          echo "--- Signed manifest ---"
+          cat manifest-${{ matrix.platform }}.json
+
+      - name: Build packages via CPack
+        run: |
+          for gen in ${{ matrix.cpack_generators }}; do
+            cpack --config build/CPackConfig.cmake -G "$gen" -B build/packages || true
+          done
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-${{ matrix.platform }}
+          path: ${{ steps.hash.outputs.binary_path }}
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-${{ matrix.platform }}-pkg
+          path: |
+            build/packages/*.deb
+            build/packages/*.rpm
+            build/packages/*.tar.gz
+          if-no-files-found: ignore
+
+      - name: Upload manifest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: manifest-${{ matrix.platform }}
+          path: manifest-${{ matrix.platform }}.json
+
+  # =========================================================================
+  # Create GitHub Release with all platform artifacts
+  # =========================================================================
+  release:
+    needs: [build-native, build-linux-distros]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            lemonade-nexus-linux-x86_64/*
+            lemonade-nexus-linux-x86_64-deb/*
+            lemonade-nexus-linux-x86_64-rpm/*
+            lemonade-nexus-linux-x86_64-arch/*
+            lemonade-nexus-darwin-arm64/*
+            lemonade-nexus-darwin-x86_64/*
+            lemonade-nexus-windows-x86_64/*
+            lemonade-nexus-linux-x86_64-deb-pkg/*
+            lemonade-nexus-linux-x86_64-rpm-pkg/*
+            lemonade-nexus-linux-x86_64-arch-pkg/*
+            lemonade-nexus-darwin-arm64-pkg/*
+            lemonade-nexus-darwin-x86_64-pkg/*
+            lemonade-nexus-windows-x86_64-installer/*
+            manifest-linux-x86_64/*
+            manifest-linux-x86_64-deb/*
+            manifest-linux-x86_64-rpm/*
+            manifest-linux-x86_64-arch/*
+            manifest-darwin-arm64/*
+            manifest-darwin-x86_64/*
+            manifest-windows-x86_64/*
+          generate_release_notes: true
+          body: |
+            ## Lemonade-Nexus Release ${{ github.ref_name }}
+
+            ### Platforms
+            | Platform | Binary | Manifest |
+            |----------|--------|----------|
+            | Linux x86_64 (Ubuntu) | `lemonade-nexus-linux-x86_64` | `manifest-linux-x86_64.json` |
+            | Linux x86_64 (Debian) | `lemonade-nexus-linux-x86_64-deb` | `manifest-linux-x86_64-deb.json` |
+            | Linux x86_64 (Fedora) | `lemonade-nexus-linux-x86_64-rpm` | `manifest-linux-x86_64-rpm.json` |
+            | Linux x86_64 (Arch) | `lemonade-nexus-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
+            | macOS ARM64 | `lemonade-nexus-darwin-arm64` | `manifest-darwin-arm64.json` |
+            | macOS x86_64 | `lemonade-nexus-darwin-x86_64` | `manifest-darwin-x86_64.json` |
+            | Windows x86_64 | `lemonade-nexus-windows-x86_64` | `manifest-windows-x86_64.json` |
+
+            ### Install
+
+            **Debian/Ubuntu (.deb)**
+            ```bash
+            sudo dpkg -i lemonade-nexus-*.deb
+            sudo vi /etc/lemonade-nexus/lemonade-nexus.env
+            sudo systemctl start lemonade-nexus
+            ```
+
+            **macOS (.pkg)**
+            ```bash
+            sudo installer -pkg lemonade-nexus-*.pkg -target /
+            sudo launchctl load /Library/LaunchDaemons/io.lemonade-nexus.plist
+            ```
+
+            **Windows (.exe / .zip)**
+            Run the NSIS installer or extract the ZIP to `C:\Program Files\lemonade-nexus\`.
+
+            ### Binary Attestation
+            Each binary has a corresponding Ed25519-signed release manifest (`manifest-*.json`).
+            Import manifests on your server with:
+            ```
+            lemonade-nexus --add-manifest manifest-linux-x86_64.json
+            ```
+
+            ### Verification
+            Manifests are signed with the project's Ed25519 release signing key.
+            Only binaries whose SHA-256 matches a signed manifest can achieve
+            Tier 1 trust status and receive distributed operational credentials.

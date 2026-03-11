@@ -1,0 +1,153 @@
+#pragma once
+
+#include <concepts>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace nexus::wireguard {
+
+/// A WireGuard Curve25519 keypair (base64-encoded strings).
+struct WgKeypair {
+    std::string public_key;
+    std::string private_key;
+};
+
+/// A WireGuard peer as reported by `wg show <iface> dump`.
+struct WgPeer {
+    std::string public_key;
+    std::string allowed_ips;
+    std::string endpoint;
+    uint64_t    last_handshake{0};
+    uint64_t    rx_bytes{0};
+    uint64_t    tx_bytes{0};
+    uint16_t    persistent_keepalive{25};
+};
+
+/// Configuration for a WireGuard interface.
+struct WgInterfaceConfig {
+    std::string private_key;
+    std::string address;
+    uint16_t    listen_port{51940};
+    std::string dns;
+};
+
+/// A peer derived from a tree node, carrying the fields needed for WireGuard
+/// configuration and sync operations.
+struct TreeNodePeer {
+    std::string public_key;       // WireGuard Curve25519 pubkey
+    std::string tunnel_ip;        // e.g. "10.64.4.210/32"
+    std::string private_subnet;   // e.g. "10.128.17.4/30"
+    std::string endpoint;         // "ip:port" (may be empty)
+    uint16_t    persistent_keepalive{25};
+};
+
+/// CRTP base for WireGuard operations.
+/// Derived must implement:
+///   WgKeypair do_generate_keypair()
+///   bool do_set_interface(const WgInterfaceConfig& config)
+///   bool do_add_peer(const std::string& pubkey, const std::string& allowed_ips, const std::string& endpoint)
+///   bool do_remove_peer(const std::string& pubkey)
+///   std::vector<WgPeer> do_get_peers()
+///   bool do_update_endpoint(const std::string& pubkey, const std::string& new_endpoint)
+///   std::string do_generate_config(const WgInterfaceConfig& config, const std::vector<WgPeer>& peers)
+///   bool do_setup_interface(const WgInterfaceConfig& config, const std::vector<WgPeer>& peers)
+///   bool do_teardown_interface()
+///   int do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers)
+///   bool do_save_config(const std::string& config_contents)
+///   std::string do_load_config()
+template <typename Derived>
+class IWireGuardProvider {
+public:
+    [[nodiscard]] WgKeypair generate_keypair() {
+        return self().do_generate_keypair();
+    }
+
+    [[nodiscard]] bool set_interface(const WgInterfaceConfig& config) {
+        return self().do_set_interface(config);
+    }
+
+    [[nodiscard]] bool add_peer(const std::string& pubkey,
+                                const std::string& allowed_ips,
+                                const std::string& endpoint) {
+        return self().do_add_peer(pubkey, allowed_ips, endpoint);
+    }
+
+    [[nodiscard]] bool remove_peer(const std::string& pubkey) {
+        return self().do_remove_peer(pubkey);
+    }
+
+    [[nodiscard]] std::vector<WgPeer> get_peers() {
+        return self().do_get_peers();
+    }
+
+    [[nodiscard]] bool update_endpoint(const std::string& pubkey,
+                                       const std::string& new_endpoint) {
+        return self().do_update_endpoint(pubkey, new_endpoint);
+    }
+
+    /// Generate a wg-quick compatible config file string.
+    [[nodiscard]] std::string generate_config(const WgInterfaceConfig& config,
+                                               const std::vector<WgPeer>& peers) {
+        return self().do_generate_config(config, peers);
+    }
+
+    /// Create the WireGuard interface, assign address, set keys, bring up,
+    /// add peers, and install routes.
+    [[nodiscard]] bool setup_interface(const WgInterfaceConfig& config,
+                                       const std::vector<WgPeer>& peers) {
+        return self().do_setup_interface(config, peers);
+    }
+
+    /// Bring the interface down and delete it.
+    [[nodiscard]] bool teardown_interface() {
+        return self().do_teardown_interface();
+    }
+
+    /// Sync peers with the desired state from tree nodes.
+    /// Returns the number of changes made (adds + removes + updates),
+    /// or -1 on error.
+    [[nodiscard]] int sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers) {
+        return self().do_sync_peers_from_tree(desired_peers);
+    }
+
+    /// Persist the config string to disk.
+    [[nodiscard]] bool save_config(const std::string& config_contents) {
+        return self().do_save_config(config_contents);
+    }
+
+    /// Load the config string from disk. Returns empty string if not found.
+    [[nodiscard]] std::string load_config() {
+        return self().do_load_config();
+    }
+
+protected:
+    ~IWireGuardProvider() = default;
+
+private:
+    [[nodiscard]] Derived& self() { return static_cast<Derived&>(*this); }
+    [[nodiscard]] const Derived& self() const { return static_cast<const Derived&>(*this); }
+};
+
+/// Concept constraining a valid IWireGuardProvider implementation.
+template <typename T>
+concept WireGuardProviderType = requires(T t,
+                                          const WgInterfaceConfig& config,
+                                          const std::string& s,
+                                          const std::vector<WgPeer>& peers,
+                                          const std::vector<TreeNodePeer>& tree_peers) {
+    { t.do_generate_keypair() } -> std::same_as<WgKeypair>;
+    { t.do_set_interface(config) } -> std::same_as<bool>;
+    { t.do_add_peer(s, s, s) } -> std::same_as<bool>;
+    { t.do_remove_peer(s) } -> std::same_as<bool>;
+    { t.do_get_peers() } -> std::same_as<std::vector<WgPeer>>;
+    { t.do_update_endpoint(s, s) } -> std::same_as<bool>;
+    { t.do_generate_config(config, peers) } -> std::same_as<std::string>;
+    { t.do_setup_interface(config, peers) } -> std::same_as<bool>;
+    { t.do_teardown_interface() } -> std::same_as<bool>;
+    { t.do_sync_peers_from_tree(tree_peers) } -> std::same_as<int>;
+    { t.do_save_config(s) } -> std::same_as<bool>;
+    { t.do_load_config() } -> std::same_as<std::string>;
+};
+
+} // namespace nexus::wireguard

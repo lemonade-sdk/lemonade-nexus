@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Stop and unload the launchd service
+if launchctl list | grep -q io.lemonade-nexus; then
+    launchctl stop io.lemonade-nexus 2>/dev/null || true
+    launchctl unload /Library/LaunchDaemons/io.lemonade-nexus.plist 2>/dev/null || true
+fi

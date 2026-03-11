@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.lemonade-nexus</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/lemonade-nexus</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SP_DATA_ROOT</key>
+        <string>/usr/local/var/lemonade-nexus/data</string>
+        <key>SP_LOG_LEVEL</key>
+        <string>info</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/usr/local/var/lemonade-nexus</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/usr/local/var/log/lemonade-nexus/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/usr/local/var/log/lemonade-nexus/stderr.log</string>
+</dict>
+</plist>

@@ -1,0 +1,323 @@
+#pragma once
+
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace lnsdk {
+
+// ---------------------------------------------------------------------------
+// Server configuration
+// ---------------------------------------------------------------------------
+
+/// A single server endpoint (host + port + TLS flag).
+struct ServerEndpoint {
+    std::string host{"127.0.0.1"};
+    uint16_t    port{9100};
+    bool        use_tls{false};
+};
+
+struct ServerConfig {
+    /// Seed list of servers (at least one).
+    std::vector<ServerEndpoint> servers{{{"127.0.0.1", 9100, false}}};
+
+    int  connect_timeout_sec{5};
+    int  read_timeout_sec{10};
+    int  write_timeout_sec{5};
+
+    /// If true, fetch /api/servers on first connect to discover additional servers.
+    bool     auto_discover{true};
+
+    /// How often to check server health (seconds). 0 = disabled.
+    uint32_t health_check_interval_sec{30};
+
+    /// Convenience: single-server constructor for backward compat.
+    ServerConfig() = default;
+    ServerConfig(const std::string& host, uint16_t port, bool tls = false)
+        : servers{{host, port, tls}} {}
+};
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+struct HealthStatus {
+    std::string status;
+    std::string service;
+};
+
+// ---------------------------------------------------------------------------
+// Authentication
+// ---------------------------------------------------------------------------
+
+enum class AuthMethod : uint8_t {
+    Ed25519,    // Primary: Ed25519 challenge-response identity auth
+    Passkey,    // Backup: WebAuthn/FIDO2 passkey
+    Password,   // Deprecated: stub on server (always fails)
+    TokenLink,  // Deprecated: stub on server (always fails)
+};
+
+struct AuthRequest {
+    AuthMethod  method{AuthMethod::Ed25519};
+    std::string username;
+    std::string password;
+    std::string token;              // for token-link
+    nlohmann::json passkey_data;    // for passkey/fido2
+};
+
+struct AuthResponse {
+    bool        authenticated{false};
+    std::string user_id;
+    std::string session_token;
+    std::string error;
+};
+
+struct PasskeyRegistration {
+    std::string    user_id;
+    nlohmann::json credential_data;
+};
+
+// ---------------------------------------------------------------------------
+// Tree types — self-contained copies matching server's wire format
+// ---------------------------------------------------------------------------
+
+enum class NodeType : uint8_t {
+    Root,
+    Customer,
+    Endpoint,
+    Relay,
+};
+
+struct Assignment {
+    std::string              management_pubkey; // "ed25519:base64..."
+    std::vector<std::string> permissions;       // ["read","write","add_child",...]
+};
+
+struct TreeNode {
+    std::string              id;
+    std::string              parent_id;
+    NodeType                 type{NodeType::Customer};
+
+    // Network allocations
+    std::string              tunnel_ip;
+    std::string              private_subnet;
+    std::string              private_shared_addresses;
+    std::string              shared_domain;
+
+    // Crypto
+    std::string              mgmt_pubkey;
+    std::string              wrapped_mgmt_privkey;
+    std::string              wg_pubkey;
+
+    // Assignments
+    std::vector<Assignment>  assignments;
+
+    // Signature by parent's management key
+    std::string              signature;
+
+    // Relay-specific fields
+    std::string              listen_endpoint;
+    std::string              region;
+    uint32_t                 capacity_mbps{0};
+    float                    reputation_score{1.0f};
+    uint64_t                 expires_at{0};
+};
+
+struct TreeDelta {
+    std::string operation;        // "create_node", "update_node", "delete_node", etc.
+    std::string target_node_id;
+    TreeNode    node_data;
+    std::string signer_pubkey;
+    std::string signature;
+    uint64_t    timestamp{0};
+};
+
+struct DeltaResult {
+    bool        success{false};
+    uint64_t    delta_sequence{0};
+    std::string node_id;
+    std::string tunnel_ip;
+    std::string private_subnet;
+    std::string error;
+};
+
+// ---------------------------------------------------------------------------
+// IPAM
+// ---------------------------------------------------------------------------
+
+enum class BlockType : uint8_t {
+    Tunnel,
+    Private,
+    Shared,
+};
+
+struct AllocationRequest {
+    std::string node_id;
+    BlockType   block_type{BlockType::Tunnel};
+    uint8_t     prefix_len{30};
+};
+
+struct AllocationResponse {
+    bool        success{false};
+    std::string network;
+    std::string node_id;
+};
+
+// ---------------------------------------------------------------------------
+// Relay
+// ---------------------------------------------------------------------------
+
+struct RelayNodeInfo {
+    std::string relay_id;
+    std::string public_key;
+    std::string endpoint;
+    std::string region;
+    uint32_t    capacity_mbps{0};
+    float       reputation_score{0.0f};
+    float       estimated_latency_ms{0.0f};
+    bool        supports_stun{true};
+    bool        supports_relay{true};
+    bool        is_central{false};
+};
+
+struct RelayTicket {
+    std::string peer_id;
+    std::string relay_id;
+    std::string session_nonce;     // base64
+    uint64_t    issued_at{0};
+    uint64_t    expires_at{0};
+    std::string signature;         // base64
+};
+
+struct RelayRegistration {
+    std::string relay_id;
+    std::string endpoint;
+    std::string region;
+    std::string public_key;
+    uint32_t    capacity_mbps{0};
+    bool        supports_stun{true};
+    bool        supports_relay{true};
+};
+
+struct RelayRegisterResult {
+    bool        success{false};
+    std::string relay_id;
+};
+
+// ---------------------------------------------------------------------------
+// Certificates
+// ---------------------------------------------------------------------------
+
+struct CertStatus {
+    std::string domain;
+    bool        has_cert{false};
+    uint64_t    expires_at{0};
+};
+
+/// An issued certificate bundle (borrowed license from server).
+/// The private key is encrypted with the client's Ed25519 key via
+/// ephemeral X25519 DH + HKDF + AES-256-GCM.
+struct IssuedCertBundle {
+    std::string domain;             ///< e.g. "my-laptop.capi.lemonade-nexus.io"
+    std::string fullchain_pem;      ///< Full certificate chain (PEM)
+    std::string encrypted_privkey;  ///< AES-GCM encrypted private key (base64)
+    std::string nonce;              ///< AES-GCM nonce (base64)
+    std::string ephemeral_pubkey;   ///< Server's ephemeral X25519 pubkey (base64)
+    uint64_t    expires_at{0};      ///< Certificate expiry (Unix timestamp)
+};
+
+/// A decrypted certificate ready for use.
+struct DecryptedCert {
+    std::string domain;
+    std::string fullchain_pem;
+    std::string privkey_pem;
+    uint64_t    expires_at{0};
+};
+
+// ---------------------------------------------------------------------------
+// High-level results
+// ---------------------------------------------------------------------------
+
+struct JoinResult {
+    bool        success{false};
+    std::string node_id;
+    std::string tunnel_ip;
+    std::string private_subnet;
+    std::string wg_pubkey;          ///< WireGuard public key (base64)
+    std::string error;
+};
+
+// ---------------------------------------------------------------------------
+// Passkey credential (for registration)
+// ---------------------------------------------------------------------------
+
+struct PasskeyCredential {
+    std::string credential_id;   // base64url
+    std::string public_key_x;   // hex, 32-byte P-256 X coordinate
+    std::string public_key_y;   // hex, 32-byte P-256 Y coordinate
+};
+
+// ---------------------------------------------------------------------------
+// Group membership
+// ---------------------------------------------------------------------------
+
+struct GroupMember {
+    std::string              management_pubkey; // "ed25519:base64..."
+    std::vector<std::string> permissions;       // ["read","write","add_child",...]
+};
+
+struct GroupJoinResult {
+    bool        success{false};
+    std::string node_id;
+    std::string tunnel_ip;
+    std::string parent_node_id;
+    std::string error;
+};
+
+// ---------------------------------------------------------------------------
+// WireGuard tunnel
+// ---------------------------------------------------------------------------
+
+struct WireGuardConfig {
+    std::string private_key;                ///< WG private key (base64, Curve25519)
+    std::string public_key;                 ///< WG public key (base64, Curve25519)
+    std::string tunnel_ip;                  ///< Assigned IP (e.g. "10.100.0.5/24")
+    std::string server_public_key;          ///< Server's WG public key
+    std::string server_endpoint;            ///< Server endpoint "host:port"
+    std::string dns_server;                 ///< DNS server IP
+    uint16_t    listen_port{0};             ///< Local listen port (0 = random)
+    std::vector<std::string> allowed_ips;   ///< Default: ["10.100.0.0/16"]
+    uint32_t    keepalive{25};              ///< Persistent keepalive interval (seconds)
+};
+
+struct TunnelStatus {
+    bool        is_up{false};
+    std::string tunnel_ip;
+    std::string server_endpoint;
+    int64_t     last_handshake{0};          ///< Unix timestamp of last WG handshake
+    uint64_t    rx_bytes{0};
+    uint64_t    tx_bytes{0};
+    int32_t     latency_ms{-1};             ///< -1 = unknown
+};
+
+// ---------------------------------------------------------------------------
+// JSON serialization
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] std::string node_type_to_string(NodeType type);
+[[nodiscard]] NodeType string_to_node_type(std::string_view s);
+
+void to_json(nlohmann::json& j, const Assignment& a);
+void from_json(const nlohmann::json& j, Assignment& a);
+void to_json(nlohmann::json& j, const TreeNode& n);
+void from_json(const nlohmann::json& j, TreeNode& n);
+void to_json(nlohmann::json& j, const TreeDelta& d);
+void from_json(const nlohmann::json& j, TreeDelta& d);
+
+/// Produce a canonical (deterministic) JSON string for Ed25519 signing.
+/// Excludes the "signature" field itself.
+[[nodiscard]] std::string canonical_delta_json(const TreeDelta& delta);
+
+} // namespace lnsdk

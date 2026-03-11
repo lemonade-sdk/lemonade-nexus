@@ -1,0 +1,41 @@
+# Build
+build/
+cmake-build-*/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Compile database
+compile_commands.json
+
+# ccache
+.ccache/
+
+# Runtime data
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Environment (secrets) — keep .env.example tracked
+.env
+*.env
+!.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Caches
+.cache/
+
+# Unwanted files
+.claude/
+*.bak

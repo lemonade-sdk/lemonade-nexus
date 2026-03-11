@@ -1,0 +1,8 @@
+#!/bin/bash
+set -e
+
+# Stop and disable the service before removal
+if systemctl is-active --quiet lemonade-nexus.service; then
+    systemctl stop lemonade-nexus.service
+fi
+systemctl disable lemonade-nexus.service 2>/dev/null || true

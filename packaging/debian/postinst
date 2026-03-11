@@ -1,0 +1,48 @@
+#!/bin/bash
+set -e
+
+# Create lemonade-nexus system user if it doesn't exist
+if ! id -u lemonade-nexus >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+        --home-dir /var/lib/lemonade-nexus lemonade-nexus
+fi
+
+# Create directories
+mkdir -p /var/lib/lemonade-nexus
+mkdir -p /etc/lemonade-nexus
+
+# Install default env file if not present
+if [ ! -f /etc/lemonade-nexus/lemonade-nexus.env ]; then
+    cat > /etc/lemonade-nexus/lemonade-nexus.env <<'ENVEOF'
+# Lemonade-Nexus configuration — see .env.example for all options
+SP_HTTP_PORT=9100
+SP_DATA_ROOT=/var/lib/lemonade-nexus/data
+SP_LOG_LEVEL=info
+SP_JWT_SECRET=CHANGE_ME
+#SP_ROOT_PUBKEY=
+#SP_SEED_PEERS=
+ENVEOF
+fi
+
+# Set ownership
+chown -R lemonade-nexus:lemonade-nexus /var/lib/lemonade-nexus
+chown -R lemonade-nexus:lemonade-nexus /etc/lemonade-nexus
+chmod 600 /etc/lemonade-nexus/lemonade-nexus.env
+
+# Enable and start service
+systemctl daemon-reload
+systemctl enable lemonade-nexus.service
+
+echo ""
+echo "========================================"
+echo " Lemonade-Nexus installed successfully"
+echo "========================================"
+echo ""
+echo " Config:  /etc/lemonade-nexus/lemonade-nexus.env"
+echo " Data:    /var/lib/lemonade-nexus/data"
+echo " Logs:    journalctl -u lemonade-nexus"
+echo ""
+echo " Edit /etc/lemonade-nexus/lemonade-nexus.env, then:"
+echo "   sudo systemctl start lemonade-nexus"
+echo ""
+echo "========================================"

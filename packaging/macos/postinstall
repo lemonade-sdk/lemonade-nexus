@@ -1,0 +1,38 @@
+#!/bin/bash
+set -e
+
+# Create directories
+mkdir -p /usr/local/var/lemonade-nexus/data
+mkdir -p /usr/local/var/log/lemonade-nexus
+mkdir -p /usr/local/etc/lemonade-nexus
+
+# Install default env config if not present
+if [ ! -f /usr/local/etc/lemonade-nexus/lemonade-nexus.env ]; then
+    cat > /usr/local/etc/lemonade-nexus/lemonade-nexus.env <<'ENVEOF'
+# Lemonade-Nexus configuration — see documentation for all options
+SP_HTTP_PORT=9100
+SP_DATA_ROOT=/usr/local/var/lemonade-nexus/data
+SP_LOG_LEVEL=info
+#SP_ROOT_PUBKEY=
+#SP_SEED_PEERS=
+ENVEOF
+fi
+
+# Load launchd service
+if [ -f /Library/LaunchDaemons/io.lemonade-nexus.plist ]; then
+    launchctl load /Library/LaunchDaemons/io.lemonade-nexus.plist 2>/dev/null || true
+fi
+
+echo ""
+echo "========================================"
+echo " Lemonade-Nexus installed successfully"
+echo "========================================"
+echo ""
+echo " Config:  /usr/local/etc/lemonade-nexus/lemonade-nexus.env"
+echo " Data:    /usr/local/var/lemonade-nexus/data"
+echo " Logs:    /usr/local/var/log/lemonade-nexus/"
+echo ""
+echo " Edit the config, then:"
+echo "   sudo launchctl start io.lemonade-nexus"
+echo ""
+echo "========================================"
