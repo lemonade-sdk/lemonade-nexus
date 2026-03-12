@@ -43,7 +43,7 @@ void ACLService::on_start() {
         std::filesystem::create_directories(parent);
     }
 
-    int rc = sqlite3_open(db_path_.c_str(), &db_);
+    int rc = sqlite3_open(db_path_.string().c_str(), &db_);
     if (rc != SQLITE_OK) {
         spdlog::error("[{}] failed to open database {}: {}",
                       name(), db_path_.string(), sqlite3_errmsg(db_));

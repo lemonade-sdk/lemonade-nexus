@@ -132,7 +132,7 @@ jobs:
           RELEASE_SIGNING_PUBKEY: ${{ vars.RELEASE_SIGNING_PUBKEY }}
 
       - name: Install Python signing dependencies
-        run: pip3 install pynacl
+        run: pip3 install pynacl --break-system-packages || pip3 install pynacl
 
       - name: Sign manifest with Ed25519
         id: sign
