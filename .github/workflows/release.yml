@@ -419,14 +419,18 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Extract signing identity name
-          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+          # Extract signing identity SHA-1 hash (use hash to avoid ambiguity with multiple certs)
+          IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
+            | grep "Developer ID Application" \
+            | head -1 \
+            | awk '{print $2}')
+          IDENTITY_NAME=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
             | grep "Developer ID Application" \
             | head -1 \
             | sed 's/.*"\(.*\)".*/\1/')
-          echo "SIGNING_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGNING_IDENTITY=$IDENTITY_HASH" >> "$GITHUB_ENV"
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          echo "Found signing identity: $IDENTITY"
+          echo "Found signing identity: $IDENTITY_NAME ($IDENTITY_HASH)"
 
       - name: Build Swift app
         working-directory: apps/LemonadeNexusMac
