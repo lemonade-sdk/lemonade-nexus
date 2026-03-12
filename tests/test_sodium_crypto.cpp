@@ -117,6 +117,9 @@ TEST_F(SodiumCryptoTest, X25519DHDifferentPeersProduceDifferentSecrets) {
 // --- AES-256-GCM ---
 
 TEST_F(SodiumCryptoTest, AesGcmEncryptDecryptRoundTrip) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
 
     AesGcmKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
@@ -134,6 +137,9 @@ TEST_F(SodiumCryptoTest, AesGcmEncryptDecryptRoundTrip) {
 }
 
 TEST_F(SodiumCryptoTest, AesGcmWithAAD) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     AesGcmKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 
@@ -153,6 +159,9 @@ TEST_F(SodiumCryptoTest, AesGcmWithAAD) {
 }
 
 TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongKey) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     AesGcmKey key1{}, key2{};
     crypto.random_bytes(std::span<uint8_t>(key1));
     crypto.random_bytes(std::span<uint8_t>(key2));
@@ -167,6 +176,9 @@ TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongKey) {
 }
 
 TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongAAD) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     AesGcmKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 
@@ -186,6 +198,9 @@ TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongAAD) {
 }
 
 TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithTamperedCiphertext) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     AesGcmKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 

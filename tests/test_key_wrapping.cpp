@@ -42,6 +42,9 @@ protected:
 };
 
 TEST_F(KeyWrappingTest, WrapUnwrapRoundTrip) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     auto keypair = crypto->ed25519_keygen();
     std::string passphrase = "test-passphrase-123";
     auto pp_bytes = std::span<const uint8_t>(
@@ -55,6 +58,9 @@ TEST_F(KeyWrappingTest, WrapUnwrapRoundTrip) {
 }
 
 TEST_F(KeyWrappingTest, UnwrapFailsWithWrongPassphrase) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     auto keypair = crypto->ed25519_keygen();
     std::string pass1 = "correct-passphrase";
     std::string pass2 = "wrong-passphrase";
@@ -69,6 +75,9 @@ TEST_F(KeyWrappingTest, UnwrapFailsWithWrongPassphrase) {
 }
 
 TEST_F(KeyWrappingTest, GenerateAndStoreIdentity) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     std::string passphrase = "identity-pass";
     auto pp = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
@@ -87,6 +96,9 @@ TEST_F(KeyWrappingTest, GenerateAndStoreIdentity) {
 }
 
 TEST_F(KeyWrappingTest, UnlockIdentityFailsWithWrongPassphrase) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     std::string pass1 = "correct";
     std::string pass2 = "wrong";
     auto pp1 = std::span<const uint8_t>(
@@ -105,6 +117,9 @@ TEST_F(KeyWrappingTest, LoadIdentityPubkeyReturnsNulloptWhenNoneStored) {
 }
 
 TEST_F(KeyWrappingTest, DelegateKeyProducesValidResult) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
+    }
     std::string passphrase = "delegate-pass";
     auto pp = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
