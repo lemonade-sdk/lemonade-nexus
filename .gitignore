@@ -36,6 +36,11 @@ Thumbs.db
 # Caches
 .cache/
 
+# Swift build artifacts
+.build/
+.swiftpm/
+Package.resolved
+
 # Unwanted files
 .claude/
 *.bak

@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <!-- Lemon body - oval with pointed ends -->
+  <ellipse cx="64" cy="68" rx="48" ry="36" fill="#FFE135" stroke="#E6C700" stroke-width="1.5"/>
+
+  <!-- Lemon tip highlights -->
+  <path d="M16 68 Q10 68 8 66 Q10 70 16 68Z" fill="#E6C700" opacity="0.5"/>
+  <path d="M112 68 Q118 68 120 66 Q118 70 112 68Z" fill="#E6C700" opacity="0.5"/>
+
+  <!-- Globe meridian lines (vertical curves) -->
+  <path d="M64 32 Q48 50 48 68 Q48 86 64 104" fill="none" stroke="#333" stroke-width="1.2" opacity="0.4"/>
+  <path d="M64 32 Q80 50 80 68 Q80 86 64 104" fill="none" stroke="#333" stroke-width="1.2" opacity="0.4"/>
+  <line x1="64" y1="36" x2="64" y2="100" stroke="#333" stroke-width="1.2" opacity="0.4"/>
+
+  <!-- Globe latitude lines (horizontal curves) -->
+  <path d="M22 55 Q64 48 106 55" fill="none" stroke="#333" stroke-width="1.0" opacity="0.35"/>
+  <line x1="18" y1="68" x2="110" y2="68" stroke="#333" stroke-width="1.0" opacity="0.35"/>
+  <path d="M22 81 Q64 88 106 81" fill="none" stroke="#333" stroke-width="1.0" opacity="0.35"/>
+
+  <!-- Network connection lines -->
+  <line x1="40" y1="55" x2="64" y2="45" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="64" y1="45" x2="88" y2="55" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="88" y1="55" x2="80" y2="68" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="80" y1="68" x2="88" y2="81" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="40" y1="55" x2="48" y2="68" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="48" y1="68" x2="40" y2="81" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="48" y1="68" x2="80" y2="68" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="40" y1="81" x2="64" y2="90" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="88" y1="81" x2="64" y2="90" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="64" y1="45" x2="48" y2="68" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+  <line x1="64" y1="45" x2="80" y2="68" stroke="#333" stroke-width="1.5" opacity="0.6"/>
+
+  <!-- Network node dots -->
+  <circle cx="64" cy="45" r="4.5" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="40" cy="55" r="4" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="88" cy="55" r="4" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="48" cy="68" r="4" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="80" cy="68" r="4" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="40" cy="81" r="3.5" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="88" cy="81" r="3.5" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+  <circle cx="64" cy="90" r="4" fill="#FF6B00" stroke="#fff" stroke-width="1"/>
+
+  <!-- Leaf stem -->
+  <path d="M64 32 Q62 24 58 20" fill="none" stroke="#388E3C" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Leaf -->
+  <path d="M58 20 Q50 12 42 16 Q44 24 54 22 Q56 22 58 20Z" fill="#4CAF50" stroke="#388E3C" stroke-width="0.8"/>
+
+  <!-- Leaf vein -->
+  <path d="M58 20 Q52 18 46 17" fill="none" stroke="#388E3C" stroke-width="0.6" opacity="0.6"/>
+
+  <!-- Subtle shine on lemon -->
+  <ellipse cx="50" cy="54" rx="18" ry="8" fill="white" opacity="0.15" transform="rotate(-15 50 54)"/>
+</svg>
