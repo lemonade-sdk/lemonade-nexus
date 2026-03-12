@@ -76,9 +76,9 @@ jobs:
         if: runner.os != 'Windows'
         id: hash
         run: |
-          BINARY_PATH="build/projects/LemonadeNexus/LemonadeNexusApp"
+          BINARY_PATH="build/projects/LemonadeNexus/lemonade-nexus"
           if [ ! -f "$BINARY_PATH" ]; then
-            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/LemonadeNexusApp"
+            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/lemonade-nexus"
           fi
           HASH=$(shasum -a 256 "$BINARY_PATH" | awk '{print $1}')
           echo "binary_hash=$HASH" >> "$GITHUB_OUTPUT"
@@ -90,9 +90,9 @@ jobs:
         id: hash-win
         shell: pwsh
         run: |
-          $binaryPath = "build/projects/LemonadeNexus/LemonadeNexusApp.exe"
+          $binaryPath = "build/projects/LemonadeNexus/lemonade-nexus.exe"
           if (-not (Test-Path $binaryPath)) {
-            $binaryPath = "build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/LemonadeNexusApp.exe"
+            $binaryPath = "build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/lemonade-nexus.exe"
           }
           $hash = (Get-FileHash -Path $binaryPath -Algorithm SHA256).Hash.ToLower()
           "binary_hash=$hash" >> $env:GITHUB_OUTPUT
@@ -276,9 +276,9 @@ jobs:
       - name: Compute binary SHA-256
         id: hash
         run: |
-          BINARY_PATH="build/projects/LemonadeNexus/LemonadeNexusApp"
+          BINARY_PATH="build/projects/LemonadeNexus/lemonade-nexus"
           if [ ! -f "$BINARY_PATH" ]; then
-            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/LemonadeNexusApp"
+            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/lemonade-nexus"
           fi
           HASH=$(sha256sum "$BINARY_PATH" | awk '{print $1}')
           echo "binary_hash=$HASH" >> "$GITHUB_OUTPUT"
