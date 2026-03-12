@@ -8,8 +8,9 @@
 
 #include <LemonadeNexus/WireGuard/WireGuardWindowsBridge.h>
 
-#include <windows.h>
 #include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
 #include <ws2ipdef.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
@@ -25,6 +26,7 @@
 
 #include <wireguard.h>  // wireguard-nt API header
 
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <sstream>
@@ -266,10 +268,10 @@ bool verify_authenticode(const wchar_t* file_path) {
     trust_data.dwStateAction = WTD_STATEACTION_VERIFY;
     trust_data.dwProvFlags = WTD_SAFER_FLAG;
 
-    LONG status = WinVerifyTrust(INVALID_HANDLE_VALUE, &action, &trust_data);
+    LONG status = WinVerifyTrust(reinterpret_cast<HWND>(INVALID_HANDLE_VALUE), &action, &trust_data);
 
     trust_data.dwStateAction = WTD_STATEACTION_CLOSE;
-    WinVerifyTrust(INVALID_HANDLE_VALUE, &action, &trust_data);
+    WinVerifyTrust(reinterpret_cast<HWND>(INVALID_HANDLE_VALUE), &action, &trust_data);
 
     return status == ERROR_SUCCESS;
 }
