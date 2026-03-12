@@ -370,22 +370,140 @@ Clients can request TLS certificates for their hostname (e.g., `my-laptop.capi.l
 
 ## Configuration
 
-Configuration priority: **CLI args > environment variables > config file > defaults**
+Configuration priority: **environment variables > CLI args > config file > compiled defaults**
 
-| Option | Env Var | Default | Description |
-|--------|---------|---------|-------------|
-| `--http-port` | `SP_HTTP_PORT` | 9100 | Public HTTP API port |
-| `--private-http-port` | `SP_PRIVATE_HTTP_PORT` | 9101 | Private (VPN-only) HTTP API port |
-| `--data-root` | `SP_DATA_ROOT` | data | Data directory |
-| `--root-pubkey` | `SP_ROOT_PUBKEY` | | Root Ed25519 public key (hex) |
-| `--seed-peer` | `SP_SEED_PEERS` | | Gossip seed peers (comma-separated) |
-| `--log-level` | `SP_LOG_LEVEL` | info | Log level: trace/debug/info/warn/error |
-| `--require-tee` | `SP_REQUIRE_TEE` | off | Require TEE for Tier 1 |
-| `--require-attestation` | `SP_REQUIRE_ATTESTATION` | off | Require binary attestation |
-| `--require-peer-confirmation` | `SP_REQUIRE_PEER_CONFIRMATION` | off | Require enrollment quorum |
-| `--ddns-domain` | `SP_DDNS_DOMAIN` | | Base domain for DDNS |
-| `--ddns-enabled` | `SP_DDNS_ENABLED` | off | Enable dynamic DNS updates |
-| `--config` | | lemonade-nexus.json | JSON config file path |
+Use `--config <path>` to specify a JSON config file (default: `lemonade-nexus.json`). Every option below can be set via CLI flag, environment variable, or JSON key.
+
+### Network Ports
+
+All ports are fully configurable at runtime — no recompilation needed.
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--http-port <N>` | `SP_HTTP_PORT` | `http_port` | `9100` | Public HTTP API (TCP) |
+| `--udp-port <N>` | `SP_UDP_PORT` | `udp_port` | `51940` | WireGuard tunnel + UDP hole-punching |
+| `--gossip-port <N>` | `SP_GOSSIP_PORT` | `gossip_port` | `9102` | Gossip protocol (UDP) |
+| `--stun-port <N>` | `SP_STUN_PORT` | `stun_port` | `3478` | STUN NAT traversal (UDP) |
+| `--relay-port <N>` | `SP_RELAY_PORT` | `relay_port` | `9103` | Relay forwarding (UDP) |
+| `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `53` | Authoritative DNS (UDP) |
+| `--private-http-port <N>` | `SP_PRIVATE_HTTP_PORT` | `private_http_port` | `9101` | Private API, binds to tunnel IP (TCP) |
+| `--bind-address <addr>` | `SP_BIND_ADDRESS` | `bind_address` | `0.0.0.0` | Listen address for all services |
+
+> All 7 ports must be unique and non-zero. The private HTTP port binds to the WireGuard tunnel IP, not the external interface.
+
+**Example — change ports via CLI:**
+```bash
+lemonade-nexus --http-port 8443 --udp-port 41820 --gossip-port 8102 --relay-port 8103
+```
+
+**Example — change ports via environment:**
+```bash
+SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
+```
+
+**Example — change ports via JSON config (`lemonade-nexus.json`):**
+```json
+{
+  "http_port": 8443,
+  "udp_port": 41820,
+  "gossip_port": 8102,
+  "stun_port": 3478,
+  "relay_port": 8103,
+  "dns_port": 5353,
+  "private_http_port": 9101
+}
+```
+
+### Server Identity & Auth
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--root-pubkey <hex>` | `SP_ROOT_PUBKEY` | `root_pubkey` | | Root Ed25519 public key (hex) |
+| `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | Relying Party ID for WebAuthn passkeys |
+| | `SP_JWT_SECRET` | `jwt_secret` | (auto-generated) | JWT signing secret |
+
+### Storage & Logging
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--data-root <path>` | `SP_DATA_ROOT` | `data_root` | `data` | Data directory for all state files |
+| `--log-level <level>` | `SP_LOG_LEVEL` | `log_level` | `info` | Log level: `trace` / `debug` / `info` / `warn` / `error` |
+| `--config <path>` | | | `lemonade-nexus.json` | JSON config file path |
+
+### Gossip & Peer Discovery
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--seed-peer <host:port>` | `SP_SEED_PEERS` | `seed_peers` | | Gossip seed peers (CLI: repeatable; env: comma-separated) |
+| | | `gossip_interval_sec` | `5` | Seconds between gossip rounds |
+| | | `rate_limit_rpm` | `120` | API rate limit: requests per minute |
+| | | `rate_limit_burst` | `20` | API rate limit: burst size |
+
+### TLS & ACME Certificates
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| | | `tls_cert_path` | | Path to TLS certificate file |
+| | | `tls_key_path` | | Path to TLS private key file |
+| | `SP_ACME_PROVIDER` | `acme_provider` | `letsencrypt` | ACME provider: `letsencrypt` / `letsencrypt_staging` / `zerossl` |
+| | `ACME_EMAIL` | | | Contact email for ACME registration |
+| | `ZEROSSL_EAB_KID` | | | ZeroSSL External Account Binding key ID |
+| | `ZEROSSL_EAB_HMAC_KEY` | | | ZeroSSL EAB HMAC key |
+| | `CLOUDFLARE_API_TOKEN` | | | Cloudflare API token (for DNS-01 challenges) |
+
+### DNS Configuration
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--dns-base-domain <dom>` | `SP_DNS_BASE_DOMAIN` | `dns_base_domain` | `lemonade-nexus.io` | DNS zone suffix for network records |
+| `--dns-ns-hostname <fqdn>` | `SP_DNS_NS_HOSTNAME` | `dns_ns_hostname` | | This server's NS hostname (e.g. `ns1.example.com`) |
+| `--dns-provider <name>` | `SP_DNS_PROVIDER` | `dns_provider` | `local` | DNS provider: `local` (self-hosted) or `cloudflare` |
+
+### Dynamic DNS (DDNS)
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--ddns-domain <domain>` | `SP_DDNS_DOMAIN` | `ddns_domain` | | Base domain for DDNS (e.g. `example.com`) |
+| `--ddns-password <pass>` | `SP_DDNS_PASSWORD` | `ddns_password` | | Namecheap DDNS password (root server only) |
+| `--ddns-enabled` | `SP_DDNS_ENABLED` | `ddns_enabled` | `false` | Enable dynamic DNS updates |
+| | | `ddns_update_interval_sec` | `300` | DDNS update interval (seconds) |
+
+### Binary Attestation
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--release-signing-pubkey <b64>` | `SP_RELEASE_SIGNING_PUBKEY` | `release_signing_pubkey` | | Base64 Ed25519 pubkey for release manifest verification |
+| `--require-attestation` | `SP_REQUIRE_ATTESTATION` | `require_binary_attestation` | `false` | Require matching manifest for credential distribution |
+| `--github-releases-url <url>` | `SP_GITHUB_RELEASES_URL` | `github_releases_url` | | GitHub API URL for fetching release manifests |
+| `--manifest-fetch-interval <sec>` | `SP_MANIFEST_FETCH_INTERVAL` | `manifest_fetch_interval_sec` | `3600` | How often to check GitHub (seconds) |
+| `--minimum-version <semver>` | `SP_MINIMUM_VERSION` | `minimum_version` | | Minimum binary version allowed (e.g. `1.2.0`) |
+| | `SP_GITHUB_TOKEN` | | | GitHub API token for higher rate limits |
+
+### TEE Attestation & Trust
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--require-tee` | `SP_REQUIRE_TEE` | `require_tee_attestation` | `false` | Require TEE hardware attestation for Tier 1 |
+| `--tee-platform <name>` | `SP_TEE_PLATFORM` | `tee_platform_override` | (auto-detect) | Force TEE platform: `sgx` / `tdx` / `sev-snp` / `secure-enclave` |
+| | | `tee_attestation_validity_sec` | `3600` | TEE report validity period (seconds) |
+
+### Quorum-Based Enrollment
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--require-peer-confirmation` | `SP_REQUIRE_PEER_CONFIRMATION` | `require_peer_confirmation` | `false` | Require Tier 1 peer votes before full admission |
+| `--enrollment-quorum <ratio>` | `SP_ENROLLMENT_QUORUM` | `enrollment_quorum_ratio` | `0.5` | Fraction of Tier 1 peers needed (50%) |
+| | | `enrollment_vote_timeout_sec` | `60` | Vote collection window (seconds) |
+| | | `enrollment_max_retries` | `3` | Retries before permanent rejection |
+
+### CLI-Only Commands (non-server modes)
+
+| CLI Flag | Description |
+|----------|-------------|
+| `--enroll-server <hex> <id>` | Sign a certificate for a new server's pubkey |
+| `--revoke-server <hex>` | Revoke a server by its pubkey |
+| `--add-manifest <path>` | Import a signed release manifest JSON |
+| `--help`, `-h` | Show usage |
 
 ### Protocol Constants (governed by Tier 1 vote)
 

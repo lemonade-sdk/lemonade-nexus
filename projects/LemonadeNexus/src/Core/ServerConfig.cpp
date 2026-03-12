@@ -112,6 +112,11 @@ void print_usage(const char* prog) {
     spdlog::info("Options:");
     spdlog::info("  --config <path>            JSON config file (default: lemonade-nexus.json)");
     spdlog::info("  --http-port <N>            HTTP port (default: 9100)");
+    spdlog::info("  --udp-port <N>             WireGuard + hole-punch UDP port (default: 51940)");
+    spdlog::info("  --gossip-port <N>          Gossip protocol UDP port (default: 9102)");
+    spdlog::info("  --stun-port <N>            STUN UDP port (default: 3478)");
+    spdlog::info("  --relay-port <N>           Relay UDP port (default: 9103)");
+    spdlog::info("  --bind-address <addr>      Bind address for all services (default: 0.0.0.0)");
     spdlog::info("  --data-root <path>         Data directory (default: data)");
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
@@ -176,6 +181,16 @@ ServerConfig load_config(int argc, char* argv[]) {
             ++i; // already handled
         } else if (std::strcmp(argv[i], "--http-port") == 0 && i + 1 < argc) {
             config.http_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--udp-port") == 0 && i + 1 < argc) {
+            config.udp_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--gossip-port") == 0 && i + 1 < argc) {
+            config.gossip_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--stun-port") == 0 && i + 1 < argc) {
+            config.stun_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--relay-port") == 0 && i + 1 < argc) {
+            config.relay_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
+            config.bind_address = argv[++i];
         } else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) {
             config.data_root = argv[++i];
         } else if (std::strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
@@ -233,6 +248,11 @@ ServerConfig load_config(int argc, char* argv[]) {
     // --- Pass 3: environment variable overrides ---
     if (const char* v = std::getenv("SP_LOG_LEVEL"))   config.log_level   = v;
     if (const char* v = std::getenv("SP_HTTP_PORT"))    config.http_port   = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_UDP_PORT"))     config.udp_port    = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_GOSSIP_PORT"))  config.gossip_port = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_STUN_PORT"))    config.stun_port   = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_BIND_ADDRESS")) config.bind_address = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
