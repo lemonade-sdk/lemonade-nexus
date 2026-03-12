@@ -7,7 +7,11 @@
 #include <ares_dns_record.h>
 
 #include <algorithm>
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
 #include <chrono>
 #include <cstring>
 #include <memory>
