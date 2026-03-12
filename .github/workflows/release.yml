@@ -390,6 +390,23 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
+      - name: Rename binaries with platform suffixes
+        run: |
+          # Rename bare binaries to include platform in filename
+          for dir in lemonade-nexus-linux-x86_64 lemonade-nexus-linux-x86_64-deb \
+                     lemonade-nexus-linux-x86_64-rpm lemonade-nexus-linux-x86_64-arch \
+                     lemonade-nexus-darwin-arm64; do
+            platform="${dir#lemonade-nexus-}"
+            if [ -f "$dir/lemonade-nexus" ]; then
+              mv "$dir/lemonade-nexus" "$dir/lemonade-nexus-${platform}"
+            fi
+          done
+          # Windows binary already has .exe extension but still needs platform suffix
+          if [ -f "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" ]; then
+            mv "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" \
+               "lemonade-nexus-windows-x86_64/lemonade-nexus-windows-x86_64.exe"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
