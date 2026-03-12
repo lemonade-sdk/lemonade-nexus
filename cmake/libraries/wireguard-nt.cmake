@@ -18,7 +18,7 @@ if(WIN32)
     include(FetchContent)
     FetchContent_Declare(wireguard_nt
         GIT_REPOSITORY https://git.zx2c4.com/wireguard-nt
-        GIT_TAG        v0.10.1
+        GIT_TAG        0.10.1
         GIT_SHALLOW    TRUE
     )
     FetchContent_MakeAvailable(wireguard_nt)

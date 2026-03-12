@@ -1,0 +1,17 @@
+FROM debian:bookworm
+
+RUN apt-get update && apt-get install -y \
+    cmake ninja-build g++ libssl-dev git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=ON
+
+RUN cmake --build build --config Release
+
+RUN ctest --test-dir build --output-on-failure -C Release

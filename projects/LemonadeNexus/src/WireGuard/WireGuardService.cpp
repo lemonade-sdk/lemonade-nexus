@@ -205,7 +205,7 @@ namespace {
 /// Returns true on success.
 bool base64_to_wg_key(const std::string& b64, wg_key& out) {
     if (b64.size() != 44) return false;
-    wg_key_from_base64(&out, b64.c_str());
+    wg_key_from_base64(out, b64.c_str());
     return true;
 }
 
@@ -634,7 +634,7 @@ bool WireGuardService::do_add_peer(const std::string& pubkey,
     if (!endpoint.empty()) {
         sockaddr_storage ep_addr{};
         if (parse_endpoint(endpoint, ep_addr)) {
-            peer->endpoint.addr = ep_addr;
+            std::memcpy(&peer->endpoint.addr, &ep_addr, sizeof(peer->endpoint.addr));
         }
     }
 
@@ -864,7 +864,9 @@ std::vector<WgPeer> WireGuardService::do_get_peers() {
     wg_for_each_peer(dev, p) {
         WgPeer peer;
         peer.public_key = wg_key_to_b64(p->public_key);
-        peer.endpoint = format_endpoint(p->endpoint.addr);
+        sockaddr_storage ep_storage{};
+        std::memcpy(&ep_storage, &p->endpoint.addr, sizeof(p->endpoint.addr));
+        peer.endpoint = format_endpoint(ep_storage);
         peer.last_handshake = static_cast<uint64_t>(p->last_handshake_time.tv_sec);
         peer.rx_bytes = p->rx_bytes;
         peer.tx_bytes = p->tx_bytes;
