@@ -26,7 +26,7 @@ void FileStorageService::on_start() {
             if (entry.path().extension() == ".json") {
                 try {
                     const auto seq = std::stoull(entry.path().stem().string());
-                    max_seq = std::max(max_seq, seq);
+                    max_seq = std::max(max_seq, static_cast<uint64_t>(seq));
                 } catch (...) {
                     // skip non-numeric filenames
                 }
