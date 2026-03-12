@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Core/Coordinator.hpp>
+#include <LemonadeNexus/Core/HostnameGenerator.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/ACL/ACLService.hpp>
@@ -384,6 +385,41 @@ int main(int argc, char* argv[]) {
         gossip.broadcast_dns_record_delta(delta);
     });
 
+    // ========================================================================
+    // Server Hostname Resolution
+    // ========================================================================
+    // Priority: --server-hostname / SP_SERVER_HOSTNAME > persisted > auto-generate
+    if (config.server_hostname.empty()) {
+        auto persisted = nexus::core::HostnameGenerator::load_persisted_hostname(data_root);
+        if (persisted) {
+            config.server_hostname = *persisted;
+            spdlog::info("Loaded server hostname from disk: {}", config.server_hostname);
+        } else {
+            auto region = nexus::core::HostnameGenerator::detect_region();
+            std::string region_code = region.value_or("unknown");
+
+            // Gather existing hostnames for collision avoidance
+            std::unordered_set<std::string> existing_hostnames;
+            // Check gossip peers
+            for (const auto& peer : gossip.get_peers()) {
+                // Try to extract server_id from peer certificate
+                if (!peer.certificate_json.empty()) {
+                    try {
+                        auto cert_j = nlohmann::json::parse(peer.certificate_json);
+                        auto sid = cert_j.value("server_id", "");
+                        if (!sid.empty()) existing_hostnames.insert(sid);
+                    } catch (...) {}
+                }
+            }
+
+            config.server_hostname = nexus::core::HostnameGenerator::generate_unique_hostname(
+                region_code, existing_hostnames);
+
+            nexus::core::HostnameGenerator::persist_hostname(data_root, config.server_hostname);
+            spdlog::info("Auto-generated server hostname: {} (region: {})", config.server_hostname, region_code);
+        }
+    }
+
     // Resolve NS hostname: explicit --dns-ns-hostname > derived from --server-hostname
     std::string ns_hostname = config.dns_ns_hostname;
     if (ns_hostname.empty() && !config.server_hostname.empty()) {
@@ -566,9 +602,9 @@ int main(int argc, char* argv[]) {
         server_fqdn = server_hostname + ".srv." + config.dns_base_domain;
     }
 
-    // Auto-TLS: if no manual cert paths, try ACME
+    // Auto-TLS: if no manual cert paths, check for existing ACME cert on disk
+    bool needs_acme_background = false;
     if (tls_cert_path.empty() && tls_key_path.empty() && config.auto_tls && !server_fqdn.empty()) {
-        // Check for existing ACME cert on disk
         const auto acme_cert_dir = data_root / "certs" / server_fqdn;
         const auto acme_cert_file = acme_cert_dir / "fullchain.pem";
         const auto acme_key_file  = acme_cert_dir / "privkey.pem";
@@ -578,21 +614,8 @@ int main(int argc, char* argv[]) {
             tls_key_path  = acme_key_file.string();
             spdlog::info("Auto-TLS: using existing ACME cert for {}", server_fqdn);
         } else {
-            // Register the server's hostname in DNS so ACME DNS-01 can validate
-            spdlog::info("Auto-TLS: requesting ACME certificate for {}", server_fqdn);
-
-            // Request certificate via ACME (synchronous — blocks until issued or fails)
-            auto acme_result = acme.request_certificate(server_fqdn);
-            if (acme_result.success) {
-                tls_cert_path = acme_result.cert_path;
-                tls_key_path  = acme_result.key_path;
-                spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
-                              server_fqdn, tls_cert_path, tls_key_path);
-            } else {
-                spdlog::warn("Auto-TLS: ACME certificate request failed for {}: {}",
-                              server_fqdn, acme_result.error_message);
-                spdlog::warn("Auto-TLS: falling back to plain HTTP — will retry on next restart");
-            }
+            needs_acme_background = true;
+            spdlog::info("Auto-TLS: no cert on disk for {} — will request in background", server_fqdn);
         }
     }
 
@@ -1771,11 +1794,56 @@ int main(int argc, char* argv[]) {
     if (http_server.is_tls() && !server_fqdn.empty()) {
         spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());
     }
+
+    // ========================================================================
+    // Background ACME retry — if no cert yet, retry every 5 minutes
+    // ========================================================================
+    std::atomic<bool> acme_retry_stop{false};
+    std::thread acme_retry_thread;
+    if (needs_acme_background) {
+        acme_retry_thread = std::thread([&]() {
+            constexpr auto retry_interval = std::chrono::minutes(5);
+            constexpr auto initial_delay  = std::chrono::seconds(30);
+
+            spdlog::info("Auto-TLS: background retry starting in 30s for {}", server_fqdn);
+            for (auto elapsed = std::chrono::seconds(0);
+                 elapsed < initial_delay && !acme_retry_stop.load();
+                 elapsed += std::chrono::seconds(1)) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            while (!acme_retry_stop.load()) {
+                spdlog::info("Auto-TLS: attempting ACME certificate for {}", server_fqdn);
+                auto result = acme.request_certificate(server_fqdn);
+                if (result.success) {
+                    spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
+                                  server_fqdn, result.cert_path, result.key_path);
+                    spdlog::info("Auto-TLS: restarting server to activate HTTPS...");
+                    // Trigger graceful shutdown — systemd will restart with the cert on disk
+                    coordinator.shutdown();
+                    break;
+                }
+                spdlog::warn("Auto-TLS: ACME retry failed for {}: {} — retrying in 5 minutes",
+                              server_fqdn, result.error_message);
+
+                for (auto elapsed = std::chrono::seconds(0);
+                     elapsed < retry_interval && !acme_retry_stop.load();
+                     elapsed += std::chrono::seconds(1)) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }
+        });
+    }
+
     coordinator.run();
 
     // ========================================================================
     // Shutdown (reverse order)
     // ========================================================================
+    acme_retry_stop.store(true);
+    if (acme_retry_thread.joinable()) {
+        acme_retry_thread.join();
+    }
     hole_punch.stop();
     if (private_http_server) {
         private_http_server->stop();

@@ -150,8 +150,8 @@ void print_usage(const char* prog) {
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
     spdlog::info("  --dns-provider <name>      DNS provider: 'local' (default) or 'cloudflare'");
     spdlog::info("  --dns-ns-hostname <fqdn>   This server's NS hostname (e.g. ns1.example.com)");
-    spdlog::info("  --server-hostname <name>   Server hostname for TLS cert (e.g. 'central')");
-    spdlog::info("  --acme-provider <name>     ACME CA provider: zerossl (default), letsencrypt, letsencrypt_staging");
+    spdlog::info("  --server-hostname <name>   Server hostname for TLS cert (auto-generated from region if omitted)");
+    spdlog::info("  --acme-provider <name>     ACME CA provider: letsencrypt (default), letsencrypt_staging, zerossl");
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");

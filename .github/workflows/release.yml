@@ -490,21 +490,22 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
-      - name: Rename binaries with platform suffixes
+      - name: Rename binaries with version and platform suffixes
         run: |
-          # Rename bare binaries to include platform in filename
+          VERSION="${GITHUB_REF_NAME}"  # e.g. v0.3.0-alpha
+          # Rename bare binaries to include version + platform in filename
           for dir in lemonade-nexus-linux-x86_64 lemonade-nexus-linux-x86_64-deb \
                      lemonade-nexus-linux-x86_64-rpm lemonade-nexus-linux-x86_64-arch \
                      lemonade-nexus-darwin-arm64; do
             platform="${dir#lemonade-nexus-}"
             if [ -f "$dir/lemonade-nexus" ]; then
-              mv "$dir/lemonade-nexus" "$dir/lemonade-nexus-${platform}"
+              mv "$dir/lemonade-nexus" "$dir/lemonade-nexus-${VERSION}-${platform}"
             fi
           done
-          # Windows binary already has .exe extension but still needs platform suffix
+          # Windows binary
           if [ -f "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" ]; then
             mv "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" \
-               "lemonade-nexus-windows-x86_64/lemonade-nexus-windows-x86_64.exe"
+               "lemonade-nexus-windows-x86_64/lemonade-nexus-${VERSION}-windows-x86_64.exe"
           fi
 
       - name: Create GitHub Release
@@ -536,13 +537,13 @@ jobs:
             ### Platforms
             | Platform | Binary | Manifest |
             |----------|--------|----------|
-            | Linux x86_64 (Ubuntu) | `lemonade-nexus-linux-x86_64` | `manifest-linux-x86_64.json` |
-            | Linux x86_64 (Debian) | `lemonade-nexus-linux-x86_64-deb` | `manifest-linux-x86_64-deb.json` |
-            | Linux x86_64 (Fedora) | `lemonade-nexus-linux-x86_64-rpm` | `manifest-linux-x86_64-rpm.json` |
-            | Linux x86_64 (Arch) | `lemonade-nexus-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
-            | macOS ARM64 | `lemonade-nexus-darwin-arm64` | `manifest-darwin-arm64.json` |
+            | Linux x86_64 (Ubuntu) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64` | `manifest-linux-x86_64.json` |
+            | Linux x86_64 (Debian .deb) | `lemonade-nexus-${{ github.ref_name }}-Linux-x86_64.deb` | `manifest-linux-x86_64-deb.json` |
+            | Linux x86_64 (Fedora .rpm) | `lemonade-nexus-${{ github.ref_name }}-Linux-x86_64.rpm` | `manifest-linux-x86_64-rpm.json` |
+            | Linux x86_64 (Arch) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
+            | macOS ARM64 | `lemonade-nexus-${{ github.ref_name }}-darwin-arm64` | `manifest-darwin-arm64.json` |
             | macOS App (.dmg) | `LemonadeNexus.dmg` | — |
-            | Windows x86_64 | `lemonade-nexus-windows-x86_64` | `manifest-windows-x86_64.json` |
+            | Windows x86_64 | `lemonade-nexus-${{ github.ref_name }}-windows-x86_64.exe` | `manifest-windows-x86_64.json` |
 
             ### Install
 

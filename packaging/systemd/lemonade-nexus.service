@@ -11,7 +11,7 @@ Group=lemonade-nexus
 ExecStart=/usr/bin/lemonade-nexus
 WorkingDirectory=/var/lib/lemonade-nexus
 EnvironmentFile=-/etc/lemonade-nexus/lemonade-nexus.env
-Restart=on-failure
+Restart=always
 RestartSec=5
 LimitNOFILE=65536
 

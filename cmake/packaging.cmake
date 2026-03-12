@@ -14,10 +14,27 @@
 
 set(CPACK_PACKAGE_NAME "lemonade-nexus")
 set(CPACK_PACKAGE_VENDOR "Lemonade-Nexus")
+
+# Derive version from git tag (e.g. v0.3.0-alpha -> 0.3.0-alpha), fallback to 0.1.0
 set(CPACK_PACKAGE_VERSION_MAJOR 0)
 set(CPACK_PACKAGE_VERSION_MINOR 1)
 set(CPACK_PACKAGE_VERSION_PATCH 0)
 set(CPACK_PACKAGE_VERSION "${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSION_MINOR}.${CPACK_PACKAGE_VERSION_PATCH}")
+
+execute_process(
+    COMMAND git describe --tags --exact-match HEAD
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE GIT_TAG
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE GIT_TAG_RESULT
+)
+if(GIT_TAG_RESULT EQUAL 0 AND GIT_TAG)
+    # Strip leading 'v' if present (v0.3.0-alpha -> 0.3.0-alpha)
+    string(REGEX REPLACE "^v" "" GIT_VERSION "${GIT_TAG}")
+    set(CPACK_PACKAGE_VERSION "${GIT_VERSION}")
+    message(STATUS "Packaging version from git tag: ${CPACK_PACKAGE_VERSION}")
+endif()
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Self-hosted WireGuard mesh VPN server")
 set(CPACK_PACKAGE_DESCRIPTION
     "Cryptographically secure, self-hosted WireGuard mesh VPN with Ed25519 identity, gossip-based state sync, distributed authoritative DNS, TEE attestation, and zero-trust enrollment.")
