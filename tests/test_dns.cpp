@@ -458,7 +458,7 @@ TEST_F(DnsResolveTest, ResolveClientApiWrongTypeNxdomain) {
 }
 
 // ===========================================================================
-// TXT record: config_ subdomain for port configuration
+// TXT record: _config. subdomain for port configuration
 // ===========================================================================
 
 TEST_F(DnsResolveTest, ConfigTxtWithoutPortConfig) {
@@ -475,11 +475,12 @@ TEST_F(DnsResolveTest, ConfigTxtWithPortConfig) {
     ports.stun_port   = 3478;
     ports.relay_port  = 9103;
     ports.dns_port    = 5353;
+    ports.private_http_port = 9101;
     dns_svc->set_port_config(ports);
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353");
+    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353 private_http=9101");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtWithTypeQualifier) {
@@ -516,11 +517,12 @@ TEST_F(DnsResolveTest, ConfigTxtCustomPorts) {
     ports.stun_port   = 8446;
     ports.relay_port  = 8447;
     ports.dns_port    = 8448;
+    ports.private_http_port = 8449;
     dns_svc->set_port_config(ports);
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=8443 udp=8444 gossip=8445 stun=8446 relay=8447 dns=8448");
+    EXPECT_EQ(*result, "v=sp1 http=8443 udp=8444 gossip=8445 stun=8446 relay=8447 dns=8448 private_http=8449");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtCaseInsensitive) {
@@ -537,5 +539,45 @@ TEST_F(DnsResolveTest, ConfigTxtServerNode) {
 
     auto result = dns_svc->resolve_config_txt("central");
     ASSERT_TRUE(result.has_value());
-    // central is the root server node — config_ works for all node types
+    // central is the root server node — _config. works for all node types
+}
+
+// ===========================================================================
+// publish_port_config() — dynamic TXT record for gossip-synced discovery
+// ===========================================================================
+
+TEST_F(DnsResolveTest, PublishPortConfigCreatesDynamicTxtRecord) {
+    network::DnsService::PortConfig ports;
+    ports.http_port   = 9100;
+    ports.udp_port    = 51940;
+    ports.gossip_port = 9102;
+    ports.stun_port   = 3478;
+    ports.relay_port  = 9103;
+    ports.dns_port    = 5353;
+    ports.private_http_port = 9101;
+    dns_svc->set_port_config(ports);
+
+    // Publish the config — this creates a dynamic TXT record
+    dns_svc->publish_port_config("central");
+
+    // The dynamic TXT record should now be discoverable
+    // Query via resolve_config_txt (which checks dynamic records first)
+    // But we can also verify the SOA serial bumped (set_record increments it)
+    EXPECT_GT(dns_svc->soa_serial(), 1u);
+}
+
+TEST_F(DnsResolveTest, PublishPortConfigEmptyServerIdIsNoop) {
+    network::DnsService::PortConfig ports;
+    dns_svc->set_port_config(ports);
+
+    uint32_t serial_before = dns_svc->soa_serial();
+    dns_svc->publish_port_config("");  // should be a no-op
+    EXPECT_EQ(dns_svc->soa_serial(), serial_before);
+}
+
+TEST_F(DnsResolveTest, PublishPortConfigWithoutPortConfigIsNoop) {
+    // Don't call set_port_config — publish should be a no-op
+    uint32_t serial_before = dns_svc->soa_serial();
+    dns_svc->publish_port_config("central");
+    EXPECT_EQ(dns_svc->soa_serial(), serial_before);
 }

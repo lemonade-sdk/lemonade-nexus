@@ -167,13 +167,13 @@ void DnsService::handle_query(std::size_t bytes) {
             return;
         }
 
-        // 2. Check config_ subdomain
+        // 2. Check _config. subdomain (per-server port config, gossip-synced)
         std::string suffix = "." + base_lower;
         if (query_lower.size() > suffix.size() &&
             query_lower.compare(query_lower.size() - suffix.size(), suffix.size(), suffix) == 0) {
             std::string prefix = query_lower.substr(0, query_lower.size() - suffix.size());
-            if (prefix.starts_with("config_.")) {
-                std::string hostname = prefix.substr(8); // strip "config_."
+            if (prefix.starts_with("_config.")) {
+                std::string hostname = prefix.substr(8); // strip "_config."
                 auto txt = resolve_config_txt(hostname);
                 if (txt) {
                     spdlog::debug("[{}] TXT {} -> {}", name(), qname, *txt);
@@ -426,6 +426,24 @@ void DnsService::set_port_config(const PortConfig& config) {
     has_port_config_ = true;
 }
 
+void DnsService::publish_port_config(const std::string& server_id) {
+    if (!has_port_config_ || server_id.empty()) return;
+
+    std::string fqdn = "_config." + server_id + "." + base_domain_;
+    std::string txt = "v=sp1"
+                      " http=" + std::to_string(port_config_.http_port) +
+                      " udp=" + std::to_string(port_config_.udp_port) +
+                      " gossip=" + std::to_string(port_config_.gossip_port) +
+                      " stun=" + std::to_string(port_config_.stun_port) +
+                      " relay=" + std::to_string(port_config_.relay_port) +
+                      " dns=" + std::to_string(port_config_.dns_port) +
+                      " private_http=" + std::to_string(port_config_.private_http_port);
+
+    // Publish as a dynamic TXT record — gossip callback broadcasts to peers
+    set_record(fqdn, "TXT", txt, 300);
+    spdlog::info("[{}] published _config record: {} -> {}", name(), fqdn, txt);
+}
+
 std::optional<std::string> DnsService::resolve_config_txt(
     const std::string& hostname) {
 
@@ -484,14 +502,15 @@ std::optional<std::string> DnsService::resolve_config_txt(
                            [](unsigned char c) { return std::tolower(c); });
 
             if (node_hostname == search_hostname && !node.tunnel_ip.empty()) {
-                // Build TXT record: "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353"
+                // Build TXT record with all port info for peer discovery
                 return "v=sp1"
                        " http=" + std::to_string(port_config_.http_port) +
                        " udp=" + std::to_string(port_config_.udp_port) +
                        " gossip=" + std::to_string(port_config_.gossip_port) +
                        " stun=" + std::to_string(port_config_.stun_port) +
                        " relay=" + std::to_string(port_config_.relay_port) +
-                       " dns=" + std::to_string(port_config_.dns_port);
+                       " dns=" + std::to_string(port_config_.dns_port) +
+                       " private_http=" + std::to_string(port_config_.private_http_port);
             }
         }
     }

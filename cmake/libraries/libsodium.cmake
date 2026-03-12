@@ -16,6 +16,14 @@ if(NOT _SODIUM_BIG_ENDIAN)
     target_compile_definitions(sodium PRIVATE NATIVE_LITTLE_ENDIAN=1)
 endif()
 
+# x86_64 AES-256-GCM: the robinlinden wrapper only sets -maes/-mpclmul/-mssse3
+# inside a clang-cl block (Windows). On Linux/macOS with GCC or Clang, the
+# AES-NI intrinsics are never enabled, causing crypto_aead_aes256gcm_is_available()
+# to return 0 even on CPUs with AES-NI support (e.g. Xeon v4).
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    target_compile_options(sodium PRIVATE -maes -mpclmul -mssse3)
+endif()
+
 # ARM64 AES-256-GCM: the robinlinden wrapper only includes the AES-NI (x86)
 # variant.  Add the ARM crypto implementation so Apple Silicon / aarch64 Linux
 # get hardware-accelerated AES-256-GCM instead of the stub that returns 0.

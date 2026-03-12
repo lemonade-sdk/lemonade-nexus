@@ -54,7 +54,7 @@ using DnsRecordCallback = std::function<void(const std::string& delta_id,
 ///   <hostname>.<base_domain>                   -> Any node matching the hostname
 ///   <hostname>.<region>.relays.<base_domain>   -> Relay in specific region
 ///   <hostname>.relays.<base_domain>            -> Relay by hostname (any region)
-///   config_.<hostname>.<base_domain>           -> TXT record with port config
+///   _config.<hostname>.<base_domain>            -> TXT record with port config
 ///   _acme-challenge.<domain>                   -> ACME DNS-01 TXT challenge
 class DnsService : public core::IService<DnsService>,
                     public IDnsProvider<DnsService> {
@@ -149,12 +149,18 @@ public:
         uint16_t stun_port{3478};
         uint16_t relay_port{9103};
         uint16_t dns_port{53};
+        uint16_t private_http_port{9101};
     };
 
     /// Set the port configuration to publish via TXT records.
     void set_port_config(const PortConfig& config);
 
-    /// Resolve a config_ subdomain query, returning TXT record data.
+    /// Publish this server's port config as a dynamic TXT record
+    /// (_config.<server_id>.<base_domain>), gossip-synced to all peers.
+    /// Must be called after set_port_config() and set_record_callback().
+    void publish_port_config(const std::string& server_id);
+
+    /// Resolve a _config. subdomain query, returning TXT record data.
     [[nodiscard]] std::optional<std::string> resolve_config_txt(
         const std::string& hostname);
 

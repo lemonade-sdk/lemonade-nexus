@@ -362,6 +362,7 @@ int main(int argc, char* argv[]) {
         dns_ports.stun_port   = stun_port;
         dns_ports.relay_port  = relay_port;
         dns_ports.dns_port    = dns_port;
+        dns_ports.private_http_port = config.private_http_port;
         dns.set_port_config(dns_ports);
     }
     // Wire DNS ↔ Gossip: local record mutations broadcast via gossip,
@@ -391,6 +392,20 @@ int main(int argc, char* argv[]) {
 
     // Wire ACME → local DNS for DNS-01 challenges
     acme.set_dns_service(&dns);
+
+    // Publish this server's _config TXT record (gossip-synced to all peers)
+    {
+        auto cert_env = storage.read_file("identity", "server_cert.json");
+        if (cert_env) {
+            try {
+                auto cert_j = nlohmann::json::parse(cert_env->data);
+                auto sid = cert_j.value("server_id", "");
+                if (!sid.empty()) {
+                    dns.publish_port_config(sid);
+                }
+            } catch (...) {}
+        }
+    }
 
     dns.start();
 
