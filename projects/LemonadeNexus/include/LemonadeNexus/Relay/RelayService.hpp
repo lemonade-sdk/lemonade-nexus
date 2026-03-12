@@ -47,7 +47,7 @@ class RelayService : public core::IService<RelayService>,
 
 public:
     /// @param io            ASIO io_context driving the socket
-    /// @param port          UDP port to listen on (default 51820)
+    /// @param port          UDP port to listen on (default 9103)
     /// @param crypto        Reference to the crypto service for verification
     /// @param central_pubkey Ed25519 public key of the central server
     RelayService(asio::io_context& io,

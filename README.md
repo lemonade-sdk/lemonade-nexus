@@ -69,7 +69,7 @@ Open the following ports on each server's firewall/security group/ACL:
 | 9102 | **UDP** | Inbound | Mesh servers only | Gossip protocol (peer sync, state replication) | Yes |
 | 3478 | **UDP** | Inbound | Mesh servers only | STUN (NAT traversal, external IP discovery) | Yes |
 | 51940 | **UDP** | Inbound | Mesh servers + clients | WireGuard tunnel + UDP hole-punching | Yes |
-| 51820 | **UDP** | Inbound | Mesh servers | Relay (forwarded WireGuard traffic) | Only if relay server |
+| 9103 | **UDP** | Inbound | Mesh servers | Relay (forwarded WireGuard traffic) | Only if relay server |
 | 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (Tier 1 servers only) | Optional |
 
 > **Note on port 9101**: The Private HTTP API (TCP :9101) binds to the **WireGuard tunnel IP** (10.64.x.x), not the external interface. It does **not** need a firewall rule — it is only reachable over the encrypted WireGuard tunnel.
@@ -83,7 +83,7 @@ ALLOW UDP  3478  IN   FROM <mesh-servers>   # STUN NAT traversal
 ALLOW UDP 51940  IN   FROM any             # WireGuard tunnels
 
 # Optional
-ALLOW UDP 51820  IN   FROM <mesh-servers>   # Relay (only if acting as relay)
+ALLOW UDP  9103  IN   FROM <mesh-servers>   # Relay (only if acting as relay)
 ALLOW UDP    53  IN   FROM any             # DNS (only Tier 1 servers)
 ```
 
@@ -116,7 +116,7 @@ The system separates traffic into two planes:
 | STUN | UDP :3478 | Server ↔ Server | NAT traversal, external IP discovery |
 | WireGuard handshake | UDP :51940 | Server ↔ Server, Client ↔ Server | Encrypted tunnel establishment |
 | Public HTTP API | TCP :9100 | Client → Server | Bootstrap: auth, join, health, server list |
-| Relay forwarding | UDP :51820 | Server ↔ Relay | Encrypted WireGuard packets when direct fails |
+| Relay forwarding | UDP :9103 | Server ↔ Relay | Encrypted WireGuard packets when direct fails |
 | DDNS updates | HTTPS outbound | Server → Namecheap | Dynamic DNS registration |
 
 **Over the WireGuard tunnel (10.64.x.x mesh):**

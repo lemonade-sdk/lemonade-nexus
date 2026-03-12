@@ -10,7 +10,7 @@ namespace nexus::relay {
 // --- Protocol constants ---
 static constexpr uint16_t kRelayMagic       = 0x4C52; // "LR"
 static constexpr uint8_t  kRelayVersion     = 0x01;
-static constexpr uint16_t kDefaultRelayPort = 51820;
+static constexpr uint16_t kDefaultRelayPort = 9103;
 static constexpr std::size_t kRelayHeaderSize = 26;
 
 /// 128-bit session identifier.

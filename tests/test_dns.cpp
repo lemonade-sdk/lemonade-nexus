@@ -473,13 +473,13 @@ TEST_F(DnsResolveTest, ConfigTxtWithPortConfig) {
     ports.udp_port    = 9101;
     ports.gossip_port = 9102;
     ports.stun_port   = 3478;
-    ports.relay_port  = 51820;
+    ports.relay_port  = 9103;
     ports.dns_port    = 5353;
     dns_svc->set_port_config(ports);
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=51820 dns=5353");
+    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtWithTypeQualifier) {

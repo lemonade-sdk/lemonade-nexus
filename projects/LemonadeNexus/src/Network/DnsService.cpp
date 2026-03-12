@@ -484,7 +484,7 @@ std::optional<std::string> DnsService::resolve_config_txt(
                            [](unsigned char c) { return std::tolower(c); });
 
             if (node_hostname == search_hostname && !node.tunnel_ip.empty()) {
-                // Build TXT record: "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=51820 dns=5353"
+                // Build TXT record: "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353"
                 return "v=sp1"
                        " http=" + std::to_string(port_config_.http_port) +
                        " udp=" + std::to_string(port_config_.udp_port) +

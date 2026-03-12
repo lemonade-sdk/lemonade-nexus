@@ -14,7 +14,7 @@ struct ServerConfig {
     uint16_t    udp_port{51940};  // WireGuard + hole-punch (shared UDP port)
     uint16_t    gossip_port{9102};
     uint16_t    stun_port{3478};
-    uint16_t    relay_port{51820};
+    uint16_t    relay_port{9103};
     uint16_t    dns_port{53};
     std::string bind_address{"0.0.0.0"};
 
