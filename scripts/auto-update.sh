@@ -22,6 +22,28 @@ VERSION_FILE="/var/lib/lemonade-nexus/.installed-release"
 
 log() { logger -t "$LOG_TAG" "$*"; echo "[$(date '+%H:%M:%S')] $*"; }
 
+# Compare two semver strings (strips leading 'v'). Returns 0 if $1 > $2.
+version_gt() {
+    local a="${1#v}" b="${2#v}"
+    # Split on dots and compare numerically
+    local IFS='.-'
+    read -ra va <<< "$a"
+    read -ra vb <<< "$b"
+    local max=$(( ${#va[@]} > ${#vb[@]} ? ${#va[@]} : ${#vb[@]} ))
+    for ((i=0; i<max; i++)); do
+        local pa="${va[i]:-0}" pb="${vb[i]:-0}"
+        # Compare numeric parts numerically, alpha parts lexically
+        if [[ "$pa" =~ ^[0-9]+$ ]] && [[ "$pb" =~ ^[0-9]+$ ]]; then
+            (( pa > pb )) && return 0
+            (( pa < pb )) && return 1
+        else
+            [[ "$pa" > "$pb" ]] && return 0
+            [[ "$pa" < "$pb" ]] && return 1
+        fi
+    done
+    return 1  # equal
+}
+
 # ---- Install/uninstall systemd timer ----
 
 install_timer() {
@@ -73,12 +95,18 @@ esac
 
 # ---- Main update logic ----
 
-# Get the latest release tag from GitHub
-LATEST=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+# Fetch the latest release JSON once (avoid duplicate API calls / rate limits)
+RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null) || true
+
+if [[ -z "$RELEASE_JSON" ]]; then
+    log "ERROR: Could not fetch latest release from GitHub"
+    exit 1
+fi
+
+LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
 if [[ -z "$LATEST" ]]; then
-    log "ERROR: Could not fetch latest release from GitHub"
+    log "ERROR: Could not parse release tag from GitHub response"
     exit 1
 fi
 
@@ -93,10 +121,15 @@ if [[ "$CURRENT" == "$LATEST" ]]; then
     exit 0
 fi
 
+if [[ -n "$CURRENT" ]] && ! version_gt "$LATEST" "$CURRENT"; then
+    log "Installed version ($CURRENT) is already >= latest release ($LATEST)"
+    exit 0
+fi
+
 log "New release available: $LATEST (current: ${CURRENT:-none})"
 
-# Find the .deb asset URL
-DEB_URL=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+# Find the .deb asset URL from cached response
+DEB_URL=$(echo "$RELEASE_JSON" \
     | grep '"browser_download_url"' \
     | grep '\.deb"' \
     | head -1 \
@@ -125,11 +158,9 @@ dpkg -i "$DEB_FILE" || apt-get install -f -y
 mkdir -p "$(dirname "$VERSION_FILE")"
 echo "$LATEST" > "$VERSION_FILE"
 
-# Restart the service
-if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-    log "Restarting $SERVICE_NAME service"
-    systemctl restart "$SERVICE_NAME"
-fi
+# Restart (or start) the service
+log "Restarting $SERVICE_NAME service"
+systemctl restart "$SERVICE_NAME" 2>/dev/null || systemctl start "$SERVICE_NAME" 2>/dev/null || true
 
 # Cleanup
 rm -rf "$DOWNLOAD_DIR"
