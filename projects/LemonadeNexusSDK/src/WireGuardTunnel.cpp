@@ -12,7 +12,9 @@
 #include <string>
 
 // Platform detection
-#if defined(__APPLE__)
+#if defined(_WIN32)
+#  include <windows.h>
+#elif defined(__APPLE__)
 #  include <TargetConditionals.h>
 #endif
 
