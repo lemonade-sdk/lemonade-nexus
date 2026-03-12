@@ -22,74 +22,93 @@ if [ ! -d "$APP_DIR" ]; then
 fi
 
 # Clean previous DMG artifacts
-echo "[1/5] Cleaning previous DMG..."
+echo "[1/4] Cleaning previous DMG..."
 rm -rf "$DMG_DIR"
 rm -f "$DMG_OUTPUT"
 rm -f "${DMG_OUTPUT/.dmg/.tmp.dmg}"
 
 # Create staging directory
-echo "[2/5] Staging DMG contents..."
+echo "[2/4] Staging DMG contents..."
 mkdir -p "$DMG_DIR"
 cp -R "$APP_DIR" "$DMG_DIR/"
 ln -s /Applications "$DMG_DIR/Applications"
 
-# Create a README file
-cat > "$DMG_DIR/.background_info" << 'README_EOF'
-Drag Lemonade Nexus to Applications to install.
-README_EOF
+if [ -n "$CI" ]; then
+    # In CI: create compressed DMG directly (no Finder customization)
+    echo "[3/4] Creating DMG (CI mode)..."
+    hdiutil create -srcfolder "$DMG_DIR" \
+        -volname "$DMG_VOLUME_NAME" \
+        -fs HFS+ \
+        -format UDZO \
+        -imagekey zlib-level=9 \
+        "$DMG_OUTPUT"
+    echo "[4/4] Skipping Finder customization in CI."
+else
+    # Local: create read-write DMG, customize with Finder, then compress
+    echo "[3/4] Creating temporary DMG..."
+    hdiutil create -srcfolder "$DMG_DIR" \
+        -volname "$DMG_VOLUME_NAME" \
+        -fs HFS+ \
+        -fsargs "-c c=64,a=16,e=16" \
+        -format UDRW \
+        -size "$DMG_SIZE" \
+        "${DMG_OUTPUT/.dmg/.tmp.dmg}"
 
-# Create temporary DMG
-echo "[3/5] Creating temporary DMG..."
-hdiutil create -srcfolder "$DMG_DIR" \
-    -volname "$DMG_VOLUME_NAME" \
-    -fs HFS+ \
-    -fsargs "-c c=64,a=16,e=16" \
-    -format UDRW \
-    -size "$DMG_SIZE" \
-    "${DMG_OUTPUT/.dmg/.tmp.dmg}"
+    # Mount temporary DMG
+    echo "[4/4] Configuring DMG appearance..."
+    MOUNT_DIR=$(hdiutil attach -readwrite -noverify -noautoopen "${DMG_OUTPUT/.dmg/.tmp.dmg}" | grep -E '^\S+\s+\S+\s+/' | tail -1 | awk '{print $3}')
 
-# Mount temporary DMG
-echo "[4/5] Configuring DMG appearance..."
-MOUNT_DIR=$(hdiutil attach -readwrite -noverify -noautoopen "${DMG_OUTPUT/.dmg/.tmp.dmg}" | grep -E '^\S+\s+\S+\s+/' | tail -1 | awk '{print $3}')
-
-if [ -n "$MOUNT_DIR" ]; then
-    # Set DMG window properties using AppleScript
-    osascript << APPLESCRIPT_EOF
-    tell application "Finder"
-        tell disk "$DMG_VOLUME_NAME"
-            open
-            set current view of container window to icon view
-            set toolbar visible of container window to false
-            set statusbar visible of container window to false
-            set the bounds of container window to {100, 100, 640, 400}
-            set viewOptions to the icon view options of container window
-            set arrangement of viewOptions to not arranged
-            set icon size of viewOptions to 80
-            set position of item "${APP_NAME}.app" of container window to {140, 150}
-            set position of item "Applications" of container window to {400, 150}
-            close
-            open
-            update without registering applications
+    if [ -n "$MOUNT_DIR" ]; then
+        # Set DMG window properties using AppleScript
+        osascript << APPLESCRIPT_EOF
+        tell application "Finder"
+            tell disk "$DMG_VOLUME_NAME"
+                open
+                set current view of container window to icon view
+                set toolbar visible of container window to false
+                set statusbar visible of container window to false
+                set the bounds of container window to {100, 100, 640, 400}
+                set viewOptions to the icon view options of container window
+                set arrangement of viewOptions to not arranged
+                set icon size of viewOptions to 80
+                set position of item "${APP_NAME}.app" of container window to {140, 150}
+                set position of item "Applications" of container window to {400, 150}
+                close
+                open
+                update without registering applications
+            end tell
         end tell
-    end tell
 APPLESCRIPT_EOF
 
-    # Wait for Finder to process
-    sleep 2
+        sleep 2
+        sync
+        hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true
+        sleep 1
+        if mount | grep -q "$DMG_VOLUME_NAME"; then
+            hdiutil detach "$MOUNT_DIR" -force 2>/dev/null || true
+            sleep 1
+        fi
+    else
+        hdiutil detach "/Volumes/$DMG_VOLUME_NAME" -force 2>/dev/null || true
+        sleep 1
+    fi
 
-    # Unmount
-    hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || hdiutil detach "$MOUNT_DIR" -force 2>/dev/null || true
+    # Final safety
+    if mount | grep -q "$DMG_VOLUME_NAME"; then
+        hdiutil detach "/Volumes/$DMG_VOLUME_NAME" -force 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Convert to compressed DMG
+    hdiutil convert "${DMG_OUTPUT/.dmg/.tmp.dmg}" \
+        -format UDZO \
+        -imagekey zlib-level=9 \
+        -o "$DMG_OUTPUT"
+
+    rm -f "${DMG_OUTPUT/.dmg/.tmp.dmg}"
 fi
 
-# Convert to compressed DMG
-echo "[5/5] Compressing final DMG..."
-hdiutil convert "${DMG_OUTPUT/.dmg/.tmp.dmg}" \
-    -format UDZO \
-    -imagekey zlib-level=9 \
-    -o "$DMG_OUTPUT"
-
-# Clean up
-rm -f "${DMG_OUTPUT/.dmg/.tmp.dmg}"
+# Clean up staging
 rm -rf "$DMG_DIR"
 
 echo ""
