@@ -80,7 +80,7 @@ final class AppState: ObservableObject {
 
     func discoverNearestServer() async {
         isDiscovering = true
-        discoveryMessage = "Resolving lemonade-nexus.io..."
+        discoveryMessage = "Querying lemonade-nexus.io DNS mesh..."
         discoveredServers = []
 
         let discovery = DnsDiscoveryService()
@@ -90,8 +90,8 @@ final class AppState: ObservableObject {
         if let fastest = servers.first {
             serverURL = fastest.url
             updateBaseURL()
-            discoveryMessage = "Found \(servers.count) server\(servers.count == 1 ? "" : "s") — selected \(fastest.ip) (\(Int(fastest.latencyMs))ms)"
-            addActivity(.success, "Auto-discovered server: \(fastest.url) (\(Int(fastest.latencyMs))ms)")
+            discoveryMessage = "Found \(servers.count) server\(servers.count == 1 ? "" : "s") — selected \(fastest.displayName) (\(Int(fastest.latencyMs))ms)"
+            addActivity(.success, "Auto-discovered server: \(fastest.displayName) at \(fastest.url) (\(Int(fastest.latencyMs))ms)")
         } else {
             discoveryMessage = "No servers found via DNS. Enter URL manually."
             addActivity(.warning, "DNS auto-discovery found no reachable servers on lemonade-nexus.io")

@@ -341,7 +341,8 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     nexus::acme::AcmeProviderConfig acme_config;
     if (config.acme_provider == "zerossl") {
-        acme_config = nexus::acme::AcmeProviderConfig::zerossl();
+        acme_config = nexus::acme::AcmeProviderConfig::zerossl(
+            config.acme_eab_kid, config.acme_eab_hmac_key);
     } else if (config.acme_provider == "letsencrypt_staging") {
         acme_config = nexus::acme::AcmeProviderConfig::letsencrypt_staging();
     } else {
@@ -383,11 +384,44 @@ int main(int argc, char* argv[]) {
         gossip.broadcast_dns_record_delta(delta);
     });
 
+    // Resolve NS hostname: explicit --dns-ns-hostname > derived from --server-hostname
+    std::string ns_hostname = config.dns_ns_hostname;
+    if (ns_hostname.empty() && !config.server_hostname.empty()) {
+        ns_hostname = config.server_hostname + "." + config.dns_base_domain;
+        spdlog::info("DNS: auto-derived NS hostname: {}", ns_hostname);
+    }
+
+    // Resolve public IP for DNS glue A records:
+    //   SP_PUBLIC_IP > non-wildcard bind address > auto-detect via external service
+    std::string server_public_ip = config.public_ip;
+    if (server_public_ip.empty() && config.bind_address != "0.0.0.0" && !config.bind_address.empty()) {
+        server_public_ip = config.bind_address;
+    }
+    if (server_public_ip.empty()) {
+        try {
+            httplib::Client ip_cli("http://api.ipify.org");
+            ip_cli.set_connection_timeout(3, 0);
+            ip_cli.set_read_timeout(3, 0);
+            auto ip_res = ip_cli.Get("/");
+            if (ip_res && ip_res->status == 200 && !ip_res->body.empty()) {
+                server_public_ip = ip_res->body;
+                // Trim whitespace
+                while (!server_public_ip.empty() && (server_public_ip.back() == '\n' || server_public_ip.back() == '\r'))
+                    server_public_ip.pop_back();
+                spdlog::info("DNS: auto-detected public IP: {}", server_public_ip);
+            }
+        } catch (...) {
+            spdlog::warn("DNS: failed to auto-detect public IP");
+        }
+    }
+
     // Configure this server's NS identity for SOA/NS responses
-    if (!config.dns_ns_hostname.empty()) {
-        // The IP will be our public IP or tunnel IP once allocated
-        dns.set_our_nameserver(config.dns_ns_hostname, config.bind_address);
-        dns.add_nameserver(config.dns_ns_hostname, config.bind_address);
+    if (!ns_hostname.empty() && !server_public_ip.empty()) {
+        dns.set_our_nameserver(ns_hostname, server_public_ip);
+        dns.add_nameserver(ns_hostname, server_public_ip);
+        spdlog::info("DNS: registered as nameserver {} -> {}", ns_hostname, server_public_ip);
+    } else if (!ns_hostname.empty()) {
+        spdlog::warn("DNS: NS hostname '{}' configured but no public IP available — skipping NS registration", ns_hostname);
     }
 
     // Wire ACME → local DNS for DNS-01 challenges
@@ -395,15 +429,22 @@ int main(int argc, char* argv[]) {
 
     // Publish this server's _config TXT record (gossip-synced to all peers)
     {
+        std::string config_id;
+        // Try server_cert.json first (enrolled servers)
         auto cert_env = storage.read_file("identity", "server_cert.json");
         if (cert_env) {
             try {
                 auto cert_j = nlohmann::json::parse(cert_env->data);
-                auto sid = cert_j.value("server_id", "");
-                if (!sid.empty()) {
-                    dns.publish_port_config(sid);
-                }
+                config_id = cert_j.value("server_id", "");
             } catch (...) {}
+        }
+        // Fall back to server_hostname (unenrolled servers)
+        if (config_id.empty()) {
+            config_id = config.server_hostname;
+        }
+        if (!config_id.empty()) {
+            dns.publish_port_config(config_id);
+            spdlog::info("DNS: published _config TXT for {}", config_id);
         }
     }
 
@@ -501,18 +542,83 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
+    // TLS Certificate Resolution
+    // ========================================================================
+    //
+    // Priority:
+    //   1. Manual override: --tls-cert-path / --tls-key-path
+    //   2. Auto-TLS via ACME: request cert for <hostname>.srv.<dns_base_domain>
+    //   3. Fallback: plain HTTP (first boot before ACME completes)
+    // ========================================================================
+
+    std::string tls_cert_path = config.tls_cert_path;
+    std::string tls_key_path  = config.tls_key_path;
+
+    // Resolve server hostname: --server-hostname > server_id from cert > empty
+    std::string server_hostname = config.server_hostname;
+    if (server_hostname.empty() && !server_node_id.empty()) {
+        server_hostname = server_node_id;
+    }
+
+    // Build the server FQDN: <hostname>.srv.<dns_base_domain>
+    std::string server_fqdn;
+    if (!server_hostname.empty()) {
+        server_fqdn = server_hostname + ".srv." + config.dns_base_domain;
+    }
+
+    // Auto-TLS: if no manual cert paths, try ACME
+    if (tls_cert_path.empty() && tls_key_path.empty() && config.auto_tls && !server_fqdn.empty()) {
+        // Check for existing ACME cert on disk
+        const auto acme_cert_dir = data_root / "certs" / server_fqdn;
+        const auto acme_cert_file = acme_cert_dir / "fullchain.pem";
+        const auto acme_key_file  = acme_cert_dir / "privkey.pem";
+
+        if (std::filesystem::exists(acme_cert_file) && std::filesystem::exists(acme_key_file)) {
+            tls_cert_path = acme_cert_file.string();
+            tls_key_path  = acme_key_file.string();
+            spdlog::info("Auto-TLS: using existing ACME cert for {}", server_fqdn);
+        } else {
+            // Register the server's hostname in DNS so ACME DNS-01 can validate
+            spdlog::info("Auto-TLS: requesting ACME certificate for {}", server_fqdn);
+
+            // Request certificate via ACME (synchronous — blocks until issued or fails)
+            auto acme_result = acme.request_certificate(server_fqdn);
+            if (acme_result.success) {
+                tls_cert_path = acme_result.cert_path;
+                tls_key_path  = acme_result.key_path;
+                spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
+                              server_fqdn, tls_cert_path, tls_key_path);
+            } else {
+                spdlog::warn("Auto-TLS: ACME certificate request failed for {}: {}",
+                              server_fqdn, acme_result.error_message);
+                spdlog::warn("Auto-TLS: falling back to plain HTTP — will retry on next restart");
+            }
+        }
+    }
+
+    // Populate config fields for other services to reference
+    if (!tls_cert_path.empty() && !tls_key_path.empty()) {
+        config.tls_cert_path = tls_cert_path;
+        config.tls_key_path  = tls_key_path;
+    }
+
+    // ========================================================================
     // HTTP Control Plane — Dual-server architecture
     // ========================================================================
     //
     // Public server:  binds to 0.0.0.0:<http_port>   — pre-VPN bootstrap endpoints
     // Private server: binds to <tunnel_ip>:<private_http_port> — post-VPN sensitive ops
     //
+    // When TLS cert is available, public server runs HTTPS; otherwise plain HTTP.
+    // Private API always runs plain HTTP (VPN-only network, trusted).
     // Private API activates automatically once the server has a tunnel IP.
     // ========================================================================
 
-    nexus::network::HttpServer http_server{http_port, "0.0.0.0"};
+    nexus::network::HttpServer http_server{http_port, "0.0.0.0",
+                                            tls_cert_path, tls_key_path};
 
     // Private server — created automatically when a tunnel IP is available
+    // Private server runs plain HTTP (only reachable over the VPN tunnel)
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
     if (!tunnel_bind_ip.empty()) {
         private_http_server = std::make_unique<nexus::network::HttpServer>(
@@ -547,6 +653,18 @@ int main(int argc, char* argv[]) {
         nexus::network::HealthResponse resp;
         nlohmann::json j = resp;
         res.set_content(j.dump(), "application/json");
+    });
+
+    // --- TLS status (public) ---
+    http_server.server().Get("/api/tls/status", [&](const httplib::Request&, httplib::Response& res) {
+        nlohmann::json resp = {
+            {"tls_enabled", http_server.is_tls()},
+            {"cert_path",   http_server.tls_cert_path()},
+            {"key_path",    http_server.tls_key_path()},
+            {"server_fqdn", server_fqdn},
+            {"auto_tls",    config.auto_tls},
+        };
+        res.set_content(resp.dump(), "application/json");
     });
 
     // --- Auth ---
@@ -1100,6 +1218,83 @@ int main(int argc, char* argv[]) {
         res.set_content(j.dump(), "application/json");
     }));
 
+    // --- TLS: hot-reload certificates ---
+    private_srv.Post("/api/tls/reload", require_auth(auth_service,
+        [&](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
+        // Optionally accept new cert/key paths in the request body
+        std::string reload_cert = http_server.tls_cert_path();
+        std::string reload_key  = http_server.tls_key_path();
+
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (!body.is_discarded()) {
+            if (body.contains("cert_path")) reload_cert = body["cert_path"].get<std::string>();
+            if (body.contains("key_path"))  reload_key  = body["key_path"].get<std::string>();
+        }
+
+        if (!http_server.is_tls()) {
+            // Try to upgrade from HTTP to HTTPS
+            if (reload_cert.empty() || reload_key.empty()) {
+                res.status = 400;
+                nlohmann::json j = nexus::network::ErrorResponse{
+                    .error = "not running TLS and no cert/key paths provided"};
+                res.set_content(j.dump(), "application/json");
+                return;
+            }
+            res.status = 400;
+            nlohmann::json j = nexus::network::ErrorResponse{
+                .error = "server is running plain HTTP — restart with TLS cert to enable HTTPS"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        bool ok = http_server.reload_tls_certs(reload_cert, reload_key);
+        nlohmann::json resp = {
+            {"success",   ok},
+            {"cert_path", reload_cert},
+            {"key_path",  reload_key},
+        };
+        res.status = ok ? 200 : 500;
+        res.set_content(resp.dump(), "application/json");
+    }));
+
+    // --- TLS: request new ACME cert and reload ---
+    private_srv.Post("/api/tls/renew", require_auth(auth_service,
+        [&](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
+        if (server_fqdn.empty()) {
+            res.status = 400;
+            nlohmann::json j = nexus::network::ErrorResponse{
+                .error = "no server FQDN configured — set --server-hostname"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        auto result = acme.renew_certificate(server_fqdn);
+        if (!result.success) {
+            res.status = 502;
+            nlohmann::json j = nexus::network::ErrorResponse{
+                .error  = "ACME renewal failed",
+                .detail = result.error_message,
+            };
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        // Hot-reload the new cert
+        bool reloaded = false;
+        if (http_server.is_tls() && !result.cert_path.empty() && !result.key_path.empty()) {
+            reloaded = http_server.reload_tls_certs(result.cert_path, result.key_path);
+        }
+
+        nlohmann::json resp = {
+            {"success",      true},
+            {"domain",       server_fqdn},
+            {"cert_path",    result.cert_path},
+            {"key_path",     result.key_path},
+            {"hot_reloaded", reloaded},
+        };
+        res.set_content(resp.dump(), "application/json");
+    }));
+
     // --- ACME: get certificate ---
     private_srv.Get(R"(/api/certs/(.+))", require_auth(auth_service,
         [&](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
@@ -1564,13 +1759,17 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Run — blocks until SIGINT/SIGTERM
     // ========================================================================
+    const auto http_proto = http_server.is_tls() ? "HTTPS" : "HTTP";
     if (private_http_server) {
-        spdlog::info("All services started. Listening on HTTP:{}, PrivateHTTP:{}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
-                     http_port, tunnel_bind_ip, config.private_http_port,
+        spdlog::info("All services started. Listening on {}:{}, PrivateHTTP:{}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
+                     http_proto, http_port, tunnel_bind_ip, config.private_http_port,
                      udp_port, gossip_port, stun_port, relay_port, dns_port);
     } else {
-        spdlog::info("All services started. Listening on HTTP:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
-                     http_port, udp_port, gossip_port, stun_port, relay_port, dns_port);
+        spdlog::info("All services started. Listening on {}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
+                     http_proto, http_port, udp_port, gossip_port, stun_port, relay_port, dns_port);
+    }
+    if (http_server.is_tls() && !server_fqdn.empty()) {
+        spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());
     }
     coordinator.run();
 

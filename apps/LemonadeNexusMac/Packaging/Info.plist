@@ -24,10 +24,6 @@
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
-    <key>NSMainStoryboardFile</key>
-    <string></string>
-    <key>NSPrincipalClass</key>
-    <string>NSApplication</string>
     <key>LSUIElement</key>
     <false/>
 </dict>

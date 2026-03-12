@@ -37,7 +37,12 @@ void to_json(json& j, const ServerConfig& c) {
         {"tls_cert_path",       c.tls_cert_path},
         {"tls_key_path",        c.tls_key_path},
         {"acme_provider",       c.acme_provider},
+        {"acme_eab_kid",        c.acme_eab_kid},
+        {"acme_eab_hmac_key",   c.acme_eab_hmac_key},
         {"dns_provider",        c.dns_provider},
+        {"public_ip",           c.public_ip},
+        {"server_hostname",     c.server_hostname},
+        {"auto_tls",            c.auto_tls},
         {"dns_base_domain",     c.dns_base_domain},
         {"dns_ns_hostname",     c.dns_ns_hostname},
         {"release_signing_pubkey",     c.release_signing_pubkey},
@@ -80,7 +85,12 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("tls_cert_path"))       j.at("tls_cert_path").get_to(c.tls_cert_path);
     if (j.contains("tls_key_path"))        j.at("tls_key_path").get_to(c.tls_key_path);
     if (j.contains("acme_provider"))       j.at("acme_provider").get_to(c.acme_provider);
+    if (j.contains("acme_eab_kid"))        j.at("acme_eab_kid").get_to(c.acme_eab_kid);
+    if (j.contains("acme_eab_hmac_key"))   j.at("acme_eab_hmac_key").get_to(c.acme_eab_hmac_key);
     if (j.contains("dns_provider"))        j.at("dns_provider").get_to(c.dns_provider);
+    if (j.contains("public_ip"))           j.at("public_ip").get_to(c.public_ip);
+    if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
+    if (j.contains("auto_tls"))            j.at("auto_tls").get_to(c.auto_tls);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
     if (j.contains("release_signing_pubkey"))     j.at("release_signing_pubkey").get_to(c.release_signing_pubkey);
@@ -140,6 +150,13 @@ void print_usage(const char* prog) {
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
     spdlog::info("  --dns-provider <name>      DNS provider: 'local' (default) or 'cloudflare'");
     spdlog::info("  --dns-ns-hostname <fqdn>   This server's NS hostname (e.g. ns1.example.com)");
+    spdlog::info("  --server-hostname <name>   Server hostname for TLS cert (e.g. 'central')");
+    spdlog::info("  --acme-provider <name>     ACME CA provider: zerossl (default), letsencrypt, letsencrypt_staging");
+    spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
+    spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
+    spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");
+    spdlog::info("  --tls-key-path <path>      Path to TLS private key PEM (manual override)");
+    spdlog::info("  --no-auto-tls              Disable automatic TLS certificate via ACME");
     spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
     spdlog::info("  --tee-platform <name>      Override TEE platform detection (sgx/tdx/sev-snp/secure-enclave)");
     spdlog::info("  --help, -h                 Show this help");
@@ -238,6 +255,20 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.dns_provider = argv[++i];
         } else if (std::strcmp(argv[i], "--dns-ns-hostname") == 0 && i + 1 < argc) {
             config.dns_ns_hostname = argv[++i];
+        } else if (std::strcmp(argv[i], "--server-hostname") == 0 && i + 1 < argc) {
+            config.server_hostname = argv[++i];
+        } else if (std::strcmp(argv[i], "--acme-provider") == 0 && i + 1 < argc) {
+            config.acme_provider = argv[++i];
+        } else if (std::strcmp(argv[i], "--acme-eab-kid") == 0 && i + 1 < argc) {
+            config.acme_eab_kid = argv[++i];
+        } else if (std::strcmp(argv[i], "--acme-eab-hmac-key") == 0 && i + 1 < argc) {
+            config.acme_eab_hmac_key = argv[++i];
+        } else if (std::strcmp(argv[i], "--no-auto-tls") == 0) {
+            config.auto_tls = false;
+        } else if (std::strcmp(argv[i], "--tls-cert-path") == 0 && i + 1 < argc) {
+            config.tls_cert_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--tls-key-path") == 0 && i + 1 < argc) {
+            config.tls_key_path = argv[++i];
         } else if (std::strcmp(argv[i], "--require-tee") == 0) {
             config.require_tee_attestation = true;
         } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
@@ -253,6 +284,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_STUN_PORT"))    config.stun_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_BIND_ADDRESS")) config.bind_address = v;
+    if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
@@ -275,6 +307,12 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ENROLLMENT_QUORUM")) config.enrollment_quorum_ratio = std::atof(v);
     if (std::getenv("SP_REQUIRE_TEE"))                   config.require_tee_attestation   = true;
     if (const char* v = std::getenv("SP_TEE_PLATFORM"))  config.tee_platform_override     = v;
+    if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
+    if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
+    if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
+    if (std::getenv("SP_NO_AUTO_TLS"))                   config.auto_tls              = false;
+    if (const char* v = std::getenv("SP_TLS_CERT_PATH")) config.tls_cert_path         = v;
+    if (const char* v = std::getenv("SP_TLS_KEY_PATH"))  config.tls_key_path          = v;
 
     if (const char* v = std::getenv("SP_SEED_PEERS")) {
         // Comma-separated list

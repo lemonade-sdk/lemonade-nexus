@@ -195,7 +195,7 @@ struct LoginView: View {
                         .foregroundColor(.green)
                         .font(.caption)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Connected to \(appState.discoveredServers.first?.ip ?? "")")
+                        Text("Connected to \(appState.discoveredServers.first?.displayName ?? "")")
                             .font(.caption)
                             .foregroundColor(.textPrimary)
                         Text("\(appState.discoveredServers.count) server\(appState.discoveredServers.count == 1 ? "" : "s") found — \(Int(appState.discoveredServers.first?.latencyMs ?? 0))ms latency")
@@ -219,9 +219,16 @@ struct LoginView: View {
                                 Image(systemName: server.url == serverURL ? "circle.inset.filled" : "circle")
                                     .font(.caption2)
                                     .foregroundColor(server.url == serverURL ? .lemonYellow : .textTertiary)
-                                Text(server.ip)
-                                    .font(.caption)
-                                    .foregroundColor(.textPrimary)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(server.displayName)
+                                        .font(.caption)
+                                        .foregroundColor(.textPrimary)
+                                    if server.hostname != nil {
+                                        Text(server.ip)
+                                            .font(.caption2)
+                                            .foregroundColor(.textTertiary)
+                                    }
+                                }
                                 Spacer()
                                 Text("\(Int(server.latencyMs))ms")
                                     .font(.caption2)
