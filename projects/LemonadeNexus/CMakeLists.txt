@@ -31,6 +31,11 @@ target_compile_definitions(LemonadeNexusApp PUBLIC
         ASIO_NO_DEPRECATED
 )
 
+if(WIN32)
+    target_link_libraries(LemonadeNexus PRIVATE ws2_32 mswsock iphlpapi)
+    target_link_libraries(LemonadeNexusApp PRIVATE ws2_32 mswsock iphlpapi)
+endif()
+
 # ── Install targets ──────────────────────────────────────────────────────────
 
 # Rename binary from LemonadeNexusApp → lemonade-nexus

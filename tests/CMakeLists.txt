@@ -14,6 +14,9 @@ function(add_nexus_test TEST_NAME)
         ASIO_STANDALONE
         ASIO_NO_DEPRECATED
     )
+    if(WIN32)
+        target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
     gtest_discover_tests(${TEST_NAME})
 endfunction()
 

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numbers>
 
 namespace nexus::relay {
 
@@ -128,7 +129,7 @@ static const std::vector<RegionInfo> kRegions = {
 // ---------------------------------------------------------------------------
 
 double GeoRegion::deg_to_rad(double deg) {
-    return deg * (M_PI / 180.0);
+    return deg * (std::numbers::pi / 180.0);
 }
 
 double GeoRegion::haversine_km(const GeoCoord& a, const GeoCoord& b) {
