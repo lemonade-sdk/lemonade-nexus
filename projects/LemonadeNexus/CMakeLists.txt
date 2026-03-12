@@ -32,8 +32,8 @@ target_compile_definitions(LemonadeNexusApp PUBLIC
 )
 
 if(WIN32)
-    target_link_libraries(LemonadeNexus PRIVATE ws2_32 mswsock iphlpapi)
-    target_link_libraries(LemonadeNexusApp PRIVATE ws2_32 mswsock iphlpapi)
+    target_link_libraries(LemonadeNexus PRIVATE ws2_32 mswsock iphlpapi urlmon wintrust shell32)
+    target_link_libraries(LemonadeNexusApp PRIVATE ws2_32 mswsock iphlpapi urlmon wintrust shell32)
 endif()
 
 # ── Install targets ──────────────────────────────────────────────────────────
