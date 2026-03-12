@@ -57,6 +57,124 @@ The server runs two HTTP listeners:
 
 The private API activates automatically once the server receives a tunnel IP — no configuration required. The first server in the mesh (genesis) self-allocates; joining servers receive their IP from an existing peer during the gossip ServerHello exchange.
 
+## Network Requirements
+
+### Ports
+
+Open the following ports on each server's firewall/security group/ACL:
+
+| Port | TCP/UDP | Direction | Source | Service | Required |
+|------|---------|-----------|--------|---------|----------|
+| 9100 | **TCP** | Inbound | Any (servers + clients) | Public HTTP API (bootstrap, health, join) | Yes |
+| 9102 | **UDP** | Inbound | Mesh servers only | Gossip protocol (peer sync, state replication) | Yes |
+| 3478 | **UDP** | Inbound | Mesh servers only | STUN (NAT traversal, external IP discovery) | Yes |
+| 51940 | **UDP** | Inbound | Mesh servers + clients | WireGuard tunnel + UDP hole-punching | Yes |
+| 51820 | **UDP** | Inbound | Mesh servers | Relay (forwarded WireGuard traffic) | Only if relay server |
+| 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (Tier 1 servers only) | Optional |
+
+> **Note on port 9101**: The Private HTTP API (TCP :9101) binds to the **WireGuard tunnel IP** (10.64.x.x), not the external interface. It does **not** need a firewall rule — it is only reachable over the encrypted WireGuard tunnel.
+
+**Firewall rule summary (minimum required):**
+```
+# Required on every server
+ALLOW TCP  9100  IN   FROM any             # Public API (client bootstrap)
+ALLOW UDP  9102  IN   FROM <mesh-servers>   # Gossip protocol
+ALLOW UDP  3478  IN   FROM <mesh-servers>   # STUN NAT traversal
+ALLOW UDP 51940  IN   FROM any             # WireGuard tunnels
+
+# Optional
+ALLOW UDP 51820  IN   FROM <mesh-servers>   # Relay (only if acting as relay)
+ALLOW UDP    53  IN   FROM any             # DNS (only Tier 1 servers)
+```
+
+> Port **9100/tcp** and **51940/udp** should allow `any` source since clients may connect from unknown IPs. Gossip (**9102/udp**) and STUN (**3478/udp**) can be restricted to known mesh server IPs if desired.
+
+### IP Addresses
+
+Lemonade-Nexus uses three types of addresses:
+
+| Address | How it's determined | Purpose |
+|---------|-------------------|---------|
+| **External (public) IP** | Auto-detected via STUN reflexive address and DDNS `detect_public_ip()` | Gossip seed peers, STUN, client connections |
+| **Bind address** | `--bind-address` / `SP_BIND_ADDRESS` (default: `0.0.0.0`) | What interfaces the server listens on |
+| **Tunnel IP** | Auto-allocated by IPAM from `10.64.0.0/10` | WireGuard mesh traffic, private API binding |
+
+- **No manual external IP config needed** — the server discovers its public IP automatically via STUN and HTTP-based detection.
+- **Seed peers** use the external IP: `--seed-peer <public-ip>:9102`
+- **Private API** binds to the tunnel IP automatically once IPAM assigns one.
+- **Clients** connect to the server's public IP on port 9100 to bootstrap, then switch to the WireGuard tunnel for all subsequent traffic.
+
+### Traffic Flow: Public Internet vs WireGuard Tunnel
+
+The system separates traffic into two planes:
+
+**Over the public internet (external IPs):**
+
+| Traffic | Protocol | Who | Purpose |
+|---------|----------|-----|---------|
+| Gossip | UDP :9102 | Server ↔ Server | Peer discovery, state sync, health, enrollment |
+| STUN | UDP :3478 | Server ↔ Server | NAT traversal, external IP discovery |
+| WireGuard handshake | UDP :51940 | Server ↔ Server, Client ↔ Server | Encrypted tunnel establishment |
+| Public HTTP API | TCP :9100 | Client → Server | Bootstrap: auth, join, health, server list |
+| Relay forwarding | UDP :51820 | Server ↔ Relay | Encrypted WireGuard packets when direct fails |
+| DDNS updates | HTTPS outbound | Server → Namecheap | Dynamic DNS registration |
+
+**Over the WireGuard tunnel (10.64.x.x mesh):**
+
+| Traffic | Protocol | Who | Purpose |
+|---------|----------|-----|---------|
+| Private HTTP API | TCP :9101 | Server ↔ Server, Client → Server | Tree mutations, IPAM, certs, governance, relay tickets |
+| Shamir key shares | Via gossip | Server ↔ Server (Tier 1) | Root key distribution and reconstruction |
+| TEE attestation challenges | Via gossip | Server ↔ Server | Mutual hardware attestation verification |
+| DNS zone sync | Via gossip | Server ↔ Server (Tier 1) | Authoritative DNS record replication |
+| Application traffic | Any | Client ↔ Client, Client ↔ Server | User application data |
+
+> **Key principle**: Only bootstrap and peer discovery happen over the public internet. All sensitive operations (tree changes, IP allocation, certificate issuance, governance votes, key shares) happen exclusively over the encrypted WireGuard tunnel.
+
+### Servers vs Endpoints (Clients)
+
+| | Servers | Endpoints (Clients) |
+|---|---------|-------------------|
+| **Role** | Infrastructure — run the mesh | Devices/apps that use the mesh |
+| **Ports needed** | All inbound ports listed above | No inbound ports (outbound only) |
+| **Identity** | Server certificate signed by root key | Ed25519 keypair + node in permission tree |
+| **Gossip** | Full participant (send + receive) | Does not participate |
+| **IPAM** | Allocates IPs to peers and clients | Receives a tunnel IP during join |
+| **Trust tier** | Tier 1 (TEE+attestation) or Tier 2 (cert-only) | N/A — not part of trust hierarchy |
+| **WireGuard** | Mesh tunnels to all peers + client tunnels | Single tunnel to one server (auto-switches) |
+| **Private API** | Serves it and calls other servers' | Calls server's private API over tunnel |
+| **Built with** | `LemonadeNexus` (server binary) | `LemonadeNexusSDK` (C++/C library) |
+
+### Connectivity Diagram
+
+```
+              Public Internet (external IPs)
+                         │
+     ┌───────────────────┼───────────────────┐
+     │                   │                   │
+┌────▼────┐        ┌─────▼─────┐       ┌─────▼─────┐
+│Server A │◄──────►│ Server B  │◄─────►│ Server C  │
+│ Tier 1  │gossip  │  Tier 1   │gossip │  Tier 2   │
+│         │:9102   │           │:9102  │           │
+└────┬────┘        └─────┬─────┘       └─────┬─────┘
+     │                   │                   │
+     └──────┬────────────┼────────────┬──────┘
+            │  WireGuard mesh (10.64.x.x)    │
+            │  Private API :9101 over tunnel │
+            │                                │
+     ┌──────▼──────┐               ┌─────────▼──┐
+     │  Client 1   │               │  Client 2   │
+     │ (laptop)    │               │ (phone)     │
+     │ joins :9100 │               │ joins :9100 │
+     │ then tunnel │               │ then tunnel │
+     └─────────────┘               └─────────────┘
+```
+
+1. **Server-to-server**: All servers must reach each other on ports 9102/udp (gossip) and 51940/udp (WireGuard). STUN hole-punching handles NAT traversal automatically.
+2. **Client-to-server**: Clients connect to any server's public IP on port 9100/tcp to bootstrap (authenticate, get tunnel IP, receive WireGuard config), then all subsequent communication goes over the encrypted WireGuard tunnel.
+3. **NAT traversal**: Servers behind NAT use the built-in STUN service (port 3478) to discover their external address and UDP hole-punching to establish direct WireGuard tunnels. If direct connection fails, traffic falls back through a relay server.
+4. **Endpoints need no open ports**: Clients only make outbound connections — they initiate the WireGuard handshake and the tunnel handles the rest.
+
 ## Quick Start
 
 ### Prerequisites
