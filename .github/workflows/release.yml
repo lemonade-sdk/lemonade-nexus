@@ -93,12 +93,20 @@ jobs:
           if (-not (Test-Path $opensslRoot)) {
             $opensslRoot = "C:\Program Files\OpenSSL"
           }
-          cmake -B build `
-            -G Ninja `
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
-            -DBUILD_TESTING=OFF `
-            -DGIT_TAG_OVERRIDE="${{ github.ref_name }}" `
-            -DOPENSSL_ROOT_DIR="$opensslRoot"
+          # Choco OpenSSL puts .lib files in lib/VC/x64/MD/ — locate them explicitly
+          $cryptoLib = Get-ChildItem "$opensslRoot" -Recurse -Filter "libcrypto.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $sslLib = Get-ChildItem "$opensslRoot" -Recurse -Filter "libssl.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+          $cmakeArgs = @(
+            "-B", "build",
+            "-G", "Ninja",
+            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}",
+            "-DBUILD_TESTING=OFF",
+            "-DGIT_TAG_OVERRIDE=${{ github.ref_name }}",
+            "-DOPENSSL_ROOT_DIR=$opensslRoot"
+          )
+          if ($cryptoLib) { $cmakeArgs += "-DOPENSSL_CRYPTO_LIBRARY=$($cryptoLib.FullName)" }
+          if ($sslLib) { $cmakeArgs += "-DOPENSSL_SSL_LIBRARY=$($sslLib.FullName)" }
+          cmake @cmakeArgs
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
