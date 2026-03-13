@@ -722,15 +722,33 @@ int main(int argc, char* argv[]) {
         }
         auto result = auth_service.authenticate(body);
 
-        // After successful Ed25519 auth, grant add_child on root so the
-        // newly registered key can create child nodes.
+        // After successful Ed25519 auth, ensure root node exists and grant
+        // add_child so the key can create child nodes.
         if (result.authenticated && body.value("method", "") == "ed25519") {
             auto pubkey = body.value("pubkey", std::string{});
             if (!pubkey.empty()) {
-                tree.grant_assignment("root", {
-                    .management_pubkey = pubkey,
-                    .permissions = {"read", "add_child"},
-                });
+                // Delta signing uses "ed25519:" prefix — match that format
+                auto prefixed = pubkey.find("ed25519:") == 0 ? pubkey : "ed25519:" + pubkey;
+                // Bootstrap root node if it doesn't exist yet
+                if (!tree.get_node("root")) {
+                    nexus::tree::TreeNode root_node;
+                    root_node.id        = "root";
+                    root_node.parent_id = "";
+                    root_node.type      = nexus::tree::NodeType::Root;
+                    root_node.hostname  = "root";
+                    root_node.mgmt_pubkey = prefixed;
+                    root_node.assignments = {{
+                        .management_pubkey = prefixed,
+                        .permissions = {"read", "write", "add_child", "delete_node",
+                                        "edit_node", "admin"},
+                    }};
+                    tree.bootstrap_root(root_node);
+                } else {
+                    tree.grant_assignment("root", {
+                        .management_pubkey = prefixed,
+                        .permissions = {"read", "add_child"},
+                    });
+                }
             }
         }
 
@@ -801,10 +819,28 @@ int main(int argc, char* argv[]) {
         if (result.authenticated) {
             auto pubkey = body.value("pubkey", std::string{});
             if (!pubkey.empty()) {
-                tree.grant_assignment("root", {
-                    .management_pubkey = pubkey,
-                    .permissions = {"read", "add_child"},
-                });
+                // Delta signing uses "ed25519:" prefix — match that format
+                auto prefixed = pubkey.find("ed25519:") == 0 ? pubkey : "ed25519:" + pubkey;
+                // Bootstrap root node if it doesn't exist yet
+                if (!tree.get_node("root")) {
+                    nexus::tree::TreeNode root_node;
+                    root_node.id        = "root";
+                    root_node.parent_id = "";
+                    root_node.type      = nexus::tree::NodeType::Root;
+                    root_node.hostname  = "root";
+                    root_node.mgmt_pubkey = prefixed;
+                    root_node.assignments = {{
+                        .management_pubkey = prefixed,
+                        .permissions = {"read", "write", "add_child", "delete_node",
+                                        "edit_node", "admin"},
+                    }};
+                    tree.bootstrap_root(root_node);
+                } else {
+                    tree.grant_assignment("root", {
+                        .management_pubkey = prefixed,
+                        .permissions = {"read", "add_child"},
+                    });
+                }
             }
         }
 

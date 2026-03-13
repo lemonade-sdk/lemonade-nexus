@@ -6,7 +6,6 @@ struct NodeDetailView: View {
 
     @EnvironmentObject private var appState: AppState
     @State private var isEditing: Bool = false
-    @State private var editHostname: String = ""
     @State private var editRegion: String = ""
     @State private var showDeleteConfirmation: Bool = false
     @State private var isSaving: Bool = false
@@ -49,7 +48,6 @@ struct NodeDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.surfaceDark)
         .onAppear {
-            editHostname = node.hostname
             editRegion = node.region ?? ""
         }
         .alert("Delete Node", isPresented: $showDeleteConfirmation) {
@@ -76,15 +74,9 @@ struct NodeDetailView: View {
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                if isEditing {
-                    TextField("Hostname", text: $editHostname)
-                        .font(.title2.bold())
-                        .textFieldStyle(.roundedBorder)
-                } else {
-                    Text(node.hostname)
-                        .font(.title2.bold())
-                        .foregroundColor(.textPrimary)
-                }
+                Text(node.hostname)
+                    .font(.title2.bold())
+                    .foregroundColor(.textPrimary)
                 HStack(spacing: 8) {
                     BadgeView(text: node.nodeType.displayName, color: nodeColor)
                     Text(node.id)
@@ -118,15 +110,8 @@ struct NodeDetailView: View {
                 propertyRow("Parent ID", value: node.parent_id, monospaced: true)
                 propertyRow("Type", value: node.nodeType.displayName)
 
+                propertyRow("Hostname", value: node.hostname)
                 if isEditing {
-                    HStack {
-                        Text("Hostname")
-                            .font(.subheadline)
-                            .foregroundColor(.textSecondary)
-                            .frame(width: 120, alignment: .leading)
-                        TextField("Hostname", text: $editHostname)
-                            .textFieldStyle(.roundedBorder)
-                    }
                     HStack {
                         Text("Region")
                             .font(.subheadline)
@@ -136,7 +121,6 @@ struct NodeDetailView: View {
                             .textFieldStyle(.roundedBorder)
                     }
                 } else {
-                    propertyRow("Hostname", value: node.hostname)
                     if let region = node.region {
                         propertyRow("Region", value: region)
                     }
@@ -252,7 +236,6 @@ struct NodeDetailView: View {
 
                     Button("Cancel") {
                         isEditing = false
-                        editHostname = node.hostname
                         editRegion = node.region ?? ""
                     }
                     .buttonStyle(LemonButtonStyle(isProminent: false))
@@ -339,17 +322,17 @@ struct NodeDetailView: View {
         isSaving = true
         statusMessage = nil
 
-        if editHostname != node.hostname {
+        if editRegion != (node.region ?? "") {
             do {
                 let response = try appState.updateNode(
                     nodeId: node.id,
-                    updates: ["hostname": editHostname]
+                    updates: ["region": editRegion]
                 )
                 if response.success == true {
-                    statusMessage = "Hostname updated"
-                    appState.addActivity(.success, "Updated hostname for \(node.id)")
+                    statusMessage = "Region updated"
+                    appState.addActivity(.success, "Updated region for \(node.id)")
                 } else {
-                    statusMessage = response.error ?? "Failed to update hostname"
+                    statusMessage = response.error ?? "Failed to update region"
                 }
             } catch {
                 statusMessage = error.localizedDescription

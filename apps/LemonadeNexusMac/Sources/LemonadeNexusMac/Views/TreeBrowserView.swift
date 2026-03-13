@@ -235,7 +235,10 @@ struct AddNodeSheet: View {
                 .font(.title2.bold())
 
             Form {
-                TextField("Hostname", text: $hostname)
+                LabeledContent("Hostname") {
+                    Text(hostname)
+                        .foregroundColor(.textSecondary)
+                }
                 Picker("Type", selection: $nodeType) {
                     ForEach(NodeType.allCases, id: \.self) { type in
                         Text(type.displayName).tag(type)
