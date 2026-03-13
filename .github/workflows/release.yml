@@ -34,6 +34,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache vcpkg packages (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\packages
+          key: vcpkg-windows-openssl-${{ hashFiles('.github/workflows/release.yml') }}
+          restore-keys: |
+            vcpkg-windows-openssl-
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-${{ matrix.platform }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-${{ matrix.platform }}-
+
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -48,8 +67,7 @@ jobs:
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
-          choco install ninja -y
-          vcpkg install openssl:x64-windows
+          choco install ninja openssl -y
 
       - name: "Use D: drive for build (Windows)"
         if: runner.os == 'Windows'
@@ -71,15 +89,19 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $opensslRoot = "C:\Program Files\OpenSSL-Win64"
+          if (-not (Test-Path $opensslRoot)) {
+            $opensslRoot = "C:\Program Files\OpenSSL"
+          }
           cmake -B build `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
             -DBUILD_TESTING=OFF `
             -DGIT_TAG_OVERRIDE="${{ github.ref_name }}" `
-            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+            -DOPENSSL_ROOT_DIR="$opensslRoot"
 
       - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
       - name: Compute binary SHA-256 (Unix)
         if: runner.os != 'Windows'
@@ -272,6 +294,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-${{ matrix.platform }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-${{ matrix.platform }}-
+
       - name: Configure CMake
         run: |
           cmake -B build \
@@ -281,7 +311,7 @@ jobs:
             -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}"
 
       - name: Build
-        run: cmake --build build --config ${{ env.BUILD_TYPE }}
+        run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
       - name: Compute binary SHA-256
         id: hash
