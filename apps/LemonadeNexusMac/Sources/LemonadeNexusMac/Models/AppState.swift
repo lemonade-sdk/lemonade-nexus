@@ -79,6 +79,8 @@ final class AppState: ObservableObject {
     // MARK: - DNS Auto-Discovery
 
     func discoverNearestServer() async {
+        // Prevent duplicate concurrent discovery runs (SwiftUI can re-fire onAppear)
+        guard !isDiscovering else { return }
         isDiscovering = true
         discoveryMessage = "Querying lemonade-nexus.io DNS mesh..."
         discoveredServers = []

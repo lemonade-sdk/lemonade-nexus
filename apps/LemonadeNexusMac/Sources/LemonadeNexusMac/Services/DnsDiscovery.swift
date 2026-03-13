@@ -224,6 +224,10 @@ final class DnsDiscoveryService: @unchecked Sendable {
                     if let port = Self.parseHttpPort(from: record.rdata) {
                         httpPort = port
                     }
+                    if let certHost = Self.parseHost(from: record.rdata) {
+                        resolvedHostname = certHost
+                        dlog("[Discovery]   TXT host=\(certHost) (cert FQDN)")
+                    }
                 }
             }
         }
@@ -246,6 +250,10 @@ final class DnsDiscoveryService: @unchecked Sendable {
                                 if let port = Self.parseHttpPort(from: cr.rdata) {
                                     httpPort = port
                                 }
+                                if let certHost = Self.parseHost(from: cr.rdata) {
+                                    resolvedHostname = certHost
+                                    dlog("[Discovery]   TXT host=\(certHost) (cert FQDN)")
+                                }
                             }
                         }
                         break
@@ -265,6 +273,18 @@ final class DnsDiscoveryService: @unchecked Sendable {
             if part.hasPrefix("http=") {
                 let value = part.dropFirst("http=".count)
                 return Int(value)
+            }
+        }
+        return nil
+    }
+
+    /// Parse `host=<fqdn>` from a TXT record value like "v=sp1 http=9100 host=ns1.srv.example.com ...".
+    private static func parseHost(from txt: String) -> String? {
+        let parts = txt.split(separator: " ")
+        for part in parts {
+            if part.hasPrefix("host=") {
+                let value = String(part.dropFirst("host=".count))
+                return value.isEmpty ? nil : value
             }
         }
         return nil

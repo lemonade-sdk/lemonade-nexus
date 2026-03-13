@@ -158,7 +158,7 @@ public:
     /// Publish this server's port config as a dynamic TXT record
     /// (_config.<server_id>.<base_domain>), gossip-synced to all peers.
     /// Must be called after set_port_config() and set_record_callback().
-    void publish_port_config(const std::string& server_id);
+    void publish_port_config(const std::string& server_id, const std::string& server_fqdn = "");
 
     /// Resolve a _config. subdomain query, returning TXT record data.
     [[nodiscard]] std::optional<std::string> resolve_config_txt(

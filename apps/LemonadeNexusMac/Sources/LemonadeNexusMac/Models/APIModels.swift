@@ -35,7 +35,7 @@ struct ChallengeRequest: Codable {
 
 struct ChallengeResponse: Codable {
     let challenge: String
-    let expires_at: String
+    let expires_at: UInt64
 }
 
 struct AuthRequest: Codable {

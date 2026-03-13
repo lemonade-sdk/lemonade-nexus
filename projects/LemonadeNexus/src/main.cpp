@@ -421,10 +421,10 @@ int main(int argc, char* argv[]) {
     }
 
     // Resolve NS hostname: explicit --dns-ns-hostname > derived from --server-hostname
-    // Uses .srv. subdomain to match the ACME cert FQDN
+    // NS hostname uses base domain (for Namecheap glue); server FQDN uses .srv. subdomain (for ACME cert)
     std::string ns_hostname = config.dns_ns_hostname;
     if (ns_hostname.empty() && !config.server_hostname.empty()) {
-        ns_hostname = config.server_hostname + ".srv." + config.dns_base_domain;
+        ns_hostname = config.server_hostname + "." + config.dns_base_domain;
         spdlog::info("DNS: auto-derived NS hostname: {}", ns_hostname);
     }
 
@@ -475,13 +475,18 @@ int main(int argc, char* argv[]) {
                 config_id = cert_j.value("server_id", "");
             } catch (...) {}
         }
-        // Fall back to server_hostname with .srv qualifier (unenrolled servers)
+        // Fall back to server_hostname (unenrolled servers)
         if (config_id.empty() && !config.server_hostname.empty()) {
-            config_id = config.server_hostname + ".srv";
+            config_id = config.server_hostname;
         }
         if (!config_id.empty()) {
-            dns.publish_port_config(config_id);
-            spdlog::info("DNS: published _config TXT for {}", config_id);
+            // Include the .srv. FQDN in _config TXT so clients know the cert hostname
+            std::string config_fqdn;
+            if (!config.server_hostname.empty() && !config.dns_base_domain.empty()) {
+                config_fqdn = config.server_hostname + ".srv." + config.dns_base_domain;
+            }
+            dns.publish_port_config(config_id, config_fqdn);
+            spdlog::info("DNS: published _config TXT for {} (host={})", config_id, config_fqdn);
         }
     }
 
@@ -606,6 +611,14 @@ int main(int argc, char* argv[]) {
         if (!server_public_ip.empty()) {
             dns.set_record(server_fqdn, "A", server_public_ip, 300);
             spdlog::info("DNS: registered server FQDN {} -> {}", server_fqdn, server_public_ip);
+        }
+
+        // Also register the NS hostname A record (ns1.lemonade-nexus.io)
+        // so both NS glue and server FQDN resolve
+        std::string ns_fqdn = server_hostname + "." + config.dns_base_domain;
+        if (ns_fqdn != server_fqdn) {
+            dns.set_record(ns_fqdn, "A", server_public_ip, 300);
+            spdlog::info("DNS: registered NS hostname {} -> {}", ns_fqdn, server_public_ip);
         }
     }
 
@@ -1863,6 +1876,49 @@ int main(int argc, char* argv[]) {
         });
     }
 
+    // ========================================================================
+    // Background ACME renewal — check daily, renew when cert expires within 30 days
+    // ========================================================================
+    std::atomic<bool> acme_renewal_stop{false};
+    std::thread acme_renewal_thread;
+    if (!server_fqdn.empty() && config.auto_tls && !needs_acme_background) {
+        acme_renewal_thread = std::thread([&]() {
+            // First check after 1 hour, then every 24 hours
+            constexpr auto initial_delay = std::chrono::hours(1);
+            constexpr auto check_interval = std::chrono::hours(24);
+
+            spdlog::info("Auto-TLS: certificate renewal monitor started for {} (checking daily)", server_fqdn);
+
+            // Wait for initial delay
+            for (auto elapsed = std::chrono::seconds(0);
+                 elapsed < initial_delay && !acme_renewal_stop.load();
+                 elapsed += std::chrono::seconds(1)) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+
+            while (!acme_renewal_stop.load()) {
+                auto result = acme.renew_certificate(server_fqdn);
+                if (result.success && !result.cert_path.empty()) {
+                    // Check if the cert was actually renewed (not just "still valid")
+                    // by comparing paths — renew_certificate returns the existing path when skipping
+                    spdlog::info("Auto-TLS: renewal check complete for {} (cert={})",
+                                  server_fqdn, result.cert_path);
+                }
+                if (!result.success) {
+                    spdlog::warn("Auto-TLS: renewal failed for {}: {}",
+                                  server_fqdn, result.error_message);
+                }
+
+                // Wait for next check
+                for (auto elapsed = std::chrono::seconds(0);
+                     elapsed < check_interval && !acme_renewal_stop.load();
+                     elapsed += std::chrono::seconds(1)) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            }
+        });
+    }
+
     coordinator.run();
 
     // ========================================================================
@@ -1871,6 +1927,10 @@ int main(int argc, char* argv[]) {
     acme_retry_stop.store(true);
     if (acme_retry_thread.joinable()) {
         acme_retry_thread.join();
+    }
+    acme_renewal_stop.store(true);
+    if (acme_renewal_thread.joinable()) {
+        acme_renewal_thread.join();
     }
     hole_punch.stop();
     if (private_http_server) {

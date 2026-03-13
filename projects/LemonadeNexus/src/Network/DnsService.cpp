@@ -433,7 +433,7 @@ void DnsService::set_port_config(const PortConfig& config) {
     has_port_config_ = true;
 }
 
-void DnsService::publish_port_config(const std::string& server_id) {
+void DnsService::publish_port_config(const std::string& server_id, const std::string& server_fqdn) {
     if (!has_port_config_ || server_id.empty()) return;
 
     std::string fqdn = "_config." + server_id + "." + base_domain_;
@@ -445,6 +445,9 @@ void DnsService::publish_port_config(const std::string& server_id) {
                       " relay=" + std::to_string(port_config_.relay_port) +
                       " dns=" + std::to_string(port_config_.dns_port) +
                       " private_http=" + std::to_string(port_config_.private_http_port);
+    if (!server_fqdn.empty()) {
+        txt += " host=" + server_fqdn;
+    }
 
     // Publish as a dynamic TXT record — gossip callback broadcasts to peers
     set_record(fqdn, "TXT", txt, 300);
