@@ -5,6 +5,11 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+
+#ifdef _WIN32
+#define popen  _popen
+#define pclose _pclose
+#endif
 #include <filesystem>
 #include <fstream>
 #include <regex>
