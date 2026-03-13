@@ -1802,8 +1802,10 @@ int main(int argc, char* argv[]) {
     std::thread acme_retry_thread;
     if (needs_acme_background) {
         acme_retry_thread = std::thread([&]() {
-            constexpr auto retry_interval = std::chrono::minutes(5);
             constexpr auto initial_delay  = std::chrono::seconds(30);
+            constexpr auto base_interval  = std::chrono::minutes(5);
+            constexpr auto max_interval   = std::chrono::hours(1);
+            auto current_interval = base_interval;
 
             spdlog::info("Auto-TLS: background retry starting in 30s for {}", server_fqdn);
             for (auto elapsed = std::chrono::seconds(0);
@@ -1819,17 +1821,36 @@ int main(int argc, char* argv[]) {
                     spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
                                   server_fqdn, result.cert_path, result.key_path);
                     spdlog::info("Auto-TLS: restarting server to activate HTTPS...");
-                    // Trigger graceful shutdown — systemd will restart with the cert on disk
                     coordinator.shutdown();
                     break;
                 }
-                spdlog::warn("Auto-TLS: ACME retry failed for {}: {} — retrying in 5 minutes",
-                              server_fqdn, result.error_message);
+
+                // Detect rate limiting — back off to 1 hour
+                bool rate_limited = result.error_message.find("rateLimited") != std::string::npos
+                                 || result.error_message.find("429") != std::string::npos
+                                 || result.error_message.find("too many") != std::string::npos;
+
+                if (rate_limited) {
+                    current_interval = max_interval;
+                    spdlog::warn("Auto-TLS: rate limited by ACME provider — backing off to {} minutes",
+                                  std::chrono::duration_cast<std::chrono::minutes>(current_interval).count());
+                } else {
+                    // Exponential backoff: 5m, 10m, 20m, 40m, capped at 60m
+                    auto mins = std::chrono::duration_cast<std::chrono::minutes>(current_interval).count();
+                    spdlog::warn("Auto-TLS: ACME retry failed — retrying in {} minutes", mins);
+                    auto doubled = current_interval * 2;
+                    current_interval = doubled > max_interval ? max_interval : doubled;
+                }
 
                 for (auto elapsed = std::chrono::seconds(0);
-                     elapsed < retry_interval && !acme_retry_stop.load();
+                     elapsed < current_interval && !acme_retry_stop.load();
                      elapsed += std::chrono::seconds(1)) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+
+                // Reset backoff after a successful wait through rate limit window
+                if (rate_limited) {
+                    current_interval = base_interval;
                 }
             }
         });

@@ -45,7 +45,7 @@ struct ServerConfig {
     std::string tls_key_path;
 
     // ACME certificate provider
-    std::string acme_provider{"letsencrypt"};    // "letsencrypt", "letsencrypt_staging", "zerossl"
+    std::string acme_provider{"zerossl"};    // "letsencrypt", "letsencrypt_staging", "zerossl"
     std::string acme_eab_kid;                // ZeroSSL External Account Binding Key ID
     std::string acme_eab_hmac_key;           // ZeroSSL EAB HMAC key (base64url)
     std::string dns_provider{"local"};       // "local" = self-hosted authoritative DNS, "cloudflare" = API fallback
