@@ -692,8 +692,9 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Health ---
-    http_server.server().Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
+    http_server.server().Get("/api/health", [&config](const httplib::Request&, httplib::Response& res) {
         nexus::network::HealthResponse resp;
+        resp.rp_id = config.rp_id;
         nlohmann::json j = resp;
         res.set_content(j.dump(), "application/json");
     });

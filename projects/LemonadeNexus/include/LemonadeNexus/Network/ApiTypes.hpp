@@ -45,10 +45,14 @@ inline void from_json(const nlohmann::json& j, ErrorResponse& r) {
 struct HealthResponse {
     std::string status{"ok"};
     std::string service{"lemonade-nexus"};
+    std::string rp_id;
 };
 
 inline void to_json(nlohmann::json& j, const HealthResponse& r) {
     j = nlohmann::json{{"status", r.status}, {"service", r.service}};
+    if (!r.rp_id.empty()) {
+        j["rp_id"] = r.rp_id;
+    }
 }
 
 inline void from_json(const nlohmann::json& j, HealthResponse& r) {

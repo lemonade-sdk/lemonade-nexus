@@ -149,6 +149,41 @@ final class NexusClient {
         return try await perform(request)
     }
 
+    func registerPasskey(userId: String, credentialId: String, publicKeyX: String, publicKeyY: String) async throws -> AuthResponse {
+        let body = PasskeyRegistrationRequest(
+            user_id: userId,
+            credential_id: credentialId,
+            public_key_x: publicKeyX,
+            public_key_y: publicKeyY
+        )
+        let request = try buildRequest("POST", path: "/api/auth/register", body: body)
+        return try await perform(request)
+    }
+
+    func authenticatePasskey(credentialId: String, authenticatorData: String, clientDataJson: String, signature: String) async throws -> AuthResponse {
+        struct PasskeyAssertion: Codable {
+            let credential_id: String
+            let authenticator_data: String
+            let client_data_json: String
+            let signature: String
+        }
+        struct PasskeyAuthRequest: Codable {
+            let method: String
+            let assertion: PasskeyAssertion
+        }
+        let body = PasskeyAuthRequest(
+            method: "passkey",
+            assertion: PasskeyAssertion(
+                credential_id: credentialId,
+                authenticator_data: authenticatorData,
+                client_data_json: clientDataJson,
+                signature: signature
+            )
+        )
+        let request = try buildRequest("POST", path: "/api/auth", body: body)
+        return try await perform(request)
+    }
+
     func joinNetwork(hostname: String, wgPubkey: String, mgmtPubkey: String) async throws -> JoinResponse {
         let body = JoinRequest(hostname: hostname, wg_pubkey: wgPubkey, mgmt_pubkey: mgmtPubkey)
         let request = try buildRequest("POST", path: "/api/join", body: body)

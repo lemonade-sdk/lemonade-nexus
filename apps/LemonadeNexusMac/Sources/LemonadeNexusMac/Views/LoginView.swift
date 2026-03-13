@@ -350,21 +350,57 @@ struct LoginView: View {
                 .foregroundColor(.lemonYellow)
                 .padding(.top, 8)
 
-            Text("Use Touch ID or your device passcode to sign in securely with a passkey.")
-                .font(.subheadline)
-                .foregroundColor(.textSecondary)
-                .multilineTextAlignment(.center)
-
-            Button(action: signInWithPasskey) {
-                HStack {
-                    Image(systemName: "person.badge.key.fill")
-                    Text("Sign in with Passkey")
+            if PasskeyManager.shared.hasCredential {
+                // Existing passkey — show sign-in
+                if let storedUser = PasskeyManager.shared.storedUserId {
+                    Text("Sign in as **\(storedUser)** using Touch ID.")
+                        .font(.subheadline)
+                        .foregroundColor(.textSecondary)
+                        .multilineTextAlignment(.center)
                 }
+
+                Button(action: signInWithPasskey) {
+                    HStack {
+                        Image(systemName: "person.badge.key.fill")
+                        Text("Sign in with Passkey")
+                    }
+                }
+                .buttonStyle(LemonButtonStyle())
+                .disabled(appState.isLoading)
+
+                Button(action: { PasskeyManager.shared.deleteCredential() }) {
+                    Text("Remove stored passkey")
+                        .font(.caption2)
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(.textTertiary)
+            } else {
+                // No passkey — show registration
+                Text("Create a passkey to sign in with Touch ID. Enter your username to get started.")
+                    .font(.subheadline)
+                    .foregroundColor(.textSecondary)
+                    .multilineTextAlignment(.center)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Username", systemImage: "person")
+                        .font(.caption)
+                        .foregroundColor(.textSecondary)
+                    TextField("Enter username", text: $username)
+                        .textFieldStyle(.roundedBorder)
+                        .textContentType(.username)
+                }
+
+                Button(action: registerPasskey) {
+                    HStack {
+                        Image(systemName: "person.badge.key.fill")
+                        Text("Create Passkey")
+                    }
+                }
+                .buttonStyle(LemonButtonStyle())
+                .disabled(username.isEmpty || appState.isLoading)
             }
-            .buttonStyle(LemonButtonStyle())
-            .disabled(appState.isLoading)
-            .padding(.bottom, 8)
         }
+        .padding(.bottom, 8)
     }
 
     // MARK: - Actions
@@ -396,7 +432,27 @@ struct LoginView: View {
     }
 
     private func signInWithPasskey() {
-        statusMessage = "Passkey authentication requires server WebAuthn support."
+        statusMessage = nil
         isError = false
+        Task {
+            await appState.signInWithPasskey()
+            if !appState.isAuthenticated {
+                isError = true
+                statusMessage = appState.errorMessage ?? "Passkey sign-in failed"
+            }
+        }
+    }
+
+    private func registerPasskey() {
+        isRegistering = true
+        statusMessage = nil
+        isError = false
+        Task {
+            await appState.registerPasskey(username: username)
+            if !appState.isAuthenticated {
+                isError = true
+                statusMessage = appState.errorMessage ?? "Passkey registration failed"
+            }
+        }
     }
 }

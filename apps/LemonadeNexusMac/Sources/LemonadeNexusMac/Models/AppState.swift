@@ -211,6 +211,98 @@ final class AppState: ObservableObject {
         isLoading = false
     }
 
+    // MARK: - Passkey Authentication
+
+    func registerPasskey(username: String) async {
+        isLoading = true
+        errorMessage = nil
+        self.username = username
+        updateBaseURL()
+
+        do {
+            // Fetch RP ID from server
+            let health = try await client.getHealth()
+            let rpId = health.rp_id ?? "lemonade-nexus.local"
+
+            // Generate P-256 credential (Secure Enclave + Touch ID)
+            let (credentialId, pubKeyX, pubKeyY) = try PasskeyManager.shared.generateCredential(userId: username)
+
+            // Register with server
+            let authResp = try await client.registerPasskey(
+                userId: username,
+                credentialId: credentialId,
+                publicKeyX: pubKeyX,
+                publicKeyY: pubKeyY
+            )
+
+            if authResp.authenticated, let token = authResp.session_token {
+                sessionToken = token
+                userId = authResp.user_id
+                publicKeyBase64 = credentialId
+                isAuthenticated = true
+                client.setSessionToken(token)
+                connectedSince = Date()
+
+                try? KeychainHelper.saveSessionToken(token)
+                addActivity(.info, "Registered passkey for \(username)")
+                await refreshAllData()
+            } else {
+                errorMessage = authResp.error ?? "Passkey registration failed"
+                addActivity(.error, "Passkey registration failed: \(errorMessage ?? "unknown")")
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            addActivity(.error, "Passkey registration error: \(error.localizedDescription)")
+        }
+
+        isLoading = false
+    }
+
+    func signInWithPasskey() async {
+        isLoading = true
+        errorMessage = nil
+        updateBaseURL()
+
+        do {
+            // Fetch RP ID from server
+            let health = try await client.getHealth()
+            let rpId = health.rp_id ?? "lemonade-nexus.local"
+
+            // Sign assertion (triggers Touch ID if Secure Enclave)
+            let (credentialId, authData, clientDataJson, signature) = try PasskeyManager.shared.signAssertion(rpId: rpId)
+
+            // Authenticate with server
+            let authResp = try await client.authenticatePasskey(
+                credentialId: credentialId,
+                authenticatorData: authData,
+                clientDataJson: clientDataJson,
+                signature: signature
+            )
+
+            if authResp.authenticated, let token = authResp.session_token {
+                sessionToken = token
+                userId = authResp.user_id
+                username = PasskeyManager.shared.storedUserId ?? ""
+                publicKeyBase64 = credentialId
+                isAuthenticated = true
+                client.setSessionToken(token)
+                connectedSince = Date()
+
+                try? KeychainHelper.saveSessionToken(token)
+                addActivity(.info, "Signed in with passkey")
+                await refreshAllData()
+            } else {
+                errorMessage = authResp.error ?? "Passkey authentication failed"
+                addActivity(.error, "Passkey auth failed: \(errorMessage ?? "unknown")")
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+            addActivity(.error, "Passkey error: \(error.localizedDescription)")
+        }
+
+        isLoading = false
+    }
+
     func signOut() {
         sessionToken = nil
         userId = nil

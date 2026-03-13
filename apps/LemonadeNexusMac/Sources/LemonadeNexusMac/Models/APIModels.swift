@@ -5,6 +5,18 @@ import Foundation
 struct HealthResponse: Codable {
     let status: String
     let service: String
+    let rp_id: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, service, rp_id
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decode(String.self, forKey: .status)
+        service = try container.decode(String.self, forKey: .service)
+        rp_id = try container.decodeIfPresent(String.self, forKey: .rp_id)
+    }
 }
 
 // MARK: - Server Discovery
@@ -56,6 +68,15 @@ struct RegisterRequest: Codable {
     let pubkey: String
     let challenge: String
     let signature: String
+}
+
+// MARK: - Passkey Registration
+
+struct PasskeyRegistrationRequest: Codable {
+    let user_id: String
+    let credential_id: String
+    let public_key_x: String
+    let public_key_y: String
 }
 
 // MARK: - Join Network
