@@ -49,8 +49,17 @@ final class DnsDiscoveryService: @unchecked Sendable {
         dlog("[Discovery] Starting discovery for domain: \(domain)")
 
         // Step 1: Bootstrap — resolve A records via system DNS.
-        let bootstrapIPs = await resolveBootstrapIPs()
+        var bootstrapIPs = await resolveBootstrapIPs()
         dlog("[Discovery] Step 1 — Bootstrap IPs: \(bootstrapIPs)")
+
+        // Fallback: if the base domain has no A record, resolve NS hostnames directly.
+        if bootstrapIPs.isEmpty {
+            dlog("[Discovery] Step 1b — No A record, trying NS hostname resolution")
+            let nsIPs = await resolveBootstrapIPs(hostname: "ns1.\(domain)")
+            bootstrapIPs = nsIPs
+            dlog("[Discovery] Step 1b — NS fallback IPs: \(bootstrapIPs)")
+        }
+
         guard !bootstrapIPs.isEmpty else {
             dlog("[Discovery] No bootstrap IPs found — aborting")
             return []
@@ -91,15 +100,16 @@ final class DnsDiscoveryService: @unchecked Sendable {
 
     // MARK: - Step 1: Bootstrap via getaddrinfo
 
-    private func resolveBootstrapIPs() async -> [String] {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async { [domain] in
+    private func resolveBootstrapIPs(hostname: String? = nil) async -> [String] {
+        let target = hostname ?? domain
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
                 var hints = addrinfo()
                 hints.ai_family = AF_INET
                 hints.ai_socktype = SOCK_STREAM
 
                 var result: UnsafeMutablePointer<addrinfo>?
-                let status = getaddrinfo(domain, nil, &hints, &result)
+                let status = getaddrinfo(target, nil, &hints, &result)
 
                 guard status == 0, let addrList = result else {
                     continuation.resume(returning: [])

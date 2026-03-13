@@ -190,6 +190,13 @@ void DnsService::handle_query(std::size_t bytes) {
 
     // --- A record queries ---
     if (qtype == ARES_REC_TYPE_A && qclass == ARES_CLASS_IN) {
+        // 0. Zone apex: return our own IP so getaddrinfo(base_domain) works
+        if (query_lower == base_lower && !our_ns_ip_.empty()) {
+            spdlog::debug("[{}] {} -> {} (zone apex)", name(), qname, our_ns_ip_);
+            send_response(build_response(data, bytes, qname, our_ns_ip_, 300));
+            return;
+        }
+
         // 1. Check dynamic A records (NS glue records, etc.)
         auto dyn_a = lookup_dynamic_a(query_lower);
         if (dyn_a) {
