@@ -41,9 +41,6 @@ struct LoginView: View {
                 serverConnectionSection
                     .onAppear {
                         serverURL = appState.serverURL
-                        if appState.autoDiscoveryEnabled && !appState.isAuthenticated {
-                            Task { await appState.discoverNearestServer() }
-                        }
                     }
                     .onChange(of: serverURL) { _, newValue in
                         appState.serverURL = newValue

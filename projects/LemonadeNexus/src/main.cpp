@@ -421,9 +421,10 @@ int main(int argc, char* argv[]) {
     }
 
     // Resolve NS hostname: explicit --dns-ns-hostname > derived from --server-hostname
+    // Uses .srv. subdomain to match the ACME cert FQDN
     std::string ns_hostname = config.dns_ns_hostname;
     if (ns_hostname.empty() && !config.server_hostname.empty()) {
-        ns_hostname = config.server_hostname + "." + config.dns_base_domain;
+        ns_hostname = config.server_hostname + ".srv." + config.dns_base_domain;
         spdlog::info("DNS: auto-derived NS hostname: {}", ns_hostname);
     }
 
@@ -474,9 +475,9 @@ int main(int argc, char* argv[]) {
                 config_id = cert_j.value("server_id", "");
             } catch (...) {}
         }
-        // Fall back to server_hostname (unenrolled servers)
-        if (config_id.empty()) {
-            config_id = config.server_hostname;
+        // Fall back to server_hostname with .srv qualifier (unenrolled servers)
+        if (config_id.empty() && !config.server_hostname.empty()) {
+            config_id = config.server_hostname + ".srv";
         }
         if (!config_id.empty()) {
             dns.publish_port_config(config_id);
@@ -600,6 +601,12 @@ int main(int argc, char* argv[]) {
     std::string server_fqdn;
     if (!server_hostname.empty()) {
         server_fqdn = server_hostname + ".srv." + config.dns_base_domain;
+
+        // Register an A record for the server FQDN so it resolves via our DNS
+        if (!server_public_ip.empty()) {
+            dns.set_record(server_fqdn, "A", server_public_ip, 300);
+            spdlog::info("DNS: registered server FQDN {} -> {}", server_fqdn, server_public_ip);
+        }
     }
 
     // Auto-TLS: if no manual cert paths, check for existing ACME cert on disk

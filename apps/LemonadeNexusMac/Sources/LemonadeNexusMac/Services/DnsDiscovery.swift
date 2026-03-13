@@ -14,7 +14,10 @@ struct DiscoveredServer: Identifiable {
     let latencyMs: Double
     let hostname: String?
 
-    var url: String { "https://\(ip):\(port)" }
+    var url: String {
+        let host = hostname ?? ip
+        return "https://\(host):\(port)"
+    }
 
     /// Display label: hostname if available, otherwise IP address.
     var displayName: String { hostname ?? ip }
@@ -270,9 +273,14 @@ final class DnsDiscoveryService: @unchecked Sendable {
     // MARK: - Step 4: Health Probe (HTTPS with HTTP fallback)
 
     private func probeServer(ip: String, port: Int, hostname: String?) async -> DiscoveredServer? {
-        // Try HTTPS first, fall back to HTTP if the server doesn't have a TLS cert yet.
-        for scheme in ["https", "http"] {
-            let urlString = "\(scheme)://\(ip):\(port)/api/health"
+        // Try HTTPS first (using hostname for cert CN match), fall back to IP, then HTTP.
+        let host = hostname ?? ip
+        let probeTargets = hostname != nil
+            ? [("https", host), ("https", ip), ("http", ip)]
+            : [("https", ip), ("http", ip)]
+
+        for (scheme, target) in probeTargets {
+            let urlString = "\(scheme)://\(target):\(port)/api/health"
             guard let url = URL(string: urlString) else { continue }
 
             dlog("[Discovery]   Probe: \(urlString)")

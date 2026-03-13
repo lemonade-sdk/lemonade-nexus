@@ -19,7 +19,7 @@ jobs:
             platform: linux-x86_64
           - os: macos-14
             platform: darwin-arm64
-          - os: windows-latest
+          - os: windows-2022
             platform: windows-x86_64
 
     runs-on: ${{ matrix.os }}
@@ -48,6 +48,13 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           vcpkg install openssl:x64-windows
+
+      - name: "Use D: drive for build (Windows)"
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "D:\build" -Force
+          New-Item -ItemType Junction -Path "build" -Target "D:\build"
 
       - name: Configure CMake (Unix)
         if: runner.os != 'Windows'
