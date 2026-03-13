@@ -616,7 +616,7 @@ int main(int argc, char* argv[]) {
         // Also register the NS hostname A record (ns1.lemonade-nexus.io)
         // so both NS glue and server FQDN resolve
         std::string ns_fqdn = server_hostname + "." + config.dns_base_domain;
-        if (ns_fqdn != server_fqdn) {
+        if (ns_fqdn != server_fqdn && !server_public_ip.empty()) {
             dns.set_record(ns_fqdn, "A", server_public_ip, 300);
             spdlog::info("DNS: registered NS hostname {} -> {}", ns_fqdn, server_public_ip);
         }
@@ -799,9 +799,11 @@ int main(int argc, char* argv[]) {
         auto peers = gossip.get_peers();
         std::vector<nexus::network::ServerEntry> entries;
 
-        // Include ourselves
+        // Include ourselves — use public IP, not bind address
+        std::string our_endpoint = (!server_public_ip.empty() ? server_public_ip : config.bind_address)
+                                   + ":" + std::to_string(config.http_port);
         entries.push_back({
-            .endpoint  = config.bind_address + ":" + std::to_string(config.http_port),
+            .endpoint  = our_endpoint,
             .http_port = config.http_port,
             .healthy   = true,
         });
@@ -866,19 +868,37 @@ int main(int argc, char* argv[]) {
         // Step 3: Create a node in the permission tree
         auto node_id = auth_result.user_id;
         if (node_id.empty()) {
-            // Generate a node ID from the pubkey if user_id wasn't returned
             node_id = "node-" + client_pubkey.substr(0, 16);
         }
 
-        nexus::tree::TreeDelta create_delta;
-        create_delta.operation = "create";
-        create_delta.target_node_id = "root";
-        create_delta.node_data.id = node_id;
-        create_delta.node_data.parent_id = "root";
-        create_delta.signer_pubkey = client_pubkey;
-
-        // Try to create the node — if it already exists, that's OK for idempotent joins
-        (void)tree.apply_delta(create_delta);
+        // Bootstrap: if no root node exists, the first joiner becomes root
+        auto existing_root = tree.get_node("root");
+        if (!existing_root) {
+            nexus::tree::TreeNode root_node;
+            root_node.id        = "root";
+            root_node.parent_id = "";
+            root_node.type      = nexus::tree::NodeType::Root;
+            root_node.hostname  = config.server_hostname.empty()
+                                    ? "root" : config.server_hostname;
+            root_node.mgmt_pubkey = client_pubkey;
+            root_node.assignments = {{
+                .management_pubkey = client_pubkey,
+                .permissions = {"read", "write", "add_child", "delete_node",
+                                "edit_node", "admin"},
+            }};
+            tree.bootstrap_root(root_node);
+            node_id = "root";  // first user IS root
+        } else if (node_id != "root") {
+            // Root exists — create an endpoint node under it
+            nexus::tree::TreeNode endpoint_node;
+            endpoint_node.id        = node_id;
+            endpoint_node.parent_id = "root";
+            endpoint_node.type      = nexus::tree::NodeType::Endpoint;
+            endpoint_node.hostname  = body.value("hostname",
+                                        "endpoint-" + node_id.substr(0, 8));
+            endpoint_node.mgmt_pubkey = client_pubkey;
+            tree.insert_join_node(endpoint_node);
+        }
 
         // Step 4: Allocate a tunnel IP
         auto alloc = ipam.allocate_tunnel_ip(node_id);

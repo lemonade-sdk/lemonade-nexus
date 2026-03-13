@@ -13,10 +13,11 @@ struct DiscoveredServer: Identifiable {
     let port: Int
     let latencyMs: Double
     let hostname: String?
+    let scheme: String  // "https" or "http" — whichever probe succeeded
 
     var url: String {
         let host = hostname ?? ip
-        return "https://\(host):\(port)"
+        return "\(scheme)://\(host):\(port)"
     }
 
     /// Display label: hostname if available, otherwise IP address.
@@ -320,7 +321,7 @@ final class DnsDiscoveryService: @unchecked Sendable {
                     continue
                 }
                 dlog("[Discovery]   Probe: \(scheme) OK — \(String(format: "%.0f", elapsed))ms")
-                return DiscoveredServer(ip: ip, port: port, latencyMs: elapsed, hostname: hostname)
+                return DiscoveredServer(ip: ip, port: port, latencyMs: elapsed, hostname: hostname, scheme: scheme)
             } catch {
                 dlog("[Discovery]   Probe: \(scheme) failed — \(error.localizedDescription)")
                 continue

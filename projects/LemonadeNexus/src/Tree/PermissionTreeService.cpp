@@ -53,6 +53,62 @@ void PermissionTreeService::on_stop() {
     spdlog::info("[{}] stopped", name());
 }
 
+// --- Join bootstrap (bypasses delta permission checks) ---
+
+bool PermissionTreeService::bootstrap_root(const TreeNode& root_node) {
+    std::lock_guard lock(mutex_);
+
+    if (nodes_.contains("root")) {
+        spdlog::info("[{}] root node already exists, skipping bootstrap", name());
+        return false;
+    }
+
+    nodes_[root_node.id] = root_node;
+    if (!persist_node(root_node)) {
+        spdlog::error("[{}] failed to persist bootstrap root node", name());
+        nodes_.erase(root_node.id);
+        return false;
+    }
+
+    spdlog::info("[{}] bootstrapped root node with pubkey '{}'",
+                  name(), root_node.mgmt_pubkey);
+    return true;
+}
+
+bool PermissionTreeService::insert_join_node(const TreeNode& node) {
+    std::lock_guard lock(mutex_);
+
+    if (node.id.empty()) {
+        spdlog::error("[{}] insert_join_node: empty node id", name());
+        return false;
+    }
+
+    if (nodes_.contains(node.id)) {
+        // Idempotent: node already exists from a previous join
+        spdlog::info("[{}] insert_join_node: node '{}' already exists, skipping",
+                      name(), node.id);
+        return true;
+    }
+
+    if (!node.parent_id.empty() && !nodes_.contains(node.parent_id)) {
+        spdlog::error("[{}] insert_join_node: parent '{}' not found for node '{}'",
+                       name(), node.parent_id, node.id);
+        return false;
+    }
+
+    nodes_[node.id] = node;
+    if (!persist_node(node)) {
+        spdlog::error("[{}] failed to persist join node '{}'", name(), node.id);
+        nodes_.erase(node.id);
+        return false;
+    }
+
+    spdlog::info("[{}] inserted join node '{}' (type={}, parent={})",
+                  name(), node.id,
+                  node_type_to_string(node.type), node.parent_id);
+    return true;
+}
+
 // --- ITreeProvider ---
 
 bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {

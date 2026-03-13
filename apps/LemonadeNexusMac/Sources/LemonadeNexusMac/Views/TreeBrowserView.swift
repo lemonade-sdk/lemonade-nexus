@@ -157,8 +157,16 @@ struct TreeBrowserView: View {
     private func loadTree() async {
         isLoadingTree = true
         do {
+            var nodes: [TreeNode] = []
+            // Load the root node itself
+            if let root = try? await appState.client.getTreeNode(id: rootId) {
+                nodes.append(root)
+                appState.rootNode = root
+            }
+            // Then load children
             let children = try await appState.client.getTreeChildren(parentId: rootId)
-            localTreeNodes = children
+            nodes.append(contentsOf: children)
+            localTreeNodes = nodes
         } catch {
             appState.addActivity(.error, "Failed to load tree: \(error.localizedDescription)")
         }
@@ -181,6 +189,42 @@ struct AddNodeSheet: View {
     @State private var errorMessage: String?
     @State private var isSubmitting: Bool = false
 
+    private static func generateHostname() -> String {
+        let base = ProcessInfo.processInfo.hostName
+            .replacingOccurrences(of: ".local", with: "")
+            .replacingOccurrences(of: ".lan", with: "")
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+        let suffix = String(format: "%04d", Int.random(in: 1000...9999))
+        return "\(base)-\(suffix)"
+    }
+
+    private static func detectRegion() -> String {
+        let tz = TimeZone.current.identifier.lowercased()
+        if tz.contains("america/los_angeles") || tz.contains("america/denver")
+            || tz.contains("america/phoenix") || tz.contains("america/boise")
+            || tz.contains("america/anchorage") || tz.contains("pacific/honolulu") {
+            return "us-west"
+        } else if tz.contains("america/chicago") || tz.contains("america/indiana")
+            || tz.contains("america/menominee") || tz.contains("america/north_dakota") {
+            return "us-central"
+        } else if tz.contains("america/new_york") || tz.contains("america/detroit")
+            || tz.contains("america/kentucky") {
+            return "us-east"
+        } else if tz.contains("europe/") {
+            return "eu-west"
+        } else if tz.contains("asia/tokyo") || tz.contains("asia/seoul") {
+            return "ap-northeast"
+        } else if tz.contains("asia/") {
+            return "ap-southeast"
+        } else if tz.contains("australia/") || tz.contains("pacific/auckland") {
+            return "ap-south"
+        } else if tz.contains("america/sao_paulo") || tz.contains("america/argentina") {
+            return "sa-east"
+        }
+        return Locale.current.region?.identifier.lowercased() ?? "unknown"
+    }
+
     var body: some View {
         VStack(spacing: 20) {
             Text("Add New Node")
@@ -193,7 +237,7 @@ struct AddNodeSheet: View {
                         Text(type.displayName).tag(type)
                     }
                 }
-                TextField("Region (e.g., us-ny)", text: $region)
+                TextField("Region (e.g., us-west)", text: $region)
 
                 LabeledContent("Parent ID") {
                     Text(parentId)
@@ -202,6 +246,10 @@ struct AddNodeSheet: View {
                 }
             }
             .formStyle(.grouped)
+            .onAppear {
+                if hostname.isEmpty { hostname = Self.generateHostname() }
+                if region.isEmpty { region = Self.detectRegion() }
+            }
 
             if let error = errorMessage {
                 Text(error)

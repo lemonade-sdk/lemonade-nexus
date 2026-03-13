@@ -23,9 +23,9 @@ struct HealthResponse: Codable {
 
 struct ServerEntry: Codable, Identifiable, Hashable {
     let endpoint: String
-    let pubkey: String
+    let pubkey: String?
     let http_port: Int
-    let last_seen: String
+    let last_seen: UInt64?
     let healthy: Bool
 
     var id: String { endpoint }
@@ -82,9 +82,11 @@ struct PasskeyRegistrationRequest: Codable {
 // MARK: - Join Network
 
 struct JoinRequest: Codable {
-    let hostname: String
-    let wg_pubkey: String
-    let mgmt_pubkey: String
+    let method: String
+    let pubkey: String
+    let challenge: String
+    let signature: String
+    let public_key: String
 }
 
 struct JoinResponse: Codable {

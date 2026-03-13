@@ -24,6 +24,17 @@ public:
     PermissionTreeService(storage::FileStorageService& storage,
                            crypto::SodiumCryptoService& crypto);
 
+    /// Bootstrap the root node if none exists.  Called during join when
+    /// the tree is empty — the first authenticated user becomes root.
+    /// Returns true if created, false if root already exists.
+    bool bootstrap_root(const TreeNode& root_node);
+
+    /// Insert a node directly during the join flow.
+    /// Bypasses the strict delta permission/signature checks because
+    /// the join handler has already authenticated the caller.
+    /// Returns true on success.
+    bool insert_join_node(const TreeNode& node);
+
     // IService
     void on_start();
     void on_stop();

@@ -218,3 +218,22 @@ func formatDate(_ dateString: String) -> String {
     displayFormatter.timeStyle = .short
     return displayFormatter.string(from: parsedDate)
 }
+
+// MARK: - Epoch Timestamp Helpers
+
+func relativeTimeString(fromEpoch epoch: UInt64?) -> String {
+    guard let epoch = epoch, epoch > 0 else { return "Unknown" }
+    let date = Date(timeIntervalSince1970: TimeInterval(epoch))
+    let relFormatter = RelativeDateTimeFormatter()
+    relFormatter.unitsStyle = .short
+    return relFormatter.localizedString(for: date, relativeTo: Date())
+}
+
+func formatDate(fromEpoch epoch: UInt64?) -> String {
+    guard let epoch = epoch, epoch > 0 else { return "Unknown" }
+    let date = Date(timeIntervalSince1970: TimeInterval(epoch))
+    let displayFormatter = DateFormatter()
+    displayFormatter.dateStyle = .medium
+    displayFormatter.timeStyle = .short
+    return displayFormatter.string(from: date)
+}

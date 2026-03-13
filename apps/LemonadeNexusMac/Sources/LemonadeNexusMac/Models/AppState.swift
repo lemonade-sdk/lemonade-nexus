@@ -146,6 +146,7 @@ final class AppState: ObservableObject {
                 )
 
                 addActivity(.info, "Signed in as \(username)")
+                await joinAsEndpoint()
                 await refreshAllData()
             } else {
                 errorMessage = authResp.error ?? "Authentication failed"
@@ -200,6 +201,7 @@ final class AppState: ObservableObject {
                 )
 
                 addActivity(.info, "Registered and signed in as \(username)")
+                await joinAsEndpoint()
                 await refreshAllData()
             } else {
                 errorMessage = authResp.error ?? "Registration failed"
@@ -209,6 +211,49 @@ final class AppState: ObservableObject {
         }
 
         isLoading = false
+    }
+
+    // MARK: - Endpoint Join
+
+    /// Joins the mesh network as an endpoint after authentication.
+    /// Requests a fresh challenge, signs it, and calls /api/join to get a tunnel IP.
+    private func joinAsEndpoint() async {
+        guard let pubkey = publicKeyBase64 else { return }
+
+        do {
+            let identity = try KeychainHelper.loadIdentity()
+            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: identity.privateKey)
+
+            // Request a fresh challenge for the join handshake
+            let challengeResp = try await client.requestChallenge(pubkey: pubkey)
+
+            guard let challengeData = Data(base64Encoded: challengeResp.challenge) ?? challengeResp.challenge.data(using: .utf8) else {
+                throw NexusClientError.invalidResponse
+            }
+            let signatureData = try signingKey.signature(for: challengeData)
+            let signatureBase64 = signatureData.base64EncodedString()
+
+            let joinResp = try await client.joinNetwork(
+                method: "ed25519",
+                pubkey: pubkey,
+                challenge: challengeResp.challenge,
+                signature: signatureBase64,
+                publicKey: pubkey
+            )
+
+            tunnelIP = joinResp.tunnel_ip
+
+            // Use the join token if returned (may supersede the auth token)
+            if !joinResp.token.isEmpty {
+                sessionToken = joinResp.token
+                client.setSessionToken(joinResp.token)
+            }
+
+            addActivity(.success, "Joined network — tunnel IP: \(joinResp.tunnel_ip)")
+        } catch {
+            // Join failure is non-fatal — user is still authenticated
+            addActivity(.warning, "Network join failed: \(error.localizedDescription)")
+        }
     }
 
     // MARK: - Passkey Authentication

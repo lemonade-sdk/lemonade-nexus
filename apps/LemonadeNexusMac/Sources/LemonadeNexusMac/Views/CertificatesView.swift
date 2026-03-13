@@ -297,19 +297,37 @@ struct RequestCertSheet: View {
     @State private var isSubmitting: Bool = false
     @State private var errorMessage: String?
 
+    private func endpointHostname() -> String {
+        // Pull hostname from the logged-in user's tree node
+        if let rootNode = appState.rootNode {
+            return rootNode.hostname
+        }
+        // Fallback: use the local machine hostname
+        return ProcessInfo.processInfo.hostName
+            .replacingOccurrences(of: ".local", with: "")
+            .replacingOccurrences(of: ".lan", with: "")
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "-")
+    }
+
     var body: some View {
         VStack(spacing: 20) {
             Text("Request Certificate")
                 .font(.title2.bold())
 
-            Text("Enter the domain name you want to secure with a TLS certificate.")
+            Text("Request a TLS certificate for your endpoint hostname.")
                 .font(.subheadline)
                 .foregroundColor(.textSecondary)
                 .multilineTextAlignment(.center)
 
-            TextField("example.com", text: $domain)
+            TextField("hostname", text: $domain)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 300)
+                .onAppear {
+                    if domain.isEmpty {
+                        domain = endpointHostname()
+                    }
+                }
 
             if let error = errorMessage {
                 Text(error)

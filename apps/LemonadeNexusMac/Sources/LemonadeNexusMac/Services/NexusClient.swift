@@ -184,8 +184,8 @@ final class NexusClient {
         return try await perform(request)
     }
 
-    func joinNetwork(hostname: String, wgPubkey: String, mgmtPubkey: String) async throws -> JoinResponse {
-        let body = JoinRequest(hostname: hostname, wg_pubkey: wgPubkey, mgmt_pubkey: mgmtPubkey)
+    func joinNetwork(method: String, pubkey: String, challenge: String, signature: String, publicKey: String) async throws -> JoinResponse {
+        let body = JoinRequest(method: method, pubkey: pubkey, challenge: challenge, signature: signature, public_key: publicKey)
         let request = try buildRequest("POST", path: "/api/join", body: body)
         return try await perform(request)
     }

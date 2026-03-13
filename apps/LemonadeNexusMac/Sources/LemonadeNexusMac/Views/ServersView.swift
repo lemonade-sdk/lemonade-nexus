@@ -113,7 +113,7 @@ struct ServersView: View {
                         .font(.caption)
                         .foregroundColor(.textSecondary)
 
-                    Label(relativeTimeString(from: server.last_seen), systemImage: "clock")
+                    Label(relativeTimeString(fromEpoch: server.last_seen), systemImage: "clock")
                         .font(.caption)
                         .foregroundColor(.textTertiary)
                 }
@@ -122,13 +122,15 @@ struct ServersView: View {
             Spacer()
 
             // Pubkey preview
-            VStack(alignment: .trailing, spacing: 4) {
-                Text("Public Key")
-                    .font(.caption2)
-                    .foregroundColor(.textTertiary)
-                Text(String(server.pubkey.prefix(16)) + "...")
-                    .font(.caption.monospaced())
-                    .foregroundColor(.textSecondary)
+            if let pubkey = server.pubkey, !pubkey.isEmpty {
+                VStack(alignment: .trailing, spacing: 4) {
+                    Text("Public Key")
+                        .font(.caption2)
+                        .foregroundColor(.textTertiary)
+                    Text(String(pubkey.prefix(16)) + "...")
+                        .font(.caption.monospaced())
+                        .foregroundColor(.textSecondary)
+                }
             }
 
             Image(systemName: "chevron.right")
@@ -185,35 +187,37 @@ struct ServerDetailSheet: View {
             VStack(spacing: 12) {
                 detailRow("Endpoint", value: server.endpoint)
                 detailRow("HTTP Port", value: "\(server.http_port)")
-                detailRow("Last Seen", value: formatDate(server.last_seen))
+                detailRow("Last Seen", value: formatDate(fromEpoch: server.last_seen))
                 detailRow("Health", value: server.healthy ? "Healthy" : "Unhealthy")
 
-                Divider()
+                if let pubkey = server.pubkey, !pubkey.isEmpty {
+                    Divider()
 
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Public Key")
-                        .font(.caption)
-                        .foregroundColor(.textSecondary)
-                    Text(server.pubkey)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundColor(.textPrimary)
-                        .textSelection(.enabled)
-                        .padding(8)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(NSColor.textBackgroundColor))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                }
-
-                HStack {
-                    Button(action: {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(server.pubkey, forType: .string)
-                    }) {
-                        Label("Copy Public Key", systemImage: "doc.on.doc")
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Public Key")
+                            .font(.caption)
+                            .foregroundColor(.textSecondary)
+                        Text(pubkey)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(.textPrimary)
+                            .textSelection(.enabled)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color(NSColor.textBackgroundColor))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
                     }
-                    .buttonStyle(.bordered)
 
-                    Spacer()
+                    HStack {
+                        Button(action: {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(pubkey, forType: .string)
+                        }) {
+                            Label("Copy Public Key", systemImage: "doc.on.doc")
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+                    }
                 }
             }
 
