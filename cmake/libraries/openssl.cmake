@@ -1,15 +1,34 @@
 cmake_minimum_required(VERSION 3.25.1)
 
-include(ExternalProject)
+# =============================================================================
+# OpenSSL — prefer system/package-manager version, build from source as fallback
+# =============================================================================
+# CI environments install OpenSSL via system packages (libssl-dev, openssl-devel,
+# choco, brew).  Local macOS builds without Homebrew need the source fallback.
+# =============================================================================
 
-# =============================================================================
-# OpenSSL 3.3.2 — built from source via ExternalProject_Add
-# =============================================================================
-# OpenSSL uses its own Configure/make build system (not CMake), so we cannot
-# use FetchContent.  Instead we build it as an external project and wire the
-# resulting static libraries + headers into IMPORTED targets that behave
-# exactly like find_package(OpenSSL) would.
-# =============================================================================
+# Skip entirely if targets already exist (e.g. from a parent project)
+if(TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+    message(STATUS "OpenSSL targets already defined — skipping")
+    return()
+endif()
+
+# ---------------------------------------------------------------------------
+# Try system OpenSSL first (respects OPENSSL_ROOT_DIR if set)
+# ---------------------------------------------------------------------------
+find_package(OpenSSL QUIET)
+
+if(OPENSSL_FOUND AND TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+    message(STATUS "Using system OpenSSL ${OPENSSL_VERSION}")
+    return()
+endif()
+
+# ---------------------------------------------------------------------------
+# System OpenSSL not found — build 3.3.2 from source via ExternalProject_Add
+# ---------------------------------------------------------------------------
+message(STATUS "System OpenSSL not found — building 3.3.2 from source")
+
+include(ExternalProject)
 
 set(OPENSSL_VERSION  "3.3.2")
 set(OPENSSL_URL      "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz")
@@ -86,14 +105,8 @@ endif()
 # ---------------------------------------------------------------------------
 # Static library paths (where they'll end up after install_sw)
 # ---------------------------------------------------------------------------
-if(WIN32)
-    set(OPENSSL_SSL_LIBRARY    "${OPENSSL_INSTALL_PREFIX}/lib/${_SSL_LIB_NAME}")
-    set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_INSTALL_PREFIX}/lib/${_CRYPTO_LIB_NAME}")
-else()
-    # OpenSSL 3.x installs to lib/ on most platforms; some 64-bit installs use lib64/
-    set(OPENSSL_SSL_LIBRARY    "${OPENSSL_INSTALL_PREFIX}/lib/${_SSL_LIB_NAME}")
-    set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_INSTALL_PREFIX}/lib/${_CRYPTO_LIB_NAME}")
-endif()
+set(OPENSSL_SSL_LIBRARY    "${OPENSSL_INSTALL_PREFIX}/lib/${_SSL_LIB_NAME}")
+set(OPENSSL_CRYPTO_LIBRARY "${OPENSSL_INSTALL_PREFIX}/lib/${_CRYPTO_LIB_NAME}")
 set(OPENSSL_INCLUDE_DIR "${OPENSSL_INSTALL_PREFIX}/include")
 
 # ---------------------------------------------------------------------------
@@ -118,9 +131,6 @@ ExternalProject_Add(openssl_external
 
 # ---------------------------------------------------------------------------
 # IMPORTED targets that mimic find_package(OpenSSL)
-# ---------------------------------------------------------------------------
-# We create OpenSSL::Crypto and OpenSSL::SSL as IMPORTED STATIC libraries.
-# All downstream targets (httplib, jwt-cpp, our own code) link against these.
 # ---------------------------------------------------------------------------
 
 # -- OpenSSL::Crypto --------------------------------------------------------

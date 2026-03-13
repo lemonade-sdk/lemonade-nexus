@@ -484,6 +484,22 @@ jobs:
           echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
           echo "Found signing identity: $IDENTITY_NAME ($IDENTITY_HASH)"
 
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: fetchcontent-macos-app-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-macos-app-
+
+      - name: Build C++ SDK and dependencies
+        run: |
+          cmake -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF
+          cmake --build build --target LemonadeNexusSDK --parallel
+
       - name: Build Swift app
         working-directory: apps/LemonadeNexusMac
         run: bash Packaging/build.sh
