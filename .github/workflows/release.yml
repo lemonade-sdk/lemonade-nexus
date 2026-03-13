@@ -500,6 +500,15 @@ jobs:
             -DBUILD_TESTING=OFF
           cmake --build build --target LemonadeNexusSDK --parallel
 
+          # If system OpenSSL was used (no source build), symlink to the expected
+          # path so Package.swift linker flags resolve correctly.
+          if [ ! -d "build/openssl-install" ]; then
+            BREW_SSL="/opt/homebrew/opt/openssl@3"
+            if [ -d "$BREW_SSL" ]; then
+              ln -sf "$BREW_SSL" build/openssl-install
+            fi
+          fi
+
       - name: Build Swift app
         working-directory: apps/LemonadeNexusMac
         run: bash Packaging/build.sh
