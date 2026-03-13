@@ -158,13 +158,17 @@ struct TreeBrowserView: View {
         isLoadingTree = true
         do {
             var nodes: [TreeNode] = []
-            // Load the root node itself
-            if let root = try? await appState.client.getTreeNode(id: rootId) {
+            // Load the root node itself via SDK
+            if let rootDict = try? appState.sdk.getTreeNode(id: rootId) {
+                let rootData = try JSONSerialization.data(withJSONObject: rootDict, options: [])
+                let root = try JSONDecoder().decode(TreeNode.self, from: rootData)
                 nodes.append(root)
                 appState.rootNode = root
             }
             // Then load children
-            let children = try await appState.client.getTreeChildren(parentId: rootId)
+            let childDicts = try appState.sdk.getTreeChildren(parentId: rootId)
+            let childData = try JSONSerialization.data(withJSONObject: childDicts, options: [])
+            let children = try JSONDecoder().decode([TreeNode].self, from: childData)
             nodes.append(contentsOf: children)
             localTreeNodes = nodes
         } catch {
@@ -276,19 +280,12 @@ struct AddNodeSheet: View {
         isSubmitting = true
         errorMessage = nil
 
-        let delta = TreeDelta(
-            node_id: UUID().uuidString,
-            field: "create",
-            value: """
-            {"hostname":"\(hostname)","type":"\(nodeType.rawValue)","parent_id":"\(parentId)","region":"\(region)"}
-            """,
-            author_pubkey: appState.publicKeyBase64 ?? "",
-            signature: ""
-        )
-
         do {
-            let response = try await appState.client.submitTreeDelta(delta)
-            if response.success {
+            let response = try appState.createChildNode(
+                parentId: parentId,
+                nodeType: nodeType.rawValue
+            )
+            if response.success == true {
                 appState.addActivity(.success, "Added node: \(hostname)")
                 onComplete()
                 dismiss()

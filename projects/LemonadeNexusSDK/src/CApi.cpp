@@ -211,12 +211,18 @@ ln_error_t ln_tree_submit_delta(ln_client_t* client,
     if (!client || !delta_json || !out_json) return LN_ERR_NULL_ARG;
 
     auto parsed = json::parse(delta_json, nullptr, false);
-    if (parsed.is_discarded()) return LN_ERR_INTERNAL;
+    if (parsed.is_discarded()) {
+        json err; err["error"] = "invalid JSON in delta";
+        *out_json = strdup_json(err);
+        return LN_ERR_INTERNAL;
+    }
 
     lnsdk::TreeDelta delta;
     try {
         delta = parsed.get<lnsdk::TreeDelta>();
-    } catch (...) {
+    } catch (const std::exception& e) {
+        json err; err["error"] = std::string("delta parse error: ") + e.what();
+        *out_json = strdup_json(err);
         return LN_ERR_INTERNAL;
     }
 
@@ -227,6 +233,75 @@ ln_error_t ln_tree_submit_delta(ln_client_t* client,
     j["node_id"]        = result.value.node_id;
     j["tunnel_ip"]      = result.value.tunnel_ip;
     j["private_subnet"] = result.value.private_subnet;
+    if (!result.ok) j["error"] = result.error;
+
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_REJECTED;
+}
+
+ln_error_t ln_create_child_node(ln_client_t* client,
+                                 const char* parent_id,
+                                 const char* node_type,
+                                 char** out_json) {
+    if (!client || !parent_id || !node_type || !out_json) return LN_ERR_NULL_ARG;
+
+    lnsdk::TreeNode child;
+    std::string type_str(node_type);
+    try {
+        child.type = lnsdk::string_to_node_type(type_str);
+    } catch (...) {
+        json err; err["error"] = "invalid node type: " + type_str;
+        *out_json = strdup_json(err);
+        return LN_ERR_INTERNAL;
+    }
+    child.parent_id = parent_id;
+
+    auto result = client->client.create_child_node(parent_id, child);
+    json j;
+    j["success"]        = result.value.success;
+    j["delta_sequence"] = result.value.delta_sequence;
+    j["node_id"]        = result.value.node_id;
+    j["tunnel_ip"]      = result.value.tunnel_ip;
+    j["private_subnet"] = result.value.private_subnet;
+    if (!result.ok) j["error"] = result.error;
+
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_REJECTED;
+}
+
+ln_error_t ln_update_node(ln_client_t* client,
+                           const char* node_id,
+                           const char* updates_json,
+                           char** out_json) {
+    if (!client || !node_id || !updates_json || !out_json) return LN_ERR_NULL_ARG;
+
+    auto parsed = json::parse(updates_json, nullptr, false);
+    if (parsed.is_discarded()) {
+        json err; err["error"] = "invalid JSON in updates";
+        *out_json = strdup_json(err);
+        return LN_ERR_INTERNAL;
+    }
+
+    auto result = client->client.update_node(node_id, parsed);
+    json j;
+    j["success"]        = result.value.success;
+    j["delta_sequence"] = result.value.delta_sequence;
+    j["node_id"]        = result.value.node_id;
+    if (!result.ok) j["error"] = result.error;
+
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_REJECTED;
+}
+
+ln_error_t ln_delete_node(ln_client_t* client,
+                           const char* node_id,
+                           char** out_json) {
+    if (!client || !node_id || !out_json) return LN_ERR_NULL_ARG;
+
+    auto result = client->client.delete_node(node_id);
+    json j;
+    j["success"]        = result.value.success;
+    j["delta_sequence"] = result.value.delta_sequence;
     if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);
@@ -703,4 +778,294 @@ char* ln_wg_generate_keypair(void) {
     j["private_key"] = priv;
     j["public_key"]  = pub;
     return strdup_json(j);
+}
+
+// ---------------------------------------------------------------------------
+// Identity: seed-based creation
+// ---------------------------------------------------------------------------
+
+ln_identity_t* ln_identity_from_seed(const uint8_t* seed, uint32_t seed_len) {
+    if (!seed || seed_len != 32) return nullptr;
+    auto* id = new(std::nothrow) ln_identity_s;
+    if (!id) return nullptr;
+    id->identity.from_seed({seed, seed_len});
+    if (!id->identity.is_valid()) {
+        delete id;
+        return nullptr;
+    }
+    return id;
+}
+
+char* ln_derive_seed(const char* username, const char* password) {
+    if (!username || !password) return nullptr;
+    auto seed = lnsdk::Identity::derive_seed(username, password);
+    if (seed.empty()) return nullptr;
+    return strdup_str(lnsdk::Identity::to_base64(seed));
+}
+
+// ---------------------------------------------------------------------------
+// Ed25519 challenge-response authentication
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_auth_ed25519(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+
+    auto result = client->client.authenticate_ed25519();
+    json j;
+    j["authenticated"] = result.value.authenticated;
+    j["user_id"]       = result.value.user_id;
+    j["session_token"] = result.value.session_token;
+    if (!result.ok) j["error"] = result.error;
+
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_AUTH;
+}
+
+// ---------------------------------------------------------------------------
+// Stats & server listing
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_stats(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_stats();
+    json j;
+    j["service"]             = result.value.service;
+    j["peer_count"]          = result.value.peer_count;
+    j["private_api_enabled"] = result.value.private_api_enabled;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+ln_error_t ln_servers(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_servers();
+    json arr = json::array();
+    for (const auto& s : result.value) {
+        arr.push_back({
+            {"endpoint",  s.endpoint},
+            {"pubkey",    s.pubkey},
+            {"http_port", s.http_port},
+            {"last_seen", s.last_seen},
+            {"healthy",   s.healthy},
+        });
+    }
+    *out_json = strdup_json(arr);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+// ---------------------------------------------------------------------------
+// Trust & attestation
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_trust_status(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_trust_status();
+    json j;
+    j["our_tier"]    = result.value.our_tier;
+    j["our_platform"] = result.value.our_platform;
+    j["require_tee"] = result.value.require_tee;
+    j["binary_hash"] = result.value.binary_hash;
+    j["peer_count"]  = result.value.peer_count;
+    json peers = json::array();
+    for (const auto& p : result.value.peers) {
+        peers.push_back({
+            {"pubkey",               p.pubkey},
+            {"tier",                 p.tier},
+            {"tier_name",            p.tier_name},
+            {"platform",             p.platform},
+            {"last_verified",        p.last_verified},
+            {"binary_hash",          p.binary_hash},
+            {"failed_verifications", p.failed_verifications},
+        });
+    }
+    j["peers"] = peers;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_json) {
+    if (!client || !pubkey || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_trust_peer(pubkey);
+    json j;
+    j["pubkey"]               = result.value.pubkey;
+    j["tier"]                 = result.value.tier;
+    j["tier_name"]            = result.value.tier_name;
+    j["platform"]             = result.value.platform;
+    j["last_verified"]        = result.value.last_verified;
+    j["attestation_hash"]     = result.value.attestation_hash;
+    j["binary_hash"]          = result.value.binary_hash;
+    j["failed_verifications"] = result.value.failed_verifications;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_NOT_FOUND;
+}
+
+// ---------------------------------------------------------------------------
+// DDNS status
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_ddns_status(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_ddns_status();
+    json j;
+    j["has_credentials"] = result.value.has_credentials;
+    j["last_ip"]         = result.value.last_ip;
+    j["binary_hash"]     = result.value.binary_hash;
+    j["binary_approved"] = result.value.binary_approved;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+// ---------------------------------------------------------------------------
+// Enrollment
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_enrollment_status(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_enrollment_status();
+    json j;
+    j["enabled"]          = result.value.enabled;
+    j["quorum_ratio"]     = result.value.quorum_ratio;
+    j["vote_timeout_sec"] = result.value.vote_timeout_sec;
+    j["pending_count"]    = result.value.pending_count;
+    json enrollments = json::array();
+    for (const auto& e : result.value.enrollments) {
+        json entry;
+        entry["request_id"]          = e.request_id;
+        entry["candidate_pubkey"]    = e.candidate_pubkey;
+        entry["candidate_server_id"] = e.candidate_server_id;
+        entry["sponsor_pubkey"]      = e.sponsor_pubkey;
+        entry["state"]               = e.state;
+        entry["state_name"]          = e.state_name;
+        entry["created_at"]          = e.created_at;
+        entry["timeout_at"]          = e.timeout_at;
+        entry["retries"]             = e.retries;
+        json votes = json::array();
+        for (const auto& v : e.votes) {
+            votes.push_back({
+                {"voter_pubkey", v.voter_pubkey},
+                {"approve",      v.approve},
+                {"reason",       v.reason},
+                {"timestamp",    v.timestamp},
+            });
+        }
+        entry["votes"] = votes;
+        enrollments.push_back(std::move(entry));
+    }
+    j["enrollments"] = enrollments;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+// ---------------------------------------------------------------------------
+// Governance
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_governance_proposals(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_governance_proposals();
+    json arr = json::array();
+    for (const auto& p : result.value) {
+        json entry;
+        entry["proposal_id"]    = p.proposal_id;
+        entry["proposer_pubkey"] = p.proposer_pubkey;
+        entry["parameter"]      = p.parameter;
+        entry["new_value"]      = p.new_value;
+        entry["old_value"]      = p.old_value;
+        entry["rationale"]      = p.rationale;
+        entry["created_at"]     = p.created_at;
+        entry["expires_at"]     = p.expires_at;
+        entry["state"]          = p.state;
+        entry["state_name"]     = p.state_name;
+        json votes = json::array();
+        for (const auto& v : p.votes) {
+            votes.push_back({
+                {"voter_pubkey", v.voter_pubkey},
+                {"approve",      v.approve},
+                {"reason",       v.reason},
+                {"timestamp",    v.timestamp},
+            });
+        }
+        entry["votes"] = votes;
+        arr.push_back(std::move(entry));
+    }
+    *out_json = strdup_json(arr);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+ln_error_t ln_governance_propose(ln_client_t* client,
+                                   uint8_t parameter,
+                                   const char* new_value,
+                                   const char* rationale,
+                                   char** out_json) {
+    if (!client || !new_value || !rationale || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.submit_governance_proposal(parameter, new_value, rationale);
+    json j;
+    j["proposal_id"] = result.value.proposal_id;
+    j["status"]      = result.value.status;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_REJECTED;
+}
+
+// ---------------------------------------------------------------------------
+// Attestation manifests
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_attestation_manifests(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.get_attestation_manifests();
+    json j;
+    j["self_hash"]     = result.value.self_hash;
+    j["self_approved"] = result.value.self_approved;
+    j["github_url"]    = result.value.github_url;
+    j["minimum_version"] = result.value.minimum_version;
+    j["manifest_fetch_interval_sec"] = result.value.manifest_fetch_interval_sec;
+    json manifests = json::array();
+    for (const auto& m : result.value.manifests) {
+        manifests.push_back({
+            {"version",       m.version},
+            {"platform",      m.platform},
+            {"binary_sha256", m.binary_sha256},
+            {"timestamp",     m.timestamp},
+        });
+    }
+    j["manifests"] = manifests;
+    if (!result.ok) j["error"] = result.error;
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
+// ---------------------------------------------------------------------------
+// Session management
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_set_session_token(ln_client_t* client, const char* token) {
+    if (!client || !token) return LN_ERR_NULL_ARG;
+    client->client.set_session_token(token);
+    return LN_OK;
+}
+
+char* ln_get_session_token(ln_client_t* client) {
+    if (!client) return nullptr;
+    auto token = client->client.session_token();
+    if (token.empty()) return nullptr;
+    return strdup_str(token);
+}
+
+ln_error_t ln_set_node_id(ln_client_t* client, const char* node_id) {
+    if (!client || !node_id) return LN_ERR_NULL_ARG;
+    client->client.set_node_id(node_id);
+    return LN_OK;
+}
+
+char* ln_get_node_id(ln_client_t* client) {
+    if (!client) return nullptr;
+    auto id = client->client.node_id();
+    if (id.empty()) return nullptr;
+    return strdup_str(id);
 }

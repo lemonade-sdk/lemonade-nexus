@@ -340,16 +340,12 @@ struct NodeDetailView: View {
         statusMessage = nil
 
         if editHostname != node.hostname {
-            let delta = TreeDelta(
-                node_id: node.id,
-                field: "hostname",
-                value: editHostname,
-                author_pubkey: appState.publicKeyBase64 ?? "",
-                signature: ""
-            )
             do {
-                let response = try await appState.client.submitTreeDelta(delta)
-                if response.success {
+                let response = try appState.updateNode(
+                    nodeId: node.id,
+                    updates: ["hostname": editHostname]
+                )
+                if response.success == true {
                     statusMessage = "Hostname updated"
                     appState.addActivity(.success, "Updated hostname for \(node.id)")
                 } else {
@@ -365,16 +361,9 @@ struct NodeDetailView: View {
     }
 
     private func deleteNode() async {
-        let delta = TreeDelta(
-            node_id: node.id,
-            field: "delete",
-            value: "true",
-            author_pubkey: appState.publicKeyBase64 ?? "",
-            signature: ""
-        )
         do {
-            let response = try await appState.client.submitTreeDelta(delta)
-            if response.success {
+            let response = try appState.deleteNode(nodeId: node.id)
+            if response.success == true {
                 appState.addActivity(.success, "Deleted node: \(node.hostname)")
             } else {
                 appState.addActivity(.error, "Failed to delete: \(response.error ?? "unknown")")

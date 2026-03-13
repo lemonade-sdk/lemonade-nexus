@@ -109,6 +109,38 @@ bool PermissionTreeService::insert_join_node(const TreeNode& node) {
     return true;
 }
 
+bool PermissionTreeService::grant_assignment(const std::string& node_id,
+                                              const Assignment& assignment) {
+    std::lock_guard lock(mutex_);
+
+    auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) {
+        spdlog::warn("[{}] grant_assignment: node '{}' not found", name(), node_id);
+        return false;
+    }
+
+    // Idempotent: skip if pubkey already has an assignment
+    for (const auto& a : it->second.assignments) {
+        if (a.management_pubkey == assignment.management_pubkey) {
+            spdlog::debug("[{}] grant_assignment: pubkey already assigned on '{}'",
+                           name(), node_id);
+            return true;
+        }
+    }
+
+    it->second.assignments.push_back(assignment);
+    if (!persist_node(it->second)) {
+        spdlog::error("[{}] grant_assignment: failed to persist node '{}'",
+                       name(), node_id);
+        it->second.assignments.pop_back();
+        return false;
+    }
+
+    spdlog::info("[{}] granted assignment on '{}' to pubkey '{}'",
+                  name(), node_id, assignment.management_pubkey.substr(0, 24));
+    return true;
+}
+
 // --- ITreeProvider ---
 
 bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {

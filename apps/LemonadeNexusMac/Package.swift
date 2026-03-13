@@ -7,9 +7,32 @@ let package = Package(
         .macOS(.v14)
     ],
     targets: [
+        .target(
+            name: "CLemonadeNexusSDK",
+            path: "Sources/CLemonadeNexusSDK",
+            publicHeadersPath: "include"
+        ),
         .executableTarget(
             name: "LemonadeNexusMac",
-            path: "Sources/LemonadeNexusMac"
-        )
+            dependencies: ["CLemonadeNexusSDK"],
+            linkerSettings: [
+                // Link against the pre-built SDK and all deps (all from CMake build tree)
+                .unsafeFlags([
+                    "-L", "../../build/projects/LemonadeNexusSDK",
+                    "-lLemonadeNexusSDK",
+                    "-L", "../../build/_deps/sodium-build",
+                    "-lsodium",
+                    "-L", "../../build/_deps/spdlog-build",
+                    "-lspdlog",
+                    "-L", "../../build/openssl-install/lib",
+                    "-lssl", "-lcrypto",
+                ]),
+                .linkedLibrary("z"),
+                .linkedLibrary("c++"),
+                .linkedFramework("Security"),
+                .linkedFramework("SystemConfiguration"),
+                .linkedFramework("CoreFoundation"),
+            ]
+        ),
     ]
 )

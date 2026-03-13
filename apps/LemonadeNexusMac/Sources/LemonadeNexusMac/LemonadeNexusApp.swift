@@ -102,7 +102,7 @@ struct LemonadeNexusApp: App {
                 appState.username = identity.username
                 appState.isAuthenticated = true
                 appState.updateBaseURL()
-                appState.client.setSessionToken(token)
+                appState.sdk.setSessionToken(token)
                 appState.connectedSince = Date()
                 Task { await appState.refreshAllData() }
             }

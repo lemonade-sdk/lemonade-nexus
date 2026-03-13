@@ -274,7 +274,17 @@ struct CertificatesView: View {
 
     private func issueCert(domain: String) async {
         do {
-            let issued = try await appState.client.issueCert(domain: domain)
+            let sdkIssued = try appState.sdk.requestCert(hostname: domain)
+            let issued = CertIssueResponse(
+                domain: sdkIssued.domain ?? domain,
+                fullchain_pem: sdkIssued.fullchain_pem ?? "",
+                encrypted_privkey: sdkIssued.encrypted_privkey ?? "",
+                nonce: sdkIssued.nonce ?? "",
+                ephemeral_pubkey: sdkIssued.ephemeral_pubkey ?? "",
+                expires_at: sdkIssued.expires_at.map {
+                    ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval($0)))
+                } ?? ""
+            )
             issuedCerts.removeAll { $0.domain == domain }
             issuedCerts.append(issued)
             appState.addActivity(.success, "Certificate issued for \(domain)")
@@ -355,7 +365,7 @@ struct RequestCertSheet: View {
         errorMessage = nil
 
         do {
-            _ = try await appState.client.issueCert(domain: domain)
+            _ = try appState.sdk.requestCert(hostname: domain)
             appState.addActivity(.success, "Certificate requested for \(domain)")
             onComplete(domain)
             dismiss()

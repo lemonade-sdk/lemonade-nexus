@@ -1,0 +1,5 @@
+module CLemonadeNexusSDK {
+    header "lemonade_nexus.h"
+    link "LemonadeNexusSDK"
+    export *
+}

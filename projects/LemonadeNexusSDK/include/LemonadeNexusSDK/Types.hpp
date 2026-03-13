@@ -303,6 +303,145 @@ struct TunnelStatus {
 };
 
 // ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+struct StatsResponse {
+    std::string service;
+    uint32_t    peer_count{0};
+    bool        private_api_enabled{false};
+};
+
+// ---------------------------------------------------------------------------
+// Server discovery
+// ---------------------------------------------------------------------------
+
+struct ServerEntry {
+    std::string endpoint;
+    std::string pubkey;
+    uint16_t    http_port{0};
+    uint64_t    last_seen{0};
+    bool        healthy{false};
+};
+
+// ---------------------------------------------------------------------------
+// Trust & attestation
+// ---------------------------------------------------------------------------
+
+struct TrustPeerInfo {
+    std::string pubkey;
+    uint8_t     tier{0};
+    std::string tier_name;
+    std::string platform;
+    uint64_t    last_verified{0};
+    std::string attestation_hash;
+    std::string binary_hash;
+    uint32_t    failed_verifications{0};
+};
+
+struct TrustStatus {
+    std::string              our_tier;
+    std::string              our_platform;
+    bool                     require_tee{false};
+    std::string              binary_hash;
+    std::size_t              peer_count{0};
+    std::vector<TrustPeerInfo> peers;
+};
+
+// ---------------------------------------------------------------------------
+// DDNS
+// ---------------------------------------------------------------------------
+
+struct DdnsStatus {
+    bool        has_credentials{false};
+    std::string last_ip;
+    std::string binary_hash;
+    bool        binary_approved{false};
+};
+
+// ---------------------------------------------------------------------------
+// Enrollment
+// ---------------------------------------------------------------------------
+
+struct EnrollmentVote {
+    std::string voter_pubkey;
+    bool        approve{false};
+    std::string reason;
+    uint64_t    timestamp{0};
+};
+
+struct EnrollmentEntry {
+    std::string              request_id;
+    std::string              candidate_pubkey;
+    std::string              candidate_server_id;
+    std::string              sponsor_pubkey;
+    uint8_t                  state{0};
+    std::string              state_name;
+    uint64_t                 created_at{0};
+    uint64_t                 timeout_at{0};
+    uint32_t                 retries{0};
+    std::vector<EnrollmentVote> votes;
+};
+
+struct EnrollmentStatus {
+    bool                         enabled{false};
+    float                        quorum_ratio{0.0f};
+    uint32_t                     vote_timeout_sec{0};
+    std::size_t                  pending_count{0};
+    std::vector<EnrollmentEntry> enrollments;
+};
+
+// ---------------------------------------------------------------------------
+// Governance
+// ---------------------------------------------------------------------------
+
+struct GovernanceVote {
+    std::string voter_pubkey;
+    bool        approve{false};
+    std::string reason;
+    uint64_t    timestamp{0};
+};
+
+struct GovernanceProposal {
+    std::string              proposal_id;
+    std::string              proposer_pubkey;
+    uint8_t                  parameter{0};
+    std::string              new_value;
+    std::string              old_value;
+    std::string              rationale;
+    uint64_t                 created_at{0};
+    uint64_t                 expires_at{0};
+    uint8_t                  state{0};
+    std::string              state_name;
+    std::vector<GovernanceVote> votes;
+};
+
+struct ProposalResult {
+    std::string proposal_id;
+    std::string status;
+};
+
+// ---------------------------------------------------------------------------
+// Attestation manifests
+// ---------------------------------------------------------------------------
+
+struct AttestationManifest {
+    std::string version;
+    std::string platform;
+    std::string binary_sha256;
+    uint64_t    timestamp{0};
+};
+
+struct AttestationManifests {
+    std::string              self_hash;
+    bool                     self_approved{false};
+    std::vector<AttestationManifest> manifests;
+    std::string              github_url;
+    std::string              minimum_version;
+    uint32_t                 manifest_fetch_interval_sec{0};
+};
+
+// ---------------------------------------------------------------------------
 // JSON serialization
 // ---------------------------------------------------------------------------
 
@@ -319,5 +458,18 @@ void from_json(const nlohmann::json& j, TreeDelta& d);
 /// Produce a canonical (deterministic) JSON string for Ed25519 signing.
 /// Excludes the "signature" field itself.
 [[nodiscard]] std::string canonical_delta_json(const TreeDelta& delta);
+
+void from_json(const nlohmann::json& j, StatsResponse& s);
+void from_json(const nlohmann::json& j, ServerEntry& s);
+void from_json(const nlohmann::json& j, TrustPeerInfo& p);
+void from_json(const nlohmann::json& j, TrustStatus& s);
+void from_json(const nlohmann::json& j, DdnsStatus& s);
+void from_json(const nlohmann::json& j, EnrollmentVote& v);
+void from_json(const nlohmann::json& j, EnrollmentEntry& e);
+void from_json(const nlohmann::json& j, EnrollmentStatus& s);
+void from_json(const nlohmann::json& j, GovernanceVote& v);
+void from_json(const nlohmann::json& j, GovernanceProposal& p);
+void from_json(const nlohmann::json& j, AttestationManifest& m);
+void from_json(const nlohmann::json& j, AttestationManifests& a);
 
 } // namespace lnsdk

@@ -35,6 +35,11 @@ public:
     /// Returns true on success.
     bool insert_join_node(const TreeNode& node);
 
+    /// Grant an assignment (pubkey + permissions) on a node.
+    /// Idempotent: no-op if the pubkey already has an assignment.
+    /// Used after Ed25519 key registration to give new keys add_child on root.
+    bool grant_assignment(const std::string& node_id, const Assignment& assignment);
+
     // IService
     void on_start();
     void on_stop();

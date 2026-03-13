@@ -15,7 +15,7 @@ namespace lnsdk {
 // Internal per-server tracking (one entry per ServerEndpoint)
 // ---------------------------------------------------------------------------
 
-struct ServerEntry {
+struct LatencyServerEntry {
     ServerEndpoint endpoint;
     double         smoothed_rtt_ms{0.0};
     bool           reachable{false};
@@ -30,7 +30,7 @@ struct ServerEntry {
 
 struct LatencyMonitor::Impl {
     LatencyConfig               config;
-    std::vector<ServerEntry>    entries;
+    std::vector<LatencyServerEntry>    entries;
     std::size_t                 current_idx{0};
     ServerSwitchCallback        switch_cb;
 
@@ -265,7 +265,7 @@ void LatencyMonitor::set_servers(const std::vector<ServerConfig>& servers) {
                 }
             }
             if (!found) {
-                ServerEntry entry;
+                LatencyServerEntry entry;
                 entry.endpoint = ep;
                 impl_->entries.push_back(std::move(entry));
             }

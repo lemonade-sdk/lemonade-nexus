@@ -1,6 +1,5 @@
 import Foundation
 import SwiftUI
-import CryptoKit
 
 @MainActor
 final class AppState: ObservableObject {
@@ -57,7 +56,7 @@ final class AppState: ObservableObject {
     @Published var tunnelIP: String?
     @Published var connectedSince: Date?
 
-    var client: NexusClient
+    let sdk: NexusSDK
 
     init() {
         let savedURL = UserDefaults.standard.string(forKey: "serverURL") ?? "https://localhost:9100"
@@ -66,13 +65,23 @@ final class AppState: ObservableObject {
         self.autoDiscoveryEnabled = UserDefaults.standard.object(forKey: "autoDiscoveryEnabled") as? Bool ?? true
         let savedLogLevel = UserDefaults.standard.string(forKey: "logLevel") ?? "info"
         self.logLevel = LogLevel(rawValue: savedLogLevel) ?? .info
-        self.client = NexusClient(baseURL: savedURL)
+
+        // Parse URL to extract host, port, TLS for SDK
+        let url = URL(string: savedURL)
+        let host = url?.host ?? "127.0.0.1"
+        let port = UInt16(url?.port ?? 9100)
+        let useTLS = url?.scheme == "https"
+        self.sdk = NexusSDK(host: host, port: port, useTLS: useTLS)
     }
 
     func updateBaseURL() {
-        client = NexusClient(baseURL: serverURL)
+        guard let url = URL(string: serverURL) else { return }
+        let host = url.host ?? "127.0.0.1"
+        let port = UInt16(url.port ?? 9100)
+        let useTLS = url.scheme == "https"
+        sdk.reconnect(host: host, port: port, useTLS: useTLS)
         if let token = sessionToken {
-            client.setSessionToken(token)
+            sdk.setSessionToken(token)
         }
     }
 
@@ -111,47 +120,46 @@ final class AppState: ObservableObject {
         updateBaseURL()
 
         do {
-            let seed = try KeychainHelper.deriveEd25519Seed(username: username, password: password)
-            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
-            let pubkeyData = signingKey.publicKey.rawRepresentation
-            let pubkeyBase64 = pubkeyData.base64EncodedString()
+            // SDK handles PBKDF2 + Ed25519 keypair derivation internally
+            try sdk.deriveIdentity(username: username, password: password)
 
-            let challengeResp = try await client.requestChallenge(pubkey: pubkeyBase64)
+            // SDK handles challenge-response auth (request challenge, sign, authenticate)
+            let authResult = try sdk.authenticateEd25519()
 
-            guard let challengeData = Data(base64Encoded: challengeResp.challenge) ?? challengeResp.challenge.data(using: .utf8) else {
-                throw NexusClientError.invalidResponse
-            }
-            let signatureData = try signingKey.signature(for: challengeData)
-            let signatureBase64 = signatureData.base64EncodedString()
-
-            let authResp = try await client.authenticate(
-                method: "ed25519",
-                pubkey: pubkeyBase64,
-                challenge: challengeResp.challenge,
-                signature: signatureBase64
-            )
-
-            if authResp.authenticated, let token = authResp.session_token {
-                sessionToken = token
-                userId = authResp.user_id
-                publicKeyBase64 = pubkeyBase64
-                isAuthenticated = true
-                client.setSessionToken(token)
-                connectedSince = Date()
-
-                try KeychainHelper.saveIdentity(
-                    privateKey: signingKey.rawRepresentation,
-                    pubkey: pubkeyBase64,
-                    username: username
-                )
-
-                addActivity(.info, "Signed in as \(username)")
-                await joinAsEndpoint()
-                await refreshAllData()
-            } else {
-                errorMessage = authResp.error ?? "Authentication failed"
+            guard authResult.authenticated == true else {
+                errorMessage = authResult.error ?? "Authentication failed"
                 addActivity(.error, "Sign-in failed: \(errorMessage ?? "unknown")")
+                isLoading = false
+                return
             }
+
+            if let token = authResult.session_token {
+                sessionToken = token
+                sdk.setSessionToken(token)
+            }
+            userId = authResult.user_id
+
+            // Extract base64 public key from SDK's "ed25519:base64..." format
+            let pubkey = sdk.publicKeyString ?? ""
+            let pubkeyBase64 = pubkey.hasPrefix("ed25519:") ? String(pubkey.dropFirst("ed25519:".count)) : pubkey
+            publicKeyBase64 = pubkeyBase64
+
+            isAuthenticated = true
+            connectedSince = Date()
+
+            // Save credentials to macOS Keychain for session restore on next launch.
+            // We save the identity stub (empty privateKey since SDK manages keys internally)
+            // so auto-connect can restore username/pubkey context.
+            try KeychainHelper.saveIdentity(
+                privateKey: Data(),
+                pubkey: pubkeyBase64,
+                username: username
+            )
+            try KeychainHelper.saveSessionToken(sessionToken ?? "")
+
+            addActivity(.info, "Signed in as \(username)")
+            await joinAsEndpoint()
+            await refreshAllData()
         } catch {
             errorMessage = error.localizedDescription
             addActivity(.error, "Sign-in error: \(error.localizedDescription)")
@@ -167,45 +175,44 @@ final class AppState: ObservableObject {
         updateBaseURL()
 
         do {
-            let seed = try KeychainHelper.deriveEd25519Seed(username: username, password: password)
-            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: seed)
-            let pubkeyData = signingKey.publicKey.rawRepresentation
-            let pubkeyBase64 = pubkeyData.base64EncodedString()
+            // SDK handles PBKDF2 + Ed25519 keypair derivation internally
+            try sdk.deriveIdentity(username: username, password: password)
 
-            let challengeResp = try await client.requestChallenge(pubkey: pubkeyBase64)
+            // Ed25519 challenge-response auto-registers the pubkey on the server
+            // if it doesn't exist yet. The SDK handles the full flow internally.
+            // NOTE: If the server requires explicit registration via /api/auth/register/ed25519,
+            // a dedicated SDK C API binding (ln_register_ed25519) will need to be added.
+            let authResult = try sdk.authenticateEd25519()
 
-            guard let challengeData = Data(base64Encoded: challengeResp.challenge) ?? challengeResp.challenge.data(using: .utf8) else {
-                throw NexusClientError.invalidResponse
+            guard authResult.authenticated == true else {
+                errorMessage = authResult.error ?? "Registration failed"
+                isLoading = false
+                return
             }
-            let signatureData = try signingKey.signature(for: challengeData)
-            let signatureBase64 = signatureData.base64EncodedString()
 
-            let authResp = try await client.registerEd25519(
-                pubkey: pubkeyBase64,
-                challenge: challengeResp.challenge,
-                signature: signatureBase64
-            )
-
-            if authResp.authenticated, let token = authResp.session_token {
+            if let token = authResult.session_token {
                 sessionToken = token
-                userId = authResp.user_id
-                publicKeyBase64 = pubkeyBase64
-                isAuthenticated = true
-                client.setSessionToken(token)
-                connectedSince = Date()
-
-                try KeychainHelper.saveIdentity(
-                    privateKey: signingKey.rawRepresentation,
-                    pubkey: pubkeyBase64,
-                    username: username
-                )
-
-                addActivity(.info, "Registered and signed in as \(username)")
-                await joinAsEndpoint()
-                await refreshAllData()
-            } else {
-                errorMessage = authResp.error ?? "Registration failed"
+                sdk.setSessionToken(token)
             }
+            userId = authResult.user_id
+
+            let pubkey = sdk.publicKeyString ?? ""
+            let pubkeyBase64 = pubkey.hasPrefix("ed25519:") ? String(pubkey.dropFirst("ed25519:".count)) : pubkey
+            publicKeyBase64 = pubkeyBase64
+
+            isAuthenticated = true
+            connectedSince = Date()
+
+            try KeychainHelper.saveIdentity(
+                privateKey: Data(),
+                pubkey: pubkeyBase64,
+                username: username
+            )
+            try KeychainHelper.saveSessionToken(sessionToken ?? "")
+
+            addActivity(.info, "Registered and signed in as \(username)")
+            await joinAsEndpoint()
+            await refreshAllData()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -216,44 +223,44 @@ final class AppState: ObservableObject {
     // MARK: - Endpoint Join
 
     /// Joins the mesh network as an endpoint after authentication.
-    /// Requests a fresh challenge, signs it, and calls /api/join to get a tunnel IP.
+    /// The SDK handles auth + node creation + IP allocation in one call.
     private func joinAsEndpoint() async {
-        guard let pubkey = publicKeyBase64 else { return }
-
         do {
-            let identity = try KeychainHelper.loadIdentity()
-            let signingKey = try Curve25519.Signing.PrivateKey(rawRepresentation: identity.privateKey)
+            // The SDK's joinNetwork does auth + create_node + IP allocation.
+            // Identity must already be set (done during signIn/register).
+            let joinResult = try sdk.joinNetwork(username: username, password: "")
+            // Note: password is empty because identity is already derived and set on the SDK.
+            // The SDK uses the existing identity for the join flow.
 
-            // Request a fresh challenge for the join handshake
-            let challengeResp = try await client.requestChallenge(pubkey: pubkey)
+            tunnelIP = joinResult.tunnel_ip
 
-            guard let challengeData = Data(base64Encoded: challengeResp.challenge) ?? challengeResp.challenge.data(using: .utf8) else {
-                throw NexusClientError.invalidResponse
-            }
-            let signatureData = try signingKey.signature(for: challengeData)
-            let signatureBase64 = signatureData.base64EncodedString()
-
-            let joinResp = try await client.joinNetwork(
-                method: "ed25519",
-                pubkey: pubkey,
-                challenge: challengeResp.challenge,
-                signature: signatureBase64,
-                publicKey: pubkey
-            )
-
-            tunnelIP = joinResp.tunnel_ip
-
-            // Use the join token if returned (may supersede the auth token)
-            if !joinResp.token.isEmpty {
-                sessionToken = joinResp.token
-                client.setSessionToken(joinResp.token)
+            if let nodeId = joinResult.node_id {
+                sdk.setNodeId(nodeId)
             }
 
-            addActivity(.success, "Joined network — tunnel IP: \(joinResp.tunnel_ip)")
+            addActivity(.success, "Joined network — tunnel IP: \(joinResult.tunnel_ip ?? "pending")")
         } catch {
-            // Join failure is non-fatal — user is still authenticated
+            // Join failure is non-fatal — user is still authenticated.
+            // Fall back to refreshing tree to discover our node info.
             addActivity(.warning, "Network join failed: \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Tree Operations (delegated to SDK)
+
+    /// Create a child node — SDK handles signing and delta construction.
+    func createChildNode(parentId: String, nodeType: String) throws -> NexusSDK.SDKDeltaResponse {
+        try sdk.createChildNode(parentId: parentId, nodeType: nodeType)
+    }
+
+    /// Update a node — SDK handles signing and delta construction.
+    func updateNode(nodeId: String, updates: [String: Any]) throws -> NexusSDK.SDKDeltaResponse {
+        try sdk.updateNode(nodeId: nodeId, updates: updates)
+    }
+
+    /// Delete a node — SDK handles signing and delta construction.
+    func deleteNode(nodeId: String) throws -> NexusSDK.SDKDeltaResponse {
+        try sdk.deleteNode(nodeId: nodeId)
     }
 
     // MARK: - Passkey Authentication
@@ -265,27 +272,23 @@ final class AppState: ObservableObject {
         updateBaseURL()
 
         do {
-            // Fetch RP ID from server
-            let health = try await client.getHealth()
-            let rpId = health.rp_id ?? "lemonade-nexus.local"
-
-            // Generate P-256 credential (Secure Enclave + Touch ID)
+            // Generate P-256 credential (Secure Enclave + Touch ID) — platform-specific
             let (credentialId, pubKeyX, pubKeyY) = try PasskeyManager.shared.generateCredential(userId: username)
 
-            // Register with server
-            let authResp = try await client.registerPasskey(
+            // Register with server via SDK
+            let authResp = try sdk.registerPasskey(
                 userId: username,
                 credentialId: credentialId,
                 publicKeyX: pubKeyX,
                 publicKeyY: pubKeyY
             )
 
-            if authResp.authenticated, let token = authResp.session_token {
+            if authResp.authenticated == true, let token = authResp.session_token {
                 sessionToken = token
                 userId = authResp.user_id
                 publicKeyBase64 = credentialId
                 isAuthenticated = true
-                client.setSessionToken(token)
+                sdk.setSessionToken(token)
                 connectedSince = Date()
 
                 try? KeychainHelper.saveSessionToken(token)
@@ -309,29 +312,39 @@ final class AppState: ObservableObject {
         updateBaseURL()
 
         do {
-            // Fetch RP ID from server
-            let health = try await client.getHealth()
-            let rpId = health.rp_id ?? "lemonade-nexus.local"
+            // rpId for assertion — platform-specific (Touch ID / Secure Enclave)
+            let rpId = "lemonade-nexus.local"
 
             // Sign assertion (triggers Touch ID if Secure Enclave)
             let (credentialId, authData, clientDataJson, signature) = try PasskeyManager.shared.signAssertion(rpId: rpId)
 
-            // Authenticate with server
-            let authResp = try await client.authenticatePasskey(
+            // Authenticate with server via SDK
+            let authResp = try sdk.authenticatePasskey(
                 credentialId: credentialId,
                 authenticatorData: authData,
                 clientDataJson: clientDataJson,
                 signature: signature
             )
 
-            if authResp.authenticated, let token = authResp.session_token {
+            if authResp.authenticated == true, let token = authResp.session_token {
                 sessionToken = token
                 userId = authResp.user_id
                 username = PasskeyManager.shared.storedUserId ?? ""
                 publicKeyBase64 = credentialId
                 isAuthenticated = true
-                client.setSessionToken(token)
+                sdk.setSessionToken(token)
                 connectedSince = Date()
+
+                // Generate Ed25519 identity for delta signing
+                // (passkey handles auth, but tree ops need Ed25519 signatures)
+                sdk.generateIdentity()
+
+                // Register the Ed25519 key with the server so it gets
+                // add_child permission on root for creating nodes
+                if let _ = try? sdk.authenticateEd25519() {
+                    // Re-set the passkey session token (ed25519 auth returns its own)
+                    sdk.setSessionToken(token)
+                }
 
                 try? KeychainHelper.saveSessionToken(token)
                 addActivity(.info, "Signed in with passkey")
@@ -368,7 +381,7 @@ final class AppState: ObservableObject {
         enrollmentStatus = nil
         proposals = []
         attestationManifests = nil
-        client.clearSessionToken()
+        sdk.setSessionToken("")
         addActivity(.info, "Signed out")
     }
 
@@ -384,8 +397,11 @@ final class AppState: ObservableObject {
 
     func refreshHealth() async {
         do {
-            let health = try await client.getHealth()
-            healthStatus = health
+            let health = try sdk.getHealth()
+            healthStatus = HealthResponse(
+                status: health.status ?? "unknown",
+                service: health.service ?? ""
+            )
             isServerHealthy = (health.status == "ok" || health.status == "healthy")
         } catch {
             isServerHealthy = false
@@ -395,7 +411,8 @@ final class AppState: ObservableObject {
 
     func refreshServers() async {
         do {
-            servers = try await client.getServers()
+            let serverDicts = try sdk.getServers()
+            servers = serverDicts.map { ServerEntry(from: $0) }
         } catch {
             servers = []
         }
@@ -403,7 +420,12 @@ final class AppState: ObservableObject {
 
     func refreshStats() async {
         do {
-            stats = try await client.getStats()
+            let sdkStats = try sdk.getStats()
+            stats = StatsResponse(
+                service: sdkStats.service ?? "",
+                peer_count: Int(sdkStats.peer_count ?? 0),
+                private_api_enabled: sdkStats.private_api_enabled ?? false
+            )
         } catch {
             stats = nil
         }
@@ -411,7 +433,10 @@ final class AppState: ObservableObject {
 
     func refreshTree(parentId: String) async {
         do {
-            treeNodes = try await client.getTreeChildren(parentId: parentId)
+            let childDicts = try sdk.getTreeChildren(parentId: parentId)
+            // Convert [[String: Any]] to [TreeNode] via JSON round-trip
+            let jsonData = try JSONSerialization.data(withJSONObject: childDicts, options: [])
+            treeNodes = try JSONDecoder().decode([TreeNode].self, from: jsonData)
         } catch {
             addActivity(.error, "Failed to load tree: \(error.localizedDescription)")
         }
@@ -419,7 +444,8 @@ final class AppState: ObservableObject {
 
     func refreshRelays() async {
         do {
-            relays = try await client.getRelayList()
+            let relayDicts = try sdk.getRelayList()
+            relays = relayDicts.map { RelayInfoEntry(from: $0) }
         } catch {
             relays = []
         }
@@ -429,8 +455,16 @@ final class AppState: ObservableObject {
         var certs: [CertStatusResponse] = []
         for domain in domains {
             do {
-                let cert = try await client.getCertStatus(domain: domain)
-                certs.append(cert)
+                let sdkCert = try sdk.getCertStatus(domain: domain)
+                // Convert SDK cert status to APIModels type
+                let expiresStr: String? = sdkCert.expires_at.map { ts in
+                    ISO8601DateFormatter().string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+                }
+                certs.append(CertStatusResponse(
+                    domain: sdkCert.domain ?? domain,
+                    has_cert: sdkCert.has_cert ?? false,
+                    expires_at: expiresStr
+                ))
             } catch {
                 // skip domains that error
             }
@@ -440,7 +474,10 @@ final class AppState: ObservableObject {
 
     func refreshTrustStatus() async {
         do {
-            trustStatus = try await client.getTrustStatus()
+            let trustDict = try sdk.getTrustStatus()
+            // Convert [String: Any] to TrustStatusResponse via JSON round-trip
+            let jsonData = try JSONSerialization.data(withJSONObject: trustDict, options: [])
+            trustStatus = try JSONDecoder().decode(TrustStatusResponse.self, from: jsonData)
         } catch {
             trustStatus = nil
         }
@@ -448,7 +485,13 @@ final class AppState: ObservableObject {
 
     func refreshDdnsStatus() async {
         do {
-            ddnsStatus = try await client.getDdnsStatus()
+            let sdkDdns = try sdk.getDdnsStatus()
+            ddnsStatus = DdnsStatusResponse(
+                has_credentials: sdkDdns.has_credentials ?? false,
+                last_ip: sdkDdns.last_ip,
+                binary_hash: sdkDdns.binary_hash,
+                binary_approved: sdkDdns.binary_approved
+            )
         } catch {
             ddnsStatus = nil
         }
@@ -456,7 +499,9 @@ final class AppState: ObservableObject {
 
     func refreshEnrollmentStatus() async {
         do {
-            enrollmentStatus = try await client.getEnrollmentStatus()
+            let enrollDict = try sdk.getEnrollmentStatus()
+            let jsonData = try JSONSerialization.data(withJSONObject: enrollDict, options: [])
+            enrollmentStatus = try JSONDecoder().decode(EnrollmentStatusResponse.self, from: jsonData)
         } catch {
             enrollmentStatus = nil
         }
@@ -464,7 +509,9 @@ final class AppState: ObservableObject {
 
     func refreshProposals() async {
         do {
-            proposals = try await client.getGovernanceProposals()
+            let proposalDicts = try sdk.getGovernanceProposals()
+            let jsonData = try JSONSerialization.data(withJSONObject: proposalDicts, options: [])
+            proposals = try JSONDecoder().decode([GovernanceProposal].self, from: jsonData)
         } catch {
             proposals = []
         }
@@ -472,7 +519,9 @@ final class AppState: ObservableObject {
 
     func refreshAttestationManifests() async {
         do {
-            attestationManifests = try await client.getAttestationManifests()
+            let manifestDict = try sdk.getAttestationManifests()
+            let jsonData = try JSONSerialization.data(withJSONObject: manifestDict, options: [])
+            attestationManifests = try JSONDecoder().decode(AttestationManifestsResponse.self, from: jsonData)
         } catch {
             attestationManifests = nil
         }

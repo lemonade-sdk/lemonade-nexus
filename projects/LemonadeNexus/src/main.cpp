@@ -721,6 +721,19 @@ int main(int argc, char* argv[]) {
             return;
         }
         auto result = auth_service.authenticate(body);
+
+        // After successful Ed25519 auth, grant add_child on root so the
+        // newly registered key can create child nodes.
+        if (result.authenticated && body.value("method", "") == "ed25519") {
+            auto pubkey = body.value("pubkey", std::string{});
+            if (!pubkey.empty()) {
+                tree.grant_assignment("root", {
+                    .management_pubkey = pubkey,
+                    .permissions = {"read", "add_child"},
+                });
+            }
+        }
+
         nexus::network::AuthResponse resp{
             .authenticated = result.authenticated,
             .user_id       = result.user_id,
@@ -783,6 +796,18 @@ int main(int argc, char* argv[]) {
             return;
         }
         auto result = auth_service.register_ed25519(body);
+
+        // Grant add_child on root for newly registered Ed25519 keys
+        if (result.authenticated) {
+            auto pubkey = body.value("pubkey", std::string{});
+            if (!pubkey.empty()) {
+                tree.grant_assignment("root", {
+                    .management_pubkey = pubkey,
+                    .permissions = {"read", "add_child"},
+                });
+            }
+        }
+
         nexus::network::AuthResponse resp{
             .authenticated = result.authenticated,
             .user_id       = result.user_id,

@@ -11,6 +11,12 @@ struct HealthResponse: Codable {
         case status, service, rp_id
     }
 
+    init(status: String, service: String, rp_id: String? = nil) {
+        self.status = status
+        self.service = service
+        self.rp_id = rp_id
+    }
+
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         status = try container.decode(String.self, forKey: .status)
@@ -29,6 +35,15 @@ struct ServerEntry: Codable, Identifiable, Hashable {
     let healthy: Bool
 
     var id: String { endpoint }
+
+    /// Construct from an SDK dictionary (keys may be missing).
+    init(from dict: [String: Any]) {
+        self.endpoint = dict["endpoint"] as? String ?? ""
+        self.pubkey = dict["pubkey"] as? String
+        self.http_port = dict["http_port"] as? Int ?? 9100
+        self.last_seen = dict["last_seen"] as? UInt64
+        self.healthy = dict["healthy"] as? Bool ?? false
+    }
 }
 
 // MARK: - Stats
@@ -162,11 +177,20 @@ enum NodeType: String, Codable, CaseIterable {
 // MARK: - Tree Delta
 
 struct TreeDelta: Codable {
-    let node_id: String
-    let field: String
-    let value: String
-    let author_pubkey: String
-    let signature: String
+    let operation: String           // "create_node", "update_node", "delete_node"
+    let target_node_id: String
+    let node_data: TreeDeltaNodeData
+    let signer_pubkey: String       // "ed25519:base64..."
+    let signature: String           // Ed25519 signature over canonical JSON
+    let timestamp: UInt64
+}
+
+struct TreeDeltaNodeData: Codable {
+    let id: String
+    let parent_id: String
+    let type: String?
+    let hostname: String?
+    let region: String?
 }
 
 struct DeltaResponse: Codable {
@@ -197,6 +221,15 @@ struct RelayInfoEntry: Codable, Identifiable, Hashable {
     let latency_ms: Double?
 
     var id: String { pubkey }
+
+    /// Construct from an SDK dictionary.
+    init(from dict: [String: Any]) {
+        self.pubkey = dict["pubkey"] as? String ?? ""
+        self.endpoint = dict["endpoint"] as? String ?? ""
+        self.region = dict["region"] as? String ?? ""
+        self.load = dict["load"] as? Double
+        self.latency_ms = dict["latency_ms"] as? Double
+    }
 }
 
 struct NearestRelayResponse: Codable {
@@ -212,6 +245,12 @@ struct CertStatusResponse: Codable, Identifiable, Hashable {
     let expires_at: String?
 
     var id: String { domain }
+
+    init(domain: String, has_cert: Bool, expires_at: String?) {
+        self.domain = domain
+        self.has_cert = has_cert
+        self.expires_at = expires_at
+    }
 
     var expiryDate: Date? {
         guard let expiresAt = expires_at else { return nil }
@@ -274,6 +313,13 @@ struct DdnsStatusResponse: Codable {
     let last_ip: String?
     let binary_hash: String?
     let binary_approved: Bool?
+
+    init(has_credentials: Bool, last_ip: String?, binary_hash: String?, binary_approved: Bool?) {
+        self.has_credentials = has_credentials
+        self.last_ip = last_ip
+        self.binary_hash = binary_hash
+        self.binary_approved = binary_approved
+    }
 }
 
 // MARK: - Enrollment

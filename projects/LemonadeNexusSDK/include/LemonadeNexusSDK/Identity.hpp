@@ -26,6 +26,16 @@ public:
     /// Generate a new random Ed25519 keypair.
     void generate();
 
+    /// Create an Ed25519 keypair from a 32-byte seed.
+    /// This is used when the seed is derived from PBKDF2(username, password).
+    void from_seed(std::span<const uint8_t> seed);
+
+    /// Derive a 32-byte Ed25519 seed from username + password using PBKDF2-SHA256.
+    /// Uses 100,000 iterations with salt "lemonade-nexus:{username}".
+    /// Returns the 32-byte seed, or empty vector on failure.
+    [[nodiscard]] static std::vector<uint8_t> derive_seed(const std::string& username,
+                                                           const std::string& password);
+
     /// Check if an identity has been loaded or generated.
     [[nodiscard]] bool is_valid() const noexcept;
 
