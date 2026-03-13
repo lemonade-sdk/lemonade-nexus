@@ -46,6 +46,7 @@ struct HealthResponse {
     std::string status{"ok"};
     std::string service{"lemonade-nexus"};
     std::string rp_id;
+    std::string dns_base_domain;
 };
 
 inline void to_json(nlohmann::json& j, const HealthResponse& r) {
@@ -53,11 +54,15 @@ inline void to_json(nlohmann::json& j, const HealthResponse& r) {
     if (!r.rp_id.empty()) {
         j["rp_id"] = r.rp_id;
     }
+    if (!r.dns_base_domain.empty()) {
+        j["dns_base_domain"] = r.dns_base_domain;
+    }
 }
 
 inline void from_json(const nlohmann::json& j, HealthResponse& r) {
-    r.status  = j.value("status", "ok");
-    r.service = j.value("service", "lemonade-nexus");
+    r.status          = j.value("status", "ok");
+    r.service         = j.value("service", "lemonade-nexus");
+    r.dns_base_domain = j.value("dns_base_domain", "");
 }
 
 // ============================================================================

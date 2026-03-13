@@ -6,7 +6,6 @@ struct NodeDetailView: View {
 
     @EnvironmentObject private var appState: AppState
     @State private var isEditing: Bool = false
-    @State private var editRegion: String = ""
     @State private var showDeleteConfirmation: Bool = false
     @State private var isSaving: Bool = false
     @State private var statusMessage: String?
@@ -48,7 +47,6 @@ struct NodeDetailView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.surfaceDark)
         .onAppear {
-            editRegion = node.region ?? ""
         }
         .alert("Delete Node", isPresented: $showDeleteConfirmation) {
             Button("Cancel", role: .cancel) { }
@@ -111,19 +109,8 @@ struct NodeDetailView: View {
                 propertyRow("Type", value: node.nodeType.displayName)
 
                 propertyRow("Hostname", value: node.hostname)
-                if isEditing {
-                    HStack {
-                        Text("Region")
-                            .font(.subheadline)
-                            .foregroundColor(.textSecondary)
-                            .frame(width: 120, alignment: .leading)
-                        TextField("Region", text: $editRegion)
-                            .textFieldStyle(.roundedBorder)
-                    }
-                } else {
-                    if let region = node.region {
-                        propertyRow("Region", value: region)
-                    }
+                if let region = node.region {
+                    propertyRow("Region", value: region)
                 }
             }
             .cardStyle()
@@ -236,7 +223,6 @@ struct NodeDetailView: View {
 
                     Button("Cancel") {
                         isEditing = false
-                        editRegion = node.region ?? ""
                     }
                     .buttonStyle(LemonButtonStyle(isProminent: false))
                 }
@@ -321,23 +307,6 @@ struct NodeDetailView: View {
     private func saveChanges() async {
         isSaving = true
         statusMessage = nil
-
-        if editRegion != (node.region ?? "") {
-            do {
-                let response = try appState.updateNode(
-                    nodeId: node.id,
-                    updates: ["region": editRegion]
-                )
-                if response.success == true {
-                    statusMessage = "Region updated"
-                    appState.addActivity(.success, "Updated region for \(node.id)")
-                } else {
-                    statusMessage = response.error ?? "Failed to update region"
-                }
-            } catch {
-                statusMessage = error.localizedDescription
-            }
-        }
 
         isEditing = false
         isSaving = false

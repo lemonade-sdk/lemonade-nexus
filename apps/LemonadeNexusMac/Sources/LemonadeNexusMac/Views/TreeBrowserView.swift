@@ -244,7 +244,10 @@ struct AddNodeSheet: View {
                         Text(type.displayName).tag(type)
                     }
                 }
-                TextField("Region (e.g., us-west)", text: $region)
+                LabeledContent("Region") {
+                    Text(region)
+                        .foregroundColor(.textSecondary)
+                }
 
                 LabeledContent("Parent ID") {
                     Text(parentId)

@@ -153,6 +153,7 @@ final class NexusSDK {
     struct SDKHealthResponse: Codable {
         let status: String?
         let service: String?
+        let dns_base_domain: String?
         let ok: Bool?
         let error: String?
     }

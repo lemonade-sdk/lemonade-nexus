@@ -26,6 +26,7 @@ final class AppState: ObservableObject {
     @Published var rootNode: TreeNode?
     @Published var certificates: [CertStatusResponse] = []
     @Published var relays: [RelayInfoEntry] = []
+    @Published var dnsBaseDomain: String = ""
     @Published var trustStatus: TrustStatusResponse?
     @Published var ddnsStatus: DdnsStatusResponse?
     @Published var enrollmentStatus: EnrollmentStatusResponse?
@@ -376,6 +377,7 @@ final class AppState: ObservableObject {
         rootNode = nil
         certificates = []
         relays = []
+        dnsBaseDomain = ""
         trustStatus = nil
         ddnsStatus = nil
         enrollmentStatus = nil
@@ -403,6 +405,9 @@ final class AppState: ObservableObject {
                 service: health.service ?? ""
             )
             isServerHealthy = (health.status == "ok" || health.status == "healthy")
+            if let domain = health.dns_base_domain, !domain.isEmpty {
+                dnsBaseDomain = domain
+            }
         } catch {
             isServerHealthy = false
             healthStatus = nil

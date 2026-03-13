@@ -118,9 +118,10 @@ ln_error_t ln_health(ln_client_t* client, char** out_json) {
 
     auto result = client->client.check_health();
     json j;
-    j["status"]  = result.value.status;
-    j["service"] = result.value.service;
-    j["ok"]      = result.ok;
+    j["status"]          = result.value.status;
+    j["service"]         = result.value.service;
+    j["dns_base_domain"] = result.value.dns_base_domain;
+    j["ok"]              = result.ok;
     if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);

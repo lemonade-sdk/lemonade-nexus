@@ -46,6 +46,7 @@ struct ServerConfig {
 struct HealthStatus {
     std::string status;
     std::string service;
+    std::string dns_base_domain;
 };
 
 // ---------------------------------------------------------------------------

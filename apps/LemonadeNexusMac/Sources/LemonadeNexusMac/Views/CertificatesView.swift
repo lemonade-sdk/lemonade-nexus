@@ -303,21 +303,33 @@ struct RequestCertSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
 
-    @State private var domain: String = ""
+    @State private var selectedHostname: String = ""
     @State private var isSubmitting: Bool = false
     @State private var errorMessage: String?
 
-    private func endpointHostname() -> String {
-        // Pull hostname from the logged-in user's tree node
-        if let rootNode = appState.rootNode {
-            return rootNode.hostname
+    /// Build FQDN from short hostname using the server's base domain.
+    private func fqdn(for hostname: String) -> String {
+        let base = appState.dnsBaseDomain
+        if base.isEmpty {
+            return hostname
         }
-        // Fallback: use the local machine hostname
-        return ProcessInfo.processInfo.hostName
-            .replacingOccurrences(of: ".local", with: "")
-            .replacingOccurrences(of: ".lan", with: "")
-            .lowercased()
-            .replacingOccurrences(of: " ", with: "-")
+        return "\(hostname).capi.\(base)"
+    }
+
+    /// Collect all hostnames from the user's tree (root + children),
+    /// displayed as full cert domains (hostname.capi.basedomain).
+    private var availableEntries: [(hostname: String, fqdn: String)] {
+        var seen = Set<String>()
+        var entries: [(hostname: String, fqdn: String)] = []
+        if let root = appState.rootNode, seen.insert(root.hostname).inserted {
+            entries.append((root.hostname, fqdn(for: root.hostname)))
+        }
+        for node in appState.treeNodes {
+            if seen.insert(node.hostname).inserted {
+                entries.append((node.hostname, fqdn(for: node.hostname)))
+            }
+        }
+        return entries
     }
 
     var body: some View {
@@ -325,19 +337,26 @@ struct RequestCertSheet: View {
             Text("Request Certificate")
                 .font(.title2.bold())
 
-            Text("Request a TLS certificate for your endpoint hostname.")
+            Text("Select a hostname from your tree to request a TLS certificate.")
                 .font(.subheadline)
                 .foregroundColor(.textSecondary)
                 .multilineTextAlignment(.center)
 
-            TextField("hostname", text: $domain)
-                .textFieldStyle(.roundedBorder)
-                .frame(maxWidth: 300)
-                .onAppear {
-                    if domain.isEmpty {
-                        domain = endpointHostname()
+            if availableEntries.isEmpty {
+                Text("No hostnames available. Add endpoints to your tree first.")
+                    .font(.caption)
+                    .foregroundColor(.textTertiary)
+                    .padding(.vertical, 8)
+            } else {
+                Picker("Hostname", selection: $selectedHostname) {
+                    Text("Select a hostname...").tag("")
+                    ForEach(availableEntries, id: \.hostname) { entry in
+                        Text(entry.fqdn).tag(entry.hostname)
                     }
                 }
+                .pickerStyle(.menu)
+                .frame(maxWidth: 400)
+            }
 
             if let error = errorMessage {
                 Text(error)
@@ -353,19 +372,26 @@ struct RequestCertSheet: View {
                     Task { await requestCert() }
                 }
                 .buttonStyle(LemonButtonStyle())
-                .disabled(domain.isEmpty || isSubmitting)
+                .disabled(selectedHostname.isEmpty || isSubmitting)
             }
         }
         .padding(32)
         .frame(width: 420)
+        .onAppear {
+            // Pre-select the first hostname if available
+            if selectedHostname.isEmpty, let first = availableEntries.first {
+                selectedHostname = first.hostname
+            }
+        }
     }
 
     private func requestCert() async {
         isSubmitting = true
         errorMessage = nil
 
+        let domain = fqdn(for: selectedHostname)
         do {
-            _ = try appState.sdk.requestCert(hostname: domain)
+            _ = try appState.sdk.requestCert(hostname: selectedHostname)
             appState.addActivity(.success, "Certificate requested for \(domain)")
             onComplete(domain)
             dismiss()

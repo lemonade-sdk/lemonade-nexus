@@ -11,7 +11,8 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
     // GET /api/health — basic liveness check
     pub.Get("/api/health", [this](const httplib::Request&, httplib::Response& res) {
         network::HealthResponse resp;
-        resp.rp_id = ctx_.config.rp_id;
+        resp.rp_id           = ctx_.config.rp_id;
+        resp.dns_base_domain = ctx_.config.dns_base_domain;
         nlohmann::json j = resp;
         json_response(res, j);
     });
