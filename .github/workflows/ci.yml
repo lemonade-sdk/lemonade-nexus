@@ -51,6 +51,10 @@ jobs:
         run: |
           choco install ninja openssl -y
 
+      - name: Set up MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: "Use D: drive for build (Windows)"
         if: runner.os == 'Windows'
         shell: pwsh
