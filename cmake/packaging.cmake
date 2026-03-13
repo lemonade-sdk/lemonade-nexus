@@ -21,19 +21,26 @@ set(CPACK_PACKAGE_VERSION_MINOR 1)
 set(CPACK_PACKAGE_VERSION_PATCH 0)
 set(CPACK_PACKAGE_VERSION "${CPACK_PACKAGE_VERSION_MAJOR}.${CPACK_PACKAGE_VERSION_MINOR}.${CPACK_PACKAGE_VERSION_PATCH}")
 
-execute_process(
-    COMMAND git describe --tags --exact-match HEAD
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    OUTPUT_VARIABLE GIT_TAG
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    RESULT_VARIABLE GIT_TAG_RESULT
-)
-if(GIT_TAG_RESULT EQUAL 0 AND GIT_TAG)
-    # Strip leading 'v' if present (v0.3.0-alpha -> 0.3.0-alpha)
-    string(REGEX REPLACE "^v" "" GIT_VERSION "${GIT_TAG}")
+# Accept version override from CI (e.g. -DGIT_TAG_OVERRIDE=v0.4.0-alpha)
+if(GIT_TAG_OVERRIDE)
+    string(REGEX REPLACE "^v" "" GIT_VERSION "${GIT_TAG_OVERRIDE}")
     set(CPACK_PACKAGE_VERSION "${GIT_VERSION}")
-    message(STATUS "Packaging version from git tag: ${CPACK_PACKAGE_VERSION}")
+    message(STATUS "Packaging version from GIT_TAG_OVERRIDE: ${CPACK_PACKAGE_VERSION}")
+else()
+    execute_process(
+        COMMAND git describe --tags --exact-match HEAD
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE GIT_TAG
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE GIT_TAG_RESULT
+    )
+    if(GIT_TAG_RESULT EQUAL 0 AND GIT_TAG)
+        # Strip leading 'v' if present (v0.3.0-alpha -> 0.3.0-alpha)
+        string(REGEX REPLACE "^v" "" GIT_VERSION "${GIT_TAG}")
+        set(CPACK_PACKAGE_VERSION "${GIT_VERSION}")
+        message(STATUS "Packaging version from git tag: ${CPACK_PACKAGE_VERSION}")
+    endif()
 endif()
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Self-hosted WireGuard mesh VPN server")
 set(CPACK_PACKAGE_DESCRIPTION

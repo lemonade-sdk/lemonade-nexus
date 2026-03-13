@@ -57,7 +57,8 @@ jobs:
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}"
 
       - name: Configure CMake (Windows)
         if: runner.os == 'Windows'
@@ -67,6 +68,7 @@ jobs:
             -G Ninja `
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} `
             -DBUILD_TESTING=OFF `
+            -DGIT_TAG_OVERRIDE="${{ github.ref_name }}" `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build
@@ -268,7 +270,8 @@ jobs:
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}"
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }}
@@ -490,6 +493,11 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
+      - name: Compute version strings
+        run: |
+          # VERSION_CLEAN strips the 'v' prefix for CPack package filenames
+          echo "VERSION_CLEAN=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Rename binaries with version and platform suffixes
         run: |
           VERSION="${GITHUB_REF_NAME}"  # e.g. v0.3.0-alpha
@@ -538,8 +546,8 @@ jobs:
             | Platform | Binary | Manifest |
             |----------|--------|----------|
             | Linux x86_64 (Ubuntu) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64` | `manifest-linux-x86_64.json` |
-            | Linux x86_64 (Debian .deb) | `lemonade-nexus-${{ github.ref_name }}-Linux-x86_64.deb` | `manifest-linux-x86_64-deb.json` |
-            | Linux x86_64 (Fedora .rpm) | `lemonade-nexus-${{ github.ref_name }}-Linux-x86_64.rpm` | `manifest-linux-x86_64-rpm.json` |
+            | Linux x86_64 (Debian .deb) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.deb` | `manifest-linux-x86_64-deb.json` |
+            | Linux x86_64 (Fedora .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.rpm` | `manifest-linux-x86_64-rpm.json` |
             | Linux x86_64 (Arch) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
             | macOS ARM64 | `lemonade-nexus-${{ github.ref_name }}-darwin-arm64` | `manifest-darwin-arm64.json` |
             | macOS App (.dmg) | `LemonadeNexus.dmg` | — |

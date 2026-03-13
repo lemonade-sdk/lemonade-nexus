@@ -1469,7 +1469,7 @@ AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
 
     // Step 9: Poll order until valid (certificate issued)
     spdlog::info("[{}] waiting for certificate to be issued...", name());
-    auto valid_order = poll_until(order_url, "valid", 30, 2);
+    auto valid_order = poll_until(order_url, "valid", 60, 5);
     if (!valid_order) {
         result.error_message = "Order did not reach valid state (certificate not issued)";
         spdlog::error("[{}] {}", name(), result.error_message);
