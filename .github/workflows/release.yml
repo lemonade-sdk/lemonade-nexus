@@ -78,6 +78,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path "D:\build" -Force
+          # Move cached _deps to D:\build if cache restored into build/
+          if (Test-Path "build\_deps") {
+            Copy-Item -Recurse -Force "build\_deps" "D:\build\_deps"
+          }
+          Remove-Item -Recurse -Force "build" -ErrorAction SilentlyContinue
           New-Item -ItemType Junction -Path "build" -Target "D:\build"
 
       - name: Configure CMake (Unix)
