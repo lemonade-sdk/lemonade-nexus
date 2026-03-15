@@ -20,6 +20,8 @@ let package = Package(
                 .unsafeFlags([
                     "-L", "../../build/projects/LemonadeNexusSDK",
                     "-lLemonadeNexusSDK",
+                    "-L", "../../build",
+                    "-llemonade_boringtun_ffi",
                     "-L", "../../build/_deps/sodium-build",
                     "-lsodium",
                     "-L", "../../build/_deps/spdlog-build",

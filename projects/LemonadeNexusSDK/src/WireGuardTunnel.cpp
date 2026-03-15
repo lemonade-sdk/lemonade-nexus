@@ -34,18 +34,6 @@ static std::string wg_base64_encode(const uint8_t* data, std::size_t len) {
     return out;
 }
 
-static std::vector<uint8_t> wg_base64_decode(const std::string& b64) {
-    std::vector<uint8_t> out(b64.size()); // over-allocate is fine
-    std::size_t bin_len = 0;
-    if (sodium_base642bin(out.data(), out.size(), b64.c_str(), b64.size(),
-                          nullptr, &bin_len, nullptr,
-                          sodium_base64_VARIANT_ORIGINAL) != 0) {
-        return {};
-    }
-    out.resize(bin_len);
-    return out;
-}
-
 // ---------------------------------------------------------------------------
 // PIMPL
 // ---------------------------------------------------------------------------

@@ -21,13 +21,11 @@ corrosion_import_crate(
     PROFILE       release
 )
 
-# Corrosion copies the .a to CMAKE_BINARY_DIR with underscored name.
-set(BORINGTUN_LIB "${CMAKE_BINARY_DIR}/liblemonade_boringtun_ffi.a")
-
-# Expose an INTERFACE target that downstream can link against
+# Expose an INTERFACE target that downstream can link against.
+# Link directly against Corrosion's imported target (lemonade_boringtun_ffi)
+# which handles the correct library naming on all platforms (.a / .lib).
 add_library(boringtun-ffi INTERFACE)
-target_link_libraries(boringtun-ffi INTERFACE "${BORINGTUN_LIB}")
-add_dependencies(boringtun-ffi cargo-build_lemonade_boringtun_ffi)
+target_link_libraries(boringtun-ffi INTERFACE lemonade_boringtun_ffi)
 
 # Platform-specific system libraries needed by the Rust static lib
 if(APPLE)

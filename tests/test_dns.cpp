@@ -8,7 +8,12 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <process.h>
+#  define getpid _getpid
+#else
+#  include <unistd.h>
+#endif
 
 using namespace nexus;
 namespace fs = std::filesystem;

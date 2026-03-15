@@ -111,7 +111,7 @@ jobs:
             platform: linux-x86_64-deb
             install_cmd: >-
               apt-get update &&
-              apt-get install -y cmake ninja-build g++ libssl-dev git ca-certificates
+              apt-get install -y cmake ninja-build g++ libssl-dev git ca-certificates curl
           - container: fedora:40
             platform: linux-x86_64-rpm
             install_cmd: >-
@@ -127,6 +127,11 @@ jobs:
     steps:
       - name: Install dependencies
         run: ${{ matrix.install_cmd }}
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
       - uses: actions/checkout@v4
 

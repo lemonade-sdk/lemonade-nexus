@@ -6,6 +6,8 @@
 #include <atomic>
 #include <array>
 #include <cstring>
+#include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -57,6 +59,7 @@ struct BoringTunBackend::Impl {
 #endif
     sockaddr_in       server_addr{};
     std::atomic<bool> running{false};
+    mutable std::mutex tunnel_mutex;   // protects tunnel, server_addr, config
     std::thread       tun_to_udp_thread;
     std::thread       udp_to_tun_thread;
     std::thread       timer_thread;
@@ -359,12 +362,70 @@ StatusResult BoringTunBackend::do_bring_up(const WireGuardConfig& config) {
     impl_->server_addr.sin_family = AF_INET;
 
     auto colon = config.server_endpoint.rfind(':');
-    if (colon != std::string::npos) {
-        auto host = config.server_endpoint.substr(0, colon);
-        auto port = std::stoi(config.server_endpoint.substr(colon + 1));
-        inet_pton(AF_INET, host.c_str(), &impl_->server_addr.sin_addr);
-        impl_->server_addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (colon == std::string::npos) {
+        result.error = "BoringTun: invalid endpoint format (expected host:port)";
+        spdlog::error("[BoringTun] {}", result.error);
+#if defined(_WIN32)
+        closesocket(impl_->udp_sock);
+        impl_->udp_sock = INVALID_SOCKET;
+        impl_->wt.EndSession(impl_->wt_session);
+        impl_->wt.CloseAdapter(impl_->wt_adapter);
+        impl_->wt_session = nullptr;
+        impl_->wt_adapter = nullptr;
+        impl_->wt.unload();
+#else
+        close(impl_->udp_fd); impl_->udp_fd = -1;
+        close(impl_->tun_fd); impl_->tun_fd = -1;
+#endif
+        tunnel_free(impl_->tunnel);
+        impl_->tunnel = nullptr;
+        return result;
     }
+
+    auto host = config.server_endpoint.substr(0, colon);
+    int port = 0;
+    try {
+        port = std::stoi(config.server_endpoint.substr(colon + 1));
+    } catch (const std::exception& e) {
+        result.error = std::string("BoringTun: invalid port: ") + e.what();
+        spdlog::error("[BoringTun] {}", result.error);
+#if defined(_WIN32)
+        closesocket(impl_->udp_sock);
+        impl_->udp_sock = INVALID_SOCKET;
+        impl_->wt.EndSession(impl_->wt_session);
+        impl_->wt.CloseAdapter(impl_->wt_adapter);
+        impl_->wt_session = nullptr;
+        impl_->wt_adapter = nullptr;
+        impl_->wt.unload();
+#else
+        close(impl_->udp_fd); impl_->udp_fd = -1;
+        close(impl_->tun_fd); impl_->tun_fd = -1;
+#endif
+        tunnel_free(impl_->tunnel);
+        impl_->tunnel = nullptr;
+        return result;
+    }
+
+    if (inet_pton(AF_INET, host.c_str(), &impl_->server_addr.sin_addr) != 1) {
+        result.error = "BoringTun: invalid server IP address: " + host;
+        spdlog::error("[BoringTun] {}", result.error);
+#if defined(_WIN32)
+        closesocket(impl_->udp_sock);
+        impl_->udp_sock = INVALID_SOCKET;
+        impl_->wt.EndSession(impl_->wt_session);
+        impl_->wt.CloseAdapter(impl_->wt_adapter);
+        impl_->wt_session = nullptr;
+        impl_->wt_adapter = nullptr;
+        impl_->wt.unload();
+#else
+        close(impl_->udp_fd); impl_->udp_fd = -1;
+        close(impl_->tun_fd); impl_->tun_fd = -1;
+#endif
+        tunnel_free(impl_->tunnel);
+        impl_->tunnel = nullptr;
+        return result;
+    }
+    impl_->server_addr.sin_port = htons(static_cast<uint16_t>(port));
 
     // Set non-blocking / receive timeout for clean shutdown
 #if defined(_WIN32)
@@ -463,7 +524,8 @@ StatusResult BoringTunBackend::do_bring_down() {
 
 TunnelStatus BoringTunBackend::do_status() const {
     TunnelStatus st;
-    st.is_up           = impl_->running.load();
+    st.is_up = impl_->running.load();
+    std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
     st.tunnel_ip       = impl_->config.tunnel_ip;
     st.server_endpoint = impl_->config.server_endpoint;
     return st;
@@ -485,13 +547,26 @@ StatusResult BoringTunBackend::do_update_endpoint(const std::string& server_pubk
     }
 
     auto host = server_endpoint.substr(0, colon);
-    auto port = std::stoi(server_endpoint.substr(colon + 1));
+    int port = 0;
+    try {
+        port = std::stoi(server_endpoint.substr(colon + 1));
+    } catch (const std::exception& e) {
+        result.error = std::string("invalid port: ") + e.what();
+        return result;
+    }
 
-    std::memset(&impl_->server_addr, 0, sizeof(impl_->server_addr));
-    impl_->server_addr.sin_family = AF_INET;
-    inet_pton(AF_INET, host.c_str(), &impl_->server_addr.sin_addr);
-    impl_->server_addr.sin_port = htons(static_cast<uint16_t>(port));
+    sockaddr_in new_addr{};
+    new_addr.sin_family = AF_INET;
+    if (inet_pton(AF_INET, host.c_str(), &new_addr.sin_addr) != 1) {
+        result.error = "invalid server IP address: " + host;
+        return result;
+    }
+    new_addr.sin_port = htons(static_cast<uint16_t>(port));
 
+    // Lock to atomically update shared state and force handshake
+    std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
+
+    impl_->server_addr = new_addr;
     impl_->config.server_public_key = server_pubkey;
     impl_->config.server_endpoint   = server_endpoint;
 
@@ -572,8 +647,12 @@ void BoringTunBackend::tun_to_udp_loop() {
         continue;
 #endif
 
-        auto r = wireguard_write(impl_->tunnel, ip_packet, ip_len,
-                                  wg_buf.data(), static_cast<uint32_t>(wg_buf.size()));
+        wireguard_result r;
+        {
+            std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
+            r = wireguard_write(impl_->tunnel, ip_packet, ip_len,
+                                wg_buf.data(), static_cast<uint32_t>(wg_buf.size()));
+        }
 
 #if defined(_WIN32)
         // Release the WinTun packet after encrypting
@@ -581,6 +660,7 @@ void BoringTunBackend::tun_to_udp_loop() {
 #endif
 
         if (r.op == WRITE_TO_NETWORK && r.size > 0) {
+            std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
 #if defined(_WIN32)
             sendto(impl_->udp_sock, reinterpret_cast<const char*>(wg_buf.data()),
                    static_cast<int>(r.size), 0,
@@ -622,8 +702,12 @@ void BoringTunBackend::udp_to_tun_loop() {
             continue;
         }
 
-        auto r = wireguard_read(impl_->tunnel, udp_buf.data(), static_cast<uint32_t>(n),
-                                 ip_buf.data(), static_cast<uint32_t>(ip_buf.size()));
+        wireguard_result r;
+        {
+            std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
+            r = wireguard_read(impl_->tunnel, udp_buf.data(), static_cast<uint32_t>(n),
+                               ip_buf.data(), static_cast<uint32_t>(ip_buf.size()));
+        }
 
         if ((r.op == WRITE_TO_TUNNEL_IPV4 || r.op == WRITE_TO_TUNNEL_IPV6) && r.size > 0) {
 #if defined(_WIN32)
@@ -648,6 +732,7 @@ void BoringTunBackend::udp_to_tun_loop() {
 #endif
         } else if (r.op == WRITE_TO_NETWORK && r.size > 0) {
             // Handshake response — send back to server
+            std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
 #if defined(_WIN32)
             sendto(impl_->udp_sock, reinterpret_cast<const char*>(ip_buf.data()),
                    static_cast<int>(r.size), 0,
@@ -673,6 +758,7 @@ void BoringTunBackend::timer_loop() {
     while (impl_->running) {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
+        std::lock_guard<std::mutex> lock(impl_->tunnel_mutex);
         if (!impl_->tunnel) continue;
 
         auto r = wireguard_tick(impl_->tunnel, buf.data(), static_cast<uint32_t>(buf.size()));
