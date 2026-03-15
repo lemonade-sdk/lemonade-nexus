@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 using namespace nexus;
@@ -216,7 +217,7 @@ protected:
 
     void SetUp() override {
         temp_dir = fs::temp_directory_path() /
-            ("nexus_test_tee_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+            ("nexus_test_tee_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         crypto = std::make_unique<crypto::SodiumCryptoService>();
@@ -353,7 +354,7 @@ protected:
 
     void SetUp() override {
         temp_dir = fs::temp_directory_path() /
-            ("nexus_test_trust_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+            ("nexus_test_trust_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         crypto = std::make_unique<crypto::SodiumCryptoService>();
@@ -581,7 +582,7 @@ protected:
     crypto::Ed25519Keypair kp_a, kp_b;
 
     void SetUp() override {
-        auto seed = std::to_string(::testing::UnitTest::GetInstance()->random_seed());
+        auto seed = std::to_string(getpid());
         temp_dir_a = fs::temp_directory_path() / ("nexus_test_trust_int_a_" + seed);
         temp_dir_b = fs::temp_directory_path() / ("nexus_test_trust_int_b_" + seed);
         fs::create_directories(temp_dir_a);

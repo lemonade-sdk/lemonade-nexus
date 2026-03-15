@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <unistd.h>
 
 using namespace nexus;
 namespace fs = std::filesystem;
@@ -26,7 +27,7 @@ using json = nlohmann::json;
 /// and tests endpoints via httplib::Client.
 class HttpEndpointTest : public ::testing::Test {
 protected:
-    static constexpr uint16_t kTestPort = 19100; // use non-standard port for tests
+    uint16_t test_port_{0};
 
     fs::path temp_dir;
     std::unique_ptr<crypto::SodiumCryptoService> crypto;
@@ -43,7 +44,8 @@ protected:
     std::string jwt_secret;
 
     void SetUp() override {
-        temp_dir = fs::temp_directory_path() / ("nexus_test_http_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+        test_port_ = static_cast<uint16_t>(19100 + (getpid() % 10000));
+        temp_dir = fs::temp_directory_path() / ("nexus_test_http_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         // Start services
@@ -77,7 +79,7 @@ protected:
         ipam->start();
 
         // Set up HTTP server with routes
-        http = std::make_unique<network::HttpServer>(kTestPort);
+        http = std::make_unique<network::HttpServer>(test_port_);
         rate_limiter = std::make_unique<network::RateLimiter>(
             network::RateLimitConfig{.requests_per_minute = 1000, .burst_size = 100});
 
@@ -251,7 +253,7 @@ protected:
     }
 
     httplib::Client make_client() {
-        return httplib::Client("localhost", kTestPort);
+        return httplib::Client("localhost", test_port_);
     }
 
     tree::TreeDelta make_signed_delta(const std::string& operation,

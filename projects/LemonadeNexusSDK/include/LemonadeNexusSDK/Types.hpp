@@ -100,6 +100,7 @@ struct TreeNode {
     std::string              id;
     std::string              parent_id;
     NodeType                 type{NodeType::Customer};
+    std::string              hostname;
 
     // Network allocations
     std::string              tunnel_ip;

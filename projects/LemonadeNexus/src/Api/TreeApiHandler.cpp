@@ -8,6 +8,7 @@
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/ACL/Permission.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -184,6 +185,159 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         auto children = ctx_.tree.get_children(parent_id);
         nlohmann::json j = children;
         res.set_content(j.dump(), "application/json");
+    }));
+
+    // ========================================================================
+    // POST /api/tree/node (PRIVATE, auth required)
+    // Create a child node. Server handles ID generation and persistence.
+    // ========================================================================
+    priv.Post("/api/tree/node", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        auto parent_id = body.value("parent_id", std::string{"root"});
+        auto type_str  = body.value("type", std::string{"endpoint"});
+        auto hostname  = body.value("hostname", std::string{});
+
+        // Check AddChild permission on the parent
+        if (!ctx_.tree.check_permission(claims.pubkey, parent_id,
+                                         acl::Permission::AddChild)) {
+            res.status = 403;
+            nlohmann::json j = network::ErrorResponse{.error = "no add_child permission on parent"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        tree::TreeNode node;
+        node.parent_id   = parent_id;
+        node.mgmt_pubkey = claims.pubkey;
+
+        if (type_str == "endpoint")  node.type = tree::NodeType::Endpoint;
+        else if (type_str == "customer") node.type = tree::NodeType::Customer;
+        else if (type_str == "relay")    node.type = tree::NodeType::Relay;
+        else {
+            res.status = 400;
+            nlohmann::json j = network::ErrorResponse{.error = "invalid type"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        // Generate node ID from pubkey
+        auto pubkey_short = claims.pubkey.substr(0, std::min<size_t>(claims.pubkey.size(), 16));
+        node.id = "node-" + pubkey_short;
+        if (hostname.empty()) {
+            hostname = type_str + "-" + node.id.substr(0, 12);
+        }
+        node.hostname = hostname;
+
+        if (!ctx_.tree.insert_join_node(node)) {
+            res.status = 409;
+            nlohmann::json j = network::ErrorResponse{.error = "node creation failed"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json resp = {
+            {"success", true},
+            {"node_id", node.id},
+        };
+        spdlog::info("[TreeApi] created node '{}' under '{}'", node.id, parent_id);
+        res.set_content(resp.dump(), "application/json");
+    }));
+
+    // ========================================================================
+    // POST /api/tree/node/update/{id} (PRIVATE, auth required)
+    // Update node fields. Server handles persistence.
+    // ========================================================================
+    priv.Post(R"(/api/tree/node/update/(.+))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto node_id = req.matches[1].str();
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        if (body.is_discarded()) {
+            res.status = 400;
+            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        // Check EditNode permission
+        if (!ctx_.tree.check_permission(claims.pubkey, node_id,
+                                         acl::Permission::EditNode)) {
+            res.status = 403;
+            nlohmann::json j = network::ErrorResponse{.error = "no edit_node permission"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        auto existing = ctx_.tree.get_node(node_id);
+        if (!existing) {
+            res.status = 404;
+            nlohmann::json j = network::ErrorResponse{.error = "node not found"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        // Apply partial updates to the existing node
+        auto updated = *existing;
+        if (body.contains("hostname"))    updated.hostname    = body["hostname"].get<std::string>();
+        if (body.contains("tunnel_ip"))   updated.tunnel_ip   = body["tunnel_ip"].get<std::string>();
+        if (body.contains("private_subnet")) updated.private_subnet = body["private_subnet"].get<std::string>();
+        if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
+        if (body.contains("wg_pubkey"))   updated.wg_pubkey   = body["wg_pubkey"].get<std::string>();
+        if (body.contains("listen_endpoint")) updated.listen_endpoint = body["listen_endpoint"].get<std::string>();
+        if (body.contains("region"))      updated.region      = body["region"].get<std::string>();
+        if (body.contains("capacity_mbps")) updated.capacity_mbps = body["capacity_mbps"].get<uint32_t>();
+        if (body.contains("reputation_score")) updated.reputation_score = body["reputation_score"].get<float>();
+        if (body.contains("expires_at"))  updated.expires_at  = body["expires_at"].get<uint64_t>();
+
+        if (!ctx_.tree.update_node_direct(node_id, updated)) {
+            res.status = 500;
+            nlohmann::json j = network::ErrorResponse{.error = "update failed"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json resp = {{"success", true}, {"node_id", node_id}};
+        spdlog::info("[TreeApi] updated node '{}'", node_id);
+        res.set_content(resp.dump(), "application/json");
+    }));
+
+    // ========================================================================
+    // POST /api/tree/node/delete/{id} (PRIVATE, auth required)
+    // Delete a node. Server handles cleanup.
+    // ========================================================================
+    priv.Post(R"(/api/tree/node/delete/(.+))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto node_id = req.matches[1].str();
+
+        // Check DeleteNode permission
+        if (!ctx_.tree.check_permission(claims.pubkey, node_id,
+                                         acl::Permission::DeleteNode)) {
+            res.status = 403;
+            nlohmann::json j = network::ErrorResponse{.error = "no delete_node permission"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        if (!ctx_.tree.delete_node_direct(node_id)) {
+            res.status = 404;
+            nlohmann::json j = network::ErrorResponse{.error = "node not found or delete failed"};
+            res.set_content(j.dump(), "application/json");
+            return;
+        }
+
+        nlohmann::json resp = {{"success", true}};
+        spdlog::info("[TreeApi] deleted node '{}'", node_id);
+        res.set_content(resp.dump(), "application/json");
     }));
 
     // ========================================================================

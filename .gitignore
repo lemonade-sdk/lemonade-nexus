@@ -41,6 +41,10 @@ Thumbs.db
 .swiftpm/
 Package.resolved
 
+# Rust
+target/
+Cargo.lock
+
 # Unwanted files
 .claude/
 *.bak

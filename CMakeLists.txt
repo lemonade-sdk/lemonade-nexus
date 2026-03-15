@@ -42,6 +42,7 @@ include(libraries/wireguard-apple)
 include(libraries/wireguard-nt)
 include(libraries/c-ares)
 include(libraries/sqlite3)
+include(libraries/boringtun)
 
 #-----------------------------------------------------------------------------
 # Projects

@@ -11,4 +11,5 @@ create_project(LemonadeNexusSDK DEPENDENCIES
         sodium
         OpenSSL::SSL
         OpenSSL::Crypto
+        boringtun-ffi
 )

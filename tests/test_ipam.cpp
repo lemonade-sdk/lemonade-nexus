@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 using namespace nexus;
 namespace fs = std::filesystem;
@@ -16,7 +17,7 @@ protected:
     std::unique_ptr<ipam::IPAMService> ipam;
 
     void SetUp() override {
-        temp_dir = fs::temp_directory_path() / ("nexus_test_ipam_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+        temp_dir = fs::temp_directory_path() / ("nexus_test_ipam_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         storage = std::make_unique<storage::FileStorageService>(temp_dir);

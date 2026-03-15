@@ -336,8 +336,7 @@ final class AppState: ObservableObject {
                 sdk.setSessionToken(token)
                 connectedSince = Date()
 
-                // Generate Ed25519 identity for delta signing
-                // (passkey handles auth, but tree ops need Ed25519 signatures)
+                // Generate Ed25519 identity for tree operations
                 sdk.generateIdentity()
 
                 // Register the Ed25519 key with the server so it gets
@@ -349,6 +348,7 @@ final class AppState: ObservableObject {
 
                 try? KeychainHelper.saveSessionToken(token)
                 addActivity(.info, "Signed in with passkey")
+                await joinAsEndpoint()
                 await refreshAllData()
             } else {
                 errorMessage = authResp.error ?? "Passkey authentication failed"

@@ -36,5 +36,21 @@ add_nexus_test(test_geo_region        test_geo_region.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
 
+# --- SDK tests (link against LemonadeNexusSDK) ---
+function(add_sdk_test TEST_NAME)
+    add_executable(${TEST_NAME} ${ARGN})
+    target_link_libraries(${TEST_NAME} PRIVATE
+        LemonadeNexusSDK
+        GTest::gtest_main
+        GTest::gmock
+    )
+    if(WIN32)
+        target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    gtest_discover_tests(${TEST_NAME})
+endfunction()
+
+add_sdk_test(test_boringtun_backend    test_boringtun_backend.cpp)
+
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)

@@ -1,4 +1,5 @@
 #include <LemonadeNexusSDK/WireGuardTunnel.hpp>
+#include <LemonadeNexusSDK/BoringTunBackend.hpp>
 
 #include <sodium.h>
 #include <spdlog/spdlog.h>
@@ -50,10 +51,12 @@ static std::vector<uint8_t> wg_base64_decode(const std::string& b64) {
 // ---------------------------------------------------------------------------
 
 struct WireGuardTunnel::Impl {
-    WireGuardConfig config;
-    bool            active{false};
-    std::string     iface_name;     // e.g. "wg0", "utun7"
-    std::string     config_path;    // temp file path for wg-quick
+    WireGuardConfig    config;
+    bool               active{false};
+    bool               using_boringtun{false}; // true when BoringTun fallback is active
+    BoringTunBackend   boringtun;              // userspace fallback
+    std::string        iface_name;             // e.g. "wg0", "utun7"
+    std::string        config_path;            // temp file path for wg-quick
 
     // Build a wg-quick compatible config string
     std::string build_config_string() const {
@@ -250,21 +253,36 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
         return result;
     }
 
-    // Use wg-quick to bring up the interface
+    // Try wg-quick first, fall back to BoringTun if not available
     std::string cmd = "wg-quick up " + path + " 2>&1";
-    spdlog::info("[WireGuardTunnel] bringing up tunnel: {}", cmd);
+    spdlog::info("[WireGuardTunnel] bringing up tunnel (Linux): {}", cmd);
 
     auto [rc, output] = Impl::exec_cmd(cmd);
     if (rc != 0) {
-        result.error = "wg-quick up failed (rc=" + std::to_string(rc) + "): " + output;
-        spdlog::error("[WireGuardTunnel] {}", result.error);
+        spdlog::warn("[WireGuardTunnel] wg-quick not available (rc={}), "
+                     "falling back to BoringTun userspace", rc);
+        std::remove(path.c_str());
+
+        auto bt_result = impl_->boringtun.bring_up(config);
+        if (!bt_result) {
+            result.error = "BoringTun fallback failed: " + bt_result.error;
+            spdlog::error("[WireGuardTunnel] {}", result.error);
+            return result;
+        }
+
+        impl_->active = true;
+        impl_->using_boringtun = true;
+        result.ok = true;
+        spdlog::info("[WireGuardTunnel] tunnel up via BoringTun (Linux): ip={}",
+                      config.tunnel_ip);
         return result;
     }
 
     impl_->active = true;
+    impl_->using_boringtun = false;
     impl_->iface_name = "lnsdk_wg0";
     result.ok = true;
-    spdlog::info("[WireGuardTunnel] tunnel up: ip={}", config.tunnel_ip);
+    spdlog::info("[WireGuardTunnel] tunnel up via wg-quick (Linux): ip={}", config.tunnel_ip);
     return result;
 }
 
@@ -272,6 +290,16 @@ StatusResult WireGuardTunnel::bring_down() {
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (impl_->using_boringtun) {
+        auto bt_result = impl_->boringtun.bring_down();
+        impl_->active = false;
+        impl_->using_boringtun = false;
+        result.ok = bt_result.ok;
+        result.error = bt_result.error;
+        spdlog::info("[WireGuardTunnel] BoringTun tunnel down (Linux)");
         return result;
     }
 
@@ -286,8 +314,6 @@ StatusResult WireGuardTunnel::bring_down() {
     }
 
     impl_->active = false;
-
-    // Clean up temp config
     std::remove(impl_->config_path.c_str());
     impl_->config_path.clear();
 
@@ -301,6 +327,10 @@ TunnelStatus WireGuardTunnel::status() const {
         TunnelStatus st;
         st.is_up = false;
         return st;
+    }
+
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.status();
     }
 
     auto [rc, output] = Impl::exec_cmd("wg show " + impl_->iface_name + " 2>&1");
@@ -318,6 +348,10 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
     if (!impl_->active) {
         result.error = "tunnel is not active";
         return result;
+    }
+
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.update_endpoint(server_pubkey, server_endpoint);
     }
 
     std::string cmd = "wg set " + impl_->iface_name +
@@ -355,25 +389,38 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
         return result;
     }
 
-    // macOS: Use the WireGuard userspace tools (wireguard-go + wg-quick).
-    // brew install wireguard-tools installs both wg-quick and wireguard-go.
-    // wg-quick on macOS creates a utun interface and manages routing.
+    // macOS: Try wg-quick first, fall back to BoringTun if not available.
     std::string cmd = "wg-quick up " + path + " 2>&1";
     spdlog::info("[WireGuardTunnel] bringing up tunnel (macOS): {}", cmd);
 
     auto [rc, output] = Impl::exec_cmd(cmd);
     if (rc != 0) {
-        result.error = "wg-quick up failed (rc=" + std::to_string(rc) + "): " + output;
-        spdlog::error("[WireGuardTunnel] {}", result.error);
+        spdlog::warn("[WireGuardTunnel] wg-quick not available (rc={}), "
+                     "falling back to BoringTun userspace", rc);
+
+        // Clean up temp config — BoringTun doesn't need it
+        std::remove(path.c_str());
+
+        auto bt_result = impl_->boringtun.bring_up(config);
+        if (!bt_result) {
+            result.error = "BoringTun fallback failed: " + bt_result.error;
+            spdlog::error("[WireGuardTunnel] {}", result.error);
+            return result;
+        }
+
+        impl_->active = true;
+        impl_->using_boringtun = true;
+        result.ok = true;
+        spdlog::info("[WireGuardTunnel] tunnel up via BoringTun (macOS): ip={}",
+                      config.tunnel_ip);
         return result;
     }
 
     impl_->active = true;
-    // wg-quick on macOS typically picks utunN. Parse from output if needed.
-    // For now, use a stable name derived from the config file.
+    impl_->using_boringtun = false;
     impl_->iface_name = "lnsdk_wg0";
     result.ok = true;
-    spdlog::info("[WireGuardTunnel] tunnel up (macOS): ip={}", config.tunnel_ip);
+    spdlog::info("[WireGuardTunnel] tunnel up via wg-quick (macOS): ip={}", config.tunnel_ip);
     return result;
 }
 
@@ -381,6 +428,16 @@ StatusResult WireGuardTunnel::bring_down() {
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (impl_->using_boringtun) {
+        auto bt_result = impl_->boringtun.bring_down();
+        impl_->active = false;
+        impl_->using_boringtun = false;
+        result.ok = bt_result.ok;
+        result.error = bt_result.error;
+        spdlog::info("[WireGuardTunnel] BoringTun tunnel down (macOS)");
         return result;
     }
 
@@ -410,11 +467,12 @@ TunnelStatus WireGuardTunnel::status() const {
         return st;
     }
 
-    // On macOS, wg show works with the interface name.
-    // wg-quick names the interface from the config file basename.
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.status();
+    }
+
     auto [rc, output] = Impl::exec_cmd("wg show " + impl_->iface_name + " 2>&1");
     if (rc != 0) {
-        // Try the default utun interface
         auto [rc2, output2] = Impl::exec_cmd("wg show 2>&1");
         if (rc2 != 0) {
             TunnelStatus st;
@@ -432,6 +490,10 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
     if (!impl_->active) {
         result.error = "tunnel is not active";
         return result;
+    }
+
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.update_endpoint(server_pubkey, server_endpoint);
     }
 
     std::string cmd = "wg set " + impl_->iface_name +
@@ -482,15 +544,30 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
         cmd = "wg-quick up " + path + " 2>&1";
         auto [rc2, output2] = Impl::exec_cmd(cmd);
         if (rc2 != 0) {
-            result.error = "wireguard.exe /installtunnelservice failed (rc=" +
-                           std::to_string(rc) + "): " + output +
-                           "; wg-quick fallback also failed: " + output2;
-            spdlog::error("[WireGuardTunnel] {}", result.error);
+            spdlog::warn("[WireGuardTunnel] wireguard.exe and wg-quick not available, "
+                         "falling back to BoringTun userspace");
+
+            // Clean up temp config — BoringTun doesn't need it
+            std::remove(path.c_str());
+
+            auto bt_result = impl_->boringtun.bring_up(config);
+            if (!bt_result) {
+                result.error = "BoringTun fallback failed: " + bt_result.error;
+                spdlog::error("[WireGuardTunnel] {}", result.error);
+                return result;
+            }
+
+            impl_->active = true;
+            impl_->using_boringtun = true;
+            result.ok = true;
+            spdlog::info("[WireGuardTunnel] tunnel up via BoringTun (Windows): ip={}",
+                          config.tunnel_ip);
             return result;
         }
     }
 
     impl_->active = true;
+    impl_->using_boringtun = false;
     impl_->iface_name = "lnsdk_wg0";
     result.ok = true;
     spdlog::info("[WireGuardTunnel] tunnel up (Windows): ip={}", config.tunnel_ip);
@@ -502,6 +579,13 @@ StatusResult WireGuardTunnel::bring_down() {
     if (!impl_->active) {
         result.error = "tunnel is not active";
         return result;
+    }
+
+    if (impl_->using_boringtun) {
+        auto bt_result = impl_->boringtun.bring_down();
+        impl_->active = false;
+        impl_->using_boringtun = false;
+        return bt_result;
     }
 
     // Try uninstalling the tunnel service
@@ -537,6 +621,10 @@ TunnelStatus WireGuardTunnel::status() const {
         return st;
     }
 
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.status();
+    }
+
     auto [rc, output] = Impl::exec_cmd("wg show " + impl_->iface_name + " 2>&1");
     if (rc != 0) {
         TunnelStatus st;
@@ -552,6 +640,10 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
     if (!impl_->active) {
         result.error = "tunnel is not active";
         return result;
+    }
+
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.update_endpoint(server_pubkey, server_endpoint);
     }
 
     std::string cmd = "wg set " + impl_->iface_name +

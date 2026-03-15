@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <unistd.h>
 
 using namespace nexus;
 namespace fs = std::filesystem;
@@ -25,7 +26,7 @@ protected:
     std::string root_pubkey_str; // "ed25519:base64..."
 
     void SetUp() override {
-        temp_dir = fs::temp_directory_path() / ("nexus_test_tree_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+        temp_dir = fs::temp_directory_path() / ("nexus_test_tree_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         crypto_svc = std::make_unique<crypto::SodiumCryptoService>();
@@ -364,6 +365,76 @@ TEST_F(PermissionTreeTest, ReplayedDeltaRejected) {
 
     // Exact same delta replayed should be rejected
     EXPECT_FALSE(tree_svc->apply_delta(delta));
+}
+
+// --- Canonical JSON includes hostname (SDK/server parity) ---
+
+TEST_F(PermissionTreeTest, CanonicalDeltaJsonIncludesHostname) {
+    // Verify that canonical_delta_json includes the "hostname" key in node_data,
+    // even when hostname is empty. This ensures SDK-signed deltas produce the
+    // same canonical form as the server, preventing signature verification failure.
+    tree::TreeNode node;
+    node.id = "ep1";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+
+    tree::TreeDelta delta;
+    delta.operation = "create_node";
+    delta.target_node_id = "ep1";
+    delta.node_data = node;
+    delta.signer_pubkey = root_pubkey_str;
+    delta.timestamp = 1000;
+
+    auto canonical = tree::canonical_delta_json(delta);
+    // hostname must appear in the canonical JSON
+    EXPECT_NE(canonical.find("\"hostname\""), std::string::npos)
+        << "canonical delta JSON must include hostname field for SDK/server parity";
+}
+
+TEST_F(PermissionTreeTest, CanonicalDeltaJsonWithHostnameSet) {
+    tree::TreeNode node;
+    node.id = "ep2";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.hostname = "my-laptop";
+
+    tree::TreeDelta delta;
+    delta.operation = "create_node";
+    delta.target_node_id = "ep2";
+    delta.node_data = node;
+    delta.signer_pubkey = root_pubkey_str;
+    delta.timestamp = 1000;
+
+    auto canonical = tree::canonical_delta_json(delta);
+    EXPECT_NE(canonical.find("\"hostname\":\"my-laptop\""), std::string::npos);
+}
+
+TEST_F(PermissionTreeTest, CreateEndpointWithHostname) {
+    // Create customer first
+    tree::TreeNode customer;
+    customer.id = "cust_host";
+    customer.parent_id = "root";
+    customer.type = tree::NodeType::Customer;
+    customer.mgmt_pubkey = root_pubkey_str;
+    customer.assignments = {{root_pubkey_str, {"admin"}}};
+    ASSERT_TRUE(tree_svc->apply_delta(
+        make_signed_delta("create_node", "cust_host", customer, root_keypair)));
+
+    // Create endpoint with hostname set
+    tree::TreeNode endpoint;
+    endpoint.id = "ep_host";
+    endpoint.parent_id = "cust_host";
+    endpoint.type = tree::NodeType::Endpoint;
+    endpoint.hostname = "my-laptop";
+    endpoint.mgmt_pubkey = root_pubkey_str;
+    endpoint.tunnel_ip = "10.64.0.5/32";
+
+    auto delta = make_signed_delta("create_node", "ep_host", endpoint, root_keypair);
+    EXPECT_TRUE(tree_svc->apply_delta(delta));
+
+    auto ep = tree_svc->get_node("ep_host");
+    ASSERT_TRUE(ep.has_value());
+    EXPECT_EQ(ep->hostname, "my-laptop");
 }
 
 // --- Create an endpoint node under a customer ---

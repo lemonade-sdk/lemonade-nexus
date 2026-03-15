@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 using namespace nexus::storage;
 namespace fs = std::filesystem;
@@ -14,7 +15,7 @@ protected:
     std::unique_ptr<FileStorageService> storage;
 
     void SetUp() override {
-        temp_dir = fs::temp_directory_path() / ("nexus_test_fs_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+        temp_dir = fs::temp_directory_path() / ("nexus_test_fs_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
         storage = std::make_unique<FileStorageService>(temp_dir);
         storage->start();

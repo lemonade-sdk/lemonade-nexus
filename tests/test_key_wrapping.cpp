@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 
 using namespace nexus::crypto;
 namespace fs = std::filesystem;
@@ -20,7 +21,7 @@ protected:
     std::unique_ptr<KeyWrappingService> kw;
 
     void SetUp() override {
-        temp_dir = fs::temp_directory_path() / ("nexus_test_kw_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+        temp_dir = fs::temp_directory_path() / ("nexus_test_kw_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         crypto = std::make_unique<SodiumCryptoService>();

@@ -803,53 +803,69 @@ Result<DeltaResult> LemonadeNexusClient::submit_delta(const TreeDelta& delta) {
 
 Result<DeltaResult> LemonadeNexusClient::create_child_node(const std::string& parent_id,
                                                              const TreeNode& child) {
-    TreeDelta delta;
-    delta.operation      = "create_node";
-    delta.target_node_id = parent_id;
-    delta.node_data      = child;
-    delta.node_data.parent_id = parent_id;
-    return submit_delta(delta);
+    Result<DeltaResult> result;
+
+    json body;
+    body["parent_id"] = parent_id;
+    body["type"]      = node_type_to_string(child.type);
+    if (!child.hostname.empty()) body["hostname"] = child.hostname;
+
+    int status = 0;
+    auto resp = impl_->http_post("/api/tree/node", body, status);
+    result.http_status = status;
+
+    if (!resp) {
+        result.error = "server unreachable";
+        return result;
+    }
+
+    result.value.success = resp->value("success", false);
+    result.value.node_id = resp->value("node_id", "");
+    result.value.error   = resp->value("error", "");
+    result.ok = result.value.success;
+    if (!result.ok) result.error = result.value.error;
+    return result;
 }
 
 Result<DeltaResult> LemonadeNexusClient::update_node(const std::string& node_id,
                                                        const nlohmann::json& updates) {
-    TreeDelta delta;
-    delta.operation      = "update_node";
-    delta.target_node_id = node_id;
+    Result<DeltaResult> result;
 
-    TreeNode partial;
-    partial.id = node_id;
+    int status = 0;
+    auto resp = impl_->http_post("/api/tree/node/update/" + node_id, updates, status);
+    result.http_status = status;
 
-    if (updates.contains("tunnel_ip"))
-        partial.tunnel_ip = updates["tunnel_ip"].get<std::string>();
-    if (updates.contains("private_subnet"))
-        partial.private_subnet = updates["private_subnet"].get<std::string>();
-    if (updates.contains("private_shared_addresses"))
-        partial.private_shared_addresses = updates["private_shared_addresses"].get<std::string>();
-    if (updates.contains("shared_domain"))
-        partial.shared_domain = updates["shared_domain"].get<std::string>();
-    if (updates.contains("wg_pubkey"))
-        partial.wg_pubkey = updates["wg_pubkey"].get<std::string>();
-    if (updates.contains("listen_endpoint"))
-        partial.listen_endpoint = updates["listen_endpoint"].get<std::string>();
-    if (updates.contains("region"))
-        partial.region = updates["region"].get<std::string>();
-    if (updates.contains("capacity_mbps"))
-        partial.capacity_mbps = updates["capacity_mbps"].get<uint32_t>();
-    if (updates.contains("reputation_score"))
-        partial.reputation_score = updates["reputation_score"].get<float>();
-    if (updates.contains("expires_at"))
-        partial.expires_at = updates["expires_at"].get<uint64_t>();
+    if (!resp) {
+        result.error = "server unreachable";
+        return result;
+    }
 
-    delta.node_data = std::move(partial);
-    return submit_delta(delta);
+    result.value.success = resp->value("success", false);
+    result.value.node_id = resp->value("node_id", "");
+    result.value.error   = resp->value("error", "");
+    result.ok = result.value.success;
+    if (!result.ok) result.error = result.value.error;
+    return result;
 }
 
 Result<DeltaResult> LemonadeNexusClient::delete_node(const std::string& node_id) {
-    TreeDelta delta;
-    delta.operation      = "delete_node";
-    delta.target_node_id = node_id;
-    return submit_delta(delta);
+    Result<DeltaResult> result;
+
+    int status = 0;
+    json body = json::object(); // empty body
+    auto resp = impl_->http_post("/api/tree/node/delete/" + node_id, body, status);
+    result.http_status = status;
+
+    if (!resp) {
+        result.error = "server unreachable";
+        return result;
+    }
+
+    result.value.success = resp->value("success", false);
+    result.value.error   = resp->value("error", "");
+    result.ok = result.value.success;
+    if (!result.ok) result.error = result.value.error;
+    return result;
 }
 
 Result<std::vector<TreeNode>> LemonadeNexusClient::get_children(const std::string& parent_id) {
@@ -1182,80 +1198,135 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
                                                        const std::string& password) {
     Result<JoinResult> result;
 
-    // Step 1: authenticate — prefer Ed25519 identity if available, fall back to password
-    Result<AuthResponse> auth;
-    if (impl_->identity.is_valid()) {
-        auth = authenticate_ed25519();
-        if (!auth) {
-            spdlog::warn("[LemonadeNexusClient] Ed25519 auth failed ({}), falling back to password",
-                          auth.error);
-            auth = authenticate(username, password);
-        }
-    } else {
-        auth = authenticate(username, password);
+    // Step 1: check if we already have a session token (e.g. from passkey auth).
+    // If not, authenticate now.
+    bool needs_auth = false;
+    {
+        std::lock_guard lock(impl_->mutex);
+        needs_auth = impl_->session_token.empty();
     }
 
-    if (!auth) {
-        result.error = "authentication failed: " + auth.error;
-        result.http_status = auth.http_status;
-        return result;
+    if (needs_auth) {
+        Result<AuthResponse> auth;
+        if (impl_->identity.is_valid()) {
+            auth = authenticate_ed25519();
+            if (!auth) {
+                spdlog::warn("[LemonadeNexusClient] Ed25519 auth failed ({}), "
+                             "falling back to password", auth.error);
+                auth = authenticate(username, password);
+            }
+        } else {
+            auth = authenticate(username, password);
+        }
+        if (!auth) {
+            result.error = "authentication failed: " + auth.error;
+            result.http_status = auth.http_status;
+            return result;
+        }
     }
 
     // Step 2: generate WireGuard keypair
     auto [wg_privkey, wg_pubkey] = WireGuardTunnel::generate_keypair();
 
-    // Step 3: create endpoint node with WG public key
-    TreeNode endpoint_node;
-    endpoint_node.type = NodeType::Endpoint;
-    endpoint_node.wg_pubkey = wg_pubkey;
+    // Step 3: create endpoint node via the server's composite /api/join endpoint.
+    // This endpoint handles node ID generation, parent assignment, IP allocation,
+    // and hostname assignment all server-side.
+    json join_body;
     if (impl_->identity.is_valid()) {
-        endpoint_node.mgmt_pubkey = impl_->identity.pubkey_string();
+        join_body["public_key"] = impl_->identity.pubkey_string(); // "ed25519:base64..."
+    }
+    join_body["wg_pubkey"] = wg_pubkey;
+
+    // Include auth credentials so /api/join can authenticate inline
+    if (impl_->identity.is_valid()) {
+        // Get a challenge nonce for Ed25519 auth
+        auto pubkey_b64 = Identity::to_base64(
+            std::span<const uint8_t>(impl_->identity.public_key()));
+
+        json challenge_body;
+        challenge_body["pubkey"] = pubkey_b64;
+
+        int challenge_status = 0;
+        auto challenge_resp = impl_->http_post("/api/auth/challenge",
+                                                challenge_body, challenge_status);
+        if (challenge_resp) {
+            auto challenge_b64 = challenge_resp->value("challenge", std::string{});
+            if (!challenge_b64.empty()) {
+                auto challenge_bytes = Identity::from_base64(challenge_b64);
+                auto signature = impl_->identity.sign(
+                    std::span<const uint8_t>(challenge_bytes));
+                auto signature_b64 = Identity::to_base64(
+                    std::span<const uint8_t>(signature));
+
+                join_body["method"]    = "ed25519";
+                join_body["pubkey"]    = pubkey_b64;
+                join_body["challenge"] = challenge_b64;
+                join_body["signature"] = signature_b64;
+            }
+        }
     }
 
-    TreeDelta join_delta;
-    join_delta.operation      = "create_node";
-    join_delta.target_node_id = "";
-    join_delta.node_data      = endpoint_node;
+    if (!join_body.contains("method")) {
+        // Fallback to password auth in join body
+        join_body["method"]   = "password";
+        join_body["username"] = username;
+        join_body["password"] = password;
+    }
 
-    auto delta_result = submit_delta(join_delta);
-    if (!delta_result) {
-        result.error = "node creation failed: " + delta_result.error;
-        result.http_status = delta_result.http_status;
+    int status = 0;
+    auto resp = impl_->http_post("/api/join", join_body, status);
+    result.http_status = status;
+
+    if (!resp) {
+        result.error = "join request failed (server unreachable)";
         return result;
     }
 
+    if (status != 200) {
+        result.error = resp->value("error", resp->value("error_message", "join failed"));
+        return result;
+    }
+
+    // Store the session token from the join response
+    auto token = resp->value("token", std::string{});
+    if (!token.empty()) {
+        std::lock_guard lock(impl_->mutex);
+        impl_->session_token = token;
+    }
+
+    auto node_id   = resp->value("node_id", std::string{});
+    auto tunnel_ip = resp->value("tunnel_ip", std::string{});
+
     result.ok = true;
     result.value.success        = true;
-    result.value.node_id        = delta_result.value.node_id;
-    result.value.tunnel_ip      = delta_result.value.tunnel_ip;
-    result.value.private_subnet = delta_result.value.private_subnet;
+    result.value.node_id        = node_id;
+    result.value.tunnel_ip      = tunnel_ip;
     result.value.wg_pubkey      = wg_pubkey;
 
     {
         std::lock_guard lock(impl_->mutex);
-        impl_->node_id = result.value.node_id;
+        impl_->node_id = node_id;
     }
 
     // Step 4: Configure the WireGuard tunnel (bring up if we have a tunnel IP)
-    if (!result.value.tunnel_ip.empty()) {
+    if (!tunnel_ip.empty()) {
         WireGuardConfig wg_config;
-        wg_config.private_key = wg_privkey;
-        wg_config.public_key  = wg_pubkey;
-        wg_config.tunnel_ip   = result.value.tunnel_ip;
-        // Server WG config should come from server response; set defaults
-        wg_config.allowed_ips = {"10.100.0.0/16"};
+        wg_config.private_key       = wg_privkey;
+        wg_config.public_key        = wg_pubkey;
+        wg_config.tunnel_ip         = tunnel_ip;
+        wg_config.server_public_key = resp->value("wg_server_pubkey", std::string{});
+        wg_config.server_endpoint   = resp->value("wg_endpoint", std::string{});
+        wg_config.allowed_ips       = {"10.100.0.0/16"};
 
-        // Store the config so it can be retrieved via get_wireguard_config()
         auto up_result = impl_->wg_tunnel.bring_up(wg_config);
         if (!up_result) {
             spdlog::warn("[LemonadeNexusClient] tunnel bring_up deferred or failed: {}",
                           up_result.error);
-            // Not fatal -- the app can bring up the tunnel later via tunnel_up()
         }
     }
 
     spdlog::info("[LemonadeNexusClient] joined network: node_id={}, tunnel_ip={}, wg_pubkey={}",
-                  result.value.node_id, result.value.tunnel_ip, wg_pubkey);
+                  node_id, tunnel_ip, wg_pubkey);
     return result;
 }
 

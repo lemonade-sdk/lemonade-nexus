@@ -109,6 +109,45 @@ bool PermissionTreeService::insert_join_node(const TreeNode& node) {
     return true;
 }
 
+bool PermissionTreeService::update_node_direct(const std::string& node_id,
+                                                const TreeNode& updated) {
+    std::lock_guard lock(mutex_);
+
+    auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) {
+        spdlog::error("[{}] update_node_direct: node '{}' not found", name(), node_id);
+        return false;
+    }
+
+    it->second = updated;
+    it->second.id = node_id; // Preserve original ID
+    if (!persist_node(it->second)) {
+        spdlog::error("[{}] update_node_direct: failed to persist '{}'", name(), node_id);
+        return false;
+    }
+
+    spdlog::info("[{}] updated node '{}' directly", name(), node_id);
+    return true;
+}
+
+bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
+    std::lock_guard lock(mutex_);
+
+    auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) {
+        spdlog::error("[{}] delete_node_direct: node '{}' not found", name(), node_id);
+        return false;
+    }
+
+    nodes_.erase(it);
+    if (!remove_node(node_id)) {
+        spdlog::warn("[{}] delete_node_direct: storage delete failed for '{}'", name(), node_id);
+    }
+
+    spdlog::info("[{}] deleted node '{}' directly", name(), node_id);
+    return true;
+}
+
 bool PermissionTreeService::grant_assignment(const std::string& node_id,
                                               const Assignment& assignment) {
     std::lock_guard lock(mutex_);

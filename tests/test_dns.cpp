@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <unistd.h>
 
 using namespace nexus;
 namespace fs = std::filesystem;
@@ -108,7 +109,7 @@ protected:
 
     void SetUp() override {
         temp_dir = fs::temp_directory_path() /
-            ("nexus_test_dns_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+            ("nexus_test_dns_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         crypto_svc = std::make_unique<crypto::SodiumCryptoService>();

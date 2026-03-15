@@ -61,11 +61,12 @@ struct TreeBrowserView: View {
                     .listStyle(.inset(alternatesRowBackgrounds: true))
                 }
             }
-            .frame(minWidth: 300, idealWidth: 380)
+            .frame(minWidth: 220, idealWidth: 300, maxWidth: 450)
 
             // Detail Panel
             if let node = selectedNode {
                 NodeDetailView(node: node)
+                    .frame(minWidth: 400, idealWidth: 550)
             } else {
                 VStack(spacing: 16) {
                     Image(systemName: "sidebar.squares.right")
@@ -79,7 +80,7 @@ struct TreeBrowserView: View {
                         .foregroundColor(.textTertiary)
                         .multilineTextAlignment(.center)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 400, idealWidth: 550, maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.surfaceDark)
             }
         }

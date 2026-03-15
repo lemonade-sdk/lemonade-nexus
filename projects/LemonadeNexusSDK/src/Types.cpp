@@ -49,6 +49,7 @@ void to_json(json& j, const TreeNode& n) {
         {"id",                       n.id},
         {"parent_id",                n.parent_id},
         {"type",                     node_type_to_string(n.type)},
+        {"hostname",                 n.hostname},
         {"tunnel_ip",                n.tunnel_ip},
         {"private_subnet",           n.private_subnet},
         {"private_shared_addresses", n.private_shared_addresses},
@@ -72,6 +73,7 @@ void from_json(const json& j, TreeNode& n) {
     if (j.contains("type") && j["type"].is_string()) {
         n.type = string_to_node_type(j["type"].get<std::string>());
     }
+    n.hostname                 = j.value("hostname", "");
     n.tunnel_ip                = j.value("tunnel_ip", "");
     n.private_subnet           = j.value("private_subnet", "");
     n.private_shared_addresses = j.value("private_shared_addresses", "");

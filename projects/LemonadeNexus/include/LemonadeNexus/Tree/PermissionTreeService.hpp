@@ -35,6 +35,14 @@ public:
     /// Returns true on success.
     bool insert_join_node(const TreeNode& node);
 
+    /// Update a node directly, bypassing delta signing.
+    /// The caller (HTTP handler) is responsible for permission checks.
+    bool update_node_direct(const std::string& node_id, const TreeNode& updated);
+
+    /// Delete a node directly, bypassing delta signing.
+    /// The caller (HTTP handler) is responsible for permission checks.
+    bool delete_node_direct(const std::string& node_id);
+
     /// Grant an assignment (pubkey + permissions) on a node.
     /// Idempotent: no-op if the pubkey already has an assignment.
     /// Used after Ed25519 key registration to give new keys add_child on root.

@@ -16,6 +16,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 using namespace nexus;
@@ -32,7 +33,7 @@ protected:
     std::string jwt_secret;
 
     void SetUp() override {
-        temp_dir = fs::temp_directory_path() / ("nexus_test_auth_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
+        temp_dir = fs::temp_directory_path() / ("nexus_test_auth_" + std::to_string(getpid()));
         fs::create_directories(temp_dir);
 
         crypto = std::make_unique<crypto::SodiumCryptoService>();
