@@ -1316,7 +1316,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         wg_config.tunnel_ip         = tunnel_ip;
         wg_config.server_public_key = resp->value("wg_server_pubkey", std::string{});
         wg_config.server_endpoint   = resp->value("wg_endpoint", std::string{});
-        wg_config.allowed_ips       = {"10.100.0.0/16"};
+        wg_config.allowed_ips       = {resp->value("tunnel_subnet", std::string{"10.64.0.0/10"})};
 
         auto up_result = impl_->wg_tunnel.bring_up(wg_config);
         if (!up_result) {

@@ -7,6 +7,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -120,7 +121,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
     // POST /api/certs/issue — issue certificate for client (borrowed license)
     priv.Post("/api/certs/issue", require_auth(ctx_.auth,
-        [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
+        [this](const httplib::Request& req, httplib::Response& res, const SessionClaims& claims) {
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
             res.status = 400;
@@ -142,6 +143,42 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
                 res.status = 400;
                 nlohmann::json j = network::ErrorResponse{.error = "invalid hostname characters"};
+                res.set_content(j.dump(), "application/json");
+                return;
+            }
+        }
+
+        // Validate hostname ownership: the requesting user must own a node
+        // with this hostname. Prevents users from requesting certs for
+        // "root" or other users' hostnames.
+        {
+            // Normalize the JWT pubkey to match tree format
+            auto caller_pk = claims.pubkey;
+            constexpr std::string_view ed_prefix = "ed25519:";
+            if (!caller_pk.starts_with(ed_prefix)) {
+                caller_pk = std::string(ed_prefix) + caller_pk;
+            }
+
+            // Check that the caller owns a node with this hostname
+            bool owns_hostname = false;
+            auto node_id = claims.node_id.empty() ? claims.user_id : claims.node_id;
+            if (!node_id.empty()) {
+                // Check the user's node and customer group
+                for (const auto& check_id : {node_id, std::string("customer-") + node_id}) {
+                    auto node = ctx_.tree.get_node(check_id);
+                    if (node && node->hostname == cert_req.hostname &&
+                        node->mgmt_pubkey == caller_pk) {
+                        owns_hostname = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!owns_hostname) {
+                res.status = 403;
+                nlohmann::json j = network::ErrorResponse{
+                    .error = "hostname ownership required",
+                    .detail = "you can only request certificates for hostnames you own"};
                 res.set_content(j.dump(), "application/json");
                 return;
             }

@@ -7,10 +7,20 @@
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
 
 #include <spdlog/spdlog.h>
+
+namespace {
+/// Ensure a pubkey string has the "ed25519:" prefix for tree storage.
+std::string normalize_pubkey(const std::string& pk) {
+    constexpr std::string_view prefix = "ed25519:";
+    if (pk.starts_with(prefix)) return pk;
+    return std::string(prefix) + pk;
+}
+} // anonymous namespace
 
 namespace nexus::api {
 
@@ -56,8 +66,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             node_id = "node-" + client_pubkey.substr(0, 16);
         }
 
+        // Normalize pubkey to "ed25519:base64..." format for tree storage
+        auto norm_pubkey = normalize_pubkey(client_pubkey);
+
         auto existing_root = ctx_.tree.get_node("root");
         if (!existing_root) {
+            // First user bootstraps root and gets a Customer group
             tree::TreeNode root_node;
             root_node.id        = "root";
             root_node.parent_id = "";
@@ -65,22 +79,69 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             root_node.hostname  = ctx_.config.server_hostname.empty()
                                       ? "root"
                                       : ctx_.config.server_hostname;
-            root_node.mgmt_pubkey = client_pubkey;
+            root_node.mgmt_pubkey = norm_pubkey;
             root_node.assignments = {{
-                .management_pubkey = client_pubkey,
+                .management_pubkey = norm_pubkey,
                 .permissions = {"read", "write", "add_child", "delete_node",
                                 "edit_node", "admin"},
             }};
             ctx_.tree.bootstrap_root(root_node);
-            node_id = "root";
-        } else if (node_id != "root") {
+
+            // Create a Customer group for the root owner
+            std::string customer_id = "customer-" + node_id;
+            tree::TreeNode customer_node;
+            customer_node.id          = customer_id;
+            customer_node.parent_id   = "root";
+            customer_node.type        = tree::NodeType::Customer;
+            customer_node.hostname    = body.value("hostname",
+                                                   "group-" + node_id.substr(0, 8));
+            customer_node.mgmt_pubkey = norm_pubkey;
+            customer_node.assignments = {{
+                .management_pubkey = norm_pubkey,
+                .permissions = {"read", "write", "add_child", "delete_node",
+                                "edit_node"},
+            }};
+            ctx_.tree.insert_join_node(customer_node);
+
+            // Create the user's Endpoint under their Customer group
             tree::TreeNode endpoint_node;
             endpoint_node.id          = node_id;
-            endpoint_node.parent_id   = "root";
+            endpoint_node.parent_id   = customer_id;
             endpoint_node.type        = tree::NodeType::Endpoint;
             endpoint_node.hostname    = body.value("hostname",
                                                    "endpoint-" + node_id.substr(0, 8));
-            endpoint_node.mgmt_pubkey = client_pubkey;
+            endpoint_node.mgmt_pubkey = norm_pubkey;
+            endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
+            ctx_.tree.insert_join_node(endpoint_node);
+        } else if (node_id != "root") {
+            // Returning or new user — find or create their Customer group
+            std::string customer_id = "customer-" + node_id;
+            auto existing_customer = ctx_.tree.get_node(customer_id);
+            if (!existing_customer) {
+                tree::TreeNode customer_node;
+                customer_node.id          = customer_id;
+                customer_node.parent_id   = "root";
+                customer_node.type        = tree::NodeType::Customer;
+                customer_node.hostname    = body.value("hostname",
+                                                       "group-" + node_id.substr(0, 8));
+                customer_node.mgmt_pubkey = norm_pubkey;
+                customer_node.assignments = {{
+                    .management_pubkey = norm_pubkey,
+                    .permissions = {"read", "write", "add_child", "delete_node",
+                                    "edit_node"},
+                }};
+                ctx_.tree.insert_join_node(customer_node);
+            }
+
+            // Create Endpoint under the Customer group (idempotent)
+            tree::TreeNode endpoint_node;
+            endpoint_node.id          = node_id;
+            endpoint_node.parent_id   = customer_id;
+            endpoint_node.type        = tree::NodeType::Endpoint;
+            endpoint_node.hostname    = body.value("hostname",
+                                                   "endpoint-" + node_id.substr(0, 8));
+            endpoint_node.mgmt_pubkey = norm_pubkey;
+            endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
             ctx_.tree.insert_join_node(endpoint_node);
         }
 
@@ -92,19 +153,23 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
+        // Convert server's Ed25519 identity key to Curve25519 (X25519) for WireGuard
         std::string wg_server_pubkey;
-        if (auto pk = ctx_.key_wrapping.load_identity_pubkey()) {
-            wg_server_pubkey = crypto::to_base64(*pk);
+        if (auto ed_pk = ctx_.key_wrapping.load_identity_pubkey()) {
+            auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*ed_pk);
+            wg_server_pubkey = crypto::to_base64(
+                std::span<const uint8_t>(x_pk.data(), x_pk.size()));
         }
 
         std::string server_tunnel = ctx_.tunnel_bind_ip.empty()
-                                        ? "10.100.0.1"
+                                        ? "10.64.0.1"
                                         : ctx_.tunnel_bind_ip;
 
         nlohmann::json resp = {
             {"token",            auth_result.session_token},
             {"node_id",          node_id},
             {"tunnel_ip",        alloc.base_network},
+            {"tunnel_subnet",    "10.64.0.0/10"},
             {"server_tunnel_ip", server_tunnel},
             {"private_api_port", !ctx_.tunnel_bind_ip.empty()
                                      ? ctx_.config.private_http_port
@@ -206,8 +271,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         auto type_str  = body.value("type", std::string{"endpoint"});
         auto hostname  = body.value("hostname", std::string{});
 
+        // Normalize pubkey for tree comparison (JWT stores raw base64,
+        // tree assignments use "ed25519:" prefix)
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
+
         // Check AddChild permission on the parent
-        if (!ctx_.tree.check_permission(claims.pubkey, parent_id,
+        if (!ctx_.tree.check_permission(caller_pubkey, parent_id,
                                          acl::Permission::AddChild)) {
             res.status = 403;
             nlohmann::json j = network::ErrorResponse{.error = "no add_child permission on parent"};
@@ -217,7 +286,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         tree::TreeNode node;
         node.parent_id   = parent_id;
-        node.mgmt_pubkey = claims.pubkey;
+        node.mgmt_pubkey = caller_pubkey;
 
         if (type_str == "endpoint")  node.type = tree::NodeType::Endpoint;
         else if (type_str == "customer") node.type = tree::NodeType::Customer;
@@ -268,8 +337,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        // Check EditNode permission
-        if (!ctx_.tree.check_permission(claims.pubkey, node_id,
+        // Check EditNode permission (normalize pubkey format)
+        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), node_id,
                                          acl::Permission::EditNode)) {
             res.status = 403;
             nlohmann::json j = network::ErrorResponse{.error = "no edit_node permission"};
@@ -319,8 +388,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
 
-        // Check DeleteNode permission
-        if (!ctx_.tree.check_permission(claims.pubkey, node_id,
+        // Check DeleteNode permission (normalize pubkey format)
+        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), node_id,
                                          acl::Permission::DeleteNode)) {
             res.status = 403;
             nlohmann::json j = network::ErrorResponse{.error = "no delete_node permission"};
