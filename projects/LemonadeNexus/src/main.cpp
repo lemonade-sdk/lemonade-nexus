@@ -219,9 +219,15 @@ int main(int argc, char* argv[]) {
     root_key_chain.set_io_context(coordinator.io_context());
     root_key_chain.start();
 
-    // If root identity exists, initialize the chain with it
+    // Load or auto-generate server identity keypair
     auto root_privkey = key_wrapping.unlock_identity({});
     auto root_pubkey = key_wrapping.load_identity_pubkey();
+    if (!root_privkey || !root_pubkey) {
+        spdlog::info("No identity keypair found — generating one for this server");
+        auto generated = key_wrapping.generate_and_store_identity({});
+        root_privkey = generated.private_key;
+        root_pubkey  = generated.public_key;
+    }
     if (root_privkey && root_pubkey) {
         nexus::crypto::Ed25519Keypair root_kp;
         root_kp.private_key = *root_privkey;

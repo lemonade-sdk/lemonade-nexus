@@ -4,6 +4,7 @@
 #include <LemonadeNexus/WireGuard/IWireGuardProvider.hpp>
 
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -53,6 +54,7 @@ public:
     /// @param config_dir      Directory for storing config files (e.g. "data/wireguard").
     explicit WireGuardService(std::string interface_name = "wg0",
                                std::filesystem::path config_dir = "data/wireguard");
+    ~WireGuardService();  // defined in .cpp (BoringTunState PIMPL)
 
     // IService
     void on_start();
@@ -131,6 +133,20 @@ private:
 #elif defined(_WIN32) && defined(HAS_WIREGUARD_NT)
     void*       nt_adapter_{nullptr}; ///< wireguard-nt adapter handle
 #endif
+
+    // --- BoringTun userspace fallback (runtime, when CLI tools unavailable) ---
+    bool use_boringtun_{false};
+    struct BoringTunState;
+    std::unique_ptr<BoringTunState> bt_;
+
+    // BoringTun helper methods (defined only in CLI fallback path)
+    int  bt_create_tun_device(std::string& iface_name_out);
+    void bt_configure_address(const std::string& iface, const std::string& address);
+    void bt_add_route(const std::string& iface, const std::string& cidr);
+    void bt_tun_to_udp_loop();
+    void bt_udp_to_tun_loop();
+    void bt_timer_loop();
+    void bt_cleanup();
 };
 
 } // namespace nexus::wireguard

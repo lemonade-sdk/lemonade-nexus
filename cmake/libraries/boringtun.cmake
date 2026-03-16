@@ -26,6 +26,9 @@ corrosion_import_crate(
 # which handles the correct library naming on all platforms (.a / .lib).
 add_library(boringtun-ffi INTERFACE)
 target_link_libraries(boringtun-ffi INTERFACE lemonade_boringtun_ffi)
+target_include_directories(boringtun-ffi INTERFACE
+    "${CMAKE_SOURCE_DIR}/crates/boringtun-ffi/include"
+)
 
 # Platform-specific system libraries needed by the Rust static lib
 if(APPLE)

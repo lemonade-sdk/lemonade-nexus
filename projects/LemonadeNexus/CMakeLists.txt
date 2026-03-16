@@ -20,6 +20,7 @@ create_project(LemonadeNexus DEPENDENCIES
         OpenSSL::Crypto
         c-ares::cares
         sqlite3
+        boringtun-ffi
 )
 
 target_compile_definitions(LemonadeNexus PUBLIC
