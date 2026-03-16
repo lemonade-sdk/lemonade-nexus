@@ -218,7 +218,13 @@ std::optional<ShamirShare> ShamirSecretSharing::share_from_string(const std::str
     if (x_val < 1 || x_val > 255) return std::nullopt;
     share.x = static_cast<uint8_t>(x_val);
 
-    share.y = from_base64(s.substr(colon + 1));
+    if (colon + 1 >= s.size()) return std::nullopt;
+
+    try {
+        share.y = from_base64(s.substr(colon + 1));
+    } catch (...) {
+        return std::nullopt;
+    }
     if (share.y.empty()) return std::nullopt;
 
     return share;

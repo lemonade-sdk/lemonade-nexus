@@ -16,15 +16,6 @@
 
 #include <cstring>
 
-namespace {
-/// Ensure a pubkey string has the "ed25519:" prefix for tree storage.
-std::string normalize_pubkey(const std::string& pk) {
-    constexpr std::string_view prefix = "ed25519:";
-    if (pk.starts_with(prefix)) return pk;
-    return std::string(prefix) + pk;
-}
-} // anonymous namespace
-
 namespace nexus::api {
 
 void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
@@ -37,30 +28,19 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // IP, return WireGuard config.
     // ========================================================================
     pub.Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
 
         auto auth_result = ctx_.auth.authenticate(body);
         if (!auth_result.authenticated) {
-            res.status = 401;
-            nlohmann::json j = network::ErrorResponse{
-                .error  = "authentication failed",
-                .detail = auth_result.error_message,
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "authentication failed", 401);
             return;
         }
 
         auto client_pubkey = body.value("public_key", "");
         if (client_pubkey.empty()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "public_key required"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "public_key required");
             return;
         }
 
@@ -150,9 +130,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         auto alloc = ctx_.ipam.allocate_tunnel_ip(node_id);
         if (alloc.base_network.empty()) {
-            res.status = 409;
-            nlohmann::json j = network::ErrorResponse{.error = "IP allocation failed"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "IP allocation failed", 409);
             return;
         }
 
@@ -213,7 +191,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             {"dns_servers",      nlohmann::json::array({server_tunnel})},
         };
         spdlog::info("[Join] node={} tunnel_ip={} wg_endpoint={}", node_id, alloc.base_network, wg_endpoint);
-        res.set_content(resp.dump(), "application/json");
+        json_response(res, resp);
     });
 
     // ========================================================================
@@ -225,13 +203,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         auto node_id = req.matches[1].str();
         auto node = ctx_.tree.get_node(node_id);
         if (!node) {
-            res.status = 404;
-            nlohmann::json j = network::ErrorResponse{.error = "node not found"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "node not found", 404);
             return;
         }
         nlohmann::json j = *node;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // ========================================================================
@@ -240,13 +216,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     priv.Post("/api/tree/delta", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims&) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
 
         tree::TreeDelta delta;
         try {
@@ -265,12 +237,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         bool ok = ctx_.tree.apply_delta(delta);
         network::DeltaResponse resp{.success = ok};
-        if (!ok) {
-            res.status = 403;
-            resp.error = "delta rejected";
-        }
+        if (!ok) resp.error = "delta rejected";
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j, ok ? 200 : 403);
     }));
 
     // ========================================================================
@@ -282,7 +251,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         auto parent_id = req.matches[1].str();
         auto children = ctx_.tree.get_children(parent_id);
         nlohmann::json j = children;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // ========================================================================
@@ -292,13 +261,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     priv.Post("/api/tree/node", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims& claims) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
 
         auto parent_id = body.value("parent_id", std::string{"root"});
         auto type_str  = body.value("type", std::string{"endpoint"});
@@ -311,9 +276,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Check AddChild permission on the parent
         if (!ctx_.tree.check_permission(caller_pubkey, parent_id,
                                          acl::Permission::AddChild)) {
-            res.status = 403;
-            nlohmann::json j = network::ErrorResponse{.error = "no add_child permission on parent"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "no add_child permission on parent", 403);
             return;
         }
 
@@ -325,9 +288,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         else if (type_str == "customer") node.type = tree::NodeType::Customer;
         else if (type_str == "relay")    node.type = tree::NodeType::Relay;
         else {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid type"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "invalid type");
             return;
         }
 
@@ -340,9 +301,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         node.hostname = hostname;
 
         if (!ctx_.tree.insert_join_node(node)) {
-            res.status = 409;
-            nlohmann::json j = network::ErrorResponse{.error = "node creation failed"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "node creation failed", 409);
             return;
         }
 
@@ -351,7 +310,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             {"node_id", node.id},
         };
         spdlog::info("[TreeApi] created node '{}' under '{}'", node.id, parent_id);
-        res.set_content(resp.dump(), "application/json");
+        json_response(res, resp);
     }));
 
     // ========================================================================
@@ -362,28 +321,20 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
 
         // Check EditNode permission (normalize pubkey format)
         if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), node_id,
                                          acl::Permission::EditNode)) {
-            res.status = 403;
-            nlohmann::json j = network::ErrorResponse{.error = "no edit_node permission"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "no edit_node permission", 403);
             return;
         }
 
         auto existing = ctx_.tree.get_node(node_id);
         if (!existing) {
-            res.status = 404;
-            nlohmann::json j = network::ErrorResponse{.error = "node not found"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "node not found", 404);
             return;
         }
 
@@ -401,15 +352,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (body.contains("expires_at"))  updated.expires_at  = body["expires_at"].get<uint64_t>();
 
         if (!ctx_.tree.update_node_direct(node_id, updated)) {
-            res.status = 500;
-            nlohmann::json j = network::ErrorResponse{.error = "update failed"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "update failed", 500);
             return;
         }
 
         nlohmann::json resp = {{"success", true}, {"node_id", node_id}};
         spdlog::info("[TreeApi] updated node '{}'", node_id);
-        res.set_content(resp.dump(), "application/json");
+        json_response(res, resp);
     }));
 
     // ========================================================================
@@ -424,22 +373,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Check DeleteNode permission (normalize pubkey format)
         if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), node_id,
                                          acl::Permission::DeleteNode)) {
-            res.status = 403;
-            nlohmann::json j = network::ErrorResponse{.error = "no delete_node permission"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "no delete_node permission", 403);
             return;
         }
 
         if (!ctx_.tree.delete_node_direct(node_id)) {
-            res.status = 404;
-            nlohmann::json j = network::ErrorResponse{.error = "node not found or delete failed"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "node not found or delete failed", 404);
             return;
         }
 
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);
-        res.set_content(resp.dump(), "application/json");
+        json_response(res, resp);
     }));
 
     // ========================================================================
@@ -448,13 +393,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     priv.Post("/api/ipam/allocate", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims&) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
 
         auto ipam_req = body.get<network::IpamAllocateRequest>();
 
@@ -468,9 +409,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             alloc = ctx_.ipam.allocate_shared_block(ipam_req.node_id,
                                                      ipam_req.prefix_len);
         } else {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid block_type"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "invalid block_type");
             return;
         }
 
@@ -480,9 +419,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             .network = alloc.base_network,
             .node_id = alloc.customer_node_id,
         };
-        res.status = ok ? 200 : 409;
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j, ok ? 200 : 409);
     }));
 }
 

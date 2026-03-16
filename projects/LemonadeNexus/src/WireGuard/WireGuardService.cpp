@@ -282,11 +282,16 @@ bool parse_endpoint(const std::string& ep, sockaddr_storage& addr) {
         if (colon == std::string::npos) return false;
 
         auto ip_str = ep.substr(1, bracket - 1);
+        if (colon + 1 >= ep.size()) return false;
         auto port_str = ep.substr(colon + 1);
 
         auto* sa6 = reinterpret_cast<sockaddr_in6*>(&addr);
         sa6->sin6_family = AF_INET6;
-        sa6->sin6_port = htons(static_cast<uint16_t>(std::stoul(port_str)));
+        try {
+            sa6->sin6_port = htons(static_cast<uint16_t>(std::stoul(port_str)));
+        } catch (...) {
+            return false;
+        }
         if (inet_pton(AF_INET6, ip_str.c_str(), &sa6->sin6_addr) != 1) return false;
         return true;
     }
@@ -294,13 +299,18 @@ bool parse_endpoint(const std::string& ep, sockaddr_storage& addr) {
     // IPv4:port
     auto colon = ep.rfind(':');
     if (colon == std::string::npos) return false;
+    if (colon + 1 >= ep.size()) return false;
 
     auto ip_str = ep.substr(0, colon);
     auto port_str = ep.substr(colon + 1);
 
     auto* sa4 = reinterpret_cast<sockaddr_in*>(&addr);
     sa4->sin_family = AF_INET;
-    sa4->sin_port = htons(static_cast<uint16_t>(std::stoul(port_str)));
+    try {
+        sa4->sin_port = htons(static_cast<uint16_t>(std::stoul(port_str)));
+    } catch (...) {
+        return false;
+    }
     if (inet_pton(AF_INET, ip_str.c_str(), &sa4->sin_addr) != 1) return false;
     return true;
 }
@@ -1713,7 +1723,7 @@ bool WireGuardService::do_update_endpoint(const std::string& pubkey,
 #ifdef BORINGTUN_FALLBACK_AVAILABLE
     if (use_boringtun_ && bt_) {
         auto colon = new_endpoint.rfind(':');
-        if (colon == std::string::npos) {
+        if (colon == std::string::npos || colon + 1 >= new_endpoint.size()) {
             spdlog::error("[{}] update_endpoint: invalid endpoint format '{}'",
                            name(), new_endpoint);
             return false;

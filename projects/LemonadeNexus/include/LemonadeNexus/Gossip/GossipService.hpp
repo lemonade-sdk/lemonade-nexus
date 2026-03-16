@@ -14,6 +14,7 @@
 #include <asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -226,6 +227,7 @@ private:
     std::vector<GossipPeer> peers_;
     uint16_t                port_;
 
+    mutable std::mutex      rng_mutex_;
     mutable std::mt19937    rng_{std::random_device{}()};
 
     // Server enrollment
@@ -242,7 +244,7 @@ private:
 
     // Democratic governance (nullptr = governance disabled)
     core::GovernanceService*         governance_{nullptr};
-    uint32_t                         last_known_generation_{0};
+    std::atomic<uint64_t>            last_known_generation_{0};
 
     // IPAM for tunnel IP allocation during ServerHello exchange
     ipam::IPAMService*               ipam_{nullptr};

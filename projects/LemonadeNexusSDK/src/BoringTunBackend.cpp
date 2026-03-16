@@ -273,6 +273,11 @@ void BoringTunBackend::add_route(const std::string& iface, const std::string& ci
 
     // Convert prefix length to subnet mask
     auto prefix_len = std::stoi(prefix);
+    if (prefix_len < 0 || prefix_len > 32) {
+        spdlog::warn("[BoringTun] invalid CIDR prefix length {} in route '{}', skipping",
+                     prefix_len, cidr);
+        return;
+    }
     uint32_t mask_val = (prefix_len == 0) ? 0 : ~((1u << (32 - prefix_len)) - 1);
     char mask_str[16];
     snprintf(mask_str, sizeof(mask_str), "%u.%u.%u.%u",

@@ -12,7 +12,6 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <unordered_map>
 
@@ -46,7 +45,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             });
         }
         nlohmann::json j = entries;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // ========================================================================
@@ -78,21 +77,12 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         }
 
         if (client_region.empty()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error = "region or lat/lon required",
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "region or lat/lon required");
             return;
         }
 
         if (!relay::GeoRegion::is_valid_region(client_region)) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error  = "unknown region",
-                .region = client_region,
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "unknown region");
             return;
         }
 
@@ -148,7 +138,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         }
 
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // ========================================================================
@@ -157,22 +147,13 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     priv.Post("/api/relay/ticket", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims&) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
 
-        auto ticket_req = body.get<network::RelayTicketRequest>();
+        auto ticket_req = body_opt->get<network::RelayTicketRequest>();
 
         if (ticket_req.peer_id.empty() || ticket_req.relay_id.empty()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error = "peer_id and relay_id required",
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "peer_id and relay_id required");
             return;
         }
 
@@ -181,9 +162,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         ticket.relay_id = ticket_req.relay_id;
         ctx_.crypto.random_bytes(std::span<uint8_t>(ticket.session_nonce));
 
-        auto now = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto now = epoch_seconds();
         ticket.issued_at  = now;
         ticket.expires_at = now + 300;
 
@@ -222,7 +201,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 std::span<const uint8_t>(ticket.signature)),
         };
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // ========================================================================
@@ -231,43 +210,26 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     priv.Post("/api/relay/register", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims&) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
 
-        auto reg_req = body.get<network::RelayRegisterRequest>();
+        auto reg_req = body_opt->get<network::RelayRegisterRequest>();
 
         if (reg_req.relay_id.empty() || reg_req.endpoint.empty()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error = "relay_id and endpoint required",
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "relay_id and endpoint required");
             return;
         }
 
         if (!reg_req.region.empty() &&
             !relay::GeoRegion::is_valid_region(reg_req.region)) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error  = "invalid region code",
-                .region = reg_req.region,
-                .hint   = "Use format: us-ca, eu-de, ap-jp, etc.",
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "invalid region code");
             return;
         }
 
         storage::SignedEnvelope envelope;
         envelope.type = "relay_node";
-        envelope.data = body.dump();
-        envelope.timestamp = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+        envelope.data = body_opt->dump();
+        envelope.timestamp = epoch_seconds();
 
         (void)ctx_.storage.write_file("relay", reg_req.relay_id, envelope);
         ctx_.relay_discovery.refresh_relay_list();
@@ -290,7 +252,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         }
 
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 }
 

@@ -13,7 +13,7 @@ namespace nexus::api {
 void AuthApiHandler::ensure_root_node(const std::string& pubkey) {
     if (pubkey.empty()) return;
 
-    auto prefixed = pubkey.find("ed25519:") == 0 ? pubkey : "ed25519:" + pubkey;
+    auto prefixed = normalize_pubkey(pubkey);
 
     if (!ctx_.tree.get_node("root")) {
         // First authenticated Ed25519 key becomes the root owner.

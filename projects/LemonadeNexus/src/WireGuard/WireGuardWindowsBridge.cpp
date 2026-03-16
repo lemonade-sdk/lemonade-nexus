@@ -150,9 +150,15 @@ bool parse_endpoint_win(const char* ep, SOCKADDR_INET& addr) {
         if (bracket == std::string::npos) return false;
         auto colon = ep_str.find(':', bracket);
         if (colon == std::string::npos) return false;
+        if (colon + 1 >= ep_str.size()) return false;
 
         auto ip = ep_str.substr(1, bracket - 1);
-        auto port = static_cast<USHORT>(std::stoul(ep_str.substr(colon + 1)));
+        USHORT port;
+        try {
+            port = static_cast<USHORT>(std::stoul(ep_str.substr(colon + 1)));
+        } catch (...) {
+            return false;
+        }
 
         addr.si_family = AF_INET6;
         addr.Ipv6.sin6_port = htons(port);
@@ -163,9 +169,15 @@ bool parse_endpoint_win(const char* ep, SOCKADDR_INET& addr) {
     // IPv4:port
     auto colon = ep_str.rfind(':');
     if (colon == std::string::npos) return false;
+    if (colon + 1 >= ep_str.size()) return false;
 
     auto ip = ep_str.substr(0, colon);
-    auto port = static_cast<USHORT>(std::stoul(ep_str.substr(colon + 1)));
+    USHORT port;
+    try {
+        port = static_cast<USHORT>(std::stoul(ep_str.substr(colon + 1)));
+    } catch (...) {
+        return false;
+    }
 
     addr.si_family = AF_INET;
     addr.Ipv4.sin_port = htons(port);

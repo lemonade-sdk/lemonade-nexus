@@ -39,16 +39,10 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         if (!ctx_.http_server.is_tls()) {
             if (reload_cert.empty() || reload_key.empty()) {
-                res.status = 400;
-                nlohmann::json j = network::ErrorResponse{
-                    .error = "not running TLS and no cert/key paths provided"};
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "not running TLS and no cert/key paths provided");
                 return;
             }
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error = "server is running plain HTTP — restart with TLS cert to enable HTTPS"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "server is running plain HTTP — restart with TLS cert to enable HTTPS");
             return;
         }
 
@@ -58,29 +52,20 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             {"cert_path", reload_cert},
             {"key_path",  reload_key},
         };
-        res.status = ok ? 200 : 500;
-        res.set_content(resp.dump(), "application/json");
+        json_response(res, resp, ok ? 200 : 500);
     }));
 
     // POST /api/tls/renew — request ACME cert renewal and hot-reload
     priv.Post("/api/tls/renew", require_auth(ctx_.auth,
         [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
         if (ctx_.server_fqdn.empty()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{
-                .error = "no server FQDN configured — set --server-hostname"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "no server FQDN configured — set --server-hostname");
             return;
         }
 
         auto result = ctx_.acme.renew_certificate(ctx_.server_fqdn);
         if (!result.success) {
-            res.status = 502;
-            nlohmann::json j = network::ErrorResponse{
-                .error  = "ACME renewal failed",
-                .detail = result.error_message,
-            };
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "ACME renewal failed", 502);
             return;
         }
 
@@ -96,7 +81,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             {"key_path",     result.key_path},
             {"hot_reloaded", reloaded},
         };
-        res.set_content(resp.dump(), "application/json");
+        json_response(res, resp);
     }));
 
     // GET /api/certs/{domain} — get certificate status for a domain
@@ -105,9 +90,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         auto domain = req.matches[1].str();
         auto bundle = ctx_.acme.get_certificate(domain);
         if (!bundle) {
-            res.status = 404;
-            nlohmann::json j = network::ErrorResponse{.error = "certificate not found"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "certificate not found", 404);
             return;
         }
         network::CertStatusResponse resp{
@@ -116,34 +99,25 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .expires_at = bundle->expires_at,
         };
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // POST /api/certs/issue — issue certificate for client (borrowed license)
     priv.Post("/api/certs/issue", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res, const SessionClaims& claims) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
 
-        auto cert_req = body.get<network::CertIssueRequest>();
+        auto cert_req = body_opt->get<network::CertIssueRequest>();
 
         if (cert_req.hostname.empty() || cert_req.client_pubkey.empty()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "hostname and client_pubkey required"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "hostname and client_pubkey required");
             return;
         }
 
         for (char c : cert_req.hostname) {
             if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') {
-                res.status = 400;
-                nlohmann::json j = network::ErrorResponse{.error = "invalid hostname characters"};
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "invalid hostname characters");
                 return;
             }
         }
@@ -153,11 +127,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         // "root" or other users' hostnames.
         {
             // Normalize the JWT pubkey to match tree format
-            auto caller_pk = claims.pubkey;
-            constexpr std::string_view ed_prefix = "ed25519:";
-            if (!caller_pk.starts_with(ed_prefix)) {
-                caller_pk = std::string(ed_prefix) + caller_pk;
-            }
+            auto caller_pk = normalize_pubkey(claims.pubkey);
 
             // Check that the caller owns a node with this hostname
             bool owns_hostname = false;
@@ -175,11 +145,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             }
 
             if (!owns_hostname) {
-                res.status = 403;
-                nlohmann::json j = network::ErrorResponse{
-                    .error = "hostname ownership required",
-                    .detail = "you can only request certificates for hostnames you own"};
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "hostname ownership required", 403);
                 return;
             }
         }
@@ -191,19 +157,12 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             spdlog::info("[CertIssue] requesting ACME cert for {}", fqdn);
             auto result = ctx_.acme.request_certificate(fqdn);
             if (!result.success) {
-                res.status = 502;
-                nlohmann::json j = network::ErrorResponse{
-                    .error  = "ACME certificate request failed",
-                    .detail = result.error_message,
-                };
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "ACME certificate request failed", 502);
                 return;
             }
             existing = ctx_.acme.get_certificate(fqdn);
             if (!existing) {
-                res.status = 500;
-                nlohmann::json j = network::ErrorResponse{.error = "certificate issued but not found in storage"};
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "certificate issued but not found in storage", 500);
                 return;
             }
         }
@@ -214,9 +173,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         }
         auto pk_bytes = crypto::from_base64(pk_data);
         if (pk_bytes.size() != crypto::kEd25519PublicKeySize) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid client_pubkey size"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "invalid client_pubkey size");
             return;
         }
         crypto::Ed25519PublicKey client_ed_pk{};
@@ -247,7 +204,7 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         };
         spdlog::info("[CertIssue] issued cert for {} to client {}", fqdn, cert_req.client_pubkey.substr(0, 16));
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 }
 

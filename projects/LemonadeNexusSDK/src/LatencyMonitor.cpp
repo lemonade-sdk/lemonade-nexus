@@ -31,7 +31,7 @@ struct LatencyServerEntry {
 struct LatencyMonitor::Impl {
     LatencyConfig               config;
     std::vector<LatencyServerEntry>    entries;
-    std::size_t                 current_idx{0};
+    mutable std::size_t         current_idx{0};
     ServerSwitchCallback        switch_cb;
 
     // Cooldown tracking
@@ -138,6 +138,7 @@ struct LatencyMonitor::Impl {
     // current_idx if no switch is warranted.
     std::size_t evaluate_switch() const {
         if (entries.empty()) return current_idx;
+        if (current_idx >= entries.size()) current_idx = 0;
         const auto& cur = entries[current_idx];
 
         // Only consider switching if current RTT exceeds threshold
@@ -289,6 +290,7 @@ void LatencyMonitor::set_current_server(const ServerConfig& server) {
 void LatencyMonitor::record_rtt(double rtt_ms) {
     std::lock_guard lock(impl_->mtx);
     if (impl_->entries.empty()) return;
+    if (impl_->current_idx >= impl_->entries.size()) impl_->current_idx = 0;
     auto& cur = impl_->entries[impl_->current_idx];
 
     if (!cur.has_samples) {
@@ -342,6 +344,7 @@ std::vector<ServerLatency> LatencyMonitor::get_stats() const {
 double LatencyMonitor::current_rtt_ms() const {
     std::lock_guard lock(impl_->mtx);
     if (impl_->entries.empty()) return 0.0;
+    if (impl_->current_idx >= impl_->entries.size()) impl_->current_idx = 0;
     return impl_->entries[impl_->current_idx].smoothed_rtt_ms;
 }
 

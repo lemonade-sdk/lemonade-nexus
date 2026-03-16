@@ -484,14 +484,21 @@ std::vector<ServerLatency> LemonadeNexusClient::server_latencies() const {
 Result<AuthResponse> LemonadeNexusClient::authenticate_ed25519() {
     Result<AuthResponse> result;
 
-    if (!impl_->identity.is_valid()) {
+    // Copy identity under lock to avoid racing with other threads
+    Identity local_identity;
+    {
+        std::lock_guard lock(impl_->mutex);
+        local_identity = impl_->identity;
+    }
+
+    if (!local_identity.is_valid()) {
         result.error = "no identity set — call set_identity() first";
         return result;
     }
 
     // Phase 1: Request a challenge nonce from the server
     auto pubkey_b64 = Identity::to_base64(
-        std::span<const uint8_t>(impl_->identity.public_key()));
+        std::span<const uint8_t>(local_identity.public_key()));
 
     json challenge_body;
     challenge_body["pubkey"] = pubkey_b64;
@@ -513,7 +520,7 @@ Result<AuthResponse> LemonadeNexusClient::authenticate_ed25519() {
 
     // Phase 2: Sign the challenge with our Ed25519 private key
     auto challenge_bytes = Identity::from_base64(challenge_b64);
-    auto signature = impl_->identity.sign(std::span<const uint8_t>(challenge_bytes));
+    auto signature = local_identity.sign(std::span<const uint8_t>(challenge_bytes));
     auto signature_b64 = Identity::to_base64(std::span<const uint8_t>(signature));
 
     // Phase 3: Authenticate with the signed challenge
@@ -550,13 +557,20 @@ Result<AuthResponse> LemonadeNexusClient::authenticate_ed25519() {
 Result<AuthResponse> LemonadeNexusClient::register_ed25519(const std::string& user_id) {
     Result<AuthResponse> result;
 
-    if (!impl_->identity.is_valid()) {
+    // Copy identity under lock to avoid racing with other threads
+    Identity local_identity;
+    {
+        std::lock_guard lock(impl_->mutex);
+        local_identity = impl_->identity;
+    }
+
+    if (!local_identity.is_valid()) {
         result.error = "no identity set — call set_identity() first";
         return result;
     }
 
     auto pubkey_b64 = Identity::to_base64(
-        std::span<const uint8_t>(impl_->identity.public_key()));
+        std::span<const uint8_t>(local_identity.public_key()));
 
     json body;
     body["pubkey"] = pubkey_b64;
@@ -1064,14 +1078,21 @@ Result<CertStatus> LemonadeNexusClient::get_cert_status(const std::string& domai
 Result<IssuedCertBundle> LemonadeNexusClient::request_certificate(const std::string& hostname) {
     Result<IssuedCertBundle> result;
 
-    if (!impl_->identity.is_valid()) {
+    // Copy identity under lock to avoid racing with other threads
+    Identity local_identity;
+    {
+        std::lock_guard lock(impl_->mutex);
+        local_identity = impl_->identity;
+    }
+
+    if (!local_identity.is_valid()) {
         result.error = "identity required for certificate request";
         return result;
     }
 
     json body;
     body["hostname"]      = hostname;
-    body["client_pubkey"] = impl_->identity.pubkey_string();
+    body["client_pubkey"] = local_identity.pubkey_string();
 
     int status = 0;
     auto resp = impl_->http_post("/api/certs/issue", body, status);
@@ -1100,7 +1121,14 @@ Result<IssuedCertBundle> LemonadeNexusClient::request_certificate(const std::str
 Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertBundle& bundle) {
     Result<DecryptedCert> result;
 
-    if (!impl_->identity.is_valid()) {
+    // Copy identity under lock to avoid racing with other threads
+    Identity local_identity;
+    {
+        std::lock_guard lock(impl_->mutex);
+        local_identity = impl_->identity;
+    }
+
+    if (!local_identity.is_valid()) {
         result.error = "identity required for decryption";
         return result;
     }
@@ -1117,7 +1145,7 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
     // to a 32-byte X25519 private key
     uint8_t our_x25519_sk[32];
     if (crypto_sign_ed25519_sk_to_curve25519(our_x25519_sk,
-            impl_->identity.private_key().data()) != 0) {
+            local_identity.private_key().data()) != 0) {
         result.error = "Ed25519→X25519 conversion failed";
         return result;
     }
@@ -1198,17 +1226,18 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
                                                        const std::string& password) {
     Result<JoinResult> result;
 
-    // Step 1: check if we already have a session token (e.g. from passkey auth).
-    // If not, authenticate now.
+    // Copy identity and session state under lock to avoid racing with other threads
+    Identity local_identity;
     bool needs_auth = false;
     {
         std::lock_guard lock(impl_->mutex);
+        local_identity = impl_->identity;
         needs_auth = impl_->session_token.empty();
     }
 
     if (needs_auth) {
         Result<AuthResponse> auth;
-        if (impl_->identity.is_valid()) {
+        if (local_identity.is_valid()) {
             auth = authenticate_ed25519();
             if (!auth) {
                 spdlog::warn("[LemonadeNexusClient] Ed25519 auth failed ({}), "
@@ -1232,16 +1261,16 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     // This endpoint handles node ID generation, parent assignment, IP allocation,
     // and hostname assignment all server-side.
     json join_body;
-    if (impl_->identity.is_valid()) {
-        join_body["public_key"] = impl_->identity.pubkey_string(); // "ed25519:base64..."
+    if (local_identity.is_valid()) {
+        join_body["public_key"] = local_identity.pubkey_string(); // "ed25519:base64..."
     }
     join_body["wg_pubkey"] = wg_pubkey;
 
     // Include auth credentials so /api/join can authenticate inline
-    if (impl_->identity.is_valid()) {
+    if (local_identity.is_valid()) {
         // Get a challenge nonce for Ed25519 auth
         auto pubkey_b64 = Identity::to_base64(
-            std::span<const uint8_t>(impl_->identity.public_key()));
+            std::span<const uint8_t>(local_identity.public_key()));
 
         json challenge_body;
         challenge_body["pubkey"] = pubkey_b64;
@@ -1253,7 +1282,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
             auto challenge_b64 = challenge_resp->value("challenge", std::string{});
             if (!challenge_b64.empty()) {
                 auto challenge_bytes = Identity::from_base64(challenge_b64);
-                auto signature = impl_->identity.sign(
+                auto signature = local_identity.sign(
                     std::span<const uint8_t>(challenge_bytes));
                 auto signature_b64 = Identity::to_base64(
                     std::span<const uint8_t>(signature));

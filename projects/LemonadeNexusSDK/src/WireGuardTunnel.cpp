@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -45,6 +46,7 @@ struct WireGuardTunnel::Impl {
     BoringTunBackend   boringtun;              // userspace fallback
     std::string        iface_name;             // e.g. "wg0", "utun7"
     std::string        config_path;            // temp file path for wg-quick
+    mutable std::mutex mutex;                  // guards active, config, iface_name
 
     // Build a wg-quick compatible config string
     std::string build_config_string() const {
@@ -139,7 +141,8 @@ struct WireGuardTunnel::Impl {
                 // We store approximate epoch — just mark as recent
                 auto vpos = line.find(':');
                 if (vpos != std::string::npos) {
-                    std::string val = line.substr(vpos + 2);
+                    auto start = (vpos + 1 < line.size() && line[vpos + 1] == ' ') ? vpos + 2 : vpos + 1;
+                    std::string val = line.substr(start);
                     // Try to parse seconds ago
                     int secs = 0;
                     if (std::sscanf(val.c_str(), "%d", &secs) == 1) {
@@ -151,7 +154,8 @@ struct WireGuardTunnel::Impl {
                 // Parse numeric values
                 auto vpos = line.find(':');
                 if (vpos != std::string::npos) {
-                    std::string val = line.substr(vpos + 2);
+                    auto start = (vpos + 1 < line.size() && line[vpos + 1] == ' ') ? vpos + 2 : vpos + 1;
+                    std::string val = line.substr(start);
                     double rx = 0, tx = 0;
                     char rx_unit[16] = {}, tx_unit[16] = {};
                     if (std::sscanf(val.c_str(), "%lf %15s received, %lf %15s sent",
@@ -182,8 +186,8 @@ WireGuardTunnel::WireGuardTunnel()
     : impl_{std::make_unique<Impl>()} {}
 
 WireGuardTunnel::~WireGuardTunnel() {
-    if (impl_ && impl_->active) {
-        bring_down();
+    if (impl_) {
+        bring_down(); // bring_down() safely handles the not-active case
     }
 }
 
@@ -222,6 +226,7 @@ std::pair<std::string, std::string> WireGuardTunnel::generate_keypair() {
 // ---------------------------------------------------------------------------
 
 std::string WireGuardTunnel::get_wg_config_string() const {
+    std::lock_guard lock(impl_->mutex);
     return impl_->build_config_string();
 }
 
@@ -232,6 +237,7 @@ std::string WireGuardTunnel::get_wg_config_string() const {
 #if defined(__linux__) && !defined(__ANDROID__)
 
 StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config = config;
 
@@ -275,6 +281,7 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
 }
 
 StatusResult WireGuardTunnel::bring_down() {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
@@ -311,6 +318,7 @@ StatusResult WireGuardTunnel::bring_down() {
 }
 
 TunnelStatus WireGuardTunnel::status() const {
+    std::lock_guard lock(impl_->mutex);
     if (!impl_->active) {
         TunnelStatus st;
         st.is_up = false;
@@ -332,6 +340,7 @@ TunnelStatus WireGuardTunnel::status() const {
 
 StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
                                                const std::string& server_endpoint) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
@@ -358,6 +367,7 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
 }
 
 bool WireGuardTunnel::is_active() const {
+    std::lock_guard lock(impl_->mutex);
     return impl_->active;
 }
 
@@ -368,6 +378,7 @@ bool WireGuardTunnel::is_active() const {
 #elif defined(__APPLE__) && TARGET_OS_MAC && !TARGET_OS_IPHONE
 
 StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config = config;
 
@@ -413,6 +424,7 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
 }
 
 StatusResult WireGuardTunnel::bring_down() {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
@@ -449,6 +461,7 @@ StatusResult WireGuardTunnel::bring_down() {
 }
 
 TunnelStatus WireGuardTunnel::status() const {
+    std::lock_guard lock(impl_->mutex);
     if (!impl_->active) {
         TunnelStatus st;
         st.is_up = false;
@@ -474,6 +487,7 @@ TunnelStatus WireGuardTunnel::status() const {
 
 StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
                                                const std::string& server_endpoint) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
@@ -500,6 +514,7 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
 }
 
 bool WireGuardTunnel::is_active() const {
+    std::lock_guard lock(impl_->mutex);
     return impl_->active;
 }
 
@@ -510,6 +525,7 @@ bool WireGuardTunnel::is_active() const {
 #elif defined(_WIN32)
 
 StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config = config;
 
@@ -563,6 +579,7 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
 }
 
 StatusResult WireGuardTunnel::bring_down() {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
@@ -603,6 +620,7 @@ StatusResult WireGuardTunnel::bring_down() {
 }
 
 TunnelStatus WireGuardTunnel::status() const {
+    std::lock_guard lock(impl_->mutex);
     if (!impl_->active) {
         TunnelStatus st;
         st.is_up = false;
@@ -624,6 +642,7 @@ TunnelStatus WireGuardTunnel::status() const {
 
 StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
                                                const std::string& server_endpoint) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
@@ -650,6 +669,7 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
 }
 
 bool WireGuardTunnel::is_active() const {
+    std::lock_guard lock(impl_->mutex);
     return impl_->active;
 }
 
@@ -664,6 +684,7 @@ bool WireGuardTunnel::is_active() const {
 // The SDK provides config generation; the app handles the NE lifecycle.
 
 StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config = config;
     impl_->active = true; // Mark as "configured" — the app manages the actual tunnel
@@ -673,6 +694,7 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
 }
 
 StatusResult WireGuardTunnel::bring_down() {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->active = false;
     result.ok = true;
@@ -681,6 +703,7 @@ StatusResult WireGuardTunnel::bring_down() {
 }
 
 TunnelStatus WireGuardTunnel::status() const {
+    std::lock_guard lock(impl_->mutex);
     TunnelStatus st;
     st.is_up          = impl_->active;
     st.tunnel_ip      = impl_->config.tunnel_ip;
@@ -691,6 +714,7 @@ TunnelStatus WireGuardTunnel::status() const {
 
 StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
                                                const std::string& server_endpoint) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config.server_public_key = server_pubkey;
     impl_->config.server_endpoint   = server_endpoint;
@@ -700,6 +724,7 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
 }
 
 bool WireGuardTunnel::is_active() const {
+    std::lock_guard lock(impl_->mutex);
     return impl_->active;
 }
 
@@ -714,6 +739,7 @@ bool WireGuardTunnel::is_active() const {
 // the Java/Kotlin layer handles the VPN lifecycle.
 
 StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config = config;
     impl_->active = true; // Mark as "configured"
@@ -723,6 +749,7 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
 }
 
 StatusResult WireGuardTunnel::bring_down() {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->active = false;
     result.ok = true;
@@ -731,6 +758,7 @@ StatusResult WireGuardTunnel::bring_down() {
 }
 
 TunnelStatus WireGuardTunnel::status() const {
+    std::lock_guard lock(impl_->mutex);
     TunnelStatus st;
     st.is_up          = impl_->active;
     st.tunnel_ip      = impl_->config.tunnel_ip;
@@ -741,6 +769,7 @@ TunnelStatus WireGuardTunnel::status() const {
 
 StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
                                                const std::string& server_endpoint) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config.server_public_key = server_pubkey;
     impl_->config.server_endpoint   = server_endpoint;
@@ -750,6 +779,7 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
 }
 
 bool WireGuardTunnel::is_active() const {
+    std::lock_guard lock(impl_->mutex);
     return impl_->active;
 }
 
@@ -760,6 +790,7 @@ bool WireGuardTunnel::is_active() const {
 #else
 
 StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     impl_->config = config;
     result.error = "WireGuard tunnel management not supported on this platform";
@@ -768,23 +799,27 @@ StatusResult WireGuardTunnel::bring_up(const WireGuardConfig& config) {
 }
 
 StatusResult WireGuardTunnel::bring_down() {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     result.error = "WireGuard tunnel management not supported on this platform";
     return result;
 }
 
 TunnelStatus WireGuardTunnel::status() const {
+    std::lock_guard lock(impl_->mutex);
     return {};
 }
 
 StatusResult WireGuardTunnel::update_endpoint(const std::string& /*server_pubkey*/,
                                                const std::string& /*server_endpoint*/) {
+    std::lock_guard lock(impl_->mutex);
     StatusResult result;
     result.error = "WireGuard tunnel management not supported on this platform";
     return result;
 }
 
 bool WireGuardTunnel::is_active() const {
+    std::lock_guard lock(impl_->mutex);
     return false;
 }
 

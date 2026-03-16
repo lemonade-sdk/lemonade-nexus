@@ -8,6 +8,7 @@
 #include <asio.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -233,7 +234,7 @@ private:
     asio::io_context* io_{nullptr};
     std::unique_ptr<asio::steady_timer> rotation_timer_;
     uint32_t rotation_interval_sec_{604800}; // default: 7 days
-    bool rotation_timer_running_{false};
+    std::atomic<bool> rotation_timer_running_{false};
 
     // Dynamic Shamir parameters
     float quorum_ratio_{0.75f};    // K = ceil(N * this), meaning 25% can be offline

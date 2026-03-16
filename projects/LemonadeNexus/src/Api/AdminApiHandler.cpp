@@ -92,24 +92,17 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // POST /api/credentials/request — DDNS credential distribution
     priv.Post("/api/credentials/request", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return;
-        }
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
 
         auto root_privkey = ctx_.key_wrapping.unlock_identity({});
         auto root_pubkey = ctx_.key_wrapping.load_identity_pubkey();
         if (!root_privkey || !root_pubkey) {
-            res.status = 503;
-            nlohmann::json j = network::ErrorResponse{.error = "root identity not available"};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, "root identity not available", 503);
             return;
         }
 
-        auto response = ctx_.ddns.handle_credential_request(body, *root_privkey, *root_pubkey);
+        auto response = ctx_.ddns.handle_credential_request(*body_opt, *root_privkey, *root_pubkey);
         if (!response) {
             res.status = 403;
             nlohmann::json j = network::CredentialErrorResponse{.success = false, .error = "verification failed"};
@@ -130,7 +123,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .binary_approved = ctx_.attestation.is_approved_binary(ctx_.attestation.self_hash()),
         };
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // POST /api/ddns/update — Force DDNS update
@@ -141,9 +134,8 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .success = ok,
             .ip      = ctx_.ddns.last_ip(),
         };
-        res.status = ok ? 200 : 500;
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j, ok ? 200 : 500);
     }));
 
     // GET /api/attestation/manifests — List binary attestation manifests
@@ -167,7 +159,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             });
         }
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // POST /api/attestation/fetch — Trigger GitHub manifest fetch
@@ -180,7 +172,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .total_manifests = ctx_.attestation.get_manifests().size(),
         };
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // GET /api/trust/status — Trust tier status
@@ -209,7 +201,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             });
         }
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // GET /api/trust/peer/{pubkey} — Peer trust detail
@@ -229,7 +221,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .failed_verifications  = state.failed_verifications,
         };
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // GET /api/enrollment/status — List pending enrollments
@@ -247,7 +239,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             resp.enrollments.push_back(ballot_to_entry(b, false));
         }
         nlohmann::json j = resp;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // GET /api/enrollment/{id} — Get specific enrollment
@@ -260,20 +252,18 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             if (b.request_id == request_id) {
                 auto entry = ballot_to_entry(b, true);
                 nlohmann::json j = entry;
-                res.set_content(j.dump(), "application/json");
+                json_response(res, j);
                 return;
             }
         }
 
-        res.status = 404;
-        nlohmann::json j = network::ErrorResponse{.error = "enrollment not found"};
-        res.set_content(j.dump(), "application/json");
+        error_response(res, "enrollment not found", 404);
     }));
 
     // GET /api/governance/params — Current governance params
     priv.Get("/api/governance/params", require_auth(ctx_.auth,
         [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
-        res.set_content(ctx_.governance.current_params().dump(), "application/json");
+        json_response(res, ctx_.governance.current_params());
     }));
 
     // GET /api/governance/proposals — List governance proposals
@@ -307,29 +297,26 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             entries.push_back(std::move(entry));
         }
         nlohmann::json j = entries;
-        res.set_content(j.dump(), "application/json");
+        json_response(res, j);
     }));
 
     // POST /api/governance/propose — Create governance proposal
     priv.Post("/api/governance/propose", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
         try {
-            auto body = nlohmann::json::parse(req.body);
-            auto propose_req = body.get<network::GovernanceProposeRequest>();
+            auto body_opt = parse_body(req, res);
+            if (!body_opt) return;
+            auto propose_req = body_opt->get<network::GovernanceProposeRequest>();
 
             if (propose_req.new_value.empty()) {
-                res.status = 400;
-                nlohmann::json j = network::ErrorResponse{.error = "new_value required"};
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "new_value required");
                 return;
             }
 
             auto param = static_cast<gossip::GovernableParam>(propose_req.parameter);
             auto proposal_id = ctx_.governance.create_proposal(param, propose_req.new_value, propose_req.rationale);
             if (proposal_id.empty()) {
-                res.status = 400;
-                nlohmann::json j = network::ErrorResponse{.error = "invalid proposal (check parameter and value)"};
-                res.set_content(j.dump(), "application/json");
+                error_response(res, "invalid proposal (check parameter and value)");
                 return;
             }
 
@@ -338,11 +325,9 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 .status      = "created",
             };
             nlohmann::json j = resp;
-            res.set_content(j.dump(), "application/json");
+            json_response(res, j);
         } catch (const std::exception& e) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = e.what()};
-            res.set_content(j.dump(), "application/json");
+            error_response(res, e.what());
         }
     }));
 }

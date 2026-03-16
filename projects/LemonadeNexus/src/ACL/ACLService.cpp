@@ -38,6 +38,7 @@ void ACLService::set_delta_callback(AclDeltaCallback cb) {
 }
 
 void ACLService::on_start() {
+    std::lock_guard lock(mutex_);
     auto parent = db_path_.parent_path();
     if (!parent.empty()) {
         std::filesystem::create_directories(parent);

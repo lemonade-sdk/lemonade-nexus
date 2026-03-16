@@ -6,9 +6,11 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <concepts>
 #include <optional>
 #include <string>
+#include <string_view>
 
 // Forward declarations — handlers only need references
 namespace nexus::core {
@@ -68,6 +70,53 @@ struct ApiContext {
     std::string                       tunnel_bind_ip;
 };
 
+// ---------------------------------------------------------------------------
+// Free helper functions (formerly protected statics on IRequestHandler).
+// Usable from any handler without dependent-base-class lookup issues.
+// ---------------------------------------------------------------------------
+
+/// Parse JSON request body. Returns nullopt and sets 400 on failure.
+inline std::optional<nlohmann::json> parse_body(
+        const httplib::Request& req, httplib::Response& res) {
+    auto body = nlohmann::json::parse(req.body, nullptr, false);
+    if (body.is_discarded()) {
+        res.status = 400;
+        nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
+        res.set_content(j.dump(), "application/json");
+        return std::nullopt;
+    }
+    return body;
+}
+
+/// Send a JSON response with the given status code.
+inline void json_response(httplib::Response& res, const nlohmann::json& j,
+                           int status = 200) {
+    res.status = status;
+    res.set_content(j.dump(), "application/json");
+}
+
+/// Send an error response.
+inline void error_response(httplib::Response& res, const std::string& error,
+                            int status = 400) {
+    res.status = status;
+    nlohmann::json j = network::ErrorResponse{.error = error};
+    res.set_content(j.dump(), "application/json");
+}
+
+/// Ensure a pubkey string has the "ed25519:" prefix for tree storage.
+[[nodiscard]] inline std::string normalize_pubkey(const std::string& pk) {
+    constexpr std::string_view prefix = "ed25519:";
+    if (pk.starts_with(prefix)) return pk;
+    return std::string(prefix) + pk;
+}
+
+/// Current Unix epoch timestamp in seconds.
+[[nodiscard]] inline uint64_t epoch_seconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
 /// CRTP base for HTTP request handler groups.
 /// Derived must implement:
 ///   void do_register_routes(httplib::Server& pub, httplib::Server& priv)
@@ -81,34 +130,6 @@ public:
 
 protected:
     ~IRequestHandler() = default;
-
-    /// Parse JSON request body. Returns nullopt and sets 400 on failure.
-    static std::optional<nlohmann::json> parse_body(
-            const httplib::Request& req, httplib::Response& res) {
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (body.is_discarded()) {
-            res.status = 400;
-            nlohmann::json j = network::ErrorResponse{.error = "invalid json"};
-            res.set_content(j.dump(), "application/json");
-            return std::nullopt;
-        }
-        return body;
-    }
-
-    /// Send a JSON response with the given status code.
-    static void json_response(httplib::Response& res, const nlohmann::json& j,
-                              int status = 200) {
-        res.status = status;
-        res.set_content(j.dump(), "application/json");
-    }
-
-    /// Send an error response.
-    static void error_response(httplib::Response& res, const std::string& error,
-                               int status = 400) {
-        res.status = status;
-        nlohmann::json j = network::ErrorResponse{.error = error};
-        res.set_content(j.dump(), "application/json");
-    }
 
 private:
     [[nodiscard]] Derived& self() { return static_cast<Derived&>(*this); }

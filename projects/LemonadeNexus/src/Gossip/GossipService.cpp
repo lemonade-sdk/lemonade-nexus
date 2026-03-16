@@ -806,19 +806,6 @@ void GossipService::on_gossip_tick() {
         expire_enrollment_ballots();
     }
 
-    // Governance: expire proposals and update Tier1 peer count
-    if (governance_) {
-        governance_->expire_proposals();
-        uint32_t tier1_count = 0;
-        {
-            std::lock_guard lock(peers_mutex_);
-            for (const auto& p : peers_) {
-                if (p.trust_tier == core::TrustTier::Tier1) ++tier1_count;
-            }
-        }
-        governance_->set_tier1_peer_count(tier1_count);
-    }
-
     // Record peer health observations and check for root key rotation
     if (root_key_chain_) {
         record_peer_health_tick();
@@ -837,13 +824,27 @@ void GossipService::on_gossip_tick() {
     {
         std::lock_guard lock(peers_mutex_);
 
+        // Governance: expire proposals and update Tier1 peer count
+        // (done inside the same lock scope as peer selection to avoid TOCTOU)
+        if (governance_) {
+            governance_->expire_proposals();
+            uint32_t tier1_count = 0;
+            for (const auto& p : peers_) {
+                if (p.trust_tier == core::TrustTier::Tier1) ++tier1_count;
+            }
+            governance_->set_tier1_peer_count(tier1_count);
+        }
+
         if (peers_.empty()) {
             return;
         }
 
         // Pick a random peer
         std::uniform_int_distribution<std::size_t> dist(0, peers_.size() - 1);
-        chosen = peers_[dist(rng_)];
+        {
+            std::lock_guard rng_lock(rng_mutex_);
+            chosen = peers_[dist(rng_)];
+        }
     }
 
     // Send digest outside of the lock to avoid holding it during I/O
@@ -1047,9 +1048,12 @@ std::vector<GossipPeer> GossipService::random_peers(std::size_t count) const {
 
     // Fisher-Yates partial shuffle to pick `count` random peers
     std::vector<GossipPeer> result = peers_;
-    for (std::size_t i = 0; i < count; ++i) {
-        std::uniform_int_distribution<std::size_t> dist(i, result.size() - 1);
-        std::swap(result[i], result[dist(rng_)]);
+    {
+        std::lock_guard rng_lock(rng_mutex_);
+        for (std::size_t i = 0; i < count; ++i) {
+            std::uniform_int_distribution<std::size_t> dist(i, result.size() - 1);
+            std::swap(result[i], result[dist(rng_)]);
+        }
     }
     result.resize(count);
     return result;
@@ -1065,9 +1069,14 @@ void GossipService::load_server_certificate() {
     if (cert_env) {
         try {
             auto j = json::parse(cert_env->data);
-            our_certificate_ = j.get<ServerCertificate>();
+            auto cert = j.get<ServerCertificate>();
+            std::string server_id = cert.server_id;
+            {
+                std::lock_guard lock(peers_mutex_);
+                our_certificate_ = std::move(cert);
+            }
             spdlog::info("[{}] loaded server certificate (id: {})",
-                          name(), our_certificate_->server_id);
+                          name(), server_id);
         } catch (const std::exception& e) {
             spdlog::warn("[{}] failed to parse server certificate: {}", name(), e.what());
         }
@@ -1671,8 +1680,8 @@ void GossipService::handle_enrollment_vote(
 
         crypto::Ed25519PublicKey pk{};
         crypto::Ed25519Signature sig{};
-        std::memcpy(pk.data(), pk_bytes.data(), pk_bytes.size());
-        std::memcpy(sig.data(), sig_bytes.data(), sig_bytes.size());
+        std::memcpy(pk.data(), pk_bytes.data(), std::min(pk_bytes.size(), pk.size()));
+        std::memcpy(sig.data(), sig_bytes.data(), std::min(sig_bytes.size(), sig.size()));
 
         if (!crypto_.ed25519_verify(pk, canonical_bytes, sig)) {
             spdlog::warn("[{}] enrollment vote signature verification failed for voter {}",
@@ -1947,8 +1956,13 @@ void GossipService::distribute_shamir_shares() {
                 if (recipient_pk_bytes.size() != crypto::kEd25519PublicKeySize) break;
 
                 crypto::Ed25519PublicKey recipient_ed_pk{};
+                if (recipient_pk_bytes.size() != recipient_ed_pk.size()) {
+                    spdlog::error("[{}] recipient pubkey size mismatch ({} vs expected {})",
+                                  name(), recipient_pk_bytes.size(), recipient_ed_pk.size());
+                    break;
+                }
                 std::memcpy(recipient_ed_pk.data(), recipient_pk_bytes.data(),
-                           recipient_pk_bytes.size());
+                           std::min(recipient_pk_bytes.size(), recipient_ed_pk.size()));
 
                 // Convert Ed25519 keys to X25519 for DH
                 auto recipient_x_pk = crypto_.ed25519_pk_to_x25519(recipient_ed_pk);
@@ -2016,6 +2030,11 @@ void GossipService::handle_shamir_share_offer(const asio::ip::udp::endpoint& sen
 
         // Decrypt the share using X25519 DH
         auto sender_pk_bytes = crypto::from_base64(sender_peer->pubkey);
+        if (sender_pk_bytes.size() != crypto::kEd25519PublicKeySize) {
+            spdlog::error("[{}] sender pubkey size mismatch in Shamir share offer ({} vs expected {})",
+                          name(), sender_pk_bytes.size(), crypto::kEd25519PublicKeySize);
+            return;
+        }
         crypto::Ed25519PublicKey sender_ed_pk{};
         std::memcpy(sender_ed_pk.data(), sender_pk_bytes.data(),
                    std::min(sender_pk_bytes.size(), sender_ed_pk.size()));

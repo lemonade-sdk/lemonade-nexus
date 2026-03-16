@@ -184,9 +184,20 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
         spdlog::warn("[{}] invalid encrypted key format", name());
         return std::nullopt;
     }
+    if (colon + 1 >= content.size()) {
+        spdlog::warn("[{}] invalid encrypted key format: empty ciphertext", name());
+        return std::nullopt;
+    }
 
-    auto nonce_bytes = from_hex(content.substr(0, colon));
-    auto ct_bytes = from_hex(content.substr(colon + 1));
+    std::vector<uint8_t> nonce_bytes;
+    std::vector<uint8_t> ct_bytes;
+    try {
+        nonce_bytes = from_hex(content.substr(0, colon));
+        ct_bytes = from_hex(content.substr(colon + 1));
+    } catch (...) {
+        spdlog::warn("[{}] invalid hex in encrypted key file", name());
+        return std::nullopt;
+    }
 
     if (nonce_bytes.size() != kAesGcmNonceSize) {
         spdlog::warn("[{}] invalid nonce size in encrypted key: {}", name(), nonce_bytes.size());
