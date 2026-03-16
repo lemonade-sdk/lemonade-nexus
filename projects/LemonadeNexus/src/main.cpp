@@ -29,6 +29,7 @@
 #include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
+#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
 
 // CRTP request handlers
 #include <LemonadeNexus/Api/PublicApiHandler.hpp>
@@ -443,6 +444,39 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
+    // WireGuard interface — server-side tunnel endpoint
+    // ========================================================================
+    nexus::wireguard::WireGuardService wireguard_service{
+        "wg0", std::filesystem::path{config.data_root} / "wireguard"};
+    wireguard_service.start();
+
+    // Derive Curve25519 keypair from Ed25519 identity for WireGuard
+    std::string wg_server_privkey_b64;
+    if (root_privkey) {
+        auto x_sk = nexus::crypto::SodiumCryptoService::ed25519_sk_to_x25519(*root_privkey);
+        wg_server_privkey_b64 = nexus::crypto::to_base64(
+            std::span<const uint8_t>(x_sk.data(), x_sk.size()));
+    }
+
+    // Set up the WireGuard interface with the server's tunnel IP
+    if (!wg_server_privkey_b64.empty() && !tunnel_bind_ip.empty()) {
+        nexus::wireguard::WgInterfaceConfig wg_iface;
+        wg_iface.private_key = wg_server_privkey_b64;
+        wg_iface.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
+        wg_iface.listen_port = config.udp_port;
+
+        if (wireguard_service.setup_interface(wg_iface, {})) {
+            spdlog::info("WireGuard: wg0 up on :{} with tunnel IP {}/10",
+                          config.udp_port, tunnel_bind_ip);
+        } else {
+            spdlog::warn("WireGuard: failed to set up wg0 — clients will not be able to connect. "
+                          "Ensure wireguard-tools and kernel module are installed.");
+        }
+    } else {
+        spdlog::warn("WireGuard: skipping wg0 setup (no identity key or tunnel IP)");
+    }
+
+    // ========================================================================
     // HTTP Control Plane -- Dual-server architecture
     // ========================================================================
     nexus::network::HttpServer http_server{http_port, "0.0.0.0",
@@ -496,6 +530,7 @@ int main(int argc, char* argv[]) {
         .tee              = tee,
         .trust_policy     = trust_policy,
         .governance       = governance,
+        .wireguard        = &wireguard_service,
         .server_fqdn      = server_fqdn,
         .server_public_ip = server_public_ip,
         .tunnel_bind_ip   = tunnel_bind_ip,
@@ -655,6 +690,7 @@ int main(int argc, char* argv[]) {
         acme_renewal_thread.join();
     }
     hole_punch.stop();
+    wireguard_service.stop();
     if (private_http_server) {
         private_http_server->stop();
     }

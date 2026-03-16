@@ -9,9 +9,12 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
 
 #include <spdlog/spdlog.h>
+
+#include <cstring>
 
 namespace {
 /// Ensure a pubkey string has the "ed25519:" prefix for tree storage.
@@ -165,6 +168,37 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         ? "10.64.0.1"
                                         : ctx_.tunnel_bind_ip;
 
+        // Add the client as a WireGuard peer on the server interface
+        auto client_wg_pubkey = body.value("wg_pubkey", std::string{});
+        if (ctx_.wireguard && !client_wg_pubkey.empty() && !alloc.base_network.empty()) {
+            // Convert Ed25519 wg_pubkey to Curve25519 if it has the ed25519: prefix
+            std::string peer_wg_key = client_wg_pubkey;
+            constexpr std::string_view ed_prefix = "ed25519:";
+            if (peer_wg_key.starts_with(ed_prefix)) {
+                // Client sent Ed25519 key — convert to Curve25519 for WireGuard
+                auto ed_bytes = crypto::from_base64(peer_wg_key.substr(ed_prefix.size()));
+                if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
+                    crypto::Ed25519PublicKey ed_pk{};
+                    std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
+                    auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
+                    peer_wg_key = crypto::to_base64(
+                        std::span<const uint8_t>(x_pk.data(), x_pk.size()));
+                }
+            }
+
+            if (ctx_.wireguard->add_peer(peer_wg_key, alloc.base_network, "")) {
+                spdlog::info("[Join] added WG peer {} allowed_ips={}", peer_wg_key.substr(0, 12), alloc.base_network);
+            } else {
+                spdlog::warn("[Join] failed to add WG peer for node {}", node_id);
+            }
+        }
+
+        // Build the WireGuard endpoint: public_ip:udp_port
+        std::string wg_endpoint;
+        if (!ctx_.server_public_ip.empty()) {
+            wg_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
+        }
+
         nlohmann::json resp = {
             {"token",            auth_result.session_token},
             {"node_id",          node_id},
@@ -175,11 +209,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                      ? ctx_.config.private_http_port
                                      : ctx_.config.http_port},
             {"wg_server_pubkey", wg_server_pubkey},
-            {"wg_endpoint",      ctx_.config.bind_address + ":"
-                                     + std::to_string(ctx_.config.relay_port)},
+            {"wg_endpoint",      wg_endpoint},
             {"dns_servers",      nlohmann::json::array({server_tunnel})},
         };
-        spdlog::info("[Join] node={} tunnel_ip={}", node_id, alloc.base_network);
+        spdlog::info("[Join] node={} tunnel_ip={} wg_endpoint={}", node_id, alloc.base_network, wg_endpoint);
         res.set_content(resp.dump(), "application/json");
     });
 

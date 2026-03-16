@@ -119,22 +119,46 @@ struct NodeDetailView: View {
 
     // MARK: - Network
 
+    private var hasNetworkInfo: Bool {
+        node.tunnel_ip != nil || node.private_subnet != nil || node.listen_endpoint != nil
+    }
+
     private var networkSection: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionHeaderView(title: "Network", icon: "network")
 
-            VStack(spacing: 10) {
-                if let tunnelIP = node.tunnel_ip {
-                    propertyRow("Tunnel IP", value: tunnelIP, monospaced: true)
+            if node.nodeType == .customer || node.nodeType == .root {
+                VStack(spacing: 10) {
+                    HStack {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.textTertiary)
+                        Text(node.nodeType == .root
+                             ? "Root node manages the network but does not have a tunnel address."
+                             : "Group nodes organize endpoints. Select a child endpoint to see network details.")
+                            .font(.subheadline)
+                            .foregroundColor(.textSecondary)
+                    }
                 }
-                if let subnet = node.private_subnet {
-                    propertyRow("Private Subnet", value: subnet, monospaced: true)
+                .cardStyle()
+            } else {
+                VStack(spacing: 10) {
+                    if let tunnelIP = node.tunnel_ip {
+                        propertyRow("Tunnel IP", value: tunnelIP, monospaced: true)
+                    }
+                    if let subnet = node.private_subnet {
+                        propertyRow("Private Subnet", value: subnet, monospaced: true)
+                    }
+                    if let endpoint = node.listen_endpoint {
+                        propertyRow("Listen Endpoint", value: endpoint, monospaced: true)
+                    }
+                    if !hasNetworkInfo {
+                        Text("No network info assigned yet.")
+                            .font(.subheadline)
+                            .foregroundColor(.textTertiary)
+                    }
                 }
-                if let endpoint = node.listen_endpoint {
-                    propertyRow("Listen Endpoint", value: endpoint, monospaced: true)
-                }
+                .cardStyle()
             }
-            .cardStyle()
         }
     }
 

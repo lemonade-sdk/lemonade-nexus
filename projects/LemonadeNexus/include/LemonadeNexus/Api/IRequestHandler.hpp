@@ -36,6 +36,9 @@ namespace nexus::relay {
     class RelayService;
     class RelayDiscoveryService;
 }
+namespace nexus::wireguard {
+    class WireGuardService;
+}
 
 namespace nexus::api {
 
@@ -59,6 +62,7 @@ struct ApiContext {
     core::TeeAttestationService&      tee;
     core::TrustPolicyService&         trust_policy;
     core::GovernanceService&          governance;
+    wireguard::WireGuardService*      wireguard{nullptr};
     std::string                       server_fqdn;
     std::string                       server_public_ip;
     std::string                       tunnel_bind_ip;

@@ -166,11 +166,21 @@ struct TreeBrowserView: View {
                 nodes.append(root)
                 appState.rootNode = root
             }
-            // Then load children
+            // Then load children (Customer groups, relays, etc.)
             let childDicts = try appState.sdk.getTreeChildren(parentId: rootId)
             let childData = try JSONSerialization.data(withJSONObject: childDicts, options: [])
             let children = try JSONDecoder().decode([TreeNode].self, from: childData)
             nodes.append(contentsOf: children)
+
+            // Load grandchildren (Endpoints under Customer groups)
+            for child in children where child.nodeType == .customer {
+                if let grandchildDicts = try? appState.sdk.getTreeChildren(parentId: child.id) {
+                    let gcData = try JSONSerialization.data(withJSONObject: grandchildDicts, options: [])
+                    let grandchildren = try JSONDecoder().decode([TreeNode].self, from: gcData)
+                    nodes.append(contentsOf: grandchildren)
+                }
+            }
+
             localTreeNodes = nodes
         } catch {
             appState.addActivity(.error, "Failed to load tree: \(error.localizedDescription)")

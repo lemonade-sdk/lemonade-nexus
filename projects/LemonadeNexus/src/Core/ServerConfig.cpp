@@ -394,7 +394,7 @@ bool validate_config(const ServerConfig& config) {
         spdlog::warn("Config: rp_id is empty — WebAuthn passkeys will not validate");
     }
 
-    spdlog::info("Config: HTTP:{} UDP:{} Gossip:{} STUN:{} Relay:{} DNS:{} data={}",
+    spdlog::info("Config: HTTP:{} UDP/WG:{} Gossip:{} STUN:{} Relay:{} DNS:{} data={}",
                   config.http_port, config.udp_port, config.gossip_port,
                   config.stun_port, config.relay_port, config.dns_port,
                   config.data_root);
