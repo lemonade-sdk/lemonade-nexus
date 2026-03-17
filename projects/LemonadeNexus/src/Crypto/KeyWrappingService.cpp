@@ -199,7 +199,9 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
         return std::nullopt;
     }
 
-    if (nonce_bytes.size() != kAesGcmNonceSize) {
+    // Accept both AES-GCM (12-byte) and XChaCha20-Poly1305 (24-byte) nonces
+    constexpr std::size_t kXChaCha20NonceSize = 24;
+    if (nonce_bytes.size() != kAesGcmNonceSize && nonce_bytes.size() != kXChaCha20NonceSize) {
         spdlog::warn("[{}] invalid nonce size in encrypted key: {}", name(), nonce_bytes.size());
         return std::nullopt;
     }

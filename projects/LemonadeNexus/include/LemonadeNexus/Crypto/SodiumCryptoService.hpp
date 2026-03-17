@@ -56,6 +56,11 @@ public:
     [[nodiscard]] static X25519PublicKey ed25519_pk_to_x25519(const Ed25519PublicKey& ed_pk);
     [[nodiscard]] static X25519PrivateKey ed25519_sk_to_x25519(const Ed25519PrivateKey& ed_sk);
 
+    /// Returns true if hardware AES-256-GCM is available on this CPU.
+    [[nodiscard]] bool aes_gcm_available() const { return aes_gcm_available_; }
+
+private:
+    bool aes_gcm_available_{false};
 };
 
 } // namespace nexus::crypto
