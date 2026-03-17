@@ -234,6 +234,23 @@ int main(int argc, char* argv[]) {
         root_kp.private_key = *root_privkey;
         root_kp.public_key = *root_pubkey;
         root_key_chain.initialize_genesis(root_kp);
+
+        // If the tree has a root node with a different pubkey (e.g. identity was
+        // regenerated after keypair files were lost), update it automatically.
+        auto identity_pk = "ed25519:" + nexus::crypto::to_base64(
+            std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
+        auto root_node = tree.get_node("root");
+        if (root_node && root_node->mgmt_pubkey != identity_pk) {
+            spdlog::warn("Root node pubkey mismatch — updating to match new server identity");
+            spdlog::info("  old: {}", root_node->mgmt_pubkey);
+            spdlog::info("  new: {}", identity_pk);
+            auto updated = *root_node;
+            updated.mgmt_pubkey = identity_pk;
+            for (auto& a : updated.assignments) {
+                a.management_pubkey = identity_pk;
+            }
+            tree.update_node_direct("root", updated);
+        }
     }
 
     nexus::core::GovernanceService governance{crypto, storage, root_key_chain};
