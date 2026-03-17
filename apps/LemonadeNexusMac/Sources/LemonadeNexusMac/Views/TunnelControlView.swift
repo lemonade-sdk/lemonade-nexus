@@ -25,11 +25,17 @@ struct TunnelControlView: View {
         .background(Color.surfaceDark)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button(action: { Task { await appState.refreshMeshStatus() } }) {
+                Button(action: {
+                    appState.refreshTunnelStatus()
+                    Task { await appState.refreshMeshStatus() }
+                }) {
                     Image(systemName: "arrow.clockwise")
                 }
                 .help("Refresh Status")
             }
+        }
+        .onAppear {
+            appState.refreshTunnelStatus()
         }
     }
 
@@ -37,19 +43,29 @@ struct TunnelControlView: View {
         HStack(spacing: 16) {
             ZStack {
                 Circle()
-                    .fill((appState.tunnelIP != nil ? Color.green : Color.red).opacity(0.2))
+                    .fill((appState.isTunnelActive ? Color.green : Color.red).opacity(0.2))
                     .frame(width: 48, height: 48)
-                Image(systemName: appState.tunnelIP != nil ? "checkmark.shield.fill" : "shield.slash")
-                    .foregroundColor(appState.tunnelIP != nil ? .green : .red)
+                Image(systemName: appState.isTunnelActive ? "checkmark.shield.fill" : "shield.slash")
+                    .foregroundColor(appState.isTunnelActive ? .green : .red)
                     .font(.title2)
             }
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Tunnel Status")
+                Text("VPN Tunnel")
                     .font(.headline)
-                Text(appState.tunnelIP != nil ? "Connected" : "Disconnected")
-                    .font(.subheadline)
-                    .foregroundColor(.textSecondary)
+                if appState.isTunnelTransitioning {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Connecting...")
+                            .font(.subheadline)
+                            .foregroundColor(.textSecondary)
+                    }
+                } else {
+                    Text(appState.isTunnelActive ? "Active" : "Inactive")
+                        .font(.subheadline)
+                        .foregroundColor(.textSecondary)
+                }
                 if let ip = appState.tunnelIP {
                     Text(ip)
                         .font(.caption.monospaced())
@@ -59,7 +75,7 @@ struct TunnelControlView: View {
 
             Spacer()
 
-            if let since = appState.connectedSince {
+            if let since = appState.connectedSince, appState.isTunnelActive {
                 VStack(alignment: .trailing, spacing: 2) {
                     Text("Uptime")
                         .font(.caption2)
@@ -69,6 +85,20 @@ struct TunnelControlView: View {
                         .foregroundColor(.textSecondary)
                 }
             }
+
+            Button(action: {
+                Task {
+                    if appState.isTunnelActive {
+                        await appState.disconnectTunnel()
+                    } else {
+                        await appState.connectTunnel()
+                    }
+                }
+            }) {
+                Text(appState.isTunnelActive ? "Disconnect" : "Connect")
+            }
+            .buttonStyle(LemonButtonStyle(isProminent: !appState.isTunnelActive))
+            .disabled(appState.isTunnelTransitioning || appState.tunnelIP == nil)
         }
         .cardStyle()
     }

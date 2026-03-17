@@ -1685,6 +1685,10 @@ std::string LemonadeNexusClient::get_wireguard_config() const {
     return impl_->wg_tunnel.get_wg_config_string();
 }
 
+std::string LemonadeNexusClient::get_wireguard_config_json() const {
+    return impl_->wg_tunnel.get_wg_config_json();
+}
+
 StatusResult LemonadeNexusClient::tunnel_up(const WireGuardConfig& config) {
     return impl_->wg_tunnel.bring_up(config);
 }

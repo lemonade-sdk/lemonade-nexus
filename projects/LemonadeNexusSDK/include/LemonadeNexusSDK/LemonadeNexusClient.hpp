@@ -266,6 +266,9 @@ public:
     /// Useful on mobile platforms where the app manages the VPN lifecycle.
     [[nodiscard]] std::string get_wireguard_config() const;
 
+    /// Get the WireGuard configuration as JSON (matching ln_tunnel_up format).
+    [[nodiscard]] std::string get_wireguard_config_json() const;
+
     /// Manually bring up the WireGuard tunnel with the given config.
     [[nodiscard]] StatusResult tunnel_up(const WireGuardConfig& config);
 

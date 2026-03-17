@@ -62,7 +62,12 @@ final class AppState: ObservableObject {
     @Published var meshStatus: NexusSDK.SDKMeshStatus?
     @Published var meshPeers: [NexusSDK.SDKMeshPeer] = []
 
+    // MARK: - Tunnel
+    @Published var isTunnelActive: Bool = false
+    @Published var isTunnelTransitioning: Bool = false
+
     let sdk: NexusSDK
+    let tunnelManager = TunnelManager.shared
 
     init() {
         let savedURL = UserDefaults.standard.string(forKey: "serverURL") ?? "https://localhost:9100"
@@ -245,6 +250,11 @@ final class AppState: ObservableObject {
             }
 
             addActivity(.success, "Joined network — tunnel IP: \(joinResult.tunnel_ip ?? "pending")")
+
+            // Auto-connect the WireGuard tunnel after joining
+            if joinResult.tunnel_ip != nil {
+                await connectTunnel()
+            }
         } catch {
             // Join failure is non-fatal — user is still authenticated.
             // Fall back to refreshing tree to discover our node info.
@@ -376,6 +386,13 @@ final class AppState: ObservableObject {
         meshStatus = nil
         meshPeers = []
 
+        // Tear down tunnel
+        if isTunnelActive {
+            Task { try? await tunnelManager.bringDown() }
+        }
+        isTunnelActive = false
+        isTunnelTransitioning = false
+
         sessionToken = nil
         userId = nil
         isAuthenticated = false
@@ -409,6 +426,46 @@ final class AppState: ObservableObject {
         await refreshRelays()
         await refreshTrustStatus()
         await refreshMeshStatus()
+    }
+
+    // MARK: - Tunnel Control
+
+    func connectTunnel() async {
+        isTunnelTransitioning = true
+        do {
+            // Get WireGuard config as JSON from SDK (matches ln_tunnel_up format)
+            guard let configJSON = sdk.wireguardConfigJSON else {
+                throw TunnelError.noConfig
+            }
+            try await tunnelManager.bringUp(config: configJSON)
+            isTunnelActive = true
+            addActivity(.success, "VPN tunnel connected")
+        } catch is CancellationError {
+            addActivity(.info, "Tunnel authorization cancelled")
+        } catch let error where error.localizedDescription == "Authorization cancelled" {
+            addActivity(.info, "Tunnel authorization cancelled")
+        } catch {
+            addActivity(.error, "Tunnel failed: \(error.localizedDescription)")
+            errorMessage = error.localizedDescription
+        }
+        isTunnelTransitioning = false
+    }
+
+    func disconnectTunnel() async {
+        isTunnelTransitioning = true
+        do {
+            try await tunnelManager.bringDown()
+            isTunnelActive = false
+            addActivity(.info, "VPN tunnel disconnected")
+        } catch {
+            addActivity(.error, "Tunnel teardown failed: \(error.localizedDescription)")
+        }
+        isTunnelTransitioning = false
+    }
+
+    func refreshTunnelStatus() {
+        tunnelManager.refreshStatus()
+        isTunnelActive = tunnelManager.isTunnelActive
     }
 
     // MARK: - Mesh P2P

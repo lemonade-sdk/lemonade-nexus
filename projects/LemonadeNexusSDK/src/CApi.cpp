@@ -773,6 +773,13 @@ char* ln_get_wg_config(ln_client_t* client) {
     return strdup_str(cfg);
 }
 
+char* ln_get_wg_config_json(ln_client_t* client) {
+    if (!client) return nullptr;
+    auto cfg = client->client.get_wireguard_config_json();
+    if (cfg.empty()) return nullptr;
+    return strdup_str(cfg);
+}
+
 char* ln_wg_generate_keypair(void) {
     auto [priv, pub] = lnsdk::WireGuardTunnel::generate_keypair();
     json j;

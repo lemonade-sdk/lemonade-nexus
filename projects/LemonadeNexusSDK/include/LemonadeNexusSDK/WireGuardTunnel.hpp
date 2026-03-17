@@ -57,6 +57,10 @@ public:
     /// pass this to the native tunnel provider.
     std::string get_wg_config_string() const;
 
+    /// Get the current config as a JSON string matching the format
+    /// that tunnel_up() / ln_tunnel_up() accepts.
+    std::string get_wg_config_json() const;
+
     // --- Multi-peer mesh methods ---
 
     /// Add a mesh peer to the tunnel.

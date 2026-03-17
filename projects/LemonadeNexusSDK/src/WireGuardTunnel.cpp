@@ -463,6 +463,44 @@ std::string WireGuardTunnel::get_wg_config_string() const {
     return impl_->build_config_string();
 }
 
+std::string WireGuardTunnel::get_wg_config_json() const {
+    std::lock_guard lock(impl_->mutex);
+    const auto& c = impl_->config;
+    if (c.private_key.empty() && c.tunnel_ip.empty()) return {};
+
+    // Build JSON matching the format ln_tunnel_up() expects.
+    // Using manual construction to avoid adding nlohmann/json dependency here.
+    auto esc = [](const std::string& s) -> std::string {
+        std::string out;
+        out.reserve(s.size());
+        for (char ch : s) {
+            if (ch == '"') out += "\\\"";
+            else if (ch == '\\') out += "\\\\";
+            else out += ch;
+        }
+        return out;
+    };
+
+    std::ostringstream ss;
+    ss << '{';
+    ss << "\"private_key\":\"" << esc(c.private_key) << '"';
+    ss << ",\"public_key\":\"" << esc(c.public_key) << '"';
+    ss << ",\"tunnel_ip\":\"" << esc(c.tunnel_ip) << '"';
+    ss << ",\"server_public_key\":\"" << esc(c.server_public_key) << '"';
+    ss << ",\"server_endpoint\":\"" << esc(c.server_endpoint) << '"';
+    if (!c.dns_server.empty())
+        ss << ",\"dns_server\":\"" << esc(c.dns_server) << '"';
+    ss << ",\"listen_port\":" << c.listen_port;
+    ss << ",\"keepalive\":" << c.keepalive;
+    ss << ",\"allowed_ips\":[";
+    for (std::size_t i = 0; i < c.allowed_ips.size(); ++i) {
+        if (i > 0) ss << ',';
+        ss << '"' << esc(c.allowed_ips[i]) << '"';
+    }
+    ss << "]}";
+    return ss.str();
+}
+
 // ---------------------------------------------------------------------------
 // Platform: Linux (not Android)
 // ---------------------------------------------------------------------------

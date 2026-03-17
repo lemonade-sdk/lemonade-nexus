@@ -541,6 +541,16 @@ final class NexusSDK {
         return result
     }
 
+    /// Get the WireGuard config as JSON (matching the format ln_tunnel_up expects).
+    /// Used by the tunnel helper binary.
+    var wireguardConfigJSON: String? {
+        guard let client else { return nil }
+        guard let ptr = ln_get_wg_config_json(client) else { return nil }
+        let result = String(cString: ptr)
+        ln_free(ptr)
+        return result
+    }
+
     // MARK: - Group Membership
 
     func joinGroup(parentNodeId: String) throws -> [String: Any] {

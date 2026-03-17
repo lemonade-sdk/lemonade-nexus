@@ -305,6 +305,13 @@ ln_error_t ln_tunnel_status(ln_client_t* client, char** out_json);
  *  Returns NULL if no config is stored. Caller must ln_free(). */
 char* ln_get_wg_config(ln_client_t* client);
 
+/** Get the WireGuard configuration as a JSON string.
+ *  Returns the same config that ln_tunnel_up() accepts:
+ *  {private_key, public_key, tunnel_ip, server_public_key,
+ *   server_endpoint, dns_server, listen_port, allowed_ips, keepalive}.
+ *  Returns NULL if no config is stored. Caller must ln_free(). */
+char* ln_get_wg_config_json(ln_client_t* client);
+
 /** Generate a WireGuard keypair (Curve25519).
  *  Returns JSON: {private_key: "base64", public_key: "base64"}.
  *  Caller must ln_free(). */
