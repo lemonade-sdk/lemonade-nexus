@@ -15,7 +15,7 @@ struct TunnelControlView: View {
                 meshCard
 
                 // Connection details
-                if let status = appState.meshStatus, status.is_up {
+                if let status = appState.meshStatus, status.is_up ?? false {
                     connectionDetailsCard(status)
                 }
             }
@@ -91,7 +91,7 @@ struct TunnelControlView: View {
                     .font(.subheadline)
                     .foregroundColor(.textSecondary)
                 if let status = appState.meshStatus {
-                    Text("\(status.online_count)/\(status.peer_count) peers online")
+                    Text("\(status.online_count ?? 0)/\(status.peer_count ?? 0) peers online")
                         .font(.caption)
                         .foregroundColor(.textTertiary)
                 }
@@ -116,16 +116,16 @@ struct TunnelControlView: View {
                 GridItem(.flexible()),
                 GridItem(.flexible()),
             ], spacing: 12) {
-                StatCard(title: "Tunnel IP", value: status.tunnel_ip, icon: "network", color: .lemonGreen)
-                StatCard(title: "Peers", value: "\(status.peer_count)", icon: "person.2", color: .lemonYellow)
-                StatCard(title: "Online", value: "\(status.online_count)", icon: "wifi", color: .green)
+                StatCard(title: "Tunnel IP", value: status.tunnel_ip ?? "—", icon: "network", color: .lemonGreen)
+                StatCard(title: "Peers", value: "\(status.peer_count ?? 0)", icon: "person.2", color: .lemonYellow)
+                StatCard(title: "Online", value: "\(status.online_count ?? 0)", icon: "wifi", color: .green)
             }
 
             HStack(spacing: 24) {
-                Label(formatBytes(status.total_rx_bytes) + " received", systemImage: "arrow.down.circle")
+                Label(formatBytes(status.total_rx_bytes ?? 0) + " received", systemImage: "arrow.down.circle")
                     .font(.caption)
                     .foregroundColor(.textSecondary)
-                Label(formatBytes(status.total_tx_bytes) + " sent", systemImage: "arrow.up.circle")
+                Label(formatBytes(status.total_tx_bytes ?? 0) + " sent", systemImage: "arrow.up.circle")
                     .font(.caption)
                     .foregroundColor(.textSecondary)
             }

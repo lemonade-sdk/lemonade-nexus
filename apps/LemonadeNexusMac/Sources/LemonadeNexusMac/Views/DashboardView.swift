@@ -142,13 +142,13 @@ struct DashboardView: View {
                         .foregroundColor(online > 0 ? .green : .textSecondary)
                 }
                 LabeledContent("Direct") {
-                    let direct = appState.meshPeers.filter { !$0.endpoint.isEmpty }.count
+                    let direct = appState.meshPeers.filter { !($0.endpoint ?? "").isEmpty }.count
                     Text("\(direct)")
                         .font(.subheadline.monospacedDigit())
                         .foregroundColor(.textSecondary)
                 }
                 LabeledContent("Relayed") {
-                    let relayed = appState.meshPeers.filter { $0.endpoint.isEmpty && !$0.relay_endpoint.isEmpty }.count
+                    let relayed = appState.meshPeers.filter { ($0.endpoint ?? "").isEmpty && !($0.relay_endpoint ?? "").isEmpty }.count
                     Text("\(relayed)")
                         .font(.subheadline.monospacedDigit())
                         .foregroundColor(.textSecondary)

@@ -368,6 +368,14 @@ final class AppState: ObservableObject {
     }
 
     func signOut() {
+        // Tear down mesh networking before clearing state
+        if isMeshEnabled {
+            try? sdk.meshDisable()
+        }
+        isMeshEnabled = false
+        meshStatus = nil
+        meshPeers = []
+
         sessionToken = nil
         userId = nil
         isAuthenticated = false
@@ -433,7 +441,7 @@ final class AppState: ObservableObject {
         do {
             let status = try sdk.meshStatus()
             meshStatus = status
-            meshPeers = status.peers
+            meshPeers = status.peers ?? []
         } catch {
             // Mesh may not be ready yet — silently ignore
         }

@@ -7,11 +7,14 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
+#include <LemonadeNexus/Auth/AuthMiddleware.hpp>
+#include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 
 #include <gtest/gtest.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+#include <jwt-cpp/jwt.h>
 
 #include <chrono>
 #include <filesystem>
@@ -222,6 +225,109 @@ protected:
             res.set_content(arr.dump(), "application/json");
         });
 
+        // Mesh: peers (auth required)
+        srv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", auth::require_auth(*auth,
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const auth::SessionClaims& claims) {
+
+            std::string node_id = req.matches[1];
+            if (node_id.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"node_id required"})", "application/json");
+                return;
+            }
+
+            auto node_opt = tree->get_node(node_id);
+            if (!node_opt) {
+                res.status = 404;
+                res.set_content(R"({"error":"node not found"})", "application/json");
+                return;
+            }
+
+            // Verify Read permission — normalize pubkey (add ed25519: prefix if missing)
+            auto caller = claims.user_id;
+            if (!caller.starts_with("ed25519:")) caller = "ed25519:" + caller;
+            bool has_perm = tree->check_permission(caller, node_id, acl::Permission::Read);
+            if (!has_perm) {
+                res.status = 403;
+                res.set_content(R"({"error":"insufficient permissions"})", "application/json");
+                return;
+            }
+
+            // Get siblings
+            const auto& node = *node_opt;
+            json peers = json::array();
+            if (!node.parent_id.empty()) {
+                auto siblings = tree->get_children(node.parent_id);
+                for (const auto& s : siblings) {
+                    if (s.id == node_id) continue;
+                    if (s.type != tree::NodeType::Endpoint) continue;
+                    // Check Read permission on sibling too
+                    bool can_read = tree->check_permission(caller, s.id, acl::Permission::Read);
+                    if (!can_read) continue;
+                    json p;
+                    p["node_id"] = s.id;
+                    p["hostname"] = s.hostname;
+                    p["wg_pubkey"] = s.wg_pubkey;
+                    p["tunnel_ip"] = s.tunnel_ip;
+                    p["endpoint"] = s.listen_endpoint;
+                    peers.push_back(std::move(p));
+                }
+            }
+
+            json j;
+            j["node_id"] = node_id;
+            j["peers"] = std::move(peers);
+            res.set_content(j.dump(), "application/json");
+        }));
+
+        // Mesh: heartbeat (auth required)
+        srv.Post("/api/mesh/heartbeat", auth::require_auth(*auth,
+            [this](const httplib::Request& req, httplib::Response& res,
+                   const auth::SessionClaims& claims) {
+
+            auto body = json::parse(req.body, nullptr, false);
+            if (body.is_discarded()) {
+                res.status = 400;
+                res.set_content(R"({"error":"invalid json"})", "application/json");
+                return;
+            }
+
+            auto hb_node_id = body.value("node_id", "");
+            if (hb_node_id.empty()) {
+                res.status = 400;
+                res.set_content(R"({"error":"node_id required"})", "application/json");
+                return;
+            }
+
+            auto node_opt = tree->get_node(hb_node_id);
+            if (!node_opt) {
+                res.status = 404;
+                res.set_content(R"({"error":"node not found"})", "application/json");
+                return;
+            }
+
+            // Verify caller owns this node (EditNode permission)
+            auto caller = claims.user_id;
+            if (!caller.starts_with("ed25519:")) caller = "ed25519:" + caller;
+            bool has_perm = tree->check_permission(caller, hb_node_id, acl::Permission::EditNode);
+            if (!has_perm) {
+                res.status = 403;
+                res.set_content(R"({"error":"insufficient permissions"})", "application/json");
+                return;
+            }
+
+            auto updated = *node_opt;
+            updated.listen_endpoint = body.value("endpoint", "");
+            tree->update_node_direct(hb_node_id, updated);
+
+            json j;
+            j["success"] = true;
+            j["node_id"] = hb_node_id;
+            j["endpoint"] = updated.listen_endpoint;
+            res.set_content(j.dump(), "application/json");
+        }));
+
         // IPAM: allocate
         srv.Post("/api/ipam/allocate", [this](const httplib::Request& req, httplib::Response& res) {
             auto body = json::parse(req.body, nullptr, false);
@@ -255,6 +361,17 @@ protected:
             };
             res.set_content(resp.dump(), "application/json");
         });
+    }
+
+    /// Generate a valid JWT for testing auth-protected endpoints.
+    std::string make_jwt(const std::string& user_id) {
+        auto now = std::chrono::system_clock::now();
+        return jwt::create()
+            .set_issuer("lemonade-nexus")
+            .set_subject(user_id)
+            .set_issued_at(now)
+            .set_expires_at(now + std::chrono::hours{1})
+            .sign(jwt::algorithm::hs256{jwt_secret});
     }
 
     httplib::Client make_client() {
@@ -470,6 +587,237 @@ TEST_F(HttpEndpointTest, CreateCustomerThenEndpoint) {
 TEST_F(HttpEndpointTest, DeltaInvalidJson) {
     auto cli = make_client();
     auto res = cli.Post("/api/tree/delta", "not json", "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 400);
+}
+
+// =========================================================================
+// Mesh API security tests
+// =========================================================================
+
+TEST_F(HttpEndpointTest, MeshPeersNoAuth) {
+    auto cli = make_client();
+    // No Authorization header → 401
+    auto res = cli.Get("/api/mesh/peers/root");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpEndpointTest, MeshPeersInvalidToken) {
+    auto cli = make_client();
+    httplib::Headers h = {{"Authorization", "Bearer invalid_token_here"}};
+    auto res = cli.Get("/api/mesh/peers/root", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpEndpointTest, MeshPeersMalformedAuthHeader) {
+    auto cli = make_client();
+    // No "Bearer " prefix
+    httplib::Headers h = {{"Authorization", "Basic dXNlcjpwYXNz"}};
+    auto res = cli.Get("/api/mesh/peers/root", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpEndpointTest, MeshHeartbeatNoAuth) {
+    auto cli = make_client();
+    json body = {{"node_id", "root"}, {"endpoint", "1.2.3.4:51820"}};
+    auto res = cli.Post("/api/mesh/heartbeat", body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 401);
+}
+
+TEST_F(HttpEndpointTest, MeshPeersValidAuthRootNode) {
+    auto cli = make_client();
+    // Create a valid JWT with root's pubkey as user_id
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    auto res = cli.Get("/api/mesh/peers/root", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = json::parse(res->body);
+    EXPECT_EQ(body["node_id"], "root");
+    // Root has no siblings, so peers should be empty
+    EXPECT_TRUE(body["peers"].empty());
+}
+
+TEST_F(HttpEndpointTest, MeshPeersNodeNotFound) {
+    auto cli = make_client();
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    auto res = cli.Get("/api/mesh/peers/nonexistent_node", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 404);
+}
+
+TEST_F(HttpEndpointTest, MeshPeersUnauthorizedUser) {
+    auto cli = make_client();
+    // Create a JWT with a different user_id that has no permissions
+    auto other_kp = crypto->ed25519_keygen();
+    auto other_pubkey = "ed25519:" + crypto::to_base64(other_kp.public_key);
+    auto token = make_jwt(other_pubkey);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    auto res = cli.Get("/api/mesh/peers/root", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403);
+}
+
+TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
+    auto cli = make_client();
+
+    // Create a customer group with two endpoint children
+    tree::TreeNode group;
+    group.id = "mesh_group";
+    group.parent_id = "root";
+    group.type = tree::NodeType::Customer;
+    group.mgmt_pubkey = root_pubkey_str;
+    group.assignments = {{root_pubkey_str, {"admin"}}};
+    auto d1 = make_signed_delta("create_node", "mesh_group", group);
+    cli.Post("/api/tree/delta", json(d1).dump(), "application/json");
+
+    tree::TreeNode ep1;
+    ep1.id = "mesh_ep1";
+    ep1.parent_id = "mesh_group";
+    ep1.type = tree::NodeType::Endpoint;
+    ep1.mgmt_pubkey = root_pubkey_str;
+    ep1.assignments = {{root_pubkey_str, {"admin"}}};
+    ep1.wg_pubkey = "wg_pubkey_ep1";
+    ep1.tunnel_ip = "10.0.0.2";
+    ep1.hostname = "peer-alpha";
+    auto d2 = make_signed_delta("create_node", "mesh_ep1", ep1);
+    cli.Post("/api/tree/delta", json(d2).dump(), "application/json");
+
+    tree::TreeNode ep2;
+    ep2.id = "mesh_ep2";
+    ep2.parent_id = "mesh_group";
+    ep2.type = tree::NodeType::Endpoint;
+    ep2.mgmt_pubkey = root_pubkey_str;
+    ep2.assignments = {{root_pubkey_str, {"admin"}}};
+    ep2.wg_pubkey = "wg_pubkey_ep2";
+    ep2.tunnel_ip = "10.0.0.3";
+    ep2.hostname = "peer-beta";
+    auto d3 = make_signed_delta("create_node", "mesh_ep2", ep2);
+    cli.Post("/api/tree/delta", json(d3).dump(), "application/json");
+
+    // Request peers for ep1 — should see ep2 but not itself
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    auto res = cli.Get("/api/mesh/peers/mesh_ep1", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = json::parse(res->body);
+    EXPECT_EQ(body["node_id"], "mesh_ep1");
+    auto peers = body["peers"];
+    EXPECT_EQ(peers.size(), 1u);
+    EXPECT_EQ(peers[0]["node_id"], "mesh_ep2");
+    EXPECT_EQ(peers[0]["hostname"], "peer-beta");
+    EXPECT_EQ(peers[0]["wg_pubkey"], "wg_pubkey_ep2");
+    EXPECT_EQ(peers[0]["tunnel_ip"], "10.0.0.3");
+}
+
+TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
+    auto cli = make_client();
+
+    // Create two separate groups with endpoints — endpoint in group A
+    // should NOT see endpoints in group B
+    tree::TreeNode groupA;
+    groupA.id = "idor_groupA";
+    groupA.parent_id = "root";
+    groupA.type = tree::NodeType::Customer;
+    groupA.mgmt_pubkey = root_pubkey_str;
+    groupA.assignments = {{root_pubkey_str, {"admin"}}};
+    auto dA = make_signed_delta("create_node", "idor_groupA", groupA);
+    cli.Post("/api/tree/delta", json(dA).dump(), "application/json");
+
+    tree::TreeNode groupB;
+    groupB.id = "idor_groupB";
+    groupB.parent_id = "root";
+    groupB.type = tree::NodeType::Customer;
+    groupB.mgmt_pubkey = root_pubkey_str;
+    groupB.assignments = {{root_pubkey_str, {"admin"}}};
+    auto dB = make_signed_delta("create_node", "idor_groupB", groupB);
+    cli.Post("/api/tree/delta", json(dB).dump(), "application/json");
+
+    tree::TreeNode epA;
+    epA.id = "idor_epA";
+    epA.parent_id = "idor_groupA";
+    epA.type = tree::NodeType::Endpoint;
+    epA.mgmt_pubkey = root_pubkey_str;
+    epA.assignments = {{root_pubkey_str, {"admin"}}};
+    epA.wg_pubkey = "wg_A";
+    auto dEpA = make_signed_delta("create_node", "idor_epA", epA);
+    cli.Post("/api/tree/delta", json(dEpA).dump(), "application/json");
+
+    tree::TreeNode epB;
+    epB.id = "idor_epB";
+    epB.parent_id = "idor_groupB";
+    epB.type = tree::NodeType::Endpoint;
+    epB.mgmt_pubkey = root_pubkey_str;
+    epB.assignments = {{root_pubkey_str, {"admin"}}};
+    epB.wg_pubkey = "wg_B";
+    auto dEpB = make_signed_delta("create_node", "idor_epB", epB);
+    cli.Post("/api/tree/delta", json(dEpB).dump(), "application/json");
+
+    // Querying peers for epA should NOT include epB (different group)
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    auto res = cli.Get("/api/mesh/peers/idor_epA", h);
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 200);
+
+    auto body = json::parse(res->body);
+    auto peers = body["peers"];
+    // epA is the only endpoint in groupA, so peers should be empty
+    EXPECT_TRUE(peers.empty());
+
+    // epB should NOT appear in epA's peer list
+    for (const auto& p : peers) {
+        EXPECT_NE(p["node_id"], "idor_epB") << "Cross-group peer leak detected!";
+    }
+}
+
+TEST_F(HttpEndpointTest, MeshHeartbeatUnauthorizedNode) {
+    auto cli = make_client();
+
+    // Create a node owned by root
+    tree::TreeNode node;
+    node.id = "hb_node";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = root_pubkey_str;
+    auto d = make_signed_delta("create_node", "hb_node", node);
+    cli.Post("/api/tree/delta", json(d).dump(), "application/json");
+
+    // Try heartbeat with a different user (no EditNode permission)
+    auto other_kp = crypto->ed25519_keygen();
+    auto other_pubkey = "ed25519:" + crypto::to_base64(other_kp.public_key);
+    auto token = make_jwt(other_pubkey);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    json body = {{"node_id", "hb_node"}, {"endpoint", "1.2.3.4:51820"}};
+    auto res = cli.Post("/api/mesh/heartbeat", h, body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403);
+}
+
+TEST_F(HttpEndpointTest, MeshHeartbeatNonexistentNode) {
+    auto cli = make_client();
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    json body = {{"node_id", "ghost_node"}, {"endpoint", "1.2.3.4:51820"}};
+    auto res = cli.Post("/api/mesh/heartbeat", h, body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 404);
+}
+
+TEST_F(HttpEndpointTest, MeshHeartbeatMissingNodeId) {
+    auto cli = make_client();
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+    json body = {{"endpoint", "1.2.3.4:51820"}};
+    auto res = cli.Post("/api/mesh/heartbeat", h, body.dump(), "application/json");
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 400);
 }

@@ -564,28 +564,28 @@ final class NexusSDK {
     struct SDKMeshPeer: Codable, Identifiable, Hashable {
         var id: String { node_id }
         let node_id: String
-        let hostname: String
-        let wg_pubkey: String
-        let tunnel_ip: String
-        let private_subnet: String
-        let endpoint: String
-        let relay_endpoint: String
-        let is_online: Bool
-        let last_handshake: Int64
-        let rx_bytes: UInt64
-        let tx_bytes: UInt64
-        let latency_ms: Int32
-        let keepalive: UInt16
+        let hostname: String?
+        let wg_pubkey: String?
+        let tunnel_ip: String?
+        let private_subnet: String?
+        let endpoint: String?
+        let relay_endpoint: String?
+        let is_online: Bool?
+        let last_handshake: Int64?
+        let rx_bytes: UInt64?
+        let tx_bytes: UInt64?
+        let latency_ms: Int32?
+        let keepalive: UInt16?
     }
 
     struct SDKMeshStatus: Codable {
-        let is_up: Bool
-        let tunnel_ip: String
-        let peer_count: UInt32
-        let online_count: UInt32
-        let total_rx_bytes: UInt64
-        let total_tx_bytes: UInt64
-        let peers: [SDKMeshPeer]
+        let is_up: Bool?
+        let tunnel_ip: String?
+        let peer_count: UInt32?
+        let online_count: UInt32?
+        let total_rx_bytes: UInt64?
+        let total_tx_bytes: UInt64?
+        let peers: [SDKMeshPeer]?
     }
 
     func meshEnable() throws {

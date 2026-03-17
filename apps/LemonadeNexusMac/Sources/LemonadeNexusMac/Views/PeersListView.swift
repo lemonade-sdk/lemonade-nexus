@@ -9,9 +9,9 @@ struct PeersListView: View {
         if searchText.isEmpty { return appState.meshPeers }
         let query = searchText.lowercased()
         return appState.meshPeers.filter {
-            $0.hostname.lowercased().contains(query) ||
+            ($0.hostname ?? "").lowercased().contains(query) ||
             $0.node_id.lowercased().contains(query) ||
-            $0.tunnel_ip.lowercased().contains(query)
+            ($0.tunnel_ip ?? "").lowercased().contains(query)
         }
     }
 
@@ -24,7 +24,7 @@ struct PeersListView: View {
                     SectionHeaderView(title: "Mesh Peers", icon: "person.2.wave.2")
                     Spacer()
                     if !appState.meshPeers.isEmpty {
-                        Text("\(appState.meshPeers.filter(\.is_online).count)/\(appState.meshPeers.count) online")
+                        Text("\(appState.meshPeers.filter { $0.is_online ?? false }.count)/\(appState.meshPeers.count) online")
                             .font(.caption)
                             .foregroundColor(.textSecondary)
                     }
@@ -86,30 +86,33 @@ struct PeersListView: View {
 
     private func peerRow(_ peer: NexusSDK.SDKMeshPeer) -> some View {
         HStack(spacing: 12) {
-            StatusDot(isHealthy: peer.is_online, size: 8)
+            StatusDot(isHealthy: peer.is_online ?? false, size: 8)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(peer.hostname.isEmpty ? peer.node_id : peer.hostname)
+                let hostname = peer.hostname ?? ""
+                Text(hostname.isEmpty ? peer.node_id : hostname)
                     .font(.body)
                     .foregroundColor(.textPrimary)
-                Text(peer.tunnel_ip)
+                    .lineLimit(1)
+                Text(peer.tunnel_ip ?? "—")
                     .font(.caption.monospaced())
                     .foregroundColor(.textTertiary)
             }
 
             Spacer()
 
-            if peer.latency_ms >= 0 {
-                Text("\(peer.latency_ms)ms")
+            let latency = peer.latency_ms ?? -1
+            if latency >= 0 {
+                Text("\(latency)ms")
                     .font(.caption.monospacedDigit())
-                    .foregroundColor(peer.latency_ms < 50 ? .green : peer.latency_ms < 150 ? .orange : .red)
+                    .foregroundColor(latency < 50 ? .green : latency < 150 ? .orange : .red)
             }
 
             VStack(alignment: .trailing, spacing: 1) {
-                Label(formatBytes(peer.rx_bytes), systemImage: "arrow.down")
+                Label(formatBytes(peer.rx_bytes ?? 0), systemImage: "arrow.down")
                     .font(.caption2)
                     .foregroundColor(.textTertiary)
-                Label(formatBytes(peer.tx_bytes), systemImage: "arrow.up")
+                Label(formatBytes(peer.tx_bytes ?? 0), systemImage: "arrow.up")
                     .font(.caption2)
                     .foregroundColor(.textTertiary)
             }
@@ -118,42 +121,50 @@ struct PeersListView: View {
     }
 
     private func peerDetail(_ peer: NexusSDK.SDKMeshPeer) -> some View {
-        ScrollView {
+        let isOnline = peer.is_online ?? false
+        let hostname = peer.hostname ?? ""
+        return ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 // Header
                 HStack(spacing: 12) {
                     ZStack {
                         Circle()
-                            .fill((peer.is_online ? Color.green : Color.red).opacity(0.2))
+                            .fill((isOnline ? Color.green : Color.red).opacity(0.2))
                             .frame(width: 40, height: 40)
-                        Image(systemName: peer.is_online ? "person.fill.checkmark" : "person.fill.xmark")
-                            .foregroundColor(peer.is_online ? .green : .red)
+                        Image(systemName: isOnline ? "person.fill.checkmark" : "person.fill.xmark")
+                            .foregroundColor(isOnline ? .green : .red)
                     }
                     VStack(alignment: .leading) {
-                        Text(peer.hostname.isEmpty ? "Unnamed Peer" : peer.hostname)
+                        Text(hostname.isEmpty ? "Unnamed Peer" : hostname)
                             .font(.title3.bold())
-                        BadgeView(text: peer.is_online ? "Online" : "Offline",
-                                  color: peer.is_online ? .green : .red)
+                            .lineLimit(1)
+                        BadgeView(text: isOnline ? "Online" : "Offline",
+                                  color: isOnline ? .green : .red)
                     }
                 }
 
                 Divider()
 
                 detailRow("Node ID", peer.node_id)
-                detailRow("Tunnel IP", peer.tunnel_ip)
-                detailRow("Private Subnet", peer.private_subnet)
-                detailRow("WG Public Key", String(peer.wg_pubkey.prefix(20)) + "...")
-                detailRow("Endpoint", peer.endpoint.isEmpty ? "Unknown" : peer.endpoint)
-                if !peer.relay_endpoint.isEmpty {
-                    detailRow("Relay Endpoint", peer.relay_endpoint)
+                detailRow("Tunnel IP", peer.tunnel_ip ?? "—")
+                detailRow("Private Subnet", peer.private_subnet ?? "—")
+                let pubkey = peer.wg_pubkey ?? ""
+                detailRow("WG Public Key", pubkey.isEmpty ? "—" : String(pubkey.prefix(20)) + "...")
+                let endpoint = peer.endpoint ?? ""
+                detailRow("Endpoint", endpoint.isEmpty ? "Unknown" : endpoint)
+                let relay = peer.relay_endpoint ?? ""
+                if !relay.isEmpty {
+                    detailRow("Relay Endpoint", relay)
                 }
-                detailRow("Latency", peer.latency_ms >= 0 ? "\(peer.latency_ms) ms" : "Unknown")
-                detailRow("Last Handshake", peer.last_handshake > 0
-                    ? relativeTimeString(fromEpoch: UInt64(peer.last_handshake))
+                let latency = peer.latency_ms ?? -1
+                detailRow("Latency", latency >= 0 ? "\(latency) ms" : "Unknown")
+                let handshake = peer.last_handshake ?? 0
+                detailRow("Last Handshake", handshake > 0
+                    ? relativeTimeString(fromEpoch: UInt64(handshake))
                     : "Never")
-                detailRow("Received", formatBytes(peer.rx_bytes))
-                detailRow("Sent", formatBytes(peer.tx_bytes))
-                detailRow("Keepalive", "\(peer.keepalive)s")
+                detailRow("Received", formatBytes(peer.rx_bytes ?? 0))
+                detailRow("Sent", formatBytes(peer.tx_bytes ?? 0))
+                detailRow("Keepalive", "\(peer.keepalive ?? 0)s")
             }
             .padding(24)
         }
@@ -170,6 +181,7 @@ struct PeersListView: View {
                 .font(.subheadline.monospaced())
                 .foregroundColor(.textPrimary)
                 .textSelection(.enabled)
+                .lineLimit(1)
             Spacer()
         }
     }
