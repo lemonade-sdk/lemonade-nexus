@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace lnsdk {
 
@@ -55,6 +56,25 @@ public:
     /// Useful on all platforms, required on iOS/Android where the app must
     /// pass this to the native tunnel provider.
     std::string get_wg_config_string() const;
+
+    // --- Multi-peer mesh methods ---
+
+    /// Add a mesh peer to the tunnel.
+    StatusResult add_peer(const MeshPeer& peer);
+
+    /// Remove a mesh peer by its WireGuard public key.
+    StatusResult remove_peer(const std::string& wg_pubkey);
+
+    /// Update a peer's endpoint address.
+    StatusResult update_peer_endpoint(const std::string& wg_pubkey,
+                                       const std::string& endpoint);
+
+    /// Get mesh tunnel status including all peers.
+    MeshTunnelStatus mesh_status() const;
+
+    /// Sync the tunnel's peer set to match the desired list.
+    /// Adds new peers, removes stale ones, updates changed endpoints.
+    StatusResult sync_peers(const std::vector<MeshPeer>& desired_peers);
 
 private:
     struct Impl;

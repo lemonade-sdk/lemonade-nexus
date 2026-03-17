@@ -1,0 +1,252 @@
+#include <LemonadeNexus/Api/MeshApiHandler.hpp>
+
+#include <LemonadeNexus/Auth/AuthService.hpp>
+#include <LemonadeNexus/Auth/AuthMiddleware.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeTypes.hpp>
+#include <LemonadeNexus/Core/ServerConfig.hpp>
+
+#include <spdlog/spdlog.h>
+
+namespace nexus::api {
+
+void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
+                                        httplib::Server& priv) {
+    using nexus::auth::require_auth;
+    using nexus::auth::SessionClaims;
+
+    // ========================================================================
+    // GET /api/mesh/peers/:node_id (PRIVATE, auth required)
+    //
+    // Returns the server as a peer plus all authorized sibling endpoints
+    // under the same parent group.  Each entry contains the WireGuard
+    // public key, tunnel IP, private subnet, and last-known endpoint,
+    // so the client SDK can build a multi-peer WireGuard config.
+    // ========================================================================
+    priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+
+        std::string node_id = req.matches[1];
+        if (node_id.empty()) {
+            error_response(res, "node_id required");
+            return;
+        }
+
+        // Look up the requesting node
+        auto node_opt = ctx_.tree.get_node(node_id);
+        if (!node_opt) {
+            error_response(res, "node not found", 404);
+            return;
+        }
+        const auto& node = *node_opt;
+
+        // Check that the authenticated user has Read permission on this node
+        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
+            error_response(res, "insufficient permissions", 403);
+            return;
+        }
+
+        // Find the parent group to get all sibling nodes
+        if (node.parent_id.empty()) {
+            // Root node has no siblings — return just the server peer
+            nlohmann::json j;
+            j["node_id"] = node_id;
+            j["peers"] = nlohmann::json::array();
+            j["server_peer"] = build_server_peer();
+            json_response(res, j);
+            return;
+        }
+
+        auto siblings = ctx_.tree.get_children(node.parent_id);
+
+        // Build peer list: all Endpoint-type siblings except the requesting node
+        nlohmann::json peers = nlohmann::json::array();
+        for (const auto& sibling : siblings) {
+            if (sibling.id == node_id) continue;  // skip self
+            if (sibling.type != tree::NodeType::Endpoint) continue;  // only endpoints
+
+            // Check that we have Read permission on the sibling
+            if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
+                                             acl::Permission::Read)) {
+                continue;  // skip nodes we can't see
+            }
+
+            nlohmann::json peer;
+            peer["node_id"]        = sibling.id;
+            peer["hostname"]       = sibling.hostname;
+            peer["wg_pubkey"]      = sibling.wg_pubkey;
+            peer["tunnel_ip"]      = sibling.tunnel_ip;
+            peer["private_subnet"] = sibling.private_subnet;
+            peer["endpoint"]       = sibling.listen_endpoint;
+            peer["relay_endpoint"] = "";  // filled by relay discovery
+            peer["is_online"]      = !sibling.listen_endpoint.empty();
+            peers.push_back(std::move(peer));
+        }
+
+        // Also include Relay-type siblings as potential relay endpoints
+        for (const auto& sibling : siblings) {
+            if (sibling.type != tree::NodeType::Relay) continue;
+            if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
+                                             acl::Permission::Read)) {
+                continue;
+            }
+
+            nlohmann::json peer;
+            peer["node_id"]        = sibling.id;
+            peer["hostname"]       = sibling.hostname;
+            peer["wg_pubkey"]      = sibling.wg_pubkey;
+            peer["tunnel_ip"]      = sibling.tunnel_ip;
+            peer["private_subnet"] = sibling.private_subnet;
+            peer["endpoint"]       = sibling.listen_endpoint;
+            peer["relay_endpoint"] = sibling.listen_endpoint;
+            peer["is_online"]      = true;  // relays are always considered online
+            peer["is_relay"]       = true;
+            peer["region"]         = sibling.region;
+            peer["capacity_mbps"]  = sibling.capacity_mbps;
+            peers.push_back(std::move(peer));
+        }
+
+        nlohmann::json j;
+        j["node_id"]     = node_id;
+        j["parent_id"]   = node.parent_id;
+        j["peers"]       = std::move(peers);
+        j["server_peer"] = build_server_peer();
+        json_response(res, j);
+    }));
+
+    // ========================================================================
+    // POST /api/mesh/heartbeat (PRIVATE, auth required)
+    //
+    // Client reports its current public endpoint (learned via STUN) and
+    // online status.  The server updates the node's listen_endpoint in the
+    // tree so that other peers can discover it.
+    //
+    // Body: { "node_id": "...", "endpoint": "ip:port" }
+    // ========================================================================
+    priv.Post("/api/mesh/heartbeat", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        const auto& body = *body_opt;
+
+        auto hb_node_id = body.value("node_id", "");
+        auto hb_endpoint = body.value("endpoint", "");
+
+        if (hb_node_id.empty()) {
+            error_response(res, "node_id required");
+            return;
+        }
+
+        // Verify the node exists
+        auto node_opt = ctx_.tree.get_node(hb_node_id);
+        if (!node_opt) {
+            error_response(res, "node not found", 404);
+            return;
+        }
+
+        // Verify the caller owns this node (has Write or EditNode permission)
+        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        if (!ctx_.tree.check_permission(caller_pubkey, hb_node_id,
+                                         acl::Permission::EditNode)) {
+            error_response(res, "insufficient permissions", 403);
+            return;
+        }
+
+        // Update the node's listen_endpoint in the tree
+        auto updated = *node_opt;
+        updated.listen_endpoint = hb_endpoint;
+        if (!ctx_.tree.update_node_direct(hb_node_id, updated)) {
+            error_response(res, "failed to update node endpoint", 500);
+            return;
+        }
+
+        spdlog::debug("Mesh heartbeat: node {} reported endpoint {}",
+                        hb_node_id, hb_endpoint);
+
+        nlohmann::json j;
+        j["success"]  = true;
+        j["node_id"]  = hb_node_id;
+        j["endpoint"] = hb_endpoint;
+        json_response(res, j);
+    }));
+
+    // ========================================================================
+    // GET /api/mesh/status/:node_id (PRIVATE, auth required)
+    //
+    // Returns mesh status for a node including peer count, online count,
+    // and the server's WireGuard peer info for that node.
+    // ========================================================================
+    priv.Get(R"(/api/mesh/status/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+
+        std::string node_id = req.matches[1];
+        if (node_id.empty()) {
+            error_response(res, "node_id required");
+            return;
+        }
+
+        auto node_opt = ctx_.tree.get_node(node_id);
+        if (!node_opt) {
+            error_response(res, "node not found", 404);
+            return;
+        }
+
+        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
+            error_response(res, "insufficient permissions", 403);
+            return;
+        }
+
+        const auto& node = *node_opt;
+        uint32_t peer_count = 0;
+        uint32_t online_count = 0;
+
+        if (!node.parent_id.empty()) {
+            auto siblings = ctx_.tree.get_children(node.parent_id);
+            for (const auto& s : siblings) {
+                if (s.id == node_id) continue;
+                if (s.type != tree::NodeType::Endpoint &&
+                    s.type != tree::NodeType::Relay) continue;
+                ++peer_count;
+                if (!s.listen_endpoint.empty()) ++online_count;
+            }
+        }
+
+        nlohmann::json j;
+        j["node_id"]      = node_id;
+        j["tunnel_ip"]    = node.tunnel_ip;
+        j["peer_count"]   = peer_count;
+        j["online_count"] = online_count;
+        j["server_peer"]  = build_server_peer();
+        json_response(res, j);
+    }));
+}
+
+nlohmann::json MeshApiHandler::build_server_peer() const {
+    nlohmann::json sp;
+    sp["node_id"]   = "server";
+    sp["hostname"]  = ctx_.server_fqdn;
+    sp["endpoint"]  = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
+    sp["tunnel_ip"] = ctx_.tunnel_bind_ip;
+    sp["is_online"] = true;
+    sp["is_server"] = true;
+
+    // Derive WireGuard public key from server identity for the peer entry
+    sp["wg_pubkey"] = "";  // filled by caller if needed; server's WG pubkey
+    if (ctx_.wireguard) {
+        // The server's WG pubkey is stored in the root node or derived from identity
+        auto root_nodes = ctx_.tree.get_nodes_by_type(tree::NodeType::Root);
+        if (!root_nodes.empty()) {
+            sp["wg_pubkey"] = root_nodes[0].wg_pubkey;
+        }
+    }
+
+    return sp;
+}
+
+} // namespace nexus::api

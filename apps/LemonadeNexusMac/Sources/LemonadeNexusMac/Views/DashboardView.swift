@@ -13,6 +13,9 @@ struct DashboardView: View {
                 // Top Stats Row
                 statsRow
 
+                // Mesh P2P Status Row
+                meshStatusRow
+
                 // Health & Connection Cards
                 HStack(alignment: .top, spacing: 16) {
                     serverHealthCard
@@ -85,6 +88,114 @@ struct DashboardView: View {
             return "\(hours)h \(minutes)m"
         }
         return "\(minutes)m"
+    }
+
+    // MARK: - Mesh Status Row
+
+    private var meshStatusRow: some View {
+        HStack(spacing: 16) {
+            // Tunnel status
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("Tunnel", systemImage: "lock.shield")
+                        .font(.headline)
+                    Spacer()
+                    StatusDot(isHealthy: appState.tunnelIP != nil)
+                }
+                Divider()
+                LabeledContent("Status") {
+                    BadgeView(
+                        text: appState.tunnelIP != nil ? "UP" : "DOWN",
+                        color: appState.tunnelIP != nil ? .green : .gray
+                    )
+                }
+                LabeledContent("Mesh") {
+                    BadgeView(
+                        text: appState.isMeshEnabled ? "ENABLED" : "DISABLED",
+                        color: appState.isMeshEnabled ? .lemonGreen : .gray
+                    )
+                }
+                if let ip = appState.meshStatus?.tunnel_ip, !ip.isEmpty {
+                    LabeledContent("Mesh IP") {
+                        Text(ip)
+                            .font(.subheadline.monospaced())
+                            .foregroundColor(.textSecondary)
+                    }
+                }
+            }
+            .cardStyle()
+            .frame(maxWidth: .infinity)
+
+            // Mesh peers
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("Mesh Peers", systemImage: "point.3.connected.trianglepath.dotted")
+                        .font(.headline)
+                    Spacer()
+                }
+                Divider()
+                let online = appState.meshStatus?.online_count ?? 0
+                let total = appState.meshStatus?.peer_count ?? 0
+                LabeledContent("Online") {
+                    Text("\(online) / \(total)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(online > 0 ? .green : .textSecondary)
+                }
+                LabeledContent("Direct") {
+                    let direct = appState.meshPeers.filter { !$0.endpoint.isEmpty }.count
+                    Text("\(direct)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.textSecondary)
+                }
+                LabeledContent("Relayed") {
+                    let relayed = appState.meshPeers.filter { $0.endpoint.isEmpty && !$0.relay_endpoint.isEmpty }.count
+                    Text("\(relayed)")
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.textSecondary)
+                }
+            }
+            .cardStyle()
+            .frame(maxWidth: .infinity)
+
+            // Bandwidth
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    Label("Bandwidth", systemImage: "arrow.up.arrow.down")
+                        .font(.headline)
+                    Spacer()
+                }
+                Divider()
+                let rx = appState.meshStatus?.total_rx_bytes ?? 0
+                let tx = appState.meshStatus?.total_tx_bytes ?? 0
+                LabeledContent("Received") {
+                    Text(formatDashboardBytes(rx))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.blue)
+                }
+                LabeledContent("Sent") {
+                    Text(formatDashboardBytes(tx))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.orange)
+                }
+                LabeledContent("Total") {
+                    Text(formatDashboardBytes(rx + tx))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundColor(.textSecondary)
+                }
+            }
+            .cardStyle()
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private func formatDashboardBytes(_ bytes: UInt64) -> String {
+        let kb = Double(bytes) / 1024
+        let mb = kb / 1024
+        let gb = mb / 1024
+        if gb >= 1 { return String(format: "%.1f GB", gb) }
+        if mb >= 1 { return String(format: "%.1f MB", mb) }
+        if kb >= 1 { return String(format: "%.0f KB", kb) }
+        return "\(bytes) B"
     }
 
     // MARK: - Server Health Card
@@ -181,6 +292,17 @@ struct DashboardView: View {
                     Text(since, style: .relative)
                         .font(.caption)
                         .foregroundColor(.textSecondary)
+                }
+            }
+
+            if appState.isMeshEnabled {
+                Divider()
+                LabeledContent("Mesh Peers") {
+                    let online = appState.meshStatus?.online_count ?? 0
+                    let total = appState.meshStatus?.peer_count ?? 0
+                    Text("\(online)/\(total) online")
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(online > 0 ? .green : .textTertiary)
                 }
             }
         }

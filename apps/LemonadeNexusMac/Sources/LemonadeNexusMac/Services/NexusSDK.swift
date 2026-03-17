@@ -559,6 +559,84 @@ final class NexusSDK {
         return obj
     }
 
+    // MARK: - Mesh P2P Networking
+
+    struct SDKMeshPeer: Codable, Identifiable, Hashable {
+        var id: String { node_id }
+        let node_id: String
+        let hostname: String
+        let wg_pubkey: String
+        let tunnel_ip: String
+        let private_subnet: String
+        let endpoint: String
+        let relay_endpoint: String
+        let is_online: Bool
+        let last_handshake: Int64
+        let rx_bytes: UInt64
+        let tx_bytes: UInt64
+        let latency_ms: Int32
+        let keepalive: UInt16
+    }
+
+    struct SDKMeshStatus: Codable {
+        let is_up: Bool
+        let tunnel_ip: String
+        let peer_count: UInt32
+        let online_count: UInt32
+        let total_rx_bytes: UInt64
+        let total_tx_bytes: UInt64
+        let peers: [SDKMeshPeer]
+    }
+
+    func meshEnable() throws {
+        guard let client else { throw SDKError.notInitialized }
+        let err = ln_mesh_enable(client)
+        guard err == LN_OK else {
+            throw SDKError.apiError(Int(err.rawValue), "Failed to enable mesh")
+        }
+    }
+
+    func meshEnableConfig(configJSON: String) throws {
+        guard let client else { throw SDKError.notInitialized }
+        let err = ln_mesh_enable_config(client, configJSON)
+        guard err == LN_OK else {
+            throw SDKError.apiError(Int(err.rawValue), "Failed to enable mesh")
+        }
+    }
+
+    func meshDisable() throws {
+        guard let client else { throw SDKError.notInitialized }
+        let err = ln_mesh_disable(client)
+        guard err == LN_OK else {
+            throw SDKError.apiError(Int(err.rawValue), "Failed to disable mesh")
+        }
+    }
+
+    func meshStatus() throws -> SDKMeshStatus {
+        try callJSON { ln_mesh_status($0, $1) }
+    }
+
+    func meshPeers() throws -> [SDKMeshPeer] {
+        guard let client else { throw SDKError.notInitialized }
+        var jsonPtr: UnsafeMutablePointer<CChar>? = nil
+        let err = ln_mesh_peers(client, &jsonPtr)
+        defer { if let jsonPtr { ln_free(jsonPtr) } }
+        guard let jsonPtr else { throw SDKError.connectionFailed }
+        let jsonString = String(cString: jsonPtr)
+        guard let jsonData = jsonString.data(using: .utf8) else {
+            throw SDKError.parseError("Invalid UTF-8")
+        }
+        if err != LN_OK {
+            throw SDKError.apiError(Int(err.rawValue), "Failed to get mesh peers")
+        }
+        return try JSONDecoder().decode([SDKMeshPeer].self, from: jsonData)
+    }
+
+    func meshRefresh() {
+        guard let client else { return }
+        ln_mesh_refresh(client)
+    }
+
     // MARK: - Reconnect
 
     /// Reinitialize the client with a new host/port.

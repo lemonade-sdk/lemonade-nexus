@@ -784,4 +784,39 @@ void BoringTunBackend::timer_loop() {
     spdlog::debug("[BoringTun] timer loop stopped");
 }
 
+// ---------------------------------------------------------------------------
+// Multi-peer mesh stubs (Phase 2B: full multi-Tunn* implementation)
+// ---------------------------------------------------------------------------
+
+StatusResult BoringTunBackend::do_add_peer(const MeshPeer& /*peer*/) {
+    StatusResult r;
+    r.error = "BoringTun multi-peer not yet implemented — use wg-quick path";
+    return r;
+}
+
+StatusResult BoringTunBackend::do_remove_peer(const std::string& /*wg_pubkey*/) {
+    StatusResult r;
+    r.error = "BoringTun multi-peer not yet implemented — use wg-quick path";
+    return r;
+}
+
+StatusResult BoringTunBackend::do_update_peer_endpoint(const std::string& /*wg_pubkey*/,
+                                                        const std::string& /*endpoint*/) {
+    StatusResult r;
+    r.error = "BoringTun multi-peer not yet implemented — use wg-quick path";
+    return r;
+}
+
+MeshTunnelStatus BoringTunBackend::do_mesh_status() const {
+    MeshTunnelStatus st;
+    st.is_up = do_is_active();
+    return st;
+}
+
+StatusResult BoringTunBackend::do_sync_peers(const std::vector<MeshPeer>& /*desired_peers*/) {
+    StatusResult r;
+    r.error = "BoringTun multi-peer not yet implemented — use wg-quick path";
+    return r;
+}
+
 } // namespace lnsdk

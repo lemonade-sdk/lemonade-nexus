@@ -102,6 +102,12 @@ struct ContentView: View {
         switch appState.selectedSidebarItem {
         case .dashboard:
             DashboardView()
+        case .tunnel:
+            TunnelControlView()
+        case .peers:
+            PeersListView()
+        case .network:
+            NetworkMonitorView()
         case .endpoints:
             TreeBrowserView()
         case .servers:

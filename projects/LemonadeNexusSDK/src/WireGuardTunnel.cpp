@@ -12,6 +12,8 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 // Platform detection
 #if defined(_WIN32)
@@ -40,13 +42,14 @@ static std::string wg_base64_encode(const uint8_t* data, std::size_t len) {
 // ---------------------------------------------------------------------------
 
 struct WireGuardTunnel::Impl {
-    WireGuardConfig    config;
-    bool               active{false};
-    bool               using_boringtun{false}; // true when BoringTun fallback is active
-    BoringTunBackend   boringtun;              // userspace fallback
-    std::string        iface_name;             // e.g. "wg0", "utun7"
-    std::string        config_path;            // temp file path for wg-quick
-    mutable std::mutex mutex;                  // guards active, config, iface_name
+    WireGuardConfig          config;
+    bool                     active{false};
+    bool                     using_boringtun{false}; // true when BoringTun fallback is active
+    BoringTunBackend         boringtun;              // userspace fallback
+    std::string              iface_name;             // e.g. "wg0", "utun7"
+    std::string              config_path;            // temp file path for wg-quick
+    mutable std::mutex       mutex;                  // guards active, config, iface_name
+    std::vector<MeshPeer>    mesh_peers;             // current mesh peer set
 
     // Build a wg-quick compatible config string
     std::string build_config_string() const {
@@ -175,6 +178,89 @@ struct WireGuardTunnel::Impl {
             }
         }
         return st;
+    }
+
+    // Build allowed-IPs string for a mesh peer (tunnel_ip + private_subnet)
+    static std::string peer_allowed_ips(const MeshPeer& peer) {
+        std::string ips;
+        if (!peer.tunnel_ip.empty()) {
+            // Ensure /32 suffix for point-to-point
+            ips = peer.tunnel_ip;
+            if (ips.find('/') == std::string::npos) ips += "/32";
+        }
+        if (!peer.private_subnet.empty()) {
+            if (!ips.empty()) ips += ",";
+            ips += peer.private_subnet;
+        }
+        return ips;
+    }
+
+    // Parse "wg show <iface> dump" output for multi-peer mesh status.
+    // dump format (tab-separated):
+    //   Line 1: private-key  public-key  listen-port  fwmark
+    //   Per-peer: public-key  preshared-key  endpoint  allowed-ips  latest-handshake  transfer-rx  transfer-tx  persistent-keepalive
+    MeshTunnelStatus parse_wg_dump(const std::string& output) const {
+        MeshTunnelStatus ms;
+        ms.is_up     = active;
+        ms.tunnel_ip = config.tunnel_ip;
+
+        std::istringstream iss(output);
+        std::string line;
+        bool first_line = true;
+        while (std::getline(iss, line)) {
+            if (first_line) { first_line = false; continue; } // skip interface line
+
+            // Split by tab
+            std::vector<std::string> fields;
+            std::istringstream lss(line);
+            std::string field;
+            while (std::getline(lss, field, '\t')) {
+                fields.push_back(field);
+            }
+            if (fields.size() < 8) continue;
+
+            MeshPeer p;
+            p.wg_pubkey = fields[0];
+            // fields[1] = preshared-key (usually "(none)")
+            // fields[2] = endpoint
+            if (fields[2] != "(none)") p.endpoint = fields[2];
+            // fields[3] = allowed-ips
+            p.tunnel_ip = fields[3]; // raw allowed-ips
+            // fields[4] = latest-handshake (epoch seconds, 0 = never)
+            try { p.last_handshake = static_cast<int64_t>(std::stoull(fields[4])); }
+            catch (...) {}
+            // fields[5] = transfer-rx (bytes)
+            try { p.rx_bytes = std::stoull(fields[5]); }
+            catch (...) {}
+            // fields[6] = transfer-tx (bytes)
+            try { p.tx_bytes = std::stoull(fields[6]); }
+            catch (...) {}
+            // fields[7] = persistent-keepalive
+            if (fields[7] != "off") {
+                try { p.keepalive = static_cast<uint16_t>(std::stoul(fields[7])); }
+                catch (...) {}
+            }
+
+            p.is_online = (p.last_handshake > 0 &&
+                           (std::time(nullptr) - p.last_handshake) < 180);
+
+            // Match against known mesh_peers to fill in node_id, hostname
+            for (const auto& known : mesh_peers) {
+                if (known.wg_pubkey == p.wg_pubkey) {
+                    p.node_id  = known.node_id;
+                    p.hostname = known.hostname;
+                    p.private_subnet = known.private_subnet;
+                    break;
+                }
+            }
+
+            ms.total_rx_bytes += p.rx_bytes;
+            ms.total_tx_bytes += p.tx_bytes;
+            if (p.is_online) ++ms.online_count;
+            ms.peers.push_back(std::move(p));
+        }
+        ms.peer_count = static_cast<uint32_t>(ms.peers.size());
+        return ms;
     }
 };
 
@@ -824,5 +910,222 @@ bool WireGuardTunnel::is_active() const {
 }
 
 #endif
+
+// ---------------------------------------------------------------------------
+// Multi-peer mesh methods (platform-independent)
+// ---------------------------------------------------------------------------
+
+StatusResult WireGuardTunnel::add_peer(const MeshPeer& peer) {
+    std::lock_guard lock(impl_->mutex);
+    StatusResult result;
+
+    if (!impl_->active) {
+        result.error = "tunnel is not active";
+        return result;
+    }
+    if (peer.wg_pubkey.empty()) {
+        result.error = "peer wg_pubkey is required";
+        return result;
+    }
+
+    // If using BoringTun, delegate
+    if (impl_->using_boringtun) {
+        result = impl_->boringtun.add_peer(peer);
+        if (result) {
+            impl_->mesh_peers.push_back(peer);
+        }
+        return result;
+    }
+
+    // wg-quick path: use `wg set` to add the peer
+    auto allowed = Impl::peer_allowed_ips(peer);
+    if (allowed.empty()) {
+        result.error = "peer has no tunnel_ip or private_subnet for allowed-ips";
+        return result;
+    }
+
+    std::string cmd = "wg set " + impl_->iface_name +
+                      " peer " + peer.wg_pubkey +
+                      " allowed-ips " + allowed;
+    if (!peer.endpoint.empty()) {
+        cmd += " endpoint " + peer.endpoint;
+    }
+    cmd += " persistent-keepalive " + std::to_string(peer.keepalive > 0 ? peer.keepalive : 25);
+    cmd += " 2>&1";
+
+    auto [rc, output] = Impl::exec_cmd(cmd);
+    if (rc != 0) {
+        result.error = "wg set add_peer failed: " + output;
+        return result;
+    }
+
+    impl_->mesh_peers.push_back(peer);
+    result.ok = true;
+    spdlog::debug("[WireGuardTunnel] added mesh peer {} ({})",
+                   peer.node_id, peer.wg_pubkey.substr(0, 8));
+    return result;
+}
+
+StatusResult WireGuardTunnel::remove_peer(const std::string& wg_pubkey) {
+    std::lock_guard lock(impl_->mutex);
+    StatusResult result;
+
+    if (!impl_->active) {
+        result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (impl_->using_boringtun) {
+        result = impl_->boringtun.remove_peer(wg_pubkey);
+        if (result) {
+            std::erase_if(impl_->mesh_peers,
+                [&](const MeshPeer& p) { return p.wg_pubkey == wg_pubkey; });
+        }
+        return result;
+    }
+
+    std::string cmd = "wg set " + impl_->iface_name +
+                      " peer " + wg_pubkey + " remove 2>&1";
+    auto [rc, output] = Impl::exec_cmd(cmd);
+    if (rc != 0) {
+        result.error = "wg set remove_peer failed: " + output;
+        return result;
+    }
+
+    std::erase_if(impl_->mesh_peers,
+        [&](const MeshPeer& p) { return p.wg_pubkey == wg_pubkey; });
+    result.ok = true;
+    spdlog::debug("[WireGuardTunnel] removed mesh peer {}", wg_pubkey.substr(0, 8));
+    return result;
+}
+
+StatusResult WireGuardTunnel::update_peer_endpoint(const std::string& wg_pubkey,
+                                                    const std::string& endpoint) {
+    std::lock_guard lock(impl_->mutex);
+    StatusResult result;
+
+    if (!impl_->active) {
+        result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (impl_->using_boringtun) {
+        result = impl_->boringtun.update_peer_endpoint(wg_pubkey, endpoint);
+        if (result) {
+            for (auto& p : impl_->mesh_peers) {
+                if (p.wg_pubkey == wg_pubkey) { p.endpoint = endpoint; break; }
+            }
+        }
+        return result;
+    }
+
+    std::string cmd = "wg set " + impl_->iface_name +
+                      " peer " + wg_pubkey +
+                      " endpoint " + endpoint + " 2>&1";
+    auto [rc, output] = Impl::exec_cmd(cmd);
+    if (rc != 0) {
+        result.error = "wg set update_peer_endpoint failed: " + output;
+        return result;
+    }
+
+    for (auto& p : impl_->mesh_peers) {
+        if (p.wg_pubkey == wg_pubkey) { p.endpoint = endpoint; break; }
+    }
+    result.ok = true;
+    return result;
+}
+
+MeshTunnelStatus WireGuardTunnel::mesh_status() const {
+    std::lock_guard lock(impl_->mutex);
+
+    if (!impl_->active) {
+        MeshTunnelStatus ms;
+        ms.is_up = false;
+        return ms;
+    }
+
+    if (impl_->using_boringtun) {
+        return impl_->boringtun.mesh_status();
+    }
+
+    // Parse `wg show <iface> dump` for full multi-peer status
+    auto [rc, output] = Impl::exec_cmd("wg show " + impl_->iface_name + " dump 2>&1");
+    if (rc != 0) {
+        MeshTunnelStatus ms;
+        ms.is_up = true;
+        ms.tunnel_ip = impl_->config.tunnel_ip;
+        ms.peers = impl_->mesh_peers; // return cached data
+        ms.peer_count = static_cast<uint32_t>(ms.peers.size());
+        return ms;
+    }
+    return impl_->parse_wg_dump(output);
+}
+
+StatusResult WireGuardTunnel::sync_peers(const std::vector<MeshPeer>& desired_peers) {
+    std::lock_guard lock(impl_->mutex);
+    StatusResult result;
+
+    if (!impl_->active) {
+        result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (impl_->using_boringtun) {
+        result = impl_->boringtun.sync_peers(desired_peers);
+        if (result) impl_->mesh_peers = desired_peers;
+        return result;
+    }
+
+    // Build sets for diffing
+    std::unordered_map<std::string, const MeshPeer*> desired_map;
+    for (const auto& p : desired_peers) {
+        desired_map[p.wg_pubkey] = &p;
+    }
+
+    std::unordered_map<std::string, const MeshPeer*> current_map;
+    for (const auto& p : impl_->mesh_peers) {
+        current_map[p.wg_pubkey] = &p;
+    }
+
+    // Remove peers not in desired set
+    for (const auto& [pubkey, _] : current_map) {
+        if (!desired_map.contains(pubkey)) {
+            std::string cmd = "wg set " + impl_->iface_name +
+                              " peer " + pubkey + " remove 2>&1";
+            auto [rc, output] = Impl::exec_cmd(cmd);
+            if (rc != 0) {
+                spdlog::warn("[WireGuardTunnel] sync: failed to remove peer {}: {}",
+                              pubkey.substr(0, 8), output);
+            }
+        }
+    }
+
+    // Add or update peers in desired set
+    for (const auto& [pubkey, peer_ptr] : desired_map) {
+        auto allowed = Impl::peer_allowed_ips(*peer_ptr);
+        if (allowed.empty()) continue;
+
+        std::string cmd = "wg set " + impl_->iface_name +
+                          " peer " + pubkey +
+                          " allowed-ips " + allowed;
+        if (!peer_ptr->endpoint.empty()) {
+            cmd += " endpoint " + peer_ptr->endpoint;
+        }
+        cmd += " persistent-keepalive " +
+               std::to_string(peer_ptr->keepalive > 0 ? peer_ptr->keepalive : 25);
+        cmd += " 2>&1";
+
+        auto [rc, output] = Impl::exec_cmd(cmd);
+        if (rc != 0) {
+            spdlog::warn("[WireGuardTunnel] sync: failed to set peer {}: {}",
+                          pubkey.substr(0, 8), output);
+        }
+    }
+
+    impl_->mesh_peers = desired_peers;
+    result.ok = true;
+    spdlog::info("[WireGuardTunnel] synced {} mesh peers", desired_peers.size());
+    return result;
+}
 
 } // namespace lnsdk

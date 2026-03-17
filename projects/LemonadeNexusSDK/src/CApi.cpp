@@ -1070,3 +1070,107 @@ char* ln_get_node_id(ln_client_t* client) {
     if (id.empty()) return nullptr;
     return strdup_str(id);
 }
+
+// ---------------------------------------------------------------------------
+// Mesh P2P networking
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_mesh_enable(ln_client_t* client) {
+    if (!client) return LN_ERR_NULL_ARG;
+    client->client.enable_mesh();
+    return LN_OK;
+}
+
+ln_error_t ln_mesh_enable_config(ln_client_t* client, const char* config_json) {
+    if (!client) return LN_ERR_NULL_ARG;
+
+    lnsdk::MeshConfig cfg;
+    if (config_json) {
+        try {
+            auto j = json::parse(config_json);
+            cfg.peer_refresh_interval_sec = j.value("peer_refresh_interval_sec", 30u);
+            cfg.heartbeat_interval_sec    = j.value("heartbeat_interval_sec", 15u);
+            cfg.stun_refresh_interval_sec = j.value("stun_refresh_interval_sec", 60u);
+            cfg.prefer_direct             = j.value("prefer_direct", true);
+            cfg.auto_connect              = j.value("auto_connect", true);
+        } catch (...) {
+            return LN_ERR_INTERNAL;
+        }
+    }
+    client->client.enable_mesh(cfg);
+    return LN_OK;
+}
+
+ln_error_t ln_mesh_disable(ln_client_t* client) {
+    if (!client) return LN_ERR_NULL_ARG;
+    client->client.disable_mesh();
+    return LN_OK;
+}
+
+ln_error_t ln_mesh_status(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto st = client->client.mesh_status();
+    json j;
+    j["is_up"]          = st.is_up;
+    j["tunnel_ip"]      = st.tunnel_ip;
+    j["peer_count"]     = st.peer_count;
+    j["online_count"]   = st.online_count;
+    j["total_rx_bytes"] = st.total_rx_bytes;
+    j["total_tx_bytes"] = st.total_tx_bytes;
+
+    json peers_arr = json::array();
+    for (const auto& p : st.peers) {
+        json pj;
+        pj["node_id"]        = p.node_id;
+        pj["hostname"]       = p.hostname;
+        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["tunnel_ip"]      = p.tunnel_ip;
+        pj["private_subnet"] = p.private_subnet;
+        pj["endpoint"]       = p.endpoint;
+        pj["relay_endpoint"] = p.relay_endpoint;
+        pj["is_online"]      = p.is_online;
+        pj["last_handshake"] = p.last_handshake;
+        pj["rx_bytes"]       = p.rx_bytes;
+        pj["tx_bytes"]       = p.tx_bytes;
+        pj["latency_ms"]     = p.latency_ms;
+        pj["keepalive"]      = p.keepalive;
+        peers_arr.push_back(std::move(pj));
+    }
+    j["peers"] = std::move(peers_arr);
+
+    *out_json = strdup_json(j);
+    return LN_OK;
+}
+
+ln_error_t ln_mesh_peers(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto peers = client->client.get_mesh_peers();
+
+    json arr = json::array();
+    for (const auto& p : peers) {
+        json pj;
+        pj["node_id"]        = p.node_id;
+        pj["hostname"]       = p.hostname;
+        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["tunnel_ip"]      = p.tunnel_ip;
+        pj["private_subnet"] = p.private_subnet;
+        pj["endpoint"]       = p.endpoint;
+        pj["relay_endpoint"] = p.relay_endpoint;
+        pj["is_online"]      = p.is_online;
+        pj["last_handshake"] = p.last_handshake;
+        pj["rx_bytes"]       = p.rx_bytes;
+        pj["tx_bytes"]       = p.tx_bytes;
+        pj["latency_ms"]     = p.latency_ms;
+        pj["keepalive"]      = p.keepalive;
+        arr.push_back(std::move(pj));
+    }
+
+    *out_json = strdup_json(arr);
+    return LN_OK;
+}
+
+ln_error_t ln_mesh_refresh(ln_client_t* client) {
+    if (!client) return LN_ERR_NULL_ARG;
+    client->client.refresh_mesh_peers();
+    return LN_OK;
+}

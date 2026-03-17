@@ -6,6 +6,7 @@
 #include <LemonadeNexusSDK/Types.hpp>
 #include <LemonadeNexusSDK/WireGuardTunnel.hpp>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -270,6 +271,40 @@ public:
 
     /// Tear down the WireGuard tunnel.
     [[nodiscard]] StatusResult tunnel_down();
+
+    // -----------------------------------------------------------------
+    // Mesh P2P networking
+    // -----------------------------------------------------------------
+
+    /// Enable mesh networking. Starts background peer discovery, NAT traversal,
+    /// and tunnel synchronization. Requires an active tunnel and node_id.
+    void enable_mesh(const MeshConfig& config = {});
+
+    /// Disable mesh networking and remove all mesh peers from the tunnel.
+    void disable_mesh();
+
+    /// Get mesh tunnel status including all peers with live stats.
+    [[nodiscard]] MeshTunnelStatus mesh_status() const;
+
+    /// Get the current list of known mesh peers.
+    [[nodiscard]] std::vector<MeshPeer> get_mesh_peers() const;
+
+    /// Force an immediate peer refresh (fetch from server + sync tunnel).
+    void refresh_mesh_peers();
+
+    /// Callback type for mesh state changes.
+    using MeshStateCallback = std::function<void(const MeshTunnelStatus&)>;
+
+    /// Set a callback to be notified on mesh state changes.
+    void set_mesh_callback(MeshStateCallback cb);
+
+    /// Fetch mesh peers from the server for a given node_id.
+    /// Used internally by MeshOrchestrator; also available for direct use.
+    [[nodiscard]] Result<std::vector<MeshPeer>> fetch_mesh_peers(const std::string& node_id);
+
+    /// Send a heartbeat to the server reporting our current endpoint.
+    [[nodiscard]] StatusResult mesh_heartbeat(const std::string& node_id,
+                                               const std::string& endpoint);
 
     // -----------------------------------------------------------------
     // Session state

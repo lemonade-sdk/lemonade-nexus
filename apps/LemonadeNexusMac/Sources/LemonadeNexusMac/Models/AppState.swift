@@ -57,6 +57,11 @@ final class AppState: ObservableObject {
     @Published var tunnelIP: String?
     @Published var connectedSince: Date?
 
+    // MARK: - Mesh P2P
+    @Published var isMeshEnabled: Bool = false
+    @Published var meshStatus: NexusSDK.SDKMeshStatus?
+    @Published var meshPeers: [NexusSDK.SDKMeshPeer] = []
+
     let sdk: NexusSDK
 
     init() {
@@ -395,6 +400,47 @@ final class AppState: ObservableObject {
         await refreshStats()
         await refreshRelays()
         await refreshTrustStatus()
+        await refreshMeshStatus()
+    }
+
+    // MARK: - Mesh P2P
+
+    func toggleMesh() async {
+        if isMeshEnabled {
+            do {
+                try sdk.meshDisable()
+                isMeshEnabled = false
+                meshStatus = nil
+                meshPeers = []
+                addActivity(.info, "Mesh networking disabled")
+            } catch {
+                addActivity(.error, "Failed to disable mesh: \(error)")
+            }
+        } else {
+            do {
+                try sdk.meshEnable()
+                isMeshEnabled = true
+                addActivity(.success, "Mesh networking enabled")
+                await refreshMeshStatus()
+            } catch {
+                addActivity(.error, "Failed to enable mesh: \(error)")
+            }
+        }
+    }
+
+    func refreshMeshStatus() async {
+        guard isMeshEnabled else { return }
+        do {
+            let status = try sdk.meshStatus()
+            meshStatus = status
+            meshPeers = status.peers
+        } catch {
+            // Mesh may not be ready yet — silently ignore
+        }
+    }
+
+    func refreshMeshPeers() {
+        sdk.meshRefresh()
     }
 
     func refreshHealth() async {
@@ -547,6 +593,9 @@ final class AppState: ObservableObject {
 
 enum SidebarItem: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
+    case tunnel = "Tunnel"
+    case peers = "Peers"
+    case network = "Network"
     case endpoints = "Endpoints"
     case servers = "Servers"
     case certificates = "Certificates"
@@ -558,6 +607,9 @@ enum SidebarItem: String, CaseIterable, Identifiable {
     var sfSymbol: String {
         switch self {
         case .dashboard: return "gauge.with.dots.needle.33percent"
+        case .tunnel: return "network"
+        case .peers: return "person.2.wave.2"
+        case .network: return "chart.bar.xaxis"
         case .endpoints: return "point.3.connected.trianglepath.dotted"
         case .servers: return "server.rack"
         case .certificates: return "lock.shield"

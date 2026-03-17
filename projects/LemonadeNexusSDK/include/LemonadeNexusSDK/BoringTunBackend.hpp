@@ -35,6 +35,14 @@ private:
                                      const std::string& server_endpoint);
     bool do_is_active() const;
 
+    // Multi-peer mesh methods (Phase 2B: full multi-Tunn* implementation)
+    StatusResult do_add_peer(const MeshPeer& peer);
+    StatusResult do_remove_peer(const std::string& wg_pubkey);
+    StatusResult do_update_peer_endpoint(const std::string& wg_pubkey,
+                                          const std::string& endpoint);
+    MeshTunnelStatus do_mesh_status() const;
+    StatusResult do_sync_peers(const std::vector<MeshPeer>& desired_peers);
+
     // Platform-specific TUN device creation
     int create_tun_device(std::string& iface_name_out);
     void configure_tun_address(const std::string& iface, const std::string& tunnel_ip);

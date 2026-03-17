@@ -38,6 +38,7 @@
 #include <LemonadeNexus/Api/RelayApiHandler.hpp>
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshApiHandler.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -548,6 +549,7 @@ int main(int argc, char* argv[]) {
     nexus::api::RelayApiHandler  relay_api{ctx};
     nexus::api::CertApiHandler   cert_api{ctx};
     nexus::api::AdminApiHandler  admin_api{ctx};
+    nexus::api::MeshApiHandler   mesh_api{ctx};
 
     public_api.register_routes(http_server.server(), private_srv);
     auth_api.register_routes(http_server.server(), private_srv);
@@ -555,6 +557,7 @@ int main(int argc, char* argv[]) {
     relay_api.register_routes(http_server.server(), private_srv);
     cert_api.register_routes(http_server.server(), private_srv);
     admin_api.register_routes(http_server.server(), private_srv);
+    mesh_api.register_routes(http_server.server(), private_srv);
 
     // ========================================================================
     // Start HTTP servers

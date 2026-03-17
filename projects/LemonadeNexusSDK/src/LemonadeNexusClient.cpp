@@ -1,5 +1,6 @@
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 #include <LemonadeNexusSDK/LatencyMonitor.hpp>
+#include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>
@@ -40,6 +41,10 @@ struct LemonadeNexusClient::Impl {
 
     // WireGuard tunnel
     WireGuardTunnel wg_tunnel;
+
+    // Mesh P2P orchestrator
+    std::unique_ptr<MeshOrchestrator> mesh_orchestrator;
+    LemonadeNexusClient::MeshStateCallback mesh_callback;
 
     explicit Impl(const ServerConfig& cfg) : config{cfg} {
         for (const auto& ep : config.servers) {
@@ -1686,6 +1691,121 @@ StatusResult LemonadeNexusClient::tunnel_up(const WireGuardConfig& config) {
 
 StatusResult LemonadeNexusClient::tunnel_down() {
     return impl_->wg_tunnel.bring_down();
+}
+
+// ---------------------------------------------------------------------------
+// Mesh P2P networking
+// ---------------------------------------------------------------------------
+
+void LemonadeNexusClient::enable_mesh(const MeshConfig& config) {
+    std::string nid;
+    {
+        std::lock_guard lock(impl_->mutex);
+        nid = impl_->node_id;
+    }
+    if (nid.empty()) {
+        spdlog::warn("[LemonadeNexusClient] enable_mesh called but node_id is not set");
+        return;
+    }
+
+    // Stop existing orchestrator if any
+    disable_mesh();
+
+    impl_->mesh_orchestrator = std::make_unique<MeshOrchestrator>(
+        *this, impl_->wg_tunnel, nid);
+
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->mesh_callback) {
+            impl_->mesh_orchestrator->set_callback(impl_->mesh_callback);
+        }
+    }
+
+    impl_->mesh_orchestrator->start(config);
+}
+
+void LemonadeNexusClient::disable_mesh() {
+    if (impl_->mesh_orchestrator) {
+        impl_->mesh_orchestrator->stop();
+        impl_->mesh_orchestrator.reset();
+    }
+}
+
+MeshTunnelStatus LemonadeNexusClient::mesh_status() const {
+    if (impl_->mesh_orchestrator) {
+        return impl_->mesh_orchestrator->status();
+    }
+    return {};
+}
+
+std::vector<MeshPeer> LemonadeNexusClient::get_mesh_peers() const {
+    if (impl_->mesh_orchestrator) {
+        return impl_->mesh_orchestrator->peers();
+    }
+    return {};
+}
+
+void LemonadeNexusClient::refresh_mesh_peers() {
+    if (impl_->mesh_orchestrator) {
+        impl_->mesh_orchestrator->refresh_now();
+    }
+}
+
+void LemonadeNexusClient::set_mesh_callback(MeshStateCallback cb) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->mesh_callback = std::move(cb);
+    if (impl_->mesh_orchestrator) {
+        impl_->mesh_orchestrator->set_callback(impl_->mesh_callback);
+    }
+}
+
+Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::string& nid) {
+    int status = 0;
+    auto resp = impl_->http_get("/api/mesh/peers/" + nid, status);
+    if (!resp) {
+        return {false, {}, status, "mesh peers request failed"};
+    }
+    if (status != 200) {
+        return {false, {}, status, resp->value("error", "mesh peers request failed")};
+    }
+
+    try {
+        std::vector<MeshPeer> peers;
+        if (resp->contains("peers") && (*resp)["peers"].is_array()) {
+            for (const auto& p : (*resp)["peers"]) {
+                MeshPeer mp;
+                mp.node_id        = p.value("node_id", "");
+                mp.hostname       = p.value("hostname", "");
+                mp.wg_pubkey      = p.value("wg_pubkey", "");
+                mp.tunnel_ip      = p.value("tunnel_ip", "");
+                mp.private_subnet = p.value("private_subnet", "");
+                mp.endpoint       = p.value("endpoint", "");
+                mp.relay_endpoint = p.value("relay_endpoint", "");
+                mp.is_online      = p.value("is_online", false);
+                peers.push_back(std::move(mp));
+            }
+        }
+        return {true, std::move(peers), status, ""};
+    } catch (const std::exception& e) {
+        return {false, {}, status, std::string("Parse error: ") + e.what()};
+    }
+}
+
+StatusResult LemonadeNexusClient::mesh_heartbeat(const std::string& nid,
+                                                   const std::string& endpoint) {
+    json body;
+    body["node_id"]  = nid;
+    body["endpoint"] = endpoint;
+
+    int status = 0;
+    auto resp = impl_->http_post("/api/mesh/heartbeat", body, status);
+    if (!resp) {
+        return {false, {}, status, "heartbeat request failed"};
+    }
+    if (status != 200) {
+        return {false, {}, status, resp->value("error", "heartbeat failed")};
+    }
+    return {true, {}, status, ""};
 }
 
 } // namespace lnsdk

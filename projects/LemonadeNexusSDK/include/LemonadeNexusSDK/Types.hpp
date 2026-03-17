@@ -305,6 +305,47 @@ struct TunnelStatus {
 };
 
 // ---------------------------------------------------------------------------
+// Mesh P2P networking
+// ---------------------------------------------------------------------------
+
+/// A single mesh peer for P2P WireGuard connections.
+struct MeshPeer {
+    std::string node_id;
+    std::string hostname;
+    std::string wg_pubkey;              ///< Curve25519 base64
+    std::string tunnel_ip;              ///< e.g. "10.64.0.5/32"
+    std::string private_subnet;         ///< e.g. "10.128.17.4/30"
+    std::string endpoint;               ///< Direct "ip:port" (from STUN/hole-punch)
+    std::string relay_endpoint;         ///< Relay fallback "ip:port" (empty if not needed)
+    bool        is_online{false};
+    int64_t     last_handshake{0};      ///< Unix timestamp
+    uint64_t    rx_bytes{0};
+    uint64_t    tx_bytes{0};
+    int32_t     latency_ms{-1};         ///< -1 = unknown
+    uint16_t    keepalive{25};
+};
+
+/// Status of the entire mesh tunnel.
+struct MeshTunnelStatus {
+    bool        is_up{false};
+    std::string tunnel_ip;
+    uint32_t    peer_count{0};
+    uint32_t    online_count{0};
+    uint64_t    total_rx_bytes{0};
+    uint64_t    total_tx_bytes{0};
+    std::vector<MeshPeer> peers;
+};
+
+/// Configuration for the mesh orchestrator.
+struct MeshConfig {
+    uint32_t peer_refresh_interval_sec{30};  ///< How often to poll for peer updates
+    uint32_t heartbeat_interval_sec{15};     ///< How often to send heartbeat
+    uint32_t stun_refresh_interval_sec{60};  ///< How often to re-probe STUN
+    bool     prefer_direct{true};            ///< Prefer direct P2P over relay
+    bool     auto_connect{true};             ///< Auto-connect to discovered peers
+};
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
@@ -473,5 +514,12 @@ void from_json(const nlohmann::json& j, GovernanceVote& v);
 void from_json(const nlohmann::json& j, GovernanceProposal& p);
 void from_json(const nlohmann::json& j, AttestationManifest& m);
 void from_json(const nlohmann::json& j, AttestationManifests& a);
+
+void to_json(nlohmann::json& j, const MeshPeer& p);
+void from_json(const nlohmann::json& j, MeshPeer& p);
+void to_json(nlohmann::json& j, const MeshTunnelStatus& s);
+void from_json(const nlohmann::json& j, MeshTunnelStatus& s);
+void to_json(nlohmann::json& j, const MeshConfig& c);
+void from_json(const nlohmann::json& j, MeshConfig& c);
 
 } // namespace lnsdk

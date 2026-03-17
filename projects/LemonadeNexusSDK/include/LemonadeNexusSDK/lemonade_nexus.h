@@ -311,6 +311,38 @@ char* ln_get_wg_config(ln_client_t* client);
 char* ln_wg_generate_keypair(void);
 
 /* ------------------------------------------------------------------ */
+/* Mesh P2P networking                                                 */
+/* ------------------------------------------------------------------ */
+
+/** Enable mesh networking with default config.
+ *  Requires node_id to be set (via ln_set_node_id or ln_join_network). */
+ln_error_t ln_mesh_enable(ln_client_t* client);
+
+/** Enable mesh networking with custom config (JSON string).
+ *  Config JSON keys: peer_refresh_interval_sec, heartbeat_interval_sec,
+ *  stun_refresh_interval_sec, prefer_direct, auto_connect. */
+ln_error_t ln_mesh_enable_config(ln_client_t* client, const char* config_json);
+
+/** Disable mesh networking and remove all mesh peers from the tunnel. */
+ln_error_t ln_mesh_disable(ln_client_t* client);
+
+/** Get mesh tunnel status as JSON.
+ *  Returns: {is_up, tunnel_ip, peer_count, online_count,
+ *  total_rx_bytes, total_tx_bytes, peers: [...]}.
+ *  Caller must ln_free(*out_json). */
+ln_error_t ln_mesh_status(ln_client_t* client, char** out_json);
+
+/** Get current mesh peers as JSON array.
+ *  Each peer: {node_id, hostname, wg_pubkey, tunnel_ip, private_subnet,
+ *  endpoint, relay_endpoint, is_online, last_handshake, rx_bytes, tx_bytes,
+ *  latency_ms, keepalive}.
+ *  Caller must ln_free(*out_json). */
+ln_error_t ln_mesh_peers(ln_client_t* client, char** out_json);
+
+/** Force an immediate mesh peer refresh (fetch from server + sync tunnel). */
+ln_error_t ln_mesh_refresh(ln_client_t* client);
+
+/* ------------------------------------------------------------------ */
 /* Identity: seed-based creation                                       */
 /* ------------------------------------------------------------------ */
 

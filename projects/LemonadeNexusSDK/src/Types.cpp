@@ -257,4 +257,83 @@ void from_json(const json& j, AttestationManifests& a) {
     }
 }
 
+// --- MeshPeer ---
+void to_json(json& j, const MeshPeer& p) {
+    j = json{
+        {"node_id",        p.node_id},
+        {"hostname",       p.hostname},
+        {"wg_pubkey",      p.wg_pubkey},
+        {"tunnel_ip",      p.tunnel_ip},
+        {"private_subnet", p.private_subnet},
+        {"endpoint",       p.endpoint},
+        {"relay_endpoint", p.relay_endpoint},
+        {"is_online",      p.is_online},
+        {"last_handshake", p.last_handshake},
+        {"rx_bytes",       p.rx_bytes},
+        {"tx_bytes",       p.tx_bytes},
+        {"latency_ms",     p.latency_ms},
+        {"keepalive",      p.keepalive},
+    };
+}
+
+void from_json(const json& j, MeshPeer& p) {
+    p.node_id        = j.value("node_id", "");
+    p.hostname       = j.value("hostname", "");
+    p.wg_pubkey      = j.value("wg_pubkey", "");
+    p.tunnel_ip      = j.value("tunnel_ip", "");
+    p.private_subnet = j.value("private_subnet", "");
+    p.endpoint       = j.value("endpoint", "");
+    p.relay_endpoint = j.value("relay_endpoint", "");
+    p.is_online      = j.value("is_online", false);
+    p.last_handshake = j.value("last_handshake", int64_t{0});
+    p.rx_bytes       = j.value("rx_bytes", uint64_t{0});
+    p.tx_bytes       = j.value("tx_bytes", uint64_t{0});
+    p.latency_ms     = j.value("latency_ms", int32_t{-1});
+    p.keepalive      = j.value("keepalive", uint16_t{25});
+}
+
+// --- MeshTunnelStatus ---
+void to_json(json& j, const MeshTunnelStatus& s) {
+    j = json{
+        {"is_up",          s.is_up},
+        {"tunnel_ip",      s.tunnel_ip},
+        {"peer_count",     s.peer_count},
+        {"online_count",   s.online_count},
+        {"total_rx_bytes", s.total_rx_bytes},
+        {"total_tx_bytes", s.total_tx_bytes},
+        {"peers",          s.peers},
+    };
+}
+
+void from_json(const json& j, MeshTunnelStatus& s) {
+    s.is_up          = j.value("is_up", false);
+    s.tunnel_ip      = j.value("tunnel_ip", "");
+    s.peer_count     = j.value("peer_count", uint32_t{0});
+    s.online_count   = j.value("online_count", uint32_t{0});
+    s.total_rx_bytes = j.value("total_rx_bytes", uint64_t{0});
+    s.total_tx_bytes = j.value("total_tx_bytes", uint64_t{0});
+    if (j.contains("peers") && j["peers"].is_array()) {
+        s.peers = j["peers"].get<std::vector<MeshPeer>>();
+    }
+}
+
+// --- MeshConfig ---
+void to_json(json& j, const MeshConfig& c) {
+    j = json{
+        {"peer_refresh_interval_sec", c.peer_refresh_interval_sec},
+        {"heartbeat_interval_sec",    c.heartbeat_interval_sec},
+        {"stun_refresh_interval_sec", c.stun_refresh_interval_sec},
+        {"prefer_direct",             c.prefer_direct},
+        {"auto_connect",              c.auto_connect},
+    };
+}
+
+void from_json(const json& j, MeshConfig& c) {
+    c.peer_refresh_interval_sec = j.value("peer_refresh_interval_sec", uint32_t{30});
+    c.heartbeat_interval_sec    = j.value("heartbeat_interval_sec", uint32_t{15});
+    c.stun_refresh_interval_sec = j.value("stun_refresh_interval_sec", uint32_t{60});
+    c.prefer_direct             = j.value("prefer_direct", true);
+    c.auto_connect              = j.value("auto_connect", true);
+}
+
 } // namespace lnsdk
