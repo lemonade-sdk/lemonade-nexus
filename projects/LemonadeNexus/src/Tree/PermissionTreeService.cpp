@@ -130,6 +130,27 @@ bool PermissionTreeService::update_node_direct(const std::string& node_id,
     return true;
 }
 
+bool PermissionTreeService::update_node_endpoint(const std::string& node_id,
+                                                  const std::string& new_endpoint) {
+    std::lock_guard lock(mutex_);
+
+    auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) {
+        spdlog::error("[{}] update_node_endpoint: node '{}' not found", name(), node_id);
+        return false;
+    }
+
+    it->second.listen_endpoint = new_endpoint;
+    if (!persist_node(it->second)) {
+        spdlog::error("[{}] update_node_endpoint: failed to persist '{}'", name(), node_id);
+        return false;
+    }
+
+    spdlog::debug("[{}] updated endpoint for node '{}' to '{}'",
+                   name(), node_id, new_endpoint);
+    return true;
+}
+
 bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
     std::lock_guard lock(mutex_);
 

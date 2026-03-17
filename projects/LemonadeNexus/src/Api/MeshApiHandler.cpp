@@ -8,7 +8,42 @@
 
 #include <spdlog/spdlog.h>
 
+#include <regex>
+
 namespace nexus::api {
+
+namespace {
+/// Validate that a mesh heartbeat endpoint string is a well-formed ip:port
+/// or hostname:port.  Empty strings are allowed (clears the endpoint).
+/// Rejects arbitrary strings that could be injected downstream.
+bool is_valid_mesh_endpoint(const std::string& ep) {
+    if (ep.empty()) return true;
+    // Max length sanity check (longest reasonable hostname:port)
+    if (ep.size() > 253 + 6) return false;  // 253 char hostname + ":" + 5 digit port
+    // IPv4:port
+    static const std::regex ipv4_re(R"(^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$)");
+    // [IPv6]:port
+    static const std::regex ipv6_re(R"(^\[[0-9a-fA-F:]+\]:\d{1,5}$)");
+    // hostname:port
+    static const std::regex host_re(
+        R"(^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*:\d{1,5}$)");
+    if (!std::regex_match(ep, ipv4_re) &&
+        !std::regex_match(ep, ipv6_re) &&
+        !std::regex_match(ep, host_re)) {
+        return false;
+    }
+    // Validate port range (1-65535)
+    auto colon_pos = ep.rfind(':');
+    if (colon_pos == std::string::npos) return false;
+    auto port_str = ep.substr(colon_pos + 1);
+    try {
+        auto port = std::stoul(port_str);
+        return port >= 1 && port <= 65535;
+    } catch (...) {
+        return false;
+    }
+}
+} // anonymous namespace
 
 void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                         httplib::Server& priv) {
@@ -141,6 +176,12 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
+        // Validate endpoint format before storing (prevents injection downstream)
+        if (!is_valid_mesh_endpoint(hb_endpoint)) {
+            error_response(res, "invalid endpoint format (expected ip:port or hostname:port)");
+            return;
+        }
+
         // Verify the node exists
         auto node_opt = ctx_.tree.get_node(hb_node_id);
         if (!node_opt) {
@@ -148,18 +189,24 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        // Verify the caller owns this node (has Write or EditNode permission)
+        // Verify the caller owns this node via management pubkey (defense in depth)
         auto caller_pubkey = normalize_pubkey(claims.user_id);
+        if (node_opt->mgmt_pubkey != caller_pubkey) {
+            spdlog::warn("[MeshAPI] Heartbeat ownership mismatch: caller={} node_mgmt={}",
+                          caller_pubkey, node_opt->mgmt_pubkey);
+            error_response(res, "insufficient permissions", 403);
+            return;
+        }
+
+        // Also verify the caller has EditNode permission (belt and suspenders)
         if (!ctx_.tree.check_permission(caller_pubkey, hb_node_id,
                                          acl::Permission::EditNode)) {
             error_response(res, "insufficient permissions", 403);
             return;
         }
 
-        // Update the node's listen_endpoint in the tree
-        auto updated = *node_opt;
-        updated.listen_endpoint = hb_endpoint;
-        if (!ctx_.tree.update_node_direct(hb_node_id, updated)) {
+        // Atomically update only the listen_endpoint field (avoids TOCTOU race)
+        if (!ctx_.tree.update_node_endpoint(hb_node_id, hb_endpoint)) {
             error_response(res, "failed to update node endpoint", 500);
             return;
         }

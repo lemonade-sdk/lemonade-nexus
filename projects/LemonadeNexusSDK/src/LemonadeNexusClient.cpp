@@ -1725,6 +1725,7 @@ void LemonadeNexusClient::enable_mesh(const MeshConfig& config) {
 }
 
 void LemonadeNexusClient::disable_mesh() {
+    std::lock_guard lock(impl_->mutex);
     if (impl_->mesh_orchestrator) {
         impl_->mesh_orchestrator->stop();
         impl_->mesh_orchestrator.reset();
@@ -1732,6 +1733,7 @@ void LemonadeNexusClient::disable_mesh() {
 }
 
 MeshTunnelStatus LemonadeNexusClient::mesh_status() const {
+    std::lock_guard lock(impl_->mutex);
     if (impl_->mesh_orchestrator) {
         return impl_->mesh_orchestrator->status();
     }
@@ -1739,6 +1741,7 @@ MeshTunnelStatus LemonadeNexusClient::mesh_status() const {
 }
 
 std::vector<MeshPeer> LemonadeNexusClient::get_mesh_peers() const {
+    std::lock_guard lock(impl_->mutex);
     if (impl_->mesh_orchestrator) {
         return impl_->mesh_orchestrator->peers();
     }
@@ -1746,6 +1749,7 @@ std::vector<MeshPeer> LemonadeNexusClient::get_mesh_peers() const {
 }
 
 void LemonadeNexusClient::refresh_mesh_peers() {
+    std::lock_guard lock(impl_->mutex);
     if (impl_->mesh_orchestrator) {
         impl_->mesh_orchestrator->refresh_now();
     }
@@ -1782,6 +1786,34 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                 mp.endpoint       = p.value("endpoint", "");
                 mp.relay_endpoint = p.value("relay_endpoint", "");
                 mp.is_online      = p.value("is_online", false);
+
+                // Validate critical fields — reject peers with shell-unsafe
+                // or malformed data before they reach WireGuard commands.
+                // Check for shell metacharacters in all string fields.
+                auto has_unsafe_chars = [](const std::string& s) {
+                    for (char c : s) {
+                        if (c == ';' || c == '|' || c == '&' || c == '$' ||
+                            c == '`' || c == '(' || c == ')' || c == '{' ||
+                            c == '}' || c == '<' || c == '>' || c == '\'' ||
+                            c == '"' || c == '\\' || c == '\n' || c == '\r') {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+                if (has_unsafe_chars(mp.wg_pubkey) || has_unsafe_chars(mp.endpoint) ||
+                    has_unsafe_chars(mp.tunnel_ip) || has_unsafe_chars(mp.private_subnet) ||
+                    has_unsafe_chars(mp.relay_endpoint) || has_unsafe_chars(mp.hostname)) {
+                    spdlog::warn("[MeshPeers] Rejected peer '{}' with shell-unsafe characters",
+                                  mp.node_id);
+                    continue;  // skip this peer entirely
+                }
+                // Reject peers with empty pubkey (unusable for WireGuard)
+                if (mp.wg_pubkey.empty()) {
+                    spdlog::debug("[MeshPeers] Skipping peer '{}' with empty wg_pubkey", mp.node_id);
+                    continue;
+                }
+
                 peers.push_back(std::move(mp));
             }
         }

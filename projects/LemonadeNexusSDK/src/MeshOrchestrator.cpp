@@ -130,12 +130,14 @@ void MeshOrchestrator::do_peer_refresh() {
         spdlog::warn("[MeshOrchestrator] sync_peers failed: {}", sync_result.error);
     }
 
+    size_t peer_count;
     {
         std::lock_guard lock(mutex_);
         known_peers_ = std::move(server_peers);
+        peer_count = known_peers_.size();
     }
 
-    spdlog::debug("[MeshOrchestrator] peer refresh: {} peers synced", known_peers_.size());
+    spdlog::debug("[MeshOrchestrator] peer refresh: {} peers synced", peer_count);
 }
 
 void MeshOrchestrator::do_heartbeat() {

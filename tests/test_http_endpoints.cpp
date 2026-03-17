@@ -307,9 +307,16 @@ protected:
                 return;
             }
 
-            // Verify caller owns this node (EditNode permission)
+            // Verify caller owns this node via mgmt_pubkey (defense in depth)
             auto caller = claims.user_id;
             if (!caller.starts_with("ed25519:")) caller = "ed25519:" + caller;
+            if (node_opt->mgmt_pubkey != caller) {
+                res.status = 403;
+                res.set_content(R"({"error":"insufficient permissions"})", "application/json");
+                return;
+            }
+
+            // Also verify EditNode permission
             bool has_perm = tree->check_permission(caller, hb_node_id, acl::Permission::EditNode);
             if (!has_perm) {
                 res.status = 403;
@@ -317,14 +324,25 @@ protected:
                 return;
             }
 
-            auto updated = *node_opt;
-            updated.listen_endpoint = body.value("endpoint", "");
-            tree->update_node_direct(hb_node_id, updated);
+            // Validate endpoint format
+            auto ep = body.value("endpoint", "");
+            if (!ep.empty()) {
+                // Basic ip:port format check
+                auto colon = ep.rfind(':');
+                if (colon == std::string::npos || colon == 0 || colon == ep.size() - 1) {
+                    res.status = 400;
+                    res.set_content(R"({"error":"invalid endpoint format"})", "application/json");
+                    return;
+                }
+            }
+
+            // Use atomic endpoint update to avoid TOCTOU
+            tree->update_node_endpoint(hb_node_id, ep);
 
             json j;
             j["success"] = true;
             j["node_id"] = hb_node_id;
-            j["endpoint"] = updated.listen_endpoint;
+            j["endpoint"] = ep;
             res.set_content(j.dump(), "application/json");
         }));
 
@@ -820,4 +838,45 @@ TEST_F(HttpEndpointTest, MeshHeartbeatMissingNodeId) {
     auto res = cli.Post("/api/mesh/heartbeat", h, body.dump(), "application/json");
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 400);
+}
+
+TEST_F(HttpEndpointTest, MeshHeartbeatInvalidEndpointFormat) {
+    auto cli = make_client();
+
+    // Create a node owned by root
+    tree::TreeNode node;
+    node.id = "hb_validate_node";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = root_pubkey_str;
+    node.assignments = {{root_pubkey_str, {"admin"}}};
+    auto d = make_signed_delta("create_node", "hb_validate_node", node);
+    cli.Post("/api/tree/delta", json(d).dump(), "application/json");
+
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+
+    // Malformed: no port
+    json body1 = {{"node_id", "hb_validate_node"}, {"endpoint", "just-a-string"}};
+    auto res1 = cli.Post("/api/mesh/heartbeat", h, body1.dump(), "application/json");
+    ASSERT_NE(res1, nullptr);
+    EXPECT_EQ(res1->status, 400) << "Endpoint with no port should be rejected";
+
+    // Malformed: shell injection attempt
+    json body2 = {{"node_id", "hb_validate_node"}, {"endpoint", "1.2.3.4; rm -rf /"}};
+    auto res2 = cli.Post("/api/mesh/heartbeat", h, body2.dump(), "application/json");
+    ASSERT_NE(res2, nullptr);
+    EXPECT_EQ(res2->status, 400) << "Shell injection in endpoint should be rejected";
+
+    // Valid endpoint should succeed
+    json body3 = {{"node_id", "hb_validate_node"}, {"endpoint", "203.0.113.1:51820"}};
+    auto res3 = cli.Post("/api/mesh/heartbeat", h, body3.dump(), "application/json");
+    ASSERT_NE(res3, nullptr);
+    EXPECT_EQ(res3->status, 200) << "Valid ip:port endpoint should be accepted";
+
+    // Empty endpoint should succeed (clearing endpoint)
+    json body4 = {{"node_id", "hb_validate_node"}, {"endpoint", ""}};
+    auto res4 = cli.Post("/api/mesh/heartbeat", h, body4.dump(), "application/json");
+    ASSERT_NE(res4, nullptr);
+    EXPECT_EQ(res4->status, 200) << "Empty endpoint (clear) should be accepted";
 }

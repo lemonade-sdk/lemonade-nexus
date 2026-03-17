@@ -39,6 +39,12 @@ public:
     /// The caller (HTTP handler) is responsible for permission checks.
     bool update_node_direct(const std::string& node_id, const TreeNode& updated);
 
+    /// Atomically update only the listen_endpoint field of a node.
+    /// Reads the current node, sets listen_endpoint, and persists — all under
+    /// a single lock.  This avoids the TOCTOU race of read → modify → write.
+    bool update_node_endpoint(const std::string& node_id,
+                               const std::string& new_endpoint);
+
     /// Delete a node directly, bypassing delta signing.
     /// The caller (HTTP handler) is responsible for permission checks.
     bool delete_node_direct(const std::string& node_id);

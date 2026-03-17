@@ -499,6 +499,11 @@ int main(int argc, char* argv[]) {
     auto& private_srv = private_http_server
         ? private_http_server->server()
         : http_server.server();
+    if (!private_http_server) {
+        spdlog::warn("SECURITY: No tunnel_bind_ip configured — private API routes "
+                     "are exposed on the public HTTP server. Set a tunnel IP to "
+                     "isolate authenticated endpoints to the WireGuard interface.");
+    }
 
     // Rate limiter
     nexus::network::RateLimiter rate_limiter{{config.rate_limit_rpm, config.rate_limit_burst}};

@@ -22,7 +22,134 @@
 #  include <TargetConditionals.h>
 #endif
 
+// POSIX headers for secure file creation (open/write/close/unlink)
+#if !defined(_WIN32)
+#  include <cerrno>
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
+
 namespace lnsdk {
+
+// ---------------------------------------------------------------------------
+// Input validation — reject shell metacharacters and enforce format
+// ---------------------------------------------------------------------------
+
+/// Returns true if the string contains NO shell-unsafe characters.
+/// This is a defense-in-depth check for all values that flow into popen().
+static bool is_shell_safe(const std::string& s) {
+    for (char c : s) {
+        switch (c) {
+            case ';': case '|': case '&': case '$': case '`':
+            case '(': case ')': case '{': case '}':
+            case '<': case '>': case '\'': case '"':
+            case '\\': case '\n': case '\r': case '\0':
+                return false;
+            default:
+                break;
+        }
+    }
+    return true;
+}
+
+/// Validate a WireGuard base64 public key: exactly 44 chars, base64 charset.
+static bool is_valid_wg_pubkey(const std::string& key) {
+    if (key.size() != 44) return false;
+    // Must end with '=' (Curve25519 keys are 32 bytes → 44 base64 chars with padding)
+    if (key.back() != '=') return false;
+    for (size_t i = 0; i < key.size() - 1; ++i) {
+        char c = key[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+              (c >= '0' && c <= '9') || c == '+' || c == '/')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Validate an endpoint string: ip:port or [ipv6]:port or hostname:port.
+/// Empty is allowed (peer without known endpoint).
+static bool is_valid_wg_endpoint(const std::string& ep) {
+    if (ep.empty()) return true;
+    if (ep.size() > 260) return false;
+    if (!is_shell_safe(ep)) return false;
+    // Must contain a colon for port separation
+    auto colon = ep.rfind(':');
+    if (colon == std::string::npos || colon == 0 || colon == ep.size() - 1) return false;
+    // Validate port is numeric and in range
+    auto port_str = ep.substr(colon + 1);
+    for (char c : port_str) {
+        if (c < '0' || c > '9') return false;
+    }
+    try {
+        auto port = std::stoul(port_str);
+        if (port < 1 || port > 65535) return false;
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+/// Validate a CIDR string: ip/prefix. No shell metacharacters.
+static bool is_valid_cidr(const std::string& cidr) {
+    if (cidr.empty()) return false;
+    if (cidr.size() > 50) return false;
+    if (!is_shell_safe(cidr)) return false;
+    // Must contain exactly one '/'
+    auto slash = cidr.find('/');
+    if (slash == std::string::npos || slash == 0 || slash == cidr.size() - 1) return false;
+    // IP part: only digits, dots, colons (for IPv6), hex chars
+    auto ip_part = cidr.substr(0, slash);
+    for (char c : ip_part) {
+        if (!((c >= '0' && c <= '9') || c == '.' || c == ':' ||
+              (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    // Prefix part: numeric, reasonable range
+    auto prefix_str = cidr.substr(slash + 1);
+    for (char c : prefix_str) {
+        if (c < '0' || c > '9') return false;
+    }
+    try {
+        auto prefix = std::stoul(prefix_str);
+        if (prefix > 128) return false;  // max IPv6 prefix
+    } catch (...) {
+        return false;
+    }
+    return true;
+}
+
+/// Validate a tunnel IP (with or without /32 suffix).
+static bool is_valid_tunnel_ip(const std::string& ip) {
+    if (ip.empty()) return true;
+    if (ip.find('/') != std::string::npos) return is_valid_cidr(ip);
+    // Plain IP: only digits and dots (IPv4) or hex and colons (IPv6)
+    if (ip.size() > 45) return false;
+    if (!is_shell_safe(ip)) return false;
+    for (char c : ip) {
+        if (!((c >= '0' && c <= '9') || c == '.' || c == ':' ||
+              (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// Validate all fields of a MeshPeer before using them in shell commands.
+/// Returns an error string if invalid, empty string if OK.
+static std::string validate_mesh_peer(const MeshPeer& peer) {
+    if (peer.wg_pubkey.empty()) return "missing wg_pubkey";
+    if (!is_valid_wg_pubkey(peer.wg_pubkey))
+        return "invalid wg_pubkey format (expected 44-char base64)";
+    if (!is_valid_wg_endpoint(peer.endpoint))
+        return "invalid endpoint format: " + peer.endpoint;
+    if (!is_valid_tunnel_ip(peer.tunnel_ip))
+        return "invalid tunnel_ip: " + peer.tunnel_ip;
+    if (!peer.private_subnet.empty() && !is_valid_cidr(peer.private_subnet))
+        return "invalid private_subnet: " + peer.private_subnet;
+    return "";
+}
 
 // ---------------------------------------------------------------------------
 // Base64 helpers (WireGuard uses standard base64, not URL-safe)
@@ -84,21 +211,41 @@ struct WireGuardTunnel::Impl {
         return ss.str();
     }
 
-    // Write config to a temp file, return the path
+    // Write config to a temp file, return the path.
+    // SECURITY: The config contains the WireGuard private key, so we must
+    // create it with restrictive permissions (0600 on Unix) and avoid
+    // following symlinks at a predictable path.
     std::string write_temp_config() {
-        // Use a stable name so we can tear down later
         std::string path;
 #if defined(_WIN32)
         char tmp[MAX_PATH];
         GetTempPathA(sizeof(tmp), tmp);
         path = std::string(tmp) + "lnsdk_wg0.conf";
-#else
-        path = "/tmp/lnsdk_wg0.conf";
-#endif
+        // On Windows, temp dir is per-user, so permissions are less critical
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs) return {};
         ofs << build_config_string();
         ofs.close();
+#else
+        path = "/tmp/lnsdk_wg0.conf";
+        // Remove any existing file/symlink first to prevent symlink attacks
+        (void)::unlink(path.c_str());
+        // Open with O_CREAT|O_EXCL|O_WRONLY to avoid TOCTOU on the unlink.
+        // Mode 0600: owner read/write only — protects the private key.
+        int fd = ::open(path.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fd < 0) {
+            spdlog::warn("[WireGuardTunnel] Failed to create config file at {}: {}",
+                          path, strerror(errno));
+            return {};
+        }
+        auto content = build_config_string();
+        auto written = ::write(fd, content.data(), content.size());
+        ::close(fd);
+        if (written < 0 || static_cast<size_t>(written) != content.size()) {
+            ::unlink(path.c_str());
+            return {};
+        }
+#endif
         config_path = path;
         return path;
     }
@@ -433,6 +580,15 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
         return result;
     }
 
+    if (!is_valid_wg_pubkey(server_pubkey)) {
+        result.error = "invalid server pubkey format";
+        return result;
+    }
+    if (!is_valid_wg_endpoint(server_endpoint)) {
+        result.error = "invalid server endpoint format";
+        return result;
+    }
+
     if (impl_->using_boringtun) {
         return impl_->boringtun.update_endpoint(server_pubkey, server_endpoint);
     }
@@ -577,6 +733,15 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (!is_valid_wg_pubkey(server_pubkey)) {
+        result.error = "invalid server pubkey format";
+        return result;
+    }
+    if (!is_valid_wg_endpoint(server_endpoint)) {
+        result.error = "invalid server endpoint format";
         return result;
     }
 
@@ -732,6 +897,15 @@ StatusResult WireGuardTunnel::update_endpoint(const std::string& server_pubkey,
     StatusResult result;
     if (!impl_->active) {
         result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (!is_valid_wg_pubkey(server_pubkey)) {
+        result.error = "invalid server pubkey format";
+        return result;
+    }
+    if (!is_valid_wg_endpoint(server_endpoint)) {
+        result.error = "invalid server endpoint format";
         return result;
     }
 
@@ -923,8 +1097,11 @@ StatusResult WireGuardTunnel::add_peer(const MeshPeer& peer) {
         result.error = "tunnel is not active";
         return result;
     }
-    if (peer.wg_pubkey.empty()) {
-        result.error = "peer wg_pubkey is required";
+    // Validate all peer fields before they touch any shell command
+    auto validation_err = validate_mesh_peer(peer);
+    if (!validation_err.empty()) {
+        result.error = "invalid peer data: " + validation_err;
+        spdlog::warn("[WireGuardTunnel] add_peer rejected: {}", validation_err);
         return result;
     }
 
@@ -975,6 +1152,11 @@ StatusResult WireGuardTunnel::remove_peer(const std::string& wg_pubkey) {
         return result;
     }
 
+    if (!is_valid_wg_pubkey(wg_pubkey)) {
+        result.error = "invalid wg_pubkey format";
+        return result;
+    }
+
     if (impl_->using_boringtun) {
         result = impl_->boringtun.remove_peer(wg_pubkey);
         if (result) {
@@ -1006,6 +1188,15 @@ StatusResult WireGuardTunnel::update_peer_endpoint(const std::string& wg_pubkey,
 
     if (!impl_->active) {
         result.error = "tunnel is not active";
+        return result;
+    }
+
+    if (!is_valid_wg_pubkey(wg_pubkey)) {
+        result.error = "invalid wg_pubkey format";
+        return result;
+    }
+    if (!is_valid_wg_endpoint(endpoint)) {
+        result.error = "invalid endpoint format";
         return result;
     }
 
@@ -1090,6 +1281,10 @@ StatusResult WireGuardTunnel::sync_peers(const std::vector<MeshPeer>& desired_pe
     // Remove peers not in desired set
     for (const auto& [pubkey, _] : current_map) {
         if (!desired_map.contains(pubkey)) {
+            if (!is_valid_wg_pubkey(pubkey)) {
+                spdlog::warn("[WireGuardTunnel] sync: skipping removal of invalid pubkey");
+                continue;
+            }
             std::string cmd = "wg set " + impl_->iface_name +
                               " peer " + pubkey + " remove 2>&1";
             auto [rc, output] = Impl::exec_cmd(cmd);
@@ -1102,6 +1297,14 @@ StatusResult WireGuardTunnel::sync_peers(const std::vector<MeshPeer>& desired_pe
 
     // Add or update peers in desired set
     for (const auto& [pubkey, peer_ptr] : desired_map) {
+        // Validate peer data before constructing shell command
+        auto verr = validate_mesh_peer(*peer_ptr);
+        if (!verr.empty()) {
+            spdlog::warn("[WireGuardTunnel] sync: skipping invalid peer {}: {}",
+                          peer_ptr->node_id, verr);
+            continue;
+        }
+
         auto allowed = Impl::peer_allowed_ips(*peer_ptr);
         if (allowed.empty()) continue;
 
