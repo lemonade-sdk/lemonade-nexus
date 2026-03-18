@@ -24,6 +24,7 @@ struct LemonadeNexusClient::Impl {
     std::string  session_token;
     std::string  node_id;
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
+    std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTP fallback
     uint16_t     private_port{9101};
     mutable std::mutex mutex;
 
@@ -225,61 +226,92 @@ struct LemonadeNexusClient::Impl {
 
     // --- Private API (HTTPS over WG tunnel via private FQDN) ---
 
+    /// Private API URL: try HTTPS via FQDN, fall back to HTTP on tunnel IP.
     std::string private_base_url() const {
         if (!server_private_fqdn.empty()) {
             return "https://" + server_private_fqdn + ":" + std::to_string(private_port);
+        }
+        if (!server_tunnel_ip.empty()) {
+            return "http://" + server_tunnel_ip + ":" + std::to_string(private_port);
+        }
+        return current_base_url();
+    }
+
+    std::string private_fallback_url() const {
+        if (!server_tunnel_ip.empty()) {
+            return "http://" + server_tunnel_ip + ":" + std::to_string(private_port);
         }
         return current_base_url();
     }
 
     std::optional<json> private_http_get(const std::string& path, int& status_out) {
-        if (server_private_fqdn.empty()) {
-            return http_get(path, status_out);
+        // Try HTTPS via private FQDN first
+        if (!server_private_fqdn.empty()) {
+            try {
+                httplib::Client cli("https://" + server_private_fqdn + ":" + std::to_string(private_port));
+                cli.set_connection_timeout(config.connect_timeout_sec);
+                cli.set_read_timeout(config.read_timeout_sec);
+                auto res = cli.Get(path, auth_headers());
+                if (res) {
+                    status_out = res->status;
+                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
+                    try { return json::parse(res->body); } catch (...) { return std::nullopt; }
+                }
+            } catch (...) {}
         }
-        try {
-            httplib::Client cli(private_base_url());
-            cli.set_connection_timeout(config.connect_timeout_sec);
-            cli.set_read_timeout(config.read_timeout_sec);
-            cli.enable_server_certificate_verification(true);
-            auto res = cli.Get(path, auth_headers());
-            if (!res) {
-                spdlog::debug("[LemonadeNexusClient] private GET {} failed, falling back", path);
-                return http_get(path, status_out);
-            }
-            status_out = res->status;
-            if (res->status < 200 || res->status >= 300) {
-                try { return json::parse(res->body); } catch (...) { return std::nullopt; }
-            }
-            return json::parse(res->body);
-        } catch (...) {
-            return http_get(path, status_out);
+        // Fall back to HTTP on tunnel IP
+        if (!server_tunnel_ip.empty()) {
+            try {
+                httplib::Client cli("http://" + server_tunnel_ip + ":" + std::to_string(private_port));
+                cli.set_connection_timeout(config.connect_timeout_sec);
+                cli.set_read_timeout(config.read_timeout_sec);
+                auto res = cli.Get(path, auth_headers());
+                if (res) {
+                    status_out = res->status;
+                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
+                    try { return json::parse(res->body); } catch (...) { return std::nullopt; }
+                }
+            } catch (...) {}
         }
+        // Last resort: public API
+        return http_get(path, status_out);
     }
 
     std::optional<json> private_http_post(const std::string& path, const json& body, int& status_out) {
-        if (server_private_fqdn.empty()) {
-            return http_post(path, body, status_out);
-        }
-        try {
-            httplib::Client cli(private_base_url());
-            cli.set_connection_timeout(config.connect_timeout_sec);
-            cli.set_read_timeout(config.read_timeout_sec);
-            cli.enable_server_certificate_verification(true);
-            auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
-            if (!res) {
-                spdlog::debug("[LemonadeNexusClient] private POST {} failed, falling back", path);
-                return http_post(path, body, status_out);
-            }
-            status_out = res->status;
-            if (res->status < 200 || res->status >= 300) {
-                try { return json::parse(res->body); } catch (...) {
-                    json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
+        // Try HTTPS via private FQDN first
+        if (!server_private_fqdn.empty()) {
+            try {
+                httplib::Client cli("https://" + server_private_fqdn + ":" + std::to_string(private_port));
+                cli.set_connection_timeout(config.connect_timeout_sec);
+                cli.set_read_timeout(config.read_timeout_sec);
+                auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
+                if (res) {
+                    status_out = res->status;
+                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
+                    try { return json::parse(res->body); } catch (...) {
+                        json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
+                    }
                 }
-            }
-            return json::parse(res->body);
-        } catch (...) {
-            return http_post(path, body, status_out);
+            } catch (...) {}
         }
+        // Fall back to HTTP on tunnel IP
+        if (!server_tunnel_ip.empty()) {
+            try {
+                httplib::Client cli("http://" + server_tunnel_ip + ":" + std::to_string(private_port));
+                cli.set_connection_timeout(config.connect_timeout_sec);
+                cli.set_read_timeout(config.read_timeout_sec);
+                auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
+                if (res) {
+                    status_out = res->status;
+                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
+                    try { return json::parse(res->body); } catch (...) {
+                        json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
+                    }
+                }
+            } catch (...) {}
+        }
+        // Last resort: public API
+        return http_post(path, body, status_out);
     }
 
     // Discover additional servers via /api/servers
@@ -1402,13 +1434,23 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         std::lock_guard lock(impl_->mutex);
         impl_->node_id = node_id;
         // Store server private FQDN for HTTPS over WG tunnel
+        // Store server tunnel IP for HTTP fallback
+        auto srv_tunnel = resp->value("server_tunnel_ip", std::string{});
+        if (!srv_tunnel.empty()) {
+            impl_->server_tunnel_ip = srv_tunnel;
+        }
+
+        // Store private FQDN for HTTPS over WG tunnel
         auto srv_priv_fqdn = resp->value("server_private_fqdn", std::string{});
+        impl_->private_port = static_cast<uint16_t>(
+            resp->value("private_api_port", 9101));
         if (!srv_priv_fqdn.empty()) {
             impl_->server_private_fqdn = srv_priv_fqdn;
-            impl_->private_port = static_cast<uint16_t>(
-                resp->value("private_api_port", 9101));
-            spdlog::info("[LemonadeNexusClient] private API via HTTPS: {}:{}",
-                          srv_priv_fqdn, impl_->private_port);
+            spdlog::info("[LemonadeNexusClient] private API: HTTPS {} / HTTP {}:{}",
+                          srv_priv_fqdn, srv_tunnel, impl_->private_port);
+        } else if (!srv_tunnel.empty()) {
+            spdlog::info("[LemonadeNexusClient] private API: HTTP {}:{}",
+                          srv_tunnel, impl_->private_port);
         }
     }
 

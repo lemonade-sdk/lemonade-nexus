@@ -621,9 +621,34 @@ int main(int argc, char* argv[]) {
 
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
     if (!tunnel_bind_ip.empty()) {
-        private_http_server = std::make_unique<nexus::network::HttpServer>(
-            config.private_http_port, tunnel_bind_ip);
-        spdlog::info("Private API will bind to {}:{}", tunnel_bind_ip, config.private_http_port);
+        // Try to get/request ACME cert for the private FQDN
+        std::string priv_cert_path, priv_key_path;
+        if (!server_private_fqdn.empty() && config.auto_tls) {
+            auto priv_tls = nexus::core::resolve_tls_cert(config, data_root, server_private_fqdn);
+            if (!priv_tls.cert_path.empty() && !priv_tls.key_path.empty()) {
+                priv_cert_path = priv_tls.cert_path;
+                priv_key_path  = priv_tls.key_path;
+                spdlog::info("Private API: using TLS cert for {}", server_private_fqdn);
+            } else if (priv_tls.needs_acme_background) {
+                spdlog::info("Private API: no cert for {} -- requesting in background", server_private_fqdn);
+                // Request cert asynchronously — private API starts as HTTP initially,
+                // will need restart to pick up the cert once ACME completes
+                std::thread([&acme, fqdn = server_private_fqdn]() {
+                    std::this_thread::sleep_for(std::chrono::seconds(5));
+                    (void)acme.request_certificate(fqdn);
+                }).detach();
+            }
+        }
+
+        if (!priv_cert_path.empty()) {
+            private_http_server = std::make_unique<nexus::network::HttpServer>(
+                config.private_http_port, tunnel_bind_ip, priv_cert_path, priv_key_path);
+        } else {
+            private_http_server = std::make_unique<nexus::network::HttpServer>(
+                config.private_http_port, tunnel_bind_ip);
+        }
+        spdlog::info("Private API will bind to {}:{} ({})", tunnel_bind_ip,
+                      config.private_http_port, priv_cert_path.empty() ? "HTTP" : "HTTPS");
     }
 
     auto& private_srv = private_http_server
