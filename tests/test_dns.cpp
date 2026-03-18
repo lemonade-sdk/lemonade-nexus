@@ -486,7 +486,7 @@ TEST_F(DnsResolveTest, ConfigTxtWithPortConfig) {
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353 private_http=9101");
+    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353 private_http=9101 region= load=0");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtWithTypeQualifier) {
@@ -528,7 +528,7 @@ TEST_F(DnsResolveTest, ConfigTxtCustomPorts) {
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=8443 udp=8444 gossip=8445 stun=8446 relay=8447 dns=8448 private_http=8449");
+    EXPECT_EQ(*result, "v=sp1 http=8443 udp=8444 gossip=8445 stun=8446 relay=8447 dns=8448 private_http=8449 region= load=0");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtCaseInsensitive) {

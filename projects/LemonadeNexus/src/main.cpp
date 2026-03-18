@@ -377,6 +377,7 @@ int main(int argc, char* argv[]) {
     // Server identity resolution (uses ServerIdentity helpers)
     // ========================================================================
     nexus::core::resolve_server_hostname(config, data_root, gossip);
+    nexus::core::resolve_server_region(config, data_root);
 
     // NS hostname: explicit > derived from server_hostname
     std::string ns_hostname = config.dns_ns_hostname;
@@ -429,7 +430,28 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Publish SEIP records: <id>.<region>.seip.<domain> for geo-aware discovery
+    dns.set_server_region(config.region);
+    {
+        auto seip_id = nexus::core::resolve_server_node_id(storage);
+        if (!seip_id.empty() && !config.region.empty() && !server_public_ip.empty()) {
+            dns.publish_seip_records(seip_id, config.region, server_public_ip);
+            spdlog::info("SEIP: published {}.{}.seip.{} -> {}",
+                          seip_id, config.region, config.dns_base_domain, server_public_ip);
+        }
+    }
+
     dns.start();
+
+    // NS slot claiming: first 9 servers claim ns1-ns9 for DNS bootstrap
+    gossip.set_our_region(config.region);
+    gossip.set_dns_base_domain(config.dns_base_domain);
+    if (!server_public_ip.empty()) {
+        gossip.try_claim_ns_slot(server_public_ip);
+        if (auto slot = gossip.our_ns_slot()) {
+            spdlog::info("SEIP: claimed NS slot ns{} for {}", *slot, server_public_ip);
+        }
+    }
 
     // ========================================================================
     // Auth + ACL

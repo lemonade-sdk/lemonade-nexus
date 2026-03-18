@@ -36,6 +36,12 @@ void resolve_server_hostname(
     const std::filesystem::path& data_root,
     gossip::GossipService& gossip);
 
+/// Resolve server region: config > persisted > auto-detect via HostnameGenerator.
+/// Mutates config.region in-place and persists to data/identity/region.
+void resolve_server_region(
+    ServerConfig& config,
+    const std::filesystem::path& data_root);
+
 /// Resolve public IP: config > non-wildcard bind address > ipify auto-detect.
 [[nodiscard]] std::string resolve_public_ip(const ServerConfig& config);
 

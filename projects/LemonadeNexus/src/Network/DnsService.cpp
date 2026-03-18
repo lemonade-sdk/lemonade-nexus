@@ -197,7 +197,42 @@ void DnsService::handle_query(std::size_t bytes) {
             return;
         }
 
-        // 1. Check dynamic A records (NS glue records, etc.)
+        // 1. SEIP region-wildcard: <region>.seip.<base_domain> -> multi-A response
+        {
+            std::string seip_suffix = ".seip." + base_lower;
+            if (query_lower.size() > seip_suffix.size() &&
+                query_lower.compare(query_lower.size() - seip_suffix.size(),
+                                     seip_suffix.size(), seip_suffix) == 0) {
+                std::string region_part = query_lower.substr(
+                    0, query_lower.size() - seip_suffix.size());
+                // Only match if region_part has no dots (i.e. it's just "<region>", not "<id>.<region>")
+                if (region_part.find('.') == std::string::npos) {
+                    // Collect all A records for servers in this region
+                    std::string match_suffix = "." + region_part + ".seip." + base_lower;
+                    std::vector<std::string> ips;
+                    {
+                        std::lock_guard<std::mutex> lock(zone_mutex_);
+                        for (const auto& [key, rec] : zone_records_) {
+                            if (key.starts_with("A:") &&
+                                key.size() > (2 + match_suffix.size()) &&
+                                key.compare(key.size() - match_suffix.size(),
+                                            match_suffix.size(), match_suffix) == 0) {
+                                ips.push_back(rec.value);
+                            }
+                        }
+                    }
+                    if (!ips.empty()) {
+                        spdlog::debug("[{}] {} -> {} SEIP A records (region {})",
+                                       name(), qname, ips.size(), region_part);
+                        send_response(build_multi_a_response(data, bytes, qname, ips, 300));
+                        return;
+                    }
+                    // No servers in this region — fall through to NXDOMAIN
+                }
+            }
+        }
+
+        // 2. Check dynamic A records (NS glue records, etc.)
         auto dyn_a = lookup_dynamic_a(query_lower);
         if (dyn_a) {
             spdlog::debug("[{}] {} -> {} (dynamic)", name(), qname, *dyn_a);
@@ -205,7 +240,7 @@ void DnsService::handle_query(std::size_t bytes) {
             return;
         }
 
-        // 2. Tree-based resolution
+        // 3. Tree-based resolution
         auto record = do_resolve(qname);
         if (record) {
             spdlog::debug("[{}] {} -> {}", name(), qname, record->ipv4_address);
@@ -252,6 +287,30 @@ std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
     // Strip the base domain suffix
     // e.g. "my-laptop.ep.lemonade-nexus.io" -> "my-laptop.ep"
     std::string prefix = query.substr(0, query.size() - suffix.size());
+
+    // Check for SEIP subdomain: <id>.<region>.seip
+    // This handles: server1.us-west.seip.lemonade-nexus.io -> specific server A record
+    {
+        const std::string seip_tag = ".seip";
+        if (prefix.size() > seip_tag.size() &&
+            prefix.compare(prefix.size() - seip_tag.size(), seip_tag.size(), seip_tag) == 0) {
+            // prefix = "<id>.<region>.seip" or "<region>.seip"
+            std::string seip_prefix = prefix.substr(0, prefix.size() - seip_tag.size());
+            // seip_prefix is now "<id>.<region>" or "<region>"
+
+            // Look up the specific dynamic A record
+            std::string a_fqdn = query; // full fqdn
+            auto dyn_a = lookup_dynamic_a(a_fqdn);
+            if (dyn_a) {
+                DnsRecord rec;
+                rec.name = fqdn;
+                rec.ipv4_address = *dyn_a;
+                rec.ttl = 300;
+                return rec;
+            }
+            return std::nullopt;
+        }
+    }
 
     // Check for "relays" subdomain: <hostname>.[region.]relays
     // This handles: relay1.us-ca.relays.lemonade-nexus.io
@@ -444,7 +503,9 @@ void DnsService::publish_port_config(const std::string& server_id, const std::st
                       " stun=" + std::to_string(port_config_.stun_port) +
                       " relay=" + std::to_string(port_config_.relay_port) +
                       " dns=" + std::to_string(port_config_.dns_port) +
-                      " private_http=" + std::to_string(port_config_.private_http_port);
+                      " private_http=" + std::to_string(port_config_.private_http_port) +
+                      " region=" + port_config_.region +
+                      " load=" + std::to_string(port_config_.connected_clients);
     if (!server_fqdn.empty()) {
         txt += " host=" + server_fqdn;
     }
@@ -456,6 +517,26 @@ void DnsService::publish_port_config(const std::string& server_id, const std::st
 
 std::optional<std::string> DnsService::resolve_config_txt(
     const std::string& hostname) {
+
+    // Check for SEIP _config queries: <id>.<region>.seip
+    // These are stored as dynamic TXT records, not in the permission tree.
+    {
+        std::string host_lower_check = hostname;
+        std::transform(host_lower_check.begin(), host_lower_check.end(),
+                       host_lower_check.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        // If the hostname ends with ".seip", look up the dynamic TXT record
+        const std::string seip_tag = ".seip";
+        if (host_lower_check.size() > seip_tag.size() &&
+            host_lower_check.compare(host_lower_check.size() - seip_tag.size(),
+                                      seip_tag.size(), seip_tag) == 0) {
+            std::string txt_fqdn = "_config." + host_lower_check + "." + base_domain_;
+            std::transform(txt_fqdn.begin(), txt_fqdn.end(), txt_fqdn.begin(),
+                [](unsigned char c) { return std::tolower(c); });
+            return lookup_dynamic_txt(txt_fqdn);
+        }
+    }
 
     if (!has_port_config_) return std::nullopt;
 
@@ -520,7 +601,9 @@ std::optional<std::string> DnsService::resolve_config_txt(
                        " stun=" + std::to_string(port_config_.stun_port) +
                        " relay=" + std::to_string(port_config_.relay_port) +
                        " dns=" + std::to_string(port_config_.dns_port) +
-                       " private_http=" + std::to_string(port_config_.private_http_port);
+                       " private_http=" + std::to_string(port_config_.private_http_port) +
+                       " region=" + port_config_.region +
+                       " load=" + std::to_string(port_config_.connected_clients);
             }
         }
     }
@@ -1041,6 +1124,167 @@ std::vector<uint8_t> DnsService::build_soa_response(
     ares_dns_record_destroy(response);
 
     if (st != ARES_SUCCESS || !buf) return {};
+
+    std::vector<uint8_t> result(buf, buf + buf_len);
+    ares_free_string(buf);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// SEIP DNS record hierarchy
+// ---------------------------------------------------------------------------
+
+void DnsService::set_server_region(const std::string& region) {
+    server_region_ = region;
+    port_config_.region = region;
+}
+
+void DnsService::publish_seip_records(const std::string& server_id,
+                                       const std::string& region,
+                                       const std::string& public_ip) {
+    // Cache IDs for update_load() re-publishing
+    seip_server_id_ = server_id;
+    server_region_ = region;
+    port_config_.region = region;
+
+    // Normalize components
+    std::string id_lower = server_id;
+    std::transform(id_lower.begin(), id_lower.end(), id_lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+    std::string region_lower = region;
+    std::transform(region_lower.begin(), region_lower.end(), region_lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+    std::string base_lower = base_domain_;
+    std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+
+    // 1. A record: <server_id>.<region>.seip.<base_domain> -> public_ip
+    std::string a_fqdn = id_lower + "." + region_lower + ".seip." + base_lower;
+    set_record(a_fqdn, "A", public_ip, 300);
+
+    // 2. _config TXT: _config.<server_id>.<region>.seip.<base_domain> -> full port config
+    std::string server_fqdn = id_lower + "." + region_lower + ".seip." + base_lower;
+    seip_server_fqdn_ = server_fqdn;
+
+    std::string txt = "v=sp1"
+                      " http=" + std::to_string(port_config_.http_port) +
+                      " udp=" + std::to_string(port_config_.udp_port) +
+                      " gossip=" + std::to_string(port_config_.gossip_port) +
+                      " stun=" + std::to_string(port_config_.stun_port) +
+                      " relay=" + std::to_string(port_config_.relay_port) +
+                      " dns=" + std::to_string(port_config_.dns_port) +
+                      " private_http=" + std::to_string(port_config_.private_http_port) +
+                      " region=" + region_lower +
+                      " load=" + std::to_string(port_config_.connected_clients) +
+                      " host=" + server_fqdn;
+
+    std::string txt_fqdn = "_config." + id_lower + "." + region_lower + ".seip." + base_lower;
+    set_record(txt_fqdn, "TXT", txt, 300);
+
+    spdlog::info("[{}] published SEIP records: {}.{}.seip.{}",
+                  name(), server_id, region, base_domain_);
+}
+
+void DnsService::update_load(uint32_t connected_client_count) {
+    // Only re-publish if the count actually changed (avoid gossip spam)
+    if (port_config_.connected_clients == connected_client_count) {
+        return;
+    }
+
+    port_config_.connected_clients = connected_client_count;
+
+    // Re-publish the SEIP _config TXT record with updated load
+    if (seip_server_id_.empty() || server_region_.empty()) {
+        return; // SEIP records haven't been published yet
+    }
+
+    std::string id_lower = seip_server_id_;
+    std::transform(id_lower.begin(), id_lower.end(), id_lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+    std::string region_lower = server_region_;
+    std::transform(region_lower.begin(), region_lower.end(), region_lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+    std::string base_lower = base_domain_;
+    std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
+        [](unsigned char c) { return std::tolower(c); });
+
+    std::string server_fqdn = seip_server_fqdn_;
+    if (server_fqdn.empty()) {
+        server_fqdn = id_lower + "." + region_lower + ".seip." + base_lower;
+    }
+
+    std::string txt = "v=sp1"
+                      " http=" + std::to_string(port_config_.http_port) +
+                      " udp=" + std::to_string(port_config_.udp_port) +
+                      " gossip=" + std::to_string(port_config_.gossip_port) +
+                      " stun=" + std::to_string(port_config_.stun_port) +
+                      " relay=" + std::to_string(port_config_.relay_port) +
+                      " dns=" + std::to_string(port_config_.dns_port) +
+                      " private_http=" + std::to_string(port_config_.private_http_port) +
+                      " region=" + region_lower +
+                      " load=" + std::to_string(port_config_.connected_clients) +
+                      " host=" + server_fqdn;
+
+    std::string txt_fqdn = "_config." + id_lower + "." + region_lower + ".seip." + base_lower;
+    set_record(txt_fqdn, "TXT", txt, 300);
+
+    spdlog::debug("[{}] updated SEIP load: {} -> {} clients",
+                   name(), txt_fqdn, connected_client_count);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-A response building (for SEIP region wildcards)
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> DnsService::build_multi_a_response(
+    const unsigned char* query_data, std::size_t query_len,
+    const std::string& qname,
+    const std::vector<std::string>& ips,
+    uint32_t ttl) {
+
+    // Parse original query to extract the ID
+    ares_dns_record_t* query_rec = nullptr;
+    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
+        return {};
+    }
+    unsigned short id = ares_dns_record_get_id(query_rec);
+    ares_dns_record_destroy(query_rec);
+
+    // Create response record
+    ares_dns_record_t* response = nullptr;
+    unsigned short flags = ARES_FLAG_QR | ARES_FLAG_AA;
+    ares_status_t status = ares_dns_record_create(
+        &response, id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
+    if (status != ARES_SUCCESS || !response) return {};
+
+    // Add the question section
+    ares_dns_record_query_add(response, qname.c_str(),
+                               ARES_REC_TYPE_A, ARES_CLASS_IN);
+
+    // Add multiple A records — cap at 5 to stay within 512-byte UDP limit
+    std::size_t count = std::min(ips.size(), static_cast<std::size_t>(5));
+    for (std::size_t i = 0; i < count; ++i) {
+        struct in_addr addr{};
+        if (inet_pton(AF_INET, ips[i].c_str(), &addr) != 1) {
+            continue; // Skip invalid IPs
+        }
+
+        ares_dns_rr_t* rr = nullptr;
+        status = ares_dns_record_rr_add(&rr, response, ARES_SECTION_ANSWER,
+                                         qname.c_str(), ARES_REC_TYPE_A,
+                                         ARES_CLASS_IN, ttl);
+        if (status == ARES_SUCCESS && rr) {
+            ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &addr);
+        }
+    }
+
+    // Serialize to wire format
+    unsigned char* buf = nullptr;
+    size_t buf_len = 0;
+    status = ares_dns_write(response, &buf, &buf_len);
+    ares_dns_record_destroy(response);
+
+    if (status != ARES_SUCCESS || !buf) return {};
 
     std::vector<uint8_t> result(buf, buf + buf_len);
     ares_free_string(buf);

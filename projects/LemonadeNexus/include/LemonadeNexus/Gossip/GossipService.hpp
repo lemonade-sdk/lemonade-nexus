@@ -79,6 +79,21 @@ public:
     /// Broadcast a backbone IPAM allocation delta to all peers.
     void broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta);
 
+    /// Set the cloud region code for this server (e.g. "us-east-1").
+    void set_our_region(const std::string& region);
+
+    /// Set the DNS base domain for NS slot FQDN construction (default: "lemonade-nexus.io").
+    void set_dns_base_domain(const std::string& domain);
+
+    /// Attempt to claim the lowest available NS slot (ns1-ns9) via gossip.
+    void try_claim_ns_slot(const std::string& our_public_ip);
+
+    /// Returns our claimed NS slot number (1-9), or nullopt if we don't hold one.
+    [[nodiscard]] std::optional<uint8_t> our_ns_slot() const;
+
+    /// Returns all currently claimed NS slots (for status reporting).
+    [[nodiscard]] std::vector<NsSlotClaimData> get_ns_slots() const;
+
     /// Try to add a gossip peer as a WireGuard backbone peer.
     void try_add_backbone_wg_peer(const GossipPeer& peer);
 
@@ -227,6 +242,16 @@ private:
     void handle_backbone_ipam_sync(const asio::ip::udp::endpoint& sender,
                                     const uint8_t* payload, std::size_t payload_len);
 
+    // NS slot claim handler
+    void handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
+                               const uint8_t* payload, std::size_t payload_len);
+
+    /// Broadcast an NS slot claim to all known peers.
+    void broadcast_ns_slot_claim(const NsSlotClaimData& claim);
+
+    /// Register an NS slot claim in the local DNS service (if available).
+    void register_ns_slot_in_dns(const NsSlotClaimData& claim);
+
     // Verify a server certificate against the root pubkey
     [[nodiscard]] bool verify_server_certificate(const ServerCertificate& cert) const;
 
@@ -280,6 +305,12 @@ private:
     std::mutex                              reconstruction_mutex_;
     std::vector<std::string>                reconstruction_shares_;
     uint8_t                                 reconstruction_threshold_{0};
+
+    // Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
+    std::string                      our_region_;
+    std::string                      dns_base_domain_{"lemonade-nexus.io"};
+    std::array<NsSlotClaimData, 9>   ns_slots_{};       // slot 0 = ns1, slot 8 = ns9
+    std::optional<uint8_t>           our_ns_slot_;
 
     // Distributed ACL sync (nullptr = ACL sync disabled)
     acl::ACLService*                 acl_{nullptr};

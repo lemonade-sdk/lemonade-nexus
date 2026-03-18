@@ -18,6 +18,7 @@ struct ServerConfig {
     uint16_t    dns_port{53};
     std::string bind_address{"0.0.0.0"};
     std::string public_ip;              // public-facing IP for DNS glue records (auto-detected if empty)
+    std::string region;                 // cloud region code (e.g. "us-east", auto-detected if empty)
 
     // Storage
     std::string data_root{"data"};

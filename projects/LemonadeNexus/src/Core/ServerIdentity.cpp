@@ -110,6 +110,42 @@ void resolve_server_hostname(
                   config.server_hostname, region_code);
 }
 
+void resolve_server_region(ServerConfig& config,
+                            const std::filesystem::path& data_root) {
+    if (!config.region.empty()) {
+        spdlog::info("Region: configured as '{}'", config.region);
+        return;
+    }
+
+    // Try loading persisted region
+    auto region_path = data_root / "identity" / "region";
+    if (std::filesystem::exists(region_path)) {
+        std::ifstream ifs(region_path);
+        std::string persisted;
+        std::getline(ifs, persisted);
+        if (!persisted.empty()) {
+            config.region = persisted;
+            spdlog::info("Region: loaded persisted '{}'", config.region);
+            return;
+        }
+    }
+
+    // Auto-detect via HostnameGenerator (HTTP geo-IP lookup)
+    auto detected = HostnameGenerator::detect_region();
+    if (detected) {
+        config.region = *detected;
+        // Persist for stable region across restarts
+        std::filesystem::create_directories(region_path.parent_path());
+        std::ofstream ofs(region_path);
+        ofs << config.region;
+        spdlog::info("Region: auto-detected '{}', persisted", config.region);
+    } else {
+        config.region = "unknown";
+        spdlog::warn("Region: auto-detection failed, using 'unknown'. "
+                      "Set --region <code> for accurate geo-aware discovery.");
+    }
+}
+
 std::string resolve_public_ip(const ServerConfig& config) {
     std::string ip = config.public_ip;
     if (ip.empty() && config.bind_address != "0.0.0.0" && !config.bind_address.empty()) {

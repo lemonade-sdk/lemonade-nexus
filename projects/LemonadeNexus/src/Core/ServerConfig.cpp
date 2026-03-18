@@ -41,6 +41,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"acme_eab_hmac_key",   c.acme_eab_hmac_key},
         {"dns_provider",        c.dns_provider},
         {"public_ip",           c.public_ip},
+        {"region",              c.region},
         {"server_hostname",     c.server_hostname},
         {"auto_tls",            c.auto_tls},
         {"dns_base_domain",     c.dns_base_domain},
@@ -89,6 +90,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("acme_eab_hmac_key"))   j.at("acme_eab_hmac_key").get_to(c.acme_eab_hmac_key);
     if (j.contains("dns_provider"))        j.at("dns_provider").get_to(c.dns_provider);
     if (j.contains("public_ip"))           j.at("public_ip").get_to(c.public_ip);
+    if (j.contains("region"))              j.at("region").get_to(c.region);
     if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
     if (j.contains("auto_tls"))            j.at("auto_tls").get_to(c.auto_tls);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
@@ -157,6 +159,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");
     spdlog::info("  --tls-key-path <path>      Path to TLS private key PEM (manual override)");
     spdlog::info("  --no-auto-tls              Disable automatic TLS certificate via ACME");
+    spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
     spdlog::info("  --tee-platform <name>      Override TEE platform detection (sgx/tdx/sev-snp/secure-enclave)");
     spdlog::info("  --help, -h                 Show this help");
@@ -273,6 +276,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.require_tee_attestation = true;
         } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
             config.tee_platform_override = argv[++i];
+        } else if (std::strcmp(argv[i], "--region") == 0 && i + 1 < argc) {
+            config.region = argv[++i];
         }
     }
 
@@ -307,6 +312,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ENROLLMENT_QUORUM")) config.enrollment_quorum_ratio = std::atof(v);
     if (std::getenv("SP_REQUIRE_TEE"))                   config.require_tee_attestation   = true;
     if (const char* v = std::getenv("SP_TEE_PLATFORM"))  config.tee_platform_override     = v;
+    if (const char* v = std::getenv("SP_REGION"))        config.region                    = v;
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;

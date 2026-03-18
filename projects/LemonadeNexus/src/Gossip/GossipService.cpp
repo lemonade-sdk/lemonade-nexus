@@ -124,6 +124,9 @@ void GossipService::on_start() {
             if (need_tunnel_ip) {
                 hello["request_tunnel_ip"] = true;
             }
+            if (!our_region_.empty()) {
+                hello["region"] = our_region_;
+            }
             auto payload_str = hello.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
 
@@ -564,6 +567,9 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             break;
         case GossipMsgType::BackboneIpamSync:
             handle_backbone_ipam_sync(remote_endpoint_, payload, payload_len);
+            break;
+        case GossipMsgType::NsSlotClaim:
+            handle_ns_slot_claim(remote_endpoint_, payload, payload_len);
             break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
@@ -1188,12 +1194,14 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
 
             if (it != peers_.end()) {
                 it->certificate_json = j.dump();
+                it->region = j.value("region", "");
                 it->last_seen = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
             } else {
                 GossipPeer peer;
                 peer.pubkey           = pk;
                 peer.endpoint         = ep;
+                peer.region           = j.value("region", "");
                 peer.http_port        = 9100; // will be updated via peer exchange
                 peer.last_seen        = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
@@ -2537,6 +2545,260 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
         spdlog::warn("[{}] failed to parse DNS record delta from {}:{}: {}",
                       name(), sender.address().to_string(), sender.port(), e.what());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
+// ---------------------------------------------------------------------------
+
+void GossipService::set_our_region(const std::string& region) {
+    our_region_ = region;
+}
+
+void GossipService::set_dns_base_domain(const std::string& domain) {
+    dns_base_domain_ = domain;
+}
+
+std::optional<uint8_t> GossipService::our_ns_slot() const {
+    return our_ns_slot_;
+}
+
+std::vector<NsSlotClaimData> GossipService::get_ns_slots() const {
+    std::lock_guard lock(peers_mutex_);
+    std::vector<NsSlotClaimData> result;
+    for (const auto& s : ns_slots_) {
+        if (s.slot > 0) result.push_back(s);
+    }
+    return result;
+}
+
+void GossipService::try_claim_ns_slot(const std::string& our_public_ip) {
+    std::lock_guard lock(peers_mutex_);
+
+    // Don't claim if we already hold a slot
+    if (our_ns_slot_.has_value()) {
+        spdlog::debug("[{}] already hold NS slot ns{}, skipping claim",
+                       name(), *our_ns_slot_);
+        return;
+    }
+
+    // Find the lowest available slot (1-9)
+    uint8_t chosen_slot = 0;
+    for (uint8_t i = 0; i < 9; ++i) {
+        if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+            chosen_slot = i + 1; // slots are 1-based
+            break;
+        }
+    }
+
+    if (chosen_slot == 0) {
+        spdlog::warn("[{}] all 9 NS slots are claimed, cannot claim a slot", name());
+        return;
+    }
+
+    auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+    auto now = static_cast<uint64_t>(
+        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+    NsSlotClaimData claim;
+    claim.slot          = chosen_slot;
+    claim.server_pubkey = our_pubkey_b64;
+    claim.server_ip     = our_public_ip;
+    claim.region        = our_region_;
+    claim.timestamp     = now;
+
+    // Sign: canonical JSON of the claim fields (excluding signature)
+    json sign_payload;
+    sign_payload["slot"]          = claim.slot;
+    sign_payload["server_pubkey"] = claim.server_pubkey;
+    sign_payload["server_ip"]     = claim.server_ip;
+    sign_payload["region"]        = claim.region;
+    sign_payload["timestamp"]     = claim.timestamp;
+
+    auto sign_data = sign_payload.dump();
+    std::span<const uint8_t> sign_bytes(
+        reinterpret_cast<const uint8_t*>(sign_data.data()), sign_data.size());
+    auto sig = crypto_.ed25519_sign(keypair_.private_key, sign_bytes);
+    claim.signature = crypto::to_base64(sig);
+
+    // Store locally
+    ns_slots_[chosen_slot - 1] = claim;
+    our_ns_slot_ = chosen_slot;
+
+    spdlog::info("[{}] claimed NS slot ns{} (ip={}, region={})",
+                  name(), chosen_slot, our_public_ip, our_region_);
+
+    // Register in DNS
+    register_ns_slot_in_dns(claim);
+
+    // Broadcast to all peers
+    broadcast_ns_slot_claim(claim);
+}
+
+void GossipService::broadcast_ns_slot_claim(const NsSlotClaimData& claim) {
+    json j;
+    j["slot"]          = claim.slot;
+    j["server_pubkey"] = claim.server_pubkey;
+    j["server_ip"]     = claim.server_ip;
+    j["region"]        = claim.region;
+    j["timestamp"]     = claim.timestamp;
+    j["signature"]     = claim.signature;
+
+    auto packed = json::to_msgpack(j);
+    std::vector<uint8_t> payload(packed.begin(), packed.end());
+
+    // peers_mutex_ must already be held by callers, or we acquire it here
+    // For broadcast from handle_ns_slot_claim we already hold the lock,
+    // but for try_claim_ns_slot we also hold it. Use the peers_ directly.
+    for (const auto& peer : peers_) {
+        auto ep = parse_endpoint(peer.endpoint);
+        if (ep) {
+            send_packet(*ep, GossipMsgType::NsSlotClaim, payload);
+        }
+    }
+}
+
+void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
+                                           const uint8_t* payload,
+                                           std::size_t payload_len) {
+    try {
+        auto j = json::from_msgpack(payload, payload + payload_len);
+
+        NsSlotClaimData claim;
+        claim.slot          = j.value("slot", uint8_t{0});
+        claim.server_pubkey = j.value("server_pubkey", "");
+        claim.server_ip     = j.value("server_ip", "");
+        claim.region        = j.value("region", "");
+        claim.timestamp     = j.value("timestamp", uint64_t{0});
+        claim.signature     = j.value("signature", "");
+
+        // Validate basic fields
+        if (claim.slot < 1 || claim.slot > 9) {
+            spdlog::warn("[{}] received NS slot claim with invalid slot {} from {}:{}",
+                          name(), claim.slot, sender.address().to_string(), sender.port());
+            return;
+        }
+        if (claim.server_pubkey.empty()) {
+            spdlog::warn("[{}] received NS slot claim with empty pubkey from {}:{}",
+                          name(), sender.address().to_string(), sender.port());
+            return;
+        }
+
+        std::lock_guard lock(peers_mutex_);
+
+        auto& existing = ns_slots_[claim.slot - 1];
+        bool is_new = false;
+
+        if (existing.slot == 0 || existing.server_pubkey.empty()) {
+            // Slot is unclaimed — accept
+            is_new = true;
+        } else if (claim.timestamp > existing.timestamp) {
+            // LWW: newer timestamp wins
+            is_new = true;
+        } else if (claim.timestamp == existing.timestamp &&
+                   claim.server_pubkey > existing.server_pubkey) {
+            // Tiebreak: higher pubkey wins (lexicographic)
+            is_new = true;
+        }
+
+        if (!is_new) {
+            spdlog::debug("[{}] rejected NS slot claim for ns{} from {} (existing claim is newer or wins tiebreak)",
+                           name(), claim.slot, claim.server_pubkey);
+            return;
+        }
+
+        // Check if our own slot is being overwritten
+        bool our_slot_stolen = false;
+        std::string our_old_ip;
+        auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+        if (existing.server_pubkey == our_pubkey_b64 &&
+            claim.server_pubkey != our_pubkey_b64 &&
+            our_ns_slot_.has_value() && *our_ns_slot_ == claim.slot) {
+            our_slot_stolen = true;
+            our_old_ip = existing.server_ip; // save before overwrite
+        }
+
+        // Accept the claim
+        existing = claim;
+
+        spdlog::info("[{}] accepted NS slot claim: ns{} -> {} (ip={}, region={})",
+                      name(), claim.slot, claim.server_pubkey, claim.server_ip, claim.region);
+
+        // Register in DNS
+        register_ns_slot_in_dns(claim);
+
+        // Forward to all peers except sender (epidemic gossip)
+        std::vector<uint8_t> fwd_payload(payload, payload + payload_len);
+        for (const auto& peer : peers_) {
+            auto ep = parse_endpoint(peer.endpoint);
+            if (ep && *ep != sender) {
+                send_packet(*ep, GossipMsgType::NsSlotClaim, fwd_payload);
+            }
+        }
+
+        // If our slot was stolen, try to re-claim a different one
+        if (our_slot_stolen) {
+            our_ns_slot_.reset();
+            spdlog::warn("[{}] our NS slot ns{} was overwritten by {}, will try to re-claim",
+                          name(), claim.slot, claim.server_pubkey);
+            // Find a new free slot
+            uint8_t new_slot = 0;
+            for (uint8_t i = 0; i < 9; ++i) {
+                if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                    new_slot = i + 1;
+                    break;
+                }
+            }
+            if (new_slot > 0) {
+                auto now = static_cast<uint64_t>(
+                    chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+                NsSlotClaimData reclaim;
+                reclaim.slot          = new_slot;
+                reclaim.server_pubkey = our_pubkey_b64;
+                reclaim.server_ip     = our_old_ip; // recovered before overwrite
+                reclaim.region        = our_region_;
+                reclaim.timestamp = now;
+
+                json sign_payload;
+                sign_payload["slot"]          = reclaim.slot;
+                sign_payload["server_pubkey"] = reclaim.server_pubkey;
+                sign_payload["server_ip"]     = reclaim.server_ip;
+                sign_payload["region"]        = reclaim.region;
+                sign_payload["timestamp"]     = reclaim.timestamp;
+
+                auto sign_data = sign_payload.dump();
+                std::span<const uint8_t> sign_bytes(
+                    reinterpret_cast<const uint8_t*>(sign_data.data()), sign_data.size());
+                auto sig = crypto_.ed25519_sign(keypair_.private_key, sign_bytes);
+                reclaim.signature = crypto::to_base64(sig);
+
+                ns_slots_[new_slot - 1] = reclaim;
+                our_ns_slot_ = new_slot;
+
+                spdlog::info("[{}] re-claimed NS slot ns{} after losing ns{}",
+                              name(), new_slot, claim.slot);
+
+                register_ns_slot_in_dns(reclaim);
+                broadcast_ns_slot_claim(reclaim);
+            } else {
+                spdlog::warn("[{}] all NS slots taken after losing ns{}, no slot available",
+                              name(), claim.slot);
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse NS slot claim from {}:{}: {}",
+                      name(), sender.address().to_string(), sender.port(), e.what());
+    }
+}
+
+void GossipService::register_ns_slot_in_dns(const NsSlotClaimData& claim) {
+    if (!dns_) return;
+
+    std::string ns_fqdn = "ns" + std::to_string(claim.slot) + "." + dns_base_domain_;
+    dns_->add_nameserver(ns_fqdn, claim.server_ip);
+    spdlog::debug("[{}] registered DNS NS record: {} -> {}",
+                   name(), ns_fqdn, claim.server_ip);
 }
 
 } // namespace nexus::gossip

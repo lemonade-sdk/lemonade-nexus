@@ -32,6 +32,7 @@ enum class GossipMsgType : uint8_t {
     AclDelta              = 0x11, // "ACL grant/revoke — distributed permission sync"
     DnsRecordSync         = 0x12, // "DNS record add/remove — distributed authoritative DNS"
     BackboneIpamSync      = 0x13, // "backbone IP allocate/release — server mesh IPAM sync"
+    NsSlotClaim           = 0x14, // "democratic NS slot claim — ns1-ns9 bootstrap nameservers"
 };
 
 #pragma pack(push, 1)
@@ -54,6 +55,7 @@ struct GossipPeer {
     std::string backbone_endpoint;   // "ip:port" (gossip port, over WG backbone — preferred when available)
     std::string wg_pubkey;           // base64 X25519 WireGuard public key
     std::string backbone_ip;         // "172.16.0.X" (empty until allocated)
+    std::string region;              // cloud region code (e.g. "us-east-1")
     uint16_t    http_port{9100};     // HTTP control plane port
     uint64_t    last_seen{0};        // Unix timestamp
     float       reputation{1.0f};
@@ -183,6 +185,21 @@ struct DnsRecordDelta {
     uint64_t    timestamp{0};
     std::string signer_pubkey;    // server that originated the change
     std::string signature;        // Ed25519 over canonical JSON (excludes this field)
+};
+
+// ---------------------------------------------------------------------------
+// Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
+// ---------------------------------------------------------------------------
+
+/// A signed NS slot claim that propagates via gossip.
+/// The first 9 servers to join the mesh claim ns1-ns9 slots (LWW conflict resolution).
+struct NsSlotClaimData {
+    uint8_t     slot{0};           // 1-9
+    std::string server_pubkey;     // base64 Ed25519
+    std::string server_ip;         // public IP
+    std::string region;            // cloud region code
+    uint64_t    timestamp{0};      // LWW conflict resolution
+    std::string signature;         // Ed25519 signature
 };
 
 } // namespace nexus::gossip

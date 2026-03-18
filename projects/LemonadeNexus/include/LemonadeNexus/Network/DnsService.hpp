@@ -54,8 +54,11 @@ using DnsRecordCallback = std::function<void(const std::string& delta_id,
 ///   <hostname>.<base_domain>                   -> Any node matching the hostname
 ///   <hostname>.<region>.relays.<base_domain>   -> Relay in specific region
 ///   <hostname>.relays.<base_domain>            -> Relay by hostname (any region)
-///   _config.<hostname>.<base_domain>            -> TXT record with port config
-///   _acme-challenge.<domain>                   -> ACME DNS-01 TXT challenge
+///   <id>.<region>.seip.<base_domain>              -> Server's public IP (SEIP A record)
+///   <region>.seip.<base_domain>                  -> All servers in region (multi-A)
+///   _config.<id>.<region>.seip.<base_domain>     -> Server config TXT (SEIP)
+///   _config.<hostname>.<base_domain>             -> TXT record with port config
+///   _acme-challenge.<domain>                     -> ACME DNS-01 TXT challenge
 class DnsService : public core::IService<DnsService>,
                     public IDnsProvider<DnsService> {
     friend class core::IService<DnsService>;
@@ -150,6 +153,8 @@ public:
         uint16_t relay_port{9103};
         uint16_t dns_port{53};
         uint16_t private_http_port{9101};
+        std::string region;
+        uint32_t connected_clients{0};
     };
 
     /// Set the port configuration to publish via TXT records.
@@ -163,6 +168,22 @@ public:
     /// Resolve a _config. subdomain query, returning TXT record data.
     [[nodiscard]] std::optional<std::string> resolve_config_txt(
         const std::string& hostname);
+
+    // -----------------------------------------------------------------
+    // SEIP DNS record hierarchy
+    // -----------------------------------------------------------------
+
+    /// Set the region for this server (used in SEIP record publishing).
+    void set_server_region(const std::string& region);
+
+    /// Publish SEIP A and _config TXT records under <id>.<region>.seip.<domain>.
+    void publish_seip_records(const std::string& server_id,
+                              const std::string& region,
+                              const std::string& public_ip);
+
+    /// Update the connected-client load count and re-publish the SEIP _config
+    /// TXT record if the count changed (avoids gossip spam).
+    void update_load(uint32_t connected_client_count);
 
 private:
     void start_receive();
@@ -187,6 +208,14 @@ private:
 
     [[nodiscard]] std::vector<uint8_t> build_nxdomain(
         const unsigned char* query_data, std::size_t query_len);
+
+    /// Build a DNS response with multiple A records (for region-wildcard SEIP queries).
+    /// Caps at 5 IPs to stay within the 512-byte UDP limit.
+    [[nodiscard]] std::vector<uint8_t> build_multi_a_response(
+        const unsigned char* query_data, std::size_t query_len,
+        const std::string& qname,
+        const std::vector<std::string>& ips,
+        uint32_t ttl);
 
     // --- Dynamic record lookup ---
     [[nodiscard]] std::optional<std::string> lookup_dynamic_txt(const std::string& fqdn);
@@ -225,6 +254,11 @@ private:
     // SOA state
     std::string              soa_email_;          // e.g. "admin.domain.com"
     std::atomic<uint32_t>    soa_serial_{1};      // auto-incremented on zone changes
+
+    // SEIP server discovery
+    std::string              server_region_;       // this server's region
+    std::string              seip_server_id_;      // cached for update_load() re-publish
+    std::string              seip_server_fqdn_;    // cached server FQDN for TXT host= field
 };
 
 } // namespace nexus::network
