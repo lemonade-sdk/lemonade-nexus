@@ -440,6 +440,7 @@ void DnsService::publish_port_config(const std::string& server_id, const std::st
     std::string txt = "v=sp1"
                       " http=" + std::to_string(port_config_.http_port) +
                       " udp=" + std::to_string(port_config_.udp_port) +
+                      " wg=" + std::to_string(port_config_.wg_port) +
                       " gossip=" + std::to_string(port_config_.gossip_port) +
                       " stun=" + std::to_string(port_config_.stun_port) +
                       " relay=" + std::to_string(port_config_.relay_port) +

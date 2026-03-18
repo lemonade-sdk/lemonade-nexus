@@ -11,7 +11,8 @@ namespace nexus::core {
 struct ServerConfig {
     // Network
     uint16_t    http_port{9100};
-    uint16_t    udp_port{51940};  // WireGuard + hole-punch (shared UDP port)
+    uint16_t    udp_port{51940};  // UDP hole-punch
+    uint16_t    wg_port{51820};   // WireGuard listen port
     uint16_t    gossip_port{9102};
     uint16_t    stun_port{3478};
     uint16_t    relay_port{9103};

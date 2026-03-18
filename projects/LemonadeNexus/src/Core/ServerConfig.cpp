@@ -20,6 +20,7 @@ void to_json(json& j, const ServerConfig& c) {
     j = json{
         {"http_port",           c.http_port},
         {"udp_port",            c.udp_port},
+        {"wg_port",             c.wg_port},
         {"gossip_port",         c.gossip_port},
         {"stun_port",           c.stun_port},
         {"relay_port",          c.relay_port},
@@ -68,6 +69,7 @@ void to_json(json& j, const ServerConfig& c) {
 void from_json(const json& j, ServerConfig& c) {
     if (j.contains("http_port"))           j.at("http_port").get_to(c.http_port);
     if (j.contains("udp_port"))            j.at("udp_port").get_to(c.udp_port);
+    if (j.contains("wg_port"))             j.at("wg_port").get_to(c.wg_port);
     if (j.contains("gossip_port"))         j.at("gossip_port").get_to(c.gossip_port);
     if (j.contains("stun_port"))           j.at("stun_port").get_to(c.stun_port);
     if (j.contains("relay_port"))          j.at("relay_port").get_to(c.relay_port);
@@ -122,7 +124,8 @@ void print_usage(const char* prog) {
     spdlog::info("Options:");
     spdlog::info("  --config <path>            JSON config file (default: lemonade-nexus.json)");
     spdlog::info("  --http-port <N>            HTTP port (default: 9100)");
-    spdlog::info("  --udp-port <N>             WireGuard + hole-punch UDP port (default: 51940)");
+    spdlog::info("  --udp-port <N>             UDP hole-punch port (default: 51940)");
+    spdlog::info("  --wg-port <N>              WireGuard listen port (default: 51820)");
     spdlog::info("  --gossip-port <N>          Gossip protocol UDP port (default: 9102)");
     spdlog::info("  --stun-port <N>            STUN UDP port (default: 3478)");
     spdlog::info("  --relay-port <N>           Relay UDP port (default: 9103)");
@@ -200,6 +203,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.http_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--udp-port") == 0 && i + 1 < argc) {
             config.udp_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--wg-port") == 0 && i + 1 < argc) {
+            config.wg_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--gossip-port") == 0 && i + 1 < argc) {
             config.gossip_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--stun-port") == 0 && i + 1 < argc) {
@@ -280,6 +285,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_LOG_LEVEL"))   config.log_level   = v;
     if (const char* v = std::getenv("SP_HTTP_PORT"))    config.http_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_UDP_PORT"))     config.udp_port    = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_WG_PORT"))      config.wg_port     = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_GOSSIP_PORT"))  config.gossip_port = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_STUN_PORT"))    config.stun_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
@@ -346,6 +352,7 @@ bool validate_config(const ServerConfig& config) {
     };
     check_port(config.http_port, "http_port");
     check_port(config.udp_port, "udp_port");
+    check_port(config.wg_port, "wg_port");
     check_port(config.gossip_port, "gossip_port");
     check_port(config.stun_port, "stun_port");
     check_port(config.relay_port, "relay_port");
@@ -353,11 +360,11 @@ bool validate_config(const ServerConfig& config) {
 
     // Check ports are unique
     std::set<uint16_t> ports = {
-        config.http_port, config.udp_port, config.gossip_port,
+        config.http_port, config.udp_port, config.wg_port, config.gossip_port,
         config.stun_port, config.relay_port, config.dns_port
     };
-    if (ports.size() < 6) {
-        spdlog::error("Config: port conflict — all 6 ports must be unique");
+    if (ports.size() < 7) {
+        spdlog::error("Config: port conflict — all 7 ports must be unique");
         valid = false;
     }
 
@@ -394,8 +401,8 @@ bool validate_config(const ServerConfig& config) {
         spdlog::warn("Config: rp_id is empty — WebAuthn passkeys will not validate");
     }
 
-    spdlog::info("Config: HTTP:{} UDP/WG:{} Gossip:{} STUN:{} Relay:{} DNS:{} data={}",
-                  config.http_port, config.udp_port, config.gossip_port,
+    spdlog::info("Config: HTTP:{} UDP:{} WG:{} Gossip:{} STUN:{} Relay:{} DNS:{} data={}",
+                  config.http_port, config.udp_port, config.wg_port, config.gossip_port,
                   config.stun_port, config.relay_port, config.dns_port,
                   config.data_root);
 
