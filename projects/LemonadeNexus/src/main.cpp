@@ -432,12 +432,17 @@ int main(int argc, char* argv[]) {
 
     // Publish SEIP records: <id>.<region>.seip.<domain> for geo-aware discovery
     dns.set_server_region(config.region);
+    std::string server_private_fqdn;
     {
         auto seip_id = nexus::core::resolve_server_node_id(storage);
         if (!seip_id.empty() && !config.region.empty() && !server_public_ip.empty()) {
             dns.publish_seip_records(seip_id, config.region, server_public_ip);
             spdlog::info("SEIP: published {}.{}.seip.{} -> {}",
                           seip_id, config.region, config.dns_base_domain, server_public_ip);
+
+            // Register private FQDN for HTTPS over WG tunnel
+            server_private_fqdn = "private." + seip_id + "." + config.region +
+                                  ".seip." + config.dns_base_domain;
         }
     }
 
@@ -583,6 +588,32 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
+    // Private DNS records: private/backend FQDNs → tunnel/backbone IPs
+    // ========================================================================
+    {
+        auto seip_id = nexus::core::resolve_server_node_id(storage);
+        if (!seip_id.empty() && !config.region.empty()) {
+            // private.<id>.<region>.seip.<domain> → server tunnel IP (for client HTTPS)
+            if (!tunnel_bind_ip.empty()) {
+                server_private_fqdn = "private." + seip_id + "." + config.region +
+                                      ".seip." + config.dns_base_domain;
+                dns.set_record(server_private_fqdn, "A", tunnel_bind_ip, 300);
+                spdlog::info("DNS: private {} -> {}", server_private_fqdn, tunnel_bind_ip);
+            }
+
+            // backend.<id>.<region>.seip.<domain> → server backbone IP (for server-to-server)
+            auto slash = backbone_ip.find('/');
+            auto bb_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
+            if (!bb_bare.empty()) {
+                auto backend_fqdn = "backend." + seip_id + "." + config.region +
+                                    ".seip." + config.dns_base_domain;
+                dns.set_record(backend_fqdn, "A", bb_bare, 300);
+                spdlog::info("DNS: backend {} -> {}", backend_fqdn, bb_bare);
+            }
+        }
+    }
+
+    // ========================================================================
     // HTTP Control Plane -- Dual-server architecture
     // ========================================================================
     nexus::network::HttpServer http_server{http_port, "0.0.0.0",
@@ -642,7 +673,9 @@ int main(int argc, char* argv[]) {
         .trust_policy     = trust_policy,
         .governance       = governance,
         .wireguard        = &wireguard_service,
+        .dns              = &dns,
         .server_fqdn      = server_fqdn,
+        .server_private_fqdn = server_private_fqdn,
         .server_public_ip = server_public_ip,
         .tunnel_bind_ip   = tunnel_bind_ip,
     };

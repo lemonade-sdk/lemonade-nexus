@@ -10,6 +10,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/WireGuard/WireGuardService.hpp>
+#include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
 
 #include <spdlog/spdlog.h>
@@ -177,12 +178,26 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             wg_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
         }
 
+        // Register private DNS for this client: private.<node_id>.ep.<domain> -> tunnel IP
+        std::string client_tunnel_ip_bare = alloc.base_network;
+        if (auto slash = client_tunnel_ip_bare.find('/'); slash != std::string::npos) {
+            client_tunnel_ip_bare = client_tunnel_ip_bare.substr(0, slash);
+        }
+        std::string client_private_fqdn;
+        if (ctx_.dns && !client_tunnel_ip_bare.empty()) {
+            client_private_fqdn = "private." + node_id + ".ep." + ctx_.config.dns_base_domain;
+            ctx_.dns->set_record(client_private_fqdn, "A", client_tunnel_ip_bare, 300);
+            spdlog::info("[Join] registered DNS: {} -> {}", client_private_fqdn, client_tunnel_ip_bare);
+        }
+
         nlohmann::json resp = {
             {"token",            auth_result.session_token},
             {"node_id",          node_id},
             {"tunnel_ip",        alloc.base_network},
             {"tunnel_subnet",    "10.64.0.0/10"},
             {"server_tunnel_ip", server_tunnel},
+            {"server_private_fqdn", ctx_.server_private_fqdn},
+            {"client_private_fqdn", client_private_fqdn},
             {"private_api_port", !ctx_.tunnel_bind_ip.empty()
                                      ? ctx_.config.private_http_port
                                      : ctx_.config.http_port},
@@ -190,7 +205,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             {"wg_endpoint",      wg_endpoint},
             {"dns_servers",      nlohmann::json::array({server_tunnel})},
         };
-        spdlog::info("[Join] node={} tunnel_ip={} wg_endpoint={}", node_id, alloc.base_network, wg_endpoint);
+        spdlog::info("[Join] node={} tunnel_ip={} wg_endpoint={} private_fqdn={}",
+                      node_id, alloc.base_network, wg_endpoint, client_private_fqdn);
         json_response(res, resp);
     });
 

@@ -23,6 +23,8 @@ struct LemonadeNexusClient::Impl {
     Identity     identity;
     std::string  session_token;
     std::string  node_id;
+    std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
+    uint16_t     private_port{9101};
     mutable std::mutex mutex;
 
     // Server pool with health state
@@ -219,6 +221,65 @@ struct LemonadeNexusClient::Impl {
         }
         status_out = 0;
         return std::nullopt;
+    }
+
+    // --- Private API (HTTPS over WG tunnel via private FQDN) ---
+
+    std::string private_base_url() const {
+        if (!server_private_fqdn.empty()) {
+            return "https://" + server_private_fqdn + ":" + std::to_string(private_port);
+        }
+        return current_base_url();
+    }
+
+    std::optional<json> private_http_get(const std::string& path, int& status_out) {
+        if (server_private_fqdn.empty()) {
+            return http_get(path, status_out);
+        }
+        try {
+            httplib::Client cli(private_base_url());
+            cli.set_connection_timeout(config.connect_timeout_sec);
+            cli.set_read_timeout(config.read_timeout_sec);
+            cli.enable_server_certificate_verification(true);
+            auto res = cli.Get(path, auth_headers());
+            if (!res) {
+                spdlog::debug("[LemonadeNexusClient] private GET {} failed, falling back", path);
+                return http_get(path, status_out);
+            }
+            status_out = res->status;
+            if (res->status < 200 || res->status >= 300) {
+                try { return json::parse(res->body); } catch (...) { return std::nullopt; }
+            }
+            return json::parse(res->body);
+        } catch (...) {
+            return http_get(path, status_out);
+        }
+    }
+
+    std::optional<json> private_http_post(const std::string& path, const json& body, int& status_out) {
+        if (server_private_fqdn.empty()) {
+            return http_post(path, body, status_out);
+        }
+        try {
+            httplib::Client cli(private_base_url());
+            cli.set_connection_timeout(config.connect_timeout_sec);
+            cli.set_read_timeout(config.read_timeout_sec);
+            cli.enable_server_certificate_verification(true);
+            auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
+            if (!res) {
+                spdlog::debug("[LemonadeNexusClient] private POST {} failed, falling back", path);
+                return http_post(path, body, status_out);
+            }
+            status_out = res->status;
+            if (res->status < 200 || res->status >= 300) {
+                try { return json::parse(res->body); } catch (...) {
+                    json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
+                }
+            }
+            return json::parse(res->body);
+        } catch (...) {
+            return http_post(path, body, status_out);
+        }
     }
 
     // Discover additional servers via /api/servers
@@ -767,7 +828,7 @@ Result<AuthResponse> LemonadeNexusClient::register_passkey_credential(const std:
 Result<TreeNode> LemonadeNexusClient::get_tree_node(const std::string& node_id) {
     Result<TreeNode> result;
     int status = 0;
-    auto resp = impl_->http_get("/api/tree/node/" + node_id, status);
+    auto resp = impl_->private_http_get("/api/tree/node/" + node_id, status);
     result.http_status = status;
 
     if (!resp) {
@@ -798,7 +859,7 @@ Result<DeltaResult> LemonadeNexusClient::submit_delta(const TreeDelta& delta) {
     json body = signed_delta;
 
     int status = 0;
-    auto resp = impl_->http_post("/api/tree/delta", body, status);
+    auto resp = impl_->private_http_post("/api/tree/delta", body, status);
     result.http_status = status;
 
     if (!resp) {
@@ -830,7 +891,7 @@ Result<DeltaResult> LemonadeNexusClient::create_child_node(const std::string& pa
     if (!child.hostname.empty()) body["hostname"] = child.hostname;
 
     int status = 0;
-    auto resp = impl_->http_post("/api/tree/node", body, status);
+    auto resp = impl_->private_http_post("/api/tree/node", body, status);
     result.http_status = status;
 
     if (!resp) {
@@ -851,7 +912,7 @@ Result<DeltaResult> LemonadeNexusClient::update_node(const std::string& node_id,
     Result<DeltaResult> result;
 
     int status = 0;
-    auto resp = impl_->http_post("/api/tree/node/update/" + node_id, updates, status);
+    auto resp = impl_->private_http_post("/api/tree/node/update/" + node_id, updates, status);
     result.http_status = status;
 
     if (!resp) {
@@ -872,7 +933,7 @@ Result<DeltaResult> LemonadeNexusClient::delete_node(const std::string& node_id)
 
     int status = 0;
     json body = json::object(); // empty body
-    auto resp = impl_->http_post("/api/tree/node/delete/" + node_id, body, status);
+    auto resp = impl_->private_http_post("/api/tree/node/delete/" + node_id, body, status);
     result.http_status = status;
 
     if (!resp) {
@@ -890,7 +951,7 @@ Result<DeltaResult> LemonadeNexusClient::delete_node(const std::string& node_id)
 Result<std::vector<TreeNode>> LemonadeNexusClient::get_children(const std::string& parent_id) {
     Result<std::vector<TreeNode>> result;
     int status = 0;
-    auto resp = impl_->http_get("/api/tree/children/" + parent_id, status);
+    auto resp = impl_->private_http_get("/api/tree/children/" + parent_id, status);
     result.http_status = status;
 
     if (!resp) {
@@ -930,7 +991,7 @@ Result<AllocationResponse> LemonadeNexusClient::allocate_ip(const AllocationRequ
     }
 
     int status = 0;
-    auto resp = impl_->http_post("/api/ipam/allocate", body, status);
+    auto resp = impl_->private_http_post("/api/ipam/allocate", body, status);
     result.http_status = status;
 
     if (!resp) {
@@ -964,7 +1025,7 @@ Result<std::vector<RelayNodeInfo>> LemonadeNexusClient::list_relays() {
     Result<std::vector<RelayNodeInfo>> result;
 
     int status = 0;
-    auto resp = impl_->http_get("/api/relay/list", status);
+    auto resp = impl_->private_http_get("/api/relay/list", status);
     result.http_status = status;
 
     if (!resp) {
@@ -1001,7 +1062,7 @@ Result<RelayTicket> LemonadeNexusClient::request_relay_ticket(const std::string&
     body["relay_id"] = relay_id;
 
     int status = 0;
-    auto resp = impl_->http_post("/api/relay/ticket", body, status);
+    auto resp = impl_->private_http_post("/api/relay/ticket", body, status);
     result.http_status = status;
 
     if (!resp) {
@@ -1032,7 +1093,7 @@ Result<RelayRegisterResult> LemonadeNexusClient::register_relay(const RelayRegis
     body["supports_relay"]  = reg.supports_relay;
 
     int status = 0;
-    auto resp = impl_->http_post("/api/relay/register", body, status);
+    auto resp = impl_->private_http_post("/api/relay/register", body, status);
     result.http_status = status;
 
     if (!resp) {
@@ -1058,7 +1119,7 @@ Result<CertStatus> LemonadeNexusClient::get_cert_status(const std::string& domai
     Result<CertStatus> result;
 
     int status = 0;
-    auto resp = impl_->http_get("/api/certs/" + domain, status);
+    auto resp = impl_->private_http_get("/api/certs/" + domain, status);
     result.http_status = status;
 
     if (!resp) {
@@ -1340,6 +1401,15 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     {
         std::lock_guard lock(impl_->mutex);
         impl_->node_id = node_id;
+        // Store server private FQDN for HTTPS over WG tunnel
+        auto srv_priv_fqdn = resp->value("server_private_fqdn", std::string{});
+        if (!srv_priv_fqdn.empty()) {
+            impl_->server_private_fqdn = srv_priv_fqdn;
+            impl_->private_port = static_cast<uint16_t>(
+                resp->value("private_api_port", 9101));
+            spdlog::info("[LemonadeNexusClient] private API via HTTPS: {}:{}",
+                          srv_priv_fqdn, impl_->private_port);
+        }
     }
 
     // Step 4: Configure the WireGuard tunnel (bring up if we have a tunnel IP)
@@ -1769,7 +1839,7 @@ void LemonadeNexusClient::set_mesh_callback(MeshStateCallback cb) {
 
 Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::string& nid) {
     int status = 0;
-    auto resp = impl_->http_get("/api/mesh/peers/" + nid, status);
+    auto resp = impl_->private_http_get("/api/mesh/peers/" + nid, status);
     if (!resp) {
         return {false, {}, status, "mesh peers request failed"};
     }
@@ -1834,7 +1904,7 @@ StatusResult LemonadeNexusClient::mesh_heartbeat(const std::string& nid,
     body["endpoint"] = endpoint;
 
     int status = 0;
-    auto resp = impl_->http_post("/api/mesh/heartbeat", body, status);
+    auto resp = impl_->private_http_post("/api/mesh/heartbeat", body, status);
     if (!resp) {
         return {false, {}, status, "heartbeat request failed"};
     }

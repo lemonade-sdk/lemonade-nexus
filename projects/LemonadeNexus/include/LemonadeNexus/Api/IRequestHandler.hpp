@@ -33,6 +33,7 @@ namespace nexus::acme { class AcmeService; }
 namespace nexus::network {
     class HttpServer;
     class DdnsService;
+    class DnsService;
 }
 namespace nexus::relay {
     class RelayService;
@@ -65,7 +66,9 @@ struct ApiContext {
     core::TrustPolicyService&         trust_policy;
     core::GovernanceService&          governance;
     wireguard::WireGuardService*      wireguard{nullptr};
+    network::DnsService*              dns{nullptr};
     std::string                       server_fqdn;
+    std::string                       server_private_fqdn;  // private.<id>.<region>.seip.<domain>
     std::string                       server_public_ip;
     std::string                       tunnel_bind_ip;
 };
