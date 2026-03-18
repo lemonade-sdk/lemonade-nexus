@@ -35,13 +35,17 @@ struct PasskeyCredentialInfo: Codable {
     var signCount: UInt32 = 0
 }
 
-final class PasskeyManager {
+final class PasskeyManager: ObservableObject {
     static let shared = PasskeyManager()
+
+    @Published var hasStoredCredential: Bool = false
 
     private let service = "io.lemonade-nexus.passkey"
     private let credentialAccount = "passkey-credential"
 
-    private init() {}
+    private init() {
+        hasStoredCredential = loadCredentialInfo() != nil
+    }
 
     // MARK: - Registration
 
@@ -204,6 +208,7 @@ final class PasskeyManager {
             kSecAttrAccount as String: credentialAccount,
         ]
         SecItemDelete(infoQuery as CFDictionary)
+        hasStoredCredential = false
     }
 
     // MARK: - Keychain Helpers
@@ -250,6 +255,7 @@ final class PasskeyManager {
     private func saveCredentialInfo(_ info: PasskeyCredentialInfo) throws {
         let data = try JSONEncoder().encode(info)
         try saveToKeychain(data: data, tag: credentialAccount)
+        hasStoredCredential = true
     }
 
     private func loadCredentialInfo() -> PasskeyCredentialInfo? {

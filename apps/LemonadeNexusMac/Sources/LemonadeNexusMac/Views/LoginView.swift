@@ -3,6 +3,7 @@ import AuthenticationServices
 
 struct LoginView: View {
     @EnvironmentObject private var appState: AppState
+    @ObservedObject private var passkeyManager = PasskeyManager.shared
     @State private var serverURL: String = ""
     @State private var username: String = ""
     @State private var password: String = ""
@@ -350,9 +351,9 @@ struct LoginView: View {
                 .foregroundColor(.lemonYellow)
                 .padding(.top, 8)
 
-            if PasskeyManager.shared.hasCredential {
+            if passkeyManager.hasStoredCredential {
                 // Existing passkey — show sign-in
-                if let storedUser = PasskeyManager.shared.storedUserId {
+                if let storedUser = passkeyManager.storedUserId {
                     Text("Sign in as **\(storedUser)** using Touch ID.")
                         .font(.subheadline)
                         .foregroundColor(.textSecondary)
@@ -368,7 +369,12 @@ struct LoginView: View {
                 .buttonStyle(LemonButtonStyle())
                 .disabled(appState.isLoading)
 
-                Button(action: { PasskeyManager.shared.deleteCredential() }) {
+                Button(action: {
+                    passkeyManager.deleteCredential()
+                    statusMessage = nil
+                    isError = false
+                    appState.errorMessage = nil
+                }) {
                     Text("Remove stored passkey")
                         .font(.caption2)
                 }

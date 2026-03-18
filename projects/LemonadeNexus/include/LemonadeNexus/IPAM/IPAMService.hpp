@@ -75,7 +75,8 @@ private:
     std::unordered_map<std::string, AllocationSet> allocations_;
 
     /// Cursor trackers for sequential allocation within each block.
-    uint32_t next_tunnel_ip_{0};   // next offset within 10.64.0.0/10
+    /// Tunnel starts at offset 2: .0 = network, .1 = server gateway.
+    uint32_t next_tunnel_ip_{2};   // next offset within 10.64.0.0/10
     uint32_t next_private_ip_{0};  // next offset within 10.128.0.0/9
     uint32_t next_shared_ip_{0};   // next offset within 172.20.0.0/14
 };

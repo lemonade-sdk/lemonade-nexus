@@ -151,12 +151,12 @@ std::string resolve_tunnel_ip(
             tunnel_bind_ip = alloc.base_network;
         }
     } else {
-        // Genesis server (no peers): self-allocate the first tunnel IP
-        auto alloc = ipam.allocate_tunnel_ip(server_node_id);
-        if (!alloc.base_network.empty()) {
-            tunnel_bind_ip = alloc.base_network;
-            spdlog::info("Genesis server -- allocated tunnel IP: {}", tunnel_bind_ip);
-        }
+        // Genesis/root server: always use .1 as the gateway address.
+        // Record an allocation so IPAM tracks this node, but override to .1.
+        auto server_alloc = ipam.allocate_tunnel_ip(server_node_id);
+        (void)server_alloc;
+        tunnel_bind_ip = "10.64.0.1";
+        spdlog::info("Genesis server -- gateway tunnel IP: {}", tunnel_bind_ip);
     }
 
     // Strip CIDR suffix (e.g. "10.64.0.1/32" -> "10.64.0.1")

@@ -89,6 +89,13 @@ struct LemonadeNexusApp: App {
     private func configureAppearance() {
         // Set the accent color globally
         NSApplication.shared.appearance = NSAppearance(named: .aqua)
+
+        // When launched as a bare binary (not .app bundle), macOS may not
+        // activate the process or make the window key.  Force both.
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            NSApplication.shared.windows.first?.makeKeyAndOrderFront(nil)
+        }
     }
 
     private func attemptAutoConnect() {

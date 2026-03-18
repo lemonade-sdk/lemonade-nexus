@@ -51,20 +51,24 @@ final class TunnelManager: ObservableObject {
         // Kill any existing tunnel helper first
         killExistingHelper()
 
-        // Run the helper with admin privileges via AppleScript.
-        // The helper creates the utun device, configures IP/routes, and runs
-        // BoringTun packet forwarding. It stays alive until signalled.
-        let escaped = helperPath
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-        let escapedConfig = configPath
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
+        // AppleScript's `do shell script` waits for ALL child file descriptors
+        // to close, not just the main process. We must fully detach the helper:
+        //   - close stdin (<&-)
+        //   - redirect stdout/stderr away from the pipe
+        //   - disown to remove from job table
+        let logPath = "/tmp/lnsdk_tunnel.log"
+        let launcherPath = "/tmp/lnsdk_launcher.sh"
+        let launcherContent = """
+            #!/bin/bash
+            "\(helperPath)" "\(configPath)" </dev/null >>/dev/null 2>"\(logPath)" &
+            disown $!
+            exit 0
+            """
+        try launcherContent.write(toFile: launcherPath, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: launcherPath)
 
-        // Launch the helper in the background (& disown) so AppleScript returns
-        // immediately while the tunnel keeps running.
-        let cmd = "\(escaped) \(escapedConfig) &"
-        let script = "do shell script \"\(cmd)\" with administrator privileges"
+        let script = "do shell script \"/bin/bash \(launcherPath)\" with administrator privileges"
 
         var errorDict: NSDictionary?
         guard let appleScript = NSAppleScript(source: script) else {
@@ -107,14 +111,22 @@ final class TunnelManager: ObservableObject {
     }
 
     /// Check if the tunnel helper is still running.
+    /// The helper runs as root, so kill(pid, 0) returns EPERM (errno 1) when
+    /// the process exists but we lack permission — that still means it's alive.
     func refreshStatus() {
         guard let pidStr = try? String(contentsOfFile: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
               let pid = Int32(pidStr) else {
-            isTunnelActive = false
+            // No PID file — only mark inactive if we didn't just start the tunnel
+            if !isTransitioning {
+                isTunnelActive = false
+            }
             return
         }
-        // kill(pid, 0) checks if the process exists without actually sending a signal
-        isTunnelActive = (kill(pid, 0) == 0)
+        let result = kill(pid, 0)
+        // result == 0: we own the process (alive)
+        // result == -1, errno == EPERM: process exists but owned by root (alive)
+        // result == -1, errno == ESRCH: no such process (dead)
+        isTunnelActive = (result == 0 || (result == -1 && errno == EPERM))
     }
 
     // MARK: - Private
@@ -123,18 +135,22 @@ final class TunnelManager: ObservableObject {
         guard let pidStr = try? String(contentsOfFile: pidPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
               let pid = Int32(pidStr) else { return }
 
-        // Send SIGTERM to gracefully shut down the helper (it tears down the tunnel)
-        kill(pid, SIGTERM)
-
-        // Wait briefly for it to exit
-        for _ in 0..<10 {
-            if kill(pid, 0) != 0 { break }
-            Thread.sleep(forTimeInterval: 0.2)
-        }
-
-        // Force kill if still alive
-        if kill(pid, 0) == 0 {
-            kill(pid, SIGKILL)
+        // Try direct kill first (works if we own the process)
+        if kill(pid, SIGTERM) == 0 {
+            for _ in 0..<10 {
+                if kill(pid, 0) != 0 { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+            if kill(pid, 0) == 0 {
+                kill(pid, SIGKILL)
+            }
+        } else if errno == EPERM {
+            // Helper runs as root — need privilege escalation to kill it
+            let script = "do shell script \"kill \(pid) 2>/dev/null; sleep 1; kill -9 \(pid) 2>/dev/null; rm -f \(pidPath)\" with administrator privileges"
+            if let as_ = NSAppleScript(source: script) {
+                var err: NSDictionary?
+                as_.executeAndReturnError(&err)
+            }
         }
 
         try? FileManager.default.removeItem(atPath: pidPath)
