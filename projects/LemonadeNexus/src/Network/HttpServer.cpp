@@ -130,7 +130,8 @@ void HttpServer::on_start() {
     server_->set_address_family(AF_INET);
     server_->set_socket_options([](socket_t sock) {
         int yes = 1;
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
+                   reinterpret_cast<const char*>(&yes), sizeof(yes));
     });
     listen_thread_ = std::thread([this]() {
         if (is_tls_) {
