@@ -245,25 +245,33 @@ struct LemonadeNexusClient::Impl {
     }
 
     std::optional<json> private_http_get(const std::string& path, int& status_out) {
-        // Try HTTPS via private FQDN first
+        spdlog::debug("[LemonadeNexusClient] private_http_get {} (fqdn={}, tunnel={})",
+                       path, server_private_fqdn, server_tunnel_ip);
+        // Try HTTPS via private FQDN (skip cert verify — traffic is already over WG tunnel)
         if (!server_private_fqdn.empty()) {
             try {
-                httplib::Client cli("https://" + server_private_fqdn + ":" + std::to_string(private_port));
+                httplib::SSLClient cli(server_private_fqdn, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
+                cli.enable_server_certificate_verification(false);
                 auto res = cli.Get(path, auth_headers());
                 if (res) {
                     status_out = res->status;
+                    spdlog::debug("[LemonadeNexusClient] private GET {} -> {}", path, res->status);
                     if (res->status >= 200 && res->status < 300) return json::parse(res->body);
                     try { return json::parse(res->body); } catch (...) { return std::nullopt; }
                 }
-            } catch (...) {}
+                spdlog::debug("[LemonadeNexusClient] private HTTPS GET {} failed (no response)", path);
+            } catch (const std::exception& e) {
+                spdlog::debug("[LemonadeNexusClient] private HTTPS GET {} exception: {}", path, e.what());
+            }
         }
-        // Fall back to HTTP on tunnel IP
+        // Fall back to HTTPS on tunnel IP (skip cert verify)
         if (!server_tunnel_ip.empty()) {
             try {
-                httplib::Client cli("http://" + server_tunnel_ip + ":" + std::to_string(private_port));
+                httplib::SSLClient cli(server_tunnel_ip, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
+                cli.enable_server_certificate_verification(false);
                 cli.set_read_timeout(config.read_timeout_sec);
                 auto res = cli.Get(path, auth_headers());
                 if (res) {
@@ -278,28 +286,36 @@ struct LemonadeNexusClient::Impl {
     }
 
     std::optional<json> private_http_post(const std::string& path, const json& body, int& status_out) {
-        // Try HTTPS via private FQDN first
+        spdlog::debug("[LemonadeNexusClient] private_http_post {} (fqdn={}, tunnel={})",
+                       path, server_private_fqdn, server_tunnel_ip);
+        // Try HTTPS via private FQDN (skip cert verify — over WG tunnel)
         if (!server_private_fqdn.empty()) {
             try {
-                httplib::Client cli("https://" + server_private_fqdn + ":" + std::to_string(private_port));
+                httplib::SSLClient cli(server_private_fqdn, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
+                cli.enable_server_certificate_verification(false);
                 auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
                 if (res) {
                     status_out = res->status;
+                    spdlog::debug("[LemonadeNexusClient] private POST {} -> {}", path, res->status);
                     if (res->status >= 200 && res->status < 300) return json::parse(res->body);
                     try { return json::parse(res->body); } catch (...) {
                         json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
                     }
                 }
-            } catch (...) {}
+                spdlog::debug("[LemonadeNexusClient] private HTTPS POST {} failed (no response)", path);
+            } catch (const std::exception& e) {
+                spdlog::debug("[LemonadeNexusClient] private HTTPS POST {} exception: {}", path, e.what());
+            }
         }
-        // Fall back to HTTP on tunnel IP
+        // Fall back to HTTPS on tunnel IP (skip cert verify)
         if (!server_tunnel_ip.empty()) {
             try {
-                httplib::Client cli("http://" + server_tunnel_ip + ":" + std::to_string(private_port));
+                httplib::SSLClient cli(server_tunnel_ip, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
+                cli.enable_server_certificate_verification(false);
                 auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
                 if (res) {
                     status_out = res->status;
