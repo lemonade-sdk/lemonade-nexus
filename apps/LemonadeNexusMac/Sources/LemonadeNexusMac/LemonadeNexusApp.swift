@@ -12,6 +12,12 @@ struct LemonadeNexusApp: App {
                 .frame(minWidth: 900, minHeight: 600)
                 .onAppear {
                     configureAppearance()
+                    // Clean up tunnel on app quit
+                    NotificationCenter.default.addObserver(
+                        forName: NSApplication.willTerminateNotification,
+                        object: nil, queue: .main) { _ in
+                            TunnelManager.shared.cleanupStaleHelper()
+                        }
                     if appState.autoDiscoveryEnabled {
                         Task {
                             await appState.discoverNearestServer()
@@ -87,6 +93,9 @@ struct LemonadeNexusApp: App {
     }
 
     private func configureAppearance() {
+        // Kill any stale tunnel helper from a previous session
+        TunnelManager.shared.cleanupStaleHelper()
+
         // Set the accent color globally
         NSApplication.shared.appearance = NSAppearance(named: .aqua)
 

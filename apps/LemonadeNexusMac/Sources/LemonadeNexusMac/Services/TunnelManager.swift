@@ -15,6 +15,12 @@ final class TunnelManager: ObservableObject {
     private let configPath = "/tmp/lnsdk_wg0.json"
     private let pidPath = "/tmp/lnsdk_tunnel.pid"
 
+    /// Clean up any stale tunnel from a previous app session.
+    /// Called once on app launch before any tunnel operations.
+    func cleanupStaleHelper() {
+        killExistingHelper()
+    }
+
     /// Path to the tunnel helper binary (built alongside the main app).
     private var helperPath: String {
         // The helper binary is in the same directory as the main app binary
