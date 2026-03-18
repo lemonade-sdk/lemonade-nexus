@@ -45,28 +45,13 @@ std::string resolve_jwt_secret(
 }
 
 std::string resolve_server_node_id(storage::FileStorageService& storage) {
-    // Prefer server certificate (from --enroll-server)
     auto cert_env = storage.read_file("identity", "server_cert.json");
     if (cert_env) {
         try {
             auto cert_j = nlohmann::json::parse(cert_env->data);
-            auto id = cert_j.value("server_id", "");
-            if (!id.empty()) return id;
+            return cert_j.value("server_id", "");
         } catch (...) {}
     }
-
-    // Fall back to identity pubkey — every server has one after first boot.
-    // Derive a stable node ID so IPAM allocations persist across restarts.
-    auto pk_env = storage.read_file("identity", "keypair.pub");
-    if (pk_env && !pk_env->data.empty()) {
-        // Use first 16 hex chars of the pubkey as a stable server node ID
-        auto pubkey = pk_env->data;
-        if (pubkey.size() > 16) pubkey = pubkey.substr(0, 16);
-        auto node_id = "server-" + pubkey;
-        spdlog::info("Derived server node ID from identity pubkey: {}", node_id);
-        return node_id;
-    }
-
     return {};
 }
 

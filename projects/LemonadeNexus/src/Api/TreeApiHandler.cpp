@@ -171,10 +171,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
         }
 
-        // Build the WireGuard endpoint: public_ip:wg_port
+        // Build the WireGuard endpoint: public_ip:udp_port
         std::string wg_endpoint;
         if (!ctx_.server_public_ip.empty()) {
-            wg_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.wg_port);
+            wg_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
         }
 
         nlohmann::json resp = {

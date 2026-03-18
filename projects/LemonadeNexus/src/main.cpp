@@ -351,7 +351,6 @@ int main(int argc, char* argv[]) {
         nexus::network::DnsService::PortConfig dns_ports;
         dns_ports.http_port   = http_port;
         dns_ports.udp_port    = udp_port;
-        dns_ports.wg_port     = config.wg_port;
         dns_ports.gossip_port = gossip_port;
         dns_ports.stun_port   = stun_port;
         dns_ports.relay_port  = relay_port;
@@ -488,11 +487,11 @@ int main(int argc, char* argv[]) {
         nexus::wireguard::WgInterfaceConfig wg_iface;
         wg_iface.private_key = wg_server_privkey_b64;
         wg_iface.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
-        wg_iface.listen_port = config.wg_port;
+        wg_iface.listen_port = config.udp_port;
 
         if (wireguard_service.setup_interface(wg_iface, {})) {
             spdlog::info("WireGuard: wg0 up on :{} with tunnel IP {}/10",
-                          config.wg_port, tunnel_bind_ip);
+                          config.udp_port, tunnel_bind_ip);
         } else {
             spdlog::warn("WireGuard: failed to set up wg0 — clients will not be able to connect. "
                           "Ensure wireguard-tools and kernel module are installed.");
