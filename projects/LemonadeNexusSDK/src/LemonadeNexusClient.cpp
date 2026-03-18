@@ -23,8 +23,9 @@ struct LemonadeNexusClient::Impl {
     Identity     identity;
     std::string  session_token;
     std::string  node_id;
+    std::string  server_seip_fqdn;     // e.g. "<id>.<region>.seip.lemonade-nexus.io" — public API after join
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
-    std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTP fallback
+    std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTPS fallback
     uint16_t     private_port{9101};
     mutable std::mutex mutex;
 
@@ -1456,16 +1457,30 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
             impl_->server_tunnel_ip = srv_tunnel;
         }
 
+        // Store SEIP FQDN — this is the server's canonical hostname
+        auto srv_seip_fqdn = resp->value("server_seip_fqdn", std::string{});
+        if (!srv_seip_fqdn.empty()) {
+            impl_->server_seip_fqdn = srv_seip_fqdn;
+            // Switch public API to use the SEIP hostname (proper cert match)
+            auto public_port = static_cast<uint16_t>(impl_->server_pool.empty() ? 9100
+                : impl_->server_pool[impl_->current_server].endpoint.port);
+            impl_->server_pool.clear();
+            impl_->server_pool.push_back({{srv_seip_fqdn, public_port, true}, true, 0, 0});
+            impl_->current_server = 0;
+            spdlog::info("[LemonadeNexusClient] switched public API to https://{}:{}",
+                          srv_seip_fqdn, public_port);
+        }
+
         // Store private FQDN for HTTPS over WG tunnel
         auto srv_priv_fqdn = resp->value("server_private_fqdn", std::string{});
         impl_->private_port = static_cast<uint16_t>(
             resp->value("private_api_port", 9101));
         if (!srv_priv_fqdn.empty()) {
             impl_->server_private_fqdn = srv_priv_fqdn;
-            spdlog::info("[LemonadeNexusClient] private API: HTTPS {} / HTTP {}:{}",
-                          srv_priv_fqdn, srv_tunnel, impl_->private_port);
+            spdlog::info("[LemonadeNexusClient] private API: https://{}:{}",
+                          srv_priv_fqdn, impl_->private_port);
         } else if (!srv_tunnel.empty()) {
-            spdlog::info("[LemonadeNexusClient] private API: HTTP {}:{}",
+            spdlog::info("[LemonadeNexusClient] private API fallback: https://{}:{}",
                           srv_tunnel, impl_->private_port);
         }
     }

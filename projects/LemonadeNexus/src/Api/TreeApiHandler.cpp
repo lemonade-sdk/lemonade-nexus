@@ -208,6 +208,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             {"tunnel_ip",        alloc.base_network},
             {"tunnel_subnet",    "10.64.0.0/10"},
             {"server_tunnel_ip", server_tunnel},
+            {"server_seip_fqdn",    ctx_.server_seip_fqdn},
             {"server_private_fqdn", ctx_.server_private_fqdn},
             {"client_private_fqdn", client_private_fqdn},
             {"private_api_port", !ctx_.tunnel_bind_ip.empty()

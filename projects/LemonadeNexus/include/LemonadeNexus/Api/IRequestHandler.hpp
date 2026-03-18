@@ -68,6 +68,7 @@ struct ApiContext {
     wireguard::WireGuardService*      wireguard{nullptr};
     network::DnsService*              dns{nullptr};
     std::string                       server_fqdn;
+    std::string                       server_seip_fqdn;     // <id>.<region>.seip.<domain>
     std::string                       server_private_fqdn;  // private.<id>.<region>.seip.<domain>
     std::string                       server_public_ip;
     std::string                       tunnel_bind_ip;

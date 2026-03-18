@@ -432,17 +432,33 @@ int main(int argc, char* argv[]) {
 
     // Publish SEIP records: <id>.<region>.seip.<domain> for geo-aware discovery
     dns.set_server_region(config.region);
+    std::string server_seip_fqdn;
     std::string server_private_fqdn;
     {
         auto seip_id = nexus::core::resolve_server_node_id(storage);
         if (!seip_id.empty() && !config.region.empty() && !server_public_ip.empty()) {
-            dns.publish_seip_records(seip_id, config.region, server_public_ip);
-            spdlog::info("SEIP: published {}.{}.seip.{} -> {}",
-                          seip_id, config.region, config.dns_base_domain, server_public_ip);
+            server_seip_fqdn = seip_id + "." + config.region + ".seip." + config.dns_base_domain;
+            server_private_fqdn = "private." + server_seip_fqdn;
 
-            // Register private FQDN for HTTPS over WG tunnel
-            server_private_fqdn = "private." + seip_id + "." + config.region +
-                                  ".seip." + config.dns_base_domain;
+            dns.publish_seip_records(seip_id, config.region, server_public_ip);
+            spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
+
+            // Request ACME cert for the SEIP hostname (public API)
+            if (config.auto_tls) {
+                auto seip_tls = nexus::core::resolve_tls_cert(config, data_root, server_seip_fqdn);
+                if (!seip_tls.cert_path.empty() && !seip_tls.key_path.empty()) {
+                    // Use SEIP cert as the primary public API cert
+                    config.tls_cert_path = seip_tls.cert_path;
+                    config.tls_key_path  = seip_tls.key_path;
+                    spdlog::info("SEIP: using TLS cert for {}", server_seip_fqdn);
+                } else if (seip_tls.needs_acme_background) {
+                    spdlog::info("SEIP: requesting ACME cert for {} in background", server_seip_fqdn);
+                    std::thread([&acme, fqdn = server_seip_fqdn]() {
+                        std::this_thread::sleep_for(std::chrono::seconds(5));
+                        (void)acme.request_certificate(fqdn);
+                    }).detach();
+                }
+            }
         }
     }
 
@@ -700,6 +716,7 @@ int main(int argc, char* argv[]) {
         .wireguard        = &wireguard_service,
         .dns              = &dns,
         .server_fqdn      = server_fqdn,
+        .server_seip_fqdn = server_seip_fqdn,
         .server_private_fqdn = server_private_fqdn,
         .server_public_ip = server_public_ip,
         .tunnel_bind_ip   = tunnel_bind_ip,
