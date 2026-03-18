@@ -633,18 +633,11 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
-    // UDP Hole Punch
+    // UDP Hole Punch (separate port from WireGuard)
     // ========================================================================
-    // HolePunch shares the UDP port with WireGuard. If WG is active on the
-    // same port, WG handles the UDP socket — skip the standalone HolePunch bind.
-    std::optional<nexus::network::HolePunchService> hole_punch;
-    if (tunnel_bind_ip.empty()) {
-        // No WG interface — start standalone HolePunch on the UDP port
-        hole_punch.emplace(coordinator.io_context(), udp_port);
-        hole_punch->start();
-    } else {
-        spdlog::info("HolePunch: WireGuard active on :{} — hole punch via WG keepalive", udp_port);
-    }
+    const uint16_t hole_punch_port = 51941;
+    nexus::network::HolePunchService hole_punch{coordinator.io_context(), hole_punch_port};
+    hole_punch.start();
 
     // ========================================================================
     // Run -- blocks until SIGINT/SIGTERM
@@ -771,7 +764,7 @@ int main(int argc, char* argv[]) {
     if (acme_renewal_thread.joinable()) {
         acme_renewal_thread.join();
     }
-    if (hole_punch) hole_punch->stop();
+    hole_punch.stop();
     wireguard_service.stop();
     if (private_http_server) {
         private_http_server->stop();
