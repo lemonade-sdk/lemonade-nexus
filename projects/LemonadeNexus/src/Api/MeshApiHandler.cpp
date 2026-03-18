@@ -232,18 +232,11 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        // Verify the caller owns this node via management pubkey (defense in depth)
-        auto caller_pubkey = normalize_pubkey(claims.user_id);
-        if (node_opt->mgmt_pubkey != caller_pubkey) {
-            spdlog::warn("[MeshAPI] Heartbeat ownership mismatch: caller={} node_mgmt={}",
-                          caller_pubkey, node_opt->mgmt_pubkey);
-            error_response(res, "insufficient permissions", 403);
-            return;
-        }
-
-        // Also verify the caller has EditNode permission (belt and suspenders)
-        if (!ctx_.tree.check_permission(caller_pubkey, hb_node_id,
-                                         acl::Permission::EditNode)) {
+        // Verify the caller owns this node: the JWT user_id must match the
+        // node_id being heartbeated (the node_id IS the user_id from join).
+        if (claims.user_id != hb_node_id) {
+            spdlog::warn("[MeshAPI] Heartbeat ownership mismatch: caller={} node={}",
+                          claims.user_id, hb_node_id);
             error_response(res, "insufficient permissions", 403);
             return;
         }
