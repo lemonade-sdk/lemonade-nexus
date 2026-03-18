@@ -152,29 +152,29 @@ std::string resolve_tunnel_ip(
 
     std::string tunnel_bind_ip;
 
-    // Check for existing IPAM allocation
-    auto existing = ipam.get_allocation(server_node_id);
-    if (existing && existing->tunnel) {
-        tunnel_bind_ip = existing->tunnel->base_network;
-    } else if (!config.seed_peers.empty()) {
-        // Joining server: wait for gossip to assign us a tunnel IP via ServerHello
-        spdlog::info("Waiting for tunnel IP assignment from network peers...");
-        for (int i = 0; i < 15 && gossip.our_tunnel_ip().empty(); ++i) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-        tunnel_bind_ip = gossip.our_tunnel_ip();
-        if (tunnel_bind_ip.empty()) {
-            spdlog::warn("No tunnel IP received from peers -- self-allocating");
-            auto alloc = ipam.allocate_tunnel_ip(server_node_id);
-            tunnel_bind_ip = alloc.base_network;
-        }
-    } else {
+    if (config.seed_peers.empty()) {
         // Genesis/root server: always use .1 as the gateway address.
-        // Record an allocation so IPAM tracks this node, but override to .1.
         auto server_alloc = ipam.allocate_tunnel_ip(server_node_id);
         (void)server_alloc;
         tunnel_bind_ip = "10.64.0.1";
         spdlog::info("Genesis server -- gateway tunnel IP: {}", tunnel_bind_ip);
+    } else {
+        // Joining server: check existing allocation or wait for gossip assignment
+        auto existing = ipam.get_allocation(server_node_id);
+        if (existing && existing->tunnel) {
+            tunnel_bind_ip = existing->tunnel->base_network;
+        } else {
+            spdlog::info("Waiting for tunnel IP assignment from network peers...");
+            for (int i = 0; i < 15 && gossip.our_tunnel_ip().empty(); ++i) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            tunnel_bind_ip = gossip.our_tunnel_ip();
+            if (tunnel_bind_ip.empty()) {
+                spdlog::warn("No tunnel IP received from peers -- self-allocating");
+                auto alloc = ipam.allocate_tunnel_ip(server_node_id);
+                tunnel_bind_ip = alloc.base_network;
+            }
+        }
     }
 
     // Strip CIDR suffix (e.g. "10.64.0.1/32" -> "10.64.0.1")
