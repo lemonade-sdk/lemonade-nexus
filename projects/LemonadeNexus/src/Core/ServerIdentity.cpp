@@ -57,13 +57,17 @@ std::string resolve_server_node_id(storage::FileStorageService& storage) {
 
     // Fall back to identity pubkey — every server has one after first boot.
     // Derive a stable node ID so IPAM allocations persist across restarts.
-    auto pk_env = storage.read_file("identity", "keypair.pub");
-    if (pk_env && !pk_env->data.empty()) {
-        auto pubkey = pk_env->data;
-        if (pubkey.size() > 16) pubkey = pubkey.substr(0, 16);
-        auto node_id = "server-" + pubkey;
-        spdlog::info("Derived server node ID from identity pubkey: {}", node_id);
-        return node_id;
+    // keypair.pub is raw hex written by KeyWrappingService, not a SignedEnvelope.
+    auto pub_path = storage.data_root() / "identity" / "keypair.pub";
+    if (std::filesystem::exists(pub_path)) {
+        std::ifstream ifs(pub_path);
+        std::string hex_str;
+        std::getline(ifs, hex_str);
+        if (hex_str.size() >= 16) {
+            auto node_id = "server-" + hex_str.substr(0, 16);
+            spdlog::info("Derived server node ID from identity pubkey: {}", node_id);
+            return node_id;
+        }
     }
 
     return {};
