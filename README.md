@@ -1,5 +1,7 @@
 # Lemonade-Nexus
 
+> 🍋 **Lemonade Nexus** > 📖 [**Explore the DOCS ➔**](https://lemonade-sdk.github.io/lemonade-nexus/) 🚀
+
 A self-hosted, cryptographically secure WireGuard mesh VPN with zero-trust architecture, federated relay servers, and democratic governance.
 
 ## Features
