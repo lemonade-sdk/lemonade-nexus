@@ -1,3 +1,8 @@
+---
+layout: default
+title: Security Model
+---
+
 # Security Model
 
 ## Layers of Security

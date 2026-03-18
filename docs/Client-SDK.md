@@ -1,3 +1,8 @@
+---
+layout: default
+title: Client SDK Overview
+---
+
 # Client SDK Overview
 
 For the full SDK reference with code examples, see the [SDK Guide](SDK-Guide.md).

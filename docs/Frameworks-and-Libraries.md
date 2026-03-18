@@ -1,3 +1,8 @@
+---
+layout: default
+title: Frameworks and Libraries
+---
+
 # Frameworks and Libraries
 
 ## Core Language: C++20

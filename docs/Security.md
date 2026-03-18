@@ -1,3 +1,8 @@
+---
+layout: default
+title: Security
+---
+
 # Security
 
 ## Table of Contents

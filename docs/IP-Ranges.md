@@ -1,3 +1,8 @@
+---
+layout: default
+title: IP Ranges and IPAM
+---
+
 # IP Ranges and IPAM
 
 ## Table of Contents

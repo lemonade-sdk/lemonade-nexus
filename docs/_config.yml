@@ -1,0 +1,12 @@
+title: Lemonade-Nexus
+description: Self-hosted, cryptographically secure WireGuard mesh VPN with zero-trust architecture
+theme: jekyll-theme-cayman
+baseurl: "/lemonade-nexus"
+url: "https://lemonade-sdk.github.io"
+
+markdown: kramdown
+highlighter: rouge
+
+exclude:
+  - Gemfile
+  - Gemfile.lock

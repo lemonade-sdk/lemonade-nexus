@@ -1,3 +1,8 @@
+---
+layout: default
+title: Why Use Lemonade-Nexus?
+---
+
 # Why Use Lemonade-Nexus?
 
 ## Self-Hosted, Self-Sovereign

@@ -1,3 +1,8 @@
+---
+layout: default
+title: SDK Guide
+---
+
 # SDK Guide
 
 ## Table of Contents

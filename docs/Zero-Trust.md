@@ -1,3 +1,8 @@
+---
+layout: default
+title: Zero-Trust Architecture
+---
+
 # Zero-Trust Architecture
 
 ## What Zero-Trust Means Here

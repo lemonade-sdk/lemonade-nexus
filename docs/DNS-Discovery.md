@@ -1,3 +1,8 @@
+---
+layout: default
+title: DNS Discovery
+---
+
 # DNS Discovery
 
 ## Table of Contents

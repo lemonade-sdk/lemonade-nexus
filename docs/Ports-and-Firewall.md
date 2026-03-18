@@ -1,3 +1,8 @@
+---
+layout: default
+title: Ports and Firewall
+---
+
 # Ports and Firewall
 
 ## Table of Contents

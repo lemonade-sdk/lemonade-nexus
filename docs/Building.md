@@ -1,3 +1,8 @@
+---
+layout: default
+title: Building from Source
+---
+
 # Building from Source
 
 ## Table of Contents

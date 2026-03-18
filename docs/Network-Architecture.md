@@ -1,3 +1,8 @@
+---
+layout: default
+title: Network Architecture
+---
+
 # Network Architecture
 
 ## Network Topology
