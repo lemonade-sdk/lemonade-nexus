@@ -111,6 +111,12 @@ public:
         return self().do_sync_peers_from_tree(desired_peers);
     }
 
+    /// Add a secondary address to the existing interface (no flush).
+    /// Used to add the backbone address after setup_interface().
+    [[nodiscard]] bool add_address(const std::string& address_cidr) {
+        return self().do_add_address(address_cidr);
+    }
+
     /// Persist the config string to disk.
     [[nodiscard]] bool save_config(const std::string& config_contents) {
         return self().do_save_config(config_contents);
@@ -146,6 +152,7 @@ concept WireGuardProviderType = requires(T t,
     { t.do_setup_interface(config, peers) } -> std::same_as<bool>;
     { t.do_teardown_interface() } -> std::same_as<bool>;
     { t.do_sync_peers_from_tree(tree_peers) } -> std::same_as<int>;
+    { t.do_add_address(s) } -> std::same_as<bool>;
     { t.do_save_config(s) } -> std::same_as<bool>;
     { t.do_load_config() } -> std::same_as<std::string>;
 };

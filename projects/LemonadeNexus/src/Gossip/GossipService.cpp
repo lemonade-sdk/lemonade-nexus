@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -560,6 +561,9 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             break;
         case GossipMsgType::DnsRecordSync:
             handle_dns_record_sync(remote_endpoint_, payload, payload_len);
+            break;
+        case GossipMsgType::BackboneIpamSync:
+            handle_backbone_ipam_sync(remote_endpoint_, payload, payload_len);
             break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
@@ -1836,9 +1840,109 @@ void GossipService::set_ipam(ipam::IPAMService* ipam) {
     ipam_ = ipam;
 }
 
+void GossipService::set_wireguard(wireguard::WireGuardService* wg) {
+    wireguard_ = wg;
+}
+
 std::string GossipService::our_tunnel_ip() const {
     std::lock_guard lock(peers_mutex_);
     return our_tunnel_ip_;
+}
+
+void GossipService::try_add_backbone_wg_peer(const GossipPeer& peer) {
+    if (!wireguard_ || peer.wg_pubkey.empty() || peer.backbone_ip.empty()) return;
+
+    // Build the backbone endpoint: use the peer's public endpoint IP + WG port (51940)
+    std::string wg_endpoint;
+    auto colon = peer.endpoint.rfind(':');
+    if (colon != std::string::npos) {
+        // Extract the IP from the gossip endpoint "ip:9102" and use port 51940
+        wg_endpoint = peer.endpoint.substr(0, colon) + ":51940";
+    }
+
+    if (wireguard_->add_peer(peer.wg_pubkey, peer.backbone_ip + "/32", wg_endpoint)) {
+        spdlog::info("[{}] added backbone WG peer {} ({}) endpoint={}",
+                      name(), peer.backbone_ip, peer.pubkey.substr(0, 12), wg_endpoint);
+    }
+}
+
+void GossipService::broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta) {
+    json j;
+    j["delta_id"]        = delta.delta_id;
+    j["operation"]       = delta.operation;
+    j["server_node_id"]  = delta.server_node_id;
+    j["server_pubkey"]   = delta.server_pubkey;
+    j["backbone_ip"]     = delta.backbone_ip;
+    j["timestamp"]       = delta.timestamp;
+    j["signer_pubkey"]   = delta.signer_pubkey;
+    j["signature"]       = delta.signature;
+
+    auto packed = json::to_msgpack(j);
+    std::vector<uint8_t> payload(packed.begin(), packed.end());
+
+    std::lock_guard lock(peers_mutex_);
+    for (const auto& peer : peers_) {
+        auto ep = parse_endpoint(peer.endpoint);
+        if (ep) {
+            send_packet(*ep, GossipMsgType::BackboneIpamSync, payload);
+        }
+    }
+}
+
+void GossipService::handle_backbone_ipam_sync(
+    const asio::ip::udp::endpoint& sender,
+    const uint8_t* payload, std::size_t payload_len) {
+    if (!ipam_) return;
+
+    try {
+        auto j = json::from_msgpack(payload, payload + payload_len);
+
+        ipam::BackboneAllocationDelta delta;
+        delta.delta_id       = j.value("delta_id", "");
+        delta.operation      = j.value("operation", "");
+        delta.server_node_id = j.value("server_node_id", "");
+        delta.server_pubkey  = j.value("server_pubkey", "");
+        delta.backbone_ip    = j.value("backbone_ip", "");
+        delta.timestamp      = j.value("timestamp", uint64_t{0});
+        delta.signer_pubkey  = j.value("signer_pubkey", "");
+        delta.signature      = j.value("signature", "");
+
+        if (delta.delta_id.empty() || delta.server_node_id.empty()) {
+            return;
+        }
+
+        if (ipam_->apply_remote_backbone_allocation(delta)) {
+            // New allocation — forward to all peers except sender
+            std::vector<uint8_t> fwd_payload(payload, payload + payload_len);
+            std::lock_guard lock(peers_mutex_);
+            for (const auto& peer : peers_) {
+                auto ep = parse_endpoint(peer.endpoint);
+                if (ep && *ep != sender) {
+                    send_packet(*ep, GossipMsgType::BackboneIpamSync, fwd_payload);
+                }
+            }
+
+            // If allocate operation, try to add as WG peer
+            if (delta.operation == "allocate") {
+                // Find the peer in our list and update backbone_ip
+                for (auto& peer : peers_) {
+                    if (peer.pubkey == delta.server_pubkey) {
+                        peer.backbone_ip = delta.backbone_ip;
+                        // Strip CIDR prefix for the stored IP
+                        auto slash = peer.backbone_ip.find('/');
+                        if (slash != std::string::npos) {
+                            peer.backbone_ip = peer.backbone_ip.substr(0, slash);
+                        }
+                        try_add_backbone_wg_peer(peer);
+                        break;
+                    }
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse backbone IPAM delta from {}:{}: {}",
+                      name(), sender.address().to_string(), sender.port(), e.what());
+    }
 }
 
 // ---------------------------------------------------------------------------

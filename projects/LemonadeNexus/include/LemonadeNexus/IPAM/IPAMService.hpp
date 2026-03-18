@@ -5,10 +5,12 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nexus::ipam {
 
@@ -41,6 +43,31 @@ public:
     [[nodiscard]] bool do_release(std::string_view node_id, BlockType block_type);
     [[nodiscard]] std::optional<AllocationSet> do_get_allocation(std::string_view node_id) const;
     [[nodiscard]] bool do_check_conflict(std::string_view network_cidr) const;
+
+    // --- Backbone (server mesh 172.16.0.0/22) ---
+
+    /// Allocate a backbone IP for a server, preferring a pubkey-hash-derived offset.
+    /// Deterministic: same pubkey always prefers the same IP.
+    [[nodiscard]] Allocation allocate_backbone_ip(std::string_view server_node_id,
+                                                   std::string_view ed25519_pubkey_b64);
+
+    /// Apply a remote backbone allocation received via gossip.
+    /// Returns true if the allocation was new (caller should forward to peers).
+    /// On conflict: lexicographically higher pubkey wins.
+    [[nodiscard]] bool apply_remote_backbone_allocation(const BackboneAllocationDelta& delta);
+
+    /// Get all backbone allocations (for anti-entropy full sync).
+    [[nodiscard]] std::vector<Allocation> get_backbone_allocations() const;
+
+    /// Update last_seen for a backbone peer (called from gossip tick).
+    void update_backbone_last_seen(std::string_view server_node_id, uint64_t timestamp);
+
+    /// Collect server_node_ids whose backbone allocation is stale.
+    [[nodiscard]] std::vector<std::string> collect_stale_backbone(uint64_t stale_threshold_sec) const;
+
+    /// Set callback for allocation changes (gossip broadcast).
+    using BackboneCallback = std::function<void(const BackboneAllocationDelta&)>;
+    void set_backbone_callback(BackboneCallback cb) { backbone_callback_ = std::move(cb); }
 
 private:
     /// Persist current allocations to storage.
@@ -76,9 +103,16 @@ private:
 
     /// Cursor trackers for sequential allocation within each block.
     /// First 10 IPs (.0-.9) reserved for system: .0=network, .1=gateway, .2-.9=future.
-    uint32_t next_tunnel_ip_{10};  // next offset within 10.64.0.0/10
-    uint32_t next_private_ip_{0};  // next offset within 10.128.0.0/9
-    uint32_t next_shared_ip_{0};   // next offset within 172.20.0.0/14
+    uint32_t next_tunnel_ip_{10};    // next offset within 10.64.0.0/10
+    uint32_t next_private_ip_{0};    // next offset within 10.128.0.0/9
+    uint32_t next_shared_ip_{0};     // next offset within 172.20.0.0/14
+    uint32_t next_backbone_ip_{10};  // next offset within 172.16.0.0/22
+
+    /// Backbone allocation dedup set (delta_id UUIDs).
+    std::unordered_set<std::string> seen_backbone_deltas_;
+
+    /// Callback to broadcast backbone allocation changes via gossip.
+    BackboneCallback backbone_callback_;
 };
 
 } // namespace nexus::ipam

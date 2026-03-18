@@ -23,6 +23,7 @@
 #include <vector>
 
 namespace nexus::network { class DnsService; }
+namespace nexus::wireguard { class WireGuardService; }
 
 namespace nexus::gossip {
 
@@ -60,8 +61,26 @@ public:
     /// Set the IPAM service for tunnel IP allocation during ServerHello exchange.
     void set_ipam(ipam::IPAMService* ipam);
 
+    /// Set the WireGuard service for backbone peer provisioning.
+    void set_wireguard(wireguard::WireGuardService* wg);
+
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
     [[nodiscard]] std::string our_tunnel_ip() const;
+
+    /// Set our backbone IP for inclusion in ServerHello messages.
+    void set_our_backbone_ip(const std::string& ip) { our_backbone_ip_ = ip; }
+
+    /// Get our backbone IP.
+    [[nodiscard]] std::string our_backbone_ip() const { return our_backbone_ip_; }
+
+    /// Set our WG pubkey for inclusion in ServerHello messages.
+    void set_our_wg_pubkey(const std::string& pubkey) { our_wg_pubkey_ = pubkey; }
+
+    /// Broadcast a backbone IPAM allocation delta to all peers.
+    void broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta);
+
+    /// Try to add a gossip peer as a WireGuard backbone peer.
+    void try_add_backbone_wg_peer(const GossipPeer& peer);
 
     /// Access the Ed25519 keypair (needed by TrustPolicy for token generation).
     [[nodiscard]] const crypto::Ed25519Keypair& keypair() const { return keypair_; }
@@ -204,6 +223,10 @@ private:
     void handle_dns_record_sync(const asio::ip::udp::endpoint& sender,
                                  const uint8_t* payload, std::size_t payload_len);
 
+    // Backbone IPAM sync handler
+    void handle_backbone_ipam_sync(const asio::ip::udp::endpoint& sender,
+                                    const uint8_t* payload, std::size_t payload_len);
+
     // Verify a server certificate against the root pubkey
     [[nodiscard]] bool verify_server_certificate(const ServerCertificate& cert) const;
 
@@ -248,7 +271,10 @@ private:
 
     // IPAM for tunnel IP allocation during ServerHello exchange
     ipam::IPAMService*               ipam_{nullptr};
-    std::string                      our_tunnel_ip_;  // assigned by peer or self
+    wireguard::WireGuardService*     wireguard_{nullptr};
+    std::string                      our_tunnel_ip_;     // assigned by peer or self
+    std::string                      our_backbone_ip_;   // 172.16.0.X backbone
+    std::string                      our_wg_pubkey_;     // base64 X25519
 
     // Shamir reconstruction: collect submitted shares from peers
     std::mutex                              reconstruction_mutex_;

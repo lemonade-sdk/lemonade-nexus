@@ -1,5 +1,4 @@
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
-
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
@@ -21,9 +20,13 @@ constexpr uint32_t kPrivateBase = (10u << 24) | (128u << 16);         // 10.128.
 constexpr uint32_t kPrivateMask = 0xFF800000u;                        // /9
 constexpr uint32_t kPrivateSize = ~kPrivateMask + 1;                  // 8,388,608 addresses
 
-constexpr uint32_t kSharedBase  = (172u << 24) | (20u << 16);         // 172.20.0.0
-constexpr uint32_t kSharedMask  = 0xFFFC0000u;                        // /14
-constexpr uint32_t kSharedSize  = ~kSharedMask + 1;                   // 262,144 addresses
+constexpr uint32_t kSharedBase    = (172u << 24) | (20u << 16);         // 172.20.0.0
+constexpr uint32_t kSharedMask    = 0xFFFC0000u;                        // /14
+constexpr uint32_t kSharedSize    = ~kSharedMask + 1;                   // 262,144 addresses
+
+constexpr uint32_t kBackboneBase  = (172u << 24) | (16u << 16);         // 172.16.0.0
+constexpr uint32_t kBackboneMask  = 0xFFFFFC00u;                        // /22
+constexpr uint32_t kBackboneSize  = ~kBackboneMask + 1;                 // 1,024 addresses
 
 /// Return the current Unix timestamp.
 uint64_t now_unix() {
@@ -36,18 +39,20 @@ uint64_t now_unix() {
 /// Stringify a BlockType for JSON serialization.
 std::string block_type_to_string(BlockType bt) {
     switch (bt) {
-        case BlockType::Tunnel:  return "tunnel";
-        case BlockType::Private: return "private";
-        case BlockType::Shared:  return "shared";
+        case BlockType::Tunnel:   return "tunnel";
+        case BlockType::Private:  return "private";
+        case BlockType::Shared:   return "shared";
+        case BlockType::Backbone: return "backbone";
     }
     return "unknown";
 }
 
 /// Parse a BlockType from its string representation.
 BlockType string_to_block_type(std::string_view s) {
-    if (s == "tunnel")  return BlockType::Tunnel;
-    if (s == "private") return BlockType::Private;
-    if (s == "shared")  return BlockType::Shared;
+    if (s == "tunnel")   return BlockType::Tunnel;
+    if (s == "private")  return BlockType::Private;
+    if (s == "shared")   return BlockType::Shared;
+    if (s == "backbone") return BlockType::Backbone;
     throw std::invalid_argument(std::string("Unknown BlockType: ") + std::string(s));
 }
 
@@ -57,6 +62,7 @@ json allocation_to_json(const Allocation& a) {
     j["base_network"]      = a.base_network;
     j["customer_node_id"]  = a.customer_node_id;
     j["allocated_at"]      = a.allocated_at;
+    j["last_seen"]         = a.last_seen;
     j["signer_pubkey"]     = a.signer_pubkey;
     j["signature"]         = a.signature;
     return j;
@@ -68,6 +74,7 @@ Allocation json_to_allocation(const json& j) {
     a.base_network      = j.value("base_network", "");
     a.customer_node_id  = j.value("customer_node_id", "");
     a.allocated_at      = j.value("allocated_at", uint64_t{0});
+    a.last_seen         = j.value("last_seen", uint64_t{0});
     a.signer_pubkey     = j.value("signer_pubkey", "");
     a.signature         = j.value("signature", "");
     return a;
@@ -183,6 +190,8 @@ Allocation IPAMService::do_expand_allocation(std::string_view node_id,
     switch (block_type) {
         case BlockType::Tunnel:
             throw std::runtime_error("Tunnel allocations are always /32 and cannot be expanded");
+        case BlockType::Backbone:
+            throw std::runtime_error("Backbone allocations are always /32 and cannot be expanded");
         case BlockType::Private:
             target = &it->second.private_subnet;
             break;
@@ -234,10 +243,15 @@ bool IPAMService::do_release(std::string_view node_id, BlockType block_type) {
             released = it->second.shared_block.has_value();
             it->second.shared_block.reset();
             break;
+        case BlockType::Backbone:
+            released = it->second.backbone.has_value();
+            it->second.backbone.reset();
+            break;
     }
 
     // Remove the node entry entirely if all allocations are released
-    if (!it->second.tunnel && !it->second.private_subnet && !it->second.shared_block) {
+    if (!it->second.tunnel && !it->second.private_subnet &&
+        !it->second.shared_block && !it->second.backbone) {
         allocations_.erase(it);
     }
 
@@ -273,7 +287,8 @@ bool IPAMService::do_check_conflict(std::string_view network_cidr) const {
 
         if (check_alloc(aset.tunnel) ||
             check_alloc(aset.private_subnet) ||
-            check_alloc(aset.shared_block)) {
+            check_alloc(aset.shared_block) ||
+            check_alloc(aset.backbone)) {
             return true;
         }
     }
@@ -289,6 +304,7 @@ void IPAMService::save_allocations() {
         if (aset.tunnel)         j.push_back(allocation_to_json(*aset.tunnel));
         if (aset.private_subnet) j.push_back(allocation_to_json(*aset.private_subnet));
         if (aset.shared_block)   j.push_back(allocation_to_json(*aset.shared_block));
+        if (aset.backbone)       j.push_back(allocation_to_json(*aset.backbone));
     }
 
     storage::SignedEnvelope envelope;
@@ -329,6 +345,9 @@ void IPAMService::load_allocations() {
             case BlockType::Shared:
                 aset.shared_block = alloc;
                 break;
+            case BlockType::Backbone:
+                aset.backbone = alloc;
+                break;
         }
     }
 
@@ -351,6 +370,11 @@ void IPAMService::load_allocations() {
             uint32_t stride = 1u << (32 - prefix);
             uint32_t offset = ip - kSharedBase + stride;
             if (offset > next_shared_ip_) next_shared_ip_ = offset;
+        }
+        if (aset.backbone) {
+            auto [ip, prefix] = parse_cidr(aset.backbone->base_network);
+            uint32_t offset = ip - kBackboneBase + 1;
+            if (offset > next_backbone_ip_) next_backbone_ip_ = std::max(offset, uint32_t{10});
         }
     }
 }
@@ -377,6 +401,11 @@ std::string IPAMService::next_address(BlockType type, uint8_t prefix_len) {
             base   = kSharedBase;
             size   = kSharedSize;
             cursor = &next_shared_ip_;
+            break;
+        case BlockType::Backbone:
+            base   = kBackboneBase;
+            size   = kBackboneSize;
+            cursor = &next_backbone_ip_;
             break;
     }
 
@@ -444,6 +473,184 @@ bool IPAMService::cidrs_overlap(uint32_t a_ip, uint8_t a_prefix,
     uint8_t min_prefix = std::min(a_prefix, b_prefix);
     uint32_t mask = min_prefix == 0 ? 0 : (~0u << (32 - min_prefix));
     return (a_ip & mask) == (b_ip & mask);
+}
+
+// --- Backbone (server mesh 172.16.0.0/22) ---
+
+Allocation IPAMService::allocate_backbone_ip(std::string_view server_node_id,
+                                              std::string_view ed25519_pubkey_b64) {
+    std::lock_guard lock(mutex_);
+
+    // Return existing allocation if present
+    auto it = allocations_.find(std::string(server_node_id));
+    if (it != allocations_.end() && it->second.backbone) {
+        return *it->second.backbone;
+    }
+
+    // Derive preferred offset from pubkey hash: SHA-256 → first 4 bytes → mod usable range
+    // Usable offsets: 10..1023 (first 10 reserved, /22 = 1024 total)
+    constexpr uint32_t kUsableStart = 10;
+    constexpr uint32_t kUsableCount = kBackboneSize - kUsableStart;
+
+    uint32_t preferred_offset = kUsableStart;
+    if (ed25519_pubkey_b64.size() >= 4) {
+        uint32_t hash_val = 0;
+        for (size_t i = 0; i < std::min(ed25519_pubkey_b64.size(), size_t{16}); ++i) {
+            hash_val = hash_val * 31 + static_cast<uint8_t>(ed25519_pubkey_b64[i]);
+        }
+        preferred_offset = (hash_val % kUsableCount) + kUsableStart;
+    }
+
+    // Linear probe from preferred offset to find a free slot
+    uint32_t offset = preferred_offset;
+    for (uint32_t tries = 0; tries < kUsableCount; ++tries) {
+        uint32_t ip = kBackboneBase + offset;
+        auto cidr = format_cidr(ip, 32);
+
+        // Check if any existing allocation uses this IP
+        bool taken = false;
+        for (const auto& [nid, aset] : allocations_) {
+            if (aset.backbone && aset.backbone->base_network == cidr) {
+                taken = true;
+                break;
+            }
+        }
+
+        if (!taken) {
+            Allocation alloc;
+            alloc.block_type       = BlockType::Backbone;
+            alloc.base_network     = cidr;
+            alloc.customer_node_id = std::string(server_node_id);
+            alloc.allocated_at     = now_unix();
+            alloc.last_seen        = now_unix();
+
+            allocations_[std::string(server_node_id)].backbone = alloc;
+
+            // Advance cursor past this allocation
+            if (offset + 1 > next_backbone_ip_) {
+                next_backbone_ip_ = offset + 1;
+            }
+
+            save_allocations();
+            spdlog::info("[{}] allocated backbone {} to server '{}'",
+                          name(), cidr, server_node_id);
+            return alloc;
+        }
+
+        // Wrap around within usable range
+        offset = ((offset - kUsableStart + 1) % kUsableCount) + kUsableStart;
+    }
+
+    throw std::runtime_error("IPAM: backbone range exhausted (172.16.0.0/22)");
+}
+
+bool IPAMService::apply_remote_backbone_allocation(const BackboneAllocationDelta& delta) {
+    std::lock_guard lock(mutex_);
+
+    // Dedup check
+    if (seen_backbone_deltas_.count(delta.delta_id)) {
+        return false;
+    }
+    // Cap dedup set to prevent unbounded growth
+    if (seen_backbone_deltas_.size() > 100000) {
+        seen_backbone_deltas_.clear();
+    }
+    seen_backbone_deltas_.insert(delta.delta_id);
+
+    if (delta.operation == "release") {
+        auto it = allocations_.find(delta.server_node_id);
+        if (it != allocations_.end() && it->second.backbone) {
+            spdlog::info("[{}] remote release backbone {} from '{}'",
+                          name(), it->second.backbone->base_network, delta.server_node_id);
+            it->second.backbone.reset();
+            if (!it->second.tunnel && !it->second.private_subnet &&
+                !it->second.shared_block && !it->second.backbone) {
+                allocations_.erase(it);
+            }
+            save_allocations();
+            return true;
+        }
+        return false;
+    }
+
+    // operation == "allocate"
+    // Check for conflict: does another server already hold this IP?
+    for (auto& [nid, aset] : allocations_) {
+        if (nid == delta.server_node_id) continue;
+        if (!aset.backbone) continue;
+        if (aset.backbone->base_network != delta.backbone_ip) continue;
+
+        // Conflict! Higher pubkey wins (lexicographic comparison)
+        if (delta.server_pubkey > aset.backbone->signer_pubkey) {
+            // Incoming wins — evict the existing holder
+            spdlog::warn("[{}] backbone conflict on {} — '{}' evicts '{}' (higher pubkey)",
+                          name(), delta.backbone_ip, delta.server_node_id, nid);
+            aset.backbone.reset();
+        } else {
+            // Existing holder wins — reject incoming
+            spdlog::warn("[{}] backbone conflict on {} — '{}' rejected (lower pubkey than '{}')",
+                          name(), delta.backbone_ip, delta.server_node_id, nid);
+            return true;  // Still forward so other peers learn about the claim
+        }
+    }
+
+    // Apply the allocation
+    Allocation alloc;
+    alloc.block_type       = BlockType::Backbone;
+    alloc.base_network     = delta.backbone_ip;
+    alloc.customer_node_id = delta.server_node_id;
+    alloc.allocated_at     = delta.timestamp;
+    alloc.last_seen        = now_unix();
+    alloc.signer_pubkey    = delta.server_pubkey;
+
+    allocations_[delta.server_node_id].backbone = alloc;
+
+    // Advance cursor past this allocation
+    auto [ip, prefix] = parse_cidr(delta.backbone_ip);
+    uint32_t offset = ip - kBackboneBase + 1;
+    if (offset > next_backbone_ip_) {
+        next_backbone_ip_ = std::max(offset, uint32_t{10});
+    }
+
+    save_allocations();
+    spdlog::info("[{}] applied remote backbone {} for '{}'",
+                  name(), delta.backbone_ip, delta.server_node_id);
+    return true;
+}
+
+std::vector<Allocation> IPAMService::get_backbone_allocations() const {
+    std::lock_guard lock(mutex_);
+    std::vector<Allocation> result;
+    for (const auto& [nid, aset] : allocations_) {
+        if (aset.backbone) {
+            result.push_back(*aset.backbone);
+        }
+    }
+    return result;
+}
+
+void IPAMService::update_backbone_last_seen(std::string_view server_node_id,
+                                              uint64_t timestamp) {
+    std::lock_guard lock(mutex_);
+    auto it = allocations_.find(std::string(server_node_id));
+    if (it != allocations_.end() && it->second.backbone) {
+        it->second.backbone->last_seen = timestamp;
+    }
+}
+
+std::vector<std::string> IPAMService::collect_stale_backbone(
+    uint64_t stale_threshold_sec) const {
+    std::lock_guard lock(mutex_);
+    auto now = now_unix();
+    std::vector<std::string> stale;
+    for (const auto& [nid, aset] : allocations_) {
+        if (!aset.backbone) continue;
+        if (aset.backbone->last_seen > 0 &&
+            (now - aset.backbone->last_seen) > stale_threshold_sec) {
+            stale.push_back(nid);
+        }
+    }
+    return stale;
 }
 
 } // namespace nexus::ipam

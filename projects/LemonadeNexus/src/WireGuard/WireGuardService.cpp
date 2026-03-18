@@ -2414,6 +2414,45 @@ std::filesystem::path WireGuardService::config_file_path() const {
     return config_dir_ / (interface_name_ + ".conf");
 }
 
+bool WireGuardService::do_add_address(const std::string& address_cidr) {
+    std::lock_guard lock(mutex_);
+
+    if (interface_name_.empty()) {
+        spdlog::error("[{}] cannot add address: no interface configured", name());
+        return false;
+    }
+
+    if (!is_valid_cidr(address_cidr)) {
+        spdlog::error("[{}] invalid CIDR for add_address: '{}'", name(), address_cidr);
+        return false;
+    }
+
+#ifdef _WIN32
+    // Windows: use netsh
+    auto cmd = "netsh interface ip add address \"" + interface_name_ + "\" " + address_cidr;
+    auto result = run_command(cmd);
+    if (result.find("error") != std::string::npos) {
+        spdlog::error("[{}] failed to add address {} to {}", name(), address_cidr, interface_name_);
+        return false;
+    }
+#elif defined(__APPLE__)
+    // macOS: ifconfig <iface> inet <ip> alias
+    auto slash = address_cidr.find('/');
+    auto ip = (slash != std::string::npos) ? address_cidr.substr(0, slash) : address_cidr;
+    auto cmd = "ifconfig " + interface_name_ + " inet " + ip + " " + ip + " alias";
+    auto result = run_command(cmd);
+    (void)result;
+#else
+    // Linux: ip addr add (no flush)
+    auto cmd = "ip addr add " + address_cidr + " dev " + interface_name_;
+    auto result = run_command(cmd);
+    (void)result;
+#endif
+
+    spdlog::info("[{}] added address {} to {}", name(), address_cidr, interface_name_);
+    return true;
+}
+
 bool WireGuardService::do_save_config(const std::string& config_contents) {
     std::lock_guard lock(mutex_);
 

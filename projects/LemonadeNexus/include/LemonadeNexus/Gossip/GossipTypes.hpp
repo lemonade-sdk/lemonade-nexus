@@ -31,6 +31,7 @@ enum class GossipMsgType : uint8_t {
     GovernanceVote        = 0x10, // "I approve/reject governance proposal P"
     AclDelta              = 0x11, // "ACL grant/revoke — distributed permission sync"
     DnsRecordSync         = 0x12, // "DNS record add/remove — distributed authoritative DNS"
+    BackboneIpamSync      = 0x13, // "backbone IP allocate/release — server mesh IPAM sync"
 };
 
 #pragma pack(push, 1)
@@ -49,7 +50,10 @@ static constexpr std::size_t kGossipSignatureSize = 64; // Ed25519 signature
 
 struct GossipPeer {
     std::string pubkey;              // base64 Ed25519 public key
-    std::string endpoint;            // "ip:port" (gossip port)
+    std::string endpoint;            // "ip:port" (gossip port, public internet)
+    std::string backbone_endpoint;   // "ip:port" (gossip port, over WG backbone — preferred when available)
+    std::string wg_pubkey;           // base64 X25519 WireGuard public key
+    std::string backbone_ip;         // "172.16.0.X" (empty until allocated)
     uint16_t    http_port{9100};     // HTTP control plane port
     uint64_t    last_seen{0};        // Unix timestamp
     float       reputation{1.0f};

@@ -90,6 +90,9 @@ public:
     /// Returns number of changes made, or -1 on error.
     [[nodiscard]] int do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers);
 
+    /// Add a secondary address to the interface without flushing existing ones.
+    [[nodiscard]] bool do_add_address(const std::string& address_cidr);
+
     /// Write config contents to <config_dir_>/<interface_name_>.conf.
     [[nodiscard]] bool do_save_config(const std::string& config_contents);
 

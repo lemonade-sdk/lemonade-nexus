@@ -7,6 +7,7 @@ using json = nlohmann::json;
 void to_json(json& j, const ServerCertificate& c) {
     j = json{
         {"server_pubkey",  c.server_pubkey},
+        {"wg_pubkey",      c.wg_pubkey},
         {"server_id",      c.server_id},
         {"endpoint_hint",  c.endpoint_hint},
         {"issued_at",      c.issued_at},
@@ -18,6 +19,7 @@ void to_json(json& j, const ServerCertificate& c) {
 
 void from_json(const json& j, ServerCertificate& c) {
     if (j.contains("server_pubkey"))  j.at("server_pubkey").get_to(c.server_pubkey);
+    if (j.contains("wg_pubkey"))      j.at("wg_pubkey").get_to(c.wg_pubkey);
     if (j.contains("server_id"))      j.at("server_id").get_to(c.server_id);
     if (j.contains("endpoint_hint"))  j.at("endpoint_hint").get_to(c.endpoint_hint);
     if (j.contains("issued_at"))      j.at("issued_at").get_to(c.issued_at);

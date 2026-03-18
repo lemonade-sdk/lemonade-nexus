@@ -501,6 +501,49 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
+    // Backbone: server-to-server WireGuard mesh (172.16.0.0/22)
+    // ========================================================================
+    std::string backbone_ip;
+    std::string wg_server_pubkey_b64;
+    if (root_pubkey) {
+        auto x_pk = nexus::crypto::SodiumCryptoService::ed25519_pk_to_x25519(*root_pubkey);
+        wg_server_pubkey_b64 = nexus::crypto::to_base64(
+            std::span<const uint8_t>(x_pk.data(), x_pk.size()));
+    }
+
+    if (!server_node_id.empty() && !wg_server_pubkey_b64.empty()) {
+        auto ed25519_pubkey_b64 = nexus::crypto::to_base64(
+            std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
+
+        auto bb_alloc = ipam.allocate_backbone_ip(server_node_id, ed25519_pubkey_b64);
+        backbone_ip = bb_alloc.base_network;
+        // Strip CIDR for display
+        auto slash = backbone_ip.find('/');
+        auto backbone_ip_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
+
+        // Add backbone address to wg0 (does NOT flush the existing client address)
+        if (wireguard_service.add_address(backbone_ip_bare + "/22")) {
+            spdlog::info("Backbone: added {}/22 to wg0", backbone_ip_bare);
+        }
+
+        // Wire gossip with WG service and backbone info
+        gossip.set_wireguard(&wireguard_service);
+        gossip.set_our_backbone_ip(backbone_ip_bare);
+        gossip.set_our_wg_pubkey(wg_server_pubkey_b64);
+
+        // Set up IPAM callback to broadcast backbone allocations via gossip
+        ipam.set_backbone_callback(
+            [&gossip](const nexus::ipam::BackboneAllocationDelta& delta) {
+                gossip.broadcast_backbone_ipam_delta(delta);
+            });
+
+        spdlog::info("Backbone: server mesh on 172.16.0.0/22, our IP: {}, WG pubkey: {}",
+                      backbone_ip_bare, wg_server_pubkey_b64.substr(0, 12) + "...");
+    } else {
+        spdlog::warn("Backbone: skipping (no server node ID or WG key)");
+    }
+
+    // ========================================================================
     // HTTP Control Plane -- Dual-server architecture
     // ========================================================================
     nexus::network::HttpServer http_server{http_port, "0.0.0.0",
