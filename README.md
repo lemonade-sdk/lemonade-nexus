@@ -65,43 +65,91 @@ Open the following ports on each server's firewall/security group/ACL:
 
 | Port | TCP/UDP | Direction | Source | Service | Required |
 |------|---------|-----------|--------|---------|----------|
-| 9100 | **TCP** | Inbound | Any (servers + clients) | Public HTTP API (bootstrap, health, join) | Yes |
+| 9100 | **TCP** | Inbound | Any (servers + clients) | Public HTTPS API (bootstrap, health, join) | Yes |
+| 51940 | **UDP** | Inbound | Mesh servers + clients | WireGuard encrypted tunnel | Yes |
+| 51941 | **UDP** | Inbound | Mesh servers + clients | UDP hole punch (NAT traversal signaling) | Yes |
 | 9102 | **UDP** | Inbound | Mesh servers only | Gossip protocol (peer sync, state replication) | Yes |
 | 3478 | **UDP** | Inbound | Mesh servers only | STUN (NAT traversal, external IP discovery) | Yes |
-| 51940 | **UDP** | Inbound | Mesh servers + clients | WireGuard tunnel + UDP hole-punching | Yes |
-| 9103 | **UDP** | Inbound | Mesh servers | Relay (forwarded WireGuard traffic) | Only if relay server |
-| 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (Tier 1 servers only) | Optional |
+| 9103 | **UDP** | Inbound | Mesh servers | Relay (forwarded WireGuard traffic) | Only if relay |
+| 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (NAT to 5353 on server) | Optional |
 
-> **Note on port 9101**: The Private HTTP API (TCP :9101) binds to the **WireGuard tunnel IP** (10.64.x.x), not the external interface. It does **not** need a firewall rule — it is only reachable over the encrypted WireGuard tunnel.
+> **Note on port 9101**: The Private HTTPS API (TCP :9101) binds to the **WireGuard tunnel IP** (10.64.x.x), not the external interface. It does **not** need a firewall rule — it is only reachable over the encrypted WireGuard tunnel. The server requests an ACME certificate for `private.<id>.<region>.seip.<domain>` to serve HTTPS on the tunnel.
 
 **Firewall rule summary (minimum required):**
 ```
 # Required on every server
-ALLOW TCP  9100  IN   FROM any             # Public API (client bootstrap)
+ALLOW TCP  9100  IN   FROM any             # Public HTTPS API (client bootstrap)
+ALLOW UDP 51940  IN   FROM any             # WireGuard tunnels
+ALLOW UDP 51941  IN   FROM any             # UDP hole punch (NAT traversal)
 ALLOW UDP  9102  IN   FROM <mesh-servers>   # Gossip protocol
 ALLOW UDP  3478  IN   FROM <mesh-servers>   # STUN NAT traversal
-ALLOW UDP 51940  IN   FROM any             # WireGuard tunnels
 
 # Optional
 ALLOW UDP  9103  IN   FROM <mesh-servers>   # Relay (only if acting as relay)
 ALLOW UDP    53  IN   FROM any             # DNS (only Tier 1 servers)
 ```
 
-> Port **9100/tcp** and **51940/udp** should allow `any` source since clients may connect from unknown IPs. Gossip (**9102/udp**) and STUN (**3478/udp**) can be restricted to known mesh server IPs if desired.
+**MikroTik example** (dst-nat to internal server at 10.10.12.16):
+```routeros
+/ip firewall filter add chain=forward action=accept protocol=tcp dst-address=10.10.12.16 dst-port=9100 comment="FRS-LMND-NXS-HTTPS-API"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=51940 comment="FRS-LMND-NXS-WIREGUARD"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=51941 comment="FRS-LMND-NXS-HOLEPUNCH"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9102 comment="FRS-LMND-NXS-GOSSIP"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=3478 comment="FRS-LMND-NXS-STUN"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9103 comment="FRS-LMND-NXS-RELAY"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=5353 comment="FRS-LMND-NXS-DNS"
+```
+
+> Port **9100/tcp**, **51940/udp**, and **51941/udp** should allow `any` source since clients may connect from unknown IPs. Gossip (**9102/udp**) and STUN (**3478/udp**) can be restricted to known mesh server IPs if desired.
 
 ### IP Addresses
 
-Lemonade-Nexus uses three types of addresses:
+| Range | Purpose | Allocation |
+|-------|---------|------------|
+| **10.64.0.0/10** | Client WireGuard tunnel | .0-.9 reserved, .1 = server gateway, clients get .10+ |
+| **172.16.0.0/22** | Server backbone mesh | Server-to-server WireGuard, pubkey-hash allocation, up to 1,022 servers |
+| **10.128.0.0/9** | Private subnets | Per-customer private addressing |
+| **172.20.0.0/14** | Shared blocks | Shared address space |
 
 | Address | How it's determined | Purpose |
 |---------|-------------------|---------|
-| **External (public) IP** | Auto-detected via STUN reflexive address and DDNS `detect_public_ip()` | Gossip seed peers, STUN, client connections |
+| **External (public) IP** | Auto-detected via STUN and HTTP-based detection | DNS glue records, client connections |
 | **Bind address** | `--bind-address` / `SP_BIND_ADDRESS` (default: `0.0.0.0`) | What interfaces the server listens on |
-| **Tunnel IP** | Auto-allocated by IPAM from `10.64.0.0/10` | WireGuard mesh traffic, private API binding |
+| **Client tunnel IP** | IPAM auto-allocation from `10.64.0.0/10` | WireGuard mesh traffic, private API access |
+| **Server backbone IP** | Pubkey-hash allocation from `172.16.0.0/22` | Server-to-server encrypted backbone mesh |
 
-- **No manual external IP config needed** — the server discovers its public IP automatically via STUN and HTTP-based detection.
+- **No manual external IP config needed** — the server discovers its public IP automatically.
 - **Seed peers** use the external IP: `--seed-peer <public-ip>:9102`
-- **Private API** binds to the tunnel IP automatically once IPAM assigns one.
+- **Private API** binds to the tunnel IP automatically. Serves HTTPS via `private.<id>.<region>.seip.<domain>`.
+- **Server backbone** enables encrypted server-to-server communication on a dedicated IP range.
+
+### DNS Discovery (SEIP)
+
+Servers register under region-aware subdomains for scalable client discovery:
+
+**Server subdomains (SEIP = Server Endpoint IP):**
+```
+<id>.<region>.seip.lemonade-nexus.io              A  → public IP     (discovery)
+_config.<id>.<region>.seip.lemonade-nexus.io      TXT → ports + region + load
+private.<id>.<region>.seip.lemonade-nexus.io      A  → tunnel IP     (client HTTPS over WG)
+backend.<id>.<region>.seip.lemonade-nexus.io      A  → backbone IP   (server-to-server mesh)
+```
+
+**Client subdomains (EP = Endpoint):**
+```
+private.<id>.ep.lemonade-nexus.io                 A  → client tunnel IP
+```
+
+**NS bootstrap:** The first 9 servers claim `ns1`–`ns9` via democratic gossip (LWW tiebreak). These serve as authoritative nameservers cached globally by recursive resolvers.
+
+**Client discovery flow:**
+1. Client determines own region via geo-IP lookup
+2. System DNS resolves `lemonade-nexus.io` NS → ns1–ns9 (our authoritative servers)
+3. Query `<own-region>.seip.lemonade-nexus.io` A records for servers in same region
+4. Query `_config` TXT for each → ports, region, load (connected clients)
+5. Probe health + measure latency. Score = `latency_ms + (load × 10)`
+6. If no servers in own region → expand to adjacent regions by geographic distance
+7. Connect to best server via HTTPS on port 9100
 - **Clients** connect to the server's public IP on port 9100 to bootstrap, then switch to the WireGuard tunnel for all subsequent traffic.
 
 ### Traffic Flow: Public Internet vs WireGuard Tunnel
@@ -112,10 +160,11 @@ The system separates traffic into two planes:
 
 | Traffic | Protocol | Who | Purpose |
 |---------|----------|-----|---------|
-| Gossip | UDP :9102 | Server ↔ Server | Peer discovery, state sync, health, enrollment |
+| Gossip | UDP :9102 | Server ↔ Server | Peer discovery, state sync, health, enrollment, IPAM sync |
 | STUN | UDP :3478 | Server ↔ Server | NAT traversal, external IP discovery |
-| WireGuard handshake | UDP :51940 | Server ↔ Server, Client ↔ Server | Encrypted tunnel establishment |
-| Public HTTP API | TCP :9100 | Client → Server | Bootstrap: auth, join, health, server list |
+| WireGuard tunnel | UDP :51940 | Server ↔ Server, Client ↔ Server | Encrypted tunnel (5s keepalive) |
+| Hole punch | UDP :51941 | Client ↔ Server | NAT traversal signaling for P2P mesh |
+| Public HTTPS API | TCP :9100 | Client → Server | Bootstrap: auth, join, health, SEIP discovery |
 | Relay forwarding | UDP :9103 | Server ↔ Relay | Encrypted WireGuard packets when direct fails |
 | DDNS updates | HTTPS outbound | Server → Namecheap | Dynamic DNS registration |
 
@@ -380,16 +429,19 @@ All ports are fully configurable at runtime — no recompilation needed.
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--http-port <N>` | `SP_HTTP_PORT` | `http_port` | `9100` | Public HTTP API (TCP) |
-| `--udp-port <N>` | `SP_UDP_PORT` | `udp_port` | `51940` | WireGuard tunnel + UDP hole-punching |
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--http-port <N>` | `SP_HTTP_PORT` | `http_port` | `9100` | Public HTTPS API (TCP) |
+| `--udp-port <N>` | `SP_UDP_PORT` | `udp_port` | `51940` | WireGuard tunnel (UDP) |
 | `--gossip-port <N>` | `SP_GOSSIP_PORT` | `gossip_port` | `9102` | Gossip protocol (UDP) |
 | `--stun-port <N>` | `SP_STUN_PORT` | `stun_port` | `3478` | STUN NAT traversal (UDP) |
 | `--relay-port <N>` | `SP_RELAY_PORT` | `relay_port` | `9103` | Relay forwarding (UDP) |
 | `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `53` | Authoritative DNS (UDP) |
-| `--private-http-port <N>` | `SP_PRIVATE_HTTP_PORT` | `private_http_port` | `9101` | Private API, binds to tunnel IP (TCP) |
+| `--private-http-port <N>` | `SP_PRIVATE_HTTP_PORT` | `private_http_port` | `9101` | Private HTTPS API, binds to tunnel IP (TCP) |
 | `--bind-address <addr>` | `SP_BIND_ADDRESS` | `bind_address` | `0.0.0.0` | Listen address for all services |
+| `--region <code>` | `SP_REGION` | `region` | (auto-detect) | Cloud region code (e.g. `us-west`, `eu-central`) |
 
-> All 7 ports must be unique and non-zero. The private HTTP port binds to the WireGuard tunnel IP, not the external interface.
+> All ports must be unique and non-zero. The private HTTPS port binds to the WireGuard tunnel IP, not the external interface. Hole punch uses a hardcoded port 51941 (separate from WireGuard on 51940).
 
 **Example — change ports via CLI:**
 ```bash

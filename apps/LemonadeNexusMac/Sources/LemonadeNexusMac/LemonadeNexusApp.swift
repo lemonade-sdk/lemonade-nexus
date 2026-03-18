@@ -90,6 +90,14 @@ struct LemonadeNexusApp: App {
                 .frame(width: 600, height: 500)
         }
         #endif
+
+        // System tray icon
+        MenuBarExtra {
+            VPNMenuView()
+                .environmentObject(appState)
+        } label: {
+            Image(systemName: appState.isTunnelActive ? "shield.checkered" : "shield.slash")
+        }
     }
 
     private func configureAppearance() {
