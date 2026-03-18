@@ -337,8 +337,8 @@ void IPAMService::load_allocations() {
         if (aset.tunnel) {
             auto [ip, prefix] = parse_cidr(aset.tunnel->base_network);
             uint32_t offset = ip - kTunnelBase + 1;
-            // Never go below 2 — .0 is network, .1 is server gateway
-            if (offset > next_tunnel_ip_) next_tunnel_ip_ = std::max(offset, uint32_t{2});
+            // Never go below 10 — .0-.9 reserved for system use
+            if (offset > next_tunnel_ip_) next_tunnel_ip_ = std::max(offset, uint32_t{10});
         }
         if (aset.private_subnet) {
             auto [ip, prefix] = parse_cidr(aset.private_subnet->base_network);
