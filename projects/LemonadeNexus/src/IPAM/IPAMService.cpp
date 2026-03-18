@@ -104,10 +104,12 @@ void IPAMService::on_stop() {
 Allocation IPAMService::do_allocate_tunnel_ip(std::string_view node_id) {
     std::lock_guard lock(mutex_);
 
-    // Check for existing tunnel allocation
+    // Check for existing tunnel allocation — DHCP-style lease renewal
     auto it = allocations_.find(std::string(node_id));
     if (it != allocations_.end() && it->second.tunnel) {
-        spdlog::warn("[{}] node '{}' already has a tunnel allocation", name(), node_id);
+        it->second.tunnel->last_seen = now_unix();
+        spdlog::info("[{}] node '{}' reclaimed tunnel {}", name(), node_id,
+                      it->second.tunnel->base_network);
         return *it->second.tunnel;
     }
 
@@ -118,6 +120,7 @@ Allocation IPAMService::do_allocate_tunnel_ip(std::string_view node_id) {
     alloc.base_network     = cidr;
     alloc.customer_node_id = std::string(node_id);
     alloc.allocated_at     = now_unix();
+    alloc.last_seen        = now_unix();
 
     allocations_[std::string(node_id)].tunnel = alloc;
     save_allocations();
@@ -473,6 +476,83 @@ bool IPAMService::cidrs_overlap(uint32_t a_ip, uint8_t a_prefix,
     uint8_t min_prefix = std::min(a_prefix, b_prefix);
     uint32_t mask = min_prefix == 0 ? 0 : (~0u << (32 - min_prefix));
     return (a_ip & mask) == (b_ip & mask);
+}
+
+// --- DHCP-style tunnel lease management ---
+
+uint64_t IPAMService::tunnel_lease_timeout_sec() const {
+    std::lock_guard lock(mutex_);
+
+    // Count tunnel allocations
+    uint32_t tunnel_count = 0;
+    for (const auto& [nid, aset] : allocations_) {
+        if (aset.tunnel) ++tunnel_count;
+    }
+
+    // Usable addresses: kTunnelSize - 10 (reserved .0-.9)
+    constexpr uint32_t usable = kTunnelSize - 10;
+    if (usable == 0) return 0;
+
+    // Percent full (0-100)
+    double pct_full = (static_cast<double>(tunnel_count) / usable) * 100.0;
+
+    // Scale from 50%: below 50% = full 7 days, above 50% scales linearly to 0
+    // Formula: lease_hours = 168 / 100 * (100 - PERCENT_FULL_SCALED_FROM_HALF)
+    // where PERCENT_FULL_SCALED_FROM_HALF = max(0, (pct_full - 50) * 2)
+    double scaled = std::max(0.0, (pct_full - 50.0) * 2.0);
+    double lease_hours = 168.0 / 100.0 * (100.0 - scaled);
+    lease_hours = std::max(0.0, lease_hours);
+
+    return static_cast<uint64_t>(lease_hours * 3600.0);
+}
+
+uint32_t IPAMService::sweep_expired_tunnel_leases() {
+    std::lock_guard lock(mutex_);
+
+    auto timeout = tunnel_lease_timeout_sec();
+    if (timeout == 0) return 0;
+
+    auto now = now_unix();
+    uint32_t released = 0;
+    std::vector<std::string> to_release;
+
+    for (const auto& [nid, aset] : allocations_) {
+        if (!aset.tunnel) continue;
+        if (aset.tunnel->last_seen > 0 &&
+            (now - aset.tunnel->last_seen) > timeout) {
+            to_release.push_back(nid);
+        }
+    }
+
+    for (const auto& nid : to_release) {
+        auto it = allocations_.find(nid);
+        if (it == allocations_.end()) continue;
+
+        spdlog::info("[{}] lease expired for '{}' (tunnel {}), releasing",
+                      name(), nid, it->second.tunnel->base_network);
+        it->second.tunnel.reset();
+
+        if (!it->second.tunnel && !it->second.private_subnet &&
+            !it->second.shared_block && !it->second.backbone) {
+            allocations_.erase(it);
+        }
+        ++released;
+    }
+
+    if (released > 0) {
+        save_allocations();
+        spdlog::info("[{}] swept {} expired tunnel leases (timeout={}h)",
+                      name(), released, timeout / 3600);
+    }
+    return released;
+}
+
+void IPAMService::update_tunnel_last_seen(std::string_view node_id) {
+    std::lock_guard lock(mutex_);
+    auto it = allocations_.find(std::string(node_id));
+    if (it != allocations_.end() && it->second.tunnel) {
+        it->second.tunnel->last_seen = now_unix();
+    }
 }
 
 // --- Backbone (server mesh 172.16.0.0/22) ---

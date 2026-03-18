@@ -65,6 +65,18 @@ public:
     /// Collect server_node_ids whose backbone allocation is stale.
     [[nodiscard]] std::vector<std::string> collect_stale_backbone(uint64_t stale_threshold_sec) const;
 
+    // --- DHCP-style tunnel lease management ---
+
+    /// Compute lease timeout in seconds based on block fullness.
+    /// Base: 7 days. Scales from 50% full (7 days) to 100% full (0).
+    [[nodiscard]] uint64_t tunnel_lease_timeout_sec() const;
+
+    /// Sweep expired tunnel leases and release them. Returns count released.
+    uint32_t sweep_expired_tunnel_leases();
+
+    /// Update last_seen for a tunnel client (call on heartbeat/join).
+    void update_tunnel_last_seen(std::string_view node_id);
+
     /// Set callback for allocation changes (gossip broadcast).
     using BackboneCallback = std::function<void(const BackboneAllocationDelta&)>;
     void set_backbone_callback(BackboneCallback cb) { backbone_callback_ = std::move(cb); }

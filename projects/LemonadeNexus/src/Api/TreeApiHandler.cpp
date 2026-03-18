@@ -129,7 +129,19 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             ctx_.tree.insert_join_node(endpoint_node);
         }
 
+        // Allocate tunnel IP (returns existing if already allocated for this node)
         auto alloc = ctx_.ipam.allocate_tunnel_ip(node_id);
+
+        // Store the tunnel IP on the endpoint node so it's visible in the tree
+        if (!alloc.base_network.empty()) {
+            auto existing_node = ctx_.tree.get_node(node_id);
+            if (existing_node && existing_node->tunnel_ip != alloc.base_network) {
+                tree::TreeNode updated = *existing_node;
+                updated.tunnel_ip = alloc.base_network;
+                updated.wg_pubkey = body.value("wg_pubkey", existing_node->wg_pubkey);
+                ctx_.tree.update_node_direct(node_id, updated);
+            }
+        }
         if (alloc.base_network.empty()) {
             error_response(res, "IP allocation failed", 409);
             return;
