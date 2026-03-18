@@ -5,12 +5,40 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
 
 #include <spdlog/spdlog.h>
 
 #include <regex>
+#include <unordered_map>
 
 namespace nexus::api {
+
+namespace {
+/// Staleness threshold: 3 missed 5-second keepalives = offline.
+constexpr uint64_t kStaleThresholdSec = 15;
+
+/// Strip CIDR prefix from tunnel IP (e.g. "10.64.0.3/32" -> "10.64.0.3")
+std::string strip_cidr(const std::string& ip) {
+    auto slash = ip.find('/');
+    return (slash != std::string::npos) ? ip.substr(0, slash) : ip;
+}
+
+/// Build a map from tunnel_ip (without /prefix) to last WG handshake epoch.
+/// Used to determine peer liveness from WireGuard layer.
+std::unordered_map<std::string, uint64_t> build_wg_handshake_map(
+    nexus::wireguard::WireGuardService* wg) {
+    std::unordered_map<std::string, uint64_t> m;
+    if (!wg) return m;
+    for (const auto& peer : wg->get_peers()) {
+        auto ip = strip_cidr(peer.allowed_ips);
+        if (!ip.empty() && peer.last_handshake > 0) {
+            m[ip] = peer.last_handshake;
+        }
+    }
+    return m;
+}
+} // anonymous namespace
 
 namespace {
 /// Validate that a mesh heartbeat endpoint string is a well-formed ip:port
@@ -96,6 +124,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         auto siblings = ctx_.tree.get_children(node.parent_id);
 
+        // Build WG handshake map to determine peer liveness from the tunnel layer
+        auto wg_map = build_wg_handshake_map(ctx_.wireguard);
+        auto now = epoch_seconds();
+
         // Build peer list: all Endpoint-type siblings except the requesting node
         nlohmann::json peers = nlohmann::json::array();
         for (const auto& sibling : siblings) {
@@ -108,6 +140,16 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 continue;  // skip nodes we can't see
             }
 
+            // Determine online status from WG handshake timestamp
+            auto sip = strip_cidr(sibling.tunnel_ip);
+            uint64_t last_seen = 0;
+            bool online = false;
+            auto it = wg_map.find(sip);
+            if (it != wg_map.end()) {
+                last_seen = it->second;
+                online = (now - last_seen) < kStaleThresholdSec;
+            }
+
             nlohmann::json peer;
             peer["node_id"]        = sibling.id;
             peer["hostname"]       = sibling.hostname;
@@ -116,7 +158,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             peer["private_subnet"] = sibling.private_subnet;
             peer["endpoint"]       = sibling.listen_endpoint;
             peer["relay_endpoint"] = "";  // filled by relay discovery
-            peer["is_online"]      = !sibling.listen_endpoint.empty();
+            peer["is_online"]      = online;
+            peer["last_seen"]      = last_seen;
             peers.push_back(std::move(peer));
         }
 
@@ -255,12 +298,22 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         if (!node.parent_id.empty()) {
             auto siblings = ctx_.tree.get_children(node.parent_id);
+            auto wg_map = build_wg_handshake_map(ctx_.wireguard);
+            auto now = epoch_seconds();
             for (const auto& s : siblings) {
                 if (s.id == node_id) continue;
                 if (s.type != tree::NodeType::Endpoint &&
                     s.type != tree::NodeType::Relay) continue;
                 ++peer_count;
-                if (!s.listen_endpoint.empty()) ++online_count;
+                if (s.type == tree::NodeType::Relay) {
+                    ++online_count;  // relays always considered online
+                } else {
+                    auto sip = strip_cidr(s.tunnel_ip);
+                    auto it = wg_map.find(sip);
+                    if (it != wg_map.end() && (now - it->second) < kStaleThresholdSec) {
+                        ++online_count;
+                    }
+                }
             }
         }
 

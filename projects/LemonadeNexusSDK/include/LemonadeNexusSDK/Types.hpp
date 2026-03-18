@@ -291,7 +291,7 @@ struct WireGuardConfig {
     std::string dns_server;                 ///< DNS server IP
     uint16_t    listen_port{0};             ///< Local listen port (0 = random)
     std::vector<std::string> allowed_ips;   ///< Default: ["10.100.0.0/16"]
-    uint32_t    keepalive{25};              ///< Persistent keepalive interval (seconds)
+    uint32_t    keepalive{5};               ///< Persistent keepalive interval (seconds)
 };
 
 struct TunnelStatus {
@@ -322,7 +322,8 @@ struct MeshPeer {
     uint64_t    rx_bytes{0};
     uint64_t    tx_bytes{0};
     int32_t     latency_ms{-1};         ///< -1 = unknown
-    uint16_t    keepalive{25};
+    uint16_t    keepalive{5};           ///< Persistent keepalive (seconds)
+    uint64_t    last_seen{0};           ///< Server-reported last heartbeat (Unix epoch)
 };
 
 /// Status of the entire mesh tunnel.
@@ -339,7 +340,7 @@ struct MeshTunnelStatus {
 /// Configuration for the mesh orchestrator.
 struct MeshConfig {
     uint32_t peer_refresh_interval_sec{30};  ///< How often to poll for peer updates
-    uint32_t heartbeat_interval_sec{15};     ///< How often to send heartbeat
+    uint32_t heartbeat_interval_sec{5};      ///< How often to send heartbeat
     uint32_t stun_refresh_interval_sec{60};  ///< How often to re-probe STUN
     bool     prefer_direct{true};            ///< Prefer direct P2P over relay
     bool     auto_connect{true};             ///< Auto-connect to discovered peers

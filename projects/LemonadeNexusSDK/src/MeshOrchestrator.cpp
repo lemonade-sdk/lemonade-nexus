@@ -164,11 +164,47 @@ void MeshOrchestrator::do_heartbeat() {
 void MeshOrchestrator::do_monitor() {
     auto ms = tunnel_.mesh_status();
 
+    // Merge WireGuard handshake timestamps with server-reported last_seen
+    // to get the most accurate peer liveness signal.
+    auto now_epoch = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    constexpr int64_t kStaleThreshold = 15;  // 3 missed 5s keepalives
+
+    {
+        std::lock_guard lock(mutex_);
+        for (auto& peer : known_peers_) {
+            // Merge handshake timestamps from WG tunnel status
+            for (const auto& tp : ms.peers) {
+                if (tp.tunnel_ip == peer.tunnel_ip ||
+                    tp.node_id == peer.node_id) {
+                    if (tp.last_handshake > peer.last_handshake) {
+                        peer.last_handshake = tp.last_handshake;
+                    }
+                    break;
+                }
+            }
+
+            // Online = best signal (WG handshake or server last_seen) is fresh
+            int64_t best_ts = std::max(peer.last_handshake,
+                                        static_cast<int64_t>(peer.last_seen));
+            if (best_ts > 0) {
+                peer.is_online = (now_epoch - best_ts) < kStaleThreshold;
+            }
+        }
+
+        // Recompute online_count from local peer data
+        ms.online_count = 0;
+        for (const auto& p : known_peers_) {
+            if (p.is_online) ++ms.online_count;
+        }
+        ms.peer_count = static_cast<uint32_t>(known_peers_.size());
+    }
+
     StateCallback cb;
     bool changed = false;
     {
         std::lock_guard lock(mutex_);
-        // Detect changes
         changed = (ms.peer_count   != last_status_.peer_count ||
                    ms.online_count != last_status_.online_count ||
                    ms.is_up        != last_status_.is_up);

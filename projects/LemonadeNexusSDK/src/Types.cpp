@@ -273,6 +273,7 @@ void to_json(json& j, const MeshPeer& p) {
         {"tx_bytes",       p.tx_bytes},
         {"latency_ms",     p.latency_ms},
         {"keepalive",      p.keepalive},
+        {"last_seen",      p.last_seen},
     };
 }
 
@@ -289,7 +290,8 @@ void from_json(const json& j, MeshPeer& p) {
     p.rx_bytes       = j.value("rx_bytes", uint64_t{0});
     p.tx_bytes       = j.value("tx_bytes", uint64_t{0});
     p.latency_ms     = j.value("latency_ms", int32_t{-1});
-    p.keepalive      = j.value("keepalive", uint16_t{25});
+    p.keepalive      = j.value("keepalive", uint16_t{5});
+    p.last_seen      = j.value("last_seen", uint64_t{0});
 }
 
 // --- MeshTunnelStatus ---
