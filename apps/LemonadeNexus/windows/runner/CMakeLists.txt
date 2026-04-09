@@ -68,3 +68,22 @@ add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
   "${CMAKE_SOURCE_DIR}/../assets"
   "$<TARGET_FILE_DIR:${BINARY_NAME}>/assets"
 )
+
+# Copy Flutter DLLs and required files to output directory
+add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+  "${FLUTTER_ROOT}/bin/cache/artifacts/engine/windows-x64/flutter_windows.dll"
+  "$<TARGET_FILE_DIR:${BINARY_NAME}>"
+)
+
+add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+  "${FLUTTER_ROOT}/bin/cache/artifacts/engine/windows-x64/icudtl.dat"
+  "$<TARGET_FILE_DIR:${BINARY_NAME}>"
+)
+
+add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy
+  "${FLUTTER_ROOT}/bin/cache/artifacts/engine/windows-x64/libtessellator.dll"
+  "$<TARGET_FILE_DIR:${BINARY_NAME}>"
+)
