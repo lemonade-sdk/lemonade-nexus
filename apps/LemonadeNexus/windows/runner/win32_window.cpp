@@ -40,6 +40,9 @@ constexpr int kNumTimers = 1;
 
 }  // namespace
 
+// Global window count
+int g_active_window_count = 0;
+
 Win32Window::Win32Window() {
   ++g_active_window_count;
 }
@@ -139,7 +142,7 @@ LRESULT Win32Window::MessageHandler(HWND hwnd, UINT message, WPARAM wparam,
       return 0;
 
     case WM_DWMCOLORIZATIONCOLORCHANGED:
-      UpdateTheme(hwnd);
+      UpdateTheme();
       return 0;
   }
 
@@ -207,7 +210,7 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
-  UpdateTheme(window);
+  UpdateTheme();
 
   return OnCreate();
 }
@@ -221,7 +224,7 @@ LRESULT CALLBACK Win32Window::WndProc(HWND hwnd, UINT message, WPARAM wparam,
                      reinterpret_cast<LONG_PTR>(window_struct->lpCreateParams));
 
     auto that = static_cast<Win32Window*>(window_struct->lpCreateParams);
-    EnableDarkMode(hwnd);
+    that->EnableDarkMode();
     that->hwnd_ = hwnd;
 
     return TRUE;
@@ -235,14 +238,22 @@ LRESULT CALLBACK Win32Window::WndProc(HWND hwnd, UINT message, WPARAM wparam,
   return DefWindowProc(hwnd, message, wparam, lparam);
 }
 
-LRESULT Win32Window::OnCreate() {
+bool Win32Window::OnCreate() {
   // Enable dark mode for the window
-  EnableDarkMode(hwnd_);
-
-  return 0;
+  EnableDarkMode();
+  return true;
 }
 
-void Win32Window::UpdateTheme(HWND hwnd) {
+void Win32Window::OnDestroy() {
+  // Cleanup on destroy
+  RemoveSystemTray();
+}
+
+// =========================================================================
+// System Tray Implementation
+// =========================================================================
+
+void Win32Window::UpdateTheme() {
   BOOL is_dark_mode = false;
   DWORD reg_value = 0;
   DWORD size = sizeof(reg_value);
@@ -254,11 +265,17 @@ void Win32Window::UpdateTheme(HWND hwnd) {
     is_dark_mode = (reg_value == 0);
   }
 
-  DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &is_dark_mode,
-                        sizeof(is_dark_mode));
+  if (hwnd_) {
+    DwmSetWindowAttribute(hwnd_, DWMWA_USE_IMMERSIVE_DARK_MODE, &is_dark_mode,
+                          sizeof(is_dark_mode));
+  }
 }
 
-void Win32Window::EnableDarkMode(HWND hwnd) {
+void Win32Window::EnableDarkMode() {
+  if (!hwnd_) {
+    return;
+  }
+
   BOOL is_dark_mode = FALSE;
   DWORD reg_value = 0;
   DWORD size = sizeof(reg_value);
@@ -271,8 +288,26 @@ void Win32Window::EnableDarkMode(HWND hwnd) {
   }
 
   if (is_dark_mode) {
-    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &is_dark_mode,
+    DwmSetWindowAttribute(hwnd_, DWMWA_USE_IMMERSIVE_DARK_MODE, &is_dark_mode,
                           sizeof(is_dark_mode));
+  }
+}
+
+RECT Win32Window::GetClientArea() const {
+  RECT rect = {0, 0, 0, 0};
+  if (hwnd_) {
+    GetClientRect(hwnd_, &rect);
+  }
+  return rect;
+}
+
+void Win32Window::SetChildContent(HWND child_content) {
+  child_content_ = child_content;
+  if (hwnd_ && child_content_) {
+    RECT rect = GetClientArea();
+    MoveWindow(child_content_, rect.left, rect.top, rect.right - rect.left,
+               rect.bottom - rect.top, TRUE);
+    ShowWindow(child_content_, SW_SHOW);
   }
 }
 
@@ -292,20 +327,23 @@ void Win32Window::CreateSystemTray() {
     icon = LoadIcon(nullptr, IDI_APPLICATION);
   }
 
-  // Set up the NOTIFYICONDATA structure
-  tray_icon_data_.cbSize = sizeof(NOTIFYICONDATA);
-  tray_icon_data_.hwnd = hwnd_;
-  tray_icon_data_.uID = ID_TRAY_APP_ICON;
-  tray_icon_data_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-  tray_icon_data_.uCallbackMessage = WM_TRAYICON;
-  tray_icon_data_.hIcon = icon;
+  // Use Shell_NotifyIconW directly with local structure
+  NOTIFYICONDATAW nid = {};
+  nid.cbSize = sizeof(NOTIFYICONDATAW);
+  nid.hWnd = hwnd_;
+  nid.uID = ID_TRAY_APP_ICON;
+  nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+  nid.uCallbackMessage = WM_TRAYICON;
+  nid.hIcon = icon;
 
   // Set initial tooltip
-  wcscpy_s(tray_icon_data_.szTip, L"Lemonade Nexus VPN");
+  wcscpy_s(nid.szTip, ARRAYSIZE(nid.szTip), L"Lemonade Nexus VPN");
 
   // Add the icon
-  if (Shell_NotifyIcon(NIM_ADD, &tray_icon_data_)) {
+  if (Shell_NotifyIconW(NIM_ADD, &nid)) {
     has_tray_icon_ = true;
+    // Copy back to raw storage if needed
+    memcpy(tray_icon_data_raw_, &nid, sizeof(nid));
   }
 }
 
@@ -314,8 +352,17 @@ void Win32Window::UpdateTrayIcon(const std::wstring& tooltip) {
     return;
   }
 
-  wcscpy_s(tray_icon_data_.szTip, tooltip.c_str());
-  Shell_NotifyIcon(NIM_MODIFY, &tray_icon_data_);
+  NOTIFYICONDATAW nid = {};
+  nid.cbSize = sizeof(NOTIFYICONDATAW);
+  nid.hWnd = hwnd_;
+  nid.uID = ID_TRAY_APP_ICON;
+  nid.uFlags = NIF_TIP;
+  nid.uCallbackMessage = WM_TRAYICON;
+
+  // Set tooltip
+  wcscpy_s(nid.szTip, ARRAYSIZE(nid.szTip), tooltip.c_str());
+
+  Shell_NotifyIconW(NIM_MODIFY, &nid);
 }
 
 void Win32Window::ShowContextMenu(HWND hwnd) {
@@ -349,9 +396,11 @@ void Win32Window::ShowContextMenu(HWND hwnd) {
 
 void Win32Window::RemoveSystemTray() {
   if (has_tray_icon_) {
-    Shell_NotifyIcon(NIM_DELETE, &tray_icon_data_);
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(NOTIFYICONDATAW);
+    nid.hWnd = hwnd_;
+    nid.uID = ID_TRAY_APP_ICON;
+    Shell_NotifyIconW(NIM_DELETE, &nid);
     has_tray_icon_ = false;
   }
 }
-
-int Win32Window::g_active_window_count = 0;

@@ -17,13 +17,6 @@
 // Tray icon ID
 #define ID_TRAY_APP_ICON 5000
 
-// Menu item IDs
-#define ID_TRAY_CONNECT 5001
-#define ID_TRAY_DISCONNECT 5002
-#define ID_TRAY_DASHBOARD 5003
-#define ID_TRAY_SETTINGS 5004
-#define ID_TRAY_EXIT 5005
-
 // A class abstraction for a high DPI-aware Win32 Window.
 class Win32Window {
  public:
@@ -50,10 +43,10 @@ class Win32Window {
                      const Size& size);
 
   // Shows the window.
-  void Show();
+  bool Show();
 
   // Hide the window.
-  void Hide();
+  bool Hide();
 
   // Sets the quit on close behavior.
   void SetQuitOnClose(bool quit_on_close);
@@ -62,14 +55,24 @@ class Win32Window {
   bool IsClosing() const;
 
   // Dispatches messages for the window.
-  LRESULT MessageHandler(HWND hwnd, UINT message, WPARAM wparam,
-                         LPARAM lparam) noexcept;
+  virtual LRESULT MessageHandler(HWND hwnd, UINT message, WPARAM wparam,
+                                 LPARAM lparam) noexcept;
 
   // System tray integration
   void CreateSystemTray();
   void UpdateTrayIcon(const std::wstring& tooltip);
   void ShowContextMenu(HWND hwnd);
   void RemoveSystemTray();
+
+  // Theme handling
+  void UpdateTheme();
+  void EnableDarkMode();
+
+  // Get client area
+  RECT GetClientArea() const;
+
+  // Set child content HWND
+  void SetChildContent(HWND child_content);
 
  protected:
   // Window handle for system tray
@@ -96,6 +99,10 @@ class Win32Window {
   static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam,
                                   LPARAM lparam) noexcept;
 
+  // Handle WM_CREATE and WM_DESTROY
+  virtual bool OnCreate();
+  virtual void OnDestroy();
+
  private:
   // The window handle.
   HWND hwnd_ = nullptr;
@@ -109,9 +116,15 @@ class Win32Window {
   // Whether the window is closing.
   bool is_closing_ = false;
 
-  // System tray icon data
-  NOTIFYICONDATA tray_icon_data_ = {};
+  // System tray icon data - use raw struct to avoid API version issues
+  BYTE tray_icon_data_raw_[sizeof(void*) * 4 + 4 + 4 + sizeof(HICON) + 260];
   bool has_tray_icon_ = false;
+
+  // Child content HWND
+  HWND child_content_ = nullptr;
 };
+
+// Global window count tracking
+extern int g_active_window_count;
 
 #endif  // RUNNER_WIN32_WINDOW_H_

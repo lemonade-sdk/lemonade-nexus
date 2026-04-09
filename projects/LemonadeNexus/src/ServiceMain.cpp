@@ -25,6 +25,7 @@ extern int main(int argc, char* argv[]);
 static SERVICE_STATUS        g_ServiceStatus = {0};
 static SERVICE_STATUS_HANDLE g_StatusHandle  = NULL;
 static HANDLE                g_StopEvent     = INVALID_HANDLE_VALUE;
+static DWORD                 g_AcceptedControls = 0;  // Store accepted controls separately for SDK compatibility
 
 // ============================================================================
 // Service Control Handler
@@ -57,11 +58,13 @@ VOID WINAPI ServiceCtrlHandler(DWORD dwControl)
 
         case SERVICE_CONTROL_PAUSE:
             g_ServiceStatus.dwCurrentState = SERVICE_PAUSED;
+            g_AcceptedControls = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PAUSE_CONTINUE;
             spdlog::info("Lemonade-Nexus service paused");
             break;
 
         case SERVICE_CONTROL_CONTINUE:
             g_ServiceStatus.dwCurrentState = SERVICE_RUNNING;
+            g_AcceptedControls = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PAUSE_CONTINUE;
             spdlog::info("Lemonade-Nexus service continuing");
             break;
 
@@ -106,9 +109,9 @@ VOID WINAPI ServiceMain(DWORD argc, LPSTR* argv)
 
     // Report SERVICE_START_PENDING
     g_ServiceStatus.dwCurrentState       = SERVICE_START_PENDING;
-    g_ServiceStatus.dwAcceptedControls   = 0;
     g_ServiceStatus.dwCheckPoint         = 1;
     g_ServiceStatus.dwWaitHint           = 3000; // 3 seconds
+    g_AcceptedControls                   = 0;
 
     if (!SetServiceStatus(g_StatusHandle, &g_ServiceStatus))
     {
@@ -129,7 +132,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPSTR* argv)
 
     // Report SERVICE_RUNNING
     g_ServiceStatus.dwCurrentState       = SERVICE_RUNNING;
-    g_ServiceStatus.dwAcceptedControls   = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
+    g_AcceptedControls                   = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
                                             SERVICE_ACCEPT_PAUSE_CONTINUE;
     g_ServiceStatus.dwCheckPoint         = 0;
     g_ServiceStatus.dwWaitHint           = 0;

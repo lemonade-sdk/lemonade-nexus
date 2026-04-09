@@ -38,6 +38,9 @@ class FlutterWindow : public Win32Window {
 
   // The Flutter view controller.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
+
+  // Command line arguments for Dart entrypoint.
+  std::vector<std::string> command_line_arguments_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_
