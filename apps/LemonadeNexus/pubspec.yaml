@@ -1,0 +1,59 @@
+name: lemonade_nexus
+description: Lemonade Nexus VPN Client for Windows
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  provider: ^6.1.1
+  riverpod: ^2.4.9
+  ffi: ^2.1.0
+  path: ^1.8.3
+  json_annotation: ^4.8.1
+  package_info_plus: ^5.0.1
+  tray_manager: ^0.2.1
+  win32: ^5.0.0
+  win32_registry: ^1.1.0
+  path_provider: ^2.1.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  mockito: ^5.4.3
+  integration_test:
+    sdk: flutter
+  msix: ^3.16.6
+  flutter_msix: ^1.0.0
+  build_runner: ^2.4.6
+  json_serializable: ^6.7.1
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/
+
+msix_config:
+  display_name: Lemonade Nexus VPN
+  publisher_display_name: Lemonade Nexus
+  identity_name: LemonadeNexus.LemonadeNexusVPN
+  logo_path: assets\app_icon.png
+  version: 1.0.0.0
+  architecture: x64
+  languages: en-us
+  sign_msix: true
+  sign_tool_path: 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe'
+  certificate_path: keys\code_signing.pfx
+  certificate_password: '${CERT_PASSWORD}'
+  timestamp_url: 'http://timestamp.digicert.com'
+  msix_version: 1.0.0.0
+  publisher: CN=Lemonade Nexus, O=Lemonade Nexus, C=US
+  capabilities: internetClient, internetClientServer
+  restricted_functionality: false
+  install_certificate: false
+  output_path: build/windows/msix
+  output_name: lemonade_nexus

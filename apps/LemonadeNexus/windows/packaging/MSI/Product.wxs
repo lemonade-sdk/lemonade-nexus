@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset Product Definition for Lemonade Nexus VPN
+  Creates a traditional MSI installer for enterprise deployment
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi"
+     xmlns:util="http://schemas.microsoft.com/wix/UtilExtension"
+     xmlns:firewall="http://schemas.microsoft.com/wix/FirewallExtension"
+     xmlns:netfx="http://schemas.microsoft.com/wix/NetFxExtension">
+  <Product Id="*"
+           Name="Lemonade Nexus VPN"
+           Language="1033"
+           Version="1.0.0.0"
+           Manufacturer="Lemonade Nexus"
+           UpgradeCode="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Lemonade Nexus VPN Client"
+             Manufacturer="Lemonade Nexus"
+             Platform="x64" />
+
+    <!-- Major upgrade configuration -->
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <!-- Media configuration -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- UI configuration -->
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+    </UI>
+
+    <!-- Icons -->
+    <Icon Id="ProductIcon" SourceFile="..\..\..\assets\app_icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/antmi/lemonade-nexus" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/antmi/lemonade-nexus" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/antmi/lemonade-nexus/releases" />
+
+    <!-- Remove arrow for modern look -->
+    <Property Id="ARPNOREMOVE" Value="0" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <!-- Launch conditions -->
+    <Condition Message="This application requires Windows 10 version 1809 or later.">
+      <![CDATA[Installed OR (VersionNT >= 603)]]>
+    </Condition>
+
+    <!-- Custom actions -->
+    <CustomAction Id="InstallWireGuardService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="lemonade_nexus.exe --install-service"
+                  Execute="deferred"
+                  Return="check"
+                  Impersonate="no" />
+
+    <CustomAction Id="UninstallWireGuardService"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="lemonade_nexus.exe --uninstall-service"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <CustomAction Id="RegisterAutoStart"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="lemonade_nexus.exe --register-auto-start"
+                  Execute="deferred"
+                  Return="ignore" />
+
+    <CustomAction Id="CreateDesktopShortcut"
+                  Directory="INSTALLFOLDER"
+                  ExeCommand="lemonade_nexus.exe --create-shortcut"
+                  Execute="deferred"
+                  Return="ignore" />
+
+    <!-- Install sequence -->
+    <InstallExecuteSequence>
+      <Custom Action="InstallWireGuardService" After="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="RegisterAutoStart" After="InstallWireGuardService">NOT Installed</Custom>
+      <Custom Action="CreateDesktopShortcut" After="RegisterAutoStart">NOT Installed</Custom>
+      <Custom Action="UninstallWireGuardService" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+
+    <!-- Directory structure -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="MANUFACTURER_DIR" Name="Lemonade Nexus">
+          <Directory Id="INSTALLFOLDER" Name="Lemonade Nexus VPN">
+            <!-- Main executable -->
+            <Component Id="MainExecutable" Guid="{B1C2D3E4-F5A6-7890-ABCD-EF1234567891}">
+              <File Id="lemonade_nexus.exe"
+                    Source="$(var.BuildDir)\lemonade_nexus.exe"
+                    KeyPath="yes"
+                    Checksum="yes">
+                <Shortcut Id="DesktopShortcut"
+                          Directory="DesktopFolder"
+                          Name="Lemonade Nexus VPN"
+                          Description="Secure WireGuard Mesh VPN Client"
+                          Icon="ProductIcon" />
+                <Shortcut Id="StartMenuShortcut"
+                          Directory="ProgramMenuFolder"
+                          Name="Lemonade Nexus VPN"
+                          Description="Secure WireGuard Mesh VPN Client"
+                          Icon="ProductIcon" />
+              </File>
+            </Component>
+
+            <!-- Flutter data directory -->
+            <Component Id="FlutterData" Guid="{C2D3E4F5-A6B7-8901-CDEF-123456789012}">
+              <File Id="flutter_data"
+                    Source="$(var.BuildDir)\data\app.so"
+                    KeyPath="yes" />
+              <File Id="flutter_assets"
+                    Source="$(var.BuildDir)\data\flutter_assets\kernel_blob.bin" />
+            </Component>
+
+            <!-- WireGuard DLL -->
+            <Component Id="WireGuardDLL" Guid="{D3E4F5A6-B7C8-9012-EFAB-234567890123}">
+              <File Id="wireguard.dll"
+                    Source="$(var.BuildDir)\wireguard.dll"
+                    KeyPath="yes" />
+            </Component>
+
+            <!-- Configuration directory -->
+            <Component Id="ConfigDirectory" Guid="{E4F5A6B7-C8D9-0123-FABC-345678901234}">
+              <CreateFolder Directory="CONFIGFOLDER" />
+              <RemoveFolder Id="RemoveConfigDir" On="uninstall" />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+
+      <!-- Configuration folder in ProgramData -->
+      <Directory Id="CommonAppDataFolder">
+        <Directory Id="CONFIGFOLDER" Name="Lemonade Nexus">
+          <Component Id="DefaultConfig" Guid="{F5A6B7C8-D9E0-1234-ABCD-456789012345}">
+            <CreateFolder />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <!-- Start Menu -->
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ProgramMenuDir" Name="Lemonade Nexus VPN">
+          <Component Id="ProgramMenuDir" Guid="{A6B7C8D9-E0F1-2345-BCDE-567890123456}">
+            <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
+            <RegistryValue Root="HKCU" Key="Software\LemonadeNexus\VPN" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- Features -->
+    <Feature Id="MainApplication"
+             Title="Lemonade Nexus VPN"
+             Description="The main application"
+             Level="1"
+             ConfigurableDirectory="INSTALLFOLDER"
+             AllowAdvertise="no"
+             Display="expand"
+             Absent="disallow">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="FlutterData" />
+      <ComponentRef Id="WireGuardDLL" />
+      <ComponentRef Id="ConfigDirectory" />
+      <ComponentRef Id="DefaultConfig" />
+      <ComponentRef Id="ProgramMenuDir" />
+    </Feature>
+
+    <!-- Variables -->
+    <WixVariable Id="WixUILicenseRtf" Value="..\..\..\LICENSE.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="..\..\..\assets\banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="..\..\..\assets\dialog.bmp" />
+    <WixVariable Id="WixUIExclamationIco" Value="..\..\..\assets\error.ico" />
+    <WixVariable Id="WixUIInfoIco" Value="..\..\..\assets\info.ico" />
+    <WixVariable Id="WixUINewIco" Value="..\..\..\assets\app_icon.ico" />
+    <WixVariable Id="WixUIUpIco" Value="..\..\..\assets\up.ico" />
+
+    <!-- Properties -->
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/antmi/lemonade-nexus/issues" />
+  </Product>
+</Wix>

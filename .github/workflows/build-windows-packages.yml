@@ -1,0 +1,182 @@
+name: Build Windows Packages
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'apps/LemonadeNexus/**'
+      - '.github/workflows/build-windows-packages.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/LemonadeNexus/**'
+
+env:
+  FLUTTER_VERSION: '3.19.0'
+  BUILD_TYPE: release
+
+jobs:
+  build-msix:
+    name: Build MSIX Package
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Setup Java (for some Flutter plugins)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Run Flutter analyzer
+        working-directory: apps/LemonadeNexus
+        run: flutter analyze
+
+      - name: Run Flutter tests
+        working-directory: apps/LemonadeNexus
+        run: flutter test
+
+      - name: Build Flutter Windows app
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Create MSIX package
+        working-directory: apps/LemonadeNexus
+        run: dart run msix:create
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-msix
+          path: apps/LemonadeNexus/build/windows/runner/Release/*.msix
+          if-no-files-found: error
+
+  build-msi:
+    name: Build MSI Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Install WiX Toolset
+        run: |
+          choco install wixtoolset -y
+          refreshenv
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Build Flutter Windows app
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build MSI installer
+        working-directory: apps/LemonadeNexus/windows/packaging/MSI
+        run: |
+          $buildDir = "$(Get-Location)\..\..\..\build\windows\runner\Release"
+          candle -arch x64 -dBuildDir="$buildDir" -out obj\ Product.wxs Installer.wxs
+          light -cultures:en-us -out lemonade_nexus_setup.msi -sval obj\Product.wixobj obj\Installer.wixobj
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-msi
+          path: apps/LemonadeNexus/windows/packaging/MSI/lemonade_nexus_setup.msi
+          if-no-files-found: error
+
+  build-standalone:
+    name: Build Standalone EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Build Flutter Windows app
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Create portable package
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: |
+          $buildDir = "build\windows\runner\Release"
+          $outputDir = "build\windows\packages\exe"
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+          # Copy required files
+          Copy-Item "$buildDir\lemonade_nexus.exe" "$outputDir\" -Force
+          Copy-Item "$buildDir\flutter_windows.dll" "$outputDir\" -Force
+          Copy-Item "$buildDir\icudtl.dat" "$outputDir\" -Force
+          Copy-Item -Recurse "$buildDir\data" "$outputDir\" -Force
+
+          # Create ZIP
+          Compress-Archive -Path "$outputDir\*" -DestinationPath "build\windows\packages\lemonade_nexus_portable.zip" -Force
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-exe
+          path: apps/LemonadeNexus/build/windows/packages/lemonade_nexus_portable.zip
+          if-no-files-found: error
+
+  build-all:
+    name: Build All Packages
+    runs-on: windows-latest
+    needs: [build-msix, build-msi, build-standalone]
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lemonade-nexus-*
+          merge-multiple: true
+
+      - name: List built packages
+        run: dir
+
+      - name: Create release summary
+        run: |
+          echo "## Windows Packages Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Package Type | File | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| MSIX | lemonade_nexus.msix | ✅ Built |" >> $GITHUB_STEP_SUMMARY
+          echo "| MSI | lemonade_nexus_setup.msi | ✅ Built |" >> $GITHUB_STEP_SUMMARY
+          echo "| Portable ZIP | lemonade_nexus_portable.zip | ✅ Built |" >> $GITHUB_STEP_SUMMARY

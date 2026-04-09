@@ -1,0 +1,253 @@
+# Code Signing Configuration for Lemonade Nexus VPN
+# This file configures code signing for all Windows distribution formats
+
+# =============================================================================
+# Certificate Configuration
+# =============================================================================
+
+# Certificate store location (choose one)
+certificate_store: current_user
+# certificate_store: local_machine
+# certificate_path: keys\code_signing.pfx
+
+# Certificate subject name
+certificate_subject: CN=Lemonade Nexus, O=Lemonade Nexus, C=US
+
+# Certificate thumbprint (optional, use if multiple certificates in store)
+# certificate_thumbprint: A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0
+
+# Certificate serial number (optional, use if multiple certificates in store)
+# certificate_serial: 1234567890ABCDEF
+
+# =============================================================================
+# Timestamp Configuration
+# =============================================================================
+
+# RFC 3161 timestamp servers (primary and backup)
+timestamp_servers:
+  - url: http://timestamp.digicert.com
+    priority: 1
+  - url: http://timestamp.sectigo.com
+    priority: 2
+  - url: http://sha256timestamp.ws.symantec.com/sha256/timestamp
+    priority: 3
+
+# Timestamp algorithm
+timestamp_algorithm: sha256
+
+# =============================================================================
+# Signing Tool Configuration
+# =============================================================================
+
+# SignTool path (auto-detected if not specified)
+# signtool_path: C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe
+
+# Windows SDK version (auto-detected if not specified)
+# windows_sdk_version: 10.0.19041.0
+
+# =============================================================================
+# File Types to Sign
+# =============================================================================
+
+sign_files:
+  # Main executable
+  - pattern: "*.exe"
+    description: "Windows Executable"
+    recursive: true
+
+  # DLL files
+  - pattern: "*.dll"
+    description: "Dynamic Link Library"
+    recursive: true
+
+  # System drivers
+  - pattern: "*.sys"
+    description: "System Driver"
+    recursive: true
+
+  # MSIX packages
+  - pattern: "*.msix"
+    description: "MSIX Package"
+    recursive: false
+
+  # MSI installers
+  - pattern: "*.msi"
+    description: "MSI Installer"
+    recursive: false
+
+  # PowerShell scripts
+  - pattern: "*.ps1"
+    description: "PowerShell Script"
+    recursive: true
+
+  # PowerShell modules
+  - pattern: "*.psm1"
+    description: "PowerShell Module"
+    recursive: true
+
+  # PowerShell format files
+  - pattern: "*.psd1"
+    description: "PowerShell Data File"
+    recursive: true
+
+  # CAB files
+  - pattern: "*.cab"
+    description: "Cabinet File"
+    recursive: false
+
+# =============================================================================
+# Signing Options
+# =============================================================================
+
+sign_options:
+  # Hash algorithm (SHA256 recommended)
+  hash_algorithm: sha256
+
+  # Page hash algorithm for authenticode
+  page_hash_algorithm: sha256
+
+  # Sign with /as flag for multiple signatures
+  append_signature: false
+
+  # Verify signature after signing
+  verify_signature: true
+
+  # Add signing certificate to trusted publishers
+  add_to_trusted_publishers: false
+
+# =============================================================================
+# EV Code Signing Specific Options
+# =============================================================================
+
+ev_signing:
+  # Enable EV signing mode (requires hardware token or cloud signing)
+  enabled: false
+
+  # EV certificate requires additional verification
+  # For EV certificates, use the following options:
+
+  # smcerts flag for Microsoft SmartGate
+  use_smart_gate: false
+
+  # Additional time for EV verification (in seconds)
+  verification_timeout: 60
+
+# =============================================================================
+# Azure Code Signing (optional)
+# =============================================================================
+
+azure_signing:
+  enabled: false
+  # tenant_id: YOUR_TENANT_ID
+  # client_id: YOUR_CLIENT_ID
+  # client_secret: ${AZURE_CLIENT_SECRET}
+  # key_vault_name: YOUR_KEY_VAULT_NAME
+  # certificate_name: YOUR_CERTIFICATE_NAME
+
+# =============================================================================
+# SignPath.io Integration (optional)
+# =============================================================================
+
+signpath:
+  enabled: false
+  # organization_id: YOUR_ORG_ID
+  # project_slug: lemonade-nexus
+  # api_token: ${SIGNPATH_API_TOKEN}
+
+# =============================================================================
+# Output Configuration
+# =============================================================================
+
+output:
+  # Directory for signed files (default: same as source)
+  output_directory: build/windows/signed
+
+  # Create backup of unsigned files
+  create_backup: true
+  backup_directory: build/windows/unsigned_backup
+
+  # Log file
+  log_file: build/windows/signing.log
+
+  # Report format (json, xml, text)
+  report_format: json
+  report_file: build/windows/signing_report.json
+
+# =============================================================================
+# Exclusions
+# =============================================================================
+
+exclude_files:
+  - "*.pdb"              # Debug symbols
+  - "*.lib"              # Import libraries
+  - "*.a"                # Static libraries
+  - "*.obj"              # Object files
+  - "test_*"             # Test executables
+  - "**/test/**"         # Files in test directories
+
+# =============================================================================
+# SmartScreen Configuration
+# =============================================================================
+
+smartscreen:
+  # Enable reputation building
+  enable_reputation_building: true
+
+  # Minimum signing timestamp for reputation
+  min_timestamp: 2024-01-01
+
+  # Application name for SmartScreen
+  application_name: Lemonade Nexus VPN
+
+  # Publisher name for SmartScreen
+  publisher_name: Lemonade Nexus
+
+# =============================================================================
+# Pre-Signing Validation
+# =============================================================================
+
+validation:
+  # Validate certificate before signing
+  validate_certificate: true
+
+  # Check certificate expiration
+  check_expiration: true
+
+  # Warn if certificate expires within N days
+  expiration_warning_days: 30
+
+  # Verify file hash before signing
+  verify_file_hash: true
+
+  # Check for existing signature
+  check_existing_signature: true
+
+  # Replace existing signature if present
+  replace_existing_signature: false
+
+# =============================================================================
+# Post-Signing Validation
+# =============================================================================
+
+post_validation:
+  # Verify signature after signing
+  verify_signature: true
+
+  # Verify timestamp
+  verify_timestamp: true
+
+  # Check SmartScreen compatibility
+  check_smartscreen: true
+
+  # Validate authenticode signature
+  validate_authenticode: true
+
+# =============================================================================
+# Environment Variables
+# =============================================================================
+
+# Required environment variables:
+# CERT_PASSWORD - Password for PFX certificate
+# CERT_FILE_PATH - Path to certificate file (if using file-based cert)
+# AZURE_CLIENT_SECRET - Azure service principal secret (if using Azure)
+# SIGNPATH_API_TOKEN - SignPath.io API token (if using SignPath)

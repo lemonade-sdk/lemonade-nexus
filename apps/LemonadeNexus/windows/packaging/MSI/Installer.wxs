@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset Installer Configuration for Lemonade Nexus VPN
+  Main installer entry point that references Product.wxs
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Lemonade Nexus VPN"
+           Language="1033"
+           Version="!(bind.fileVersion.lemonade_nexus.exe)"
+           Manufacturer="Lemonade Nexus"
+           UpgradeCode="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Lemonade Nexus VPN Client Installer"
+             Manufacturer="Lemonade Nexus"
+             Platform="x64" />
+
+    <!-- Major upgrade - remove previous versions first -->
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  AllowDowngrades="no"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit."
+                  IgnoreRemoveFailure="no" />
+
+    <!-- Compression -->
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Property definitions -->
+    <Property Id="APPLICATIONFOLDER" Value="Lemonade Nexus VPN\" Secure="yes" />
+    <Property Id="MSIUSEREALADMINDETECTION" Value="1" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/antmi/lemonade-nexus" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/antmi/lemonade-nexus" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/antmi/lemonade-nexus/releases" />
+    <Property Id="ARPHELPPHONE" Value="" />
+    <Property Id="ARPNOREMOVE" Value="0" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="ARPCOMMENTS" Value="Secure WireGuard Mesh VPN Client" />
+    <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+    <!-- UI Properties -->
+    <Property Id="WIXUI_INSTALLDIR" Value="APPLICATIONFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lemonade Nexus VPN" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+
+    <!-- Launch conditions -->
+    <Condition Message="This application requires Windows 10 version 1809 (build 17763) or later.">
+      <![CDATA[Installed OR (VersionNT >= 603)]]>
+    </Condition>
+
+    <!-- Check for pending reboot -->
+    <Property Id="PENDINGREBOOT">
+      <RegistrySearch Id="RegistrySearchPendingReboot1"
+                      Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+                      Type="raw" />
+      <RegistrySearch Id="RegistrySearchPendingReboot2"
+                      Root="HKLM"
+                      Key="SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+                      Type="raw" />
+    </Property>
+    <Condition Message="A reboot is pending. Please restart your computer and run this installer again.">
+      <![CDATA[Installed OR NOT PENDINGREBOOT]]>
+    </Condition>
+
+    <!-- Binary for custom actions -->
+    <Binary Id="CustomActionDll" SourceFile="!(bind.path.CustomActions)\CustomActions.dll" />
+
+    <!-- Custom Actions -->
+    <CustomAction Id="SetDefaultInstallFolder"
+                  Property="APPLICATIONFOLDER"
+                  Value="[ProgramFiles64Folder]Lemonade Nexus\"
+                  Execute="firstSequence" />
+
+    <CustomAction Id="CheckForRunningInstance"
+                  BinaryKey="CustomActionDll"
+                  DllEntry="CheckForRunningInstance"
+                  Execute="immediate"
+                  Return="check" />
+
+    <CustomAction Id="StopRunningInstance"
+                  BinaryKey="CustomActionDll"
+                  DllEntry="StopRunningInstance"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <CustomAction Id="InstallWireGuardService"
+                  Directory="APPLICATIONFOLDER"
+                  ExeCommand="&quot;[APPLICATIONFOLDER]lemonade_nexus.exe&quot; --install-service"
+                  Execute="deferred"
+                  Return="check"
+                  Impersonate="no" />
+
+    <CustomAction Id="UninstallWireGuardService"
+                  Directory="APPLICATIONFOLDER"
+                  ExeCommand="&quot;[APPLICATIONFOLDER]lemonade_nexus.exe&quot; --uninstall-service"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <CustomAction Id="RegisterAutoStart"
+                  Directory="APPLICATIONFOLDER"
+                  ExeCommand="&quot;[APPLICATIONFOLDER]lemonade_nexus.exe&quot; --register-auto-start"
+                  Execute="deferred"
+                  Return="ignore" />
+
+    <CustomAction Id="CreateShortcuts"
+                  BinaryKey="CustomActionDll"
+                  DllEntry="CreateShortcuts"
+                  Execute="deferred"
+                  Return="ignore" />
+
+    <CustomAction Id="LaunchApplication"
+                  FileKey="lemonade_nexus.exe"
+                  ExeCommand=""
+                  Execute="immediate"
+                  Return="asyncNoWait"
+                  HideTarget="yes" />
+
+    <CustomAction Id="CleanupOldInstallation"
+                  BinaryKey="CustomActionDll"
+                  DllEntry="CleanupOldInstallation"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="no" />
+
+    <!-- Install Execute Sequence -->
+    <InstallExecuteSequence>
+      <Custom Action="SetDefaultInstallFolder" Before="CostFinalize">APPLICATIONFOLDER=""</Custom>
+      <Custom Action="CheckForRunningInstance" Before="InstallValidate">NOT Installed</Custom>
+      <Custom Action="StopRunningInstance" After="InstallInitialize">NOT Installed</Custom>
+      <Custom Action="CleanupOldInstallation" After="InstallInitialize">UPGRADINGPRODUCTCODE</Custom>
+      <Custom Action="InstallWireGuardService" Before="InstallFinalize">NOT Installed</Custom>
+      <Custom Action="RegisterAutoStart" After="InstallWireGuardService">NOT Installed</Custom>
+      <Custom Action="CreateShortcuts" After="RegisterAutoStart">NOT Installed</Custom>
+      <Custom Action="UninstallWireGuardService" Before="RemoveFiles">Installed AND REMOVE="ALL"</Custom>
+    </InstallExecuteSequence>
+
+    <!-- UI Sequence -->
+    <InstallUISequence>
+      <Custom Action="SetDefaultInstallFolder" Before="CostFinalize">APPLICATIONFOLDER=""</Custom>
+    </InstallUISequence>
+
+    <!-- Directory structure -->
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="APPLICATIONFOLDER" Name="Lemonade Nexus">
+          <Component Id="CleanupComponent" Guid="{11111111-2222-3333-4444-555555555555}">
+            <CreateFolder />
+            <RemoveFolder Id="CleanupAPPLICATIONFOLDER" On="uninstall" />
+          </Component>
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="StartMenuDir" Name="Lemonade Nexus VPN">
+          <Component Id="StartMenuDir" Guid="{22222222-3333-4444-5555-666666666666}">
+            <RemoveFolder Id="RemoveStartMenuDir" On="uninstall" />
+            <RegistryValue Root="HKCU"
+                          Key="Software\LemonadeNexus\VPN"
+                          Name="StartMenuInstalled"
+                          Type="integer"
+                          Value="1"
+                          KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <!-- Main Application Feature -->
+    <Feature Id="MainApplication"
+             Title="Lemonade Nexus VPN"
+             Description="Lemonade Nexus VPN Client"
+             Level="1"
+             ConfigurableDirectory="APPLICATIONFOLDER"
+             AllowAdvertise="no"
+             Display="expand"
+             Absent="disallow">
+
+      <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="CleanupComponent" />
+      <ComponentRef Id="StartMenuDir" />
+
+      <!-- Sub-features -->
+      <Feature Id="DesktopShortcut"
+               Title="Desktop Shortcut"
+               Description="Create a desktop shortcut"
+               Level="1"
+               Absent="allow">
+        <ComponentRef Id="DesktopShortcutComponent" />
+      </Feature>
+
+      <Feature Id="AutoStart"
+               Title="Auto Start"
+               Description="Start Lemonade Nexus VPN when Windows starts"
+               Level="1"
+               Absent="allow">
+        <ComponentRef Id="AutoStartComponent" />
+      </Feature>
+    </Feature>
+
+    <!-- Component Groups (to be populated by heat.exe) -->
+    <ComponentGroup Id="ApplicationFiles" Directory="APPLICATIONFOLDER">
+      <!-- Heat.exe will populate this with all files from the build directory -->
+    </ComponentGroup>
+
+    <!-- Desktop Shortcut Component -->
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent" Guid="{33333333-4444-5555-6666-777777777777}">
+        <Shortcut Id="DesktopShortcut"
+                  Name="Lemonade Nexus VPN"
+                  Description="Secure WireGuard Mesh VPN Client"
+                  Target="[#lemonade_nexus.exe]"
+                  WorkingDirectory="APPLICATIONFOLDER" />
+        <RegistryValue Root="HKCU"
+                      Key="Software\LemonadeNexus\VPN"
+                      Name="DesktopShortcut"
+                      Type="integer"
+                      Value="1"
+                      KeyPath="yes" />
+        <RemoveFolder Id="RemoveDesktopShortcut" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- AutoStart Component -->
+    <DirectoryRef Id="StartupFolder">
+      <Component Id="AutoStartComponent" Guid="{44444444-5555-6666-7777-888888888888}">
+        <Shortcut Id="AutoStartShortcut"
+                  Name="Lemonade Nexus VPN"
+                  Description="Secure WireGuard Mesh VPN Client"
+                  Target="[#lemonade_nexus.exe]"
+                  Arguments="--minimized"
+                  WorkingDirectory="APPLICATIONFOLDER" />
+        <RegistryValue Root="HKCU"
+                      Key="Software\LemonadeNexus\VPN"
+                      Name="AutoStart"
+                      Type="integer"
+                      Value="0"
+                      KeyPath="yes" />
+        <RemoveFolder Id="RemoveAutoStart" On="uninstall" />
+      </Component>
+    </DirectoryRef>
+
+    <!-- UI Reference -->
+    <UIRef Id="WixUI_InstallDir" />
+
+    <!-- UI Customization -->
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+
+      <!-- Skip license agreement -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+
+      <!-- Launch application checkbox on exit dialog -->
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+    </UI>
+
+    <!-- Wix Variables (set during build) -->
+    <!--
+      WixVariable Id="WixUILicenseRtf" Value="LICENSE.rtf"
+      WixVariable Id="WixUIBannerBmp" Value="banner.bmp"
+      WixVariable Id="WixUIDialogBmp" Value="dialog.bmp"
+      WixVariable Id="WixUIExclamationIco" Value="error.ico"
+      WixVariable Id="WixUIInfoIco" Value="info.ico"
+      WixVariable Id="WixUINewIco" Value="app_icon.ico"
+      WixVariable Id="WixUIUpIco" Value="up.ico"
+    -->
+  </Product>
+</Wix>

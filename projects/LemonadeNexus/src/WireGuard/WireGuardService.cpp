@@ -102,8 +102,8 @@ void WireGuardService::on_start() {
                       name(), interface_name_,
                       (driver_ver >> 16) & 0xFFFF, driver_ver & 0xFFFF);
     }
-#else
-    // CLI fallback — verify that the `wg` tool is reachable
+#elif defined(__linux__)
+    // CLI fallback — verify that the `wg` tool is reachable (Linux only)
     auto version = run_command("wg --version 2>/dev/null");
     if (version.empty()) {
         // wg not found — fall back to BoringTun userspace WireGuard
@@ -131,6 +131,16 @@ void WireGuardService::on_start() {
                           "until iproute2 is installed", name());
         }
     }
+#elif defined(_WIN32)
+    // Windows: wireguard-nt is the only supported backend
+    // If HAS_WIREGUARD_NT is not defined, BoringTun fallback is used but without
+    // CLI tools (Windows doesn't have wg/ip commands). Actual WireGuard functionality
+    // requires wireguard-nt to be enabled at compile time.
+    spdlog::warn("[{}] Windows: wireguard-nt not available at compile time. "
+                  "WireGuard functionality will be limited.", name());
+#else
+    // Other Unix-like systems (BSD, etc.)
+    spdlog::warn("[{}] Unknown platform — WireGuard backend not determined", name());
 #endif
 
     // Ensure the config directory exists
@@ -926,7 +936,8 @@ WgKeypair WireGuardService::do_generate_keypair() {
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
-    // Generate private key
+#ifndef _WIN32
+    // Generate private key using wg CLI (Unix only)
     auto private_key = run_command("wg genkey 2>/dev/null");
     if (private_key.empty()) {
         spdlog::error("[{}] failed to generate WireGuard private key", name());
@@ -968,6 +979,12 @@ WgKeypair WireGuardService::do_generate_keypair() {
         .public_key  = std::move(public_key),
         .private_key = std::move(private_key),
     };
+#else
+    // Windows: key generation requires libsodium or embeddable-wg
+    // wg CLI is not available on Windows
+    spdlog::error("[{}] key generation not supported on Windows without libsodium", name());
+    return {};
+#endif
 #endif // HAS_EMBEDDABLE_WG
 }
 
@@ -1082,6 +1099,7 @@ bool WireGuardService::do_set_interface(const WgInterfaceConfig& config) {
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifndef _WIN32
     // Write private key to a temp file to avoid shell interpolation (command injection)
     auto tmp_key_path = config_dir_ / ".privkey.tmp";
     {
@@ -1120,6 +1138,12 @@ bool WireGuardService::do_set_interface(const WgInterfaceConfig& config) {
     spdlog::info("[{}] configured interface '{}' (listen_port: {}, address: {})",
                   name(), interface_name_, config.listen_port, config.address);
     return true;
+#else
+    // Windows: wireguard-nt is the only supported backend
+    // If we reach here, HAS_WIREGUARD_NT was not enabled at compile time
+    spdlog::error("[{}] set_interface not supported on Windows without wireguard-nt", name());
+    return false;
+#endif
 #endif // HAS_EMBEDDABLE_WG / HAS_WIREGUARDKIT
 }
 
@@ -1338,6 +1362,7 @@ bool WireGuardService::do_add_peer(const std::string& pubkey,
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifndef _WIN32
     std::ostringstream cmd;
     cmd << "wg set " << interface_name_
         << " peer " << pubkey
@@ -1358,6 +1383,11 @@ bool WireGuardService::do_add_peer(const std::string& pubkey,
     spdlog::info("[{}] added peer {} (allowed_ips: {}, endpoint: {})",
                   name(), pubkey, allowed_ips, endpoint);
     return true;
+#else
+    // Windows: wireguard-nt is required for peer management
+    spdlog::error("[{}] add_peer not supported on Windows without wireguard-nt", name());
+    return false;
+#endif
 #endif
 }
 
@@ -1444,6 +1474,7 @@ bool WireGuardService::do_remove_peer(const std::string& pubkey) {
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifndef _WIN32
     std::ostringstream cmd;
     cmd << "wg set " << interface_name_
         << " peer " << pubkey
@@ -1457,6 +1488,11 @@ bool WireGuardService::do_remove_peer(const std::string& pubkey) {
 
     spdlog::info("[{}] removed peer {}", name(), pubkey);
     return true;
+#else
+    // Windows: wireguard-nt is required for peer management
+    spdlog::error("[{}] remove_peer not supported on Windows without wireguard-nt", name());
+    return false;
+#endif
 #endif
 }
 
@@ -1584,6 +1620,7 @@ std::vector<WgPeer> WireGuardService::do_get_peers() {
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifdef __linux__
     // `wg show <iface> dump` outputs tab-separated fields:
     //   Line 1 (interface): private-key  public-key  listen-port  fwmark
     //   Line 2+ (peers):    public-key  preshared-key  endpoint  allowed-ips
@@ -1665,6 +1702,11 @@ std::vector<WgPeer> WireGuardService::do_get_peers() {
     spdlog::debug("[{}] enumerated {} peers on '{}'",
                    name(), peers.size(), interface_name_);
     return peers;
+#else
+    // Windows and other platforms - no CLI fallback available
+    spdlog::debug("[{}] get_peers not supported on this platform without wireguard-nt or BoringTun", name());
+    return {};
+#endif
 #endif // HAS_EMBEDDABLE_WG
 }
 
@@ -1759,6 +1801,7 @@ bool WireGuardService::do_update_endpoint(const std::string& pubkey,
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifndef _WIN32
     std::ostringstream cmd;
     cmd << "wg set " << interface_name_
         << " peer " << pubkey
@@ -1774,6 +1817,11 @@ bool WireGuardService::do_update_endpoint(const std::string& pubkey,
     spdlog::info("[{}] updated endpoint for peer {} to {}",
                   name(), pubkey, new_endpoint);
     return true;
+#else
+    // Windows: wireguard-nt is required for peer management
+    spdlog::error("[{}] update_endpoint not supported on Windows without wireguard-nt", name());
+    return false;
+#endif
 #endif
 }
 
@@ -2090,6 +2138,7 @@ bool WireGuardService::do_setup_interface(const WgInterfaceConfig& config,
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifdef __linux__
     // --- Linux / CLI fallback ---
 
     // 1. Check if the interface already exists
@@ -2246,6 +2295,11 @@ bool WireGuardService::do_setup_interface(const WgInterfaceConfig& config,
     spdlog::info("[{}] interface '{}' is up with {} peers configured",
                   name(), interface_name_, peers.size());
     return true;
+#else
+    // Windows and other platforms without wireguard-nt/BoringTun
+    spdlog::warn("[{}] interface setup not supported on this platform without wireguard-nt or BoringTun", name());
+    return false;
+#endif
 #endif // __APPLE__ && HAS_WIREGUARDKIT
 }
 
@@ -2288,6 +2342,7 @@ bool WireGuardService::do_teardown_interface() {
     }
 #endif // BORINGTUN_FALLBACK_AVAILABLE
 
+#ifdef __linux__
     // --- Linux / CLI fallback ---
 
     // 1. Bring the interface down
@@ -2314,6 +2369,11 @@ bool WireGuardService::do_teardown_interface() {
 
     spdlog::info("[{}] interface '{}' torn down", name(), interface_name_);
     return true;
+#else
+    // Windows and other platforms without wireguard-nt/BoringTun
+    spdlog::warn("[{}] interface teardown not supported on this platform without wireguard-nt", name());
+    return false;
+#endif
 #endif // __APPLE__ && HAS_WIREGUARDKIT
 }
 
@@ -2429,10 +2489,12 @@ bool WireGuardService::do_add_address(const std::string& address_cidr) {
 
 #ifdef _WIN32
     // Windows: use netsh
+    // Note: netsh returns empty output on success, error text on failure
     auto cmd = "netsh interface ip add address \"" + interface_name_ + "\" " + address_cidr;
     auto result = run_command(cmd);
-    if (result.find("error") != std::string::npos) {
-        spdlog::error("[{}] failed to add address {} to {}", name(), address_cidr, interface_name_);
+    if (!result.empty()) {
+        // netsh outputs error message on failure (empty output means success)
+        spdlog::error("[{}] netsh failed: {}", name(), result);
         return false;
     }
 #elif defined(__APPLE__)
