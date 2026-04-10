@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <windows.h>
 
 #include "flutter_window.h"
 #include "run_loop.h"
@@ -33,9 +34,21 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // plugins.
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
+  // Get the executable path to build the data directory path
+  wchar_t exe_path[MAX_PATH];
+  GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+
+  // Extract directory from executable path
+  std::wstring exe_dir(exe_path);
+  size_t last_slash = exe_dir.find_last_of(L"\\");
+  if (last_slash != std::wstring::npos) {
+    exe_dir = exe_dir.substr(0, last_slash);
+  }
+  std::wstring data_path = exe_dir + L"\\data";
+
   // Initialize the Flutter engine
   auto run_loop = std::make_unique<RunLoop>();
-  flutter::DartProject project(L"data");
+  flutter::DartProject project(data_path.c_str());
 
   std::vector<std::string> arguments;
   arguments.push_back("--disable-dart-profile");

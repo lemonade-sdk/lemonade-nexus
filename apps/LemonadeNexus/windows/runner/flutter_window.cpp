@@ -24,13 +24,8 @@ bool FlutterWindow::OnCreate() {
   const int width = frame.right - frame.left;
   const int height = frame.bottom - frame.top;
 
-  flutter::DartProject project(L"data");
-
-  // Configure the dart entrypoint.
-  project.set_dart_entrypoint_arguments(std::move(command_line_arguments_));
-
   flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
-      width, height, project);
+      width, height, project_);
 
   // Ensure that basic setup of the controller was successful.
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {

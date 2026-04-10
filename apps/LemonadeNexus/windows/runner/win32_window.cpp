@@ -57,6 +57,11 @@ bool Win32Window::CreateAndShow(const std::wstring& title,
                                 const Size& size) {
   Destroy();
 
+  // Register the window class first
+  if (!RegisterWindowClass(kWindowClassName)) {
+    return false;
+  }
+
   const POINT target_point = {static_cast<LONG>(origin.x),
                               static_cast<LONG>(origin.y)};
   HMONITOR monitor = MonitorFromPoint(target_point, MONITOR_DEFAULTTONEAREST);
@@ -174,6 +179,10 @@ bool Win32Window::RegisterWindowClass(const std::wstring& class_name) {
   window_class.hInstance = GetModuleHandle(nullptr);
   window_class.hIcon =
       LoadIcon(window_class.hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
+  if (!window_class.hIcon) {
+    // Fallback to default icon
+    window_class.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+  }
   window_class.hbrBackground = 0;
   window_class.lpszMenuName = nullptr;
   window_class.lpfnWndProc = WndProc;
