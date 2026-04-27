@@ -37,14 +37,15 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: flutter pub get
+
       - name: Scaffold Windows target
         working-directory: apps/LemonadeNexus
         shell: pwsh
         run: flutter create --platforms=windows . --project-name lemonade_nexus
-
-      - name: Get Flutter dependencies
-        working-directory: apps/LemonadeNexus
-        run: flutter pub get
 
       - name: Run Flutter analyzer
         working-directory: apps/LemonadeNexus
@@ -89,17 +90,19 @@ jobs:
           choco install wixtoolset -y
           refreshenv
 
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: flutter pub get
+
       - name: Scaffold Windows target
         working-directory: apps/LemonadeNexus
         shell: pwsh
         run: flutter create --platforms=windows . --project-name lemonade_nexus
 
-      - name: Get Flutter dependencies
-        working-directory: apps/LemonadeNexus
-        run: flutter pub get
-
       - name: Build Flutter Windows app
         working-directory: apps/LemonadeNexus
+        shell: pwsh
         run: flutter build windows --release
 
       - name: Setup MSBuild
@@ -134,17 +137,19 @@ jobs:
           channel: 'stable'
           cache: true
 
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: flutter pub get
+
       - name: Scaffold Windows target
         working-directory: apps/LemonadeNexus
         shell: pwsh
         run: flutter create --platforms=windows . --project-name lemonade_nexus
 
-      - name: Get Flutter dependencies
-        working-directory: apps/LemonadeNexus
-        run: flutter pub get
-
       - name: Build Flutter Windows app
         working-directory: apps/LemonadeNexus
+        shell: pwsh
         run: flutter build windows --release
 
       - name: Create portable package
