@@ -143,7 +143,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.account_tree_outlined, size: 48, color: Colors.white.withOpacity(0.2)),
+          Icon(Icons.account_tree, size: 48, color: Colors.white.withOpacity(0.2)),
           const SizedBox(height: 16),
           Text('No Nodes', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
@@ -285,7 +285,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: () => _showAddNodeDialog(appState, node.id),
+                  onPressed: () => _showAddNodeDialog(node.id),
                   icon: const Icon(Icons.add),
                   label: const Text('Add Child Node'),
                   style: ElevatedButton.styleFrom(
@@ -299,7 +299,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
               const SizedBox(width: 12),
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: () => _confirmDeleteNode(appState, node),
+                  onPressed: () => _confirmDeleteNode(node),
                   icon: const Icon(Icons.delete),
                   label: const Text('Delete Node'),
                   style: ElevatedButton.styleFrom(
@@ -322,7 +322,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.account_tree_outlined, size: 64, color: Colors.white.withOpacity(0.2)),
+          Icon(Icons.account_tree, size: 64, color: Colors.white.withOpacity(0.2)),
           const SizedBox(height: 16),
           Text('Select a Node', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
@@ -487,7 +487,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
         ),
         title: const Text('Delete Node', style: TextStyle(color: Colors.white)),
         content: Text(
-          'Are you sure you want to delete "${node.data['hostname'] ?? node.id}'?',
+          "Are you sure you want to delete \"${node.data['hostname'] ?? node.id}\"?",
           style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 13),
         ),
         actions: [
@@ -566,16 +566,16 @@ enum NodeType {
     }
   }
 
-  String get icon {
+  IconData get icon {
     switch (this) {
       case root:
-        return 'account_tree';
+        return Icons.account_tree;
       case customer:
-        return 'group';
+        return Icons.group;
       case endpoint:
-        return 'dns';
+        return Icons.dns;
       case relay:
-        return 'hub';
+        return Icons.hub;
     }
   }
 

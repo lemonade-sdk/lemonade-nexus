@@ -37,6 +37,11 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
+      - name: Scaffold Windows target
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: flutter create --platforms=windows . --project-name lemonade_nexus
+
       - name: Get Flutter dependencies
         working-directory: apps/LemonadeNexus
         run: flutter pub get
@@ -84,6 +89,11 @@ jobs:
           choco install wixtoolset -y
           refreshenv
 
+      - name: Scaffold Windows target
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: flutter create --platforms=windows . --project-name lemonade_nexus
+
       - name: Get Flutter dependencies
         working-directory: apps/LemonadeNexus
         run: flutter pub get
@@ -123,6 +133,11 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: 'stable'
           cache: true
+
+      - name: Scaffold Windows target
+        working-directory: apps/LemonadeNexus
+        shell: pwsh
+        run: flutter create --platforms=windows . --project-name lemonade_nexus
 
       - name: Get Flutter dependencies
         working-directory: apps/LemonadeNexus
