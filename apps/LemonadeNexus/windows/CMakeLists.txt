@@ -45,30 +45,14 @@ file(TO_CMAKE_PATH "${FLUTTER_ROOT}" FLUTTER_ROOT)
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
 set(FLUTTER_BIN_DIR "${FLUTTER_ROOT}/bin")
 
-# Add Flutter library
-add_library(flutter INTERFACE)
-target_compile_definitions(flutter INTERFACE DART_SHARED_LIB)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  target_compile_definitions(flutter INTERFACE _DEBUG)
-endif()
+# Include the Flutter managed directory first
+# This must happen before add_subdirectory(runner) because the runner depends on flutter_assemble
+add_subdirectory(flutter)
 
-# Add flutter_wrapper_app library
-add_library(flutter_wrapper_app INTERFACE)
-target_include_directories(flutter_wrapper_app INTERFACE
-  "${FLUTTER_ROOT}/bin/cache/artifacts/engine/common/cpp_client_wrapper/include"
-)
-target_link_libraries(flutter_wrapper_app INTERFACE flutter)
-target_link_libraries(flutter_wrapper_app INTERFACE
-  "${FLUTTER_ROOT}/bin/cache/artifacts/engine/windows-x64/flutter_windows.dll.lib"
-)
-
-# Add flutter_wrapper_plugin library
-add_library(flutter_wrapper_plugin INTERFACE)
-target_link_libraries(flutter_wrapper_plugin INTERFACE flutter)
-
-# Add flutter_texture_registrar library
-add_library(flutter_texture_registrar INTERFACE)
-target_link_libraries(flutter_texture_registrar INTERFACE flutter)
+# Add Flutter library (defined in flutter/CMakeLists.txt)
+# Add flutter_wrapper_app library (defined in flutter/CMakeLists.txt)
+# Add flutter_wrapper_plugin library (defined in flutter/CMakeLists.txt)
+# Add flutter_texture_registrar library (defined in flutter/CMakeLists.txt)
 
 # Build the SDK library
 set(SDK_ROOT "${CMAKE_SOURCE_DIR}/../../projects/LemonadeNexusSDK")
