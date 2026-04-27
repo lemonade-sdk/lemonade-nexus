@@ -34,6 +34,13 @@ A self-hosted, cryptographically secure WireGuard mesh VPN with zero-trust archi
 - [Client SDK](Client-SDK) — SDK overview and linking
 - [Frameworks and Libraries](Frameworks-and-Libraries) — Tech stack and dependencies
 - [Building](Building) — Build instructions for all platforms
+- [Development Guide](DEVELOPMENT) — Complete development workflow
+
+### Windows Platform
+- [Windows Port](WINDOWS-PORT) — C++ server port architecture and build
+- [Flutter Client](FLUTTER-CLIENT) — Windows client application
+- [Installation Guide](INSTALLATION) — Installation procedures for Windows
+- [Release Notes](RELEASE-NOTES-WINDOWS) — Windows release information
 
 ## Quick Links
 

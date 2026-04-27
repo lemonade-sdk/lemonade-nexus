@@ -48,3 +48,35 @@ Cargo.lock
 # Unwanted files
 .claude/
 *.bak
+
+# Flutter
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+build/
+*.lock
+**/windows/flutter/ephemeral/
+
+# MSIX/MSI packaging artifacts
+*.msix
+*.msi
+*.appxupload
+*.msixbundle
+windows/packaging/MSI/obj/
+windows/packaging/signing/*.pfx
+windows/packaging/signing/*.p12
+keys/*.pfx
+keys/*.p12
+keys/*.cer
+keys/*.pem
+
+# WiX Toolset
+*.wixobj
+*.wixpdb
+
+# Build artifacts
+build/windows/packages/
+build/windows/signed/
+build/windows/unsigned_backup/

@@ -1,0 +1,57 @@
+// Microsoft Visual C++ generated resource script.
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from resource TEMPLATE
+//
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+// Microsoft Visual C++ resource definitions
+//
+#include <windows.h>
+/////////////////////////////////////////////////////////////////////////////
+// Icon resources
+//
+IDI_APP_ICON ICON "../assets/icons/tray_icon.ico"
+IDI_FLUTTER_ICON ICON "../assets/icons/tray_icon.ico"
+
+/////////////////////////////////////////////////////////////////////////////
+// Version resource
+//
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,1
+ PRODUCTVERSION 1,0,0,1
+ FILEFLAGMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x4L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Lemonade Nexus"
+            VALUE "FileDescription", "Lemonade Nexus VPN Client"
+            VALUE "FileVersion", "1.0.0.1"
+            VALUE "InternalName", "lemonade_nexus.exe"
+            VALUE "LegalCopyright", "Copyright (c) 2024 Lemonade Nexus"
+            VALUE "OriginalFilename", "lemonade_nexus.exe"
+            VALUE "ProductName", "Lemonade Nexus VPN Client"
+            VALUE "ProductVersion", "1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+#endif    // APSTUDIO_INVOKED
