@@ -57,6 +57,7 @@ Cargo.lock
 .pub/
 build/
 *.lock
+**/windows/flutter/ephemeral/
 
 # MSIX/MSI packaging artifacts
 *.msix
