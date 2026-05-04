@@ -171,7 +171,9 @@ TeePlatform TeeAttestationService::do_detected_platform() const {
 
 TeeAttestationReport TeeAttestationService::do_generate_report(
     const std::array<uint8_t, 32>& nonce) {
-
+    //TODO: detouring
+    //Lets look into function detouring and verify there is no security implications,
+    //  from that method that can effect this function and the following functions after this function as well. perhaps we could do function call obsecurity.
     switch (detected_platform_) {
         case TeePlatform::IntelSgx:          return generate_sgx_report(nonce);
         case TeePlatform::IntelTdx:          return generate_tdx_report(nonce);
@@ -190,7 +192,9 @@ TeeAttestationReport TeeAttestationService::do_generate_report(
     report.binary_hash = binary_attestation_.self_hash();
     return report;
 }
-
+//TODO: READ THIS OVER AND OVER AGAIN
+//I'm not sure about any of this, the reason is that 
+//this code needs to be written very specifically to not allow someone to inject anything which would or could effect the outcome of the verification.
 bool TeeAttestationService::do_verify_report(
     const TeeAttestationReport& report,
     const std::array<uint8_t, 32>& expected_nonce) {
@@ -263,7 +267,7 @@ bool TeeAttestationService::do_verify_report(
 // ---------------------------------------------------------------------------
 // AttestationToken generation and verification
 // ---------------------------------------------------------------------------
-
+//TODO: READ THIS OVER AND OVER (also)
 AttestationToken TeeAttestationService::generate_token(
     const crypto::Ed25519Keypair& keypair) {
 
@@ -306,6 +310,8 @@ AttestationToken TeeAttestationService::generate_token(
     return token;
 }
 
+//Look into memory sandboxing and any other security features that may not be really standard.
+//In general software, would be interesting to see if we can wrap the entire execution of this function in some sort of extra sandboxing of execution.
 bool TeeAttestationService::verify_token(const AttestationToken& token) const {
     // 1. Check platform — must have TEE
     if (token.platform == TeePlatform::None) {

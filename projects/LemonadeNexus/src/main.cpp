@@ -138,6 +138,8 @@ int main(int argc, char* argv[]) {
         manifest_storage.start();
 
         nexus::core::BinaryAttestationService manifest_attestation{manifest_crypto, manifest_storage};
+        // if release signing pubkey is empty we need to really throw, it should always
+        //be there no matter what, even if our platform doesnt support TEE
         if (!config.release_signing_pubkey.empty()) {
             manifest_attestation.set_release_signing_pubkey(config.release_signing_pubkey);
         }
@@ -202,9 +204,13 @@ int main(int argc, char* argv[]) {
     attestation.start();
 
     nexus::core::TeeAttestationService tee{crypto, storage, attestation};
-    if (!config.tee_platform_override.empty()) {
+    if (!config.tee_platform_override.empty()) 
+        //Questionable whats actually happening here,
+        // this needs to be looked into further, this could leave a hole into the system to allow someone to override TEE for a system that doesnt support that type of TEE
+        //Maybe they could implement a custom TEE wrapper, not sure. Need to double check this and probably with some theories / research against TEE
+        
         tee.set_platform_override(config.tee_platform_override);
-    }
+    
     tee.start();
 
     nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};

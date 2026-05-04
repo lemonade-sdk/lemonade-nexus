@@ -77,6 +77,8 @@ void BinaryAttestationService::on_start() {
     // Compute our binary hash
     self_hash_ = compute_self_hash();
     if (self_hash_.empty()) {
+        //Throw error that there is no binary hash because even again if we are testing,
+        // or are hacked we dont allow it to not exist even without TEE it means this is unnoficial.
         spdlog::warn("[{}] could not compute self binary hash", name());
     } else {
         spdlog::info("[{}] binary SHA-256: {}", name(), self_hash_);
@@ -92,6 +94,8 @@ void BinaryAttestationService::on_start() {
         } else {
             spdlog::warn("[{}] our binary does NOT match any approved release manifest "
                           "(this may be a development build)", name());
+            // we need access to a api client to log the attempt of loading a binary that is not approved.
+            //basically we get to log they're IP, MAC, HOST, and any other information we deem "needed" in order to obtain a good blacklist.
         }
     }
 
@@ -201,6 +205,9 @@ void BinaryAttestationService::load_manifests() {
     const auto releases_dir = storage_.data_root() / "releases";
     if (!std::filesystem::exists(releases_dir)) {
         spdlog::debug("[{}] no releases directory at {}", name(), releases_dir.string());
+        //I would prefer to throw here as well or perhaps soft throw and then hard throw after, so we can report
+        //  the IP to the blacklist and host informarion for attempting to load up a binary incorrectly.
+        // there should not be a way to load this software in a way it is not correct that is the job of the publisher/packager.
         return;
     }
 
