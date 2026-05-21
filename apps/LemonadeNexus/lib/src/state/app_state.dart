@@ -224,7 +224,7 @@ extension SidebarItemExtension on SidebarItem {
       case SidebarItem.servers:
         return Icons.dns;
       case SidebarItem.certificates:
-        return Icons.cert;
+        return Icons.verified_user;
       case SidebarItem.relays:
         return Icons.wifi_tethering;
       case SidebarItem.settings:

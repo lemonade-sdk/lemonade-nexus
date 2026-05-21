@@ -10,6 +10,7 @@
 /// - Settings provider (app preferences)
 /// - Theme provider (light/dark mode)
 
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
@@ -293,10 +294,10 @@ class DiscoveryService {
   List<RelayInfo> get relays => _notifier.state.relays;
 
   /// Get current server host.
-  String get serverHost => _notifier.settings.serverHost;
+  String get serverHost => _notifier.state.serverHost;
 
   /// Get current server port.
-  int get serverPort => _notifier.settings.serverPort;
+  int get serverPort => _notifier.state.serverPort;
 
   /// Check if connected to server.
   bool get isConnected => _notifier.state.isConnected;
