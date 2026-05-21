@@ -114,21 +114,41 @@ jobs:
           }
           "msix-path=$msix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      # MSI build is non-blocking - see build-windows-packages.yml for details
-      # on the WiX issues that prevent the current .wxs files from linking.
       - name: Install WiX Toolset
         run: choco install wixtoolset -y
-        continue-on-error: true
+
+      - name: Add WiX to PATH
+        run: |
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          if (Test-Path $wixBin) {
+            Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+          }
+
+      - name: Harvest Flutter output with heat.exe
+        working-directory: apps/LemonadeNexus/windows/packaging/MSI
+        run: |
+          $buildDir = "${{ steps.locate.outputs.release-dir }}"
+          & heat.exe dir "$buildDir" `
+            -gg -sfrag -srd -scom -sreg -ke `
+            -dr INSTALLFOLDER `
+            -cg ApplicationFiles `
+            -var var.BuildDir `
+            -out HarvestedFiles.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build MSI installer
         id: build-msi
-        continue-on-error: true
         working-directory: apps/LemonadeNexus/windows/packaging/MSI
         run: |
           $buildDir = "${{ steps.locate.outputs.release-dir }}"
           New-Item -ItemType Directory -Path obj -Force | Out-Null
-          & candle.exe -arch x64 -dBuildDir="$buildDir" -out obj\ Product.wxs BuildFiles.wxs
-          & light.exe -ext WixUIExtension -cultures:en-us -out lemonade_nexus_setup.msi -sval obj\Product.wixobj obj\BuildFiles.wixobj
+          & candle.exe -arch x64 -dBuildDir="$buildDir" -out "obj\" Product.wxs HarvestedFiles.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & light.exe -ext WixUIExtension -cultures:en-us `
+            -out lemonade_nexus_setup.msi `
+            -sval `
+            obj\Product.wixobj obj\HarvestedFiles.wixobj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Create portable package
         working-directory: apps/LemonadeNexus

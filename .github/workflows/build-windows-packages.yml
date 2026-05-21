@@ -159,16 +159,6 @@ jobs:
   build-msi:
     name: Build MSI Installer
     runs-on: windows-latest
-    # FLAG: the WiX sources in apps/LemonadeNexus/windows/packaging/MSI are not
-    # buildable as-is:
-    #   * Product.wxs and Installer.wxs both define <Product> with the same
-    #     UpgradeCode - they cannot be linked together.
-    #   * Both reference a CustomActions.dll that does not exist in the repo.
-    #   * Product.wxs references assets/app_icon.ico but only app_icon.png
-    #     exists in apps/LemonadeNexus/assets/.
-    #   * Installer.wxs uses WixUI_InstallDir which requires -ext WixUIExtension.
-    # Until the WiX project is rewritten, this job is non-blocking.
-    continue-on-error: true
     needs: build-flutter-windows
     steps:
       - name: Checkout repository
@@ -183,6 +173,13 @@ jobs:
 
       - name: Install WiX Toolset
         run: choco install wixtoolset -y
+
+      - name: Add WiX to PATH
+        run: |
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          if (Test-Path $wixBin) {
+            Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+          }
 
       - name: Enable Windows desktop
         run: flutter config --enable-windows-desktop
@@ -220,22 +217,49 @@ jobs:
           }
           "release-dir=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - name: Harvest Flutter output with heat.exe
+        working-directory: apps/LemonadeNexus/windows/packaging/MSI
+        run: |
+          $buildDir = "${{ steps.locate.outputs.release-dir }}"
+          # heat.exe walks the Release dir and emits a WiX fragment containing
+          # one Component per file plus the directory tree under INSTALLFOLDER.
+          #   -gg  generate component GUIDs at compile time
+          #   -sfrag  emit a single fragment instead of one per file
+          #   -srd  do not emit the root directory (we own INSTALLFOLDER)
+          #   -scom -sreg  no COM/registry harvesting
+          #   -ke  keep empty directories
+          #   -dr  reference INSTALLFOLDER from Product.wxs
+          #   -cg  ComponentGroup id consumed by Product.wxs
+          #   -var var.BuildDir  parameterise File@Source via -dBuildDir
+          & heat.exe dir "$buildDir" `
+            -gg -sfrag -srd -scom -sreg -ke `
+            -dr INSTALLFOLDER `
+            -cg ApplicationFiles `
+            -var var.BuildDir `
+            -out HarvestedFiles.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Harvested files:"
+          Get-Content HarvestedFiles.wxs | Select-Object -First 60
+
       - name: Build MSI installer
         working-directory: apps/LemonadeNexus/windows/packaging/MSI
         run: |
           $buildDir = "${{ steps.locate.outputs.release-dir }}"
           New-Item -ItemType Directory -Path obj -Force | Out-Null
-          # NOTE: Only Product.wxs is compiled. Installer.wxs is excluded
-          # because both files define <Product> and cannot be linked together.
-          & candle.exe -arch x64 -dBuildDir="$buildDir" -out obj\ Product.wxs BuildFiles.wxs
-          & light.exe -ext WixUIExtension -cultures:en-us -out lemonade_nexus_setup.msi -sval obj\Product.wixobj obj\BuildFiles.wixobj
+          & candle.exe -arch x64 -dBuildDir="$buildDir" -out "obj\" Product.wxs HarvestedFiles.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & light.exe -ext WixUIExtension -cultures:en-us `
+            -out lemonade_nexus_setup.msi `
+            -sval `
+            obj\Product.wixobj obj\HarvestedFiles.wixobj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
         with:
           name: lemonade-nexus-msi
           path: apps/LemonadeNexus/windows/packaging/MSI/lemonade_nexus_setup.msi
-          if-no-files-found: warn
+          if-no-files-found: error
 
   build-standalone:
     name: Build Standalone EXE
@@ -307,7 +331,7 @@ jobs:
     name: Build All Packages
     runs-on: windows-latest
     needs: [build-msix, build-msi, build-standalone]
-    if: always() && needs.build-msix.result == 'success' && needs.build-standalone.result == 'success'
+    if: always() && needs.build-msix.result == 'success' && needs.build-msi.result == 'success' && needs.build-standalone.result == 'success'
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -325,5 +349,5 @@ jobs:
           "| Package Type | Status |"                                       | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "|--------------|--------|"                                       | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "| MSIX         | ${{ needs.build-msix.result }} |"               | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
-          "| MSI          | ${{ needs.build-msi.result }} (non-blocking) |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| MSI          | ${{ needs.build-msi.result }} |"               | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
           "| Portable ZIP | ${{ needs.build-standalone.result }} |"         | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append

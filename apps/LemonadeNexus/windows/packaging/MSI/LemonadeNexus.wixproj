@@ -43,15 +43,14 @@
 
   <ItemGroup>
     <WixCompile Include="Product.wxs" />
-    <WixCompile Include="Installer.wxs" />
+    <!-- HarvestedFiles.wxs is generated at build time by heat.exe;
+         see .github/workflows/build-windows-packages.yml. -->
+    <WixCompile Include="HarvestedFiles.wxs" Condition="Exists('HarvestedFiles.wxs')" />
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\..\..\assets\app_icon.ico">
-      <Link>app_icon.ico</Link>
-    </None>
-    <None Include="..\..\..\LICENSE.rtf">
-      <Link>LICENSE.rtf</Link>
+    <None Include="..\..\..\assets\icons\tray_icon.ico">
+      <Link>tray_icon.ico</Link>
     </None>
   </ItemGroup>
 

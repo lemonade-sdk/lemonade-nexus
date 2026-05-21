@@ -75,3 +75,4 @@ apps/LemonadeNexus/keys/*.pem
 # WiX Toolset
 *.wixobj
 *.wixpdb
+apps/LemonadeNexus/windows/packaging/MSI/HarvestedFiles.wxs
