@@ -13,7 +13,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import 'windows_integration.dart';
-import 'system_tray.dart';
 
 /// Windows tunnel service configuration
 class WindowsTunnelConfig {

@@ -39,7 +39,6 @@ class AppTheme {
         tertiary: warningColor,
         error: errorColor,
         surface: lightSurface,
-        background: lightBackground,
       ),
       appBarTheme: const AppBarTheme(
         backgroundColor: lightSurface,
@@ -128,7 +127,6 @@ class AppTheme {
         tertiary: warningColor,
         error: errorColor,
         surface: darkSurface,
-        background: darkBackground,
       ),
       appBarTheme: const AppBarTheme(
         backgroundColor: darkSurface,

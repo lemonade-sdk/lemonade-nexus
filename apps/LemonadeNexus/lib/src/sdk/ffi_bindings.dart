@@ -42,8 +42,8 @@ typedef LnIdentityHandle = ffi.Pointer<ffi.Void>;
 /// FFI type mappings for C SDK functions.
 
 // Memory management
-typedef _LnFree = ffi.Int32 Function(ffi.Pointer<ffi.Char> ptr);
-typedef _LnFreeDart = int Function(ffi.Pointer<ffi.Char> ptr);
+typedef _LnFree = ffi.Void Function(ffi.Pointer<ffi.Char> ptr);
+typedef _LnFreeDart = void Function(ffi.Pointer<ffi.Char> ptr);
 
 // Client lifecycle
 typedef _LnCreate = LnClientHandle Function(

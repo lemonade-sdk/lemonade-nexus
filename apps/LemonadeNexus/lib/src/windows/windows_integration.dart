@@ -16,8 +16,6 @@ import 'system_tray.dart';
 import 'auto_start.dart';
 import 'windows_service.dart';
 import 'windows_paths.dart';
-import '../state/providers.dart';
-import '../state/app_state.dart';
 
 /// Windows integration settings
 class WindowsIntegrationSettings {

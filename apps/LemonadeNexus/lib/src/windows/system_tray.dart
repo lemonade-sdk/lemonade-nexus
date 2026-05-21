@@ -15,9 +15,25 @@ import '../state/providers.dart';
 import '../state/app_state.dart';
 
 /// System tray service for Windows
-class WindowsSystemTray extends TrayListener {
+class WindowsSystemTray with TrayListener {
   final Ref _ref;
   bool _isInitialized = false;
+
+  /// Bring the main app window to the foreground.
+  ///
+  /// NOTE: `tray_manager` does not expose a `showAppWindow` API. The proper
+  /// fix is to add the `window_manager` package and call `windowManager.show()`
+  /// / `windowManager.focus()`, but that requires a pubspec dependency change
+  /// which is out of scope for this fix. For now we stub this as a no-op that
+  /// logs, and flag it as a TODO so the platform integration can be wired up
+  /// later (e.g. via `win32` `SetForegroundWindow` once we have a stable HWND
+  /// or by adding `window_manager`).
+  Future<void> _bringWindowToFront() async {
+    // TODO(windows): integrate `window_manager` or a `win32`-based HWND lookup
+    // (`FindWindow` + `SetForegroundWindow`) to actually restore/raise the
+    // Flutter window from the tray. Stubbed as a no-op for now.
+    debugPrint('[SystemTray] _bringWindowToFront stub - window not raised');
+  }
 
   /// Connection status colors for tray icon tooltip
   static const Map<ConnectionStatus, String> statusColors = {
@@ -149,7 +165,7 @@ class WindowsSystemTray extends TrayListener {
   void onTrayIconMouseDown() async {
     debugPrint('[SystemTray] Icon clicked');
     // Left click - open/restore the main window
-    await trayManager.showAppWindow();
+    await _bringWindowToFront();
   }
 
   @override
@@ -179,13 +195,13 @@ class WindowsSystemTray extends TrayListener {
         break;
 
       case 'dashboard':
-        await trayManager.showAppWindow();
+        await _bringWindowToFront();
         // Navigate to dashboard
         notifier.setSelectedSidebarItem(SidebarItem.dashboard);
         break;
 
       case 'settings':
-        await trayManager.showAppWindow();
+        await _bringWindowToFront();
         // Navigate to settings
         notifier.setSelectedSidebarItem(SidebarItem.settings);
         break;
@@ -201,23 +217,13 @@ class WindowsSystemTray extends TrayListener {
     // Handle right mouse up if needed
   }
 
-  @override
-  void onTrayIconMouseMove() {
-    // Handle mouse hover if needed
-  }
-
-  @override
-  void onTrayIconSecondaryMouseUp() {
-    // Handle secondary mouse up if needed
-  }
-
   /// Handle exit action
   Future<void> _handleExit() async {
     debugPrint('[SystemTray] Exiting application');
 
     // Disconnect tunnel before exit
     final notifier = _ref.read(appNotifierProvider.notifier);
-    if (await _ref.read(appNotifierProvider).isTunnelUp) {
+    if (_ref.read(appNotifierProvider).isTunnelUp) {
       await notifier.disconnectTunnel();
     }
 
