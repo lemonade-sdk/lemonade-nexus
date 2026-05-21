@@ -183,6 +183,5 @@
 
     <!-- Properties -->
     <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
-    <Property Id="ARPHELPLINK" Value="https://github.com/antmi/lemonade-nexus/issues" />
   </Product>
 </Wix>
