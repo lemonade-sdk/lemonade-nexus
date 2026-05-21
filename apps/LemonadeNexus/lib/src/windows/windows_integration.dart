@@ -11,7 +11,7 @@
 
 import 'dart:io';
 import 'package:flutter/foundation.dart';
-import 'package:riverpod/riverpod.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'system_tray.dart';
 import 'auto_start.dart';
 import 'windows_service.dart';

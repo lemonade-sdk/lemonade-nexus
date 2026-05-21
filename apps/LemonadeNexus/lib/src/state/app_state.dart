@@ -4,8 +4,8 @@
 /// Tracks authentication, tunnel status, UI navigation state,
 /// and all data fetched from the C SDK.
 
-import 'package:flutter/foundation.dart';
-import 'package:riverpod/riverpod.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
 

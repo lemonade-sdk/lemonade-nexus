@@ -10,7 +10,7 @@
 /// - Settings provider (app preferences)
 /// - Theme provider (light/dark mode)
 
-import 'package:riverpod/riverpod.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
 import 'app_state.dart';

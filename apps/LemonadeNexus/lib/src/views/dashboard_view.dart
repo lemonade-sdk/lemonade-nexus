@@ -10,6 +10,7 @@
 /// - Trust card
 /// - Recent activity section
 
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';

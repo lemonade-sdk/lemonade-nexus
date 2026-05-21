@@ -924,8 +924,11 @@ std::vector<uint8_t> AcmeService::create_csr(const std::string& domain,
 
     X509_REQ_set_version(req, 0); // v1
 
-    // Set subject CN
-    X509_NAME* subj = X509_REQ_get_subject_name(req);
+    // Set subject CN. Some OpenSSL builds (notably the Win64 build shipped by
+    // Chocolatey on the CI runner) declare X509_REQ_get_subject_name() as
+    // returning const X509_NAME*. const_cast is a no-op on builds that already
+    // return non-const.
+    X509_NAME* subj = const_cast<X509_NAME*>(X509_REQ_get_subject_name(req));
     X509_NAME_add_entry_by_txt(subj, "CN", MBSTRING_ASC,
                                 reinterpret_cast<const unsigned char*>(domain.c_str()),
                                 -1, -1, 0);
