@@ -154,7 +154,6 @@ class _LoginViewState extends ConsumerState<LoginView> with SingleTickerProvider
   @override
   Widget build(BuildContext context) {
     final appState = ref.watch(appNotifierProvider);
-    final settings = ref.watch(settingsProvider);
 
     return Scaffold(
       body: Container(
@@ -341,6 +340,7 @@ class _LoginViewState extends ConsumerState<LoginView> with SingleTickerProvider
   }
 
   Widget _buildServerConnectionSection(AppState appState) {
+    final settings = appState.settings;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -354,7 +354,7 @@ class _LoginViewState extends ConsumerState<LoginView> with SingleTickerProvider
             const SizedBox(width: 6),
             Text(
               'Server',
-              style: Theme.of(context).textTheme.caption?.copyWith(
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
                     color: Colors.white.withOpacity(0.6),
                   ),
             ),
@@ -378,7 +378,7 @@ class _LoginViewState extends ConsumerState<LoginView> with SingleTickerProvider
                   const SizedBox(width: 4),
                   Text(
                     appState.isConnected ? 'Connected' : 'Connect',
-                    style: Theme.of(context).textTheme.caption?.copyWith(
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
                           color: appState.isConnected
                               ? const Color(0xFFE9C46A)
                               : Colors.white.withOpacity(0.6),
@@ -420,7 +420,7 @@ class _LoginViewState extends ConsumerState<LoginView> with SingleTickerProvider
                       ),
                       Text(
                         'Ready to authenticate',
-                        style: Theme.of(context).textTheme.caption?.copyWith(
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
                               color: Colors.white.withOpacity(0.6),
                             ),
                       ),

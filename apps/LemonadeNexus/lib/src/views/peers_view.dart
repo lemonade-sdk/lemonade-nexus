@@ -208,7 +208,7 @@ class _PeersViewState extends ConsumerState<PeersView> {
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
-            if (peer.latencyMs != null && peer.latencyMs! >= 0) Text('${peer.latencyMs}ms', style: TextStyle(color: _getLatencyColor(peer.latencyMs!), fontSize: 11, fontFamily: 'monospace')),
+            if (peer.latencyMs != null && peer.latencyMs! >= 0) Text('${peer.latencyMs!.round()}ms', style: TextStyle(color: _getLatencyColor(peer.latencyMs!), fontSize: 11, fontFamily: 'monospace')),
             const SizedBox(width: 8),
             Column(
               mainAxisAlignment: MainAxisAlignment.center,
@@ -250,11 +250,11 @@ class _PeersViewState extends ConsumerState<PeersView> {
           _buildDetailRow('Node ID', peer.nodeId, showCopy: true),
           _buildDetailRow('Tunnel IP', peer.tunnelIp ?? 'Not assigned'),
           _buildDetailRow('Private Subnet', peer.privateSubnet ?? 'Not assigned'),
-          _buildDetailRow('WG Public Key', (peer.wgPubkey ?? '').isNotEmpty ? '${peer.wgPubkey!.substring(0, peer.wgPubkey!.length.clamp(0, 20))}...' : 'Not available', showCopy: true),
+          _buildDetailRow('WG Public Key', peer.wgPubkey.isNotEmpty ? '${peer.wgPubkey.substring(0, peer.wgPubkey.length.clamp(0, 20))}...' : 'Not available', showCopy: true),
           _buildDetailRow('Endpoint', peer.endpoint?.isNotEmpty == true ? peer.endpoint! : 'Unknown'),
           if (peer.relayEndpoint?.isNotEmpty == true) _buildDetailRow('Relay Endpoint', peer.relayEndpoint!),
-          _buildDetailRow('Latency', peer.latencyMs != null && peer.latencyMs! >= 0 ? '${peer.latencyMs} ms' : 'Unknown'),
-          _buildDetailRow('Last Handshake', peer.lastHandshake != null && peer.lastHandshake! > 0 ? _formatRelativeTime(DateTime.fromMillisecondsSinceEpoch(peer.lastHandshake! * 1000)) : 'Never'),
+          _buildDetailRow('Latency', peer.latencyMs != null && peer.latencyMs! >= 0 ? '${peer.latencyMs!.round()} ms' : 'Unknown'),
+          _buildDetailRow('Last Handshake', (peer.lastHandshake ?? '').isNotEmpty ? peer.lastHandshake! : 'Never'),
           _buildDetailRow('Received', _formatBytes(peer.rxBytes ?? 0)),
           _buildDetailRow('Sent', _formatBytes(peer.txBytes ?? 0)),
           _buildDetailRow('Keepalive', '${peer.keepalive}s'),
@@ -331,7 +331,7 @@ class _PeersViewState extends ConsumerState<PeersView> {
     );
   }
 
-  Color _getLatencyColor(int ms) {
+  Color _getLatencyColor(double ms) {
     if (ms < 50) return Colors.green;
     if (ms < 150) return Colors.orange;
     return Colors.red;

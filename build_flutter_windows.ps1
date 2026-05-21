@@ -1,20 +1,32 @@
 $ErrorActionPreference = "Stop"
 
-# Set Flutter path
-$flutterPath = "C:\Users\antmi\AppData\Local\Flutter\flutter"
-$env:Path = "$env:Path;$flutterPath\bin"
-$env:FLUTTER_ROOT = $flutterPath
+# Resolve the directory this script lives in so the build works from any cwd
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$appDir = Join-Path $scriptDir "apps\LemonadeNexus"
 
-# Navigate to Flutter project
-Set-Location "C:\Users\antmi\lemonade-nexus\apps\LemonadeNexus"
+if (-not (Test-Path $appDir)) {
+    Write-Host "Flutter app directory not found at $appDir"
+    exit 1
+}
 
-# Run Flutter build
-Write-Host "Building Flutter Windows application..."
-flutter build windows --release
+Push-Location $appDir
+try {
+    Write-Host "Fetching Flutter dependencies..."
+    flutter pub get
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "flutter pub get failed with exit code $LASTEXITCODE"
+        exit $LASTEXITCODE
+    }
 
-if ($LASTEXITCODE -eq 0) {
+    Write-Host "Building Flutter Windows application..."
+    flutter build windows --release
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "flutter build windows failed with exit code $LASTEXITCODE"
+        exit $LASTEXITCODE
+    }
+
     Write-Host "Build successful!"
-} else {
-    Write-Host "Build failed with exit code $LASTEXITCODE"
-    exit $LASTEXITCODE
+}
+finally {
+    Pop-Location
 }

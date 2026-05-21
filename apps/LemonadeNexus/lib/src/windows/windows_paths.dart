@@ -6,12 +6,18 @@
 /// - ProgramData for shared data
 /// - Proper path handling with path_provider
 /// - Windows-specific directory conventions
+///
+/// Uses `SHGetKnownFolderPath` from `package:win32` to resolve canonical
+/// paths, falling back to environment variables / path_provider when the
+/// shell call fails or we're running off-Windows.
 
+import 'dart:ffi';
 import 'dart:io';
+
+import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as path;
 import 'package:path_provider/path_provider.dart';
 import 'package:win32/win32.dart';
-import 'package:ffi/ffi.dart';
 
 /// Windows-specific paths
 class WindowsPaths {
@@ -23,7 +29,14 @@ class WindowsPaths {
   /// Get the user's AppData Local directory for this app
   /// Use for: cache, temporary data, user-specific settings
   Future<Directory> getLocalAppDataDir() async {
-    // Use path_provider for standard locations
+    final shellPath = _knownFolderPath(FOLDERID_LocalAppData);
+    if (shellPath != null) {
+      final dir = Directory(path.join(shellPath, appName));
+      await dir.create(recursive: true);
+      return dir;
+    }
+
+    // Fallback to path_provider's application support directory
     final dir = await getApplicationSupportDirectory();
     final appDir = Directory(path.join(dir.path, appName));
     await appDir.create(recursive: true);
@@ -33,7 +46,14 @@ class WindowsPaths {
   /// Get the user's AppData Roaming directory for this app
   /// Use for: settings that should roam with user profile
   Future<Directory> getRoamingAppDataDir() async {
-    // On Windows, APPDATA is the roaming directory
+    final shellPath = _knownFolderPath(FOLDERID_RoamingAppData);
+    if (shellPath != null) {
+      final dir = Directory(path.join(shellPath, appName));
+      await dir.create(recursive: true);
+      return dir;
+    }
+
+    // APPDATA points at the roaming directory on Windows
     final appData = Platform.environment['APPDATA'];
     if (appData != null) {
       final dir = Directory(path.join(appData, appName));
@@ -41,14 +61,20 @@ class WindowsPaths {
       return dir;
     }
 
-    // Fallback to application support
+    // Last resort: local app data
     return getLocalAppDataDir();
   }
 
   /// Get the ProgramData directory for shared data
   /// Use for: shared configuration, logs, data accessible to all users
   Future<Directory> getProgramDataDir() async {
-    // PROGRAMDATA environment variable points to C:\ProgramData
+    final shellPath = _knownFolderPath(FOLDERID_ProgramData);
+    if (shellPath != null) {
+      final dir = Directory(path.join(shellPath, appName));
+      await dir.create(recursive: true);
+      return dir;
+    }
+
     final programData = Platform.environment['PROGRAMDATA'];
     if (programData != null) {
       final dir = Directory(path.join(programData, appName));
@@ -56,8 +82,7 @@ class WindowsPaths {
       return dir;
     }
 
-    // Fallback - this shouldn't happen on Windows
-    throw Exception('PROGRAMDATA environment variable not found');
+    throw Exception('Unable to resolve ProgramData directory');
   }
 
   /// Get the cache directory
@@ -70,6 +95,13 @@ class WindowsPaths {
 
   /// Get the documents directory for user exports
   Future<Directory> getDocumentsDir() async {
+    final shellPath = _knownFolderPath(FOLDERID_Documents);
+    if (shellPath != null) {
+      final dir = Directory(path.join(shellPath, appName));
+      await dir.create(recursive: true);
+      return dir;
+    }
+
     final dir = await getApplicationDocumentsDirectory();
     final docsDir = Directory(path.join(dir.path, appName));
     await docsDir.create(recursive: true);
@@ -181,25 +213,11 @@ class WindowsPaths {
   }
 
   /// Get the Windows version string
+  ///
+  /// We don't use `RtlGetVersion` here because Dart can't safely synthesize
+  /// the `OSVERSIONINFOEXW` struct without a generator. `Platform.operatingSystemVersion`
+  /// reflects the same kernel data Windows reports to the process.
   static Future<String> getWindowsVersion() async {
-    // Use RtlGetVersion for accurate Windows version
-    final osVersionInfo = _OSVERSIONINFOEXW();
-    osVersionInfo.dwOSVersionInfoSize = sizeOf<_OSVERSIONINFOEXW>();
-
-    final ntdll = GetModuleHandle('ntdll.dll');
-    if (ntdll != 0) {
-      final rtlGetVersion = GetProcAddress(ntdll, 'RtlGetVersion');
-      if (rtlGetVersion != 0) {
-        final getVersion = rtlGetVersion
-            .asFunction<int Function(Pointer<_OSVERSIONINFOEXW>)>();
-        getVersion(osVersionInfo);
-
-        return 'Windows ${osVersionInfo.dwMajorVersion}.${osVersionInfo.dwMinorVersion} '
-            '(Build ${osVersionInfo.dwBuildNumber})';
-      }
-    }
-
-    // Fallback to environment
     return Platform.operatingSystemVersion;
   }
 
@@ -214,41 +232,31 @@ class WindowsPaths {
   }
 }
 
-/// OSVERSIONINFOEXW structure for Windows version detection
-class _OSVERSIONINFOEXW extends Struct {
-  @Uint32()
-  external int dwOSVersionInfoSize;
-
-  @Uint32()
-  external int dwMajorVersion;
-
-  @Uint32()
-  external int dwMinorVersion;
-
-  @Uint32()
-  external int dwBuildNumber;
-
-  @Uint32()
-  external int dwPlatformId;
-
-  @Array(128)
-  external Array<Uint16> szCSDVersion;
-
-  @Uint16()
-  external int wServicePackMajor;
-
-  @Uint16()
-  external int wServicePackMinor;
-
-  @Uint16()
-  external int wSuiteMask;
-
-  @Uint8()
-  external int wProductType;
-
-  @Uint8()
-  external int wReserved;
-}
-
 /// Provider-style accessor for Windows paths
 final windowsPathsProvider = WindowsPaths();
+
+/// Resolves a Windows known folder using `SHGetKnownFolderPath`.
+///
+/// Returns the directory path on success, or `null` on failure (including
+/// when this code is exercised outside of Windows by unit tests).
+String? _knownFolderPath(String folderIdGuid) {
+  if (!Platform.isWindows) return null;
+
+  final pGuid = GUIDFromString(folderIdGuid);
+  final ppPath = calloc<Pointer<Utf16>>();
+  try {
+    final hr = SHGetKnownFolderPath(pGuid, 0, 0, ppPath);
+    if (hr != S_OK) {
+      return null;
+    }
+    final result = ppPath.value.toDartString();
+    // The shell allocates the returned string via CoTaskMemAlloc.
+    CoTaskMemFree(ppPath.value);
+    return result;
+  } catch (_) {
+    return null;
+  } finally {
+    calloc.free(pGuid);
+    calloc.free(ppPath);
+  }
+}

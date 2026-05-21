@@ -14,7 +14,6 @@ import 'dart:io';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../windows/windows_integration.dart';
-import '../windows/auto_start.dart';
 
 class SettingsView extends ConsumerStatefulWidget {
   const SettingsView({super.key});
@@ -219,14 +218,14 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                 _buildPreferenceToggle(
                   'DNS Auto-discovery',
                   'Resolve lemonade-nexus.io to find the nearest server',
-                  appState.autoDiscoveryEnabled,
+                  appState.settings.autoDiscoveryEnabled,
                   (value) => notifier.setAutoDiscoveryEnabled(value),
                 ),
                 const Divider(color: Color(0xFF2D3748), height: 16),
                 _buildPreferenceToggle(
                   'Auto-connect on launch',
                   'Automatically connect to the VPN on app startup',
-                  appState.autoConnectOnLaunch,
+                  appState.settings.autoConnectOnLaunch,
                   (value) => notifier.setAutoConnectOnLaunch(value),
                 ),
               ],
@@ -238,14 +237,14 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
           // Windows Integration Section (Windows only)
           if (Platform.isWindows) ...[
             _buildSection(
-              icon: Icons.windows,
+              icon: Icons.desktop_windows,
               title: 'Windows Integration',
               child: Column(
                 children: [
                   _buildWindowsPreferenceToggle(
                     'Start on login',
                     'Automatically start the VPN when you log in to Windows',
-                    ref.watch(windowsIntegrationNotifierProvider).isAutoStartEnabled,
+                    ref.watch(windowsIntegrationNotifierProvider).enableAutoStart,
                     (value) async {
                       final result = await ref
                           .read(windowsIntegrationNotifierProvider.notifier)
@@ -369,7 +368,28 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
     );
   }
 
-  Widget _buildWindowsPreferenceToggle(String title, String description, bool value, Function(bool) onChanged) {
+  Widget _buildPreferenceToggle(String title, String description, bool value, ValueChanged<bool> onChanged) {
+    return Row(
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: const TextStyle(color: Colors.white, fontSize: 13)),
+              Text(description, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 11)),
+            ],
+          ),
+        ),
+        Switch(
+          value: value,
+          onChanged: onChanged,
+          activeColor: const Color(0xFFE9C46A),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildWindowsPreferenceToggle(String title, String description, bool value, ValueChanged<bool> onChanged) {
     return Row(
       children: [
         Expanded(
@@ -392,6 +412,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
 
   Widget _buildWindowsServiceSection(WidgetRef ref) {
     final notifier = ref.read(windowsIntegrationNotifierProvider.notifier);
+    final service = ref.read(windowsIntegrationProvider);
     final isInstalled = notifier.isServiceInstalled();
 
     return Container(
@@ -450,7 +471,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                       Expanded(
                         child: ElevatedButton(
                           onPressed: () async {
-                            final result = await notifier.startService();
+                            final result = await service.startService();
                             if (!mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(
@@ -474,7 +495,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                       Expanded(
                         child: ElevatedButton(
                           onPressed: () async {
-                            final result = await notifier.stopService();
+                            final result = await service.stopService();
                             if (!mounted) return;
                             ScaffoldMessenger.of(context).showSnackBar(
                               SnackBar(

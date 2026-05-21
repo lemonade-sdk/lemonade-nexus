@@ -5,6 +5,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../state/app_state.dart';
 import '../state/providers.dart';
 import '../views/dashboard_view.dart';
 import '../views/tunnel_control_view.dart';
@@ -73,7 +74,7 @@ class _MainNavigationState extends ConsumerState<MainNavigation> {
     );
   }
 
-  Widget _buildSidebar(appState) {
+  Widget _buildSidebar(AppState appState) {
     return Column(
       children: [
         // Logo area
@@ -143,7 +144,7 @@ class _MainNavigationState extends ConsumerState<MainNavigation> {
     );
   }
 
-  Widget _buildSidebarItem(SidebarItem item, appState) {
+  Widget _buildSidebarItem(SidebarItem item, AppState appState) {
     final isSelected = appState.selectedSidebarItem == item;
 
     return ListTile(

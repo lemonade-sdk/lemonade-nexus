@@ -1,5 +1,6 @@
 name: Release Windows Packages
 
+# Trigger: tag push (v*) or manual dispatch. Do not change CI cadence here.
 on:
   push:
     tags:
@@ -12,49 +13,34 @@ on:
         type: string
 
 env:
-  FLUTTER_VERSION: '3.41.0'
-  BUILD_TYPE: release
+  # Pin to a known-good stable Flutter (ships Dart >=3.0 required by pubspec).
+  # Do not pin to a non-existent version (e.g. 3.41) - keep this on the stable track.
+  FLUTTER_VERSION: '3.32.0'
 
 jobs:
-  # Get version from tag or input
   get-version:
     name: Get Version
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      version-clean: ${{ steps.version.outputs.version-clean }}
-
     steps:
-      - name: Get version from tag
-        if: startsWith(github.ref, 'refs/tags/')
-        id: version-tag
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "version-clean=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Get version from input
-        if: github.event_name == 'workflow_dispatch'
-        id: version-input
-        run: |
-          echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          echo "version-clean=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-
-      - name: Set version output
+      - name: Resolve version from tag or input
         id: version
         run: |
-          if [ "${{ steps.version-tag.outputs.version }}" != "" ]; then
-            echo "version=${{ steps.version-tag.outputs.version }}" >> "$GITHUB_OUTPUT"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
           else
-            echo "version=${{ steps.version-input.outputs.version }}" >> "$GITHUB_OUTPUT"
+            VERSION="${{ inputs.version }}"
           fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-  # Build all package types
   build-windows-packages:
     name: Build Windows Packages
     runs-on: windows-latest
     needs: get-version
-
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -66,55 +52,106 @@ jobs:
           channel: 'stable'
           cache: true
 
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Scaffold Windows target (if missing)
+        working-directory: apps/LemonadeNexus
+        run: |
+          if (-not (Test-Path "windows/runner/CMakeLists.txt")) {
+            flutter create --platforms=windows . --project-name lemonade_nexus
+          }
+
       - name: Get Flutter dependencies
         working-directory: apps/LemonadeNexus
         run: flutter pub get
 
-      - name: Build Flutter Windows app
+      - name: Build Flutter Windows app (Release)
         working-directory: apps/LemonadeNexus
         run: flutter build windows --release --dart-define=VERSION=${{ needs.get-version.outputs.version }}
+
+      - name: Locate Release output directory
+        id: locate
+        working-directory: apps/LemonadeNexus
+        run: |
+          $candidates = @(
+            "build/windows/x64/runner/Release",
+            "build/windows/runner/Release"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = (Resolve-Path $c).Path; break }
+          }
+          if (-not $found) {
+            Write-Error "Could not locate Flutter Windows Release output"
+            exit 1
+          }
+          "release-dir=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create MSIX package
         working-directory: apps/LemonadeNexus
         run: dart run msix:create
 
+      - name: Locate MSIX output
+        id: locate-msix
+        working-directory: apps/LemonadeNexus
+        run: |
+          $candidates = @(
+            "build/windows/msix",
+            "build/windows/x64/runner/Release",
+            "build/windows/runner/Release"
+          )
+          $msix = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) {
+              $found = Get-ChildItem -Path $c -Filter "*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $msix = $found.FullName; break }
+            }
+          }
+          if (-not $msix) {
+            Write-Error "No .msix produced"
+            exit 1
+          }
+          "msix-path=$msix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      # MSI build is non-blocking - see build-windows-packages.yml for details
+      # on the WiX issues that prevent the current .wxs files from linking.
       - name: Install WiX Toolset
         run: choco install wixtoolset -y
+        continue-on-error: true
 
       - name: Build MSI installer
+        id: build-msi
+        continue-on-error: true
         working-directory: apps/LemonadeNexus/windows/packaging/MSI
         run: |
-          $buildDir = "$(Get-Location)\..\..\..\build\windows\runner\Release"
+          $buildDir = "${{ steps.locate.outputs.release-dir }}"
           New-Item -ItemType Directory -Path obj -Force | Out-Null
-          candle -arch x64 -dBuildDir="$buildDir" -out obj\ Product.wxs Installer.wxs
-          light -cultures:en-us -out lemonade_nexus_setup.msi -sval obj\Product.wixobj obj\Installer.wixobj
+          & candle.exe -arch x64 -dBuildDir="$buildDir" -out obj\ Product.wxs BuildFiles.wxs
+          & light.exe -ext WixUIExtension -cultures:en-us -out lemonade_nexus_setup.msi -sval obj\Product.wixobj obj\BuildFiles.wixobj
 
       - name: Create portable package
         working-directory: apps/LemonadeNexus
-        shell: pwsh
         run: |
-          $buildDir = "build\windows\runner\Release"
-          $outputDir = "build\windows\packages\exe"
+          $buildDir = "${{ steps.locate.outputs.release-dir }}"
+          $outputDir = "build/windows/packages/exe"
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-
-          Copy-Item "$buildDir\lemonade_nexus.exe" "$outputDir\" -Force
-          Copy-Item "$buildDir\flutter_windows.dll" "$outputDir\" -Force
-          Copy-Item "$buildDir\icudtl.dat" "$outputDir\" -Force
-          Copy-Item -Recurse "$buildDir\data" "$outputDir\" -Force
-
+          New-Item -ItemType Directory -Path "build/windows/packages" -Force | Out-Null
+          Copy-Item -Recurse -Force "$buildDir\*" $outputDir
           Compress-Archive -Path "$outputDir\*" -DestinationPath "build\windows\packages\lemonade_nexus_portable.zip" -Force
 
       - name: Rename packages with version
         working-directory: apps/LemonadeNexus
-        shell: pwsh
         run: |
           $version = "${{ needs.get-version.outputs.version }}"
-          $msixPath = "build\windows\runner\Release\lemonade_nexus.msix"
-          $msiPath = "build\windows\packaging\MSI\lemonade_nexus_setup.msi"
-          $zipPath = "build\windows\packages\lemonade_nexus_portable.zip"
+          $msixPath = "${{ steps.locate-msix.outputs.msix-path }}"
+          $msiPath  = "windows\packaging\MSI\lemonade_nexus_setup.msi"
+          $zipPath  = "build\windows\packages\lemonade_nexus_portable.zip"
 
           if (Test-Path $msixPath) {
-            Rename-Item -Path $msixPath -NewName "lemonade_nexus-${version}.msix"
+            $newName = "lemonade_nexus-${version}.msix"
+            Rename-Item -Path $msixPath -NewName $newName
+            "msix-final=$(Split-Path $msixPath -Parent)\$newName" | Out-File -FilePath $env:GITHUB_ENV -Append
           }
           if (Test-Path $msiPath) {
             Rename-Item -Path $msiPath -NewName "lemonade_nexus_setup-${version}.msi"
@@ -127,27 +164,38 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: lemonade-nexus-msix
-          path: apps/LemonadeNexus/build/windows/runner/Release/lemonade_nexus-*.msix
+          path: |
+            apps/LemonadeNexus/build/windows/msix/lemonade_nexus-*.msix
+            apps/LemonadeNexus/build/windows/x64/runner/Release/lemonade_nexus-*.msix
+            apps/LemonadeNexus/build/windows/runner/Release/lemonade_nexus-*.msix
+          if-no-files-found: error
 
       - name: Upload MSI artifact
         uses: actions/upload-artifact@v4
+        if: steps.build-msi.outcome == 'success'
         with:
           name: lemonade-nexus-msi
           path: apps/LemonadeNexus/windows/packaging/MSI/lemonade_nexus_setup-*.msi
+          if-no-files-found: warn
 
       - name: Upload portable artifact
         uses: actions/upload-artifact@v4
         with:
           name: lemonade-nexus-portable
           path: apps/LemonadeNexus/build/windows/packages/lemonade_nexus_portable-*.zip
+          if-no-files-found: error
 
-  # Code signing (optional - requires signing certificate)
+  # Code signing - requires the CERT_PFX_BASE64 and CERT_PASSWORD secrets.
+  # FLAG: no signing certificate is provisioned today; this job is skipped
+  # unless the repo secrets are populated.
   sign-packages:
     name: Sign Packages
     runs-on: windows-latest
     needs: [get-version, build-windows-packages]
-    if: ${{ secrets.CERT_PASSWORD != '' }}
-
+    if: ${{ vars.HAS_SIGNING_CERT == 'true' }}
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - name: Download MSIX artifact
         uses: actions/download-artifact@v4
@@ -156,6 +204,7 @@ jobs:
 
       - name: Download MSI artifact
         uses: actions/download-artifact@v4
+        continue-on-error: true
         with:
           name: lemonade-nexus-msi
 
@@ -165,7 +214,6 @@ jobs:
           name: lemonade-nexus-portable
 
       - name: Import code signing certificate
-        shell: pwsh
         env:
           CERT_PFX: ${{ secrets.CERT_PFX_BASE64 }}
           CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
@@ -173,63 +221,50 @@ jobs:
           $pfxPath = "code_signing.pfx"
           $certBytes = [Convert]::FromBase64String($env:CERT_PFX)
           [IO.File]::WriteAllBytes($pfxPath, $certBytes)
-
-          # Import certificate
-          Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:CERT_PASSWORD -Force -AsPlainText)
+          Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My `
+            -Password (ConvertTo-SecureString -String $env:CERT_PASSWORD -Force -AsPlainText)
 
       - name: Sign MSIX package
-        shell: pwsh
         env:
           CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
-          $msixFile = Get-ChildItem -Path . -Filter "lemonade_nexus-*.msix" | Select-Object -First 1
-          if ($msixFile) {
-            & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe" sign `
-              /f code_signing.pfx `
-              /p $env:CERT_PASSWORD `
-              /t http://timestamp.digicert.com `
-              /fd sha256 `
-              $msixFile.FullName
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
+                       Where-Object { $_.FullName -like "*x64*" } |
+                       Select-Object -First 1).FullName
+          $msixFile = Get-ChildItem -Path . -Filter "lemonade_nexus-*.msix" -Recurse | Select-Object -First 1
+          if ($msixFile -and $signtool) {
+            & $signtool sign /f code_signing.pfx /p $env:CERT_PASSWORD /t http://timestamp.digicert.com /fd sha256 $msixFile.FullName
           }
 
       - name: Sign MSI installer
-        shell: pwsh
+        if: hashFiles('lemonade_nexus_setup-*.msi') != ''
         env:
           CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
-          $msiFile = Get-ChildItem -Path . -Filter "lemonade_nexus_setup-*.msi" | Select-Object -First 1
-          if ($msiFile) {
-            & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe" sign `
-              /f code_signing.pfx `
-              /p $env:CERT_PASSWORD `
-              /t http://timestamp.digicert.com `
-              /fd sha256 `
-              $msiFile.FullName
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
+                       Where-Object { $_.FullName -like "*x64*" } |
+                       Select-Object -First 1).FullName
+          $msiFile = Get-ChildItem -Path . -Filter "lemonade_nexus_setup-*.msi" -Recurse | Select-Object -First 1
+          if ($msiFile -and $signtool) {
+            & $signtool sign /f code_signing.pfx /p $env:CERT_PASSWORD /t http://timestamp.digicert.com /fd sha256 $msiFile.FullName
           }
 
       - name: Sign portable executable
-        shell: pwsh
         env:
           CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
         run: |
-          $zipFile = Get-ChildItem -Path . -Filter "lemonade_nexus_portable-*.zip" | Select-Object -First 1
-          if ($zipFile) {
-            # Extract, sign exe, re-zip
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" |
+                       Where-Object { $_.FullName -like "*x64*" } |
+                       Select-Object -First 1).FullName
+          $zipFile = Get-ChildItem -Path . -Filter "lemonade_nexus_portable-*.zip" -Recurse | Select-Object -First 1
+          if ($zipFile -and $signtool) {
             $extractPath = "portable_extract"
             New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
             Expand-Archive -Path $zipFile.FullName -DestinationPath $extractPath
-
             $exeFile = Get-ChildItem -Path $extractPath -Filter "*.exe" | Select-Object -First 1
             if ($exeFile) {
-              & "C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe" sign `
-                /f code_signing.pfx `
-                /p $env:CERT_PASSWORD `
-                /t http://timestamp.digicert.com `
-                /fd sha256 `
-                $exeFile.FullName
+              & $signtool sign /f code_signing.pfx /p $env:CERT_PASSWORD /t http://timestamp.digicert.com /fd sha256 $exeFile.FullName
             }
-
-            # Re-create ZIP
             Remove-Item $zipFile.FullName
             Compress-Archive -Path "$extractPath\*" -DestinationPath $zipFile.FullName -Force
             Remove-Item $extractPath -Recurse -Force
@@ -243,6 +278,7 @@ jobs:
 
       - name: Upload signed MSI
         uses: actions/upload-artifact@v4
+        if: hashFiles('lemonade_nexus_setup-*.msi') != ''
         with:
           name: lemonade-nexus-msi-signed
           path: lemonade_nexus_setup-*.msi
@@ -253,14 +289,12 @@ jobs:
           name: lemonade-nexus-portable-signed
           path: lemonade_nexus_portable-*.zip
 
-  # Create GitHub release
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [get-version, build-windows-packages]
     permissions:
       contents: write
-
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -281,6 +315,7 @@ jobs:
             lemonade_nexus-*.msix
             lemonade_nexus_setup-*.msi
             lemonade_nexus_portable-*.zip
+          fail_on_unmatched_files: false
           body: |
             ## Lemonade Nexus VPN v${{ needs.get-version.outputs.version }}
 
@@ -289,99 +324,29 @@ jobs:
             | Package Type | File | Description |
             |--------------|------|-------------|
             | MSIX | `lemonade_nexus-*.msix` | Modern Windows package (recommended for Windows 10/11) |
-            | MSI | `lemonade_nexus_setup-*.msi` | Traditional installer (enterprise deployment) |
+            | MSI | `lemonade_nexus_setup-*.msi` | Traditional installer (when available) |
             | Portable | `lemonade_nexus_portable-*.zip` | Standalone executable (no installation required) |
 
             ### Installation
 
-            #### MSIX (Recommended for most users)
+            #### MSIX (Recommended)
             ```powershell
-            # Double-click to install, or use PowerShell
             Add-AppxPackage lemonade_nexus-*.msix
-            ```
-
-            #### MSI (Enterprise deployment)
-            ```powershell
-            # Silent install
-            msiexec /i lemonade_nexus_setup-*.msi /quiet
-
-            # Deploy via SCCM/Intune
-            # Use the .msi file with your MDM solution
             ```
 
             #### Portable
             ```powershell
-            # Extract and run
             Expand-Archive lemonade_nexus_portable-*.zip
             cd lemonade_nexus_portable
             .\lemonade_nexus.exe
             ```
 
-            ### Verification
-
-            All packages are code-signed by Lemonade Nexus.
-            Verify the signature:
-            ```powershell
-            Get-AuthenticodeSignature lemonade_nexus-*.msix
-            ```
-
-            ### Support
-
-            - Issues: https://github.com/antmi/lemonade-nexus/issues
-            - Documentation: https://github.com/antmi/lemonade-nexus/tree/main/docs
-
-  # Publish to Winget (optional)
   publish-winget:
     name: Publish to Winget
     runs-on: ubuntu-latest
     needs: [get-version, create-release]
-    if: ${{ !contains(github.ref, '-pre') }}
-
+    if: ${{ vars.PUBLISH_WINGET == 'true' && !contains(github.ref, '-pre') }}
     steps:
-      - name: Download MSIX artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: lemonade-nexus-msix
-
-      - name: Get MSIX filename
-        id: msix-file
-        run: |
-          MSIX_FILE=$(ls lemonade_nexus-*.msix | head -1)
-          echo "filename=$MSIX_FILE" >> "$GITHUB_OUTPUT"
-
-      - name: Create Winget manifest
-        run: |
-          VERSION="${{ needs.get-version.outputs.version }}"
-          cat > LemonadeNexus.LemonadeNexusVPN.yaml << EOF
-          # Created by GitHub Actions
-          Id: LemonadeNexus.LemonadeNexusVPN
-          Publisher: Lemonade Nexus
-          Name: Lemonade Nexus VPN
-          Version: $VERSION
-          License: Proprietary
-          LicenseUrl: https://github.com/antmi/lemonade-nexus/blob/main/LICENSE
-          PublisherUrl: https://github.com/antmi/lemonade-nexus
-          PublisherSupportUrl: https://github.com/antmi/lemonade-nexus/issues
-          ReleaseNotesUrl: https://github.com/antmi/lemonade-nexus/releases/tag/v$VERSION
-          ShortDescription: Secure WireGuard Mesh VPN Client
-          Description: |
-            Lemonade Nexus VPN is a secure WireGuard mesh VPN client for Windows.
-            It provides encrypted peer-to-peer connectivity with automatic key rotation
-            and certificate-based authentication.
-          Tags:
-            - vpn
-            - wireguard
-            - mesh
-            - security
-            - networking
-          Installers:
-            - Architecture: x64
-              InstallerType: msix
-              InstallerUrl: https://github.com/antmi/lemonade-nexus/releases/download/v$VERSION/${{ steps.msix-file.outputs.filename }}
-              InstallerSha256: $(sha256sum ${{ steps.msix-file.outputs.filename }} | cut -d' ' -f1)
-              Scope: user
-          EOF
-
       - name: Submit to Winget
         uses: vedantmgoyal9/winget-releaser@main
         with:

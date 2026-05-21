@@ -4,6 +4,7 @@
 /// Tracks authentication, tunnel status, UI navigation state,
 /// and all data fetched from the C SDK.
 
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
@@ -463,7 +464,7 @@ class AppNotifier extends StateNotifier<AppState> {
       // First derive seed from credentials
       final seed = await _sdk.deriveSeed(username, password);
       // Create identity from seed
-      await _sdk.createIdentityFromSeed(seed.codeUnits);
+      await _sdk.createIdentityFromSeed(Uint8List.fromList(seed.codeUnits));
       // Set identity for client
       await _sdk.setIdentity();
 

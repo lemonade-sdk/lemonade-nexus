@@ -2,15 +2,21 @@
 /// @description Auto-start service for Windows VPN client.
 ///
 /// Provides:
-/// - Registry Run key approach (user-level, non-elevated)
-/// - Task Scheduler approach (elevated, system-level)
+/// - Registry Run key (user-level, non-elevated) via `package:win32_registry`
+/// - Task Scheduler (elevated) via the `schtasks` command-line tool
 /// - User preference toggle
 /// - Handle both elevated and non-elevated modes
 
+import 'dart:ffi';
 import 'dart:io';
+
 import 'package:ffi/ffi.dart';
-import 'package:win32/win32.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:win32/win32.dart';
+import 'package:win32_registry/win32_registry.dart';
+
+/// HKCU subkey controlling per-user auto-start applications.
+const _kRunSubKey = r'Software\Microsoft\Windows\CurrentVersion\Run';
 
 /// Auto-start methods available on Windows
 enum AutoStartMethod {
@@ -87,17 +93,14 @@ class WindowsAutoStart {
 
   /// Check if auto-start is currently enabled
   bool isEnabled() {
-    // Try registry first (most common)
     if (_isRegistryAutoStartEnabled()) {
       return true;
     }
 
-    // Try Task Scheduler
     if (_isTaskSchedulerAutoStartEnabled()) {
       return true;
     }
 
-    // Try startup folder
     if (_isStartupFolderEnabled()) {
       return true;
     }
@@ -121,20 +124,17 @@ class WindowsAutoStart {
 
   /// Enable auto-start using the best available method
   Future<AutoStartResult> enable({AutoStartMethod? method}) async {
-    // If a specific method is requested, use it
     if (method != null) {
       return _enableWithMethod(method);
     }
 
-    // Otherwise, try methods in order of preference
-    // Registry is preferred for non-elevated apps
     AutoStartResult result;
 
-    // Try registry first (works without elevation)
+    // Registry first (works without elevation)
     result = _enableRegistryAutoStart();
     if (result.success) return result;
 
-    // Try startup folder (also works without elevation)
+    // Startup folder (also works without elevation)
     result = _enableStartupFolder();
     if (result.success) return result;
 
@@ -143,22 +143,30 @@ class WindowsAutoStart {
     return result;
   }
 
+  Future<AutoStartResult> _enableWithMethod(AutoStartMethod method) async {
+    switch (method) {
+      case AutoStartMethod.registryRun:
+        return _enableRegistryAutoStart();
+      case AutoStartMethod.startupFolder:
+        return _enableStartupFolder();
+      case AutoStartMethod.taskScheduler:
+        return _enableTaskScheduler();
+    }
+  }
+
   /// Disable all auto-start methods
   Future<AutoStartResult> disable() async {
     var anySuccess = false;
     String? lastMessage;
 
-    // Disable registry
     final registryResult = _disableRegistryAutoStart();
     if (registryResult.success) anySuccess = true;
     lastMessage = registryResult.message;
 
-    // Disable Task Scheduler
     final taskResult = await _disableTaskScheduler();
     if (taskResult.success) anySuccess = true;
     lastMessage = taskResult.message;
 
-    // Disable startup folder
     final folderResult = _disableStartupFolder();
     if (folderResult.success) anySuccess = true;
     lastMessage = folderResult.message;
@@ -166,61 +174,54 @@ class WindowsAutoStart {
     if (anySuccess) {
       return AutoStartResult.success(AutoStartMethod.registryRun, lastMessage);
     } else {
-      return AutoStartResult.failure(lastMessage ?? 'Failed to disable auto-start');
+      return AutoStartResult.failure(
+          lastMessage ?? 'Failed to disable auto-start');
     }
   }
 
-  /// Check if the current process is running elevated
+  /// Check if the current process is running elevated.
+  ///
+  /// Calls `OpenProcessToken` -> `GetTokenInformation(TokenElevation)` via
+  /// the bindings exposed by `package:win32`.
   static bool isElevated() {
-    final hToken = calloc<HANDLE>();
+    if (!Platform.isWindows) return false;
+
+    final pToken = calloc<HANDLE>();
+    Pointer<_TokenElevation>? pElevation;
+    Pointer<DWORD>? pReturnLength;
+
     try {
-      final result = OpenProcessToken(
+      final ok = OpenProcessToken(
         GetCurrentProcess(),
         TOKEN_QUERY,
-        hToken,
+        pToken,
       );
-
-      if (result == 0) {
-        calloc.free(hToken);
+      if (ok == 0) {
         return false;
       }
 
-      final tokenElevation = calloc<_TOKEN_ELEVATION>();
-      try {
-        final cbSize = sizeOf<_TOKEN_ELEVATION>();
-        final pReturnLength = calloc<DWORD>();
+      pElevation = calloc<_TokenElevation>();
+      pReturnLength = calloc<DWORD>();
 
-        final getinfoResult = GetTokenInformation(
-          hToken.value,
-          TOKEN_INFORMATION_CLASS.TokenElevation,
-          tokenElevation.cast(),
-          cbSize,
-          pReturnLength,
-        );
-
-        calloc.free(pReturnLength);
-
-        if (getinfoResult == 0) {
-          calloc.free(tokenElevation);
-          calloc.free(hToken);
-          return false;
-        }
-
-        final isElevated = tokenElevation.ref.TokenIsElevated != 0;
-        calloc.free(tokenElevation);
-        calloc.free(hToken);
-        return isElevated;
-      } finally {
-        // Cleanup in case of early return
+      final infoOk = GetTokenInformation(
+        pToken.value,
+        TokenElevation, // top-level constant exported by package:win32
+        pElevation.cast(),
+        sizeOf<_TokenElevation>(),
+        pReturnLength,
+      );
+      if (infoOk == 0) {
+        return false;
       }
-    } catch (e) {
+
+      return pElevation.ref.TokenIsElevated != 0;
+    } catch (_) {
       return false;
     } finally {
-      // Ensure cleanup
-      try {
-        CloseHandle(hToken.value);
-        calloc.free(hToken);
-      } catch (_) {}
+      if (pElevation != null) calloc.free(pElevation);
+      if (pReturnLength != null) calloc.free(pReturnLength);
+      if (pToken.value != 0) CloseHandle(pToken.value);
+      calloc.free(pToken);
     }
   }
 
@@ -229,146 +230,81 @@ class WindowsAutoStart {
   // =========================================================================
 
   bool _isRegistryAutoStartEnabled() {
+    if (!Platform.isWindows) return false;
+    RegistryKey? key;
     try {
-      final hKey = _openRegistryKey();
-      if (hKey == 0) return false;
-
-      final valuePointer = wsalloc(MAX_PATH);
-      final dataSize = calloc<DWORD>();
-
-      final result = RegQueryValueEx(
-        hKey,
-        _config.appName.toNativeUtf16(),
-        nullptr,
-        nullptr,
-        valuePointer,
-        dataSize,
+      key = Registry.openPath(
+        RegistryHive.currentUser,
+        path: _kRunSubKey,
+        desiredAccessRights: AccessRights.readOnly,
       );
-
-      final exists = result == ERROR_SUCCESS;
-
-      RegCloseKey(hKey);
-      calloc.free(dataSize);
-      calloc.free(valuePointer);
-
-      return exists;
-    } catch (e) {
+      return key.getValueAsString(_config.appName) != null;
+    } catch (_) {
       return false;
+    } finally {
+      key?.close();
     }
   }
 
   AutoStartResult _enableRegistryAutoStart() {
+    if (!Platform.isWindows) {
+      return AutoStartResult.failure('Registry auto-start requires Windows');
+    }
+    RegistryKey? key;
     try {
-      final hKey = _openOrCreateRegistryKey();
-      if (hKey == 0) {
-        return AutoStartResult.failure('Failed to open registry key');
-      }
+      key = Registry.openPath(
+        RegistryHive.currentUser,
+        path: _kRunSubKey,
+        desiredAccessRights: AccessRights.writeOnly,
+      );
 
-      // Get the current executable path
       final exePath = Platform.resolvedExecutable;
-      final exePathPtr = exePath.toNativeUtf16();
-
-      // Build the command line (exe + optional arguments)
       final cmdLine = _config.arguments.isEmpty
           ? exePath
           : '"$exePath" ${_config.arguments.join(' ')}';
-      final cmdLinePtr = cmdLine.toNativeUtf16();
 
-      // Set the registry value
-      final result = RegSetValueEx(
-        hKey,
-        _config.appName.toNativeUtf16(),
-        0,
-        REG_SZ,
-        cmdLinePtr.cast(),
-        (cmdLinePtr.length * 2) + 2, // Length in bytes including null terminator
+      key.createValue(
+        RegistryValue(_config.appName, RegistryValueType.string, cmdLine),
       );
 
-      RegCloseKey(hKey);
-      calloc.free(exePathPtr);
-      calloc.free(cmdLinePtr);
-
-      if (result == ERROR_SUCCESS) {
-        return AutoStartResult.success(AutoStartMethod.registryRun);
-      } else {
-        return AutoStartResult.failure('Failed to set registry value: $result');
-      }
+      return AutoStartResult.success(AutoStartMethod.registryRun);
     } catch (e) {
       return AutoStartResult.failure('Registry error: $e');
+    } finally {
+      key?.close();
     }
   }
 
   AutoStartResult _disableRegistryAutoStart() {
+    if (!Platform.isWindows) {
+      return AutoStartResult.failure('Registry auto-start requires Windows');
+    }
+    RegistryKey? key;
     try {
-      final hKey = _openRegistryKey();
-      if (hKey == 0) {
-        return AutoStartResult.failure('Failed to open registry key');
-      }
-
-      final result = RegDeleteValue(
-        hKey,
-        _config.appName.toNativeUtf16(),
+      key = Registry.openPath(
+        RegistryHive.currentUser,
+        path: _kRunSubKey,
+        desiredAccessRights: AccessRights.allAccess,
       );
 
-      RegCloseKey(hKey);
-
-      if (result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND) {
-        return AutoStartResult.success(
-          AutoStartMethod.registryRun,
-          'Registry auto-start disabled',
-        );
-      } else {
-        return AutoStartResult.failure('Failed to delete registry value: $result');
+      try {
+        key.deleteValue(_config.appName);
+      } on WindowsException catch (e) {
+        // ERROR_FILE_NOT_FOUND surfaces as HRESULT 0x80070002 — treat as success.
+        if (e.hr != HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+          rethrow;
+        }
       }
+
+      return AutoStartResult.success(
+        AutoStartMethod.registryRun,
+        'Registry auto-start disabled',
+      );
     } catch (e) {
       return AutoStartResult.failure('Registry error: $e');
+    } finally {
+      key?.close();
     }
-  }
-
-  int _openRegistryKey() {
-    final phKey = calloc<HKEY>();
-
-    final result = RegOpenKeyEx(
-      HKEY_CURRENT_USER,
-      r'Software\Microsoft\Windows\CurrentVersion\Run'.toNativeUtf16(),
-      0,
-      KEY_READ,
-      phKey,
-    );
-
-    if (result == ERROR_SUCCESS) {
-      final hKey = phKey.value;
-      calloc.free(phKey);
-      return hKey;
-    }
-
-    calloc.free(phKey);
-    return 0;
-  }
-
-  int _openOrCreateRegistryKey() {
-    final phKey = calloc<HKEY>();
-
-    final result = RegCreateKeyEx(
-      HKEY_CURRENT_USER,
-      r'Software\Microsoft\Windows\CurrentVersion\Run'.toNativeUtf16(),
-      0,
-      nullptr,
-      0,
-      KEY_SET_VALUE,
-      nullptr,
-      phKey,
-      nullptr,
-    );
-
-    if (result == ERROR_SUCCESS) {
-      final hKey = phKey.value;
-      calloc.free(phKey);
-      return hKey;
-    }
-
-    calloc.free(phKey);
-    return 0;
   }
 
   // =========================================================================
@@ -392,7 +328,6 @@ class WindowsAutoStart {
 
   Future<AutoStartResult> _enableTaskScheduler() async {
     try {
-      // Check if elevated
       if (!isElevated()) {
         return AutoStartResult.failure(
           'Task Scheduler requires elevated privileges',
@@ -404,7 +339,6 @@ class WindowsAutoStart {
           ? exePath
           : '"$exePath" ${_config.arguments.join(' ')}';
 
-      // Create task using schtasks command
       final result = await Process.run(
         'schtasks',
         [
@@ -432,10 +366,6 @@ class WindowsAutoStart {
 
   Future<AutoStartResult> _disableTaskScheduler() async {
     try {
-      if (!isElevated()) {
-        // Try to delete anyway, might fail
-      }
-
       final result = await Process.run(
         'schtasks',
         ['/Delete', '/TN', _config.appName, '/F'],
@@ -448,7 +378,6 @@ class WindowsAutoStart {
           'Task Scheduler auto-start disabled',
         );
       } else {
-        // Task might not exist, which is fine
         if (result.stderr.toString().contains('ERROR: The specified task')) {
           return AutoStartResult.success(
             AutoStartMethod.taskScheduler,
@@ -471,7 +400,9 @@ class WindowsAutoStart {
   bool _isStartupFolderEnabled() {
     try {
       final shortcutPath = _getShortcutPath();
-      return File(shortcutPath).existsSync();
+      if (shortcutPath == null) return false;
+      final batPath = shortcutPath.replaceAll('.lnk', '.bat');
+      return File(shortcutPath).existsSync() || File(batPath).existsSync();
     } catch (e) {
       return false;
     }
@@ -480,9 +411,14 @@ class WindowsAutoStart {
   AutoStartResult _enableStartupFolder() {
     try {
       final shortcutPath = _getShortcutPath();
+      if (shortcutPath == null) {
+        return AutoStartResult.failure(
+            'Could not resolve startup folder path');
+      }
       final exePath = Platform.resolvedExecutable;
 
-      // Create a simple batch file as a shortcut alternative
+      // We can't create a true .lnk shortcut from Dart without COM, so emit
+      // a small launcher batch file in the startup folder instead.
       final batchContent = '''
 @echo off
 start "" "$exePath" ${_config.arguments.join(' ')}
@@ -501,6 +437,10 @@ exit
   AutoStartResult _disableStartupFolder() {
     try {
       final shortcutPath = _getShortcutPath();
+      if (shortcutPath == null) {
+        return AutoStartResult.failure(
+            'Could not resolve startup folder path');
+      }
       final batPath = shortcutPath.replaceAll('.lnk', '.bat');
 
       if (File(shortcutPath).existsSync()) {
@@ -519,11 +459,17 @@ exit
     }
   }
 
-  String _getShortcutPath() {
-    // Get the startup folder path
-    final appData = Platform.environment['APPDATA'] ?? '';
-    final startupPath = '$appData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup';
+  String? _getShortcutPath() {
+    // Try FOLDERID_Startup first; fall back to APPDATA-relative path.
+    final startupFolder = _knownFolderPath(FOLDERID_Startup);
+    if (startupFolder != null) {
+      return '$startupFolder\\${_config.appName}.lnk';
+    }
 
+    final appData = Platform.environment['APPDATA'];
+    if (appData == null || appData.isEmpty) return null;
+    final startupPath =
+        '$appData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup';
     return '$startupPath\\${_config.appName}.lnk';
   }
 }
@@ -533,4 +479,38 @@ final autoStartProvider = Provider<WindowsAutoStart>((ref) {
   return WindowsAutoStart();
 });
 
-// Extension removed - using direct toNativeUtf16() from package:ffi/ffi.dart
+// =========================================================================
+// FFI helpers — TOKEN_ELEVATION isn't exposed by `package:win32` 5.x, so we
+// declare just the single-field struct we need locally.
+// =========================================================================
+
+/// `typedef struct _TOKEN_ELEVATION { DWORD TokenIsElevated; } TOKEN_ELEVATION;`
+base class _TokenElevation extends Struct {
+  @Uint32()
+  // ignore: non_constant_identifier_names
+  external int TokenIsElevated;
+}
+
+/// Resolves a Windows known folder using `SHGetKnownFolderPath`.
+///
+/// Returns `null` if the call fails or we're not running on Windows.
+String? _knownFolderPath(String folderIdGuid) {
+  if (!Platform.isWindows) return null;
+
+  final pGuid = GUIDFromString(folderIdGuid);
+  final ppPath = calloc<Pointer<Utf16>>();
+  try {
+    final hr = SHGetKnownFolderPath(pGuid, 0, 0, ppPath);
+    if (hr != S_OK) {
+      return null;
+    }
+    final result = ppPath.value.toDartString();
+    CoTaskMemFree(ppPath.value);
+    return result;
+  } catch (_) {
+    return null;
+  } finally {
+    calloc.free(pGuid);
+    calloc.free(ppPath);
+  }
+}

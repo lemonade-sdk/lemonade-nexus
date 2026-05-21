@@ -35,7 +35,7 @@ class VPNMenuView extends ConsumerWidget {
           const Divider(height: 16),
           // Connect/Disconnect Button
           if (appState.isAuthenticated) ...[
-            _buildConnectButton(appState),
+            _buildConnectButton(appState, ref),
             const Divider(height: 16),
           ],
           // Open Manager Button
@@ -129,7 +129,7 @@ class VPNMenuView extends ConsumerWidget {
     );
   }
 
-  Widget _buildConnectButton(AppState appState) {
+  Widget _buildConnectButton(AppState appState, WidgetRef ref) {
     final isConnecting = appState.isTunnelUp == false && appState.tunnelIP == null;
     final isDisconnecting = appState.isTunnelUp == true && appState.tunnelIP == null;
     final isBusy = isConnecting || isDisconnecting;

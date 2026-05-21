@@ -363,9 +363,20 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
               ),
             ),
             _buildLabeledContent(
-              'Service',
+              'Version',
               Text(
-                appState.healthStatus!.service,
+                appState.healthStatus!.version,
+                style: const TextStyle(
+                  color: Color(0xFFA0AEC0),
+                  fontSize: 13,
+                  fontFamily: 'monospace',
+                ),
+              ),
+            ),
+            _buildLabeledContent(
+              'Uptime',
+              Text(
+                '${appState.healthStatus!.uptime}s',
                 style: const TextStyle(
                   color: Color(0xFFA0AEC0),
                   fontSize: 13,
@@ -599,36 +610,9 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
               'Our Tier',
               _buildBadge(
                 text: 'TIER ${appState.trustStatus!.trustTier}',
-                color: appState.trustStatus!.trustTier == 1
+                color: appState.trustStatus!.trustTier == '1'
                     ? Colors.green
                     : Colors.orange,
-              ),
-            ),
-            _buildLabeledContent(
-              'Platform',
-              Text(
-                appState.trustStatus!.ourPlatform,
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                ),
-              ),
-            ),
-            _buildLabeledContent(
-              'TEE Required',
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(
-                    appState.trustStatus!.requireTee
-                        ? Icons.check_circle
-                        : Icons.cancel,
-                    size: 16,
-                    color: appState.trustStatus!.requireTee
-                        ? Colors.green
-                        : const Color(0xFF718096),
-                  ),
-                ],
               ),
             ),
             _buildLabeledContent(
@@ -875,6 +859,74 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
       decoration: BoxDecoration(
         color: isHealthy ? Colors.green : Colors.red,
         shape: BoxShape.circle,
+      ),
+    );
+  }
+}
+
+/// Small stat card used in the top stats row.
+class _StatCard extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String value;
+  final Color color;
+
+  const _StatCard({
+    required this.icon,
+    required this.title,
+    required this.value,
+    required this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A2E).withOpacity(0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF2D3748)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(8),
+            decoration: BoxDecoration(
+              color: color.withOpacity(0.15),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Icon(icon, color: color, size: 18),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.6),
+                    fontSize: 11,
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  style: TextStyle(
+                    color: color,
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                    fontFamily: 'monospace',
+                  ),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

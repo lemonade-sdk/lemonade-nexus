@@ -219,7 +219,7 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
             SizedBox(
               width: 50,
               child: Text(
-                '${peer.latencyMs}ms',
+                '${peer.latencyMs!.round()}ms',
                 style: TextStyle(
                   color: _getLatencyColor(peer.latencyMs!),
                   fontSize: 11,
@@ -359,7 +359,7 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
     );
   }
 
-  Color _getLatencyColor(int ms) {
+  Color _getLatencyColor(double ms) {
     if (ms < 50) return Colors.green;
     if (ms < 150) return Colors.orange;
     return Colors.red;

@@ -65,7 +65,7 @@ class _CertificatesViewState extends ConsumerState<CertificatesView> {
                 padding: const EdgeInsets.all(16),
                 child: Row(
                   children: [
-                    const Icon(Icons.cert, color: Color(0xFFE9C46A), size: 20),
+                    const Icon(Icons.verified_user, color: Color(0xFFE9C46A), size: 20),
                     const SizedBox(width: 8),
                     const Text('Certificates', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
                     const Spacer(),

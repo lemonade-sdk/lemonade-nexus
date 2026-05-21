@@ -12,9 +12,74 @@
 
 import 'dart:ffi';
 import 'dart:io';
+
 import 'package:ffi/ffi.dart';
-import 'package:win32/win32.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:win32/win32.dart';
+
+// ---------------------------------------------------------------------------
+// CreateServiceW binding
+//
+// The win32 ^5.0 package does not expose CreateService directly, so we look
+// it up ourselves from advapi32.dll. The signature mirrors the Win32 docs:
+//
+//   SC_HANDLE CreateServiceW(
+//     SC_HANDLE hSCManager,
+//     LPCWSTR   lpServiceName,
+//     LPCWSTR   lpDisplayName,
+//     DWORD     dwDesiredAccess,
+//     DWORD     dwServiceType,
+//     DWORD     dwStartType,
+//     DWORD     dwErrorControl,
+//     LPCWSTR   lpBinaryPathName,
+//     LPCWSTR   lpLoadOrderGroup,
+//     LPDWORD   lpdwTagId,
+//     LPCWSTR   lpDependencies,
+//     LPCWSTR   lpServiceStartName,
+//     LPCWSTR   lpPassword
+//   );
+// ---------------------------------------------------------------------------
+
+typedef _CreateServiceWNative =
+    IntPtr Function(
+      IntPtr hSCManager,
+      Pointer<Utf16> lpServiceName,
+      Pointer<Utf16> lpDisplayName,
+      Uint32 dwDesiredAccess,
+      Uint32 dwServiceType,
+      Uint32 dwStartType,
+      Uint32 dwErrorControl,
+      Pointer<Utf16> lpBinaryPathName,
+      Pointer<Utf16> lpLoadOrderGroup,
+      Pointer<Uint32> lpdwTagId,
+      Pointer<Utf16> lpDependencies,
+      Pointer<Utf16> lpServiceStartName,
+      Pointer<Utf16> lpPassword,
+    );
+
+typedef _CreateServiceWDart =
+    int Function(
+      int hSCManager,
+      Pointer<Utf16> lpServiceName,
+      Pointer<Utf16> lpDisplayName,
+      int dwDesiredAccess,
+      int dwServiceType,
+      int dwStartType,
+      int dwErrorControl,
+      Pointer<Utf16> lpBinaryPathName,
+      Pointer<Utf16> lpLoadOrderGroup,
+      Pointer<Uint32> lpdwTagId,
+      Pointer<Utf16> lpDependencies,
+      Pointer<Utf16> lpServiceStartName,
+      Pointer<Utf16> lpPassword,
+    );
+
+final DynamicLibrary _advapi32 = DynamicLibrary.open('advapi32.dll');
+
+final _CreateServiceWDart _createServiceW = _advapi32
+    .lookupFunction<_CreateServiceWNative, _CreateServiceWDart>(
+      'CreateServiceW',
+    );
 
 /// Windows service configuration
 class WindowsServiceConfig {
@@ -36,7 +101,7 @@ class WindowsServiceConfig {
   /// Service start type
   final ServiceStartType startType;
 
-  const WindowsServiceConfig({
+  WindowsServiceConfig({
     this.serviceName = 'LemonadeNexusService',
     this.displayName = 'Lemonade Nexus VPN Service',
     this.description = 'WireGuard Mesh VPN background service',
@@ -108,7 +173,7 @@ class WindowsServiceManager {
   int _scManagerHandle = 0;
 
   WindowsServiceManager({WindowsServiceConfig? config})
-      : _config = config ?? const WindowsServiceConfig();
+      : _config = config ?? WindowsServiceConfig();
 
   /// Connect to the Service Control Manager
   bool _connect() {
@@ -137,10 +202,11 @@ class WindowsServiceManager {
   bool isInstalled() {
     if (!_connect()) return false;
 
+    final namePtr = _config.serviceName.toNativeUtf16();
     try {
       final serviceHandle = OpenService(
         _scManagerHandle,
-        _config.serviceName.toNativeUtf16(),
+        namePtr,
         SERVICE_QUERY_STATUS,
       );
 
@@ -151,6 +217,7 @@ class WindowsServiceManager {
 
       return false;
     } finally {
+      calloc.free(namePtr);
       _disconnect();
     }
   }
@@ -159,10 +226,11 @@ class WindowsServiceManager {
   ServiceState getState() {
     if (!_connect()) return ServiceState.unknown;
 
+    final namePtr = _config.serviceName.toNativeUtf16();
     try {
       final serviceHandle = OpenService(
         _scManagerHandle,
-        _config.serviceName.toNativeUtf16(),
+        namePtr,
         SERVICE_QUERY_STATUS,
       );
 
@@ -170,7 +238,7 @@ class WindowsServiceManager {
         return ServiceState.unknown;
       }
 
-      final serviceStatus = calloc<_SERVICE_STATUS>();
+      final serviceStatus = calloc<SERVICE_STATUS>();
       try {
         final result = QueryServiceStatus(
           serviceHandle,
@@ -189,6 +257,7 @@ class WindowsServiceManager {
         calloc.free(serviceStatus);
       }
     } finally {
+      calloc.free(namePtr);
       _disconnect();
     }
   }
@@ -196,24 +265,29 @@ class WindowsServiceManager {
   /// Install the Windows service
   ServiceResult install() {
     if (!_connect()) {
-      return ServiceResult.failure('Failed to connect to Service Control Manager');
+      return ServiceResult.failure(
+        'Failed to connect to Service Control Manager',
+      );
     }
 
+    final namePtr = _config.serviceName.toNativeUtf16();
+    final displayPtr = _config.displayName.toNativeUtf16();
+    final cmdPtr = _config.serviceCommandLine.toNativeUtf16();
     try {
-      final serviceHandle = CreateService(
+      final serviceHandle = _createServiceW(
         _scManagerHandle,
-        _config.serviceName.toNativeUtf16(),
-        _config.displayName.toNativeUtf16(),
+        namePtr,
+        displayPtr,
         SERVICE_ALL_ACCESS,
         SERVICE_WIN32_OWN_PROCESS,
         _mapStartType(_config.startType),
         SERVICE_ERROR_NORMAL,
-        _config.serviceCommandLine.toNativeUtf16(),
-        nullptr,
-        nullptr,
-        nullptr,
-        nullptr, // No logon account
-        nullptr, // No password
+        cmdPtr,
+        nullptr, // lpLoadOrderGroup
+        nullptr, // lpdwTagId
+        nullptr, // lpDependencies
+        nullptr, // lpServiceStartName (no logon account)
+        nullptr, // lpPassword
       );
 
       if (serviceHandle == 0) {
@@ -233,6 +307,9 @@ class WindowsServiceManager {
       CloseServiceHandle(serviceHandle);
       return ServiceResult.success('Service installed successfully');
     } finally {
+      calloc.free(namePtr);
+      calloc.free(displayPtr);
+      calloc.free(cmdPtr);
       _disconnect();
     }
   }
@@ -240,14 +317,17 @@ class WindowsServiceManager {
   /// Uninstall the Windows service
   ServiceResult uninstall() {
     if (!_connect()) {
-      return ServiceResult.failure('Failed to connect to Service Control Manager');
+      return ServiceResult.failure(
+        'Failed to connect to Service Control Manager',
+      );
     }
 
+    final namePtr = _config.serviceName.toNativeUtf16();
     try {
       final serviceHandle = OpenService(
         _scManagerHandle,
-        _config.serviceName.toNativeUtf16(),
-        DELETE,
+        namePtr,
+        DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS,
       );
 
       if (serviceHandle == 0) {
@@ -267,9 +347,12 @@ class WindowsServiceManager {
       if (result != 0) {
         return ServiceResult.success('Service uninstalled successfully');
       } else {
-        return ServiceResult.failure('Failed to delete service: ${GetLastError()}');
+        return ServiceResult.failure(
+          'Failed to delete service: ${GetLastError()}',
+        );
       }
     } finally {
+      calloc.free(namePtr);
       _disconnect();
     }
   }
@@ -277,18 +360,23 @@ class WindowsServiceManager {
   /// Start the Windows service
   ServiceResult start() {
     if (!_connect()) {
-      return ServiceResult.failure('Failed to connect to Service Control Manager');
+      return ServiceResult.failure(
+        'Failed to connect to Service Control Manager',
+      );
     }
 
+    final namePtr = _config.serviceName.toNativeUtf16();
     try {
       final serviceHandle = OpenService(
         _scManagerHandle,
-        _config.serviceName.toNativeUtf16(),
+        namePtr,
         SERVICE_START,
       );
 
       if (serviceHandle == 0) {
-        return ServiceResult.failure('Failed to open service: ${GetLastError()}');
+        return ServiceResult.failure(
+          'Failed to open service: ${GetLastError()}',
+        );
       }
 
       final result = StartService(
@@ -300,15 +388,22 @@ class WindowsServiceManager {
       CloseServiceHandle(serviceHandle);
 
       if (result != 0) {
-        return ServiceResult.success('Service started', ServiceState.startPending);
+        return ServiceResult.success(
+          'Service started',
+          ServiceState.startPending,
+        );
       } else {
         final error = GetLastError();
         if (error == ERROR_SERVICE_ALREADY_RUNNING) {
-          return ServiceResult.success('Service is already running', ServiceState.running);
+          return ServiceResult.success(
+            'Service is already running',
+            ServiceState.running,
+          );
         }
         return ServiceResult.failure('Failed to start service: $error');
       }
     } finally {
+      calloc.free(namePtr);
       _disconnect();
     }
   }
@@ -316,31 +411,37 @@ class WindowsServiceManager {
   /// Stop the Windows service
   ServiceResult stop() {
     if (!_connect()) {
-      return ServiceResult.failure('Failed to connect to Service Control Manager');
+      return ServiceResult.failure(
+        'Failed to connect to Service Control Manager',
+      );
     }
 
+    final namePtr = _config.serviceName.toNativeUtf16();
     try {
       final serviceHandle = OpenService(
         _scManagerHandle,
-        _config.serviceName.toNativeUtf16(),
+        namePtr,
         SERVICE_STOP | SERVICE_QUERY_STATUS,
       );
 
       if (serviceHandle == 0) {
-        return ServiceResult.failure('Failed to open service: ${GetLastError()}');
+        return ServiceResult.failure(
+          'Failed to open service: ${GetLastError()}',
+        );
       }
 
       final result = _stopService(serviceHandle);
       CloseServiceHandle(serviceHandle);
       return result;
     } finally {
+      calloc.free(namePtr);
       _disconnect();
     }
   }
 
   /// Stop the service (internal)
   ServiceResult _stopService(int serviceHandle) {
-    final serviceStatus = calloc<_SERVICE_STATUS>();
+    final serviceStatus = calloc<SERVICE_STATUS>();
 
     try {
       final result = ControlService(
@@ -350,11 +451,17 @@ class WindowsServiceManager {
       );
 
       if (result != 0) {
-        return ServiceResult.success('Service stopped', ServiceState.stopPending);
+        return ServiceResult.success(
+          'Service stopped',
+          ServiceState.stopPending,
+        );
       } else {
         final error = GetLastError();
         if (error == ERROR_SERVICE_NOT_ACTIVE) {
-          return ServiceResult.success('Service was not running', ServiceState.stopped);
+          return ServiceResult.success(
+            'Service was not running',
+            ServiceState.stopped,
+          );
         }
         return ServiceResult.failure('Failed to stop service: $error');
       }
@@ -365,40 +472,40 @@ class WindowsServiceManager {
 
   /// Set the service description
   void _setDescription(int serviceHandle) {
-    final description = _SERVICE_DESCRIPTION(
-      lpDescription: _config.description.toNativeUtf16(),
-    );
+    final descPtr = calloc<SERVICE_DESCRIPTION>();
+    final textPtr = _config.description.toNativeUtf16();
+    try {
+      descPtr.ref.lpDescription = textPtr;
 
-    final descriptionPtr = calloc<_SERVICE_DESCRIPTION>()
-      ..ref.lpDescription = description.lpDescription;
-
-    ChangeServiceConfig2(
-      serviceHandle,
-      SERVICE_CONFIG_DESCRIPTION,
-      descriptionPtr.cast(),
-    );
-
-    calloc.free(descriptionPtr);
+      ChangeServiceConfig2(
+        serviceHandle,
+        SERVICE_CONFIG_DESCRIPTION,
+        descPtr,
+      );
+    } finally {
+      calloc.free(textPtr);
+      calloc.free(descPtr);
+    }
   }
 
   /// Configure service recovery options
   void _configureRecovery(int serviceHandle) {
     // Configure recovery actions: restart on failure
-    final actions = calloc<_SERVICE_FAILURE_ACTIONS>();
-    final actionArray = calloc<_SC_ACTION>(count: 3);
+    final actions = calloc<SERVICE_FAILURE_ACTIONS>();
+    final actionArray = calloc<SC_ACTION>(3);
 
     try {
       // First failure: restart after 1 minute
-      actionArray[0].type = SC_ACTION_RESTART;
-      actionArray[0].delay = 60000; // 1 minute
+      actionArray[0].Type = SC_ACTION_RESTART;
+      actionArray[0].Delay = 60000; // 1 minute
 
       // Second failure: restart after 1 minute
-      actionArray[1].type = SC_ACTION_RESTART;
-      actionArray[1].delay = 60000;
+      actionArray[1].Type = SC_ACTION_RESTART;
+      actionArray[1].Delay = 60000;
 
       // Subsequent failures: restart after 5 minutes
-      actionArray[2].type = SC_ACTION_RESTART;
-      actionArray[2].delay = 300000; // 5 minutes
+      actionArray[2].Type = SC_ACTION_RESTART;
+      actionArray[2].Delay = 300000; // 5 minutes
 
       actions.ref.cActions = 3;
       actions.ref.lpsaActions = actionArray;
@@ -409,7 +516,7 @@ class WindowsServiceManager {
       ChangeServiceConfig2(
         serviceHandle,
         SERVICE_CONFIG_FAILURE_ACTIONS,
-        actions.cast(),
+        actions,
       );
     } finally {
       calloc.free(actionArray);

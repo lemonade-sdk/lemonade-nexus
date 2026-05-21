@@ -49,34 +49,29 @@ Cargo.lock
 .claude/
 *.bak
 
-# Flutter
+# Flutter (Windows client at apps/LemonadeNexus/)
 .dart_tool/
 .flutter-plugins
 .flutter-plugins-dependencies
 .packages
 .pub/
-build/
-*.lock
+pubspec.lock
 **/windows/flutter/ephemeral/
+apps/LemonadeNexus/build/
 
 # MSIX/MSI packaging artifacts
 *.msix
 *.msi
 *.appxupload
 *.msixbundle
-windows/packaging/MSI/obj/
-windows/packaging/signing/*.pfx
-windows/packaging/signing/*.p12
-keys/*.pfx
-keys/*.p12
-keys/*.cer
-keys/*.pem
+apps/LemonadeNexus/windows/packaging/MSI/obj/
+apps/LemonadeNexus/windows/packaging/signing/*.pfx
+apps/LemonadeNexus/windows/packaging/signing/*.p12
+apps/LemonadeNexus/keys/*.pfx
+apps/LemonadeNexus/keys/*.p12
+apps/LemonadeNexus/keys/*.cer
+apps/LemonadeNexus/keys/*.pem
 
 # WiX Toolset
 *.wixobj
 *.wixpdb
-
-# Build artifacts
-build/windows/packages/
-build/windows/signed/
-build/windows/unsigned_backup/

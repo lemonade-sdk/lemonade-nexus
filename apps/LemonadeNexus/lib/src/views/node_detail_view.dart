@@ -15,6 +15,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../sdk/models.dart';
+import 'tree_browser_view.dart' show NodeType;
 
 class NodeDetailView extends ConsumerStatefulWidget {
   final TreeNode node;
@@ -29,11 +30,9 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   bool _isEditing = false;
   bool _isSaving = false;
   String? _statusMessage;
-  bool _showDeleteConfirmation = false;
 
   @override
   Widget build(BuildContext context) {
-    final appState = ref.watch(appNotifierProvider);
     final node = widget.node;
     final nodeType = NodeType.fromRaw(node.nodeType);
 
@@ -60,7 +59,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           ],
           const SizedBox(height: 20),
           // Actions
-          _buildActionsSection(appState, node),
+          _buildActionsSection(node),
         ],
       ),
     );
@@ -142,7 +141,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   Widget _buildNetworkSection(TreeNode node, NodeType nodeType) {
     if (nodeType == NodeType.customer || nodeType == NodeType.root) {
       return _buildSection(
-        icon: Icons.network,
+        icon: Icons.lan,
         title: 'Network',
         child: Row(
           children: [
@@ -165,7 +164,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     }
 
     return _buildSection(
-      icon: Icons.network,
+      icon: Icons.lan,
       title: 'Network',
       child: Column(
         children: [
@@ -212,7 +211,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
       icon: Icons.badge,
       title: 'Assignments (${assignments.length})',
       child: Column(
-        children: assignments.map((assignment) => _buildAssignmentCard(assignment)).toList(),
+        children: assignments.map(_buildAssignmentCard).toList(),
       ),
     );
   }
@@ -241,17 +240,19 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           const SizedBox(height: 6),
           Wrap(
             spacing: 4,
-            children: assignment.permissions.map((perm) => _buildBadge(
-              text: perm,
-              color: _permissionColor(perm),
-            )).toList(),
+            children: assignment.permissions
+                .map((perm) => _buildBadge(
+                      text: perm,
+                      color: _permissionColor(perm),
+                    ))
+                .toList(),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildActionsSection(AppState appState, TreeNode node) {
+  Widget _buildActionsSection(TreeNode node) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -266,9 +267,11 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
               children: [
                 const Icon(Icons.info, color: Colors.blue, size: 16),
                 const SizedBox(width: 8),
-                Text(
-                  _statusMessage!,
-                  style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 12),
+                Expanded(
+                  child: Text(
+                    _statusMessage!,
+                    style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 12),
+                  ),
                 ),
               ],
             ),
@@ -280,7 +283,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
             if (_isEditing) ...[
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _isSaving ? null : () async => await _saveChanges(appState, node),
+                  onPressed: _isSaving ? null : () => _saveChanges(node),
                   icon: _isSaving
                       ? const SizedBox(
                           width: 14,
@@ -314,7 +317,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
             ],
             Expanded(
               child: ElevatedButton.icon(
-                onPressed: () => _showDeleteConfirmation = true,
+                onPressed: () => _showDeleteConfirmationDialog(node),
                 icon: const Icon(Icons.delete),
                 label: const Text('Delete Node'),
                 style: ElevatedButton.styleFrom(
@@ -367,6 +370,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
             width: 120,
@@ -421,6 +425,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
                 color: const Color(0xFF718096),
                 onPressed: () async {
                   await Clipboard.setData(ClipboardData(text: value));
+                  if (!mounted) return;
                   setState(() => _statusMessage = 'Copied $label to clipboard');
                   Future.delayed(const Duration(seconds: 3), () {
                     if (mounted) setState(() => _statusMessage = null);
@@ -452,7 +457,9 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   }
 
   Widget _buildIdBadge(String id) {
-    final shortId = id.length > 12 ? '${id.substring(0, 6)}...${id.substring(id.length - 4)}' : id;
+    final shortId = id.length > 12
+        ? '${id.substring(0, 6)}...${id.substring(id.length - 4)}'
+        : id;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
       decoration: BoxDecoration(
@@ -480,8 +487,6 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
         return const Color(0xFFE9C46A);
       case NodeType.relay:
         return const Color(0xFF2A9D8F);
-      default:
-        return Colors.grey;
     }
   }
 
@@ -500,16 +505,22 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     }
   }
 
-  Future<void> _saveChanges(AppState appState, TreeNode node) async {
-    setState(() => _isSaving = true);
-    setState(() => _statusMessage = null);
+  Future<void> _saveChanges(TreeNode node) async {
+    setState(() {
+      _isSaving = true;
+      _statusMessage = null;
+    });
 
-    // TODO: Implement actual save functionality when edit fields are added
-    // For now, just mark as saved
+    // TODO: Implement actual save functionality when edit fields are added.
+    // For now this is a placeholder; AppNotifier currently exposes no
+    // "update node properties" entry point.
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    if (!mounted) return;
     setState(() {
       _isEditing = false;
       _isSaving = false;
-      _statusMessage = 'Changes saved successfully';
+      _statusMessage = 'Changes saved (not yet wired to SDK)';
     });
 
     Future.delayed(const Duration(seconds: 3), () {
@@ -517,10 +528,10 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     });
   }
 
-  void _showDeleteConfirmationDialog(AppState appState, TreeNode node) {
-    showDialog(
+  void _showDeleteConfirmationDialog(TreeNode node) {
+    showDialog<void>(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (dialogContext) => AlertDialog(
         backgroundColor: const Color(0xFF1A1A2E),
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
@@ -533,13 +544,13 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Cancel', style: TextStyle(color: Color(0xFFA0AEC0))),
           ),
           ElevatedButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              await _deleteNode(appState, node);
+            onPressed: () {
+              Navigator.pop(dialogContext);
+              _deleteNode(node);
             },
             style: ElevatedButton.styleFrom(
               backgroundColor: Colors.red.shade600,
@@ -552,33 +563,25 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     );
   }
 
-  Future<void> _deleteNode(AppState appState, TreeNode node) async {
+  Future<void> _deleteNode(TreeNode node) async {
+    final notifier = ref.read(appNotifierProvider.notifier);
     try {
-      final notifier = ref.read(appNotifierProvider.notifier);
       final success = await notifier.deleteNode(nodeId: node.id);
+      if (!mounted) return;
       if (success) {
-        notifier.addActivity(ActivityEntry.success('Deleted node: ${node.displayName}'));
-        if (mounted) {
-          Navigator.pop(context); // Pop back to tree browser
-        }
+        notifier.addActivity(
+          ActivityLevel.success,
+          'Deleted node: ${node.displayName}',
+        );
+        Navigator.pop(context); // Pop back to tree browser
       } else {
-        notifier.addActivity(ActivityEntry.error('Failed to delete: ${node.displayName}'));
+        notifier.addActivity(
+          ActivityLevel.error,
+          'Failed to delete: ${node.displayName}',
+        );
       }
     } catch (e) {
-      notifier.addActivity(ActivityEntry.error('Delete failed: $e'));
+      notifier.addActivity(ActivityLevel.error, 'Delete failed: $e');
     }
-  }
-
-  @override
-  void didChangeDependencies() {
-    super.didChangeDependencies();
-    // Handle delete confirmation dialog
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_showDeleteConfirmation) {
-        setState(() => _showDeleteConfirmation = false);
-        final appState = ref.read(appNotifierProvider);
-        _showDeleteConfirmationDialog(appState, widget.node);
-      }
-    });
   }
 }

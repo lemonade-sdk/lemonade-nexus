@@ -360,7 +360,7 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                 child: _buildStatItem(
                   'Tunnel IP',
                   status?.tunnelIp ?? 'N/A',
-                  Icons.network,
+                  Icons.lan,
                   const Color(0xFF2A9D8F),
                 ),
               ),
