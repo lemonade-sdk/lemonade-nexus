@@ -379,7 +379,7 @@ extension SidebarItemData on SidebarItem {
       case SidebarItem.servers:
         return Icons.dns_outlined;
       case SidebarItem.certificates:
-        return Icons.cert_outlined;
+        return Icons.verified_user_outlined;
       case SidebarItem.relays:
         return Icons.wifi_tethering_outlined;
       case SidebarItem.settings:

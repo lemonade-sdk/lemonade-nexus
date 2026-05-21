@@ -200,7 +200,7 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _buildCardHeader('Tunnel', Icons.lock_shield),
+                _buildCardHeader('Tunnel', Icons.shield),
                 const Divider(color: Color(0xFF2D3748)),
                 _buildLabeledContent(
                   'Status',

@@ -113,13 +113,13 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
           color: Colors.green,
         ),
         _buildSummaryCard(
-          icon: Icons.arrow_downward_circle,
+          icon: Icons.arrow_circle_down,
           title: 'Total Received',
           value: _formatBytes(status?.totalRxBytes ?? 0),
           color: Colors.blue,
         ),
         _buildSummaryCard(
-          icon: Icons.arrow_upward_circle,
+          icon: Icons.arrow_circle_up,
           title: 'Total Sent',
           value: _formatBytes(status?.totalTxBytes ?? 0),
           color: Colors.orange,

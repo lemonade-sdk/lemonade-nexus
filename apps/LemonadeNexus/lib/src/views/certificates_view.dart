@@ -117,7 +117,7 @@ class _CertificatesViewState extends ConsumerState<CertificatesView> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.cert_outline, size: 48, color: Colors.white.withOpacity(0.2)),
+          Icon(Icons.verified_user_outlined, size: 48, color: Colors.white.withOpacity(0.2)),
           const SizedBox(height: 16),
           Text('No Certificates', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 16, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
@@ -183,7 +183,7 @@ class _CertificatesViewState extends ConsumerState<CertificatesView> {
         borderRadius: BorderRadius.circular(8),
       ),
       child: Icon(
-        isIssued ? Icons.check_circle : Icons.certificate_outlined,
+        isIssued ? Icons.check_circle : Icons.verified_user_outlined,
         color: isIssued ? const Color(0xFF2A9D8F) : Colors.grey,
         size: 18,
       ),
@@ -206,7 +206,7 @@ class _CertificatesViewState extends ConsumerState<CertificatesView> {
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(
-                  cert.isIssued ? Icons.check_circle : Icons.certificate_outlined,
+                  cert.isIssued ? Icons.check_circle : Icons.verified_user_outlined,
                   color: cert.isIssued ? const Color(0xFF2A9D8F) : Colors.grey,
                   size: 28,
                 ),
@@ -256,7 +256,7 @@ class _CertificatesViewState extends ConsumerState<CertificatesView> {
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.cert_outline, size: 64, color: Colors.white.withOpacity(0.2)),
+          Icon(Icons.verified_user_outlined, size: 64, color: Colors.white.withOpacity(0.2)),
           const SizedBox(height: 16),
           Text('Select a Certificate', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),

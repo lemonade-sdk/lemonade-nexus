@@ -394,7 +394,7 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                 child: Row(
                   children: [
                     Icon(
-                      Icons.arrow_downward_circle,
+                      Icons.arrow_circle_down,
                       size: 16,
                       color: Colors.blue.shade400,
                     ),
@@ -422,7 +422,7 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                 child: Row(
                   children: [
                     Icon(
-                      Icons.arrow_upward_circle,
+                      Icons.arrow_circle_up,
                       size: 16,
                       color: Colors.orange.shade400,
                     ),
