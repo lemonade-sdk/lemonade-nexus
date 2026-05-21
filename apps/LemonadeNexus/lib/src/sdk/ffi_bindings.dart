@@ -7,6 +7,7 @@
 import 'dart:ffi' as ffi;
 import 'dart:io';
 import 'dart:convert';
+import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
 /// Error codes from the C SDK.
@@ -691,176 +692,176 @@ class LemonadeNexusFfi {
   late final ffi.DynamicLibrary _lib;
 
   // Memory management
-  late final _lnFree = _lookup<_LnFree, _LnFreeDart>('ln_free');
+  late final _lnFree = _lib.lookupFunction<_LnFree, _LnFreeDart>('ln_free');
 
   // Client lifecycle
-  late final _lnCreate = _lookup<_LnCreate, _LnCreateDart>('ln_create');
+  late final _lnCreate = _lib.lookupFunction<_LnCreate, _LnCreateDart>('ln_create');
   late final _lnCreateTls =
-      _lookup<_LnCreateTls, _LnCreateTlsDart>('ln_create_tls');
+      _lib.lookupFunction<_LnCreateTls, _LnCreateTlsDart>('ln_create_tls');
   late final _lnDestroy =
-      _lookup<_LnDestroy, _LnDestroyDart>('ln_destroy');
+      _lib.lookupFunction<_LnDestroy, _LnDestroyDart>('ln_destroy');
 
   // Identity management
-  late final _lnIdentityGenerate = _lookup<_LnIdentityGenerate,
+  late final _lnIdentityGenerate = _lib.lookupFunction<_LnIdentityGenerate,
           _LnIdentityGenerateDart>('ln_identity_generate');
   late final _lnIdentityLoad =
-      _lookup<_LnIdentityLoad, _LnIdentityLoadDart>('ln_identity_load');
+      _lib.lookupFunction<_LnIdentityLoad, _LnIdentityLoadDart>('ln_identity_load');
   late final _lnIdentitySave =
-      _lookup<_LnIdentitySave, _LnIdentitySaveDart>('ln_identity_save');
-  late final _lnIdentityPubkey = _lookup<_LnIdentityPubkey,
+      _lib.lookupFunction<_LnIdentitySave, _LnIdentitySaveDart>('ln_identity_save');
+  late final _lnIdentityPubkey = _lib.lookupFunction<_LnIdentityPubkey,
           _LnIdentityPubkeyDart>('ln_identity_pubkey');
-  late final _lnIdentityDestroy = _lookup<_LnIdentityDestroy,
+  late final _lnIdentityDestroy = _lib.lookupFunction<_LnIdentityDestroy,
           _LnIdentityDestroyDart>('ln_identity_destroy');
   late final _lnSetIdentity =
-      _lookup<_LnSetIdentity, _LnSetIdentityDart>('ln_set_identity');
-  late final _lnIdentityFromSeed = _lookup<_LnIdentityFromSeed,
+      _lib.lookupFunction<_LnSetIdentity, _LnSetIdentityDart>('ln_set_identity');
+  late final _lnIdentityFromSeed = _lib.lookupFunction<_LnIdentityFromSeed,
           _LnIdentityFromSeedDart>('ln_identity_from_seed');
   late final _lnDeriveSeed =
-      _lookup<_LnDeriveSeed, _LnDeriveSeedDart>('ln_derive_seed');
+      _lib.lookupFunction<_LnDeriveSeed, _LnDeriveSeedDart>('ln_derive_seed');
 
   // Health
   late final _lnHealth =
-      _lookup<_LnHealth, _LnHealthDart>('ln_health');
+      _lib.lookupFunction<_LnHealth, _LnHealthDart>('ln_health');
 
   // Authentication
   late final _lnAuthPassword =
-      _lookup<_LnAuthPassword, _LnAuthPasswordDart>('ln_auth_password');
+      _lib.lookupFunction<_LnAuthPassword, _LnAuthPasswordDart>('ln_auth_password');
   late final _lnAuthPasskey =
-      _lookup<_LnAuthPasskey, _LnAuthPasskeyDart>('ln_auth_passkey');
+      _lib.lookupFunction<_LnAuthPasskey, _LnAuthPasskeyDart>('ln_auth_passkey');
   late final _lnAuthToken =
-      _lookup<_LnAuthToken, _LnAuthTokenDart>('ln_auth_token');
+      _lib.lookupFunction<_LnAuthToken, _LnAuthTokenDart>('ln_auth_token');
   late final _lnAuthEd25519 =
-      _lookup<_LnAuthEd25519, _LnAuthEd25519Dart>('ln_auth_ed25519');
-  late final _lnRegisterPasskey = _lookup<_LnRegisterPasskey,
+      _lib.lookupFunction<_LnAuthEd25519, _LnAuthEd25519Dart>('ln_auth_ed25519');
+  late final _lnRegisterPasskey = _lib.lookupFunction<_LnRegisterPasskey,
           _LnRegisterPasskeyDart>('ln_register_passkey');
 
   // Tree operations
   late final _lnTreeGetNode =
-      _lookup<_LnTreeGetNode, _LnTreeGetNodeDart>('ln_tree_get_node');
-  late final _lnTreeSubmitDelta = _lookup<_LnTreeSubmitDelta,
+      _lib.lookupFunction<_LnTreeGetNode, _LnTreeGetNodeDart>('ln_tree_get_node');
+  late final _lnTreeSubmitDelta = _lib.lookupFunction<_LnTreeSubmitDelta,
           _LnTreeSubmitDeltaDart>('ln_tree_submit_delta');
-  late final _lnCreateChildNode = _lookup<_LnCreateChildNode,
+  late final _lnCreateChildNode = _lib.lookupFunction<_LnCreateChildNode,
           _LnCreateChildNodeDart>('ln_create_child_node');
   late final _lnUpdateNode =
-      _lookup<_LnUpdateNode, _LnUpdateNodeDart>('ln_update_node');
+      _lib.lookupFunction<_LnUpdateNode, _LnUpdateNodeDart>('ln_update_node');
   late final _lnDeleteNode =
-      _lookup<_LnDeleteNode, _LnDeleteNodeDart>('ln_delete_node');
-  late final _lnTreeGetChildren = _lookup<_LnTreeGetChildren,
+      _lib.lookupFunction<_LnDeleteNode, _LnDeleteNodeDart>('ln_delete_node');
+  late final _lnTreeGetChildren = _lib.lookupFunction<_LnTreeGetChildren,
           _LnTreeGetChildrenDart>('ln_tree_get_children');
 
   // IPAM
   late final _lnIpamAllocate =
-      _lookup<_LnIpamAllocate, _LnIpamAllocateDart>('ln_ipam_allocate');
+      _lib.lookupFunction<_LnIpamAllocate, _LnIpamAllocateDart>('ln_ipam_allocate');
 
   // Relay
   late final _lnRelayList =
-      _lookup<_LnRelayList, _LnRelayListDart>('ln_relay_list');
+      _lib.lookupFunction<_LnRelayList, _LnRelayListDart>('ln_relay_list');
   late final _lnRelayTicket =
-      _lookup<_LnRelayTicket, _LnRelayTicketDart>('ln_relay_ticket');
+      _lib.lookupFunction<_LnRelayTicket, _LnRelayTicketDart>('ln_relay_ticket');
   late final _lnRelayRegister =
-      _lookup<_LnRelayRegister, _LnRelayRegisterDart>('ln_relay_register');
+      _lib.lookupFunction<_LnRelayRegister, _LnRelayRegisterDart>('ln_relay_register');
 
   // Certificates
   late final _lnCertStatus =
-      _lookup<_LnCertStatus, _LnCertStatusDart>('ln_cert_status');
+      _lib.lookupFunction<_LnCertStatus, _LnCertStatusDart>('ln_cert_status');
   late final _lnCertRequest =
-      _lookup<_LnCertRequest, _LnCertRequestDart>('ln_cert_request');
+      _lib.lookupFunction<_LnCertRequest, _LnCertRequestDart>('ln_cert_request');
   late final _lnCertDecrypt =
-      _lookup<_LnCertDecrypt, _LnCertDecryptDart>('ln_cert_decrypt');
+      _lib.lookupFunction<_LnCertDecrypt, _LnCertDecryptDart>('ln_cert_decrypt');
 
   // Group membership
-  late final _lnAddGroupMember = _lookup<_LnAddGroupMember,
+  late final _lnAddGroupMember = _lib.lookupFunction<_LnAddGroupMember,
           _LnAddGroupMemberDart>('ln_add_group_member');
-  late final _lnRemoveGroupMember = _lookup<_LnRemoveGroupMember,
+  late final _lnRemoveGroupMember = _lib.lookupFunction<_LnRemoveGroupMember,
           _LnRemoveGroupMemberDart>('ln_remove_group_member');
-  late final _lnGetGroupMembers = _lookup<_LnGetGroupMembers,
+  late final _lnGetGroupMembers = _lib.lookupFunction<_LnGetGroupMembers,
           _LnGetGroupMembersDart>('ln_get_group_members');
   late final _lnJoinGroup =
-      _lookup<_LnJoinGroup, _LnJoinGroupDart>('ln_join_group');
+      _lib.lookupFunction<_LnJoinGroup, _LnJoinGroupDart>('ln_join_group');
 
   // High-level operations
   late final _lnJoinNetwork =
-      _lookup<_LnJoinNetwork, _LnJoinNetworkDart>('ln_join_network');
+      _lib.lookupFunction<_LnJoinNetwork, _LnJoinNetworkDart>('ln_join_network');
   late final _lnLeaveNetwork =
-      _lookup<_LnLeaveNetwork, _LnLeaveNetworkDart>('ln_leave_network');
+      _lib.lookupFunction<_LnLeaveNetwork, _LnLeaveNetworkDart>('ln_leave_network');
 
   // Auto-switching
-  late final _lnEnableAutoSwitching = _lookup<_LnEnableAutoSwitching,
+  late final _lnEnableAutoSwitching = _lib.lookupFunction<_LnEnableAutoSwitching,
           _LnEnableAutoSwitchingDart>('ln_enable_auto_switching');
-  late final _lnDisableAutoSwitching = _lookup<_LnDisableAutoSwitching,
+  late final _lnDisableAutoSwitching = _lib.lookupFunction<_LnDisableAutoSwitching,
           _LnDisableAutoSwitchingDart>('ln_disable_auto_switching');
-  late final _lnCurrentLatencyMs = _lookup<_LnCurrentLatencyMs,
+  late final _lnCurrentLatencyMs = _lib.lookupFunction<_LnCurrentLatencyMs,
           _LnCurrentLatencyMsDart>('ln_current_latency_ms');
   late final _lnServerLatencies =
-      _lookup<_LnServerLatencies, _LnServerLatenciesDart>('ln_server_latencies');
+      _lib.lookupFunction<_LnServerLatencies, _LnServerLatenciesDart>('ln_server_latencies');
 
   // WireGuard tunnel
   late final _lnTunnelUp =
-      _lookup<_LnTunnelUp, _LnTunnelUpDart>('ln_tunnel_up');
+      _lib.lookupFunction<_LnTunnelUp, _LnTunnelUpDart>('ln_tunnel_up');
   late final _lnTunnelDown =
-      _lookup<_LnTunnelDown, _LnTunnelDownDart>('ln_tunnel_down');
+      _lib.lookupFunction<_LnTunnelDown, _LnTunnelDownDart>('ln_tunnel_down');
   late final _lnTunnelStatus =
-      _lookup<_LnTunnelStatus, _LnTunnelStatusDart>('ln_tunnel_status');
+      _lib.lookupFunction<_LnTunnelStatus, _LnTunnelStatusDart>('ln_tunnel_status');
   late final _lnGetWgConfig =
-      _lookup<_LnGetWgConfig, _LnGetWgConfigDart>('ln_get_wg_config');
-  late final _lnGetWgConfigJson = _lookup<_LnGetWgConfigJson,
+      _lib.lookupFunction<_LnGetWgConfig, _LnGetWgConfigDart>('ln_get_wg_config');
+  late final _lnGetWgConfigJson = _lib.lookupFunction<_LnGetWgConfigJson,
           _LnGetWgConfigJsonDart>('ln_get_wg_config_json');
-  late final _lnWgGenerateKeypair = _lookup<_LnWgGenerateKeypair,
+  late final _lnWgGenerateKeypair = _lib.lookupFunction<_LnWgGenerateKeypair,
           _LnWgGenerateKeypairDart>('ln_wg_generate_keypair');
 
   // Mesh P2P
   late final _lnMeshEnable =
-      _lookup<_LnMeshEnable, _LnMeshEnableDart>('ln_mesh_enable');
-  late final _lnMeshEnableConfig = _lookup<_LnMeshEnableConfig,
+      _lib.lookupFunction<_LnMeshEnable, _LnMeshEnableDart>('ln_mesh_enable');
+  late final _lnMeshEnableConfig = _lib.lookupFunction<_LnMeshEnableConfig,
           _LnMeshEnableConfigDart>('ln_mesh_enable_config');
   late final _lnMeshDisable =
-      _lookup<_LnMeshDisable, _LnMeshDisableDart>('ln_mesh_disable');
+      _lib.lookupFunction<_LnMeshDisable, _LnMeshDisableDart>('ln_mesh_disable');
   late final _lnMeshStatus =
-      _lookup<_LnMeshStatus, _LnMeshStatusDart>('ln_mesh_status');
+      _lib.lookupFunction<_LnMeshStatus, _LnMeshStatusDart>('ln_mesh_status');
   late final _lnMeshPeers =
-      _lookup<_LnMeshPeers, _LnMeshPeersDart>('ln_mesh_peers');
+      _lib.lookupFunction<_LnMeshPeers, _LnMeshPeersDart>('ln_mesh_peers');
   late final _lnMeshRefresh =
-      _lookup<_LnMeshRefresh, _LnMeshRefreshDart>('ln_mesh_refresh');
+      _lib.lookupFunction<_LnMeshRefresh, _LnMeshRefreshDart>('ln_mesh_refresh');
 
   // Stats & server listing
   late final _lnStats =
-      _lookup<_LnStats, _LnStatsDart>('ln_stats');
+      _lib.lookupFunction<_LnStats, _LnStatsDart>('ln_stats');
   late final _lnServers =
-      _lookup<_LnServers, _LnServersDart>('ln_servers');
+      _lib.lookupFunction<_LnServers, _LnServersDart>('ln_servers');
 
   // Trust & attestation
   late final _lnTrustStatus =
-      _lookup<_LnTrustStatus, _LnTrustStatusDart>('ln_trust_status');
+      _lib.lookupFunction<_LnTrustStatus, _LnTrustStatusDart>('ln_trust_status');
   late final _lnTrustPeer =
-      _lookup<_LnTrustPeer, _LnTrustPeerDart>('ln_trust_peer');
+      _lib.lookupFunction<_LnTrustPeer, _LnTrustPeerDart>('ln_trust_peer');
 
   // DDNS status
   late final _lnDdnsStatus =
-      _lookup<_LnDdnsStatus, _LnDdnsStatusDart>('ln_ddns_status');
+      _lib.lookupFunction<_LnDdnsStatus, _LnDdnsStatusDart>('ln_ddns_status');
 
   // Enrollment
-  late final _lnEnrollmentStatus = _lookup<_LnEnrollmentStatus,
+  late final _lnEnrollmentStatus = _lib.lookupFunction<_LnEnrollmentStatus,
           _LnEnrollmentStatusDart>('ln_enrollment_status');
 
   // Governance
-  late final _lnGovernanceProposals = _lookup<_LnGovernanceProposals,
+  late final _lnGovernanceProposals = _lib.lookupFunction<_LnGovernanceProposals,
           _LnGovernanceProposalsDart>('ln_governance_proposals');
-  late final _lnGovernancePropose = _lookup<_LnGovernancePropose,
+  late final _lnGovernancePropose = _lib.lookupFunction<_LnGovernancePropose,
           _LnGovernanceProposeDart>('ln_governance_propose');
 
   // Attestation manifests
-  late final _lnAttestationManifests = _lookup<_LnAttestationManifests,
+  late final _lnAttestationManifests = _lib.lookupFunction<_LnAttestationManifests,
           _LnAttestationManifestsDart>('ln_attestation_manifests');
 
   // Session management
-  late final _lnSetSessionToken = _lookup<_LnSetSessionToken,
+  late final _lnSetSessionToken = _lib.lookupFunction<_LnSetSessionToken,
           _LnSetSessionTokenDart>('ln_set_session_token');
-  late final _lnGetSessionToken = _lookup<_LnGetSessionToken,
+  late final _lnGetSessionToken = _lib.lookupFunction<_LnGetSessionToken,
           _LnGetSessionTokenDart>('ln_get_session_token');
   late final _lnSetNodeId =
-      _lookup<_LnSetNodeId, _LnSetNodeIdDart>('ln_set_node_id');
+      _lib.lookupFunction<_LnSetNodeId, _LnSetNodeIdDart>('ln_set_node_id');
   late final _lnGetNodeId =
-      _lookup<_LnGetNodeId, _LnGetNodeIdDart>('ln_get_node_id');
+      _lib.lookupFunction<_LnGetNodeId, _LnGetNodeIdDart>('ln_get_node_id');
 
   /// Creates a new FFI binding instance.
   ///
@@ -881,10 +882,6 @@ class LemonadeNexusFfi {
         throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
       }
     }
-  }
-
-  T _lookup<T, D>(String symbol) {
-    return _lib.lookup<T>(symbol).asFunction<D>();
   }
 
   // =========================================================================
