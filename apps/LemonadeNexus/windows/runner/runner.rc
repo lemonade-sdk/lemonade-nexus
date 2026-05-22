@@ -15,8 +15,8 @@
 /////////////////////////////////////////////////////////////////////////////
 // Icon resources
 //
-IDI_APP_ICON ICON "../assets/icons/tray_icon.ico"
-IDI_FLUTTER_ICON ICON "../assets/icons/tray_icon.ico"
+IDI_APP_ICON ICON "../assets/icons/app_icon.ico"
+IDI_FLUTTER_ICON ICON "../assets/icons/app_icon.ico"
 
 /////////////////////////////////////////////////////////////////////////////
 // Version resource

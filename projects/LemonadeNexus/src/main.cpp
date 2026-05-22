@@ -52,7 +52,33 @@
 #include <memory>
 #include <thread>
 
+#ifdef _WIN32
+#include <windows.h>
+// When running as a Windows Service, ServiceMain() sets this flag before
+// calling main() to prevent infinite recursion through StartServiceCtrlDispatcher.
+bool g_running_as_service = false;
+#endif
+
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    if (!g_running_as_service) {
+        // Not started by the SCM — try to register as a service dispatcher.
+        // If we're not a service, this fails with 1063 and we fall through
+        // to normal console-mode startup.
+        extern VOID WINAPI ServiceMain(DWORD argc, LPSTR* argv);
+        SERVICE_TABLE_ENTRYA dispatch_table[] = {
+            {"LemonadeNexus", (LPSERVICE_MAIN_FUNCTIONA)ServiceMain},
+            {NULL, NULL}
+        };
+
+        if (StartServiceCtrlDispatcher(dispatch_table)) {
+            // We ran as a service — ServiceMain() handled everything.
+            return 0;
+        }
+        // ERROR_FAILED_SERVICE_CONTROLLER_START (1063) = console mode
+    }
+#endif
+
     // --- Load configuration: CLI args > env vars > config file > defaults ---
     auto config = nexus::core::load_config(argc, argv);
     spdlog::set_level(spdlog::level::from_str(config.log_level));

@@ -30,7 +30,7 @@
 
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="ProductIcon" SourceFile="..\..\..\assets\icons\tray_icon.ico" />
+    <Icon Id="ProductIcon" SourceFile="..\..\..\assets\icons\app_icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
     <Property Id="ARPHELPLINK" Value="https://github.com/antmi/lemonade-nexus" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/antmi/lemonade-nexus" />
@@ -97,6 +97,52 @@
       </Component>
     </DirectoryRef>
 
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="LemonadeNexusService"
+                 Guid="{C8D9E0F1-A2B3-4567-DEFA-789012345678}"
+                 Win64="yes">
+        <!-- Server binary registered as Windows Service -->
+        <File Id="LemonadeNexusServiceExe"
+              Name="lemonade-nexus.exe"
+              Source="$(var.BuildDir)\lemonade-nexus.exe"
+              KeyPath="yes" />
+
+        <!-- Service installation and configuration -->
+        <ServiceInstall Id="ServiceInstaller"
+                        Type="ownProcess"
+                        Name="LemonadeNexus"
+                        DisplayName="Lemonade Nexus VPN Service"
+                        Description="Secure WireGuard Mesh VPN Coordination Server"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments=""
+                        Account="LocalSystem"
+                        Interactive="no">
+          <!-- Service dependencies - ensure network is available -->
+          <ServiceDependency Id="TcpIp" />
+          <ServiceDependency Id="Dnscache" />
+        </ServiceInstall>
+
+        <!-- Service control - start on install, stop on uninstall -->
+        <ServiceControl Id="StartService"
+                        Name="LemonadeNexus"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <!-- Default server configuration file -->
+      <Component Id="ServerConfigFile"
+                 Guid="{D9E0F1A2-B3C4-5678-EFAB-890123456789}"
+                 Win64="yes">
+        <File Id="ServerConfigJson"
+              Name="lemonade-nexus.json"
+              Source="$(var.BuildDir)\lemonade-nexus.json"
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
     <Feature Id="MainApplication"
              Title="Lemonade Nexus VPN"
              Description="The main application"
@@ -107,6 +153,8 @@
              Absent="disallow">
       <ComponentGroupRef Id="ApplicationFiles" />
       <ComponentRef Id="ProgramMenuShortcut" />
+      <ComponentRef Id="LemonadeNexusService" />
+      <ComponentRef Id="ServerConfigFile" />
     </Feature>
 
     <Feature Id="DesktopShortcutFeature"

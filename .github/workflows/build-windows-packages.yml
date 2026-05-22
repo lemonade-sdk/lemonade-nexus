@@ -217,6 +217,58 @@ jobs:
           }
           "release-dir=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - name: Build C++ Server
+        working-directory: .
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target LemonadeNexusApp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Server binary built successfully"
+          Get-ChildItem build/projects/LemonadeNexus/Release -Filter "*.exe" | Select-Object Name
+
+      - name: Bundle server into Flutter output
+        working-directory: apps/LemonadeNexus
+        run: |
+          $releaseDir = "${{ steps.locate.outputs.release-dir }}"
+          $serverDir = (Resolve-Path "../../build/projects/LemonadeNexus/Release").Path
+
+          # Copy server binary
+          Copy-Item "$serverDir/lemonade-nexus.exe" $releaseDir -Force
+          Write-Host "Copied lemonade-nexus.exe to release dir"
+
+          # Copy OpenSSL DLLs (needed by server)
+          foreach ($dll in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+            if (Test-Path "$releaseDir/$dll") {
+              Write-Host "$dll already exists in release dir"
+            } else {
+              Copy-Item "$serverDir/$dll" $releaseDir -Force
+              Write-Host "Copied $dll to release dir"
+            }
+          }
+
+          # Create default server config
+          $config = @{
+            http_port = 9100
+            private_http_port = 9101
+            dns_port = 5353
+            stun_port = 13478
+            gossip_port = 19102
+            relay_port = 19103
+            udp_port = 151940
+            bind_address = "0.0.0.0"
+            data_root = "data"
+            rp_id = "lemonade-nexus.local"
+            log_level = "info"
+            dns_base_domain = "lemonade-nexus.local"
+            region = "local"
+            auto_tls = $false
+          }
+          $config | ConvertTo-Json | Out-File "$releaseDir/lemonade-nexus.json" -Encoding UTF8
+          Write-Host "Created default server config"
+
+          # List final contents
+          Get-ChildItem $releaseDir | Select-Object Name, Length
+
       - name: Harvest Flutter output with heat.exe
         working-directory: apps/LemonadeNexus/windows/packaging/MSI
         run: |

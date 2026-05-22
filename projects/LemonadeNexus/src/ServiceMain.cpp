@@ -18,6 +18,10 @@
 // Forward declaration of main() from main.cpp
 extern int main(int argc, char* argv[]);
 
+// Flag defined in main.cpp — set to true before calling main() from
+// ServiceMain to prevent infinite recursion through StartServiceCtrlDispatcher.
+extern bool g_running_as_service;
+
 // ============================================================================
 // Global Service State
 // ============================================================================
@@ -144,6 +148,9 @@ VOID WINAPI ServiceMain(DWORD argc, LPSTR* argv)
     }
 
     spdlog::info("Lemonade-Nexus service started");
+
+    // Set flag to prevent main() from calling StartServiceCtrlDispatcher again
+    g_running_as_service = true;
 
     // Run the main application logic
     // Note: This runs in the service thread context

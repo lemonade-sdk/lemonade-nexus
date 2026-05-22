@@ -35,6 +35,7 @@ flutter:
 
   assets:
     - assets/
+    - assets/icons/
 
 msix_config:
   display_name: Lemonade Nexus VPN
