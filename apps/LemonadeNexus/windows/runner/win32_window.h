@@ -11,16 +11,16 @@
 #include <memory>
 #include <string>
 
+#include "resource.h"
+
 // Tray icon message ID
 #define WM_TRAYICON (WM_USER + 1)
 
-// Tray icon ID
-#define ID_TRAY_APP_ICON 5000
-
-// A class abstraction for a high DPI-aware Win32 Window.
+// A class abstraction for a high DPI-aware Win32 Window. Intended to be
+// inherited from by classes that wish to specialize with custom
+// rendering and input handling
 class Win32Window {
  public:
-  // Point and size types for convenience.
   struct Point {
     unsigned int x;
     unsigned int y;
@@ -37,94 +37,82 @@ class Win32Window {
   Win32Window();
   virtual ~Win32Window();
 
-  // Creates a win32 window with the given title, origin, and size.
-  bool CreateAndShow(const std::wstring& title,
-                     const Point& origin,
-                     const Size& size);
+  // Creates a win32 window with |title| that is positioned and sized using
+  // |origin| and |size|. New windows are created on the default monitor. Window
+  // sizes are specified to the OS in physical pixels, hence to ensure a
+  // consistent size this function will scale the inputted width and height as
+  // as appropriate for the default monitor. The window is invisible until
+  // |Show| is called. Returns true if the window was created successfully.
+  bool Create(const std::wstring& title, const Point& origin, const Size& size);
 
-  // Shows the window.
+  // Show the current window. Returns true if the window was successfully shown.
   bool Show();
 
-  // Hide the window.
-  bool Hide();
+  // Release OS resources associated with window.
+  void Destroy();
 
-  // Sets the quit on close behavior.
+  // Inserts |content| into the window tree.
+  void SetChildContent(HWND content);
+
+  // Returns the backing Window handle to enable clients to set icon and other
+  // window properties. Returns nullptr if the window has been destroyed.
+  HWND GetHandle();
+
+  // If true, closing this window will quit the application.
   void SetQuitOnClose(bool quit_on_close);
 
-  // Returns true if the window is closing.
-  bool IsClosing() const;
-
-  // Dispatches messages for the window.
-  virtual LRESULT MessageHandler(HWND hwnd, UINT message, WPARAM wparam,
-                                 LPARAM lparam) noexcept;
+  // Return a RECT representing the bounds of the current client area.
+  RECT GetClientArea();
 
   // System tray integration
   void CreateSystemTray();
-  void UpdateTrayIcon(const std::wstring& tooltip);
-  void ShowContextMenu(HWND hwnd);
   void RemoveSystemTray();
 
-  // Theme handling
-  void UpdateTheme();
-  void EnableDarkMode();
-
-  // Get client area
-  RECT GetClientArea() const;
-
-  // Set child content HWND
-  void SetChildContent(HWND child_content);
-
  protected:
-  // Window handle for system tray
-  HWND GetHwnd() const { return hwnd_; }
+  // Processes and route salient window messages for mouse handling,
+  // size change and DPI. Delegates handling of these to member overloads that
+  // inheriting classes can handle.
+  virtual LRESULT MessageHandler(HWND window,
+                                 UINT const message,
+                                 WPARAM const wparam,
+                                 LPARAM const lparam) noexcept;
 
-  // Registers a window class.
-  static bool RegisterWindowClass(const std::wstring& class_name);
-
-  // Unregisters a window class.
-  static void UnregisterWindowClass(const std::wstring& class_name);
-
-  // Creates the window.
-  virtual bool Create(const std::wstring& title,
-                      const Point& origin,
-                      const Size& size);
-
-  // Destroy the window.
-  virtual void Destroy();
-
-  // Resets the window state.
-  void Reset();
-
-  // Handle top-level window procedure.
-  static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wparam,
-                                  LPARAM lparam) noexcept;
-
-  // Handle WM_CREATE and WM_DESTROY
+  // Called when Create is called, allowing subclass window-related
+  // setup. Subclasses should return false if setup fails.
   virtual bool OnCreate();
+
+  // Called when Destroy is called.
   virtual void OnDestroy();
 
  private:
-  // The window handle.
-  HWND hwnd_ = nullptr;
+  friend class WindowClassRegistrar;
 
-  // The window class name.
-  std::wstring window_class_ = L"LemonadeNexusWindow";
+  // OS callback called by message pump. Handles the WM_NCCREATE message which
+  // is passed when the non-client area is being created and enables automatic
+  // non-client DPI scaling so that the non-client area automatically
+  // responds to changes in DPI. All other messages are handled by
+  // MessageHandler.
+  static LRESULT CALLBACK WndProc(HWND const window,
+                                  UINT const message,
+                                  WPARAM const wparam,
+                                  LPARAM const lparam) noexcept;
 
-  // Whether to quit on close.
-  bool quit_on_close_ = true;
+  // Retrieves a class instance pointer for |window|
+  static Win32Window* GetThisFromHandle(HWND const window) noexcept;
 
-  // Whether the window is closing.
-  bool is_closing_ = false;
+  // Update the window frame's theme to match the system theme.
+  static void UpdateTheme(HWND const window);
 
-  // System tray icon data - use raw struct to avoid API version issues
-  BYTE tray_icon_data_raw_[sizeof(void*) * 4 + 4 + 4 + sizeof(HICON) + 260];
-  bool has_tray_icon_ = false;
+  bool quit_on_close_ = false;
 
-  // Child content HWND
+  // window handle for top level window.
+  HWND window_handle_ = nullptr;
+
+  // window handle for hosted content.
   HWND child_content_ = nullptr;
-};
 
-// Global window count tracking
-extern int g_active_window_count;
+  // System tray
+  bool has_tray_icon_ = false;
+};
 
 #endif  // RUNNER_WIN32_WINDOW_H_

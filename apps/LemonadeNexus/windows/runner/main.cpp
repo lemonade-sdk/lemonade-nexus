@@ -11,7 +11,6 @@
 #include <windows.h>
 
 #include "flutter_window.h"
-#include "run_loop.h"
 #include "utils.h"
 #include "win32_window.h"
 
@@ -25,7 +24,7 @@ constexpr const wchar_t* kWindowTitle = L"Lemonade Nexus";
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command) {
   // Attach to console when present (e.g., 'flutter run') or create a
-  // new console when running as a debugger.
+  // new console when running with a debugger.
   if (!::AttachConsole(ATTACH_PARENT_PROCESS) && ::IsDebuggerPresent()) {
     CreateAndAttachConsole();
   }
@@ -34,49 +33,31 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // plugins.
   ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-  // Get the executable path to build the data directory path
-  wchar_t exe_path[MAX_PATH];
-  GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+  flutter::DartProject project(L"data");
 
-  // Extract directory from executable path
-  std::wstring exe_dir(exe_path);
-  size_t last_slash = exe_dir.find_last_of(L"\\");
-  if (last_slash != std::wstring::npos) {
-    exe_dir = exe_dir.substr(0, last_slash);
-  }
-  std::wstring data_path = exe_dir + L"\\data";
+  std::vector<std::string> command_line_arguments =
+      GetCommandLineArguments();
 
-  // Initialize the Flutter engine
-  auto run_loop = std::make_unique<RunLoop>();
-  flutter::DartProject project(data_path.c_str());
+  project.set_dart_entrypoint_arguments(std::move(command_line_arguments));
 
-  std::vector<std::string> arguments;
-  arguments.push_back("--disable-dart-profile");
-
-  const wchar_t* target_platform = L"--target-platform=windows-x64";
-  arguments.push_back(Utf8FromUtf16(target_platform));
-
-  project.set_dart_entrypoint_arguments(std::move(arguments));
-
-  FlutterWindow window(run_loop.get(), std::move(project));
+  FlutterWindow window(project);
   Win32Window::Point origin(10, 10);
   Win32Window::Size size(1280, 720);
-
-  if (!window.CreateAndShow(kWindowTitle, origin, size)) {
+  if (!window.Create(kWindowTitle, origin, size)) {
     return EXIT_FAILURE;
   }
-
-  // Explicitly show the window (WS_OVERLAPPEDWINDOW doesn't always show it)
-  window.Show();
-
   window.SetQuitOnClose(true);
 
-  // Create system tray icon
+  window.Show();
+
   window.CreateSystemTray();
 
-  run_loop->Run();
+  ::MSG msg;
+  while (::GetMessage(&msg, nullptr, 0, 0)) {
+    ::TranslateMessage(&msg);
+    ::DispatchMessage(&msg);
+  }
 
-  // Clean up system tray
   window.RemoveSystemTray();
 
   ::CoUninitialize();

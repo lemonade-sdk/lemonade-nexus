@@ -8,9 +8,8 @@
 
 #include "flutter/generated_plugin_registrant.h"
 
-FlutterWindow::FlutterWindow(RunLoop* run_loop,
-                             flutter::DartProject project)
-    : run_loop_(run_loop), project_(std::move(project)) {}
+FlutterWindow::FlutterWindow(const flutter::DartProject& project)
+    : project_(project) {}
 
 FlutterWindow::~FlutterWindow() {}
 
@@ -21,33 +20,25 @@ bool FlutterWindow::OnCreate() {
 
   RECT frame = GetClientArea();
 
-  const int width = frame.right - frame.left;
-  const int height = frame.bottom - frame.top;
-
   flutter_controller_ = std::make_unique<flutter::FlutterViewController>(
-      width, height, project_);
-
-  // Ensure that basic setup of the controller was successful.
+      frame.right - frame.left, frame.bottom - frame.top, project_);
   if (!flutter_controller_->engine() || !flutter_controller_->view()) {
     return false;
   }
-
   RegisterPlugins(flutter_controller_->engine());
-
-  run_loop_->RegisterFlutterInstance(flutter_controller_->engine());
-
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
-    // This can be used for initial window sizing if needed.
+    this->Show();
   });
+
+  flutter_controller_->ForceRedraw();
 
   return true;
 }
 
 void FlutterWindow::OnDestroy() {
   if (flutter_controller_) {
-    run_loop_->UnregisterFlutterInstance(flutter_controller_->engine());
     flutter_controller_ = nullptr;
   }
 
@@ -57,7 +48,6 @@ void FlutterWindow::OnDestroy() {
 LRESULT FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                                       WPARAM const wparam,
                                       LPARAM const lparam) noexcept {
-  // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
         flutter_controller_->HandleTopLevelWindowProc(hwnd, message, wparam,

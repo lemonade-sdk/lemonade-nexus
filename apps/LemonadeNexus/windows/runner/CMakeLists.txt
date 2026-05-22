@@ -9,7 +9,6 @@ set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../flutter")
 add_executable(${BINARY_NAME} WIN32
   flutter_window.cpp
   main.cpp
-  run_loop.cpp
   utils.cpp
   win32_window.cpp
   runner.rc

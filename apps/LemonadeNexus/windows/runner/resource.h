@@ -5,6 +5,9 @@
 #define IDI_APP_ICON            101
 #define IDI_FLUTTER_ICON        102
 
+// Tray icon
+#define ID_TRAY_APP_ICON        5000
+
 // Tray icon menu commands
 #define ID_TRAY_CONNECT         5001
 #define ID_TRAY_DISCONNECT      5002
