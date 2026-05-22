@@ -205,7 +205,7 @@ class WindowsAutoStart {
 
       final infoOk = GetTokenInformation(
         pToken.value,
-        TokenElevation, // top-level constant exported by package:win32
+        TOKEN_INFORMATION_CLASS.TokenElevation, // top-level constant exported by package:win32
         pElevation.cast(),
         sizeOf<_TokenElevation>(),
         pReturnLength,

@@ -66,6 +66,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
     return EXIT_FAILURE;
   }
 
+  // Explicitly show the window (WS_OVERLAPPEDWINDOW doesn't always show it)
+  window.Show();
+
   window.SetQuitOnClose(true);
 
   // Create system tray icon
