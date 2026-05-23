@@ -67,7 +67,7 @@ int main(int argc, char* argv[]) {
         // to normal console-mode startup.
         extern VOID WINAPI ServiceMain(DWORD argc, LPSTR* argv);
         SERVICE_TABLE_ENTRYA dispatch_table[] = {
-            {"LemonadeNexus", (LPSERVICE_MAIN_FUNCTIONA)ServiceMain},
+            {const_cast<LPSTR>("LemonadeNexus"), (LPSERVICE_MAIN_FUNCTIONA)ServiceMain},
             {NULL, NULL}
         };
 

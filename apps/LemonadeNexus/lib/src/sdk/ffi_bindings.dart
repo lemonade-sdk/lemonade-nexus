@@ -873,7 +873,7 @@ class LemonadeNexusFfi {
     } else {
       // Platform-specific library naming
       if (Platform.isWindows) {
-        _lib = ffi.DynamicLibrary.open('lemonade_nexus.dll');
+        _lib = ffi.DynamicLibrary.open('lemonade_nexus_sdk.dll');
       } else if (Platform.isMacOS) {
         _lib = ffi.DynamicLibrary.open('liblemonade_nexus.dylib');
       } else if (Platform.isLinux) {
