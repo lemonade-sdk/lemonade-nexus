@@ -25,6 +25,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"relay_port",          c.relay_port},
         {"dns_port",            c.dns_port},
         {"bind_address",        c.bind_address},
+        {"wg_interface",        c.wg_interface},
         {"data_root",           c.data_root},
         {"rp_id",               c.rp_id},
         {"jwt_secret",          c.jwt_secret},
@@ -74,6 +75,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("relay_port"))          j.at("relay_port").get_to(c.relay_port);
     if (j.contains("dns_port"))            j.at("dns_port").get_to(c.dns_port);
     if (j.contains("bind_address"))        j.at("bind_address").get_to(c.bind_address);
+    if (j.contains("wg_interface"))        j.at("wg_interface").get_to(c.wg_interface);
     if (j.contains("data_root"))           j.at("data_root").get_to(c.data_root);
     if (j.contains("rp_id"))               j.at("rp_id").get_to(c.rp_id);
     if (j.contains("jwt_secret"))          j.at("jwt_secret").get_to(c.jwt_secret);
@@ -129,6 +131,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --stun-port <N>            STUN UDP port (default: 3478)");
     spdlog::info("  --relay-port <N>           Relay UDP port (default: 9103)");
     spdlog::info("  --bind-address <addr>      Bind address for all services (default: 0.0.0.0)");
+    spdlog::info("  --wg-interface <name>      WireGuard interface (default: nexus0). NEVER use 'wg0' or anything in use.");
     spdlog::info("  --data-root <path>         Data directory (default: data)");
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
@@ -211,6 +214,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.relay_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
             config.bind_address = argv[++i];
+        } else if (std::strcmp(argv[i], "--wg-interface") == 0 && i + 1 < argc) {
+            config.wg_interface = argv[++i];
         } else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) {
             config.data_root = argv[++i];
         } else if (std::strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
@@ -289,6 +294,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_STUN_PORT"))    config.stun_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_BIND_ADDRESS")) config.bind_address = v;
+    if (const char* v = std::getenv("SP_WG_INTERFACE")) config.wg_interface = v;
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;

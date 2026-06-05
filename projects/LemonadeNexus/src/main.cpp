@@ -210,7 +210,7 @@ int main(int argc, char* argv[]) {
         //Maybe they could implement a custom TEE wrapper, not sure. Need to double check this and probably with some theories / research against TEE
         
         tee.set_platform_override(config.tee_platform_override);
-    
+
     tee.start();
 
     nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
@@ -537,7 +537,7 @@ int main(int argc, char* argv[]) {
     // WireGuard interface — server-side tunnel endpoint
     // ========================================================================
     nexus::wireguard::WireGuardService wireguard_service{
-        "wg0", std::filesystem::path{config.data_root} / "wireguard"};
+        config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
     wireguard_service.start();
 
     // Derive Curve25519 keypair from Ed25519 identity for WireGuard
@@ -556,14 +556,14 @@ int main(int argc, char* argv[]) {
         wg_iface.listen_port = config.udp_port;
 
         if (wireguard_service.setup_interface(wg_iface, {})) {
-            spdlog::info("WireGuard: wg0 up on :{} with tunnel IP {}/10",
-                          config.udp_port, tunnel_bind_ip);
+            spdlog::info("WireGuard: {} up on :{} with tunnel IP {}/10",
+                          config.wg_interface, config.udp_port, tunnel_bind_ip);
         } else {
-            spdlog::warn("WireGuard: failed to set up wg0 — clients will not be able to connect. "
-                          "Ensure wireguard-tools and kernel module are installed.");
+            spdlog::warn("WireGuard: failed to set up {} — clients will not be able to connect. "
+                          "Ensure wireguard-tools and kernel module are installed.", config.wg_interface);
         }
     } else {
-        spdlog::warn("WireGuard: skipping wg0 setup (no identity key or tunnel IP)");
+        spdlog::warn("WireGuard: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
     }
 
     // ========================================================================
@@ -587,9 +587,9 @@ int main(int argc, char* argv[]) {
         auto slash = backbone_ip.find('/');
         auto backbone_ip_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
 
-        // Add backbone address to wg0 (does NOT flush the existing client address)
+        // Add backbone address to the WG interface (does NOT flush the existing client address)
         if (wireguard_service.add_address(backbone_ip_bare + "/22")) {
-            spdlog::info("Backbone: added {}/22 to wg0", backbone_ip_bare);
+            spdlog::info("Backbone: added {}/22 to {}", backbone_ip_bare, config.wg_interface);
         }
 
         // Wire gossip with WG service and backbone info
