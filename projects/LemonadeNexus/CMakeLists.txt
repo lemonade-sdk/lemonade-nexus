@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.25.1)
 include(CreateProject)
 
 # OpenSSL::SSL and OpenSSL::Crypto are provided by cmake/libraries/openssl.cmake
+# tss2::fapi provided by cmake/libraries/tss2-fapi.cmake
 # (built from source via ExternalProject_Add — no system/Homebrew dependency).
 
 create_project(LemonadeNexus DEPENDENCIES
@@ -18,6 +19,7 @@ create_project(LemonadeNexus DEPENDENCIES
         wireguard::nt
         OpenSSL::SSL
         OpenSSL::Crypto
+        tss2::fapi
         c-ares::cares
         sqlite3
         boringtun-ffi

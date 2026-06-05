@@ -28,6 +28,7 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 #-----------------------------------------------------------------------------
 # Libraries
 #-----------------------------------------------------------------------------
+include(libraries/tss2-fapi)      # TPM2 Feature API (Linux only; no-op elsewhere)
 include(libraries/openssl)        # Must come before httplib and jwt-cpp (they depend on OpenSSL)
 include(libraries/asio)
 include(libraries/nlohmann_json)
