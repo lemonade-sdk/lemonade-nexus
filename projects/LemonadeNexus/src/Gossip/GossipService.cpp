@@ -166,6 +166,12 @@ void GossipService::on_stop() {
 // ---------------------------------------------------------------------------
 
 void GossipService::do_add_peer(std::string_view endpoint, std::string_view pubkey) {
+    // Never add ourselves as a peer (e.g. peer-exchange echoing our own identity).
+    if (!pubkey.empty() && pubkey == crypto::to_base64(keypair_.public_key)) {
+        spdlog::debug("[{}] refusing to add self as peer ({})", name(), endpoint);
+        return;
+    }
+
     std::lock_guard lock(peers_mutex_);
 
     // Check if peer already exists
@@ -1236,6 +1242,24 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
         // Add or update peer with verified certificate
         auto pk = cert.server_pubkey;
         auto ep = sender.address().to_string() + ":" + std::to_string(sender.port());
+
+        // Never peer with ourselves. A lone/genesis server can discover its own
+        // tier/region DNS record and seed itself; when our own ServerHello hairpins
+        // back (or peer-exchange echoes us), drop the self-referential entry and stop.
+        if (pk == crypto::to_base64(keypair_.public_key)) {
+            std::lock_guard lock(peers_mutex_);
+            auto before = peers_.size();
+            peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
+                [&](const GossipPeer& p) { return p.endpoint == ep || p.pubkey == pk; }),
+                peers_.end());
+            if (peers_.size() != before) {
+                spdlog::info("[{}] dropped self-referential peer at {} (own identity)",
+                              name(), ep);
+            } else {
+                spdlog::debug("[{}] ignored ServerHello from self ({})", name(), ep);
+            }
+            return;
+        }
 
         {
             std::lock_guard lock(peers_mutex_);
