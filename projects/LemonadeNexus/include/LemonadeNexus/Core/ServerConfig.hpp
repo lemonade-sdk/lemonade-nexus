@@ -15,7 +15,8 @@ struct ServerConfig {
     uint16_t    gossip_port{9102};
     uint16_t    stun_port{3478};
     uint16_t    relay_port{9103};
-    uint16_t    dns_port{5335};
+    uint16_t    dns_port{5335};          // internal DNS listen port (behind NAT)
+    uint16_t    public_dns_port{53};     // DNS port advertised to clients (NAT-mapped to dns_port)
     std::string bind_address{"0.0.0.0"};
     std::string public_ip;              // public-facing IP for DNS glue records (auto-detected if empty)
     std::string region;                 // cloud region code (e.g. "us-east", auto-detected if empty)
@@ -49,7 +50,7 @@ struct ServerConfig {
     std::string tls_key_path;
 
     // ACME certificate provider
-    std::string acme_provider{"zerossl"};    // "letsencrypt", "letsencrypt_staging", "zerossl"
+    std::string acme_provider{"letsencrypt"}; // "letsencrypt", "letsencrypt_staging", "zerossl"
     std::string acme_eab_kid;                // ZeroSSL External Account Binding Key ID
     std::string acme_eab_hmac_key;           // ZeroSSL EAB HMAC key (base64url)
     std::string dns_provider{"local"};       // "local" = self-hosted authoritative DNS, "cloudflare" = API fallback

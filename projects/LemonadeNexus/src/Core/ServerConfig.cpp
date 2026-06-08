@@ -24,6 +24,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"stun_port",           c.stun_port},
         {"relay_port",          c.relay_port},
         {"dns_port",            c.dns_port},
+        {"public_dns_port",     c.public_dns_port},
         {"bind_address",        c.bind_address},
         {"wg_interface",        c.wg_interface},
         {"data_root",           c.data_root},
@@ -74,6 +75,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("stun_port"))           j.at("stun_port").get_to(c.stun_port);
     if (j.contains("relay_port"))          j.at("relay_port").get_to(c.relay_port);
     if (j.contains("dns_port"))            j.at("dns_port").get_to(c.dns_port);
+    if (j.contains("public_dns_port"))     j.at("public_dns_port").get_to(c.public_dns_port);
     if (j.contains("bind_address"))        j.at("bind_address").get_to(c.bind_address);
     if (j.contains("wg_interface"))        j.at("wg_interface").get_to(c.wg_interface);
     if (j.contains("data_root"))           j.at("data_root").get_to(c.data_root);
@@ -154,7 +156,8 @@ void print_usage(const char* prog) {
     spdlog::info("  --private-http-port <N>      Private API port (default: 9101)");
     spdlog::info("  --require-peer-confirmation  Require peer quorum before full enrollment");
     spdlog::info("  --enrollment-quorum <ratio>  Fraction of Tier1 peers needed (default 0.5)");
-    spdlog::info("  --dns-port <N>             Authoritative DNS port (default: 53)");
+    spdlog::info("  --dns-port <N>             Internal DNS listen port (default: 5335, NAT-mapped from public)");
+    spdlog::info("  --public-dns-port <N>      DNS port advertised to clients (default: 53)");
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
     spdlog::info("  --dns-provider <name>      DNS provider: 'local' (default) or 'cloudflare'");
     spdlog::info("  --dns-ns-hostname <fqdn>   This server's NS hostname (e.g. ns1.example.com)");
@@ -266,6 +269,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enrollment_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
+            config.public_dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--dns-base-domain") == 0 && i + 1 < argc) {
             config.dns_base_domain = argv[++i];
         } else if (std::strcmp(argv[i], "--dns-provider") == 0 && i + 1 < argc) {
@@ -312,6 +317,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ACME_PROVIDER"))    config.acme_provider   = v;
     if (const char* v = std::getenv("SP_DNS_PROVIDER"))     config.dns_provider    = v;
     if (const char* v = std::getenv("SP_DNS_PORT"))         config.dns_port        = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_PUBLIC_DNS_PORT"))  config.public_dns_port = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_DNS_BASE_DOMAIN"))  config.dns_base_domain = v;
     if (const char* v = std::getenv("SP_DNS_NS_HOSTNAME")) config.dns_ns_hostname = v;
     if (const char* v = std::getenv("SP_RELEASE_SIGNING_PUBKEY")) config.release_signing_pubkey = v;
@@ -371,6 +377,9 @@ bool validate_config(const ServerConfig& config) {
     check_port(config.stun_port, "stun_port");
     check_port(config.relay_port, "relay_port");
     check_port(config.dns_port, "dns_port");
+    // public_dns_port is the externally-advertised (NAT-mapped) DNS port, not a local
+    // listener — validate it's non-zero but exclude it from the internal-uniqueness set.
+    check_port(config.public_dns_port, "public_dns_port");
 
     // Check ports are unique
     std::set<uint16_t> ports = {

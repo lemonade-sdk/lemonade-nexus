@@ -216,6 +216,7 @@ int main(int argc, char* argv[]) {
     const auto stun_port   = config.stun_port;
     const auto relay_port  = config.relay_port;
     const auto dns_port    = config.dns_port;
+    const auto public_dns_port = config.public_dns_port;
 
     // --- Data directory ---
     const std::filesystem::path data_root = config.data_root;
@@ -422,6 +423,7 @@ int main(int argc, char* argv[]) {
         dns_ports.stun_port   = stun_port;
         dns_ports.relay_port  = relay_port;
         dns_ports.dns_port    = dns_port;
+        dns_ports.public_dns_port = public_dns_port;
         dns_ports.private_http_port = config.private_http_port;
         dns.set_port_config(dns_ports);
     }

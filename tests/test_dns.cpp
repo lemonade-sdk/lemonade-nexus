@@ -480,13 +480,15 @@ TEST_F(DnsResolveTest, ConfigTxtWithPortConfig) {
     ports.gossip_port = 9102;
     ports.stun_port   = 3478;
     ports.relay_port  = 9103;
-    ports.dns_port    = 5335;
+    ports.dns_port    = 5335;        // internal listen port
+    ports.public_dns_port = 53;      // advertised (NAT-mapped) port — this is what TXT must show
     ports.private_http_port = 9101;
     dns_svc->set_port_config(ports);
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5335 private_http=9101 region= load=0");
+    // dns= must advertise the public port (53), not the internal listen port (5335)
+    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=53 private_http=9101 region= load=0");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtWithTypeQualifier) {
@@ -523,6 +525,7 @@ TEST_F(DnsResolveTest, ConfigTxtCustomPorts) {
     ports.stun_port   = 8446;
     ports.relay_port  = 8447;
     ports.dns_port    = 8448;
+    ports.public_dns_port = 8448;    // custom deployment: public port == listen port (no NAT remap)
     ports.private_http_port = 8449;
     dns_svc->set_port_config(ports);
 

@@ -502,7 +502,7 @@ void DnsService::publish_port_config(const std::string& server_id, const std::st
                       " gossip=" + std::to_string(port_config_.gossip_port) +
                       " stun=" + std::to_string(port_config_.stun_port) +
                       " relay=" + std::to_string(port_config_.relay_port) +
-                      " dns=" + std::to_string(port_config_.dns_port) +
+                      " dns=" + std::to_string(port_config_.public_dns_port) +
                       " private_http=" + std::to_string(port_config_.private_http_port) +
                       " region=" + port_config_.region +
                       " load=" + std::to_string(port_config_.connected_clients);
@@ -600,7 +600,7 @@ std::optional<std::string> DnsService::resolve_config_txt(
                        " gossip=" + std::to_string(port_config_.gossip_port) +
                        " stun=" + std::to_string(port_config_.stun_port) +
                        " relay=" + std::to_string(port_config_.relay_port) +
-                       " dns=" + std::to_string(port_config_.dns_port) +
+                       " dns=" + std::to_string(port_config_.public_dns_port) +
                        " private_http=" + std::to_string(port_config_.private_http_port) +
                        " region=" + port_config_.region +
                        " load=" + std::to_string(port_config_.connected_clients);
@@ -1172,7 +1172,7 @@ void DnsService::publish_seip_records(const std::string& server_id,
                       " gossip=" + std::to_string(port_config_.gossip_port) +
                       " stun=" + std::to_string(port_config_.stun_port) +
                       " relay=" + std::to_string(port_config_.relay_port) +
-                      " dns=" + std::to_string(port_config_.dns_port) +
+                      " dns=" + std::to_string(port_config_.public_dns_port) +
                       " private_http=" + std::to_string(port_config_.private_http_port) +
                       " region=" + region_lower +
                       " load=" + std::to_string(port_config_.connected_clients) +
@@ -1219,7 +1219,7 @@ void DnsService::update_load(uint32_t connected_client_count) {
                       " gossip=" + std::to_string(port_config_.gossip_port) +
                       " stun=" + std::to_string(port_config_.stun_port) +
                       " relay=" + std::to_string(port_config_.relay_port) +
-                      " dns=" + std::to_string(port_config_.dns_port) +
+                      " dns=" + std::to_string(port_config_.public_dns_port) +
                       " private_http=" + std::to_string(port_config_.private_http_port) +
                       " region=" + region_lower +
                       " load=" + std::to_string(port_config_.connected_clients) +
