@@ -151,7 +151,7 @@ public:
         uint16_t gossip_port{9102};
         uint16_t stun_port{3478};
         uint16_t relay_port{9103};
-        uint16_t dns_port{53};
+        uint16_t dns_port{5335};
         uint16_t private_http_port{9101};
         std::string region;
         uint32_t connected_clients{0};

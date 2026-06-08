@@ -480,13 +480,13 @@ TEST_F(DnsResolveTest, ConfigTxtWithPortConfig) {
     ports.gossip_port = 9102;
     ports.stun_port   = 3478;
     ports.relay_port  = 9103;
-    ports.dns_port    = 5353;
+    ports.dns_port    = 5335;
     ports.private_http_port = 9101;
     dns_svc->set_port_config(ports);
 
     auto result = dns_svc->resolve_config_txt("my-laptop");
     ASSERT_TRUE(result.has_value());
-    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5353 private_http=9101 region= load=0");
+    EXPECT_EQ(*result, "v=sp1 http=9100 udp=9101 gossip=9102 stun=3478 relay=9103 dns=5335 private_http=9101 region= load=0");
 }
 
 TEST_F(DnsResolveTest, ConfigTxtWithTypeQualifier) {
@@ -559,7 +559,7 @@ TEST_F(DnsResolveTest, PublishPortConfigCreatesDynamicTxtRecord) {
     ports.gossip_port = 9102;
     ports.stun_port   = 3478;
     ports.relay_port  = 9103;
-    ports.dns_port    = 5353;
+    ports.dns_port    = 5335;
     ports.private_http_port = 9101;
     dns_svc->set_port_config(ports);
 
