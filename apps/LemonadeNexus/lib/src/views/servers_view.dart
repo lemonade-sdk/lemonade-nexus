@@ -1,10 +1,8 @@
 /// @title Servers View
-/// @description Server list and selection interface.
+/// @description Server list and selection interface with admin console.
 ///
-/// Matches macOS ServersView.swift functionality:
-/// - Server list with health status
-/// - Server count badge
-/// - Server detail view
+/// Left panel: list of Lemonade servers with health status
+/// Right panel: Admin Console for the selected server (Dashboard, Models, Backends, System, Logs)
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -12,6 +10,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../sdk/models.dart';
+import '../views/admin_console/server_admin_provider.dart';
+import '../views/admin_console/admin_console_widget.dart';
 
 class ServersView extends ConsumerStatefulWidget {
   const ServersView({super.key});
@@ -21,7 +21,7 @@ class ServersView extends ConsumerStatefulWidget {
 }
 
 class _ServersViewState extends ConsumerState<ServersView> {
-  ServerInfo? _selectedServer;
+  AdminServer? _selectedAdminServer;
   bool _isLoading = false;
 
   @override
@@ -33,6 +33,32 @@ class _ServersViewState extends ConsumerState<ServersView> {
   Future<void> _loadServers() async {
     setState(() => _isLoading = true);
     await ref.read(appNotifierProvider.notifier).refreshServers();
+
+    // Sync SDK servers into admin server list
+    final appState = ref.read(appNotifierProvider);
+    final sdkServers = appState.servers;
+    final adminNotifer = ref.read(adminServersProvider.notifier);
+
+    // Convert SDK ServerInfo to AdminServer entries
+    final adminServers = sdkServers.map((s) {
+      return AdminServer(
+        id: s.id,
+        name: '${s.host}:${s.port}',
+        baseUrl: 'http://${s.host}:${s.port}',
+        available: s.available,
+      );
+    }).toList();
+
+    adminNotifer.syncFromSdkServers(sdkServers.map((s) => {
+      'id': s.id,
+      'host': s.host,
+      'port': s.port,
+      'name': '${s.host}:${s.port}',
+      'region': s.region,
+      'available': s.available,
+      'latencyMs': s.latencyMs,
+    }).toList());
+
     setState(() => _isLoading = false);
   }
 
@@ -40,6 +66,7 @@ class _ServersViewState extends ConsumerState<ServersView> {
   Widget build(BuildContext context) {
     final appState = ref.watch(appNotifierProvider);
     final servers = appState.servers;
+    final adminServers = ref.watch(adminServersProvider);
     final healthyCount = servers.where((s) => s.available).length;
 
     return Row(
@@ -92,17 +119,13 @@ class _ServersViewState extends ConsumerState<ServersView> {
             ),
           ),
         ),
-        // Detail panel
-        if (_selectedServer != null)
-          Expanded(
-            flex: 1,
-            child: _buildDetailPanel(_selectedServer!),
-          )
-        else
-          Expanded(
-            flex: 1,
-            child: _buildNoSelectionState(),
-          ),
+        // Right panel: Admin Console for selected server
+        Expanded(
+          flex: 2,
+          child: _selectedAdminServer != null
+              ? AdminConsoleWidget(serverName: _selectedAdminServer!.name)
+              : _buildNoSelectionState(),
+        ),
       ],
     );
   }
@@ -150,7 +173,7 @@ class _ServersViewState extends ConsumerState<ServersView> {
   }
 
   Widget _buildServerCard(ServerInfo server) {
-    final isSelected = _selectedServer?.id == server.id;
+    final isSelected = _selectedAdminServer?.id == server.id;
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
       padding: const EdgeInsets.all(12),
@@ -160,7 +183,16 @@ class _ServersViewState extends ConsumerState<ServersView> {
         border: Border.all(color: const Color(0xFF2D3748)),
       ),
       child: InkWell(
-        onTap: () => setState(() => _selectedServer = server),
+        onTap: () {
+          setState(() {
+            _selectedAdminServer = AdminServer(
+              id: server.id,
+              name: '${server.host}:${server.port}',
+              baseUrl: 'http://${server.host}:${server.port}',
+              available: server.available,
+            );
+          });
+        },
         child: Row(
           children: [
             _buildStatusDot(server.available),
@@ -201,71 +233,16 @@ class _ServersViewState extends ConsumerState<ServersView> {
     );
   }
 
-  Widget _buildDetailPanel(ServerInfo server) {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(24),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Header
-          Row(
-            children: [
-              Container(
-                width: 56, height: 56,
-                decoration: BoxDecoration(
-                  color: (server.available ? Colors.green : Colors.red).withOpacity(0.15),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: Icon(Icons.dns, color: server.available ? Colors.green : Colors.red, size: 28),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('${server.host}:${server.port}', style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 4),
-                    _buildBadge(text: server.available ? 'HEALTHY' : 'UNHEALTHY', color: server.available ? Colors.green : Colors.red),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const Divider(color: Color(0xFF2D3748), height: 24),
-          // Details
-          _buildDetailRow('Endpoint', '${server.host}:${server.port}'),
-          _buildDetailRow('Port', '${server.port}'),
-          _buildDetailRow('Region', server.region),
-          _buildDetailRow('Health', server.available ? 'Healthy' : 'Unhealthy'),
-          if (server.latencyMs != null) _buildDetailRow('Latency', '${server.latencyMs}ms'),
-        ],
-      ),
-    );
-  }
-
   Widget _buildNoSelectionState() {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.dns_outlined, size: 64, color: Colors.white.withOpacity(0.2)),
+          Icon(Icons.admin_panel_settings_outlined, size: 64, color: Colors.white.withOpacity(0.2)),
           const SizedBox(height: 16),
           Text('Select a Server', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
-          Text('Choose a server from the list to view details.', style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 14), textAlign: TextAlign.center),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDetailRow(String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(width: 100, child: Text(label, style: const TextStyle(color: Color(0xFF718096), fontSize: 13))),
-          Expanded(child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'))),
+          Text('Choose a server from the list to access its Admin Console.', style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 14), textAlign: TextAlign.center),
         ],
       ),
     );

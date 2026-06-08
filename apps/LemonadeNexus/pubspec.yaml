@@ -19,6 +19,9 @@ dependencies:
   win32: ^5.0.0
   win32_registry: ^1.1.0
   path_provider: ^2.1.0
+  http: ^1.1.0
+  http_parser: ^4.0.2
+  web_socket_channel: ^2.4.0
 
 dev_dependencies:
   flutter_test:
