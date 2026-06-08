@@ -344,28 +344,34 @@ int main(int argc, char* argv[]) {
         gossip.add_peer(peer_endpoint, "");
     }
 
-    // Resolve our region + public IP early (reused later for NS/SEIP setup) so we can
-    // auto-discover seed peers from tier/region DNS before the gossip layer starts —
-    // discovered peers are then included in the initial ServerHello broadcast.
+    // Resolve our region + public IP early (reused later for NS/SEIP setup).
     nexus::core::resolve_server_region(config, data_root);
     std::string server_public_ip = nexus::core::resolve_public_ip(config);
-    if (config.dns_seed_discovery) {
-        std::unordered_set<std::string> existing(
-            config.seed_peers.begin(), config.seed_peers.end());
-        auto found = nexus::core::discover_seed_endpoints(
-            config.dns_base_domain, config.region, server_public_ip, config.gossip_port);
-        std::size_t added = 0;
-        for (const auto& ep : found) {
-            if (existing.insert(ep).second) {
-                gossip.add_peer(ep, "");
-                ++added;
-            }
-        }
-        spdlog::info("DNS discovery: seeded {} peer(s) from tier/region DNS (region '{}')",
-                      added, config.region);
-    }
 
     gossip.start();
+
+    // DNS seed discovery uses BLOCKING system DNS lookups for names this server may
+    // itself be authoritative for, so it must NOT run on the startup path — it would
+    // hang until our own DNS service is up. Run it detached; discovered peers are
+    // added once they resolve and get a ServerHello on the next gossip tick. Self
+    // entries are dropped by the gossip identity guard.
+    if (config.dns_seed_discovery) {
+        std::thread([&gossip,
+                     base   = config.dns_base_domain,
+                     region = config.region,
+                     ip     = server_public_ip,
+                     port   = config.gossip_port,
+                     seeds  = config.seed_peers]() {
+            auto found = nexus::core::discover_seed_endpoints(base, region, ip, port);
+            std::unordered_set<std::string> existing(seeds.begin(), seeds.end());
+            std::size_t added = 0;
+            for (const auto& ep : found) {
+                if (existing.insert(ep).second) { gossip.add_peer(ep, ""); ++added; }
+            }
+            spdlog::info("DNS discovery: seeded {} peer(s) from tier/region DNS (region '{}')",
+                          added, region);
+        }).detach();
+    }
 
     // Bind our identity into the TPM quote's qualifyingData. Use the very keypair
     // gossip signs TEE reports with, so report.server_pubkey matches what the prover

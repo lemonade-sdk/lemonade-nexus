@@ -835,6 +835,33 @@ void GossipService::on_gossip_tick() {
         }
     }
 
+    // Re-introduce ourselves (ServerHello) to any peer we haven't handshaked with
+    // yet — e.g. seeds added after startup by background DNS discovery, or peers
+    // that were unreachable during the initial hello. Once a peer responds its
+    // certificate_json is populated and we stop. Self-seeds are dropped by the
+    // identity guard in handle_server_hello.
+    if (our_certificate_) {
+        std::vector<std::string> pending;
+        {
+            std::lock_guard lock(peers_mutex_);
+            for (const auto& p : peers_) {
+                if (p.certificate_json.empty()) pending.push_back(p.endpoint);
+            }
+        }
+        if (!pending.empty()) {
+            json hello = *our_certificate_;
+            if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
+            if (!our_region_.empty()) hello["region"] = our_region_;
+            auto hello_str = hello.dump();
+            std::vector<uint8_t> hello_bytes(hello_str.begin(), hello_str.end());
+            for (const auto& ep : pending) {
+                if (auto target = parse_endpoint(ep)) {
+                    send_packet(*target, GossipMsgType::ServerHello, hello_bytes);
+                }
+            }
+        }
+    }
+
     GossipPeer chosen;
 
     {
