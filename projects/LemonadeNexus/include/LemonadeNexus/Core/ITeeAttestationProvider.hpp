@@ -4,6 +4,7 @@
 
 #include <array>
 #include <concepts>
+#include <string>
 
 namespace nexus::core {
 
@@ -12,7 +13,8 @@ namespace nexus::core {
 /// Derived must implement:
 ///   - TeeAttestationReport do_generate_report(const std::array<uint8_t, 32>& nonce)
 ///   - bool do_verify_report(const TeeAttestationReport& report,
-///                           const std::array<uint8_t, 32>& expected_nonce)
+///                           const std::array<uint8_t, 32>& expected_nonce,
+///                           const std::string& trusted_ak_pubkey)
 ///   - bool do_platform_available() const
 ///   - TeePlatform do_detected_platform() const
 template <typename Derived>
@@ -27,10 +29,15 @@ public:
 
     /// Verify a remote server's TEE attestation report.
     /// Checks: platform-specific quote validity, nonce binding, timestamp freshness.
+    /// `trusted_ak_pubkey` is the AK pinned in the peer's enrolled certificate
+    /// (base64 DER SPKI); for TeePlatform::Tpm2 the hardware signature is verified
+    /// against it — NOT against any key carried inside the report. Empty for the
+    /// legacy structural backends, which ignore it.
     [[nodiscard]] bool verify_report(
             const TeeAttestationReport& report,
-            const std::array<uint8_t, 32>& expected_nonce) {
-        return self().do_verify_report(report, expected_nonce);
+            const std::array<uint8_t, 32>& expected_nonce,
+            const std::string& trusted_ak_pubkey = {}) {
+        return self().do_verify_report(report, expected_nonce, trusted_ak_pubkey);
     }
 
     /// Check if any TEE hardware is available on this machine.
@@ -55,9 +62,10 @@ private:
 template <typename T>
 concept TeeAttestationProviderType = requires(T t, const T ct,
                                                const std::array<uint8_t, 32>& nonce,
-                                               const TeeAttestationReport& report) {
+                                               const TeeAttestationReport& report,
+                                               const std::string& trusted_ak_pubkey) {
     { t.do_generate_report(nonce) } -> std::same_as<TeeAttestationReport>;
-    { t.do_verify_report(report, nonce) } -> std::same_as<bool>;
+    { t.do_verify_report(report, nonce, trusted_ak_pubkey) } -> std::same_as<bool>;
     { ct.do_platform_available() } -> std::same_as<bool>;
     { ct.do_detected_platform() } -> std::same_as<TeePlatform>;
 };

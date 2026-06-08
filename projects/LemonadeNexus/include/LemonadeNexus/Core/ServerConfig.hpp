@@ -80,7 +80,10 @@ struct ServerConfig {
     // Enrollment CLI mode (non-empty = run enrollment and exit)
     std::string enroll_server_pubkey;
     std::string enroll_server_id;
+    std::string enroll_tpm_ak_pubkey;  // base64 DER SPKI AK to pin in the cert (Model A)
+    std::string enroll_tpm_ek_cert_path; // optional path to the joining TPM's EK cert (PEM)
     std::string revoke_server_pubkey;
+    bool        print_tpm_ak{false};   // print this host's TPM AK pubkey (base64 DER SPKI) and exit
 
     // Manifest CLI mode
     std::string add_manifest_path;  // path to a release manifest JSON to import

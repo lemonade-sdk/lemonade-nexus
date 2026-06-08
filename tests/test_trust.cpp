@@ -189,8 +189,9 @@ TEST(TrustTypesTest, CanonicalAttestationJsonIsDeterministic) {
     auto a = core::canonical_attestation_json(r);
     auto b = core::canonical_attestation_json(r);
     EXPECT_EQ(a, b);
-    // Should NOT contain "signature" (canonical excludes it)
-    EXPECT_EQ(a.find("signature"), std::string::npos);
+    // Should NOT contain the "signature" key (canonical excludes the Ed25519 sig).
+    // Match the quoted key so the legitimate "tpm_signature" field is not a false hit.
+    EXPECT_EQ(a.find("\"signature\""), std::string::npos);
 }
 
 TEST(TrustTypesTest, CanonicalTokenJsonIsDeterministic) {
@@ -249,31 +250,33 @@ protected:
 
 TEST_F(TeeAttestationTest, StartsSuccessfully) {
     // On a dev machine without TEE hardware, platform should be None
-    // (unless running on Apple Silicon or inside SEV-SNP VM, etc.)
+    // (unless running on Apple Silicon, inside a SEV-SNP VM, or with a usable TPM)
     // We just verify it doesn't crash and reports a valid platform
     auto platform = tee->detected_platform();
     EXPECT_TRUE(platform == core::TeePlatform::None ||
                 platform == core::TeePlatform::IntelSgx ||
                 platform == core::TeePlatform::IntelTdx ||
                 platform == core::TeePlatform::AmdSevSnp ||
-                platform == core::TeePlatform::AppleSecureEnclave);
+                platform == core::TeePlatform::AppleSecureEnclave ||
+                platform == core::TeePlatform::Tpm2);
 }
 
 TEST_F(TeeAttestationTest, PlatformOverride) {
-    tee->set_platform_override("sev-snp");
-    EXPECT_EQ(tee->detected_platform(), core::TeePlatform::AmdSevSnp);
-
-    tee->set_platform_override("sgx");
-    EXPECT_EQ(tee->detected_platform(), core::TeePlatform::IntelSgx);
-
-    tee->set_platform_override("tdx");
-    EXPECT_EQ(tee->detected_platform(), core::TeePlatform::IntelTdx);
-
-    tee->set_platform_override("secure-enclave");
-    EXPECT_EQ(tee->detected_platform(), core::TeePlatform::AppleSecureEnclave);
-
+    // Hardened (hardening plan issue 7): the override can DOWNGRADE to None, but it
+    // must NOT be able to fabricate a TEE platform whose hardware is absent —
+    // otherwise a non-TEE box could forge Tier-1 capability.
     tee->set_platform_override("none");
     EXPECT_EQ(tee->detected_platform(), core::TeePlatform::None);
+
+    // Requesting platforms this machine does not have must not make us claim them.
+    tee->set_platform_override("sev-snp");
+    EXPECT_NE(tee->detected_platform(), core::TeePlatform::AmdSevSnp);
+
+    tee->set_platform_override("sgx");
+    EXPECT_NE(tee->detected_platform(), core::TeePlatform::IntelSgx);
+
+    tee->set_platform_override("tdx");
+    EXPECT_NE(tee->detected_platform(), core::TeePlatform::IntelTdx);
 }
 
 TEST_F(TeeAttestationTest, PlatformAvailableMatchesDetection) {

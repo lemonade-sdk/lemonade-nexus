@@ -138,6 +138,9 @@ void print_usage(const char* prog) {
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --enroll-server <hex> <id> Enroll a server: sign cert for pubkey with given ID");
+    spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
+    spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
+    spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
     spdlog::info("  --revoke-server <hex>      Revoke a server by its pubkey");
     spdlog::info("  --add-manifest <path>      Import a signed release manifest JSON");
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
@@ -229,6 +232,12 @@ ServerConfig load_config(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--enroll-server") == 0 && i + 2 < argc) {
             config.enroll_server_pubkey = argv[++i];
             config.enroll_server_id     = argv[++i];
+        } else if (std::strcmp(argv[i], "--enroll-tpm-ak") == 0 && i + 1 < argc) {
+            config.enroll_tpm_ak_pubkey = argv[++i];
+        } else if (std::strcmp(argv[i], "--enroll-tpm-ek-cert") == 0 && i + 1 < argc) {
+            config.enroll_tpm_ek_cert_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
+            config.print_tpm_ak = true;
         } else if (std::strcmp(argv[i], "--revoke-server") == 0 && i + 1 < argc) {
             config.revoke_server_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--add-manifest") == 0 && i + 1 < argc) {
@@ -391,6 +400,15 @@ bool validate_config(const ServerConfig& config) {
             spdlog::error("Config: cannot create data_root '{}': {}", config.data_root, ec.message());
             valid = false;
         }
+    }
+
+    // Tier 1 (require_tee_attestation) gates sensitive operations on a verified
+    // binary measurement. Without a release signing pubkey, is_approved_binary()
+    // cannot be evaluated and the binary check is silently skipped — so require it.
+    if (config.require_tee_attestation && config.release_signing_pubkey.empty()) {
+        spdlog::error("Config: require_tee_attestation is set but release_signing_pubkey "
+                       "is empty — Tier1 binary attestation cannot be enforced");
+        valid = false;
     }
 
     // Warnings (non-fatal)

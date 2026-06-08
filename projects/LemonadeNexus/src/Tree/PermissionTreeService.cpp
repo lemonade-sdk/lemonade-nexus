@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <unordered_set>
 
 namespace nexus::tree {
 
@@ -429,7 +430,19 @@ bool PermissionTreeService::do_validate_signature_chain(std::string_view node_id
 
     std::string current_id(node_id);
 
+    // Cycle guard: a corrupt/malicious parent_id can form a loop (self-parent or
+    // A->B->A). Without this, the walk spins forever holding mutex_, wedging every
+    // other tree operation. Reject any chain that revisits a node or exceeds the
+    // node count (a valid chain visits each node at most once on the way to root).
+    std::unordered_set<std::string> visited;
+
     while (true) {
+        if (!visited.insert(current_id).second) {
+            spdlog::error("[{}] signature chain has a cycle at node '{}' -- rejecting",
+                           name(), current_id);
+            return false;
+        }
+
         auto it = nodes_.find(current_id);
         if (it == nodes_.end()) {
             spdlog::error("[{}] signature chain broken: node '{}' not found",

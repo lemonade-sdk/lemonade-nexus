@@ -1,9 +1,11 @@
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
+#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -109,6 +111,27 @@ TeePlatform TeeAttestationService::detect_tee_platform() {
 #endif
 
 #if defined(__linux__)
+    // Check for a TPM 2.0 first — it is the only backend with a real hardware
+    // root of trust (an enrollment-pinned AK), so it is preferred even on a box
+    // that also exposes SEV/TDX/SGX. We require the TPM to be actually USABLE
+    // (the device opens R/W, or an explicit TCTI such as swtpm is configured) and
+    // an ESYS context to come up — a TPM we cannot drive must not advertise a
+    // Tier-1 capability we can't back. This also keeps a plain no-TPM box quiet
+    // (we don't even attempt ESYS unless there's a reason to).
+    {
+        bool reachable = (std::getenv("TSS2_TCTI") != nullptr);
+        if (!reachable) {
+            for (const char* dev : {"/dev/tpmrm0", "/dev/tpm0"}) {
+                int fd = open(dev, O_RDWR | O_CLOEXEC);
+                if (fd >= 0) { close(fd); reachable = true; break; }
+            }
+        }
+        if (reachable && tpm::tpm_available()) {
+            spdlog::debug("[{}] usable TPM 2.0 detected", name());
+            return TeePlatform::Tpm2;
+        }
+    }
+
     // Check for AMD SEV-SNP (runs inside a confidential VM)
     // Docker: /dev/sev-guest is mapped into the container automatically
     // when the host VM runs on SEV-SNP
@@ -171,10 +194,11 @@ TeePlatform TeeAttestationService::do_detected_platform() const {
 
 TeeAttestationReport TeeAttestationService::do_generate_report(
     const std::array<uint8_t, 32>& nonce) {
-    //TODO: detouring
-    //Lets look into function detouring and verify there is no security implications,
-    //  from that method that can effect this function and the following functions after this function as well. perhaps we could do function call obsecurity.
+    // The prover does not need obfuscation: security comes from the *verifier*
+    // checking a hardware-signed TPM quote against a cert-pinned AK, not from
+    // hiding this code. See docs/TEE-Attestation-Hardening-Plan.md §6.
     switch (detected_platform_) {
+        case TeePlatform::Tpm2:              return generate_tpm_report(nonce);
         case TeePlatform::IntelSgx:          return generate_sgx_report(nonce);
         case TeePlatform::IntelTdx:          return generate_tdx_report(nonce);
         case TeePlatform::AmdSevSnp:         return generate_sev_snp_report(nonce);
@@ -192,12 +216,16 @@ TeeAttestationReport TeeAttestationService::do_generate_report(
     report.binary_hash = binary_attestation_.self_hash();
     return report;
 }
-//TODO: READ THIS OVER AND OVER AGAIN
-//I'm not sure about any of this, the reason is that 
-//this code needs to be written very specifically to not allow someone to inject anything which would or could effect the outcome of the verification.
+// Verification rules — see docs/TEE-Attestation-Hardening-Plan.md.
+// Invariant: nothing the caller cannot vouch for may decide the outcome. Every
+// gate below is fail-closed; the signature is mandatory; the platform quote must
+// verify (Phase 3 adds the TPM hardware root of trust). The report's
+// server_pubkey is NOT a trust anchor on its own — callers must already have
+// bound it to an enrolled, root-CA-signed certificate before trusting the result.
 bool TeeAttestationService::do_verify_report(
     const TeeAttestationReport& report,
-    const std::array<uint8_t, 32>& expected_nonce) {
+    const std::array<uint8_t, 32>& expected_nonce,
+    const std::string& trusted_ak_pubkey) {
 
     // 1. Check nonce binding
     if (report.nonce != expected_nonce) {
@@ -218,8 +246,15 @@ bool TeeAttestationService::do_verify_report(
         return false;
     }
 
-    // 3. Verify Ed25519 signature over canonical JSON
-    if (!report.signature.empty() && !report.server_pubkey.empty()) {
+    // 3. Verify Ed25519 signature over canonical JSON.
+    //    MANDATORY: an unsigned or unkeyed report must never pass. (Previously
+    //    this block was skipped when the signature/pubkey were empty, letting an
+    //    attacker bypass it by simply omitting the signature.)
+    if (report.signature.empty() || report.server_pubkey.empty()) {
+        spdlog::warn("[{}] attestation report missing signature or pubkey — rejected", name());
+        return false;
+    }
+    {
         auto pubkey_bytes = crypto::from_base64(report.server_pubkey);
         if (pubkey_bytes.size() != crypto::kEd25519PublicKeySize) {
             spdlog::warn("[{}] attestation report has invalid pubkey size", name());
@@ -254,6 +289,10 @@ bool TeeAttestationService::do_verify_report(
     }
 
     switch (report.platform) {
+        case TeePlatform::Tpm2:
+            // The only backend with a real hardware root of trust: the quote
+            // signature is checked against the cert-pinned AK, not report.ak_pubkey.
+            return verify_tpm_report(report, expected_nonce, trusted_ak_pubkey);
         case TeePlatform::IntelSgx:          return verify_sgx_report(report);
         case TeePlatform::IntelTdx:          return verify_tdx_report(report);
         case TeePlatform::AmdSevSnp:         return verify_sev_snp_report(report);
@@ -383,8 +422,34 @@ std::optional<TeeAttestationReport> TeeAttestationService::cached_report() const
 }
 
 void TeeAttestationService::set_platform_override(const std::string& platform_str) {
-    detected_platform_ = tee_platform_from_string(platform_str);
-    spdlog::info("[{}] platform overridden to: {}", name(), tee_platform_name(detected_platform_));
+    auto requested = tee_platform_from_string(platform_str);
+
+    // Downgrading (forcing None) is always safe — it only reduces our own claims.
+    if (requested == TeePlatform::None) {
+        detected_platform_ = TeePlatform::None;
+        spdlog::info("[{}] platform override: forced to None (downgrade)", name());
+        return;
+    }
+
+    // Otherwise the requested platform's hardware MUST actually be present. The
+    // override is for selecting among genuinely-available platforms / testing — it
+    // must NEVER let a box with no TEE assert one (issue 7 in the hardening plan),
+    // which would forge Tier-1 capability on a machine with no root of trust.
+    auto actual = detect_tee_platform();
+    if (requested == actual) {
+        detected_platform_ = requested;
+        spdlog::info("[{}] platform override accepted: {}", name(), tee_platform_name(requested));
+    } else {
+        spdlog::warn("[{}] platform override to '{}' REJECTED — hardware actually detected is "
+                      "'{}'. Refusing to fabricate TEE capability; keeping detected platform.",
+                      name(), platform_str, tee_platform_name(actual));
+        detected_platform_ = actual;
+    }
+}
+
+void TeeAttestationService::set_identity_pubkey(const std::string& pubkey_b64) {
+    std::lock_guard lock(mutex_);
+    identity_pubkey_b64_ = pubkey_b64;
 }
 
 // ===========================================================================
@@ -471,17 +536,20 @@ bool TeeAttestationService::verify_sgx_report(const TeeAttestationReport& report
         return false;
     }
 
-    // In production: use sgx_ql_verify_quote() or Intel Attestation Service API
-    // to verify the DCAP quote against Intel's root of trust.
-    //
-    // For now, verify the structural integrity (nonce binding, binary hash)
+    // STRUCTURAL ONLY — NOT SECURE until Phase 3 (DCAP/IAS verification against
+    // Intel's root of trust). This proves nothing about hardware; it only rejects
+    // malformed quotes. See docs/TEE-Attestation-Hardening-Plan.md.
 
-    if (report.quote.size() >= 36) {
-        // Verify nonce binding (bytes 4-35)
-        if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
-            spdlog::warn("[{}] SGX quote nonce mismatch", name());
-            return false;
-        }
+    // Nonce binding (bytes 4-35) is MANDATORY: a quote too short to carry the
+    // nonce must be rejected, not waved through.
+    if (report.quote.size() < 36) {
+        spdlog::warn("[{}] SGX quote too short for nonce binding ({} bytes)",
+                      name(), report.quote.size());
+        return false;
+    }
+    if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
+        spdlog::warn("[{}] SGX quote nonce mismatch", name());
+        return false;
     }
 
     spdlog::debug("[{}] SGX report verified (structural)", name());
@@ -541,11 +609,16 @@ bool TeeAttestationService::verify_tdx_report(const TeeAttestationReport& report
         return false;
     }
 
-    // Verify nonce binding
-    if (report.quote.size() >= 36) {
-        if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
-            return false;
-        }
+    // STRUCTURAL ONLY — NOT SECURE until Phase 3 (TDX quote verification against
+    // Intel's root of trust). Nonce binding is MANDATORY.
+    if (report.quote.size() < 36) {
+        spdlog::warn("[{}] TDX quote too short for nonce binding ({} bytes)",
+                      name(), report.quote.size());
+        return false;
+    }
+    if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
+        spdlog::warn("[{}] TDX quote nonce mismatch", name());
+        return false;
     }
 
     spdlog::debug("[{}] TDX report verified (structural)", name());
@@ -617,13 +690,17 @@ bool TeeAttestationService::verify_sev_snp_report(const TeeAttestationReport& re
         return false;
     }
 
-    // In production: fetch VCEK cert from AMD KDS, verify ECDSA P-384 signature
-    // on the attestation report, validate cert chain against AMD root CA
-
-    if (report.quote.size() >= 36) {
-        if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
-            return false;
-        }
+    // STRUCTURAL ONLY — NOT SECURE until Phase 3 (fetch VCEK cert from AMD KDS,
+    // verify the ECDSA P-384 signature on the report, validate the chain against
+    // the AMD root CA). Nonce binding is MANDATORY.
+    if (report.quote.size() < 36) {
+        spdlog::warn("[{}] SEV-SNP quote too short for nonce binding ({} bytes)",
+                      name(), report.quote.size());
+        return false;
+    }
+    if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
+        spdlog::warn("[{}] SEV-SNP quote nonce mismatch", name());
+        return false;
     }
 
     spdlog::debug("[{}] SEV-SNP report verified (structural)", name());
@@ -760,27 +837,28 @@ bool TeeAttestationService::verify_apple_se_report(const TeeAttestationReport& r
         return false;
     }
 
-#if defined(__APPLE__)
-    // Verify: extract public key from quote, verify ECDSA signature over nonce
-    // In production: also validate the key attestation certificate chain
-    // against Apple's root CA
-
-    if (report.quote.size() < 36) return false;
-
-    // Verify nonce binding (bytes 4-35)
+    // STRUCTURAL ONLY — NOT SECURE until Phase 3 (extract the public key from the
+    // quote, verify the ECDSA signature over the nonce, and validate the key
+    // attestation certificate chain against Apple's root CA). Nonce binding is
+    // MANDATORY on every platform.
+    if (report.quote.size() < 36) {
+        spdlog::warn("[{}] Apple SE quote too short for nonce binding ({} bytes)",
+                      name(), report.quote.size());
+        return false;
+    }
     if (std::memcmp(report.quote.data() + 4, report.nonce.data(), 32) != 0) {
         spdlog::warn("[{}] Apple SE quote nonce mismatch", name());
         return false;
     }
 
+#if defined(__APPLE__)
     spdlog::debug("[{}] Apple SE report verified (structural)", name());
-    return true;
 #else
-    // Can't verify Apple attestation on non-Apple platforms
-    // In production, you'd verify the certificate chain using OpenSSL
-    spdlog::debug("[{}] Apple SE verification on non-Apple platform (chain only)", name());
-    return report.quote.size() >= 36;
+    // Non-Apple verifier: cannot check the ECDSA signature / cert chain, but the
+    // nonce binding above is still enforced (previously any 36-byte blob passed).
+    spdlog::debug("[{}] Apple SE verification on non-Apple platform (structural only)", name());
 #endif
+    return true;
 }
 
 } // namespace nexus::core

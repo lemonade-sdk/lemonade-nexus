@@ -35,6 +35,7 @@ add_nexus_test(test_dns               test_dns.cpp)
 add_nexus_test(test_geo_region        test_geo_region.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
+add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)

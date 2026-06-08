@@ -1168,6 +1168,56 @@ bool GossipService::is_revoked(const std::string& server_pubkey) const {
                      server_pubkey) != revoked_pubkeys_.end();
 }
 
+bool GossipService::peer_has_verified_certificate(const std::string& pubkey) const {
+    if (pubkey.empty() || is_revoked(pubkey)) return false;
+
+    // Snapshot the peer's stored certificate JSON under the lock, then verify
+    // outside it (verify_server_certificate does not take peers_mutex_).
+    std::string cert_json;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = std::find_if(peers_.begin(), peers_.end(),
+            [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+        if (it == peers_.end() || it->certificate_json.empty()) return false;
+        cert_json = it->certificate_json;
+    }
+
+    try {
+        auto cert = json::parse(cert_json).get<ServerCertificate>();
+        // The certificate must actually belong to this pubkey and be valid under
+        // our root. (When no root pubkey is configured, verify_server_certificate
+        // returns true by design — trust is advisory in that deployment mode.)
+        if (cert.server_pubkey != pubkey) return false;
+        return verify_server_certificate(cert);
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) const {
+    if (pubkey.empty() || is_revoked(pubkey)) return {};
+
+    std::string cert_json;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = std::find_if(peers_.begin(), peers_.end(),
+            [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+        if (it == peers_.end() || it->certificate_json.empty()) return {};
+        cert_json = it->certificate_json;
+    }
+
+    try {
+        auto cert = json::parse(cert_json).get<ServerCertificate>();
+        // Only return the AK from a certificate that actually belongs to this
+        // pubkey and verifies under our root — otherwise the AK is not trustworthy.
+        if (cert.server_pubkey != pubkey) return {};
+        if (!verify_server_certificate(cert)) return {};
+        return cert.tpm_ak_pubkey;
+    } catch (...) {
+        return {};
+    }
+}
+
 void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                                           const uint8_t* payload,
                                           std::size_t payload_len) {
@@ -1334,6 +1384,17 @@ std::string GossipService::verify_message_trust(
 
         auto token = j["attestation_token"].get<core::AttestationToken>();
 
+        // Zero-trust identity binding: the token's pubkey must belong to a peer
+        // that presented a valid, root-CA-signed certificate. Without this, an
+        // attacker mints a self-signed token for an arbitrary key and is promoted
+        // to Tier1 (the token's signature only proves self-consistency).
+        if (!peer_has_verified_certificate(token.server_pubkey)) {
+            spdlog::warn("[{}] rejecting attestation token: pubkey {} is not an "
+                          "enrolled, certificate-verified peer", name(),
+                          token.server_pubkey.substr(0, 12) + "...");
+            return {};
+        }
+
         // Verify and update trust state through TrustPolicy
         auto tier = trust_policy_->verify_and_update(token.server_pubkey, token);
 
@@ -1437,8 +1498,21 @@ void GossipService::handle_tee_response(const asio::ip::udp::endpoint& sender,
 
         auto report = j.get<core::TeeAttestationReport>();
 
+        // Zero-trust identity binding: only honor a challenge response from a peer
+        // whose pubkey we have already bound to a valid, root-CA-signed certificate.
+        if (!peer_has_verified_certificate(report.server_pubkey)) {
+            spdlog::warn("[{}] rejecting TEE challenge response from {}:{}: pubkey {} "
+                          "is not an enrolled, certificate-verified peer", name(),
+                          sender.address().to_string(), sender.port(),
+                          report.server_pubkey.substr(0, 12) + "...");
+            return;
+        }
+
+        // The TPM quote signature must verify against the AK pinned in this peer's
+        // enrolled certificate — never the AK hint carried inside the report itself.
+        auto trusted_ak = certificate_ak_pubkey(report.server_pubkey);
         bool accepted = trust_policy_->handle_challenge_response(
-            report.server_pubkey, report);
+            report.server_pubkey, report, trusted_ak);
 
         if (accepted) {
             spdlog::info("[{}] peer {}:{} (pk: {}...) promoted to Tier1 via TEE challenge",
@@ -1602,6 +1676,17 @@ void GossipService::handle_enrollment_vote_request(
         if (trust_policy_) {
             if (j.contains("attestation_token")) {
                 auto token = j["attestation_token"].get<core::AttestationToken>();
+                // The token must actually belong to the claimed sponsor, and the
+                // sponsor must be an enrolled, certificate-verified peer. Otherwise
+                // an attacker replays a stolen token under a forged sponsor_pubkey.
+                if (token.server_pubkey != sponsor_pubkey ||
+                    !peer_has_verified_certificate(sponsor_pubkey)) {
+                    spdlog::warn("[{}] enrollment vote request with mismatched/unverified "
+                                  "sponsor token (sponsor={}, token={})", name(),
+                                  sponsor_pubkey.substr(0, 12),
+                                  token.server_pubkey.substr(0, 12));
+                    return;
+                }
                 auto tier = trust_policy_->verify_and_update(sponsor_pubkey, token);
                 if (tier == core::TrustTier::Untrusted) {
                     spdlog::warn("[{}] enrollment vote request from untrusted sponsor {}",

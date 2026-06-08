@@ -258,6 +258,17 @@ private:
     // Check if a server pubkey has been revoked
     [[nodiscard]] bool is_revoked(const std::string& server_pubkey) const;
 
+    /// Zero-trust identity binding: true only if `pubkey` belongs to a known peer
+    /// that presented a valid, non-revoked, root-CA-signed certificate. Used to
+    /// reject attestation tokens/reports whose self-asserted pubkey is not an
+    /// enrolled identity (see docs/TEE-Attestation-Hardening-Plan.md).
+    [[nodiscard]] bool peer_has_verified_certificate(const std::string& pubkey) const;
+
+    /// The TPM Attestation Key pinned in `pubkey`'s enrolled certificate (base64
+    /// DER SPKI), or "" if the peer has no verified certificate or no AK enrolled.
+    /// This is the trust anchor a TPM quote signature is verified against.
+    [[nodiscard]] std::string certificate_ak_pubkey(const std::string& pubkey) const;
+
     // Load the server certificate and root pubkey
     void load_server_certificate();
 

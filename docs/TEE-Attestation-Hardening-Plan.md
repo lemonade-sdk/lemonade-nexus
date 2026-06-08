@@ -173,7 +173,7 @@ canonical report with the identity key (mandatory).
 
 | Phase | Scope | Status |
 |------|-------|--------|
-| **1. Cheap hardening** (no TPM): mandatory signature, hard size checks, cert-pubkey binding in gossip, sponsor/token cross-check, remove `cin.get`, gate override, config enforcement | **landing** |
+| **1. Cheap hardening** (no TPM): mandatory signature, hard size checks, cert-pubkey binding in gossip, sponsor/token cross-check, gate override, config enforcement | **landing** |
 | **2. Data model**: new report/token/cert fields, canonical JSON, `Tpm2` enum, `trusted_pubkey` threaded through CRTP + callers | pending |
 | **3. TPM backend**: FAPI generate + OpenSSL verify, PCR extend, detection | pending |
 | **4. Enrollment binding**: AK pinning in `--enroll`, EK validation, config validation | pending |

@@ -26,6 +26,7 @@
 #include <LemonadeNexus/Core/GovernanceService.hpp>
 #include <LemonadeNexus/Core/RootKeyChain.hpp>
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
+#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 #include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
@@ -45,10 +46,12 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <thread>
 
@@ -61,6 +64,20 @@ int main(int argc, char* argv[]) {
     if (!nexus::core::validate_config(config)) {
         spdlog::error("Invalid configuration, exiting");
         return 1;
+    }
+
+    // --- Print this host's TPM AK pubkey and exit (for enrollment) ---
+    if (config.print_tpm_ak) {
+        auto ak = nexus::core::tpm::export_ak_pubkey_b64();
+        if (!ak) {
+            spdlog::error("No TPM available — cannot export an Attestation Key. "
+                          "(Need /dev/tpmrm0 or a TCTI such as swtpm, on a Linux TPM build.)");
+            return 1;
+        }
+        // Print the raw value to stdout so it can be piped into --enroll-tpm-ak.
+        spdlog::info("TPM AK pubkey (base64 DER SPKI):");
+        std::printf("%s\n", ak->c_str());
+        return 0;
     }
 
     // --- Handle enrollment/revocation CLI commands (exit after) ---
@@ -87,6 +104,33 @@ int main(int argc, char* argv[]) {
                 std::chrono::system_clock::now().time_since_epoch()).count());
         cert.expires_at     = 0; // no expiry
         cert.issuer_pubkey  = nexus::crypto::to_base64(*pubkey);
+
+        // Model A: pin the joining server's TPM Attestation Key into the cert so the
+        // root signature binds identity ↔ AK. The admin is asserting (having validated
+        // the EK→AK chain out of band) that this AK belongs to a genuine TPM.
+        cert.tpm_ak_pubkey = config.enroll_tpm_ak_pubkey;
+        if (!config.enroll_tpm_ek_cert_path.empty()) {
+            std::ifstream ek_f(config.enroll_tpm_ek_cert_path);
+            if (ek_f) {
+                std::string ek_pem((std::istreambuf_iterator<char>(ek_f)),
+                                    std::istreambuf_iterator<char>());
+                cert.tpm_ek_cert = ek_pem;
+                spdlog::info("Enroll: attached EK certificate from {} ({} bytes) — validate the "
+                             "EK→AK chain to the TPM vendor CA before trusting this AK.",
+                             config.enroll_tpm_ek_cert_path, ek_pem.size());
+            } else {
+                spdlog::warn("Enroll: could not read EK cert '{}' — continuing without it",
+                             config.enroll_tpm_ek_cert_path);
+            }
+        }
+        if (cert.tpm_ak_pubkey.empty()) {
+            spdlog::warn("Enroll: no TPM AK pinned (--enroll-tpm-ak) — '{}' will be a Tier-2 "
+                         "certificate and cannot reach Tier 1 under require_tee_attestation.",
+                         config.enroll_server_id);
+        } else {
+            spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",
+                         cert.tpm_ak_pubkey.substr(0, 16), config.enroll_server_id);
+        }
 
         auto canonical = nexus::gossip::canonical_cert_json(cert);
         auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
@@ -204,16 +248,26 @@ int main(int argc, char* argv[]) {
     attestation.start();
 
     nexus::core::TeeAttestationService tee{crypto, storage, attestation};
-    if (!config.tee_platform_override.empty()) 
-        //Questionable whats actually happening here,
-        // this needs to be looked into further, this could leave a hole into the system to allow someone to override TEE for a system that doesnt support that type of TEE
-        //Maybe they could implement a custom TEE wrapper, not sure. Need to double check this and probably with some theories / research against TEE
-        
+    if (!config.tee_platform_override.empty()) {
+        // set_platform_override is now hardware-gated: it can only select a platform
+        // whose device is actually present, or downgrade to None. It can no longer
+        // fabricate TEE capability on a box with no root of trust (hardening plan,
+        // issue 7) — so this is safe to drive from config.
         tee.set_platform_override(config.tee_platform_override);
+    }
 
     tee.start();
 
+    if (config.require_tee_attestation &&
+        tee.detected_platform() != nexus::core::TeePlatform::Tpm2) {
+        spdlog::warn("require_tee_attestation is set but no TPM 2.0 was detected on this host. "
+                     "This server will operate as Tier 2 (it can VERIFY Tier-1 peers but cannot "
+                     "self-attest). Provision a TPM (/dev/tpmrm0) to become Tier-1 capable.");
+    }
+
     nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
+    // Strict TPM-only Tier 1 is enforced whenever attestation is required.
+    trust_policy.set_require_tpm(config.require_tee_attestation);
     trust_policy.start();
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
@@ -288,6 +342,13 @@ int main(int argc, char* argv[]) {
         gossip.add_peer(peer_endpoint, "");
     }
     gossip.start();
+
+    // Bind our identity into the TPM quote's qualifyingData. Use the very keypair
+    // gossip signs TEE reports with, so report.server_pubkey matches what the prover
+    // hashes into the quote (and what a verifier recomputes).
+    tee.set_identity_pubkey(nexus::crypto::to_base64(
+        std::span<const uint8_t>(gossip.keypair().public_key.data(),
+                                 gossip.keypair().public_key.size())));
 
     // ========================================================================
     // Dynamic DNS
