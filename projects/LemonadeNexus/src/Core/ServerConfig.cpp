@@ -133,6 +133,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --stun-port <N>            STUN UDP port (default: 3478)");
     spdlog::info("  --relay-port <N>           Relay UDP port (default: 9103)");
     spdlog::info("  --bind-address <addr>      Bind address for all services (default: 0.0.0.0)");
+    spdlog::info("  --public-ip <addr>         Public IP to advertise in DNS (default: auto-detect)");
     spdlog::info("  --wg-interface <name>      WireGuard interface (default: nexus0). NEVER use 'wg0' or anything in use.");
     spdlog::info("  --data-root <path>         Data directory (default: data)");
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
@@ -220,6 +221,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.relay_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
             config.bind_address = argv[++i];
+        } else if (std::strcmp(argv[i], "--public-ip") == 0 && i + 1 < argc) {
+            config.public_ip = argv[++i];
         } else if (std::strcmp(argv[i], "--wg-interface") == 0 && i + 1 < argc) {
             config.wg_interface = argv[++i];
         } else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) {
