@@ -47,6 +47,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"server_hostname",     c.server_hostname},
         {"auto_tls",            c.auto_tls},
         {"dns_base_domain",     c.dns_base_domain},
+        {"dns_seed_discovery",  c.dns_seed_discovery},
         {"dns_ns_hostname",     c.dns_ns_hostname},
         {"release_signing_pubkey",     c.release_signing_pubkey},
         {"require_binary_attestation", c.require_binary_attestation},
@@ -98,6 +99,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
     if (j.contains("auto_tls"))            j.at("auto_tls").get_to(c.auto_tls);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
+    if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
     if (j.contains("release_signing_pubkey"))     j.at("release_signing_pubkey").get_to(c.release_signing_pubkey);
     if (j.contains("require_binary_attestation")) j.at("require_binary_attestation").get_to(c.require_binary_attestation);
@@ -160,6 +162,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --dns-port <N>             Internal DNS listen port (default: 5335, NAT-mapped from public)");
     spdlog::info("  --public-dns-port <N>      DNS port advertised to clients (default: 53)");
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
+    spdlog::info("  --no-dns-seed-discovery    Disable auto-discovery of seed peers from tier/region DNS");
     spdlog::info("  --dns-provider <name>      DNS provider: 'local' (default) or 'cloudflare'");
     spdlog::info("  --dns-ns-hostname <fqdn>   This server's NS hostname (e.g. ns1.example.com)");
     spdlog::info("  --server-hostname <name>   Server hostname for TLS cert (auto-generated from region if omitted)");
@@ -276,6 +279,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.public_dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--dns-base-domain") == 0 && i + 1 < argc) {
             config.dns_base_domain = argv[++i];
+        } else if (std::strcmp(argv[i], "--no-dns-seed-discovery") == 0) {
+            config.dns_seed_discovery = false;
         } else if (std::strcmp(argv[i], "--dns-provider") == 0 && i + 1 < argc) {
             config.dns_provider = argv[++i];
         } else if (std::strcmp(argv[i], "--dns-ns-hostname") == 0 && i + 1 < argc) {
@@ -322,6 +327,10 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_DNS_PORT"))         config.dns_port        = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_PUBLIC_DNS_PORT"))  config.public_dns_port = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_DNS_BASE_DOMAIN"))  config.dns_base_domain = v;
+    if (const char* v = std::getenv("SP_DNS_SEED_DISCOVERY")) {
+        std::string s = v;
+        config.dns_seed_discovery = !(s == "0" || s == "false" || s == "no");
+    }
     if (const char* v = std::getenv("SP_DNS_NS_HOSTNAME")) config.dns_ns_hostname = v;
     if (const char* v = std::getenv("SP_RELEASE_SIGNING_PUBKEY")) config.release_signing_pubkey = v;
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;

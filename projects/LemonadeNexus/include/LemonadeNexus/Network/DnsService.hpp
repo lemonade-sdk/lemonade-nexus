@@ -182,6 +182,14 @@ public:
                               const std::string& region,
                               const std::string& public_ip);
 
+    /// Publish a per-server tier A record under <id>.tier<tier>.<region>.seip.<domain>.
+    /// Aggregated by the tier+region wildcard so a bootstrapping node can resolve
+    /// tier<tier>.<region>.seip.<domain> to all servers of that tier in that region.
+    void publish_tier_record(const std::string& server_id,
+                             const std::string& region,
+                             int tier,
+                             const std::string& public_ip);
+
     /// Update the connected-client load count and re-publish the SEIP _config
     /// TXT record if the count changed (avoids gossip spam).
     void update_load(uint32_t connected_client_count);

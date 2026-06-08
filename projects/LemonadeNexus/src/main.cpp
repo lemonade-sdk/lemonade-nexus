@@ -54,6 +54,7 @@
 #include <iterator>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 
 int main(int argc, char* argv[]) {
     // --- Load configuration: CLI args > env vars > config file > defaults ---
@@ -342,6 +343,28 @@ int main(int argc, char* argv[]) {
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
     }
+
+    // Resolve our region + public IP early (reused later for NS/SEIP setup) so we can
+    // auto-discover seed peers from tier/region DNS before the gossip layer starts —
+    // discovered peers are then included in the initial ServerHello broadcast.
+    nexus::core::resolve_server_region(config, data_root);
+    std::string server_public_ip = nexus::core::resolve_public_ip(config);
+    if (config.dns_seed_discovery) {
+        std::unordered_set<std::string> existing(
+            config.seed_peers.begin(), config.seed_peers.end());
+        auto found = nexus::core::discover_seed_endpoints(
+            config.dns_base_domain, config.region, server_public_ip, config.gossip_port);
+        std::size_t added = 0;
+        for (const auto& ep : found) {
+            if (existing.insert(ep).second) {
+                gossip.add_peer(ep, "");
+                ++added;
+            }
+        }
+        spdlog::info("DNS discovery: seeded {} peer(s) from tier/region DNS (region '{}')",
+                      added, config.region);
+    }
+
     gossip.start();
 
     // Bind our identity into the TPM quote's qualifyingData. Use the very keypair
@@ -446,7 +469,7 @@ int main(int argc, char* argv[]) {
     // Server identity resolution (uses ServerIdentity helpers)
     // ========================================================================
     nexus::core::resolve_server_hostname(config, data_root, gossip);
-    nexus::core::resolve_server_region(config, data_root);
+    // (region already resolved before gossip.start() for DNS seed discovery)
 
     // NS hostname: explicit > derived from server_hostname
     std::string ns_hostname = config.dns_ns_hostname;
@@ -455,7 +478,7 @@ int main(int argc, char* argv[]) {
         spdlog::info("DNS: auto-derived NS hostname: {}", ns_hostname);
     }
 
-    std::string server_public_ip = nexus::core::resolve_public_ip(config);
+    // (server_public_ip already resolved before gossip.start() for DNS seed discovery)
 
     // Configure NS identity for SOA/NS responses
     if (!ns_hostname.empty() && !server_public_ip.empty()) {
@@ -511,6 +534,15 @@ int main(int argc, char* argv[]) {
 
             dns.publish_seip_records(seip_id, config.region, server_public_ip);
             spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
+
+            // Publish our tier record so other nodes can discover us by tier+region
+            // (tier<N>.<region>.seip.<domain>). Tier1 = TEE-attested, Tier2 = cert-only.
+            const auto our_tier = trust_policy.our_tier();
+            const int tier_num = (our_tier == nexus::core::TrustTier::Tier1) ? 1
+                               : (our_tier == nexus::core::TrustTier::Tier2) ? 2 : 0;
+            if (tier_num > 0) {
+                dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
+            }
 
             // Request ACME cert for the SEIP hostname (public API)
             if (config.auto_tls) {

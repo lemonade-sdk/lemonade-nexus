@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 // Forward declarations — keep the header lightweight
 namespace nexus::core { struct ServerConfig; }
@@ -44,6 +46,28 @@ void resolve_server_region(
 
 /// Resolve public IP: config > non-wildcard bind address > ipify auto-detect.
 [[nodiscard]] std::string resolve_public_ip(const ServerConfig& config);
+
+/// Resolve IPv4 (A) records for a hostname via the system resolver (getaddrinfo).
+/// Returns de-duplicated dotted-quad strings; empty on failure.
+[[nodiscard]] std::vector<std::string> resolve_a_records(const std::string& hostname);
+
+/// Pure selection step (no network): turn an ordered list of candidate IPs into a
+/// de-duplicated list of "ip:port" seed endpoints, excluding our own public IP and
+/// preserving priority order. Factored out of discover_seed_endpoints for testing.
+[[nodiscard]] std::vector<std::string> select_seed_endpoints(
+    const std::vector<std::string>& candidate_ips,
+    const std::string& our_public_ip,
+    uint16_t gossip_port);
+
+/// Discover gossip seed endpoints ("ip:port") from public tier+region DNS records.
+/// Queries tier1/tier2.<region>.seip.<base_domain> for our region plus the nearest
+/// regions (by geo distance), preferring higher tier and closer region first.
+/// Excludes our_public_ip (no self-seeding) and de-duplicates. Empty on failure.
+[[nodiscard]] std::vector<std::string> discover_seed_endpoints(
+    const std::string& base_domain,
+    const std::string& our_region,
+    const std::string& our_public_ip,
+    uint16_t gossip_port);
 
 /// Build server FQDN from hostname + base domain.
 [[nodiscard]] std::string build_server_fqdn(

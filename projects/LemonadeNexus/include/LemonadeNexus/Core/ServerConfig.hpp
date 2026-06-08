@@ -62,6 +62,7 @@ struct ServerConfig {
     // DNS resolution
     std::string dns_base_domain{"lemonade-nexus.io"};
     std::string dns_ns_hostname;            // this server's NS hostname (e.g. "ns1.lemonade-nexus.io")
+    bool        dns_seed_discovery{true};   // auto-discover seed peers from tier/region DNS records on startup
 
     // Binary attestation
     std::string release_signing_pubkey;       // base64 Ed25519 pubkey for release manifest verification
