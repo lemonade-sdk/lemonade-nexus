@@ -837,13 +837,19 @@ int main(int argc, char* argv[]) {
     nexus::api::AdminApiHandler  admin_api{ctx};
     nexus::api::MeshApiHandler   mesh_api{ctx};
 
-    public_api.register_routes(http_server.server(), private_srv);
-    auth_api.register_routes(http_server.server(), private_srv);
-    tree_api.register_routes(http_server.server(), private_srv);
-    relay_api.register_routes(http_server.server(), private_srv);
-    cert_api.register_routes(http_server.server(), private_srv);
-    admin_api.register_routes(http_server.server(), private_srv);
-    mesh_api.register_routes(http_server.server(), private_srv);
+    // Route registration is factored into a lambda so it can be re-run if the
+    // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
+    // a background ACME cert is issued).
+    auto register_public_routes = [&]() {
+        public_api.register_routes(http_server.server(), private_srv);
+        auth_api.register_routes(http_server.server(), private_srv);
+        tree_api.register_routes(http_server.server(), private_srv);
+        relay_api.register_routes(http_server.server(), private_srv);
+        cert_api.register_routes(http_server.server(), private_srv);
+        admin_api.register_routes(http_server.server(), private_srv);
+        mesh_api.register_routes(http_server.server(), private_srv);
+    };
+    register_public_routes();
 
     // ========================================================================
     // Start HTTP servers
@@ -901,8 +907,29 @@ int main(int argc, char* argv[]) {
                 if (result.success) {
                     spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
                                   server_fqdn, result.cert_path, result.key_path);
-                    spdlog::info("Auto-TLS: restarting server to activate HTTPS...");
-                    coordinator.shutdown();
+                    // Activate HTTPS in place — restart ONLY the HTTP server, leaving
+                    // gossip/DNS/STUN/relay/etc. running. Never tear down the whole process.
+                    if (http_server.is_tls()) {
+                        // Already HTTPS — hot-swap the cert, no restart needed.
+                        if (http_server.reload_tls_certs(result.cert_path, result.key_path)) {
+                            spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", server_fqdn);
+                        } else {
+                            spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", server_fqdn);
+                        }
+                    } else {
+                        spdlog::info("Auto-TLS: activating HTTPS on the API server (in place)...");
+                        http_server.stop();
+                        if (http_server.upgrade_to_tls(result.cert_path, result.key_path)) {
+                            register_public_routes();  // server object changed — re-register
+                            http_server.start();
+                            spdlog::info("Auto-TLS: HTTPS active for {} — other services unaffected",
+                                          server_fqdn);
+                        } else {
+                            http_server.start();  // upgrade failed — resume plain HTTP
+                            spdlog::warn("Auto-TLS: TLS upgrade failed for {}; continuing on HTTP",
+                                          server_fqdn);
+                        }
+                    }
                     break;
                 }
 
