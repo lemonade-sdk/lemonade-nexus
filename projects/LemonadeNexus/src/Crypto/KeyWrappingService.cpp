@@ -3,15 +3,24 @@
 #include <spdlog/spdlog.h>
 #include <sodium.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 
 namespace nexus::crypto {
 
 namespace fs = std::filesystem;
 
 static constexpr std::string_view kHkdfSalt = "lemonade-nexus-mgmt-key";
+
+// Per-install random secret mixed into the Machine wrapping binding.
+static constexpr std::string_view kLocalSecretFile = "wrap_local.key";
+// keypair.enc payloads written with the machine binding carry this prefix; the
+// absence of any prefix marks a legacy (pre-hardening) blob that is migrated on read.
+static constexpr std::string_view kEncV2Prefix = "v2:";
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -49,7 +58,21 @@ void KeyWrappingService::on_stop() {
 WrappedKey KeyWrappingService::wrap_key(const Ed25519PrivateKey& privkey,
                                          std::span<const uint8_t> passphrase,
                                          const Ed25519PublicKey& pubkey) {
-    auto aes_key = derive_wrapping_key(passphrase, pubkey);
+    return wrap_with_binding(privkey, passphrase, pubkey, WrapBinding::Machine);
+}
+
+std::optional<Ed25519PrivateKey> KeyWrappingService::unwrap_key(
+        const WrappedKey& wrapped,
+        std::span<const uint8_t> passphrase,
+        const Ed25519PublicKey& pubkey) {
+    return unwrap_with_binding(wrapped, passphrase, pubkey, WrapBinding::Machine);
+}
+
+WrappedKey KeyWrappingService::wrap_with_binding(const Ed25519PrivateKey& privkey,
+                                                 std::span<const uint8_t> passphrase,
+                                                 const Ed25519PublicKey& pubkey,
+                                                 WrapBinding binding) {
+    auto aes_key = derive_wrapping_key(passphrase, pubkey, binding);
 
     // Encrypt the 64-byte Ed25519 private key
     auto ct = crypto_.aes_gcm_encrypt(
@@ -62,11 +85,12 @@ WrappedKey KeyWrappingService::wrap_key(const Ed25519PrivateKey& privkey,
     return result;
 }
 
-std::optional<Ed25519PrivateKey> KeyWrappingService::unwrap_key(
+std::optional<Ed25519PrivateKey> KeyWrappingService::unwrap_with_binding(
         const WrappedKey& wrapped,
         std::span<const uint8_t> passphrase,
-        const Ed25519PublicKey& pubkey) {
-    auto aes_key = derive_wrapping_key(passphrase, pubkey);
+        const Ed25519PublicKey& pubkey,
+        WrapBinding binding) {
+    auto aes_key = derive_wrapping_key(passphrase, pubkey, binding);
 
     auto plaintext = crypto_.aes_gcm_decrypt(
         aes_key,
@@ -112,13 +136,14 @@ Ed25519Keypair KeyWrappingService::generate_and_store_identity(
     }
 
     {
-        // Store wrapped private key as: nonce_hex + ":" + ciphertext_hex
+        // Store wrapped private key as: "v2:" + nonce_hex + ":" + ciphertext_hex.
+        // The "v2:" prefix marks the machine-bound binding (see WrapBinding::Machine).
         auto enc_path = identity_dir / "keypair.enc";
         std::ofstream ofs(enc_path, std::ios::binary);
         auto nonce_hex = to_hex(std::span<const uint8_t>(
             wrapped.ciphertext.nonce.data(), wrapped.ciphertext.nonce.size()));
         auto ct_hex = to_hex(std::span<const uint8_t>(wrapped.ciphertext.ciphertext));
-        ofs << nonce_hex << ":" << ct_hex;
+        ofs << kEncV2Prefix << nonce_hex << ":" << ct_hex;
         ofs.close();
         // Owner read/write only — encrypted key material
         std::error_code ec;
@@ -178,6 +203,15 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
 
     std::string content;
     std::getline(ifs, content);
+    ifs.close();
+
+    // A "v2:" prefix marks the machine-bound binding; its absence marks a legacy
+    // (pre-hardening) blob that we transparently migrate to the machine binding.
+    WrapBinding binding = WrapBinding::Legacy;
+    if (content.rfind(kEncV2Prefix, 0) == 0) {
+        binding = WrapBinding::Machine;
+        content.erase(0, kEncV2Prefix.size());
+    }
 
     auto colon = content.find(':');
     if (colon == std::string::npos) {
@@ -210,7 +244,71 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
     wrapped.ciphertext.nonce = std::move(nonce_bytes);
     wrapped.ciphertext.ciphertext = std::move(ct_bytes);
 
-    return unwrap_key(wrapped, passphrase, *pubkey);
+    auto privkey = unwrap_with_binding(wrapped, passphrase, *pubkey, binding);
+    if (!privkey) {
+        return std::nullopt;
+    }
+
+    // Transparently migrate a legacy blob to the machine binding so a stolen
+    // keypair.enc stops being usable on another host / without wrap_local.key.
+    if (binding == WrapBinding::Legacy) {
+        migrate_legacy_identity(enc_path, *privkey, passphrase, *pubkey);
+    }
+    return privkey;
+}
+
+void KeyWrappingService::migrate_legacy_identity(
+        const std::filesystem::path& enc_path,
+        const Ed25519PrivateKey& privkey,
+        std::span<const uint8_t> passphrase,
+        const Ed25519PublicKey& pubkey) {
+    std::error_code ec;
+    // Keep the original blob so a rollback to pre-hardening code can still unlock.
+    auto backup = enc_path;
+    backup += ".legacy.bak";
+    if (!fs::exists(backup, ec)) {
+        fs::copy_file(enc_path, backup, fs::copy_options::overwrite_existing, ec);
+        if (ec) {
+            spdlog::warn("[{}] legacy identity migration: backup failed ({}); skipping re-wrap",
+                         name(), ec.message());
+            return;
+        }
+        fs::permissions(backup, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, ec);
+    }
+
+    auto rewrapped = wrap_with_binding(privkey, passphrase, pubkey, WrapBinding::Machine);
+    auto nonce_hex = to_hex(std::span<const uint8_t>(
+        rewrapped.ciphertext.nonce.data(), rewrapped.ciphertext.nonce.size()));
+    auto ct_hex = to_hex(std::span<const uint8_t>(rewrapped.ciphertext.ciphertext));
+
+    // Write atomically: temp file + rename, so a crash never truncates keypair.enc.
+    auto tmp = enc_path;
+    tmp += ".tmp";
+    {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            spdlog::warn("[{}] legacy identity migration: cannot open temp file", name());
+            return;
+        }
+        ofs << kEncV2Prefix << nonce_hex << ":" << ct_hex;
+        ofs.close();
+        if (!ofs) {
+            spdlog::warn("[{}] legacy identity migration: temp write failed", name());
+            fs::remove(tmp, ec);
+            return;
+        }
+    }
+    fs::rename(tmp, enc_path, ec);
+    if (ec) {
+        spdlog::warn("[{}] legacy identity migration: rename failed ({})", name(), ec.message());
+        fs::remove(tmp, ec);
+        return;
+    }
+    fs::permissions(enc_path, fs::perms::owner_read | fs::perms::owner_write,
+                    fs::perm_options::replace, ec);
+    spdlog::info("[{}] migrated identity key to machine-bound wrapping "
+                 "(legacy blob backed up to {})", name(), backup.string());
 }
 
 // ---------------------------------------------------------------------------
@@ -282,17 +380,96 @@ DelegationResult KeyWrappingService::delegate_key(
 
 AesGcmKey KeyWrappingService::derive_wrapping_key(
         std::span<const uint8_t> passphrase,
-        const Ed25519PublicKey& pubkey) const {
+        const Ed25519PublicKey& pubkey,
+        WrapBinding binding) const {
+    // ikm  = passphrase                (Legacy)  |  passphrase ‖ local_secret (Machine)
+    // info = pubkey                    (Legacy)  |  pubkey ‖ machine_id        (Machine)
+    // The local secret and machine-id never leave this host, so a copied keypair.enc
+    // cannot be unwrapped elsewhere even though the passphrase is empty today.
+    std::vector<uint8_t> ikm(passphrase.begin(), passphrase.end());
+    std::vector<uint8_t> info(pubkey.begin(), pubkey.end());
+
+    if (binding == WrapBinding::Machine) {
+        auto secret = machine_binding_secret();
+        ikm.insert(ikm.end(), secret.begin(), secret.end());
+        auto mid = machine_id_bytes();
+        info.insert(info.end(), mid.begin(), mid.end());
+    }
+
     auto derived = crypto_.hkdf_sha256(
-        passphrase,
+        std::span<const uint8_t>(ikm.data(), ikm.size()),
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kHkdfSalt.data()),
                                  kHkdfSalt.size()),
-        std::span<const uint8_t>(pubkey.data(), pubkey.size()),
+        std::span<const uint8_t>(info.data(), info.size()),
         kAesGcmKeySize);
 
     AesGcmKey key{};
     std::memcpy(key.data(), derived.data(), kAesGcmKeySize);
+    sodium_memzero(ikm.data(), ikm.size());
     return key;
+}
+
+std::vector<uint8_t> KeyWrappingService::machine_binding_secret() const {
+    auto identity_dir = storage_.data_root() / "identity";
+    auto path = identity_dir / std::string(kLocalSecretFile);
+
+    if (fs::exists(path)) {
+        std::ifstream ifs(path);
+        std::string hex_str;
+        if (ifs && (ifs >> hex_str)) {
+            try {
+                auto bytes = from_hex(hex_str);
+                if (bytes.size() == kAesGcmKeySize) {
+                    return bytes;
+                }
+            } catch (...) {
+                // fall through and regenerate
+            }
+        }
+        spdlog::warn("[{}] wrap_local.key unreadable/corrupt — regenerating "
+                     "(any keypair.enc bound to the old secret will need its backup)",
+                     name());
+    }
+
+    // First use (or corrupt): generate a fresh per-install secret, owner-only.
+    std::vector<uint8_t> secret(kAesGcmKeySize);
+    crypto_.random_bytes(std::span<uint8_t>(secret.data(), secret.size()));
+
+    std::error_code ec;
+    fs::create_directories(identity_dir, ec);
+    auto tmp = path;
+    tmp += ".tmp";
+    {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+        if (ofs) {
+            ofs << to_hex(std::span<const uint8_t>(secret.data(), secret.size()));
+        }
+    }
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        spdlog::error("[{}] could not persist wrap_local.key ({})", name(), ec.message());
+        fs::remove(tmp, ec);
+    } else {
+        fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, ec);
+    }
+    return secret;
+}
+
+std::vector<uint8_t> KeyWrappingService::machine_id_bytes() const {
+    // Linux: /etc/machine-id is a stable per-installation identifier. Binding to it
+    // makes a copied keypair.enc useless on a different machine. Absent elsewhere —
+    // we degrade to local-secret-only binding, which is still far stronger than the
+    // previous fully-public derivation.
+    std::ifstream ifs("/etc/machine-id");
+    if (!ifs) return {};
+    std::string id;
+    std::getline(ifs, id);
+    // Trim trailing whitespace/newline.
+    while (!id.empty() && std::isspace(static_cast<unsigned char>(id.back()))) {
+        id.pop_back();
+    }
+    return std::vector<uint8_t>(id.begin(), id.end());
 }
 
 } // namespace nexus::crypto

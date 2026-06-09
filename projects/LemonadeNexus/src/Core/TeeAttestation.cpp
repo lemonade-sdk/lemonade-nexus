@@ -293,10 +293,28 @@ bool TeeAttestationService::do_verify_report(
             // The only backend with a real hardware root of trust: the quote
             // signature is checked against the cert-pinned AK, not report.ak_pubkey.
             return verify_tpm_report(report, expected_nonce, trusted_ak_pubkey);
-        case TeePlatform::IntelSgx:          return verify_sgx_report(report);
-        case TeePlatform::IntelTdx:          return verify_tdx_report(report);
-        case TeePlatform::AmdSevSnp:         return verify_sev_snp_report(report);
-        case TeePlatform::AppleSecureEnclave: return verify_apple_se_report(report);
+
+        // SGX/TDX/SEV/Apple are STRUCTURAL-ONLY: they check a magic + nonce but have
+        // no hardware-signed quote chained to a trusted root, so a structurally-valid
+        // report proves nothing about real TEE hardware. They must never establish
+        // Tier 1 in production — that is enforced separately by TrustPolicy's strict
+        // require_tpm_ mode (set from require_tee_attestation). The warning makes any
+        // reliance on them visible in logs until they are removed or given real
+        // DCAP/SEV-SNP/Apple-CA verification.
+        case TeePlatform::IntelSgx:
+        case TeePlatform::IntelTdx:
+        case TeePlatform::AmdSevSnp:
+        case TeePlatform::AppleSecureEnclave:
+            spdlog::warn("[{}] verifying a STRUCTURAL-ONLY {} report — NO hardware root "
+                          "of trust; this must not grant Tier 1 (require_tpm_ enforces TPM-only)",
+                          name(), tee_platform_name(report.platform));
+            switch (report.platform) {
+                case TeePlatform::IntelSgx:           return verify_sgx_report(report);
+                case TeePlatform::IntelTdx:           return verify_tdx_report(report);
+                case TeePlatform::AmdSevSnp:          return verify_sev_snp_report(report);
+                case TeePlatform::AppleSecureEnclave: return verify_apple_se_report(report);
+                default:                              return false;
+            }
         case TeePlatform::None:
             return false;
     }
