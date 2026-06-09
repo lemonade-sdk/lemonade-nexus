@@ -33,6 +33,7 @@ enum class GossipMsgType : uint8_t {
     DnsRecordSync         = 0x12, // "DNS record add/remove — distributed authoritative DNS"
     BackboneIpamSync      = 0x13, // "backbone IP allocate/release — server mesh IPAM sync"
     NsSlotClaim           = 0x14, // "democratic NS slot claim — ns1-ns9 bootstrap nameservers"
+    MisbehaviorProofBroadcast = 0x15, // "proof a peer equivocated — verify and ban the accused"
 };
 
 #pragma pack(push, 1)

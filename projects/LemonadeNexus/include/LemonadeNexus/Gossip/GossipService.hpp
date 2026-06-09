@@ -27,6 +27,8 @@ namespace nexus::wireguard { class WireGuardService; }
 
 namespace nexus::gossip {
 
+struct MisbehaviorProof;  // Gossip/MisbehaviorDetector.hpp
+
 /// Gossip-based state synchronization service.
 ///
 /// Runs a UDP socket on the gossip port (default 9102). Every 5 seconds, picks a
@@ -258,6 +260,27 @@ private:
     // Check if a server pubkey has been revoked
     [[nodiscard]] bool is_revoked(const std::string& server_pubkey) const;
 
+    // --- Misbehavior detection (equivocation proofs) ---
+
+    /// Handle an inbound MisbehaviorProofBroadcast: verify the proof is dispositive
+    /// (both statements signed by the accused + genuine conflict), and if so ban the
+    /// accused and re-broadcast (epidemic spread, verify-before-forward).
+    void handle_misbehavior_proof(const asio::ip::udp::endpoint& sender,
+                                  const uint8_t* payload, std::size_t payload_len);
+
+    /// Gossip a verified proof to all peers (except an optional origin we got it from).
+    void broadcast_misbehavior_proof(const MisbehaviorProof& proof,
+                                     const std::string& exclude_endpoint = {});
+
+    /// Durably ban a convicted pubkey: add to the revocation list (persisted), drop
+    /// its trust state and peer entry, exclude it from Tier1/Shamir eligibility, and
+    /// persist the proof as evidence. Idempotent. `pubkey` may carry an "ed25519:"
+    /// prefix; it is normalized to the certificate/revocation form.
+    void apply_ban(const std::string& pubkey, const MisbehaviorProof& proof);
+
+    /// Persist the current revocation list to identity/revoked_servers.json.
+    void save_revoked_servers() const;
+
     /// Zero-trust identity binding: true only if `pubkey` belongs to a known peer
     /// that presented a valid, non-revoked, root-CA-signed certificate. Used to
     /// reject attestation tokens/reports whose self-asserted pubkey is not an
@@ -294,6 +317,18 @@ private:
     crypto::Ed25519PublicKey         root_pubkey_{};
     bool                             has_root_pubkey_{false};
     std::vector<std::string>         revoked_pubkeys_;
+
+    // Equivocation detection: last signed tree-delta we've seen per conflict identity
+    // (signer ‖ target_node_id ‖ sequence) → the delta's JSON. A second, differing
+    // statement at the same identity is provable equivocation. Bounded to avoid
+    // unbounded growth; on overflow we clear (losing only detection memory, never
+    // correctness — a re-sent conflicting pair is re-detected).
+    mutable std::mutex               seen_statements_mutex_;
+    std::unordered_map<std::string, std::string> seen_statements_;
+    static constexpr std::size_t     kMaxSeenStatements = 50000;
+
+    // Misbehavior proofs we've already processed (proof_id) — dedupe re-broadcasts.
+    std::unordered_map<std::string, uint64_t> known_proofs_;
 
     // Zero-trust enforcement (nullptr = trust checks disabled)
     core::TrustPolicyService*        trust_policy_{nullptr};
@@ -335,6 +370,10 @@ private:
     uint32_t enrollment_vote_timeout_sec_{60};
     uint32_t enrollment_max_retries_{3};
     std::unordered_map<std::string, EnrollmentBallot> pending_enrollments_;
+
+    // Throttle for proactive Tier-1 re-challenge (pubkey → last challenge unix sec).
+    // Only touched from on_gossip_tick (the single gossip-timer thread).
+    std::unordered_map<std::string, uint64_t> last_rechallenge_;
 
 public:
     /// Set the ACL service for distributed permission sync.

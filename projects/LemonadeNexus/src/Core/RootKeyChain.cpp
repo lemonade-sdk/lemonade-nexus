@@ -489,6 +489,8 @@ std::optional<crypto::Ed25519Keypair> RootKeyChainService::root_keypair() const 
 void RootKeyChainService::record_peer_check(const std::string& pubkey, bool responded) {
     std::lock_guard lock(health_mutex_);
 
+    if (banned_.count(pubkey)) return;  // never re-accrue health for a convicted peer
+
     auto now = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
@@ -535,11 +537,18 @@ std::vector<std::string> RootKeyChainService::eligible_tier1_peers() const {
     std::lock_guard lock(health_mutex_);
     std::vector<std::string> result;
     for (const auto& [pubkey, record] : peer_health_) {
+        if (banned_.count(pubkey)) continue;  // convicted peers never hold shares
         if (record.total_checks >= 100 && record.uptime_ratio >= min_uptime_) {
             result.push_back(pubkey);
         }
     }
     return result;
+}
+
+void RootKeyChainService::ban_peer(const std::string& pubkey) {
+    std::lock_guard lock(health_mutex_);
+    banned_.insert(pubkey);
+    peer_health_.erase(pubkey);  // drop accrued uptime so it can't re-qualify
 }
 
 // ---------------------------------------------------------------------------

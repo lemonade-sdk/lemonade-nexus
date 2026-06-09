@@ -37,6 +37,7 @@ add_nexus_test(test_seed_discovery    test_seed_discovery.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
 add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
+add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
