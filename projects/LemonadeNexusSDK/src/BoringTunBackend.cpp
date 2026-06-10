@@ -1,5 +1,5 @@
 #include <LemonadeNexusSDK/BoringTunBackend.hpp>
-#include <LemonadeNexusSDK/boringtun_ffi.h>
+#include <boringtun_ffi.h>
 
 #include <spdlog/spdlog.h>
 
@@ -310,8 +310,9 @@ StatusResult BoringTunBackend::do_bring_up(const WireGuardConfig& config) {
     impl_->tunnel = new_tunnel(
         config.private_key.c_str(),
         config.server_public_key.c_str(),
-        nullptr,  // no log callback
-        0         // silent
+        nullptr,                                    // no preshared key
+        static_cast<uint16_t>(config.keepalive),    // persistent keepalive (s)
+        1                                           // single-peer index
     );
     if (!impl_->tunnel) {
         result.error = "BoringTun: failed to create tunnel (bad keys?)";

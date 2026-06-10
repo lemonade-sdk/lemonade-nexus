@@ -14,15 +14,13 @@ create_project(LemonadeNexus DEPENDENCIES
         xxhash
         httplib::httplib
         sodium
-        wireguard::embeddable
-        wireguard::apple
-        wireguard::nt
         OpenSSL::SSL
         OpenSSL::Crypto
         tss2::fapi
         c-ares::cares
         sqlite3
         boringtun-ffi
+        virtual-netstack
 )
 
 target_compile_definitions(LemonadeNexus PUBLIC

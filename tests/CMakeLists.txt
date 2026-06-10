@@ -35,6 +35,10 @@ add_nexus_test(test_dns               test_dns.cpp)
 add_nexus_test(test_geo_region        test_geo_region.cpp)
 add_nexus_test(test_seed_discovery    test_seed_discovery.cpp)
 
+add_nexus_test(test_wg_wire_protocol  test_wg_wire_protocol.cpp)
+add_nexus_test(test_ip_router         test_ip_router.cpp)
+add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
+
 add_nexus_test(test_trust             test_trust.cpp)
 add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
@@ -57,3 +61,4 @@ add_sdk_test(test_boringtun_backend    test_boringtun_backend.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
+add_nexus_test(test_virtual_e2e        test_virtual_e2e.cpp)

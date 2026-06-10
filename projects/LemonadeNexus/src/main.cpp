@@ -31,6 +31,7 @@
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/WireGuard/WireGuardService.hpp>
+#include <LemonadeNexus/Network/VirtualNetService.hpp>
 
 // CRTP request handlers
 #include <LemonadeNexus/Api/PublicApiHandler.hpp>
@@ -641,6 +642,17 @@ int main(int argc, char* argv[]) {
         config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
     wireguard_service.start();
 
+    // In-process traffic termination: the userspace netstack answers on our
+    // virtual IPs and bridges to the (unchanged) httplib private API. Wire the
+    // dataplane <-> netstack seam before the dataplane starts taking packets.
+    nexus::network::VirtualNetService vnet{};
+    vnet.start();
+    wireguard_service.dataplane().set_inbound_handler(
+        [&vnet](std::span<const uint8_t> pkt) { vnet.deliver_inbound_ip_packet(pkt); });
+    vnet.set_outbound_sink([&wireguard_service](std::span<const uint8_t> pkt) {
+        wireguard_service.dataplane().send_outbound_ip_packet(pkt);
+    });
+
     // Derive Curve25519 keypair from Ed25519 identity for WireGuard
     std::string wg_server_privkey_b64;
     if (root_privkey) {
@@ -657,11 +669,13 @@ int main(int argc, char* argv[]) {
         wg_iface.listen_port = config.udp_port;
 
         if (wireguard_service.setup_interface(wg_iface, {})) {
-            spdlog::info("WireGuard: {} up on :{} with tunnel IP {}/10",
-                          config.wg_interface, config.udp_port, tunnel_bind_ip);
+            // The netstack answers on our tunnel IP across the whole client plane.
+            vnet.add_local_ip(tunnel_bind_ip + "/10");
+            spdlog::info("WireGuard: userspace dataplane up on :{} with tunnel IP {}/10",
+                          config.udp_port, tunnel_bind_ip);
         } else {
-            spdlog::warn("WireGuard: failed to set up {} — clients will not be able to connect. "
-                          "Ensure wireguard-tools and kernel module are installed.", config.wg_interface);
+            spdlog::warn("WireGuard: failed to start userspace dataplane on :{} — "
+                          "clients will not be able to connect.", config.udp_port);
         }
     } else {
         spdlog::warn("WireGuard: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
@@ -688,9 +702,11 @@ int main(int argc, char* argv[]) {
         auto slash = backbone_ip.find('/');
         auto backbone_ip_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
 
-        // Add backbone address to the WG interface (does NOT flush the existing client address)
+        // Register the backbone address as a second virtual local IP (both the
+        // dataplane router and the netstack must answer for it).
         if (wireguard_service.add_address(backbone_ip_bare + "/22")) {
-            spdlog::info("Backbone: added {}/22 to {}", backbone_ip_bare, config.wg_interface);
+            vnet.add_local_ip(backbone_ip_bare + "/22");
+            spdlog::info("Backbone: registered virtual {}/22", backbone_ip_bare);
         }
 
         // Wire gossip with WG service and backbone info
@@ -770,8 +786,30 @@ int main(int argc, char* argv[]) {
             private_http_server = std::make_unique<nexus::network::HttpServer>(
                 config.private_http_port, tunnel_bind_ip);
         }
-        spdlog::info("Private API will bind to {}:{} ({})", tunnel_bind_ip,
-                      config.private_http_port, priv_cert_path.empty() ? "HTTP" : "HTTPS");
+
+        // The private API has no kernel tunnel address to bind anymore. Bind it
+        // to loopback and let the in-process netstack pipe virtual TCP from the
+        // tunnel/backbone IPs to it. Reaching loopback:private_http_port is no
+        // more exposed than the old kernel bind to the (local) tunnel IP was,
+        // and every private route is JWT-gated.
+        private_http_server->set_bind_address("127.0.0.1");
+        std::string bridge_target =
+            "tcp:127.0.0.1:" + std::to_string(config.private_http_port);
+
+        // Answer for the private API on both the client-tunnel IP and the
+        // server backbone IP (the latter fixes the previously-unserved
+        // backend.<id> record). Backbone IP is registered after allocation.
+        vnet.add_tcp_forward(tunnel_bind_ip, config.private_http_port, bridge_target);
+        {
+            auto slash = backbone_ip.find('/');
+            auto bb_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
+            if (!bb_bare.empty())
+                vnet.add_tcp_forward(bb_bare, config.private_http_port, bridge_target);
+        }
+
+        spdlog::info("Private API on virtual {}:{} ({}) via {}", tunnel_bind_ip,
+                      config.private_http_port, priv_cert_path.empty() ? "HTTP" : "HTTPS",
+                      bridge_target);
     }
 
     auto& private_srv = private_http_server
@@ -1013,7 +1051,8 @@ int main(int argc, char* argv[]) {
         acme_renewal_thread.join();
     }
     hole_punch.stop();
-    wireguard_service.stop();
+    wireguard_service.stop();   // stops the dataplane: no more inbound packets
+    vnet.stop();                // tears down the netstack + bridges
     if (private_http_server) {
         private_http_server->stop();
     }
