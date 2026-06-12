@@ -41,11 +41,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
 
-      - name: Set OpenSSL path (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          echo "OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3" >> "$GITHUB_ENV"
-
       - name: Cache vcpkg binaries (Windows)
         if: runner.os == 'Windows'
         uses: actions/cache@v5
@@ -79,13 +74,16 @@ jobs:
           Remove-Item -Recurse -Force "build" -ErrorAction SilentlyContinue
           New-Item -ItemType Junction -Path "build" -Target "D:\build"
 
+      # On macOS, build OpenSSL from source (static) instead of using Homebrew
+      # so the resulting binaries have no Homebrew dylib dependencies.
       - name: Configure CMake (Unix)
         if: runner.os != 'Windows'
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=ON
+            -DBUILD_TESTING=ON \
+            -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
 
       - name: Configure CMake (Windows)
         if: runner.os == 'Windows'
@@ -101,6 +99,20 @@ jobs:
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Verify no Homebrew linkage (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          status=0
+          while IFS= read -r bin; do
+            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/' || true)
+            if [ -n "$deps" ]; then
+              echo "::error::$bin links against Homebrew/local libraries:"
+              echo "$deps"
+              status=1
+            fi
+          done < <(find build/projects build/tests -type f -perm +111)
+          exit $status
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }}
