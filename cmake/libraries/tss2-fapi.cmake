@@ -95,6 +95,7 @@ endif()
 ExternalProject_Add(tss2_external
     URL               ${TSS2_URL}
     URL_HASH          ${TSS2_URL_HASH}
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     DOWNLOAD_DIR      "${CMAKE_BINARY_DIR}/_download/tss2"
     SOURCE_DIR        "${CMAKE_BINARY_DIR}/_deps/tss2-src"
     BINARY_DIR        "${CMAKE_BINARY_DIR}/_deps/tss2-build"   # out-of-source (VPATH) build
@@ -119,6 +120,7 @@ ExternalProject_Add(tss2_external
     LOG_CONFIGURE     TRUE
     LOG_BUILD         TRUE
     LOG_INSTALL       TRUE
+    LOG_OUTPUT_ON_FAILURE TRUE
 )
 
 # Build OpenSSL first if it's also built from source.

@@ -125,6 +125,7 @@ set(OPENSSL_INCLUDE_DIR "${OPENSSL_INSTALL_PREFIX}/include")
 ExternalProject_Add(openssl_external
     URL               ${OPENSSL_URL}
     URL_HASH          SHA256=2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     DOWNLOAD_DIR      "${CMAKE_BINARY_DIR}/_download/openssl"
     SOURCE_DIR        "${CMAKE_BINARY_DIR}/_deps/openssl-src"
     BINARY_DIR        "${CMAKE_BINARY_DIR}/_deps/openssl-src"   # OpenSSL builds in-source
@@ -137,6 +138,7 @@ ExternalProject_Add(openssl_external
     LOG_CONFIGURE     TRUE
     LOG_BUILD         TRUE
     LOG_INSTALL       TRUE
+    LOG_OUTPUT_ON_FAILURE TRUE
 )
 
 # ---------------------------------------------------------------------------
