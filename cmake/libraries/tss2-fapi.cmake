@@ -11,6 +11,7 @@ cmake_minimum_required(VERSION 3.25.1)
 #   • OpenSSL  — the copy this repo builds from source (OpenSSL::Crypto)
 #   • json-c   — system package, via pkg-config   (Debian: libjson-c-dev)
 #   • libcurl  — system package, via pkg-config   (Debian: libcurl4-openssl-dev)
+#   • libuuid  — system package, via pkg-config   (Debian: uuid-dev)
 #
 # We use the upstream *release tarball* (not a git clone) because it ships a
 # pre-generated ./configure — so the build host only needs a C compiler, make
@@ -52,6 +53,7 @@ include(ProcessorCount)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(JSONC IMPORTED_TARGET REQUIRED json-c)
 pkg_check_modules(CURL  IMPORTED_TARGET REQUIRED libcurl)
+pkg_check_modules(UUID  IMPORTED_TARGET REQUIRED uuid)
 
 # OpenSSL is included before this module (see top-level CMakeLists.txt) and
 # provides OpenSSL::Crypto. When built from source, OPENSSL_ROOT_DIR points at
@@ -143,7 +145,7 @@ find_package(Threads REQUIRED)
 # Remaining tss2 archives + transitive deps, in link order.
 set_target_properties(tss2::fapi PROPERTIES
     INTERFACE_LINK_LIBRARIES
-        "${TSS2_ESYS_LIB};${TSS2_SYS_LIB};${TSS2_TCTILDR_LIB};${TSS2_MU_LIB};${TSS2_RC_LIB};OpenSSL::Crypto;PkgConfig::CURL;PkgConfig::JSONC;Threads::Threads;${CMAKE_DL_LIBS}"
+        "${TSS2_ESYS_LIB};${TSS2_SYS_LIB};${TSS2_TCTILDR_LIB};${TSS2_MU_LIB};${TSS2_RC_LIB};OpenSSL::Crypto;PkgConfig::CURL;PkgConfig::JSONC;PkgConfig::UUID;Threads::Threads;${CMAKE_DL_LIBS}"
 )
 add_dependencies(tss2::fapi tss2_external)
 

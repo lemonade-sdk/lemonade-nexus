@@ -39,7 +39,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev
+          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
 
       - name: Set OpenSSL path (macOS)
         if: runner.os == 'macOS'
@@ -115,16 +115,16 @@ jobs:
             install_cmd: >-
               apt-get update &&
               apt-get install -y cmake ninja-build g++ libssl-dev pkg-config
-              libjson-c-dev libcurl4-openssl-dev git ca-certificates curl
+              libjson-c-dev libcurl4-openssl-dev uuid-dev git ca-certificates curl
           - container: fedora:40
             platform: linux-x86_64-rpm
             install_cmd: >-
               dnf install -y cmake ninja-build gcc-c++ openssl-devel
-              pkgconf-pkg-config json-c-devel libcurl-devel git
+              pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
           - container: archlinux:latest
             platform: linux-x86_64-arch
             install_cmd: >-
-              pacman -Syu --noconfirm cmake ninja gcc openssl pkgconf json-c curl git
+              pacman -Syu --noconfirm cmake ninja gcc openssl pkgconf json-c curl util-linux-libs git
 
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
