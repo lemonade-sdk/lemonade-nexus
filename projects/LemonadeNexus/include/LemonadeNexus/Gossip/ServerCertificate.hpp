@@ -17,6 +17,11 @@ struct ServerCertificate {
     uint64_t    issued_at{0};    // Unix timestamp
     uint64_t    expires_at{0};   // Unix timestamp (0 = no expiry)
     std::string issuer_pubkey;   // base64 Ed25519 public key of signer (root key)
+    // TPM 2.0 root of trust (Model A): the Attestation Key the admin validated
+    // (EK→AK chain) at enrollment. Runtime quote verification checks the TPM
+    // signature against THIS key — making identity ↔ AK ↔ cert one signed unit.
+    std::string tpm_ak_pubkey;   // base64 DER SubjectPublicKeyInfo of the pinned AK ("" = no TPM enrolled)
+    std::string tpm_ek_cert;     // optional PEM EK certificate (audit / future model-B re-validation)
     std::string signature;       // base64 Ed25519 signature by issuer
 };
 

@@ -5,6 +5,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
+#include <filesystem>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -86,10 +87,46 @@ public:
             std::span<const uint8_t> parent_passphrase);
 
 private:
-    /// Derive an AES-256 key from a passphrase using HKDF-SHA256.
+    /// How a wrapping key is bound to this machine.
+    ///   Legacy  — HKDF(passphrase, salt, info=pubkey). Reproduces the original
+    ///             (pre-hardening) derivation. Used ONLY to read & migrate old
+    ///             keypair.enc files; never written for new keys.
+    ///   Machine — HKDF(passphrase ‖ local_secret, salt, info=pubkey ‖ machine_id).
+    ///             Mixes in a per-install random secret (data/identity/wrap_local.key,
+    ///             owner-only) and /etc/machine-id, so a copied keypair.enc is useless
+    ///             on another host and useless without the separate local-secret file.
+    ///             This closes the "empty passphrase ⇒ keypair.enc is plaintext-
+    ///             equivalent" weakness. (A TPM-sealed binding is the stronger future
+    ///             layer — see docs/TEE-Attestation-Hardening-Plan.md §2 / wrap_seal TODO.)
+    enum class WrapBinding { Legacy, Machine };
+
+    /// Derive an AES-256 key from a passphrase using HKDF-SHA256, bound per `binding`.
     [[nodiscard]] AesGcmKey derive_wrapping_key(
             std::span<const uint8_t> passphrase,
-            const Ed25519PublicKey& pubkey) const;
+            const Ed25519PublicKey& pubkey,
+            WrapBinding binding) const;
+
+    [[nodiscard]] WrappedKey wrap_with_binding(const Ed25519PrivateKey& privkey,
+                                               std::span<const uint8_t> passphrase,
+                                               const Ed25519PublicKey& pubkey,
+                                               WrapBinding binding);
+    [[nodiscard]] std::optional<Ed25519PrivateKey> unwrap_with_binding(
+            const WrappedKey& wrapped,
+            std::span<const uint8_t> passphrase,
+            const Ed25519PublicKey& pubkey,
+            WrapBinding binding);
+
+    /// Per-install 32-byte secret, created (owner-only) on first use and reused.
+    [[nodiscard]] std::vector<uint8_t> machine_binding_secret() const;
+    /// Raw /etc/machine-id bytes (trimmed), or empty if unavailable.
+    [[nodiscard]] std::vector<uint8_t> machine_id_bytes() const;
+
+    /// Re-wrap a successfully-unlocked legacy keypair.enc under the machine binding,
+    /// preserving the original as a ".legacy.bak" for rollback safety.
+    void migrate_legacy_identity(const std::filesystem::path& enc_path,
+                                 const Ed25519PrivateKey& privkey,
+                                 std::span<const uint8_t> passphrase,
+                                 const Ed25519PublicKey& pubkey);
 
     SodiumCryptoService&        crypto_;
     storage::FileStorageService& storage_;

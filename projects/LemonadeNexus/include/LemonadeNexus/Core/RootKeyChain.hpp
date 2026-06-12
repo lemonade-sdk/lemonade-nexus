@@ -15,6 +15,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nexus::core {
@@ -182,7 +183,15 @@ public:
     [[nodiscard]] std::vector<PeerHealthRecord> all_peer_health() const;
 
     /// Get list of Tier1-eligible peers (uptime >= min_uptime, enough checks).
+    /// Banned peers (see ban_peer) are always excluded.
     [[nodiscard]] std::vector<std::string> eligible_tier1_peers() const;
+
+    /// Permanently exclude a peer from Tier1 eligibility and Shamir share
+    /// distribution (called when a MisbehaviorProof convicts it). Drops the peer's
+    /// health record and remembers the ban so a future health record cannot
+    /// resurrect eligibility within this process. Durable cross-restart exclusion is
+    /// provided by GossipService's revocation list (revoked_servers.json).
+    void ban_peer(const std::string& pubkey);
 
     /// Compute the Shamir threshold for current eligible peer count.
     /// K = ceil(N * quorum_ratio), minimum 2, capped at 255.
@@ -229,6 +238,7 @@ private:
     // Peer health tracking
     mutable std::mutex health_mutex_;
     std::unordered_map<std::string, PeerHealthRecord> peer_health_;
+    std::unordered_set<std::string> banned_;  ///< pubkeys convicted of misbehavior (excluded from eligibility)
 
     // Rotation timer
     asio::io_context* io_{nullptr};

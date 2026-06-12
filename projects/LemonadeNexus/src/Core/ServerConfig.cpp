@@ -24,7 +24,9 @@ void to_json(json& j, const ServerConfig& c) {
         {"stun_port",           c.stun_port},
         {"relay_port",          c.relay_port},
         {"dns_port",            c.dns_port},
+        {"public_dns_port",     c.public_dns_port},
         {"bind_address",        c.bind_address},
+        {"wg_interface",        c.wg_interface},
         {"data_root",           c.data_root},
         {"rp_id",               c.rp_id},
         {"jwt_secret",          c.jwt_secret},
@@ -45,6 +47,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"server_hostname",     c.server_hostname},
         {"auto_tls",            c.auto_tls},
         {"dns_base_domain",     c.dns_base_domain},
+        {"dns_seed_discovery",  c.dns_seed_discovery},
         {"dns_ns_hostname",     c.dns_ns_hostname},
         {"release_signing_pubkey",     c.release_signing_pubkey},
         {"require_binary_attestation", c.require_binary_attestation},
@@ -73,7 +76,9 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("stun_port"))           j.at("stun_port").get_to(c.stun_port);
     if (j.contains("relay_port"))          j.at("relay_port").get_to(c.relay_port);
     if (j.contains("dns_port"))            j.at("dns_port").get_to(c.dns_port);
+    if (j.contains("public_dns_port"))     j.at("public_dns_port").get_to(c.public_dns_port);
     if (j.contains("bind_address"))        j.at("bind_address").get_to(c.bind_address);
+    if (j.contains("wg_interface"))        j.at("wg_interface").get_to(c.wg_interface);
     if (j.contains("data_root"))           j.at("data_root").get_to(c.data_root);
     if (j.contains("rp_id"))               j.at("rp_id").get_to(c.rp_id);
     if (j.contains("jwt_secret"))          j.at("jwt_secret").get_to(c.jwt_secret);
@@ -94,6 +99,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
     if (j.contains("auto_tls"))            j.at("auto_tls").get_to(c.auto_tls);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
+    if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
     if (j.contains("release_signing_pubkey"))     j.at("release_signing_pubkey").get_to(c.release_signing_pubkey);
     if (j.contains("require_binary_attestation")) j.at("require_binary_attestation").get_to(c.require_binary_attestation);
@@ -129,12 +135,17 @@ void print_usage(const char* prog) {
     spdlog::info("  --stun-port <N>            STUN UDP port (default: 3478)");
     spdlog::info("  --relay-port <N>           Relay UDP port (default: 9103)");
     spdlog::info("  --bind-address <addr>      Bind address for all services (default: 0.0.0.0)");
+    spdlog::info("  --public-ip <addr>         Public IP to advertise in DNS (default: auto-detect)");
+    spdlog::info("  --wg-interface <name>      WireGuard interface (default: nexus0). NEVER use 'wg0' or anything in use.");
     spdlog::info("  --data-root <path>         Data directory (default: data)");
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --enroll-server <hex> <id> Enroll a server: sign cert for pubkey with given ID");
+    spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
+    spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
+    spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
     spdlog::info("  --revoke-server <hex>      Revoke a server by its pubkey");
     spdlog::info("  --add-manifest <path>      Import a signed release manifest JSON");
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
@@ -148,8 +159,10 @@ void print_usage(const char* prog) {
     spdlog::info("  --private-http-port <N>      Private API port (default: 9101)");
     spdlog::info("  --require-peer-confirmation  Require peer quorum before full enrollment");
     spdlog::info("  --enrollment-quorum <ratio>  Fraction of Tier1 peers needed (default 0.5)");
-    spdlog::info("  --dns-port <N>             Authoritative DNS port (default: 53)");
+    spdlog::info("  --dns-port <N>             Internal DNS listen port (default: 5335, NAT-mapped from public)");
+    spdlog::info("  --public-dns-port <N>      DNS port advertised to clients (default: 53)");
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
+    spdlog::info("  --no-dns-seed-discovery    Disable auto-discovery of seed peers from tier/region DNS");
     spdlog::info("  --dns-provider <name>      DNS provider: 'local' (default) or 'cloudflare'");
     spdlog::info("  --dns-ns-hostname <fqdn>   This server's NS hostname (e.g. ns1.example.com)");
     spdlog::info("  --server-hostname <name>   Server hostname for TLS cert (auto-generated from region if omitted)");
@@ -211,6 +224,10 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.relay_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--bind-address") == 0 && i + 1 < argc) {
             config.bind_address = argv[++i];
+        } else if (std::strcmp(argv[i], "--public-ip") == 0 && i + 1 < argc) {
+            config.public_ip = argv[++i];
+        } else if (std::strcmp(argv[i], "--wg-interface") == 0 && i + 1 < argc) {
+            config.wg_interface = argv[++i];
         } else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) {
             config.data_root = argv[++i];
         } else if (std::strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
@@ -224,6 +241,12 @@ ServerConfig load_config(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--enroll-server") == 0 && i + 2 < argc) {
             config.enroll_server_pubkey = argv[++i];
             config.enroll_server_id     = argv[++i];
+        } else if (std::strcmp(argv[i], "--enroll-tpm-ak") == 0 && i + 1 < argc) {
+            config.enroll_tpm_ak_pubkey = argv[++i];
+        } else if (std::strcmp(argv[i], "--enroll-tpm-ek-cert") == 0 && i + 1 < argc) {
+            config.enroll_tpm_ek_cert_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
+            config.print_tpm_ak = true;
         } else if (std::strcmp(argv[i], "--revoke-server") == 0 && i + 1 < argc) {
             config.revoke_server_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--add-manifest") == 0 && i + 1 < argc) {
@@ -252,8 +275,12 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enrollment_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
+            config.public_dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--dns-base-domain") == 0 && i + 1 < argc) {
             config.dns_base_domain = argv[++i];
+        } else if (std::strcmp(argv[i], "--no-dns-seed-discovery") == 0) {
+            config.dns_seed_discovery = false;
         } else if (std::strcmp(argv[i], "--dns-provider") == 0 && i + 1 < argc) {
             config.dns_provider = argv[++i];
         } else if (std::strcmp(argv[i], "--dns-ns-hostname") == 0 && i + 1 < argc) {
@@ -289,6 +316,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_STUN_PORT"))    config.stun_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_BIND_ADDRESS")) config.bind_address = v;
+    if (const char* v = std::getenv("SP_WG_INTERFACE")) config.wg_interface = v;
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
@@ -297,7 +325,12 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ACME_PROVIDER"))    config.acme_provider   = v;
     if (const char* v = std::getenv("SP_DNS_PROVIDER"))     config.dns_provider    = v;
     if (const char* v = std::getenv("SP_DNS_PORT"))         config.dns_port        = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("SP_PUBLIC_DNS_PORT"))  config.public_dns_port = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_DNS_BASE_DOMAIN"))  config.dns_base_domain = v;
+    if (const char* v = std::getenv("SP_DNS_SEED_DISCOVERY")) {
+        std::string s = v;
+        config.dns_seed_discovery = !(s == "0" || s == "false" || s == "no");
+    }
     if (const char* v = std::getenv("SP_DNS_NS_HOSTNAME")) config.dns_ns_hostname = v;
     if (const char* v = std::getenv("SP_RELEASE_SIGNING_PUBKEY")) config.release_signing_pubkey = v;
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;
@@ -356,6 +389,9 @@ bool validate_config(const ServerConfig& config) {
     check_port(config.stun_port, "stun_port");
     check_port(config.relay_port, "relay_port");
     check_port(config.dns_port, "dns_port");
+    // public_dns_port is the externally-advertised (NAT-mapped) DNS port, not a local
+    // listener — validate it's non-zero but exclude it from the internal-uniqueness set.
+    check_port(config.public_dns_port, "public_dns_port");
 
     // Check ports are unique
     std::set<uint16_t> ports = {
@@ -385,6 +421,15 @@ bool validate_config(const ServerConfig& config) {
             spdlog::error("Config: cannot create data_root '{}': {}", config.data_root, ec.message());
             valid = false;
         }
+    }
+
+    // Tier 1 (require_tee_attestation) gates sensitive operations on a verified
+    // binary measurement. Without a release signing pubkey, is_approved_binary()
+    // cannot be evaluated and the binary check is silently skipped — so require it.
+    if (config.require_tee_attestation && config.release_signing_pubkey.empty()) {
+        spdlog::error("Config: require_tee_attestation is set but release_signing_pubkey "
+                       "is empty — Tier1 binary attestation cannot be enforced");
+        valid = false;
     }
 
     // Warnings (non-fatal)

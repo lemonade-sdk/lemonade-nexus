@@ -37,7 +37,10 @@ namespace nexus::wireguard {
 /// On other platforms: shells out to `wg` and `ip` CLI tools with input
 /// validation to prevent command injection.
 ///
-/// Manages a single WireGuard interface (default "wg0"), providing keypair
+/// Manages a single WireGuard interface (default "nexus0" -- deliberately NOT
+/// "wg0", which is the conventional name an operator's own tunnel uses; the
+/// setup path flushes and re-keys this device, so it must not collide with a
+/// tunnel you are connected through), providing keypair
 /// generation, peer management, endpoint updates, config file generation,
 /// full interface setup/teardown, and peer synchronization from the
 /// permission tree.
@@ -50,9 +53,10 @@ class WireGuardService : public core::IService<WireGuardService>,
     friend class IWireGuardProvider<WireGuardService>;
 
 public:
-    /// @param interface_name  WireGuard interface name (e.g. "wg0").
+    /// @param interface_name  WireGuard interface name (e.g. "nexus0"). Never pass
+    ///                        "wg0" or any interface in use -- it is re-keyed on setup.
     /// @param config_dir      Directory for storing config files (e.g. "data/wireguard").
-    explicit WireGuardService(std::string interface_name = "wg0",
+    explicit WireGuardService(std::string interface_name = "nexus0",
                                std::filesystem::path config_dir = "data/wireguard");
     ~WireGuardService();  // defined in .cpp (BoringTunState PIMPL)
 

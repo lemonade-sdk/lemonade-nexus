@@ -26,6 +26,7 @@
 #include <LemonadeNexus/Core/GovernanceService.hpp>
 #include <LemonadeNexus/Core/RootKeyChain.hpp>
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
+#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 #include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
@@ -45,12 +46,15 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <thread>
+#include <unordered_set>
 
 int main(int argc, char* argv[]) {
     // --- Load configuration: CLI args > env vars > config file > defaults ---
@@ -61,6 +65,20 @@ int main(int argc, char* argv[]) {
     if (!nexus::core::validate_config(config)) {
         spdlog::error("Invalid configuration, exiting");
         return 1;
+    }
+
+    // --- Print this host's TPM AK pubkey and exit (for enrollment) ---
+    if (config.print_tpm_ak) {
+        auto ak = nexus::core::tpm::export_ak_pubkey_b64();
+        if (!ak) {
+            spdlog::error("No TPM available — cannot export an Attestation Key. "
+                          "(Need /dev/tpmrm0 or a TCTI such as swtpm, on a Linux TPM build.)");
+            return 1;
+        }
+        // Print the raw value to stdout so it can be piped into --enroll-tpm-ak.
+        spdlog::info("TPM AK pubkey (base64 DER SPKI):");
+        std::printf("%s\n", ak->c_str());
+        return 0;
     }
 
     // --- Handle enrollment/revocation CLI commands (exit after) ---
@@ -87,6 +105,33 @@ int main(int argc, char* argv[]) {
                 std::chrono::system_clock::now().time_since_epoch()).count());
         cert.expires_at     = 0; // no expiry
         cert.issuer_pubkey  = nexus::crypto::to_base64(*pubkey);
+
+        // Model A: pin the joining server's TPM Attestation Key into the cert so the
+        // root signature binds identity ↔ AK. The admin is asserting (having validated
+        // the EK→AK chain out of band) that this AK belongs to a genuine TPM.
+        cert.tpm_ak_pubkey = config.enroll_tpm_ak_pubkey;
+        if (!config.enroll_tpm_ek_cert_path.empty()) {
+            std::ifstream ek_f(config.enroll_tpm_ek_cert_path);
+            if (ek_f) {
+                std::string ek_pem((std::istreambuf_iterator<char>(ek_f)),
+                                    std::istreambuf_iterator<char>());
+                cert.tpm_ek_cert = ek_pem;
+                spdlog::info("Enroll: attached EK certificate from {} ({} bytes) — validate the "
+                             "EK→AK chain to the TPM vendor CA before trusting this AK.",
+                             config.enroll_tpm_ek_cert_path, ek_pem.size());
+            } else {
+                spdlog::warn("Enroll: could not read EK cert '{}' — continuing without it",
+                             config.enroll_tpm_ek_cert_path);
+            }
+        }
+        if (cert.tpm_ak_pubkey.empty()) {
+            spdlog::warn("Enroll: no TPM AK pinned (--enroll-tpm-ak) — '{}' will be a Tier-2 "
+                         "certificate and cannot reach Tier 1 under require_tee_attestation.",
+                         config.enroll_server_id);
+        } else {
+            spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",
+                         cert.tpm_ak_pubkey.substr(0, 16), config.enroll_server_id);
+        }
 
         auto canonical = nexus::gossip::canonical_cert_json(cert);
         auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
@@ -172,6 +217,7 @@ int main(int argc, char* argv[]) {
     const auto stun_port   = config.stun_port;
     const auto relay_port  = config.relay_port;
     const auto dns_port    = config.dns_port;
+    const auto public_dns_port = config.public_dns_port;
 
     // --- Data directory ---
     const std::filesystem::path data_root = config.data_root;
@@ -204,16 +250,26 @@ int main(int argc, char* argv[]) {
     attestation.start();
 
     nexus::core::TeeAttestationService tee{crypto, storage, attestation};
-    if (!config.tee_platform_override.empty()) 
-        //Questionable whats actually happening here,
-        // this needs to be looked into further, this could leave a hole into the system to allow someone to override TEE for a system that doesnt support that type of TEE
-        //Maybe they could implement a custom TEE wrapper, not sure. Need to double check this and probably with some theories / research against TEE
-        
+    if (!config.tee_platform_override.empty()) {
+        // set_platform_override is now hardware-gated: it can only select a platform
+        // whose device is actually present, or downgrade to None. It can no longer
+        // fabricate TEE capability on a box with no root of trust (hardening plan,
+        // issue 7) — so this is safe to drive from config.
         tee.set_platform_override(config.tee_platform_override);
-    
+    }
+
     tee.start();
 
+    if (config.require_tee_attestation &&
+        tee.detected_platform() != nexus::core::TeePlatform::Tpm2) {
+        spdlog::warn("require_tee_attestation is set but no TPM 2.0 was detected on this host. "
+                     "This server will operate as Tier 2 (it can VERIFY Tier-1 peers but cannot "
+                     "self-attest). Provision a TPM (/dev/tpmrm0) to become Tier-1 capable.");
+    }
+
     nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
+    // Strict TPM-only Tier 1 is enforced whenever attestation is required.
+    trust_policy.set_require_tpm(config.require_tee_attestation);
     trust_policy.start();
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
@@ -287,7 +343,42 @@ int main(int argc, char* argv[]) {
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
     }
+
+    // Resolve our region + public IP early (reused later for NS/SEIP setup).
+    nexus::core::resolve_server_region(config, data_root);
+    std::string server_public_ip = nexus::core::resolve_public_ip(config);
+
     gossip.start();
+
+    // DNS seed discovery uses BLOCKING system DNS lookups for names this server may
+    // itself be authoritative for, so it must NOT run on the startup path — it would
+    // hang until our own DNS service is up. Run it detached; discovered peers are
+    // added once they resolve and get a ServerHello on the next gossip tick. Self
+    // entries are dropped by the gossip identity guard.
+    if (config.dns_seed_discovery) {
+        std::thread([&gossip,
+                     base   = config.dns_base_domain,
+                     region = config.region,
+                     ip     = server_public_ip,
+                     port   = config.gossip_port,
+                     seeds  = config.seed_peers]() {
+            auto found = nexus::core::discover_seed_endpoints(base, region, ip, port);
+            std::unordered_set<std::string> existing(seeds.begin(), seeds.end());
+            std::size_t added = 0;
+            for (const auto& ep : found) {
+                if (existing.insert(ep).second) { gossip.add_peer(ep, ""); ++added; }
+            }
+            spdlog::info("DNS discovery: seeded {} peer(s) from tier/region DNS (region '{}')",
+                          added, region);
+        }).detach();
+    }
+
+    // Bind our identity into the TPM quote's qualifyingData. Use the very keypair
+    // gossip signs TEE reports with, so report.server_pubkey matches what the prover
+    // hashes into the quote (and what a verifier recomputes).
+    tee.set_identity_pubkey(nexus::crypto::to_base64(
+        std::span<const uint8_t>(gossip.keypair().public_key.data(),
+                                 gossip.keypair().public_key.size())));
 
     // ========================================================================
     // Dynamic DNS
@@ -361,6 +452,7 @@ int main(int argc, char* argv[]) {
         dns_ports.stun_port   = stun_port;
         dns_ports.relay_port  = relay_port;
         dns_ports.dns_port    = dns_port;
+        dns_ports.public_dns_port = public_dns_port;
         dns_ports.private_http_port = config.private_http_port;
         dns.set_port_config(dns_ports);
     }
@@ -383,7 +475,7 @@ int main(int argc, char* argv[]) {
     // Server identity resolution (uses ServerIdentity helpers)
     // ========================================================================
     nexus::core::resolve_server_hostname(config, data_root, gossip);
-    nexus::core::resolve_server_region(config, data_root);
+    // (region already resolved before gossip.start() for DNS seed discovery)
 
     // NS hostname: explicit > derived from server_hostname
     std::string ns_hostname = config.dns_ns_hostname;
@@ -392,7 +484,7 @@ int main(int argc, char* argv[]) {
         spdlog::info("DNS: auto-derived NS hostname: {}", ns_hostname);
     }
 
-    std::string server_public_ip = nexus::core::resolve_public_ip(config);
+    // (server_public_ip already resolved before gossip.start() for DNS seed discovery)
 
     // Configure NS identity for SOA/NS responses
     if (!ns_hostname.empty() && !server_public_ip.empty()) {
@@ -448,6 +540,15 @@ int main(int argc, char* argv[]) {
 
             dns.publish_seip_records(seip_id, config.region, server_public_ip);
             spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
+
+            // Publish our tier record so other nodes can discover us by tier+region
+            // (tier<N>.<region>.seip.<domain>). Tier1 = TEE-attested, Tier2 = cert-only.
+            const auto our_tier = trust_policy.our_tier();
+            const int tier_num = (our_tier == nexus::core::TrustTier::Tier1) ? 1
+                               : (our_tier == nexus::core::TrustTier::Tier2) ? 2 : 0;
+            if (tier_num > 0) {
+                dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
+            }
 
             // Request ACME cert for the SEIP hostname (public API)
             if (config.auto_tls) {
@@ -537,7 +638,7 @@ int main(int argc, char* argv[]) {
     // WireGuard interface — server-side tunnel endpoint
     // ========================================================================
     nexus::wireguard::WireGuardService wireguard_service{
-        "wg0", std::filesystem::path{config.data_root} / "wireguard"};
+        config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
     wireguard_service.start();
 
     // Derive Curve25519 keypair from Ed25519 identity for WireGuard
@@ -556,14 +657,14 @@ int main(int argc, char* argv[]) {
         wg_iface.listen_port = config.udp_port;
 
         if (wireguard_service.setup_interface(wg_iface, {})) {
-            spdlog::info("WireGuard: wg0 up on :{} with tunnel IP {}/10",
-                          config.udp_port, tunnel_bind_ip);
+            spdlog::info("WireGuard: {} up on :{} with tunnel IP {}/10",
+                          config.wg_interface, config.udp_port, tunnel_bind_ip);
         } else {
-            spdlog::warn("WireGuard: failed to set up wg0 — clients will not be able to connect. "
-                          "Ensure wireguard-tools and kernel module are installed.");
+            spdlog::warn("WireGuard: failed to set up {} — clients will not be able to connect. "
+                          "Ensure wireguard-tools and kernel module are installed.", config.wg_interface);
         }
     } else {
-        spdlog::warn("WireGuard: skipping wg0 setup (no identity key or tunnel IP)");
+        spdlog::warn("WireGuard: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
     }
 
     // ========================================================================
@@ -587,9 +688,9 @@ int main(int argc, char* argv[]) {
         auto slash = backbone_ip.find('/');
         auto backbone_ip_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
 
-        // Add backbone address to wg0 (does NOT flush the existing client address)
+        // Add backbone address to the WG interface (does NOT flush the existing client address)
         if (wireguard_service.add_address(backbone_ip_bare + "/22")) {
-            spdlog::info("Backbone: added {}/22 to wg0", backbone_ip_bare);
+            spdlog::info("Backbone: added {}/22 to {}", backbone_ip_bare, config.wg_interface);
         }
 
         // Wire gossip with WG service and backbone info
@@ -736,13 +837,19 @@ int main(int argc, char* argv[]) {
     nexus::api::AdminApiHandler  admin_api{ctx};
     nexus::api::MeshApiHandler   mesh_api{ctx};
 
-    public_api.register_routes(http_server.server(), private_srv);
-    auth_api.register_routes(http_server.server(), private_srv);
-    tree_api.register_routes(http_server.server(), private_srv);
-    relay_api.register_routes(http_server.server(), private_srv);
-    cert_api.register_routes(http_server.server(), private_srv);
-    admin_api.register_routes(http_server.server(), private_srv);
-    mesh_api.register_routes(http_server.server(), private_srv);
+    // Route registration is factored into a lambda so it can be re-run if the
+    // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
+    // a background ACME cert is issued).
+    auto register_public_routes = [&]() {
+        public_api.register_routes(http_server.server(), private_srv);
+        auth_api.register_routes(http_server.server(), private_srv);
+        tree_api.register_routes(http_server.server(), private_srv);
+        relay_api.register_routes(http_server.server(), private_srv);
+        cert_api.register_routes(http_server.server(), private_srv);
+        admin_api.register_routes(http_server.server(), private_srv);
+        mesh_api.register_routes(http_server.server(), private_srv);
+    };
+    register_public_routes();
 
     // ========================================================================
     // Start HTTP servers
@@ -800,8 +907,29 @@ int main(int argc, char* argv[]) {
                 if (result.success) {
                     spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
                                   server_fqdn, result.cert_path, result.key_path);
-                    spdlog::info("Auto-TLS: restarting server to activate HTTPS...");
-                    coordinator.shutdown();
+                    // Activate HTTPS in place — restart ONLY the HTTP server, leaving
+                    // gossip/DNS/STUN/relay/etc. running. Never tear down the whole process.
+                    if (http_server.is_tls()) {
+                        // Already HTTPS — hot-swap the cert, no restart needed.
+                        if (http_server.reload_tls_certs(result.cert_path, result.key_path)) {
+                            spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", server_fqdn);
+                        } else {
+                            spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", server_fqdn);
+                        }
+                    } else {
+                        spdlog::info("Auto-TLS: activating HTTPS on the API server (in place)...");
+                        http_server.stop();
+                        if (http_server.upgrade_to_tls(result.cert_path, result.key_path)) {
+                            register_public_routes();  // server object changed — re-register
+                            http_server.start();
+                            spdlog::info("Auto-TLS: HTTPS active for {} — other services unaffected",
+                                          server_fqdn);
+                        } else {
+                            http_server.start();  // upgrade failed — resume plain HTTP
+                            spdlog::warn("Auto-TLS: TLS upgrade failed for {}; continuing on HTTP",
+                                          server_fqdn);
+                        }
+                    }
                     break;
                 }
 

@@ -70,6 +70,7 @@ enum class TeePlatform : uint8_t {
     IntelTdx          = 2,  ///< Intel TDX (VM-level trust domain)
     AmdSevSnp         = 3,  ///< AMD SEV-SNP (VM-level encrypted)
     AppleSecureEnclave = 4, ///< Apple Secure Enclave (macOS bare-metal)
+    Tpm2              = 5,  ///< TPM 2.0 hardware-signed quote (real root of trust)
 };
 
 [[nodiscard]] inline std::string_view tee_platform_name(TeePlatform p) {
@@ -79,6 +80,7 @@ enum class TeePlatform : uint8_t {
         case TeePlatform::IntelTdx:          return "tdx";
         case TeePlatform::AmdSevSnp:         return "sev-snp";
         case TeePlatform::AppleSecureEnclave: return "secure-enclave";
+        case TeePlatform::Tpm2:              return "tpm2";
     }
     return "unknown";
 }
@@ -88,6 +90,7 @@ enum class TeePlatform : uint8_t {
     if (s == "tdx")             return TeePlatform::IntelTdx;
     if (s == "sev-snp")         return TeePlatform::AmdSevSnp;
     if (s == "secure-enclave")  return TeePlatform::AppleSecureEnclave;
+    if (s == "tpm2")            return TeePlatform::Tpm2;
     return TeePlatform::None;
 }
 
@@ -100,12 +103,21 @@ enum class TeePlatform : uint8_t {
 /// attestation token that the receiver must verify before processing.
 struct TeeAttestationReport {
     TeePlatform platform{TeePlatform::None};
-    std::vector<uint8_t> quote;         ///< Platform-specific attestation quote/report bytes
+    std::vector<uint8_t> quote;         ///< Legacy structural quote bytes (SGX/TDX/SEV/Apple)
     std::array<uint8_t, 32> nonce{};    ///< Challenge nonce this report is bound to
     uint64_t timestamp{0};              ///< Unix timestamp of report generation
     std::string server_pubkey;          ///< base64 Ed25519 pubkey of the attesting server
     std::string binary_hash;            ///< hex SHA-256 of the running binary
     std::string signature;              ///< base64 Ed25519 signature over canonical JSON
+
+    // --- TPM 2.0 evidence (TeePlatform::Tpm2) ---
+    // The AK's hardware signature over `tpms_attest` covers a qualifyingData of
+    // SHA256(nonce ‖ server_pubkey ‖ binary_hash); the signature is verified
+    // against the AK pinned in the peer's enrolled certificate (NOT `ak_pubkey`).
+    std::vector<uint8_t> tpms_attest;    ///< raw TPMS_ATTEST (the hardware-signed structure)
+    std::vector<uint8_t> tpm_signature;  ///< raw TPMT_SIGNATURE over tpms_attest
+    std::string          ak_pubkey;      ///< base64 DER SPKI AK pub — HINT ONLY; must match cert-pinned AK
+    std::vector<uint8_t> pcr_values;     ///< concatenated selected PCR values (to recompute pcrDigest)
 };
 
 /// Canonical JSON for signing (excludes signature field).
@@ -136,6 +148,7 @@ struct AttestationToken {
     std::string binary_hash;                 ///< hex SHA-256 of running binary
     uint64_t timestamp{0};                   ///< when this token was generated
     uint64_t attestation_timestamp{0};       ///< when the underlying TEE report was generated
+    std::string challenge_nonce;             ///< base64 echo of the verifier's most recent challenge (anti-replay)
     std::string signature;                   ///< base64 Ed25519 over canonical token JSON
 };
 

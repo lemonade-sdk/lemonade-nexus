@@ -72,9 +72,13 @@ public:
 
     /// Handle a TEE report sent in response to our challenge.
     /// Returns true if the report is valid and the peer is promoted to Tier 1.
+    /// `trusted_ak_pubkey` is the TPM AK pinned in the peer's enrolled certificate
+    /// (base64 DER SPKI); under strict mode the hardware quote signature is verified
+    /// against it. This is the ONLY path that establishes Tier 1.
     [[nodiscard]] bool handle_challenge_response(
         const std::string& pubkey,
-        const TeeAttestationReport& report);
+        const TeeAttestationReport& report,
+        const std::string& trusted_ak_pubkey = {});
 
     // -----------------------------------------------------------------------
     // Trust state queries
@@ -103,6 +107,13 @@ public:
     /// Explicitly set a peer to Tier 2 (certificate-only, e.g., after adding via certificate).
     void set_peer_tier2(const std::string& pubkey);
 
+    /// Strict TPM-only enforcement. When enabled (wired from
+    /// config.require_tee_attestation), Tier 1 is granted ONLY by a verified TPM
+    /// quote (challenge-response) against the cert-pinned AK: legacy structural
+    /// backends no longer promote, and a signed token alone cannot establish Tier 1
+    /// (it may only refresh liveness for a peer already TPM-attested).
+    void set_require_tpm(bool require);
+
     /// Remove a peer from the trust state map entirely.
     void remove_peer(const std::string& pubkey);
 
@@ -127,6 +138,8 @@ private:
     TeeAttestationService& tee_;
     BinaryAttestationService& binary_attestation_;
     crypto::SodiumCryptoService& crypto_;
+
+    bool require_tpm_{false};  ///< strict TPM-only Tier 1 (see set_require_tpm)
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, PeerTrustState> peers_;

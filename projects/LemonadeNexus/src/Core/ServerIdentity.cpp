@@ -5,14 +5,26 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Relay/GeoRegion.hpp>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#endif
+
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <set>
 #include <thread>
 #include <unordered_set>
 
@@ -168,6 +180,93 @@ std::string resolve_public_ip(const ServerConfig& config) {
         }
     }
     return ip;
+}
+
+std::vector<std::string> resolve_a_records(const std::string& hostname) {
+    std::vector<std::string> ips;
+    if (hostname.empty()) return ips;
+
+    struct addrinfo hints{};
+    hints.ai_family   = AF_INET;     // IPv4 only
+    hints.ai_socktype = SOCK_DGRAM;  // hint; we only want addresses
+
+    struct addrinfo* res = nullptr;
+    int rc = ::getaddrinfo(hostname.c_str(), nullptr, &hints, &res);
+    if (rc != 0 || res == nullptr) return ips;
+
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        if (p->ai_family != AF_INET || p->ai_addr == nullptr) continue;
+        auto* sa = reinterpret_cast<struct sockaddr_in*>(p->ai_addr);
+        char buf[INET_ADDRSTRLEN] = {0};
+        if (::inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf)) != nullptr) {
+            std::string ip(buf);
+            if (std::find(ips.begin(), ips.end(), ip) == ips.end())
+                ips.push_back(std::move(ip));
+        }
+    }
+    ::freeaddrinfo(res);
+    return ips;
+}
+
+std::vector<std::string> select_seed_endpoints(
+    const std::vector<std::string>& candidate_ips,
+    const std::string& our_public_ip,
+    uint16_t gossip_port)
+{
+    std::vector<std::string> endpoints;
+    std::set<std::string> seen;
+    if (!our_public_ip.empty()) seen.insert(our_public_ip);  // never seed ourselves
+    for (const auto& ip : candidate_ips) {
+        if (ip.empty()) continue;
+        if (!seen.insert(ip).second) continue;  // skip self / duplicates
+        endpoints.push_back(ip + ":" + std::to_string(gossip_port));
+    }
+    return endpoints;
+}
+
+std::vector<std::string> discover_seed_endpoints(
+    const std::string& base_domain,
+    const std::string& our_region,
+    const std::string& our_public_ip,
+    uint16_t gossip_port)
+{
+    if (base_domain.empty()) return {};
+
+    // Region search order: our own region first, then the nearest regions by
+    // great-circle distance. One reachable seed is enough to bootstrap — gossip
+    // peer-exchange then spreads the rest of the mesh.
+    static constexpr std::size_t kNearbyRegions = 3;  // own + 3 nearest = 4 total
+
+    std::vector<std::string> region_order;
+    {
+        std::vector<std::string> codes;
+        for (const auto& r : relay::GeoRegion::all_regions()) codes.push_back(r.code);
+        auto sorted = relay::GeoRegion::sort_by_distance(our_region, codes);
+        for (const auto& c : sorted) {
+            region_order.push_back(c);
+            if (region_order.size() >= kNearbyRegions + 1) break;
+        }
+        // Always include our own region first, even if GeoRegion doesn't know it.
+        if (!our_region.empty() &&
+            std::find(region_order.begin(), region_order.end(), our_region) == region_order.end()) {
+            region_order.insert(region_order.begin(), our_region);
+        }
+    }
+
+    // Resolve candidates in priority order: nearest region first, Tier 1 before Tier 2.
+    std::vector<std::string> candidate_ips;
+    for (const auto& region : region_order) {
+        for (int tier : {1, 2}) {
+            std::string host = "tier" + std::to_string(tier) + "." + region +
+                               ".seip." + base_domain;
+            for (const auto& ip : resolve_a_records(host)) {
+                spdlog::info("DNS discovery: found tier{} server {} in region '{}'",
+                              tier, ip, region);
+                candidate_ips.push_back(ip);
+            }
+        }
+    }
+    return select_seed_endpoints(candidate_ips, our_public_ip, gossip_port);
 }
 
 std::string build_server_fqdn(

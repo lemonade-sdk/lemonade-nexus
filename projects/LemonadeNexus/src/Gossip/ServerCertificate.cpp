@@ -13,6 +13,8 @@ void to_json(json& j, const ServerCertificate& c) {
         {"issued_at",      c.issued_at},
         {"expires_at",     c.expires_at},
         {"issuer_pubkey",  c.issuer_pubkey},
+        {"tpm_ak_pubkey",  c.tpm_ak_pubkey},
+        {"tpm_ek_cert",    c.tpm_ek_cert},
         {"signature",      c.signature},
     };
 }
@@ -25,11 +27,15 @@ void from_json(const json& j, ServerCertificate& c) {
     if (j.contains("issued_at"))      j.at("issued_at").get_to(c.issued_at);
     if (j.contains("expires_at"))     j.at("expires_at").get_to(c.expires_at);
     if (j.contains("issuer_pubkey"))  j.at("issuer_pubkey").get_to(c.issuer_pubkey);
+    if (j.contains("tpm_ak_pubkey"))  j.at("tpm_ak_pubkey").get_to(c.tpm_ak_pubkey);
+    if (j.contains("tpm_ek_cert"))    j.at("tpm_ek_cert").get_to(c.tpm_ek_cert);
     if (j.contains("signature"))      j.at("signature").get_to(c.signature);
 }
 
 std::string canonical_cert_json(const ServerCertificate& cert) {
-    // Sorted keys (nlohmann default), excludes "signature"
+    // Sorted keys (nlohmann default), excludes "signature". The pinned AK and EK
+    // cert are inside the canonical form so the root signature binds them to the
+    // server identity (closing the self-asserted-key gap structurally).
     json j;
     j["endpoint_hint"]  = cert.endpoint_hint;
     j["expires_at"]     = cert.expires_at;
@@ -37,6 +43,8 @@ std::string canonical_cert_json(const ServerCertificate& cert) {
     j["issuer_pubkey"]  = cert.issuer_pubkey;
     j["server_id"]      = cert.server_id;
     j["server_pubkey"]  = cert.server_pubkey;
+    j["tpm_ak_pubkey"]  = cert.tpm_ak_pubkey;
+    j["tpm_ek_cert"]    = cert.tpm_ek_cert;
     return j.dump();
 }
 

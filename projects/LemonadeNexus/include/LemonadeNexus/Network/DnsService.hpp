@@ -151,7 +151,8 @@ public:
         uint16_t gossip_port{9102};
         uint16_t stun_port{3478};
         uint16_t relay_port{9103};
-        uint16_t dns_port{53};
+        uint16_t dns_port{5335};        ///< internal listen port (behind NAT)
+        uint16_t public_dns_port{53};   ///< port advertised to clients (NAT-mapped to dns_port)
         uint16_t private_http_port{9101};
         std::string region;
         uint32_t connected_clients{0};
@@ -180,6 +181,14 @@ public:
     void publish_seip_records(const std::string& server_id,
                               const std::string& region,
                               const std::string& public_ip);
+
+    /// Publish a per-server tier A record under <id>.tier<tier>.<region>.seip.<domain>.
+    /// Aggregated by the tier+region wildcard so a bootstrapping node can resolve
+    /// tier<tier>.<region>.seip.<domain> to all servers of that tier in that region.
+    void publish_tier_record(const std::string& server_id,
+                             const std::string& region,
+                             int tier,
+                             const std::string& public_ip);
 
     /// Update the connected-client load count and re-publish the SEIP _config
     /// TXT record if the count changed (avoids gossip spam).

@@ -3,9 +3,13 @@ cmake_minimum_required(VERSION 3.25.1)
 # =============================================================================
 # OpenSSL — prefer system/package-manager version, build from source as fallback
 # =============================================================================
-# CI environments install OpenSSL via system packages (libssl-dev, openssl-devel,
-# choco, brew).  Local macOS builds without Homebrew need the source fallback.
+# CI environments install OpenSSL via system packages on Linux (libssl-dev,
+# openssl-devel) and vcpkg on Windows.  On macOS, set OPENSSL_FORCE_BUNDLED=ON
+# to build statically from source so distributed binaries carry no Homebrew
+# (or other /usr/local) dylib dependencies.
 # =============================================================================
+
+option(OPENSSL_FORCE_BUNDLED "Always build OpenSSL from source, ignoring any system copy" OFF)
 
 # Skip entirely if targets already exist (e.g. from a parent project)
 if(TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
@@ -16,17 +20,23 @@ endif()
 # ---------------------------------------------------------------------------
 # Try system OpenSSL first (respects OPENSSL_ROOT_DIR if set)
 # ---------------------------------------------------------------------------
-find_package(OpenSSL QUIET)
+if(NOT OPENSSL_FORCE_BUNDLED)
+    find_package(OpenSSL QUIET)
 
-if(OPENSSL_FOUND AND TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
-    message(STATUS "Using system OpenSSL ${OPENSSL_VERSION}")
-    return()
+    if(OPENSSL_FOUND AND TARGET OpenSSL::SSL AND TARGET OpenSSL::Crypto)
+        message(STATUS "Using system OpenSSL ${OPENSSL_VERSION}")
+        return()
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
 # System OpenSSL not found — build 3.3.2 from source via ExternalProject_Add
 # ---------------------------------------------------------------------------
-message(STATUS "System OpenSSL not found — building 3.3.2 from source")
+if(OPENSSL_FORCE_BUNDLED)
+    message(STATUS "OPENSSL_FORCE_BUNDLED=ON — building OpenSSL from source")
+else()
+    message(STATUS "System OpenSSL not found — building from source")
+endif()
 
 include(ExternalProject)
 
@@ -115,6 +125,7 @@ set(OPENSSL_INCLUDE_DIR "${OPENSSL_INSTALL_PREFIX}/include")
 ExternalProject_Add(openssl_external
     URL               ${OPENSSL_URL}
     URL_HASH          SHA256=2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     DOWNLOAD_DIR      "${CMAKE_BINARY_DIR}/_download/openssl"
     SOURCE_DIR        "${CMAKE_BINARY_DIR}/_deps/openssl-src"
     BINARY_DIR        "${CMAKE_BINARY_DIR}/_deps/openssl-src"   # OpenSSL builds in-source
@@ -127,6 +138,7 @@ ExternalProject_Add(openssl_external
     LOG_CONFIGURE     TRUE
     LOG_BUILD         TRUE
     LOG_INSTALL       TRUE
+    LOG_OUTPUT_ON_FAILURE TRUE
 )
 
 # ---------------------------------------------------------------------------

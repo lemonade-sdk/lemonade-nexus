@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Gossip/MisbehaviorDetector.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/WireGuard/WireGuardService.hpp>
 
@@ -166,6 +167,12 @@ void GossipService::on_stop() {
 // ---------------------------------------------------------------------------
 
 void GossipService::do_add_peer(std::string_view endpoint, std::string_view pubkey) {
+    // Never add ourselves as a peer (e.g. peer-exchange echoing our own identity).
+    if (!pubkey.empty() && pubkey == crypto::to_base64(keypair_.public_key)) {
+        spdlog::debug("[{}] refusing to add self as peer ({})", name(), endpoint);
+        return;
+    }
+
     std::lock_guard lock(peers_mutex_);
 
     // Check if peer already exists
@@ -402,6 +409,47 @@ void GossipService::do_handle_deltas(const GossipPeer& peer,
             }
         }
 
+        // Equivocation detection (signature already verified above): if this signer
+        // previously signed a DIFFERENT statement at the same (target_node_id,
+        // sequence), that is non-repudiable proof it equivocated. Mint a proof, ban
+        // the signer, gossip the proof, and refuse to apply the conflicting delta.
+        {
+            std::string id = normalize_pubkey(delta.signer_pubkey) + "\x1f" +
+                             delta.target_node_id + "\x1f" + std::to_string(delta.sequence);
+            std::string current = d.dump();
+            std::string prev;
+            {
+                std::lock_guard lk(seen_statements_mutex_);
+                auto it = seen_statements_.find(id);
+                if (it != seen_statements_.end()) {
+                    prev = it->second;
+                } else if (seen_statements_.size() >= kMaxSeenStatements) {
+                    seen_statements_.clear();  // bounded; only loses detection memory
+                }
+                seen_statements_[id] = current;
+            }
+            if (!prev.empty() && prev != current) {
+                try {
+                    auto prev_json = json::parse(prev);
+                    auto now = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
+                        chrono::system_clock::now().time_since_epoch()).count());
+                    auto proof = make_tree_delta_equivocation_proof(
+                        prev_json, d, crypto::to_base64(keypair_.public_key), now, crypto_);
+                    if (proof) {
+                        spdlog::warn("[{}] EQUIVOCATION: peer {} signed two conflicting deltas "
+                                      "at {}/seq {} — banning", name(), proof->accused_pubkey,
+                                      delta.target_node_id, delta.sequence);
+                        apply_ban(proof->accused_pubkey, *proof);
+                        broadcast_misbehavior_proof(*proof);
+                        ++rejected;
+                        continue;
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::debug("[{}] equivocation check parse error: {}", name(), e.what());
+                }
+            }
+        }
+
         // Apply the delta via storage
         auto seq = storage_.append_delta(delta);
         if (seq > 0) {
@@ -570,6 +618,9 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             break;
         case GossipMsgType::NsSlotClaim:
             handle_ns_slot_claim(remote_endpoint_, payload, payload_len);
+            break;
+        case GossipMsgType::MisbehaviorProofBroadcast:
+            handle_misbehavior_proof(remote_endpoint_, payload, payload_len);
             break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
@@ -811,6 +862,42 @@ void GossipService::on_gossip_tick() {
         trust_policy_->expire_stale_peers(core::TrustPolicyService::kTrustExpirationSec);
     }
 
+    // Proactively re-challenge Tier-1 peers once they pass the halfway point of their
+    // trust window. Tokens on each gossip message already refresh liveness, so this is
+    // defense-in-depth: it forces a fresh *hardware quote* periodically (bounding the
+    // TOCTOU window) and recovers peers that have gone quiet before they expire. Throttled
+    // to at most once/minute per peer so we never flood challenges.
+    if (trust_policy_ && our_certificate_) {
+        const uint64_t now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        constexpr uint64_t kRechallengeAfter   = core::TrustPolicyService::kTrustExpirationSec / 2;
+        constexpr uint64_t kRechallengeThrottle = 60;
+
+        std::vector<std::pair<std::string, std::string>> targets;  // (pubkey, endpoint)
+        for (const auto& st : trust_policy_->all_peer_states()) {
+            if (st.tier != core::TrustTier::Tier1) continue;
+            if (now < st.last_verified + kRechallengeAfter) continue;
+            auto it = last_rechallenge_.find(st.pubkey);
+            if (it != last_rechallenge_.end() && now < it->second + kRechallengeThrottle) continue;
+            targets.emplace_back(st.pubkey, std::string{});
+        }
+        if (!targets.empty()) {
+            std::lock_guard lock(peers_mutex_);
+            for (auto& [pk, ep] : targets) {
+                for (const auto& p : peers_) {
+                    if (p.pubkey == pk) { ep = p.endpoint; break; }
+                }
+            }
+        }
+        for (auto& [pk, ep] : targets) {
+            if (ep.empty()) continue;
+            if (auto target = parse_endpoint(ep)) {
+                send_tee_challenge(*target, pk);
+                last_rechallenge_[pk] = now;
+            }
+        }
+    }
+
     // Expire timed-out enrollment ballots
     if (enrollment_quorum_enabled_) {
         expire_enrollment_ballots();
@@ -826,6 +913,33 @@ void GossipService::on_gossip_tick() {
             last_known_generation_ = current_chain.back().generation;
             broadcast_root_key_rotation(current_chain.back());
             distribute_shamir_shares();
+        }
+    }
+
+    // Re-introduce ourselves (ServerHello) to any peer we haven't handshaked with
+    // yet — e.g. seeds added after startup by background DNS discovery, or peers
+    // that were unreachable during the initial hello. Once a peer responds its
+    // certificate_json is populated and we stop. Self-seeds are dropped by the
+    // identity guard in handle_server_hello.
+    if (our_certificate_) {
+        std::vector<std::string> pending;
+        {
+            std::lock_guard lock(peers_mutex_);
+            for (const auto& p : peers_) {
+                if (p.certificate_json.empty()) pending.push_back(p.endpoint);
+            }
+        }
+        if (!pending.empty()) {
+            json hello = *our_certificate_;
+            if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
+            if (!our_region_.empty()) hello["region"] = our_region_;
+            auto hello_str = hello.dump();
+            std::vector<uint8_t> hello_bytes(hello_str.begin(), hello_str.end());
+            for (const auto& ep : pending) {
+                if (auto target = parse_endpoint(ep)) {
+                    send_packet(*target, GossipMsgType::ServerHello, hello_bytes);
+                }
+            }
         }
     }
 
@@ -1168,6 +1282,151 @@ bool GossipService::is_revoked(const std::string& server_pubkey) const {
                      server_pubkey) != revoked_pubkeys_.end();
 }
 
+// ---------------------------------------------------------------------------
+// Misbehavior detection — equivocation proofs (dispositive auto-ban)
+// ---------------------------------------------------------------------------
+
+void GossipService::save_revoked_servers() const {
+    json arr = json::array();
+    for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
+
+    storage::SignedEnvelope env;
+    env.type = "revocation_list";
+    env.data = arr.dump();
+    env.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
+        chrono::system_clock::now().time_since_epoch()).count());
+    (void)storage_.write_file("identity", "revoked_servers.json", env);
+}
+
+void GossipService::apply_ban(const std::string& pubkey, const MisbehaviorProof& proof) {
+    const std::string pk = normalize_pubkey(pubkey);
+    if (pk.empty() || is_revoked(pk)) return;  // idempotent
+
+    // 1. Durable revocation — is_revoked now rejects all of this peer's certs, tokens
+    //    and messages, across restarts (revoked_servers.json is reloaded on start).
+    revoked_pubkeys_.push_back(pk);
+    save_revoked_servers();
+
+    // 2. Persist the proof as durable, independently-verifiable evidence.
+    {
+        storage::SignedEnvelope env;
+        env.type = "misbehavior_proof";
+        json pj = proof;
+        env.data = pj.dump();
+        env.timestamp = proof.observed_at;
+        (void)storage_.write_file("misbehavior_proofs", proof.proof_id + ".json", env);
+    }
+
+    // 3. Drop trust state and the peer entry; exclude from Tier1/Shamir eligibility.
+    if (trust_policy_) trust_policy_->remove_peer(pk);
+    if (root_key_chain_) root_key_chain_->ban_peer(pk);
+    do_remove_peer(pk);
+
+    spdlog::warn("[{}] BANNED peer {} (proof {})", name(), pk, proof.proof_id);
+}
+
+void GossipService::broadcast_misbehavior_proof(const MisbehaviorProof& proof,
+                                                const std::string& exclude_endpoint) {
+    json j = proof;
+    auto s = j.dump();
+    std::vector<uint8_t> payload(s.begin(), s.end());
+
+    std::lock_guard lock(peers_mutex_);
+    for (const auto& peer : peers_) {
+        if (!exclude_endpoint.empty() && peer.endpoint == exclude_endpoint) continue;
+        if (auto ep = parse_endpoint(peer.endpoint)) {
+            send_packet(*ep, GossipMsgType::MisbehaviorProofBroadcast, payload);
+        }
+    }
+}
+
+void GossipService::handle_misbehavior_proof(const asio::ip::udp::endpoint& sender,
+                                             const uint8_t* payload, std::size_t payload_len) {
+    MisbehaviorProof proof;
+    try {
+        proof = json::parse(std::string_view(reinterpret_cast<const char*>(payload), payload_len))
+                    .get<MisbehaviorProof>();
+    } catch (const std::exception& e) {
+        spdlog::debug("[{}] malformed misbehavior proof from {}: {}",
+                      name(), sender.address().to_string(), e.what());
+        return;
+    }
+
+    // Dedupe: we may receive the same proof from many peers (epidemic spread).
+    if (known_proofs_.count(proof.proof_id)) return;
+
+    // DISPOSITIVE verification — trust ONLY the accused's own signatures, never the
+    // reporter. A malicious relayer cannot forge this; an invalid proof dies here and
+    // is never forwarded (verify-before-forward), so bad proofs cannot spread.
+    if (!verify_misbehavior_proof(proof, crypto_)) {
+        spdlog::warn("[{}] rejecting INVALID misbehavior proof {} from {}",
+                      name(), proof.proof_id, sender.address().to_string());
+        return;
+    }
+
+    known_proofs_[proof.proof_id] = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
+        chrono::system_clock::now().time_since_epoch()).count());
+
+    spdlog::warn("[{}] verified misbehavior proof {} against {} — banning and re-gossiping",
+                  name(), proof.proof_id, proof.accused_pubkey);
+    apply_ban(proof.accused_pubkey, proof);
+
+    // Re-broadcast to everyone except the peer we received it from (epidemic spread;
+    // every honest node independently verifies, so convergence is guaranteed).
+    std::string from = sender.address().to_string() + ":" + std::to_string(sender.port());
+    broadcast_misbehavior_proof(proof, from);
+}
+
+bool GossipService::peer_has_verified_certificate(const std::string& pubkey) const {
+    if (pubkey.empty() || is_revoked(pubkey)) return false;
+
+    // Snapshot the peer's stored certificate JSON under the lock, then verify
+    // outside it (verify_server_certificate does not take peers_mutex_).
+    std::string cert_json;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = std::find_if(peers_.begin(), peers_.end(),
+            [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+        if (it == peers_.end() || it->certificate_json.empty()) return false;
+        cert_json = it->certificate_json;
+    }
+
+    try {
+        auto cert = json::parse(cert_json).get<ServerCertificate>();
+        // The certificate must actually belong to this pubkey and be valid under
+        // our root. (When no root pubkey is configured, verify_server_certificate
+        // returns true by design — trust is advisory in that deployment mode.)
+        if (cert.server_pubkey != pubkey) return false;
+        return verify_server_certificate(cert);
+    } catch (...) {
+        return false;
+    }
+}
+
+std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) const {
+    if (pubkey.empty() || is_revoked(pubkey)) return {};
+
+    std::string cert_json;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = std::find_if(peers_.begin(), peers_.end(),
+            [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+        if (it == peers_.end() || it->certificate_json.empty()) return {};
+        cert_json = it->certificate_json;
+    }
+
+    try {
+        auto cert = json::parse(cert_json).get<ServerCertificate>();
+        // Only return the AK from a certificate that actually belongs to this
+        // pubkey and verifies under our root — otherwise the AK is not trustworthy.
+        if (cert.server_pubkey != pubkey) return {};
+        if (!verify_server_certificate(cert)) return {};
+        return cert.tpm_ak_pubkey;
+    } catch (...) {
+        return {};
+    }
+}
+
 void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                                           const uint8_t* payload,
                                           std::size_t payload_len) {
@@ -1186,6 +1445,24 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
         // Add or update peer with verified certificate
         auto pk = cert.server_pubkey;
         auto ep = sender.address().to_string() + ":" + std::to_string(sender.port());
+
+        // Never peer with ourselves. A lone/genesis server can discover its own
+        // tier/region DNS record and seed itself; when our own ServerHello hairpins
+        // back (or peer-exchange echoes us), drop the self-referential entry and stop.
+        if (pk == crypto::to_base64(keypair_.public_key)) {
+            std::lock_guard lock(peers_mutex_);
+            auto before = peers_.size();
+            peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
+                [&](const GossipPeer& p) { return p.endpoint == ep || p.pubkey == pk; }),
+                peers_.end());
+            if (peers_.size() != before) {
+                spdlog::info("[{}] dropped self-referential peer at {} (own identity)",
+                              name(), ep);
+            } else {
+                spdlog::debug("[{}] ignored ServerHello from self ({})", name(), ep);
+            }
+            return;
+        }
 
         {
             std::lock_guard lock(peers_mutex_);
@@ -1334,6 +1611,17 @@ std::string GossipService::verify_message_trust(
 
         auto token = j["attestation_token"].get<core::AttestationToken>();
 
+        // Zero-trust identity binding: the token's pubkey must belong to a peer
+        // that presented a valid, root-CA-signed certificate. Without this, an
+        // attacker mints a self-signed token for an arbitrary key and is promoted
+        // to Tier1 (the token's signature only proves self-consistency).
+        if (!peer_has_verified_certificate(token.server_pubkey)) {
+            spdlog::warn("[{}] rejecting attestation token: pubkey {} is not an "
+                          "enrolled, certificate-verified peer", name(),
+                          token.server_pubkey.substr(0, 12) + "...");
+            return {};
+        }
+
         // Verify and update trust state through TrustPolicy
         auto tier = trust_policy_->verify_and_update(token.server_pubkey, token);
 
@@ -1437,8 +1725,21 @@ void GossipService::handle_tee_response(const asio::ip::udp::endpoint& sender,
 
         auto report = j.get<core::TeeAttestationReport>();
 
+        // Zero-trust identity binding: only honor a challenge response from a peer
+        // whose pubkey we have already bound to a valid, root-CA-signed certificate.
+        if (!peer_has_verified_certificate(report.server_pubkey)) {
+            spdlog::warn("[{}] rejecting TEE challenge response from {}:{}: pubkey {} "
+                          "is not an enrolled, certificate-verified peer", name(),
+                          sender.address().to_string(), sender.port(),
+                          report.server_pubkey.substr(0, 12) + "...");
+            return;
+        }
+
+        // The TPM quote signature must verify against the AK pinned in this peer's
+        // enrolled certificate — never the AK hint carried inside the report itself.
+        auto trusted_ak = certificate_ak_pubkey(report.server_pubkey);
         bool accepted = trust_policy_->handle_challenge_response(
-            report.server_pubkey, report);
+            report.server_pubkey, report, trusted_ak);
 
         if (accepted) {
             spdlog::info("[{}] peer {}:{} (pk: {}...) promoted to Tier1 via TEE challenge",
@@ -1602,6 +1903,17 @@ void GossipService::handle_enrollment_vote_request(
         if (trust_policy_) {
             if (j.contains("attestation_token")) {
                 auto token = j["attestation_token"].get<core::AttestationToken>();
+                // The token must actually belong to the claimed sponsor, and the
+                // sponsor must be an enrolled, certificate-verified peer. Otherwise
+                // an attacker replays a stolen token under a forged sponsor_pubkey.
+                if (token.server_pubkey != sponsor_pubkey ||
+                    !peer_has_verified_certificate(sponsor_pubkey)) {
+                    spdlog::warn("[{}] enrollment vote request with mismatched/unverified "
+                                  "sponsor token (sponsor={}, token={})", name(),
+                                  sponsor_pubkey.substr(0, 12),
+                                  token.server_pubkey.substr(0, 12));
+                    return;
+                }
                 auto tier = trust_policy_->verify_and_update(sponsor_pubkey, token);
                 if (tier == core::TrustTier::Untrusted) {
                     spdlog::warn("[{}] enrollment vote request from untrusted sponsor {}",

@@ -15,10 +15,14 @@ struct ServerConfig {
     uint16_t    gossip_port{9102};
     uint16_t    stun_port{3478};
     uint16_t    relay_port{9103};
-    uint16_t    dns_port{53};
+    uint16_t    dns_port{5335};          // internal DNS listen port (behind NAT)
+    uint16_t    public_dns_port{53};     // DNS port advertised to clients (NAT-mapped to dns_port)
     std::string bind_address{"0.0.0.0"};
     std::string public_ip;              // public-facing IP for DNS glue records (auto-detected if empty)
     std::string region;                 // cloud region code (e.g. "us-east", auto-detected if empty)
+    std::string wg_interface{"nexus0"}; // WireGuard interface name. MUST NOT be "wg0" or any
+                                        // interface you are connected through -- the server flushes
+                                        // and re-keys this device on startup, which would drop that tunnel.
 
     // Storage
     std::string data_root{"data"};
@@ -46,7 +50,7 @@ struct ServerConfig {
     std::string tls_key_path;
 
     // ACME certificate provider
-    std::string acme_provider{"zerossl"};    // "letsencrypt", "letsencrypt_staging", "zerossl"
+    std::string acme_provider{"letsencrypt"}; // "letsencrypt", "letsencrypt_staging", "zerossl"
     std::string acme_eab_kid;                // ZeroSSL External Account Binding Key ID
     std::string acme_eab_hmac_key;           // ZeroSSL EAB HMAC key (base64url)
     std::string dns_provider{"local"};       // "local" = self-hosted authoritative DNS, "cloudflare" = API fallback
@@ -58,6 +62,7 @@ struct ServerConfig {
     // DNS resolution
     std::string dns_base_domain{"lemonade-nexus.io"};
     std::string dns_ns_hostname;            // this server's NS hostname (e.g. "ns1.lemonade-nexus.io")
+    bool        dns_seed_discovery{true};   // auto-discover seed peers from tier/region DNS records on startup
 
     // Binary attestation
     std::string release_signing_pubkey;       // base64 Ed25519 pubkey for release manifest verification
@@ -77,7 +82,10 @@ struct ServerConfig {
     // Enrollment CLI mode (non-empty = run enrollment and exit)
     std::string enroll_server_pubkey;
     std::string enroll_server_id;
+    std::string enroll_tpm_ak_pubkey;  // base64 DER SPKI AK to pin in the cert (Model A)
+    std::string enroll_tpm_ek_cert_path; // optional path to the joining TPM's EK cert (PEM)
     std::string revoke_server_pubkey;
+    bool        print_tpm_ak{false};   // print this host's TPM AK pubkey (base64 DER SPKI) and exit
 
     // Manifest CLI mode
     std::string add_manifest_path;  // path to a release manifest JSON to import

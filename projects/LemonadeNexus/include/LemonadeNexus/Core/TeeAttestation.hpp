@@ -51,6 +51,11 @@ public:
     /// Force override the detected platform (for testing or config).
     void set_platform_override(const std::string& platform_str);
 
+    /// Provide our enrolled Ed25519 identity pubkey (base64). The TPM prover binds
+    /// it into the quote's qualifyingData so the hardware signature covers our
+    /// identity as well as the nonce + binary hash. Set once the identity is loaded.
+    void set_identity_pubkey(const std::string& pubkey_b64);
+
 private:
     void on_start();
     void on_stop();
@@ -59,7 +64,8 @@ private:
     // ITeeAttestationProvider
     [[nodiscard]] TeeAttestationReport do_generate_report(const std::array<uint8_t, 32>& nonce);
     [[nodiscard]] bool do_verify_report(const TeeAttestationReport& report,
-                                         const std::array<uint8_t, 32>& expected_nonce);
+                                         const std::array<uint8_t, 32>& expected_nonce,
+                                         const std::string& trusted_ak_pubkey);
     [[nodiscard]] bool do_platform_available() const;
     [[nodiscard]] TeePlatform do_detected_platform() const;
 
@@ -77,13 +83,22 @@ private:
     [[nodiscard]] bool verify_sev_snp_report(const TeeAttestationReport& report) const;
     [[nodiscard]] bool verify_apple_se_report(const TeeAttestationReport& report) const;
 
+    // TPM 2.0 backend — defined in Core/TeeAttestationTpm.cpp.
+    //   generation: ESYS prover, Linux + LEMONADE_HAVE_TPM_FAPI only
+    //   verification: pure OpenSSL, runs on every platform (verify-only nodes)
+    [[nodiscard]] TeeAttestationReport generate_tpm_report(const std::array<uint8_t, 32>& nonce);
+    [[nodiscard]] bool verify_tpm_report(const TeeAttestationReport& report,
+                                          const std::array<uint8_t, 32>& expected_nonce,
+                                          const std::string& trusted_ak_pubkey) const;
+
     crypto::SodiumCryptoService& crypto_;
     storage::FileStorageService& storage_;
     BinaryAttestationService& binary_attestation_;
 
     TeePlatform detected_platform_{TeePlatform::None};
     std::optional<TeeAttestationReport> cached_report_;
-    std::string report_hash_;  // hex SHA-256 of cached_report_ canonical JSON
+    std::string report_hash_;       // hex SHA-256 of cached_report_ canonical JSON
+    std::string identity_pubkey_b64_; // our enrolled Ed25519 identity (for TPM qualifyingData)
     mutable std::mutex mutex_;
 };
 
