@@ -501,24 +501,31 @@ jobs:
 
       - name: Build C++ SDK and dependencies
         run: |
+          # Build OpenSSL statically from source (OPENSSL_FORCE_BUNDLED=ON installs
+          # libssl.a/libcrypto.a into build/openssl-install/lib, which Package.swift
+          # links). The shipped .app must NOT depend on a Homebrew dylib — that path
+          # doesn't exist on end-user Macs and dyld aborts the app at launch.
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DOPENSSL_FORCE_BUNDLED=ON
           cmake --build build --target LemonadeNexusSDK --parallel
-
-          # If system OpenSSL was used (no source build), symlink to the expected
-          # path so Package.swift linker flags resolve correctly.
-          if [ ! -d "build/openssl-install" ]; then
-            BREW_SSL="/opt/homebrew/opt/openssl@3"
-            if [ -d "$BREW_SSL" ]; then
-              ln -sf "$BREW_SSL" build/openssl-install
-            fi
-          fi
 
       - name: Build Swift app
         working-directory: apps/LemonadeNexusMac
         run: bash Packaging/build.sh
+
+      - name: Verify app has no external OpenSSL/Homebrew linkage
+        run: |
+          bin="apps/LemonadeNexusMac/.build/LemonadeNexus.app/Contents/MacOS/LemonadeNexusMac"
+          echo "otool -L $bin:"
+          otool -L "$bin"
+          if otool -L "$bin" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/|libssl|libcrypto'; then
+            echo "::error::App links an external OpenSSL/Homebrew dylib — it will crash on user Macs"
+            exit 1
+          fi
+          echo "OK: OpenSSL is statically linked; no external dylib dependency"
 
       - name: Create DMG
         working-directory: apps/LemonadeNexusMac
