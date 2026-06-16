@@ -61,4 +61,8 @@ elseif(APPLE)
     install(FILES "${CMAKE_SOURCE_DIR}/packaging/macos/io.lemonade-nexus.plist"
             DESTINATION Library/LaunchDaemons
             COMPONENT Runtime)
+elseif(WIN32)
+    # Windows: Service registration is handled by MSI installer (WiX Toolset).
+    # For local development, register the service manually:
+    #   sc create LemonadeNexus binPath= "<path>\lemonade-nexus.exe" start= auto
 endif()

@@ -1,0 +1,405 @@
+name: Build Windows Packages
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'apps/LemonadeNexus/**'
+      - '.github/workflows/build-windows-packages.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/LemonadeNexus/**'
+      - '.github/workflows/build-windows-packages.yml'
+
+env:
+  # Pin to a known-good stable Flutter (ships Dart >=3.0 required by pubspec).
+  # Do not pin to a non-existent version (e.g. 3.41) - keep this on the stable track.
+  FLUTTER_VERSION: '3.32.0'
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  build-flutter-windows:
+    name: Build Flutter Windows app
+    runs-on: windows-latest
+    outputs:
+      build-dir: build/windows/x64/runner/Release
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Scaffold Windows target (if missing)
+        working-directory: apps/LemonadeNexus
+        run: |
+          if (-not (Test-Path "windows/runner/CMakeLists.txt")) {
+            flutter create --platforms=windows . --project-name lemonade_nexus
+          } else {
+            Write-Host "Windows target already scaffolded - skipping flutter create"
+          }
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Build Flutter Windows app (Release)
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Locate Release output directory
+        id: locate
+        working-directory: apps/LemonadeNexus
+        run: |
+          # Flutter 3.13+ uses build/windows/x64/runner/Release;
+          # older versions used build/windows/runner/Release.
+          $candidates = @(
+            "build/windows/x64/runner/Release",
+            "build/windows/runner/Release"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = $c; break }
+          }
+          if (-not $found) {
+            Write-Error "Could not locate Flutter Windows Release output"
+            Get-ChildItem -Recurse build/windows -Directory | Select-Object -ExpandProperty FullName
+            exit 1
+          }
+          Write-Host "Found release dir: $found"
+          "release-dir=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload Flutter build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-windows-release
+          path: apps/LemonadeNexus/${{ steps.locate.outputs.release-dir }}
+          if-no-files-found: error
+
+  build-msix:
+    name: Build MSIX Package
+    runs-on: windows-latest
+    needs: build-flutter-windows
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Scaffold Windows target (if missing)
+        working-directory: apps/LemonadeNexus
+        run: |
+          if (-not (Test-Path "windows/runner/CMakeLists.txt")) {
+            flutter create --platforms=windows . --project-name lemonade_nexus
+          }
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Build Flutter Windows app (Release)
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Create MSIX package
+        working-directory: apps/LemonadeNexus
+        run: dart run msix:create
+
+      - name: Locate MSIX output
+        id: locate-msix
+        working-directory: apps/LemonadeNexus
+        run: |
+          # msix_config.output_path in pubspec.yaml is build/windows/msix
+          $candidates = @(
+            "build/windows/msix",
+            "build/windows/x64/runner/Release",
+            "build/windows/runner/Release"
+          )
+          $msix = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) {
+              $found = Get-ChildItem -Path $c -Filter "*.msix" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($found) { $msix = $found.FullName; break }
+            }
+          }
+          if (-not $msix) {
+            Write-Error "No .msix produced - dumping build tree"
+            Get-ChildItem -Recurse build/windows -Filter "*.msix" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "Found MSIX: $msix"
+          "msix-path=$msix" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-msix
+          path: ${{ steps.locate-msix.outputs.msix-path }}
+          if-no-files-found: error
+
+  build-msi:
+    name: Build MSI Installer
+    runs-on: windows-latest
+    needs: build-flutter-windows
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Install WiX Toolset
+        run: choco install wixtoolset -y
+
+      - name: Add WiX to PATH
+        run: |
+          $wixBin = "C:\Program Files (x86)\WiX Toolset v3.14\bin"
+          if (Test-Path $wixBin) {
+            Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+          }
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Scaffold Windows target (if missing)
+        working-directory: apps/LemonadeNexus
+        run: |
+          if (-not (Test-Path "windows/runner/CMakeLists.txt")) {
+            flutter create --platforms=windows . --project-name lemonade_nexus
+          }
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Build Flutter Windows app (Release)
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Locate Release output directory
+        id: locate
+        working-directory: apps/LemonadeNexus
+        run: |
+          $candidates = @(
+            "build/windows/x64/runner/Release",
+            "build/windows/runner/Release"
+          )
+          $found = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $found = (Resolve-Path $c).Path; break }
+          }
+          if (-not $found) {
+            Write-Error "Could not locate Flutter Windows Release output"
+            exit 1
+          }
+          "release-dir=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Build C++ Server
+        working-directory: .
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target LemonadeNexusApp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Server binary built successfully"
+          Get-ChildItem build/projects/LemonadeNexus/Release -Filter "*.exe" | Select-Object Name
+
+      - name: Bundle server into Flutter output
+        working-directory: apps/LemonadeNexus
+        run: |
+          $releaseDir = "${{ steps.locate.outputs.release-dir }}"
+          $serverDir = (Resolve-Path "../../build/projects/LemonadeNexus/Release").Path
+
+          # Copy server binary
+          Copy-Item "$serverDir/lemonade-nexus.exe" $releaseDir -Force
+          Write-Host "Copied lemonade-nexus.exe to release dir"
+
+          # Copy OpenSSL DLLs (needed by server)
+          foreach ($dll in @("libcrypto-3-x64.dll", "libssl-3-x64.dll")) {
+            if (Test-Path "$releaseDir/$dll") {
+              Write-Host "$dll already exists in release dir"
+            } else {
+              Copy-Item "$serverDir/$dll" $releaseDir -Force
+              Write-Host "Copied $dll to release dir"
+            }
+          }
+
+          # Create default server config
+          $config = @{
+            http_port = 9100
+            private_http_port = 9101
+            dns_port = 5353
+            stun_port = 13478
+            gossip_port = 19102
+            relay_port = 19103
+            udp_port = 151940
+            bind_address = "0.0.0.0"
+            data_root = "data"
+            rp_id = "lemonade-nexus.local"
+            log_level = "info"
+            dns_base_domain = "lemonade-nexus.local"
+            region = "local"
+            auto_tls = $false
+          }
+          $config | ConvertTo-Json | Out-File "$releaseDir/lemonade-nexus.json" -Encoding UTF8
+          Write-Host "Created default server config"
+
+          # List final contents
+          Get-ChildItem $releaseDir | Select-Object Name, Length
+
+      - name: Harvest Flutter output with heat.exe
+        working-directory: apps/LemonadeNexus/windows/packaging/MSI
+        run: |
+          $buildDir = "${{ steps.locate.outputs.release-dir }}"
+          # heat.exe walks the Release dir and emits a WiX fragment containing
+          # one Component per file plus the directory tree under INSTALLFOLDER.
+          #   -gg  generate component GUIDs at compile time
+          #   -sfrag  emit a single fragment instead of one per file
+          #   -srd  do not emit the root directory (we own INSTALLFOLDER)
+          #   -scom -sreg  no COM/registry harvesting
+          #   -ke  keep empty directories
+          #   -dr  reference INSTALLFOLDER from Product.wxs
+          #   -cg  ComponentGroup id consumed by Product.wxs
+          #   -var var.BuildDir  parameterise File@Source via -dBuildDir
+          & heat.exe dir "$buildDir" `
+            -gg -sfrag -srd -scom -sreg -ke `
+            -dr INSTALLFOLDER `
+            -cg ApplicationFiles `
+            -var var.BuildDir `
+            -out HarvestedFiles.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "Harvested files:"
+          Get-Content HarvestedFiles.wxs | Select-Object -First 60
+
+      - name: Build MSI installer
+        working-directory: apps/LemonadeNexus/windows/packaging/MSI
+        run: |
+          $buildDir = "${{ steps.locate.outputs.release-dir }}"
+          New-Item -ItemType Directory -Path obj -Force | Out-Null
+          & candle.exe -arch x64 -dBuildDir="$buildDir" -out "obj\" Product.wxs HarvestedFiles.wxs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & light.exe -ext WixUIExtension -cultures:en-us `
+            -out lemonade_nexus_setup.msi `
+            -sval `
+            obj\Product.wixobj obj\HarvestedFiles.wixobj
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-msi
+          path: apps/LemonadeNexus/windows/packaging/MSI/lemonade_nexus_setup.msi
+          if-no-files-found: error
+
+  build-standalone:
+    name: Build Standalone EXE
+    runs-on: windows-latest
+    needs: build-flutter-windows
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: 'stable'
+          cache: true
+
+      - name: Enable Windows desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Scaffold Windows target (if missing)
+        working-directory: apps/LemonadeNexus
+        run: |
+          if (-not (Test-Path "windows/runner/CMakeLists.txt")) {
+            flutter create --platforms=windows . --project-name lemonade_nexus
+          }
+
+      - name: Get Flutter dependencies
+        working-directory: apps/LemonadeNexus
+        run: flutter pub get
+
+      - name: Build Flutter Windows app (Release)
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - name: Create portable package
+        working-directory: apps/LemonadeNexus
+        run: |
+          $candidates = @(
+            "build/windows/x64/runner/Release",
+            "build/windows/runner/Release"
+          )
+          $buildDir = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) { $buildDir = $c; break }
+          }
+          if (-not $buildDir) {
+            Write-Error "Could not locate Flutter Windows Release output"
+            exit 1
+          }
+
+          $outputDir = "build/windows/packages/exe"
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+          New-Item -ItemType Directory -Path "build/windows/packages" -Force | Out-Null
+
+          # Copy everything in the release dir verbatim - this includes the
+          # exe, flutter_windows.dll, icudtl.dat and the data/ folder.
+          Copy-Item -Recurse -Force "$buildDir\*" $outputDir
+
+          Compress-Archive -Path "$outputDir\*" -DestinationPath "build\windows\packages\lemonade_nexus_portable.zip" -Force
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-exe
+          path: apps/LemonadeNexus/build/windows/packages/lemonade_nexus_portable.zip
+          if-no-files-found: error
+
+  build-all:
+    name: Build All Packages
+    runs-on: windows-latest
+    needs: [build-msix, build-msi, build-standalone]
+    if: always() && needs.build-msix.result == 'success' && needs.build-msi.result == 'success' && needs.build-standalone.result == 'success'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lemonade-nexus-*
+          merge-multiple: true
+
+      - name: List built packages
+        run: Get-ChildItem -Recurse
+
+      - name: Create release summary
+        run: |
+          "## Windows Packages Built"                                       | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          ""                                                                | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Package Type | Status |"                                       | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "|--------------|--------|"                                       | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| MSIX         | ${{ needs.build-msix.result }} |"               | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| MSI          | ${{ needs.build-msi.result }} |"               | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+          "| Portable ZIP | ${{ needs.build-standalone.result }} |"         | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append

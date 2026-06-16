@@ -48,3 +48,31 @@ Cargo.lock
 # Unwanted files
 .claude/
 *.bak
+
+# Flutter (Windows client at apps/LemonadeNexus/)
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub/
+pubspec.lock
+**/windows/flutter/ephemeral/
+apps/LemonadeNexus/build/
+
+# MSIX/MSI packaging artifacts
+*.msix
+*.msi
+*.appxupload
+*.msixbundle
+apps/LemonadeNexus/windows/packaging/MSI/obj/
+apps/LemonadeNexus/windows/packaging/signing/*.pfx
+apps/LemonadeNexus/windows/packaging/signing/*.p12
+apps/LemonadeNexus/keys/*.pfx
+apps/LemonadeNexus/keys/*.p12
+apps/LemonadeNexus/keys/*.cer
+apps/LemonadeNexus/keys/*.pem
+
+# WiX Toolset
+*.wixobj
+*.wixpdb
+apps/LemonadeNexus/windows/packaging/MSI/HarvestedFiles.wxs
