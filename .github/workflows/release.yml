@@ -57,17 +57,19 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev
+          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
 
-      - name: Set OpenSSL path (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          echo "OPENSSL_ROOT_DIR=/opt/homebrew/opt/openssl@3" >> "$GITHUB_ENV"
+      # macOS builds OpenSSL from source (static) via -DOPENSSL_FORCE_BUNDLED=ON
+      # in the Configure step, so no Homebrew OpenSSL path is needed here.
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
-          choco install ninja openssl -y
+          choco install ninja -y
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\vcpkg-binary-cache" | Out-Null
+          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg-binary-cache"
+          vcpkg install openssl:x64-windows-static-md
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
@@ -92,30 +94,23 @@ jobs:
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
-            -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}"
+            -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}" \
+            -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
 
       - name: Configure CMake (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $opensslRoot = "C:\Program Files\OpenSSL-Win64"
-          if (-not (Test-Path $opensslRoot)) {
-            $opensslRoot = "C:\Program Files\OpenSSL"
-          }
-          # Choco OpenSSL puts .lib files in lib/VC/x64/MD/ — locate them explicitly
-          $cryptoLib = Get-ChildItem "$opensslRoot" -Recurse -Filter "libcrypto.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
-          $sslLib = Get-ChildItem "$opensslRoot" -Recurse -Filter "libssl.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
-          $cmakeArgs = @(
-            "-B", "build",
-            "-G", "Ninja",
-            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}",
-            "-DBUILD_TESTING=OFF",
-            "-DGIT_TAG_OVERRIDE=${{ github.ref_name }}",
-            "-DOPENSSL_ROOT_DIR=$opensslRoot"
-          )
-          if ($cryptoLib) { $cmakeArgs += "-DOPENSSL_CRYPTO_LIBRARY=$($cryptoLib.FullName)" }
-          if ($sslLib) { $cmakeArgs += "-DOPENSSL_SSL_LIBRARY=$($sslLib.FullName)" }
-          cmake @cmakeArgs
+          # Use the vcpkg static OpenSSL (x64-windows-static-md) installed above.
+          # Choco's OpenSSL is 4.x, whose const-qualified X509 APIs break the build.
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          cmake -B build `
+            -G Ninja `
+            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
+            -DBUILD_TESTING=OFF `
+            "-DGIT_TAG_OVERRIDE=${{ github.ref_name }}" `
+            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
+            -DOPENSSL_USE_STATIC_LIBS=ON
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
@@ -285,19 +280,21 @@ jobs:
             cpack_generators: "DEB"
             install_cmd: >-
               apt-get update &&
-              apt-get install -y cmake ninja-build g++ libssl-dev git ca-certificates curl
+              apt-get install -y cmake ninja-build make g++ libssl-dev pkg-config
+              libjson-c-dev libcurl4-openssl-dev uuid-dev git ca-certificates curl
               python3 python3-pip python3-venv dpkg-dev
           - container: fedora:40
             platform: linux-x86_64-rpm
             cpack_generators: "RPM"
             install_cmd: >-
-              dnf install -y cmake ninja-build gcc-c++ openssl-devel git
+              dnf install -y cmake ninja-build make gcc-c++ openssl-devel
+              pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
               python3 python3-pip rpm-build
           - container: archlinux:latest
             platform: linux-x86_64-arch
             cpack_generators: "TGZ"
             install_cmd: >-
-              pacman -Syu --noconfirm cmake ninja gcc openssl git
+              pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git
               python python-pip python-pynacl
 
     runs-on: ubuntu-latest
@@ -504,24 +501,31 @@ jobs:
 
       - name: Build C++ SDK and dependencies
         run: |
+          # Build OpenSSL statically from source (OPENSSL_FORCE_BUNDLED=ON installs
+          # libssl.a/libcrypto.a into build/openssl-install/lib, which Package.swift
+          # links). The shipped .app must NOT depend on a Homebrew dylib — that path
+          # doesn't exist on end-user Macs and dyld aborts the app at launch.
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=OFF
+            -DBUILD_TESTING=OFF \
+            -DOPENSSL_FORCE_BUNDLED=ON
           cmake --build build --target LemonadeNexusSDK --parallel
-
-          # If system OpenSSL was used (no source build), symlink to the expected
-          # path so Package.swift linker flags resolve correctly.
-          if [ ! -d "build/openssl-install" ]; then
-            BREW_SSL="/opt/homebrew/opt/openssl@3"
-            if [ -d "$BREW_SSL" ]; then
-              ln -sf "$BREW_SSL" build/openssl-install
-            fi
-          fi
 
       - name: Build Swift app
         working-directory: apps/LemonadeNexusMac
         run: bash Packaging/build.sh
+
+      - name: Verify app has no external OpenSSL/Homebrew linkage
+        run: |
+          bin="apps/LemonadeNexusMac/.build/LemonadeNexus.app/Contents/MacOS/LemonadeNexusMac"
+          echo "otool -L $bin:"
+          otool -L "$bin"
+          if otool -L "$bin" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/|libssl|libcrypto'; then
+            echo "::error::App links an external OpenSSL/Homebrew dylib — it will crash on user Macs"
+            exit 1
+          fi
+          echo "OK: OpenSSL is statically linked; no external dylib dependency"
 
       - name: Create DMG
         working-directory: apps/LemonadeNexusMac
