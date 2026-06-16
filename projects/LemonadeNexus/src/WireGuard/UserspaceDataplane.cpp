@@ -6,9 +6,12 @@
 #include <sodium.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 
 #ifdef _WIN32
 #  include <winsock2.h>

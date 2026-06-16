@@ -4,6 +4,7 @@
 #include <sodium.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <fstream>
 #include <optional>
 #include <regex>
