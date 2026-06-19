@@ -50,6 +50,12 @@ public:
     /// Set the root management pubkey for certificate verification.
     void set_root_pubkey(const crypto::Ed25519PublicKey& pk);
 
+    /// True once a root-of-trust pubkey has been configured.
+    [[nodiscard]] bool has_root_pubkey() const { return has_root_pubkey_; }
+
+    /// The configured root pubkey (only valid when has_root_pubkey()).
+    [[nodiscard]] const crypto::Ed25519PublicKey& root_pubkey() const { return root_pubkey_; }
+
     /// Set the TrustPolicyService for zero-trust enforcement.
     /// Must be called before start() for trust features to be active.
     void set_trust_policy(core::TrustPolicyService* policy);

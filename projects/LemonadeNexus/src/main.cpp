@@ -41,6 +41,8 @@
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
+#include <LemonadeNexus/Api/RoutingApiHandler.hpp>
+#include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -425,6 +427,10 @@ int main(int argc, char* argv[]) {
 
     nexus::relay::RelayDiscoveryService relay_discovery{storage};
     relay_discovery.start();
+
+    // Routing-layer coordination control plane (fails closed without a root key).
+    nexus::routing::RoutingCoordinationService routing{crypto, gossip};
+    routing.start();
 
     // ========================================================================
     // ACME
@@ -854,6 +860,7 @@ int main(int argc, char* argv[]) {
         .ddns             = ddns,
         .relay            = relay,
         .relay_discovery  = relay_discovery,
+        .routing          = routing,
         .attestation      = attestation,
         .tee              = tee,
         .trust_policy     = trust_policy,
@@ -874,6 +881,7 @@ int main(int argc, char* argv[]) {
     nexus::api::CertApiHandler   cert_api{ctx};
     nexus::api::AdminApiHandler  admin_api{ctx};
     nexus::api::MeshApiHandler   mesh_api{ctx};
+    nexus::api::RoutingApiHandler routing_api{ctx};
 
     // Route registration is factored into a lambda so it can be re-run if the
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
@@ -886,6 +894,7 @@ int main(int argc, char* argv[]) {
         cert_api.register_routes(http_server.server(), private_srv);
         admin_api.register_routes(http_server.server(), private_srv);
         mesh_api.register_routes(http_server.server(), private_srv);
+        routing_api.register_routes(http_server.server(), private_srv);
     };
     register_public_routes();
 
@@ -1060,6 +1069,7 @@ int main(int argc, char* argv[]) {
     ddns.stop();
     dns.stop();
     acme.stop();
+    routing.stop();
     relay_discovery.stop();
     relay.stop();
     stun.stop();
