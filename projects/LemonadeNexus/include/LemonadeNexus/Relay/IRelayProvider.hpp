@@ -29,8 +29,9 @@ public:
 
     /// Bind a peer endpoint to an existing session.
     [[nodiscard]] RelayBindResult bind(const SessionId& session_id,
-                                       const asio::ip::udp::endpoint& peer_endpoint) {
-        return self().do_bind(session_id, peer_endpoint);
+                                       const asio::ip::udp::endpoint& peer_endpoint,
+                                       std::span<const uint8_t> bind_token) {
+        return self().do_bind(session_id, peer_endpoint, bind_token);
     }
 
     /// Forward data within a session from the given source endpoint.
@@ -66,7 +67,7 @@ concept RelayProviderType = requires(T t, const T ct,
                                       const asio::ip::udp::endpoint& ep,
                                       std::span<const uint8_t> data) {
     { t.do_allocate(ticket) } -> std::same_as<RelayAllocation>;
-    { t.do_bind(sid, ep) } -> std::same_as<RelayBindResult>;
+    { t.do_bind(sid, ep, data) } -> std::same_as<RelayBindResult>;
     { t.do_forward(sid, data, ep) } -> std::same_as<bool>;
     { t.do_teardown(sid) } -> std::same_as<void>;
     { ct.do_verify_ticket(ticket) } -> std::same_as<bool>;

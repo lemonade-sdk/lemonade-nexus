@@ -30,6 +30,20 @@ struct EndpointControlSession {
     std::vector<std::string> pending_connection_ids;
 };
 
+/// Coordinator-signed authorization for one connection. Carries NO Noise static
+/// key — the peer's E2E static comes only from the root-signed IdentityBinding,
+/// so a (weaker-than-root) coordinator signature can never substitute a key.
+struct ConnectionTicket {
+    std::string connection_id;
+    std::string client_node_id;
+    std::string endpoint_node_id;
+    std::array<uint8_t, 16> conn_nonce{};
+    DataPath    data_path{DataPath::DirectP2P};
+    uint64_t    issued_at{0};
+    uint64_t    expires_at{0};
+    std::array<uint8_t, 64> signature{};
+};
+
 enum class SessionPhase {
     Requested,        // client asked; endpoint not yet ready
     EndpointReady,    // endpoint signalled readiness

@@ -56,6 +56,12 @@ public:
     /// The configured root pubkey (only valid when has_root_pubkey()).
     [[nodiscard]] const crypto::Ed25519PublicKey& root_pubkey() const { return root_pubkey_; }
 
+    /// Strict identity-binding verification for the routed E2E trust path.
+    /// Unlike verify_server_certificate, this HARD-FAILS when no root pubkey is
+    /// configured (no fail-open): a node that cannot anchor the root of trust
+    /// cannot accept any binding.
+    [[nodiscard]] bool verify_identity_binding(const ServerCertificate& cert) const;
+
     /// Set the TrustPolicyService for zero-trust enforcement.
     /// Must be called before start() for trust features to be active.
     void set_trust_policy(core::TrustPolicyService* policy);
@@ -262,6 +268,12 @@ private:
 
     // Verify a server certificate against the root pubkey
     [[nodiscard]] bool verify_server_certificate(const ServerCertificate& cert) const;
+
+    // Shared cert checks (issuer == root, expiry, revocation, signature).
+    // Assumes a root pubkey is configured; the root-presence policy differs
+    // between verify_server_certificate (fail-open) and verify_identity_binding
+    // (hard-fail), so it is handled by the callers.
+    [[nodiscard]] bool verify_cert_core(const ServerCertificate& cert) const;
 
     // Check if a server pubkey has been revoked
     [[nodiscard]] bool is_revoked(const std::string& server_pubkey) const;

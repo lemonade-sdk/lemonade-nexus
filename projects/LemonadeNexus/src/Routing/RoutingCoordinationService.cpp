@@ -192,6 +192,8 @@ std::optional<ClientDirective> RoutingCoordinationService::build_client_directiv
 
     ClientDirective d;
     d.connection_id        = s.connection_id;
+    d.client_node_id       = s.client_node_id;
+    d.endpoint_node_id     = s.endpoint_node_id;
     d.endpoint_identifier  = s.endpoint_identifier;
     d.endpoint_wg_pub      = s.endpoint_wg_pub;
     d.endpoint_mgmt_pubkey = s.endpoint_mgmt_pubkey;

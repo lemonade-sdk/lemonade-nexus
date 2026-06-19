@@ -6,7 +6,10 @@
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
+#include <LemonadeNexus/Routing/ConnectionTicket.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
 
 #include <spdlog/spdlog.h>
@@ -260,9 +263,26 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         auto d = ctx_.routing.build_client_directive(connection_id, claims.user_id);
         if (!d) { error_response(res, "connection not ready or not yours", 409); return; }
 
+        // Coordinator-signed ConnectionTicket (authorizes the connection; carries
+        // NO Noise static). M4 wraps the peer's Noise static in a root-signed
+        // IdentityBinding so a coordinator signature can never substitute a key.
+        routing::ConnectionTicket ticket;
+        ticket.connection_id    = d->connection_id;
+        ticket.client_node_id   = d->client_node_id;
+        ticket.endpoint_node_id = d->endpoint_node_id;
+        ticket.conn_nonce       = d->conn_nonce;
+        ticket.data_path        = d->data_path;
+        ticket.issued_at        = epoch_seconds();
+        ticket.expires_at       = ticket.issued_at + 30;
+        bool ticket_signed = false;
+        if (auto privkey = ctx_.key_wrapping.unlock_identity({})) {
+            routing::sign_connection_ticket(ticket, ctx_.crypto, *privkey);
+            ticket_signed = true;
+        }
+
         nlohmann::json j = {
             {"connection_id", d->connection_id},
-            {"peer_binding", {                       // M3.5: become a root-signed IdentityBinding
+            {"peer_binding", {                       // M4: root-signed IdentityBinding
                 {"identifier",  d->endpoint_identifier},
                 {"mgmt_pubkey", d->endpoint_mgmt_pubkey},
                 {"wg_pubkey",   d->endpoint_wg_pub},  // the E2E Noise static
@@ -273,11 +293,16 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
             {"data_path",  path_str(d->data_path)},
             {"relay_endpoint", d->relay_endpoint},
             {"punch_at", d->punch_at},
-            {"ticket", {                              // M3.5: signed ConnectionTicket
-                {"connection_id", d->connection_id},
-                {"conn_nonce", crypto::to_base64(std::span<const uint8_t>(d->conn_nonce))},
-                {"data_path", path_str(d->data_path)},
-                {"signed", false},
+            {"ticket", {
+                {"connection_id",    ticket.connection_id},
+                {"client_node_id",   ticket.client_node_id},
+                {"endpoint_node_id", ticket.endpoint_node_id},
+                {"conn_nonce", crypto::to_base64(std::span<const uint8_t>(ticket.conn_nonce))},
+                {"data_path",  path_str(ticket.data_path)},
+                {"issued_at",  ticket.issued_at},
+                {"expires_at", ticket.expires_at},
+                {"signature",  crypto::to_base64(std::span<const uint8_t>(ticket.signature))},
+                {"signed",     ticket_signed},
             }},
         };
         json_response(res, j);

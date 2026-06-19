@@ -54,6 +54,8 @@ struct RequestResult {
 
 struct ClientDirective {
     std::string connection_id;
+    std::string client_node_id;
+    std::string endpoint_node_id;
     std::string endpoint_identifier;
     std::string endpoint_wg_pub;
     std::string endpoint_mgmt_pubkey;

@@ -17,6 +17,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nexus::relay {
@@ -62,8 +63,19 @@ public:
 
     // -- IRelayProvider --
     [[nodiscard]] RelayAllocation do_allocate(const RelayTicket& ticket);
+    /// Bind a peer to a session slot. Requires a single-use, side-bound token
+    /// (compute_bind_token) so that knowing the session_id alone is not enough
+    /// to hijack a slot. A token binds exactly one side, exactly once.
     [[nodiscard]] RelayBindResult do_bind(const SessionId& session_id,
-                                          const asio::ip::udp::endpoint& peer_endpoint);
+                                          const asio::ip::udp::endpoint& peer_endpoint,
+                                          std::span<const uint8_t> bind_token);
+
+    /// Derive the 16-byte bind token for a session side (0 = A, 1 = B). Keyed by
+    /// a per-process secret, so only this relay can produce valid tokens; the
+    /// coordinator obtains them at allocation time and hands them to each peer
+    /// over the authenticated control channel.
+    [[nodiscard]] std::array<uint8_t, 16> compute_bind_token(const SessionId& session_id,
+                                                             uint8_t side) const;
     [[nodiscard]] bool do_forward(const SessionId& session_id,
                                   std::span<const uint8_t> data,
                                   const asio::ip::udp::endpoint& from);
@@ -109,9 +121,15 @@ private:
     std::array<uint8_t, kMaxDatagram> recv_buf_{};
     asio::ip::udp::endpoint           remote_endpoint_;
 
+    // Per-process secret keying the bind tokens (random at on_start).
+    crypto::Hash256 bind_secret_{};
+
     // Session table
     mutable std::mutex mutex_;
     std::unordered_map<SessionId, std::shared_ptr<RelaySession>, SessionIdHash> sessions_;
+
+    // Ticket session-nonces already allocated (reject re-allocation / replay).
+    std::unordered_set<std::string> seen_ticket_nonces_;
 
     // TTL enforcement timer (fires every 30 seconds)
     asio::steady_timer ttl_timer_{io_};
