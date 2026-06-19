@@ -59,11 +59,6 @@ struct ServerConfig {
     std::string server_hostname;             // e.g. "central" -> "central.srv.lemonade-nexus.io"
     bool        auto_tls{true};              // automatically request TLS cert via ACME on startup
 
-    // Legacy unauthenticated UDP hole-punch registry (UdpHolePunch). Off by
-    // default: it has no auth/TTL and is a spoof/DoS surface. The routing layer
-    // coordinates hole punching over the authenticated control channel instead.
-    bool        enable_legacy_hole_punch{false};
-
     // DNS resolution
     std::string dns_base_domain{"lemonade-nexus.io"};
     std::string dns_ns_hostname;            // this server's NS hostname (e.g. "ns1.lemonade-nexus.io")

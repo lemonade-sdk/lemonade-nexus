@@ -6,7 +6,6 @@
 #include <LemonadeNexus/ACL/ACLService.hpp>
 #include <LemonadeNexus/Network/HttpServer.hpp>
 #include <LemonadeNexus/Network/RateLimiter.hpp>
-#include <LemonadeNexus/Network/UdpHolePunch.hpp>
 
 // Lemonade-Nexus services
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
@@ -907,20 +906,6 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
-    // UDP Hole Punch (separate port from WireGuard)
-    // ========================================================================
-    const uint16_t hole_punch_port = 51941;
-    nexus::network::HolePunchService hole_punch{coordinator.io_context(), hole_punch_port};
-    if (config.enable_legacy_hole_punch) {
-        spdlog::warn("[main] legacy UdpHolePunch enabled (unauthenticated) — "
-                     "prefer routing-layer coordinated hole punching");
-        hole_punch.start();
-    } else {
-        spdlog::info("[main] legacy UdpHolePunch disabled (default); routing layer "
-                     "coordinates hole punching over the authenticated control channel");
-    }
-
-    // ========================================================================
     // Run -- blocks until SIGINT/SIGTERM
     // ========================================================================
     const auto http_proto = http_server.is_tls() ? "HTTPS" : "HTTP";
@@ -1066,7 +1051,6 @@ int main(int argc, char* argv[]) {
     if (acme_renewal_thread.joinable()) {
         acme_renewal_thread.join();
     }
-    if (config.enable_legacy_hole_punch) hole_punch.stop();
     wireguard_service.stop();   // stops the dataplane: no more inbound packets
     vnet.stop();                // tears down the netstack + bridges
     if (private_http_server) {
