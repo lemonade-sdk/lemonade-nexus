@@ -19,6 +19,10 @@ enum class Permission : uint32_t {
     StunRespond     = 1 << 9,
     RelayRegister   = 1 << 10,
     AllocateIP      = 1 << 11,
+    // Routing-layer coordinator capability. ACL-rooted (parent/root-signed) and
+    // revocable independent of attestation. A node with RoutingCoordinate but
+    // not RelayForward is a pure broker; the inverse is a pure relay.
+    RoutingCoordinate = 1 << 12,
     Admin           = 0xFFFFFFFF,
 };
 

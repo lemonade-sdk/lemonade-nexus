@@ -911,7 +911,14 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     const uint16_t hole_punch_port = 51941;
     nexus::network::HolePunchService hole_punch{coordinator.io_context(), hole_punch_port};
-    hole_punch.start();
+    if (config.enable_legacy_hole_punch) {
+        spdlog::warn("[main] legacy UdpHolePunch enabled (unauthenticated) — "
+                     "prefer routing-layer coordinated hole punching");
+        hole_punch.start();
+    } else {
+        spdlog::info("[main] legacy UdpHolePunch disabled (default); routing layer "
+                     "coordinates hole punching over the authenticated control channel");
+    }
 
     // ========================================================================
     // Run -- blocks until SIGINT/SIGTERM
@@ -1059,7 +1066,7 @@ int main(int argc, char* argv[]) {
     if (acme_renewal_thread.joinable()) {
         acme_renewal_thread.join();
     }
-    hole_punch.stop();
+    if (config.enable_legacy_hole_punch) hole_punch.stop();
     wireguard_service.stop();   // stops the dataplane: no more inbound packets
     vnet.stop();                // tears down the netstack + bridges
     if (private_http_server) {

@@ -776,6 +776,7 @@ acl::Permission PermissionTreeService::string_to_permission(std::string_view per
     if (perm_str == "connect_private") return acl::Permission::ConnectPrivate;
     if (perm_str == "connect_shared")  return acl::Permission::ConnectShared;
     if (perm_str == "relay_forward")   return acl::Permission::RelayForward;
+    if (perm_str == "routing_coordinate") return acl::Permission::RoutingCoordinate;
     if (perm_str == "stun_respond")    return acl::Permission::StunRespond;
     if (perm_str == "relay_register")  return acl::Permission::RelayRegister;
     if (perm_str == "allocate_ip")     return acl::Permission::AllocateIP;

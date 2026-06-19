@@ -1,8 +1,33 @@
 #include <LemonadeNexus/ACL/Permission.hpp>
+#include <LemonadeNexus/Core/TrustTypes.hpp>
 
 #include <gtest/gtest.h>
 
 using namespace nexus::acl;
+
+// M6: routing capability is an ACL bit, distinct from RelayForward, so a node
+// can be a pure broker (coordinate, no forward) or pure relay (forward, no
+// coordinate). The trust tier is only a liveness floor.
+TEST(RoutingRolePermissions, BrokerAndRelayAreSeparable) {
+    auto broker = Permission::RoutingCoordinate;
+    EXPECT_TRUE(has_permission(broker, Permission::RoutingCoordinate));
+    EXPECT_FALSE(has_permission(broker, Permission::RelayForward));
+
+    auto relay = Permission::RelayForward;
+    EXPECT_TRUE(has_permission(relay, Permission::RelayForward));
+    EXPECT_FALSE(has_permission(relay, Permission::RoutingCoordinate));
+
+    EXPECT_TRUE(has_permission(Permission::Admin, Permission::RoutingCoordinate));
+}
+
+TEST(RoutingRolePermissions, RoutingCoordinateIsTier2LivenessFloor) {
+    using nexus::core::TrustTier;
+    using nexus::core::TrustOperation;
+    using nexus::core::is_operation_allowed;
+    EXPECT_FALSE(is_operation_allowed(TrustTier::Untrusted, TrustOperation::RoutingCoordinate));
+    EXPECT_TRUE(is_operation_allowed(TrustTier::Tier2, TrustOperation::RoutingCoordinate));
+    EXPECT_TRUE(is_operation_allowed(TrustTier::Tier1, TrustOperation::RoutingCoordinate));
+}
 
 TEST(PermissionTest, NoneHasNoPermissions) {
     EXPECT_FALSE(has_permission(Permission::None, Permission::Read));
