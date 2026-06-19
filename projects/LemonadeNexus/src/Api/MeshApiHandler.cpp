@@ -81,10 +81,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     // GET /api/mesh/peers/:node_id (PRIVATE, auth required)
     //
-    // Returns the server as a peer plus all authorized sibling endpoints
-    // under the same parent group.  Each entry contains the WireGuard
-    // public key, tunnel IP, private subnet, and last-known endpoint,
-    // so the client SDK can build a multi-peer WireGuard config.
+    // Returns the server peer plus every endpoint BELOW the caller in the access
+    // chain (its parent group's subtree), filtered per-node by Read permission.
     // ========================================================================
     priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -122,15 +120,16 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        auto siblings = ctx_.tree.get_children(node.parent_id);
+        // Descendants of the caller's parent group; ACL-filtered per node below.
+        auto reachable = ctx_.tree.collect_subtree(node.parent_id);
 
         // Build WG handshake map to determine peer liveness from the tunnel layer
         auto wg_map = build_wg_handshake_map(ctx_.wireguard);
         auto now = epoch_seconds();
 
-        // Build peer list: all Endpoint-type siblings except the requesting node
+        // Build peer list: all Endpoint-type nodes in scope except the caller
         nlohmann::json peers = nlohmann::json::array();
-        for (const auto& sibling : siblings) {
+        for (const auto& sibling : reachable) {
             if (sibling.id == node_id) continue;  // skip self
             if (sibling.type != tree::NodeType::Endpoint) continue;  // only endpoints
 
@@ -163,8 +162,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             peers.push_back(std::move(peer));
         }
 
-        // Also include Relay-type siblings as potential relay endpoints
-        for (const auto& sibling : siblings) {
+        // Also include Relay-type nodes in scope as potential relay endpoints
+        for (const auto& sibling : reachable) {
             if (sibling.type != tree::NodeType::Relay) continue;
             if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
                                              acl::Permission::Read)) {
@@ -290,13 +289,16 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         uint32_t online_count = 0;
 
         if (!node.parent_id.empty()) {
-            auto siblings = ctx_.tree.get_children(node.parent_id);
+            auto reachable = ctx_.tree.collect_subtree(node.parent_id);
             auto wg_map = build_wg_handshake_map(ctx_.wireguard);
             auto now = epoch_seconds();
-            for (const auto& s : siblings) {
+            for (const auto& s : reachable) {
                 if (s.id == node_id) continue;
                 if (s.type != tree::NodeType::Endpoint &&
                     s.type != tree::NodeType::Relay) continue;
+                // Only count nodes the caller is allowed to see.
+                if (!ctx_.tree.check_permission(caller_pubkey, s.id,
+                                                 acl::Permission::Read)) continue;
                 ++peer_count;
                 if (s.type == tree::NodeType::Relay) {
                     ++online_count;  // relays always considered online

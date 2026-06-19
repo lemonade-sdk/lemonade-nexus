@@ -43,6 +43,13 @@ struct TreeNode {
     std::string              wrapped_mgmt_privkey;       // "aeskw:base64blob..."
     std::string              wg_pubkey;                  // WireGuard Curve25519 pubkey
 
+    // Routing-layer endpoint identity. cpu_id/net_mac are self-reported label
+    // seeds, NOT security controls — integrity comes from the node signature.
+    std::string              endpoint_identifier;        // server-derived, stable
+    std::string              cpu_id;
+    std::string              net_mac;
+    bool                     is_inference{false};        // "infer-" vs "client-" prefix
+
     // Assignments (explicit per-user permissions)
     std::vector<Assignment>  assignments;
 

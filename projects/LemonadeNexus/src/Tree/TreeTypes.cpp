@@ -56,6 +56,10 @@ void to_json(json& j, const TreeNode& n) {
         {"mgmt_pubkey",              n.mgmt_pubkey},
         {"wrapped_mgmt_privkey",     n.wrapped_mgmt_privkey},
         {"wg_pubkey",                n.wg_pubkey},
+        {"endpoint_identifier",      n.endpoint_identifier},
+        {"cpu_id",                   n.cpu_id},
+        {"net_mac",                  n.net_mac},
+        {"is_inference",             n.is_inference},
         {"assignments",              n.assignments},
         {"signature",                n.signature},
         {"listen_endpoint",          n.listen_endpoint},
@@ -78,6 +82,11 @@ void from_json(const json& j, TreeNode& n) {
     j.at("mgmt_pubkey").get_to(n.mgmt_pubkey);
     j.at("wrapped_mgmt_privkey").get_to(n.wrapped_mgmt_privkey);
     j.at("wg_pubkey").get_to(n.wg_pubkey);
+    // Optional: nodes persisted before the routing layer lack these.
+    if (j.contains("endpoint_identifier")) j.at("endpoint_identifier").get_to(n.endpoint_identifier);
+    if (j.contains("cpu_id"))              j.at("cpu_id").get_to(n.cpu_id);
+    if (j.contains("net_mac"))             j.at("net_mac").get_to(n.net_mac);
+    if (j.contains("is_inference"))        j.at("is_inference").get_to(n.is_inference);
     j.at("assignments").get_to(n.assignments);
     j.at("signature").get_to(n.signature);
     j.at("listen_endpoint").get_to(n.listen_endpoint);
@@ -127,6 +136,10 @@ std::string canonical_node_json(const TreeNode& node) {
     j["mgmt_pubkey"]              = node.mgmt_pubkey;
     j["wrapped_mgmt_privkey"]     = node.wrapped_mgmt_privkey;
     j["wg_pubkey"]                = node.wg_pubkey;
+    j["endpoint_identifier"]      = node.endpoint_identifier;
+    j["cpu_id"]                   = node.cpu_id;
+    j["net_mac"]                  = node.net_mac;
+    j["is_inference"]             = node.is_inference;
     j["assignments"]              = node.assignments;
     j["listen_endpoint"]          = node.listen_endpoint;
     j["region"]                   = node.region;

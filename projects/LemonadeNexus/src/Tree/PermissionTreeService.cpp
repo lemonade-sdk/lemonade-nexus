@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
+#include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
+
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
@@ -47,7 +49,16 @@ void PermissionTreeService::on_start() {
         }
     }
 
-    spdlog::info("[{}] loaded {} nodes from storage", name(), nodes_.size());
+    // Build the endpoint-identifier reverse index from the loaded nodes.
+    identifier_index_.clear();
+    for (const auto& [id, node] : nodes_) {
+        if (!node.endpoint_identifier.empty()) {
+            identifier_index_[node.endpoint_identifier] = id;
+        }
+    }
+
+    spdlog::info("[{}] loaded {} nodes from storage ({} with endpoint identifiers)",
+                  name(), nodes_.size(), identifier_index_.size());
 }
 
 void PermissionTreeService::on_stop() {
@@ -97,11 +108,27 @@ bool PermissionTreeService::insert_join_node(const TreeNode& node) {
         return false;
     }
 
+    // Reject a colliding identifier owned by a different node; the incumbent
+    // keeps it (no rename), which removes the order-dependent squatting vector.
+    if (!node.endpoint_identifier.empty()) {
+        auto ix = identifier_index_.find(node.endpoint_identifier);
+        if (ix != identifier_index_.end() && ix->second != node.id) {
+            spdlog::error("[{}] insert_join_node: endpoint_identifier '{}' already "
+                          "bound to node '{}' — rejecting colliding node '{}'",
+                          name(), node.endpoint_identifier, ix->second, node.id);
+            return false;
+        }
+    }
+
     nodes_[node.id] = node;
     if (!persist_node(node)) {
         spdlog::error("[{}] failed to persist join node '{}'", name(), node.id);
         nodes_.erase(node.id);
         return false;
+    }
+
+    if (!node.endpoint_identifier.empty()) {
+        identifier_index_[node.endpoint_identifier] = node.id;
     }
 
     spdlog::info("[{}] inserted join node '{}' (type={}, parent={})",
@@ -120,11 +147,21 @@ bool PermissionTreeService::update_node_direct(const std::string& node_id,
         return false;
     }
 
+    const std::string old_identifier = it->second.endpoint_identifier;
+
     it->second = updated;
     it->second.id = node_id; // Preserve original ID
     if (!persist_node(it->second)) {
         spdlog::error("[{}] update_node_direct: failed to persist '{}'", name(), node_id);
         return false;
+    }
+
+    // Keep the reverse index in sync if the identifier changed.
+    if (old_identifier != it->second.endpoint_identifier) {
+        if (!old_identifier.empty()) identifier_index_.erase(old_identifier);
+        if (!it->second.endpoint_identifier.empty()) {
+            identifier_index_[it->second.endpoint_identifier] = node_id;
+        }
     }
 
     spdlog::info("[{}] updated node '{}' directly", name(), node_id);
@@ -161,6 +198,9 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
         return false;
     }
 
+    if (!it->second.endpoint_identifier.empty()) {
+        identifier_index_.erase(it->second.endpoint_identifier);
+    }
     nodes_.erase(it);
     if (!remove_node(node_id)) {
         spdlog::warn("[{}] delete_node_direct: storage delete failed for '{}'", name(), node_id);
@@ -411,6 +451,120 @@ std::optional<TreeNode> PermissionTreeService::do_get_node(std::string_view node
         return it->second;
     }
     return std::nullopt;
+}
+
+std::string PermissionTreeService::derive_endpoint_identifier(const TreeNode& node) const {
+    // Pure: derive purely from the node's own stable inputs.
+    return routing::derive_endpoint_identifier(node.id, node.region, node.cpu_id,
+                                                node.net_mac, node.is_inference);
+}
+
+bool PermissionTreeService::validate_identifier_binding(const TreeNode& node) const {
+    if (node.endpoint_identifier.empty()) {
+        return false;
+    }
+    return node.endpoint_identifier == derive_endpoint_identifier(node);
+}
+
+std::optional<TreeNode> PermissionTreeService::resolve_by_identifier(
+        std::string_view identifier) const {
+    std::lock_guard lock(mutex_);
+    auto ix = identifier_index_.find(std::string(identifier));
+    if (ix == identifier_index_.end()) {
+        return std::nullopt;
+    }
+    auto it = nodes_.find(ix->second);
+    if (it == nodes_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::vector<TreeNode> PermissionTreeService::collect_subtree(std::string_view root_parent_id,
+                                                             std::size_t max_depth,
+                                                             std::size_t max_nodes) const {
+    std::lock_guard lock(mutex_);
+    std::vector<TreeNode> result;
+
+    // Build a parent_id -> children adjacency once, so the BFS is linear.
+    std::unordered_map<std::string, std::vector<const TreeNode*>> children_of;
+    for (const auto& [id, node] : nodes_) {
+        children_of[node.parent_id].push_back(&node);
+    }
+
+    // Independent cycle guard; seed with the root so a loop can't re-expand it.
+    std::unordered_set<std::string> visited;
+    visited.insert(std::string(root_parent_id));
+
+    std::vector<std::string> frontier{std::string(root_parent_id)};
+    std::size_t depth = 0;
+    while (!frontier.empty() && depth < max_depth) {
+        std::vector<std::string> next;
+        for (const auto& pid : frontier) {
+            auto it = children_of.find(pid);
+            if (it == children_of.end()) continue;
+            for (const TreeNode* child : it->second) {
+                if (!visited.insert(child->id).second) continue; // cycle/dup guard
+                result.push_back(*child);
+                if (result.size() >= max_nodes) {
+                    spdlog::warn("[{}] collect_subtree hit max_nodes={} under '{}' -- truncating",
+                                 name(), max_nodes, std::string(root_parent_id));
+                    return result;
+                }
+                next.push_back(child->id);
+            }
+        }
+        frontier = std::move(next);
+        ++depth;
+    }
+    if (depth >= max_depth && !frontier.empty()) {
+        spdlog::warn("[{}] collect_subtree hit max_depth={} under '{}' -- truncating",
+                     name(), max_depth, std::string(root_parent_id));
+    }
+    return result;
+}
+
+bool PermissionTreeService::is_descendant_of(std::string_view node_id,
+                                              std::string_view ancestor_id) const {
+    std::lock_guard lock(mutex_);
+    if (node_id == ancestor_id) return false; // a node is not its own descendant
+
+    std::unordered_set<std::string> visited;
+    std::string current(node_id);
+    while (true) {
+        if (!visited.insert(current).second) return false; // cycle
+        auto it = nodes_.find(current);
+        if (it == nodes_.end()) return false;
+        const std::string& parent = it->second.parent_id;
+        if (parent.empty()) return false;          // reached root, no match
+        if (parent == ancestor_id) return true;
+        current = parent;
+    }
+}
+
+std::optional<TreeNode> PermissionTreeService::resolve_authorized(
+        std::string_view caller_pubkey,
+        std::string_view caller_node_id,
+        std::string_view identifier) const {
+    // Composes individually-locked methods; must NOT be called while holding mutex_.
+    auto target = resolve_by_identifier(identifier);
+    if (!target) return std::nullopt;
+    if (!validate_identifier_binding(*target)) return std::nullopt;
+
+    auto caller = do_get_node(caller_node_id);
+    if (!caller) return std::nullopt;
+    if (caller->parent_id.empty()) return std::nullopt;   // root owns no group
+    if (target->id == caller_node_id) return std::nullopt; // no self-connect
+
+    // Scope: target must be within the caller's parent-group subtree.
+    if (!is_descendant_of(target->id, caller->parent_id)) return std::nullopt;
+
+    // Per-node ACL — permissions are not inherited.
+    if (!do_check_permission(caller_pubkey, target->id, acl::Permission::ConnectPrivate) &&
+        !do_check_permission(caller_pubkey, target->id, acl::Permission::ConnectShared)) {
+        return std::nullopt;
+    }
+    return target;
 }
 
 std::vector<TreeNode> PermissionTreeService::do_get_children(std::string_view parent_id) const {
