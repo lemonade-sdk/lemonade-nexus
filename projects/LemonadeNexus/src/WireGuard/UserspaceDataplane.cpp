@@ -301,6 +301,100 @@ bool UserspaceDataplane::add_peer(const std::string& pubkey_b64,
     return true;
 }
 
+bool UserspaceDataplane::add_identity_session(const std::string& pubkey_b64,
+                                              const std::string& conn_id,
+                                              const std::string& endpoint,
+                                              bool is_initiator,
+                                              InboundIpHandler sink,
+                                              uint16_t persistent_keepalive) {
+    if (!decode_key(pubkey_b64)) {
+        spdlog::warn("[dataplane] add_identity_session: invalid pubkey '{}'", pubkey_b64);
+        return false;
+    }
+    if (pubkey_b64 == config_.public_key_b64) {
+        spdlog::warn("[dataplane] add_identity_session: refusing to add ourselves");
+        return false;
+    }
+    uint64_t packed_endpoint = 0;
+    if (!endpoint.empty()) {
+        auto parsed = parse_endpoint(endpoint);
+        if (!parsed) {
+            spdlog::warn("[dataplane] add_identity_session {}: bad endpoint '{}'",
+                         pubkey_b64, endpoint);
+            return false;
+        }
+        packed_endpoint = *parsed;
+    }
+
+    PeerPtr peer;
+    {
+        std::unique_lock lock(tables_mtx_);
+        if (auto it = by_pubkey_.find(pubkey_b64); it != by_pubkey_.end()) {
+            // Refuse to shadow a routed peer with the same static; for an
+            // existing identity session just refresh its endpoint.
+            if (!it->second->identity_keyed) {
+                spdlog::warn("[dataplane] add_identity_session {}: static already "
+                             "used by a routed peer", pubkey_b64);
+                return false;
+            }
+            if (packed_endpoint)
+                it->second->endpoint.store(packed_endpoint, std::memory_order_relaxed);
+            return true;
+        }
+
+        uint32_t index;
+        if (!free_indices_.empty()) {
+            index = free_indices_.back();
+            free_indices_.pop_back();
+        } else {
+            index = next_index_++;
+        }
+
+        Tunn* tunn = new_tunnel(config_.private_key_b64.c_str(), pubkey_b64.c_str(),
+                                nullptr, persistent_keepalive, index);
+        if (!tunn) {
+            free_indices_.push_back(index);
+            spdlog::error("[dataplane] new_tunnel failed for identity session {}", pubkey_b64);
+            return false;
+        }
+
+        peer                = std::make_shared<Peer>();
+        peer->tunn          = tunn;
+        peer->index         = index;
+        peer->pubkey_b64    = pubkey_b64;
+        peer->keepalive     = persistent_keepalive;
+        peer->identity_keyed= true;
+        peer->conn_id       = conn_id;
+        peer->sink          = std::move(sink);
+        peer->endpoint.store(packed_endpoint, std::memory_order_relaxed);
+
+        by_pubkey_[pubkey_b64] = peer;
+        by_index_[index]       = peer;
+        // Deliberately NOT added to router_ — identity sessions are keyed by the
+        // Noise static / receiver index, never by a virtual IP.
+    }
+
+    if (is_initiator && packed_endpoint && running_) {
+        std::vector<uint8_t> buf(wire::kMaxOverhead + 64);
+        auto r = wireguard_force_handshake(peer->tunn, buf.data(),
+                                           static_cast<uint32_t>(buf.size()));
+        if (r.op == WRITE_TO_NETWORK && r.size > 0)
+            send_udp(buf.data(), r.size, packed_endpoint);
+    }
+
+    spdlog::debug("[dataplane] added identity session {} (conn_id={}, endpoint={})",
+                  pubkey_b64, conn_id, endpoint.empty() ? "<roaming>" : endpoint);
+    return true;
+}
+
+bool UserspaceDataplane::send_on_session(const std::string& pubkey_b64,
+                                         std::span<const uint8_t> ip_packet) {
+    PeerPtr peer = peer_by_pubkey(pubkey_b64);
+    if (!peer || !peer->identity_keyed) return false;
+    thread_local std::vector<uint8_t> scratch(kBufSize + wire::kMaxOverhead);
+    return encrypt_and_send(peer, ip_packet, scratch);
+}
+
 bool UserspaceDataplane::remove_peer(const std::string& pubkey_b64) {
     std::unique_lock lock(tables_mtx_);
     auto it = by_pubkey_.find(pubkey_b64);
@@ -537,6 +631,15 @@ void UserspaceDataplane::drain_followups(const PeerPtr& peer, uint64_t to_packed
 void UserspaceDataplane::route_decrypted(std::span<const uint8_t> ip_pkt,
                                          const PeerPtr& src,
                                          std::vector<uint8_t>& scratch) {
+    // Identity-keyed routing-layer session: authentication is the Noise static
+    // itself (the peer was authorized at add time), so there is no virtual-IP
+    // scope to check and no cryptokey routing — deliver straight to the session
+    // sink. The app layer runs HELLO and gates payload over this stream.
+    if (src->identity_keyed) {
+        if (src->sink) src->sink(ip_pkt);
+        return;
+    }
+
     auto src_ip = wire::ipv4::src_addr(ip_pkt);
     auto dst_ip = wire::ipv4::dst_addr(ip_pkt);
     if (!src_ip || !dst_ip) return;

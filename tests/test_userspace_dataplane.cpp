@@ -294,3 +294,67 @@ TEST_F(UserspaceDataplaneTest, ControlPlaneValidation) {
     node.dataplane.stop();
     node.dataplane.stop();
 }
+
+// Retry-send over an identity session until the session sink sees the payload.
+namespace {
+bool send_session_until_received(UserspaceDataplane& from, const std::string& peer_pub,
+                                 Inbox& to, const std::vector<uint8_t>& pkt,
+                                 const std::string& needle,
+                                 std::chrono::milliseconds timeout = 5000ms) {
+    auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        (void)from.send_on_session(peer_pub, pkt);
+        if (to.wait_for_payload(needle, 100ms)) return true;
+    }
+    return false;
+}
+} // namespace
+
+TEST_F(UserspaceDataplaneTest, IdentitySessionDeliversToSinkNotRouter) {
+    Node a, b;
+    ASSERT_TRUE(a.start());
+    ASSERT_TRUE(b.start());
+
+    // Per-session sinks, independent of the node's global inbound handler and
+    // with NO add_local_ip / add_peer — purely identity-keyed (no virtual IPs).
+    Inbox sink_a, sink_b;
+    ASSERT_TRUE(b.dataplane.add_identity_session(a.keys.pub_b64, "conn-1",
+                /*endpoint=*/"", /*is_initiator=*/false, sink_b.handler()));
+    ASSERT_TRUE(a.dataplane.add_identity_session(b.keys.pub_b64, "conn-1",
+                b.loopback_endpoint(), /*is_initiator=*/true, sink_a.handler()));
+
+    auto pkt = make_ipv4(ip(10, 0, 0, 1), ip(10, 0, 0, 2), "id-payload");
+    EXPECT_TRUE(send_session_until_received(a.dataplane, b.keys.pub_b64, sink_b, pkt,
+                                            "id-payload"))
+        << "identity-session payload never delivered to the session sink";
+    // It must NOT have gone through the cryptokey router / local handler.
+    EXPECT_FALSE(b.inbox.contains("id-payload"));
+
+    a.dataplane.stop();
+    b.dataplane.stop();
+}
+
+TEST_F(UserspaceDataplaneTest, RemoveIdentitySessionRevokesDelivery) {
+    Node a, b;
+    ASSERT_TRUE(a.start());
+    ASSERT_TRUE(b.start());
+
+    Inbox sink_a, sink_b;
+    ASSERT_TRUE(b.dataplane.add_identity_session(a.keys.pub_b64, "conn-2", "",
+                false, sink_b.handler()));
+    ASSERT_TRUE(a.dataplane.add_identity_session(b.keys.pub_b64, "conn-2",
+                b.loopback_endpoint(), true, sink_a.handler()));
+
+    auto first = make_ipv4(ip(10, 0, 0, 1), ip(10, 0, 0, 2), "before-revoke");
+    ASSERT_TRUE(send_session_until_received(a.dataplane, b.keys.pub_b64, sink_b, first,
+                                            "before-revoke"));
+
+    // Revoke by removing the peer; further frames must not be delivered.
+    ASSERT_TRUE(b.dataplane.remove_peer(a.keys.pub_b64));
+    auto after = make_ipv4(ip(10, 0, 0, 1), ip(10, 0, 0, 2), "after-revoke");
+    EXPECT_FALSE(send_session_until_received(a.dataplane, b.keys.pub_b64, sink_b, after,
+                                             "after-revoke", 1500ms));
+
+    a.dataplane.stop();
+    b.dataplane.stop();
+}

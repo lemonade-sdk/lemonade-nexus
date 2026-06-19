@@ -76,6 +76,26 @@ public:
                                 const std::string& allowed_ips,
                                 const std::string& endpoint,
                                 uint16_t persistent_keepalive = 25);
+
+    /// Add an identity-keyed E2E session for the routing layer: keyed purely by
+    /// the peer's Noise static (which the caller MUST take from a verified,
+    /// root-signed IdentityBinding), with NO virtual-IP routing — it is not
+    /// added to the cryptokey router. Decrypted frames are delivered to `sink`.
+    /// This is the add-time authorization gate: only an authorized peer is ever
+    /// added, and revocation is `remove_peer`. The HELLO handshake and payload
+    /// gate are an app-layer protocol carried over this session (the dataplane
+    /// only moves encrypted IP frames).
+    [[nodiscard]] bool add_identity_session(const std::string& pubkey_b64,
+                                            const std::string& conn_id,
+                                            const std::string& endpoint,
+                                            bool is_initiator,
+                                            InboundIpHandler sink,
+                                            uint16_t persistent_keepalive = 25);
+
+    /// Encrypt and send an IP packet over an existing identity session.
+    [[nodiscard]] bool send_on_session(const std::string& pubkey_b64,
+                                       std::span<const uint8_t> ip_packet);
+
     [[nodiscard]] bool remove_peer(const std::string& pubkey_b64);
     [[nodiscard]] bool has_peer(const std::string& pubkey_b64) const;
     [[nodiscard]] bool update_endpoint(const std::string& pubkey_b64,
@@ -103,6 +123,12 @@ private:
         /// the table lock to roam.
         std::atomic<uint64_t> endpoint{0};
         uint16_t         keepalive{25};
+
+        // Identity-keyed routing-layer session: not in the IpRouter; decrypted
+        // frames go straight to `sink` (set once at creation, never reassigned).
+        bool             identity_keyed{false};
+        std::string      conn_id;
+        InboundIpHandler sink;
 
         ~Peer();
     };
