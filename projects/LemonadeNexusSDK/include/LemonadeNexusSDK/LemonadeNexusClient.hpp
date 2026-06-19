@@ -3,8 +3,11 @@
 #include <LemonadeNexusSDK/Error.hpp>
 #include <LemonadeNexusSDK/Identity.hpp>
 #include <LemonadeNexusSDK/LatencyMonitor.hpp>
+#include <LemonadeNexusSDK/RoutingTypes.hpp>
 #include <LemonadeNexusSDK/Types.hpp>
 #include <LemonadeNexusSDK/WireGuardTunnel.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <memory>
@@ -173,6 +176,42 @@ public:
 
     /// Join an existing group: create endpoint child under parent_node_id + allocate tunnel IP.
     [[nodiscard]] Result<GroupJoinResult> join_group(const std::string& parent_node_id);
+
+    // -----------------------------------------------------------------
+    // Routing layer (connect-by-identifier control plane)
+    // -----------------------------------------------------------------
+
+    /// GET /api/routing/profile — identity + authorized endpoint identifiers.
+    [[nodiscard]] Result<RoutingProfile> get_routing_profile(int page = 0,
+                                                             int page_size = 200);
+
+    /// POST /api/routing/request — request a connection to an endpoint by id.
+    /// conn_nonce_b64 is a client-chosen 16-byte nonce (base64).
+    [[nodiscard]] Result<ConnectionRequestResult> request_endpoint(
+        const std::string& identifier, const std::string& conn_nonce_b64,
+        const std::string& client_wg_pub = "",
+        const std::vector<std::string>& candidates = {});
+
+    /// POST /api/routing/connect — fetch the directive once the endpoint is ready.
+    [[nodiscard]] Result<ConnectionDirective> routing_connect(
+        const std::string& connection_id);
+
+    /// GET /api/routing/session/{id} — current connection state.
+    [[nodiscard]] Result<ConnectionStatus> connection_status(
+        const std::string& connection_id);
+
+    // Endpoint-role calls (for a node that exposes an inference endpoint).
+
+    /// POST /api/routing/endpoint/register — returns any pending connection ids.
+    [[nodiscard]] Result<nlohmann::json> routing_register_endpoint(
+        const std::string& cpu_id, const std::string& net_mac,
+        const std::string& wg_pubkey, const std::string& stun_endpoint = "");
+
+    /// POST /api/routing/endpoint/ready — signal readiness for a connection.
+    [[nodiscard]] Result<nlohmann::json> routing_endpoint_ready(
+        const std::string& connection_id, const std::string& cpu_id,
+        const std::string& net_mac, const std::string& endpoint_wg_pub = "",
+        const std::vector<std::string>& candidates = {});
 
     // -----------------------------------------------------------------
     // Server discovery & health

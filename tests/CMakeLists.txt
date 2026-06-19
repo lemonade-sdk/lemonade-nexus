@@ -61,6 +61,7 @@ function(add_sdk_test TEST_NAME)
 endfunction()
 
 add_sdk_test(test_boringtun_backend    test_boringtun_backend.cpp)
+add_sdk_test(test_routing_pool         test_routing_pool.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
