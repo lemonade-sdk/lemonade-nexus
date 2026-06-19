@@ -10,7 +10,11 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Gossip/GossipTypes.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
+
+#include <cstring>
 
 #include <spdlog/spdlog.h>
 
@@ -323,6 +327,80 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
             {"expires_at", v->expires_at},
         });
     }));
+
+    // ── POST /api/routing/internal/broker (server-to-server, backbone) ──────
+    // Cross-node coordination: a peer routing node (A) asks this node (B) to
+    // broker a connection to a B-local endpoint for A's client. SERVER-IDENTITY
+    // GATED (the caller must be an enrolled gossip peer and sign the request),
+    // and — critically — B RE-VERIFIES the client's authorization against its
+    // own replicated tree (confused-deputy defense): A's "this client is
+    // authorized" claim is NEVER trusted.
+    priv.Post("/api/routing/internal/broker",
+        [this](const httplib::Request& req, httplib::Response& res) {
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
+
+        const auto caller_pubkey  = body.value("caller_server_pubkey", std::string{});
+        const auto signature_b64  = body.value("signature", std::string{});
+        const auto client_pubkey  = body.value("client_pubkey", std::string{});
+        const auto client_node_id = body.value("client_node_id", std::string{});
+        const auto identifier     = body.value("identifier", std::string{});
+        const auto conn_nonce_b64 = body.value("conn_nonce", std::string{});
+        const auto client_wg_pub  = body.value("client_wg_pub", std::string{});
+
+        // (1a) caller must be a known enrolled peer.
+        bool known = false;
+        for (const auto& p : ctx_.gossip.get_peers()) {
+            if (p.pubkey == caller_pubkey) { known = true; break; }
+        }
+        if (!known) { error_response(res, "unknown calling server", 403); return; }
+
+        // (1b) ...with a valid signature over the canonical (length-prefixed) request.
+        std::vector<uint8_t> canonical;
+        auto put = [&](const std::string& s) {
+            uint32_t n = static_cast<uint32_t>(s.size());
+            for (int i = 0; i < 4; ++i) canonical.push_back((n >> (i * 8)) & 0xFF);
+            canonical.insert(canonical.end(), s.begin(), s.end());
+        };
+        put("ln-broker:v1"); put(client_pubkey); put(client_node_id);
+        put(identifier); put(conn_nonce_b64);
+
+        auto pk = crypto::from_base64(caller_pubkey);
+        auto sig = crypto::from_base64(signature_b64);
+        if (pk.size() != crypto::kEd25519PublicKeySize ||
+            sig.size() != crypto::kEd25519SignatureSize) {
+            error_response(res, "bad signature material"); return;
+        }
+        crypto::Ed25519PublicKey caller_pk{};
+        crypto::Ed25519Signature caller_sig{};
+        std::memcpy(caller_pk.data(), pk.data(), pk.size());
+        std::memcpy(caller_sig.data(), sig.data(), sig.size());
+        if (!ctx_.crypto.ed25519_verify(caller_pk, std::span<const uint8_t>(canonical),
+                                        caller_sig)) {
+            error_response(res, "invalid server signature", 403); return;
+        }
+
+        // (2) confused-deputy defense: re-verify against THIS node's tree.
+        auto target = ctx_.tree.resolve_authorized(client_pubkey, client_node_id, identifier);
+        if (!target) { error_response(res, "client not authorized for endpoint", 403); return; }
+
+        // (3) create the local pending session (the endpoint is B-local).
+        routing::ConnectionRequestInput in;
+        in.client_node_id    = client_node_id;
+        in.client_pubkey     = client_pubkey;
+        in.client_wg_pub     = client_wg_pub;
+        in.target_node_id    = target->id;
+        in.target_identifier = identifier;
+        in.source_ip         = req.remote_addr;
+        if (!decode_nonce(conn_nonce_b64, in.conn_nonce)) {
+            error_response(res, "conn_nonce must be 16 bytes base64"); return;
+        }
+        auto r = ctx_.routing.create_request(in);
+        if (!r.ok) { error_response(res, r.error, r.status); return; }
+        json_response(res, {{"connection_id", r.connection_id}, {"state", "requested"}},
+                      r.status);
+    });
 }
 
 } // namespace nexus::api
