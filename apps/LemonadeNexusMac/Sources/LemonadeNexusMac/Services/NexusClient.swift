@@ -1,4 +1,5 @@
 import Foundation
+import Security
 
 enum NexusClientError: LocalizedError {
     case invalidURL
@@ -279,6 +280,16 @@ private struct AnyEncodable: Encodable {
 // MARK: - Insecure Session Delegate (for self-signed certs in dev)
 
 final class InsecureSessionDelegate: NSObject, URLSessionDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _observedCertCN: String?
+
+    /// Subject CN of the server's leaf certificate, captured even though this
+    /// delegate accepts any cert (so callers can pin to the cert-matching host).
+    var observedCertCN: String? {
+        lock.lock(); defer { lock.unlock() }
+        return _observedCertCN
+    }
+
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
@@ -286,6 +297,11 @@ final class InsecureSessionDelegate: NSObject, URLSessionDelegate, @unchecked Se
     ) {
         if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
            let serverTrust = challenge.protectionSpace.serverTrust {
+            if let chain = SecTrustCopyCertificateChain(serverTrust) as? [SecCertificate],
+               let leaf = chain.first,
+               let cn = SecCertificateCopySubjectSummary(leaf) as String? {
+                lock.lock(); _observedCertCN = cn; lock.unlock()
+            }
             completionHandler(.useCredential, URLCredential(trust: serverTrust))
         } else {
             completionHandler(.performDefaultHandling, nil)
