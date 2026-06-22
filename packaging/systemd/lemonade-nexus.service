@@ -27,9 +27,12 @@ ProtectControlGroups=true
 ReadWritePaths=/var/lib/lemonade-nexus
 ReadOnlyPaths=/etc/lemonade-nexus
 
-# Allow binding to privileged ports (DNS 53, etc.) without running as root
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+# Allow binding to privileged ports (HTTP 80/443, DNS 53) without running as
+# root. CAP_NET_ADMIN is intentionally NOT granted: the WireGuard dataplane runs
+# fully in userspace (no kernel interface / TUN device), so the daemon needs no
+# network-administration privileges.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target

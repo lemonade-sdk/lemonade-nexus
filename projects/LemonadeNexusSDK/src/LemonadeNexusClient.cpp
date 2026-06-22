@@ -1987,4 +1987,126 @@ StatusResult LemonadeNexusClient::mesh_heartbeat(const std::string& nid,
     return {true, {}, status, ""};
 }
 
+// ---------------------------------------------------------------------------
+// Routing layer (connect-by-identifier control plane)
+// ---------------------------------------------------------------------------
+
+Result<RoutingProfile> LemonadeNexusClient::get_routing_profile(int page, int page_size) {
+    Result<RoutingProfile> result;
+    int status = 0;
+    auto path = "/api/routing/profile?page=" + std::to_string(page) +
+                "&page_size=" + std::to_string(page_size);
+    auto resp = impl_->private_http_get(path, status);
+    result.http_status = status;
+    if (!resp) { result.error = "routing profile unreachable"; return result; }
+    try {
+        result.value = resp->get<RoutingProfile>();
+        result.ok = true;
+    } catch (const std::exception& e) {
+        result.error = std::string("failed to parse profile: ") + e.what();
+    }
+    return result;
+}
+
+Result<ConnectionRequestResult> LemonadeNexusClient::request_endpoint(
+    const std::string& identifier, const std::string& conn_nonce_b64,
+    const std::string& client_wg_pub, const std::vector<std::string>& candidates) {
+    Result<ConnectionRequestResult> result;
+    nlohmann::json body = {
+        {"identifier", identifier},
+        {"conn_nonce", conn_nonce_b64},
+        {"client_wg_pub", client_wg_pub},
+        {"client_candidates", candidates},
+    };
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/routing/request", body, status);
+    result.http_status = status;
+    if (!resp) {
+        result.error = status == 403 ? "endpoint not found or not authorized"
+                                     : "routing request failed";
+        return result;
+    }
+    try {
+        result.value = resp->get<ConnectionRequestResult>();
+        result.ok = true;
+    } catch (const std::exception& e) {
+        result.error = std::string("failed to parse request result: ") + e.what();
+    }
+    return result;
+}
+
+Result<ConnectionDirective> LemonadeNexusClient::routing_connect(
+    const std::string& connection_id) {
+    Result<ConnectionDirective> result;
+    nlohmann::json body = {{"connection_id", connection_id}};
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/routing/connect", body, status);
+    result.http_status = status;
+    if (!resp) {
+        result.error = status == 409 ? "connection not ready" : "connect failed";
+        return result;
+    }
+    try {
+        result.value = resp->get<ConnectionDirective>();
+        result.ok = true;
+    } catch (const std::exception& e) {
+        result.error = std::string("failed to parse directive: ") + e.what();
+    }
+    return result;
+}
+
+Result<ConnectionStatus> LemonadeNexusClient::connection_status(
+    const std::string& connection_id) {
+    Result<ConnectionStatus> result;
+    int status = 0;
+    auto resp = impl_->private_http_get("/api/routing/session/" + connection_id, status);
+    result.http_status = status;
+    if (!resp) {
+        result.error = status == 404 ? "session not found" : "status unreachable";
+        return result;
+    }
+    try {
+        result.value = resp->get<ConnectionStatus>();
+        result.ok = true;
+    } catch (const std::exception& e) {
+        result.error = std::string("failed to parse status: ") + e.what();
+    }
+    return result;
+}
+
+Result<nlohmann::json> LemonadeNexusClient::routing_register_endpoint(
+    const std::string& cpu_id, const std::string& net_mac,
+    const std::string& wg_pubkey, const std::string& stun_endpoint) {
+    Result<nlohmann::json> result;
+    nlohmann::json body = {
+        {"cpu_id", cpu_id}, {"net_mac", net_mac},
+        {"wg_pubkey", wg_pubkey}, {"stun_endpoint", stun_endpoint},
+    };
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/routing/endpoint/register", body, status);
+    result.http_status = status;
+    if (!resp) { result.error = "endpoint register failed"; return result; }
+    result.value = *resp;
+    result.ok = true;
+    return result;
+}
+
+Result<nlohmann::json> LemonadeNexusClient::routing_endpoint_ready(
+    const std::string& connection_id, const std::string& cpu_id,
+    const std::string& net_mac, const std::string& endpoint_wg_pub,
+    const std::vector<std::string>& candidates) {
+    Result<nlohmann::json> result;
+    nlohmann::json body = {
+        {"connection_id", connection_id}, {"cpu_id", cpu_id}, {"net_mac", net_mac},
+        {"endpoint_wg_pub", endpoint_wg_pub}, {"endpoint_candidates", candidates},
+    };
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/routing/endpoint/ready", body, status);
+    result.http_status = status;
+    if (!resp) { result.error = "endpoint ready failed"; return result; }
+    result.value = *resp;
+    result.ok = true;
+    return result;
+}
+
 } // namespace lnsdk

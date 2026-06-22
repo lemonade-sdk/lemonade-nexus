@@ -18,8 +18,11 @@ struct DiscoveredServer: Identifiable {
     var load: Int?
     var score: Double  // latency_ms + (load * 10)
 
+    /// Host to connect to (the cert's CN) when it differs from the display `hostname`.
+    var connectHost: String? = nil
+
     var url: String {
-        let host = hostname ?? ip
+        let host = connectHost ?? hostname ?? ip
         return "\(scheme)://\(host):\(port)"
     }
 
@@ -617,9 +620,19 @@ final class DnsDiscoveryService: @unchecked Sendable {
                     continue
                 }
                 dlog("[Discovery]   Probe: \(scheme) OK — \(String(format: "%.0f", elapsed))ms")
+
+                // Connect by the cert's CN rather than the discovered host, so the
+                // later verified-TLS calls succeed when the cert doesn't cover it.
+                var certHost: String? = nil
+                if scheme == "https", let cn = delegate.observedCertCN,
+                   !cn.isEmpty, cn.contains("."), cn != ip, cn != hostname {
+                    dlog("[Discovery]   pinned connection to cert CN \(cn)")
+                    certHost = cn
+                }
+
                 return DiscoveredServer(
                     ip: ip, port: port, latencyMs: elapsed, hostname: hostname, scheme: scheme,
-                    region: nil, load: nil, score: elapsed
+                    region: nil, load: nil, score: elapsed, connectHost: certHost
                 )
             } catch {
                 dlog("[Discovery]   Probe: \(scheme) failed — \(error.localizedDescription)")

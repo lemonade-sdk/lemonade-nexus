@@ -1228,7 +1228,21 @@ bool GossipService::verify_server_certificate(const ServerCertificate& cert) con
         // No root pubkey configured — skip certificate verification
         return true;
     }
+    return verify_cert_core(cert);
+}
 
+bool GossipService::verify_identity_binding(const ServerCertificate& cert) const {
+    // Routed-flow trust anchor: NO fail-open. A node that cannot anchor the root
+    // of trust must reject every binding — otherwise a malicious coordinator
+    // could substitute a Noise static and MITM the E2E session.
+    if (!has_root_pubkey_) {
+        spdlog::warn("[{}] identity-binding rejected: no root pubkey configured", name());
+        return false;
+    }
+    return verify_cert_core(cert);
+}
+
+bool GossipService::verify_cert_core(const ServerCertificate& cert) const {
     // Check issuer matches our root pubkey
     auto issuer_bytes = crypto::from_base64(cert.issuer_pubkey);
     if (issuer_bytes.size() != crypto::kEd25519PublicKeySize) {

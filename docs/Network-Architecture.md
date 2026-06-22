@@ -121,6 +121,24 @@ Client A (behind NAT)              Server              Client B (behind NAT)
     │           No server in the middle                     │
 ```
 
+## Userspace dataplane
+
+The server terminates WireGuard **entirely in userspace** (boringtun Noise
+sessions + an in-process smoltcp netstack). There is no kernel WireGuard
+interface and no TUN device on the server, so:
+
+- The daemon needs **no root and no `CAP_NET_ADMIN`** — only `CAP_NET_BIND_SERVICE`
+  to bind privileged ports (HTTP/DNS).
+- Tunnel keys and decrypted plaintext never leave the process; host-level tools
+  (`wg show`, `tcpdump` on an interface) cannot observe mesh traffic.
+- Both the client plane (`10.64.0.0/10`) and the server backbone
+  (`172.16.0.0/22`) are virtual addresses that exist only inside the daemon.
+  Traffic addressed to them (e.g. the private API) is delivered to in-process
+  listeners; traffic for other peers is re-encrypted and forwarded in userspace.
+
+Clients are unaffected on the wire — same WireGuard protocol, same UDP :51940,
+same `/api/join` contract.
+
 ## Traffic Planes
 
 ### Public Internet

@@ -54,6 +54,39 @@ public:
     /// Used after Ed25519 key registration to give new keys add_child on root.
     bool grant_assignment(const std::string& node_id, const Assignment& assignment);
 
+    // --- Endpoint identifier resolution (routing layer) ---
+
+    /// Re-derive the canonical identifier from a node's inputs (pure).
+    [[nodiscard]] std::string derive_endpoint_identifier(const TreeNode& node) const;
+
+    /// True iff the stored endpoint_identifier matches the re-derived value.
+    [[nodiscard]] bool validate_identifier_binding(const TreeNode& node) const;
+
+    /// Resolve an endpoint identifier to its node via the reverse index.
+    [[nodiscard]] std::optional<TreeNode> resolve_by_identifier(
+            std::string_view identifier) const;
+
+    /// Descendants beneath `root_parent_id` (excluding it). Own cycle guard +
+    /// depth/node caps so a malformed parent_id loop can't wedge the tree.
+    /// Callers MUST still filter per node — permissions are not inherited.
+    [[nodiscard]] std::vector<TreeNode> collect_subtree(
+            std::string_view root_parent_id,
+            std::size_t max_depth = 32,
+            std::size_t max_nodes = 4096) const;
+
+    /// True iff `node_id` lies strictly beneath `ancestor_id`.
+    [[nodiscard]] bool is_descendant_of(std::string_view node_id,
+                                        std::string_view ancestor_id) const;
+
+    /// Routing-layer authorization chokepoint. Returns the target node only if
+    /// the identifier resolves, its binding validates, the target is within the
+    /// caller's parent-group subtree, and the caller holds ConnectPrivate or
+    /// ConnectShared on it; nullopt otherwise. caller_pubkey must be normalized.
+    [[nodiscard]] std::optional<TreeNode> resolve_authorized(
+            std::string_view caller_pubkey,
+            std::string_view caller_node_id,
+            std::string_view identifier) const;
+
     // IService
     void on_start();
     void on_stop();
@@ -87,6 +120,11 @@ private:
     crypto::SodiumCryptoService& crypto_;
     mutable std::mutex           mutex_;
     std::unordered_map<std::string, TreeNode> nodes_;
+
+    // Reverse index: endpoint_identifier -> node_id. Kept in sync with nodes_ in
+    // on_start / insert_join_node / update_node_direct / delete_node_direct so
+    // resolve_by_identifier is O(1) and new colliding registrations are rejected.
+    std::unordered_map<std::string, std::string> identifier_index_;
 
     // Replay protection: SHA-256 hash of canonical delta → timestamp of receipt
     std::unordered_map<std::string, uint64_t> recent_deltas_;

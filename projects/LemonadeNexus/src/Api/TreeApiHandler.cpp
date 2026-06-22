@@ -4,6 +4,7 @@
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
+#include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
@@ -53,6 +54,22 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Normalize pubkey to "ed25519:base64..." format for tree storage
         auto norm_pubkey = normalize_pubkey(client_pubkey);
 
+        // cpu_id/net_mac are self-reported label seeds (not security controls).
+        auto cpu_id       = body.value("cpu_id", std::string{});
+        auto net_mac      = body.value("net_mac", std::string{});
+        auto node_region  = body.value("region", std::string{});
+        bool is_inference = body.value("is_inference", false);
+        auto endpoint_identifier = routing::derive_endpoint_identifier(
+                node_id, node_region, cpu_id, net_mac, is_inference);
+
+        auto stamp_endpoint_identity = [&](tree::TreeNode& n) {
+            n.endpoint_identifier = endpoint_identifier;
+            n.cpu_id              = cpu_id;
+            n.net_mac             = net_mac;
+            n.region              = node_region;
+            n.is_inference        = is_inference;
+        };
+
         auto existing_root = ctx_.tree.get_node("root");
         if (!existing_root) {
             // First user bootstraps root and gets a Customer group
@@ -96,7 +113,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                                    "endpoint-" + node_id.substr(0, 8));
             endpoint_node.mgmt_pubkey = norm_pubkey;
             endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
-            ctx_.tree.insert_join_node(endpoint_node);
+            stamp_endpoint_identity(endpoint_node);
+            if (!ctx_.tree.insert_join_node(endpoint_node)) {
+                error_response(res, "endpoint identifier conflict", 409);
+                return;
+            }
         } else if (node_id != "root") {
             // Returning or new user — find or create their Customer group
             std::string customer_id = "customer-" + node_id;
@@ -126,7 +147,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                                    "endpoint-" + node_id.substr(0, 8));
             endpoint_node.mgmt_pubkey = norm_pubkey;
             endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
-            ctx_.tree.insert_join_node(endpoint_node);
+            stamp_endpoint_identity(endpoint_node);
+            if (!ctx_.tree.insert_join_node(endpoint_node)) {
+                error_response(res, "endpoint identifier conflict", 409);
+                return;
+            }
         }
 
         // Allocate tunnel IP (returns existing if already allocated for this node)
@@ -205,6 +230,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         nlohmann::json resp = {
             {"token",            auth_result.session_token},
             {"node_id",          node_id},
+            {"endpoint_identifier", endpoint_identifier},
             {"tunnel_ip",        alloc.base_network},
             {"tunnel_subnet",    "10.64.0.0/10"},
             {"server_tunnel_ip", server_tunnel},

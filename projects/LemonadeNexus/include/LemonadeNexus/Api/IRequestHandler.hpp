@@ -42,6 +42,9 @@ namespace nexus::relay {
 namespace nexus::wireguard {
     class WireGuardService;
 }
+namespace nexus::routing {
+    class RoutingCoordinationService;
+}
 
 namespace nexus::api {
 
@@ -61,6 +64,7 @@ struct ApiContext {
     network::DdnsService&             ddns;
     relay::RelayService&              relay;
     relay::RelayDiscoveryService&     relay_discovery;
+    routing::RoutingCoordinationService& routing;
     core::BinaryAttestationService&   attestation;
     core::TeeAttestationService&      tee;
     core::TrustPolicyService&         trust_policy;

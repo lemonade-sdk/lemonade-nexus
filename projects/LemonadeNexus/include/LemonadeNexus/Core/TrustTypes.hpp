@@ -35,6 +35,7 @@ enum class TrustOperation : uint8_t {
     CredentialRequest = 8,  ///< Request DDNS credentials (Tier 1 only)
     KeyAccess         = 9,  ///< Read/modify keys (Tier 1 only)
     IpamAllocate      = 10, ///< IP allocation (Tier 1 only)
+    RoutingCoordinate = 11, ///< Coordinate routed connections (Tier 2+ liveness floor)
 };
 
 /// Check if a trust tier allows a specific operation.
@@ -44,6 +45,11 @@ enum class TrustOperation : uint8_t {
         case TrustOperation::HolePunch:
         case TrustOperation::ServerDiscovery:
         case TrustOperation::HealthCheck:
+        // RoutingCoordinate gates on Tier2 only as a LIVENESS floor; the actual
+        // capability is the ACL Permission::RoutingCoordinate (root/parent-signed),
+        // so an attestation Tier1->Tier2 blip never strips routing, and ACL
+        // revocation removes it even on a still-attesting node.
+        case TrustOperation::RoutingCoordinate:
             return tier >= TrustTier::Tier2;
 
         // Tier 1 only operations (data, keys, DNS)

@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 #include <sodium.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -29,6 +30,7 @@ RelayService::RelayService(asio::io_context& io,
 // ---------------------------------------------------------------------------
 
 void RelayService::on_start() {
+    crypto_.random_bytes(std::span<uint8_t>(bind_secret_));
     spdlog::info("[{}] listening on UDP port {}", name(), port_);
     start_receive();
     start_ttl_timer();
@@ -73,6 +75,10 @@ RelayAllocation RelayService::do_allocate(const RelayTicket& ticket) {
         return result;
     }
 
+    // Reject replay: a ticket's session-nonce may allocate at most one session.
+    const std::string nonce_key = crypto::to_hex(
+        std::span<const uint8_t>(ticket.session_nonce));
+
     // Create a new session
     auto session = std::make_shared<RelaySession>();
     session->session_id = generate_session_id();
@@ -85,6 +91,12 @@ RelayAllocation RelayService::do_allocate(const RelayTicket& ticket) {
 
     {
         std::lock_guard lock(mutex_);
+        if (!seen_ticket_nonces_.insert(nonce_key).second) {
+            result.session_id = {};
+            result.error_message = "ticket already used";
+            spdlog::warn("[{}] allocation denied: replayed ticket nonce", name());
+            return result;
+        }
         sessions_.emplace(session->session_id, std::move(session));
     }
 
@@ -96,8 +108,23 @@ RelayAllocation RelayService::do_allocate(const RelayTicket& ticket) {
 // IRelayProvider -- bind
 // ---------------------------------------------------------------------------
 
+std::array<uint8_t, 16> RelayService::compute_bind_token(const SessionId& session_id,
+                                                         uint8_t side) const {
+    // token = HKDF-SHA256(ikm=bind_secret_, salt=session_id, info=side)[0..16]
+    const uint8_t info[1] = {side};
+    auto out = crypto_.hkdf_sha256(
+        std::span<const uint8_t>(bind_secret_),
+        std::span<const uint8_t>(session_id),
+        std::span<const uint8_t>(info, 1),
+        16);
+    std::array<uint8_t, 16> token{};
+    std::copy_n(out.begin(), token.size(), token.begin());
+    return token;
+}
+
 RelayBindResult RelayService::do_bind(const SessionId& session_id,
-                                       const asio::ip::udp::endpoint& peer_endpoint) {
+                                       const asio::ip::udp::endpoint& peer_endpoint,
+                                       std::span<const uint8_t> bind_token) {
     RelayBindResult result;
     result.session_id = session_id;
 
@@ -108,18 +135,28 @@ RelayBindResult RelayService::do_bind(const SessionId& session_id,
         spdlog::warn("[{}] bind failed: {}", name(), result.error_message);
         return result;
     }
-
     auto& session = *it->second;
-    if (!session.peer_a_bound) {
+
+    // The presented token must equal exactly one side's secret-derived token,
+    // and that side must be unbound. This makes knowledge of the session_id
+    // alone insufficient to hijack a slot, and each token binds its side once.
+    const auto token_a = compute_bind_token(session_id, 0);
+    const auto token_b = compute_bind_token(session_id, 1);
+    const bool match_a = bind_token.size() == token_a.size() &&
+        sodium_memcmp(bind_token.data(), token_a.data(), token_a.size()) == 0;
+    const bool match_b = bind_token.size() == token_b.size() &&
+        sodium_memcmp(bind_token.data(), token_b.data(), token_b.size()) == 0;
+
+    if (match_a && !session.peer_a_bound) {
         session.peer_a_endpoint = peer_endpoint;
         session.peer_a_bound = true;
         spdlog::info("[{}] peer_a bound to session", name());
-    } else if (!session.peer_b_bound) {
+    } else if (match_b && !session.peer_b_bound) {
         session.peer_b_endpoint = peer_endpoint;
         session.peer_b_bound = true;
         spdlog::info("[{}] peer_b bound to session", name());
     } else {
-        result.error_message = "session already has two peers bound";
+        result.error_message = "invalid or already-used bind token";
         spdlog::warn("[{}] bind failed: {}", name(), result.error_message);
         return result;
     }
@@ -301,7 +338,10 @@ void RelayService::handle_relay_packet(std::span<const uint8_t> data,
 
     switch (header.msg_type) {
         case RelayMsgType::Bind: {
-            auto result = do_bind(header.session_id, remote);
+            // Bind payload carries the 16-byte bind token.
+            std::span<const uint8_t> token;
+            if (payload.size() >= 16) token = payload.subspan(0, 16);
+            auto result = do_bind(header.session_id, remote, token);
             // Build a Bound response
             RelayPacketHeader resp_header{};
             resp_header.magic = kRelayMagic;

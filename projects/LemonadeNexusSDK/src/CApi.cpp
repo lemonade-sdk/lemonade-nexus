@@ -1181,3 +1181,51 @@ ln_error_t ln_mesh_refresh(ln_client_t* client) {
     client->client.refresh_mesh_peers();
     return LN_OK;
 }
+
+// ---------------------------------------------------------------------------
+// Routing layer (connect-by-identifier)
+// ---------------------------------------------------------------------------
+
+ln_error_t ln_routing_profile(ln_client_t* client, int page, int page_size,
+                              char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto r = client->client.get_routing_profile(page, page_size);
+    if (!r.ok) return r.http_status == 404 ? LN_ERR_NOT_FOUND : LN_ERR_CONNECT;
+
+    json eps = json::array();
+    for (const auto& e : r.value.authorized_endpoints) {
+        eps.push_back({{"identifier", e.identifier}, {"node_id", e.node_id},
+                       {"hostname", e.hostname}, {"region", e.region},
+                       {"is_inference", e.is_inference}, {"tunnel_ip", e.tunnel_ip}});
+    }
+    json j = {{"node_id", r.value.node_id}, {"endpoint_identifier", r.value.endpoint_identifier},
+              {"parent_id", r.value.parent_id}, {"authorized_endpoints", eps},
+              {"total", r.value.total}, {"page", r.value.page},
+              {"page_size", r.value.page_size}};
+    *out_json = strdup_json(j);
+    return LN_OK;
+}
+
+ln_error_t ln_routing_request(ln_client_t* client, const char* identifier,
+                              const char* conn_nonce_b64, const char* client_wg_pub,
+                              char** out_json) {
+    if (!client || !identifier || !conn_nonce_b64 || !out_json) return LN_ERR_NULL_ARG;
+    auto r = client->client.request_endpoint(identifier, conn_nonce_b64,
+                                             client_wg_pub ? client_wg_pub : "");
+    if (!r.ok) return r.http_status == 403 ? LN_ERR_REJECTED : LN_ERR_CONNECT;
+    json j = {{"connection_id", r.value.connection_id}, {"state", r.value.state}};
+    *out_json = strdup_json(j);
+    return LN_OK;
+}
+
+ln_error_t ln_routing_connection_status(ln_client_t* client, const char* connection_id,
+                                        char** out_json) {
+    if (!client || !connection_id || !out_json) return LN_ERR_NULL_ARG;
+    auto r = client->client.connection_status(connection_id);
+    if (!r.ok) return r.http_status == 404 ? LN_ERR_NOT_FOUND : LN_ERR_CONNECT;
+    json j = {{"connection_id", r.value.connection_id}, {"phase", r.value.phase},
+              {"data_path", r.value.data_path}, {"created_at", r.value.created_at},
+              {"expires_at", r.value.expires_at}};
+    *out_json = strdup_json(j);
+    return LN_OK;
+}

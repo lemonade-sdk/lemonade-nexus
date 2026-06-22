@@ -38,12 +38,10 @@ include(libraries/magic_enum)
 include(libraries/xxHash)
 include(libraries/httplib)
 include(libraries/libsodium)
-include(libraries/wireguard-embeddable)
-include(libraries/wireguard-apple)
-include(libraries/wireguard-nt)
 include(libraries/c-ares)
 include(libraries/sqlite3)
 include(libraries/boringtun)
+include(libraries/virtual-netstack)
 
 #-----------------------------------------------------------------------------
 # Projects
