@@ -213,6 +213,7 @@
 				33CC10EB2044A3C60003C045 /* Resources */,
 				33CC110E2044A8840003C045 /* Bundle Framework */,
 				3399D490228B24CF009A79C7 /* ShellScript */,
+				A11EAD5DC0DE000000000001 /* Embed Lemonade Nexus SDK */,
 			);
 			buildRules = (
 			);
@@ -338,6 +339,21 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"$FLUTTER_ROOT\"/packages/flutter_tools/bin/macos_assemble.sh && touch Flutter/ephemeral/tripwire";
+		};
+		A11EAD5DC0DE000000000001 /* Embed Lemonade Nexus SDK */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+			);
+			name = "Embed Lemonade Nexus SDK";
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nSDK_DYLIB=\"${SRCROOT}/../../../build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.dylib\"\nif [ ! -f \"${SDK_DYLIB}\" ]; then\n  echo \"warning: liblemonade_nexus_sdk.dylib not found at ${SDK_DYLIB}; run 'cmake --build build --target LemonadeNexusSDKShared' from the repo root\"\n  exit 0\nfi\nDEST=\"${BUILT_PRODUCTS_DIR}/${FRAMEWORKS_FOLDER_PATH}\"\nmkdir -p \"${DEST}\"\ncp -f \"${SDK_DYLIB}\" \"${DEST}/\"\ncodesign --force --sign \"${EXPANDED_CODE_SIGN_IDENTITY:--}\" \"${DEST}/liblemonade_nexus_sdk.dylib\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
