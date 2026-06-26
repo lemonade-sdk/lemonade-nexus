@@ -15,17 +15,20 @@ create_project(LemonadeNexusSDK DEPENDENCIES
 )
 
 # The userspace WireGuard dataplane lives in the server project; the SDK's packet
-# pump (PacketPump.cpp / ln_pump_*) drives it for host-owned tunnels (macOS NE,
-# mobile). Compile it into the SDK and expose the server include path.
+# pump (PacketPump.cpp / ln_pump_*) joins it to the virtual netstack to expose
+# mesh connectivity as loopback sockets (no TUN device). Compile the dataplane
+# into the SDK, expose the server include path, and link the netstack.
 set(LN_DATAPLANE_SRC "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/WireGuard/UserspaceDataplane.cpp")
 set(LN_SERVER_INCLUDE "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/include")
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}")
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")
+    target_link_libraries(LemonadeNexusSDK PUBLIC virtual-netstack)
 endif()
 if(TARGET LemonadeNexusSDKApp)
     target_sources(LemonadeNexusSDKApp PRIVATE "${LN_DATAPLANE_SRC}")
     target_include_directories(LemonadeNexusSDKApp PRIVATE "${LN_SERVER_INCLUDE}")
+    target_link_libraries(LemonadeNexusSDKApp PUBLIC virtual-netstack)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -57,7 +60,8 @@ if(BUILD_SDK_SHARED)
             sodium
             OpenSSL::SSL
             OpenSSL::Crypto
-            boringtun-ffi)
+            boringtun-ffi
+            virtual-netstack)
 
     # Tells the header which build this is (used for __declspec on MSVC if ever needed).
     target_compile_definitions(LemonadeNexusSDKShared PRIVATE LN_BUILD_SHARED)

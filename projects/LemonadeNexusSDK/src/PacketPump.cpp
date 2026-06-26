@@ -1,13 +1,20 @@
-/// ln_pump_* — a host-owned WireGuard dataplane for platforms where the OS owns
-/// the virtual interface (macOS/iOS NetworkExtension, Android VpnService). Wraps
-/// nexus::wireguard::UserspaceDataplane: the host bridges plaintext IP packets
-/// in/out, the pump owns the UDP socket, Noise sessions, routing, and timers.
+/// ln_pump_* — a host-owned, socket-level tunnel with no kernel TUN device and
+/// no system VPN. Joins the userspace BoringTun dataplane
+/// (nexus::wireguard::UserspaceDataplane) to the in-process virtual netstack
+/// (crates/virtual-netstack, smoltcp), and exposes mesh connectivity as ordinary
+/// loopback sockets:
+///   - egress: a 127.0.0.1 listener bridged to a virtual TCP connect across the
+///     mesh (connect a normal socket to reach a mesh endpoint);
+///   - ingress: a virtual vip:vport bridged to a local service.
+/// Decrypted inbound IP goes dataplane -> netstack; the netstack's outbound IP
+/// goes netstack -> dataplane (encrypt -> UDP).
 
 #include <LemonadeNexusSDK/lemonade_nexus.h>
 
 #include <LemonadeNexus/WireGuard/IpRouter.hpp>
 #include <LemonadeNexus/WireGuard/UserspaceDataplane.hpp>
 
+#include <virtual_netstack.h>
 #include <nlohmann/json.hpp>
 
 #include <cstdlib>
@@ -23,10 +30,10 @@ using nexus::wireguard::UserspaceDataplane;
 using nexus::wireguard::WgPeer;
 
 struct ln_pump_s {
-    UserspaceDataplane   dp;
-    ln_pump_tun_write_cb cb{nullptr};
-    void*                ctx{nullptr};
-    std::string          server_pubkey;  // never removed by sync_peers
+    UserspaceDataplane dp;
+    NsHandle*          ns{nullptr};
+    std::string        server_pubkey;  // never removed by sync_peers
+    std::string        tunnel_addr;    // our virtual IP (no prefix), egress source
 };
 
 namespace {
@@ -36,13 +43,19 @@ std::string json_str(const json& j, const char* key) {
     return it != j.end() && it->is_string() ? it->get<std::string>() : std::string{};
 }
 
-/// Host-order address from "a.b.c.d" or "a.b.c.d/NN" (the address, not network).
-std::optional<uint32_t> address_of(const std::string& cidr) {
-    if (cidr.empty()) return std::nullopt;
+std::string addr_part(const std::string& cidr) {
     auto slash = cidr.find('/');
-    auto c = Cidr::parse(slash == std::string::npos ? cidr : cidr.substr(0, slash));
-    if (!c || c->prefix_len != 32) return std::nullopt;
-    return c->network;
+    return slash == std::string::npos ? cidr : cidr.substr(0, slash);
+}
+
+int prefix_part(const std::string& cidr, int fallback) {
+    auto slash = cidr.find('/');
+    if (slash == std::string::npos) return fallback;
+    try {
+        return std::stoi(cidr.substr(slash + 1));
+    } catch (...) {
+        return fallback;
+    }
 }
 
 std::string allowed_for(const std::string& tunnel_ip, const std::string& private_subnet) {
@@ -62,10 +75,15 @@ char* dup_cstr(const std::string& s) {
     return p;
 }
 
+// The netstack hands every outbound IP packet here; re-inject into the dataplane.
+void output_trampoline(void* ctx, const uint8_t* pkt, size_t len) {
+    if (!ctx || !pkt || len == 0) return;
+    static_cast<ln_pump_s*>(ctx)->dp.send_outbound_ip_packet({pkt, len});
+}
+
 }  // namespace
 
-ln_pump_t* ln_pump_create(const char* config_json,
-                          ln_pump_tun_write_cb on_tun_write, void* ctx) {
+ln_pump_t* ln_pump_create(const char* config_json) {
     if (!config_json) return nullptr;
     json cfg;
     try {
@@ -85,19 +103,48 @@ ln_pump_t* ln_pump_create(const char* config_json,
     if (dpcfg.private_key_b64.empty() || dpcfg.public_key_b64.empty()) return nullptr;
 
     auto* pump = new ln_pump_s{};
-    pump->cb  = on_tun_write;
-    pump->ctx = ctx;
-    pump->dp.set_inbound_handler([pump](std::span<const uint8_t> pkt) {
-        if (pump->cb) pump->cb(pump->ctx, pkt.data(), pkt.size());
-    });
 
-    if (!pump->dp.start(dpcfg)) {
+    pump->ns = ns_create(dpcfg.mtu, &output_trampoline, pump);
+    if (!pump->ns) {
         delete pump;
         return nullptr;
     }
 
-    if (auto ip = address_of(json_str(cfg, "tunnel_ip"))) pump->dp.add_local_ip(*ip);
+    // Decrypted inbound IP -> netstack.
+    pump->dp.set_inbound_handler([pump](std::span<const uint8_t> pkt) {
+        if (!pkt.empty()) ns_feed_inbound(pump->ns, pkt.data(), pkt.size());
+    });
 
+    if (!pump->dp.start(dpcfg)) {
+        ns_destroy(pump->ns);
+        delete pump;
+        return nullptr;
+    }
+
+    // Register our virtual address; widen the prefix to the mesh plane (from the
+    // first allowed-IPs entry) so mesh peers are on-link for egress.
+    std::string tunnel_cidr = json_str(cfg, "tunnel_ip");
+    pump->tunnel_addr = addr_part(tunnel_cidr);
+    if (!pump->tunnel_addr.empty()) {
+        // Register in the dataplane's cryptokey router so decrypted packets to
+        // our tunnel IP are delivered locally (to the netstack) rather than dropped.
+        if (auto c = Cidr::parse(pump->tunnel_addr); c && c->prefix_len == 32) {
+            pump->dp.add_local_ip(c->network);
+        }
+        int prefix = 10;
+        std::string allowed_join;
+        if (auto it = cfg.find("allowed_ips"); it != cfg.end() && it->is_array() && !it->empty()) {
+            if ((*it)[0].is_string()) prefix = prefix_part((*it)[0].get<std::string>(), 10);
+            for (const auto& a : *it) {
+                if (!a.is_string()) continue;
+                if (!allowed_join.empty()) allowed_join += ",";
+                allowed_join += a.get<std::string>();
+            }
+        }
+        ns_add_local_ip(pump->ns, (pump->tunnel_addr + "/" + std::to_string(prefix)).c_str());
+    }
+
+    // Add the server as the initial peer.
     pump->server_pubkey = json_str(cfg, "server_public_key");
     if (!pump->server_pubkey.empty()) {
         std::string allowed;
@@ -117,13 +164,26 @@ ln_pump_t* ln_pump_create(const char* config_json,
 }
 
 void ln_pump_destroy(ln_pump_t* pump) {
-    delete reinterpret_cast<ln_pump_s*>(pump);  // dtor stops the dataplane
+    if (!pump) return;
+    auto* p = reinterpret_cast<ln_pump_s*>(pump);
+    p->dp.stop();          // stop feeding the netstack before tearing it down
+    if (p->ns) ns_destroy(p->ns);
+    delete p;
 }
 
-ln_error_t ln_pump_outbound_ip(ln_pump_t* pump, const uint8_t* ip_packet, size_t len) {
-    if (!pump || !ip_packet) return LN_ERR_NULL_ARG;
+uint16_t ln_pump_tcp_egress(ln_pump_t* pump, const char* dst_ip, uint16_t dst_port) {
+    if (!pump || !dst_ip) return 0;
     auto* p = reinterpret_cast<ln_pump_s*>(pump);
-    return p->dp.send_outbound_ip_packet({ip_packet, len}) ? LN_OK : LN_ERR_REJECTED;
+    if (!p->ns || p->tunnel_addr.empty()) return 0;
+    return ns_add_tcp_egress(p->ns, dst_ip, dst_port, p->tunnel_addr.c_str());
+}
+
+ln_error_t ln_pump_tcp_forward(ln_pump_t* pump, const char* vip, uint16_t vport,
+                               const char* target) {
+    if (!pump || !vip || !target) return LN_ERR_NULL_ARG;
+    auto* p = reinterpret_cast<ln_pump_s*>(pump);
+    if (!p->ns) return LN_ERR_INTERNAL;
+    return ns_add_tcp_forward(p->ns, vip, vport, target) == 0 ? LN_OK : LN_ERR_REJECTED;
 }
 
 ln_error_t ln_pump_sync_peers(ln_pump_t* pump, const char* peers_json) {
