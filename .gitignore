@@ -48,3 +48,4 @@ Cargo.lock
 # Unwanted files
 .claude/
 *.bak
+dmg/

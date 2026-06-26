@@ -165,7 +165,7 @@ void StunService::handle_receive(std::size_t bytes_received) {
         return;
     }
 
-    spdlog::debug("[{}] STUN Binding Request from {}:{}",
+    spdlog::trace("[{}] STUN Binding Request from {}:{}",
                    name(),
                    remote_endpoint_.address().to_string(),
                    remote_endpoint_.port());
