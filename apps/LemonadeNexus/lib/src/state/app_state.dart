@@ -10,6 +10,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
+import '../platform/tunnel_controller.dart';
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -346,8 +347,11 @@ class AppState {
 /// Notifier for managing app state
 class AppNotifier extends StateNotifier<AppState> {
   final LemonadeNexusSdk _sdk;
+  final TunnelController _tunnel;
 
-  AppNotifier(this._sdk) : super(AppState.initial);
+  AppNotifier(this._sdk, {TunnelController? tunnel})
+      : _tunnel = tunnel ?? SdkTunnelController(_sdk),
+        super(AppState.initial);
 
   /// Initialize app state - load preferences
   Future<void> initialize() async {
@@ -705,7 +709,7 @@ class AppNotifier extends StateNotifier<AppState> {
       // Get WG config first
       final config = await _sdk.getWgConfigJson();
       if (config != null) {
-        await _sdk.tunnelUp(config);
+        await _tunnel.up(config);
       }
       await refreshTunnelStatus();
       addActivity(ActivityLevel.success, 'Tunnel connected');
@@ -721,7 +725,7 @@ class AppNotifier extends StateNotifier<AppState> {
   Future<void> disconnectTunnel() async {
     state = state.copyWith(isLoading: true);
     try {
-      await _sdk.tunnelDown();
+      await _tunnel.down();
       await refreshTunnelStatus();
       addActivity(ActivityLevel.info, 'Tunnel disconnected');
     } catch (e) {
@@ -735,7 +739,7 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Refresh tunnel status
   Future<void> refreshTunnelStatus() async {
     try {
-      final tunnelStatus = await _sdk.getTunnelStatus();
+      final tunnelStatus = await _tunnel.status();
       state = state.copyWith(
         tunnelStatus: tunnelStatus,
       );

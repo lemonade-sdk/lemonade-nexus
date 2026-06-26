@@ -1,11 +1,9 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'src/state/providers.dart';
 import 'src/views/login_view.dart';
 import 'src/views/main_navigation.dart';
-import 'src/windows/windows_integration.dart';
 import 'theme/app_theme.dart';
 
 void main() {
@@ -48,10 +46,7 @@ class _AppShellState extends ConsumerState<AppShell> {
     // Initialize app state on startup
     WidgetsBinding.instance.addPostFrameCallback((_) {
       ref.read(appNotifierProvider.notifier).initialize();
-      // Initialize Windows integrations
-      if (Platform.isWindows) {
-        ref.read(windowsIntegrationProvider).initialize();
-      }
+      ref.read(platformIntegrationProvider).initialize();
     });
   }
 

@@ -14,6 +14,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
+import '../platform/platform_integration.dart';
+import '../platform/tunnel_controller.dart';
 import 'app_state.dart';
 
 // =========================================================================
@@ -45,7 +47,15 @@ final ffiProvider = Provider<LemonadeNexusFfi>((ref) {
 /// Main app state notifier provider.
 /// Provides the AppNotifier instance and AppState state.
 final appNotifierProvider = StateNotifierProvider<AppNotifier, AppState>((ref) {
-  return AppNotifier(ref.watch(sdkProvider));
+  final sdk = ref.watch(sdkProvider);
+  return AppNotifier(sdk, tunnel: createTunnelController(sdk));
+});
+
+/// Platform-specific desktop integration (tray/menu-bar, auto-start, lifecycle).
+final platformIntegrationProvider = Provider<PlatformIntegration>((ref) {
+  final integration = createPlatformIntegration(ref);
+  ref.onDispose(integration.dispose);
+  return integration;
 });
 
 /// Selector for authentication state only.
