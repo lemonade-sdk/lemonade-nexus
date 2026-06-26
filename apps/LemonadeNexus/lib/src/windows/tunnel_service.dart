@@ -7,6 +7,7 @@
 /// - Auto-connect on startup
 /// - Background operation
 
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -41,6 +42,7 @@ class WindowsTunnelService {
   final Ref _ref;
   WindowsTunnelConfig _config;
   bool _isTunnelMonitoring = false;
+  Timer? _monitorTimer;
 
   WindowsTunnelService(this._ref, {WindowsTunnelConfig? config})
       : _config = config ?? const WindowsTunnelConfig();
@@ -74,21 +76,21 @@ class WindowsTunnelService {
     }
   }
 
-  /// Start monitoring tunnel state changes
+  /// Poll tunnel status periodically and reflect it in the tray.
   void _startTunnelMonitoring() {
     if (_isTunnelMonitoring) return;
-
     _isTunnelMonitoring = true;
-    debugPrint('[WindowsTunnel] Started monitoring');
-
-    // Monitor tunnel state and update tray
-    // In a real implementation, this would use streams or listeners
+    _monitorTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      await _ref.read(appNotifierProvider.notifier).refreshTunnelStatus();
+      _ref.read(windowsIntegrationProvider).updateTrayConnectionState();
+    });
   }
 
   /// Stop monitoring tunnel state
   void _stopTunnelMonitoring() {
+    _monitorTimer?.cancel();
+    _monitorTimer = null;
     _isTunnelMonitoring = false;
-    debugPrint('[WindowsTunnel] Stopped monitoring');
   }
 
   /// Connect tunnel with Windows integration

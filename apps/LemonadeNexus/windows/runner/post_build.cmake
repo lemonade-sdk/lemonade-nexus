@@ -37,10 +37,11 @@ copy_file("${BINARY_DIR}/plugins/screen_retriever/Release/screen_retriever_plugi
 copy_file("${BINARY_DIR}/plugins/tray_manager/Release/tray_manager_plugin.dll" "${OUT_DIR}/")
 copy_file("${BINARY_DIR}/plugins/window_manager/Release/window_manager_plugin.dll" "${OUT_DIR}/")
 
-# Copy SDK DLLs
-copy_file("${SDK_RELEASE_DIR}/lemonade_nexus.dll" "${OUT_DIR}/")
-copy_file("${SDK_RELEASE_DIR}/libcrypto-3-x64.dll" "${OUT_DIR}/")
-copy_file("${SDK_RELEASE_DIR}/libssl-3-x64.dll" "${OUT_DIR}/")
+# Copy the self-contained SDK DLL (OpenSSL/sodium/boringtun are statically
+# embedded, so no separate crypto DLLs are needed). wintun.dll is required for
+# the in-process WireGuard tunnel on Windows when present.
+copy_file("${SDK_RELEASE_DIR}/lemonade_nexus_sdk.dll" "${OUT_DIR}/")
+copy_file("${SDK_RELEASE_DIR}/wintun.dll" "${OUT_DIR}/")
 
 # Copy app.so
 copy_file("${SOURCE_DIR}/../build/windows/app.so" "${OUT_DIR}/data/")

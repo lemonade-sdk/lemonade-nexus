@@ -33,10 +33,10 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_link_options(${TARGET} PRIVATE "/SUBSYSTEM:WINDOWS")
 endfunction()
 
-# Root folder
+# Root folder (set by the Flutter tool during `flutter build windows`).
 set(FLUTTER_ROOT "$ENV{FLUTTER_ROOT}")
 if(NOT FLUTTER_ROOT OR FLUTTER_ROOT STREQUAL "")
-  set(FLUTTER_ROOT "C:/Users/antmi/lemonade-nexus/apps/LemonadeNexus/flutter-sdk/flutter")
+  message(FATAL_ERROR "FLUTTER_ROOT is not set. Build via 'flutter build windows', not bare cmake.")
 endif()
 # Normalize path to use forward slashes (required for CMake on Windows)
 file(TO_CMAKE_PATH "${FLUTTER_ROOT}" FLUTTER_ROOT)

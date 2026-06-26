@@ -10,6 +10,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:tray_manager/tray_manager.dart';
+import 'package:window_manager/window_manager.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
@@ -19,20 +20,17 @@ class WindowsSystemTray with TrayListener {
   final Ref _ref;
   bool _isInitialized = false;
 
-  /// Bring the main app window to the foreground.
-  ///
-  /// NOTE: `tray_manager` does not expose a `showAppWindow` API. The proper
-  /// fix is to add the `window_manager` package and call `windowManager.show()`
-  /// / `windowManager.focus()`, but that requires a pubspec dependency change
-  /// which is out of scope for this fix. For now we stub this as a no-op that
-  /// logs, and flag it as a TODO so the platform integration can be wired up
-  /// later (e.g. via `win32` `SetForegroundWindow` once we have a stable HWND
-  /// or by adding `window_manager`).
+  /// Restore and raise the main app window (e.g. from a tray click).
   Future<void> _bringWindowToFront() async {
-    // TODO(windows): integrate `window_manager` or a `win32`-based HWND lookup
-    // (`FindWindow` + `SetForegroundWindow`) to actually restore/raise the
-    // Flutter window from the tray. Stubbed as a no-op for now.
-    debugPrint('[SystemTray] _bringWindowToFront stub - window not raised');
+    try {
+      if (await windowManager.isMinimized()) {
+        await windowManager.restore();
+      }
+      await windowManager.show();
+      await windowManager.focus();
+    } catch (e) {
+      debugPrint('[SystemTray] failed to raise window: $e');
+    }
   }
 
   /// Connection status colors for tray icon tooltip
