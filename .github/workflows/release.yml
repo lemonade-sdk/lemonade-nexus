@@ -296,6 +296,23 @@ jobs:
             install_cmd: >-
               pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git
               python python-pip python-pynacl
+          - container: amazonlinux:2023
+            platform: linux-x86_64-amzn2023
+            cpack_generators: "RPM"
+            # AL2023's defaults are too old for this codebase: GCC 11.5 lacks the
+            # <expected> header (need GCC 14, same major as the green Fedora 40
+            # build) and CMake 3.22 is below the 3.25.1 floor (pull current CMake
+            # from PyPI). Symlink GCC 14 as the default cc/g++ on PATH so the
+            # shared Configure step auto-detects it.
+            install_cmd: >-
+              dnf install -y ninja-build make gcc14 gcc14-c++ openssl-devel
+              pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
+              ca-certificates tar gzip python3 python3-pip rpm-build &&
+              ln -sf /usr/bin/gcc14-gcc /usr/local/bin/gcc &&
+              ln -sf /usr/bin/gcc14-gcc /usr/local/bin/cc &&
+              ln -sf /usr/bin/gcc14-g++ /usr/local/bin/g++ &&
+              ln -sf /usr/bin/gcc14-g++ /usr/local/bin/c++ &&
+              pip3 install cmake
 
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
@@ -592,6 +609,7 @@ jobs:
           # Rename bare binaries to include version + platform in filename
           for dir in lemonade-nexus-linux-x86_64 lemonade-nexus-linux-x86_64-deb \
                      lemonade-nexus-linux-x86_64-rpm lemonade-nexus-linux-x86_64-arch \
+                     lemonade-nexus-linux-x86_64-amzn2023 \
                      lemonade-nexus-darwin-arm64; do
             platform="${dir#lemonade-nexus-}"
             if [ -f "$dir/lemonade-nexus" ]; then
@@ -603,6 +621,12 @@ jobs:
             mv "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" \
                "lemonade-nexus-windows-x86_64/lemonade-nexus-${VERSION}-windows-x86_64.exe"
           fi
+          # Disambiguate the Amazon Linux 2023 RPM — CPack names it identically to
+          # the Fedora RPM, which would collide as a release asset.
+          for rpm in lemonade-nexus-linux-x86_64-amzn2023-pkg/*.rpm; do
+            [ -f "$rpm" ] || continue
+            mv "$rpm" "${rpm%.rpm}.amzn2023.rpm"
+          done
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -612,11 +636,13 @@ jobs:
             lemonade-nexus-linux-x86_64-deb/*
             lemonade-nexus-linux-x86_64-rpm/*
             lemonade-nexus-linux-x86_64-arch/*
+            lemonade-nexus-linux-x86_64-amzn2023/*
             lemonade-nexus-darwin-arm64/*
             lemonade-nexus-windows-x86_64/*
             lemonade-nexus-linux-x86_64-deb-pkg/*
             lemonade-nexus-linux-x86_64-rpm-pkg/*
             lemonade-nexus-linux-x86_64-arch-pkg/*
+            lemonade-nexus-linux-x86_64-amzn2023-pkg/*
             lemonade-nexus-darwin-arm64-pkg/*
             lemonade-nexus-windows-x86_64-installer/*
             lemonade-nexus-macos-app/*
@@ -624,6 +650,7 @@ jobs:
             manifest-linux-x86_64-deb/*
             manifest-linux-x86_64-rpm/*
             manifest-linux-x86_64-arch/*
+            manifest-linux-x86_64-amzn2023/*
             manifest-darwin-arm64/*
             manifest-windows-x86_64/*
           generate_release_notes: true
@@ -637,6 +664,7 @@ jobs:
             | Linux x86_64 (Debian .deb) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.deb` | `manifest-linux-x86_64-deb.json` |
             | Linux x86_64 (Fedora .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.rpm` | `manifest-linux-x86_64-rpm.json` |
             | Linux x86_64 (Arch) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
+            | Linux x86_64 (Amazon Linux 2023 .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.amzn2023.rpm` | `manifest-linux-x86_64-amzn2023.json` |
             | macOS ARM64 | `lemonade-nexus-${{ github.ref_name }}-darwin-arm64` | `manifest-darwin-arm64.json` |
             | macOS App (.dmg) | `LemonadeNexus.dmg` | — |
             | Windows x86_64 | `lemonade-nexus-${{ github.ref_name }}-windows-x86_64.exe` | `manifest-windows-x86_64.json` |
