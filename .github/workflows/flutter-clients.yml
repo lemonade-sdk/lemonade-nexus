@@ -1,0 +1,143 @@
+name: Flutter Desktop Clients
+
+# Builds the self-contained native SDK shared library and the Flutter desktop
+# client (apps/LemonadeNexus) on macOS and Windows, and runs analyze + tests.
+# Packaging (DMG / MSIX) is layered on top of these artifacts separately.
+
+on:
+  push:
+    branches: [main, client-port-flutter]
+    paths:
+      - 'apps/LemonadeNexus/**'
+      - 'projects/LemonadeNexusSDK/**'
+      - 'projects/LemonadeNexus/src/WireGuard/**'
+      - 'cmake/**'
+      - 'crates/**'
+      - '.github/workflows/flutter-clients.yml'
+  pull_request:
+    paths:
+      - 'apps/LemonadeNexus/**'
+      - 'projects/LemonadeNexusSDK/**'
+      - 'cmake/**'
+      - '.github/workflows/flutter-clients.yml'
+
+env:
+  BUILD_TYPE: Release
+  FLUTTER_CHANNEL: stable
+
+jobs:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v5
+        with:
+          path: build/_deps
+          key: fetchcontent-macos-14-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: fetchcontent-macos-14-
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      # Build OpenSSL from source (static) so the dylib has no Homebrew deps.
+      - name: Build shared SDK
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF \
+            -DOPENSSL_FORCE_BUNDLED=ON \
+            -DBUILD_SDK_SHARED=ON
+          cmake --build build --target LemonadeNexusSDKShared --parallel
+
+      - name: Verify SDK exports + no Homebrew linkage
+        run: |
+          dylib=build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.dylib
+          test "$(nm -gU "$dylib" | grep -c ' _ln_')" -ge 69
+          if otool -L "$dylib" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/'; then
+            echo "::error::SDK dylib links Homebrew/local libraries"; exit 1
+          fi
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+
+      - name: Analyze + test
+        working-directory: apps/LemonadeNexus
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Build macOS app
+        working-directory: apps/LemonadeNexus
+        run: flutter build macos --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-macos
+          path: apps/LemonadeNexus/build/macos/Build/Products/Release/*.app
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v5
+        with:
+          path: build/_deps
+          key: fetchcontent-windows-2022-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: fetchcontent-windows-2022-
+
+      - name: Install Ninja + static OpenSSL (vcpkg)
+        shell: pwsh
+        run: |
+          choco install ninja -y
+          vcpkg install openssl:x64-windows-static-md
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build shared SDK
+        shell: pwsh
+        run: |
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          cmake -B build -G Ninja `
+            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
+            -DBUILD_TESTING=OFF `
+            -DBUILD_SDK_SHARED=ON `
+            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
+            -DOPENSSL_USE_STATIC_LIBS=ON
+          cmake --build build --target LemonadeNexusSDKShared --parallel
+
+      # The Windows runner's post_build.cmake reads the DLL + header from a
+      # Release/ subdir; Ninja is single-config, so stage them there.
+      - name: Stage SDK DLL for the runner
+        shell: pwsh
+        run: |
+          $rel = "build/projects/LemonadeNexusSDK/Release"
+          New-Item -ItemType Directory -Force -Path $rel | Out-Null
+          Copy-Item "build/projects/LemonadeNexusSDK/lemonade_nexus_sdk.dll" $rel -Force
+          Copy-Item "projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h" $rel -Force
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+
+      - name: Analyze + test
+        working-directory: apps/LemonadeNexus
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Build Windows app
+        working-directory: apps/LemonadeNexus
+        run: flutter build windows --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lemonade-nexus-windows
+          path: apps/LemonadeNexus/build/windows/x64/runner/Release/
