@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AppxManifest.xml for Lemonade Nexus VPN
+  This file defines the identity, capabilities, and metadata for the MSIX package.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:desktop2="http://schemas.microsoft.com/appx/manifest/desktop/windows10/2"
+  IgnorableNamespaces="uap rescap desktop desktop2">
+
+  <Identity
+    Name="LemonadeNexus.LemonadeNexusVPN"
+    Publisher="CN=Lemonade Nexus, O=Lemonade Nexus, C=US"
+    Version="1.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Lemonade Nexus VPN</DisplayName>
+    <PublisherDisplayName>Lemonade Nexus</PublisherDisplayName>
+    <Logo>assets\app_icon.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="LemonadeNexusVPN"
+      Executable="windows\runner\lemonade_nexus.exe"
+      EntryPoint="windows.app.FullTrustApplication">
+
+      <uap:VisualElements
+        DisplayName="Lemonade Nexus VPN"
+        Description="Secure WireGuard Mesh VPN Client"
+        BackgroundColor="#48BB78"
+        Square150x150Logo="assets\app_icon.png"
+        Square44x44Logo="assets\app_icon.png">
+        <uap:DefaultTile Wide310x150Logo="assets\app_icon.png" />
+        <uap:SplashScreen Image="assets\splash_screen.png" />
+      </uap:VisualElements>
+
+      <Extensions>
+        <!-- Desktop extension for Win32 app -->
+        <desktop:Extension Category="windows.desktopApp">
+          <desktop:DesktopApp />
+        </desktop:Extension>
+
+        <!-- Startup task for auto-start -->
+        <desktop:Extension Category="windows.startupTask">
+          <desktop:StartupTask TaskId="LemonadeNexusStartup" Enabled="false" DisplayName="Lemonade Nexus VPN" />
+        </desktop:Extension>
+
+        <!-- Protocol activation for VPN links -->
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="lemonade-nexus">
+            <uap:DisplayName>Lemonade Nexus VPN</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
+
+        <!-- File type associations -->
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="lemonade-nexus-config">
+            <uap:SupportedFileTypes>
+              <uap:FileType>.lnxconfig</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Network capabilities for VPN -->
+    <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
+
+    <!-- Restricted capabilities for VPN functionality -->
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="packageManagement" />
+
+    <!-- Device capabilities -->
+    <DeviceCapability Name="networking" />
+  </Capabilities>
+
+  <Extensions>
+    <!-- App service for background VPN operations -->
+    <Extension Category="windows.appService">
+      <AppService Name="LemonadeNexusVPNService">
+        <desktop:EntryPoint Executable="windows\runner\lemonade_nexus.exe" />
+      </AppService>
+    </Extension>
+  </Extensions>
+</Package>

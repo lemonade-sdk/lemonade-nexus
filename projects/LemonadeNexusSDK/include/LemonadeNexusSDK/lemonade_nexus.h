@@ -15,6 +15,13 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
+
+/* Shared FFI build is compiled with hidden visibility; mark the ln_* C API
+ * default-visible so only it is exported (MSVC uses WINDOWS_EXPORT_ALL_SYMBOLS). */
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC visibility push(default)
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Error codes                                                         */
@@ -446,6 +453,44 @@ ln_error_t ln_routing_connection_status(ln_client_t* client, const char* connect
                                         char** out_json);
 
 /* ------------------------------------------------------------------ */
+/* Packet pump (host-owned virtual interface, e.g. macOS NetworkExtension) */
+/* ------------------------------------------------------------------ */
+
+/** Opaque packet-pump handle. A userspace, multi-peer WireGuard dataplane that
+ *  does NOT own a TUN device: the host (e.g. an NEPacketTunnelProvider) owns the
+ *  virtual interface and bridges packets via the calls below. The pump owns its
+ *  UDP socket and timer threads. Independent of ln_client_t. */
+typedef struct ln_pump_s ln_pump_t;
+
+/** Delivers one decrypted inbound IP packet to the host. Invoked on a pump rx
+ *  thread; must not block. */
+typedef void (*ln_pump_tun_write_cb)(void* ctx, const uint8_t* ip_packet, size_t len);
+
+/** Create a pump from a WireGuard config JSON (same schema as ln_tunnel_up:
+ *  private_key, public_key, server_public_key, server_endpoint, tunnel_ip,
+ *  allowed_ips, listen_port, keepalive). Binds the UDP socket, starts the
+ *  dataplane, registers tunnel_ip as a local address, and adds server_public_key
+ *  as the initial peer. Returns NULL on failure. */
+ln_pump_t* ln_pump_create(const char* config_json,
+                          ln_pump_tun_write_cb on_tun_write, void* ctx);
+
+/** Stop the dataplane and free the pump. */
+void ln_pump_destroy(ln_pump_t* pump);
+
+/** Encrypt + route a plaintext IP packet read from the host's virtual interface.
+ *  Returns LN_OK if accepted (sent or queued pending handshake). */
+ln_error_t ln_pump_outbound_ip(ln_pump_t* pump, const uint8_t* ip_packet, size_t len);
+
+/** Replace the mesh peer set. peers_json is a JSON array as returned by
+ *  ln_mesh_peers (keys: wg_pubkey, tunnel_ip, private_subnet, endpoint,
+ *  relay_endpoint, keepalive). Adds new, updates changed, removes stale. The
+ *  initial server peer is preserved. */
+ln_error_t ln_pump_sync_peers(ln_pump_t* pump, const char* peers_json);
+
+/** Per-peer status as a JSON array. Caller must ln_free(*out_json). */
+ln_error_t ln_pump_status(ln_pump_t* pump, char** out_json);
+
+/* ------------------------------------------------------------------ */
 /* Session management                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -460,6 +505,10 @@ ln_error_t ln_set_node_id(ln_client_t* client, const char* node_id);
 
 /** Get the current node ID. Caller must ln_free(). Returns NULL if not set. */
 char* ln_get_node_id(ln_client_t* client);
+
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC visibility pop
+#endif
 
 #ifdef __cplusplus
 }
