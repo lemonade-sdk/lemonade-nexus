@@ -137,6 +137,22 @@ jobs:
             platform: linux-x86_64-arch
             install_cmd: >-
               pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git
+          - container: amazonlinux:2023
+            platform: linux-x86_64-amzn2023
+            # AL2023's defaults are too old for this codebase: GCC 11.5 lacks the
+            # <expected> header (need GCC 14, same major as the green Fedora 40
+            # build) and CMake 3.22 is below the 3.25.1 floor (pull current CMake
+            # from PyPI). Symlink GCC 14 as the default cc/g++ on PATH so the
+            # shared Configure step auto-detects it.
+            install_cmd: >-
+              dnf install -y ninja-build make gcc14 gcc14-c++ openssl-devel
+              pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
+              ca-certificates tar gzip python3 python3-pip &&
+              ln -sf /usr/bin/gcc14-gcc /usr/local/bin/gcc &&
+              ln -sf /usr/bin/gcc14-gcc /usr/local/bin/cc &&
+              ln -sf /usr/bin/gcc14-g++ /usr/local/bin/g++ &&
+              ln -sf /usr/bin/gcc14-g++ /usr/local/bin/c++ &&
+              pip3 install cmake
 
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
