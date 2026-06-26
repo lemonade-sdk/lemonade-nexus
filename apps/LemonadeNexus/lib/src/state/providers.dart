@@ -16,6 +16,7 @@ import '../sdk/sdk.dart';
 import '../sdk/models.dart';
 import '../platform/platform_integration.dart';
 import '../platform/tunnel_controller.dart';
+import '../platform/settings_store.dart';
 import 'app_state.dart';
 
 // =========================================================================
@@ -149,18 +150,27 @@ final activityLogProvider = Provider<List<ActivityEntry>>((ref) {
 
 /// Theme mode provider (light, dark, system).
 final themeProvider = StateNotifierProvider<ThemeNotifier, ThemeMode>((ref) {
-  return ThemeNotifier();
+  return ThemeNotifier(SettingsStore());
 });
 
 class ThemeNotifier extends StateNotifier<ThemeMode> {
-  ThemeNotifier() : super(ThemeMode.system);
+  final SettingsStore _store;
+
+  ThemeNotifier(this._store) : super(ThemeMode.system) {
+    _load();
+  }
+
+  Future<void> _load() async {
+    state = await _store.loadThemeMode();
+  }
 
   void setTheme(ThemeMode mode) {
     state = mode;
+    _store.saveThemeMode(mode);
   }
 
   void toggleDarkMode() {
-    state = state == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark;
+    setTheme(state == ThemeMode.dark ? ThemeMode.light : ThemeMode.dark);
   }
 }
 

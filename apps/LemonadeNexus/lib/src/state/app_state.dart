@@ -5,12 +5,16 @@
 /// and all data fetched from the C SDK.
 
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
 import '../platform/tunnel_controller.dart';
+import '../platform/settings_store.dart';
+import '../platform/secure_store.dart';
+import '../platform/app_paths.dart';
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -348,6 +352,8 @@ class AppState {
 class AppNotifier extends StateNotifier<AppState> {
   final LemonadeNexusSdk _sdk;
   final TunnelController _tunnel;
+  final SettingsStore _settingsStore = SettingsStore();
+  final SecureStore _secureStore = SecureStore();
 
   AppNotifier(this._sdk, {TunnelController? tunnel})
       : _tunnel = tunnel ?? SdkTunnelController(_sdk),
@@ -358,16 +364,57 @@ class AppNotifier extends StateNotifier<AppState> {
     await _loadPreferences();
   }
 
-  /// Load preferences from storage
+  /// Load persisted preferences, then attempt to restore a prior session.
   Future<void> _loadPreferences() async {
-    // TODO: Load from shared_preferences when implemented
-    // For now, use defaults
-    state = state.copyWith(
-      settings: state.settings.copyWith(
-        autoDiscoveryEnabled: true,
-        autoConnectOnLaunch: false,
-      ),
-    );
+    final settings = await _settingsStore.load();
+    state = state.copyWith(settings: settings);
+    await _restoreSession();
+  }
+
+  Future<void> _persistSettings() => _settingsStore.save(state.settings);
+
+  Future<void> _persistIdentity() async {
+    try {
+      await _sdk.saveIdentity(await AppPaths.identityFilePath());
+    } catch (_) {
+      // No identity to persist (e.g. password-only auth).
+    }
+  }
+
+  /// Best-effort restore of a previous session (identity + token) on launch.
+  Future<void> _restoreSession() async {
+    final session = await _secureStore.loadSession();
+    if (session == null) return;
+    try {
+      final s = state.settings;
+      if (s.useTls) {
+        await _sdk.connectTls(s.serverHost, s.serverPort);
+      } else {
+        await _sdk.connect(s.serverHost, s.serverPort);
+      }
+      final idPath = await AppPaths.identityFilePath();
+      if (await File(idPath).exists()) {
+        await _sdk.loadIdentity(idPath);
+        await _sdk.setIdentity();
+      }
+      await _sdk.setSessionToken(session.token);
+      state = state.copyWith(
+        connectionStatus: ConnectionStatus.connected,
+        authState: state.authState.copyWith(
+          isAuthenticated: true,
+          username: session.username,
+          userId: session.userId,
+          sessionToken: session.token,
+        ),
+      );
+      await _loadIdentity();
+      await refreshAllData();
+      if (state.settings.autoConnectOnLaunch) {
+        await connectTunnel();
+      }
+    } catch (e) {
+      await _secureStore.clear();
+    }
   }
 
   /// Connect to server
@@ -389,6 +436,7 @@ class AppNotifier extends StateNotifier<AppState> {
         connectedSince: DateTime.now(),
         isLoading: false,
       );
+      await _persistSettings();
       addActivity(ActivityLevel.success, 'Connected to $host:$port');
       return true;
     } catch (e) {
@@ -441,6 +489,14 @@ class AppNotifier extends StateNotifier<AppState> {
 
         await _loadIdentity();
         await refreshAllData();
+        await _persistIdentity();
+        if (response.sessionToken != null) {
+          await _secureStore.saveSession(StoredSession(
+            token: response.sessionToken!,
+            username: username,
+            userId: response.userId,
+          ));
+        }
         addActivity(ActivityLevel.success, 'Signed in as $username');
         return true;
       } else {
@@ -488,6 +544,14 @@ class AppNotifier extends StateNotifier<AppState> {
           isLoading: false,
         );
         await _loadIdentity();
+        await _persistIdentity();
+        if (response.sessionToken != null) {
+          await _secureStore.saveSession(StoredSession(
+            token: response.sessionToken!,
+            username: username,
+            userId: response.userId,
+          ));
+        }
         addActivity(ActivityLevel.success, 'Registered as $username');
         return true;
       } else {
@@ -523,6 +587,7 @@ class AppNotifier extends StateNotifier<AppState> {
 
   /// Sign out
   Future<void> signOut() async {
+    await _secureStore.clear();
     await disconnectFromServer();
     state = state.copyWith(
       authState: AuthState.initial,
@@ -826,6 +891,7 @@ class AppNotifier extends StateNotifier<AppState> {
     state = state.copyWith(
       settings: state.settings.copyWith(autoDiscoveryEnabled: enabled),
     );
+    _persistSettings();
   }
 
   /// Set auto connect on launch
@@ -833,6 +899,7 @@ class AppNotifier extends StateNotifier<AppState> {
     state = state.copyWith(
       settings: state.settings.copyWith(autoConnectOnLaunch: enabled),
     );
+    _persistSettings();
   }
 
   /// Clear error message
