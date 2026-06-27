@@ -15,6 +15,7 @@ import '../platform/tunnel_controller.dart';
 import '../platform/settings_store.dart';
 import '../platform/secure_store.dart';
 import '../platform/app_paths.dart';
+import '../services/dns_discovery.dart';
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -258,6 +259,8 @@ class AppState {
   final SidebarItem selectedSidebarItem;
   final bool isLoading;
   final bool isDiscovering;
+  final List<DiscoveredServer> discoveredServers;
+  final String? discoveryMessage;
   final String? errorMessage;
   final List<ActivityEntry> activityLog;
   final DateTime? connectedSince;
@@ -279,6 +282,8 @@ class AppState {
     this.selectedSidebarItem = SidebarItem.dashboard,
     this.isLoading = false,
     this.isDiscovering = false,
+    this.discoveredServers = const [],
+    this.discoveryMessage,
     this.errorMessage,
     this.activityLog = const [],
     this.connectedSince,
@@ -301,6 +306,8 @@ class AppState {
     SidebarItem? selectedSidebarItem,
     bool? isLoading,
     bool? isDiscovering,
+    List<DiscoveredServer>? discoveredServers,
+    String? discoveryMessage,
     String? errorMessage,
     List<ActivityEntry>? activityLog,
     DateTime? connectedSince,
@@ -322,6 +329,8 @@ class AppState {
       selectedSidebarItem: selectedSidebarItem ?? this.selectedSidebarItem,
       isLoading: isLoading ?? this.isLoading,
       isDiscovering: isDiscovering ?? this.isDiscovering,
+      discoveredServers: discoveredServers ?? this.discoveredServers,
+      discoveryMessage: discoveryMessage ?? this.discoveryMessage,
       errorMessage: errorMessage ?? this.errorMessage,
       activityLog: activityLog ?? this.activityLog,
       connectedSince: connectedSince ?? this.connectedSince,
@@ -418,7 +427,7 @@ class AppNotifier extends StateNotifier<AppState> {
   }
 
   /// Connect to server
-  Future<bool> connectToServer(String host, int port) async {
+  Future<bool> connectToServer(String host, int port, {bool useTls = false}) async {
     state = state.copyWith(
       isLoading: true,
       errorMessage: null,
@@ -426,11 +435,16 @@ class AppNotifier extends StateNotifier<AppState> {
     );
 
     try {
-      await _sdk.connect(host, port);
+      if (useTls) {
+        await _sdk.connectTls(host, port);
+      } else {
+        await _sdk.connect(host, port);
+      }
       state = state.copyWith(
         settings: state.settings.copyWith(
           serverHost: host,
           serverPort: port,
+          useTls: useTls,
         ),
         connectionStatus: ConnectionStatus.connected,
         connectedSince: DateTime.now(),
@@ -884,6 +898,38 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Set selected sidebar item
   void setSelectedSidebarItem(SidebarItem item) {
     state = state.copyWith(selectedSidebarItem: item);
+  }
+
+  /// Region-aware DNS discovery of the nearest server; points settings at it.
+  Future<void> discoverNearestServer() async {
+    state = state.copyWith(isDiscovering: true);
+    final service = DnsDiscoveryService();
+    try {
+      final servers = await service.discoverServers();
+      state = state.copyWith(
+        isDiscovering: false,
+        discoveredServers: servers,
+        discoveryMessage: service.lastMessage,
+      );
+      if (servers.isNotEmpty) {
+        final best = servers.first;
+        await connectToServer(
+          best.connectHost ?? best.hostname ?? best.ip,
+          best.port,
+          useTls: best.scheme == 'https',
+        );
+        addActivity(ActivityLevel.success,
+            'Discovered ${servers.length} server${servers.length == 1 ? '' : 's'} — nearest ${best.displayName}');
+      } else {
+        addActivity(ActivityLevel.warning,
+            service.lastMessage ?? 'No servers discovered');
+      }
+    } catch (e) {
+      state = state.copyWith(
+          isDiscovering: false, discoveryMessage: 'Discovery failed: $e');
+    } finally {
+      service.close();
+    }
   }
 
   /// Set auto discovery enabled

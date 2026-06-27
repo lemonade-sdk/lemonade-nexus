@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/providers.dart';
 import '../state/app_state.dart';
+import '../services/dns_discovery.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 
@@ -26,6 +27,7 @@ class _LoginViewState extends ConsumerState<LoginView> {
   AuthTab _selectedTab = AuthTab.password;
   bool _isLoading = false;
   bool _isRegistering = false;
+  bool _showManualUrl = false;
   String? _statusMessage;
   bool _isError = false;
 
@@ -33,8 +35,15 @@ class _LoginViewState extends ConsumerState<LoginView> {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final settings = ref.read(settingsProvider);
-      _serverController.text = '${settings.serverHost}:${settings.serverPort}';
+      final notifier = ref.read(appNotifierProvider.notifier);
+      final state = ref.read(appNotifierProvider);
+      _serverController.text =
+          '${state.settings.serverHost}:${state.settings.serverPort}';
+      if (state.settings.autoDiscoveryEnabled &&
+          state.discoveredServers.isEmpty &&
+          !state.isDiscovering) {
+        notifier.discoverNearestServer();
+      }
     });
   }
 
@@ -193,7 +202,76 @@ class _LoginViewState extends ConsumerState<LoginView> {
 
   Widget _buildServerSection(AppState appState) {
     final scheme = Theme.of(context).colorScheme;
-    final settings = appState.settings;
+    final notifier = ref.read(appNotifierProvider.notifier);
+
+    if (appState.isDiscovering) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const SizedBox(
+              width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2)),
+          const SizedBox(width: 10),
+          Text('Discovering servers on lemonade-nexus.io…',
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+        ],
+      );
+    }
+
+    final servers = appState.discoveredServers;
+    if (servers.isNotEmpty && !_showManualUrl) {
+      final best = servers.first;
+      final currentKey = '${appState.settings.serverHost}:${appState.settings.serverPort}';
+      return Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const StatusDot(isHealthy: true, size: 8),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('Connected to ${best.displayName}',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12)),
+                    Text(
+                      '${servers.length} server${servers.length == 1 ? '' : 's'} found — ${best.latencyMs.round()}ms latency',
+                      style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Re-discover',
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.refresh, size: 16, color: scheme.onSurfaceVariant),
+                onPressed: notifier.discoverNearestServer,
+              ),
+            ],
+          ),
+          if (servers.length > 1) ...[
+            const SizedBox(height: 4),
+            ...servers.map((s) => _serverPickerRow(s, currentKey)),
+          ],
+          Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => setState(() => _showManualUrl = true),
+              style: TextButton.styleFrom(
+                minimumSize: Size.zero,
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                foregroundColor: scheme.onSurfaceVariant,
+              ),
+              icon: const Icon(Icons.link, size: 13),
+              label: const Text('Enter URL manually', style: TextStyle(fontSize: 11)),
+            ),
+          ),
+        ],
+      );
+    }
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -201,59 +279,77 @@ class _LoginViewState extends ConsumerState<LoginView> {
           children: [
             Icon(Icons.link, size: 14, color: scheme.onSurfaceVariant),
             const SizedBox(width: 6),
-            Text('Server',
+            Text('Server URL',
                 style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
             const Spacer(),
             TextButton.icon(
-              onPressed: _handleConnect,
+              onPressed: notifier.discoverNearestServer,
               style: TextButton.styleFrom(
                 minimumSize: Size.zero,
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                foregroundColor:
-                    appState.isConnected ? AppTheme.lemonGreen : AppTheme.lemonYellowDark,
+                foregroundColor: AppTheme.lemonYellowDark,
               ),
-              icon: Icon(
-                appState.isConnected ? Icons.check_circle : Icons.wifi_tethering,
-                size: 14,
-              ),
-              label: Text(appState.isConnected ? 'Connected' : 'Connect',
-                  style: const TextStyle(fontSize: 12)),
+              icon: const Icon(Icons.wifi_tethering, size: 14),
+              label: const Text('Auto-discover', style: TextStyle(fontSize: 11)),
             ),
           ],
         ),
         const SizedBox(height: 8),
-        if (appState.isConnected)
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: AppTheme.lemonGreen.withValues(alpha: 0.12),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: AppTheme.lemonGreen.withValues(alpha: 0.3)),
-            ),
-            child: Row(
-              children: [
-                const StatusDot(isHealthy: true, size: 8),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Text(
-                    'Connected to ${settings.serverHost}:${settings.serverPort}',
-                    style: const TextStyle(fontSize: 12),
-                  ),
-                ),
-              ],
-            ),
-          )
-        else
-          TextFormField(
-            controller: _serverController,
-            decoration: const InputDecoration(
-              hintText: 'localhost:9100',
-              prefixIcon: Icon(Icons.link, size: 18),
-              isDense: true,
-            ),
-            onFieldSubmitted: (_) => _handleConnect(),
+        TextFormField(
+          controller: _serverController,
+          decoration: const InputDecoration(
+            hintText: 'localhost:9100',
+            prefixIcon: Icon(Icons.link, size: 18),
+            isDense: true,
           ),
+          onFieldSubmitted: (_) => _handleConnect(),
+        ),
+        if (appState.discoveryMessage != null && servers.isEmpty) ...[
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Icon(Icons.error_outline, size: 13, color: AppTheme.nodeOrange),
+              const SizedBox(width: 4),
+              Expanded(
+                child: Text(appState.discoveryMessage!,
+                    style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
+              ),
+            ],
+          ),
+        ],
       ],
+    );
+  }
+
+  Widget _serverPickerRow(DiscoveredServer s, String currentKey) {
+    final scheme = Theme.of(context).colorScheme;
+    final host = s.connectHost ?? s.hostname ?? s.ip;
+    final selected = '$host:${s.port}' == currentKey;
+    return InkWell(
+      onTap: () => ref
+          .read(appNotifierProvider.notifier)
+          .connectToServer(host, s.port, useTls: s.scheme == 'https'),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Row(
+          children: [
+            Icon(
+              selected ? Icons.radio_button_checked : Icons.radio_button_unchecked,
+              size: 13,
+              color: selected ? AppTheme.lemonYellowDark : scheme.onSurfaceVariant,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(s.displayName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 12)),
+            ),
+            Text('${s.latencyMs.round()}ms',
+                style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant)),
+          ],
+        ),
+      ),
     );
   }
 
