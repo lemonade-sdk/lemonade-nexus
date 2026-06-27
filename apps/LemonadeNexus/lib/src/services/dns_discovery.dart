@@ -649,35 +649,64 @@ class DnsDiscoveryService {
         : <(String, String)>[('https', ip), ('http', ip)];
 
     for (final (scheme, target) in probeTargets) {
-      final urlString = '$scheme://$target:$port/api/health';
-      final uri = Uri.tryParse(urlString);
+      final uri = Uri.tryParse('$scheme://$target:$port/api/health');
       if (uri == null) continue;
 
-      _dlog('[Discovery]   Probe: $urlString');
+      // Raw HttpClient so we can read the peer (leaf) certificate after the
+      // response. The SDK does strict TLS verification, so it must connect by
+      // the cert's hostname (CN) rather than the bare IP (which fails to verify).
+      final inner = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 5)
+        ..badCertificateCallback = (cert, h, p) => true;
+
+      _dlog('[Discovery]   Probe: $uri');
       final stopwatch = Stopwatch()..start();
       try {
-        final resp = await _httpProbeClient
-            .get(uri)
-            .timeout(const Duration(seconds: 8));
+        final req = await inner.getUrl(uri).timeout(const Duration(seconds: 8));
+        final resp = await req.close().timeout(const Duration(seconds: 8));
         final elapsed = stopwatch.elapsedMicroseconds / 1000.0;
+        // Leaf certificate of the peer (NOT a CA in the chain); its CN is the
+        // server's real FQDN.
+        final certCn =
+            resp.certificate != null ? _cnOf(resp.certificate!.subject) : null;
+        await resp.drain<void>();
         if (resp.statusCode < 200 || resp.statusCode >= 300) {
           _dlog('[Discovery]   Probe: $scheme returned status ${resp.statusCode}');
+          inner.close();
           continue;
         }
-        _dlog('[Discovery]   Probe: $scheme OK — ${elapsed.toStringAsFixed(0)}ms');
+        // The leaf CN is the server's real hostname. Use it as the DISPLAY host
+        // when DNS gave us none (our DoH path can't read the server's per-IP
+        // _config TXT), and as the CONNECT host when it differs from the display
+        // host — the SDK does strict TLS verification, so it must connect by a
+        // cert-matching name, not the bare IP.
+        final certHost = (scheme == 'https' &&
+                certCn != null &&
+                certCn.contains('.') &&
+                certCn != ip &&
+                certCn != target)
+            ? certCn
+            : null;
+        final displayHost = hostname ?? certHost;
+        final connectHost =
+            (certHost != null && certHost != displayHost) ? certHost : null;
+        _dlog('[Discovery]   Probe: $scheme OK — ${elapsed.toStringAsFixed(0)}ms'
+            '${displayHost != null ? ' (host $displayHost)' : ''}');
+        inner.close();
         return DiscoveredServer(
           ip: ip,
           port: port,
           latencyMs: elapsed,
-          hostname: hostname,
+          hostname: displayHost,
           scheme: scheme,
           region: null,
           load: null,
           score: elapsed,
-          connectHost: null,
+          connectHost: connectHost,
         );
       } catch (e) {
         _dlog('[Discovery]   Probe: $scheme failed — $e');
+        inner.close();
         continue;
       }
     }
@@ -695,16 +724,8 @@ class DnsDiscoveryService {
   /// accepts self-signed / mismatched certificates — the Dart analogue of the
   /// Swift `InsecureSessionDelegate` — since discovered servers commonly present
   /// certs that don't match the bare IP. Exposed through the `http` package API.
-  late final http.Client _httpProbeClient = () {
-    final inner = HttpClient();
-    inner.badCertificateCallback = (cert, host, port) => true;
-    inner.connectionTimeout = const Duration(seconds: 5);
-    return _IOHttpClient(inner);
-  }();
-
   /// Releases the underlying HTTP clients. Call when discovery is no longer used.
   void close() {
-    _httpProbeClient.close();
     _doh.close();
   }
 
@@ -721,6 +742,12 @@ class DnsDiscoveryService {
 
   static String _stripTrailingDot(String s) =>
       s.endsWith('.') ? s.substring(0, s.length - 1) : s;
+
+  /// Common Name from an X.509 subject string (e.g. "...CN=host.example...").
+  static String? _cnOf(String subject) {
+    final m = RegExp(r'CN=([^,/]+)').firstMatch(subject);
+    return m?.group(1)?.trim();
+  }
 }
 
 // =============================================================================
@@ -886,60 +913,4 @@ class _DohResolver {
       s.endsWith('.') ? s.substring(0, s.length - 1) : s;
 
   void close() => _client.close();
-}
-
-// =============================================================================
-// IOClient shim
-// =============================================================================
-
-/// Minimal `http.Client` backed by a `dart:io` [HttpClient] so the health-probe
-/// requests can accept self-signed certificates (via the inner client's
-/// `badCertificateCallback`) while still using the `http` package API.
-///
-/// Equivalent to `package:http/io_client.dart`'s `IOClient`, inlined here to
-/// avoid relying on that import path.
-class _IOHttpClient extends http.BaseClient {
-  final HttpClient _inner;
-  _IOHttpClient(this._inner);
-
-  @override
-  Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    final ioRequest = await _inner.openUrl(request.method, request.url);
-
-    request.headers.forEach((name, value) {
-      ioRequest.headers.set(name, value);
-    });
-    ioRequest.followRedirects = request.followRedirects;
-    ioRequest.maxRedirects = request.maxRedirects;
-    ioRequest.persistentConnection = request.persistentConnection;
-
-    final bodyBytes = await request.finalize().toBytes();
-    if (bodyBytes.isNotEmpty) {
-      ioRequest.contentLength = bodyBytes.length;
-      ioRequest.add(bodyBytes);
-    }
-
-    final ioResponse = await ioRequest.close();
-    final headers = <String, String>{};
-    ioResponse.headers.forEach((name, values) {
-      headers[name] = values.join(',');
-    });
-
-    return http.StreamedResponse(
-      ioResponse,
-      ioResponse.statusCode,
-      contentLength:
-          ioResponse.contentLength == -1 ? null : ioResponse.contentLength,
-      request: request,
-      headers: headers,
-      isRedirect: ioResponse.isRedirect,
-      persistentConnection: ioResponse.persistentConnection,
-      reasonPhrase: ioResponse.reasonPhrase,
-    );
-  }
-
-  @override
-  void close() {
-    _inner.close(force: true);
-  }
 }

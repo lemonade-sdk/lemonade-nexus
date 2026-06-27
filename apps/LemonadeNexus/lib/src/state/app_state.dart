@@ -16,6 +16,7 @@ import '../platform/settings_store.dart';
 import '../platform/secure_store.dart';
 import '../platform/app_paths.dart';
 import '../services/dns_discovery.dart';
+import '../services/passkey_manager.dart';
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -261,6 +262,8 @@ class AppState {
   final bool isDiscovering;
   final List<DiscoveredServer> discoveredServers;
   final String? discoveryMessage;
+  final bool hasStoredPasskey;
+  final String? storedPasskeyUserId;
   final String? errorMessage;
   final List<ActivityEntry> activityLog;
   final DateTime? connectedSince;
@@ -284,6 +287,8 @@ class AppState {
     this.isDiscovering = false,
     this.discoveredServers = const [],
     this.discoveryMessage,
+    this.hasStoredPasskey = false,
+    this.storedPasskeyUserId,
     this.errorMessage,
     this.activityLog = const [],
     this.connectedSince,
@@ -308,6 +313,8 @@ class AppState {
     bool? isDiscovering,
     List<DiscoveredServer>? discoveredServers,
     String? discoveryMessage,
+    bool? hasStoredPasskey,
+    String? storedPasskeyUserId,
     String? errorMessage,
     List<ActivityEntry>? activityLog,
     DateTime? connectedSince,
@@ -331,6 +338,8 @@ class AppState {
       isDiscovering: isDiscovering ?? this.isDiscovering,
       discoveredServers: discoveredServers ?? this.discoveredServers,
       discoveryMessage: discoveryMessage ?? this.discoveryMessage,
+      hasStoredPasskey: hasStoredPasskey ?? this.hasStoredPasskey,
+      storedPasskeyUserId: storedPasskeyUserId ?? this.storedPasskeyUserId,
       errorMessage: errorMessage ?? this.errorMessage,
       activityLog: activityLog ?? this.activityLog,
       connectedSince: connectedSince ?? this.connectedSince,
@@ -363,6 +372,7 @@ class AppNotifier extends StateNotifier<AppState> {
   final TunnelController _tunnel;
   final SettingsStore _settingsStore = SettingsStore();
   final SecureStore _secureStore = SecureStore();
+  final PasskeyManager _passkey = PasskeyManager();
 
   AppNotifier(this._sdk, {TunnelController? tunnel})
       : _tunnel = tunnel ?? SdkTunnelController(_sdk),
@@ -371,6 +381,16 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Initialize app state - load preferences
   Future<void> initialize() async {
     await _loadPreferences();
+    await _loadPasskeyState();
+  }
+
+  Future<void> _loadPasskeyState() async {
+    try {
+      state = state.copyWith(
+        hasStoredPasskey: await _passkey.hasCredential(),
+        storedPasskeyUserId: await _passkey.storedUserId(),
+      );
+    } catch (_) {}
   }
 
   /// Load persisted preferences, then attempt to restore a prior session.
@@ -584,6 +604,100 @@ class AppNotifier extends StateNotifier<AppState> {
       addActivity(ActivityLevel.error, 'Registration failed: $e');
       return false;
     }
+  }
+
+  /// Register a passkey (Secure Enclave) and authenticate with it.
+  Future<bool> registerPasskey(String username) async {
+    state = state.copyWith(isLoading: true, errorMessage: null);
+    try {
+      final cred = await _passkey.generateCredential(username);
+      final resp = await _sdk.registerPasskey(
+        userId: username,
+        credentialId: cred.credentialId,
+        publicKeyX: cred.publicKeyX,
+        publicKeyY: cred.publicKeyY,
+      );
+      final token = resp['session_token'] as String?;
+      if (resp['authenticated'] == true) {
+        if (token != null) await _sdk.setSessionToken(token);
+        state = state.copyWith(
+          authState: state.authState.copyWith(
+            isAuthenticated: true,
+            username: username,
+            userId: resp['user_id'] as String?,
+            sessionToken: token,
+          ),
+          hasStoredPasskey: true,
+          storedPasskeyUserId: username,
+          isLoading: false,
+        );
+        if (token != null) {
+          await _secureStore.saveSession(StoredSession(
+              token: token, username: username, userId: resp['user_id'] as String?));
+        }
+        await _loadIdentity();
+        await refreshAllData();
+        addActivity(ActivityLevel.success, 'Registered passkey for $username');
+        return true;
+      }
+      state = state.copyWith(
+        isLoading: false,
+        hasStoredPasskey: true,
+        storedPasskeyUserId: username,
+        errorMessage: resp['error'] as String? ?? 'Passkey registration failed',
+      );
+      return false;
+    } catch (e) {
+      state = state.copyWith(
+          isLoading: false, errorMessage: 'Passkey registration failed: $e');
+      return false;
+    }
+  }
+
+  /// Sign in with the stored passkey (triggers Touch ID).
+  Future<bool> signInWithPasskey() async {
+    state = state.copyWith(isLoading: true, errorMessage: null);
+    try {
+      final assertion = await _passkey.signAssertion('lemonade-nexus.local');
+      final resp = await _sdk.authPasskey({
+        'method': 'passkey',
+        'assertion': assertion.toAssertionJson(),
+      });
+      if (resp.authenticated) {
+        final username = state.storedPasskeyUserId ?? '';
+        if (resp.sessionToken != null) await _sdk.setSessionToken(resp.sessionToken!);
+        state = state.copyWith(
+          authState: state.authState.copyWith(
+            isAuthenticated: true,
+            username: username,
+            userId: resp.userId,
+            sessionToken: resp.sessionToken,
+          ),
+          isLoading: false,
+        );
+        if (resp.sessionToken != null) {
+          await _secureStore.saveSession(StoredSession(
+              token: resp.sessionToken!, username: username, userId: resp.userId));
+        }
+        await _loadIdentity();
+        await refreshAllData();
+        addActivity(ActivityLevel.success, 'Signed in with passkey');
+        return true;
+      }
+      state = state.copyWith(
+          isLoading: false, errorMessage: resp.error ?? 'Passkey sign-in failed');
+      return false;
+    } catch (e) {
+      state = state.copyWith(
+          isLoading: false, errorMessage: 'Passkey sign-in failed: $e');
+      return false;
+    }
+  }
+
+  /// Remove the stored passkey credential.
+  Future<void> deletePasskey() async {
+    await _passkey.deleteCredential();
+    state = state.copyWith(hasStoredPasskey: false);
   }
 
   /// Load identity public key
@@ -951,6 +1065,11 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Clear error message
   void clearError() {
     state = state.copyWith(errorMessage: null);
+  }
+
+  /// Set an error message (e.g. client-side validation).
+  void setError(String message) {
+    state = state.copyWith(errorMessage: message);
   }
 
   @override

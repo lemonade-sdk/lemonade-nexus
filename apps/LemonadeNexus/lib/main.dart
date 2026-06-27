@@ -12,6 +12,18 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
     await windowManager.ensureInitialized();
+    const options = WindowOptions(
+      size: Size(1100, 750),
+      minimumSize: Size(900, 600),
+      center: true,
+      title: 'Lemonade Nexus',
+      titleBarStyle: TitleBarStyle.normal,
+    );
+    await windowManager.waitUntilReadyToShow(options, () async {
+      await windowManager.setTitle('Lemonade Nexus');
+      await windowManager.show();
+      await windowManager.focus();
+    });
   }
   runApp(
     ProviderScope(
