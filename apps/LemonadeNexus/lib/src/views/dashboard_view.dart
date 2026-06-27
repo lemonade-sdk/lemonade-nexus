@@ -1,21 +1,14 @@
 /// @title Dashboard View
-/// @description Main dashboard with connection status and stats.
-///
-/// Matches macOS DashboardView.swift functionality:
-/// - Stats row with peer count, servers, relays, uptime
-/// - Mesh status row with tunnel, peers, bandwidth
-/// - Server health card
-/// - Connection status card
-/// - Network info card
-/// - Trust card
-/// - Recent activity section
+/// @description Connection status and mesh stats, styled like the macOS app.
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
 import '../state/providers.dart';
 import '../state/app_state.dart';
-import '../sdk/models.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class DashboardView extends ConsumerStatefulWidget {
   const DashboardView({super.key});
@@ -30,7 +23,9 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
   @override
   void initState() {
     super.initState();
-    _startAutoRefresh();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      ref.read(appNotifierProvider.notifier).refreshMeshStatus();
+    });
   }
 
   @override
@@ -39,794 +34,288 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
     super.dispose();
   }
 
-  void _startAutoRefresh() {
-    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      ref.read(appNotifierProvider.notifier).refreshMeshStatus();
-    });
-  }
-
   @override
   Widget build(BuildContext context) {
     final appState = ref.watch(appNotifierProvider);
-
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Header
-          _buildHeader(appState),
-
-          const SizedBox(height: 24),
-
-          // Stats Row
-          _buildStatsRow(appState),
-
-          const SizedBox(height: 20),
-
-          // Mesh Status Row
-          _buildMeshStatusRow(appState),
-
-          const SizedBox(height: 20),
-
-          // Health & Connection Cards
           Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: _buildServerHealthCard(appState),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: _buildConnectionStatusCard(appState),
+              const SectionHeader(title: 'Dashboard', icon: Icons.dashboard_outlined),
+              const Spacer(),
+              IconButton(
+                tooltip: 'Refresh',
+                icon: const Icon(Icons.refresh, size: 20),
+                onPressed: () =>
+                    ref.read(appNotifierProvider.notifier).refreshAllData(),
               ),
             ],
           ),
-
           const SizedBox(height: 20),
-
-          // Trust & Network Info
+          _statsRow(appState),
+          const SizedBox(height: 16),
+          _meshRow(appState),
+          const SizedBox(height: 16),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: _buildNetworkInfoCard(appState),
-              ),
+              Expanded(child: _serverHealthCard(appState)),
               const SizedBox(width: 16),
-              Expanded(
-                child: _buildTrustCard(appState),
-              ),
+              Expanded(child: _connectionCard(appState)),
             ],
           ),
-
+          const SizedBox(height: 16),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(child: _networkCard(appState)),
+              const SizedBox(width: 16),
+              Expanded(child: _trustCard(appState)),
+            ],
+          ),
           const SizedBox(height: 24),
-
-          // Recent Activity
-          _buildActivitySection(appState),
+          const SectionHeader(title: 'Recent Activity', icon: Icons.list_alt),
+          const SizedBox(height: 12),
+          _activityCard(appState),
         ],
       ),
     );
   }
 
-  Widget _buildHeader(AppState appState) {
-    return Row(
-      children: [
-        const Icon(
-          Icons.dashboard_outlined,
-          color: Color(0xFFE9C46A),
-          size: 24,
-        ),
-        const SizedBox(width: 12),
-        const Text(
-          'Dashboard',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        const Spacer(),
-        IconButton(
-          icon: const Icon(Icons.refresh),
-          color: const Color(0xFFA0AEC0),
-          onPressed: () {
-            ref.read(appNotifierProvider.notifier).refreshAllData();
-          },
-          tooltip: 'Refresh All Data',
-        ),
-      ],
-    );
-  }
-
-  Widget _buildStatsRow(AppState appState) {
+  Widget _statsRow(AppState appState) {
     return Row(
       children: [
         Expanded(
-          child: _StatCard(
-            icon: Icons.people,
+          child: StatCard(
+            icon: Icons.people_outline,
             title: 'Peer Count',
             value: '${appState.stats?.peerCount ?? 0}',
-            color: const Color(0xFFE9C46A),
           ),
         ),
         const SizedBox(width: 16),
         Expanded(
-          child: _StatCard(
-            icon: Icons.dns,
+          child: StatCard(
+            icon: Icons.dns_outlined,
             title: 'Servers',
             value: '${appState.servers.length}',
-            color: Colors.blue,
+            color: AppTheme.lemonGreen,
           ),
         ),
         const SizedBox(width: 16),
         Expanded(
-          child: _StatCard(
+          child: StatCard(
             icon: Icons.wifi_tethering,
             title: 'Relays',
             value: '${appState.relays.length}',
-            color: const Color(0xFF2A9D8F),
+            color: AppTheme.nodeOrange,
           ),
         ),
         const SizedBox(width: 16),
         Expanded(
-          child: _StatCard(
+          child: StatCard(
             icon: Icons.access_time,
             title: 'Uptime',
-            value: _formatUptime(appState.connectedSince),
-            color: Colors.orange,
+            value: _uptime(appState.connectedSince),
+            color: AppTheme.lemonGreen,
           ),
         ),
       ],
     );
   }
 
-  String _formatUptime(DateTime? since) {
-    if (since == null) return '--';
-    final interval = DateTime.now().difference(since);
-    final hours = interval.inHours;
-    final minutes = interval.inMinutes % 60;
-    if (hours > 0) {
-      return '${hours}h ${minutes}m';
-    }
-    return '${minutes}m';
-  }
-
-  Widget _buildMeshStatusRow(AppState appState) {
+  Widget _meshRow(AppState appState) {
+    final mesh = appState.meshStatus;
     return Row(
-      children: [
-        // Tunnel status card
-        Expanded(
-          child: _buildCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildCardHeader('Tunnel', Icons.shield),
-                const Divider(color: Color(0xFF2D3748)),
-                _buildLabeledContent(
-                  'Status',
-                  _buildBadge(
-                    text: appState.isTunnelUp ? 'UP' : 'DOWN',
-                    color: appState.isTunnelUp ? Colors.green : Colors.grey,
-                  ),
-                ),
-                _buildLabeledContent(
-                  'Mesh',
-                  _buildBadge(
-                    text: appState.isMeshEnabled ? 'ENABLED' : 'DISABLED',
-                    color: appState.isMeshEnabled ? const Color(0xFF2A9D8F) : Colors.grey,
-                  ),
-                ),
-                if (appState.meshStatus?.tunnelIp != null &&
-                    appState.meshStatus!.tunnelIp!.isNotEmpty)
-                  _buildLabeledContent(
-                    'Mesh IP',
-                    Text(
-                      appState.meshStatus!.tunnelIp!,
-                      style: const TextStyle(
-                        color: Color(0xFFA0AEC0),
-                        fontSize: 13,
-                        fontFamily: 'monospace',
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(width: 16),
-
-        // Mesh peers card
-        Expanded(
-          child: _buildCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildCardHeader('Mesh Peers', Icons.connect_without_contact),
-                const Divider(color: Color(0xFF2D3748)),
-                _buildLabeledContent(
-                  'Online',
-                  Text(
-                    '${appState.meshStatus?.onlineCount ?? 0} / ${appState.meshStatus?.peerCount ?? 0}',
-                    style: const TextStyle(
-                      color: Color(0xFFA0AEC0),
-                      fontSize: 13,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-                _buildLabeledContent(
-                  'Direct',
-                  Text(
-                    '${appState.meshPeers.where((p) => (p.endpoint ?? '').isNotEmpty).length}',
-                    style: const TextStyle(
-                      color: Color(0xFF718096),
-                      fontSize: 13,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-                _buildLabeledContent(
-                  'Relayed',
-                  Text(
-                    '${appState.meshPeers.where((p) => (p.endpoint ?? '').isEmpty && (p.relayEndpoint ?? '').isNotEmpty).length}',
-                    style: const TextStyle(
-                      color: Color(0xFF718096),
-                      fontSize: 13,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(width: 16),
-
-        // Bandwidth card
-        Expanded(
-          child: _buildCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _buildCardHeader('Bandwidth', Icons.swap_horiz),
-                const Divider(color: Color(0xFF2D3748)),
-                _buildLabeledContent(
-                  'Received',
-                  Text(
-                    _formatBytes(appState.meshStatus?.totalRxBytes ?? 0),
-                    style: const TextStyle(
-                      color: Colors.blue,
-                      fontSize: 13,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-                _buildLabeledContent(
-                  'Sent',
-                  Text(
-                    _formatBytes(appState.meshStatus?.totalTxBytes ?? 0),
-                    style: const TextStyle(
-                      color: Colors.orange,
-                      fontSize: 13,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-                _buildLabeledContent(
-                  'Total',
-                  Text(
-                    _formatBytes(
-                      (appState.meshStatus?.totalRxBytes ?? 0) +
-                          (appState.meshStatus?.totalTxBytes ?? 0),
-                    ),
-                    style: const TextStyle(
-                      color: Color(0xFF718096),
-                      fontSize: 13,
-                      fontFamily: 'monospace',
-                    ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildServerHealthCard(AppState appState) {
-    return _buildCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Text(
-                'Server Health',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const Spacer(),
-              _buildStatusDot(appState.isServerHealthy),
-            ],
-          ),
-          const Divider(color: Color(0xFF2D3748)),
-          if (appState.healthStatus != null) ...[
-            _buildLabeledContent(
-              'Status',
-              _buildBadge(
-                text: appState.healthStatus!.status.toUpperCase(),
-                color: appState.isServerHealthy ? Colors.green : Colors.red,
-              ),
-            ),
-            _buildLabeledContent(
-              'Version',
-              Text(
-                appState.healthStatus!.version,
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-            _buildLabeledContent(
-              'Uptime',
-              Text(
-                '${appState.healthStatus!.uptime}s',
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          ] else ...[
-            Row(
-              children: [
-                Icon(
-                  Icons.warning_amber,
-                  size: 16,
-                  color: Colors.orange.shade400,
-                ),
-                const SizedBox(width: 8),
-                const Text(
-                  'Unable to reach server',
-                  style: TextStyle(
-                    color: Color(0xFFA0AEC0),
-                    fontSize: 13,
-                  ),
-                ),
-              ],
-            ),
-          ],
-          const SizedBox(height: 8),
-          _buildLabeledContent(
-            'URL',
-            Text(
-              '${appState.serverHost}:${appState.serverPort}',
-              style: const TextStyle(
-                color: Color(0xFF718096),
-                fontSize: 11,
-                fontFamily: 'monospace',
-              ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildConnectionStatusCard(AppState appState) {
-    return _buildCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              const Text(
-                'Connection',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-              const Spacer(),
-              _buildBadge(
-                text: appState.isAuthenticated ? 'ACTIVE' : 'INACTIVE',
-                color: appState.isAuthenticated ? const Color(0xFF2A9D8F) : Colors.grey,
-              ),
-            ],
-          ),
-          const Divider(color: Color(0xFF2D3748)),
-          if (appState.tunnelIP != null)
-            _buildLabeledContent(
-              'Tunnel IP',
-              Text(
-                appState.tunnelIP!,
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          if (appState.userId != null)
-            _buildLabeledContent(
-              'User ID',
-              Text(
-                appState.userId!,
-                style: const TextStyle(
-                  color: Color(0xFF718096),
-                  fontSize: 11,
-                  fontFamily: 'monospace',
-                ),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-          if (appState.publicKeyBase64 != null)
-            _buildLabeledContent(
-              'Public Key',
-              Text(
-                '${appState.publicKeyBase64!.substring(0, appState.publicKeyBase64!.length.clamp(0, 20))}...',
-                style: const TextStyle(
-                  color: Color(0xFF718096),
-                  fontSize: 11,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          if (appState.connectedSince != null)
-            _buildLabeledContent(
-              'Connected Since',
-              Text(
-                _formatRelativeTime(appState.connectedSince!),
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 12,
-                ),
-              ),
-            ),
-          if (appState.isMeshEnabled) ...[
-            const Divider(color: Color(0xFF2D3748)),
-            _buildLabeledContent(
-              'Mesh Peers',
-              Text(
-                '${appState.meshStatus?.onlineCount ?? 0}/${appState.meshStatus?.peerCount ?? 0} online',
-                style: const TextStyle(
-                  color: Color(0xFF718096),
-                  fontSize: 12,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildNetworkInfoCard(AppState appState) {
-    return _buildCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Text(
-                'Network',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          const Divider(color: Color(0xFF2D3748)),
-          if (appState.stats != null) ...[
-            _buildLabeledContent(
-              'Service',
-              Text(
-                appState.stats!.service,
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-            _buildLabeledContent(
-              'Peer Count',
-              Text(
-                '${appState.stats!.peerCount}',
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-            _buildLabeledContent(
-              'Private API',
-              _buildBadge(
-                text: appState.stats!.privateApiEnabled ? 'ENABLED' : 'DISABLED',
-                color: appState.stats!.privateApiEnabled
-                    ? const Color(0xFF2A9D8F)
-                    : Colors.grey,
-              ),
-            ),
-          ] else
-            const Text(
-              'No stats available',
-              style: TextStyle(
-                color: Color(0xFF718096),
-                fontSize: 13,
-              ),
-            ),
-          const SizedBox(height: 8),
-          _buildLabeledContent(
-            'Mesh Servers',
-            Text(
-              '${appState.servers.where((s) => s.available).length}/${appState.servers.length} healthy',
-              style: const TextStyle(
-                color: Color(0xFFA0AEC0),
-                fontSize: 12,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildTrustCard(AppState appState) {
-    return _buildCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Row(
-            children: [
-              Text(
-                'Trust Status',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
-          ),
-          const Divider(color: Color(0xFF2D3748)),
-          if (appState.trustStatus != null) ...[
-            _buildLabeledContent(
-              'Our Tier',
-              _buildBadge(
-                text: 'TIER ${appState.trustStatus!.trustTier}',
-                color: appState.trustStatus!.trustTier == '1'
-                    ? Colors.green
-                    : Colors.orange,
-              ),
-            ),
-            _buildLabeledContent(
-              'Trusted Peers',
-              Text(
-                '${appState.trustStatus!.peerCount}',
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                ),
-              ),
-            ),
-          ] else
-            const Text(
-              'Trust data unavailable',
-              style: TextStyle(
-                color: Color(0xFF718096),
-                fontSize: 13,
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildActivitySection(AppState appState) {
-    return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            const Icon(
-              Icons.list_alt,
-              color: Color(0xFFE9C46A),
-              size: 18,
-            ),
-            const SizedBox(width: 8),
-            const Text(
-              'Recent Activity',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
+        Expanded(
+          child: _card('Tunnel', Icons.shield_outlined, [
+            _kv('Status', LemonBadge(
+              text: appState.isTunnelUp ? 'UP' : 'DOWN',
+              color: appState.isTunnelUp ? AppTheme.lemonGreen : Colors.grey,
+            )),
+            _kv('Mesh', LemonBadge(
+              text: appState.isMeshEnabled ? 'ENABLED' : 'DISABLED',
+              color: appState.isMeshEnabled ? AppTheme.lemonGreen : Colors.grey,
+            )),
+            if ((mesh?.tunnelIp ?? '').isNotEmpty) _kv('Mesh IP', _mono(mesh!.tunnelIp!)),
+          ]),
         ),
-        const SizedBox(height: 12),
-        if (appState.activityLog.isEmpty)
-          _buildCard(
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Center(
-                child: Text(
-                  'No recent activity',
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.4),
-                    fontSize: 13,
-                  ),
-                ),
-              ),
-            ),
-          )
-        else
-          _buildCard(
-            child: Column(
-              children: appState.activityLog.take(10).map((entry) {
-                return _buildActivityRow(entry);
-              }).toList(),
-            ),
-          ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: _card('Mesh Peers', Icons.hub_outlined, [
+            _kv('Online', _mono('${mesh?.onlineCount ?? 0} / ${mesh?.peerCount ?? 0}')),
+            _kv('Direct', _mono('${appState.meshPeers.where((p) => (p.endpoint ?? '').isNotEmpty).length}')),
+            _kv('Relayed', _mono('${appState.meshPeers.where((p) => (p.endpoint ?? '').isEmpty && (p.relayEndpoint ?? '').isNotEmpty).length}')),
+          ]),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: _card('Bandwidth', Icons.swap_horiz, [
+            _kv('Received', _mono(_bytes(mesh?.totalRxBytes ?? 0))),
+            _kv('Sent', _mono(_bytes(mesh?.totalTxBytes ?? 0))),
+            _kv('Total', _mono(_bytes((mesh?.totalRxBytes ?? 0) + (mesh?.totalTxBytes ?? 0)))),
+          ]),
+        ),
       ],
     );
   }
 
-  Widget _buildActivityRow(ActivityEntry entry) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        border: Border(
-          bottom: BorderSide(
-            color: const Color(0xFF2D3748),
-            width: 1,
+  Widget _serverHealthCard(AppState appState) {
+    final h = appState.healthStatus;
+    return _card('Server Health', Icons.favorite_outline, [
+      if (h != null) ...[
+        _kv('Status', LemonBadge(
+          text: h.status.toUpperCase(),
+          color: appState.isServerHealthy ? AppTheme.lemonGreen : AppTheme.errorColor,
+        )),
+        _kv('Version', _mono(h.version)),
+        _kv('Uptime', _mono('${h.uptime}s')),
+      ] else
+        _kv('', Text('Unable to reach server',
+            style: TextStyle(fontSize: 13, color: AppTheme.nodeOrange))),
+      _kv('URL', _mono('${appState.serverHost}:${appState.serverPort}', size: 11)),
+    ], trailing: StatusDot(isHealthy: appState.isServerHealthy, size: 8));
+  }
+
+  Widget _connectionCard(AppState appState) {
+    return _card('Connection', Icons.cable_outlined, [
+      if (appState.tunnelIP != null) _kv('Tunnel IP', _mono(appState.tunnelIP!)),
+      if (appState.userId != null) _kv('User ID', _mono(appState.userId!, size: 11)),
+      if (appState.publicKeyBase64 != null)
+        _kv('Public Key', _mono('${appState.publicKeyBase64!.substring(0, appState.publicKeyBase64!.length.clamp(0, 20))}…', size: 11)),
+      if (appState.connectedSince != null)
+        _kv('Since', Text(_rel(appState.connectedSince!),
+            style: const TextStyle(fontSize: 12))),
+    ], trailing: LemonBadge(
+      text: appState.isAuthenticated ? 'ACTIVE' : 'INACTIVE',
+      color: appState.isAuthenticated ? AppTheme.lemonGreen : Colors.grey,
+    ));
+  }
+
+  Widget _networkCard(AppState appState) {
+    final s = appState.stats;
+    return _card('Network', Icons.lan_outlined, [
+      if (s != null) ...[
+        _kv('Service', _mono(s.service)),
+        _kv('Peers', _mono('${s.peerCount}')),
+        _kv('Private API', LemonBadge(
+          text: s.privateApiEnabled ? 'ENABLED' : 'DISABLED',
+          color: s.privateApiEnabled ? AppTheme.lemonGreen : Colors.grey,
+        )),
+      ] else
+        _kv('', const Text('No stats available', style: TextStyle(fontSize: 13))),
+      _kv('Servers', Text(
+        '${appState.servers.where((s) => s.available).length}/${appState.servers.length} healthy',
+        style: const TextStyle(fontSize: 12))),
+    ]);
+  }
+
+  Widget _trustCard(AppState appState) {
+    final t = appState.trustStatus;
+    return _card('Trust Status', Icons.verified_user_outlined, [
+      if (t != null) ...[
+        _kv('Our Tier', LemonBadge(
+          text: 'TIER ${t.trustTier}',
+          color: t.trustTier == '1' ? AppTheme.lemonGreen : AppTheme.nodeOrange,
+        )),
+        _kv('Trusted Peers', _mono('${t.peerCount}')),
+      ] else
+        _kv('', const Text('Trust data unavailable', style: TextStyle(fontSize: 13))),
+    ]);
+  }
+
+  Widget _activityCard(AppState appState) {
+    final scheme = Theme.of(context).colorScheme;
+    if (appState.activityLog.isEmpty) {
+      return AppCard(
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Center(
+            child: Text('No recent activity',
+                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
           ),
         ),
-      ),
-      child: Row(
+      );
+    }
+    final entries = appState.activityLog.take(10).toList();
+    return AppCard(
+      padding: EdgeInsets.zero,
+      child: Column(
         children: [
-          Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(
-              color: _getActivityColor(entry.level),
-              shape: BoxShape.circle,
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              entry.message,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 12,
+          for (var i = 0; i < entries.length; i++)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              decoration: BoxDecoration(
+                border: i == entries.length - 1
+                    ? null
+                    : Border(bottom: BorderSide(color: scheme.outline, width: 0.5)),
               ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+              child: Row(
+                children: [
+                  Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      color: _activityColor(entries[i].level),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(entries[i].message,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 12)),
+                  ),
+                  Text(_rel(entries[i].timestamp),
+                      style: TextStyle(fontSize: 10, color: scheme.onSurfaceVariant)),
+                ],
+              ),
             ),
-          ),
-          Text(
-            _formatRelativeTime(entry.timestamp),
-            style: const TextStyle(
-              color: Color(0xFF718096),
-              fontSize: 10,
-            ),
-          ),
         ],
       ),
     );
   }
 
-  Color _getActivityColor(ActivityLevel level) {
-    switch (level) {
-      case ActivityLevel.info:
-        return Colors.blue;
-      case ActivityLevel.success:
-        return Colors.green;
-      case ActivityLevel.warning:
-        return Colors.orange;
-      case ActivityLevel.error:
-        return Colors.red;
-    }
-  }
+  // ---- helpers --------------------------------------------------------------
 
-  String _formatRelativeTime(DateTime time) {
-    final diff = DateTime.now().difference(time);
-    if (diff.inSeconds < 60) {
-      return '${diff.inSeconds}s ago';
-    } else if (diff.inMinutes < 60) {
-      return '${diff.inMinutes}m ago';
-    } else if (diff.inHours < 24) {
-      return '${diff.inHours}h ago';
-    } else {
-      return '${diff.inDays}d ago';
-    }
-  }
-
-  String _formatBytes(int bytes) {
-    final kb = bytes / 1024;
-    final mb = kb / 1024;
-    final gb = mb / 1024;
-
-    if (gb >= 1) {
-      return '${gb.toStringAsFixed(1)} GB';
-    } else if (mb >= 1) {
-      return '${mb.toStringAsFixed(1)} MB';
-    } else if (kb >= 1) {
-      return '${kb.toStringAsFixed(0)} KB';
-    } else {
-      return '$bytes B';
-    }
-  }
-
-  Widget _buildCard({required Widget child}) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A2E).withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: const Color(0xFF2D3748),
-          width: 1,
-        ),
-      ),
-      child: child,
-    );
-  }
-
-  Widget _buildCardHeader(String title, IconData icon) {
-    return Row(
-      children: [
-        Icon(
-          icon,
-          color: const Color(0xFFE9C46A),
-          size: 16,
-        ),
-        const SizedBox(width: 8),
-        Text(
-          title,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 14,
-            fontWeight: FontWeight.bold,
+  Widget _card(String title, IconData icon, List<Widget> rows, {Widget? trailing}) {
+    final scheme = Theme.of(context).colorScheme;
+    return AppCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(icon, size: 16, color: AppTheme.lemonYellowDark),
+              const SizedBox(width: 8),
+              Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+              const Spacer(),
+              if (trailing != null) trailing,
+            ],
           ),
-        ),
-      ],
+          Divider(height: 16, color: scheme.outline),
+          ...rows,
+        ],
+      ),
     );
   }
 
-  Widget _buildLabeledContent(String label, Widget value) {
+  Widget _kv(String label, Widget value) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 80,
-            child: Text(
-              label,
-              style: const TextStyle(
-                color: Color(0xFF718096),
-                fontSize: 12,
-              ),
-            ),
+            width: 84,
+            child: Text(label,
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
           ),
           Expanded(child: value),
         ],
@@ -834,100 +323,48 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
     );
   }
 
-  Widget _buildBadge({required String text, required Color color}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        text,
+  Widget _mono(String text, {double size = 13}) {
+    final scheme = Theme.of(context).colorScheme;
+    return Text(text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
         style: TextStyle(
-          color: color,
-          fontSize: 10,
-          fontWeight: FontWeight.bold,
-        ),
-      ),
-    );
+            fontSize: size, fontFamily: 'monospace', color: scheme.onSurface));
   }
 
-  Widget _buildStatusDot(bool isHealthy) {
-    return Container(
-      width: 8,
-      height: 8,
-      decoration: BoxDecoration(
-        color: isHealthy ? Colors.green : Colors.red,
-        shape: BoxShape.circle,
-      ),
-    );
+  Color _activityColor(ActivityLevel level) {
+    switch (level) {
+      case ActivityLevel.info:
+        return AppTheme.infoColor;
+      case ActivityLevel.success:
+        return AppTheme.lemonGreen;
+      case ActivityLevel.warning:
+        return AppTheme.nodeOrange;
+      case ActivityLevel.error:
+        return AppTheme.errorColor;
+    }
   }
-}
 
-/// Small stat card used in the top stats row.
-class _StatCard extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String value;
-  final Color color;
+  String _uptime(DateTime? since) {
+    if (since == null) return '--';
+    final d = DateTime.now().difference(since);
+    final h = d.inHours, m = d.inMinutes % 60;
+    return h > 0 ? '${h}h ${m}m' : '${m}m';
+  }
 
-  const _StatCard({
-    required this.icon,
-    required this.title,
-    required this.value,
-    required this.color,
-  });
+  String _rel(DateTime time) {
+    final d = DateTime.now().difference(time);
+    if (d.inSeconds < 60) return '${d.inSeconds}s ago';
+    if (d.inMinutes < 60) return '${d.inMinutes}m ago';
+    if (d.inHours < 24) return '${d.inHours}h ago';
+    return '${d.inDays}d ago';
+  }
 
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(14),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A2E).withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF2D3748)),
-      ),
-      child: Row(
-        children: [
-          Container(
-            padding: const EdgeInsets.all(8),
-            decoration: BoxDecoration(
-              color: color.withOpacity(0.15),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Icon(icon, color: color, size: 18),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: TextStyle(
-                    color: Colors.white.withOpacity(0.6),
-                    fontSize: 11,
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  value,
-                  style: TextStyle(
-                    color: color,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    fontFamily: 'monospace',
-                  ),
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
+  String _bytes(int bytes) {
+    final kb = bytes / 1024, mb = kb / 1024, gb = mb / 1024;
+    if (gb >= 1) return '${gb.toStringAsFixed(1)} GB';
+    if (mb >= 1) return '${mb.toStringAsFixed(1)} MB';
+    if (kb >= 1) return '${kb.toStringAsFixed(0)} KB';
+    return '$bytes B';
   }
 }

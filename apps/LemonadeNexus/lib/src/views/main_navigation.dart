@@ -1,322 +1,49 @@
 /// @title Main Navigation
-/// @description Main navigation shell with sidebar and content area.
-///
-/// Provides the primary navigation structure for the authenticated app.
+/// @description Sidebar + detail shell, styled like the macOS NavigationSplitView.
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+
 import '../state/app_state.dart';
 import '../state/providers.dart';
-import '../views/dashboard_view.dart';
-import '../views/tunnel_control_view.dart';
-import '../views/peers_view.dart';
-import '../views/network_monitor_view.dart';
-import '../views/tree_browser_view.dart';
-import '../views/servers_view.dart';
-import '../views/certificates_view.dart';
-import '../views/settings_view.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
+import 'dashboard_view.dart';
+import 'tunnel_control_view.dart';
+import 'peers_view.dart';
+import 'network_monitor_view.dart';
+import 'tree_browser_view.dart';
+import 'servers_view.dart';
+import 'certificates_view.dart';
+import 'settings_view.dart';
 
-class MainNavigation extends ConsumerStatefulWidget {
+class MainNavigation extends ConsumerWidget {
   const MainNavigation({super.key});
 
   @override
-  ConsumerState<MainNavigation> createState() => _MainNavigationState();
-}
-
-class _MainNavigationState extends ConsumerState<MainNavigation> {
-  bool _sidebarCollapsed = false;
-
-  @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final appState = ref.watch(appNotifierProvider);
-    final selectedView = appState.selectedSidebarItem;
+    final scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
       body: Row(
         children: [
-          // Sidebar
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 200),
-            width: _sidebarCollapsed ? 60 : 240,
+          Container(
+            width: 220,
             decoration: BoxDecoration(
-              color: const Color(0xFF1A1A2E).withOpacity(0.95),
-              border: Border(
-                right: BorderSide(
-                  color: const Color(0xFF2D3748),
-                  width: 1,
-                ),
-              ),
+              color: scheme.surface,
+              border: Border(right: BorderSide(color: scheme.outline, width: 0.5)),
             ),
-            child: _buildSidebar(appState),
+            child: _Sidebar(appState: appState),
           ),
-
-          // Main content area
-          Expanded(
-            child: Container(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    const Color(0xFF1A1A2E),
-                    const Color(0xFF16213E),
-                    const Color(0xFF0F3460),
-                  ],
-                ),
-              ),
-              child: SafeArea(
-                child: _buildContentView(selectedView),
-              ),
-            ),
-          ),
+          Expanded(child: _content(appState.selectedSidebarItem)),
         ],
       ),
     );
   }
 
-  Widget _buildSidebar(AppState appState) {
-    return Column(
-      children: [
-        // Logo area
-        _buildLogo(),
-
-        const SizedBox(height: 16),
-
-        // Navigation items
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.symmetric(vertical: 8),
-            children: SidebarItem.values.map((item) {
-              return _buildSidebarItem(item, appState);
-            }).toList(),
-          ),
-        ),
-
-        // Bottom actions
-        _buildBottomActions(),
-      ],
-    );
-  }
-
-  Widget _buildLogo() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 32,
-            height: 32,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                Container(
-                  width: 26,
-                  height: 18,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFE9C46A),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: const BoxDecoration(
-                    color: Color(0xFF2A9D8F),
-                    shape: BoxShape.circle,
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (!_sidebarCollapsed) ...[
-            const SizedBox(width: 12),
-            const Text(
-              'Nexus',
-              style: TextStyle(
-                color: Color(0xFFE9C46A),
-                fontSize: 18,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSidebarItem(SidebarItem item, AppState appState) {
-    final isSelected = appState.selectedSidebarItem == item;
-
-    return ListTile(
-      selected: isSelected,
-      selectedTileColor: const Color(0xFFE9C46A).withOpacity(0.2),
-      leading: Icon(
-        item.icon,
-        color: isSelected
-            ? const Color(0xFFE9C46A)
-            : Colors.white.withOpacity(0.6),
-        size: 22,
-      ),
-      title: _sidebarCollapsed
-          ? null
-          : Text(
-              item.label,
-              style: TextStyle(
-                color: isSelected
-                    ? const Color(0xFFE9C46A)
-                    : Colors.white.withOpacity(0.8),
-                fontSize: 14,
-                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-              ),
-            ),
-      onTap: () {
-        ref.read(appNotifierProvider.notifier).setSelectedSidebarItem(item);
-      },
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(8),
-      ),
-      contentPadding: _sidebarCollapsed
-          ? const EdgeInsets.symmetric(horizontal: 16, vertical: 4)
-          : const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-    );
-  }
-
-  Widget _buildBottomActions() {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        border: Border(
-          top: BorderSide(
-            color: const Color(0xFF2D3748),
-            width: 1,
-          ),
-        ),
-      ),
-      child: Column(
-        children: [
-          // Connection status indicator
-          Consumer(
-            builder: (context, ref, child) {
-              final appState = ref.watch(appNotifierProvider);
-              return Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                decoration: BoxDecoration(
-                  color: appState.isConnected
-                      ? Colors.green.withOpacity(0.1)
-                      : Colors.grey.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Row(
-                  children: [
-                    Container(
-                      width: 8,
-                      height: 8,
-                      decoration: BoxDecoration(
-                        color: appState.isConnected ? Colors.green : Colors.grey,
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    if (!_sidebarCollapsed) ...[
-                      const SizedBox(width: 8),
-                      Text(
-                        appState.isConnected ? 'Connected' : 'Disconnected',
-                        style: TextStyle(
-                          color: appState.isConnected
-                              ? Colors.green
-                              : Colors.grey,
-                          fontSize: 12,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              );
-            },
-          ),
-
-          const SizedBox(height: 8),
-
-          // Collapse/expand button
-          IconButton(
-            icon: Icon(
-              _sidebarCollapsed
-                  ? Icons.chevron_right
-                  : Icons.chevron_left,
-              color: Colors.white.withOpacity(0.6),
-            ),
-            onPressed: () {
-              setState(() {
-                _sidebarCollapsed = !_sidebarCollapsed;
-              });
-            },
-            tooltip: _sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar',
-          ),
-
-          // Settings
-          ListTile(
-            selected: false,
-            leading: Icon(
-              Icons.logout,
-              color: Colors.white.withOpacity(0.6),
-              size: 22,
-            ),
-            title: _sidebarCollapsed
-                ? null
-                : const Text(
-                    'Sign Out',
-                    style: TextStyle(
-                      color: Color(0xFFE9C46A),
-                      fontSize: 14,
-                    ),
-                  ),
-            onTap: () {
-              _showSignOutConfirmation();
-            },
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showSignOutConfirmation() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A2E),
-        title: const Text(
-          'Sign Out',
-          style: TextStyle(color: Colors.white),
-        ),
-        content: const Text(
-          'Are you sure you want to sign out?',
-          style: TextStyle(color: Color(0xFFA0AEC0)),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text(
-              'Cancel',
-              style: TextStyle(color: Color(0xFFA0AEC0)),
-            ),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              ref.read(appNotifierProvider.notifier).signOut();
-              Navigator.pop(context);
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red,
-              foregroundColor: Colors.white,
-            ),
-            child: const Text('Sign Out'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildContentView(SidebarItem selectedView) {
-    switch (selectedView) {
+  Widget _content(SidebarItem item) {
+    switch (item) {
       case SidebarItem.dashboard:
         return const DashboardView();
       case SidebarItem.tunnel:
@@ -332,9 +59,138 @@ class _MainNavigationState extends ConsumerState<MainNavigation> {
       case SidebarItem.certificates:
         return const CertificatesView();
       case SidebarItem.relays:
-        return const ServersView(); // Reuse servers view for relays
+        return const ServersView();
       case SidebarItem.settings:
         return const SettingsView();
     }
+  }
+}
+
+class _Sidebar extends ConsumerWidget {
+  final AppState appState;
+  const _Sidebar({required this.appState});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        const SizedBox(height: 12),
+        _header(scheme),
+        Divider(height: 16, color: scheme.outline),
+        Expanded(
+          child: ListView(
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            children: SidebarItem.values
+                .map((item) => _item(context, ref, item))
+                .toList(),
+          ),
+        ),
+        Divider(height: 1, color: scheme.outline),
+        _footer(context, ref, scheme),
+      ],
+    );
+  }
+
+  Widget _header(ColorScheme scheme) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Row(
+        children: [
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: AppTheme.lemonYellow.withValues(alpha: 0.2),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(Icons.shield_outlined, color: AppTheme.lemonYellowDark, size: 18),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Lemonade Nexus',
+                    style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Row(
+                  children: [
+                    StatusDot(isHealthy: appState.isServerHealthy, size: 6),
+                    const SizedBox(width: 4),
+                    Text(
+                      appState.isServerHealthy ? 'Connected' : 'Disconnected',
+                      style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _item(BuildContext context, WidgetRef ref, SidebarItem item) {
+    final scheme = Theme.of(context).colorScheme;
+    final selected = appState.selectedSidebarItem == item;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Material(
+        color: selected ? AppTheme.lemonYellow.withValues(alpha: 0.18) : Colors.transparent,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(6),
+          onTap: () =>
+              ref.read(appNotifierProvider.notifier).setSelectedSidebarItem(item),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+            child: Row(
+              children: [
+                Icon(item.icon,
+                    size: 18,
+                    color: selected ? AppTheme.lemonYellowDark : scheme.onSurfaceVariant),
+                const SizedBox(width: 10),
+                Text(
+                  item.label,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                    color: selected ? scheme.onSurface : scheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _footer(BuildContext context, WidgetRef ref, ColorScheme scheme) {
+    final username = appState.username;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      child: Row(
+        children: [
+          Icon(Icons.account_circle_outlined, size: 18, color: scheme.onSurfaceVariant),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              (username == null || username.isEmpty) ? 'User' : username,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Sign Out',
+            visualDensity: VisualDensity.compact,
+            icon: Icon(Icons.logout, size: 16, color: scheme.onSurfaceVariant),
+            onPressed: () => ref.read(appNotifierProvider.notifier).signOut(),
+          ),
+        ],
+      ),
+    );
   }
 }
