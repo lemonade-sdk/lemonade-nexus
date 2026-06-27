@@ -12,6 +12,8 @@ import '../state/app_state.dart';
 import '../sdk/models.dart';
 import '../views/admin_console/server_admin_provider.dart';
 import '../views/admin_console/admin_console_widget.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class ServersView extends ConsumerStatefulWidget {
   const ServersView({super.key});
@@ -64,6 +66,7 @@ class _ServersViewState extends ConsumerState<ServersView> {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final appState = ref.watch(appNotifierProvider);
     final servers = appState.servers;
     final adminServers = ref.watch(adminServersProvider);
@@ -76,26 +79,23 @@ class _ServersViewState extends ConsumerState<ServersView> {
         Expanded(
           flex: 1,
           child: Container(
-            decoration: const BoxDecoration(
-              color: Color(0xFF1A1A2E),
-              border: Border(right: BorderSide(color: Color(0xFF2D3748), width: 1)),
+            decoration: BoxDecoration(
+              border: Border(right: BorderSide(color: scheme.outline, width: 1)),
             ),
             child: Column(
               children: [
                 // Header
                 Padding(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(24),
                   child: Row(
                     children: [
-                      const Icon(Icons.dns, color: Color(0xFFE9C46A), size: 20),
-                      const SizedBox(width: 8),
-                      const Text('Mesh Servers', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                      const SectionHeader(title: 'Mesh Servers', icon: Icons.dns),
                       const Spacer(),
                       _buildHealthBadge(healthyCount, servers.length),
                       const SizedBox(width: 8),
                       IconButton(
+                        tooltip: 'Refresh',
                         icon: const Icon(Icons.refresh, size: 18),
-                        color: const Color(0xFFA0AEC0),
                         onPressed: _loadServers,
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(),
@@ -110,7 +110,7 @@ class _ServersViewState extends ConsumerState<ServersView> {
                       : servers.isEmpty
                           ? _buildEmptyState()
                           : ListView.builder(
-                              padding: const EdgeInsets.all(8),
+                              padding: const EdgeInsets.all(24),
                               itemCount: servers.length,
                               itemBuilder: (context, index) => _buildServerCard(servers[index]),
                             ),
@@ -131,58 +131,39 @@ class _ServersViewState extends ConsumerState<ServersView> {
   }
 
   Widget _buildHealthBadge(int healthy, int total) {
+    final scheme = Theme.of(context).colorScheme;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
-        color: const Color(0xFF2D3748),
-        borderRadius: BorderRadius.circular(12),
+        color: scheme.surface,
+        borderRadius: BorderRadius.circular(100),
       ),
       child: Row(
         children: [
-          _buildStatusDot(healthy > 0),
+          StatusDot(isHealthy: healthy > 0, size: 8),
           const SizedBox(width: 6),
-          Text('$healthy/$total healthy', style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 11)),
+          Text('$healthy/$total healthy',
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11)),
         ],
       ),
-    );
-  }
-
-  Widget _buildStatusDot(bool isHealthy) {
-    return Container(
-      width: 8, height: 8,
-      decoration: BoxDecoration(color: isHealthy ? Colors.green : Colors.red, shape: BoxShape.circle),
     );
   }
 
   Widget _buildEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.dns_outlined, size: 48, color: Colors.white.withOpacity(0.2)),
-          const SizedBox(height: 16),
-          Text('No Servers', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 16, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: Text('No mesh servers are currently visible. Check your connection.', textAlign: TextAlign.center, style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 13)),
-          ),
-        ],
-      ),
+    return const EmptyState(
+      icon: Icons.dns_outlined,
+      title: 'No Servers',
+      message: 'No mesh servers are currently visible. Check your connection.',
     );
   }
 
   Widget _buildServerCard(ServerInfo server) {
+    final scheme = Theme.of(context).colorScheme;
     final isSelected = _selectedAdminServer?.id == server.id;
-    return Container(
-      margin: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: isSelected ? const Color(0xFFE9C46A).withOpacity(0.15) : Colors.transparent,
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF2D3748)),
-      ),
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
       child: InkWell(
+        borderRadius: BorderRadius.circular(12),
         onTap: () {
           setState(() {
             _selectedAdminServer = AdminServer(
@@ -193,72 +174,84 @@ class _ServersViewState extends ConsumerState<ServersView> {
             );
           });
         },
-        child: Row(
-          children: [
-            _buildStatusDot(server.available),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+        child: AppCard(
+          padding: const EdgeInsets.all(12),
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: isSelected
+                  ? AppTheme.lemonYellowDark.withValues(alpha: 0.15)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Row(
                 children: [
-                  Row(
-                    children: [
-                      Expanded(
-                        child: Text(
-                          '${server.host}:${server.port}',
-                          style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                  StatusDot(isHealthy: server.available, size: 10),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Text(
+                                '${server.host}:${server.port}',
+                                style: const TextStyle(
+                                    fontSize: 13, fontWeight: FontWeight.w600),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            LemonBadge(
+                              text: server.available ? 'HEALTHY' : 'UNHEALTHY',
+                              color: server.available
+                                  ? AppTheme.lemonGreen
+                                  : AppTheme.errorColor,
+                            ),
+                          ],
                         ),
-                      ),
-                      _buildBadge(text: server.available ? 'HEALTHY' : 'UNHEALTHY', color: server.available ? Colors.green : Colors.red),
-                    ],
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            if (server.latencyMs != null)
+                              Text('${server.latencyMs}ms',
+                                  style: TextStyle(
+                                      color: _getLatencyColor(server.latencyMs!),
+                                      fontSize: 11,
+                                      fontFamily: 'monospace')),
+                            if (server.latencyMs != null) const SizedBox(width: 8),
+                            Text(server.region,
+                                style: TextStyle(
+                                    color: scheme.onSurfaceVariant, fontSize: 11)),
+                          ],
+                        ),
+                      ],
+                    ),
                   ),
-                  const SizedBox(height: 4),
-                  Row(
-                    children: [
-                      if (server.latencyMs != null)
-                        Text('${server.latencyMs}ms', style: TextStyle(color: _getLatencyColor(server.latencyMs!), fontSize: 11, fontFamily: 'monospace')),
-                      if (server.latencyMs != null) const SizedBox(width: 8),
-                      Text(server.region, style: const TextStyle(color: Color(0xFF718096), fontSize: 11)),
-                    ],
-                  ),
+                  Icon(Icons.chevron_right,
+                      color: scheme.onSurfaceVariant, size: 16),
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, color: Color(0xFF718096), size: 16),
-          ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildNoSelectionState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.admin_panel_settings_outlined, size: 64, color: Colors.white.withOpacity(0.2)),
-          const SizedBox(height: 16),
-          Text('Select a Server', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Text('Choose a server from the list to access its Admin Console.', style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 14), textAlign: TextAlign.center),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildBadge({required String text, required Color color}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-      decoration: BoxDecoration(color: color.withOpacity(0.15), borderRadius: BorderRadius.circular(4)),
-      child: Text(text, style: TextStyle(color: color, fontSize: 9, fontWeight: FontWeight.bold)),
+    return const EmptyState(
+      icon: Icons.admin_panel_settings_outlined,
+      title: 'Select a Server',
+      message: 'Choose a server from the list to access its Admin Console.',
     );
   }
 
   Color _getLatencyColor(double ms) {
-    if (ms < 50) return Colors.green;
-    if (ms < 150) return Colors.orange;
-    return Colors.red;
+    if (ms < 50) return AppTheme.lemonGreen;
+    if (ms < 150) return AppTheme.nodeOrange;
+    return AppTheme.errorColor;
   }
 }

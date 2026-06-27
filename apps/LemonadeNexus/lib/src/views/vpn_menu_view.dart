@@ -15,6 +15,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class VPNMenuView extends ConsumerWidget {
   const VPNMenuView({super.key});
@@ -22,24 +24,27 @@ class VPNMenuView extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final appState = ref.watch(appNotifierProvider);
+    final scheme = Theme.of(context).colorScheme;
 
     return Container(
       constraints: const BoxConstraints(minWidth: 200),
       padding: const EdgeInsets.symmetric(vertical: 8),
+      color: scheme.surface,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
           // Status Section
-          _buildStatusSection(appState),
-          const Divider(height: 16),
+          _buildStatusSection(context, appState),
+          Divider(height: 16, color: scheme.outline),
           // Connect/Disconnect Button
           if (appState.isAuthenticated) ...[
             _buildConnectButton(appState, ref),
-            const Divider(height: 16),
+            Divider(height: 16, color: scheme.outline),
           ],
           // Open Manager Button
           _buildMenuItem(
+            context: context,
             icon: Icons.dashboard,
             label: 'Open Manager',
             shortcut: 'O',
@@ -48,9 +53,10 @@ class VPNMenuView extends ConsumerWidget {
               // This is handled by the tray manager
             },
           ),
-          const Divider(height: 16),
+          Divider(height: 16, color: scheme.outline),
           // Quit Button
           _buildMenuItem(
+            context: context,
             icon: Icons.close,
             label: 'Quit Lemonade Nexus',
             shortcut: 'Q',
@@ -64,12 +70,15 @@ class VPNMenuView extends ConsumerWidget {
     );
   }
 
-  Widget _buildStatusSection(AppState appState) {
+  Widget _buildStatusSection(BuildContext context, AppState appState) {
+    final scheme = Theme.of(context).colorScheme;
+
     if (!appState.isAuthenticated) {
       return _buildStatusItem(
-        icon: Icons.person_off,
+        context: context,
+        isHealthy: false,
         label: 'Not signed in',
-        color: const Color(0xFFA0AEC0),
+        color: scheme.onSurfaceVariant,
       );
     }
 
@@ -78,9 +87,10 @@ class VPNMenuView extends ConsumerWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           _buildStatusItem(
-            icon: Icons.check_circle,
+            context: context,
+            isHealthy: true,
             label: 'VPN: Connected',
-            color: Colors.green,
+            color: AppTheme.lemonGreen,
           ),
           if (appState.tunnelIP != null && appState.tunnelIP!.isNotEmpty)
             Padding(
@@ -88,7 +98,7 @@ class VPNMenuView extends ConsumerWidget {
               child: Text(
                 'IP: ${appState.tunnelIP}',
                 style: TextStyle(
-                  color: const Color(0xFFA0AEC0),
+                  color: scheme.onSurfaceVariant,
                   fontSize: 11,
                   fontFamily: 'monospace',
                 ),
@@ -99,14 +109,16 @@ class VPNMenuView extends ConsumerWidget {
     }
 
     return _buildStatusItem(
-      icon: Icons.cancel,
+      context: context,
+      isHealthy: false,
       label: 'VPN: Disconnected',
-      color: const Color(0xFFA0AEC0),
+      color: scheme.onSurfaceVariant,
     );
   }
 
   Widget _buildStatusItem({
-    required IconData icon,
+    required BuildContext context,
+    required bool isHealthy,
     required String label,
     required Color color,
   }) {
@@ -114,7 +126,7 @@ class VPNMenuView extends ConsumerWidget {
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       child: Row(
         children: [
-          Icon(icon, size: 16, color: color),
+          StatusDot(isHealthy: isHealthy, size: 10),
           const SizedBox(width: 8),
           Text(
             label,
@@ -136,11 +148,16 @@ class VPNMenuView extends ConsumerWidget {
 
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      child: Material(
-        color: appState.isTunnelUp ? Colors.red.shade600 : const Color(0xFF2A9D8F),
-        borderRadius: BorderRadius.circular(6),
-        child: InkWell(
-          onTap: isBusy
+      child: SizedBox(
+        width: double.infinity,
+        child: ElevatedButton(
+          style: appState.isTunnelUp
+              ? ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.errorColor,
+                  foregroundColor: Colors.white,
+                )
+              : null,
+          onPressed: isBusy
               ? null
               : () {
                   final notifier = ref.read(appNotifierProvider.notifier);
@@ -150,37 +167,29 @@ class VPNMenuView extends ConsumerWidget {
                     notifier.connectTunnel();
                   }
                 },
-          borderRadius: BorderRadius.circular(6),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-            child: Row(
-              children: [
-                if (isBusy)
-                  SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
-                    ),
-                  )
-                else
-                  Icon(
-                    appState.isTunnelUp ? Icons.close : Icons.play_arrow,
-                    size: 16,
-                    color: Colors.white,
-                  ),
-                const SizedBox(width: 8),
-                Text(
-                  appState.isTunnelUp ? 'Disconnect VPN' : 'Connect VPN',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w500,
-                  ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (isBusy)
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              else
+                Icon(
+                  appState.isTunnelUp ? Icons.close : Icons.play_arrow,
+                  size: 16,
                 ),
-              ],
-            ),
+              const SizedBox(width: 8),
+              Text(
+                appState.isTunnelUp ? 'Disconnect VPN' : 'Connect VPN',
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -188,11 +197,13 @@ class VPNMenuView extends ConsumerWidget {
   }
 
   Widget _buildMenuItem({
+    required BuildContext context,
     required IconData icon,
     required String label,
     required String shortcut,
     required VoidCallback onTap,
   }) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       child: Material(
@@ -204,13 +215,12 @@ class VPNMenuView extends ConsumerWidget {
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
             child: Row(
               children: [
-                Icon(icon, size: 16, color: const Color(0xFFE9C46A)),
+                Icon(icon, size: 16, color: AppTheme.lemonYellowDark),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Text(
                     label,
                     style: const TextStyle(
-                      color: Colors.white,
                       fontSize: 12,
                     ),
                   ),
@@ -218,13 +228,13 @@ class VPNMenuView extends ConsumerWidget {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF2D3748),
+                    color: scheme.surfaceContainerHighest,
                     borderRadius: BorderRadius.circular(4),
                   ),
                   child: Text(
                     shortcut,
                     style: TextStyle(
-                      color: const Color(0xFFA0AEC0),
+                      color: scheme.onSurfaceVariant,
                       fontSize: 10,
                       fontFamily: 'monospace',
                     ),

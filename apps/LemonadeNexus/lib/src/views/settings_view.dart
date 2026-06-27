@@ -14,6 +14,8 @@ import 'dart:io';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../windows/windows_integration.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class SettingsView extends ConsumerStatefulWidget {
   const SettingsView({super.key});
@@ -41,6 +43,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final appState = ref.watch(appNotifierProvider);
     final notifier = ref.read(appNotifierProvider.notifier);
 
@@ -50,13 +53,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           // Header
-          Row(
-            children: [
-              const Icon(Icons.settings, color: Color(0xFFE9C46A), size: 24),
-              const SizedBox(width: 12),
-              const Text('Settings', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
-            ],
-          ),
+          const SectionHeader(title: 'Settings', icon: Icons.settings),
           const SizedBox(height: 24),
 
           // Server Connection Section
@@ -67,20 +64,16 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
               children: [
                 Row(
                   children: [
-                    const Text('Server URL', style: TextStyle(color: Color(0xFFA0AEC0), fontSize: 13),),
+                    Text('Server URL', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13)),
                     const SizedBox(width: 12),
                     Expanded(
                       child: TextField(
                         controller: _serverController,
-                        decoration: InputDecoration(
+                        decoration: const InputDecoration(
                           hintText: 'localhost:9100',
-                          hintStyle: TextStyle(color: Colors.white.withOpacity(0.4)),
-                          filled: true,
-                          fillColor: const Color(0xFF2D3748),
-                          border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                         ),
-                        style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
+                        style: const TextStyle(fontSize: 13, fontFamily: 'monospace'),
                         onChanged: (_) => setState(() => _hasChanges = true),
                       ),
                     ),
@@ -96,16 +89,11 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
                                   content: Text('Server URL updated to $host:$port'),
-                                  backgroundColor: const Color(0xFF2A9D8F),
+                                  backgroundColor: AppTheme.lemonGreen,
                                 ),
                               );
                             }
                           : null,
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFFE9C46A),
-                        foregroundColor: Colors.black,
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                      ),
                       child: const Text('Save'),
                     ),
                   ],
@@ -113,13 +101,13 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                 const SizedBox(height: 12),
                 Row(
                   children: [
-                    const Text('Status', style: TextStyle(color: Color(0xFFA0AEC0), fontSize: 13)),
+                    Text('Status', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13)),
                     const SizedBox(width: 12),
                     Row(
                       children: [
-                        _buildStatusDot(appState.isServerHealthy),
+                        StatusDot(isHealthy: appState.isServerHealthy, size: 8),
                         const SizedBox(width: 6),
-                        Text(appState.isServerHealthy ? 'Connected' : 'Disconnected', style: const TextStyle(color: Colors.white, fontSize: 13)),
+                        Text(appState.isServerHealthy ? 'Connected' : 'Disconnected', style: const TextStyle(fontSize: 13)),
                       ],
                     ),
                     const Spacer(),
@@ -138,7 +126,6 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                       },
                       icon: const Icon(Icons.refresh, size: 16),
                       label: const Text('Test Connection'),
-                      style: TextButton.styleFrom(foregroundColor: const Color(0xFFE9C46A)),
                     ),
                   ],
                 ),
@@ -178,10 +165,6 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                         },
                         icon: const Icon(Icons.upload),
                         label: const Text('Export Identity'),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xFFE9C46A),
-                          side: const BorderSide(color: Color(0xFFE9C46A)),
-                        ),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -195,10 +178,6 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                         },
                         icon: const Icon(Icons.download),
                         label: const Text('Import Identity'),
-                        style: OutlinedButton.styleFrom(
-                          foregroundColor: const Color(0xFFE9C46A),
-                          side: const BorderSide(color: Color(0xFFE9C46A)),
-                        ),
                       ),
                     ),
                   ],
@@ -221,7 +200,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                   appState.settings.autoDiscoveryEnabled,
                   (value) => notifier.setAutoDiscoveryEnabled(value),
                 ),
-                const Divider(color: Color(0xFF2D3748), height: 16),
+                Divider(color: scheme.outline, height: 16),
                 _buildPreferenceToggle(
                   'Auto-connect on launch',
                   'Automatically connect to the VPN on app startup',
@@ -319,10 +298,9 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
               icon: const Icon(Icons.logout),
               label: const Text('Sign Out'),
               style: ElevatedButton.styleFrom(
-                backgroundColor: Colors.red.shade600,
+                backgroundColor: AppTheme.errorColor,
                 foregroundColor: Colors.white,
                 padding: const EdgeInsets.symmetric(vertical: 16),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
               ),
             ),
           ),
@@ -332,85 +310,75 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
   }
 
   Widget _buildSection({required IconData icon, required String title, required Widget child}) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A2E).withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF2D3748)),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, color: const Color(0xFFE9C46A), size: 18),
-              const SizedBox(width: 8),
-              Text(title, style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
-            ],
-          ),
-          const SizedBox(height: 12),
-          child,
-        ],
-      ),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SectionHeader(title: title, icon: icon),
+        const SizedBox(height: 12),
+        AppCard(child: child),
+      ],
     );
   }
 
   Widget _buildIdentityRow(String label, String value) {
+    final scheme = Theme.of(context).colorScheme;
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        SizedBox(width: 100, child: Text(label, style: const TextStyle(color: Color(0xFF718096), fontSize: 13))),
+        SizedBox(width: 100, child: Text(label, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13))),
         Expanded(
-          child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace')),
+          child: Text(value, style: const TextStyle(fontSize: 13, fontFamily: 'monospace')),
         ),
       ],
     );
   }
 
   Widget _buildPreferenceToggle(String title, String description, bool value, ValueChanged<bool> onChanged) {
+    final scheme = Theme.of(context).colorScheme;
     return Row(
       children: [
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(title, style: const TextStyle(color: Colors.white, fontSize: 13)),
-              Text(description, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 11)),
+              Text(title, style: const TextStyle(fontSize: 13)),
+              Text(description, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11)),
             ],
           ),
         ),
         Switch(
           value: value,
           onChanged: onChanged,
-          activeColor: const Color(0xFFE9C46A),
+          activeColor: AppTheme.lemonYellow,
         ),
       ],
     );
   }
 
   Widget _buildWindowsPreferenceToggle(String title, String description, bool value, ValueChanged<bool> onChanged) {
+    final scheme = Theme.of(context).colorScheme;
     return Row(
       children: [
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(title, style: const TextStyle(color: Colors.white, fontSize: 13)),
-              Text(description, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 11)),
+              Text(title, style: const TextStyle(fontSize: 13)),
+              Text(description, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11)),
             ],
           ),
         ),
         Switch(
           value: value,
           onChanged: onChanged,
-          activeColor: const Color(0xFFE9C46A),
+          activeColor: AppTheme.lemonYellow,
         ),
       ],
     );
   }
 
   Widget _buildWindowsServiceSection(WidgetRef ref) {
+    final scheme = Theme.of(context).colorScheme;
     final notifier = ref.read(windowsIntegrationNotifierProvider.notifier);
     final service = ref.read(windowsIntegrationProvider);
     final isInstalled = notifier.isServiceInstalled();
@@ -418,24 +386,24 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: const Color(0xFF2D3748).withOpacity(0.3),
+        color: scheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF4A5568)),
+        border: Border.all(color: scheme.outline),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(Icons.admin_panel_settings, color: Color(0xFFE9C46A), size: 16),
+              const Icon(Icons.admin_panel_settings, color: AppTheme.lemonYellowDark, size: 16),
               const SizedBox(width: 8),
-              const Text('Windows Service (Advanced)', style: TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold)),
+              const Text('Windows Service (Advanced)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
             ],
           ),
           const SizedBox(height: 8),
-          const Text(
+          Text(
             'Install as a Windows Service for enterprise deployment. Requires administrator privileges.',
-            style: TextStyle(color: Color(0xFFA0AEC0), fontSize: 11),
+            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11),
           ),
           const SizedBox(height: 12),
           Row(
@@ -451,15 +419,12 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                           content: Text(result
                               ? 'Service installed successfully'
                               : 'Failed to install service. Run as administrator.'),
-                          backgroundColor: result ? const Color(0xFF2A9D8F) : Colors.orange,
+                          backgroundColor: result ? AppTheme.lemonGreen : Colors.orange,
                         ),
                       );
                     },
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFFE9C46A),
-                      foregroundColor: Colors.black,
                       padding: const EdgeInsets.symmetric(vertical: 8),
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                     ),
                     child: const Text('Install Service'),
                   ),
@@ -478,15 +443,14 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                                 content: Text(result
                                     ? 'Service started'
                                     : 'Failed to start service'),
-                                backgroundColor: result ? const Color(0xFF2A9D8F) : Colors.orange,
+                                backgroundColor: result ? AppTheme.lemonGreen : Colors.orange,
                               ),
                             );
                           },
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF2A9D8F),
+                            backgroundColor: AppTheme.lemonGreen,
                             foregroundColor: Colors.white,
                             padding: const EdgeInsets.symmetric(vertical: 8),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                           ),
                           child: const Text('Start'),
                         ),
@@ -502,15 +466,14 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                                 content: Text(result
                                     ? 'Service stopped'
                                     : 'Failed to stop service'),
-                                backgroundColor: result ? Colors.orange : const Color(0xFF2A9D8F),
+                                backgroundColor: result ? Colors.orange : AppTheme.lemonGreen,
                               ),
                             );
                           },
                           style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.orange,
+                            backgroundColor: AppTheme.nodeOrange,
                             foregroundColor: Colors.white,
                             padding: const EdgeInsets.symmetric(vertical: 8),
-                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                           ),
                           child: const Text('Stop'),
                         ),
@@ -534,10 +497,9 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                     );
                   },
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red.shade600,
+                    backgroundColor: AppTheme.errorColor,
                     foregroundColor: Colors.white,
                     padding: const EdgeInsets.symmetric(vertical: 8),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(6)),
                   ),
                   child: const Text('Uninstall'),
                 ),
@@ -549,41 +511,37 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
   }
 
   Widget _buildAboutRow(String label, String value) {
+    final scheme = Theme.of(context).colorScheme;
     return Row(
       children: [
-        SizedBox(width: 120, child: Text(label, style: const TextStyle(color: Color(0xFF718096), fontSize: 13))),
-        Text(value, style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace')),
+        SizedBox(width: 120, child: Text(label, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13))),
+        Text(value, style: const TextStyle(fontSize: 13, fontFamily: 'monospace')),
       ],
-    );
-  }
-
-  Widget _buildStatusDot(bool isHealthy) {
-    return Container(
-      width: 8, height: 8,
-      decoration: BoxDecoration(color: isHealthy ? Colors.green : Colors.red, shape: BoxShape.circle),
     );
   }
 
   void _showSignOutDialog(AppNotifier notifier) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A2E),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: const BorderSide(color: Color(0xFF2D3748))),
-        title: const Text('Sign Out', style: TextStyle(color: Colors.white)),
-        content: const Text('Are you sure you want to sign out? You will need to re-enter your credentials.', style: TextStyle(color: Color(0xFFA0AEC0), fontSize: 13)),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel', style: TextStyle(color: Color(0xFFA0AEC0)))),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(context);
-              notifier.signOut();
-            },
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade600, foregroundColor: Colors.white),
-            child: const Text('Sign Out'),
-          ),
-        ],
-      ),
+      builder: (context) {
+        final scheme = Theme.of(context).colorScheme;
+        return AlertDialog(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          title: const Text('Sign Out'),
+          content: Text('Are you sure you want to sign out? You will need to re-enter your credentials.', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13)),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+            ElevatedButton(
+              onPressed: () {
+                Navigator.pop(context);
+                notifier.signOut();
+              },
+              style: ElevatedButton.styleFrom(backgroundColor: AppTheme.errorColor, foregroundColor: Colors.white),
+              child: const Text('Sign Out'),
+            ),
+          ],
+        );
+      },
     );
   }
 }

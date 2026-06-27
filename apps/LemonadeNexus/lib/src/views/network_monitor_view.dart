@@ -13,6 +13,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../sdk/models.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class NetworkMonitorView extends ConsumerStatefulWidget {
   const NetworkMonitorView({super.key});
@@ -78,13 +80,10 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
   Widget _buildHeader(AppState appState) {
     return Row(
       children: [
-        const Icon(Icons.bar_chart, color: Color(0xFFE9C46A), size: 24),
-        const SizedBox(width: 12),
-        const Text('Network Monitor', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+        const SectionHeader(title: 'Network Monitor', icon: Icons.bar_chart),
         const Spacer(),
         IconButton(
-          icon: const Icon(Icons.refresh),
-          color: const Color(0xFFA0AEC0),
+          icon: const Icon(Icons.refresh, size: 20),
           onPressed: () => ref.read(appNotifierProvider.notifier).refreshMeshStatus(),
           tooltip: 'Refresh',
         ),
@@ -98,49 +97,45 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
       mainAxisSpacing: 16,
+      crossAxisSpacing: 16,
       childAspectRatio: 2.5,
       children: [
         _buildSummaryCard(
           icon: Icons.people,
           title: 'Total Peers',
           value: '${status?.peerCount ?? 0}',
-          color: const Color(0xFFE9C46A),
+          color: AppTheme.lemonYellowDark,
         ),
         _buildSummaryCard(
           icon: Icons.wifi,
           title: 'Online',
           value: '${status?.onlineCount ?? 0}',
-          color: Colors.green,
+          color: AppTheme.lemonGreen,
         ),
         _buildSummaryCard(
           icon: Icons.arrow_circle_down,
           title: 'Total Received',
           value: _formatBytes(status?.totalRxBytes ?? 0),
-          color: Colors.blue,
+          color: AppTheme.infoColor,
         ),
         _buildSummaryCard(
           icon: Icons.arrow_circle_up,
           title: 'Total Sent',
           value: _formatBytes(status?.totalTxBytes ?? 0),
-          color: Colors.orange,
+          color: AppTheme.nodeOrange,
         ),
       ],
     );
   }
 
   Widget _buildSummaryCard({required IconData icon, required String title, required String value, required Color color}) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A2E).withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF2D3748)),
-      ),
+    final scheme = Theme.of(context).colorScheme;
+    return AppCard(
       child: Row(
         children: [
           Container(
             padding: const EdgeInsets.all(10),
-            decoration: BoxDecoration(color: color.withOpacity(0.15), borderRadius: BorderRadius.circular(8)),
+            decoration: BoxDecoration(color: color.withValues(alpha: 0.15), borderRadius: BorderRadius.circular(8)),
             child: Icon(icon, color: color, size: 22),
           ),
           const SizedBox(width: 12),
@@ -149,7 +144,7 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
-                Text(title, style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 11)),
+                Text(title, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11)),
                 const SizedBox(height: 2),
                 Text(value, style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.bold, fontFamily: 'monospace')),
               ],
@@ -161,23 +156,18 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
   }
 
   Widget _buildPeerTopology(List<MeshPeer> peers) {
-    return _buildCard(
+    final scheme = Theme.of(context).colorScheme;
+    return AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Icon(Icons.share, color: Color(0xFFE9C46A), size: 18),
-              const SizedBox(width: 8),
-              const Text('Peer Topology', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
-            ],
-          ),
+          const SectionHeader(title: 'Peer Topology', icon: Icons.share),
           const SizedBox(height: 12),
           ListView.separated(
             shrinkWrap: true,
             physics: const NeverScrollableScrollPhysics(),
             itemCount: peers.length,
-            separatorBuilder: (_, __) => const Divider(color: Color(0xFF2D3748), height: 1),
+            separatorBuilder: (_, __) => Divider(color: scheme.outline, height: 1),
             itemBuilder: (context, index) => _buildPeerTopologyRow(peers[index]),
           ),
         ],
@@ -186,6 +176,7 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
   }
 
   Widget _buildPeerTopologyRow(MeshPeer peer) {
+    final scheme = Theme.of(context).colorScheme;
     final isOnline = peer.isOnline;
     final hostname = peer.hostname?.isNotEmpty == true ? peer.hostname! : peer.nodeId.substring(0, 12);
     final hasDirectEndpoint = peer.endpoint?.isNotEmpty == true;
@@ -195,24 +186,24 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
         children: [
-          _buildStatusDot(isOnline),
+          StatusDot(isHealthy: isOnline),
           const SizedBox(width: 10),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(hostname, style: const TextStyle(color: Colors.white, fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
-                Text(peer.tunnelIp ?? 'No IP', style: const TextStyle(color: Color(0xFF718096), fontSize: 11, fontFamily: 'monospace')),
+                Text(hostname, style: const TextStyle(fontSize: 13), maxLines: 1, overflow: TextOverflow.ellipsis),
+                Text(peer.tunnelIp ?? 'No IP', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11, fontFamily: 'monospace')),
               ],
             ),
           ),
           // Connection type badge
           if (hasDirectEndpoint)
-            _buildBadge(text: 'Direct', color: Colors.green)
+            const LemonBadge(text: 'Direct', color: AppTheme.lemonGreen)
           else if (hasRelayEndpoint)
-            _buildBadge(text: 'Relay', color: Colors.orange)
+            const LemonBadge(text: 'Relay', color: AppTheme.nodeOrange)
           else
-            _buildBadge(text: 'No Route', color: Colors.red),
+            const LemonBadge(text: 'No Route', color: AppTheme.errorColor),
           const SizedBox(width: 12),
           // Latency
           if (peer.latencyMs != null && peer.latencyMs! >= 0)
@@ -229,7 +220,7 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
               ),
             )
           else
-            const SizedBox(width: 50, child: Text('--', style: TextStyle(color: Color(0xFF718096), fontSize: 11), textAlign: TextAlign.right)),
+            SizedBox(width: 50, child: Text('--', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11), textAlign: TextAlign.right)),
           const SizedBox(width: 8),
           // Bandwidth
           SizedBox(
@@ -238,12 +229,12 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 Row(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.arrow_downward, size: 10, color: Color(0xFF718096)),
-                  Text(_formatBytes(peer.rxBytes ?? 0), style: const TextStyle(color: Color(0xFF718096), fontSize: 9)),
+                  Icon(Icons.arrow_downward, size: 10, color: scheme.onSurfaceVariant),
+                  Text(_formatBytes(peer.rxBytes ?? 0), style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 9)),
                 ]),
                 Row(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.arrow_upward, size: 10, color: Color(0xFF718096)),
-                  Text(_formatBytes(peer.txBytes ?? 0), style: const TextStyle(color: Color(0xFF718096), fontSize: 9)),
+                  Icon(Icons.arrow_upward, size: 10, color: scheme.onSurfaceVariant),
+                  Text(_formatBytes(peer.txBytes ?? 0), style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 9)),
                 ]),
               ],
             ),
@@ -254,21 +245,16 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
   }
 
   Widget _buildBandwidthBreakdown(List<MeshPeer> peers) {
+    final scheme = Theme.of(context).colorScheme;
     final totalRx = peers.fold<int>(0, (sum, p) => sum + (p.rxBytes ?? 0));
     final totalTx = peers.fold<int>(0, (sum, p) => sum + (p.txBytes ?? 0));
     final maxTotal = peers.map((p) => (p.rxBytes ?? 0) + (p.txBytes ?? 0)).reduce((a, b) => a > b ? a : b);
 
-    return _buildCard(
+    return AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Icon(Icons.bar_chart, color: Color(0xFFE9C46A), size: 18),
-              const SizedBox(width: 8),
-              const Text('Bandwidth by Peer', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
-            ],
-          ),
+          const SectionHeader(title: 'Bandwidth by Peer', icon: Icons.bar_chart),
           const SizedBox(height: 16),
           ...peers.map((peer) => _buildPeerBandwidthRow(peer, maxTotal)),
           if (totalRx + totalTx > 0) ...[
@@ -276,15 +262,15 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
             Row(
               children: [
                 Row(children: [
-                  Container(width: 8, height: 8, decoration: BoxDecoration(color: Colors.blue.withOpacity(0.7), borderRadius: BorderRadius.circular(2))),
+                  Container(width: 8, height: 8, decoration: BoxDecoration(color: AppTheme.infoColor.withValues(alpha: 0.7), borderRadius: BorderRadius.circular(2))),
                   const SizedBox(width: 4),
-                  Text('Received (${_formatBytes(totalRx)})', style: const TextStyle(color: Color(0xFF718096), fontSize: 11)),
+                  Text('Received (${_formatBytes(totalRx)})', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11)),
                 ]),
                 const SizedBox(width: 16),
                 Row(children: [
-                  Container(width: 8, height: 8, decoration: BoxDecoration(color: Colors.orange.withOpacity(0.7), borderRadius: BorderRadius.circular(2))),
+                  Container(width: 8, height: 8, decoration: BoxDecoration(color: AppTheme.nodeOrange.withValues(alpha: 0.7), borderRadius: BorderRadius.circular(2))),
                   const SizedBox(width: 4),
-                  Text('Sent (${_formatBytes(totalTx)})', style: const TextStyle(color: Color(0xFF718096), fontSize: 11)),
+                  Text('Sent (${_formatBytes(totalTx)})', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11)),
                 ]),
               ],
             ),
@@ -295,6 +281,7 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
   }
 
   Widget _buildPeerBandwidthRow(MeshPeer peer, int maxTotal) {
+    final scheme = Theme.of(context).colorScheme;
     final hostname = peer.hostname?.isNotEmpty == true ? peer.hostname! : peer.nodeId.substring(0, 12);
     final rxBytes = peer.rxBytes ?? 0;
     final txBytes = peer.txBytes ?? 0;
@@ -309,9 +296,9 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
         children: [
           Row(
             children: [
-              Text(hostname, style: const TextStyle(color: Colors.white, fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
+              Text(hostname, style: const TextStyle(fontSize: 12), maxLines: 1, overflow: TextOverflow.ellipsis),
               const Spacer(),
-              Text(_formatBytes(peerTotal), style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 11, fontFamily: 'monospace')),
+              Text(_formatBytes(peerTotal), style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11, fontFamily: 'monospace')),
             ],
           ),
           const SizedBox(height: 4),
@@ -321,8 +308,8 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
               height: 8,
               child: Row(
                 children: [
-                  SizedBox(width: (800 * fraction * rxFraction).clamp(0, 800.0), child: Container(decoration: BoxDecoration(color: Colors.blue.withOpacity(0.7)))),
-                  SizedBox(width: (800 * fraction * (1 - rxFraction)).clamp(0, 800.0), child: Container(decoration: BoxDecoration(color: Colors.orange.withOpacity(0.7)))),
+                  SizedBox(width: (800 * fraction * rxFraction).clamp(0, 800.0), child: Container(decoration: BoxDecoration(color: AppTheme.infoColor.withValues(alpha: 0.7)))),
+                  SizedBox(width: (800 * fraction * (1 - rxFraction)).clamp(0, 800.0), child: Container(decoration: BoxDecoration(color: AppTheme.nodeOrange.withValues(alpha: 0.7)))),
                 ],
               ),
             ),
@@ -332,37 +319,10 @@ class _NetworkMonitorViewState extends ConsumerState<NetworkMonitorView> {
     );
   }
 
-  Widget _buildCard({required Widget child}) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A2E).withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF2D3748)),
-      ),
-      child: child,
-    );
-  }
-
-  Widget _buildStatusDot(bool isOnline) {
-    return Container(
-      width: 10, height: 10,
-      decoration: BoxDecoration(color: isOnline ? Colors.green : Colors.red, shape: BoxShape.circle),
-    );
-  }
-
-  Widget _buildBadge({required String text, required Color color}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-      decoration: BoxDecoration(color: color.withOpacity(0.15), borderRadius: BorderRadius.circular(4)),
-      child: Text(text, style: TextStyle(color: color, fontSize: 9, fontWeight: FontWeight.bold)),
-    );
-  }
-
   Color _getLatencyColor(double ms) {
-    if (ms < 50) return Colors.green;
-    if (ms < 150) return Colors.orange;
-    return Colors.red;
+    if (ms < 50) return AppTheme.lemonGreen;
+    if (ms < 150) return AppTheme.nodeOrange;
+    return AppTheme.errorColor;
   }
 
   String _formatBytes(int bytes) {

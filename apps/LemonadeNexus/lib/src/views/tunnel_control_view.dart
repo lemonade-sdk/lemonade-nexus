@@ -14,6 +14,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../windows/windows_integration.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class TunnelControlView extends ConsumerStatefulWidget {
   const TunnelControlView({super.key});
@@ -94,24 +96,10 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
   Widget _buildHeader(AppState appState) {
     return Row(
       children: [
-        const Icon(
-          Icons.security,
-          color: Color(0xFFE9C46A),
-          size: 24,
-        ),
-        const SizedBox(width: 12),
-        const Text(
-          'WireGuard Tunnel',
-          style: TextStyle(
-            color: Colors.white,
-            fontSize: 20,
-            fontWeight: FontWeight.bold,
-          ),
-        ),
+        const SectionHeader(title: 'WireGuard Tunnel', icon: Icons.security),
         const Spacer(),
         IconButton(
-          icon: const Icon(Icons.refresh),
-          color: const Color(0xFFA0AEC0),
+          icon: const Icon(Icons.refresh, size: 20),
           onPressed: () {
             ref.read(appNotifierProvider.notifier).refreshTunnelStatus();
             ref.read(appNotifierProvider.notifier).refreshMeshStatus();
@@ -123,7 +111,9 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
   }
 
   Widget _buildTunnelCard(AppState appState) {
-    return _buildCard(
+    final scheme = Theme.of(context).colorScheme;
+    return AppCard(
+      padding: const EdgeInsets.all(20),
       child: Row(
         children: [
           // Status indicator
@@ -131,15 +121,16 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
             width: 56,
             height: 56,
             decoration: BoxDecoration(
-              color: (appState.isTunnelUp ? Colors.green : Colors.red)
-                  .withOpacity(0.15),
+              color: (appState.isTunnelUp
+                      ? AppTheme.lemonGreen
+                      : AppTheme.errorColor)
+                  .withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(28),
             ),
             child: Icon(
-              appState.isTunnelUp
-                  ? Icons.check_circle
-                  : Icons.cancel,
-              color: appState.isTunnelUp ? Colors.green : Colors.red,
+              appState.isTunnelUp ? Icons.check_circle : Icons.cancel,
+              color:
+                  appState.isTunnelUp ? AppTheme.lemonGreen : AppTheme.errorColor,
               size: 28,
             ),
           ),
@@ -150,27 +141,37 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'VPN Tunnel',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
+                Row(
+                  children: [
+                    const Text(
+                      'VPN Tunnel',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    LemonBadge(
+                      text: appState.isTunnelUp ? 'UP' : 'DOWN',
+                      color: appState.isTunnelUp
+                          ? AppTheme.lemonGreen
+                          : Colors.grey,
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 4),
                 Text(
                   appState.isTunnelUp ? 'Active' : 'Inactive',
                   style: TextStyle(
-                    color: Colors.white.withOpacity(0.6),
+                    color: scheme.onSurfaceVariant,
                     fontSize: 13,
                   ),
                 ),
                 if (appState.tunnelIP != null && appState.tunnelIP!.isNotEmpty)
                   Text(
                     appState.tunnelIP!,
-                    style: const TextStyle(
-                      color: Color(0xFF718096),
+                    style: TextStyle(
+                      color: scheme.onSurfaceVariant,
                       fontSize: 11,
                       fontFamily: 'monospace',
                     ),
@@ -187,7 +188,7 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                 Text(
                   'Uptime',
                   style: TextStyle(
-                    color: Colors.white.withOpacity(0.4),
+                    color: scheme.onSurfaceVariant,
                     fontSize: 11,
                   ),
                 ),
@@ -195,7 +196,6 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                 Text(
                   _formatUptime(appState.connectedSince!),
                   style: const TextStyle(
-                    color: Color(0xFFA0AEC0),
                     fontSize: 12,
                     fontFamily: 'monospace',
                   ),
@@ -206,37 +206,30 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
           const SizedBox(width: 16),
 
           // Action button
-          ElevatedButton(
-            onPressed: appState.isTunnelUp
-                ? () => ref.read(appNotifierProvider.notifier).disconnectTunnel()
-                : () => ref.read(appNotifierProvider.notifier).connectTunnel(),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: appState.isTunnelUp
-                  ? Colors.red.shade600
-                  : const Color(0xFFE9C46A),
-              foregroundColor: appState.isTunnelUp
-                  ? Colors.white
-                  : Colors.black,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-            child: Text(
-              appState.isTunnelUp ? 'Disconnect' : 'Connect',
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 14,
-              ),
-            ),
-          ),
+          appState.isTunnelUp
+              ? ElevatedButton(
+                  onPressed: () =>
+                      ref.read(appNotifierProvider.notifier).disconnectTunnel(),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: AppTheme.errorColor,
+                    foregroundColor: Colors.white,
+                  ),
+                  child: const Text('Disconnect'),
+                )
+              : ElevatedButton(
+                  onPressed: () =>
+                      ref.read(appNotifierProvider.notifier).connectTunnel(),
+                  child: const Text('Connect'),
+                ),
         ],
       ),
     );
   }
 
   Widget _buildMeshCard(AppState appState) {
-    return _buildCard(
+    final scheme = Theme.of(context).colorScheme;
+    return AppCard(
+      padding: const EdgeInsets.all(20),
       child: Row(
         children: [
           // Status indicator
@@ -245,18 +238,15 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
             height: 56,
             decoration: BoxDecoration(
               color: (appState.isMeshEnabled
-                      ? const Color(0xFF2A9D8F)
+                      ? AppTheme.lemonGreen
                       : Colors.grey)
-                  .withOpacity(0.15),
+                  .withValues(alpha: 0.15),
               borderRadius: BorderRadius.circular(28),
             ),
             child: Icon(
-              appState.isMeshEnabled
-                  ? Icons.people
-                  : Icons.people_outline,
-              color: appState.isMeshEnabled
-                  ? const Color(0xFF2A9D8F)
-                  : Colors.grey,
+              appState.isMeshEnabled ? Icons.people : Icons.people_outline,
+              color:
+                  appState.isMeshEnabled ? AppTheme.lemonGreen : Colors.grey,
               size: 28,
             ),
           ),
@@ -267,27 +257,37 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
-                  'P2P Mesh Networking',
-                  style: TextStyle(
-                    color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                  ),
+                Row(
+                  children: [
+                    const Text(
+                      'P2P Mesh Networking',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    LemonBadge(
+                      text: appState.isMeshEnabled ? 'ENABLED' : 'DISABLED',
+                      color: appState.isMeshEnabled
+                          ? AppTheme.lemonGreen
+                          : Colors.grey,
+                    ),
+                  ],
                 ),
                 const SizedBox(height: 4),
                 Text(
                   appState.isMeshEnabled ? 'Active' : 'Inactive',
                   style: TextStyle(
-                    color: Colors.white.withOpacity(0.6),
+                    color: scheme.onSurfaceVariant,
                     fontSize: 13,
                   ),
                 ),
                 if (appState.meshStatus != null)
                   Text(
                     '${appState.meshStatus!.onlineCount}/${appState.meshStatus!.peerCount} peers online',
-                    style: const TextStyle(
-                      color: Color(0xFF718096),
+                    style: TextStyle(
+                      color: scheme.onSurfaceVariant,
                       fontSize: 11,
                     ),
                   ),
@@ -296,31 +296,17 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
           ),
 
           // Action button
-          ElevatedButton(
-            onPressed: () => ref.read(appNotifierProvider.notifier).toggleMesh(),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: appState.isMeshEnabled
-                  ? Colors.transparent
-                  : const Color(0xFF2A9D8F),
-              foregroundColor: appState.isMeshEnabled
-                  ? Colors.white
-                  : Colors.black,
-              side: appState.isMeshEnabled
-                  ? const BorderSide(color: Color(0xFF2A9D8F))
-                  : null,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-              ),
-            ),
-            child: Text(
-              appState.isMeshEnabled ? 'Disable' : 'Enable',
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 14,
-              ),
-            ),
-          ),
+          appState.isMeshEnabled
+              ? OutlinedButton(
+                  onPressed: () =>
+                      ref.read(appNotifierProvider.notifier).toggleMesh(),
+                  child: const Text('Disable'),
+                )
+              : ElevatedButton(
+                  onPressed: () =>
+                      ref.read(appNotifierProvider.notifier).toggleMesh(),
+                  child: const Text('Enable'),
+                ),
         ],
       ),
     );
@@ -329,27 +315,15 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
   Widget _buildConnectionDetailsCard(AppState appState) {
     final status = appState.meshStatus;
 
-    return _buildCard(
+    final scheme = Theme.of(context).colorScheme;
+    return AppCard(
+      padding: const EdgeInsets.all(20),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const Icon(
-                Icons.info_outline,
-                color: Color(0xFFE9C46A),
-                size: 18,
-              ),
-              const SizedBox(width: 8),
-              const Text(
-                'Connection Details',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 14,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ],
+          const SectionHeader(
+            title: 'Connection Details',
+            icon: Icons.info_outline,
           ),
           const SizedBox(height: 16),
 
@@ -357,29 +331,29 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
           Row(
             children: [
               Expanded(
-                child: _buildStatItem(
-                  'Tunnel IP',
-                  status?.tunnelIp ?? 'N/A',
-                  Icons.lan,
-                  const Color(0xFF2A9D8F),
+                child: StatCard(
+                  title: 'Tunnel IP',
+                  value: status?.tunnelIp ?? 'N/A',
+                  icon: Icons.lan,
+                  color: AppTheme.lemonGreen,
                 ),
               ),
               const SizedBox(width: 16),
               Expanded(
-                child: _buildStatItem(
-                  'Peers',
-                  '${status?.peerCount ?? 0}',
-                  Icons.people,
-                  const Color(0xFFE9C46A),
+                child: StatCard(
+                  title: 'Peers',
+                  value: '${status?.peerCount ?? 0}',
+                  icon: Icons.people,
+                  color: AppTheme.lemonYellowDark,
                 ),
               ),
               const SizedBox(width: 16),
               Expanded(
-                child: _buildStatItem(
-                  'Online',
-                  '${status?.onlineCount ?? 0}',
-                  Icons.wifi,
-                  Colors.green,
+                child: StatCard(
+                  title: 'Online',
+                  value: '${status?.onlineCount ?? 0}',
+                  icon: Icons.wifi,
+                  color: AppTheme.lemonGreen,
                 ),
               ),
             ],
@@ -393,16 +367,16 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
               Expanded(
                 child: Row(
                   children: [
-                    Icon(
+                    const Icon(
                       Icons.arrow_circle_down,
                       size: 16,
-                      color: Colors.blue.shade400,
+                      color: AppTheme.infoColor,
                     ),
                     const SizedBox(width: 8),
                     Text(
                       _formatBytes(status?.totalRxBytes ?? 0),
-                      style: TextStyle(
-                        color: Colors.blue.shade400,
+                      style: const TextStyle(
+                        color: AppTheme.infoColor,
                         fontSize: 12,
                         fontFamily: 'monospace',
                       ),
@@ -411,7 +385,7 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                     Text(
                       'received',
                       style: TextStyle(
-                        color: Colors.white.withOpacity(0.5),
+                        color: scheme.onSurfaceVariant,
                         fontSize: 11,
                       ),
                     ),
@@ -421,16 +395,16 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
               Expanded(
                 child: Row(
                   children: [
-                    Icon(
+                    const Icon(
                       Icons.arrow_circle_up,
                       size: 16,
-                      color: Colors.orange.shade400,
+                      color: AppTheme.nodeOrange,
                     ),
                     const SizedBox(width: 8),
                     Text(
                       _formatBytes(status?.totalTxBytes ?? 0),
-                      style: TextStyle(
-                        color: Colors.orange.shade400,
+                      style: const TextStyle(
+                        color: AppTheme.nodeOrange,
                         fontSize: 12,
                         fontFamily: 'monospace',
                       ),
@@ -439,7 +413,7 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
                     Text(
                       'sent',
                       style: TextStyle(
-                        color: Colors.white.withOpacity(0.5),
+                        color: scheme.onSurfaceVariant,
                         fontSize: 11,
                       ),
                     ),
@@ -450,59 +424,6 @@ class _TunnelControlViewState extends ConsumerState<TunnelControlView> {
           ),
         ],
       ),
-    );
-  }
-
-  Widget _buildStatItem(
-    String label,
-    String value,
-    IconData icon,
-    Color color,
-  ) {
-    return Container(
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        children: [
-          Icon(icon, color: color, size: 20),
-          const SizedBox(height: 4),
-          Text(
-            label,
-            style: TextStyle(
-              color: Colors.white.withOpacity(0.6),
-              fontSize: 11,
-            ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            value,
-            style: TextStyle(
-              color: color,
-              fontSize: 14,
-              fontWeight: FontWeight.bold,
-              fontFamily: 'monospace',
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCard({required Widget child}) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1A1A2E).withOpacity(0.5),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(
-          color: const Color(0xFF2D3748),
-          width: 1,
-        ),
-      ),
-      child: child,
     );
   }
 

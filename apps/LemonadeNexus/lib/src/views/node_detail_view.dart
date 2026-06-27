@@ -15,6 +15,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../sdk/models.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 import 'tree_browser_view.dart' show NodeType;
 
 class NodeDetailView extends ConsumerStatefulWidget {
@@ -35,6 +37,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   Widget build(BuildContext context) {
     final node = widget.node;
     final nodeType = NodeType.fromRaw(node.nodeType);
+    final scheme = Theme.of(context).colorScheme;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -43,18 +46,18 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
         children: [
           // Header
           _buildHeader(node, nodeType),
-          const Divider(color: Color(0xFF2D3748), height: 24),
+          Divider(color: scheme.outline, height: 24),
           // Properties
           _buildPropertiesSection(node),
-          const Divider(color: Color(0xFF2D3748), height: 24),
+          Divider(color: scheme.outline, height: 24),
           // Network
           _buildNetworkSection(node, nodeType),
-          const Divider(color: Color(0xFF2D3748), height: 24),
+          Divider(color: scheme.outline, height: 24),
           // Keys
           _buildKeysSection(node),
           // Assignments
           if (node.assignments != null && node.assignments!.isNotEmpty) ...[
-            const Divider(color: Color(0xFF2D3748), height: 24),
+            Divider(color: scheme.outline, height: 24),
             _buildAssignmentsSection(node.assignments!),
           ],
           const SizedBox(height: 20),
@@ -73,7 +76,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           width: 56,
           height: 56,
           decoration: BoxDecoration(
-            color: _nodeColor(nodeType).withOpacity(0.15),
+            color: _nodeColor(nodeType).withValues(alpha: 0.15),
             borderRadius: BorderRadius.circular(12),
           ),
           child: Icon(
@@ -91,7 +94,6 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
               Text(
                 node.displayName,
                 style: const TextStyle(
-                  color: Colors.white,
                   fontSize: 18,
                   fontWeight: FontWeight.bold,
                 ),
@@ -99,7 +101,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
               const SizedBox(height: 4),
               Row(
                 children: [
-                  _buildBadge(text: nodeType.displayName, color: _nodeColor(nodeType)),
+                  LemonBadge(text: nodeType.displayName, color: _nodeColor(nodeType)),
                   const SizedBox(width: 8),
                   _buildIdBadge(node.id),
                 ],
@@ -111,7 +113,9 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
         IconButton(
           icon: Icon(
             _isEditing ? Icons.check_circle : Icons.edit,
-            color: _isEditing ? const Color(0xFF2A9D8F) : const Color(0xFFA0AEC0),
+            color: _isEditing
+                ? AppTheme.lemonGreen
+                : Theme.of(context).colorScheme.onSurfaceVariant,
             size: 24,
           ),
           onPressed: () => setState(() => _isEditing = !_isEditing),
@@ -140,20 +144,21 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
 
   Widget _buildNetworkSection(TreeNode node, NodeType nodeType) {
     if (nodeType == NodeType.customer || nodeType == NodeType.root) {
+      final scheme = Theme.of(context).colorScheme;
       return _buildSection(
         icon: Icons.lan,
         title: 'Network',
         child: Row(
           children: [
-            const Icon(Icons.info, size: 16, color: Color(0xFF718096)),
+            Icon(Icons.info, size: 16, color: scheme.onSurfaceVariant),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
                 nodeType == NodeType.root
                     ? 'Root node manages the network but does not have a tunnel address.'
                     : 'Group nodes organize endpoints. Select a child endpoint to see network details.',
-                style: const TextStyle(
-                  color: Color(0xFFA0AEC0),
+                style: TextStyle(
+                  color: scheme.onSurfaceVariant,
                   fontSize: 12,
                 ),
               ),
@@ -177,9 +182,12 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           if (node.displayTunnelIp == null &&
               node.privateSubnet == null &&
               node.listenEndpoint == null)
-            const Text(
+            Text(
               'No network info assigned yet.',
-              style: TextStyle(color: Color(0xFF718096), fontSize: 12),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
         ],
       ),
@@ -197,9 +205,12 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           if (node.wgPubkey != null)
             _buildKeyRow('WireGuard Key', value: node.wgPubkey!),
           if (node.mgmtPubkey == null && node.wgPubkey == null)
-            const Text(
+            Text(
               'No keys available.',
-              style: TextStyle(color: Color(0xFF718096), fontSize: 12),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
         ],
       ),
@@ -217,42 +228,47 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   }
 
   Widget _buildAssignmentCard(NodeAssignment assignment) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      padding: const EdgeInsets.all(10),
-      decoration: BoxDecoration(
-        color: const Color(0xFF16213E),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Text(
-            assignment.managementPubkey,
-            style: const TextStyle(
-              color: Color(0xFFA0AEC0),
-              fontSize: 11,
-              fontFamily: 'monospace',
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Container(
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              assignment.managementPubkey,
+              style: TextStyle(
+                color: scheme.onSurfaceVariant,
+                fontSize: 11,
+                fontFamily: 'monospace',
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 6),
-          Wrap(
-            spacing: 4,
-            children: assignment.permissions
-                .map((perm) => _buildBadge(
-                      text: perm,
-                      color: _permissionColor(perm),
-                    ))
-                .toList(),
-          ),
-        ],
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 4,
+              runSpacing: 4,
+              children: assignment.permissions
+                  .map((perm) => LemonBadge(
+                        text: perm,
+                        color: _permissionColor(perm),
+                      ))
+                  .toList(),
+            ),
+          ],
+        ),
       ),
     );
   }
 
   Widget _buildActionsSection(TreeNode node) {
+    final scheme = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -260,17 +276,17 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           Container(
             padding: const EdgeInsets.all(10),
             decoration: BoxDecoration(
-              color: Colors.blue.withOpacity(0.1),
+              color: AppTheme.infoColor.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(8),
             ),
             child: Row(
               children: [
-                const Icon(Icons.info, color: Colors.blue, size: 16),
+                const Icon(Icons.info, color: AppTheme.infoColor, size: 16),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
                     _statusMessage!,
-                    style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 12),
+                    style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
                   ),
                 ),
               ],
@@ -293,7 +309,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
                       : const Icon(Icons.save),
                   label: const Text('Save Changes'),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFE9C46A),
+                    backgroundColor: AppTheme.lemonYellowDark,
                     foregroundColor: Colors.black,
                     padding: const EdgeInsets.symmetric(vertical: 12),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -305,8 +321,8 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
                 child: ElevatedButton(
                   onPressed: () => setState(() => _isEditing = false),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2D3748),
-                    foregroundColor: Colors.white,
+                    backgroundColor: scheme.surfaceContainerHighest,
+                    foregroundColor: scheme.onSurface,
                     padding: const EdgeInsets.symmetric(vertical: 12),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
                   ),
@@ -321,7 +337,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
                 icon: const Icon(Icons.delete),
                 label: const Text('Delete Node'),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.red.shade600,
+                  backgroundColor: AppTheme.errorColor,
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
@@ -338,35 +354,15 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          children: [
-            Icon(icon, color: const Color(0xFFE9C46A), size: 18),
-            const SizedBox(width: 8),
-            Text(
-              title,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ],
-        ),
+        SectionHeader(title: title, icon: icon),
         const SizedBox(height: 12),
-        Container(
-          padding: const EdgeInsets.all(16),
-          decoration: BoxDecoration(
-            color: const Color(0xFF1A1A2E).withOpacity(0.5),
-            borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: const Color(0xFF2D3748)),
-          ),
-          child: child,
-        ),
+        AppCard(child: child),
       ],
     );
   }
 
   Widget _buildPropertyRow(String label, {required String value, bool monospaced = false}) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
       child: Row(
@@ -376,14 +372,13 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
             width: 120,
             child: Text(
               label,
-              style: const TextStyle(color: Color(0xFF718096), fontSize: 12),
+              style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12),
             ),
           ),
           Expanded(
             child: Text(
               value,
               style: TextStyle(
-                color: Colors.white,
                 fontSize: 12,
                 fontFamily: monospaced ? 'monospace' : null,
               ),
@@ -395,6 +390,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   }
 
   Widget _buildKeyRow(String label, {required String value}) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Column(
@@ -402,7 +398,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
         children: [
           Text(
             label,
-            style: const TextStyle(color: Color(0xFF718096), fontSize: 11),
+            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11),
           ),
           const SizedBox(height: 4),
           Row(
@@ -411,7 +407,6 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
                 child: Text(
                   value,
                   style: const TextStyle(
-                    color: Colors.white,
                     fontSize: 11,
                     fontFamily: 'monospace',
                   ),
@@ -422,7 +417,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
               const SizedBox(width: 8),
               IconButton(
                 icon: const Icon(Icons.copy, size: 16),
-                color: const Color(0xFF718096),
+                color: scheme.onSurfaceVariant,
                 onPressed: () async {
                   await Clipboard.setData(ClipboardData(text: value));
                   if (!mounted) return;
@@ -442,34 +437,21 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
     );
   }
 
-  Widget _buildBadge({required String text, required Color color}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
-      ),
-    );
-  }
-
   Widget _buildIdBadge(String id) {
+    final scheme = Theme.of(context).colorScheme;
     final shortId = id.length > 12
         ? '${id.substring(0, 6)}...${id.substring(id.length - 4)}'
         : id;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
       decoration: BoxDecoration(
-        color: const Color(0xFF2D3748),
+        color: scheme.surfaceContainerHighest,
         borderRadius: BorderRadius.circular(4),
       ),
       child: Text(
         shortId,
-        style: const TextStyle(
-          color: Color(0xFFA0AEC0),
+        style: TextStyle(
+          color: scheme.onSurfaceVariant,
           fontSize: 9,
           fontFamily: 'monospace',
         ),
@@ -482,22 +464,22 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
       case NodeType.root:
         return const Color(0xFF9B5DE5);
       case NodeType.customer:
-        return const Color(0xFF3B82F6);
+        return AppTheme.infoColor;
       case NodeType.endpoint:
-        return const Color(0xFFE9C46A);
+        return AppTheme.lemonYellowDark;
       case NodeType.relay:
-        return const Color(0xFF2A9D8F);
+        return AppTheme.lemonGreen;
     }
   }
 
   Color _permissionColor(String perm) {
     switch (perm) {
       case 'read':
-        return const Color(0xFF3B82F6);
+        return AppTheme.infoColor;
       case 'write':
-        return Colors.orange;
+        return AppTheme.nodeOrange;
       case 'admin':
-        return Colors.red;
+        return AppTheme.errorColor;
       case 'manage':
         return const Color(0xFF9B5DE5);
       default:
@@ -529,23 +511,24 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
   }
 
   void _showDeleteConfirmationDialog(TreeNode node) {
+    final scheme = Theme.of(context).colorScheme;
     showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A2E),
+        backgroundColor: scheme.surface,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: Color(0xFF2D3748)),
+          side: BorderSide(color: scheme.outline),
         ),
-        title: const Text('Delete Node', style: TextStyle(color: Colors.white)),
+        title: const Text('Delete Node'),
         content: Text(
           'Are you sure you want to delete "${node.displayName}"? This action cannot be undone.',
-          style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 13),
+          style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('Cancel', style: TextStyle(color: Color(0xFFA0AEC0))),
+            child: const Text('Cancel'),
           ),
           ElevatedButton(
             onPressed: () {
@@ -553,7 +536,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
               _deleteNode(node);
             },
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade600,
+              backgroundColor: AppTheme.errorColor,
               foregroundColor: Colors.white,
             ),
             child: const Text('Delete'),

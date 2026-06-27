@@ -14,6 +14,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../sdk/models.dart';
+import '../../theme/app_theme.dart';
+import '../../theme/components.dart';
 
 class TreeBrowserView extends ConsumerStatefulWidget {
   const TreeBrowserView({super.key});
@@ -78,6 +80,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
   @override
   Widget build(BuildContext context) {
     final appState = ref.watch(appNotifierProvider);
+    final scheme = Theme.of(context).colorScheme;
 
     return Row(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -85,9 +88,9 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
         // Tree List Panel
         Container(
           width: 350,
-          decoration: const BoxDecoration(
-            color: Color(0xFF1A1A2E),
-            border: Border(right: BorderSide(color: Color(0xFF2D3748), width: 1)),
+          decoration: BoxDecoration(
+            color: scheme.surface,
+            border: Border(right: BorderSide(color: scheme.outline, width: 1)),
           ),
           child: Column(
             children: [
@@ -97,22 +100,15 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                 child: TextField(
                   controller: _searchController
                     ..addListener(() => setState(() => _searchText = _searchController.text)),
-                  decoration: InputDecoration(
+                  decoration: const InputDecoration(
                     hintText: 'Search nodes...',
-                    hintStyle: TextStyle(color: Colors.white.withOpacity(0.4)),
-                    prefixIcon: const Icon(Icons.search, color: Color(0xFF718096), size: 20),
-                    filled: true,
-                    fillColor: const Color(0xFF2D3748),
-                    border: OutlineInputBorder(
-                      borderRadius: BorderRadius.circular(8),
-                      borderSide: BorderSide.none,
-                    ),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    prefixIcon: Icon(Icons.search, size: 20),
+                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                   ),
-                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  style: const TextStyle(fontSize: 13),
                 ),
               ),
-              const Divider(color: Color(0xFF2D3748), height: 1),
+              Divider(color: scheme.outline, height: 1),
               // List
               Expanded(
                 child: _isLoadingTree
@@ -139,38 +135,27 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
   }
 
   Widget _buildEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.account_tree, size: 48, color: Colors.white.withOpacity(0.2)),
-          const SizedBox(height: 16),
-          Text('No Nodes', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 16, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: Text(
-              _searchText.isEmpty
-                  ? 'No tree nodes found. The network tree may be empty.'
-                  : 'No nodes match your search.',
-              textAlign: TextAlign.center,
-              style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 13),
-            ),
-          ),
-        ],
-      ),
+    return EmptyState(
+      icon: Icons.account_tree,
+      title: 'No Nodes',
+      message: _searchText.isEmpty
+          ? 'No tree nodes found. The network tree may be empty.'
+          : 'No nodes match your search.',
     );
   }
 
   Widget _buildNodeRow(TreeNode node) {
     final isSelected = _selectedNode?.id == node.id;
     final nodeType = NodeType.fromRaw(node.nodeType);
+    final scheme = Theme.of(context).colorScheme;
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 2, horizontal: 4),
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: isSelected ? const Color(0xFFE9C46A).withOpacity(0.15) : Colors.transparent,
+        color: isSelected
+            ? AppTheme.lemonYellowDark.withValues(alpha: 0.15)
+            : Colors.transparent,
         borderRadius: BorderRadius.circular(8),
       ),
       child: InkWell(
@@ -189,28 +174,28 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                 children: [
                   Text(
                     node.data['hostname']?.toString() ?? node.id,
-                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600),
+                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 4),
                   Row(
                     children: [
-                      _buildBadge(text: nodeType.displayName, color: _nodeColor(nodeType)),
+                      LemonBadge(text: nodeType.displayName, color: _nodeColor(nodeType)),
                       if (node.data['tunnel_ip'] != null) ...[
                         const SizedBox(width: 8),
                         Text(
                           node.data['tunnel_ip'] as String,
-                          style: const TextStyle(color: Color(0xFF718096), fontSize: 10, fontFamily: 'monospace'),
+                          style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 10, fontFamily: 'monospace'),
                         ),
                       ],
                       if (node.data['region'] != null) ...[
                         const SizedBox(width: 8),
-                        Icon(Icons.public, size: 10, color: const Color(0xFF718096)),
+                        Icon(Icons.public, size: 10, color: scheme.onSurfaceVariant),
                         const SizedBox(width: 2),
                         Text(
                           node.data['region'] as String,
-                          style: const TextStyle(color: Color(0xFF718096), fontSize: 10),
+                          style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 10),
                         ),
                       ],
                     ],
@@ -218,7 +203,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                 ],
               ),
             ),
-            const Icon(Icons.chevron_right, color: Color(0xFF718096), size: 16),
+            Icon(Icons.chevron_right, color: scheme.onSurfaceVariant, size: 16),
           ],
         ),
       ),
@@ -227,6 +212,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
 
   Widget _buildDetailPanel(AppState appState, TreeNode node) {
     final nodeType = NodeType.fromRaw(node.nodeType);
+    final scheme = Theme.of(context).colorScheme;
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(24),
@@ -240,7 +226,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                 width: 56,
                 height: 56,
                 decoration: BoxDecoration(
-                  color: _nodeColor(nodeType).withOpacity(0.15),
+                  color: _nodeColor(nodeType).withValues(alpha: 0.15),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Icon(
@@ -256,16 +242,16 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                   children: [
                     Text(
                       node.data['hostname']?.toString() ?? node.id,
-                      style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 4),
-                    _buildBadge(text: nodeType.displayName, color: _nodeColor(nodeType)),
+                    LemonBadge(text: nodeType.displayName, color: _nodeColor(nodeType)),
                   ],
                 ),
               ),
             ],
           ),
-          const Divider(color: Color(0xFF2D3748), height: 24),
+          Divider(color: scheme.outline, height: 24),
           // Details
           _buildDetailRow('Node ID', node.id),
           _buildDetailRow('Parent ID', node.parentId),
@@ -279,7 +265,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
           _buildDetailRow('Updated', node.updatedAt),
           // Actions
           const SizedBox(height: 24),
-          const Text('Actions', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.bold)),
+          const SectionHeader(title: 'Actions', icon: Icons.bolt_outlined),
           const SizedBox(height: 12),
           Row(
             children: [
@@ -288,25 +274,17 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                   onPressed: () => _showAddNodeDialog(node.id),
                   icon: const Icon(Icons.add),
                   label: const Text('Add Child Node'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFE9C46A),
-                    foregroundColor: Colors.black,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                  ),
                 ),
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: ElevatedButton.icon(
+                child: OutlinedButton.icon(
                   onPressed: () => _confirmDeleteNode(node),
                   icon: const Icon(Icons.delete),
                   label: const Text('Delete Node'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red.shade600,
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: AppTheme.errorColor,
+                    side: const BorderSide(color: AppTheme.errorColor, width: 1.5),
                   ),
                 ),
               ),
@@ -318,43 +296,23 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
   }
 
   Widget _buildNoSelectionState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.account_tree, size: 64, color: Colors.white.withOpacity(0.2)),
-          const SizedBox(height: 16),
-          Text('Select a Node', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 8),
-          Text('Choose a node from the tree to view its details.', style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 14), textAlign: TextAlign.center),
-        ],
-      ),
+    return const EmptyState(
+      icon: Icons.account_tree,
+      title: 'Select a Node',
+      message: 'Choose a node from the tree to view its details.',
     );
   }
 
   Widget _buildDetailRow(String label, String value) {
+    final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(width: 100, child: Text(label, style: const TextStyle(color: Color(0xFF718096), fontSize: 13))),
-          Expanded(child: Text(value, style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'))),
+          SizedBox(width: 100, child: Text(label, style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13))),
+          Expanded(child: Text(value, style: const TextStyle(fontSize: 13, fontFamily: 'monospace'))),
         ],
-      ),
-    );
-  }
-
-  Widget _buildBadge({required String text, required Color color}) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.15),
-        borderRadius: BorderRadius.circular(4),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
       ),
     );
   }
@@ -362,13 +320,13 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
   Color _nodeColor(NodeType type) {
     switch (type) {
       case NodeType.root:
-        return const Color(0xFF9B5DE5);
+        return AppTheme.infoColor;
       case NodeType.customer:
-        return const Color(0xFF3B82F6);
+        return AppTheme.infoColor;
       case NodeType.endpoint:
-        return const Color(0xFFE9C46A);
+        return AppTheme.lemonYellowDark;
       case NodeType.relay:
-        return const Color(0xFF2A9D8F);
+        return AppTheme.lemonGreen;
       default:
         return Colors.grey;
     }
@@ -381,138 +339,110 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
 
     showDialog(
       context: context,
-      builder: (context) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          backgroundColor: const Color(0xFF1A1A2E),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: const BorderSide(color: Color(0xFF2D3748)),
-          ),
-          title: const Text('Add New Node', style: TextStyle(color: Colors.white)),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: hostnameController,
-                decoration: InputDecoration(
-                  labelText: 'Hostname',
-                  labelStyle: const TextStyle(color: Color(0xFFA0AEC0)),
-                  filled: true,
-                  fillColor: const Color(0xFF2D3748),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: BorderSide.none,
-                  ),
+      builder: (context) {
+        final scheme = Theme.of(context).colorScheme;
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            backgroundColor: scheme.surface,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: scheme.outline),
+            ),
+            title: const Text('Add New Node'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: hostnameController,
+                  decoration: const InputDecoration(labelText: 'Hostname'),
                 ),
-                style: const TextStyle(color: Colors.white),
-              ),
-              const SizedBox(height: 12),
-              DropdownButtonFormField<String>(
-                value: selectedType,
-                decoration: InputDecoration(
-                  labelText: 'Type',
-                  labelStyle: const TextStyle(color: Color(0xFFA0AEC0)),
-                  filled: true,
-                  fillColor: const Color(0xFF2D3748),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: BorderSide.none,
-                  ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  value: selectedType,
+                  decoration: const InputDecoration(labelText: 'Type'),
+                  dropdownColor: scheme.surface,
+                  items: const [
+                    DropdownMenuItem(value: 'root', child: Text('Root')),
+                    DropdownMenuItem(value: 'customer', child: Text('Customer')),
+                    DropdownMenuItem(value: 'endpoint', child: Text('Endpoint')),
+                    DropdownMenuItem(value: 'relay', child: Text('Relay')),
+                  ],
+                  onChanged: (value) => setDialogState(() => selectedType = value!),
                 ),
-                dropdownColor: const Color(0xFF2D3748),
-                style: const TextStyle(color: Colors.white),
-                items: const [
-                  DropdownMenuItem(value: 'root', child: Text('Root')),
-                  DropdownMenuItem(value: 'customer', child: Text('Customer')),
-                  DropdownMenuItem(value: 'endpoint', child: Text('Endpoint')),
-                  DropdownMenuItem(value: 'relay', child: Text('Relay')),
-                ],
-                onChanged: (value) => setDialogState(() => selectedType = value!),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                decoration: InputDecoration(
-                  labelText: 'Region',
-                  labelStyle: const TextStyle(color: Color(0xFFA0AEC0)),
-                  filled: true,
-                  fillColor: const Color(0xFF2D3748),
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(8),
-                    borderSide: BorderSide.none,
-                  ),
+                const SizedBox(height: 12),
+                TextField(
+                  decoration: const InputDecoration(labelText: 'Region'),
+                  controller: TextEditingController(text: region),
                 ),
-                controller: TextEditingController(text: region),
-                style: const TextStyle(color: Colors.white),
+                const SizedBox(height: 12),
+                Text('Parent ID: $parentId', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 11, fontFamily: 'monospace')),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('Cancel'),
               ),
-              const SizedBox(height: 12),
-              Text('Parent ID: $parentId', style: const TextStyle(color: Color(0xFF718096), fontSize: 11, fontFamily: 'monospace')),
+              ElevatedButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  final notifier = ref.read(appNotifierProvider.notifier);
+                  await notifier.createChildNode(
+                    parentId: parentId,
+                    nodeType: selectedType,
+                    hostname: hostnameController.text.isEmpty ? null : hostnameController.text,
+                  );
+                  _loadTree();
+                },
+                child: const Text('Add Node'),
+              ),
             ],
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('Cancel', style: TextStyle(color: Color(0xFFA0AEC0))),
-            ),
-            ElevatedButton(
-              onPressed: () async {
-                Navigator.pop(context);
-                final notifier = ref.read(appNotifierProvider.notifier);
-                await notifier.createChildNode(
-                  parentId: parentId,
-                  nodeType: selectedType,
-                  hostname: hostnameController.text.isEmpty ? null : hostnameController.text,
-                );
-                _loadTree();
-              },
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFFE9C46A),
-                foregroundColor: Colors.black,
-              ),
-              child: const Text('Add Node'),
-            ),
-          ],
-        ),
-      ),
+        );
+      },
     );
   }
 
   void _confirmDeleteNode(TreeNode node) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF1A1A2E),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: const BorderSide(color: Color(0xFF2D3748)),
-        ),
-        title: const Text('Delete Node', style: TextStyle(color: Colors.white)),
-        content: Text(
-          "Are you sure you want to delete \"${node.data['hostname'] ?? node.id}\"?",
-          style: const TextStyle(color: Color(0xFFA0AEC0), fontSize: 13),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel', style: TextStyle(color: Color(0xFFA0AEC0))),
+      builder: (context) {
+        final scheme = Theme.of(context).colorScheme;
+        return AlertDialog(
+          backgroundColor: scheme.surface,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: scheme.outline),
           ),
-          ElevatedButton(
-            onPressed: () async {
-              Navigator.pop(context);
-              final notifier = ref.read(appNotifierProvider.notifier);
-              await notifier.deleteNode(nodeId: node.id);
-              setState(() {
-                _selectedNode = null;
-                _localTreeNodes.removeWhere((n) => n.id == node.id);
-              });
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade600,
-              foregroundColor: Colors.white,
+          title: const Text('Delete Node'),
+          content: Text(
+            "Are you sure you want to delete \"${node.data['hostname'] ?? node.id}\"?",
+            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
             ),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
+            ElevatedButton(
+              onPressed: () async {
+                Navigator.pop(context);
+                final notifier = ref.read(appNotifierProvider.notifier);
+                await notifier.deleteNode(nodeId: node.id);
+                setState(() {
+                  _selectedNode = null;
+                  _localTreeNodes.removeWhere((n) => n.id == node.id);
+                });
+              },
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppTheme.errorColor,
+                foregroundColor: Colors.white,
+              ),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
     );
   }
 
