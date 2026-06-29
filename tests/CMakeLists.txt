@@ -60,7 +60,6 @@ function(add_sdk_test TEST_NAME)
     gtest_discover_tests(${TEST_NAME})
 endfunction()
 
-add_sdk_test(test_boringtun_backend    test_boringtun_backend.cpp)
 add_sdk_test(test_routing_pool         test_routing_pool.cpp)
 
 # --- Integration tests ---

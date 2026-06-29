@@ -14,10 +14,11 @@ create_project(LemonadeNexusSDK DEPENDENCIES
         boringtun-ffi
 )
 
-# The userspace WireGuard dataplane lives in the server project; the SDK's packet
-# pump (PacketPump.cpp / ln_pump_*) joins it to the virtual netstack to expose
-# mesh connectivity as loopback sockets (no TUN device). Compile the dataplane
-# into the SDK, expose the server include path, and link the netstack.
+# The userspace boringtun dataplane lives in the server project; the SDK's
+# BoringtunMesh (BoringtunMesh.cpp) joins it to the virtual netstack to carry
+# mesh P2P traffic and egress the private API as loopback sockets (no TUN
+# device). Compile the dataplane into the SDK, expose the server include path,
+# and link the netstack.
 set(LN_DATAPLANE_SRC "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/WireGuard/UserspaceDataplane.cpp")
 set(LN_SERVER_INCLUDE "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/include")
 if(TARGET LemonadeNexusSDK)
