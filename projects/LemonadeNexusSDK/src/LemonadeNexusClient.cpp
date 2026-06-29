@@ -1706,7 +1706,9 @@ Result<std::vector<ServerEntry>> LemonadeNexusClient::get_servers() {
 Result<TrustStatus> LemonadeNexusClient::get_trust_status() {
     std::lock_guard lock(impl_->mutex);
     int status = 0;
-    auto resp = impl_->http_get("/api/trust/status", status);
+    // /api/trust/status is a private-API route (served over the WG tunnel),
+    // like /api/relay/list — route it through the private base URL.
+    auto resp = impl_->private_http_get("/api/trust/status", status);
     if (!resp) return {false, {}, status, "Connection failed"};
     try {
         return {true, resp->get<TrustStatus>(), status, ""};

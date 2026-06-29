@@ -740,9 +740,12 @@ class AppNotifier extends StateNotifier<AppState> {
       refreshHealth(),
       refreshStats(),
       refreshServers(),
-      refreshRelays(),
       refreshMeshStatus(),
-      refreshTrustStatus(),
+      // /api/relay/list and /api/trust/status are private API endpoints served
+      // only over the WireGuard tunnel; calling them on the public connection
+      // 404s. Refresh them once the tunnel (private API) is up.
+      if (state.isTunnelUp) refreshRelays(),
+      if (state.isTunnelUp) refreshTrustStatus(),
     ]);
   }
 
