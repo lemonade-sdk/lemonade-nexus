@@ -8,17 +8,31 @@ part of 'models.dart';
 
 AuthResponse _$AuthResponseFromJson(Map<String, dynamic> json) => AuthResponse(
       authenticated: json['authenticated'] as bool,
-      userId: json['userId'] as String?,
-      sessionToken: json['sessionToken'] as String?,
+      userId: json['user_id'] as String?,
+      sessionToken: json['session_token'] as String?,
       error: json['error'] as String?,
     );
 
 Map<String, dynamic> _$AuthResponseToJson(AuthResponse instance) =>
     <String, dynamic>{
       'authenticated': instance.authenticated,
-      'userId': instance.userId,
-      'sessionToken': instance.sessionToken,
+      'user_id': instance.userId,
+      'session_token': instance.sessionToken,
       'error': instance.error,
+    };
+
+NodeAssignment _$NodeAssignmentFromJson(Map<String, dynamic> json) =>
+    NodeAssignment(
+      managementPubkey: json['management_pubkey'] as String,
+      permissions: (json['permissions'] as List<dynamic>)
+          .map((e) => e as String)
+          .toList(),
+    );
+
+Map<String, dynamic> _$NodeAssignmentToJson(NodeAssignment instance) =>
+    <String, dynamic>{
+      'management_pubkey': instance.managementPubkey,
+      'permissions': instance.permissions,
     };
 
 TreeNode _$TreeNodeFromJson(Map<String, dynamic> json) => TreeNode(
@@ -27,7 +41,7 @@ TreeNode _$TreeNodeFromJson(Map<String, dynamic> json) => TreeNode(
       nodeType: json['node_type'] as String,
       ownerId: json['owner_id'] as String,
       data: json['data'] as Map<String, dynamic>,
-      version: json['version'] as int,
+      version: (json['version'] as num).toInt(),
       createdAt: json['created_at'] as String,
       updatedAt: json['updated_at'] as String,
       hostname: json['hostname'] as String?,
@@ -56,23 +70,9 @@ Map<String, dynamic> _$TreeNodeToJson(TreeNode instance) => <String, dynamic>{
       'private_subnet': instance.privateSubnet,
       'mgmt_pubkey': instance.mgmtPubkey,
       'wg_pubkey': instance.wgPubkey,
-      'assignments': instance.assignments?.map((e) => e.toJson()).toList(),
+      'assignments': instance.assignments,
       'region': instance.region,
       'listen_endpoint': instance.listenEndpoint,
-    };
-
-NodeAssignment _$NodeAssignmentFromJson(Map<String, dynamic> json) =>
-    NodeAssignment(
-      managementPubkey: json['management_pubkey'] as String,
-      permissions: (json['permissions'] as List<dynamic>)
-          .map((e) => e as String)
-          .toList(),
-    );
-
-Map<String, dynamic> _$NodeAssignmentToJson(NodeAssignment instance) =>
-    <String, dynamic>{
-      'management_pubkey': instance.managementPubkey,
-      'permissions': instance.permissions,
     };
 
 TreeOperationResponse _$TreeOperationResponseFromJson(
@@ -92,9 +92,9 @@ Map<String, dynamic> _$TreeOperationResponseToJson(
         TreeOperationResponse instance) =>
     <String, dynamic>{
       'success': instance.success,
-      'node': instance.node?.toJson(),
+      'node': instance.node,
       'error': instance.error,
-      'children': instance.children?.map((e) => e.toJson()).toList(),
+      'children': instance.children,
     };
 
 IpAllocation _$IpAllocationFromJson(Map<String, dynamic> json) => IpAllocation(
@@ -117,10 +117,10 @@ Map<String, dynamic> _$IpAllocationToJson(IpAllocation instance) =>
 RelayInfo _$RelayInfoFromJson(Map<String, dynamic> json) => RelayInfo(
       id: json['id'] as String,
       host: json['host'] as String,
-      port: json['port'] as int,
+      port: (json['port'] as num).toInt(),
       region: json['region'] as String,
       available: json['available'] as bool,
-      latencyMs: json['latency_ms'] as double?,
+      latencyMs: (json['latency_ms'] as num?)?.toDouble(),
     );
 
 Map<String, dynamic> _$RelayInfoToJson(RelayInfo instance) => <String, dynamic>{
@@ -221,7 +221,8 @@ NetworkJoinResponse _$NetworkJoinResponseFromJson(Map<String, dynamic> json) =>
       error: json['error'] as String?,
     );
 
-Map<String, dynamic> _$NetworkJoinResponseToJson(NetworkJoinResponse instance) =>
+Map<String, dynamic> _$NetworkJoinResponseToJson(
+        NetworkJoinResponse instance) =>
     <String, dynamic>{
       'success': instance.success,
       'node_id': instance.nodeId,
@@ -230,12 +231,13 @@ Map<String, dynamic> _$NetworkJoinResponseToJson(NetworkJoinResponse instance) =
       'error': instance.error,
     };
 
-ServerLatency _$ServerLatencyFromJson(Map<String, dynamic> json) => ServerLatency(
+ServerLatency _$ServerLatencyFromJson(Map<String, dynamic> json) =>
+    ServerLatency(
       host: json['host'] as String,
-      port: json['port'] as int,
-      smoothedRttMs: json['smoothed_rtt_ms'] as double,
+      port: (json['port'] as num).toInt(),
+      smoothedRttMs: (json['smoothed_rtt_ms'] as num).toDouble(),
       reachable: json['reachable'] as bool,
-      consecutiveFailures: json['consecutive_failures'] as int,
+      consecutiveFailures: (json['consecutive_failures'] as num).toInt(),
     );
 
 Map<String, dynamic> _$ServerLatencyToJson(ServerLatency instance) =>
@@ -252,9 +254,9 @@ TunnelStatus _$TunnelStatusFromJson(Map<String, dynamic> json) => TunnelStatus(
       tunnelIp: json['tunnel_ip'] as String?,
       serverEndpoint: json['server_endpoint'] as String?,
       lastHandshake: json['last_handshake'] as String?,
-      rxBytes: json['rx_bytes'] as int?,
-      txBytes: json['tx_bytes'] as int?,
-      latencyMs: json['latency_ms'] as double?,
+      rxBytes: (json['rx_bytes'] as num?)?.toInt(),
+      txBytes: (json['tx_bytes'] as num?)?.toInt(),
+      latencyMs: (json['latency_ms'] as num?)?.toDouble(),
     );
 
 Map<String, dynamic> _$TunnelStatusToJson(TunnelStatus instance) =>
@@ -274,12 +276,12 @@ WgConfig _$WgConfigFromJson(Map<String, dynamic> json) => WgConfig(
       tunnelIp: json['tunnel_ip'] as String,
       serverPublicKey: json['server_public_key'] as String,
       serverEndpoint: json['server_endpoint'] as String,
-      dnsServer: json['dns_server'] as String,
-      listenPort: json['listen_port'] as int,
+      dnsServer: json['dns_server'] as String?,
+      listenPort: (json['listen_port'] as num).toInt(),
       allowedIps: (json['allowed_ips'] as List<dynamic>)
           .map((e) => e as String)
           .toList(),
-      keepalive: json['keepalive'] as int,
+      keepalive: (json['keepalive'] as num).toInt(),
     );
 
 Map<String, dynamic> _$WgConfigToJson(WgConfig instance) => <String, dynamic>{
@@ -314,10 +316,10 @@ MeshPeer _$MeshPeerFromJson(Map<String, dynamic> json) => MeshPeer(
       relayEndpoint: json['relay_endpoint'] as String?,
       isOnline: json['is_online'] as bool,
       lastHandshake: json['last_handshake'] as String?,
-      rxBytes: json['rx_bytes'] as int?,
-      txBytes: json['tx_bytes'] as int?,
-      latencyMs: json['latency_ms'] as double?,
-      keepalive: json['keepalive'] as int,
+      rxBytes: (json['rx_bytes'] as num?)?.toInt(),
+      txBytes: (json['tx_bytes'] as num?)?.toInt(),
+      latencyMs: (json['latency_ms'] as num?)?.toDouble(),
+      keepalive: (json['keepalive'] as num).toInt(),
     );
 
 Map<String, dynamic> _$MeshPeerToJson(MeshPeer instance) => <String, dynamic>{
@@ -339,10 +341,10 @@ Map<String, dynamic> _$MeshPeerToJson(MeshPeer instance) => <String, dynamic>{
 MeshStatus _$MeshStatusFromJson(Map<String, dynamic> json) => MeshStatus(
       isUp: json['is_up'] as bool,
       tunnelIp: json['tunnel_ip'] as String?,
-      peerCount: json['peer_count'] as int,
-      onlineCount: json['online_count'] as int,
-      totalRxBytes: json['total_rx_bytes'] as int,
-      totalTxBytes: json['total_tx_bytes'] as int,
+      peerCount: (json['peer_count'] as num).toInt(),
+      onlineCount: (json['online_count'] as num).toInt(),
+      totalRxBytes: (json['total_rx_bytes'] as num).toInt(),
+      totalTxBytes: (json['total_tx_bytes'] as num).toInt(),
       peers: (json['peers'] as List<dynamic>)
           .map((e) => MeshPeer.fromJson(e as Map<String, dynamic>))
           .toList(),
@@ -356,12 +358,12 @@ Map<String, dynamic> _$MeshStatusToJson(MeshStatus instance) =>
       'online_count': instance.onlineCount,
       'total_rx_bytes': instance.totalRxBytes,
       'total_tx_bytes': instance.totalTxBytes,
-      'peers': instance.peers.map((e) => e.toJson()).toList(),
+      'peers': instance.peers,
     };
 
 ServiceStats _$ServiceStatsFromJson(Map<String, dynamic> json) => ServiceStats(
       service: json['service'] as String,
-      peerCount: json['peer_count'] as int,
+      peerCount: (json['peer_count'] as num).toInt(),
       privateApiEnabled: json['private_api_enabled'] as bool,
     );
 
@@ -375,10 +377,10 @@ Map<String, dynamic> _$ServiceStatsToJson(ServiceStats instance) =>
 ServerInfo _$ServerInfoFromJson(Map<String, dynamic> json) => ServerInfo(
       id: json['id'] as String,
       host: json['host'] as String,
-      port: json['port'] as int,
+      port: (json['port'] as num).toInt(),
       region: json['region'] as String,
       available: json['available'] as bool,
-      latencyMs: json['latency_ms'] as double?,
+      latencyMs: (json['latency_ms'] as num?)?.toDouble(),
     );
 
 Map<String, dynamic> _$ServerInfoToJson(ServerInfo instance) =>
@@ -393,7 +395,7 @@ Map<String, dynamic> _$ServerInfoToJson(ServerInfo instance) =>
 
 TrustStatus _$TrustStatusFromJson(Map<String, dynamic> json) => TrustStatus(
       trustTier: json['trust_tier'] as String,
-      peerCount: json['peer_count'] as int,
+      peerCount: (json['peer_count'] as num).toInt(),
       peers: (json['peers'] as List<dynamic>?)
           ?.map((e) => TrustPeerInfo.fromJson(e as Map<String, dynamic>))
           .toList(),
@@ -403,14 +405,14 @@ Map<String, dynamic> _$TrustStatusToJson(TrustStatus instance) =>
     <String, dynamic>{
       'trust_tier': instance.trustTier,
       'peer_count': instance.peerCount,
-      'peers': instance.peers?.map((e) => e.toJson()).toList(),
+      'peers': instance.peers,
     };
 
 TrustPeerInfo _$TrustPeerInfoFromJson(Map<String, dynamic> json) =>
     TrustPeerInfo(
       pubkey: json['pubkey'] as String,
       trustLevel: json['trust_level'] as String,
-      attestations: json['attestations'] as int,
+      attestations: (json['attestations'] as num).toInt(),
       lastSeen: json['last_seen'] as String?,
     );
 
@@ -423,64 +425,74 @@ Map<String, dynamic> _$TrustPeerInfoToJson(TrustPeerInfo instance) =>
     };
 
 DdnsStatus _$DdnsStatusFromJson(Map<String, dynamic> json) => DdnsStatus(
-      isEnabled: json['is_enabled'] as bool,
-      hostname: json['hostname'] as String?,
-      lastUpdated: json['last_updated'] as String?,
-      status: json['status'] as String?,
+      hasCredentials: json['has_credentials'] as bool? ?? false,
+      lastIp: json['last_ip'] as String?,
+      binaryHash: json['binary_hash'] as String?,
+      binaryApproved: json['binary_approved'] as bool?,
+      error: json['error'] as String?,
     );
 
 Map<String, dynamic> _$DdnsStatusToJson(DdnsStatus instance) =>
     <String, dynamic>{
-      'is_enabled': instance.isEnabled,
-      'hostname': instance.hostname,
-      'last_updated': instance.lastUpdated,
-      'status': instance.status,
+      'has_credentials': instance.hasCredentials,
+      'last_ip': instance.lastIp,
+      'binary_hash': instance.binaryHash,
+      'binary_approved': instance.binaryApproved,
+      'error': instance.error,
     };
 
 EnrollmentEntry _$EnrollmentEntryFromJson(Map<String, dynamic> json) =>
     EnrollmentEntry(
-      id: json['id'] as String,
-      status: json['status'] as String,
-      createdAt: json['created_at'] as String,
-      expiresAt: json['expires_at'] as String?,
+      requestId: json['request_id'] as String,
+      candidatePubkey: json['candidate_pubkey'] as String?,
+      candidateServerId: json['candidate_server_id'] as String?,
+      sponsorPubkey: json['sponsor_pubkey'] as String?,
+      state: (json['state'] as num?)?.toInt() ?? 0,
+      stateName: json['state_name'] as String?,
+      createdAt: json['created_at'] as String?,
+      timeoutAt: json['timeout_at'] as String?,
+      retries: (json['retries'] as num?)?.toInt() ?? 0,
     );
 
 Map<String, dynamic> _$EnrollmentEntryToJson(EnrollmentEntry instance) =>
     <String, dynamic>{
-      'id': instance.id,
-      'status': instance.status,
+      'request_id': instance.requestId,
+      'candidate_pubkey': instance.candidatePubkey,
+      'candidate_server_id': instance.candidateServerId,
+      'sponsor_pubkey': instance.sponsorPubkey,
+      'state': instance.state,
+      'state_name': instance.stateName,
       'created_at': instance.createdAt,
-      'expires_at': instance.expiresAt,
+      'timeout_at': instance.timeoutAt,
+      'retries': instance.retries,
     };
 
 GovernanceProposal _$GovernanceProposalFromJson(Map<String, dynamic> json) =>
     GovernanceProposal(
-      id: json['id'] as String,
-      parameter: json['parameter'] as int,
-      currentValue: json['current_value'] as String,
-      proposedValue: json['proposed_value'] as String,
-      rationale: json['rationale'] as String,
-      proposerId: json['proposer_id'] as String,
-      votesFor: json['votes_for'] as int,
-      votesAgainst: json['votes_against'] as int,
-      status: json['status'] as String,
-      createdAt: json['created_at'] as String,
-      resolvedAt: json['resolved_at'] as String?,
+      proposalId: json['proposal_id'] as String,
+      proposerPubkey: json['proposer_pubkey'] as String?,
+      parameter: (json['parameter'] as num).toInt(),
+      newValue: json['new_value'] as String? ?? '',
+      oldValue: json['old_value'] as String? ?? '',
+      rationale: json['rationale'] as String? ?? '',
+      createdAt: json['created_at'] as String?,
+      expiresAt: json['expires_at'] as String?,
+      state: (json['state'] as num?)?.toInt() ?? 0,
+      stateName: json['state_name'] as String?,
     );
 
 Map<String, dynamic> _$GovernanceProposalToJson(GovernanceProposal instance) =>
     <String, dynamic>{
-      'id': instance.id,
+      'proposal_id': instance.proposalId,
+      'proposer_pubkey': instance.proposerPubkey,
       'parameter': instance.parameter,
-      'current_value': instance.currentValue,
-      'proposed_value': instance.proposedValue,
+      'new_value': instance.newValue,
+      'old_value': instance.oldValue,
       'rationale': instance.rationale,
-      'proposer_id': instance.proposerId,
-      'votes_for': instance.votesFor,
-      'votes_against': instance.votesAgainst,
-      'status': instance.status,
       'created_at': instance.createdAt,
-      'resolved_at': instance.resolvedAt,
+      'expires_at': instance.expiresAt,
+      'state': instance.state,
+      'state_name': instance.stateName,
     };
 
 ProposeResponse _$ProposeResponseFromJson(Map<String, dynamic> json) =>
@@ -499,34 +511,37 @@ Map<String, dynamic> _$ProposeResponseToJson(ProposeResponse instance) =>
 
 AttestationManifest _$AttestationManifestFromJson(Map<String, dynamic> json) =>
     AttestationManifest(
-      id: json['id'] as String,
-      nodeId: json['node_id'] as String,
-      statement: json['statement'] as String,
-      signature: json['signature'] as String,
-      createdAt: json['created_at'] as String,
+      version: json['version'] as String? ?? '',
+      platform: json['platform'] as String?,
+      binarySha256: json['binary_sha256'] as String? ?? '',
+      timestamp: (json['timestamp'] as num?)?.toInt(),
     );
 
-Map<String, dynamic> _$AttestationManifestToJson(AttestationManifest instance) =>
+Map<String, dynamic> _$AttestationManifestToJson(
+        AttestationManifest instance) =>
     <String, dynamic>{
-      'id': instance.id,
-      'node_id': instance.nodeId,
-      'statement': instance.statement,
-      'signature': instance.signature,
-      'created_at': instance.createdAt,
+      'version': instance.version,
+      'platform': instance.platform,
+      'binary_sha256': instance.binarySha256,
+      'timestamp': instance.timestamp,
     };
 
 HealthResponse _$HealthResponseFromJson(Map<String, dynamic> json) =>
     HealthResponse(
       status: json['status'] as String,
-      version: json['version'] as String,
-      uptime: json['uptime'] as int,
+      service: json['service'] as String? ?? '',
+      dnsBaseDomain: json['dns_base_domain'] as String?,
+      ok: json['ok'] as bool?,
+      error: json['error'] as String?,
     );
 
 Map<String, dynamic> _$HealthResponseToJson(HealthResponse instance) =>
     <String, dynamic>{
       'status': instance.status,
-      'version': instance.version,
-      'uptime': instance.uptime,
+      'service': instance.service,
+      'dns_base_domain': instance.dnsBaseDomain,
+      'ok': instance.ok,
+      'error': instance.error,
     };
 
 IdentityInfo _$IdentityInfoFromJson(Map<String, dynamic> json) => IdentityInfo(

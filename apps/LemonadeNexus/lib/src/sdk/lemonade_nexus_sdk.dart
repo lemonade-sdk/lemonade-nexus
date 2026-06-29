@@ -105,6 +105,33 @@ class LemonadeNexusSdk {
     }
   }
 
+  /// Parses a list that the SDK nests inside an envelope object.
+  ///
+  /// Some endpoints (e.g. `ln_enrollment_status`, `ln_attestation_manifests`)
+  /// return `{...meta, "<key>": [ ... ]}` rather than a bare array. This
+  /// extracts the nested array under [key]; if the SDK instead returns a bare
+  /// array, that is handled too.
+  List<T> _parseNestedList<T>(
+    String? json,
+    String key,
+    T Function(Map<String, dynamic>) fromJson,
+  ) {
+    if (json == null) {
+      throw JsonParseException('null', 'Received null JSON response');
+    }
+    try {
+      final decoded = jsonDecode(json);
+      final List<dynamic> list = decoded is List
+          ? decoded
+          : (decoded is Map<String, dynamic>
+              ? (decoded[key] as List<dynamic>? ?? const [])
+              : const []);
+      return list.whereType<Map<String, dynamic>>().map(fromJson).toList();
+    } catch (e) {
+      throw JsonParseException(json, e.toString());
+    }
+  }
+
   // =========================================================================
   // Lifecycle
   // =========================================================================
@@ -228,16 +255,15 @@ class LemonadeNexusSdk {
   // Health
   // =========================================================================
 
-  /// Checks server health.
+  /// Checks server health, returning the parsed `{status, service, rp_id}`.
   Future<HealthResponse> health() async {
     _checkDisposed();
     _checkConnected();
-    final error = _ffi.health(_client!);
-    if (error != LnError.success) {
-      throw SdkException(error, message: 'Health check failed');
+    final json = _ffi.health(_client!);
+    if (json == null) {
+      throw SdkException(LnError.connect, message: 'Health check failed');
     }
-    // Note: FFI health() already frees the JSON
-    return HealthResponse(status: 'ok', version: 'unknown', uptime: 0);
+    return _parseJson(json, HealthResponse.fromJson);
   }
 
   // =========================================================================
@@ -832,7 +858,8 @@ class LemonadeNexusSdk {
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get enrollment status');
     }
-    return _parseJsonList(json, EnrollmentEntry.fromJson);
+    // SDK returns an envelope `{enabled, ..., enrollments: [...]}`.
+    return _parseNestedList(json, 'enrollments', EnrollmentEntry.fromJson);
   }
 
   // =========================================================================
@@ -877,7 +904,8 @@ class LemonadeNexusSdk {
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get manifests');
     }
-    return _parseJsonList(json, AttestationManifest.fromJson);
+    // SDK returns an envelope `{self_hash, ..., manifests: [...]}`.
+    return _parseNestedList(json, 'manifests', AttestationManifest.fromJson);
   }
 
   // =========================================================================

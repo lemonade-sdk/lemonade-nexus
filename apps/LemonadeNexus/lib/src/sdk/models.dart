@@ -181,8 +181,31 @@ class RelayInfo {
     this.latencyMs,
   });
 
-  factory RelayInfo.fromJson(Map<String, dynamic> json) =>
-      _$RelayInfoFromJson(json);
+  /// Parses an entry from the SDK's `ln_relay_list` output.
+  ///
+  /// Per the SDK source of truth (`CApi.cpp`), the real shape is
+  /// `{relay_id, endpoint, region, reputation_score, supports_stun,
+  /// supports_relay}` — NOT `{id, host, port, available}` and NOT the macOS
+  /// mirror's `{pubkey, load, latency_ms}` (the macOS app diverged here). We map
+  /// the real keys; `available` reflects `supports_relay`. No latency is exposed
+  /// by this endpoint.
+  factory RelayInfo.fromJson(Map<String, dynamic> json) {
+    final endpoint = (json['endpoint'] ?? json['host'] ?? '').toString();
+    final hostPart = endpoint.contains(':') ? endpoint.split(':').first : endpoint;
+    final portPart = endpoint.contains(':')
+        ? int.tryParse(endpoint.split(':').last)
+        : null;
+    return RelayInfo(
+      id: (json['relay_id'] ?? json['id'] ?? endpoint).toString(),
+      host: (json['host'] ?? hostPart).toString(),
+      port: ((json['port']) as num?)?.toInt() ?? portPart ?? 0,
+      region: (json['region'] ?? '').toString(),
+      available: (json['supports_relay'] as bool?) ??
+          (json['available'] as bool?) ??
+          true,
+      latencyMs: (json['latency_ms'] as num?)?.toDouble(),
+    );
+  }
 
   Map<String, dynamic> toJson() => _$RelayInfoToJson(this);
 }
@@ -229,8 +252,16 @@ class CertStatus {
     this.status,
   });
 
-  factory CertStatus.fromJson(Map<String, dynamic> json) =>
-      _$CertStatusFromJson(json);
+  /// Mirrors `ln_cert_status` (SDK CApi.cpp): `{domain, has_cert, expires_at,
+  /// error?}`. The SDK key is `has_cert`, not `is_issued`, and it does not emit
+  /// `issued_at`/`status`.
+  factory CertStatus.fromJson(Map<String, dynamic> json) => CertStatus(
+        domain: (json['domain'] ?? '').toString(),
+        isIssued: (json['has_cert'] ?? json['is_issued'] ?? false) as bool,
+        expiresAt: json['expires_at']?.toString(),
+        issuedAt: json['issued_at']?.toString(),
+        status: json['status']?.toString() ?? json['error']?.toString(),
+      );
 
   Map<String, dynamic> toJson() => _$CertStatusToJson(this);
 }
@@ -388,6 +419,11 @@ class TunnelStatus {
 }
 
 /// WireGuard configuration.
+///
+/// Mirrors `ln_get_wg_config_json`: `{private_key, public_key, tunnel_ip,
+/// server_public_key, server_endpoint, listen_port, keepalive, allowed_ips}`.
+/// Note the SDK does NOT emit `dns_server`, so it must be nullable — marking it
+/// a required String made config parsing throw and blocked the tunnel.
 @JsonSerializable()
 class WgConfig {
   final String privateKey;
@@ -395,7 +431,7 @@ class WgConfig {
   final String tunnelIp;
   final String serverPublicKey;
   final String serverEndpoint;
-  final String dnsServer;
+  final String? dnsServer;
   final int listenPort;
   final List<String> allowedIps;
   final int keepalive;
@@ -406,7 +442,7 @@ class WgConfig {
     required this.tunnelIp,
     required this.serverPublicKey,
     required this.serverEndpoint,
-    required this.dnsServer,
+    this.dnsServer,
     required this.listenPort,
     required this.allowedIps,
     required this.keepalive,
@@ -472,8 +508,27 @@ class MeshPeer {
     required this.keepalive,
   });
 
-  factory MeshPeer.fromJson(Map<String, dynamic> json) =>
-      _$MeshPeerFromJson(json);
+  /// Parses a peer from the SDK's mesh output.
+  ///
+  /// The SDK sends every field as optional (macOS `SDKMeshPeer`), and uses
+  /// numeric `latency_ms`/`last_handshake`. The generated parser's strict
+  /// `as bool`/`as double?`/`as String?` casts threw on missing/numeric values,
+  /// silently emptying mesh status. We parse defensively instead.
+  factory MeshPeer.fromJson(Map<String, dynamic> json) => MeshPeer(
+        nodeId: (json['node_id'] ?? '').toString(),
+        hostname: json['hostname']?.toString(),
+        wgPubkey: (json['wg_pubkey'] ?? '').toString(),
+        tunnelIp: json['tunnel_ip']?.toString(),
+        privateSubnet: json['private_subnet']?.toString(),
+        endpoint: json['endpoint']?.toString(),
+        relayEndpoint: json['relay_endpoint']?.toString(),
+        isOnline: (json['is_online'] as bool?) ?? false,
+        lastHandshake: json['last_handshake']?.toString(),
+        rxBytes: (json['rx_bytes'] as num?)?.toInt(),
+        txBytes: (json['tx_bytes'] as num?)?.toInt(),
+        latencyMs: (json['latency_ms'] as num?)?.toDouble(),
+        keepalive: (json['keepalive'] as num?)?.toInt() ?? 0,
+      );
 
   Map<String, dynamic> toJson() => _$MeshPeerToJson(this);
 }
@@ -499,8 +554,23 @@ class MeshStatus {
     required this.peers,
   });
 
-  factory MeshStatus.fromJson(Map<String, dynamic> json) =>
-      _$MeshStatusFromJson(json);
+  /// Parses the SDK's mesh status output (macOS `SDKMeshStatus`).
+  ///
+  /// `peers` and the counters are optional in the SDK; the generated parser's
+  /// strict casts (`peers as List`, `as int`) threw when they were absent.
+  factory MeshStatus.fromJson(Map<String, dynamic> json) => MeshStatus(
+        isUp: (json['is_up'] as bool?) ?? false,
+        tunnelIp: json['tunnel_ip']?.toString(),
+        peerCount: (json['peer_count'] as num?)?.toInt() ?? 0,
+        onlineCount: (json['online_count'] as num?)?.toInt() ?? 0,
+        totalRxBytes: (json['total_rx_bytes'] as num?)?.toInt() ?? 0,
+        totalTxBytes: (json['total_tx_bytes'] as num?)?.toInt() ?? 0,
+        peers: (json['peers'] as List<dynamic>?)
+                ?.whereType<Map<String, dynamic>>()
+                .map(MeshPeer.fromJson)
+                .toList() ??
+            const [],
+      );
 
   Map<String, dynamic> toJson() => _$MeshStatusToJson(this);
 }
@@ -547,8 +617,29 @@ class ServerInfo {
     this.latencyMs,
   });
 
-  factory ServerInfo.fromJson(Map<String, dynamic> json) =>
-      _$ServerInfoFromJson(json);
+  /// Parses an entry from the SDK's `ln_servers` output.
+  ///
+  /// The SDK returns `{endpoint, pubkey, http_port, last_seen, healthy}`
+  /// (matching the macOS `ServerEntry` parser) — NOT the
+  /// `{id, host, port, region, available, latency_ms}` shape json_serializable
+  /// generated. We map the real keys here and fall back to the alternate shape
+  /// so either form parses without throwing (a throw here previously emptied
+  /// the whole server list).
+  factory ServerInfo.fromJson(Map<String, dynamic> json) {
+    final endpoint = (json['endpoint'] ?? json['host'] ?? '').toString();
+    // `endpoint` may be "host:port"; the HTTP/admin port comes from http_port.
+    final hostPart = endpoint.contains(':') ? endpoint.split(':').first : endpoint;
+    final httpPort =
+        ((json['http_port'] ?? json['port']) as num?)?.toInt() ?? 9100;
+    return ServerInfo(
+      id: (json['id'] ?? endpoint).toString(),
+      host: (json['host'] ?? hostPart).toString(),
+      port: httpPort,
+      region: (json['region'] ?? '').toString(),
+      available: (json['healthy'] ?? json['available'] ?? false) as bool,
+      latencyMs: (json['latency_ms'] as num?)?.toDouble(),
+    );
+  }
 
   Map<String, dynamic> toJson() => _$ServerInfoToJson(this);
 }
@@ -570,8 +661,23 @@ class TrustStatus {
     this.peers,
   });
 
-  factory TrustStatus.fromJson(Map<String, dynamic> json) =>
-      _$TrustStatusFromJson(json);
+  /// Parses the SDK's `ln_trust_status` output.
+  ///
+  /// The SDK returns `{our_tier: int, our_platform, require_tee, peer_count,
+  /// peers}` (matching the macOS `TrustStatusResponse`) — NOT `trust_tier`. We
+  /// map `our_tier` -> [trustTier] (as a string for display) and tolerate the
+  /// alternate `trust_tier` shape.
+  factory TrustStatus.fromJson(Map<String, dynamic> json) {
+    final tier = json['our_tier'] ?? json['trust_tier'];
+    return TrustStatus(
+      trustTier: tier?.toString() ?? '0',
+      peerCount: ((json['peer_count']) as num?)?.toInt() ?? 0,
+      peers: (json['peers'] as List<dynamic>?)
+          ?.whereType<Map<String, dynamic>>()
+          .map(TrustPeerInfo.fromJson)
+          .toList(),
+    );
+  }
 
   Map<String, dynamic> toJson() => _$TrustStatusToJson(this);
 }
@@ -591,8 +697,20 @@ class TrustPeerInfo {
     this.lastSeen,
   });
 
-  factory TrustPeerInfo.fromJson(Map<String, dynamic> json) =>
-      _$TrustPeerInfoFromJson(json);
+  /// Parses a peer from the SDK's trust status `peers` array.
+  ///
+  /// The SDK returns `{pubkey, tier: int, platform, last_verified}` (macOS
+  /// `TrustPeer`) — NOT `{trust_level, attestations, last_seen}`. We map
+  /// `tier` -> [trustLevel] and `last_verified` -> [lastSeen].
+  factory TrustPeerInfo.fromJson(Map<String, dynamic> json) {
+    final tier = json['tier'] ?? json['trust_level'];
+    return TrustPeerInfo(
+      pubkey: (json['pubkey'] ?? '').toString(),
+      trustLevel: tier?.toString() ?? '0',
+      attestations: ((json['attestations']) as num?)?.toInt() ?? 0,
+      lastSeen: (json['last_verified'] ?? json['last_seen'])?.toString(),
+    );
+  }
 
   Map<String, dynamic> toJson() => _$TrustPeerInfoToJson(this);
 }
@@ -602,18 +720,23 @@ class TrustPeerInfo {
 // =========================================================================
 
 /// DDNS credential status.
+///
+/// Mirrors `ln_ddns_status` (SDK CApi.cpp): `{has_credentials, last_ip,
+/// binary_hash, binary_approved, error?}`.
 @JsonSerializable()
 class DdnsStatus {
-  final bool isEnabled;
-  final String? hostname;
-  final String? lastUpdated;
-  final String? status;
+  final bool hasCredentials;
+  final String? lastIp;
+  final String? binaryHash;
+  final bool? binaryApproved;
+  final String? error;
 
   DdnsStatus({
-    required this.isEnabled,
-    this.hostname,
-    this.lastUpdated,
-    this.status,
+    this.hasCredentials = false,
+    this.lastIp,
+    this.binaryHash,
+    this.binaryApproved,
+    this.error,
   });
 
   factory DdnsStatus.fromJson(Map<String, dynamic> json) =>
@@ -627,18 +750,32 @@ class DdnsStatus {
 // =========================================================================
 
 /// Enrollment entry.
+///
+/// Mirrors an item of the `enrollments` array in `ln_enrollment_status` (SDK
+/// CApi.cpp): `{request_id, candidate_pubkey, candidate_server_id,
+/// sponsor_pubkey, state, state_name, created_at, timeout_at, retries, votes}`.
 @JsonSerializable()
 class EnrollmentEntry {
-  final String id;
-  final String status;
-  final String createdAt;
-  final String? expiresAt;
+  final String requestId;
+  final String? candidatePubkey;
+  final String? candidateServerId;
+  final String? sponsorPubkey;
+  final int state;
+  final String? stateName;
+  final String? createdAt;
+  final String? timeoutAt;
+  final int retries;
 
   EnrollmentEntry({
-    required this.id,
-    required this.status,
-    required this.createdAt,
-    this.expiresAt,
+    required this.requestId,
+    this.candidatePubkey,
+    this.candidateServerId,
+    this.sponsorPubkey,
+    this.state = 0,
+    this.stateName,
+    this.createdAt,
+    this.timeoutAt,
+    this.retries = 0,
   });
 
   factory EnrollmentEntry.fromJson(Map<String, dynamic> json) =>
@@ -652,32 +789,34 @@ class EnrollmentEntry {
 // =========================================================================
 
 /// Governance proposal.
+///
+/// Mirrors an entry of `ln_governance_proposals` (SDK CApi.cpp):
+/// `{proposal_id, proposer_pubkey, parameter, new_value, old_value, rationale,
+/// created_at, expires_at, state, state_name, votes:[...]}`.
 @JsonSerializable()
 class GovernanceProposal {
-  final String id;
+  final String proposalId;
+  final String? proposerPubkey;
   final int parameter;
-  final String currentValue;
-  final String proposedValue;
+  final String newValue;
+  final String oldValue;
   final String rationale;
-  final String proposerId;
-  final int votesFor;
-  final int votesAgainst;
-  final String status;
-  final String createdAt;
-  final String? resolvedAt;
+  final String? createdAt;
+  final String? expiresAt;
+  final int state;
+  final String? stateName;
 
   GovernanceProposal({
-    required this.id,
+    required this.proposalId,
+    this.proposerPubkey,
     required this.parameter,
-    required this.currentValue,
-    required this.proposedValue,
-    required this.rationale,
-    required this.proposerId,
-    required this.votesFor,
-    required this.votesAgainst,
-    required this.status,
-    required this.createdAt,
-    this.resolvedAt,
+    this.newValue = '',
+    this.oldValue = '',
+    this.rationale = '',
+    this.createdAt,
+    this.expiresAt,
+    this.state = 0,
+    this.stateName,
   });
 
   factory GovernanceProposal.fromJson(Map<String, dynamic> json) =>
@@ -710,20 +849,22 @@ class ProposeResponse {
 // =========================================================================
 
 /// Attestation manifest.
+///
+/// Mirrors an item of the `manifests` array in `ln_attestation_manifests` (SDK
+/// CApi.cpp): `{version, platform, binary_sha256, timestamp}`. The surrounding
+/// envelope (`self_hash`, `self_approved`, …) is unwrapped by the SDK wrapper.
 @JsonSerializable()
 class AttestationManifest {
-  final String id;
-  final String nodeId;
-  final String statement;
-  final String signature;
-  final String createdAt;
+  final String version;
+  final String? platform;
+  final String binarySha256;
+  final int? timestamp;
 
   AttestationManifest({
-    required this.id,
-    required this.nodeId,
-    required this.statement,
-    required this.signature,
-    required this.createdAt,
+    this.version = '',
+    this.platform,
+    this.binarySha256 = '',
+    this.timestamp,
   });
 
   factory AttestationManifest.fromJson(Map<String, dynamic> json) =>
@@ -737,16 +878,25 @@ class AttestationManifest {
 // =========================================================================
 
 /// Health check response.
+///
+/// Mirrors `ln_health` in the SDK (`projects/LemonadeNexusSDK`, CApi.cpp):
+/// `{status, service, dns_base_domain, ok, error?}`. The SDK does NOT return
+/// version/uptime (those were a fiction that left the dashboard showing
+/// "unknown" / "0s") nor `rp_id`.
 @JsonSerializable()
 class HealthResponse {
   final String status;
-  final String version;
-  final int uptime;
+  final String service;
+  final String? dnsBaseDomain;
+  final bool? ok;
+  final String? error;
 
   HealthResponse({
     required this.status,
-    required this.version,
-    required this.uptime,
+    this.service = '',
+    this.dnsBaseDomain,
+    this.ok,
+    this.error,
   });
 
   factory HealthResponse.fromJson(Map<String, dynamic> json) =>

@@ -9,7 +9,6 @@ import '../state/providers.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 import 'dashboard_view.dart';
-import 'tunnel_control_view.dart';
 import 'peers_view.dart';
 import 'network_monitor_view.dart';
 import 'tree_browser_view.dart';
@@ -46,8 +45,6 @@ class MainNavigation extends ConsumerWidget {
     switch (item) {
       case SidebarItem.dashboard:
         return const DashboardView();
-      case SidebarItem.tunnel:
-        return const TunnelControlView();
       case SidebarItem.peers:
         return const PeersView();
       case SidebarItem.network:

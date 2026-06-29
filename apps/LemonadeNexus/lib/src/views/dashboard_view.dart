@@ -131,19 +131,7 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Expanded(
-          child: _card('Tunnel', Icons.shield_outlined, [
-            _kv('Status', LemonBadge(
-              text: appState.isTunnelUp ? 'UP' : 'DOWN',
-              color: appState.isTunnelUp ? AppTheme.lemonGreen : Colors.grey,
-            )),
-            _kv('Mesh', LemonBadge(
-              text: appState.isMeshEnabled ? 'ENABLED' : 'DISABLED',
-              color: appState.isMeshEnabled ? AppTheme.lemonGreen : Colors.grey,
-            )),
-            if ((mesh?.tunnelIp ?? '').isNotEmpty) _kv('Mesh IP', _mono(mesh!.tunnelIp!)),
-          ]),
-        ),
+        Expanded(child: _p2pMeshCard(appState)),
         const SizedBox(width: 16),
         Expanded(
           child: _card('Mesh Peers', Icons.hub_outlined, [
@@ -164,6 +152,48 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
     );
   }
 
+  /// P2P mesh networking card with an enable/disable control. Replaces the old
+  /// WireGuard "Tunnel" card — endpoint connectivity is via the userspace mesh
+  /// routing layer, not a VPN tunnel.
+  Widget _p2pMeshCard(AppState appState) {
+    final mesh = appState.meshStatus;
+    final enabled = appState.isMeshEnabled;
+    final loading = appState.isLoading;
+    return _card('P2P Mesh', Icons.hub, [
+      _kv('Status', LemonBadge(
+        text: enabled ? 'ENABLED' : 'DISABLED',
+        color: enabled ? AppTheme.lemonGreen : Colors.grey,
+      )),
+      _kv('Online', _mono('${mesh?.onlineCount ?? 0} / ${mesh?.peerCount ?? 0}')),
+      if ((mesh?.tunnelIp ?? '').isNotEmpty) _kv('Mesh IP', _mono(mesh!.tunnelIp!)),
+      const SizedBox(height: 12),
+      SizedBox(
+        width: double.infinity,
+        child: enabled
+            ? OutlinedButton.icon(
+                onPressed: loading
+                    ? null
+                    : () => ref.read(appNotifierProvider.notifier).toggleMesh(),
+                icon: const Icon(Icons.stop_circle_outlined, size: 16),
+                label: const Text('Disable Mesh'),
+              )
+            : ElevatedButton.icon(
+                onPressed: loading
+                    ? null
+                    : () => ref.read(appNotifierProvider.notifier).toggleMesh(),
+                icon: loading
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.play_circle_outline, size: 16),
+                label: const Text('Enable Mesh'),
+              ),
+      ),
+    ], trailing: StatusDot(isHealthy: enabled, size: 8));
+  }
+
   Widget _serverHealthCard(AppState appState) {
     final h = appState.healthStatus;
     return _card('Server Health', Icons.favorite_outline, [
@@ -172,8 +202,9 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
           text: h.status.toUpperCase(),
           color: appState.isServerHealthy ? AppTheme.lemonGreen : AppTheme.errorColor,
         )),
-        _kv('Version', _mono(h.version)),
-        _kv('Uptime', _mono('${h.uptime}s')),
+        _kv('Service', _mono(h.service.isEmpty ? '—' : h.service)),
+        if ((h.dnsBaseDomain ?? '').isNotEmpty)
+          _kv('DNS Domain', _mono(h.dnsBaseDomain!, size: 11)),
       ] else
         _kv('', Text('Unable to reach server',
             style: TextStyle(fontSize: 13, color: AppTheme.nodeOrange))),
@@ -224,8 +255,14 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
         )),
         _kv('Trusted Peers', _mono('${t.peerCount}')),
       ] else
-        _kv('', const Text('Trust data unavailable', style: TextStyle(fontSize: 13))),
-    ]);
+        // /api/trust/status is a private-API route reached via the mesh layer.
+        _kv('', Text(
+          appState.isMeshEnabled
+              ? 'Trust data unavailable'
+              : 'Enable mesh to view trust status',
+          style: const TextStyle(fontSize: 13, color: AppTheme.nodeOrange),
+        )),
+    ], trailing: StatusDot(isHealthy: appState.trustStatus != null, size: 8));
   }
 
   Widget _activityCard(AppState appState) {

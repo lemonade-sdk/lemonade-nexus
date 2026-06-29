@@ -15,7 +15,6 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../sdk/models.dart';
 import '../platform/platform_integration.dart';
-import '../platform/tunnel_controller.dart';
 import '../platform/settings_store.dart';
 import 'app_state.dart';
 
@@ -49,7 +48,7 @@ final ffiProvider = Provider<LemonadeNexusFfi>((ref) {
 /// Provides the AppNotifier instance and AppState state.
 final appNotifierProvider = StateNotifierProvider<AppNotifier, AppState>((ref) {
   final sdk = ref.watch(sdkProvider);
-  return AppNotifier(sdk, tunnel: createTunnelController(sdk));
+  return AppNotifier(sdk);
 });
 
 /// Platform-specific desktop integration (tray/menu-bar, auto-start, lifecycle).
@@ -237,31 +236,27 @@ class AuthService {
   String? get userId => _notifier.state.authState.userId;
 }
 
-/// Tunnel service.
-/// Handles WireGuard tunnel lifecycle management.
+/// Mesh networking service.
+///
+/// The WireGuard VPN-tunnel model was removed in favour of the userspace mesh;
+/// connect/disconnect now map to enabling/disabling P2P mesh networking.
 class TunnelService {
   final LemonadeNexusSdk _sdk;
   final AppNotifier _notifier;
 
   TunnelService(this._sdk, this._notifier);
 
-  /// Connect the WireGuard tunnel.
-  Future<void> connect() => _notifier.connectTunnel();
+  /// Enable P2P mesh networking.
+  Future<void> connect() => _notifier.enableMesh();
 
-  /// Disconnect the WireGuard tunnel.
-  Future<void> disconnect() => _notifier.disconnectTunnel();
+  /// Disable P2P mesh networking.
+  Future<void> disconnect() => _notifier.disableMesh();
 
-  /// Toggle tunnel connection.
-  Future<void> toggle() async {
-    if (_notifier.state.isTunnelUp) {
-      await disconnect();
-    } else {
-      await connect();
-    }
-  }
+  /// Toggle mesh connectivity.
+  Future<void> toggle() => _notifier.toggleMesh();
 
-  /// Refresh tunnel status.
-  Future<void> refreshStatus() => _notifier.refreshTunnelStatus();
+  /// Refresh mesh status.
+  Future<void> refreshStatus() => _notifier.refreshMeshStatus();
 
   /// Enable mesh networking.
   Future<void> enableMesh() => _notifier.enableMesh();
@@ -272,16 +267,10 @@ class TunnelService {
   /// Toggle mesh networking.
   Future<void> toggleMesh() => _notifier.toggleMesh();
 
-  /// Get current tunnel status.
-  TunnelStatus? get status => _notifier.state.tunnelStatus;
-
-  /// Check if tunnel is up.
-  bool get isTunnelUp => _notifier.state.isTunnelUp;
-
   /// Check if mesh is enabled.
   bool get isMeshEnabled => _notifier.state.isMeshEnabled;
 
-  /// Get tunnel IP address.
+  /// Get the mesh-assigned IP address.
   String? get tunnelIp => _notifier.state.tunnelIP;
 }
 

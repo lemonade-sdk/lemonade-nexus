@@ -1106,14 +1106,19 @@ class LemonadeNexusFfi {
   // Health
   // =========================================================================
 
-  LnError health(LnClientHandle client) {
+  /// Calls `ln_health` and returns the JSON body (e.g. `{status, service,
+  /// rp_id}`), or null on error. Previously this discarded the JSON and only
+  /// returned the error code, which is why the dashboard could never show real
+  /// health fields.
+  String? health(LnClientHandle client) {
     final outJson = calloc<ffi.Pointer<ffi.Char>>();
     try {
       final result = _lnHealth(client, outJson);
       if (result == 0) {
-        freeString(outJson.value);
+        return toStringAndFree(outJson.value);
       }
-      return LnError.fromCode(result);
+      freeString(outJson.value);
+      return null;
     } finally {
       calloc.free(outJson);
     }

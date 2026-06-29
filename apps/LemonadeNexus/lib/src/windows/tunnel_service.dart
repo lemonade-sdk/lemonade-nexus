@@ -69,7 +69,7 @@ class WindowsTunnelService {
     final appState = _ref.read(appNotifierProvider);
     if (appState.isAuthenticated) {
       try {
-        await _ref.read(appNotifierProvider.notifier).connectTunnel();
+        await _ref.read(appNotifierProvider.notifier).enableMesh();
       } catch (e) {
         debugPrint('[WindowsTunnel] Auto-connect failed: $e');
       }
@@ -81,7 +81,7 @@ class WindowsTunnelService {
     if (_isTunnelMonitoring) return;
     _isTunnelMonitoring = true;
     _monitorTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      await _ref.read(appNotifierProvider.notifier).refreshTunnelStatus();
+      await _ref.read(appNotifierProvider.notifier).refreshMeshStatus();
       _ref.read(windowsIntegrationProvider).updateTrayConnectionState();
     });
   }
@@ -98,7 +98,7 @@ class WindowsTunnelService {
     final notifier = _ref.read(appNotifierProvider.notifier);
 
     try {
-      await notifier.connectTunnel();
+      await notifier.enableMesh();
 
       // Update tray icon
       if (Platform.isWindows) {
@@ -121,7 +121,7 @@ class WindowsTunnelService {
     final notifier = _ref.read(appNotifierProvider.notifier);
 
     try {
-      await notifier.disconnectTunnel();
+      await notifier.disableMesh();
 
       // Update tray icon
       if (Platform.isWindows) {
@@ -142,7 +142,7 @@ class WindowsTunnelService {
   /// Toggle tunnel connection
   Future<bool> toggle() async {
     final appState = _ref.read(appNotifierProvider);
-    if (appState.isTunnelUp) {
+    if (appState.isMeshEnabled) {
       return await disconnect();
     } else {
       return await connect();
@@ -154,7 +154,7 @@ class WindowsTunnelService {
     debugPrint('[WindowsTunnel] Handling app exit');
 
     final appState = _ref.read(appNotifierProvider);
-    if (appState.isTunnelUp) {
+    if (appState.isMeshEnabled) {
       await disconnect();
     }
 

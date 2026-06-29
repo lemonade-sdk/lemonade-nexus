@@ -1,0 +1,9 @@
+targets:
+  $default:
+    builders:
+      json_serializable:
+        options:
+          # The C/Rust SDK emits snake_case JSON keys (e.g. peer_count, is_up,
+          # rp_id). Generate parsers that read snake_case so models match the
+          # SDK output without per-field @JsonKey annotations.
+          field_rename: snake

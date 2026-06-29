@@ -10,13 +10,15 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
-import '../sdk/models.dart';
-import '../platform/tunnel_controller.dart';
 import '../platform/settings_store.dart';
 import '../platform/secure_store.dart';
 import '../platform/app_paths.dart';
 import '../services/dns_discovery.dart';
 import '../services/passkey_manager.dart';
+
+/// Lightweight console logger for connection/state diagnostics.
+/// Mirrors the `[Discovery]`-style tagging used in dns_discovery.dart.
+void _log(String msg) => print('[AppState] $msg');
 
 /// Connection status enum
 enum ConnectionStatus {
@@ -184,7 +186,6 @@ enum ActivityLevel { info, success, warning, error }
 /// Sidebar navigation items
 enum SidebarItem {
   dashboard,
-  tunnel,
   peers,
   network,
   endpoints,
@@ -199,8 +200,6 @@ extension SidebarItemExtension on SidebarItem {
     switch (this) {
       case SidebarItem.dashboard:
         return 'Dashboard';
-      case SidebarItem.tunnel:
-        return 'Tunnel';
       case SidebarItem.peers:
         return 'Peers';
       case SidebarItem.network:
@@ -222,8 +221,6 @@ extension SidebarItemExtension on SidebarItem {
     switch (this) {
       case SidebarItem.dashboard:
         return Icons.dashboard;
-      case SidebarItem.tunnel:
-        return Icons.security;
       case SidebarItem.peers:
         return Icons.people;
       case SidebarItem.network:
@@ -354,14 +351,17 @@ class AppState {
   bool get isTunnelUp => tunnelStatus?.isUp ?? false;
   bool get isMeshEnabled => peerState.isMeshEnabled;
   bool get isConnected => connectionStatus == ConnectionStatus.connected;
-  bool get isServerHealthy => healthStatus?.status == 'ok';
+  bool get isServerHealthy =>
+      healthStatus?.status == 'ok' || healthStatus?.status == 'healthy';
   String? get username => authState.username;
   String? get userId => authState.userId;
   String? get sessionToken => authState.sessionToken;
   String? get publicKeyBase64 => authState.publicKeyBase64;
   String get serverHost => settings.serverHost;
   int get serverPort => settings.serverPort;
-  String? get tunnelIP => tunnelStatus?.tunnelIp;
+  // The WireGuard tunnel was removed in favour of the userspace mesh; surface
+  // the mesh-assigned IP here so existing views keep showing a usable address.
+  String? get tunnelIP => tunnelStatus?.tunnelIp ?? meshStatus?.tunnelIp;
   MeshStatus? get meshStatus => peerState.meshStatus;
   List<MeshPeer> get meshPeers => peerState.meshPeers;
 }
@@ -369,14 +369,11 @@ class AppState {
 /// Notifier for managing app state
 class AppNotifier extends StateNotifier<AppState> {
   final LemonadeNexusSdk _sdk;
-  final TunnelController _tunnel;
   final SettingsStore _settingsStore = SettingsStore();
   final SecureStore _secureStore = SecureStore();
   final PasskeyManager _passkey = PasskeyManager();
 
-  AppNotifier(this._sdk, {TunnelController? tunnel})
-      : _tunnel = tunnel ?? SdkTunnelController(_sdk),
-        super(AppState.initial);
+  AppNotifier(this._sdk) : super(AppState.initial);
 
   /// Initialize app state - load preferences
   Future<void> initialize() async {
@@ -413,7 +410,12 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Best-effort restore of a previous session (identity + token) on launch.
   Future<void> _restoreSession() async {
     final session = await _secureStore.loadSession();
-    if (session == null) return;
+    if (session == null) {
+      _log('_restoreSession: no stored session');
+      return;
+    }
+    _log('_restoreSession: restoring user=${session.username} '
+        'host=${state.settings.serverHost}:${state.settings.serverPort} tls=${state.settings.useTls}');
     try {
       final s = state.settings;
       if (s.useTls) {
@@ -427,21 +429,26 @@ class AppNotifier extends StateNotifier<AppState> {
         await _sdk.setIdentity();
       }
       await _sdk.setSessionToken(session.token);
+      // Stay on the login view until the restored session's data has loaded;
+      // isAuthenticated (which reveals the dashboard) flips only after.
       state = state.copyWith(
-        connectionStatus: ConnectionStatus.connected,
+        connectionStatus: ConnectionStatus.connecting,
         authState: state.authState.copyWith(
-          isAuthenticated: true,
           username: session.username,
           userId: session.userId,
           sessionToken: session.token,
         ),
       );
       await _loadIdentity();
+      await _joinNetwork();
+      _log('_restoreSession: connected + identity set, refreshing data');
       await refreshAllData();
-      if (state.settings.autoConnectOnLaunch) {
-        await connectTunnel();
-      }
+      state = state.copyWith(
+        connectionStatus: ConnectionStatus.connected,
+        authState: state.authState.copyWith(isAuthenticated: true),
+      );
     } catch (e) {
+      _log('_restoreSession: FAILED -> $e (clearing stored session)');
       await _secureStore.clear();
     }
   }
@@ -454,6 +461,7 @@ class AppNotifier extends StateNotifier<AppState> {
       connectionStatus: ConnectionStatus.connecting,
     );
 
+    _log('connectToServer: host=$host port=$port useTls=$useTls');
     try {
       if (useTls) {
         await _sdk.connectTls(host, port);
@@ -472,6 +480,7 @@ class AppNotifier extends StateNotifier<AppState> {
       );
       await _persistSettings();
       addActivity(ActivityLevel.success, 'Connected to $host:$port');
+      _log('connectToServer: client created OK for $host:$port');
       return true;
     } catch (e) {
       state = state.copyWith(
@@ -480,6 +489,7 @@ class AppNotifier extends StateNotifier<AppState> {
         isLoading: false,
       );
       addActivity(ActivityLevel.error, 'Connection failed: $e');
+      _log('connectToServer: FAILED -> $e');
       return false;
     }
   }
@@ -502,18 +512,22 @@ class AppNotifier extends StateNotifier<AppState> {
   Future<bool> signIn(String username, String password) async {
     state = state.copyWith(isLoading: true, errorMessage: null);
 
+    _log('signIn: start user=$username (connStatus=${state.connectionStatus.name})');
     try {
       final response = await _sdk.authPassword(username, password);
+      _log('signIn: authPassword authenticated=${response.authenticated}');
       if (response.authenticated) {
+        // Record session/identity but stay on the login view (spinner) until
+        // the initial data load completes. isAuthenticated (which gates the
+        // dashboard) and isLoading flip only once the connection is established.
         state = state.copyWith(
           authState: state.authState.copyWith(
-            isAuthenticated: true,
             username: username,
             userId: response.userId,
             sessionToken: response.sessionToken,
             authenticatedAt: DateTime.now(),
           ),
-          isLoading: false,
+          connectionStatus: ConnectionStatus.connecting,
         );
 
         // Set session token for future requests
@@ -522,6 +536,7 @@ class AppNotifier extends StateNotifier<AppState> {
         }
 
         await _loadIdentity();
+        await _joinNetwork();
         await refreshAllData();
         await _persistIdentity();
         if (response.sessionToken != null) {
@@ -531,6 +546,12 @@ class AppNotifier extends StateNotifier<AppState> {
             userId: response.userId,
           ));
         }
+        // Connection established — reveal the dashboard.
+        state = state.copyWith(
+          authState: state.authState.copyWith(isAuthenticated: true),
+          connectionStatus: ConnectionStatus.connected,
+          isLoading: false,
+        );
         addActivity(ActivityLevel.success, 'Signed in as $username');
         return true;
       } else {
@@ -567,17 +588,22 @@ class AppNotifier extends StateNotifier<AppState> {
       // Try to authenticate
       final response = await _sdk.authPassword(username, password);
       if (response.authenticated) {
+        // Stay on the login view (spinner) until the initial data load finishes.
         state = state.copyWith(
           authState: state.authState.copyWith(
-            isAuthenticated: true,
             username: username,
             userId: response.userId,
             sessionToken: response.sessionToken,
             authenticatedAt: DateTime.now(),
           ),
-          isLoading: false,
+          connectionStatus: ConnectionStatus.connecting,
         );
+        if (response.sessionToken != null) {
+          await _sdk.setSessionToken(response.sessionToken!);
+        }
         await _loadIdentity();
+        await _joinNetwork();
+        await refreshAllData();
         await _persistIdentity();
         if (response.sessionToken != null) {
           await _secureStore.saveSession(StoredSession(
@@ -586,6 +612,12 @@ class AppNotifier extends StateNotifier<AppState> {
             userId: response.userId,
           ));
         }
+        // Connection established — reveal the dashboard.
+        state = state.copyWith(
+          authState: state.authState.copyWith(isAuthenticated: true),
+          connectionStatus: ConnectionStatus.connected,
+          isLoading: false,
+        );
         addActivity(ActivityLevel.success, 'Registered as $username');
         return true;
       } else {
@@ -620,23 +652,31 @@ class AppNotifier extends StateNotifier<AppState> {
       final token = resp['session_token'] as String?;
       if (resp['authenticated'] == true) {
         if (token != null) await _sdk.setSessionToken(token);
+        // Stay on the login view (spinner) until the initial data load finishes.
         state = state.copyWith(
           authState: state.authState.copyWith(
-            isAuthenticated: true,
             username: username,
             userId: resp['user_id'] as String?,
             sessionToken: token,
           ),
           hasStoredPasskey: true,
           storedPasskeyUserId: username,
-          isLoading: false,
+          connectionStatus: ConnectionStatus.connecting,
         );
         if (token != null) {
           await _secureStore.saveSession(StoredSession(
               token: token, username: username, userId: resp['user_id'] as String?));
         }
+        await _establishPasskeyMeshIdentity(token);
         await _loadIdentity();
+        await _joinNetwork();
         await refreshAllData();
+        // Connection established — reveal the dashboard.
+        state = state.copyWith(
+          authState: state.authState.copyWith(isAuthenticated: true),
+          connectionStatus: ConnectionStatus.connected,
+          isLoading: false,
+        );
         addActivity(ActivityLevel.success, 'Registered passkey for $username');
         return true;
       }
@@ -657,30 +697,41 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Sign in with the stored passkey (triggers Touch ID).
   Future<bool> signInWithPasskey() async {
     state = state.copyWith(isLoading: true, errorMessage: null);
+    _log('signInWithPasskey: start (connStatus=${state.connectionStatus.name})');
     try {
       final assertion = await _passkey.signAssertion('lemonade-nexus.local');
       final resp = await _sdk.authPasskey({
         'method': 'passkey',
         'assertion': assertion.toAssertionJson(),
       });
+      _log('signInWithPasskey: authPasskey authenticated=${resp.authenticated}');
       if (resp.authenticated) {
         final username = state.storedPasskeyUserId ?? '';
         if (resp.sessionToken != null) await _sdk.setSessionToken(resp.sessionToken!);
+        // Stay on the login view (spinner) until the initial data load finishes;
+        // isAuthenticated/isLoading flip only once the connection is established.
         state = state.copyWith(
           authState: state.authState.copyWith(
-            isAuthenticated: true,
             username: username,
             userId: resp.userId,
             sessionToken: resp.sessionToken,
           ),
-          isLoading: false,
+          connectionStatus: ConnectionStatus.connecting,
         );
         if (resp.sessionToken != null) {
           await _secureStore.saveSession(StoredSession(
               token: resp.sessionToken!, username: username, userId: resp.userId));
         }
+        await _establishPasskeyMeshIdentity(resp.sessionToken);
         await _loadIdentity();
+        await _joinNetwork();
         await refreshAllData();
+        // Connection established — reveal the dashboard.
+        state = state.copyWith(
+          authState: state.authState.copyWith(isAuthenticated: true),
+          connectionStatus: ConnectionStatus.connected,
+          isLoading: false,
+        );
         addActivity(ActivityLevel.success, 'Signed in with passkey');
         return true;
       }
@@ -698,6 +749,60 @@ class AppNotifier extends StateNotifier<AppState> {
   Future<void> deletePasskey() async {
     await _passkey.deleteCredential();
     state = state.copyWith(hasStoredPasskey: false);
+  }
+
+  /// Joins the mesh network as an endpoint (auth + create_node + IP allocation).
+  ///
+  /// This is what populates the SDK's WireGuard config (assigns the tunnel IP +
+  /// node id); without it [connectTunnel] has no config to bring up. Mirrors the
+  /// macOS `joinAsEndpoint()`. Best-effort: a join failure leaves the user
+  /// authenticated but without a tunnel.
+  Future<void> _joinNetwork() async {
+    try {
+      final username = state.username ?? '';
+      final join = await _sdk.joinNetwork(username: username, password: '');
+      _log('joinNetwork: success=${join.success} nodeId=${join.nodeId} '
+          'tunnelIp=${join.tunnelIp}');
+      if (join.nodeId != null) {
+        await _sdk.setNodeId(join.nodeId!);
+      }
+      if (join.tunnelIp != null) {
+        addActivity(ActivityLevel.success,
+            'Joined network — tunnel IP: ${join.tunnelIp}');
+      } else if (!join.success) {
+        addActivity(ActivityLevel.warning,
+            'Network join incomplete: ${join.error ?? 'no tunnel IP assigned'}');
+      }
+    } catch (e) {
+      _log('joinNetwork: FAILED -> $e');
+      addActivity(ActivityLevel.warning, 'Network join failed: $e');
+    }
+  }
+
+  /// Establishes the Ed25519 mesh identity for a passkey session.
+  ///
+  /// Passkey auth (Secure Enclave P-256) is auth-only; mesh node creation needs
+  /// a separate Ed25519 identity. Generate + set one, register it via an Ed25519
+  /// challenge so the server grants node-creation permission, then restore the
+  /// passkey session token (Ed25519 auth returns its own). Mirrors the macOS
+  /// passkey flow (generateIdentity -> authenticateEd25519 -> re-set token).
+  Future<void> _establishPasskeyMeshIdentity(String? passkeyToken) async {
+    try {
+      await _sdk.generateIdentity();
+      // Flutter's generateIdentity() (unlike macOS) does not set the identity on
+      // the client — do it explicitly so join/tree ops can sign.
+      await _sdk.setIdentity();
+      try {
+        await _sdk.authEd25519();
+        _log('establishPasskeyMeshIdentity: Ed25519 key registered');
+      } catch (e) {
+        _log('establishPasskeyMeshIdentity: authEd25519 failed (non-fatal): $e');
+      }
+      // Ed25519 auth returns its own token; restore the passkey session token.
+      if (passkeyToken != null) await _sdk.setSessionToken(passkeyToken);
+    } catch (e) {
+      _log('establishPasskeyMeshIdentity: FAILED -> $e');
+    }
   }
 
   /// Load identity public key
@@ -736,37 +841,49 @@ class AppNotifier extends StateNotifier<AppState> {
 
   /// Refresh all data
   Future<void> refreshAllData() async {
+    _log('refreshAllData: meshEnabled=${state.isMeshEnabled} '
+        'connStatus=${state.connectionStatus.name} authed=${state.isAuthenticated}');
     await Future.wait([
       refreshHealth(),
       refreshStats(),
       refreshServers(),
       refreshMeshStatus(),
-      // /api/relay/list and /api/trust/status are private API endpoints served
-      // only over the WireGuard tunnel; calling them on the public connection
-      // 404s. Refresh them once the tunnel (private API) is up.
-      if (state.isTunnelUp) refreshRelays(),
-      if (state.isTunnelUp) refreshTrustStatus(),
+      // /api/relay/list and /api/trust/status are private-API endpoints reached
+      // through the mesh/routing layer; they 404 on the plain public connection.
+      // Refresh them once the mesh is up.
+      if (state.isMeshEnabled) refreshRelays(),
+      if (state.isMeshEnabled) refreshTrustStatus(),
     ]);
+    _log('refreshAllData done: isServerHealthy=${state.isServerHealthy} '
+        'servers=${state.servers.length} stats=${state.stats != null}');
   }
 
   /// Refresh health status
   Future<void> refreshHealth() async {
     try {
-      await _sdk.health();
-      state = state.copyWith(
-        healthStatus: HealthResponse(status: 'ok', version: 'unknown', uptime: 0),
-      );
+      final h = await _sdk.health();
+      state = state.copyWith(healthStatus: h);
+      _log('refreshHealth: OK (status=${h.status} service=${h.service}) '
+          '-> isServerHealthy=${state.isServerHealthy}');
     } catch (e) {
       state = state.copyWith(
-        healthStatus: HealthResponse(status: 'error', version: 'unknown', uptime: 0),
+        healthStatus: HealthResponse(status: 'error'),
       );
+      _log('refreshHealth: FAILED -> $e');
     }
   }
 
   /// Refresh stats
+  ///
+  /// Note: the value is awaited into a local *before* `state = state.copyWith`.
+  /// Inlining the await (`state.copyWith(stats: await ...)`) evaluates the
+  /// `state` receiver before suspending, so a concurrent refresh in
+  /// [refreshAllData]'s Future.wait can overwrite this update from a stale
+  /// snapshot (this is what was wiping out the health status -> "Disconnected").
   Future<void> refreshStats() async {
     try {
-      state = state.copyWith(stats: await _sdk.getStats());
+      final stats = await _sdk.getStats();
+      state = state.copyWith(stats: stats);
     } catch (e) {
       // Stats unavailable
     }
@@ -775,16 +892,20 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Refresh servers
   Future<void> refreshServers() async {
     try {
-      state = state.copyWith(servers: await _sdk.listServers());
+      final servers = await _sdk.listServers();
+      state = state.copyWith(servers: servers);
+      _log('refreshServers: ${servers.length} server(s)');
     } catch (e) {
       state = state.copyWith(servers: []);
+      _log('refreshServers: FAILED -> $e');
     }
   }
 
   /// Refresh relays
   Future<void> refreshRelays() async {
     try {
-      state = state.copyWith(relays: await _sdk.listRelays());
+      final relays = await _sdk.listRelays();
+      state = state.copyWith(relays: relays);
     } catch (e) {
       state = state.copyWith(relays: []);
     }
@@ -802,6 +923,9 @@ class AppNotifier extends StateNotifier<AppState> {
           isMeshEnabled: meshStatus.isUp,
         ),
       );
+      _log('refreshMeshStatus: up=${meshStatus.isUp} '
+          'peers=${meshStatus.peerCount} online=${meshStatus.onlineCount} '
+          'meshIp=${meshStatus.tunnelIp} (${meshPeers.length} peer records)');
     } catch (e) {
       state = state.copyWith(
         peerState: const PeerState(
@@ -809,15 +933,19 @@ class AppNotifier extends StateNotifier<AppState> {
           meshPeers: [],
         ),
       );
+      _log('refreshMeshStatus: FAILED -> $e');
     }
   }
 
-  /// Refresh trust status
+  /// Refresh trust status (private API — reached via the mesh routing layer).
   Future<void> refreshTrustStatus() async {
     try {
-      state = state.copyWith(trustStatus: await _sdk.getTrustStatus());
+      final trustStatus = await _sdk.getTrustStatus();
+      state = state.copyWith(trustStatus: trustStatus);
+      _log('refreshTrustStatus: OK tier=${trustStatus.trustTier} '
+          'peers=${trustStatus.peerCount}');
     } catch (e) {
-      // Trust status unavailable
+      _log('refreshTrustStatus: FAILED -> $e');
     }
   }
 
@@ -898,84 +1026,48 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Connect tunnel
-  Future<void> connectTunnel() async {
-    state = state.copyWith(isLoading: true);
-    try {
-      // Get WG config first
-      final config = await _sdk.getWgConfigJson();
-      if (config != null) {
-        await _tunnel.up(config);
-      }
-      await refreshTunnelStatus();
-      addActivity(ActivityLevel.success, 'Tunnel connected');
-    } catch (e) {
-      state = state.copyWith(errorMessage: 'Failed to connect tunnel: $e');
-      addActivity(ActivityLevel.error, 'Failed to connect tunnel: $e');
-    } finally {
-      state = state.copyWith(isLoading: false);
-    }
-  }
-
-  /// Disconnect tunnel
-  Future<void> disconnectTunnel() async {
-    state = state.copyWith(isLoading: true);
-    try {
-      await _tunnel.down();
-      await refreshTunnelStatus();
-      addActivity(ActivityLevel.info, 'Tunnel disconnected');
-    } catch (e) {
-      state = state.copyWith(errorMessage: 'Failed to disconnect tunnel: $e');
-      addActivity(ActivityLevel.error, 'Failed to disconnect tunnel: $e');
-    } finally {
-      state = state.copyWith(isLoading: false);
-    }
-  }
-
-  /// Refresh tunnel status
-  Future<void> refreshTunnelStatus() async {
-    try {
-      final tunnelStatus = await _tunnel.status();
-      state = state.copyWith(
-        tunnelStatus: tunnelStatus,
-      );
-    } catch (e) {
-      state = state.copyWith(tunnelStatus: null);
-    }
-  }
-
-  /// Enable mesh
+  /// Enable P2P mesh networking (userspace BoringTun via the routing layer).
   Future<void> enableMesh() async {
     state = state.copyWith(isLoading: true);
+    _log('enableMesh: start (nodeId set, connStatus=${state.connectionStatus.name})');
     try {
       await _sdk.enableMesh();
+      _log('enableMesh: ln_mesh_enable OK — refreshing mesh status');
       await refreshMeshStatus();
+      final m = state.meshStatus;
+      _log('enableMesh: meshUp=${m?.isUp} peers=${m?.peerCount} '
+          'online=${m?.onlineCount} meshIp=${m?.tunnelIp}');
       addActivity(ActivityLevel.success, 'Mesh enabled');
     } catch (e) {
       state = state.copyWith(errorMessage: 'Failed to enable mesh: $e');
       addActivity(ActivityLevel.error, 'Failed to enable mesh: $e');
+      _log('enableMesh: FAILED -> $e');
     } finally {
       state = state.copyWith(isLoading: false);
     }
   }
 
-  /// Disable mesh
+  /// Disable P2P mesh networking.
   Future<void> disableMesh() async {
     state = state.copyWith(isLoading: true);
+    _log('disableMesh: start');
     try {
       await _sdk.disableMesh();
       await refreshMeshStatus();
+      _log('disableMesh: ln_mesh_disable OK -> meshUp=${state.meshStatus?.isUp}');
       addActivity(ActivityLevel.info, 'Mesh disabled');
     } catch (e) {
       state = state.copyWith(errorMessage: 'Failed to disable mesh: $e');
       addActivity(ActivityLevel.error, 'Failed to disable mesh: $e');
+      _log('disableMesh: FAILED -> $e');
     } finally {
       state = state.copyWith(isLoading: false);
     }
   }
 
-  /// Toggle mesh
+  /// Toggle P2P mesh networking.
   Future<void> toggleMesh() async {
+    _log('toggleMesh: currentlyEnabled=${state.isMeshEnabled}');
     if (state.isMeshEnabled) {
       await disableMesh();
     } else {
@@ -1028,8 +1120,12 @@ class AppNotifier extends StateNotifier<AppState> {
         discoveredServers: servers,
         discoveryMessage: service.lastMessage,
       );
+      _log('discoverNearestServer: found ${servers.length} server(s)');
       if (servers.isNotEmpty) {
         final best = servers.first;
+        _log('discoverNearestServer: best=${best.displayName} '
+            'host=${best.connectHost ?? best.hostname ?? best.ip} '
+            'port=${best.port} scheme=${best.scheme}');
         await connectToServer(
           best.connectHost ?? best.hostname ?? best.ip,
           best.port,

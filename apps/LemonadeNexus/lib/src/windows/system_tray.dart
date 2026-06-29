@@ -98,13 +98,12 @@ class WindowsSystemTray with TrayListener {
   /// Update the context menu based on current state
   Future<void> _updateContextMenu() async {
     final appState = _ref.read(appNotifierProvider);
-    final isTunnelUp = appState.isTunnelUp;
     final isMeshEnabled = appState.isMeshEnabled;
 
     final menuItems = [
       MenuItem(
         key: 'connect',
-        label: isTunnelUp ? 'Disconnect' : 'Connect',
+        label: isMeshEnabled ? 'Disable Mesh' : 'Enable Mesh',
       ),
       MenuItem.separator(),
       MenuItem(
@@ -132,8 +131,8 @@ class WindowsSystemTray with TrayListener {
 
     if (appState.isConnected) {
       tooltipText += ' - Connected';
-      if (appState.tunnelStatus?.tunnelIp != null) {
-        tooltipText += ' (${appState.tunnelStatus!.tunnelIp})';
+      if (appState.tunnelIP != null) {
+        tooltipText += ' (${appState.tunnelIP})';
       }
     } else if (appState.connectionStatus == ConnectionStatus.connecting) {
       tooltipText += ' - Connecting...';
@@ -180,12 +179,7 @@ class WindowsSystemTray with TrayListener {
 
     switch (menuItem.key) {
       case 'connect':
-        final appState = _ref.read(appNotifierProvider);
-        if (appState.isTunnelUp) {
-          await notifier.disconnectTunnel();
-        } else {
-          await notifier.connectTunnel();
-        }
+        await notifier.toggleMesh();
         // Update menu after toggle
         await Future.delayed(const Duration(milliseconds: 500));
         await _updateContextMenu();
@@ -219,10 +213,10 @@ class WindowsSystemTray with TrayListener {
   Future<void> _handleExit() async {
     debugPrint('[SystemTray] Exiting application');
 
-    // Disconnect tunnel before exit
+    // Disable mesh before exit
     final notifier = _ref.read(appNotifierProvider.notifier);
-    if (_ref.read(appNotifierProvider).isTunnelUp) {
-      await notifier.disconnectTunnel();
+    if (_ref.read(appNotifierProvider).isMeshEnabled) {
+      await notifier.disableMesh();
     }
 
     // Close the application
