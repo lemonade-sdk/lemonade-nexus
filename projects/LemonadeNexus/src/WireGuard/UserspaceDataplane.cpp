@@ -477,17 +477,24 @@ void UserspaceDataplane::set_inbound_handler(InboundIpHandler handler) {
 
 bool UserspaceDataplane::send_outbound_ip_packet(std::span<const uint8_t> ip_packet) {
     auto dst = wire::ipv4::dst_addr(ip_packet);
-    if (!dst) return false;
+    if (!dst) { spdlog::debug("[dataplane] tx: no dst addr"); return false; }
 
     IpRouter<PeerPtr>::Result route;
     {
         std::shared_lock lock(tables_mtx_);
         route = router_.lookup(*dst);
     }
-    if (route.verdict != IpRouter<PeerPtr>::Verdict::Peer) return false;
+    if (route.verdict != IpRouter<PeerPtr>::Verdict::Peer) {
+        spdlog::debug("[dataplane] tx dst={:08x}: NO ROUTE (verdict={})",
+                      *dst, static_cast<int>(route.verdict));
+        return false;
+    }
 
     thread_local std::vector<uint8_t> scratch(kBufSize + wire::kMaxOverhead);
-    return encrypt_and_send(route.peer, ip_packet, scratch);
+    bool ok = encrypt_and_send(route.peer, ip_packet, scratch);
+    spdlog::debug("[dataplane] tx dst={:08x} -> peer {}: send={}",
+                  *dst, route.peer->pubkey_b64.substr(0, 8), ok);
+    return ok;
 }
 
 bool UserspaceDataplane::encrypt_and_send(const PeerPtr& dst,
@@ -496,12 +503,16 @@ bool UserspaceDataplane::encrypt_and_send(const PeerPtr& dst,
     auto r = wireguard_write(dst->tunn, ip_pkt.data(),
                              static_cast<uint32_t>(ip_pkt.size()),
                              scratch.data(), static_cast<uint32_t>(scratch.size()));
-    if (r.op != WRITE_TO_NETWORK || r.size == 0)
+    if (r.op != WRITE_TO_NETWORK || r.size == 0) {
+        spdlog::debug("[dataplane] encap: op={} size={} (no session -> pending handshake)",
+                      static_cast<int>(r.op), r.size);
         return r.op == WIREGUARD_DONE;  // queued pending handshake
+    }
 
     uint64_t endpoint = dst->endpoint.load(std::memory_order_relaxed);
-    if (!endpoint) return false;
+    if (!endpoint) { spdlog::debug("[dataplane] encap: WRITE but no endpoint"); return false; }
     send_udp(scratch.data(), r.size, endpoint);
+    spdlog::debug("[dataplane] encap: sent {} bytes (data)", r.size);
     return true;
 }
 
@@ -702,7 +713,12 @@ void UserspaceDataplane::timer_loop() {
                                     static_cast<uint32_t>(buf.size()));
             if (r.op == WRITE_TO_NETWORK && r.size > 0) {
                 uint64_t endpoint = peer->endpoint.load(std::memory_order_relaxed);
+                spdlog::debug("[dataplane] tick: peer {} -> {} bytes, endpoint={:#x}",
+                              peer->pubkey_b64.substr(0, 8), r.size, endpoint);
                 if (endpoint) send_udp(buf.data(), r.size, endpoint);
+            } else if (r.op != WIREGUARD_DONE) {
+                spdlog::debug("[dataplane] tick: peer {} op={} size={}",
+                              peer->pubkey_b64.substr(0, 8), static_cast<int>(r.op), r.size);
             }
         }
         slot = (slot + 1) % kTimerSlots;

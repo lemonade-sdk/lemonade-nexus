@@ -285,44 +285,13 @@ double ln_current_latency_ms(ln_client_t* client);
 ln_error_t ln_server_latencies(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */
-/* WireGuard tunnel management                                         */
+/* Mesh dataplane                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Bring up the WireGuard tunnel with the given config (JSON string).
- *  Config JSON keys: private_key, public_key, tunnel_ip, server_public_key,
- *  server_endpoint, dns_server, listen_port, allowed_ips (array), keepalive.
- *  Returns status JSON via out_json. Caller must ln_free(*out_json). */
-ln_error_t ln_tunnel_up(ln_client_t* client,
-                         const char* config_json,
-                         char** out_json);
-
-/** Tear down the WireGuard tunnel.
- *  Returns status JSON via out_json. Caller must ln_free(*out_json). */
-ln_error_t ln_tunnel_down(ln_client_t* client, char** out_json);
-
-/** Get the current WireGuard tunnel status as JSON.
- *  Returns: {is_up, tunnel_ip, server_endpoint, last_handshake,
- *            rx_bytes, tx_bytes, latency_ms}.
- *  Caller must ln_free(*out_json). */
-ln_error_t ln_tunnel_status(ln_client_t* client, char** out_json);
-
-/** Get the WireGuard configuration string (wg-quick format).
- *  Useful on mobile platforms (iOS/Android) where the app manages
- *  the tunnel via NetworkExtension or VpnService.
- *  Returns NULL if no config is stored. Caller must ln_free(). */
-char* ln_get_wg_config(ln_client_t* client);
-
-/** Get the WireGuard configuration as a JSON string.
- *  Returns the same config that ln_tunnel_up() accepts:
- *  {private_key, public_key, tunnel_ip, server_public_key,
- *   server_endpoint, dns_server, listen_port, allowed_ips, keepalive}.
- *  Returns NULL if no config is stored. Caller must ln_free(). */
-char* ln_get_wg_config_json(ln_client_t* client);
-
-/** Generate a WireGuard keypair (Curve25519).
+/** Generate a Curve25519 keypair for the mesh dataplane.
  *  Returns JSON: {private_key: "base64", public_key: "base64"}.
  *  Caller must ln_free(). */
-char* ln_wg_generate_keypair(void);
+char* ln_generate_keypair(void);
 
 /* ------------------------------------------------------------------ */
 /* Mesh P2P networking                                                 */
@@ -451,47 +420,6 @@ ln_error_t ln_routing_request(ln_client_t* client, const char* identifier,
 /** GET /api/routing/session/{id}. Returns session-state JSON. ln_free(*out_json). */
 ln_error_t ln_routing_connection_status(ln_client_t* client, const char* connection_id,
                                         char** out_json);
-
-/* ------------------------------------------------------------------ */
-/* Packet pump (host-owned, socket-level tunnel — no TUN device, no VPN)   */
-/* ------------------------------------------------------------------ */
-
-/** Opaque packet-pump handle. A userspace, multi-peer WireGuard dataplane
- *  (BoringTun) joined to an in-process TCP/IP stack, exposing mesh connectivity
- *  as ordinary loopback sockets. No kernel TUN device, no system VPN, no
- *  elevated privileges. The pump owns its UDP socket and worker threads.
- *  Independent of ln_client_t. */
-typedef struct ln_pump_s ln_pump_t;
-
-/** Create a pump from a WireGuard config JSON (same schema as ln_tunnel_up:
- *  private_key, public_key, server_public_key, server_endpoint, tunnel_ip,
- *  allowed_ips, listen_port, keepalive). Binds the UDP socket, starts the
- *  dataplane + netstack, registers tunnel_ip as a local address, and adds
- *  server_public_key as the initial peer. Returns NULL on failure. */
-ln_pump_t* ln_pump_create(const char* config_json);
-
-/** Stop the dataplane + netstack and free the pump. */
-void ln_pump_destroy(ln_pump_t* pump);
-
-/** Open an egress proxy: bind a loopback TCP listener; each accepted connection
- *  is bridged to a virtual TCP connection to dst_ip:dst_port across the mesh,
- *  sourced from our tunnel IP. Returns the bound 127.0.0.1 port, or 0 on
- *  failure. Connect a normal socket to 127.0.0.1:<port> to reach the endpoint. */
-uint16_t ln_pump_tcp_egress(ln_pump_t* pump, const char* dst_ip, uint16_t dst_port);
-
-/** Add an ingress forward: expose a local service to the mesh. Virtual
- *  vip:vport -> target ("tcp:127.0.0.1:PORT" or "unix:/path"). LN_OK on success. */
-ln_error_t ln_pump_tcp_forward(ln_pump_t* pump, const char* vip, uint16_t vport,
-                               const char* target);
-
-/** Replace the mesh peer set. peers_json is a JSON array as returned by
- *  ln_mesh_peers (keys: wg_pubkey, tunnel_ip, private_subnet, endpoint,
- *  relay_endpoint, keepalive). Adds new, updates changed, removes stale. The
- *  initial server peer is preserved. */
-ln_error_t ln_pump_sync_peers(ln_pump_t* pump, const char* peers_json);
-
-/** Per-peer status as a JSON array. Caller must ln_free(*out_json). */
-ln_error_t ln_pump_status(ln_pump_t* pump, char** out_json);
 
 /* ------------------------------------------------------------------ */
 /* Session management                                                  */

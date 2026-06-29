@@ -5,7 +5,7 @@
 #include <LemonadeNexusSDK/LatencyMonitor.hpp>
 #include <LemonadeNexusSDK/RoutingTypes.hpp>
 #include <LemonadeNexusSDK/Types.hpp>
-#include <LemonadeNexusSDK/WireGuardTunnel.hpp>
+#include <LemonadeNexusSDK/BoringtunMesh.hpp>
 
 #include <nlohmann/json.hpp>
 
@@ -292,34 +292,14 @@ public:
     [[nodiscard]] std::vector<ServerLatency> server_latencies() const;
 
     // -----------------------------------------------------------------
-    // WireGuard tunnel management
-    // -----------------------------------------------------------------
-
-    /// Get current WireGuard tunnel status.
-    [[nodiscard]] TunnelStatus tunnel_status() const;
-
-    /// Check if the WireGuard tunnel is currently active.
-    [[nodiscard]] bool is_tunnel_active() const;
-
-    /// Get the WireGuard configuration string (wg-quick format).
-    /// Useful on mobile platforms where the app manages the VPN lifecycle.
-    [[nodiscard]] std::string get_wireguard_config() const;
-
-    /// Get the WireGuard configuration as JSON (matching ln_tunnel_up format).
-    [[nodiscard]] std::string get_wireguard_config_json() const;
-
-    /// Manually bring up the WireGuard tunnel with the given config.
-    [[nodiscard]] StatusResult tunnel_up(const WireGuardConfig& config);
-
-    /// Tear down the WireGuard tunnel.
-    [[nodiscard]] StatusResult tunnel_down();
-
-    // -----------------------------------------------------------------
     // Mesh P2P networking
     // -----------------------------------------------------------------
 
+    /// Whether the userspace mesh dataplane is up (started at join).
+    [[nodiscard]] bool is_mesh_active() const;
+
     /// Enable mesh networking. Starts background peer discovery, NAT traversal,
-    /// and tunnel synchronization. Requires an active tunnel and node_id.
+    /// and dataplane peer sync. Requires a joined node (node_id + dataplane).
     void enable_mesh(const MeshConfig& config = {});
 
     /// Disable mesh networking and remove all mesh peers from the tunnel.

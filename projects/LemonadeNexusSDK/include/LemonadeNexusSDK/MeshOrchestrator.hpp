@@ -15,13 +15,13 @@ namespace lnsdk {
 
 // Forward declarations — avoid including full headers
 class LemonadeNexusClient;
-class WireGuardTunnel;
+class BoringtunMesh;
 
-/// Background orchestrator for P2P mesh WireGuard networking.
+/// Background orchestrator for P2P mesh networking over the boringtun dataplane.
 ///
 /// Periodically:
 ///   1. Fetches authorized peers from the server (GET /api/mesh/peers/{node_id})
-///   2. Syncs the WireGuard tunnel's peer set (add/remove/update)
+///   2. Syncs the mesh dataplane's peer set (add/remove/update)
 ///   3. Reports our public endpoint via heartbeat (POST /api/mesh/heartbeat)
 ///   4. Monitors peer connectivity and fires state callbacks
 class MeshOrchestrator {
@@ -29,7 +29,7 @@ public:
     using StateCallback = std::function<void(const MeshTunnelStatus&)>;
 
     MeshOrchestrator(LemonadeNexusClient& client,
-                     WireGuardTunnel& tunnel,
+                     BoringtunMesh& mesh,
                      const std::string& node_id);
     ~MeshOrchestrator();
 
@@ -62,17 +62,17 @@ private:
     /// Main orchestration loop (runs on background thread).
     void run_loop();
 
-    /// Fetch peers from server and sync to tunnel.
+    /// Fetch peers from server and sync to the mesh dataplane.
     void do_peer_refresh();
 
     /// Send heartbeat to server with our current endpoint.
     void do_heartbeat();
 
-    /// Poll tunnel status and fire callback if changed.
+    /// Poll mesh dataplane status and fire callback if changed.
     void do_monitor();
 
     LemonadeNexusClient&     client_;
-    WireGuardTunnel&         tunnel_;
+    BoringtunMesh&           mesh_;
     std::string              node_id_;
 
     MeshConfig               config_;
