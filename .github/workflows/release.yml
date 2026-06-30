@@ -454,142 +454,10 @@ jobs:
           path: manifest-${{ matrix.platform }}.json
 
   # =========================================================================
-  # macOS SwiftUI app build (.dmg)
-  # =========================================================================
-  build-macos-app:
-    runs-on: macos-14
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Import Developer ID Application certificate
-        env:
-          CERTIFICATE_P12: ${{ secrets.MACOS_DEV_SIGNING_IDENTITY_KEY }}
-          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          # Create temporary keychain
-          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
-          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Import certificate
-          CERT_PATH=$RUNNER_TEMP/certificate.p12
-          echo "$CERTIFICATE_P12" | base64 --decode > "$CERT_PATH"
-          security import "$CERT_PATH" \
-            -P "$CERTIFICATE_PASSWORD" \
-            -A \
-            -t cert \
-            -f pkcs12 \
-            -k "$KEYCHAIN_PATH"
-          rm -f "$CERT_PATH"
-
-          # Set keychain search list
-          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
-
-          # Allow codesign to access the key without UI prompt
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Extract signing identity SHA-1 hash (use hash to avoid ambiguity with multiple certs)
-          IDENTITY_HASH=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-            | grep "Developer ID Application" \
-            | head -1 \
-            | awk '{print $2}')
-          IDENTITY_NAME=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" \
-            | grep "Developer ID Application" \
-            | head -1 \
-            | sed 's/.*"\(.*\)".*/\1/')
-          echo "SIGNING_IDENTITY=$IDENTITY_HASH" >> "$GITHUB_ENV"
-          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          echo "Found signing identity: $IDENTITY_NAME ($IDENTITY_HASH)"
-
-      - name: Cache CMake FetchContent dependencies
-        uses: actions/cache@v4
-        with:
-          path: build/_deps
-          key: fetchcontent-macos-app-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
-          restore-keys: |
-            fetchcontent-macos-app-
-
-      - name: Build C++ SDK and dependencies
-        run: |
-          # Build OpenSSL statically from source (OPENSSL_FORCE_BUNDLED=ON installs
-          # libssl.a/libcrypto.a into build/openssl-install/lib, which Package.swift
-          # links). The shipped .app must NOT depend on a Homebrew dylib — that path
-          # doesn't exist on end-user Macs and dyld aborts the app at launch.
-          cmake -B build \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=OFF \
-            -DOPENSSL_FORCE_BUNDLED=ON
-          cmake --build build --target LemonadeNexusSDK --parallel
-
-      - name: Build Swift app
-        working-directory: apps/LemonadeNexusMac
-        run: bash Packaging/build.sh
-
-      - name: Verify app has no external OpenSSL/Homebrew linkage
-        run: |
-          bin="apps/LemonadeNexusMac/.build/LemonadeNexus.app/Contents/MacOS/LemonadeNexusMac"
-          echo "otool -L $bin:"
-          otool -L "$bin"
-          if otool -L "$bin" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/|libssl|libcrypto'; then
-            echo "::error::App links an external OpenSSL/Homebrew dylib — it will crash on user Macs"
-            exit 1
-          fi
-          echo "OK: OpenSSL is statically linked; no external dylib dependency"
-
-      - name: Create DMG
-        working-directory: apps/LemonadeNexusMac
-        run: bash Packaging/create_dmg.sh
-
-      - name: Codesign the DMG
-        working-directory: apps/LemonadeNexusMac
-        run: |
-          codesign --force --sign "$SIGNING_IDENTITY" --timestamp \
-            .build/LemonadeNexus.dmg
-
-      - name: Notarize DMG
-        env:
-          APPLE_ID: ${{ vars.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-        working-directory: apps/LemonadeNexusMac
-        run: |
-          # Submit for notarization
-          xcrun notarytool submit .build/LemonadeNexus.dmg \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 15m
-
-          # Staple the notarization ticket
-          xcrun stapler staple .build/LemonadeNexus.dmg
-
-          # Verify
-          spctl --assess --type open --context context:primary-signature \
-            .build/LemonadeNexus.dmg || true
-
-      - name: Cleanup keychain
-        if: always()
-        run: security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
-
-      - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lemonade-nexus-macos-app
-          path: apps/LemonadeNexusMac/.build/LemonadeNexus.dmg
-
-  # =========================================================================
   # Create GitHub Release with all platform artifacts
   # =========================================================================
   release:
-    needs: [build-native, build-linux-distros, build-macos-app]
+    needs: [build-native, build-linux-distros]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -645,7 +513,6 @@ jobs:
             lemonade-nexus-linux-x86_64-amzn2023-pkg/*
             lemonade-nexus-darwin-arm64-pkg/*
             lemonade-nexus-windows-x86_64-installer/*
-            lemonade-nexus-macos-app/*
             manifest-linux-x86_64/*
             manifest-linux-x86_64-deb/*
             manifest-linux-x86_64-rpm/*
@@ -666,7 +533,6 @@ jobs:
             | Linux x86_64 (Arch) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
             | Linux x86_64 (Amazon Linux 2023 .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.amzn2023.rpm` | `manifest-linux-x86_64-amzn2023.json` |
             | macOS ARM64 | `lemonade-nexus-${{ github.ref_name }}-darwin-arm64` | `manifest-darwin-arm64.json` |
-            | macOS App (.dmg) | `LemonadeNexus.dmg` | — |
             | Windows x86_64 | `lemonade-nexus-${{ github.ref_name }}-windows-x86_64.exe` | `manifest-windows-x86_64.json` |
 
             ### Install
@@ -683,10 +549,6 @@ jobs:
             sudo installer -pkg lemonade-nexus-*.pkg -target /
             sudo launchctl load /Library/LaunchDaemons/io.lemonade-nexus.plist
             ```
-
-            **macOS Client App (.dmg)**
-            Download `LemonadeNexus.dmg`, open it, and drag Lemonade Nexus to Applications.
-            The app is signed and notarized by Apple.
 
             **Windows (.exe / .zip)**
             Run the NSIS installer or extract the ZIP to `C:\Program Files\lemonade-nexus\`.

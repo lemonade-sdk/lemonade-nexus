@@ -76,28 +76,6 @@ cmake --build build
 
 Requires Visual Studio 2022 Build Tools with C++ workload.
 
-## macOS Client App
-
-```bash
-# Build the C++ SDK first
-cmake --build build --target LemonadeNexusSDK
-
-# Build the Swift app
-cd apps/LemonadeNexusMac
-swift build
-
-# Codesign
-codesign --force --sign - .build/debug/LemonadeNexusMac
-codesign --force --sign - .build/debug/LemonadeNexusTunnelHelper
-
-# Install to /Applications
-APP="/Applications/Lemonade Nexus.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/debug/LemonadeNexusMac "$APP/Contents/MacOS/"
-cp .build/debug/LemonadeNexusTunnelHelper "$APP/Contents/MacOS/"
-codesign --force --sign - "$APP"
-```
-
 ## Running Tests
 
 ```bash
