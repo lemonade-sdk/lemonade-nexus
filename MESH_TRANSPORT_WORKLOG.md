@@ -105,6 +105,41 @@ So "remove WireGuard" is really **consolidate the mesh dataplane onto the pump**
   `mesh_request` egresses to 10.64.0.1:9101 over the dataplane. Added `resolve_ipv4`
   + info-level `private(mesh)` logging to confirm.
 
+### Phase 1 test #2/#3 — dataplane works; private API was HTTPS, we spoke plain HTTP
+- Fixed `mesh_request` egress target: resolve `server_private_fqdn` -> server mesh
+  IP (10.64.0.1); egress now runs.
+- Dataplane fully works: boringtun handshake completes (server learns our endpoint,
+  no longer <roaming>), TCP 3-way handshake to 10.64.0.1:9101 completes bidirec-
+  tionally, data flows both ways. Confirmed on BOTH ends via dataplane tx logging.
+- BUT request died: `Failed to read connection` ~140ms, server `[private-http]`
+  never logged, server sent only small ACKs (no HTTP response body).
+- ROOT CAUSE: the private API is **HTTPS** (carries the private.<server> cert —
+  server log: "Private API on virtual 10.64.0.1:9101 (HTTPS) via tcp:127.0.0.1:9101",
+  "HttpServer (HTTPS) listening on 127.0.0.1:9101"). `mesh_request` used
+  `httplib::Client` (plain HTTP) -> TLS listener reset the connection -> never
+  routed -> no [private-http] log. The "plain on loopback" assumption from the
+  code map was wrong for a deployment with the private cert present.
+- FIX: `mesh_request` now uses `httplib::SSLClient` with cert verification
+  disabled (cert is for the FQDN not 127.0.0.1; confidentiality already from the
+  mesh + loopback). Client-only change; server unchanged.
+
+### Phase 1 test #4 — transport SOLVED; was an HTTPS + ACL gap
+- HTTPS fix worked: `private(mesh) POST /api/mesh/heartbeat -> HTTP 200`, mesh
+  `up=true`. Transport + dataplane + TLS all working end to end.
+- Remaining: `GET /api/mesh/peers/<node> -> HTTP 403` (heartbeat 200, same token).
+- Server proved the token is node-scoped (JWT subject == node id), so NOT a token
+  issue. The two routes differ: `/heartbeat` authorizes by ownership; `/peers`
+  requires `check_permission(caller, node, Read)` (MeshApiHandler.cpp:107).
+- Root cause: at join, the Customer node gets an explicit owner assignment
+  (read/write/add_child/delete_node/edit_node) but the Endpoint node got NONE, so
+  the owner had no Read on its own endpoint -> /peers + /status 403.
+- FIX (server, owner-confirmed "explicit behaviour"): the join endpoint node now
+  gets the same explicit owner assignment (TreeApiHandler.cpp, both join sites).
+  Only applies to NEW joins -> needs server rebuild + fresh client login.
+
 ### TODO next
-- Rebuild + run: expect `[LemonadeNexusClient] server mesh IP 10.64.0.1` at join,
-  then `private(mesh) GET /api/mesh/peers -> HTTP 200`, peers sync, card populates.
+- Rebuild + restart server; fresh client login + enable mesh: expect
+  `GET /api/mesh/peers -> HTTP 200`, peers sync, P2P Mesh card populates.
+- Then CLEANUP before Phase 2: remove temp logging — LN_DEBUG gate (CApi),
+  dataplane tx/encap/tick logs (UserspaceDataplane.cpp), mesh_request info logs,
+  [private-http] logger (main.cpp), client mesh_request/refresh debug `_log`s.

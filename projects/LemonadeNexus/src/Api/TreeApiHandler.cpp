@@ -112,6 +112,16 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             endpoint_node.hostname    = body.value("hostname",
                                                    "endpoint-" + node_id.substr(0, 8));
             endpoint_node.mgmt_pubkey = norm_pubkey;
+            // Explicit ACL grant for the endpoint's owner. Heartbeat authorizes
+            // via ownership, but node-scoped reads (GET /api/mesh/peers/<node>,
+            // /api/mesh/status/<node>) require an explicit Read permission on the
+            // node; without this assignment they 403. Mirrors the Customer grant
+            // so the owner has full control of their own endpoint.
+            endpoint_node.assignments = {{
+                .management_pubkey = norm_pubkey,
+                .permissions = {"read", "write", "add_child", "delete_node",
+                                "edit_node"},
+            }};
             endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
             stamp_endpoint_identity(endpoint_node);
             if (!ctx_.tree.insert_join_node(endpoint_node)) {
@@ -146,6 +156,16 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             endpoint_node.hostname    = body.value("hostname",
                                                    "endpoint-" + node_id.substr(0, 8));
             endpoint_node.mgmt_pubkey = norm_pubkey;
+            // Explicit ACL grant for the endpoint's owner. Heartbeat authorizes
+            // via ownership, but node-scoped reads (GET /api/mesh/peers/<node>,
+            // /api/mesh/status/<node>) require an explicit Read permission on the
+            // node; without this assignment they 403. Mirrors the Customer grant
+            // so the owner has full control of their own endpoint.
+            endpoint_node.assignments = {{
+                .management_pubkey = norm_pubkey,
+                .permissions = {"read", "write", "add_child", "delete_node",
+                                "edit_node"},
+            }};
             endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
             stamp_endpoint_identity(endpoint_node);
             if (!ctx_.tree.insert_join_node(endpoint_node)) {

@@ -276,11 +276,16 @@ struct LemonadeNexusClient::Impl {
     // Send a private-API request over the userspace mesh dataplane — the only
     // path to the server's private routes (the server terminates the tunnel in
     // userspace + smoltcp, so there is no OS route to its tunnel IP). Egresses a
-    // loopback port bridged through the netstack and speaks plain HTTP (the
-    // server's private httplib is plain on loopback). Returns the parsed body if
-    // the dataplane served the request (success OR error status); `served`
-    // distinguishes "handled" from "not attempted / no response" so the caller
-    // can fall through to legacy transports when the dataplane isn't up.
+    // loopback port bridged through the netstack to the server's private API.
+    //
+    // The private API is HTTPS (it carries the private.<server> cert), so we
+    // speak TLS over the loopback bridge with certificate verification disabled:
+    // the cert is for the server FQDN (not 127.0.0.1), and confidentiality is
+    // already provided by the WireGuard/Noise mesh plus the loopback hop.
+    //
+    // Returns the parsed body if the dataplane served the request (success OR
+    // error status); `served` distinguishes "handled" from "not attempted / no
+    // response" so the caller can fall through to legacy transports.
     std::optional<json> mesh_request(const char* method, const std::string& path,
                                      const std::string& body, int& status_out,
                                      bool& served) {
@@ -296,7 +301,8 @@ struct LemonadeNexusClient::Impl {
                      method, path, server_tunnel_ip, private_port, lp);
         if (lp == 0) return std::nullopt;
         try {
-            httplib::Client cli("127.0.0.1", lp);
+            httplib::SSLClient cli("127.0.0.1", lp);
+            cli.enable_server_certificate_verification(false);
             cli.set_connection_timeout(config.connect_timeout_sec);
             cli.set_read_timeout(config.read_timeout_sec);
             httplib::Result res = (std::string(method) == "GET")

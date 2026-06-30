@@ -799,6 +799,7 @@ class AppNotifier extends StateNotifier<AppState> {
         _log('establishPasskeyMeshIdentity: authEd25519 failed (non-fatal): $e');
       }
       // Ed25519 auth returns its own token; restore the passkey session token.
+      // (The join flow then overrides this with the node-scoped token.)
       if (passkeyToken != null) await _sdk.setSessionToken(passkeyToken);
     } catch (e) {
       _log('establishPasskeyMeshIdentity: FAILED -> $e');
