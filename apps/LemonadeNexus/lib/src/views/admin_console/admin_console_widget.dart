@@ -1,6 +1,7 @@
 /// Admin console widget — 5-tab management panel for a selected Lemonade server.
 ///
 /// When a server is selected in the left sidebar, this widget fills the right panel.
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -31,11 +32,11 @@ class AdminConsoleWidget extends ConsumerWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(Icons.dns_outlined, size: 48, color: Colors.white.withOpacity(0.3)),
+                Icon(Icons.dns_outlined, size: 48, color: Colors.white.withValues(alpha: 0.3)),
                 const SizedBox(height: 16),
                 Text(
                   'Select a server to access admin features.',
-                  style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 14),
+                  style: TextStyle(color: Colors.white.withValues(alpha: 0.6), fontSize: 14),
                   textAlign: TextAlign.center,
                 ),
               ],
@@ -53,8 +54,8 @@ class AdminConsoleWidget extends ConsumerWidget {
             // App bar with server name and tabs
             Container(
               decoration: BoxDecoration(
-                color: const Color(0xFF1A1A2E).withOpacity(0.95),
-                border: Border(bottom: BorderSide(color: const Color(0xFF2D3748))),
+                color: const Color(0xFF1A1A2E).withValues(alpha: 0.95),
+                border: const Border(bottom: BorderSide(color: Color(0xFF2D3748))),
               ),
               child: Column(
                 children: [
@@ -74,7 +75,7 @@ class AdminConsoleWidget extends ConsumerWidget {
                   TabBar(
                     isScrollable: true,
                     labelColor: const Color(0xFFE9C46A),
-                    unselectedLabelColor: Colors.white.withOpacity(0.6),
+                    unselectedLabelColor: Colors.white.withValues(alpha: 0.6),
                     indicatorColor: const Color(0xFFE9C46A),
                     tabs: const [
                       Tab(text: 'Dashboard', icon: Icon(Icons.dashboard, size: 18)),
@@ -88,9 +89,9 @@ class AdminConsoleWidget extends ConsumerWidget {
               ),
             ),
             // Tab content
-            Expanded(
+            const Expanded(
               child: TabBarView(
-                children: const [
+                children: [
                   AdminDashboardTab(),
                   AdminModelsTab(),
                   AdminBackendsTab(),

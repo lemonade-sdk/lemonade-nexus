@@ -1,6 +1,7 @@
 /// @title Login View
 /// @description Passkey-first authentication with region-aware server discovery.
 /// Styled to match the macOS app.
+library;
 
 import 'dart:io';
 import 'package:flutter/material.dart';

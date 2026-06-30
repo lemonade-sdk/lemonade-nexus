@@ -5,6 +5,7 @@
 /// ```dart
 /// import 'package:lemonade_nexus/src/windows/windows_exports.dart';
 /// ```
+library;
 
 // Core integration
 export 'windows_integration.dart';

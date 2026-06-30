@@ -7,6 +7,7 @@
 ///
 /// final sdk = LemonadeNexusSdk();
 /// ```
+library;
 
 // Core SDK
 export 'lemonade_nexus_sdk.dart';

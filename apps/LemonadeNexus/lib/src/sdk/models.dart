@@ -3,6 +3,7 @@
 ///
 /// These classes provide type-safe representations of JSON data
 /// returned by the C SDK FFI bindings.
+library;
 
 import 'package:json_annotation/json_annotation.dart';
 

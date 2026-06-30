@@ -6,6 +6,7 @@
 /// - Peer detail panel
 /// - Online/offline status
 /// - Bandwidth and latency display
+library;
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -124,7 +125,7 @@ class _PeersViewState extends ConsumerState<PeersView> {
         children: [
           const SectionHeader(title: 'Mesh Peers', icon: Icons.people),
           const Spacer(),
-          if (!appState.meshPeers.isEmpty)
+          if (appState.meshPeers.isNotEmpty)
             Text('$onlineCount/${appState.meshPeers.length} online', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12)),
           const SizedBox(width: 8),
           IconButton(
@@ -310,13 +311,5 @@ class _PeersViewState extends ConsumerState<PeersView> {
     if (mb >= 1) return '${mb.toStringAsFixed(1)} MB';
     if (kb >= 1) return '${kb.toStringAsFixed(0)} KB';
     return '$bytes B';
-  }
-
-  String _formatRelativeTime(DateTime time) {
-    final diff = DateTime.now().difference(time);
-    if (diff.inSeconds < 60) return '${diff.inSeconds}s ago';
-    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
-    if (diff.inHours < 24) return '${diff.inHours}h ago';
-    return '${diff.inDays}d ago';
   }
 }

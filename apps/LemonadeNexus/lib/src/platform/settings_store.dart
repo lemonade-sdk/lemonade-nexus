@@ -1,4 +1,5 @@
 /// Non-secret preference persistence via shared_preferences.
+library;
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';

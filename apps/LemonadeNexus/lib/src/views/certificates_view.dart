@@ -6,6 +6,7 @@
 /// - Certificate detail panel
 /// - Request certificate action
 /// - Issue/renew certificate
+library;
 
 import 'dart:async';
 import 'package:flutter/material.dart';

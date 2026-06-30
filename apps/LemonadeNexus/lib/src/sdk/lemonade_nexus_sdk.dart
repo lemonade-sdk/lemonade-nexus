@@ -4,12 +4,12 @@
 /// This class provides a type-safe, async Dart API wrapping the
 /// low-level FFI bindings. It handles memory management, JSON parsing,
 /// and error handling automatically.
+library;
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:typed_data';
-import 'package:ffi/ffi.dart';
 
 import 'ffi_bindings.dart';
 import 'models.dart';

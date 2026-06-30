@@ -3,6 +3,7 @@
 ///
 /// Tracks authentication, mesh status, UI navigation state,
 /// and all data fetched from the C SDK.
+library;
 
 import 'dart:convert';
 import 'dart:io';
@@ -379,6 +380,9 @@ class AppNotifier extends StateNotifier<AppState> {
   final PasskeyManager _passkey = PasskeyManager();
 
   AppNotifier(this._sdk) : super(AppState.initial);
+
+  /// Public, read-only accessor to the current state for external callers.
+  AppState get currentState => state;
 
   /// Initialize app state - load preferences
   Future<void> initialize() async {

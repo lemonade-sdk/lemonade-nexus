@@ -9,11 +9,11 @@
 /// - Peer provider (peer list)
 /// - Settings provider (app preferences)
 /// - Theme provider (light/dark mode)
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
-import '../sdk/models.dart';
 import '../platform/platform_integration.dart';
 import '../platform/settings_store.dart';
 import 'app_state.dart';
@@ -180,25 +180,25 @@ class ThemeNotifier extends StateNotifier<ThemeMode> {
 /// Authentication service provider.
 /// Provides methods for authentication operations.
 final authServiceProvider = Provider<AuthService>((ref) {
-  return AuthService(ref.watch(sdkProvider), ref.watch(appNotifierProvider.notifier));
+  return AuthService(ref.watch(appNotifierProvider.notifier));
 });
 
 /// Tunnel service provider.
 /// Provides methods for tunnel control operations.
 final tunnelServiceProvider = Provider<TunnelService>((ref) {
-  return TunnelService(ref.watch(sdkProvider), ref.watch(appNotifierProvider.notifier));
+  return TunnelService(ref.watch(appNotifierProvider.notifier));
 });
 
 /// Discovery service provider.
 /// Provides methods for server discovery and selection.
 final discoveryServiceProvider = Provider<DiscoveryService>((ref) {
-  return DiscoveryService(ref.watch(sdkProvider), ref.watch(appNotifierProvider.notifier));
+  return DiscoveryService(ref.watch(appNotifierProvider.notifier));
 });
 
 /// Tree service provider.
 /// Provides methods for permission tree operations.
 final treeServiceProvider = Provider<TreeService>((ref) {
-  return TreeService(ref.watch(sdkProvider), ref.watch(appNotifierProvider.notifier));
+  return TreeService(ref.watch(appNotifierProvider.notifier));
 });
 
 // =========================================================================
@@ -208,10 +208,9 @@ final treeServiceProvider = Provider<TreeService>((ref) {
 /// Authentication service.
 /// Handles all authentication-related operations.
 class AuthService {
-  final LemonadeNexusSdk _sdk;
   final AppNotifier _notifier;
 
-  AuthService(this._sdk, this._notifier);
+  AuthService(this._notifier);
 
   /// Sign in with username and password.
   Future<bool> signIn(String username, String password) {
@@ -227,13 +226,13 @@ class AuthService {
   Future<void> signOut() => _notifier.signOut();
 
   /// Check if user is authenticated.
-  bool get isAuthenticated => _notifier.state.authState.isAuthenticated;
+  bool get isAuthenticated => _notifier.currentState.authState.isAuthenticated;
 
   /// Get current username.
-  String? get username => _notifier.state.authState.username;
+  String? get username => _notifier.currentState.authState.username;
 
   /// Get user ID.
-  String? get userId => _notifier.state.authState.userId;
+  String? get userId => _notifier.currentState.authState.userId;
 }
 
 /// Mesh networking service.
@@ -241,10 +240,9 @@ class AuthService {
 /// The legacy VPN-tunnel model was removed in favour of the userspace mesh;
 /// connect/disconnect now map to enabling/disabling P2P mesh networking.
 class TunnelService {
-  final LemonadeNexusSdk _sdk;
   final AppNotifier _notifier;
 
-  TunnelService(this._sdk, this._notifier);
+  TunnelService(this._notifier);
 
   /// Enable P2P mesh networking.
   Future<void> connect() => _notifier.enableMesh();
@@ -268,19 +266,18 @@ class TunnelService {
   Future<void> toggleMesh() => _notifier.toggleMesh();
 
   /// Check if mesh is enabled.
-  bool get isMeshEnabled => _notifier.state.isMeshEnabled;
+  bool get isMeshEnabled => _notifier.currentState.isMeshEnabled;
 
   /// Get the mesh-assigned IP address.
-  String? get tunnelIp => _notifier.state.tunnelIP;
+  String? get tunnelIp => _notifier.currentState.tunnelIP;
 }
 
 /// Discovery service.
 /// Handles server discovery and selection.
 class DiscoveryService {
-  final LemonadeNexusSdk _sdk;
   final AppNotifier _notifier;
 
-  DiscoveryService(this._sdk, this._notifier);
+  DiscoveryService(this._notifier);
 
   /// Connect to a server.
   Future<bool> connectToServer(String host, int port) {
@@ -297,31 +294,30 @@ class DiscoveryService {
   Future<void> refreshRelays() => _notifier.refreshRelays();
 
   /// Get available servers.
-  List<ServerInfo> get servers => _notifier.state.servers;
+  List<ServerInfo> get servers => _notifier.currentState.servers;
 
   /// Get available relays.
-  List<RelayInfo> get relays => _notifier.state.relays;
+  List<RelayInfo> get relays => _notifier.currentState.relays;
 
   /// Get current server host.
-  String get serverHost => _notifier.state.serverHost;
+  String get serverHost => _notifier.currentState.serverHost;
 
   /// Get current server port.
-  int get serverPort => _notifier.state.serverPort;
+  int get serverPort => _notifier.currentState.serverPort;
 
   /// Check if connected to server.
-  bool get isConnected => _notifier.state.isConnected;
+  bool get isConnected => _notifier.currentState.isConnected;
 
   /// Get connection status.
-  ConnectionStatus get connectionStatus => _notifier.state.connectionStatus;
+  ConnectionStatus get connectionStatus => _notifier.currentState.connectionStatus;
 }
 
 /// Tree service.
 /// Handles permission tree operations.
 class TreeService {
-  final LemonadeNexusSdk _sdk;
   final AppNotifier _notifier;
 
-  TreeService(this._sdk, this._notifier);
+  TreeService(this._notifier);
 
   /// Load the tree.
   Future<void> loadTree() => _notifier.loadTree();
@@ -345,13 +341,13 @@ class TreeService {
   }
 
   /// Get root node.
-  TreeNode? get rootNode => _notifier.state.rootNode;
+  TreeNode? get rootNode => _notifier.currentState.rootNode;
 
   /// Get all tree nodes.
-  List<TreeNode> get treeNodes => _notifier.state.treeNodes;
+  List<TreeNode> get treeNodes => _notifier.currentState.treeNodes;
 
   /// Get trust status.
-  TrustStatus? get trustStatus => _notifier.state.trustStatus;
+  TrustStatus? get trustStatus => _notifier.currentState.trustStatus;
 }
 
 // =========================================================================

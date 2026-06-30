@@ -6,6 +6,7 @@
 /// - Peer topology list
 /// - Bandwidth breakdown by peer
 /// - Auto-refresh
+library;
 
 import 'dart:async';
 import 'package:flutter/material.dart';

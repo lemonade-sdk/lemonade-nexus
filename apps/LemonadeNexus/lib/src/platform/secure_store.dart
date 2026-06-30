@@ -6,6 +6,7 @@
 /// relaunch), so a Keychain failure (e.g. a missing entitlement -> errSecMissing-
 /// Entitlement / -34018) must NOT block sign-in. Failures are swallowed and the
 /// app simply behaves as if no session was stored.
+library;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';

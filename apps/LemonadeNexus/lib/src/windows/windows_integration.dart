@@ -8,6 +8,7 @@
 /// - Path management
 ///
 /// Provides a unified API for Windows integration features.
+library;
 
 import 'dart:io';
 import 'package:flutter/foundation.dart';

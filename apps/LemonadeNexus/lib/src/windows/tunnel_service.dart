@@ -6,13 +6,13 @@
 /// - System tray integration
 /// - Auto-connect on startup
 /// - Background operation
+library;
 
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
-import '../state/app_state.dart';
 import 'windows_integration.dart';
 
 /// Windows tunnel service configuration

@@ -10,6 +10,7 @@
 /// Uses `SHGetKnownFolderPath` from `package:win32` to resolve canonical
 /// paths, falling back to environment variables / path_provider when the
 /// shell call fails or we're running off-Windows.
+library;
 
 import 'dart:ffi';
 import 'dart:io';

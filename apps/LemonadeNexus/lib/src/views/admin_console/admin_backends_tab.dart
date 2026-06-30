@@ -1,9 +1,9 @@
 /// Admin console — Backends tab.
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
-import '../../api/lemonade_api_client.dart';
 import 'server_admin_provider.dart';
 
 class AdminBackendsTab extends ConsumerStatefulWidget {

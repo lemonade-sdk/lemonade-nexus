@@ -7,6 +7,7 @@
 /// - Add node sheet
 /// - Delete node confirmation
 /// - Auto-refresh tree structure
+library;
 
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -29,9 +30,6 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
   String _searchText = '';
   TreeNode? _selectedNode;
   bool _isLoadingTree = false;
-  bool _showingAddSheet = false;
-  bool _showingDeleteConfirmation = false;
-  String _rootId = 'root';
   List<TreeNode> _localTreeNodes = [];
 
   List<TreeNode> get filteredNodes {
@@ -69,9 +67,12 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
     setState(() => _isLoadingTree = true);
     final notifier = ref.read(appNotifierProvider.notifier);
     await notifier.loadTree();
-    if (notifier.state.rootNode != null) {
+    if (notifier.currentState.rootNode != null) {
       setState(() {
-        _localTreeNodes = [notifier.state.rootNode!, ...notifier.state.treeNodes];
+        _localTreeNodes = [
+          notifier.currentState.rootNode!,
+          ...notifier.currentState.treeNodes,
+        ];
       });
     }
     setState(() => _isLoadingTree = false);
@@ -327,8 +328,6 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
         return AppTheme.lemonYellowDark;
       case NodeType.relay:
         return AppTheme.lemonGreen;
-      default:
-        return Colors.grey;
     }
   }
 
@@ -358,7 +357,7 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                 ),
                 const SizedBox(height: 12),
                 DropdownButtonFormField<String>(
-                  value: selectedType,
+                  initialValue: selectedType,
                   decoration: const InputDecoration(labelText: 'Type'),
                   dropdownColor: scheme.surface,
                   items: const [

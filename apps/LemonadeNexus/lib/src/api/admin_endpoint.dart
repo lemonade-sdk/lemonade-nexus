@@ -1,4 +1,5 @@
 /// Lemonade admin / management endpoints.
+library;
 
 import 'dart:async';
 import 'dart:convert';

@@ -1,6 +1,7 @@
 /// Provider for per-server admin HTTP clients.
 ///
 /// Creates one [LemonadeApiClient] per selected server and auto-disposes it on change.
+library;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../api/lemonade_api_client.dart';
@@ -122,6 +123,6 @@ class SelectedAdminServerNotifier extends StateNotifier<AdminServer?> {
   }
 
   void selectById(String id) {
-    final servers = state; // Note: need to watch adminServersProvider separately
+    // Note: selection by id requires watching adminServersProvider separately.
   }
 }

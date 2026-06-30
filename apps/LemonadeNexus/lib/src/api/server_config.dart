@@ -1,4 +1,5 @@
 /// Configuration for a connected Lemonade server.
+library;
 
 class ServerConfig {
   final String baseUrl;

@@ -5,6 +5,7 @@
 /// - Icon creation from assets
 /// - Icon color based on connection status
 /// - Icon scaling for different DPI settings
+library;
 
 import 'dart:io';
 import 'dart:typed_data';

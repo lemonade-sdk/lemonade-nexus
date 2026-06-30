@@ -1,4 +1,5 @@
 /// Admin console — Logs tab (WebSocket-based live log viewer).
+library;
 
 import 'dart:async';
 
@@ -6,7 +7,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../api/logs_socket.dart';
-import '../../api/lemonade_api_client.dart';
 import 'server_admin_provider.dart';
 
 class AdminLogsTab extends ConsumerStatefulWidget {

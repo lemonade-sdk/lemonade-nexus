@@ -9,6 +9,7 @@
 ///
 /// Note: This is an advanced feature for enterprise deployments.
 /// For most users, the system tray auto-start is sufficient.
+library;
 
 import 'dart:ffi';
 import 'dart:io';
@@ -279,9 +280,9 @@ class WindowsServiceManager {
         namePtr,
         displayPtr,
         SERVICE_ALL_ACCESS,
-        ENUM_SERVICE_TYPE.SERVICE_WIN32_OWN_PROCESS,
+        SERVICE_WIN32_OWN_PROCESS,
         _mapStartType(_config.startType),
-        SERVICE_ERROR.SERVICE_ERROR_NORMAL,
+        SERVICE_ERROR_NORMAL,
         cmdPtr,
         nullptr, // lpLoadOrderGroup
         nullptr, // lpdwTagId
@@ -292,7 +293,7 @@ class WindowsServiceManager {
 
       if (serviceHandle == 0) {
         final error = GetLastError();
-        if (error == WIN32_ERROR.ERROR_SERVICE_EXISTS) {
+        if (error == ERROR_SERVICE_EXISTS) {
           return ServiceResult.failure('Service already exists');
         }
         return ServiceResult.failure('Failed to create service: $error');
@@ -332,7 +333,7 @@ class WindowsServiceManager {
 
       if (serviceHandle == 0) {
         final error = GetLastError();
-        if (error == WIN32_ERROR.ERROR_SERVICE_DOES_NOT_EXIST) {
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
           return ServiceResult.success('Service was not installed');
         }
         return ServiceResult.failure('Failed to open service: $error');
@@ -394,7 +395,7 @@ class WindowsServiceManager {
         );
       } else {
         final error = GetLastError();
-        if (error == WIN32_ERROR.ERROR_SERVICE_ALREADY_RUNNING) {
+        if (error == ERROR_SERVICE_ALREADY_RUNNING) {
           return ServiceResult.success(
             'Service is already running',
             ServiceState.running,
@@ -457,7 +458,7 @@ class WindowsServiceManager {
         );
       } else {
         final error = GetLastError();
-        if (error == WIN32_ERROR.ERROR_SERVICE_NOT_ACTIVE) {
+        if (error == ERROR_SERVICE_NOT_ACTIVE) {
           return ServiceResult.success(
             'Service was not running',
             ServiceState.stopped,
@@ -479,7 +480,7 @@ class WindowsServiceManager {
 
       ChangeServiceConfig2(
         serviceHandle,
-        SERVICE_CONFIG.SERVICE_CONFIG_DESCRIPTION,
+        SERVICE_CONFIG_DESCRIPTION,
         descPtr,
       );
     } finally {
@@ -496,15 +497,15 @@ class WindowsServiceManager {
 
     try {
       // First failure: restart after 1 minute
-      actionArray[0].Type = SC_ACTION_TYPE.SC_ACTION_RESTART;
+      actionArray[0].Type = SC_ACTION_RESTART;
       actionArray[0].Delay = 60000; // 1 minute
 
       // Second failure: restart after 1 minute
-      actionArray[1].Type = SC_ACTION_TYPE.SC_ACTION_RESTART;
+      actionArray[1].Type = SC_ACTION_RESTART;
       actionArray[1].Delay = 60000;
 
       // Subsequent failures: restart after 5 minutes
-      actionArray[2].Type = SC_ACTION_TYPE.SC_ACTION_RESTART;
+      actionArray[2].Type = SC_ACTION_RESTART;
       actionArray[2].Delay = 300000; // 5 minutes
 
       actions.ref.cActions = 3;
@@ -515,7 +516,7 @@ class WindowsServiceManager {
 
       ChangeServiceConfig2(
         serviceHandle,
-        SERVICE_CONFIG.SERVICE_CONFIG_FAILURE_ACTIONS,
+        SERVICE_CONFIG_FAILURE_ACTIONS,
         actions,
       );
     } finally {
@@ -527,19 +528,19 @@ class WindowsServiceManager {
   /// Map Windows service state to our enum
   ServiceState _mapServiceState(int dwState) {
     switch (dwState) {
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_STOPPED:
+      case SERVICE_STOPPED:
         return ServiceState.stopped;
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_START_PENDING:
+      case SERVICE_START_PENDING:
         return ServiceState.startPending;
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_STOP_PENDING:
+      case SERVICE_STOP_PENDING:
         return ServiceState.stopPending;
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_RUNNING:
+      case SERVICE_RUNNING:
         return ServiceState.running;
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_CONTINUE_PENDING:
+      case SERVICE_CONTINUE_PENDING:
         return ServiceState.continuePending;
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_PAUSE_PENDING:
+      case SERVICE_PAUSE_PENDING:
         return ServiceState.pausePending;
-      case SERVICE_STATUS_CURRENT_STATE.SERVICE_PAUSED:
+      case SERVICE_PAUSED:
         return ServiceState.paused;
       default:
         return ServiceState.unknown;
@@ -550,15 +551,15 @@ class WindowsServiceManager {
   int _mapStartType(ServiceStartType startType) {
     switch (startType) {
       case ServiceStartType.boot:
-        return SERVICE_START_TYPE.SERVICE_BOOT_START;
+        return SERVICE_BOOT_START;
       case ServiceStartType.system:
-        return SERVICE_START_TYPE.SERVICE_SYSTEM_START;
+        return SERVICE_SYSTEM_START;
       case ServiceStartType.automatic:
-        return SERVICE_START_TYPE.SERVICE_AUTO_START;
+        return SERVICE_AUTO_START;
       case ServiceStartType.manual:
-        return SERVICE_START_TYPE.SERVICE_DEMAND_START;
+        return SERVICE_DEMAND_START;
       case ServiceStartType.disabled:
-        return SERVICE_START_TYPE.SERVICE_DISABLED;
+        return SERVICE_DISABLED;
     }
   }
 

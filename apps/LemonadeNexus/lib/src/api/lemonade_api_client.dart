@@ -2,6 +2,7 @@
 ///
 /// Holds one [http.Client] for connection pooling. Call [close] when the underlying
 /// [ServerConfig] is no longer in use to free sockets.
+library;
 
 import 'dart:async';
 import 'dart:convert';

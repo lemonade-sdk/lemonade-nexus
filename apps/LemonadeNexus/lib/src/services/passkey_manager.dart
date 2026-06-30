@@ -1,5 +1,6 @@
 /// Dart side of the native passkey (WebAuthn / Secure Enclave) manager.
 /// Talks to the macOS runner over the `io.lemonade-nexus/passkey` channel.
+library;
 
 import 'dart:io';
 import 'package:flutter/services.dart';

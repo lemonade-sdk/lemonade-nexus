@@ -8,6 +8,7 @@
 /// - Cryptographic keys section
 /// - Assignments section
 /// - Delete node action
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';

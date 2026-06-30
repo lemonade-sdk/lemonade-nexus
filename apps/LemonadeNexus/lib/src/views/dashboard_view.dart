@@ -1,5 +1,6 @@
 /// @title Dashboard View
 /// @description Connection status and mesh stats, styled like the macOS app.
+library;
 
 import 'dart:async';
 import 'package:flutter/material.dart';
@@ -206,7 +207,7 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
         if ((h.dnsBaseDomain ?? '').isNotEmpty)
           _kv('DNS Domain', _mono(h.dnsBaseDomain!, size: 11)),
       ] else
-        _kv('', Text('Unable to reach server',
+        _kv('', const Text('Unable to reach server',
             style: TextStyle(fontSize: 13, color: AppTheme.nodeOrange))),
       _kv('URL', _mono('${appState.serverHost}:${appState.serverPort}', size: 11)),
     ], trailing: StatusDot(isHealthy: appState.isServerHealthy, size: 8));

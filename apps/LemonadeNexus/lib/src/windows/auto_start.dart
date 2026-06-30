@@ -6,6 +6,7 @@
 /// - Task Scheduler (elevated) via the `schtasks` command-line tool
 /// - User preference toggle
 /// - Handle both elevated and non-elevated modes
+library;
 
 import 'dart:ffi';
 import 'dart:io';
@@ -205,7 +206,7 @@ class WindowsAutoStart {
 
       final infoOk = GetTokenInformation(
         pToken.value,
-        TOKEN_INFORMATION_CLASS.TokenElevation, // top-level constant exported by package:win32
+        TokenElevation, // top-level constant exported by package:win32
         pElevation.cast(),
         sizeOf<_TokenElevation>(),
         pReturnLength,

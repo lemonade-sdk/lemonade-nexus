@@ -3,12 +3,12 @@
 ///
 /// Left panel: list of Lemonade servers with health status
 /// Right panel: Admin Console for the selected server (Dashboard, Models, Backends, System, Logs)
+library;
 
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
-import '../state/app_state.dart';
 import '../sdk/models.dart';
 import '../views/admin_console/server_admin_provider.dart';
 import '../views/admin_console/admin_console_widget.dart';
@@ -41,16 +41,6 @@ class _ServersViewState extends ConsumerState<ServersView> {
     final sdkServers = appState.servers;
     final adminNotifer = ref.read(adminServersProvider.notifier);
 
-    // Convert SDK ServerInfo to AdminServer entries
-    final adminServers = sdkServers.map((s) {
-      return AdminServer(
-        id: s.id,
-        name: '${s.host}:${s.port}',
-        baseUrl: 'http://${s.host}:${s.port}',
-        available: s.available,
-      );
-    }).toList();
-
     adminNotifer.syncFromSdkServers(sdkServers.map((s) => {
       'id': s.id,
       'host': s.host,
@@ -69,7 +59,6 @@ class _ServersViewState extends ConsumerState<ServersView> {
     final scheme = Theme.of(context).colorScheme;
     final appState = ref.watch(appNotifierProvider);
     final servers = appState.servers;
-    final adminServers = ref.watch(adminServersProvider);
     final healthyCount = servers.where((s) => s.available).length;
 
     return Row(

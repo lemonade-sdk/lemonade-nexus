@@ -1,5 +1,6 @@
 /// Cross-platform application data paths (Application Support on macOS, AppData
 /// on Windows, the XDG data dir on Linux).
+library;
 
 import 'dart:io';
 

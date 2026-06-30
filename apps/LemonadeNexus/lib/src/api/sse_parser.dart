@@ -1,4 +1,5 @@
 /// Lightweight SSE event parser.
+library;
 
 import 'dart:async';
 import 'dart:convert';

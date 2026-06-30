@@ -1,10 +1,10 @@
 /// Admin console — Models tab.
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../api/admin_endpoint.dart';
-import '../../api/lemonade_api_client.dart';
 import 'server_admin_provider.dart';
 
 class AdminModelsTab extends ConsumerStatefulWidget {
@@ -126,24 +126,24 @@ class _AdminModelsTabState extends ConsumerState<AdminModelsTab> {
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Pull a model'),
-        content: SingleChildScrollView(
+        content: const SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               TextField(
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'Model name',
                   helperText: 'For HuggingFace pulls use the user.* namespace',
                 ),
               ),
               TextField(
-                decoration: const InputDecoration(
+                decoration: InputDecoration(
                   labelText: 'HF checkpoint (optional)',
                   hintText: 'e.g. unsloth/Qwen3-8B-GGUF:Q4_K_M',
                 ),
               ),
               TextField(
-                decoration: const InputDecoration(labelText: 'Recipe'),
+                decoration: InputDecoration(labelText: 'Recipe'),
               ),
             ],
           ),
@@ -249,10 +249,10 @@ class _AdminModelsTabState extends ConsumerState<AdminModelsTab> {
 }
 
 class _PullSpec {
-  final String modelName;
-  final String? checkpoint;
-  final String? recipe;
-  _PullSpec({this.modelName = '', this.checkpoint, this.recipe});
+  final String modelName = '';
+  final String? checkpoint = null;
+  final String? recipe = null;
+  _PullSpec();
 }
 
 class _ModelTile extends StatelessWidget {

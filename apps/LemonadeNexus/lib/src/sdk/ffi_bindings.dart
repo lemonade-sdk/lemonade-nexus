@@ -3,10 +3,10 @@
 ///
 /// This file contains the raw FFI bindings to the C SDK. Use the
 /// [LemonadeNexusSdk] class for a high-level Dart API.
+library;
 
 import 'dart:ffi' as ffi;
 import 'dart:io';
-import 'dart:convert';
 import 'dart:typed_data';
 import 'package:ffi/ffi.dart';
 
@@ -35,7 +35,7 @@ enum LnError {
 }
 
 /// Opaque handle types.
-/// In FFI, these are represented as Pointer<Void>
+/// In FFI, these are represented as `Pointer<Void>`
 typedef LnClientHandle = ffi.Pointer<ffi.Void>;
 typedef LnIdentityHandle = ffi.Pointer<ffi.Void>;
 

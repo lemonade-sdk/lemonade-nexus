@@ -1,5 +1,6 @@
 /// @title Main Navigation
 /// @description Sidebar + detail shell, styled like the macOS NavigationSplitView.
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';

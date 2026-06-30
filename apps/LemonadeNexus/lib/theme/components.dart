@@ -1,6 +1,7 @@
 /// Reusable UI components mirroring the macOS app's Theme.swift helpers:
 /// the lemon logo, cards, status dots, badges, section headers, stat cards and
 /// empty states. Keeps the Flutter views looking like the original app.
+library;
 
 import 'package:flutter/material.dart';
 

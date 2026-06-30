@@ -7,6 +7,7 @@
 /// - Preferences (auto-discovery, auto-connect)
 /// - About section
 /// - Sign out
+library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -85,6 +86,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                               final host = parts[0].trim();
                               final port = parts.length > 1 ? int.tryParse(parts[1].trim()) ?? 9100 : 9100;
                               await notifier.connectToServer(host, port);
+                              if (!context.mounted) return;
                               setState(() => _hasChanges = false);
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
@@ -114,6 +116,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                     TextButton.icon(
                       onPressed: () async {
                         await notifier.refreshHealth();
+                        if (!context.mounted) return;
                         if (appState.isServerHealthy) {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(content: Text('Connection successful'), backgroundColor: Colors.green),
@@ -142,7 +145,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
             child: Column(
               children: [
                 if (appState.publicKeyBase64 != null) ...[
-                  _buildIdentityRow('Public Key', appState.publicKeyBase64!.substring(0, appState.publicKeyBase64!.length.clamp(0, 32)) + '...'),
+                  _buildIdentityRow('Public Key', '${appState.publicKeyBase64!.substring(0, appState.publicKeyBase64!.length.clamp(0, 32))}...'),
                   const SizedBox(height: 12),
                 ],
                 if (appState.username != null && appState.username!.isNotEmpty) ...[
@@ -228,7 +231,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                       final result = await ref
                           .read(windowsIntegrationNotifierProvider.notifier)
                           .toggleAutoStart(value);
-                      if (!result && mounted) {
+                      if (!result && context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
                           SnackBar(
                             content: Text('Failed to update auto-start: ${Platform.isWindows ? "May require administrator privileges" : "Not available on this platform"}'),
@@ -349,7 +352,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
         Switch(
           value: value,
           onChanged: onChanged,
-          activeColor: AppTheme.lemonYellow,
+          activeThumbColor: AppTheme.lemonYellow,
         ),
       ],
     );
@@ -371,7 +374,7 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
         Switch(
           value: value,
           onChanged: onChanged,
-          activeColor: AppTheme.lemonYellow,
+          activeThumbColor: AppTheme.lemonYellow,
         ),
       ],
     );
@@ -393,11 +396,11 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
+          const Row(
             children: [
-              const Icon(Icons.admin_panel_settings, color: AppTheme.lemonYellowDark, size: 16),
-              const SizedBox(width: 8),
-              const Text('Windows Service (Advanced)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
+              Icon(Icons.admin_panel_settings, color: AppTheme.lemonYellowDark, size: 16),
+              SizedBox(width: 8),
+              Text('Windows Service (Advanced)', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold)),
             ],
           ),
           const SizedBox(height: 8),

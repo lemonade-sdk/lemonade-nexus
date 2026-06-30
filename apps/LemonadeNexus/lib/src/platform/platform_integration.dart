@@ -1,6 +1,7 @@
 /// Platform-specific desktop integration (tray/menu-bar, auto-start, lifecycle),
 /// selected at runtime. Replaces the Windows-only init path in main.dart with a
 /// platform-agnostic facade.
+library;
 
 import 'dart:io';
 

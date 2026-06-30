@@ -6,6 +6,7 @@
 /// - Context menu (Connect, Disconnect, Settings, Exit)
 /// - Click handlers for tunnel control
 /// - Tooltip with current connection status
+library;
 
 import 'dart:io';
 import 'package:flutter/material.dart';

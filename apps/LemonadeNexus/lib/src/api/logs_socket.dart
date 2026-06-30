@@ -1,4 +1,5 @@
 /// Subscribes to the Lemonade server's `/logs/stream` WebSocket.
+library;
 
 import 'dart:async';
 import 'dart:convert';
