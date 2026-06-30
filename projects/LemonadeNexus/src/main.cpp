@@ -823,16 +823,7 @@ int main(int argc, char* argv[]) {
     if (!private_http_server) {
         spdlog::warn("SECURITY: No tunnel_bind_ip configured — private API routes "
                      "are exposed on the public HTTP server. Set a tunnel IP to "
-                     "isolate authenticated endpoints to the WireGuard interface.");
-    } else {
-        // Diagnostic: log every request that actually reaches the private httplib
-        // (i.e. made it through the smoltcp tcp_forward from the mesh tunnel IP).
-        private_http_server->server().set_logger(
-            [](const httplib::Request& req, const httplib::Response& res) {
-                spdlog::debug("[private-http] {} {} from {} -> {} ({} bytes)",
-                              req.method, req.path, req.remote_addr, res.status,
-                              res.body.size());
-            });
+                     "isolate authenticated endpoints to the mesh interface.");
     }
 
     // Rate limiter

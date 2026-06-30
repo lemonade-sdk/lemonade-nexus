@@ -281,7 +281,7 @@ struct LemonadeNexusClient::Impl {
     // The private API is HTTPS (it carries the private.<server> cert), so we
     // speak TLS over the loopback bridge with certificate verification disabled:
     // the cert is for the server FQDN (not 127.0.0.1), and confidentiality is
-    // already provided by the WireGuard/Noise mesh plus the loopback hop.
+    // already provided by the boringtun/Noise mesh plus the loopback hop.
     //
     // Returns the parsed body if the dataplane served the request (success OR
     // error status); `served` distinguishes "handled" from "not attempted / no
@@ -291,14 +291,14 @@ struct LemonadeNexusClient::Impl {
                                      bool& served) {
         served = false;
         if (!meshplane.is_active() || server_tunnel_ip.empty()) {
-            spdlog::info("[LemonadeNexusClient] private(mesh) {} {} SKIP "
+            spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} SKIP "
                          "(active={}, server_tunnel_ip='{}')",
                          method, path, meshplane.is_active(), server_tunnel_ip);
             return std::nullopt;
         }
         uint16_t lp = meshplane.tcp_egress(server_tunnel_ip, private_port);
-        spdlog::info("[LemonadeNexusClient] private(mesh) {} {} -> egress {}:{} = 127.0.0.1:{}",
-                     method, path, server_tunnel_ip, private_port, lp);
+        spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> egress {}:{} = 127.0.0.1:{}",
+                      method, path, server_tunnel_ip, private_port, lp);
         if (lp == 0) return std::nullopt;
         try {
             httplib::SSLClient cli("127.0.0.1", lp);
@@ -311,19 +311,19 @@ struct LemonadeNexusClient::Impl {
             if (res) {
                 served = true;
                 status_out = res->status;
-                spdlog::info("[LemonadeNexusClient] private(mesh) {} {} -> HTTP {}",
-                             method, path, res->status);
+                spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> HTTP {}",
+                              method, path, res->status);
                 try { return json::parse(res->body); }
                 catch (...) {
                     if (res->status >= 200 && res->status < 300) return std::nullopt;
                     json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
                 }
             }
-            spdlog::info("[LemonadeNexusClient] private(mesh) {} {} NO RESPONSE "
+            spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} NO RESPONSE "
                          "(httplib err={})", method, path, httplib::to_string(res.error()));
         } catch (const std::exception& e) {
-            spdlog::info("[LemonadeNexusClient] private(mesh) {} {} EXCEPTION: {}",
-                          method, path, e.what());
+            spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} EXCEPTION: {}",
+                         method, path, e.what());
         }
         return std::nullopt;
     }

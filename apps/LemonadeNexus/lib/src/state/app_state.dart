@@ -1,12 +1,12 @@
 /// @title Application State
 /// @description Central state management for the Flutter app using Riverpod.
 ///
-/// Tracks authentication, tunnel status, UI navigation state,
+/// Tracks authentication, mesh status, UI navigation state,
 /// and all data fetched from the C SDK.
 
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
@@ -18,7 +18,12 @@ import '../services/passkey_manager.dart';
 
 /// Lightweight console logger for connection/state diagnostics.
 /// Mirrors the `[Discovery]`-style tagging used in dns_discovery.dart.
-void _log(String msg) => print('[AppState] $msg');
+/// Debug-only: compiles to nothing in release builds (mirrors the native
+/// `LN_DEBUG` gate), so the diagnostics stay in the source without adding
+/// noise to production.
+void _log(String msg) {
+  if (kDebugMode) debugPrint('[AppState] $msg');
+}
 
 /// Connection status enum
 enum ConnectionStatus {

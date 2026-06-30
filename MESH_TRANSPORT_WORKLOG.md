@@ -137,9 +137,33 @@ So "remove WireGuard" is really **consolidate the mesh dataplane onto the pump**
   gets the same explicit owner assignment (TreeApiHandler.cpp, both join sites).
   Only applies to NEW joins -> needs server rebuild + fresh client login.
 
+### Phase 1 test #5 — DONE. Transport + ACL fully working end to end.
+- Server fix was `MeshApiHandler.cpp`: `/peers` + `/status` checked
+  `check_permission` with `normalize_pubkey(claims.user_id)`, but assignments are
+  keyed by **pubkey** (`claims.user_id` is a hash-derived node id, not the pubkey).
+  Switched both to `normalize_pubkey(claims.pubkey)` (commit a9d1ff2).
+- Fresh client login (node f207bdad…): `private(mesh) GET /api/mesh/peers/<node>
+  -> HTTP 200`, `[MeshOrchestrator] peer refresh: 0 peers synced`,
+  `refreshMeshStatus: up=true peers=0 meshIp=10.64.0.27`. P2P Mesh card populates.
+- `peers=0` is correct: single endpoint in the mesh. The fetch->sync mechanism is
+  proven; a second endpoint joining would show as a peer row.
+
+### Cleanup pass — DONE (temp diagnostics stripped; diagnostics kept gated)
+- main.cpp: removed the `[private-http]` request logger (pure session diagnostic).
+- UserspaceDataplane.cpp: removed per-packet `tx`/`encap`/`tick` debug spam; kept
+  the lifecycle logs (started/stopped/added peer/added session/dropped spoofed).
+- LemonadeNexusClient.cpp `mesh_request`: success logs (egress, HTTP status) ->
+  `debug`; failure logs (SKIP, NO RESPONSE, EXCEPTION) -> `warn`. Comment de-WG'd.
+- CApi.cpp: **kept** the `LN_DEBUG` env gate (clean off-by-default toggle, not
+  noise) — deviation from the original TODO, flagged to owner.
+- Dart app_state.dart: `_log` now gated on `kDebugMode` (compiles out in release;
+  still visible under `flutter run`) — mirrors the native LN_DEBUG philosophy.
+- Verified: SDK dylib + server app both rebuild clean (exit 0).
+- Server-side edits (main.cpp, UserspaceDataplane.cpp) need a pull+rebuild+restart
+  to take effect on the running host.
+
 ### TODO next
-- Rebuild + restart server; fresh client login + enable mesh: expect
-  `GET /api/mesh/peers -> HTTP 200`, peers sync, P2P Mesh card populates.
-- Then CLEANUP before Phase 2: remove temp logging — LN_DEBUG gate (CApi),
-  dataplane tx/encap/tick logs (UserspaceDataplane.cpp), mesh_request info logs,
-  [private-http] logger (main.cpp), client mesh_request/refresh debug `_log`s.
+- Phase 2: rename server `nexus::wireguard`->`nexus::boringtun`, `WgPeer`->
+  `BoringtunPeer`, the `WireGuard/` dir, and the `wg_pubkey` JSON contract key.
+  Also clean dead Dart FFI bindings (ln_tunnel_*/ln_pump_*) + WgConfig/WgKeypair.
+- Deferred: contract test harness; `doOperation(sdkOps.X, args)` FFI simplification.
