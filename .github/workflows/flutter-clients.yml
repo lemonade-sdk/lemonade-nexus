@@ -51,12 +51,16 @@ jobs:
             -DBUILD_SDK_SHARED=ON
           cmake --build build --target LemonadeNexusSDKShared --parallel
 
-      - name: Verify SDK exports + no Homebrew linkage
+      - name: Verify SDK dylib is self-contained
         run: |
           dylib=build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.dylib
-          test "$(nm -gU "$dylib" | grep -c ' _ln_')" -ge 69
+          # Sanity floor: the public C API is ~64 ln_* functions. Catches a dylib
+          # that built but failed to export the API (Flutter FFI would break at runtime).
+          test "$(nm -gU "$dylib" | grep -c ' _ln_')" -ge 60
+          # Must run on machines without Homebrew: OpenSSL etc. are statically bundled,
+          # so the dylib must not link anything under /opt/homebrew or /usr/local.
           if otool -L "$dylib" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/'; then
-            echo "::error::SDK dylib links Homebrew/local libraries"; exit 1
+            echo "::error::SDK dylib links Homebrew/local libraries — not self-contained"; exit 1
           fi
 
       - uses: subosito/flutter-action@v2
