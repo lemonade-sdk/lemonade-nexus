@@ -1,10 +1,10 @@
-# Lemonade Nexus - Flutter Windows Client
+# Lemonade Nexus — Flutter Desktop Client
 
-VPN mesh network client for Windows built with Flutter/Dart.
+Desktop client (macOS + Windows) for the Lemonade Nexus userspace mesh, built with Flutter/Dart.
 
 ## Overview
 
-This Flutter application provides a Windows-native client for the Lemonade Nexus userspace mesh VPN network. It uses FFI bindings to communicate with the C SDK (`lemonade_nexus.h`).
+This Flutter application is the desktop client (macOS and Windows) for the Lemonade Nexus userspace mesh VPN network. It uses FFI bindings to communicate with the C SDK (`lemonade_nexus.h`).
 
 ## Architecture
 
@@ -40,8 +40,9 @@ lib/
 
 - Flutter SDK 3.x+
 - Dart SDK 3.x+
-- Visual Studio Build Tools (Windows)
-- C SDK library (`lemonade_nexus_sdk.dll`)
+- CMake + Ninja, plus a C/C++ toolchain: Xcode (macOS) or Visual Studio Build Tools (Windows)
+- The native SDK shared library, built from the repo root
+  (`liblemonade_nexus_sdk.dylib` on macOS, `lemonade_nexus_sdk.dll` on Windows)
 
 ## Setup
 
@@ -50,9 +51,9 @@ lib/
    flutter doctor
    ```
 
-2. Enable Windows desktop:
+2. Enable desktop:
    ```bash
-   flutter config --enable-windows-desktop
+   flutter config --enable-macos-desktop    # or --enable-windows-desktop
    ```
 
 3. Install dependencies:
@@ -60,13 +61,14 @@ lib/
    flutter pub get
    ```
 
-4. Build C SDK (from root):
+4. Build the native SDK shared library (from the repo root):
    ```bash
-   cmake -B build -DCMAKE_BUILD_TYPE=Release
-   cmake --build build --target LemonadeNexusSDK
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build --target LemonadeNexusSDKShared
    ```
 
-5. Copy SDK DLL:
+5. **Windows only** — stage the SDK DLL next to the runner (macOS auto-embeds the
+   dylib via the Xcode "Embed Lemonade Nexus SDK" build phase):
    ```bash
    copy build\projects\LemonadeNexusSDK\Release\lemonade_nexus_sdk.dll windows\
    ```
@@ -75,7 +77,7 @@ lib/
 
 Run the app:
 ```bash
-flutter run -d windows
+flutter run -d macos      # or: flutter run -d windows
 ```
 
 Hot reload during development:
@@ -86,10 +88,12 @@ Hot reload during development:
 ## Building for Release
 
 ```bash
-flutter build windows --release
+flutter build macos --release      # or: flutter build windows --release
 ```
 
-Output: `build/windows/runner/Release/lemonade_nexus.exe`
+Output:
+- macOS: `build/macos/Build/Products/Release/lemonade_nexus.app`
+- Windows: `build/windows/runner/Release/lemonade_nexus.exe`
 
 ## Packaging
 
@@ -110,7 +114,7 @@ Run integration tests:
 flutter test integration_test/
 ```
 
-## UI Views (Matching macOS App)
+## UI Views
 
 All 12 Flutter views have been implemented with full parity to macOS SwiftUI views:
 
