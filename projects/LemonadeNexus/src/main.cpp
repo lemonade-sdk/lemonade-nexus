@@ -29,7 +29,7 @@
 #include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
-#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
+#include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 #include <LemonadeNexus/Network/VirtualNetService.hpp>
 
 // CRTP request handlers
@@ -641,24 +641,24 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
-    // WireGuard interface — server-side tunnel endpoint
+    // boringtun interface — server-side tunnel endpoint
     // ========================================================================
-    nexus::wireguard::WireGuardService wireguard_service{
+    nexus::boringtun::BoringtunService boringtun_service{
         config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
-    wireguard_service.start();
+    boringtun_service.start();
 
     // In-process traffic termination: the userspace netstack answers on our
     // virtual IPs and bridges to the (unchanged) httplib private API. Wire the
     // dataplane <-> netstack seam before the dataplane starts taking packets.
     nexus::network::VirtualNetService vnet{};
     vnet.start();
-    wireguard_service.dataplane().set_inbound_handler(
+    boringtun_service.dataplane().set_inbound_handler(
         [&vnet](std::span<const uint8_t> pkt) { vnet.deliver_inbound_ip_packet(pkt); });
-    vnet.set_outbound_sink([&wireguard_service](std::span<const uint8_t> pkt) {
-        wireguard_service.dataplane().send_outbound_ip_packet(pkt);
+    vnet.set_outbound_sink([&boringtun_service](std::span<const uint8_t> pkt) {
+        boringtun_service.dataplane().send_outbound_ip_packet(pkt);
     });
 
-    // Derive Curve25519 keypair from Ed25519 identity for WireGuard
+    // Derive Curve25519 keypair from Ed25519 identity for the mesh
     std::string wg_server_privkey_b64;
     if (root_privkey) {
         auto x_sk = nexus::crypto::SodiumCryptoService::ed25519_sk_to_x25519(*root_privkey);
@@ -666,28 +666,28 @@ int main(int argc, char* argv[]) {
             std::span<const uint8_t>(x_sk.data(), x_sk.size()));
     }
 
-    // Set up the WireGuard interface with the server's tunnel IP
+    // Set up the boringtun interface with the server's tunnel IP
     if (!wg_server_privkey_b64.empty() && !tunnel_bind_ip.empty()) {
-        nexus::wireguard::WgInterfaceConfig wg_iface;
+        nexus::boringtun::BoringtunInterfaceConfig wg_iface;
         wg_iface.private_key = wg_server_privkey_b64;
         wg_iface.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
         wg_iface.listen_port = config.udp_port;
 
-        if (wireguard_service.setup_interface(wg_iface, {})) {
+        if (boringtun_service.setup_interface(wg_iface, {})) {
             // The netstack answers on our tunnel IP across the whole client plane.
             vnet.add_local_ip(tunnel_bind_ip + "/10");
-            spdlog::info("WireGuard: userspace dataplane up on :{} with tunnel IP {}/10",
+            spdlog::info("boringtun: userspace dataplane up on :{} with tunnel IP {}/10",
                           config.udp_port, tunnel_bind_ip);
         } else {
-            spdlog::warn("WireGuard: failed to start userspace dataplane on :{} — "
+            spdlog::warn("boringtun: failed to start userspace dataplane on :{} — "
                           "clients will not be able to connect.", config.udp_port);
         }
     } else {
-        spdlog::warn("WireGuard: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
+        spdlog::warn("boringtun: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
     }
 
     // ========================================================================
-    // Backbone: server-to-server WireGuard mesh (172.16.0.0/22)
+    // Backbone: server-to-server boringtun mesh (172.16.0.0/22)
     // ========================================================================
     std::string backbone_ip;
     std::string wg_server_pubkey_b64;
@@ -709,13 +709,13 @@ int main(int argc, char* argv[]) {
 
         // Register the backbone address as a second virtual local IP (both the
         // dataplane router and the netstack must answer for it).
-        if (wireguard_service.add_address(backbone_ip_bare + "/22")) {
+        if (boringtun_service.add_address(backbone_ip_bare + "/22")) {
             vnet.add_local_ip(backbone_ip_bare + "/22");
             spdlog::info("Backbone: registered virtual {}/22", backbone_ip_bare);
         }
 
         // Wire gossip with WG service and backbone info
-        gossip.set_wireguard(&wireguard_service);
+        gossip.set_boringtun(&boringtun_service);
         gossip.set_our_backbone_ip(backbone_ip_bare);
         gossip.set_our_wg_pubkey(wg_server_pubkey_b64);
 
@@ -823,7 +823,7 @@ int main(int argc, char* argv[]) {
     if (!private_http_server) {
         spdlog::warn("SECURITY: No tunnel_bind_ip configured — private API routes "
                      "are exposed on the public HTTP server. Set a tunnel IP to "
-                     "isolate authenticated endpoints to the WireGuard interface.");
+                     "isolate authenticated endpoints to the mesh interface.");
     }
 
     // Rate limiter
@@ -864,7 +864,7 @@ int main(int argc, char* argv[]) {
         .tee              = tee,
         .trust_policy     = trust_policy,
         .governance       = governance,
-        .wireguard        = &wireguard_service,
+        .boringtun        = &boringtun_service,
         .dns              = &dns,
         .server_fqdn      = server_fqdn,
         .server_seip_fqdn = server_seip_fqdn,
@@ -1051,7 +1051,7 @@ int main(int argc, char* argv[]) {
     if (acme_renewal_thread.joinable()) {
         acme_renewal_thread.join();
     }
-    wireguard_service.stop();   // stops the dataplane: no more inbound packets
+    boringtun_service.stop();   // stops the dataplane: no more inbound packets
     vnet.stop();                // tears down the netstack + bridges
     if (private_http_server) {
         private_http_server->stop();

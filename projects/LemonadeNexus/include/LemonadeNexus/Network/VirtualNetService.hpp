@@ -2,7 +2,7 @@
 
 /// In-process traffic termination for the virtual mesh planes.
 ///
-/// The WireGuard dataplane decrypts and routes IP packets in userspace; packets
+/// The boringtun dataplane decrypts and routes IP packets in userspace; packets
 /// addressed to one of the server's own virtual IPs (its tunnel IP on the
 /// client plane, its backbone IP on the server plane) are handed here. This
 /// service owns the embedded smoltcp netstack (crates/virtual-netstack) and

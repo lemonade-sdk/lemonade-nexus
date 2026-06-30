@@ -1,6 +1,6 @@
 //! C FFI for the in-process virtual netstack.
 //!
-//! The WireGuard dataplane (C++) owns the UDP socket and per-peer Noise
+//! The boringtun dataplane (C++) owns the UDP socket and per-peer Noise
 //! sessions; this crate terminates the TCP/UDP that is addressed to the
 //! server's own virtual IPs, with no kernel network interface. Decrypted IP
 //! packets are fed in with `ns_feed_inbound`; packets the stack emits are

@@ -11,7 +11,7 @@ namespace nexus::core {
 struct ServerConfig {
     // Network
     uint16_t    http_port{9100};
-    uint16_t    udp_port{51940};  // WireGuard + hole-punch (shared UDP port)
+    uint16_t    udp_port{51940};  // mesh + hole-punch (shared UDP port)
     uint16_t    gossip_port{9102};
     uint16_t    stun_port{3478};
     uint16_t    relay_port{9103};
@@ -20,7 +20,7 @@ struct ServerConfig {
     std::string bind_address{"0.0.0.0"};
     std::string public_ip;              // public-facing IP for DNS glue records (auto-detected if empty)
     std::string region;                 // cloud region code (e.g. "us-east", auto-detected if empty)
-    std::string wg_interface{"nexus0"}; // WireGuard interface name. MUST NOT be "wg0" or any
+    std::string wg_interface{"nexus0"}; // boringtun interface name. MUST NOT be "wg0" or any
                                         // interface you are connected through -- the server flushes
                                         // and re-keys this device on startup, which would drop that tunnel.
 

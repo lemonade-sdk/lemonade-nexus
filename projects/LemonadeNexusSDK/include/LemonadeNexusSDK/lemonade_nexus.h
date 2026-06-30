@@ -15,6 +15,13 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include <stddef.h>
+
+/* Shared FFI build is compiled with hidden visibility; mark the ln_* C API
+ * default-visible so only it is exported (MSVC uses WINDOWS_EXPORT_ALL_SYMBOLS). */
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC visibility push(default)
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Error codes                                                         */
@@ -278,44 +285,13 @@ double ln_current_latency_ms(ln_client_t* client);
 ln_error_t ln_server_latencies(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */
-/* WireGuard tunnel management                                         */
+/* Mesh dataplane                                                      */
 /* ------------------------------------------------------------------ */
 
-/** Bring up the WireGuard tunnel with the given config (JSON string).
- *  Config JSON keys: private_key, public_key, tunnel_ip, server_public_key,
- *  server_endpoint, dns_server, listen_port, allowed_ips (array), keepalive.
- *  Returns status JSON via out_json. Caller must ln_free(*out_json). */
-ln_error_t ln_tunnel_up(ln_client_t* client,
-                         const char* config_json,
-                         char** out_json);
-
-/** Tear down the WireGuard tunnel.
- *  Returns status JSON via out_json. Caller must ln_free(*out_json). */
-ln_error_t ln_tunnel_down(ln_client_t* client, char** out_json);
-
-/** Get the current WireGuard tunnel status as JSON.
- *  Returns: {is_up, tunnel_ip, server_endpoint, last_handshake,
- *            rx_bytes, tx_bytes, latency_ms}.
- *  Caller must ln_free(*out_json). */
-ln_error_t ln_tunnel_status(ln_client_t* client, char** out_json);
-
-/** Get the WireGuard configuration string (wg-quick format).
- *  Useful on mobile platforms (iOS/Android) where the app manages
- *  the tunnel via NetworkExtension or VpnService.
- *  Returns NULL if no config is stored. Caller must ln_free(). */
-char* ln_get_wg_config(ln_client_t* client);
-
-/** Get the WireGuard configuration as a JSON string.
- *  Returns the same config that ln_tunnel_up() accepts:
- *  {private_key, public_key, tunnel_ip, server_public_key,
- *   server_endpoint, dns_server, listen_port, allowed_ips, keepalive}.
- *  Returns NULL if no config is stored. Caller must ln_free(). */
-char* ln_get_wg_config_json(ln_client_t* client);
-
-/** Generate a WireGuard keypair (Curve25519).
+/** Generate a Curve25519 keypair for the mesh dataplane.
  *  Returns JSON: {private_key: "base64", public_key: "base64"}.
  *  Caller must ln_free(). */
-char* ln_wg_generate_keypair(void);
+char* ln_generate_keypair(void);
 
 /* ------------------------------------------------------------------ */
 /* Mesh P2P networking                                                 */
@@ -460,6 +436,10 @@ ln_error_t ln_set_node_id(ln_client_t* client, const char* node_id);
 
 /** Get the current node ID. Caller must ln_free(). Returns NULL if not set. */
 char* ln_get_node_id(ln_client_t* client);
+
+#if defined(__GNUC__) || defined(__clang__)
+#  pragma GCC visibility pop
+#endif
 
 #ifdef __cplusplus
 }

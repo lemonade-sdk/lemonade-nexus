@@ -1,0 +1,87 @@
+# MSIX Packaging Configuration for Lemonade Nexus VPN
+# This file configures the msix Flutter package for creating MSIX bundles
+
+# Basic package information
+display_name: Lemonade Nexus VPN
+publisher_display_name: Lemonade Nexus
+identity_name: LemonadeNexus.LemonadeNexusVPN
+publisher: CN=Lemonade Nexus, O=Lemonade Nexus, C=US
+
+# Version information
+version: 1.0.0.0
+msix_version: 1.0.0.0
+
+# Architecture
+architecture: x64
+languages:
+  - en-us
+
+# Logo and assets
+logo_path: assets\app_icon.png
+splash_screen_path: assets\splash_screen.png
+
+# Output configuration
+output_path: build/windows/msix
+output_name: lemonade_nexus
+
+# Code signing configuration
+sign_msix: true
+sign_tool_path: 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\signtool.exe'
+certificate_path: keys\code_signing.pfx
+certificate_password: '${CERT_PASSWORD}'
+timestamp_url: 'http://timestamp.digicert.com'
+hash_algorithm: sha256
+
+# Capabilities required for VPN functionality
+capabilities:
+  - internetClient
+  - internetClientServer
+  - privateNetworkClientServer
+
+restricted_capabilities:
+  - runFullTrust
+  - packageManagement
+
+# Device capabilities
+device_capabilities:
+  - networking
+
+# App extensions
+protocol_activation:
+  - name: lemonade-nexus
+    display_name: Lemonade Nexus VPN
+
+file_type_associations:
+  - name: lemonade-nexus-config
+    extensions:
+      - .lnxconfig
+    display_name: Lemonade Nexus Configuration
+
+# Startup task configuration
+startup_task:
+  task_id: LemonadeNexusStartup
+  enabled: false
+  display_name: Lemonade Nexus VPN
+
+# Install certificate options
+install_certificate: false
+
+# Package family name (generated after first install)
+# package_family_name: LemonadeNexus.LemonadeNexusVPN_randomstring
+
+# Microsoft Store configuration
+store_configuration:
+  automatic_update: true
+  telemetry: true
+
+# Build configuration
+build_mode: release
+flutter_build_args:
+  - --release
+  - --dart-define=BUILD_TYPE=msix
+
+# Post-build actions
+post_build:
+  - sign_msix
+  - create_appxupload  # For Store submission
+  - create_msix_bundle  # For multiple architectures

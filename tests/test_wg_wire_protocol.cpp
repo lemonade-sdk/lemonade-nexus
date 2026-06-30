@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include <LemonadeNexus/WireGuard/WireProtocol.hpp>
+#include <LemonadeNexus/Boringtun/WireProtocol.hpp>
 
 #include <vector>
 
-using namespace nexus::wireguard::wire;
+using namespace nexus::boringtun::wire;
 
 namespace {
 

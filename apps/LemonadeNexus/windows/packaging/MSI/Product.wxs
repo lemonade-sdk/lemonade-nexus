@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX Toolset Product Definition for Lemonade Nexus VPN.
+
+  This file owns the Product, directory layout, shortcuts and features.
+  The actual file payload is generated at build time by heat.exe into
+  HarvestedFiles.wxs (ComponentGroup Id="ApplicationFiles", DirectoryRef
+  Id="INSTALLFOLDER"). See .github/workflows/build-windows-packages.yml.
+
+  Variables expected from candle.exe:
+    -dBuildDir=<absolute path to Flutter Release output>
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*"
+           Name="Lemonade Nexus VPN"
+           Language="1033"
+           Version="1.0.0.0"
+           Manufacturer="Lemonade Nexus"
+           UpgradeCode="{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}">
+
+    <Package InstallerVersion="500"
+             Compressed="yes"
+             InstallScope="perMachine"
+             Description="Lemonade Nexus VPN Client"
+             Manufacturer="Lemonade Nexus"
+             Platform="x64" />
+
+    <MajorUpgrade Schedule="afterInstallInitialize"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="ProductIcon" SourceFile="..\..\..\assets\icons\app_icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/antmi/lemonade-nexus" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/antmi/lemonade-nexus" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/antmi/lemonade-nexus/releases" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <Condition Message="This application requires Windows 7 or later.">
+      <![CDATA[Installed OR (VersionNT >= 601)]]>
+    </Condition>
+
+    <UI>
+      <UIRef Id="WixUI_InstallDir" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="2">1</Publish>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2">1</Publish>
+    </UI>
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="MANUFACTURER_DIR" Name="Lemonade Nexus">
+          <Directory Id="INSTALLFOLDER" Name="Lemonade Nexus VPN" />
+        </Directory>
+      </Directory>
+
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Lemonade Nexus VPN" />
+      </Directory>
+
+      <Directory Id="DesktopFolder" Name="Desktop" />
+    </Directory>
+
+    <DirectoryRef Id="ApplicationProgramsFolder">
+      <Component Id="ProgramMenuShortcut" Guid="{A6B7C8D9-E0F1-2345-BCDE-567890123456}">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="Lemonade Nexus VPN"
+                  Description="Secure userspace mesh VPN Client"
+                  Target="[INSTALLFOLDER]lemonade_nexus.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="ProductIcon" />
+        <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\LemonadeNexus\VPN"
+                       Name="StartMenuShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="{B7C8D9E0-F1A2-3456-CDEF-678901234567}">
+        <Shortcut Id="DesktopShortcutItem"
+                  Name="Lemonade Nexus VPN"
+                  Description="Secure userspace mesh VPN Client"
+                  Target="[INSTALLFOLDER]lemonade_nexus.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="ProductIcon" />
+        <RegistryValue Root="HKCU"
+                       Key="Software\LemonadeNexus\VPN"
+                       Name="DesktopShortcut"
+                       Type="integer"
+                       Value="1"
+                       KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="LemonadeNexusService"
+                 Guid="{C8D9E0F1-A2B3-4567-DEFA-789012345678}"
+                 Win64="yes">
+        <!-- Server binary registered as Windows Service -->
+        <File Id="LemonadeNexusServiceExe"
+              Name="lemonade-nexus.exe"
+              Source="$(var.BuildDir)\lemonade-nexus.exe"
+              KeyPath="yes" />
+
+        <!-- Service installation and configuration -->
+        <ServiceInstall Id="ServiceInstaller"
+                        Type="ownProcess"
+                        Name="LemonadeNexus"
+                        DisplayName="Lemonade Nexus VPN Service"
+                        Description="Secure userspace mesh VPN Coordination Server"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments=""
+                        Account="LocalSystem"
+                        Interactive="no">
+          <!-- Service dependencies - ensure network is available -->
+          <ServiceDependency Id="TcpIp" />
+          <ServiceDependency Id="Dnscache" />
+        </ServiceInstall>
+
+        <!-- Service control - start on install, stop on uninstall -->
+        <ServiceControl Id="StartService"
+                        Name="LemonadeNexus"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <!-- Default server configuration file -->
+      <Component Id="ServerConfigFile"
+                 Guid="{D9E0F1A2-B3C4-5678-EFAB-890123456789}"
+                 Win64="yes">
+        <File Id="ServerConfigJson"
+              Name="lemonade-nexus.json"
+              Source="$(var.BuildDir)\lemonade-nexus.json"
+              KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainApplication"
+             Title="Lemonade Nexus VPN"
+             Description="The main application"
+             Level="1"
+             ConfigurableDirectory="INSTALLFOLDER"
+             AllowAdvertise="no"
+             Display="expand"
+             Absent="disallow">
+      <ComponentGroupRef Id="ApplicationFiles" />
+      <ComponentRef Id="ProgramMenuShortcut" />
+      <ComponentRef Id="LemonadeNexusService" />
+      <ComponentRef Id="ServerConfigFile" />
+    </Feature>
+
+    <Feature Id="DesktopShortcutFeature"
+             Title="Desktop Shortcut"
+             Description="Create a shortcut on the Desktop"
+             Level="1">
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Product>
+</Wix>

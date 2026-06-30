@@ -76,27 +76,37 @@ cmake --build build
 
 Requires Visual Studio 2022 Build Tools with C++ workload.
 
-## macOS Client App
+## Flutter Client App
+
+The desktop client (`apps/LemonadeNexus`) is a Flutter app that talks to the C
+SDK over FFI. Build the SDK **shared** library first, then run Flutter.
+
+### macOS
 
 ```bash
-# Build the C++ SDK first
-cmake --build build --target LemonadeNexusSDK
+# 1. Build the SDK dylib from the repo root
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --target LemonadeNexusSDKShared
 
-# Build the Swift app
-cd apps/LemonadeNexusMac
-swift build
-
-# Codesign
-codesign --force --sign - .build/debug/LemonadeNexusMac
-codesign --force --sign - .build/debug/LemonadeNexusTunnelHelper
-
-# Install to /Applications
-APP="/Applications/Lemonade Nexus.app"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/debug/LemonadeNexusMac "$APP/Contents/MacOS/"
-cp .build/debug/LemonadeNexusTunnelHelper "$APP/Contents/MacOS/"
-codesign --force --sign - "$APP"
+# 2. Run / build the app — the Xcode "Embed Lemonade Nexus SDK" build phase
+#    copies and codesigns the dylib into the .app automatically (no manual copy)
+cd apps/LemonadeNexus
+flutter pub get
+flutter run -d macos              # development (hot reload)
+flutter build macos --release     # release build
 ```
+
+Output: `apps/LemonadeNexus/build/macos/Build/Products/Release/lemonade_nexus.app`.
+Set `LN_DEBUG=1` to surface verbose SDK + mesh diagnostics in the console.
+
+### Windows
+
+See [`apps/LemonadeNexus/README.md`](../apps/LemonadeNexus/README.md) — the
+Windows runner needs the SDK DLL staged into `apps/LemonadeNexus/windows/` before
+`flutter build windows`.
+
+CI builds both desktop targets on every push — see
+[`.github/workflows/flutter-clients.yml`](../.github/workflows/flutter-clients.yml).
 
 ## Running Tests
 

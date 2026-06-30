@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Main lemon gradient -->
+    <radialGradient id="lemonGrad" cx="40%" cy="35%" r="60%">
+      <stop offset="0%" stop-color="#FFE066"/>
+      <stop offset="50%" stop-color="#F5C842"/>
+      <stop offset="100%" stop-color="#D4A017"/>
+    </radialGradient>
+    <!-- Glow effect -->
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#FFE066" stop-opacity="0.4"/>
+      <stop offset="100%" stop-color="#FFE066" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Node gradient -->
+    <radialGradient id="nodeGrad" cx="30%" cy="30%" r="70%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E8C547"/>
+    </radialGradient>
+    <!-- Drop shadow -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.25"/>
+    </filter>
+    <filter id="softShadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <!-- Background glow -->
+  <circle cx="128" cy="128" r="120" fill="url(#glow)"/>
+
+  <!-- Main lemon body (organic rounded shape) -->
+  <g filter="url(#shadow)">
+    <!-- Lemon body - slightly elongated ellipse -->
+    <ellipse cx="128" cy="132" rx="82" ry="72" fill="url(#lemonGrad)"/>
+
+    <!-- Lemon highlight (top-left light reflection) -->
+    <ellipse cx="108" cy="108" rx="40" ry="30" fill="#FFF9E0" opacity="0.35" transform="rotate(-15 108 108)"/>
+
+    <!-- Lemon tip (right side pointed end) -->
+    <path d="M 200 132 Q 225 128 238 132 Q 225 136 200 132 Z" fill="#E8B830"/>
+
+    <!-- Lemon stem area (top) -->
+    <ellipse cx="128" cy="62" rx="18" ry="8" fill="#C49520"/>
+
+    <!-- Leaf -->
+    <path d="M 128 62 Q 145 40 165 45 Q 150 55 128 62 Z" fill="#2D8B4E"/>
+    <path d="M 128 62 Q 140 48 155 50" stroke="#1E6B35" stroke-width="1.5" fill="none"/>
+
+    <!-- Lemon surface texture (subtle curved lines) -->
+    <path d="M 60 100 Q 90 85 120 95" stroke="#E8C040" stroke-width="1" fill="none" opacity="0.5"/>
+    <path d="M 55 120 Q 85 105 115 115" stroke="#E8C040" stroke-width="1" fill="none" opacity="0.5"/>
+    <path d="M 55 140 Q 85 125 115 135" stroke="#E8C040" stroke-width="1" fill="none" opacity="0.5"/>
+  </g>
+
+  <!-- Mesh Network Overlay -->
+  <g filter="url(#softShadow)">
+    <!-- Connection lines -->
+    <line x1="128" y1="90" x2="158" y2="115" stroke="#FFFFFF" stroke-width="2" opacity="0.7"/>
+    <line x1="128" y1="90" x2="98" y2="115" stroke="#FFFFFF" stroke-width="2" opacity="0.7"/>
+    <line x1="98" y1="115" x2="98" y2="150" stroke="#FFFFFF" stroke-width="2" opacity="0.7"/>
+    <line x1="158" y1="115" x2="158" y2="150" stroke="#FFFFFF" stroke-width="2" opacity="0.7"/>
+    <line x1="98" y1="150" x2="128" y2="170" stroke="#FFFFFF" stroke-width="2" opacity="0.7"/>
+    <line x1="158" y1="150" x2="128" y2="170" stroke="#FFFFFF" stroke-width="2" opacity="0.7"/>
+    <line x1="128" y1="90" x2="128" y2="170" stroke="#FFFFFF" stroke-width="1.5" opacity="0.4"/>
+    <line x1="98" y1="115" x2="158" y2="115" stroke="#FFFFFF" stroke-width="1.5" opacity="0.4"/>
+    <line x1="98" y1="150" x2="158" y2="150" stroke="#FFFFFF" stroke-width="1.5" opacity="0.4"/>
+
+    <!-- Network nodes -->
+    <circle cx="128" cy="90" r="10" fill="url(#nodeGrad)" stroke="#D4A017" stroke-width="2"/>
+    <circle cx="98" cy="115" r="8" fill="url(#nodeGrad)" stroke="#D4A017" stroke-width="2"/>
+    <circle cx="158" cy="115" r="8" fill="url(#nodeGrad)" stroke="#D4A017" stroke-width="2"/>
+    <circle cx="98" cy="150" r="8" fill="url(#nodeGrad)" stroke="#D4A017" stroke-width="2"/>
+    <circle cx="158" cy="150" r="8" fill="url(#nodeGrad)" stroke="#D4A017" stroke-width="2"/>
+    <circle cx="128" cy="170" r="10" fill="url(#nodeGrad)" stroke="#D4A017" stroke-width="2"/>
+
+    <!-- Center node (larger, active) -->
+    <circle cx="128" cy="130" r="14" fill="#FFFFFF" stroke="#D4A017" stroke-width="2.5"/>
+    <circle cx="128" cy="130" r="6" fill="#F5C842"/>
+  </g>
+
+  <!-- Subtle ring accent -->
+  <circle cx="128" cy="128" r="108" fill="none" stroke="#F5C842" stroke-width="1" opacity="0.3"/>
+</svg>

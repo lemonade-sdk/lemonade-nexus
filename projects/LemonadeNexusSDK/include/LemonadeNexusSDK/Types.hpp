@@ -247,7 +247,7 @@ struct JoinResult {
     std::string node_id;
     std::string tunnel_ip;
     std::string private_subnet;
-    std::string wg_pubkey;          ///< WireGuard public key (base64)
+    std::string wg_pubkey;          ///< mesh public key (base64)
     std::string error;
 };
 
@@ -279,18 +279,20 @@ struct GroupJoinResult {
 };
 
 // ---------------------------------------------------------------------------
-// WireGuard tunnel
+// Mesh tunnel
 // ---------------------------------------------------------------------------
 
-struct WireGuardConfig {
-    std::string private_key;                ///< WG private key (base64, Curve25519)
-    std::string public_key;                 ///< WG public key (base64, Curve25519)
-    std::string tunnel_ip;                  ///< Assigned IP (e.g. "10.100.0.5/24")
-    std::string server_public_key;          ///< Server's WG public key
+/// Config for the userspace boringtun mesh dataplane (Noise session to the
+/// server + cryptokey routing). No kernel interface — see BoringtunMesh.
+struct BoringtunConfig {
+    std::string private_key;                ///< Our Curve25519 private key (base64)
+    std::string public_key;                 ///< Our Curve25519 public key (base64)
+    std::string tunnel_ip;                  ///< Assigned mesh IP (e.g. "10.64.0.5/32")
+    std::string server_public_key;          ///< Server's Curve25519 public key
     std::string server_endpoint;            ///< Server endpoint "host:port"
-    std::string dns_server;                 ///< DNS server IP
-    uint16_t    listen_port{0};             ///< Local listen port (0 = random)
-    std::vector<std::string> allowed_ips;   ///< Default: ["10.100.0.0/16"]
+    std::string dns_server;                 ///< DNS server IP (optional)
+    uint16_t    listen_port{0};             ///< Local UDP port (0 = random)
+    std::vector<std::string> allowed_ips;   ///< Mesh plane, e.g. ["10.64.0.0/10"]
     uint32_t    keepalive{5};               ///< Persistent keepalive interval (seconds)
 };
 
@@ -308,7 +310,7 @@ struct TunnelStatus {
 // Mesh P2P networking
 // ---------------------------------------------------------------------------
 
-/// A single mesh peer for P2P WireGuard connections.
+/// A single mesh peer for P2P connections.
 struct MeshPeer {
     std::string node_id;
     std::string hostname;

@@ -60,7 +60,7 @@ Benefits: zero-overhead dispatch, compile-time type safety, no vtable pointer pe
    Tun: 10.64.0.1    Tun: 10.64.0.1    Tun: 10.64.0.1
    BB:  172.16.0.66   BB:  172.16.0.120  BB:  172.16.0.45
         |                  |                  |
-        └───── WG Backbone (172.16.0.0/22) ───┘
+        └─── Mesh Backbone (172.16.0.0/22) ───┘
         |                  |                  |
    [Clients]          [Clients]          [Clients]
    10.64.0.10+        10.64.0.10+        10.64.0.10+
@@ -68,8 +68,8 @@ Benefits: zero-overhead dispatch, compile-time type safety, no vtable pointer pe
 
 **Three network planes:**
 1. **Public Internet** — gossip (9102/udp), STUN (3478/udp), public HTTPS API (9100/tcp)
-2. **Client tunnel** (10.64.0.0/10) — WireGuard between client and server, private HTTPS API
-3. **Server backbone** (172.16.0.0/22) — WireGuard between servers, backend communication
+2. **Client tunnel** (10.64.0.0/10) — boringtun between client and server, private HTTPS API
+3. **Server backbone** (172.16.0.0/22) — boringtun between servers, backend communication
 
 ## Service Architecture
 
@@ -82,7 +82,7 @@ SodiumCryptoService → FileStorageService → KeyWrappingService
     → GovernanceService → GossipService → DdnsService
     → StunService → RelayService → RelayDiscoveryService
     → AcmeService → DnsService → AuthService → ACLService
-    → WireGuardService → HttpServer(s) → HolePunchService
+    → BoringtunService → HttpServer(s) → HolePunchService
 ```
 
 ## Data Storage
@@ -113,4 +113,4 @@ data/
 | Public | `0.0.0.0:9100` | HTTPS | Bootstrap: auth, join, health, discovery |
 | Private | `<tunnel_ip>:9101` | HTTPS | Tree, IPAM, mesh, certs, governance |
 
-The private server only starts after WireGuard allocates a tunnel IP. It serves HTTPS using an ACME certificate for `private.<id>.<region>.seip.<domain>`.
+The private server only starts after the boringtun dataplane allocates a tunnel IP. It serves HTTPS using an ACME certificate for `private.<id>.<region>.seip.<domain>`.

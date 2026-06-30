@@ -18,7 +18,7 @@ title: Security Model
 │ Layer 3: Two-Tier Zero Trust                │
 │ Every message authenticated + authorized    │
 ├─────────────────────────────────────────────┤
-│ Layer 2: WireGuard Tunnel                   │
+│ Layer 2: Mesh Tunnel                        │
 │ All data encrypted in transit               │
 ├─────────────────────────────────────────────┤
 │ Layer 1: Ed25519 Identity                   │
@@ -34,13 +34,13 @@ Every server and client has an Ed25519 keypair. Keys are:
 - **Stored** encrypted at rest (AES-256-GCM with HKDF-derived key)
 
 The Ed25519 key is the root of all trust. From it, we derive:
-- **X25519** keys for WireGuard tunnel (Curve25519 key exchange)
+- **X25519** keys for the mesh tunnel (Curve25519 Noise key exchange)
 - **Signatures** on all tree deltas, gossip messages, credentials
 - **JWT tokens** for API session authentication
 
-## Transport (WireGuard)
+## Transport (Mesh)
 
-All tunnel traffic uses WireGuard:
+All tunnel traffic uses the boringtun mesh:
 - **Key exchange:** Curve25519 (Noise_IK handshake)
 - **Encryption:** ChaCha20-Poly1305
 - **Keepalive:** 5-second persistent keepalive for liveness detection

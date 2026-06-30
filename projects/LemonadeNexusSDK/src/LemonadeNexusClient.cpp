@@ -8,11 +8,43 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
+#include <map>
 #include <mutex>
+#include <utility>
+
+// Cross-platform name resolution (getaddrinfo / inet_ntop / sockaddr_in).
+// On Windows these live in the Winsock headers; Winsock is already initialized
+// process-wide by httplib (included above).
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netdb.h>
+#endif
 
 namespace lnsdk {
 
 using json = nlohmann::json;
+
+namespace {
+/// Resolve a hostname to its first IPv4 address (dotted string), or "" on
+/// failure. Used to learn the server's mesh IP from its private FQDN (which the
+/// authoritative DNS maps to the in-mesh address, e.g. 10.64.0.1).
+std::string resolve_ipv4(const std::string& host) {
+    struct addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res) return {};
+    char buf[INET_ADDRSTRLEN] = {0};
+    auto* sin = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+    inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof buf);
+    freeaddrinfo(res);
+    return buf;
+}
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // PIMPL implementation
@@ -43,8 +75,12 @@ struct LemonadeNexusClient::Impl {
     // Latency-based auto-switching
     std::unique_ptr<LatencyMonitor> latency_monitor;
 
-    // WireGuard tunnel
-    WireGuardTunnel wg_tunnel;
+    // The client's single userspace mesh dataplane (boringtun Noise + smoltcp
+    // netstack, no TUN). Brought up at join; carries both mesh P2P traffic and
+    // the private-API transport (see private_http_*).
+    BoringtunMesh meshplane;
+    // The join-assigned dataplane config, kept so callers can inspect it.
+    BoringtunConfig boringtun_config;
 
     // Mesh P2P orchestrator
     std::unique_ptr<MeshOrchestrator> mesh_orchestrator;
@@ -245,10 +281,71 @@ struct LemonadeNexusClient::Impl {
         return current_base_url();
     }
 
+    // Send a private-API request over the userspace mesh dataplane — the only
+    // path to the server's private routes (the server terminates the tunnel in
+    // userspace + smoltcp, so there is no OS route to its tunnel IP). Egresses a
+    // loopback port bridged through the netstack to the server's private API.
+    //
+    // The private API is HTTPS (it carries the private.<server> cert), so we
+    // speak TLS over the loopback bridge with certificate verification disabled:
+    // the cert is for the server FQDN (not 127.0.0.1), and confidentiality is
+    // already provided by the boringtun/Noise mesh plus the loopback hop.
+    //
+    // Returns the parsed body if the dataplane served the request (success OR
+    // error status); `served` distinguishes "handled" from "not attempted / no
+    // response" so the caller can fall through to legacy transports.
+    std::optional<json> mesh_request(const char* method, const std::string& path,
+                                     const std::string& body, int& status_out,
+                                     bool& served) {
+        served = false;
+        if (!meshplane.is_active() || server_tunnel_ip.empty()) {
+            spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} SKIP "
+                         "(active={}, server_tunnel_ip='{}')",
+                         method, path, meshplane.is_active(), server_tunnel_ip);
+            return std::nullopt;
+        }
+        uint16_t lp = meshplane.tcp_egress(server_tunnel_ip, private_port);
+        spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> egress {}:{} = 127.0.0.1:{}",
+                      method, path, server_tunnel_ip, private_port, lp);
+        if (lp == 0) return std::nullopt;
+        try {
+            httplib::SSLClient cli("127.0.0.1", lp);
+            cli.enable_server_certificate_verification(false);
+            cli.set_connection_timeout(config.connect_timeout_sec);
+            cli.set_read_timeout(config.read_timeout_sec);
+            httplib::Result res = (std::string(method) == "GET")
+                ? cli.Get(path, auth_headers())
+                : cli.Post(path, auth_headers(), body, "application/json");
+            if (res) {
+                served = true;
+                status_out = res->status;
+                spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> HTTP {}",
+                              method, path, res->status);
+                try { return json::parse(res->body); }
+                catch (...) {
+                    if (res->status >= 200 && res->status < 300) return std::nullopt;
+                    json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
+                }
+            }
+            spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} NO RESPONSE "
+                         "(httplib err={})", method, path, httplib::to_string(res.error()));
+        } catch (const std::exception& e) {
+            spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} EXCEPTION: {}",
+                         method, path, e.what());
+        }
+        return std::nullopt;
+    }
+
     std::optional<json> private_http_get(const std::string& path, int& status_out) {
-        spdlog::debug("[LemonadeNexusClient] private_http_get {} (fqdn={}, tunnel={})",
-                       path, server_private_fqdn, server_tunnel_ip);
-        // Try HTTPS via private FQDN (skip cert verify — traffic is already over WG tunnel)
+        spdlog::debug("[LemonadeNexusClient] private_http_get {} (mesh={}, tunnel={})",
+                       path, meshplane.is_active(), server_tunnel_ip);
+        // Preferred: over the userspace mesh dataplane.
+        {
+            bool served = false;
+            auto r = mesh_request("GET", path, "", status_out, served);
+            if (served) return r;
+        }
+        // Legacy OS-routed paths (kernel tunnel platforms) below.
         if (!server_private_fqdn.empty()) {
             try {
                 httplib::SSLClient cli(server_private_fqdn, private_port);
@@ -287,9 +384,15 @@ struct LemonadeNexusClient::Impl {
     }
 
     std::optional<json> private_http_post(const std::string& path, const json& body, int& status_out) {
-        spdlog::debug("[LemonadeNexusClient] private_http_post {} (fqdn={}, tunnel={})",
-                       path, server_private_fqdn, server_tunnel_ip);
-        // Try HTTPS via private FQDN (skip cert verify — over WG tunnel)
+        spdlog::debug("[LemonadeNexusClient] private_http_post {} (mesh={}, tunnel={})",
+                       path, meshplane.is_active(), server_tunnel_ip);
+        // Preferred: over the userspace mesh dataplane.
+        {
+            bool served = false;
+            auto r = mesh_request("POST", path, body.dump(), status_out, served);
+            if (served) return r;
+        }
+        // Legacy OS-routed paths (kernel tunnel platforms) below.
         if (!server_private_fqdn.empty()) {
             try {
                 httplib::SSLClient cli(server_private_fqdn, private_port);
@@ -1369,8 +1472,8 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
     }
 
-    // Step 2: generate WireGuard keypair
-    auto [wg_privkey, wg_pubkey] = WireGuardTunnel::generate_keypair();
+    // Step 2: generate mesh keypair
+    auto [wg_privkey, wg_pubkey] = BoringtunMesh::generate_keypair();
 
     // Step 3: create endpoint node via the server's composite /api/join endpoint.
     // This endpoint handles node ID generation, parent assignment, IP allocation,
@@ -1471,12 +1574,25 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
                           srv_seip_fqdn, public_port);
         }
 
-        // Store private FQDN for HTTPS over WG tunnel
+        // Store private FQDN, and resolve it to the server's in-mesh IP so the
+        // mesh dataplane can egress to the private API (the FQDN maps to the
+        // server's tunnel IP, e.g. 10.64.0.1, via the authoritative DNS).
         auto srv_priv_fqdn = resp->value("server_private_fqdn", std::string{});
         impl_->private_port = static_cast<uint16_t>(
             resp->value("private_api_port", 9101));
         if (!srv_priv_fqdn.empty()) {
             impl_->server_private_fqdn = srv_priv_fqdn;
+            if (impl_->server_tunnel_ip.empty()) {
+                auto ip = resolve_ipv4(srv_priv_fqdn);
+                if (!ip.empty()) {
+                    impl_->server_tunnel_ip = ip;
+                    spdlog::info("[LemonadeNexusClient] server mesh IP {} (from {})",
+                                  ip, srv_priv_fqdn);
+                } else {
+                    spdlog::warn("[LemonadeNexusClient] could not resolve private FQDN {}",
+                                  srv_priv_fqdn);
+                }
+            }
             spdlog::info("[LemonadeNexusClient] private API: https://{}:{}",
                           srv_priv_fqdn, impl_->private_port);
         } else if (!srv_tunnel.empty()) {
@@ -1485,20 +1601,22 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
     }
 
-    // Step 4: Configure the WireGuard tunnel (bring up if we have a tunnel IP)
+    // Step 4: bring up the userspace mesh dataplane with the assigned config.
     if (!tunnel_ip.empty()) {
-        WireGuardConfig wg_config;
-        wg_config.private_key       = wg_privkey;
-        wg_config.public_key        = wg_pubkey;
-        wg_config.tunnel_ip         = tunnel_ip;
-        wg_config.server_public_key = resp->value("wg_server_pubkey", std::string{});
-        wg_config.server_endpoint   = resp->value("wg_endpoint", std::string{});
-        wg_config.allowed_ips       = {resp->value("tunnel_subnet", std::string{"10.64.0.0/10"})};
+        BoringtunConfig bt;
+        bt.private_key       = wg_privkey;
+        bt.public_key        = wg_pubkey;
+        bt.tunnel_ip         = tunnel_ip;
+        bt.server_public_key = resp->value("wg_server_pubkey", std::string{});
+        bt.server_endpoint   = resp->value("wg_endpoint", std::string{});
+        bt.allowed_ips       = {resp->value("tunnel_subnet", std::string{"10.64.0.0/10"})};
 
-        auto up_result = impl_->wg_tunnel.bring_up(wg_config);
-        if (!up_result) {
-            spdlog::warn("[LemonadeNexusClient] tunnel bring_up deferred or failed: {}",
-                          up_result.error);
+        {
+            std::lock_guard lock(impl_->mutex);
+            impl_->boringtun_config = bt;
+        }
+        if (!impl_->meshplane.start(bt)) {
+            spdlog::warn("[LemonadeNexusClient] mesh dataplane start failed");
         }
     }
 
@@ -1510,12 +1628,9 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
 StatusResult LemonadeNexusClient::leave_network() {
     StatusResult result;
 
-    // Tear down WireGuard tunnel if active
-    if (impl_->wg_tunnel.is_active()) {
-        auto td = impl_->wg_tunnel.bring_down();
-        if (!td) {
-            spdlog::warn("[LemonadeNexusClient] tunnel tear-down failed: {}", td.error);
-        }
+    // Tear down the mesh dataplane if active
+    if (impl_->meshplane.is_active()) {
+        impl_->meshplane.stop();
     }
 
     std::string current_node_id;
@@ -1706,7 +1821,9 @@ Result<std::vector<ServerEntry>> LemonadeNexusClient::get_servers() {
 Result<TrustStatus> LemonadeNexusClient::get_trust_status() {
     std::lock_guard lock(impl_->mutex);
     int status = 0;
-    auto resp = impl_->http_get("/api/trust/status", status);
+    // /api/trust/status is a private-API route (served over the WG tunnel),
+    // like /api/relay/list — route it through the private base URL.
+    auto resp = impl_->private_http_get("/api/trust/status", status);
     if (!resp) return {false, {}, status, "Connection failed"};
     try {
         return {true, resp->get<TrustStatus>(), status, ""};
@@ -1813,31 +1930,11 @@ Result<AttestationManifests> LemonadeNexusClient::get_attestation_manifests() {
 }
 
 // ---------------------------------------------------------------------------
-// WireGuard tunnel management
+// Mesh dataplane
 // ---------------------------------------------------------------------------
 
-TunnelStatus LemonadeNexusClient::tunnel_status() const {
-    return impl_->wg_tunnel.status();
-}
-
-bool LemonadeNexusClient::is_tunnel_active() const {
-    return impl_->wg_tunnel.is_active();
-}
-
-std::string LemonadeNexusClient::get_wireguard_config() const {
-    return impl_->wg_tunnel.get_wg_config_string();
-}
-
-std::string LemonadeNexusClient::get_wireguard_config_json() const {
-    return impl_->wg_tunnel.get_wg_config_json();
-}
-
-StatusResult LemonadeNexusClient::tunnel_up(const WireGuardConfig& config) {
-    return impl_->wg_tunnel.bring_up(config);
-}
-
-StatusResult LemonadeNexusClient::tunnel_down() {
-    return impl_->wg_tunnel.bring_down();
+bool LemonadeNexusClient::is_mesh_active() const {
+    return impl_->meshplane.is_active();
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,11 +1952,17 @@ void LemonadeNexusClient::enable_mesh(const MeshConfig& config) {
         return;
     }
 
+    if (!impl_->meshplane.is_active()) {
+        spdlog::warn("[LemonadeNexusClient] enable_mesh: dataplane not up "
+                     "(join the network first)");
+        return;
+    }
+
     // Stop existing orchestrator if any
     disable_mesh();
 
     impl_->mesh_orchestrator = std::make_unique<MeshOrchestrator>(
-        *this, impl_->wg_tunnel, nid);
+        *this, impl_->meshplane, nid);
 
     {
         std::lock_guard lock(impl_->mutex);
@@ -1935,7 +2038,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                 mp.is_online      = p.value("is_online", false);
 
                 // Validate critical fields — reject peers with shell-unsafe
-                // or malformed data before they reach WireGuard commands.
+                // or malformed data before they reach mesh commands.
                 // Check for shell metacharacters in all string fields.
                 auto has_unsafe_chars = [](const std::string& s) {
                     for (char c : s) {
@@ -1955,7 +2058,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                                   mp.node_id);
                     continue;  // skip this peer entirely
                 }
-                // Reject peers with empty pubkey (unusable for WireGuard)
+                // Reject peers with empty pubkey (unusable for the mesh)
                 if (mp.wg_pubkey.empty()) {
                     spdlog::debug("[MeshPeers] Skipping peer '{}' with empty wg_pubkey", mp.node_id);
                     continue;

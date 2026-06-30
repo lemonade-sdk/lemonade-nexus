@@ -12,7 +12,6 @@ title: SDK Guide
 - [Identity Management](#identity-management)
 - [Authentication](#authentication)
 - [Joining the Network](#joining-the-network)
-- [WireGuard Tunnel](#wireguard-tunnel)
 - [Tree Operations](#tree-operations)
 - [Mesh P2P](#mesh-p2p)
 - [Best Practices](#best-practices)
@@ -21,7 +20,7 @@ title: SDK Guide
 
 ## Overview
 
-The **LemonadeNexusSDK** is a C++ library with a C FFI layer for integrating the mesh VPN into any application. It handles identity, authentication, network joining, WireGuard tunnel management, and peer-to-peer mesh networking.
+The **LemonadeNexusSDK** is a C++ library with a C FFI layer for integrating the mesh VPN into any application. It handles identity, authentication, network joining, and peer-to-peer mesh networking.
 
 ## Quick Start (C++)
 
@@ -37,12 +36,12 @@ lnsdk::LemonadeNexusClient client(config);
 // Derive identity from username/password (deterministic: same creds = same keypair)
 client.derive_identity("user@example.com", "password123");
 
-// Join the mesh (auth + create node + allocate IP + WG config)
+// Join the mesh (auth + create node + allocate IP + mesh keys)
 auto result = client.join_network("user@example.com", "");
 if (result.ok) {
     std::cout << "Node ID: " << result.value.node_id << "\n";
     std::cout << "Tunnel IP: " << result.value.tunnel_ip << "\n";
-    // WireGuard tunnel is automatically configured
+    // boringtun mesh tunnel is automatically configured
 }
 
 // Enable mesh P2P for direct client-to-client connections
@@ -71,12 +70,8 @@ ln_free(auth_json);
 char* join_json = NULL;
 ln_join_network(client, &join_json);
 // join_json contains: tunnel_ip, node_id, wg_endpoint, etc.
+// The mesh dataplane is brought up automatically during join.
 ln_free(join_json);
-
-// Bring up WireGuard tunnel
-char* tunnel_json = NULL;
-ln_tunnel_up(client, NULL, &tunnel_json);
-ln_free(tunnel_json);
 
 // Clean up
 ln_destroy(client);
@@ -109,7 +104,7 @@ username + password
     → PBKDF2(SHA256, 100k rounds)
     → 32-byte seed
     → Ed25519 keypair (identity)
-    → X25519 keypair (WireGuard, derived from Ed25519)
+    → X25519 keypair (Noise static, derived from Ed25519)
 ```
 
 ## Authentication
@@ -139,45 +134,22 @@ The join flow is composite — one call does everything:
 1. Authenticate (Ed25519 challenge-response)
 2. Create endpoint node in the permission tree
 3. Allocate tunnel IP from IPAM (10.64.0.10+)
-4. Get server's WireGuard public key and endpoint
-5. Configure WireGuard tunnel (bring up if possible)
 
 **Response fields:**
 | Field | Example | Description |
 |-------|---------|-------------|
 | `node_id` | `09ba6947...` | Your unique node ID |
-| `tunnel_ip` | `10.64.0.10/32` | Your WireGuard tunnel IP |
+| `tunnel_ip` | `10.64.0.10/32` | Your mesh tunnel IP |
 | `server_tunnel_ip` | `10.64.0.1` | Server's tunnel IP |
 | `server_private_fqdn` | `private.<id>.<region>.seip.<domain>` | Server's private HTTPS hostname |
-| `wg_server_pubkey` | `base64...` | Server's WireGuard X25519 key |
-| `wg_endpoint` | `67.x.x.x:51940` | Server's WireGuard endpoint |
+| `wg_server_pubkey` | `base64...` | Server's mesh X25519 key |
+| `wg_endpoint` | `67.x.x.x:51940` | Server's mesh endpoint |
 
-After joining, private API calls (tree, IPAM, mesh) route through HTTPS over the WireGuard tunnel via the `server_private_fqdn`.
-
-## WireGuard Tunnel
-
-```cpp
-// Tunnel is usually brought up automatically during join_network()
-// Manual control:
-
-WireGuardConfig config;
-config.private_key = "base64...";
-config.public_key = "base64...";
-config.tunnel_ip = "10.64.0.10/32";
-config.server_public_key = "base64...";
-config.server_endpoint = "67.x.x.x:51940";
-config.keepalive = 5;  // 5-second persistent keepalive
-
-auto result = client.bring_up_tunnel(config);
-auto result = client.bring_down_tunnel();
-
-// Get config as JSON (for external tunnel management on iOS/Android)
-auto json = client.wireguard_config_json();
-```
+After joining, private API calls (tree, IPAM, mesh) route through HTTPS over the mesh tunnel via the `server_private_fqdn`.
 
 ## Tree Operations
 
-All tree operations go through the private API (HTTPS over WG tunnel):
+All tree operations go through the private API (HTTPS over the mesh tunnel):
 
 ```cpp
 // Read a node
@@ -231,8 +203,8 @@ client.disable_mesh();
 6. **Enable mesh** for P2P connectivity between clients
 7. **Handle join failure gracefully** — retry with exponential backoff
 8. **Session tokens expire** — re-authenticate if you get HTTP 401
-9. **Clean up on exit** — call `bring_down_tunnel()` and `disable_mesh()`
-10. **Use the private FQDN** — after join, all sensitive API calls route through HTTPS over the WG tunnel
+9. **Clean up on exit** — call `disable_mesh()`
+10. **Use the private FQDN** — after join, all sensitive API calls route through HTTPS over the mesh tunnel
 
 ## Error Handling
 
@@ -260,12 +232,8 @@ C API error codes:
 
 ## Platform Notes
 
-| Platform | WireGuard Backend | Notes |
-|----------|------------------|-------|
-| **Linux** | Kernel module (preferred), BoringTun fallback | Best performance with kernel WG |
-| **macOS** | BoringTun via privilege-escalated helper | AppleScript password dialog for utun creation |
-| **Windows** | wireguard-nt kernel driver (auto-downloaded) | Requires admin privileges |
-| **iOS** | Config-only | App uses `NEPacketTunnelProvider`, SDK generates WG config |
-| **Android** | Config-only | App uses `VpnService`, SDK generates WG config |
-
-On mobile platforms, the SDK generates the WireGuard configuration string and the host app manages the VPN lifecycle through OS APIs.
+The mesh dataplane is identical on every platform: an in-process **boringtun**
+userspace Noise dataplane over a smoltcp netstack — no kernel module, no
+TUN/utun device, and no elevated privileges. The SDK ships as a native dynamic
+library (`.so` / `.dylib` / `.dll`) loaded over FFI, so there is no
+per-platform VPN backend to manage.
