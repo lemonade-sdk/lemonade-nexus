@@ -1,6 +1,6 @@
-#include <LemonadeNexus/WireGuard/UserspaceDataplane.hpp>
+#include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
 
-#include <LemonadeNexus/WireGuard/WireProtocol.hpp>
+#include <LemonadeNexus/Boringtun/WireProtocol.hpp>
 
 #include <boringtun_ffi.h>
 #include <sodium.h>
@@ -29,7 +29,7 @@ static constexpr socket_t kInvalidSocket = -1;
 static void close_socket(socket_t s) { close(s); }
 #endif
 
-namespace nexus::wireguard {
+namespace nexus::boringtun {
 
 namespace {
 
@@ -434,7 +434,7 @@ bool UserspaceDataplane::update_endpoint(const std::string& pubkey_b64,
     return true;
 }
 
-std::vector<WgPeer> UserspaceDataplane::snapshot_peers() const {
+std::vector<BoringtunPeer> UserspaceDataplane::snapshot_peers() const {
     std::vector<PeerPtr> peers;
     {
         std::shared_lock lock(tables_mtx_);
@@ -442,11 +442,11 @@ std::vector<WgPeer> UserspaceDataplane::snapshot_peers() const {
         for (const auto& [pubkey, peer] : by_pubkey_) peers.push_back(peer);
     }
 
-    std::vector<WgPeer> out;
+    std::vector<BoringtunPeer> out;
     out.reserve(peers.size());
     const auto now = static_cast<uint64_t>(std::time(nullptr));
     for (const auto& peer : peers) {
-        WgPeer wg;
+        BoringtunPeer wg;
         wg.public_key           = peer->pubkey_b64;
         wg.allowed_ips          = peer->allowed_ips;
         wg.endpoint             = endpoint_to_string(peer->endpoint.load(std::memory_order_relaxed));
@@ -709,4 +709,4 @@ void UserspaceDataplane::timer_loop() {
     }
 }
 
-} // namespace nexus::wireguard
+} // namespace nexus::boringtun

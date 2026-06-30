@@ -10,7 +10,7 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
-#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
+#include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
 
@@ -206,7 +206,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         // Add the client as a WireGuard peer on the server interface
         auto client_wg_pubkey = body.value("wg_pubkey", std::string{});
-        if (ctx_.wireguard && !client_wg_pubkey.empty() && !alloc.base_network.empty()) {
+        if (ctx_.boringtun && !client_wg_pubkey.empty() && !alloc.base_network.empty()) {
             // Convert Ed25519 wg_pubkey to Curve25519 if it has the ed25519: prefix
             std::string peer_wg_key = client_wg_pubkey;
             constexpr std::string_view ed_prefix = "ed25519:";
@@ -222,7 +222,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 }
             }
 
-            if (ctx_.wireguard->add_peer(peer_wg_key, alloc.base_network, "")) {
+            if (ctx_.boringtun->add_peer(peer_wg_key, alloc.base_network, "")) {
                 spdlog::info("[Join] added WG peer {} allowed_ips={}", peer_wg_key.substr(0, 12), alloc.base_network);
             } else {
                 spdlog::warn("[Join] failed to add WG peer for node {}", node_id);

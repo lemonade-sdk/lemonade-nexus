@@ -270,42 +270,6 @@ Map<String, dynamic> _$TunnelStatusToJson(TunnelStatus instance) =>
       'latency_ms': instance.latencyMs,
     };
 
-WgConfig _$WgConfigFromJson(Map<String, dynamic> json) => WgConfig(
-      privateKey: json['private_key'] as String,
-      publicKey: json['public_key'] as String,
-      tunnelIp: json['tunnel_ip'] as String,
-      serverPublicKey: json['server_public_key'] as String,
-      serverEndpoint: json['server_endpoint'] as String,
-      dnsServer: json['dns_server'] as String?,
-      listenPort: (json['listen_port'] as num).toInt(),
-      allowedIps: (json['allowed_ips'] as List<dynamic>)
-          .map((e) => e as String)
-          .toList(),
-      keepalive: (json['keepalive'] as num).toInt(),
-    );
-
-Map<String, dynamic> _$WgConfigToJson(WgConfig instance) => <String, dynamic>{
-      'private_key': instance.privateKey,
-      'public_key': instance.publicKey,
-      'tunnel_ip': instance.tunnelIp,
-      'server_public_key': instance.serverPublicKey,
-      'server_endpoint': instance.serverEndpoint,
-      'dns_server': instance.dnsServer,
-      'listen_port': instance.listenPort,
-      'allowed_ips': instance.allowedIps,
-      'keepalive': instance.keepalive,
-    };
-
-WgKeypair _$WgKeypairFromJson(Map<String, dynamic> json) => WgKeypair(
-      privateKey: json['private_key'] as String,
-      publicKey: json['public_key'] as String,
-    );
-
-Map<String, dynamic> _$WgKeypairToJson(WgKeypair instance) => <String, dynamic>{
-      'private_key': instance.privateKey,
-      'public_key': instance.publicKey,
-    };
-
 MeshPeer _$MeshPeerFromJson(Map<String, dynamic> json) => MeshPeer(
       nodeId: json['node_id'] as String,
       hostname: json['hostname'] as String?,

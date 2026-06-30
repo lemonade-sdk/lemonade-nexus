@@ -1,6 +1,6 @@
 # Lemonade Nexus SDK for Flutter
 
-Dart SDK for the Lemonade Nexus WireGuard mesh VPN platform.
+Dart SDK for the Lemonade Nexus userspace mesh VPN platform.
 
 ## Files
 
@@ -78,14 +78,6 @@ Dart SDK for the Lemonade Nexus WireGuard mesh VPN platform.
 - `ln_current_latency_ms` - Get current RTT
 - `ln_server_latencies` - Get all server latencies
 
-### WireGuard Tunnel (6)
-- `ln_tunnel_up` - Bring up tunnel
-- `ln_tunnel_down` - Tear down tunnel
-- `ln_tunnel_status` - Get tunnel status
-- `ln_get_wg_config` - Get wg-quick config
-- `ln_get_wg_config_json` - Get config as JSON
-- `ln_wg_generate_keypair` - Generate Curve25519 keypair
-
 ### Mesh P2P (6)
 - `ln_mesh_enable` - Enable mesh (default config)
 - `ln_mesh_enable_config` - Enable mesh (custom config)
@@ -159,35 +151,6 @@ try {
 } finally {
   sdk.dispose();
 }
-```
-
-### WireGuard Tunnel
-
-```dart
-// Generate keypair
-final keypair = await sdk.generateWgKeypair();
-
-// Create config
-final config = WgConfig(
-  privateKey: keypair.privateKey,
-  publicKey: keypair.publicKey,
-  tunnelIp: network.tunnelIp!,
-  serverPublicKey: serverPublicKey,
-  serverEndpoint: '${server.host}:${server.port}',
-  dnsServer: '8.8.8.8',
-  listenPort: 0,  // Auto
-  allowedIps: ['0.0.0.0/0'],
-  keepalive: 25,
-);
-
-// Bring up tunnel
-await sdk.tunnelUp(config);
-
-// Check status
-final status = await sdk.getTunnelStatus();
-print('Tunnel is ${status.isUp ? "up" : "down"}');
-print('RX: ${status.rxBytes} bytes');
-print('TX: ${status.txBytes} bytes');
 ```
 
 ### Mesh P2P

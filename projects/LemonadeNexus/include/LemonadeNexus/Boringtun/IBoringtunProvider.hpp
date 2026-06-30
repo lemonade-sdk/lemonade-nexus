@@ -5,16 +5,16 @@
 #include <string>
 #include <vector>
 
-namespace nexus::wireguard {
+namespace nexus::boringtun {
 
 /// A WireGuard Curve25519 keypair (base64-encoded strings).
-struct WgKeypair {
+struct BoringtunKeypair {
     std::string public_key;
     std::string private_key;
 };
 
 /// A WireGuard peer as reported by `wg show <iface> dump`.
-struct WgPeer {
+struct BoringtunPeer {
     std::string public_key;
     std::string allowed_ips;
     std::string endpoint;
@@ -25,7 +25,7 @@ struct WgPeer {
 };
 
 /// Configuration for a WireGuard interface.
-struct WgInterfaceConfig {
+struct BoringtunInterfaceConfig {
     std::string private_key;
     std::string address;
     uint16_t    listen_port{51940};
@@ -44,26 +44,26 @@ struct TreeNodePeer {
 
 /// CRTP base for WireGuard operations.
 /// Derived must implement:
-///   WgKeypair do_generate_keypair()
-///   bool do_set_interface(const WgInterfaceConfig& config)
+///   BoringtunKeypair do_generate_keypair()
+///   bool do_set_interface(const BoringtunInterfaceConfig& config)
 ///   bool do_add_peer(const std::string& pubkey, const std::string& allowed_ips, const std::string& endpoint)
 ///   bool do_remove_peer(const std::string& pubkey)
-///   std::vector<WgPeer> do_get_peers()
+///   std::vector<BoringtunPeer> do_get_peers()
 ///   bool do_update_endpoint(const std::string& pubkey, const std::string& new_endpoint)
-///   std::string do_generate_config(const WgInterfaceConfig& config, const std::vector<WgPeer>& peers)
-///   bool do_setup_interface(const WgInterfaceConfig& config, const std::vector<WgPeer>& peers)
+///   std::string do_generate_config(const BoringtunInterfaceConfig& config, const std::vector<BoringtunPeer>& peers)
+///   bool do_setup_interface(const BoringtunInterfaceConfig& config, const std::vector<BoringtunPeer>& peers)
 ///   bool do_teardown_interface()
 ///   int do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers)
 ///   bool do_save_config(const std::string& config_contents)
 ///   std::string do_load_config()
 template <typename Derived>
-class IWireGuardProvider {
+class IBoringtunProvider {
 public:
-    [[nodiscard]] WgKeypair generate_keypair() {
+    [[nodiscard]] BoringtunKeypair generate_keypair() {
         return self().do_generate_keypair();
     }
 
-    [[nodiscard]] bool set_interface(const WgInterfaceConfig& config) {
+    [[nodiscard]] bool set_interface(const BoringtunInterfaceConfig& config) {
         return self().do_set_interface(config);
     }
 
@@ -77,7 +77,7 @@ public:
         return self().do_remove_peer(pubkey);
     }
 
-    [[nodiscard]] std::vector<WgPeer> get_peers() {
+    [[nodiscard]] std::vector<BoringtunPeer> get_peers() {
         return self().do_get_peers();
     }
 
@@ -87,15 +87,15 @@ public:
     }
 
     /// Generate a wg-quick compatible config file string.
-    [[nodiscard]] std::string generate_config(const WgInterfaceConfig& config,
-                                               const std::vector<WgPeer>& peers) {
+    [[nodiscard]] std::string generate_config(const BoringtunInterfaceConfig& config,
+                                               const std::vector<BoringtunPeer>& peers) {
         return self().do_generate_config(config, peers);
     }
 
     /// Create the WireGuard interface, assign address, set keys, bring up,
     /// add peers, and install routes.
-    [[nodiscard]] bool setup_interface(const WgInterfaceConfig& config,
-                                       const std::vector<WgPeer>& peers) {
+    [[nodiscard]] bool setup_interface(const BoringtunInterfaceConfig& config,
+                                       const std::vector<BoringtunPeer>& peers) {
         return self().do_setup_interface(config, peers);
     }
 
@@ -128,25 +128,25 @@ public:
     }
 
 protected:
-    ~IWireGuardProvider() = default;
+    ~IBoringtunProvider() = default;
 
 private:
     [[nodiscard]] Derived& self() { return static_cast<Derived&>(*this); }
     [[nodiscard]] const Derived& self() const { return static_cast<const Derived&>(*this); }
 };
 
-/// Concept constraining a valid IWireGuardProvider implementation.
+/// Concept constraining a valid IBoringtunProvider implementation.
 template <typename T>
-concept WireGuardProviderType = requires(T t,
-                                          const WgInterfaceConfig& config,
+concept BoringtunProviderType = requires(T t,
+                                          const BoringtunInterfaceConfig& config,
                                           const std::string& s,
-                                          const std::vector<WgPeer>& peers,
+                                          const std::vector<BoringtunPeer>& peers,
                                           const std::vector<TreeNodePeer>& tree_peers) {
-    { t.do_generate_keypair() } -> std::same_as<WgKeypair>;
+    { t.do_generate_keypair() } -> std::same_as<BoringtunKeypair>;
     { t.do_set_interface(config) } -> std::same_as<bool>;
     { t.do_add_peer(s, s, s) } -> std::same_as<bool>;
     { t.do_remove_peer(s) } -> std::same_as<bool>;
-    { t.do_get_peers() } -> std::same_as<std::vector<WgPeer>>;
+    { t.do_get_peers() } -> std::same_as<std::vector<BoringtunPeer>>;
     { t.do_update_endpoint(s, s) } -> std::same_as<bool>;
     { t.do_generate_config(config, peers) } -> std::same_as<std::string>;
     { t.do_setup_interface(config, peers) } -> std::same_as<bool>;
@@ -157,4 +157,4 @@ concept WireGuardProviderType = requires(T t,
     { t.do_load_config() } -> std::same_as<std::string>;
 };
 
-} // namespace nexus::wireguard
+} // namespace nexus::boringtun

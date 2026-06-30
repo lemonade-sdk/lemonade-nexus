@@ -38,7 +38,6 @@ enum LnError {
 /// In FFI, these are represented as Pointer<Void>
 typedef LnClientHandle = ffi.Pointer<ffi.Void>;
 typedef LnIdentityHandle = ffi.Pointer<ffi.Void>;
-typedef LnPumpHandle = ffi.Pointer<ffi.Void>;
 
 /// FFI type mappings for C SDK functions.
 
@@ -461,53 +460,6 @@ typedef _LnServerLatenciesDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
-// WireGuard tunnel
-typedef _LnTunnelUp = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Char> configJson,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnTunnelUpDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Char> configJson,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-typedef _LnTunnelDown = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnTunnelDownDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-typedef _LnTunnelStatus = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnTunnelStatusDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-typedef _LnGetWgConfig = ffi.Pointer<ffi.Char> Function(
-  LnClientHandle client,
-);
-typedef _LnGetWgConfigDart = ffi.Pointer<ffi.Char> Function(
-  LnClientHandle client,
-);
-
-typedef _LnGetWgConfigJson = ffi.Pointer<ffi.Char> Function(
-  LnClientHandle client,
-);
-typedef _LnGetWgConfigJsonDart = ffi.Pointer<ffi.Char> Function(
-  LnClientHandle client,
-);
-
-typedef _LnWgGenerateKeypair = ffi.Pointer<ffi.Char> Function();
-typedef _LnWgGenerateKeypairDart = ffi.Pointer<ffi.Char> Function();
-
 // Mesh P2P
 typedef _LnMeshEnable = ffi.Int32 Function(
   LnClientHandle client,
@@ -725,55 +677,6 @@ typedef _LnRoutingConnectionStatusDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
-// Packet pump (socket-proxy tunnel: netstack + BoringTun, no TUN device)
-typedef _LnPumpCreate = LnPumpHandle Function(ffi.Pointer<ffi.Char> configJson);
-typedef _LnPumpCreateDart = LnPumpHandle Function(ffi.Pointer<ffi.Char> configJson);
-
-typedef _LnPumpDestroy = ffi.Void Function(LnPumpHandle pump);
-typedef _LnPumpDestroyDart = void Function(LnPumpHandle pump);
-
-typedef _LnPumpTcpEgress = ffi.Uint16 Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Char> dstIp,
-  ffi.Uint16 dstPort,
-);
-typedef _LnPumpTcpEgressDart = int Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Char> dstIp,
-  int dstPort,
-);
-
-typedef _LnPumpTcpForward = ffi.Int32 Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Char> vip,
-  ffi.Uint16 vport,
-  ffi.Pointer<ffi.Char> target,
-);
-typedef _LnPumpTcpForwardDart = int Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Char> vip,
-  int vport,
-  ffi.Pointer<ffi.Char> target,
-);
-
-typedef _LnPumpSyncPeers = ffi.Int32 Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Char> peersJson,
-);
-typedef _LnPumpSyncPeersDart = int Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Char> peersJson,
-);
-
-typedef _LnPumpStatus = ffi.Int32 Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnPumpStatusDart = int Function(
-  LnPumpHandle pump,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
 /// Low-level FFI bindings to the Lemonade Nexus C SDK.
 ///
 /// This class provides direct access to all C SDK functions via FFI.
@@ -885,20 +788,6 @@ class LemonadeNexusFfi {
   late final _lnServerLatencies =
       _lib.lookupFunction<_LnServerLatencies, _LnServerLatenciesDart>('ln_server_latencies');
 
-  // WireGuard tunnel
-  late final _lnTunnelUp =
-      _lib.lookupFunction<_LnTunnelUp, _LnTunnelUpDart>('ln_tunnel_up');
-  late final _lnTunnelDown =
-      _lib.lookupFunction<_LnTunnelDown, _LnTunnelDownDart>('ln_tunnel_down');
-  late final _lnTunnelStatus =
-      _lib.lookupFunction<_LnTunnelStatus, _LnTunnelStatusDart>('ln_tunnel_status');
-  late final _lnGetWgConfig =
-      _lib.lookupFunction<_LnGetWgConfig, _LnGetWgConfigDart>('ln_get_wg_config');
-  late final _lnGetWgConfigJson = _lib.lookupFunction<_LnGetWgConfigJson,
-          _LnGetWgConfigJsonDart>('ln_get_wg_config_json');
-  late final _lnWgGenerateKeypair = _lib.lookupFunction<_LnWgGenerateKeypair,
-          _LnWgGenerateKeypairDart>('ln_wg_generate_keypair');
-
   // Mesh P2P
   late final _lnMeshEnable =
       _lib.lookupFunction<_LnMeshEnable, _LnMeshEnableDart>('ln_mesh_enable');
@@ -961,20 +850,6 @@ class LemonadeNexusFfi {
   late final _lnRoutingConnectionStatus = _lib.lookupFunction<
           _LnRoutingConnectionStatus,
           _LnRoutingConnectionStatusDart>('ln_routing_connection_status');
-
-  // Packet pump (socket-proxy tunnel)
-  late final _lnPumpCreate =
-      _lib.lookupFunction<_LnPumpCreate, _LnPumpCreateDart>('ln_pump_create');
-  late final _lnPumpDestroy =
-      _lib.lookupFunction<_LnPumpDestroy, _LnPumpDestroyDart>('ln_pump_destroy');
-  late final _lnPumpTcpEgress = _lib.lookupFunction<_LnPumpTcpEgress,
-          _LnPumpTcpEgressDart>('ln_pump_tcp_egress');
-  late final _lnPumpTcpForward = _lib.lookupFunction<_LnPumpTcpForward,
-          _LnPumpTcpForwardDart>('ln_pump_tcp_forward');
-  late final _lnPumpSyncPeers = _lib.lookupFunction<_LnPumpSyncPeers,
-          _LnPumpSyncPeersDart>('ln_pump_sync_peers');
-  late final _lnPumpStatus =
-      _lib.lookupFunction<_LnPumpStatus, _LnPumpStatusDart>('ln_pump_status');
 
   /// Creates a new FFI binding instance.
   ///
@@ -1636,69 +1511,6 @@ class LemonadeNexusFfi {
   }
 
   // =========================================================================
-  // WireGuard Tunnel
-  // =========================================================================
-
-  String? tunnelUp(LnClientHandle client, String configJson) {
-    final jsonPtr = configJson.toNativeUtf8().cast<ffi.Char>();
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnTunnelUp(client, jsonPtr, outJson);
-      malloc.free(jsonPtr);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  String? tunnelDown(LnClientHandle client) {
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnTunnelDown(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  String? tunnelStatus(LnClientHandle client) {
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnTunnelStatus(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  String? getWgConfig(LnClientHandle client) {
-    final ptr = _lnGetWgConfig(client);
-    return toStringAndFree(ptr);
-  }
-
-  String? getWgConfigJson(LnClientHandle client) {
-    final ptr = _lnGetWgConfigJson(client);
-    return toStringAndFree(ptr);
-  }
-
-  String? wgGenerateKeypair() {
-    final ptr = _lnWgGenerateKeypair();
-    return toStringAndFree(ptr);
-  }
-
-  // =========================================================================
   // Mesh P2P
   // =========================================================================
 
@@ -2011,71 +1823,4 @@ class LemonadeNexusFfi {
     }
   }
 
-  // =========================================================================
-  // Packet pump (socket-proxy tunnel: netstack + BoringTun, no TUN device)
-  // =========================================================================
-
-  /// Create a pump from a WireGuard config JSON. Returns the handle, or nullptr
-  /// on failure. The pump is independent of the ln_client handle.
-  LnPumpHandle pumpCreate(String configJson) {
-    final cfgPtr = configJson.toNativeUtf8().cast<ffi.Char>();
-    try {
-      return _lnPumpCreate(cfgPtr);
-    } finally {
-      malloc.free(cfgPtr);
-    }
-  }
-
-  /// Stop the dataplane + netstack and free the pump.
-  void pumpDestroy(LnPumpHandle pump) {
-    if (pump != ffi.nullptr) _lnPumpDestroy(pump);
-  }
-
-  /// Open an egress proxy to dst:port across the mesh. Returns the bound
-  /// 127.0.0.1 port, or 0 on failure.
-  int pumpTcpEgress(LnPumpHandle pump, String dstIp, int dstPort) {
-    final ipPtr = dstIp.toNativeUtf8().cast<ffi.Char>();
-    try {
-      return _lnPumpTcpEgress(pump, ipPtr, dstPort);
-    } finally {
-      malloc.free(ipPtr);
-    }
-  }
-
-  /// Expose a local service to the mesh at vip:vport.
-  LnError pumpTcpForward(LnPumpHandle pump, String vip, int vport, String target) {
-    final vipPtr = vip.toNativeUtf8().cast<ffi.Char>();
-    final targetPtr = target.toNativeUtf8().cast<ffi.Char>();
-    try {
-      return LnError.fromCode(_lnPumpTcpForward(pump, vipPtr, vport, targetPtr));
-    } finally {
-      malloc.free(vipPtr);
-      malloc.free(targetPtr);
-    }
-  }
-
-  /// Replace the mesh peer set (JSON array, ln_mesh_peers shape).
-  LnError pumpSyncPeers(LnPumpHandle pump, String peersJson) {
-    final ptr = peersJson.toNativeUtf8().cast<ffi.Char>();
-    try {
-      return LnError.fromCode(_lnPumpSyncPeers(pump, ptr));
-    } finally {
-      malloc.free(ptr);
-    }
-  }
-
-  /// Per-peer status JSON array, or null on error.
-  String? pumpStatus(LnPumpHandle pump) {
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnPumpStatus(pump, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
 }

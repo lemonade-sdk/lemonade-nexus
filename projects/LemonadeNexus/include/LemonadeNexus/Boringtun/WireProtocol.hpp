@@ -21,7 +21,7 @@
 #include <optional>
 #include <span>
 
-namespace nexus::wireguard::wire {
+namespace nexus::boringtun::wire {
 
 enum class MsgType : uint32_t {
     HandshakeInit     = 1,
@@ -116,4 +116,4 @@ inline std::optional<uint32_t> dst_addr(std::span<const uint8_t> pkt) {
 
 } // namespace ipv4
 
-} // namespace nexus::wireguard::wire
+} // namespace nexus::boringtun::wire

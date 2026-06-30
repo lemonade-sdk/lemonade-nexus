@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <LemonadeNexus/Network/VirtualNetService.hpp>
-#include <LemonadeNexus/WireGuard/UserspaceDataplane.hpp>
+#include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
 
 #include <httplib.h>
 #include <sodium.h>
@@ -26,7 +26,7 @@
 
 using namespace std::chrono_literals;
 using nexus::network::VirtualNetService;
-using nexus::wireguard::UserspaceDataplane;
+using nexus::boringtun::UserspaceDataplane;
 
 namespace {
 

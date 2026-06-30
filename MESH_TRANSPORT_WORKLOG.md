@@ -162,8 +162,39 @@ So "remove WireGuard" is really **consolidate the mesh dataplane onto the pump**
 - Server-side edits (main.cpp, UserspaceDataplane.cpp) need a pull+rebuild+restart
   to take effect on the running host.
 
+### Phase 2 — DONE (namespace/dir/symbol rename; builds clean; wire contract intact)
+Discovery workflow (4 parallel classifiers) mapped the full surface first, then a
+deterministic perl + git-mv pass executed it. Verified: server app + SDK dylib
+rebuild clean (exit 0); Flutter `flutter analyze` 0 errors.
+- Namespace `nexus::wireguard` -> `nexus::boringtun` (18 files; the nested `wire`
+  and `ipv4` leaf sub-namespaces keep their names).
+- Dirs `src/WireGuard/` + `include/.../WireGuard/` -> `Boringtun/` (git-tracked
+  renames); 18 `#include` path updates; SDK CMakeLists.txt LN_DATAPLANE_SRC path.
+- Types: `WireGuardService`->`BoringtunService`, `IWireGuardProvider`->
+  `IBoringtunProvider`, `WireGuardProviderType`->`BoringtunProviderType`,
+  `WgPeer`->`BoringtunPeer`, `WgKeypair`->`BoringtunKeypair`,
+  `WgInterfaceConfig`->`BoringtunInterfaceConfig`; files
+  `WireGuardService.{hpp,cpp}`->`BoringtunService.*`, `IWireGuardProvider.hpp`->
+  `IBoringtunProvider.hpp`. Members: `wireguard_`->`boringtun_`, ApiContext
+  `.wireguard`->`.boringtun`, `set_wireguard`->`set_boringtun`, `wireguard_service`
+  local -> `boringtun_service`.
+- Dart: deleted dead FFI bindings (ln_tunnel_*/ln_get_wg_config*/ln_pump_*),
+  `LnPumpHandle`, the `tunnelUp/.../pumpStatus` wrappers, and `WgConfig`/`WgKeypair`
+  models; regenerated models.g.dart; pruned a dead pump smoke test; cleaned the
+  SDK README. `TunnelStatus` model kept (still referenced by live app state).
+
+### KEPT DELIBERATELY (owner decision: "don't rename wg_pubkey — remind us where
+### we came from"): the entire `wg_` wire/JSON contract. Verified untouched by
+### counting every literal HEAD vs working tree (29/29 `wg_pubkey`, 2/2 each for
+### `wg_server_pubkey`/`wg_endpoint`/`wg_interface`/`endpoint_wg_pub`).
+- WHY load-bearing (beyond the breadcrumb): `wg_pubkey` is inside the Ed25519-
+  signed canonical node form (renaming it invalidates every persisted node
+  signature + tree hash), rides server<->server gossip inside ServerCertificate,
+  and crosses the client/server join + mesh-peers API + public C API + Dart models.
+- Also kept: boringtun-ffi C symbols (`wireguard_write/tick/...`, WIREGUARD_DONE),
+  the `wire::`/WireProtocol.hpp packet parsers, factual WireGuard-protocol comments,
+  the `data_root/"wireguard"` config dir string, and the `wg_interface`/SP_WG_INTERFACE
+  config+env keys.
+
 ### TODO next
-- Phase 2: rename server `nexus::wireguard`->`nexus::boringtun`, `WgPeer`->
-  `BoringtunPeer`, the `WireGuard/` dir, and the `wg_pubkey` JSON contract key.
-  Also clean dead Dart FFI bindings (ln_tunnel_*/ln_pump_*) + WgConfig/WgKeypair.
 - Deferred: contract test harness; `doOperation(sdkOps.X, args)` FFI simplification.

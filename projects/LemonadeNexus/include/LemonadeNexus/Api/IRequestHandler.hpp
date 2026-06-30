@@ -39,8 +39,8 @@ namespace nexus::relay {
     class RelayService;
     class RelayDiscoveryService;
 }
-namespace nexus::wireguard {
-    class WireGuardService;
+namespace nexus::boringtun {
+    class BoringtunService;
 }
 namespace nexus::routing {
     class RoutingCoordinationService;
@@ -69,7 +69,7 @@ struct ApiContext {
     core::TeeAttestationService&      tee;
     core::TrustPolicyService&         trust_policy;
     core::GovernanceService&          governance;
-    wireguard::WireGuardService*      wireguard{nullptr};
+    boringtun::BoringtunService*      boringtun{nullptr};
     network::DnsService*              dns{nullptr};
     std::string                       server_fqdn;
     std::string                       server_seip_fqdn;     // <id>.<region>.seip.<domain>

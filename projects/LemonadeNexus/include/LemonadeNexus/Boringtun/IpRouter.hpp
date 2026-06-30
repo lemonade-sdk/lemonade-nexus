@@ -22,7 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace nexus::wireguard {
+namespace nexus::boringtun {
 
 /// An IPv4 prefix in host byte order.
 struct Cidr {
@@ -150,4 +150,4 @@ private:
     std::vector<std::pair<Cidr, PeerPtr>>       cidr_routes_;  // sorted: longest prefix first
 };
 
-} // namespace nexus::wireguard
+} // namespace nexus::boringtun

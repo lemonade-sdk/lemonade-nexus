@@ -418,59 +418,6 @@ class TunnelStatus {
   Map<String, dynamic> toJson() => _$TunnelStatusToJson(this);
 }
 
-/// WireGuard configuration.
-///
-/// Mirrors `ln_get_wg_config_json`: `{private_key, public_key, tunnel_ip,
-/// server_public_key, server_endpoint, listen_port, keepalive, allowed_ips}`.
-/// Note the SDK does NOT emit `dns_server`, so it must be nullable — marking it
-/// a required String made config parsing throw and blocked the tunnel.
-@JsonSerializable()
-class WgConfig {
-  final String privateKey;
-  final String publicKey;
-  final String tunnelIp;
-  final String serverPublicKey;
-  final String serverEndpoint;
-  final String? dnsServer;
-  final int listenPort;
-  final List<String> allowedIps;
-  final int keepalive;
-
-  WgConfig({
-    required this.privateKey,
-    required this.publicKey,
-    required this.tunnelIp,
-    required this.serverPublicKey,
-    required this.serverEndpoint,
-    this.dnsServer,
-    required this.listenPort,
-    required this.allowedIps,
-    required this.keepalive,
-  });
-
-  factory WgConfig.fromJson(Map<String, dynamic> json) =>
-      _$WgConfigFromJson(json);
-
-  Map<String, dynamic> toJson() => _$WgConfigToJson(this);
-}
-
-/// WireGuard keypair.
-@JsonSerializable()
-class WgKeypair {
-  final String privateKey;
-  final String publicKey;
-
-  WgKeypair({
-    required this.privateKey,
-    required this.publicKey,
-  });
-
-  factory WgKeypair.fromJson(Map<String, dynamic> json) =>
-      _$WgKeypairFromJson(json);
-
-  Map<String, dynamic> toJson() => _$WgKeypairToJson(this);
-}
-
 // =========================================================================
 // Mesh Models
 // =========================================================================

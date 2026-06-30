@@ -19,7 +19,7 @@ create_project(LemonadeNexusSDK DEPENDENCIES
 # mesh P2P traffic and egress the private API as loopback sockets (no TUN
 # device). Compile the dataplane into the SDK, expose the server include path,
 # and link the netstack.
-set(LN_DATAPLANE_SRC "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/WireGuard/UserspaceDataplane.cpp")
+set(LN_DATAPLANE_SRC "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/Boringtun/UserspaceDataplane.cpp")
 set(LN_SERVER_INCLUDE "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/include")
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}")

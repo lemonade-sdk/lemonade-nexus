@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <LemonadeNexus/WireGuard/UserspaceDataplane.hpp>
+#include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
 
 #include <sodium.h>
 
@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-using namespace nexus::wireguard;
+using namespace nexus::boringtun;
 using namespace std::chrono_literals;
 
 namespace {

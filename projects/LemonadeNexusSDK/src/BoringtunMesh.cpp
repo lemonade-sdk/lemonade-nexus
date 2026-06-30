@@ -1,7 +1,7 @@
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 
-#include <LemonadeNexus/WireGuard/IpRouter.hpp>
-#include <LemonadeNexus/WireGuard/UserspaceDataplane.hpp>
+#include <LemonadeNexus/Boringtun/IpRouter.hpp>
+#include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
 
 #include <virtual_netstack.h>
 #include <sodium.h>
@@ -15,8 +15,8 @@
 
 namespace lnsdk {
 
-using nexus::wireguard::Cidr;
-using nexus::wireguard::UserspaceDataplane;
+using nexus::boringtun::Cidr;
+using nexus::boringtun::UserspaceDataplane;
 
 namespace {
 
