@@ -20,7 +20,7 @@ title: Security
 | Primitive | Algorithm | Purpose |
 |-----------|-----------|---------|
 | Identity keys | Ed25519 | Server and client identity, signing |
-| WireGuard keys | X25519 (Curve25519) | Tunnel encryption (derived from Ed25519) |
+| Mesh keys | X25519 (Curve25519) | Tunnel encryption (derived from Ed25519) |
 | Symmetric AEAD | XChaCha20-Poly1305 / AES-256-GCM | Credential encryption, at-rest encryption |
 | Key derivation | HKDF-SHA256 | Derive encryption keys from shared secrets |
 | Password hashing | PBKDF2-SHA256 (100k iterations) | Derive Ed25519 seed from username+password |
@@ -33,9 +33,9 @@ All cryptography via **libsodium** (identity, signing, DH, AEAD) and **OpenSSL**
 ## Transport Security
 
 - **Public API:** HTTPS with ACME auto-provisioned TLS certificates (ZeroSSL/Let's Encrypt)
-- **Private API:** HTTPS over WireGuard tunnel (double encryption)
+- **Private API:** HTTPS over the mesh tunnel (double encryption)
 - **Gossip:** Ed25519 signed messages, optionally with attestation tokens
-- **WireGuard:** Curve25519 key exchange, ChaCha20-Poly1305 encryption, 5-second keepalive
+- **Mesh transport (boringtun):** Curve25519 key exchange, ChaCha20-Poly1305 encryption, 5-second keepalive
 
 ## Authentication
 

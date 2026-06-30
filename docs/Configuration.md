@@ -27,7 +27,7 @@ Priority (highest to lowest):
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
 | `--http-port <N>` | `SP_HTTP_PORT` | `http_port` | `9100` | Public HTTPS API |
-| `--udp-port <N>` | `SP_UDP_PORT` | `udp_port` | `51940` | WireGuard tunnel |
+| `--udp-port <N>` | `SP_UDP_PORT` | `udp_port` | `51940` | Mesh tunnel (boringtun) |
 | `--gossip-port <N>` | `SP_GOSSIP_PORT` | `gossip_port` | `9102` | Gossip protocol |
 | `--stun-port <N>` | `SP_STUN_PORT` | `stun_port` | `3478` | STUN NAT traversal |
 | `--relay-port <N>` | `SP_RELAY_PORT` | `relay_port` | `9103` | Relay forwarding |
@@ -36,7 +36,7 @@ Priority (highest to lowest):
 | `--bind-address <addr>` | `SP_BIND_ADDRESS` | `bind_address` | `0.0.0.0` | Listen address |
 | `--region <code>` | `SP_REGION` | `region` | (auto) | Cloud region code |
 
-> Hole punch uses hardcoded port 51941 (separate from WireGuard on 51940).
+> Hole punch uses hardcoded port 51941 (separate from the mesh on 51940).
 
 ## Identity and Auth
 

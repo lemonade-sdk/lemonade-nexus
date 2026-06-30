@@ -16,8 +16,8 @@ title: IP Ranges and IPAM
 
 | Range | CIDR | Size | Purpose |
 |-------|------|------|---------|
-| **Client tunnel** | `10.64.0.0/10` | 4,194,304 | WireGuard tunnel between clients and servers |
-| **Server backbone** | `172.16.0.0/22` | 1,024 | Server-to-server encrypted WireGuard mesh |
+| **Client tunnel** | `10.64.0.0/10` | 4,194,304 | Encrypted mesh tunnel between clients and servers |
+| **Server backbone** | `172.16.0.0/22` | 1,024 | Server-to-server encrypted boringtun mesh |
 | **Private subnets** | `10.128.0.0/9` | 8,388,608 | Per-customer private addressing |
 | **Shared blocks** | `172.20.0.0/14` | 262,144 | Shared address space |
 

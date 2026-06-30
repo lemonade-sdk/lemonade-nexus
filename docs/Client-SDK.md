@@ -13,8 +13,7 @@ The LemonadeNexusSDK handles everything a client application needs to join and p
 
 - **Identity** — Ed25519 keypair generation/derivation, persistence
 - **Authentication** — challenge-response, passkey, password
-- **Network joining** — composite endpoint that does auth + node creation + IP allocation + WG config in one call
-- **WireGuard tunnel** — cross-platform tunnel bring-up/tear-down
+- **Network joining** — composite endpoint that does auth + node creation + IP allocation + mesh config in one call
 - **Mesh P2P** — automatic peer discovery, heartbeat, direct tunnels between clients
 - **Tree operations** — read/create/update/delete nodes in the permission tree
 - **Latency monitoring** — probe servers, auto-switch to the best one

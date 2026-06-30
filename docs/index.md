@@ -5,7 +5,7 @@ title: Home
 
 # Lemonade-Nexus
 
-A self-hosted, cryptographically secure WireGuard mesh VPN with zero-trust architecture, federated relay servers, and democratic governance.
+A self-hosted, cryptographically secure userspace mesh VPN with zero-trust architecture, federated relay servers, and democratic governance.
 
 ## Documentation
 

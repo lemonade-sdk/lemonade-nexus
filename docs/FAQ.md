@@ -7,7 +7,7 @@ title: Frequently Asked Questions
 
 ## What is Lemonade-Nexus?
 
-A self-hosted, cryptographically secure WireGuard mesh VPN. Think of it as a decentralized alternative to Tailscale or ZeroTier that you fully own and control. All servers are equal peers — no central authority.
+A self-hosted, cryptographically secure userspace mesh VPN. Think of it as a decentralized alternative to Tailscale or ZeroTier that you fully own and control. All servers are equal peers — no central authority.
 
 ## How is it different from Tailscale / ZeroTier / Nebula?
 
@@ -20,7 +20,7 @@ A self-hosted, cryptographically secure WireGuard mesh VPN. Think of it as a dec
 | **DNS** | Built-in authoritative DNS | MagicDNS (SaaS) | None | None |
 | **Binary attestation** | Yes (SHA-256 + Ed25519 manifests) | No | No | No |
 | **ACME TLS** | Auto-provisioned (ZeroSSL/Let's Encrypt) | Managed | N/A | N/A |
-| **Protocol** | WireGuard | WireGuard | Custom (ZT) | Custom (Nebula) |
+| **Protocol** | boringtun (WireGuard protocol) | WireGuard | Custom (ZT) | Custom (Nebula) |
 
 ## Do I need to run my own server?
 
@@ -43,7 +43,7 @@ Yes. See the repository license.
 
 1. STUN service discovers each client's public IP and port
 2. Hole punch service (port 51941) coordinates port-mapping exchange between clients
-3. Both clients send WireGuard handshake packets to each other's discovered endpoints
+3. Both clients send Noise handshake packets (WireGuard protocol) to each other's discovered endpoints
 4. NAT mappings are "punched" and a direct P2P tunnel is established
 5. If direct fails, traffic falls back through a relay server
 
