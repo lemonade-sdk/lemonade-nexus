@@ -2,9 +2,11 @@
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 using json = nlohmann::json;
 
@@ -50,14 +52,28 @@ void ln_free(char* ptr) {
 // Client lifecycle
 // ---------------------------------------------------------------------------
 
+// Bump spdlog to debug when LN_DEBUG is set in the environment — surfaces the
+// dataplane's route/send/handshake logs for diagnosing mesh connectivity.
+static void ln_apply_debug_log_level() {
+    static bool applied = false;
+    if (applied) return;
+    applied = true;
+    if (const char* v = std::getenv("LN_DEBUG"); v && *v && std::string(v) != "0") {
+        spdlog::set_level(spdlog::level::debug);
+        spdlog::debug("[CApi] debug logging enabled (LN_DEBUG)");
+    }
+}
+
 ln_client_t* ln_create(const char* host, uint16_t port) {
     if (!host) return nullptr;
+    ln_apply_debug_log_level();
     lnsdk::ServerConfig cfg(host, port, false);
     return new(std::nothrow) ln_client_s{cfg};
 }
 
 ln_client_t* ln_create_tls(const char* host, uint16_t port) {
     if (!host) return nullptr;
+    ln_apply_debug_log_level();
     lnsdk::ServerConfig cfg(host, port, true);
     return new(std::nothrow) ln_client_s{cfg};
 }
@@ -701,87 +717,11 @@ ln_error_t ln_server_latencies(ln_client_t* client, char** out_json) {
 }
 
 // ---------------------------------------------------------------------------
-// WireGuard tunnel management
+// Mesh dataplane keypair
 // ---------------------------------------------------------------------------
 
-ln_error_t ln_tunnel_up(ln_client_t* client,
-                         const char* config_json,
-                         char** out_json) {
-    if (!client || !config_json || !out_json) return LN_ERR_NULL_ARG;
-
-    auto parsed = json::parse(config_json, nullptr, false);
-    if (parsed.is_discarded()) return LN_ERR_INTERNAL;
-
-    lnsdk::WireGuardConfig config;
-    config.private_key       = parsed.value("private_key", "");
-    config.public_key        = parsed.value("public_key", "");
-    config.tunnel_ip         = parsed.value("tunnel_ip", "");
-    config.server_public_key = parsed.value("server_public_key", "");
-    config.server_endpoint   = parsed.value("server_endpoint", "");
-    config.dns_server        = parsed.value("dns_server", "");
-    config.listen_port       = parsed.value("listen_port", uint16_t{0});
-    config.keepalive         = parsed.value("keepalive", uint32_t{25});
-
-    if (parsed.contains("allowed_ips") && parsed["allowed_ips"].is_array()) {
-        for (const auto& ip : parsed["allowed_ips"]) {
-            if (ip.is_string()) config.allowed_ips.push_back(ip.get<std::string>());
-        }
-    }
-
-    auto result = client->client.tunnel_up(config);
-    json j;
-    j["success"] = result.ok;
-    if (!result.ok) j["error"] = result.error;
-
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_INTERNAL;
-}
-
-ln_error_t ln_tunnel_down(ln_client_t* client, char** out_json) {
-    if (!client || !out_json) return LN_ERR_NULL_ARG;
-
-    auto result = client->client.tunnel_down();
-    json j;
-    j["success"] = result.ok;
-    if (!result.ok) j["error"] = result.error;
-
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_INTERNAL;
-}
-
-ln_error_t ln_tunnel_status(ln_client_t* client, char** out_json) {
-    if (!client || !out_json) return LN_ERR_NULL_ARG;
-
-    auto st = client->client.tunnel_status();
-    json j;
-    j["is_up"]            = st.is_up;
-    j["tunnel_ip"]        = st.tunnel_ip;
-    j["server_endpoint"]  = st.server_endpoint;
-    j["last_handshake"]   = st.last_handshake;
-    j["rx_bytes"]         = st.rx_bytes;
-    j["tx_bytes"]         = st.tx_bytes;
-    j["latency_ms"]       = st.latency_ms;
-
-    *out_json = strdup_json(j);
-    return LN_OK;
-}
-
-char* ln_get_wg_config(ln_client_t* client) {
-    if (!client) return nullptr;
-    auto cfg = client->client.get_wireguard_config();
-    if (cfg.empty()) return nullptr;
-    return strdup_str(cfg);
-}
-
-char* ln_get_wg_config_json(ln_client_t* client) {
-    if (!client) return nullptr;
-    auto cfg = client->client.get_wireguard_config_json();
-    if (cfg.empty()) return nullptr;
-    return strdup_str(cfg);
-}
-
-char* ln_wg_generate_keypair(void) {
-    auto [priv, pub] = lnsdk::WireGuardTunnel::generate_keypair();
+char* ln_generate_keypair(void) {
+    auto [priv, pub] = lnsdk::BoringtunMesh::generate_keypair();
     json j;
     j["private_key"] = priv;
     j["public_key"]  = pub;

@@ -23,7 +23,7 @@
 #include <vector>
 
 namespace nexus::network { class DnsService; }
-namespace nexus::wireguard { class WireGuardService; }
+namespace nexus::boringtun { class BoringtunService; }
 
 namespace nexus::gossip {
 
@@ -75,8 +75,8 @@ public:
     /// Set the IPAM service for tunnel IP allocation during ServerHello exchange.
     void set_ipam(ipam::IPAMService* ipam);
 
-    /// Set the WireGuard service for backbone peer provisioning.
-    void set_wireguard(wireguard::WireGuardService* wg);
+    /// Set the boringtun service for backbone peer provisioning.
+    void set_boringtun(boringtun::BoringtunService* wg);
 
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
     [[nodiscard]] std::string our_tunnel_ip() const;
@@ -108,7 +108,7 @@ public:
     /// Returns all currently claimed NS slots (for status reporting).
     [[nodiscard]] std::vector<NsSlotClaimData> get_ns_slots() const;
 
-    /// Try to add a gossip peer as a WireGuard backbone peer.
+    /// Try to add a gossip peer as a mesh backbone peer.
     void try_add_backbone_wg_peer(const GossipPeer& peer);
 
     /// Access the Ed25519 keypair (needed by TrustPolicy for token generation).
@@ -360,7 +360,7 @@ private:
 
     // IPAM for tunnel IP allocation during ServerHello exchange
     ipam::IPAMService*               ipam_{nullptr};
-    wireguard::WireGuardService*     wireguard_{nullptr};
+    boringtun::BoringtunService*     boringtun_{nullptr};
     std::string                      our_tunnel_ip_;     // assigned by peer or self
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
     std::string                      our_wg_pubkey_;     // base64 X25519

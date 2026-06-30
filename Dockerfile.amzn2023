@@ -1,0 +1,44 @@
+# Amazon Linux 2023 build of the Lemonade-Nexus server.
+# Mirrors the `amazonlinux:2023` entry in .github/workflows/release.yml so the
+# release RPM build can be reproduced locally.
+#
+#   docker build -f Dockerfile.amzn2023 -t lemonade-nexus-amzn2023 .
+FROM amazonlinux:2023
+
+# tar/gzip/git/ca-certificates are absent from the minimal base image but are
+# needed to fetch sources and dependencies; rpm-build is needed for CPack RPM.
+# AL2023's default toolchain is GCC 11.5, whose libstdc++ has no <expected>
+# header (the codebase uses std::expected). Install the parallel-installable
+# GCC 14 (same major as the green Fedora 40 build) instead.
+RUN dnf install -y ninja-build make gcc14 gcc14-c++ openssl-devel \
+        pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git \
+        ca-certificates tar gzip python3 python3-pip rpm-build \
+    && dnf clean all \
+    # Expose GCC 14 as the default cc/gcc/g++ on PATH (/usr/local/bin precedes
+    # /usr/bin) so CMake auto-detects it and Rust's `cc` linker stays consistent.
+    && ln -sf /usr/bin/gcc14-gcc /usr/local/bin/gcc \
+    && ln -sf /usr/bin/gcc14-gcc /usr/local/bin/cc \
+    && ln -sf /usr/bin/gcc14-g++ /usr/local/bin/g++ \
+    && ln -sf /usr/bin/gcc14-g++ /usr/local/bin/c++
+
+# AL2023 ships CMake 3.22, but the project requires >= 3.25.1. Install a current
+# CMake from PyPI (prebuilt wheel, ships cmake/ctest/cpack) — it lands in
+# /usr/local/bin, ahead of the distro cmake on PATH.
+RUN pip3 install --no-cache-dir cmake
+
+# Rust toolchain (boringtun-ffi and virtual-netstack are built from the crates/).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -B build \
+    -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_TESTING=OFF
+
+RUN cmake --build build --config Release --parallel
+
+# Produce the .rpm exactly as the release workflow does.
+RUN cpack --config build/CPackConfig.cmake -G RPM -B build/packages

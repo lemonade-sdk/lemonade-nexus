@@ -1,6 +1,6 @@
 #include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
-#include <LemonadeNexusSDK/WireGuardTunnel.hpp>
+#include <LemonadeNexusSDK/BoringtunMesh.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -9,9 +9,9 @@
 namespace lnsdk {
 
 MeshOrchestrator::MeshOrchestrator(LemonadeNexusClient& client,
-                                   WireGuardTunnel& tunnel,
+                                   BoringtunMesh& mesh,
                                    const std::string& node_id)
-    : client_(client), tunnel_(tunnel), node_id_(node_id) {}
+    : client_(client), mesh_(mesh), node_id_(node_id) {}
 
 MeshOrchestrator::~MeshOrchestrator() {
     stop();
@@ -37,11 +37,11 @@ void MeshOrchestrator::stop() {
     cv_.notify_all();
     if (thread_.joinable()) thread_.join();
 
-    // Remove all mesh peers from tunnel
+    // Remove all mesh peers from the dataplane
     {
         std::lock_guard lock(mutex_);
         for (const auto& peer : known_peers_) {
-            tunnel_.remove_peer(peer.wg_pubkey);
+            mesh_.remove_peer(peer.wg_pubkey);
         }
         known_peers_.clear();
         last_status_ = {};
@@ -124,8 +124,8 @@ void MeshOrchestrator::do_peer_refresh() {
 
     auto server_peers = std::move(result.value);
 
-    // Sync to WireGuard tunnel
-    auto sync_result = tunnel_.sync_peers(server_peers);
+    // Sync to the boringtun mesh dataplane
+    auto sync_result = mesh_.sync_peers(server_peers);
     if (!sync_result) {
         spdlog::warn("[MeshOrchestrator] sync_peers failed: {}", sync_result.error);
     }
@@ -162,9 +162,9 @@ void MeshOrchestrator::do_heartbeat() {
 }
 
 void MeshOrchestrator::do_monitor() {
-    auto ms = tunnel_.mesh_status();
+    auto ms = mesh_.mesh_status();
 
-    // Merge WireGuard handshake timestamps with server-reported last_seen
+    // Merge boringtun handshake timestamps with server-reported last_seen
     // to get the most accurate peer liveness signal.
     auto now_epoch = static_cast<int64_t>(
         std::chrono::duration_cast<std::chrono::seconds>(
@@ -174,7 +174,7 @@ void MeshOrchestrator::do_monitor() {
     {
         std::lock_guard lock(mutex_);
         for (auto& peer : known_peers_) {
-            // Merge handshake timestamps from WG tunnel status
+            // Merge handshake timestamps from the dataplane status
             for (const auto& tp : ms.peers) {
                 if (tp.tunnel_ip == peer.tunnel_ip ||
                     tp.node_id == peer.node_id) {

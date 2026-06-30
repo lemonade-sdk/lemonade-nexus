@@ -5,7 +5,7 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
-#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
+#include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -25,9 +25,9 @@ std::string strip_cidr(const std::string& ip) {
 }
 
 /// Build a map from tunnel_ip (without /prefix) to last WG handshake epoch.
-/// Used to determine peer liveness from WireGuard layer.
+/// Used to determine peer liveness from the boringtun layer.
 std::unordered_map<std::string, uint64_t> build_wg_handshake_map(
-    nexus::wireguard::WireGuardService* wg) {
+    nexus::boringtun::BoringtunService* wg) {
     std::unordered_map<std::string, uint64_t> m;
     if (!wg) return m;
     for (const auto& peer : wg->get_peers()) {
@@ -103,7 +103,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         const auto& node = *node_opt;
 
         // Check that the authenticated user has Read permission on this node
-        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        // Permission assignments are keyed by the caller's pubkey (see the join
+        // flow + createChildNode), NOT the user_id (which is a hash-derived node
+        // id). Using user_id here made every Read check miss its assignment -> 403.
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
         if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
             error_response(res, "insufficient permissions", 403);
             return;
@@ -124,7 +127,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         auto reachable = ctx_.tree.collect_subtree(node.parent_id);
 
         // Build WG handshake map to determine peer liveness from the tunnel layer
-        auto wg_map = build_wg_handshake_map(ctx_.wireguard);
+        auto wg_map = build_wg_handshake_map(ctx_.boringtun);
         auto now = epoch_seconds();
 
         // Build peer list: all Endpoint-type nodes in scope except the caller
@@ -260,7 +263,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // GET /api/mesh/status/:node_id (PRIVATE, auth required)
     //
     // Returns mesh status for a node including peer count, online count,
-    // and the server's WireGuard peer info for that node.
+    // and the server's mesh peer info for that node.
     // ========================================================================
     priv.Get(R"(/api/mesh/status/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -278,7 +281,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        // Permission assignments are keyed by the caller's pubkey (see the join
+        // flow + createChildNode), NOT the user_id (which is a hash-derived node
+        // id). Using user_id here made every Read check miss its assignment -> 403.
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
         if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
             error_response(res, "insufficient permissions", 403);
             return;
@@ -290,7 +296,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         if (!node.parent_id.empty()) {
             auto reachable = ctx_.tree.collect_subtree(node.parent_id);
-            auto wg_map = build_wg_handshake_map(ctx_.wireguard);
+            auto wg_map = build_wg_handshake_map(ctx_.boringtun);
             auto now = epoch_seconds();
             for (const auto& s : reachable) {
                 if (s.id == node_id) continue;
@@ -331,9 +337,9 @@ nlohmann::json MeshApiHandler::build_server_peer() const {
     sp["is_online"] = true;
     sp["is_server"] = true;
 
-    // Derive WireGuard public key from server identity for the peer entry
+    // Derive mesh public key from server identity for the peer entry
     sp["wg_pubkey"] = "";  // filled by caller if needed; server's WG pubkey
-    if (ctx_.wireguard) {
+    if (ctx_.boringtun) {
         // The server's WG pubkey is stored in the root node or derived from identity
         auto root_nodes = ctx_.tree.get_nodes_by_type(tree::NodeType::Root);
         if (!root_nodes.empty()) {

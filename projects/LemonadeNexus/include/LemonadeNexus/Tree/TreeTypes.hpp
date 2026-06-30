@@ -41,7 +41,7 @@ struct TreeNode {
     // Crypto
     std::string              mgmt_pubkey;                // "ed25519:base64..."
     std::string              wrapped_mgmt_privkey;       // "aeskw:base64blob..."
-    std::string              wg_pubkey;                  // WireGuard Curve25519 pubkey
+    std::string              wg_pubkey;                  // mesh Curve25519 pubkey
 
     // Routing-layer endpoint identity. cpu_id/net_mac are self-reported label
     // seeds, NOT security controls — integrity comes from the node signature.

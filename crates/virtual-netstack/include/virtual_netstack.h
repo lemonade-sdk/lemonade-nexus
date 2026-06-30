@@ -3,7 +3,7 @@
 /// C header for the in-process virtual netstack (crates/virtual-netstack).
 ///
 /// Terminates TCP/UDP addressed to the server's own virtual IPs without any
-/// kernel network interface. The WireGuard dataplane feeds decrypted IP
+/// kernel network interface. The boringtun dataplane feeds decrypted IP
 /// packets in via ns_feed_inbound; packets the stack emits are handed back
 /// through the output callback for re-encryption and sending.
 

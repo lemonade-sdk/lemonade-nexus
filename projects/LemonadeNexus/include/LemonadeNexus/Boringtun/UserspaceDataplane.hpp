@@ -1,6 +1,6 @@
 #pragma once
 
-/// Fully in-process WireGuard dataplane.
+/// Fully in-process boringtun dataplane.
 ///
 /// One UDP socket + one boringtun Noise session per peer + a userspace
 /// cryptokey router. No TUN device, no kernel interface, no elevated
@@ -17,10 +17,10 @@
 /// initiations (rare) are identified with a single anonymous parse.
 ///
 /// Plain class (not a CRTP service) so tests can run several instances in
-/// one process. WireGuardService owns one and delegates to it.
+/// one process. BoringtunService owns one and delegates to it.
 
-#include <LemonadeNexus/WireGuard/IWireGuardProvider.hpp>
-#include <LemonadeNexus/WireGuard/IpRouter.hpp>
+#include <LemonadeNexus/Boringtun/IBoringtunProvider.hpp>
+#include <LemonadeNexus/Boringtun/IpRouter.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -35,7 +35,7 @@
 
 struct Tunn;  // boringtun_ffi.h
 
-namespace nexus::wireguard {
+namespace nexus::boringtun {
 
 class UserspaceDataplane {
 public:
@@ -100,7 +100,7 @@ public:
     [[nodiscard]] bool has_peer(const std::string& pubkey_b64) const;
     [[nodiscard]] bool update_endpoint(const std::string& pubkey_b64,
                                        const std::string& endpoint);
-    [[nodiscard]] std::vector<WgPeer> snapshot_peers() const;
+    [[nodiscard]] std::vector<BoringtunPeer> snapshot_peers() const;
     [[nodiscard]] size_t peer_count() const;
 
     // ---- termination-layer seam ---------------------------------------------
@@ -179,4 +179,4 @@ private:
     std::thread              timer_thread_;
 };
 
-} // namespace nexus::wireguard
+} // namespace nexus::boringtun

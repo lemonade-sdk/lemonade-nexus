@@ -1,5 +1,5 @@
 //! A smoltcp `Device` with no hardware behind it: received IP packets are fed
-//! in from the WireGuard dataplane, and transmitted IP packets are handed to a
+//! in from the boringtun dataplane, and transmitted IP packets are handed to a
 //! C callback (`send_outbound_ip_packet`). Ethernet/ARP are absent — this is a
 //! point-to-point IP medium.
 

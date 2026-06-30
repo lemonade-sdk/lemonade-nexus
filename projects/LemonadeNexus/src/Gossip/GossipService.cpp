@@ -1,7 +1,7 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/MisbehaviorDetector.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
-#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
+#include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -2174,8 +2174,8 @@ void GossipService::set_ipam(ipam::IPAMService* ipam) {
     ipam_ = ipam;
 }
 
-void GossipService::set_wireguard(wireguard::WireGuardService* wg) {
-    wireguard_ = wg;
+void GossipService::set_boringtun(boringtun::BoringtunService* wg) {
+    boringtun_ = wg;
 }
 
 std::string GossipService::our_tunnel_ip() const {
@@ -2184,7 +2184,7 @@ std::string GossipService::our_tunnel_ip() const {
 }
 
 void GossipService::try_add_backbone_wg_peer(const GossipPeer& peer) {
-    if (!wireguard_ || peer.wg_pubkey.empty() || peer.backbone_ip.empty()) return;
+    if (!boringtun_ || peer.wg_pubkey.empty() || peer.backbone_ip.empty()) return;
 
     // Build the backbone endpoint: use the peer's public endpoint IP + WG port (51940)
     std::string wg_endpoint;
@@ -2194,7 +2194,7 @@ void GossipService::try_add_backbone_wg_peer(const GossipPeer& peer) {
         wg_endpoint = peer.endpoint.substr(0, colon) + ":51940";
     }
 
-    if (wireguard_->add_peer(peer.wg_pubkey, peer.backbone_ip + "/32", wg_endpoint)) {
+    if (boringtun_->add_peer(peer.wg_pubkey, peer.backbone_ip + "/32", wg_endpoint)) {
         spdlog::info("[{}] added backbone WG peer {} ({}) endpoint={}",
                       name(), peer.backbone_ip, peer.pubkey.substr(0, 12), wg_endpoint);
     }

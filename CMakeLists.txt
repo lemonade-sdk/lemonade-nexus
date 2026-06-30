@@ -8,6 +8,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Build everything position-independent so static dependencies (spdlog, sodium,
+# …) can be linked into the shared FFI library liblemonade_nexus_sdk.so. Without
+# this, GNU ld rejects the .so link ("recompile with -fPIC"); harmless for the
+# server/test executables. Set before the library includes below so fetched
+# deps inherit it.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Set build-type specific compiler flags

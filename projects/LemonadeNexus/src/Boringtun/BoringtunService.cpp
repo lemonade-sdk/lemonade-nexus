@@ -1,5 +1,5 @@
-#include <LemonadeNexus/WireGuard/WireGuardService.hpp>
-#include <LemonadeNexus/WireGuard/IpRouter.hpp>
+#include <LemonadeNexus/Boringtun/BoringtunService.hpp>
+#include <LemonadeNexus/Boringtun/IpRouter.hpp>
 
 #include <sodium.h>
 #include <spdlog/spdlog.h>
@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace nexus::wireguard {
+namespace nexus::boringtun {
 
 namespace {
 
@@ -28,18 +28,18 @@ std::optional<uint32_t> parse_host_ip(const std::string& cidr) {
 
 } // namespace
 
-WireGuardService::WireGuardService(std::string interface_name,
+BoringtunService::BoringtunService(std::string interface_name,
                                    std::filesystem::path config_dir)
     : interface_name_(std::move(interface_name)),
       config_dir_(std::move(config_dir)) {}
 
-WireGuardService::~WireGuardService() = default;
+BoringtunService::~BoringtunService() = default;
 
-void WireGuardService::on_start() {
+void BoringtunService::on_start() {
     spdlog::info("[{}] userspace dataplane facade ready (no kernel interface)", name());
 }
 
-void WireGuardService::on_stop() {
+void BoringtunService::on_stop() {
     std::lock_guard lock(mutex_);
     dataplane_.stop();
 }
@@ -48,13 +48,13 @@ void WireGuardService::on_stop() {
 // Input validation
 // ---------------------------------------------------------------------------
 
-bool WireGuardService::is_valid_pubkey(const std::string& key) {
+bool BoringtunService::is_valid_pubkey(const std::string& key) {
     if (key.size() != 44) return false;
     static const std::regex base64_re(R"(^[A-Za-z0-9+/]{43}=$)");
     return std::regex_match(key, base64_re);
 }
 
-bool WireGuardService::is_valid_endpoint(const std::string& ep) {
+bool BoringtunService::is_valid_endpoint(const std::string& ep) {
     if (ep.empty()) return true;  // peer without endpoint (NATed client)
     static const std::regex ipv4_ep_re(R"(^(\d{1,3}\.){3}\d{1,3}:\d{1,5}$)");
     static const std::regex ipv6_ep_re(R"(^\[[0-9a-fA-F:]+\]:\d{1,5}$)");
@@ -65,7 +65,7 @@ bool WireGuardService::is_valid_endpoint(const std::string& ep) {
            std::regex_match(ep, host_ep_re);
 }
 
-bool WireGuardService::is_valid_cidr(const std::string& cidr) {
+bool BoringtunService::is_valid_cidr(const std::string& cidr) {
     if (cidr.empty()) return false;
     static const std::regex ipv4_cidr_re(R"(^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$)");
     static const std::regex ipv6_cidr_re(R"(^[0-9a-fA-F:]+/\d{1,3}$)");
@@ -73,7 +73,7 @@ bool WireGuardService::is_valid_cidr(const std::string& cidr) {
            std::regex_match(cidr, ipv6_cidr_re);
 }
 
-bool WireGuardService::is_valid_allowed_ips(const std::string& allowed_ips) {
+bool BoringtunService::is_valid_allowed_ips(const std::string& allowed_ips) {
     if (allowed_ips.empty()) return false;
     std::istringstream stream(allowed_ips);
     std::string token;
@@ -86,7 +86,7 @@ bool WireGuardService::is_valid_allowed_ips(const std::string& allowed_ips) {
     return true;
 }
 
-bool WireGuardService::is_valid_interface_name(const std::string& iface) {
+bool BoringtunService::is_valid_interface_name(const std::string& iface) {
     if (iface.empty() || iface.size() > 15) return false;
     static const std::regex iface_re(R"(^[a-zA-Z0-9_-]+$)");
     return std::regex_match(iface, iface_re);
@@ -96,7 +96,7 @@ bool WireGuardService::is_valid_interface_name(const std::string& iface) {
 // Keys
 // ---------------------------------------------------------------------------
 
-std::string WireGuardService::derive_public_key(const std::string& private_key_b64) {
+std::string BoringtunService::derive_public_key(const std::string& private_key_b64) {
     std::array<uint8_t, crypto_box_SECRETKEYBYTES> sk{};
     size_t len = 0;
     if (sodium_base642bin(sk.data(), sk.size(), private_key_b64.c_str(),
@@ -112,7 +112,7 @@ std::string WireGuardService::derive_public_key(const std::string& private_key_b
     return b64;
 }
 
-WgKeypair WireGuardService::do_generate_keypair() {
+BoringtunKeypair BoringtunService::do_generate_keypair() {
     std::lock_guard lock(mutex_);
     unsigned char pk[crypto_box_PUBLICKEYBYTES];
     unsigned char sk[crypto_box_SECRETKEYBYTES];
@@ -126,22 +126,22 @@ WgKeypair WireGuardService::do_generate_keypair() {
                       sodium_base64_VARIANT_ORIGINAL);
     sodium_bin2base64(sk_b64, sizeof(sk_b64), sk, crypto_box_SECRETKEYBYTES,
                       sodium_base64_VARIANT_ORIGINAL);
-    return WgKeypair{.public_key = pk_b64, .private_key = sk_b64};
+    return BoringtunKeypair{.public_key = pk_b64, .private_key = sk_b64};
 }
 
 // ---------------------------------------------------------------------------
 // Interface lifecycle (now purely virtual — registers addresses with the router)
 // ---------------------------------------------------------------------------
 
-bool WireGuardService::do_set_interface(const WgInterfaceConfig& config) {
+bool BoringtunService::do_set_interface(const BoringtunInterfaceConfig& config) {
     std::lock_guard lock(mutex_);
     private_key_b64_ = config.private_key;
     listen_port_     = config.listen_port;
     return true;
 }
 
-bool WireGuardService::do_setup_interface(const WgInterfaceConfig& config,
-                                          const std::vector<WgPeer>& peers) {
+bool BoringtunService::do_setup_interface(const BoringtunInterfaceConfig& config,
+                                          const std::vector<BoringtunPeer>& peers) {
     if (!config.address.empty() && !is_valid_cidr(config.address)) {
         spdlog::error("[{}] setup_interface rejected: invalid address '{}'",
                        name(), config.address);
@@ -187,13 +187,13 @@ bool WireGuardService::do_setup_interface(const WgInterfaceConfig& config,
     return true;
 }
 
-bool WireGuardService::do_teardown_interface() {
+bool BoringtunService::do_teardown_interface() {
     std::lock_guard lock(mutex_);
     dataplane_.stop();
     return true;
 }
 
-bool WireGuardService::do_add_address(const std::string& address_cidr) {
+bool BoringtunService::do_add_address(const std::string& address_cidr) {
     if (!is_valid_cidr(address_cidr)) {
         spdlog::error("[{}] invalid CIDR for add_address: '{}'", name(), address_cidr);
         return false;
@@ -204,7 +204,7 @@ bool WireGuardService::do_add_address(const std::string& address_cidr) {
     return true;
 }
 
-bool WireGuardService::add_local_address(const std::string& address_cidr) {
+bool BoringtunService::add_local_address(const std::string& address_cidr) {
     auto ip = parse_host_ip(address_cidr);
     if (!ip) return false;
     dataplane_.add_local_ip(*ip);
@@ -215,7 +215,7 @@ bool WireGuardService::add_local_address(const std::string& address_cidr) {
 // Peer management (delegated to the dataplane)
 // ---------------------------------------------------------------------------
 
-bool WireGuardService::do_add_peer(const std::string& pubkey,
+bool BoringtunService::do_add_peer(const std::string& pubkey,
                                    const std::string& allowed_ips,
                                    const std::string& endpoint) {
     if (!is_valid_pubkey(pubkey)) {
@@ -234,20 +234,20 @@ bool WireGuardService::do_add_peer(const std::string& pubkey,
     return dataplane_.add_peer(pubkey, allowed_ips, endpoint);
 }
 
-bool WireGuardService::do_remove_peer(const std::string& pubkey) {
+bool BoringtunService::do_remove_peer(const std::string& pubkey) {
     if (!is_valid_pubkey(pubkey)) return false;
     std::lock_guard lock(mutex_);
     return dataplane_.remove_peer(pubkey);
 }
 
-bool WireGuardService::do_update_endpoint(const std::string& pubkey,
+bool BoringtunService::do_update_endpoint(const std::string& pubkey,
                                           const std::string& new_endpoint) {
     if (!is_valid_pubkey(pubkey) || !is_valid_endpoint(new_endpoint)) return false;
     std::lock_guard lock(mutex_);
     return dataplane_.update_endpoint(pubkey, new_endpoint);
 }
 
-std::vector<WgPeer> WireGuardService::do_get_peers() {
+std::vector<BoringtunPeer> BoringtunService::do_get_peers() {
     std::lock_guard lock(mutex_);
     return dataplane_.snapshot_peers();
 }
@@ -256,7 +256,7 @@ std::vector<WgPeer> WireGuardService::do_get_peers() {
 // Peer sync from tree (composes the verbs above)
 // ---------------------------------------------------------------------------
 
-int WireGuardService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers) {
+int BoringtunService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& desired_peers) {
     for (const auto& dp : desired_peers) {
         if (!is_valid_pubkey(dp.public_key)) {
             spdlog::error("[{}] sync: invalid pubkey '{}'", name(), dp.public_key);
@@ -277,7 +277,7 @@ int WireGuardService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& d
     }
 
     auto current_peers = do_get_peers();
-    std::unordered_map<std::string, const WgPeer*> current_map;
+    std::unordered_map<std::string, const BoringtunPeer*> current_map;
     for (const auto& cp : current_peers) current_map[cp.public_key] = &cp;
 
     std::unordered_set<std::string> desired_keys;
@@ -314,8 +314,8 @@ int WireGuardService::do_sync_peers_from_tree(const std::vector<TreeNodePeer>& d
 // Config file generation / persistence (unchanged semantics)
 // ---------------------------------------------------------------------------
 
-std::string WireGuardService::do_generate_config(const WgInterfaceConfig& config,
-                                                 const std::vector<WgPeer>& peers) {
+std::string BoringtunService::do_generate_config(const BoringtunInterfaceConfig& config,
+                                                 const std::vector<BoringtunPeer>& peers) {
     std::ostringstream out;
     out << "[Interface]\n";
     out << "PrivateKey = " << config.private_key << "\n";
@@ -333,11 +333,11 @@ std::string WireGuardService::do_generate_config(const WgInterfaceConfig& config
     return out.str();
 }
 
-std::filesystem::path WireGuardService::config_file_path() const {
+std::filesystem::path BoringtunService::config_file_path() const {
     return config_dir_ / (interface_name_ + ".conf");
 }
 
-bool WireGuardService::do_save_config(const std::string& config_contents) {
+bool BoringtunService::do_save_config(const std::string& config_contents) {
     std::lock_guard lock(mutex_);
     auto path = config_file_path();
 
@@ -372,7 +372,7 @@ bool WireGuardService::do_save_config(const std::string& config_contents) {
     return true;
 }
 
-std::string WireGuardService::do_load_config() {
+std::string BoringtunService::do_load_config() {
     std::lock_guard lock(mutex_);
     auto path = config_file_path();
     if (!std::filesystem::exists(path)) return {};
@@ -387,4 +387,4 @@ std::string WireGuardService::do_load_config() {
     return buf.str();
 }
 
-} // namespace nexus::wireguard
+} // namespace nexus::boringtun

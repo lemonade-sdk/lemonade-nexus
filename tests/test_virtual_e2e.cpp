@@ -1,5 +1,5 @@
-// Flagship end-to-end test: a real HTTP request travels over a real WireGuard
-// (boringtun) tunnel that is terminated FULLY in userspace on BOTH ends — no
+// Flagship end-to-end test: a real HTTP request travels over a real encrypted
+// mesh tunnel (boringtun) that is terminated FULLY in userspace on BOTH ends — no
 // kernel network interface, no TUN device, no root. This is the user-visible
 // goal of the in-process dataplane: node-to-node traffic that the host kernel
 // (and anything running on it) cannot observe.
@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <LemonadeNexus/Network/VirtualNetService.hpp>
-#include <LemonadeNexus/WireGuard/UserspaceDataplane.hpp>
+#include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
 
 #include <httplib.h>
 #include <sodium.h>
@@ -26,7 +26,7 @@
 
 using namespace std::chrono_literals;
 using nexus::network::VirtualNetService;
-using nexus::wireguard::UserspaceDataplane;
+using nexus::boringtun::UserspaceDataplane;
 
 namespace {
 
@@ -47,7 +47,7 @@ Keypair make_keypair() {
 
 } // namespace
 
-TEST(VirtualE2E, HttpOverUserspaceWireGuardTunnel) {
+TEST(VirtualE2E, HttpOverUserspaceMeshTunnel) {
     ASSERT_GE(sodium_init(), 0);
 
     // --- A real httplib server, reachable only on loopback ---

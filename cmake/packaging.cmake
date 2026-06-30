@@ -42,9 +42,9 @@ else()
         message(STATUS "Packaging version from git tag: ${CPACK_PACKAGE_VERSION}")
     endif()
 endif()
-set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Self-hosted WireGuard mesh VPN server")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Self-hosted userspace mesh VPN server")
 set(CPACK_PACKAGE_DESCRIPTION
-    "Cryptographically secure, self-hosted WireGuard mesh VPN with Ed25519 identity, gossip-based state sync, distributed authoritative DNS, TEE attestation, and zero-trust enrollment.")
+    "Cryptographically secure, self-hosted userspace mesh VPN with Ed25519 identity, gossip-based state sync, distributed authoritative DNS, TEE attestation, and zero-trust enrollment.")
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/geramyloveless/lemonade-nexus")
 set(CPACK_PACKAGE_CONTACT "admin@lemonade-nexus.io")
 

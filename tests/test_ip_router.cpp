@@ -1,11 +1,11 @@
 #include <gtest/gtest.h>
 
-#include <LemonadeNexus/WireGuard/IpRouter.hpp>
+#include <LemonadeNexus/Boringtun/IpRouter.hpp>
 
 #include <memory>
 
-using nexus::wireguard::Cidr;
-using nexus::wireguard::IpRouter;
+using nexus::boringtun::Cidr;
+using nexus::boringtun::IpRouter;
 
 using Peer   = std::shared_ptr<std::string>;
 using Router = IpRouter<Peer>;
