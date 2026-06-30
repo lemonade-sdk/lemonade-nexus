@@ -27,7 +27,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     // POST /api/join (PUBLIC, no auth)
     // Composite bootstrap endpoint: authenticate, create node, allocate tunnel
-    // IP, return WireGuard config.
+    // IP, return mesh config.
     // ========================================================================
     pub.Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
         auto body_opt = parse_body(req, res);
@@ -192,7 +192,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        // Convert server's Ed25519 identity key to Curve25519 (X25519) for WireGuard
+        // Convert server's Ed25519 identity key to Curve25519 (X25519) for the mesh
         std::string wg_server_pubkey;
         if (auto ed_pk = ctx_.key_wrapping.load_identity_pubkey()) {
             auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*ed_pk);
@@ -204,14 +204,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         ? "10.64.0.1"
                                         : ctx_.tunnel_bind_ip;
 
-        // Add the client as a WireGuard peer on the server interface
+        // Add the client as a mesh peer on the server interface
         auto client_wg_pubkey = body.value("wg_pubkey", std::string{});
         if (ctx_.boringtun && !client_wg_pubkey.empty() && !alloc.base_network.empty()) {
             // Convert Ed25519 wg_pubkey to Curve25519 if it has the ed25519: prefix
             std::string peer_wg_key = client_wg_pubkey;
             constexpr std::string_view ed_prefix = "ed25519:";
             if (peer_wg_key.starts_with(ed_prefix)) {
-                // Client sent Ed25519 key — convert to Curve25519 for WireGuard
+                // Client sent Ed25519 key — convert to Curve25519 for the mesh
                 auto ed_bytes = crypto::from_base64(peer_wg_key.substr(ed_prefix.size()));
                 if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
                     crypto::Ed25519PublicKey ed_pk{};
@@ -229,7 +229,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
         }
 
-        // Build the WireGuard endpoint: public_ip:udp_port
+        // Build the mesh endpoint: public_ip:udp_port
         std::string wg_endpoint;
         if (!ctx_.server_public_ip.empty()) {
             wg_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);

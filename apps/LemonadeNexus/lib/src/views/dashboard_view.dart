@@ -153,7 +153,7 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
   }
 
   /// P2P mesh networking card with an enable/disable control. Replaces the old
-  /// WireGuard "Tunnel" card — endpoint connectivity is via the userspace mesh
+  /// VPN "Tunnel" card — endpoint connectivity is via the userspace mesh
   /// routing layer, not a VPN tunnel.
   Widget _p2pMeshCard(AppState appState) {
     final mesh = appState.meshStatus;

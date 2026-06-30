@@ -75,7 +75,7 @@ public:
     /// Set the IPAM service for tunnel IP allocation during ServerHello exchange.
     void set_ipam(ipam::IPAMService* ipam);
 
-    /// Set the WireGuard service for backbone peer provisioning.
+    /// Set the boringtun service for backbone peer provisioning.
     void set_boringtun(boringtun::BoringtunService* wg);
 
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
@@ -108,7 +108,7 @@ public:
     /// Returns all currently claimed NS slots (for status reporting).
     [[nodiscard]] std::vector<NsSlotClaimData> get_ns_slots() const;
 
-    /// Try to add a gossip peer as a WireGuard backbone peer.
+    /// Try to add a gossip peer as a mesh backbone peer.
     void try_add_backbone_wg_peer(const GossipPeer& peer);
 
     /// Access the Ed25519 keypair (needed by TrustPolicy for token generation).

@@ -19,7 +19,7 @@ namespace nexus::client {
 struct ServerEndpoint {
     std::string address;           // IP or hostname
     uint16_t    http_port{9100};   // HTTP control plane
-    uint16_t    udp_port{51940};   // WireGuard + hole punch (shared UDP port)
+    uint16_t    udp_port{51940};   // mesh + hole punch (shared UDP port)
     uint16_t    stun_port{3478};   // STUN
     uint16_t    gossip_port{9102}; // Gossip
     std::string pubkey;            // server's Ed25519 pubkey (base64)

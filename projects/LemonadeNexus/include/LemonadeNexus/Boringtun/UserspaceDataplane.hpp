@@ -1,6 +1,6 @@
 #pragma once
 
-/// Fully in-process WireGuard dataplane.
+/// Fully in-process boringtun dataplane.
 ///
 /// One UDP socket + one boringtun Noise session per peer + a userspace
 /// cryptokey router. No TUN device, no kernel interface, no elevated

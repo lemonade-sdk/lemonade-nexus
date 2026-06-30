@@ -42,7 +42,7 @@ title: Network Architecture
    Client ──POST /api/auth──> Server  (Ed25519 challenge-response)
    Client ──POST /api/join──> Server  (allocate IP, get WG config)
 
-3. WireGuard Tunnel (UDP :51940)
+3. Mesh Tunnel (UDP :51940)
    Client ──WG handshake──> Server
    Client <──WG keepalive (5s)──> Server
    Tunnel established: client 10.64.0.10 ↔ server 10.64.0.1
@@ -117,7 +117,7 @@ Client A (behind NAT)              Server              Client B (behind NAT)
     │────── WG handshake (direct) ────────────────────────>│
     │<─────────────────────────────── WG handshake ────────│
     │                                                       │
-    │<═══════════ Direct P2P WireGuard Tunnel ════════════>│
+    │<═══════════ Direct P2P encrypted mesh tunnel ═══════>│
     │           No server in the middle                     │
 ```
 
@@ -145,14 +145,14 @@ same `/api/join` contract.
 | Traffic | Port | Purpose |
 |---------|------|---------|
 | Public HTTPS API | TCP :9100 | Bootstrap, auth, join, discovery |
-| WireGuard | UDP :51940 | Encrypted tunnel establishment + data |
+| Mesh tunnel (boringtun) | UDP :51940 | Encrypted tunnel establishment + data |
 | Hole Punch | UDP :51941 | NAT traversal signaling |
 | Gossip | UDP :9102 | Server state sync |
 | STUN | UDP :3478 | External IP discovery |
-| Relay | UDP :9103 | Fallback WG forwarding |
+| Relay | UDP :9103 | Fallback mesh forwarding |
 | DNS | UDP :53/5353 | Authoritative zone |
 
-### Over WireGuard Tunnel (10.64.x.x)
+### Over Mesh Tunnel (10.64.x.x)
 | Traffic | Port | Purpose |
 |---------|------|---------|
 | Private HTTPS API | TCP :9101 | Tree, IPAM, mesh, certs, governance |

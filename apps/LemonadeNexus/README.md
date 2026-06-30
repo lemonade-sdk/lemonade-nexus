@@ -4,7 +4,7 @@ VPN mesh network client for Windows built with Flutter/Dart.
 
 ## Overview
 
-This Flutter application provides a Windows-native client for the Lemonade Nexus WireGuard mesh VPN network. It uses FFI bindings to communicate with the C SDK (`lemonade_nexus.h`).
+This Flutter application provides a Windows-native client for the Lemonade Nexus userspace mesh VPN network. It uses FFI bindings to communicate with the C SDK (`lemonade_nexus.h`).
 
 ## Architecture
 

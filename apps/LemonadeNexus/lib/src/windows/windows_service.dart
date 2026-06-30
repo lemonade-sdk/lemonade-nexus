@@ -104,7 +104,7 @@ class WindowsServiceConfig {
   WindowsServiceConfig({
     this.serviceName = 'LemonadeNexusService',
     this.displayName = 'Lemonade Nexus VPN Service',
-    this.description = 'WireGuard Mesh VPN background service',
+    this.description = 'userspace mesh VPN background service',
     String? executablePath,
     this.arguments = const ['--service'],
     this.startType = ServiceStartType.automatic,

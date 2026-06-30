@@ -238,7 +238,7 @@ class AuthService {
 
 /// Mesh networking service.
 ///
-/// The WireGuard VPN-tunnel model was removed in favour of the userspace mesh;
+/// The legacy VPN-tunnel model was removed in favour of the userspace mesh;
 /// connect/disconnect now map to enabling/disabling P2P mesh networking.
 class TunnelService {
   final LemonadeNexusSdk _sdk;

@@ -388,10 +388,10 @@ class ServerLatency {
 }
 
 // =========================================================================
-// WireGuard Models
+// Mesh Models
 // =========================================================================
 
-/// WireGuard tunnel status.
+/// Mesh tunnel status.
 @JsonSerializable()
 class TunnelStatus {
   final bool isUp;

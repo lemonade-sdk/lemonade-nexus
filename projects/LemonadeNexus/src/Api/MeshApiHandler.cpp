@@ -25,7 +25,7 @@ std::string strip_cidr(const std::string& ip) {
 }
 
 /// Build a map from tunnel_ip (without /prefix) to last WG handshake epoch.
-/// Used to determine peer liveness from WireGuard layer.
+/// Used to determine peer liveness from the boringtun layer.
 std::unordered_map<std::string, uint64_t> build_wg_handshake_map(
     nexus::boringtun::BoringtunService* wg) {
     std::unordered_map<std::string, uint64_t> m;
@@ -263,7 +263,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // GET /api/mesh/status/:node_id (PRIVATE, auth required)
     //
     // Returns mesh status for a node including peer count, online count,
-    // and the server's WireGuard peer info for that node.
+    // and the server's mesh peer info for that node.
     // ========================================================================
     priv.Get(R"(/api/mesh/status/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -337,7 +337,7 @@ nlohmann::json MeshApiHandler::build_server_peer() const {
     sp["is_online"] = true;
     sp["is_server"] = true;
 
-    // Derive WireGuard public key from server identity for the peer entry
+    // Derive mesh public key from server identity for the peer entry
     sp["wg_pubkey"] = "";  // filled by caller if needed; server's WG pubkey
     if (ctx_.boringtun) {
         // The server's WG pubkey is stored in the root node or derived from identity

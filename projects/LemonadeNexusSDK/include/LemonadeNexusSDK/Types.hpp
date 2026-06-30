@@ -247,7 +247,7 @@ struct JoinResult {
     std::string node_id;
     std::string tunnel_ip;
     std::string private_subnet;
-    std::string wg_pubkey;          ///< WireGuard public key (base64)
+    std::string wg_pubkey;          ///< mesh public key (base64)
     std::string error;
 };
 
@@ -279,7 +279,7 @@ struct GroupJoinResult {
 };
 
 // ---------------------------------------------------------------------------
-// WireGuard tunnel
+// Mesh tunnel
 // ---------------------------------------------------------------------------
 
 /// Config for the userspace boringtun mesh dataplane (Noise session to the
@@ -310,7 +310,7 @@ struct TunnelStatus {
 // Mesh P2P networking
 // ---------------------------------------------------------------------------
 
-/// A single mesh peer for P2P WireGuard connections.
+/// A single mesh peer for P2P connections.
 struct MeshPeer {
     std::string node_id;
     std::string hostname;

@@ -364,7 +364,7 @@ class AppState {
   String? get publicKeyBase64 => authState.publicKeyBase64;
   String get serverHost => settings.serverHost;
   int get serverPort => settings.serverPort;
-  // The WireGuard tunnel was removed in favour of the userspace mesh; surface
+  // The legacy VPN tunnel was removed in favour of the userspace mesh; surface
   // the mesh-assigned IP here so existing views keep showing a usable address.
   String? get tunnelIP => tunnelStatus?.tunnelIp ?? meshStatus?.tunnelIp;
   MeshStatus? get meshStatus => peerState.meshStatus;
@@ -758,7 +758,7 @@ class AppNotifier extends StateNotifier<AppState> {
 
   /// Joins the mesh network as an endpoint (auth + create_node + IP allocation).
   ///
-  /// This is what populates the SDK's WireGuard config (assigns the tunnel IP +
+  /// This is what populates the SDK's mesh config (assigns the tunnel IP +
   /// node id); without it [connectTunnel] has no config to bring up. Mirrors the
   /// macOS `joinAsEndpoint()`. Best-effort: a join failure leaves the user
   /// authenticated but without a tunnel.

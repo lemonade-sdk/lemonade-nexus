@@ -557,7 +557,7 @@ void UserspaceDataplane::handle_datagram(std::span<const uint8_t> pkt,
                                          std::vector<uint8_t>& scratch_a,
                                          std::vector<uint8_t>& scratch_b) {
     auto type = wire::parse_type(pkt);
-    if (!type) return;  // not a WireGuard packet
+    if (!type) return;  // not a boringtun/Noise packet
 
     PeerPtr peer;
     if (*type == wire::MsgType::HandshakeInit) {

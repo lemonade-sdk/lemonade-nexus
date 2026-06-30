@@ -641,7 +641,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
-    // WireGuard interface — server-side tunnel endpoint
+    // boringtun interface — server-side tunnel endpoint
     // ========================================================================
     nexus::boringtun::BoringtunService boringtun_service{
         config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
@@ -658,7 +658,7 @@ int main(int argc, char* argv[]) {
         boringtun_service.dataplane().send_outbound_ip_packet(pkt);
     });
 
-    // Derive Curve25519 keypair from Ed25519 identity for WireGuard
+    // Derive Curve25519 keypair from Ed25519 identity for the mesh
     std::string wg_server_privkey_b64;
     if (root_privkey) {
         auto x_sk = nexus::crypto::SodiumCryptoService::ed25519_sk_to_x25519(*root_privkey);
@@ -666,7 +666,7 @@ int main(int argc, char* argv[]) {
             std::span<const uint8_t>(x_sk.data(), x_sk.size()));
     }
 
-    // Set up the WireGuard interface with the server's tunnel IP
+    // Set up the boringtun interface with the server's tunnel IP
     if (!wg_server_privkey_b64.empty() && !tunnel_bind_ip.empty()) {
         nexus::boringtun::BoringtunInterfaceConfig wg_iface;
         wg_iface.private_key = wg_server_privkey_b64;
@@ -676,18 +676,18 @@ int main(int argc, char* argv[]) {
         if (boringtun_service.setup_interface(wg_iface, {})) {
             // The netstack answers on our tunnel IP across the whole client plane.
             vnet.add_local_ip(tunnel_bind_ip + "/10");
-            spdlog::info("WireGuard: userspace dataplane up on :{} with tunnel IP {}/10",
+            spdlog::info("boringtun: userspace dataplane up on :{} with tunnel IP {}/10",
                           config.udp_port, tunnel_bind_ip);
         } else {
-            spdlog::warn("WireGuard: failed to start userspace dataplane on :{} — "
+            spdlog::warn("boringtun: failed to start userspace dataplane on :{} — "
                           "clients will not be able to connect.", config.udp_port);
         }
     } else {
-        spdlog::warn("WireGuard: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
+        spdlog::warn("boringtun: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
     }
 
     // ========================================================================
-    // Backbone: server-to-server WireGuard mesh (172.16.0.0/22)
+    // Backbone: server-to-server boringtun mesh (172.16.0.0/22)
     // ========================================================================
     std::string backbone_ip;
     std::string wg_server_pubkey_b64;

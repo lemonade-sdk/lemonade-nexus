@@ -203,7 +203,7 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
           if (node.mgmtPubkey != null)
             _buildKeyRow('Management Key', value: node.mgmtPubkey!),
           if (node.wgPubkey != null)
-            _buildKeyRow('WireGuard Key', value: node.wgPubkey!),
+            _buildKeyRow('Mesh Key', value: node.wgPubkey!),
           if (node.mgmtPubkey == null && node.wgPubkey == null)
             Text(
               'No keys available.',

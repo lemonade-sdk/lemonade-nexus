@@ -39,7 +39,7 @@ copy_file("${BINARY_DIR}/plugins/window_manager/Release/window_manager_plugin.dl
 
 # Copy the self-contained SDK DLL (OpenSSL/sodium/boringtun are statically
 # embedded, so no separate crypto DLLs are needed). wintun.dll is required for
-# the in-process WireGuard tunnel on Windows when present.
+# the in-process encrypted mesh tunnel on Windows when present.
 copy_file("${SDK_RELEASE_DIR}/lemonade_nexus_sdk.dll" "${OUT_DIR}/")
 copy_file("${SDK_RELEASE_DIR}/wintun.dll" "${OUT_DIR}/")
 

@@ -108,12 +108,12 @@ v=sp1 http=9100 udp=51940 gossip=9102 stun=3478 relay=9103 dns=5353 private_http
 |-------|-------------|
 | `v=sp1` | Protocol version |
 | `http=` | Public HTTPS API port |
-| `udp=` | WireGuard port |
+| `udp=` | Mesh port |
 | `gossip=` | Gossip protocol port |
 | `stun=` | STUN port |
 | `relay=` | Relay port |
 | `dns=` | Authoritative DNS port |
-| `private_http=` | Private HTTPS API port (over WG tunnel) |
+| `private_http=` | Private HTTPS API port (over the mesh tunnel) |
 | `region=` | Server's cloud region code |
 | `load=` | Connected client count |
 | `host=` | Server's TLS certificate FQDN |

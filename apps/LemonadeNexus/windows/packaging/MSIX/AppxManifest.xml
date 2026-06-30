@@ -40,7 +40,7 @@
 
       <uap:VisualElements
         DisplayName="Lemonade Nexus VPN"
-        Description="Secure WireGuard Mesh VPN Client"
+        Description="Secure userspace mesh VPN Client"
         BackgroundColor="#48BB78"
         Square150x150Logo="assets\app_icon.png"
         Square44x44Logo="assets\app_icon.png">

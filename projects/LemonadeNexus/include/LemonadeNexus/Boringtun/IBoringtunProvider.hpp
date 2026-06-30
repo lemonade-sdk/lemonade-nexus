@@ -7,13 +7,13 @@
 
 namespace nexus::boringtun {
 
-/// A WireGuard Curve25519 keypair (base64-encoded strings).
+/// A mesh Curve25519 keypair (base64-encoded strings).
 struct BoringtunKeypair {
     std::string public_key;
     std::string private_key;
 };
 
-/// A WireGuard peer as reported by `wg show <iface> dump`.
+/// A mesh peer as reported by `wg show <iface> dump`.
 struct BoringtunPeer {
     std::string public_key;
     std::string allowed_ips;
@@ -24,7 +24,7 @@ struct BoringtunPeer {
     uint16_t    persistent_keepalive{25};
 };
 
-/// Configuration for a WireGuard interface.
+/// Configuration for a boringtun interface.
 struct BoringtunInterfaceConfig {
     std::string private_key;
     std::string address;
@@ -32,17 +32,17 @@ struct BoringtunInterfaceConfig {
     std::string dns;
 };
 
-/// A peer derived from a tree node, carrying the fields needed for WireGuard
+/// A peer derived from a tree node, carrying the fields needed for mesh
 /// configuration and sync operations.
 struct TreeNodePeer {
-    std::string public_key;       // WireGuard Curve25519 pubkey
+    std::string public_key;       // mesh Curve25519 pubkey
     std::string tunnel_ip;        // e.g. "10.64.4.210/32"
     std::string private_subnet;   // e.g. "10.128.17.4/30"
     std::string endpoint;         // "ip:port" (may be empty)
     uint16_t    persistent_keepalive{25};
 };
 
-/// CRTP base for WireGuard operations.
+/// CRTP base for mesh operations.
 /// Derived must implement:
 ///   BoringtunKeypair do_generate_keypair()
 ///   bool do_set_interface(const BoringtunInterfaceConfig& config)
@@ -92,7 +92,7 @@ public:
         return self().do_generate_config(config, peers);
     }
 
-    /// Create the WireGuard interface, assign address, set keys, bring up,
+    /// Create the boringtun interface, assign address, set keys, bring up,
     /// add peers, and install routes.
     [[nodiscard]] bool setup_interface(const BoringtunInterfaceConfig& config,
                                        const std::vector<BoringtunPeer>& peers) {

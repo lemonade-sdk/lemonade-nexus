@@ -66,7 +66,7 @@
       <Component Id="ProgramMenuShortcut" Guid="{A6B7C8D9-E0F1-2345-BCDE-567890123456}">
         <Shortcut Id="StartMenuShortcut"
                   Name="Lemonade Nexus VPN"
-                  Description="Secure WireGuard Mesh VPN Client"
+                  Description="Secure userspace mesh VPN Client"
                   Target="[INSTALLFOLDER]lemonade_nexus.exe"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="ProductIcon" />
@@ -84,7 +84,7 @@
       <Component Id="DesktopShortcut" Guid="{B7C8D9E0-F1A2-3456-CDEF-678901234567}">
         <Shortcut Id="DesktopShortcutItem"
                   Name="Lemonade Nexus VPN"
-                  Description="Secure WireGuard Mesh VPN Client"
+                  Description="Secure userspace mesh VPN Client"
                   Target="[INSTALLFOLDER]lemonade_nexus.exe"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="ProductIcon" />
@@ -112,7 +112,7 @@
                         Type="ownProcess"
                         Name="LemonadeNexus"
                         DisplayName="Lemonade Nexus VPN Service"
-                        Description="Secure WireGuard Mesh VPN Coordination Server"
+                        Description="Secure userspace mesh VPN Coordination Server"
                         Start="auto"
                         ErrorControl="normal"
                         Arguments=""

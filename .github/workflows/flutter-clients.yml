@@ -10,7 +10,7 @@ on:
     paths:
       - 'apps/LemonadeNexus/**'
       - 'projects/LemonadeNexusSDK/**'
-      - 'projects/LemonadeNexus/src/WireGuard/**'
+      - 'projects/LemonadeNexus/src/Boringtun/**'
       - 'cmake/**'
       - 'crates/**'
       - '.github/workflows/flutter-clients.yml'

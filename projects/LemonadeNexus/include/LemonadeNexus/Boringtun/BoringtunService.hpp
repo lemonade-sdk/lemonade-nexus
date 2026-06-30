@@ -12,11 +12,11 @@
 
 namespace nexus::boringtun {
 
-/// WireGuard management service.
+/// Mesh management service.
 ///
 /// A thin facade over the fully in-process userspace dataplane
 /// (UserspaceDataplane): one UDP socket, per-peer boringtun Noise sessions, and
-/// a userspace cryptokey router. There is no kernel WireGuard interface and no
+/// a userspace cryptokey router. There is no kernel network interface and no
 /// TUN device, so the server needs no root / CAP_NET_ADMIN and host-level tools
 /// (`wg`, `tcpdump`) cannot observe tunnel keys or plaintext.
 ///

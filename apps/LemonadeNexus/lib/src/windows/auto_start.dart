@@ -50,7 +50,7 @@ class AutoStartConfig {
   const AutoStartConfig({
     this.appName = 'LemonadeNexus',
     this.displayName = 'Lemonade Nexus VPN',
-    this.description = 'WireGuard Mesh VPN Client',
+    this.description = 'userspace mesh VPN Client',
     this.arguments = const ['--minimized'],
     this.runElevated = false,
   });

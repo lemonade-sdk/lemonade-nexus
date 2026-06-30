@@ -141,7 +141,7 @@ class WindowsPaths {
   }
 
   /// Get the tunnel working directory
-  /// Stores: WireGuard configuration files, socket files
+  /// Stores: mesh configuration files, socket files
   Future<Directory> getTunnelDir() async {
     final dir = await getDataDir();
     final tunnelDir = Directory(path.join(dir.path, 'tunnel'));

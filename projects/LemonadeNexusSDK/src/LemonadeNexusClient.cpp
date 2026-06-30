@@ -1464,7 +1464,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
     }
 
-    // Step 2: generate WireGuard keypair
+    // Step 2: generate mesh keypair
     auto [wg_privkey, wg_pubkey] = BoringtunMesh::generate_keypair();
 
     // Step 3: create endpoint node via the server's composite /api/join endpoint.
@@ -2030,7 +2030,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                 mp.is_online      = p.value("is_online", false);
 
                 // Validate critical fields — reject peers with shell-unsafe
-                // or malformed data before they reach WireGuard commands.
+                // or malformed data before they reach mesh commands.
                 // Check for shell metacharacters in all string fields.
                 auto has_unsafe_chars = [](const std::string& s) {
                     for (char c : s) {
@@ -2050,7 +2050,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                                   mp.node_id);
                     continue;  // skip this peer entirely
                 }
-                // Reject peers with empty pubkey (unusable for WireGuard)
+                // Reject peers with empty pubkey (unusable for the mesh)
                 if (mp.wg_pubkey.empty()) {
                     spdlog::debug("[MeshPeers] Skipping peer '{}' with empty wg_pubkey", mp.node_id);
                     continue;
