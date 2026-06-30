@@ -103,7 +103,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         const auto& node = *node_opt;
 
         // Check that the authenticated user has Read permission on this node
-        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        // Permission assignments are keyed by the caller's pubkey (see the join
+        // flow + createChildNode), NOT the user_id (which is a hash-derived node
+        // id). Using user_id here made every Read check miss its assignment -> 403.
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
         if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
             error_response(res, "insufficient permissions", 403);
             return;
@@ -278,7 +281,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        auto caller_pubkey = normalize_pubkey(claims.user_id);
+        // Permission assignments are keyed by the caller's pubkey (see the join
+        // flow + createChildNode), NOT the user_id (which is a hash-derived node
+        // id). Using user_id here made every Read check miss its assignment -> 403.
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
         if (!ctx_.tree.check_permission(caller_pubkey, node_id, acl::Permission::Read)) {
             error_response(res, "insufficient permissions", 403);
             return;
