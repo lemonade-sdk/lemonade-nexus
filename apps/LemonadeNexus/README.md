@@ -61,9 +61,11 @@ lib/
    flutter pub get
    ```
 
-4. Build the native SDK shared library (from the repo root):
+4. Build the native SDK shared library (from the repo root). `OPENSSL_FORCE_BUNDLED=ON`
+   statically bundles OpenSSL so the dylib/DLL is self-contained — without it the
+   macOS dylib links Homebrew's OpenSSL and the app fails to load it at runtime:
    ```bash
-   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_FORCE_BUNDLED=ON
    cmake --build build --target LemonadeNexusSDKShared
    ```
 

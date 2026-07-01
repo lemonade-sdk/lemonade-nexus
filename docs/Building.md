@@ -84,8 +84,11 @@ SDK over FFI. Build the SDK **shared** library first, then run Flutter.
 ### macOS
 
 ```bash
-# 1. Build the SDK dylib from the repo root
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+# 1. Build the SDK dylib from the repo root. OPENSSL_FORCE_BUNDLED=ON statically
+#    bundles OpenSSL so the dylib is self-contained — without it the dylib links
+#    Homebrew's OpenSSL and the app fails at runtime ("Library not loaded:
+#    /opt/homebrew/.../libssl.3.dylib"). This matches the release/CI build.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_FORCE_BUNDLED=ON
 cmake --build build --target LemonadeNexusSDKShared
 
 # 2. Run / build the app — the Xcode "Embed Lemonade Nexus SDK" build phase
