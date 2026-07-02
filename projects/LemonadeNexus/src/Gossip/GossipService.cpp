@@ -1489,6 +1489,15 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
             std::lock_guard lock(peers_mutex_);
             auto it = std::find_if(peers_.begin(), peers_.end(),
                 [&](const GossipPeer& p) { return p.pubkey == pk; });
+            if (it == peers_.end()) {
+                // A seed peer is added by endpoint with an empty pubkey. Upgrade
+                // it in place on first hello — appending a second entry would
+                // leave a certless duplicate that the re-introduce loop hellos
+                // at every tick, forever.
+                it = std::find_if(peers_.begin(), peers_.end(),
+                    [&](const GossipPeer& p) { return p.pubkey.empty() && p.endpoint == ep; });
+                if (it != peers_.end()) it->pubkey = pk;
+            }
 
             if (it != peers_.end()) {
                 it->certificate_json = j.dump();
@@ -1507,6 +1516,12 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                 peer.certificate_json = j.dump();
                 peers_.push_back(std::move(peer));
             }
+
+            // Heal duplicates persisted before this fix: once this endpoint has
+            // an identified entry, any certless twin is redundant.
+            std::erase_if(peers_, [&](const GossipPeer& p) {
+                return p.pubkey.empty() && p.endpoint == ep;
+            });
         }
 
         spdlog::info("[{}] accepted ServerHello from {} ({})",
