@@ -18,6 +18,9 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -180,6 +183,53 @@ std::string resolve_public_ip(const ServerConfig& config) {
         }
     }
     return ip;
+}
+
+bool tcp_connect_check(const std::string& ip, uint16_t port, int timeout_sec) {
+    struct addrinfo hints{};
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    struct addrinfo* res = nullptr;
+    if (::getaddrinfo(ip.c_str(), std::to_string(port).c_str(), &hints, &res) != 0 ||
+        res == nullptr) {
+        return false;
+    }
+
+#ifdef _WIN32
+    SOCKET fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd == INVALID_SOCKET) { ::freeaddrinfo(res); return false; }
+    u_long nonblock = 1;
+    ::ioctlsocket(fd, FIONBIO, &nonblock);
+#else
+    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) { ::freeaddrinfo(res); return false; }
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+#endif
+
+    bool ok = false;
+    if (::connect(fd, res->ai_addr, static_cast<socklen_t>(res->ai_addrlen)) == 0) {
+        ok = true;
+    } else {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        struct timeval tv{};
+        tv.tv_sec = timeout_sec;
+        if (::select(static_cast<int>(fd) + 1, nullptr, &wfds, nullptr, &tv) == 1) {
+            int err = 0;
+            socklen_t len = sizeof(err);
+            ::getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+            ok = (err == 0);
+        }
+    }
+
+#ifdef _WIN32
+    ::closesocket(fd);
+#else
+    ::close(fd);
+#endif
+    ::freeaddrinfo(res);
+    return ok;
 }
 
 std::vector<std::string> resolve_a_records(const std::string& hostname) {

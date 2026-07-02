@@ -809,6 +809,29 @@ int main(int argc, char* argv[]) {
         spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());
     }
 
+    // Public-IP self-check: auto-detection measures the egress path, which on
+    // multihomed/VPN'd hosts is not the ingress peers must reach. Probe our own
+    // public endpoint once the listeners are up and warn if it refuses.
+    if (!server_public_ip.empty()) {
+        std::thread([ip = server_public_ip, port = http_port,
+                     configured = !config.public_ip.empty()]() {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (nexus::core::tcp_connect_check(ip, port, 4)) {
+                spdlog::info("Public IP self-check: {}:{} accepts connections from this host",
+                             ip, port);
+            } else if (configured) {
+                spdlog::warn("Public IP self-check: configured public_ip {}:{} did not accept "
+                             "a connection from this host. This can be a NAT that doesn't "
+                             "hairpin, but verify that peers can actually reach it.", ip, port);
+            } else {
+                spdlog::warn("Public IP self-check: auto-detected public IP {}:{} did not "
+                             "accept a connection. Detection measures the egress path and is "
+                             "often wrong on multihomed/VPN'd hosts — set public_ip explicitly "
+                             "if peers cannot reach this server.", ip, port);
+            }
+        }).detach();
+    }
+
     // ========================================================================
     // Background ACME retry -- if no cert yet, retry every 5 minutes
     // ========================================================================

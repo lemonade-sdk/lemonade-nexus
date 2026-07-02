@@ -47,6 +47,12 @@ void resolve_server_region(
 /// Resolve public IP: config > non-wildcard bind address > ipify auto-detect.
 [[nodiscard]] std::string resolve_public_ip(const ServerConfig& config);
 
+/// TCP connect probe with timeout. Used to sanity-check that our advertised
+/// public IP actually accepts connections (auto-detection measures the egress
+/// path, which is not necessarily the ingress on multihomed/VPN'd hosts).
+[[nodiscard]] bool tcp_connect_check(const std::string& ip, uint16_t port,
+                                     int timeout_sec);
+
 /// Resolve IPv4 (A) records for a hostname via the system resolver (getaddrinfo).
 /// Returns de-duplicated dotted-quad strings; empty on failure.
 [[nodiscard]] std::vector<std::string> resolve_a_records(const std::string& hostname);
