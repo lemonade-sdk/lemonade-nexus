@@ -91,6 +91,11 @@ public:
     /// Set our WG pubkey for inclusion in ServerHello messages.
     void set_our_wg_pubkey(const std::string& pubkey) { our_wg_pubkey_ = pubkey; }
 
+    /// Set the "ip:port" this server is reachable at, carried in ServerHello so
+    /// peers share it instead of the UDP source they happen to observe. Call
+    /// before start().
+    void set_our_advertised_endpoint(const std::string& ep) { our_advertised_endpoint_ = ep; }
+
     /// Broadcast a backbone IPAM allocation delta to all peers.
     void broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta);
 
@@ -365,6 +370,7 @@ private:
     std::string                      our_tunnel_ip_;     // assigned by peer or self
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
     std::string                      our_wg_pubkey_;     // base64 X25519
+    std::string                      our_advertised_endpoint_;  // "ip:port" we are reachable at
 
     // Shamir reconstruction: collect submitted shares from peers
     std::mutex                              reconstruction_mutex_;

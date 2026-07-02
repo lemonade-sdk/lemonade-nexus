@@ -214,6 +214,10 @@ int main(int argc, char* argv[]) {
     // Resolve our region + public IP early (reused later for NS/SEIP setup).
     nexus::core::resolve_server_region(config, data_root);
     std::string server_public_ip = nexus::core::resolve_public_ip(config);
+    if (!server_public_ip.empty()) {
+        gossip.set_our_advertised_endpoint(
+            server_public_ip + ":" + std::to_string(gossip_port));
+    }
 
     gossip.start();
 

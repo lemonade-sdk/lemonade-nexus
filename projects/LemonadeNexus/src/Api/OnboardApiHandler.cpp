@@ -55,12 +55,16 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
     }
 
-    // Seed peers: our own gossip endpoint plus every known peer's endpoint.
+    // Seed peers: our own gossip endpoint plus every known peer's endpoint —
+    // preferring what each peer advertises over the UDP source we observed,
+    // which can be a NAT/VPN artifact only reachable from our vantage point.
     nlohmann::json seeds = nlohmann::json::array();
     if (!ctx_.server_public_ip.empty())
         seeds.push_back(ctx_.server_public_ip + ":" + std::to_string(ctx_.config.gossip_port));
-    for (const auto& p : ctx_.gossip.get_peers())
-        if (!p.endpoint.empty()) seeds.push_back(p.endpoint);
+    for (const auto& p : ctx_.gossip.get_peers()) {
+        const auto& ep = p.advertised_endpoint.empty() ? p.endpoint : p.advertised_endpoint;
+        if (!ep.empty()) seeds.push_back(ep);
+    }
     bundle["seed_peers"] = seeds;
 
     if (!ctx_.server_public_ip.empty())

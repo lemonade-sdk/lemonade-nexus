@@ -130,6 +130,9 @@ void GossipService::on_start() {
             if (!our_region_.empty()) {
                 hello["region"] = our_region_;
             }
+            if (!our_advertised_endpoint_.empty()) {
+                hello["advertised_endpoint"] = our_advertised_endpoint_;
+            }
             auto payload_str = hello.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
 
@@ -824,7 +827,11 @@ void GossipService::handle_peer_exchange(const asio::ip::udp::endpoint& sender,
             for (const auto& p : our_peers) {
                 json peer_j;
                 peer_j["pubkey"]           = p.pubkey;
-                peer_j["endpoint"]         = p.endpoint;
+                // Share what the peer says it's reachable at, not the UDP source
+                // we observed — the source can be a NAT/VPN artifact only valid
+                // from our vantage point.
+                peer_j["endpoint"]         = p.advertised_endpoint.empty()
+                                                 ? p.endpoint : p.advertised_endpoint;
                 peer_j["http_port"]        = p.http_port;
                 peer_j["certificate_json"] = p.certificate_json;
                 peers_array.push_back(std::move(peer_j));
@@ -935,6 +942,8 @@ void GossipService::on_gossip_tick() {
             json hello = *our_certificate_;
             if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
             if (!our_region_.empty()) hello["region"] = our_region_;
+            if (!our_advertised_endpoint_.empty())
+                hello["advertised_endpoint"] = our_advertised_endpoint_;
             auto hello_str = hello.dump();
             std::vector<uint8_t> hello_bytes(hello_str.begin(), hello_str.end());
             for (const auto& ep : pending) {
@@ -1054,12 +1063,13 @@ void GossipService::load_peers() {
 
         for (const auto& p : j["peers"]) {
             GossipPeer peer;
-            peer.pubkey           = p.value("pubkey", "");
-            peer.endpoint         = p.value("endpoint", "");
-            peer.http_port        = p.value("http_port", uint16_t{9100});
-            peer.last_seen        = p.value("last_seen", uint64_t{0});
-            peer.reputation       = p.value("reputation", 1.0f);
-            peer.certificate_json = p.value("certificate_json", "");
+            peer.pubkey              = p.value("pubkey", "");
+            peer.endpoint            = p.value("endpoint", "");
+            peer.advertised_endpoint = p.value("advertised_endpoint", "");
+            peer.http_port           = p.value("http_port", uint16_t{9100});
+            peer.last_seen           = p.value("last_seen", uint64_t{0});
+            peer.reputation          = p.value("reputation", 1.0f);
+            peer.certificate_json    = p.value("certificate_json", "");
 
             if (!peer.pubkey.empty() && !peer.endpoint.empty() &&
                 known_endpoints.insert(peer.endpoint).second) {
@@ -1081,12 +1091,13 @@ void GossipService::save_peers() {
     json peers_array = json::array();
     for (const auto& p : peers_) {
         json peer_j;
-        peer_j["pubkey"]           = p.pubkey;
-        peer_j["endpoint"]         = p.endpoint;
-        peer_j["http_port"]        = p.http_port;
-        peer_j["last_seen"]        = p.last_seen;
-        peer_j["reputation"]       = p.reputation;
-        peer_j["certificate_json"] = p.certificate_json;
+        peer_j["pubkey"]              = p.pubkey;
+        peer_j["endpoint"]            = p.endpoint;
+        peer_j["advertised_endpoint"] = p.advertised_endpoint;
+        peer_j["http_port"]           = p.http_port;
+        peer_j["last_seen"]           = p.last_seen;
+        peer_j["reputation"]          = p.reputation;
+        peer_j["certificate_json"]    = p.certificate_json;
         peers_array.push_back(std::move(peer_j));
     }
     j["peers"] = std::move(peers_array);
@@ -1499,21 +1510,24 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                 if (it != peers_.end()) it->pubkey = pk;
             }
 
+            const auto advertised = j.value("advertised_endpoint", std::string{});
             if (it != peers_.end()) {
                 it->certificate_json = j.dump();
                 it->region = j.value("region", "");
+                if (!advertised.empty()) it->advertised_endpoint = advertised;
                 it->last_seen = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
             } else {
                 GossipPeer peer;
-                peer.pubkey           = pk;
-                peer.endpoint         = ep;
-                peer.region           = j.value("region", "");
-                peer.http_port        = 9100; // will be updated via peer exchange
-                peer.last_seen        = static_cast<uint64_t>(
+                peer.pubkey             = pk;
+                peer.endpoint           = ep;
+                peer.advertised_endpoint = advertised;
+                peer.region             = j.value("region", "");
+                peer.http_port          = 9100; // will be updated via peer exchange
+                peer.last_seen          = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
-                peer.reputation       = 1.0f;
-                peer.certificate_json = j.dump();
+                peer.reputation         = 1.0f;
+                peer.certificate_json   = j.dump();
                 peers_.push_back(std::move(peer));
             }
 
@@ -1544,6 +1558,8 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                     json response = *our_certificate_;
                     response["is_response"] = true;
                     response["assigned_tunnel_ip"] = assigned_ip;
+                    if (!our_advertised_endpoint_.empty())
+                        response["advertised_endpoint"] = our_advertised_endpoint_;
                     auto payload_str = response.dump();
                     std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
                     send_packet(sender, GossipMsgType::ServerHello, payload_bytes);
@@ -1554,6 +1570,8 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
         else if (our_certificate_ && !j.value("is_response", false)) {
             json response = *our_certificate_;
             response["is_response"] = true;
+            if (!our_advertised_endpoint_.empty())
+                response["advertised_endpoint"] = our_advertised_endpoint_;
             auto payload_str = response.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
             send_packet(sender, GossipMsgType::ServerHello, payload_bytes);
