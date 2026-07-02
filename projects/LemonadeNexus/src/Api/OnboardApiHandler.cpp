@@ -66,6 +66,9 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
     if (!ctx_.server_public_ip.empty())
         bundle["wg_endpoint"] =
             ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
+    // Lets the candidate seed the address it actually reached us on, which may
+    // differ from our self-detected public IP (multihomed/NAT'd genesis).
+    bundle["gossip_port"] = ctx_.config.gossip_port;
     return bundle;
 }
 

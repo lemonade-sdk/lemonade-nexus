@@ -13,6 +13,7 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -312,7 +313,19 @@ int run_onboard_server(ServerConfig& config) {
     std::vector<std::string> seeds;
     if (approved.contains("seed_peers"))
         seeds = approved["seed_peers"].get<std::vector<std::string>>();
+    // The server-reported seeds use its self-detected public IP, which can be
+    // wrong (multihomed/NAT). The address we just onboarded through is proven
+    // reachable — seed it first.
+    auto proven = host + ":" + std::to_string(approved.value("gossip_port", 9102));
+    if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
+        seeds.insert(seeds.begin(), proven);
     merge_config(config.config_path, root_hex, seeds);
+
+    // Align our hostname with the admitted server_id so DNS/NS records carry
+    // one name instead of an auto-generated <region>-N.
+    if (HostnameGenerator::persist_hostname(std::filesystem::path(config.data_root), server_id)) {
+        config.server_hostname = server_id;
+    }
 
     // 5. Acknowledge (releases the server-side pending record).
     uint64_t ats = now_unix();

@@ -88,6 +88,15 @@ void ServerAdmissionService::on_start() {
     load();
     spdlog::info("[ServerAdmissionService] started ({} persisted admission(s), accepts_onboarding={})",
                  admissions_.size(), accepts_onboarding());
+
+    // A root holder without its own certificate never sends ServerHello, so
+    // servers it admits can exchange digests with it but never verify it or
+    // sync state — a confusing half-joined mesh.
+    if (accepts_onboarding() && !storage_.read_file("identity", "server_cert.json")) {
+        spdlog::warn("[ServerAdmissionService] this server issues certificates but has NO "
+                     "certificate of its own — peers cannot verify it and state will not "
+                     "sync. Self-enroll once: --enroll-server '<own gossip pubkey>' <server-id>");
+    }
 }
 
 void ServerAdmissionService::on_stop() {
