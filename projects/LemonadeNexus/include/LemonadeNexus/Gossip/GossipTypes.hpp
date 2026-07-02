@@ -95,14 +95,21 @@ struct EnrollmentBallot {
         TimedOut   = 3,
     };
 
+    // Enrollment gates acceptance of an already-root-signed cert; Admission
+    // decides whether to ISSUE a cert to a certless candidate (governed join).
+    enum class Kind : uint8_t { Enrollment = 0, Admission = 1 };
+
     std::string    request_id;
     std::string    candidate_pubkey;
     std::string    candidate_server_id;
-    std::string    certificate_json;     // full ServerCertificate JSON
+    std::string    certificate_json;     // full ServerCertificate JSON (Enrollment)
+    std::string    admission_claim_json; // candidate's self-signed claim (Admission)
     std::string    sponsor_pubkey;       // server that first received ServerHello
     uint64_t       created_at{0};
     uint64_t       timeout_at{0};
     State          state{State::Collecting};
+    Kind           kind{Kind::Enrollment};
+    float          required_ratio{0.0f}; // 0 = use configured enrollment ratio
     uint32_t       retries{0};
     std::vector<EnrollmentVoteData> votes;
 };

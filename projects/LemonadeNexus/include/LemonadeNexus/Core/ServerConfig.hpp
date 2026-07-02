@@ -79,6 +79,10 @@ struct ServerConfig {
     uint32_t    ddns_update_interval_sec{300};
     bool        ddns_enabled{false};
 
+    // First-run CLI mode: initialize the data directory (identity + gossip
+    // keypairs), print onboarding info (pubkeys, node ID, next steps), and exit.
+    bool        first_run{false};
+
     // Enrollment CLI mode (non-empty = run enrollment and exit)
     std::string enroll_server_pubkey;
     std::string enroll_server_id;
@@ -89,6 +93,23 @@ struct ServerConfig {
 
     // Manifest CLI mode
     std::string add_manifest_path;  // path to a release manifest JSON to import
+
+    // Runtime-only: path the config was loaded from (not persisted to JSON).
+    std::string config_path{"lemonade-nexus.json"};
+
+    // Onboarding — candidate side (--onboard-server [host:port])
+    bool        onboard_server{false};       // run the onboarding client and exit
+    std::string onboard_target;              // optional "host:port" of a mesh server (else DNS discovery)
+    std::string onboard_server_id;           // requested DNS label (auto-derived if empty)
+    uint32_t    onboard_timeout_sec{900};    // give up waiting for admission after this
+
+    // Onboarding — mesh side
+    bool        onboard_enabled{true};             // accept onboarding requests when we hold the root key
+    bool        onboard_auto_approve_bootstrap{true}; // auto-approve until the first admission is approved
+    float       admission_quorum_ratio{0.75f};     // Tier1 vote fraction for admission ballots
+    uint32_t    onboard_min_tier1_for_vote{6};     // switch from sole-discretion to voting at this many Tier1s
+    uint32_t    onboard_request_ttl_sec{3600};     // pending admission lifetime
+    uint32_t    onboard_max_pending{8};            // cap on concurrent pending admissions
 
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)

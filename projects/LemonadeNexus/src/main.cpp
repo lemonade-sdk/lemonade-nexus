@@ -1,3 +1,4 @@
+#include <LemonadeNexus/Core/CliModes.hpp>
 #include <LemonadeNexus/Core/Coordinator.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
@@ -23,6 +24,7 @@
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/GovernanceService.hpp>
+#include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/RootKeyChain.hpp>
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
@@ -40,6 +42,7 @@
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
+#include <LemonadeNexus/Api/OnboardApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
 
@@ -69,148 +72,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // --- Print this host's TPM AK pubkey and exit (for enrollment) ---
-    if (config.print_tpm_ak) {
-        auto ak = nexus::core::tpm::export_ak_pubkey_b64();
-        if (!ak) {
-            spdlog::error("No TPM available — cannot export an Attestation Key. "
-                          "(Need /dev/tpmrm0 or a TCTI such as swtpm, on a Linux TPM build.)");
-            return 1;
-        }
-        // Print the raw value to stdout so it can be piped into --enroll-tpm-ak.
-        spdlog::info("TPM AK pubkey (base64 DER SPKI):");
-        std::printf("%s\n", ak->c_str());
-        return 0;
-    }
-
-    // --- Handle enrollment/revocation CLI commands (exit after) ---
-    if (!config.enroll_server_pubkey.empty()) {
-        nexus::crypto::SodiumCryptoService enroll_crypto;
-        enroll_crypto.start();
-        nexus::storage::FileStorageService enroll_storage{std::filesystem::path(config.data_root)};
-        enroll_storage.start();
-        nexus::crypto::KeyWrappingService enroll_kw{enroll_crypto, enroll_storage};
-        enroll_kw.start();
-
-        auto privkey = enroll_kw.unlock_identity({});
-        auto pubkey = enroll_kw.load_identity_pubkey();
-        if (!privkey || !pubkey) {
-            spdlog::error("Cannot enroll: root identity not available. Run server once first to generate identity.");
-            return 1;
-        }
-
-        nexus::gossip::ServerCertificate cert;
-        cert.server_pubkey  = config.enroll_server_pubkey;
-        cert.server_id      = config.enroll_server_id;
-        cert.issued_at      = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
-        cert.expires_at     = 0; // no expiry
-        cert.issuer_pubkey  = nexus::crypto::to_base64(*pubkey);
-
-        // Model A: pin the joining server's TPM Attestation Key into the cert so the
-        // root signature binds identity ↔ AK. The admin is asserting (having validated
-        // the EK→AK chain out of band) that this AK belongs to a genuine TPM.
-        cert.tpm_ak_pubkey = config.enroll_tpm_ak_pubkey;
-        if (!config.enroll_tpm_ek_cert_path.empty()) {
-            std::ifstream ek_f(config.enroll_tpm_ek_cert_path);
-            if (ek_f) {
-                std::string ek_pem((std::istreambuf_iterator<char>(ek_f)),
-                                    std::istreambuf_iterator<char>());
-                cert.tpm_ek_cert = ek_pem;
-                spdlog::info("Enroll: attached EK certificate from {} ({} bytes) — validate the "
-                             "EK→AK chain to the TPM vendor CA before trusting this AK.",
-                             config.enroll_tpm_ek_cert_path, ek_pem.size());
-            } else {
-                spdlog::warn("Enroll: could not read EK cert '{}' — continuing without it",
-                             config.enroll_tpm_ek_cert_path);
-            }
-        }
-        if (cert.tpm_ak_pubkey.empty()) {
-            spdlog::warn("Enroll: no TPM AK pinned (--enroll-tpm-ak) — '{}' will be a Tier-2 "
-                         "certificate and cannot reach Tier 1 under require_tee_attestation.",
-                         config.enroll_server_id);
-        } else {
-            spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",
-                         cert.tpm_ak_pubkey.substr(0, 16), config.enroll_server_id);
-        }
-
-        auto canonical = nexus::gossip::canonical_cert_json(cert);
-        auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
-        auto sig = enroll_crypto.ed25519_sign(*privkey, canonical_bytes);
-        cert.signature = nexus::crypto::to_base64(sig);
-
-        nlohmann::json cert_json = cert;
-        nexus::storage::SignedEnvelope env;
-        env.type = "server_certificate";
-        env.data = cert_json.dump();
-        env.timestamp = cert.issued_at;
-        (void)enroll_storage.write_file("identity", "server_cert.json", env);
-
-        spdlog::info("Enrolled server '{}' (pubkey: {})", cert.server_id, cert.server_pubkey);
-        spdlog::info("Certificate written to {}/identity/server_cert.json", config.data_root);
-        return 0;
-    }
-
-    if (!config.revoke_server_pubkey.empty()) {
-        // Load existing revoked list, append, save
-        nexus::storage::FileStorageService rev_storage{std::filesystem::path(config.data_root)};
-        rev_storage.start();
-
-        nlohmann::json revoked = nlohmann::json::array();
-        auto env = rev_storage.read_file("identity", "revoked_servers.json");
-        if (env) {
-            try { revoked = nlohmann::json::parse(env->data); } catch (...) {}
-        }
-        revoked.push_back(config.revoke_server_pubkey);
-
-        nexus::storage::SignedEnvelope rev_env;
-        rev_env.type = "revocation_list";
-        rev_env.data = revoked.dump();
-        rev_env.timestamp = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
-        (void)rev_storage.write_file("identity", "revoked_servers.json", rev_env);
-
-        spdlog::info("Revoked server pubkey: {}", config.revoke_server_pubkey);
-        rev_storage.stop();
-        return 0;
-    }
-
-    // --- Handle --add-manifest CLI command ---
-    if (!config.add_manifest_path.empty()) {
-        nexus::crypto::SodiumCryptoService manifest_crypto;
-        manifest_crypto.start();
-        nexus::storage::FileStorageService manifest_storage{std::filesystem::path(config.data_root)};
-        manifest_storage.start();
-
-        nexus::core::BinaryAttestationService manifest_attestation{manifest_crypto, manifest_storage};
-        // if release signing pubkey is empty we need to really throw, it should always
-        //be there no matter what, even if our platform doesnt support TEE
-        if (!config.release_signing_pubkey.empty()) {
-            manifest_attestation.set_release_signing_pubkey(config.release_signing_pubkey);
-        }
-
-        try {
-            std::ifstream f(config.add_manifest_path);
-            auto j = nlohmann::json::parse(f);
-            auto manifest = j.get<nexus::core::ReleaseManifest>();
-
-            if (manifest_attestation.add_manifest(manifest)) {
-                spdlog::info("Added release manifest: v{} {} (hash: {})",
-                              manifest.version, manifest.platform, manifest.binary_sha256);
-            } else {
-                spdlog::error("Failed to add manifest (invalid signature?)");
-                return 1;
-            }
-        } catch (const std::exception& e) {
-            spdlog::error("Failed to parse manifest file '{}': {}", config.add_manifest_path, e.what());
-            return 1;
-        }
-
-        manifest_storage.stop();
-        manifest_crypto.stop();
-        return 0;
+    // --- CLI modes (--first-run, --enroll-server, ...) and the
+    // uninitialized-data-dir gate live in Core/CliModes.cpp.
+    if (auto rc = nexus::core::run_cli_mode(config, argv[0])) {
+        return *rc;
     }
 
     const auto http_port   = config.http_port;
@@ -843,6 +708,26 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
+    // Server onboarding (admission of new servers over the public API)
+    // ========================================================================
+    nexus::core::ServerAdmissionService admission{
+        config, crypto, key_wrapping, storage, gossip,
+        config.require_tee_attestation ? &trust_policy : nullptr};
+    admission.start();
+
+    // Governed-admission ballots (>= onboard_min_tier1_for_vote Tier1 peers)
+    // resolve through the gossip enrollment machinery; map the outcome back to
+    // certificate issuance / denial.
+    gossip.set_enrollment_decision_callback(
+        [&admission](const nexus::gossip::EnrollmentBallot& b) {
+            if (b.kind != nexus::gossip::EnrollmentBallot::Kind::Admission) return;
+            const bool approved = b.state == nexus::gossip::EnrollmentBallot::State::Approved;
+            admission.on_ballot_decision(
+                b.request_id, approved,
+                approved ? "" : "admission ballot did not reach quorum");
+        });
+
+    // ========================================================================
     // Register CRTP request handlers
     // ========================================================================
     nexus::api::ApiContext ctx{
@@ -864,6 +749,7 @@ int main(int argc, char* argv[]) {
         .tee              = tee,
         .trust_policy     = trust_policy,
         .governance       = governance,
+        .admission        = admission,
         .boringtun        = &boringtun_service,
         .dns              = &dns,
         .server_fqdn      = server_fqdn,
@@ -881,6 +767,7 @@ int main(int argc, char* argv[]) {
     nexus::api::AdminApiHandler  admin_api{ctx};
     nexus::api::MeshApiHandler   mesh_api{ctx};
     nexus::api::RoutingApiHandler routing_api{ctx};
+    nexus::api::OnboardApiHandler onboard_api{ctx};
 
     // Route registration is factored into a lambda so it can be re-run if the
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
@@ -894,6 +781,7 @@ int main(int argc, char* argv[]) {
         admin_api.register_routes(http_server.server(), private_srv);
         mesh_api.register_routes(http_server.server(), private_srv);
         routing_api.register_routes(http_server.server(), private_srv);
+        onboard_api.register_routes(http_server.server(), private_srv);
     };
     register_public_routes();
 
@@ -1057,6 +945,7 @@ int main(int argc, char* argv[]) {
         private_http_server->stop();
     }
     http_server.stop();
+    admission.stop();
     ddns.stop();
     dns.stop();
     acme.stop();

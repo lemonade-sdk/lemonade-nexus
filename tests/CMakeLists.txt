@@ -43,6 +43,7 @@ add_nexus_test(test_ip_router         test_ip_router.cpp)
 add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
+add_nexus_test(test_onboarding        test_onboarding.cpp)
 add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 

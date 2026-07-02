@@ -66,6 +66,12 @@ void to_json(json& j, const ServerConfig& c) {
         {"require_tee_attestation",    c.require_tee_attestation},
         {"tee_attestation_validity_sec", c.tee_attestation_validity_sec},
         {"tee_platform_override",      c.tee_platform_override},
+        {"onboard_enabled",            c.onboard_enabled},
+        {"onboard_auto_approve_bootstrap", c.onboard_auto_approve_bootstrap},
+        {"admission_quorum_ratio",     c.admission_quorum_ratio},
+        {"onboard_min_tier1_for_vote", c.onboard_min_tier1_for_vote},
+        {"onboard_request_ttl_sec",    c.onboard_request_ttl_sec},
+        {"onboard_max_pending",        c.onboard_max_pending},
     };
 }
 
@@ -118,6 +124,12 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("require_tee_attestation"))   j.at("require_tee_attestation").get_to(c.require_tee_attestation);
     if (j.contains("tee_attestation_validity_sec")) j.at("tee_attestation_validity_sec").get_to(c.tee_attestation_validity_sec);
     if (j.contains("tee_platform_override"))     j.at("tee_platform_override").get_to(c.tee_platform_override);
+    if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
+    if (j.contains("onboard_auto_approve_bootstrap")) j.at("onboard_auto_approve_bootstrap").get_to(c.onboard_auto_approve_bootstrap);
+    if (j.contains("admission_quorum_ratio"))    j.at("admission_quorum_ratio").get_to(c.admission_quorum_ratio);
+    if (j.contains("onboard_min_tier1_for_vote")) j.at("onboard_min_tier1_for_vote").get_to(c.onboard_min_tier1_for_vote);
+    if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
+    if (j.contains("onboard_max_pending"))       j.at("onboard_max_pending").get_to(c.onboard_max_pending);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +154,15 @@ void print_usage(const char* prog) {
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
-    spdlog::info("  --enroll-server <hex> <id> Enroll a server: sign cert for pubkey with given ID");
+    spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
+    spdlog::info("  --onboard-server [host:port] Join an existing mesh: request admission over its public API, then exit");
+    spdlog::info("  --onboard-id <label>       Requested server ID for onboarding (default: auto-derived)");
+    spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
+    spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
     spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
     spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
-    spdlog::info("  --revoke-server <hex>      Revoke a server by its pubkey");
+    spdlog::info("  --revoke-server <b64>      Revoke a server by its base64 gossip pubkey");
     spdlog::info("  --add-manifest <path>      Import a signed release manifest JSON");
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
     spdlog::info("  --ddns-password <pass>     Namecheap DDNS password");
@@ -204,6 +220,7 @@ ServerConfig load_config(int argc, char* argv[]) {
             spdlog::warn("Failed to parse config {}: {}", config_path, e.what());
         }
     }
+    config.config_path = config_path;  // remembered for onboarding write-back
 
     // --- Pass 2: CLI overrides ---
     for (int i = 1; i < argc; ++i) {
@@ -245,6 +262,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enroll_tpm_ak_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-tpm-ek-cert") == 0 && i + 1 < argc) {
             config.enroll_tpm_ek_cert_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--first-run") == 0) {
+            config.first_run = true;
         } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
             config.print_tpm_ak = true;
         } else if (std::strcmp(argv[i], "--revoke-server") == 0 && i + 1 < argc) {
@@ -273,6 +292,18 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.require_peer_confirmation = true;
         } else if (std::strcmp(argv[i], "--enrollment-quorum") == 0 && i + 1 < argc) {
             config.enrollment_quorum_ratio = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--onboard-server") == 0) {
+            config.onboard_server = true;
+            // Optional positional target ("host:port"); anything starting with '-' is a flag.
+            if (i + 1 < argc && argv[i + 1][0] != '-') config.onboard_target = argv[++i];
+        } else if (std::strcmp(argv[i], "--onboard-id") == 0 && i + 1 < argc) {
+            config.onboard_server_id = argv[++i];
+        } else if (std::strcmp(argv[i], "--onboard-timeout") == 0 && i + 1 < argc) {
+            config.onboard_timeout_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--no-onboard") == 0) {
+            config.onboard_enabled = false;
+        } else if (std::strcmp(argv[i], "--admission-quorum") == 0 && i + 1 < argc) {
+            config.admission_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
@@ -410,17 +441,11 @@ bool validate_config(const ServerConfig& config) {
         valid = false;
     }
 
-    // Check data root
+    // Check data root (created by --first-run, not here — a plain start against
+    // a missing data dir must be able to fail cleanly without side effects)
     if (config.data_root.empty()) {
         spdlog::error("Config: data_root cannot be empty");
         valid = false;
-    } else {
-        std::error_code ec;
-        std::filesystem::create_directories(config.data_root, ec);
-        if (ec) {
-            spdlog::error("Config: cannot create data_root '{}': {}", config.data_root, ec.message());
-            valid = false;
-        }
     }
 
     // Tier 1 (require_tee_attestation) gates sensitive operations on a verified

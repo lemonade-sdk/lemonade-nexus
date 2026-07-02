@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <functional>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -388,6 +389,7 @@ private:
     uint32_t enrollment_vote_timeout_sec_{60};
     uint32_t enrollment_max_retries_{3};
     std::unordered_map<std::string, EnrollmentBallot> pending_enrollments_;
+    std::function<void(const EnrollmentBallot&)> enrollment_decision_cb_;
 
     // Throttle for proactive Tier-1 re-challenge (pubkey → last challenge unix sec).
     // Only touched from on_gossip_tick (the single gossip-timer thread).
@@ -412,6 +414,21 @@ public:
 
     /// Get pending enrollment ballots (for status API).
     [[nodiscard]] std::vector<EnrollmentBallot> pending_enrollments() const;
+
+    /// Fired when a ballot leaves Collecting (Approved/Rejected/TimedOut). The
+    /// callback runs outside peers_mutex_ with a snapshot of the ballot.
+    void set_enrollment_decision_callback(
+        std::function<void(const EnrollmentBallot&)> cb) {
+        enrollment_decision_cb_ = std::move(cb);
+    }
+
+    /// Open a governed ADMISSION ballot for a certless candidate (75% Tier1).
+    /// `claim_json` is the candidate's self-signed onboarding claim.
+    void start_admission_ballot(const std::string& request_id,
+                                const std::string& candidate_pubkey,
+                                const std::string& server_id,
+                                const std::string& claim_json,
+                                float required_ratio);
 };
 
 } // namespace nexus::gossip

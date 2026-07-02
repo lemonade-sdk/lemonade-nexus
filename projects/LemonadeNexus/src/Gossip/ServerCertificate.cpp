@@ -1,5 +1,8 @@
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 
+#include <chrono>
+#include <vector>
+
 namespace nexus::gossip {
 
 using json = nlohmann::json;
@@ -46,6 +49,40 @@ std::string canonical_cert_json(const ServerCertificate& cert) {
     j["tpm_ak_pubkey"]  = cert.tpm_ak_pubkey;
     j["tpm_ek_cert"]    = cert.tpm_ek_cert;
     return j.dump();
+}
+
+bool valid_server_id_label(const std::string& s) {
+    if (s.empty() || s.size() > 63) return false;
+    if (s.front() == '-' || s.back() == '-') return false;
+    for (char c : s) {
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+ServerCertificate issue_server_certificate(
+    const CertIssueParams& params,
+    crypto::SodiumCryptoService& crypto,
+    const crypto::Ed25519PrivateKey& root_privkey,
+    const crypto::Ed25519PublicKey& root_pubkey)
+{
+    ServerCertificate cert;
+    cert.server_pubkey = params.server_pubkey_b64;
+    cert.server_id     = params.server_id;
+    cert.issued_at     = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    cert.expires_at    = params.expires_at;
+    cert.issuer_pubkey = crypto::to_base64(root_pubkey);
+    cert.tpm_ak_pubkey = params.tpm_ak_pubkey;
+    cert.tpm_ek_cert   = params.tpm_ek_cert;
+
+    auto canonical = canonical_cert_json(cert);
+    auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
+    auto sig = crypto.ed25519_sign(root_privkey, canonical_bytes);
+    cert.signature = crypto::to_base64(sig);
+    return cert;
 }
 
 } // namespace nexus::gossip

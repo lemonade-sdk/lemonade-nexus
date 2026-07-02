@@ -19,6 +19,7 @@ namespace nexus::core {
     class TeeAttestationService;
     class TrustPolicyService;
     class GovernanceService;
+    class ServerAdmissionService;
 }
 namespace nexus::auth { class AuthService; }
 namespace nexus::tree { class PermissionTreeService; }
@@ -69,6 +70,7 @@ struct ApiContext {
     core::TeeAttestationService&      tee;
     core::TrustPolicyService&         trust_policy;
     core::GovernanceService&          governance;
+    core::ServerAdmissionService&     admission;
     boringtun::BoringtunService*      boringtun{nullptr};
     network::DnsService*              dns{nullptr};
     std::string                       server_fqdn;

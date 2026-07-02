@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <unordered_set>
 
 namespace nexus::gossip {
 
@@ -1031,11 +1033,15 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
 
 void GossipService::load_peers() {
     std::lock_guard lock(peers_mutex_);
-    peers_.clear();
+    // Do NOT clear: seed peers added (with empty pubkey) before start() must
+    // survive so the startup ServerHello reaches them. Merge by endpoint.
+    std::unordered_set<std::string> known_endpoints;
+    for (const auto& p : peers_) known_endpoints.insert(p.endpoint);
 
     auto envelope = storage_.read_file("identity", "peers.json");
     if (!envelope) {
-        spdlog::info("[{}] no peers.json found, starting with empty peer list", name());
+        spdlog::info("[{}] no peers.json found ({} seed peer(s) present)",
+                     name(), peers_.size());
         return;
     }
 
@@ -1055,12 +1061,13 @@ void GossipService::load_peers() {
             peer.reputation       = p.value("reputation", 1.0f);
             peer.certificate_json = p.value("certificate_json", "");
 
-            if (!peer.pubkey.empty() && !peer.endpoint.empty()) {
+            if (!peer.pubkey.empty() && !peer.endpoint.empty() &&
+                known_endpoints.insert(peer.endpoint).second) {
                 peers_.push_back(std::move(peer));
             }
         }
 
-        spdlog::info("[{}] loaded {} peers from storage", name(), peers_.size());
+        spdlog::info("[{}] {} peer(s) after loading storage", name(), peers_.size());
 
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse peers.json: {}", name(), e.what());
@@ -1805,15 +1812,50 @@ std::vector<EnrollmentBallot> GossipService::pending_enrollments() const {
     return result;
 }
 
+void GossipService::start_admission_ballot(const std::string& request_id,
+                                            const std::string& candidate_pubkey,
+                                            const std::string& server_id,
+                                            const std::string& claim_json,
+                                            float required_ratio) {
+    auto now = static_cast<uint64_t>(
+        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+    EnrollmentBallot ballot;
+    ballot.request_id          = request_id;
+    ballot.candidate_pubkey    = candidate_pubkey;
+    ballot.candidate_server_id = server_id;
+    ballot.admission_claim_json = claim_json;
+    ballot.sponsor_pubkey      = crypto::to_base64(keypair_.public_key);
+    ballot.created_at          = now;
+    ballot.timeout_at          = now + enrollment_vote_timeout_sec_;
+    ballot.kind                = EnrollmentBallot::Kind::Admission;
+    ballot.required_ratio      = required_ratio;
+    {
+        std::lock_guard lock(peers_mutex_);
+        if (pending_enrollments_.contains(request_id)) return;
+        pending_enrollments_[request_id] = ballot;
+    }
+    broadcast_enrollment_vote_request(ballot);
+    // Sponsor auto-votes approve (counted only if the sponsor is Tier1).
+    cast_enrollment_vote(request_id, candidate_pubkey, true, "sponsor");
+    check_enrollment_quorum(request_id);
+}
+
 void GossipService::broadcast_enrollment_vote_request(const EnrollmentBallot& ballot) {
     json request = {
         {"request_id",         ballot.request_id},
         {"candidate_pubkey",   ballot.candidate_pubkey},
         {"candidate_server_id", ballot.candidate_server_id},
-        {"certificate",        json::parse(ballot.certificate_json)},
         {"sponsor_pubkey",     ballot.sponsor_pubkey},
         {"timestamp",          ballot.created_at},
     };
+    if (ballot.kind == EnrollmentBallot::Kind::Admission) {
+        // Certless candidate: carry its self-signed onboarding claim instead.
+        request["admission_claim"] = ballot.admission_claim_json.empty()
+            ? json::object() : json::parse(ballot.admission_claim_json);
+        request["required_ratio"] = ballot.required_ratio;
+    } else {
+        request["certificate"] = json::parse(ballot.certificate_json);
+    }
 
     // Attach our attestation token if we're Tier1
     if (trust_policy_ && trust_policy_->our_tier() == core::TrustTier::Tier1) {
@@ -2027,11 +2069,26 @@ void GossipService::handle_enrollment_vote(
             return;
         }
 
-        // Only accept votes from Tier1 peers (if trust is enabled)
+        // Determine the ballot kind for vote-eligibility rules.
+        bool is_admission = false;
+        {
+            std::lock_guard lock(peers_mutex_);
+            auto it = pending_enrollments_.find(request_id);
+            if (it != pending_enrollments_.end())
+                is_admission = it->second.kind == EnrollmentBallot::Kind::Admission;
+        }
+
+        // Vote eligibility. Admission (governed join) requires Tier1 voters only;
+        // enrollment ballots accept Tier1/Tier2 (legacy behavior).
         if (trust_policy_) {
             auto tier = trust_policy_->peer_tier(voter_pubkey);
-            if (tier != core::TrustTier::Tier1 && tier != core::TrustTier::Tier2) {
-                spdlog::debug("[{}] ignoring vote from untrusted peer {}", name(), voter_pubkey.substr(0, 12));
+            const bool ok = is_admission
+                ? (tier == core::TrustTier::Tier1)
+                : (tier == core::TrustTier::Tier1 || tier == core::TrustTier::Tier2);
+            if (!ok) {
+                spdlog::debug("[{}] ignoring {} vote from ineligible peer {}", name(),
+                              is_admission ? "admission" : "enrollment",
+                              voter_pubkey.substr(0, 12));
                 return;
             }
         }
@@ -2068,79 +2125,102 @@ void GossipService::handle_enrollment_vote(
 }
 
 void GossipService::check_enrollment_quorum(const std::string& request_id) {
-    std::lock_guard lock(peers_mutex_);
-    auto it = pending_enrollments_.find(request_id);
-    if (it == pending_enrollments_.end()) return;
-    if (it->second.state != EnrollmentBallot::State::Collecting) return;
+    std::optional<EnrollmentBallot> decided;  // snapshot to notify outside the lock
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = pending_enrollments_.find(request_id);
+        if (it == pending_enrollments_.end()) return;
+        if (it->second.state != EnrollmentBallot::State::Collecting) return;
 
-    auto& ballot = it->second;
+        auto& ballot = it->second;
 
-    // Count Tier1 peers for quorum calculation
-    uint32_t tier1_count = 0;
-    if (trust_policy_) {
-        auto states = trust_policy_->all_peer_states();
-        for (const auto& s : states) {
-            if (s.tier == core::TrustTier::Tier1) ++tier1_count;
+        // Count Tier1 peers for quorum calculation
+        uint32_t tier1_count = 0;
+        if (trust_policy_) {
+            auto states = trust_policy_->all_peer_states();
+            for (const auto& s : states) {
+                if (s.tier == core::TrustTier::Tier1) ++tier1_count;
+            }
+        } else {
+            tier1_count = static_cast<uint32_t>(peers_.size());
         }
-    } else {
-        tier1_count = static_cast<uint32_t>(peers_.size());
-    }
 
-    // Genesis case: no peers = auto-approve
-    if (tier1_count == 0) {
-        ballot.state = EnrollmentBallot::State::Approved;
-        spdlog::info("[{}] enrollment approved for '{}' (genesis — no peers)",
-                      name(), ballot.candidate_server_id);
-        return;
-    }
+        // Genesis case: no eligible voters = auto-approve. NOT for Admission —
+        // below-quorum admission is handled by sole discretion before any ballot.
+        if (tier1_count == 0) {
+            if (ballot.kind == EnrollmentBallot::Kind::Admission) return;
+            ballot.state = EnrollmentBallot::State::Approved;
+            spdlog::info("[{}] enrollment approved for '{}' (genesis — no peers)",
+                          name(), ballot.candidate_server_id);
+            decided = ballot;
+        } else {
+            uint32_t approve_count = 0;
+            uint32_t reject_count = 0;
+            for (const auto& v : ballot.votes) {
+                if (v.approve) ++approve_count;
+                else ++reject_count;
+            }
 
-    // Count approval votes
-    uint32_t approve_count = 0;
-    uint32_t reject_count = 0;
-    for (const auto& v : ballot.votes) {
-        if (v.approve) ++approve_count;
-        else ++reject_count;
-    }
+            const float ratio = ballot.required_ratio > 0.0f
+                ? ballot.required_ratio : enrollment_quorum_ratio_;
+            uint32_t needed = std::max(1u, static_cast<uint32_t>(
+                std::ceil(static_cast<float>(tier1_count) * ratio)));
 
-    uint32_t needed = std::max(1u, static_cast<uint32_t>(
-        std::ceil(static_cast<float>(tier1_count) * enrollment_quorum_ratio_)));
-
-    if (approve_count >= needed) {
-        ballot.state = EnrollmentBallot::State::Approved;
-        spdlog::info("[{}] enrollment APPROVED for '{}' ({}/{} votes, needed {})",
-                      name(), ballot.candidate_server_id,
-                      approve_count, ballot.votes.size(), needed);
-    } else if (reject_count > tier1_count - needed) {
-        // Impossible to reach quorum even if all remaining vote approve
-        ballot.state = EnrollmentBallot::State::Rejected;
-        spdlog::warn("[{}] enrollment REJECTED for '{}' ({} rejections)",
-                      name(), ballot.candidate_server_id, reject_count);
+            if (approve_count >= needed) {
+                ballot.state = EnrollmentBallot::State::Approved;
+                spdlog::info("[{}] {} APPROVED for '{}' ({}/{} votes, needed {})",
+                              name(),
+                              ballot.kind == EnrollmentBallot::Kind::Admission
+                                  ? "admission" : "enrollment",
+                              ballot.candidate_server_id,
+                              approve_count, ballot.votes.size(), needed);
+                decided = ballot;
+            } else if (reject_count > tier1_count - needed) {
+                ballot.state = EnrollmentBallot::State::Rejected;
+                spdlog::warn("[{}] {} REJECTED for '{}' ({} rejections)",
+                              name(),
+                              ballot.kind == EnrollmentBallot::Kind::Admission
+                                  ? "admission" : "enrollment",
+                              ballot.candidate_server_id, reject_count);
+                decided = ballot;
+            }
+        }
     }
+    if (decided && enrollment_decision_cb_) enrollment_decision_cb_(*decided);
 }
 
 void GossipService::expire_enrollment_ballots() {
     auto now = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
-    std::lock_guard lock(peers_mutex_);
-    for (auto& [id, ballot] : pending_enrollments_) {
-        if (ballot.state != EnrollmentBallot::State::Collecting) continue;
-        if (now < ballot.timeout_at) continue;
+    // broadcast_enrollment_vote_request and the decision callback both need to
+    // run without peers_mutex_ held, so gather work under the lock and act after.
+    std::vector<EnrollmentBallot> to_rebroadcast;
+    std::vector<EnrollmentBallot> timed_out;
+    {
+        std::lock_guard lock(peers_mutex_);
+        for (auto& [id, ballot] : pending_enrollments_) {
+            if (ballot.state != EnrollmentBallot::State::Collecting) continue;
+            if (now < ballot.timeout_at) continue;
 
-        if (ballot.retries < enrollment_max_retries_) {
-            // Retry: extend timeout, re-broadcast
-            ballot.retries++;
-            ballot.timeout_at = now + enrollment_vote_timeout_sec_;
-            spdlog::info("[{}] enrollment vote timeout for '{}', retry {}/{}",
-                          name(), ballot.candidate_server_id,
-                          ballot.retries, enrollment_max_retries_);
-            // Re-broadcast will happen on next gossip tick
-        } else {
-            ballot.state = EnrollmentBallot::State::TimedOut;
-            spdlog::warn("[{}] enrollment TIMED OUT for '{}' after {} retries",
-                          name(), ballot.candidate_server_id, enrollment_max_retries_);
+            if (ballot.retries < enrollment_max_retries_) {
+                ballot.retries++;
+                ballot.timeout_at = now + enrollment_vote_timeout_sec_;
+                spdlog::info("[{}] vote timeout for '{}', retry {}/{}",
+                              name(), ballot.candidate_server_id,
+                              ballot.retries, enrollment_max_retries_);
+                to_rebroadcast.push_back(ballot);
+            } else {
+                ballot.state = EnrollmentBallot::State::TimedOut;
+                spdlog::warn("[{}] TIMED OUT for '{}' after {} retries",
+                              name(), ballot.candidate_server_id, enrollment_max_retries_);
+                timed_out.push_back(ballot);
+            }
         }
     }
+    for (const auto& b : to_rebroadcast) broadcast_enrollment_vote_request(b);
+    if (enrollment_decision_cb_)
+        for (const auto& b : timed_out) enrollment_decision_cb_(b);
 }
 
 // ---------------------------------------------------------------------------
