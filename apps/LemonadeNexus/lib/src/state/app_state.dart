@@ -5,6 +5,7 @@
 /// and all data fetched from the C SDK.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
@@ -379,7 +380,20 @@ class AppNotifier extends StateNotifier<AppState> {
   final SecureStore _secureStore = SecureStore();
   final PasskeyManager _passkey = PasskeyManager();
 
-  AppNotifier(this._sdk) : super(AppState.initial);
+  // --- Connection recovery ---
+  // Periodic health probe that drives auto-reconnect when the connected server
+  // goes down. One timer for the notifier's lifetime; no-ops until authed.
+  Timer? _healthTimer;
+  bool _isRecovering = false;
+  DateTime? _lastRecoveryAttempt;
+  int _recoveryFailures = 0;
+  static const Duration _recoveryCooldown = Duration(seconds: 20);
+  static const Duration _healthInterval = Duration(seconds: 5);
+  static const int _maxRecoveryFailures = 3;
+
+  AppNotifier(this._sdk) : super(AppState.initial) {
+    _startHealthMonitor();
+  }
 
   /// Public, read-only accessor to the current state for external callers.
   AppState get currentState => state;
@@ -503,10 +517,14 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Disconnect from server
-  Future<void> disconnectFromServer() async {
+  /// Disconnect from server.
+  ///
+  /// Uses [LemonadeNexusSdk.disconnect] (not [dispose]) so the SDK stays
+  /// reusable for a later reconnect/re-login; [clearIdentity] drops the Ed25519
+  /// identity too, which logout wants so the next session starts clean.
+  Future<void> disconnectFromServer({bool clearIdentity = false}) async {
     try {
-      _sdk.dispose();
+      _sdk.disconnect(clearIdentity: clearIdentity);
     } catch (e) {
       // Ignore disconnect errors
     }
@@ -766,7 +784,9 @@ class AppNotifier extends StateNotifier<AppState> {
   /// node id); without it [connectTunnel] has no config to bring up. Mirrors the
   /// macOS `joinAsEndpoint()`. Best-effort: a join failure leaves the user
   /// authenticated but without a tunnel.
-  Future<void> _joinNetwork() async {
+  ///
+  /// Returns true once the server has issued a node id (the join is usable).
+  Future<bool> _joinNetwork() async {
     try {
       final username = state.username ?? '';
       final join = await _sdk.joinNetwork(username: username, password: '');
@@ -782,9 +802,11 @@ class AppNotifier extends StateNotifier<AppState> {
         addActivity(ActivityLevel.warning,
             'Network join incomplete: ${join.error ?? 'no tunnel IP assigned'}');
       }
+      return join.success && join.nodeId != null;
     } catch (e) {
       _log('joinNetwork: FAILED -> $e');
       addActivity(ActivityLevel.warning, 'Network join failed: $e');
+      return false;
     }
   }
 
@@ -831,7 +853,7 @@ class AppNotifier extends StateNotifier<AppState> {
   /// Sign out
   Future<void> signOut() async {
     await _secureStore.clear();
-    await disconnectFromServer();
+    await disconnectFromServer(clearIdentity: true);
     state = state.copyWith(
       authState: AuthState.initial,
       peerState: PeerState.initial,
@@ -866,6 +888,12 @@ class AppNotifier extends StateNotifier<AppState> {
     ]);
     _log('refreshAllData done: isServerHealthy=${state.isServerHealthy} '
         'servers=${state.servers.length} stats=${state.stats != null}');
+    // A manual dashboard refresh against a dead server self-heals here; the
+    // periodic monitor covers the untouched case. _recoverConnection guards
+    // its own re-entrancy.
+    if (state.isAuthenticated && !state.isServerHealthy) {
+      await _recoverConnection();
+    }
   }
 
   /// Refresh health status
@@ -1155,6 +1183,100 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
+  /// Starts the periodic health probe that drives auto-reconnect.
+  ///
+  /// Runs for the notifier's lifetime and no-ops until the user is authed. When
+  /// the connected server stops answering `/api/health`, it kicks off
+  /// [_recoverConnection]. Cancelled in [dispose].
+  void _startHealthMonitor() {
+    _healthTimer?.cancel();
+    _healthTimer = Timer.periodic(_healthInterval, (_) async {
+      if (!state.isAuthenticated || _isRecovering) return;
+      await refreshHealth();
+      if (state.isAuthenticated && !state.isServerHealthy) {
+        await _recoverConnection();
+      }
+    });
+  }
+
+  /// Manually trigger a reconnect (bypasses the auto-recovery cooldown/backoff).
+  Future<void> reconnect() => _recoverConnection(force: true);
+
+  /// Recovers the control-plane connection after the current server goes down.
+  ///
+  /// Session tokens are per-server JWTs, so failover to a different server can't
+  /// reuse the old token — instead we drop the dead client (and its tunnel),
+  /// re-discover a live server via DNS, re-bind the preserved Ed25519 identity,
+  /// and re-join to obtain a fresh server-issued token (which also rebuilds the
+  /// tunnel). Guarded against re-entrancy, rate-limited, and bounded: after
+  /// [_maxRecoveryFailures] it stops auto-retrying until a manual [reconnect].
+  Future<void> _recoverConnection({bool force = false}) async {
+    if (_isRecovering || !state.isAuthenticated) return;
+    if (!force) {
+      final last = _lastRecoveryAttempt;
+      if (last != null && DateTime.now().difference(last) < _recoveryCooldown) {
+        return;
+      }
+      if (_recoveryFailures >= _maxRecoveryFailures) return;
+    }
+    // A cross-server re-join self-authenticates with the Ed25519 identity; a
+    // password-only session has none, so we can't recover silently — re-login.
+    if (_sdk.identityPubkey == null) {
+      _log('recoverConnection: no identity — forcing re-login');
+      addActivity(ActivityLevel.warning, 'Connection lost — please sign in again');
+      await signOut();
+      return;
+    }
+
+    _isRecovering = true;
+    _lastRecoveryAttempt = DateTime.now();
+    if (force) _recoveryFailures = 0;
+    _log('recoverConnection: start (failures=$_recoveryFailures force=$force)');
+    addActivity(ActivityLevel.warning, 'Connection lost — reconnecting…');
+    state = state.copyWith(connectionStatus: ConnectionStatus.connecting);
+    try {
+      // Drop the dead client + tunnel, but keep the identity for the re-join.
+      _sdk.disconnect();
+      // DNS/SEIP discovery health-probes as it goes, so dead servers are skipped
+      // and connectToServer brings up a fresh client on a reachable one.
+      await discoverNearestServer();
+      if (!state.isConnected) {
+        throw StateError('no reachable server found');
+      }
+      await _sdk.setIdentity();
+      if (!await _joinNetwork()) {
+        throw StateError('re-join failed');
+      }
+      // Persist the new server-issued token so a later restart doesn't replay
+      // the dead one.
+      final token = await _sdk.getSessionToken();
+      if (token != null) {
+        state = state.copyWith(
+          authState: state.authState.copyWith(sessionToken: token),
+        );
+        await _secureStore.saveSession(StoredSession(
+            token: token,
+            username: state.username ?? '',
+            userId: state.userId));
+      }
+      await refreshAllData();
+      state = state.copyWith(connectionStatus: ConnectionStatus.connected);
+      _recoveryFailures = 0;
+      addActivity(ActivityLevel.success, 'Reconnected');
+      _log('recoverConnection: success');
+    } catch (e) {
+      _recoveryFailures++;
+      state = state.copyWith(connectionStatus: ConnectionStatus.error);
+      _log('recoverConnection: FAILED ($_recoveryFailures) -> $e');
+      if (_recoveryFailures >= _maxRecoveryFailures) {
+        addActivity(ActivityLevel.error,
+            'Could not reconnect after $_recoveryFailures attempts');
+      }
+    } finally {
+      _isRecovering = false;
+    }
+  }
+
   /// Set auto discovery enabled
   void setAutoDiscoveryEnabled(bool enabled) {
     state = state.copyWith(
@@ -1183,6 +1305,7 @@ class AppNotifier extends StateNotifier<AppState> {
 
   @override
   void dispose() {
+    _healthTimer?.cancel();
     try {
       _sdk.dispose();
     } catch (e) {

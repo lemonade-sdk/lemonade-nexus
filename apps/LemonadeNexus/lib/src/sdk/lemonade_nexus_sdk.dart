@@ -142,6 +142,7 @@ class LemonadeNexusSdk {
   /// [port] - Server port number.
   Future<void> connect(String host, int port) async {
     _checkDisposed();
+    _destroyClient();
     _client = _ffi.create(host, port);
     if (_client == ffi.nullptr) {
       throw SdkException(LnError.connect, message: 'Failed to create client');
@@ -154,26 +155,56 @@ class LemonadeNexusSdk {
   /// [port] - Server port number.
   Future<void> connectTls(String host, int port) async {
     _checkDisposed();
+    _destroyClient();
     _client = _ffi.createTls(host, port);
     if (_client == ffi.nullptr) {
       throw SdkException(LnError.connect, message: 'Failed to create client');
     }
   }
 
-  /// Disconnects and releases all resources.
-  void dispose() {
+  /// Tears down the active client (and, optionally, the identity) while keeping
+  /// the SDK reusable — unlike [dispose], this leaves [_isDisposed] false so a
+  /// subsequent [connect]/[connectTls] can bring up a fresh client.
+  ///
+  /// Used for logout and for failover reconnects. The identity is preserved by
+  /// default so a reconnect can re-bind it (via [setIdentity]) and re-join;
+  /// pass [clearIdentity] on logout to start the next session clean.
+  void disconnect({bool clearIdentity = false}) {
     if (_isDisposed) return;
-    _isDisposed = true;
-
-    if (_identity != null) {
-      _ffi.identityDestroy(_identity!);
-      _identity = null;
+    _destroyClient();
+    if (clearIdentity) {
+      _destroyIdentity();
     }
+  }
 
+  /// Destroys the native client handle if present. Destroying the client also
+  /// tears down its boringtun dataplane (the tunnel), which is owned by value
+  /// inside the C client.
+  void _destroyClient() {
     if (_client != null) {
       _ffi.destroy(_client!);
       _client = null;
     }
+  }
+
+  /// Destroys the native identity handle if present.
+  void _destroyIdentity() {
+    if (_identity != null) {
+      _ffi.identityDestroy(_identity!);
+      _identity = null;
+    }
+  }
+
+  /// Disposes the SDK for good and releases all resources.
+  ///
+  /// Reserved for teardown (Riverpod provider / notifier disposal). After this
+  /// the instance is permanently unusable — use [disconnect] to close a
+  /// connection while keeping the SDK reusable.
+  void dispose() {
+    if (_isDisposed) return;
+    _isDisposed = true;
+    _destroyIdentity();
+    _destroyClient();
   }
 
   // =========================================================================

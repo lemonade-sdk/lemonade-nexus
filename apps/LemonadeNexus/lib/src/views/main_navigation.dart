@@ -74,7 +74,7 @@ class _Sidebar extends ConsumerWidget {
     return Column(
       children: [
         const SizedBox(height: 12),
-        _header(scheme),
+        _header(ref, scheme),
         Divider(height: 16, color: scheme.outline),
         Expanded(
           child: ListView(
@@ -90,7 +90,7 @@ class _Sidebar extends ConsumerWidget {
     );
   }
 
-  Widget _header(ColorScheme scheme) {
+  Widget _header(WidgetRef ref, ColorScheme scheme) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
@@ -125,6 +125,13 @@ class _Sidebar extends ConsumerWidget {
               ],
             ),
           ),
+          if (appState.isAuthenticated && !appState.isServerHealthy)
+            IconButton(
+              tooltip: 'Reconnect',
+              visualDensity: VisualDensity.compact,
+              icon: Icon(Icons.refresh, size: 16, color: scheme.onSurfaceVariant),
+              onPressed: () => ref.read(appNotifierProvider.notifier).reconnect(),
+            ),
         ],
       ),
     );
