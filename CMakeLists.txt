@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.25.1)
+
+# Use static runtime library on Windows to avoid DLL dependencies
+# (a parent project or -D on the command line takes precedence)
+if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 project(Lemonade_Nexus LANGUAGES C CXX)
 
 #-----------------------------------------------------------------------------
@@ -17,11 +24,13 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Set build-type specific compiler flags
-set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
-set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+# Set build-type specific compiler flags (MSVC keeps CMake's /O2 defaults)
+if(NOT MSVC)
+    set(CMAKE_CXX_FLAGS_DEBUG "-g")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+    set(CMAKE_CXX_FLAGS_MINSIZEREL "-Os -DNDEBUG")
+endif()
 
 # Enable ccache for faster rebuilds if available
 find_program(CCACHE_FOUND ccache)
@@ -35,6 +44,11 @@ list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 #-----------------------------------------------------------------------------
 # Libraries
 #-----------------------------------------------------------------------------
+# Let fetched deps declaring cmake_minimum_required(<3.5) configure on CMake 4+
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+endif()
+
 include(libraries/tss2-fapi)      # TPM2 Feature API (Linux only; no-op elsewhere)
 include(libraries/openssl)        # Must come before httplib and jwt-cpp (they depend on OpenSSL)
 include(libraries/asio)

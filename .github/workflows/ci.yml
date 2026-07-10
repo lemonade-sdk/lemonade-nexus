@@ -21,6 +21,11 @@ jobs:
             platform: darwin-arm64
           - os: windows-2022
             platform: windows-x86_64
+          # Same configuration Lemonade uses to build the bundled sidecar:
+          # VS generator, no vcvars, /MT against static OpenSSL
+          - os: windows-2022
+            platform: windows-x86_64-vs
+            vs_generator: true
 
     runs-on: ${{ matrix.os }}
 
@@ -31,9 +36,10 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps
-          key: fetchcontent-${{ matrix.os }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          # Keyed by platform: FetchContent sub-builds record the generator
+          key: fetchcontent-${{ matrix.platform }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
           restore-keys: |
-            fetchcontent-${{ matrix.os }}-
+            fetchcontent-${{ matrix.platform }}-
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -54,13 +60,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install ninja -y
+          if (-not "${{ matrix.vs_generator }}") { choco install ninja -y }
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\vcpkg-binary-cache" | Out-Null
           $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg-binary-cache"
-          vcpkg install openssl:x64-windows-static-md
+          vcpkg install openssl:x64-windows-static
 
+      # VS generator skips vcvars — MSBuild finds the toolchain itself,
+      # matching how Lemonade's parent configure invokes the sub-build
       - name: Set up MSVC environment (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !matrix.vs_generator
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: "Use D: drive for build (Windows)"
@@ -85,14 +93,24 @@ jobs:
             -DBUILD_TESTING=ON \
             -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
 
-      - name: Configure CMake (Windows)
-        if: runner.os == 'Windows'
+      - name: Configure CMake (Windows, Ninja)
+        if: runner.os == 'Windows' && !matrix.vs_generator
         shell: pwsh
         run: |
-          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
           cmake -B build `
             -G Ninja `
             "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
+            -DBUILD_TESTING=ON `
+            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
+            -DOPENSSL_USE_STATIC_LIBS=ON
+
+      - name: Configure CMake (Windows, Visual Studio)
+        if: matrix.vs_generator
+        shell: pwsh
+        run: |
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
+          cmake --preset windows `
             -DBUILD_TESTING=ON `
             "-DOPENSSL_ROOT_DIR=$opensslRoot" `
             -DOPENSSL_USE_STATIC_LIBS=ON

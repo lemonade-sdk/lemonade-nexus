@@ -69,7 +69,7 @@ jobs:
           choco install ninja -y
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\vcpkg-binary-cache" | Out-Null
           $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg-binary-cache"
-          vcpkg install openssl:x64-windows-static-md
+          vcpkg install openssl:x64-windows-static
 
       - name: Set up MSVC environment (Windows)
         if: runner.os == 'Windows'
@@ -101,9 +101,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Use the vcpkg static OpenSSL (x64-windows-static-md) installed above.
+          # Use the vcpkg static OpenSSL (x64-windows-static, matches the /MT CRT).
           # Choco's OpenSSL is 4.x, whose const-qualified X509 APIs break the build.
-          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
           cmake -B build `
             -G Ninja `
             "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
