@@ -13,7 +13,7 @@ AuthService::AuthService(storage::FileStorageService& storage,
                          std::string jwt_secret)
     : password_provider_{}
     , passkey_provider_{storage, crypto, std::move(rp_id), jwt_secret}
-    , token_link_provider_{}
+    , token_link_provider_{storage, crypto}
     , ed25519_provider_{storage, crypto, jwt_secret}
     , jwt_secret_{std::move(jwt_secret)}
 {
@@ -41,6 +41,18 @@ AuthResult AuthService::register_passkey(const nlohmann::json& registration) {
 
 nlohmann::json AuthService::issue_ed25519_challenge(const std::string& pubkey_b64) {
     return ed25519_provider_.issue_challenge(pubkey_b64);
+}
+
+std::optional<std::pair<std::string, LinkTokenRecord>>
+AuthService::mint_link_token(const std::string& owner_user_id,
+                             const std::string& owner_pubkey,
+                             const std::string& group_node_id,
+                             std::chrono::seconds ttl) {
+    return token_link_provider_.mint(owner_user_id, owner_pubkey, group_node_id, ttl);
+}
+
+std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token) {
+    return token_link_provider_.consume(token);
 }
 
 AuthResult AuthService::register_ed25519(const nlohmann::json& registration) {

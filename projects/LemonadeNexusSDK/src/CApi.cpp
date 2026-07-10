@@ -1011,6 +1011,20 @@ ln_error_t ln_set_node_id(ln_client_t* client, const char* node_id) {
     return LN_OK;
 }
 
+ln_error_t ln_set_link_token(ln_client_t* client, const char* token) {
+    if (!client || !token) return LN_ERR_NULL_ARG;
+    client->client.set_link_token(token);
+    return LN_OK;
+}
+
+ln_error_t ln_link_token_create(ln_client_t* client, uint32_t ttl_sec, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    auto result = client->client.create_link_token(ttl_sec);
+    json j = result.ok ? result.value : json{{"error", result.error}};
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
 char* ln_get_node_id(ln_client_t* client) {
     if (!client) return nullptr;
     auto id = client->client.node_id();

@@ -55,6 +55,7 @@ struct LemonadeNexusClient::Impl {
     Identity     identity;
     std::string  session_token;
     std::string  node_id;
+    std::string  link_token;           // single-use device link token for the next join
     std::string  server_seip_fqdn;     // e.g. "<id>.<region>.seip.lemonade-nexus.io" — public API after join
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
     std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTPS fallback
@@ -569,6 +570,32 @@ std::string LemonadeNexusClient::node_id() const {
 void LemonadeNexusClient::set_node_id(const std::string& id) {
     std::lock_guard lock(impl_->mutex);
     impl_->node_id = id;
+}
+
+void LemonadeNexusClient::set_link_token(const std::string& token) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->link_token = token;
+}
+
+Result<nlohmann::json> LemonadeNexusClient::create_link_token(uint32_t ttl_sec) {
+    Result<nlohmann::json> result;
+    json body = {{"ttl_sec", ttl_sec}};
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/link/token", body, status);
+    result.http_status = status;
+
+    if (!resp) {
+        result.error = "link token request failed (server unreachable)";
+        return result;
+    }
+    if (status != 200) {
+        result.error = resp->value("error", "link token request failed");
+        return result;
+    }
+
+    result.ok    = true;
+    result.value = *resp;
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -1484,6 +1511,14 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     }
     join_body["wg_pubkey"] = wg_pubkey;
 
+    // Single-use device link token (see set_link_token / create_link_token)
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (!impl_->link_token.empty()) {
+            join_body["link_token"] = impl_->link_token;
+        }
+    }
+
     // Include auth credentials so /api/join can authenticate inline
     if (local_identity.is_valid()) {
         // Get a challenge nonce for Ed25519 auth
@@ -1553,6 +1588,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     {
         std::lock_guard lock(impl_->mutex);
         impl_->node_id = node_id;
+        impl_->link_token.clear();  // consumed server-side on successful join
         // Store server private FQDN for HTTPS over WG tunnel
         // Store server tunnel IP for HTTP fallback
         auto srv_tunnel = resp->value("server_tunnel_ip", std::string{});

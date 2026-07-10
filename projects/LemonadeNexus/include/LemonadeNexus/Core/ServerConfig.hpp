@@ -111,6 +111,9 @@ struct ServerConfig {
     uint32_t    onboard_request_ttl_sec{3600};     // pending admission lifetime
     uint32_t    onboard_max_pending{8};            // cap on concurrent pending admissions
 
+    // User/device registration policy
+    bool        open_registration{true};     // false: new identities need a device link token to join
+
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
 

@@ -54,6 +54,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Normalize pubkey to "ed25519:base64..." format for tree storage
         auto norm_pubkey = normalize_pubkey(client_pubkey);
 
+        // Optional device-link token (single use, minted via POST /api/link/token):
+        // places the new endpoint under the token owner's Customer group.
+        auto link_token = body.value("link_token", std::string{});
+        std::optional<auth::LinkTokenRecord> link;
+        if (!link_token.empty()) {
+            link = ctx_.auth.consume_link_token(link_token);
+            if (!link) {
+                error_response(res, "invalid or expired link token", 403);
+                return;
+            }
+        }
+
         // cpu_id/net_mac are self-reported label seeds (not security controls).
         auto cpu_id       = body.value("cpu_id", std::string{});
         auto net_mac      = body.value("net_mac", std::string{});
@@ -129,48 +141,111 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 return;
             }
         } else if (node_id != "root") {
-            // Returning or new user — find or create their Customer group
-            std::string customer_id = "customer-" + node_id;
-            auto existing_customer = ctx_.tree.get_node(customer_id);
-            if (!existing_customer) {
-                tree::TreeNode customer_node;
-                customer_node.id          = customer_id;
-                customer_node.parent_id   = "root";
-                customer_node.type        = tree::NodeType::Customer;
-                customer_node.hostname    = body.value("hostname",
-                                                       "group-" + node_id.substr(0, 8));
-                customer_node.mgmt_pubkey = norm_pubkey;
-                customer_node.assignments = {{
-                    .management_pubkey = norm_pubkey,
-                    .permissions = {"read", "write", "add_child", "delete_node",
-                                    "edit_node"},
-                }};
-                ctx_.tree.insert_join_node(customer_node);
+            std::string customer_id;
+            auto existing_endpoint = ctx_.tree.get_node(node_id);
+
+            if (existing_endpoint) {
+                // Returning device — keep its current placement (a linked device
+                // must not be reparented into a fresh group of its own).
+                customer_id = existing_endpoint->parent_id;
+            } else if (link) {
+                // Linked join — place the device under the token owner's group.
+                customer_id = link->group_node_id;
+                if (!ctx_.tree.get_node(customer_id)) {
+                    error_response(res, "link token group no longer exists", 409);
+                    return;
+                }
+            } else {
+                if (!ctx_.config.open_registration &&
+                    !ctx_.tree.get_node("customer-" + node_id)) {
+                    error_response(res, "registration closed — link token required", 403);
+                    return;
+                }
+
+                // Returning or new user — find or create their Customer group
+                customer_id = "customer-" + node_id;
+                auto existing_customer = ctx_.tree.get_node(customer_id);
+                if (!existing_customer) {
+                    tree::TreeNode customer_node;
+                    customer_node.id          = customer_id;
+                    customer_node.parent_id   = "root";
+                    customer_node.type        = tree::NodeType::Customer;
+                    customer_node.hostname    = body.value("hostname",
+                                                           "group-" + node_id.substr(0, 8));
+                    customer_node.mgmt_pubkey = norm_pubkey;
+                    customer_node.assignments = {{
+                        .management_pubkey = norm_pubkey,
+                        .permissions = {"read", "write", "add_child", "delete_node",
+                                        "edit_node"},
+                    }};
+                    ctx_.tree.insert_join_node(customer_node);
+                }
             }
 
-            // Create Endpoint under the Customer group (idempotent)
-            tree::TreeNode endpoint_node;
-            endpoint_node.id          = node_id;
-            endpoint_node.parent_id   = customer_id;
-            endpoint_node.type        = tree::NodeType::Endpoint;
-            endpoint_node.hostname    = body.value("hostname",
-                                                   "endpoint-" + node_id.substr(0, 8));
-            endpoint_node.mgmt_pubkey = norm_pubkey;
-            // Explicit ACL grant for the endpoint's owner. Heartbeat authorizes
-            // via ownership, but node-scoped reads (GET /api/mesh/peers/<node>,
-            // /api/mesh/status/<node>) require an explicit Read permission on the
-            // node; without this assignment they 403. Mirrors the Customer grant
-            // so the owner has full control of their own endpoint.
-            endpoint_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node"},
-            }};
-            endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
-            stamp_endpoint_identity(endpoint_node);
-            if (!ctx_.tree.insert_join_node(endpoint_node)) {
-                error_response(res, "endpoint identifier conflict", 409);
-                return;
+            if (!existing_endpoint) {
+                // Create Endpoint under the Customer group
+                tree::TreeNode endpoint_node;
+                endpoint_node.id          = node_id;
+                endpoint_node.parent_id   = customer_id;
+                endpoint_node.type        = tree::NodeType::Endpoint;
+                endpoint_node.hostname    = body.value("hostname",
+                                                       "endpoint-" + node_id.substr(0, 8));
+                endpoint_node.mgmt_pubkey = norm_pubkey;
+                // Explicit ACL grant for the endpoint's owner. Heartbeat authorizes
+                // via ownership, but node-scoped reads (GET /api/mesh/peers/<node>,
+                // /api/mesh/status/<node>) require an explicit Read permission on the
+                // node; without this assignment they 403. Mirrors the Customer grant
+                // so the owner has full control of their own endpoint.
+                if (link) {
+                    // The device manages itself; the group owner keeps control.
+                    endpoint_node.assignments = {
+                        {.management_pubkey = norm_pubkey,
+                         .permissions = {"read", "write", "edit_node"}},
+                        {.management_pubkey = link->owner_pubkey,
+                         .permissions = {"read", "write", "add_child", "delete_node",
+                                         "edit_node"}},
+                    };
+                } else {
+                    endpoint_node.assignments = {{
+                        .management_pubkey = norm_pubkey,
+                        .permissions = {"read", "write", "add_child", "delete_node",
+                                        "edit_node"},
+                    }};
+                }
+                endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
+                stamp_endpoint_identity(endpoint_node);
+                if (!ctx_.tree.insert_join_node(endpoint_node)) {
+                    error_response(res, "endpoint identifier conflict", 409);
+                    return;
+                }
+
+                if (link) {
+                    // Pairwise grants so devices in the group can list and dial
+                    // each other (peer reads and connects check the sibling node)
+                    for (const auto& sibling : ctx_.tree.get_children(customer_id)) {
+                        if (sibling.type != tree::NodeType::Endpoint ||
+                            sibling.id == node_id) {
+                            continue;
+                        }
+                        if (!sibling.mgmt_pubkey.empty()) {
+                            ctx_.tree.grant_assignment(node_id, {
+                                .management_pubkey = sibling.mgmt_pubkey,
+                                .permissions       = {"read", "connect_private"},
+                            });
+                        }
+                        ctx_.tree.grant_assignment(sibling.id, {
+                            .management_pubkey = norm_pubkey,
+                            .permissions       = {"read", "connect_private"},
+                        });
+                    }
+                    // Let the device read its group node
+                    ctx_.tree.grant_assignment(customer_id, {
+                        .management_pubkey = norm_pubkey,
+                        .permissions       = {"read"},
+                    });
+                    spdlog::info("[Join] linked device {} into group {} (owner {})",
+                                 node_id, customer_id, link->owner_user_id);
+                }
             }
         }
 

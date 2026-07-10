@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <span>
 #include <string>
 #ifdef _WIN32
 #  include <process.h>
@@ -225,6 +227,70 @@ TEST_F(AuthTest, PasskeyAuthUnknownCredential) {
     };
     auto result = auth->authenticate(req);
     EXPECT_FALSE(result.authenticated);
+}
+
+// --- Token-link device linking ---
+
+TEST_F(AuthTest, LinkTokenMintAndConsume) {
+    auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA",
+                                        "customer-owner", std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    EXPECT_TRUE(minted->first.starts_with("lnk_"));
+    EXPECT_EQ(minted->second.group_node_id, "customer-owner");
+    EXPECT_GT(minted->second.expires_at, minted->second.created_at);
+
+    auto consumed = auth->consume_link_token(minted->first);
+    ASSERT_TRUE(consumed.has_value());
+    EXPECT_EQ(consumed->owner_user_id, "owner-user");
+    EXPECT_EQ(consumed->owner_pubkey, "ed25519:AAAA");
+    EXPECT_EQ(consumed->group_node_id, "customer-owner");
+
+    // Single use — a second consume fails
+    EXPECT_FALSE(auth->consume_link_token(minted->first).has_value());
+}
+
+TEST_F(AuthTest, LinkTokenUnknownRejected) {
+    EXPECT_FALSE(auth->consume_link_token("lnk_deadbeef").has_value());
+    EXPECT_FALSE(auth->consume_link_token("").has_value());
+}
+
+TEST_F(AuthTest, LinkTokenExpiredRejected) {
+    auto minted = auth->mint_link_token("owner-user", "ed25519:BBBB",
+                                        "customer-owner", std::chrono::seconds{60});
+    ASSERT_TRUE(minted.has_value());
+    const auto& token = minted->first;
+
+    // Rewind the stored expiry (tokens are stored hashed by sha256(token))
+    auto hash = crypto->sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(token.data()), token.size()));
+    auto path = temp_dir / "link_tokens"
+              / (crypto::to_hex(std::span<const uint8_t>(hash)) + ".json");
+    ASSERT_TRUE(fs::exists(path));
+    nlohmann::json j;
+    {
+        std::ifstream ifs(path);
+        ifs >> j;
+    }
+    j["expires_at"] = 1;
+    {
+        std::ofstream ofs(path, std::ios::trunc);
+        ofs << j.dump();
+    }
+
+    EXPECT_FALSE(auth->consume_link_token(token).has_value());
+    EXPECT_FALSE(fs::exists(path));  // expired tokens are removed on sight
+}
+
+TEST_F(AuthTest, LinkTokenMintRequiresGroup) {
+    EXPECT_FALSE(auth->mint_link_token("owner-user", "ed25519:CCCC", "",
+                                       std::chrono::seconds{600}).has_value());
+}
+
+TEST_F(AuthTest, TokenLinkIsNotStandaloneAuth) {
+    nlohmann::json req = {{"method", "token-link"}, {"link_token", "lnk_x"}};
+    auto result = auth->authenticate(req);
+    EXPECT_FALSE(result.authenticated);
+    EXPECT_NE(result.error_message.find("/api/join"), std::string::npos);
 }
 
 // --- Service interface ---

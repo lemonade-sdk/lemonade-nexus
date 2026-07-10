@@ -346,6 +346,15 @@ public:
     /// Set the node ID manually.
     void set_node_id(const std::string& id);
 
+    /// Set a single-use device link token to include in the next join_network
+    /// call (obtained out-of-band from an already-joined device).
+    void set_link_token(const std::string& token);
+
+    /// Mint a device link token so another device can join this account's
+    /// group (requires an established mesh session; calls the private API).
+    /// Response JSON: {link_token, group_node_id, expires_at}.
+    [[nodiscard]] Result<nlohmann::json> create_link_token(uint32_t ttl_sec = 600);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

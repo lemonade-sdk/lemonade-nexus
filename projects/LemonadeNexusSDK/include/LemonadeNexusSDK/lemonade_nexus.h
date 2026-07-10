@@ -437,6 +437,14 @@ ln_error_t ln_set_node_id(ln_client_t* client, const char* node_id);
 /** Get the current node ID. Caller must ln_free(). Returns NULL if not set. */
 char* ln_get_node_id(ln_client_t* client);
 
+/** Set a single-use device link token to include in the next ln_join_network. */
+ln_error_t ln_set_link_token(ln_client_t* client, const char* token);
+
+/** Mint a device link token for adding another device to this account's group.
+ *  Requires an established mesh session. Returns {link_token, group_node_id,
+ *  expires_at} JSON. ln_free(*out_json). */
+ln_error_t ln_link_token_create(ln_client_t* client, uint32_t ttl_sec, char** out_json);
+
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC visibility pop
 #endif

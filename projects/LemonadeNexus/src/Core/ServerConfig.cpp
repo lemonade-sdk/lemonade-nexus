@@ -58,6 +58,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"ddns_password",              c.ddns_password},
         {"ddns_update_interval_sec",   c.ddns_update_interval_sec},
         {"ddns_enabled",               c.ddns_enabled},
+        {"open_registration",          c.open_registration},
         {"private_http_port",          c.private_http_port},
         {"require_peer_confirmation",  c.require_peer_confirmation},
         {"enrollment_quorum_ratio",    c.enrollment_quorum_ratio},
@@ -116,6 +117,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_password"))              j.at("ddns_password").get_to(c.ddns_password);
     if (j.contains("ddns_update_interval_sec"))   j.at("ddns_update_interval_sec").get_to(c.ddns_update_interval_sec);
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
+    if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
     if (j.contains("require_peer_confirmation"))  j.at("require_peer_confirmation").get_to(c.require_peer_confirmation);
     if (j.contains("enrollment_quorum_ratio"))  j.at("enrollment_quorum_ratio").get_to(c.enrollment_quorum_ratio);
@@ -188,6 +190,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");
     spdlog::info("  --tls-key-path <path>      Path to TLS private key PEM (manual override)");
     spdlog::info("  --no-auto-tls              Disable automatic TLS certificate via ACME");
+    spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
     spdlog::info("  --tee-platform <name>      Override TEE platform detection (sgx/tdx/sev-snp/secure-enclave)");
@@ -326,6 +329,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_hmac_key = argv[++i];
         } else if (std::strcmp(argv[i], "--no-auto-tls") == 0) {
             config.auto_tls = false;
+        } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
+            config.open_registration = false;
         } else if (std::strcmp(argv[i], "--tls-cert-path") == 0 && i + 1 < argc) {
             config.tls_cert_path = argv[++i];
         } else if (std::strcmp(argv[i], "--tls-key-path") == 0 && i + 1 < argc) {
@@ -381,6 +386,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
     if (std::getenv("SP_NO_AUTO_TLS"))                   config.auto_tls              = false;
+    if (std::getenv("SP_CLOSED_REGISTRATION"))           config.open_registration     = false;
     if (const char* v = std::getenv("SP_TLS_CERT_PATH")) config.tls_cert_path         = v;
     if (const char* v = std::getenv("SP_TLS_KEY_PATH"))  config.tls_key_path          = v;
 
