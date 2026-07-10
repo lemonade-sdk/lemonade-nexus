@@ -310,9 +310,15 @@ struct LemonadeNexusClient::Impl {
         spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> egress {}:{} = 127.0.0.1:{}",
                       method, path, server_tunnel_ip, private_port, lp);
         if (lp == 0) return std::nullopt;
-        try {
-            httplib::SSLClient cli("127.0.0.1", lp);
-            cli.enable_server_certificate_verification(false);
+
+        // The private API follows the public API's scheme: HTTPS in production
+        // (ACME cert on the private FQDN), plain HTTP for a TLS-less local/dev
+        // server. Confidentiality comes from the mesh either way; TLS cert
+        // verification is disabled (the cert is for the FQDN, not 127.0.0.1).
+        const bool tls = !server_pool.empty()
+                       && server_pool[current_server].endpoint.use_tls;
+
+        auto run = [&](auto& cli) -> std::optional<json> {
             cli.set_connection_timeout(config.connect_timeout_sec);
             cli.set_read_timeout(config.read_timeout_sec);
             httplib::Result res = (std::string(method) == "GET")
@@ -331,6 +337,17 @@ struct LemonadeNexusClient::Impl {
             }
             spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} NO RESPONSE "
                          "(httplib err={})", method, path, httplib::to_string(res.error()));
+            return std::nullopt;
+        };
+
+        try {
+            if (tls) {
+                httplib::SSLClient cli("127.0.0.1", lp);
+                cli.enable_server_certificate_verification(false);
+                return run(cli);
+            }
+            httplib::Client cli("127.0.0.1", lp);
+            return run(cli);
         } catch (const std::exception& e) {
             spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} EXCEPTION: {}",
                          method, path, e.what());
@@ -1635,7 +1652,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
 
         // Store SEIP FQDN — this is the server's canonical hostname
         auto srv_seip_fqdn = resp->value("server_seip_fqdn", std::string{});
-        if (!srv_seip_fqdn.empty()) {
+        if (!srv_seip_fqdn.empty() && !impl_->config.pin_server) {
             impl_->server_seip_fqdn = srv_seip_fqdn;
             // Switch public API to use the SEIP hostname (proper cert match)
             auto public_port = static_cast<uint16_t>(impl_->server_pool.empty() ? 9100

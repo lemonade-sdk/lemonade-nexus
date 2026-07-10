@@ -156,7 +156,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                     return;
                 }
             } else {
-                if (!ctx_.config.open_registration &&
+                // Under closed registration a brand-new identity needs a link
+                // token — except the root owner, who bootstraps their own
+                // account (their key already owns root via /api/auth).
+                bool is_root_owner = false;
+                if (auto root = ctx_.tree.get_node("root")) {
+                    is_root_owner = (root->mgmt_pubkey == norm_pubkey);
+                }
+                if (!ctx_.config.open_registration && !is_root_owner &&
                     !ctx_.tree.get_node("customer-" + node_id)) {
                     error_response(res, "registration closed — link token required", 403);
                     return;

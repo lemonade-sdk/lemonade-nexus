@@ -30,6 +30,11 @@ struct ServerConfig {
     /// If true, fetch /api/servers on first connect to discover additional servers.
     bool     auto_discover{true};
 
+    /// If true, keep talking to the configured endpoint after join instead of
+    /// switching the public API to the server's advertised SEIP FQDN. Needed for
+    /// direct-IP / local / TLS-less servers whose SEIP name doesn't resolve.
+    bool     pin_server{false};
+
     /// How often to check server health (seconds). 0 = disabled.
     uint32_t health_check_interval_sec{30};
 
