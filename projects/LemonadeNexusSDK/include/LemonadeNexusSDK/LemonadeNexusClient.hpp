@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace lnsdk {
@@ -354,6 +355,18 @@ public:
     /// group (requires an established mesh session; calls the private API).
     /// Response JSON: {link_token, group_node_id, expires_at}.
     [[nodiscard]] Result<nlohmann::json> create_link_token(uint32_t ttl_sec = 600);
+
+    /// Publish a local service to mesh peers: our mesh IP:vport bridges to
+    /// `target` ("tcp:127.0.0.1:PORT"). Requires an active mesh (join first);
+    /// exposures are remembered and re-applied on re-join.
+    [[nodiscard]] StatusResult expose_service(uint16_t vport, const std::string& target);
+
+    /// Exposures registered via expose_service ({vport, target} pairs).
+    [[nodiscard]] std::vector<std::pair<uint16_t, std::string>> exposed_services() const;
+
+    /// Open (or reuse) a loopback bridge to a mesh peer's dst_ip:dst_port.
+    /// Returns the bound 127.0.0.1 port, or 0 when the mesh is inactive.
+    [[nodiscard]] uint16_t open_egress(const std::string& dst_ip, uint16_t dst_port);
 
 private:
     struct Impl;

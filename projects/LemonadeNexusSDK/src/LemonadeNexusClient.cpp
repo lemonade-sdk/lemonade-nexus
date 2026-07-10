@@ -56,6 +56,7 @@ struct LemonadeNexusClient::Impl {
     std::string  session_token;
     std::string  node_id;
     std::string  link_token;           // single-use device link token for the next join
+    std::vector<std::pair<uint16_t, std::string>> exposed_services;  // vport -> target
     std::string  server_seip_fqdn;     // e.g. "<id>.<region>.seip.lemonade-nexus.io" — public API after join
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
     std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTPS fallback
@@ -596,6 +597,42 @@ Result<nlohmann::json> LemonadeNexusClient::create_link_token(uint32_t ttl_sec) 
     result.ok    = true;
     result.value = *resp;
     return result;
+}
+
+StatusResult LemonadeNexusClient::expose_service(uint16_t vport, const std::string& target) {
+    StatusResult result;
+    if (vport == 0 || target.empty()) {
+        result.error = "vport and target required";
+        return result;
+    }
+    if (!impl_->meshplane.is_active()) {
+        result.error = "mesh dataplane not active — join first";
+        return result;
+    }
+    if (!impl_->meshplane.tcp_ingress(vport, target)) {
+        result.error = "failed to register ingress forward";
+        return result;
+    }
+    {
+        std::lock_guard lock(impl_->mutex);
+        auto& v = impl_->exposed_services;
+        bool known = false;
+        for (const auto& e : v) {
+            if (e.first == vport && e.second == target) { known = true; break; }
+        }
+        if (!known) v.emplace_back(vport, target);
+    }
+    result.ok = true;
+    return result;
+}
+
+std::vector<std::pair<uint16_t, std::string>> LemonadeNexusClient::exposed_services() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->exposed_services;
+}
+
+uint16_t LemonadeNexusClient::open_egress(const std::string& dst_ip, uint16_t dst_port) {
+    return impl_->meshplane.tcp_egress(dst_ip, dst_port);
 }
 
 // ---------------------------------------------------------------------------
@@ -1653,6 +1690,19 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
         if (!impl_->meshplane.start(bt)) {
             spdlog::warn("[LemonadeNexusClient] mesh dataplane start failed");
+        } else {
+            // Re-apply service exposures registered before a re-join
+            std::vector<std::pair<uint16_t, std::string>> exposures;
+            {
+                std::lock_guard lock(impl_->mutex);
+                exposures = impl_->exposed_services;
+            }
+            for (const auto& [vport, target] : exposures) {
+                if (!impl_->meshplane.tcp_ingress(vport, target)) {
+                    spdlog::warn("[LemonadeNexusClient] re-exposing {} -> {} failed",
+                                 vport, target);
+                }
+            }
         }
     }
 

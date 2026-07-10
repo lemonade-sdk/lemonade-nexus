@@ -445,6 +445,15 @@ ln_error_t ln_set_link_token(ln_client_t* client, const char* token);
  *  expires_at} JSON. ln_free(*out_json). */
 ln_error_t ln_link_token_create(ln_client_t* client, uint32_t ttl_sec, char** out_json);
 
+/** Publish a local service to mesh peers: our mesh IP:vport bridges to `target`
+ *  ("tcp:127.0.0.1:PORT"). Requires an active mesh; re-applied on re-join. */
+ln_error_t ln_mesh_expose_service(ln_client_t* client, uint16_t vport, const char* target);
+
+/** Open (or reuse) a loopback bridge to a mesh peer's dst_ip:dst_port.
+ *  On success *out_port is the bound 127.0.0.1 port to dial. */
+ln_error_t ln_mesh_open_egress(ln_client_t* client, const char* dst_ip,
+                               uint16_t dst_port, uint16_t* out_port);
+
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC visibility pop
 #endif
