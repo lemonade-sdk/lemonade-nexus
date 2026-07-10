@@ -49,6 +49,10 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND NOT DEFINED CMAKE_POLICY_VERSION_
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 endif()
 
+# Skip TPM attestation and its dynamic deps (json-c, libcurl, libuuid) —
+# intended for the Lemonade sidecar and embeddable profiles
+option(LEMONADE_NEXUS_MINIMAL_DEPS "Build without TPM FAPI support" OFF)
+
 include(libraries/tss2-fapi)      # TPM2 Feature API (Linux only; no-op elsewhere)
 include(libraries/openssl)        # Must come before httplib and jwt-cpp (they depend on OpenSSL)
 include(libraries/asio)
@@ -73,7 +77,8 @@ add_subdirectory(projects/LemonadeNexusSDK)
 #-----------------------------------------------------------------------------
 # Tests (optional, enabled by default)
 #-----------------------------------------------------------------------------
-option(BUILD_TESTING "Build unit and integration tests" ON)
+# Tests default off when embedded in a parent project (e.g. Lemonade)
+option(BUILD_TESTING "Build unit and integration tests" ${PROJECT_IS_TOP_LEVEL})
 if(BUILD_TESTING)
     include(libraries/googletest)
     enable_testing()
@@ -83,4 +88,7 @@ endif()
 #-----------------------------------------------------------------------------
 # Packaging (CPack)
 #-----------------------------------------------------------------------------
-include(packaging)
+# CPack config only makes sense when this repo is the build's top level
+if(PROJECT_IS_TOP_LEVEL)
+    include(packaging)
+endif()
