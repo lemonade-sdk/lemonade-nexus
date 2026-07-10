@@ -78,6 +78,7 @@ include(libraries/virtual-netstack)
 #-----------------------------------------------------------------------------
 add_subdirectory(projects/LemonadeNexus)
 add_subdirectory(projects/LemonadeNexusSDK)
+add_subdirectory(projects/LemonadeNexusSidecar)
 
 #-----------------------------------------------------------------------------
 # Tests (optional, enabled by default)
