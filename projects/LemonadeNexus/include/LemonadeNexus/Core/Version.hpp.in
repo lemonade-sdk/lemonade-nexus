@@ -1,0 +1,11 @@
+#pragma once
+
+// Generated from Version.hpp.in by CMake — do not edit.
+
+namespace nexus::core {
+
+inline constexpr const char* kVersion = "@NEXUS_VERSION@";
+inline constexpr const char* kGitCommit = "@NEXUS_GIT_COMMIT@";
+inline constexpr int kSidecarApiVersion = @NEXUS_API_VERSION@;
+
+}  // namespace nexus::core

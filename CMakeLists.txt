@@ -6,7 +6,10 @@ if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(Lemonade_Nexus LANGUAGES C CXX)
+# Single source of truth for the release version (see also cmake/version.cmake)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" LEMONADE_NEXUS_VERSION LIMIT_COUNT 1)
+
+project(Lemonade_Nexus VERSION ${LEMONADE_NEXUS_VERSION} LANGUAGES C CXX)
 
 #-----------------------------------------------------------------------------
 # Project-wide Settings
@@ -40,6 +43,8 @@ if(CCACHE_FOUND)
 endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
+
+include(version)   # NEXUS_VERSION / NEXUS_GIT_COMMIT / NEXUS_API_VERSION
 
 #-----------------------------------------------------------------------------
 # Libraries
