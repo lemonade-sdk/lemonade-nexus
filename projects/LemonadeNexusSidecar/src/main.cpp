@@ -100,6 +100,7 @@ struct SidecarConfig {
     uint16_t    control_port{9110};            // localhost-only control API
     long        parent_pid{0};
     std::string log_level{"info"};
+    bool        pin_server{false};             // keep the configured endpoint (no SEIP switch)
 };
 
 std::optional<ExposeMapping> parse_expose(const std::string& spec) {
@@ -154,6 +155,7 @@ void apply_env(SidecarConfig& cfg) {
     if (const char* v = std::getenv("LN_SIDECAR_EXPOSE")) {
         if (auto m = parse_expose(v)) cfg.exposes.push_back(*m);
     }
+    if (std::getenv("LN_SIDECAR_PIN_SERVER"))         cfg.pin_server = true;
     if (const char* v = std::getenv("SP_PARENT_PID")) cfg.parent_pid = std::atol(v);
     if (const char* v = std::getenv("SP_LOG_LEVEL"))  cfg.log_level = v;
 }
@@ -166,6 +168,8 @@ void print_usage(const char* prog) {
         "Options:\n"
         "  --server <host:port>    Nexus server public API (default 127.0.0.1:9100)\n"
         "  --tls                   Use HTTPS for the public API\n"
+        "  --pin-server            Keep the configured endpoint (no SEIP switch;\n"
+        "                          automatic when --tls is not set)\n"
         "  --identity <path>       Ed25519 identity file (default <data-root>/identity.json)\n"
         "  --data-root <path>      State directory (default ./nexus-sidecar)\n"
         "  --link-token <token>    Single-use device link token (first join)\n"
@@ -222,6 +226,8 @@ SidecarConfig load_config(int argc, char* argv[], bool& want_exit) {
             }
         } else if (std::strcmp(argv[i], "--tls") == 0) {
             cfg.use_tls = true;
+        } else if (std::strcmp(argv[i], "--pin-server") == 0) {
+            cfg.pin_server = true;
         } else if (const char* v2 = next("--identity")) {
             cfg.identity_path = v2;
         } else if (const char* v3 = next("--data-root")) {
@@ -288,6 +294,9 @@ int main(int argc, char* argv[]) {
     }
 
     lnsdk::ServerConfig sc(cfg.host, cfg.port, cfg.use_tls);
+    // Pin explicitly, or automatically for a TLS-less (local/direct) server whose
+    // advertised SEIP FQDN won't resolve.
+    sc.pin_server = cfg.pin_server || !cfg.use_tls;
     lnsdk::LemonadeNexusClient client{sc};
     client.set_identity(identity);
     if (!cfg.link_token.empty()) client.set_link_token(cfg.link_token);
@@ -328,6 +337,43 @@ int main(int argc, char* argv[]) {
             {"exposed", exposed},
         };
         res.set_content(j.dump(), "application/json");
+    });
+    // Mint a device link token for adding another device to this account
+    // (the host app shows it as a QR / copies it into the new device's config).
+    control.Post("/link-token", [&](const httplib::Request& req, httplib::Response& res) {
+        uint32_t ttl_sec = 600;
+        if (!req.body.empty()) {
+            auto j = nlohmann::json::parse(req.body, nullptr, false);
+            if (!j.is_discarded()) ttl_sec = j.value("ttl_sec", ttl_sec);
+        }
+        auto result = client.create_link_token(ttl_sec);
+        if (!result.ok) {
+            res.status = 502;
+            res.set_content(nlohmann::json{{"error", result.error}}.dump(),
+                            "application/json");
+            return;
+        }
+        res.set_content(result.value.dump(), "application/json");
+    });
+    // Open a loopback bridge to a peer's mesh service; the host app dials the
+    // returned 127.0.0.1 port.
+    control.Post("/egress", [&](const httplib::Request& req, httplib::Response& res) {
+        auto j = nlohmann::json::parse(req.body, nullptr, false);
+        if (j.is_discarded() || !j.contains("ip") || !j.contains("port")) {
+            res.status = 400;
+            res.set_content(R"({"error":"expected {ip, port}"})", "application/json");
+            return;
+        }
+        uint16_t lp = client.open_egress(j.at("ip").get<std::string>(),
+                                         j.at("port").get<uint16_t>());
+        if (lp == 0) {
+            res.status = 502;
+            res.set_content(R"({"error":"mesh inactive or egress failed"})",
+                            "application/json");
+            return;
+        }
+        res.set_content(nlohmann::json{{"loopback_port", lp}}.dump(),
+                        "application/json");
     });
 
     std::thread control_thread([&] {
@@ -409,18 +455,26 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        // Supervise: refresh status and detect a dropped tunnel.
+        // Supervise. The dataplane being active is the real liveness signal
+        // (mesh_status().is_up reflects the orchestrator's peer-refresh state,
+        // which lags and would cause spurious teardowns). The SDK's MeshOrchestrator
+        // handles peer refresh, heartbeat and server-pool failover internally; we
+        // only re-join if the dataplane itself is gone.
+        // TODO: detect a silently-dead server (dataplane stays "active" on a local
+        // UDP socket) via a periodic private-API probe over the mesh, then re-join.
         auto status = client.mesh_status();
+        bool active = client.is_mesh_active();
         {
             std::lock_guard lock(state.mtx);
-            state.mesh_up    = status.is_up;
+            state.mesh_up    = active;
             state.peer_count = status.peer_count;
         }
-        if (!status.is_up) {
-            spdlog::warn("Mesh tunnel down — re-joining");
+
+        if (!active) {
+            spdlog::warn("Mesh dataplane down — re-joining");
             set_status("degraded");
             client.disable_mesh();
-            joined = false;  // re-join on the next iteration (exposures re-apply)
+            joined = false;  // exposures re-apply on the next join
             continue;
         }
         set_status("running");
