@@ -686,9 +686,6 @@ int main(int argc, char* argv[]) {
                       bridge_target);
     }
 
-    auto& private_srv = private_http_server
-        ? private_http_server->server()
-        : http_server.server();
     if (!private_http_server) {
         spdlog::warn("SECURITY: No tunnel_bind_ip configured — private API routes "
                      "are exposed on the public HTTP server. Set a tunnel IP to "
@@ -706,10 +703,6 @@ int main(int argc, char* argv[]) {
         }
         return httplib::Server::HandlerResponse::Unhandled;
     };
-    http_server.server().set_pre_routing_handler(rate_limit_handler);
-    if (private_http_server) {
-        private_http_server->server().set_pre_routing_handler(rate_limit_handler);
-    }
 
     // ========================================================================
     // Server onboarding (admission of new servers over the public API)
@@ -777,6 +770,14 @@ int main(int argc, char* argv[]) {
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
     // a background ACME cert is issued).
     auto register_public_routes = [&]() {
+        // Resolved on every call: upgrade_to_tls replaces the server object,
+        // invalidating both the registered routes and the pre-routing handler
+        auto& private_srv = private_http_server ? private_http_server->server()
+                                                : http_server.server();
+        http_server.server().set_pre_routing_handler(rate_limit_handler);
+        if (private_http_server) {
+            private_srv.set_pre_routing_handler(rate_limit_handler);
+        }
         public_api.register_routes(http_server.server(), private_srv);
         auth_api.register_routes(http_server.server(), private_srv);
         tree_api.register_routes(http_server.server(), private_srv);
