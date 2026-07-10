@@ -3,7 +3,7 @@ include(FetchContent)
 FetchContent_Declare(
         jwt-cpp
         GIT_REPOSITORY https://github.com/Thalhammer/jwt-cpp.git
-        GIT_TAG v0.7.0
+        GIT_TAG 08bcf77a687fb06e34138e9e9fa12a4ecbe12332  # v0.7.0
 )
 # Use EXCLUDE_FROM_ALL to prevent jwt-cpp's install() targets from polluting packages.
 # FetchContent_MakeAvailable doesn't support EXCLUDE_FROM_ALL until CMake 3.28,

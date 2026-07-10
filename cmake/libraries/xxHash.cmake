@@ -3,7 +3,7 @@ include(FetchContent)
 FetchContent_Declare(
         xxhash
         GIT_REPOSITORY https://github.com/Cyan4973/xxHash.git
-        GIT_TAG v0.8.3
+        GIT_TAG e626a72bc2321cd320e953a0ccf1584cad60f363  # v0.8.3
         OVERRIDE_FIND_PACKAGE
         SOURCE_DIR ${FETCHCONTENT_BASE_DIR}/xxhash/include/xxhash
 )

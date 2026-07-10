@@ -11,7 +11,7 @@ include(FetchContent)
 # --- Corrosion: CMake integration for Rust ---
 FetchContent_Declare(corrosion
     GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG        v0.5.1
+    GIT_TAG        b1fab721655c5c4b1b08a083d3cd29f163af75d0  # v0.5.1
 )
 
 # Probe Rust with the static CRT so Corrosion links libcmt (not msvcrt) under /MT

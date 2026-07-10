@@ -4,7 +4,7 @@ include(FetchContent)
 
 FetchContent_Declare(Sodium
     GIT_REPOSITORY https://github.com/robinlinden/libsodium-cmake.git
-    GIT_TAG efe978b57451  # libsodium 1.0.20
+    GIT_TAG efe978b574516d7708c0feeb5231cf7ab4906283  # libsodium 1.0.20
 )
 set(SODIUM_DISABLE_TESTS ON)
 FetchContent_MakeAvailable(Sodium)
