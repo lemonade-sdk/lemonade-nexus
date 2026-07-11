@@ -1,11 +1,13 @@
 #include <LemonadeNexus/Api/OnboardApiHandler.hpp>
 
+#include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -78,6 +80,18 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
 
 void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
     auto& admission = ctx_.admission;
+
+    // Admitting servers into the mesh is a root-admin action; a valid JWT alone
+    // is not enough.
+    auto require_admin = [this](const auth::SessionClaims& claims,
+                                httplib::Response& res) -> bool {
+        if (ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), "root",
+                                       acl::Permission::Admin)) {
+            return true;
+        }
+        error_response(res, "admin authorization required", 403);
+        return false;
+    };
 
     // ── GET /api/onboard/info (public) ──────────────────────────────────────
     pub.Get("/api/onboard/info", [this, &admission](const httplib::Request&,
@@ -171,8 +185,9 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
 
     // ── GET /api/onboard/pending (private, JWT) ─────────────────────────────
     priv.Get("/api/onboard/pending", auth::require_auth(ctx_.auth,
-        [this, &admission](const httplib::Request&, httplib::Response& res,
-                           const auth::SessionClaims&) {
+        [this, &admission, require_admin](const httplib::Request&, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& a : admission.pending()) {
             arr.push_back({
@@ -191,8 +206,9 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
 
     // ── POST /api/onboard/approve/<id> (private, JWT) ───────────────────────
     priv.Post(R"(/api/onboard/approve/([a-f0-9]+))", auth::require_auth(ctx_.auth,
-        [this, &admission](const httplib::Request& req, httplib::Response& res,
-                           const auth::SessionClaims&) {
+        [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
         auto body = parse_body(req, res);
         if (!body) return;
         auto request_id = req.matches[1];
@@ -205,8 +221,9 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
 
     // ── POST /api/onboard/deny/<id> (private, JWT) ──────────────────────────
     priv.Post(R"(/api/onboard/deny/([a-f0-9]+))", auth::require_auth(ctx_.auth,
-        [this, &admission](const httplib::Request& req, httplib::Response& res,
-                           const auth::SessionClaims&) {
+        [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
         auto body = parse_body(req, res);
         if (!body) return;
         auto request_id = req.matches[1];
