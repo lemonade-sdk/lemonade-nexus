@@ -19,6 +19,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -95,6 +96,7 @@ struct SidecarConfig {
     std::string link_token;
     std::vector<ExposeMapping> exposes;
     uint16_t    control_port{9110};
+    std::string control_token;                 // bearer required by the control API (disabled if empty)
     long        parent_pid{0};
     std::string log_level{"info"};
     bool        pin_server{false};             // keep the configured endpoint (no SEIP switch)
@@ -127,6 +129,7 @@ void apply_json_config(SidecarConfig& cfg, const nlohmann::json& j) {
     if (j.contains("data_root"))    cfg.data_root     = j.at("data_root").get<std::string>();
     if (j.contains("link_token"))   cfg.link_token    = j.at("link_token").get<std::string>();
     if (j.contains("control_port")) cfg.control_port  = j.at("control_port").get<uint16_t>();
+    if (j.contains("control_token")) cfg.control_token = j.at("control_token").get<std::string>();
     if (j.contains("log_level"))    cfg.log_level     = j.at("log_level").get<std::string>();
     if (j.contains("expose") && j.at("expose").is_array()) {
         for (const auto& e : j.at("expose")) {
@@ -149,6 +152,7 @@ void apply_env(SidecarConfig& cfg) {
     if (const char* v = std::getenv("LN_SIDECAR_LINK_TOKEN")) cfg.link_token = v;
     if (const char* v = std::getenv("LN_SIDECAR_CONTROL_PORT"))
         cfg.control_port = static_cast<uint16_t>(std::atoi(v));
+    if (const char* v = std::getenv("LN_SIDECAR_CONTROL_TOKEN")) cfg.control_token = v;
     if (const char* v = std::getenv("LN_SIDECAR_EXPOSE")) {
         if (auto m = parse_expose(v)) cfg.exposes.push_back(*m);
     }
@@ -172,6 +176,7 @@ void print_usage(const char* prog) {
         "  --link-token <token>    Single-use device link token (first join)\n"
         "  --expose <vport:local>  Publish 127.0.0.1:local at <mesh_ip>:vport (repeatable)\n"
         "  --control-port <N>      Localhost control API port (default 9110)\n"
+        "  --control-token <tok>   Bearer required by all control endpoints (API off if unset)\n"
         "  --parent-pid <pid>      Exit when this process disappears\n"
         "  --config <path>         JSON config file (CLI and env override it)\n"
         "  --log-level <level>     trace/debug/info/warn/error\n"
@@ -240,6 +245,8 @@ SidecarConfig load_config(int argc, char* argv[], bool& want_exit) {
             cfg.parent_pid = std::atol(v7);
         } else if (const char* v8 = next("--log-level")) {
             cfg.log_level = v8;
+        } else if (const char* v9 = next("--control-token")) {
+            cfg.control_token = v9;
         } else if (next("--config")) {
             // already handled
         }
@@ -301,7 +308,34 @@ int main(int argc, char* argv[]) {
     SidecarState state;
 
     // --- Localhost control API (parent health-checks this) ------------------
+    // Loopback is not an authorization boundary: any local process (or a browser
+    // via DNS-rebinding) can reach it. Every endpoint requires the bearer token
+    // the parent passes in; with no token configured the control API serves
+    // nothing.
     httplib::Server control;
+    control.set_pre_routing_handler(
+        [&cfg](const httplib::Request& req, httplib::Response& res) {
+        if (req.has_header("Origin")) {  // block browser (DNS-rebinding/CSRF) callers
+            res.status = 403;
+            res.set_content(R"({"error":"origin not allowed"})", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        if (cfg.control_token.empty()) {
+            res.status = 503;
+            res.set_content(R"({"error":"control API disabled: no control token configured"})",
+                            "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        const auto& h = req.get_header_value("Authorization");
+        constexpr std::string_view bearer = "Bearer ";
+        if (h.size() <= bearer.size() || h.compare(0, bearer.size(), bearer) != 0 ||
+            h.substr(bearer.size()) != cfg.control_token) {
+            res.status = 401;
+            res.set_content(R"({"error":"control token required"})", "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
     control.Get("/version", [](const httplib::Request&, httplib::Response& res) {
         nlohmann::json j = {{"service", "lemonade-nexus-sidecar"},
                             {"version", NEXUS_VERSION},
