@@ -1,10 +1,9 @@
 # =============================================================================
-# Version identity — NEXUS_VERSION, NEXUS_GIT_COMMIT, NEXUS_API_VERSION
+# Version identity for the build and the generated Version.hpp.
 # =============================================================================
-# Precedence: -D override → git metadata → VERSION file. Overrides let a parent
-# project (Lemonade) or release CI pin exact values for reproducible builds.
+# Overrides let a parent project (Lemonade) or release CI pin exact values.
 
-# Release CI already passes GIT_TAG_OVERRIDE (see packaging.cmake); reuse it
+# Release CI already passes GIT_TAG_OVERRIDE (see packaging.cmake); reuse it.
 if(GIT_TAG_OVERRIDE AND NOT NEXUS_VERSION_OVERRIDE)
     set(NEXUS_VERSION_OVERRIDE "${GIT_TAG_OVERRIDE}")
 endif()
@@ -46,11 +45,10 @@ else()
     endif()
 endif()
 
-# Re-run configure when the version inputs change
 set_property(DIRECTORY "${PROJECT_SOURCE_DIR}" APPEND PROPERTY
     CMAKE_CONFIGURE_DEPENDS VERSION API_VERSION)
 
-# Sidecar-facing HTTP API version — bump only on incompatible changes
+# Bump only on incompatible changes to the sidecar-facing HTTP surface.
 file(STRINGS "${PROJECT_SOURCE_DIR}/API_VERSION" NEXUS_API_VERSION LIMIT_COUNT 1)
 if(NOT NEXUS_API_VERSION MATCHES "^[0-9]+$")
     message(FATAL_ERROR "API_VERSION must be a single integer, got '${NEXUS_API_VERSION}'")

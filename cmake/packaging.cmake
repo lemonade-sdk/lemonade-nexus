@@ -15,8 +15,7 @@
 set(CPACK_PACKAGE_NAME "lemonade-nexus")
 set(CPACK_PACKAGE_VENDOR "Lemonade-Nexus")
 
-# Derive version from git tag (e.g. v0.3.0-alpha -> 0.3.0-alpha), fallback to
-# the VERSION file (via project())
+# Default from the VERSION file (via project()); overridden below for CI/tags.
 set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
 set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})

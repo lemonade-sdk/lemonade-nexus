@@ -27,7 +27,7 @@ corrosion_import_crate(
     PROFILE       release
 )
 
-# Match rustc to the static CRT (/MT) so the final link uses a single runtime
+# Same crt-static flag for the crate's own build.
 if(MSVC AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
     corrosion_add_target_rustflags(lemonade_boringtun_ffi "-Ctarget-feature=+crt-static")
 endif()

@@ -21,8 +21,7 @@ jobs:
             platform: darwin-arm64
           - os: windows-2022
             platform: windows-x86_64
-          # Same configuration Lemonade uses to build the bundled sidecar:
-          # VS generator, no vcvars, /MT against static OpenSSL
+          # Mirrors how Lemonade builds the bundled sidecar.
           - os: windows-2022
             platform: windows-x86_64-vs
             vs_generator: true

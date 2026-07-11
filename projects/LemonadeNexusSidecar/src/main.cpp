@@ -1,9 +1,6 @@
-// lemonade-nexus-sidecar — a headless mesh client for embedding in a host app
-// (e.g. Lemonade's lemond). It joins a Nexus mesh using the SDK's fully
-// userspace dataplane (no TUN, no admin), publishes one or more of the host's
-// local services to authorized mesh peers, and exposes a localhost-only control
-// API the parent process health-checks. It stays alive across server outages by
-// re-joining, and exits when its parent process disappears.
+// Headless mesh client for embedding in a host app (e.g. Lemonade's lemond):
+// joins a mesh over the SDK's userspace dataplane, publishes the host's local
+// services to mesh peers, and serves a localhost control API the parent polls.
 
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
@@ -58,7 +55,7 @@ void request_stop() {
 
 extern "C" void handle_signal(int) { request_stop(); }
 
-/// Sleep up to `d`, waking early on shutdown. Returns false if stopping.
+/// Returns false if shutdown was requested during the wait.
 bool interruptible_sleep(std::chrono::milliseconds d) {
     std::unique_lock lock(g_stop_mtx);
     g_stop_cv.wait_for(lock, d, [] { return g_stop.load(); });
@@ -68,7 +65,7 @@ bool interruptible_sleep(std::chrono::milliseconds d) {
 // --- Parent-process liveness (closes the orphan gap on all platforms) -------
 
 bool parent_alive(long parent_pid) {
-    if (parent_pid <= 0) return true;  // not tracking a parent
+    if (parent_pid <= 0) return true;  // no parent to track
 #ifdef _WIN32
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
                            static_cast<DWORD>(parent_pid));
@@ -93,11 +90,11 @@ struct SidecarConfig {
     std::string host{"127.0.0.1"};
     uint16_t    port{9100};
     bool        use_tls{false};
-    std::string identity_path;                 // default: <data_root>/identity.json
+    std::string identity_path;
     std::string data_root{"nexus-sidecar"};
     std::string link_token;
     std::vector<ExposeMapping> exposes;
-    uint16_t    control_port{9110};            // localhost-only control API
+    uint16_t    control_port{9110};
     long        parent_pid{0};
     std::string log_level{"info"};
     bool        pin_server{false};             // keep the configured endpoint (no SEIP switch)
@@ -338,8 +335,7 @@ int main(int argc, char* argv[]) {
         };
         res.set_content(j.dump(), "application/json");
     });
-    // Mint a device link token for adding another device to this account
-    // (the host app shows it as a QR / copies it into the new device's config).
+    // Mint a device link token so another device can join this account.
     control.Post("/link-token", [&](const httplib::Request& req, httplib::Response& res) {
         uint32_t ttl_sec = 600;
         if (!req.body.empty()) {
@@ -355,8 +351,7 @@ int main(int argc, char* argv[]) {
         }
         res.set_content(result.value.dump(), "application/json");
     });
-    // Open a loopback bridge to a peer's mesh service; the host app dials the
-    // returned 127.0.0.1 port.
+    // Bridge a peer's mesh service to a loopback port the host app can dial.
     control.Post("/egress", [&](const httplib::Request& req, httplib::Response& res) {
         auto j = nlohmann::json::parse(req.body, nullptr, false);
         if (j.is_discarded() || !j.contains("ip") || !j.contains("port")) {

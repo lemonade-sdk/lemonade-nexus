@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.25.1)
 
-# Headless mesh-client binary that embeds the SDK. Links the LemonadeNexusSDK
-# static library (built by projects/LemonadeNexusSDK) plus its transitive deps
-# (httplib, sodium, boringtun, virtual-netstack, OpenSSL).
-
+# Headless mesh-client binary that embeds the SDK.
 add_executable(LemonadeNexusSidecar src/main.cpp)
 set_target_properties(LemonadeNexusSidecar PROPERTIES OUTPUT_NAME "lemonade-nexus-sidecar")
 

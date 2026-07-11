@@ -40,5 +40,3 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
     target_compile_definitions(sodium PRIVATE HAVE_ARMCRYPTO=1)
     target_compile_options(sodium PRIVATE -march=armv8-a+crypto)
 endif()
-
-# Target: sodium

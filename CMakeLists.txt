@@ -1,12 +1,10 @@
 cmake_minimum_required(VERSION 3.25.1)
 
-# Use static runtime library on Windows to avoid DLL dependencies
-# (a parent project or -D on the command line takes precedence)
+# Static runtime on Windows to avoid a VC++ redistributable dependency.
 if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Single source of truth for the release version (see also cmake/version.cmake)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" LEMONADE_NEXUS_VERSION LIMIT_COUNT 1)
 
 project(Lemonade_Nexus VERSION ${LEMONADE_NEXUS_VERSION} LANGUAGES C CXX)
@@ -27,7 +25,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Set build-type specific compiler flags (MSVC keeps CMake's /O2 defaults)
+# GNU-style flags only; MSVC would discard its own /O2 defaults for these.
 if(NOT MSVC)
     set(CMAKE_CXX_FLAGS_DEBUG "-g")
     set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
@@ -44,7 +42,7 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
 
-include(version)   # NEXUS_VERSION / NEXUS_GIT_COMMIT / NEXUS_API_VERSION
+include(version)
 
 #-----------------------------------------------------------------------------
 # Libraries
@@ -54,8 +52,8 @@ if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0 AND NOT DEFINED CMAKE_POLICY_VERSION_
     set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 endif()
 
-# Skip TPM attestation and its dynamic deps (json-c, libcurl, libuuid) —
-# intended for the Lemonade sidecar and embeddable profiles
+# Also drops the tss2 transitive deps (json-c, libcurl, libuuid) for the
+# sidecar/embeddable profiles.
 option(LEMONADE_NEXUS_MINIMAL_DEPS "Build without TPM FAPI support" OFF)
 
 include(libraries/tss2-fapi)      # TPM2 Feature API (Linux only; no-op elsewhere)
@@ -83,7 +81,7 @@ add_subdirectory(projects/LemonadeNexusSidecar)
 #-----------------------------------------------------------------------------
 # Tests (optional, enabled by default)
 #-----------------------------------------------------------------------------
-# Tests default off when embedded in a parent project (e.g. Lemonade)
+# Off by default when embedded in a parent project.
 option(BUILD_TESTING "Build unit and integration tests" ${PROJECT_IS_TOP_LEVEL})
 if(BUILD_TESTING)
     include(libraries/googletest)
@@ -94,7 +92,6 @@ endif()
 #-----------------------------------------------------------------------------
 # Packaging (CPack)
 #-----------------------------------------------------------------------------
-# CPack config only makes sense when this repo is the build's top level
 if(PROJECT_IS_TOP_LEVEL)
     include(packaging)
 endif()

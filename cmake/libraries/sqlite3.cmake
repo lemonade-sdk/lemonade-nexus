@@ -27,5 +27,3 @@ target_compile_definitions(sqlite3_lib PRIVATE
     SQLITE_USE_ALLOCA
 )
 add_library(sqlite3 ALIAS sqlite3_lib)
-
-# Target: sqlite3
