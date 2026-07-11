@@ -35,10 +35,11 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps
-          # Keyed by platform: FetchContent sub-builds record the generator
-          key: fetchcontent-${{ matrix.platform }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          # Keyed by generator: FetchContent sub-builds record it, and the two
+          # Windows jobs must not restore each other's cache.
+          key: fetchcontent-${{ matrix.os }}-${{ matrix.vs_generator && 'vs' || 'ninja' }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
           restore-keys: |
-            fetchcontent-${{ matrix.platform }}-
+            fetchcontent-${{ matrix.os }}-${{ matrix.vs_generator && 'vs' || 'ninja' }}-
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
