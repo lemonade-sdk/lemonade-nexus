@@ -299,18 +299,24 @@ file copying. The candidate proves it holds its gossip key, the mesh decides
 whether to admit it, and on approval the root-signed certificate is delivered
 back and installed automatically.
 
+Onboarding **requires the mesh root pubkey up front** (`--root-pubkey`,
+printed by the genesis at `--first-run`). The response can only confirm that
+pinned key — a server that delivers a different root is rejected, so an
+intermediary can never hand the candidate a substitute trust anchor.
+
 ```bash
 # On the new server. Give it a mesh server to contact (or omit the address to
 # discover one via the region's DNS tier records).
 ./build/projects/LemonadeNexus/lemonade-nexus \
     --onboard-server <genesis-host>:9100 \
+    --root-pubkey <mesh-root-pubkey-hex> \
     --onboard-id aws-use1-a \
     --data-root ./data
 ```
 
 The command initializes the data directory if needed, prints the candidate's
 key fingerprint, requests admission, waits for the decision, then writes
-`identity/server_cert.json` and records the mesh `root_pubkey` + seed peers
+`identity/server_cert.json` and records the pinned `root_pubkey` + seed peers
 into the config file before exiting. Start the server normally afterwards:
 
 ```bash
@@ -320,9 +326,8 @@ into the config file before exiting. Start the server normally afterwards:
 **How admission is decided**
 
 - **Small mesh (below the Tier-1 vote threshold, default 6):** the genesis
-  server has sole discretion. The **first** server to ever join is
-  auto-approved to bootstrap the mesh; after that, an admin approves each
-  request, confirming the candidate's fingerprint out of band:
+  server has sole discretion. By default every request waits for an admin to
+  approve it, confirming the candidate's fingerprint out of band:
 
   ```bash
   # On the genesis (private API, over the tunnel/loopback; needs an admin JWT)
@@ -332,11 +337,28 @@ into the config file before exiting. Start the server normally afterwards:
        -d '{"fingerprint":"<candidate-fingerprint>"}'
   ```
 
-  Auto-approve disarms itself permanently once the first admission is approved.
-  Disable it up front with `onboard_auto_approve_bootstrap: false`.
+  For unattended joins, mint a **single-use enrollment token** on the root
+  server and hand it to the candidate out of band. A valid token admits the
+  request immediately and is consumed; tokens expire (default 10 min, max 1 h)
+  and can be bound to the candidate's gossip pubkey so nobody else can spend
+  them — recommended on untrusted networks:
+
+  ```bash
+  # On the root server (locally; works while the daemon is running)
+  ./lemonade-nexus --mint-admission-token \
+      --token-candidate <candidate-gossip-pubkey-b64>   # optional bind
+  # ...or over the private API with a root-admin JWT:
+  curl -X POST http://127.0.0.1:9101/api/onboard/token \
+       -H 'Authorization: Bearer <admin-jwt>' -d '{"ttl_sec":600}'
+
+  # On the joining server
+  ./lemonade-nexus --onboard-server <genesis-host>:9100 \
+      --root-pubkey <mesh-root-pubkey-hex> --onboard-token adm_...
+  ```
 
 - **Hardened mesh (≥6 Tier-1 servers):** admission requires a 75% vote of the
   Tier-1 peers (`admission_quorum_ratio`), carried over the gossip layer.
+  Enrollment tokens are not honored in this regime — the quorum governs.
 
 `<server-id>` becomes the server's name across the mesh (DNS records, IPAM), so
 keep it a short, unique, DNS-friendly label like `aws-use1-a`. On cloud hosts

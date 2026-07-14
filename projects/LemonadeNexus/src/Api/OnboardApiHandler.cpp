@@ -3,6 +3,7 @@
 #include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
+#include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
@@ -47,11 +48,13 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
     bundle["state"] = "approved";
     bundle["certificate"] = nlohmann::json::parse(cert_json, nullptr, false);
 
-    // Root anchor as hex — this is what the candidate persists as --root-pubkey.
+    // Root anchor as hex, sourced from the configured trust anchor — NOT from
+    // whichever local identity handled the request. This is what the candidate
+    // persists as --root-pubkey. (Issuance is gated on being the root holder, so
+    // these coincide, but the anchor is the authoritative source.)
+    bundle["root_pubkey"] = ctx_.config.root_pubkey;
+    // Server mesh WG pubkey (X25519), for the candidate's optional handshake probe.
     if (auto pk = ctx_.key_wrapping.load_identity_pubkey()) {
-        bundle["root_pubkey"] = crypto::to_hex(
-            std::span<const uint8_t>(pk->data(), pk->size()));
-        // Server mesh WG pubkey (X25519), for the candidate's optional handshake probe.
         auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*pk);
         bundle["wg_server_pubkey"] = crypto::to_base64(
             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
@@ -136,6 +139,7 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         in.timestamp        = body->value("timestamp", uint64_t{0});
         in.signature        = body->value("signature", std::string{});
         in.source_ip        = req.remote_addr;
+        in.enrollment_token = body->value("enrollment_token", std::string{});
         auto r = admission.create_request(in);
         if (!r.ok) { error_response(res, r.error, r.status); return; }
         if (r.needs_ballot) admission.start_pending_ballot(r.request_id);
@@ -231,6 +235,39 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         auto r = admission.deny(request_id, reason);
         if (!r.ok) { error_response(res, r.error, r.status); return; }
         json_response(res, {{"state", "denied"}, {"request_id", r.request_id}});
+    }));
+
+    // ── POST /api/onboard/token (private, JWT + root admin) ─────────────────
+    // Mints a single-use server-admission enrollment token. The response is a
+    // complete invitation payload (token + root anchor) for out-of-band handoff.
+    priv.Post("/api/onboard/token", auth::require_auth(ctx_.auth,
+        [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
+        auto body = parse_body(req, res);
+        if (!body) return;
+        auto candidate = body->value("candidate_pubkey", std::string{});
+        if (!candidate.empty()) {
+            bool valid = false;
+            try {   // from_base64 throws on malformed input
+                valid = crypto::from_base64(candidate).size() ==
+                        crypto::kEd25519PublicKeySize;
+            } catch (...) {}
+            if (!valid) {
+                error_response(res, "candidate_pubkey must be a base64 Ed25519 key"); return;
+            }
+        }
+        auto ttl = std::chrono::seconds{body->value(
+            "ttl_sec", static_cast<uint64_t>(core::AdmissionTokenStore::kDefaultTtl.count()))};
+        auto minted = admission.mint_admission_token(candidate, ttl);
+        if (!minted) {
+            error_response(res, "this server does not hold the root key or "
+                                "onboarding is disabled", 503); return;
+        }
+        json_response(res, {{"enrollment_token", minted->first},
+                            {"expires_at", minted->second.expires_at},
+                            {"candidate_pubkey", minted->second.candidate_pubkey},
+                            {"root_pubkey", ctx_.config.root_pubkey}});
     }));
 }
 

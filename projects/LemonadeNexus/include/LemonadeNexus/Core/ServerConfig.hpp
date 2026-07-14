@@ -102,10 +102,13 @@ struct ServerConfig {
     std::string onboard_target;              // optional "host:port" of a mesh server (else DNS discovery)
     std::string onboard_server_id;           // requested DNS label (auto-derived if empty)
     uint32_t    onboard_timeout_sec{900};    // give up waiting for admission after this
+    std::string onboard_token;               // single-use enrollment token (runtime-only, never persisted)
 
     // Onboarding — mesh side
     bool        onboard_enabled{true};             // accept onboarding requests when we hold the root key
-    bool        onboard_auto_approve_bootstrap{true}; // auto-approve until the first admission is approved
+    bool        mint_admission_token{false};       // CLI mode: mint an enrollment token and exit (runtime-only)
+    std::string mint_token_candidate;              // optional base64 candidate key to bind (runtime-only)
+    uint32_t    mint_token_ttl_sec{600};           // minted-token TTL (runtime-only)
     float       admission_quorum_ratio{0.75f};     // Tier1 vote fraction for admission ballots
     uint32_t    onboard_min_tier1_for_vote{6};     // switch from sole-discretion to voting at this many Tier1s
     uint32_t    onboard_request_ttl_sec{3600};     // pending admission lifetime

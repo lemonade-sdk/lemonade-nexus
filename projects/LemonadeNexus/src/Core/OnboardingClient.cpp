@@ -35,8 +35,10 @@ uint64_t now_unix() {
 
 struct HttpResult { bool connected{false}; int status{0}; std::string body; };
 
-/// POST/GET to "host:port", trying HTTPS (no cert verification — trust is
-/// anchored in Ed25519 signatures) then plain HTTP.
+/// POST/GET to "host:port", trying HTTPS (no cert verification) then plain
+/// HTTP. Trust is anchored in the pre-pinned root pubkey: the issued cert and
+/// all signatures verify against it, never against the transport. Local dev
+/// runs plain HTTP.
 HttpResult http_call(const std::string& host, int port, const std::string& method,
                      const std::string& path, const std::string& body) {
     auto run = [&](auto& cli) -> HttpResult {
@@ -171,7 +173,36 @@ std::string pick_target(const std::vector<std::string>& targets) {
 
 } // namespace
 
+std::string validate_pinned_root(const std::string& pinned_hex) {
+    if (pinned_hex.empty())
+        return "onboarding requires a pinned mesh root key: pass --root-pubkey <hex> "
+               "(obtain it out of band — the genesis server prints it at --first-run)";
+    try {   // from_hex throws on malformed input
+        if (crypto::from_hex(pinned_hex).size() == crypto::kEd25519PublicKeySize)
+            return {};
+    } catch (...) {}
+    return "--root-pubkey is not a 32-byte hex Ed25519 public key";
+}
+
+std::string check_root_confirmation(const std::string& pinned_hex,
+                                    const std::string& delivered_hex) {
+    if (delivered_hex.empty()) return {};   // confirm-only: absent is fine
+    try {   // malformed delivered hex is a mismatch, not a crash
+        if (crypto::from_hex(pinned_hex) == crypto::from_hex(delivered_hex))
+            return {};
+    } catch (...) {}
+    return "server delivered a root pubkey that does not match the pinned "
+           "--root-pubkey; refusing (possible MITM or wrong mesh)";
+}
+
 int run_onboard_server(ServerConfig& config) {
+    // Trust must be pre-anchored: the response may confirm the root key,
+    // never establish it.
+    if (auto err = validate_pinned_root(config.root_pubkey); !err.empty()) {
+        spdlog::error("Onboard: {}", err);
+        return 1;
+    }
+
     auto init = ensure_initialized(config);
     if (!init) return 1;
 
@@ -245,6 +276,10 @@ int run_onboard_server(ServerConfig& config) {
     json reqbody{{"candidate_pubkey", keys.pub_b64}, {"server_id", server_id},
                  {"region", region}, {"tpm_ak_pubkey", tpm_ak}, {"nonce", nonce},
                  {"timestamp", ts}, {"signature", req_sig}};
+    // Deliberately outside the signed canonical: nonce+PoP already bind the
+    // request to our key; mint-time binding ties the token to it.
+    if (!config.onboard_token.empty())
+        reqbody["enrollment_token"] = config.onboard_token;
     auto rq = http_call(host, port, "POST", "/api/onboard/request", reqbody.dump());
     if (!rq.connected || rq.status != 200) {
         spdlog::error("Onboard: admission request rejected ({})", rq.body); return 1;
@@ -255,10 +290,14 @@ int run_onboard_server(ServerConfig& config) {
     std::printf("\nOnboarding request submitted.\n");
     std::printf("  server ID:   %s\n", server_id.c_str());
     std::printf("  fingerprint: %s\n", keys.pub_b64.substr(0, 16).c_str());
-    std::printf("  Approve on the genesis:\n");
-    std::printf("    curl -H 'Authorization: Bearer <admin-jwt>' -X POST \\\n");
-    std::printf("      http://<genesis>:9101/api/onboard/approve/%s \\\n", request_id.c_str());
-    std::printf("      -d '{\"fingerprint\":\"%s\"}'\n\n", keys.pub_b64.substr(0, 16).c_str());
+    if (config.onboard_token.empty()) {
+        std::printf("  Approve on the genesis:\n");
+        std::printf("    curl -H 'Authorization: Bearer <admin-jwt>' -X POST \\\n");
+        std::printf("      http://<genesis>:9101/api/onboard/approve/%s \\\n", request_id.c_str());
+        std::printf("      -d '{\"fingerprint\":\"%s\"}'\n", keys.pub_b64.substr(0, 16).c_str());
+        std::printf("  (or skip the wait next time: mint a token on the root server with\n");
+        std::printf("   --mint-admission-token and pass it via --onboard-token)\n\n");
+    }
 
     // 3. Poll until decided or timeout.
     const uint64_t deadline = now_unix() + config.onboard_timeout_sec;
@@ -287,15 +326,16 @@ int run_onboard_server(ServerConfig& config) {
         return 1;
     }
 
-    // 4. Verify + install the certificate.
-    std::string root_hex = approved.value("root_pubkey", "");
-    if (!config.root_pubkey.empty() && !root_hex.empty() && config.root_pubkey != root_hex) {
-        spdlog::error("Onboard: delivered root pubkey does not match the configured --root-pubkey");
+    // 4. Verify + install the certificate — strictly against the pinned root.
+    if (auto err = check_root_confirmation(config.root_pubkey,
+                                           approved.value("root_pubkey", ""));
+        !err.empty()) {
+        spdlog::error("Onboard: {}", err);
         return 1;
     }
-    if (root_hex.empty()) root_hex = config.root_pubkey;
     std::string err;
-    if (!verify_issued_cert(crypto, approved["certificate"], keys.pub_b64, root_hex, err)) {
+    if (!verify_issued_cert(crypto, approved["certificate"], keys.pub_b64,
+                            config.root_pubkey, err)) {
         spdlog::error("Onboard: refusing certificate — {}", err);
         return 1;
     }
@@ -319,7 +359,7 @@ int run_onboard_server(ServerConfig& config) {
     auto proven = host + ":" + std::to_string(approved.value("gossip_port", 9102));
     if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
         seeds.insert(seeds.begin(), proven);
-    merge_config(config.config_path, root_hex, seeds);
+    merge_config(config.config_path, config.root_pubkey, seeds);
 
     // Align our hostname with the admitted server_id so DNS/NS records carry
     // one name instead of an auto-generated <region>-N.

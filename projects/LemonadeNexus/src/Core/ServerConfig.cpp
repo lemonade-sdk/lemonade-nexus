@@ -68,7 +68,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"tee_attestation_validity_sec", c.tee_attestation_validity_sec},
         {"tee_platform_override",      c.tee_platform_override},
         {"onboard_enabled",            c.onboard_enabled},
-        {"onboard_auto_approve_bootstrap", c.onboard_auto_approve_bootstrap},
         {"admission_quorum_ratio",     c.admission_quorum_ratio},
         {"onboard_min_tier1_for_vote", c.onboard_min_tier1_for_vote},
         {"onboard_request_ttl_sec",    c.onboard_request_ttl_sec},
@@ -127,7 +126,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("tee_attestation_validity_sec")) j.at("tee_attestation_validity_sec").get_to(c.tee_attestation_validity_sec);
     if (j.contains("tee_platform_override"))     j.at("tee_platform_override").get_to(c.tee_platform_override);
     if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
-    if (j.contains("onboard_auto_approve_bootstrap")) j.at("onboard_auto_approve_bootstrap").get_to(c.onboard_auto_approve_bootstrap);
     if (j.contains("admission_quorum_ratio"))    j.at("admission_quorum_ratio").get_to(c.admission_quorum_ratio);
     if (j.contains("onboard_min_tier1_for_vote")) j.at("onboard_min_tier1_for_vote").get_to(c.onboard_min_tier1_for_vote);
     if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
@@ -157,8 +155,12 @@ void print_usage(const char* prog) {
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
-    spdlog::info("  --onboard-server [host:port] Join an existing mesh: request admission over its public API, then exit");
+    spdlog::info("  --onboard-server [host:port] Join an existing mesh: request admission over its public API, then exit (requires --root-pubkey)");
     spdlog::info("  --onboard-id <label>       Requested server ID for onboarding (default: auto-derived)");
+    spdlog::info("  --onboard-token <tok>      Single-use enrollment token for immediate admission (or SP_ONBOARD_TOKEN)");
+    spdlog::info("  --mint-admission-token     Mint a server-admission enrollment token and exit (root holder only)");
+    spdlog::info("  --token-candidate <b64>    Bind the minted token to a candidate gossip pubkey (base64)");
+    spdlog::info("  --token-ttl <sec>          Minted-token lifetime, 60-3600s (default: 600)");
     spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
     spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
     spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
@@ -303,6 +305,14 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.onboard_server_id = argv[++i];
         } else if (std::strcmp(argv[i], "--onboard-timeout") == 0 && i + 1 < argc) {
             config.onboard_timeout_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--onboard-token") == 0 && i + 1 < argc) {
+            config.onboard_token = argv[++i];
+        } else if (std::strcmp(argv[i], "--mint-admission-token") == 0) {
+            config.mint_admission_token = true;
+        } else if (std::strcmp(argv[i], "--token-candidate") == 0 && i + 1 < argc) {
+            config.mint_token_candidate = argv[++i];
+        } else if (std::strcmp(argv[i], "--token-ttl") == 0 && i + 1 < argc) {
+            config.mint_token_ttl_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--no-onboard") == 0) {
             config.onboard_enabled = false;
         } else if (std::strcmp(argv[i], "--admission-quorum") == 0 && i + 1 < argc) {
@@ -356,6 +366,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
+    if (const char* v = std::getenv("SP_ONBOARD_TOKEN")) config.onboard_token = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
     if (const char* v = std::getenv("SP_RP_ID"))          config.rp_id       = v;
     if (const char* v = std::getenv("SP_ACME_PROVIDER"))    config.acme_provider   = v;

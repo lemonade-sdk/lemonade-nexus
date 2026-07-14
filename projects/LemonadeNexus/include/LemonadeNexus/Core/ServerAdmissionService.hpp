@@ -1,12 +1,15 @@
 #pragma once
 
+#include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/IService.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nexus::crypto { class SodiumCryptoService; class KeyWrappingService; }
@@ -41,13 +44,12 @@ public:
         uint64_t    expires_at{0};
         std::string issued_cert_json;   // set when Approved
         std::string decision_reason;
-        std::string decided_by;         // "auto" | "admin" | "ballot"
+        std::string decided_by;         // "token" | "admin" | "ballot"
         std::string ballot_claim_json;  // candidate self-signed claim (vote regime)
     };
 
     struct Config {
         bool     enabled{true};
-        bool     auto_approve_bootstrap{true};
         float    admission_quorum_ratio{0.75f};
         uint32_t min_tier1_for_vote{6};
         uint32_t request_ttl_sec{3600};
@@ -88,6 +90,7 @@ public:
         uint64_t    timestamp{0};
         std::string signature;    // base64 Ed25519 over the canonical request
         std::string source_ip;
+        std::string enrollment_token;  // optional; not part of the signed canonical
     };
     struct Result {
         bool ok{false}; int status{200}; std::string error; std::string request_id;
@@ -95,8 +98,14 @@ public:
     };
 
     /// Verify PoP + caps, create (or idempotently refresh) a PendingAdmission.
-    /// Below the vote threshold with the bootstrap window open, auto-approves.
+    /// Below the vote threshold a valid enrollment token admits immediately;
+    /// in the vote regime the ballot governs and tokens are ignored.
     [[nodiscard]] Result create_request(const RequestInput& in);
+
+    /// Mint a single-use server-admission token (root holder only — returns
+    /// nullopt unless accepts_onboarding()). Empty candidate_pubkey = unbound.
+    [[nodiscard]] std::optional<std::pair<std::string, AdmissionTokenRecord>>
+    mint_admission_token(const std::string& candidate_pubkey, std::chrono::seconds ttl);
 
     /// Open the governed Tier1 ballot for a request that needs one (called by
     /// the handler after create_request returns, so no lock is held).
@@ -132,7 +141,6 @@ private:
     void sweep_expired();
     void persist();
     void load();
-    [[nodiscard]] bool ever_approved() const;
     [[nodiscard]] Result do_approve_locked(Admission& a, const std::string& decided_by,
                                            bool supersede);
     [[nodiscard]] bool verify_sig(const std::string& pubkey_b64,
@@ -146,6 +154,11 @@ private:
     gossip::GossipService&         gossip_;
     TrustPolicyService*            trust_policy_{nullptr};
     Config                         cfg_;
+    AdmissionTokenStore            tokens_;
+
+    /// True iff this server's local identity IS the configured root anchor.
+    /// Computed once in on_start(); gates all certificate issuance.
+    bool is_root_key_holder_{false};
 
     mutable std::mutex mu_;
     std::unordered_map<std::string, Admission> admissions_;   // by request_id

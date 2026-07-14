@@ -54,9 +54,9 @@ ServerAdmissionService::ServerAdmissionService(
         gossip::GossipService& gossip,
         TrustPolicyService* trust_policy)
     : config_(config), crypto_(crypto), key_wrapping_(key_wrapping),
-      storage_(storage), gossip_(gossip), trust_policy_(trust_policy) {
+      storage_(storage), gossip_(gossip), trust_policy_(trust_policy),
+      tokens_(storage, crypto) {
     cfg_.enabled                = config.onboard_enabled;
-    cfg_.auto_approve_bootstrap  = config.onboard_auto_approve_bootstrap;
     cfg_.admission_quorum_ratio  = config.admission_quorum_ratio;
     cfg_.min_tier1_for_vote      = config.onboard_min_tier1_for_vote;
     cfg_.request_ttl_sec         = config.onboard_request_ttl_sec;
@@ -86,6 +86,16 @@ std::vector<uint8_t> ServerAdmissionService::canonical_poll(
 
 void ServerAdmissionService::on_start() {
     load();
+
+    // Only a server whose own identity IS the configured root anchor may issue
+    // certificates. Compare the raw key bytes so hex casing never matters;
+    // malformed config hex means not-the-holder, not a crash.
+    auto lp = key_wrapping_.load_identity_pubkey();
+    std::vector<uint8_t> want;
+    try { want = crypto::from_hex(config_.root_pubkey); } catch (...) {}
+    is_root_key_holder_ = lp && want.size() == crypto::kEd25519PublicKeySize &&
+                          std::memcmp(lp->data(), want.data(), want.size()) == 0;
+
     spdlog::info("[ServerAdmissionService] started ({} persisted admission(s), accepts_onboarding={})",
                  admissions_.size(), accepts_onboarding());
 
@@ -104,8 +114,10 @@ void ServerAdmissionService::on_stop() {
 }
 
 bool ServerAdmissionService::accepts_onboarding() const {
-    // No fail-open: only a root-anchored server that holds the root key may issue.
-    return cfg_.enabled && !config_.root_pubkey.empty();
+    // No fail-open: onboarding is advertised/accepted only by the server whose
+    // local identity actually holds the root key — not merely one that has a
+    // root_pubkey configured (every enrolled server does).
+    return cfg_.enabled && !config_.root_pubkey.empty() && is_root_key_holder_;
 }
 
 uint32_t ServerAdmissionService::eligible_voter_count() const {
@@ -152,8 +164,12 @@ std::string ServerAdmissionService::issue_challenge(const std::string& candidate
     return nonce;
 }
 
-bool ServerAdmissionService::ever_approved() const {
-    return ever_approved_;
+std::optional<std::pair<std::string, AdmissionTokenRecord>>
+ServerAdmissionService::mint_admission_token(const std::string& candidate_pubkey,
+                                             std::chrono::seconds ttl) {
+    // Only the root holder may pre-authorize admissions.
+    if (!accepts_onboarding()) return std::nullopt;
+    return tokens_.mint(candidate_pubkey, ttl);
 }
 
 ServerAdmissionService::Result ServerAdmissionService::create_request(const RequestInput& in) {
@@ -186,17 +202,25 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         it != denied_until_.end() && it->second > now)
         return {false, 429, "this identity was recently denied; try again later", ""};
 
-    // Idempotent refresh of an existing pending request for the same pubkey.
-    for (auto& [rid, a] : admissions_) {
-        if (a.candidate_pubkey == in.candidate_pubkey && a.state == State::Pending) {
-            a.expires_at = now + cfg_.request_ttl_sec;
-            a.source_ip  = in.source_ip;
-            persist();
-            return {true, 200, "", rid};
+    // Enrollment token: below the vote threshold a valid token admits
+    // immediately; in the vote regime the quorum ballot governs and the token
+    // is neither honored nor consumed. Verify here (no burn) — the token is
+    // consumed only once issuance actually succeeds, below.
+    const bool below_vote = eligible_voter_count() < cfg_.min_tier1_for_vote;
+    bool token_admit = false;
+    if (!in.enrollment_token.empty()) {
+        if (below_vote) {
+            if (!tokens_.verify(in.enrollment_token, in.candidate_pubkey))
+                return {false, 403, "invalid, expired, or already-used enrollment token", ""};
+            token_admit = true;
+        } else {
+            spdlog::info("[ServerAdmissionService] vote regime — enrollment token "
+                         "ignored; ballot governs");
         }
     }
 
-    // server_id uniqueness vs enrolled peers.
+    // server_id uniqueness vs enrolled peers — runs before any approval or
+    // token consumption so a conflict never burns a token.
     for (const auto& p : gossip_.get_peers()) {
         if (p.certificate_json.empty()) continue;
         try {
@@ -207,19 +231,36 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         } catch (...) {}
     }
 
-    // Capacity.
-    uint32_t pending_count = 0;
-    for (const auto& [rid, a] : admissions_)
-        if (a.state == State::Pending) ++pending_count;
-    if (pending_count >= cfg_.max_pending)
-        return {false, 429, "too many pending admissions; try again later", ""};
+    // Reuse an existing pending record for this candidate (idempotent retry),
+    // else allocate a fresh request_id.
+    std::string request_id;
+    bool is_existing = false;
+    for (const auto& [rid, a] : admissions_) {
+        if (a.candidate_pubkey == in.candidate_pubkey && a.state == State::Pending) {
+            request_id = rid; is_existing = true; break;
+        }
+    }
 
-    // Create the record.
-    std::array<uint8_t, 16> rid_raw{};
-    crypto_.random_bytes(std::span<uint8_t>(rid_raw));
-    auto request_id = crypto::to_hex(std::span<const uint8_t>(rid_raw));
+    // Capacity — only a brand-new, non-token pending record counts against it;
+    // cheap self-signed pending spam must not lock out a valid token.
+    if (!is_existing && !token_admit) {
+        uint32_t pending_count = 0;
+        for (const auto& [rid, a] : admissions_)
+            if (a.state == State::Pending) ++pending_count;
+        if (pending_count >= cfg_.max_pending)
+            return {false, 429, "too many pending admissions; try again later", ""};
+    }
 
-    Admission a;
+    if (!is_existing) {
+        std::array<uint8_t, 16> rid_raw{};
+        crypto_.random_bytes(std::span<uint8_t>(rid_raw));
+        request_id = crypto::to_hex(std::span<const uint8_t>(rid_raw));
+    }
+
+    // Build/refresh the record from the CURRENT signed request — never from a
+    // stale earlier one, so the issued cert always binds the fields this
+    // request proved possession of.
+    Admission& a = admissions_[request_id];
     a.request_id       = request_id;
     a.candidate_pubkey = in.candidate_pubkey;
     a.server_id        = in.server_id;
@@ -227,28 +268,39 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.tpm_ak_pubkey    = in.tpm_ak_pubkey;
     a.tpm_ek_cert      = in.tpm_ek_cert;
     a.source_ip        = in.source_ip;
-    a.state            = State::Pending;
-    a.created_at       = now;
     a.expires_at       = now + cfg_.request_ttl_sec;
+    if (!is_existing) { a.state = State::Pending; a.created_at = now; }
 
-    const bool below_vote = eligible_voter_count() < cfg_.min_tier1_for_vote;
-
-    // Bootstrap auto-approve: only while no admission has ever been approved and
-    // we're below the voting threshold. Self-enrollment/manual enroll don't count.
-    if (below_vote && cfg_.auto_approve_bootstrap && !ever_approved()) {
-        spdlog::warn("[ServerAdmissionService] SECURITY: auto-approving '{}' (bootstrap window — "
-                     "no prior admissions). Disable with onboard_auto_approve_bootstrap=false.",
+    // Token admission (sole-discretion regime only). Approve first; burn the
+    // token only on success so a failed issuance (409/500) never spends it.
+    // The lock serializes create_request, so no concurrent request can
+    // double-spend between the approve and the consume.
+    if (token_admit) {
+        auto r = do_approve_locked(a, "token", /*supersede=*/false);
+        if (!r.ok) {
+            if (!is_existing) admissions_.erase(request_id);  // no phantom record
+            persist();
+            return r;
+        }
+        tokens_.consume(in.enrollment_token, in.candidate_pubkey);
+        spdlog::info("[ServerAdmissionService] admitted '{}' via enrollment token",
                      in.server_id);
-        auto r = do_approve_locked(a, "auto", /*supersede=*/false);
-        admissions_[request_id] = a;
         persist();
-        if (!r.ok) return r;
         return {true, 200, "", request_id};
     }
 
-    // Above the vote threshold: defer to a governed Tier1 ballot. Store the
-    // candidate's self-signed claim so peers can verify it; the handler kicks
-    // the ballot after this call returns (the decision callback re-enters us).
+    // Non-token retry of an already-pending request: refresh only, no duplicate
+    // ballot.
+    if (is_existing) {
+        persist();
+        return {true, 200, "", request_id};
+    }
+
+    // New record above the vote threshold: defer to a governed Tier1 ballot.
+    // Store the candidate's self-signed claim so peers can verify it; the
+    // handler kicks the ballot after this call returns. The enrollment token is
+    // deliberately excluded — the claim is gossip-replicated and must never
+    // carry token material.
     if (!below_vote) {
         json claim{{"candidate_pubkey", in.candidate_pubkey}, {"server_id", in.server_id},
                    {"region", in.region}, {"tpm_ak_pubkey", in.tpm_ak_pubkey},
@@ -257,7 +309,6 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         a.ballot_claim_json = claim.dump();
     }
 
-    admissions_[request_id] = a;
     persist();
     spdlog::info("[ServerAdmissionService] pending admission '{}' for server_id '{}' (regime={})",
                  request_id, in.server_id, regime());
@@ -302,6 +353,13 @@ void ServerAdmissionService::on_ballot_decision(const std::string& request_id,
 
 ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
         Admission& a, const std::string& decided_by, bool supersede) {
+    // Re-check at issuance: never sign a server certificate unless this server's
+    // identity is the configured root anchor. The local identity below would
+    // otherwise self-sign a cert peers reject, from a server that shouldn't issue.
+    if (!is_root_key_holder_)
+        return {false, 403, "not the root-key holder — cannot issue server certificate",
+                a.request_id};
+
     auto root_sk = key_wrapping_.unlock_identity({});
     auto root_pk = key_wrapping_.load_identity_pubkey();
     if (!root_sk || !root_pk)

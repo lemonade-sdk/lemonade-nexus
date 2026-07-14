@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Core/CliModes.hpp>
 
+#include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
@@ -115,6 +116,20 @@ int run_enroll(const ServerConfig& config) {
         return 1;
     }
 
+    // Only the root-key holder may issue certificates. A fresh genesis has an
+    // empty root_pubkey (the operator sets it after --first-run), so enforce the
+    // match only once an anchor is configured — otherwise genesis bootstrap breaks.
+    if (!config.root_pubkey.empty()) {
+        std::vector<uint8_t> have(pubkey->begin(), pubkey->end());
+        std::vector<uint8_t> want;
+        try { want = crypto::from_hex(config.root_pubkey); } catch (...) {}
+        if (have != want) {
+            spdlog::error("Cannot enroll: this server's identity is not the configured root "
+                          "key (root_pubkey); only the root-key holder may issue certificates.");
+            return 1;
+        }
+    }
+
     gossip::CertIssueParams params;
     params.server_pubkey_b64 = config.enroll_server_pubkey;
     params.server_id         = config.enroll_server_id;
@@ -181,6 +196,58 @@ int run_enroll(const ServerConfig& config) {
         spdlog::info("Copy it to the joining server as <data-root>/identity/server_cert.json, "
                      "then (re)start that server.");
     }
+    return 0;
+}
+
+int run_mint_admission_token(const ServerConfig& config) {
+    // A token pre-authorizes admission to the mesh anchored at root_pubkey, so
+    // minting is stricter than --enroll-server: no anchor, no token.
+    if (config.root_pubkey.empty()) {
+        spdlog::error("Cannot mint: no --root-pubkey configured. The mesh root pubkey is "
+                      "printed by --first-run on the genesis server.");
+        return 1;
+    }
+
+    crypto::SodiumCryptoService mint_crypto;
+    mint_crypto.start();
+    storage::FileStorageService mint_storage{std::filesystem::path(config.data_root)};
+    mint_storage.start();
+    crypto::KeyWrappingService mint_kw{mint_crypto, mint_storage};
+    mint_kw.start();
+
+    auto pubkey = mint_kw.load_identity_pubkey();
+    if (!pubkey) {
+        spdlog::error("Cannot mint: root identity not available. "
+                      "Run '--first-run' first to initialize this server's identity.");
+        return 1;
+    }
+    std::vector<uint8_t> have(pubkey->begin(), pubkey->end());
+    std::vector<uint8_t> want;
+    try { want = crypto::from_hex(config.root_pubkey); } catch (...) {}
+    if (have != want) {
+        spdlog::error("Cannot mint: this server's identity is not the configured root key "
+                      "(root_pubkey); only the root-key holder may mint admission tokens.");
+        return 1;
+    }
+
+    // The store is shared with a live daemon on the same data_root — no restart
+    // needed; single-use is enforced by an atomic file remove at consumption.
+    AdmissionTokenStore tokens{mint_storage, mint_crypto};
+    auto minted = tokens.mint(config.mint_token_candidate,
+                              std::chrono::seconds{config.mint_token_ttl_sec});
+    if (!minted) return 1;
+
+    std::printf("\nServer-admission enrollment token (single-use):\n");
+    std::printf("  token:      %s\n", minted->first.c_str());
+    std::printf("  expires_at: %llu (unix)\n",
+                static_cast<unsigned long long>(minted->second.expires_at));
+    std::printf("  bound to:   %s\n",
+                minted->second.candidate_pubkey.empty()
+                    ? "any candidate" : minted->second.candidate_pubkey.c_str());
+    std::printf("\nOn the joining server:\n");
+    std::printf("  ./lemonade-nexus --onboard-server <host:port> \\\n");
+    std::printf("      --root-pubkey %s \\\n", config.root_pubkey.c_str());
+    std::printf("      --onboard-token %s\n\n", minted->first.c_str());
     return 0;
 }
 
@@ -311,6 +378,7 @@ std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0) {
     if (config.print_tpm_ak)                      return run_print_tpm_ak();
     if (config.first_run)                         return run_first_run(config);
     if (config.onboard_server)                    return run_onboard_server(config);
+    if (config.mint_admission_token)              return run_mint_admission_token(config);
     if (!config.enroll_server_pubkey.empty())     return run_enroll(config);
     if (!config.revoke_server_pubkey.empty())     return run_revoke(config);
     if (!config.add_manifest_path.empty())        return run_add_manifest(config);
