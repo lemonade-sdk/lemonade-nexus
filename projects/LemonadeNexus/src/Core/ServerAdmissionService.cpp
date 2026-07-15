@@ -204,14 +204,20 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
 
     // Enrollment token: below the vote threshold a valid token admits
     // immediately; in the vote regime the quorum ballot governs and the token
-    // is neither honored nor consumed. Verify here (no burn) — the token is
-    // consumed only once issuance actually succeeds, below.
+    // is neither honored nor consumed.
     const bool below_vote = eligible_voter_count() < cfg_.min_tier1_for_vote;
     bool token_admit = false;
     if (!in.enrollment_token.empty()) {
         if (below_vote) {
-            if (!tokens_.verify(in.enrollment_token, in.candidate_pubkey))
+            auto rec = tokens_.verify(in.enrollment_token, in.candidate_pubkey);
+            if (!rec)
                 return {false, 403, "invalid, expired, or already-used enrollment token", ""};
+            // The onboarding transport is not authenticated (cert verification
+            // is disabled and plain HTTP is permitted), so a bearer token must
+            // be bound to the candidate key — an intermediary must not be able
+            // to capture an unbound token and spend it with its own key.
+            if (rec->candidate_pubkey.empty())
+                return {false, 403, "enrollment token is not bound to a candidate key", ""};
             token_admit = true;
         } else {
             spdlog::info("[ServerAdmissionService] vote regime — enrollment token "
@@ -271,18 +277,22 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.expires_at       = now + cfg_.request_ttl_sec;
     if (!is_existing) { a.state = State::Pending; a.created_at = now; }
 
-    // Token admission (sole-discretion regime only). Approve first; burn the
-    // token only on success so a failed issuance (409/500) never spends it.
-    // The lock serializes create_request, so no concurrent request can
-    // double-spend between the approve and the consume.
+    // Token admission (sole-discretion regime only). Consume fail-closed:
+    // spend the token BEFORE issuing and require it to actually be removed, so
+    // a delete failure can never leave a reusable bearer credential. The
+    // server_id-uniqueness 409 is already checked above, so the common failure
+    // can't burn a token; a rarer issuance failure requires a fresh token.
     if (token_admit) {
+        if (!tokens_.consume(in.enrollment_token, in.candidate_pubkey)) {
+            if (!is_existing) admissions_.erase(request_id);  // no phantom record
+            return {false, 403, "enrollment token already used", ""};
+        }
         auto r = do_approve_locked(a, "token", /*supersede=*/false);
         if (!r.ok) {
-            if (!is_existing) admissions_.erase(request_id);  // no phantom record
+            if (!is_existing) admissions_.erase(request_id);
             persist();
             return r;
         }
-        tokens_.consume(in.enrollment_token, in.candidate_pubkey);
         spdlog::info("[ServerAdmissionService] admitted '{}' via enrollment token",
                      in.server_id);
         persist();

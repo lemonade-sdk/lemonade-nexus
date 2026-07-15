@@ -30,6 +30,9 @@ public:
 
     /// Mint a token; plaintext is only ever returned here. `candidate_pubkey`
     /// (when non-empty) must be a 32-byte base64 Ed25519 key and binds the token.
+    /// The onboarding admission path only accepts bound tokens — the mint
+    /// surfaces (CLI/API) require a binding; an empty binding is a low-level
+    /// primitive for a future authenticated transport.
     [[nodiscard]] std::optional<std::pair<std::string, AdmissionTokenRecord>>
     mint(const std::string& candidate_pubkey, std::chrono::seconds ttl);
 

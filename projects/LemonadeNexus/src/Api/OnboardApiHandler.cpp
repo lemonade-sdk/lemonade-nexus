@@ -246,16 +246,18 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         if (!require_admin(claims, res)) return;
         auto body = parse_body(req, res);
         if (!body) return;
+        // Candidate binding is mandatory: the token travels the unauthenticated
+        // onboarding transport as a bearer credential, so it must be spendable
+        // only by the intended candidate key.
         auto candidate = body->value("candidate_pubkey", std::string{});
-        if (!candidate.empty()) {
-            bool valid = false;
-            try {   // from_base64 throws on malformed input
-                valid = crypto::from_base64(candidate).size() ==
-                        crypto::kEd25519PublicKeySize;
-            } catch (...) {}
-            if (!valid) {
-                error_response(res, "candidate_pubkey must be a base64 Ed25519 key"); return;
-            }
+        bool valid = false;
+        try {   // from_base64 throws on malformed input
+            valid = crypto::from_base64(candidate).size() ==
+                    crypto::kEd25519PublicKeySize;
+        } catch (...) {}
+        if (!valid) {
+            error_response(res, "candidate_pubkey (base64 Ed25519 gossip key of the "
+                                "joining server) is required"); return;
         }
         auto ttl = std::chrono::seconds{body->value(
             "ttl_sec", static_cast<uint64_t>(core::AdmissionTokenStore::kDefaultTtl.count()))};

@@ -207,6 +207,14 @@ int run_mint_admission_token(const ServerConfig& config) {
                       "printed by --first-run on the genesis server.");
         return 1;
     }
+    // Candidate binding is mandatory: the token is a bearer credential carried
+    // over the unauthenticated onboarding transport, so it must be spendable
+    // only by the joining server's own key.
+    if (config.mint_token_candidate.empty()) {
+        spdlog::error("Cannot mint: --token-candidate <b64> is required. Pass the joining "
+                      "server's gossip pubkey (printed as 'Gossip pubkey' at its --first-run).");
+        return 1;
+    }
 
     crypto::SodiumCryptoService mint_crypto;
     mint_crypto.start();
@@ -241,9 +249,7 @@ int run_mint_admission_token(const ServerConfig& config) {
     std::printf("  token:      %s\n", minted->first.c_str());
     std::printf("  expires_at: %llu (unix)\n",
                 static_cast<unsigned long long>(minted->second.expires_at));
-    std::printf("  bound to:   %s\n",
-                minted->second.candidate_pubkey.empty()
-                    ? "any candidate" : minted->second.candidate_pubkey.c_str());
+    std::printf("  bound to:   %s\n", minted->second.candidate_pubkey.c_str());
     std::printf("\nOn the joining server:\n");
     std::printf("  ./lemonade-nexus --onboard-server <host:port> \\\n");
     std::printf("      --root-pubkey %s \\\n", config.root_pubkey.c_str());

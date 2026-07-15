@@ -339,19 +339,21 @@ into the config file before exiting. Start the server normally afterwards:
 
   For unattended joins, mint a **single-use enrollment token** on the root
   server and hand it to the candidate out of band. A valid token admits the
-  request immediately and is consumed; tokens expire (default 10 min, max 1 h)
-  and can be bound to the candidate's gossip pubkey so nobody else can spend
-  them — recommended on untrusted networks:
+  request immediately and is consumed; tokens expire (default 10 min, max 1 h).
+  Because the onboarding transport is not authenticated, the token **must be
+  bound to the joining server's gossip pubkey** (printed as its `Gossip pubkey`
+  at `--first-run`) so an intermediary can't capture and spend it:
 
   ```bash
   # On the root server (locally; works while the daemon is running)
   ./lemonade-nexus --mint-admission-token \
-      --token-candidate <candidate-gossip-pubkey-b64>   # optional bind
+      --token-candidate <candidate-gossip-pubkey-b64>   # required
   # ...or over the private API with a root-admin JWT:
   curl -X POST http://127.0.0.1:9101/api/onboard/token \
-       -H 'Authorization: Bearer <admin-jwt>' -d '{"ttl_sec":600}'
+       -H 'Authorization: Bearer <admin-jwt>' \
+       -d '{"candidate_pubkey":"<candidate-gossip-pubkey-b64>","ttl_sec":600}'
 
-  # On the joining server
+  # On the joining server (its gossip pubkey must match the token binding)
   ./lemonade-nexus --onboard-server <genesis-host>:9100 \
       --root-pubkey <mesh-root-pubkey-hex> --onboard-token adm_...
   ```

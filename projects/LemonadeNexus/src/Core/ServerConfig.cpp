@@ -159,7 +159,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --onboard-id <label>       Requested server ID for onboarding (default: auto-derived)");
     spdlog::info("  --onboard-token <tok>      Single-use enrollment token for immediate admission (or SP_ONBOARD_TOKEN)");
     spdlog::info("  --mint-admission-token     Mint a server-admission enrollment token and exit (root holder only)");
-    spdlog::info("  --token-candidate <b64>    Bind the minted token to a candidate gossip pubkey (base64)");
+    spdlog::info("  --token-candidate <b64>    Required with --mint-admission-token: joining server's gossip pubkey (base64) the token is bound to");
     spdlog::info("  --token-ttl <sec>          Minted-token lifetime, 60-3600s (default: 600)");
     spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
     spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");

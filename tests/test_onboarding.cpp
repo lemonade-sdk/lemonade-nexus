@@ -387,15 +387,16 @@ TEST_F(AdmissionServiceTest, FirstRequestParksInPending) {
 }
 
 TEST_F(AdmissionServiceTest, RequestWithValidTokenApproved) {
-    // A minted token admits immediately, is single-use, and the issued cert is
-    // signed by the root anchor (proves the issuance path uses it).
+    // A candidate-bound token admits immediately, is single-use, and the issued
+    // cert is signed by the root anchor (proves the issuance path uses it).
     make(/*root_is_local=*/true);
 
-    auto minted = admission->mint_admission_token("", std::chrono::seconds{600});
+    auto cand     = crypto_svc->ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    auto minted   = admission->mint_admission_token(cand_b64, std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
 
-    auto cand = crypto_svc->ed25519_keygen();
-    auto in   = signed_request(cand, "berlin-2");
+    auto in = signed_request(cand, "berlin-2");
     in.enrollment_token = minted->first;
     auto r = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
@@ -411,9 +412,8 @@ TEST_F(AdmissionServiceTest, RequestWithValidTokenApproved) {
               crypto::to_base64(std::span<const uint8_t>(
                   local_identity.public_key.data(), local_identity.public_key.size())));
 
-    // Spent: a second candidate presenting the same token is rejected.
-    auto cand2 = crypto_svc->ed25519_keygen();
-    auto in2   = signed_request(cand2, "berlin-3");
+    // Spent: the same token cannot be redeemed again (single-use).
+    auto in2 = signed_request(cand, "berlin-3");
     in2.enrollment_token = minted->first;
     auto r2 = admission->create_request(in2);
     EXPECT_FALSE(r2.ok);
@@ -431,6 +431,27 @@ TEST_F(AdmissionServiceTest, RequestWithInvalidTokenRejected) {
     EXPECT_EQ(r.status, 403);
     // A bad token must not leave a pending record behind.
     EXPECT_TRUE(admission->pending().empty());
+}
+
+TEST_F(AdmissionServiceTest, UnboundTokenRejectedOnUnauthTransport) {
+    // An unbound token must not be spendable over the onboarding path — an
+    // intermediary could otherwise capture it and race with its own key.
+    make(/*root_is_local=*/true);
+
+    auto minted = admission->mint_admission_token("", std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());  // store allows unbound; the admission path rejects it
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    in.enrollment_token = minted->first;
+    auto r = admission->create_request(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 403);
+    EXPECT_TRUE(admission->pending().empty());
+
+    // Not consumed: the unbound token is still on disk (rejected, not burned).
+    core::AdmissionTokenStore store{*storage_svc, *crypto_svc};
+    EXPECT_TRUE(store.verify(minted->first, in.candidate_pubkey).has_value());
 }
 
 TEST_F(AdmissionServiceTest, BoundTokenEnforced) {
@@ -464,12 +485,13 @@ TEST_F(AdmissionServiceTest, TokenRetryApprovesExistingPending) {
     // record flips to Approved instead of duplicating.
     make(/*root_is_local=*/true);
 
-    auto cand = crypto_svc->ed25519_keygen();
+    auto cand     = crypto_svc->ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     auto in1  = signed_request(cand, "berlin-2");
     auto r1   = admission->create_request(in1);
     ASSERT_TRUE(r1.ok) << r1.error;
 
-    auto minted = admission->mint_admission_token("", std::chrono::seconds{600});
+    auto minted = admission->mint_admission_token(cand_b64, std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
 
     auto in2 = signed_request(cand, "berlin-2");
@@ -553,10 +575,11 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     core::ServerAdmissionService admission{config, c, kw, s, gossip, nullptr};
     admission.start();
 
-    auto token = admission.mint_admission_token("", std::chrono::seconds{600});
+    auto cand     = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    auto token    = admission.mint_admission_token(cand_b64, std::chrono::seconds{600});
     ASSERT_TRUE(token.has_value());
 
-    auto cand = c.ed25519_keygen();
     auto sign_req = [&](const std::string& server_id) {
         core::ServerAdmissionService::RequestInput in;
         in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
@@ -578,7 +601,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     EXPECT_FALSE(r1.ok);
     EXPECT_EQ(r1.status, 409);
     core::AdmissionTokenStore store{s, c};
-    ASSERT_TRUE(store.verify(token->first, "").has_value());
+    ASSERT_TRUE(store.verify(token->first, cand_b64).has_value());
 
     // A free name with the same token admits.
     auto free_req = sign_req("berlin-3");
