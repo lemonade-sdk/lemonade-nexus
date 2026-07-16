@@ -45,6 +45,11 @@ add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
 add_nexus_test(test_onboarding        test_onboarding.cpp)
+
+# Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
+add_nexus_test(test_tls_transport     test_tls_transport.cpp)
+target_compile_definitions(test_tls_transport PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(test_tls_transport PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 

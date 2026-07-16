@@ -100,6 +100,8 @@ struct SidecarConfig {
     long        parent_pid{0};
     std::string log_level{"info"};
     bool        pin_server{false};             // keep the configured endpoint (no SEIP switch)
+    std::string ca_cert_path;                  // extra CA to trust (dev cert); verification stays on
+    std::string server_addr;                   // connect --server's FQDN at this IP (dev/split-horizon)
 };
 
 std::optional<ExposeMapping> parse_expose(const std::string& spec) {
@@ -131,6 +133,8 @@ void apply_json_config(SidecarConfig& cfg, const nlohmann::json& j) {
     if (j.contains("control_port")) cfg.control_port  = j.at("control_port").get<uint16_t>();
     if (j.contains("control_token")) cfg.control_token = j.at("control_token").get<std::string>();
     if (j.contains("log_level"))    cfg.log_level     = j.at("log_level").get<std::string>();
+    if (j.contains("ca_cert"))      cfg.ca_cert_path  = j.at("ca_cert").get<std::string>();
+    if (j.contains("server_addr"))  cfg.server_addr   = j.at("server_addr").get<std::string>();
     if (j.contains("expose") && j.at("expose").is_array()) {
         for (const auto& e : j.at("expose")) {
             if (auto m = parse_expose(e.get<std::string>())) cfg.exposes.push_back(*m);
@@ -157,6 +161,8 @@ void apply_env(SidecarConfig& cfg) {
         if (auto m = parse_expose(v)) cfg.exposes.push_back(*m);
     }
     if (std::getenv("LN_SIDECAR_PIN_SERVER"))         cfg.pin_server = true;
+    if (const char* v = std::getenv("LN_SIDECAR_CA_CERT"))     cfg.ca_cert_path = v;
+    if (const char* v = std::getenv("LN_SIDECAR_SERVER_ADDR")) cfg.server_addr = v;
     if (const char* v = std::getenv("SP_PARENT_PID")) cfg.parent_pid = std::atol(v);
     if (const char* v = std::getenv("SP_LOG_LEVEL"))  cfg.log_level = v;
 }
@@ -167,10 +173,11 @@ void print_usage(const char* prog) {
         "Headless Lemonade Nexus mesh client. Joins a mesh and publishes local\n"
         "services to authorized peers over the userspace dataplane.\n\n"
         "Options:\n"
-        "  --server <host:port>    Nexus server public API (default 127.0.0.1:9100)\n"
-        "  --tls                   Use HTTPS for the public API\n"
-        "  --pin-server            Keep the configured endpoint (no SEIP switch;\n"
-        "                          automatic when --tls is not set)\n"
+        "  --server <fqdn:port>    Nexus server public API by cert FQDN (default 127.0.0.1:9100)\n"
+        "  --tls                   Use HTTPS for the public API (default; verification always on)\n"
+        "  --pin-server            Keep the configured endpoint (no SEIP switch after join)\n"
+        "  --ca-cert <path>        Trust an extra CA (PEM) — e.g. a dev cert (verification stays on)\n"
+        "  --server-addr <ip>      Connect --server's FQDN at this IP (dev/split-horizon; still verifies the FQDN)\n"
         "  --identity <path>       Ed25519 identity file (default <data-root>/identity.json)\n"
         "  --data-root <path>      State directory (default ./nexus-sidecar)\n"
         "  --link-token <token>    Single-use device link token (first join)\n"
@@ -230,6 +237,10 @@ SidecarConfig load_config(int argc, char* argv[], bool& want_exit) {
             cfg.use_tls = true;
         } else if (std::strcmp(argv[i], "--pin-server") == 0) {
             cfg.pin_server = true;
+        } else if (const char* vca = next("--ca-cert")) {
+            cfg.ca_cert_path = vca;
+        } else if (const char* vsa = next("--server-addr")) {
+            cfg.server_addr = vsa;
         } else if (const char* v2 = next("--identity")) {
             cfg.identity_path = v2;
         } else if (const char* v3 = next("--data-root")) {
@@ -302,6 +313,8 @@ int main(int argc, char* argv[]) {
     // on); pinning keeps the SDK on that FQDN instead of switching to the
     // server's advertised SEIP FQDN after join.
     sc.pin_server = cfg.pin_server;
+    sc.ca_cert_path = cfg.ca_cert_path;
+    if (!cfg.server_addr.empty()) sc.host_addr[cfg.host] = cfg.server_addr;
     lnsdk::LemonadeNexusClient client{sc};
     client.set_identity(identity);
     if (!cfg.link_token.empty()) client.set_link_token(cfg.link_token);

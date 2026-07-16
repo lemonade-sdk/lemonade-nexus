@@ -3,10 +3,13 @@
 # token-gated control API, and private-API reachability over the userspace mesh.
 #
 # TODO(tls): this script still assumes plain HTTP (--no-auto-tls). Mesh HTTP is
-# now verified-HTTPS-only (no plaintext, no verify-off), so this needs porting to
-# the TLS flow: serve a cert for a dev FQDN, trust it (CurrentUser Root store or a
-# real Cloudflare dns-01 cert), and point the sidecar at that FQDN. See
-# .idea/local-dev.md §3-4. Until then it will not pass against a current server.
+# now verified-HTTPS-only. The sidecar can now do the PUBLIC path over TLS with
+# the new flags: --server <fqdn>:9100 --ca-cert <pem> --server-addr 127.0.0.1
+# (+ --pin-server), against a server started with --tls-cert-path for that FQDN.
+# The PRIVATE-API-over-mesh assertion still needs a cert for the derived
+# private.<seip> FQDN, which today requires auto-TLS/ACME (Cloudflare dns-01) or a
+# new --private-tls-cert-path flag — so the full port is a follow-up. The core
+# verified-TLS mechanism is covered in CI by tests/test_tls_transport.cpp.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 [-BuildDir <path>]
 param([string]$BuildDir = "$PSScriptRoot\..\build")

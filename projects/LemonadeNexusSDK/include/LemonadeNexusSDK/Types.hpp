@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,15 @@ struct ServerConfig {
 
     /// How often to check server health (seconds). 0 = disabled.
     uint32_t health_check_interval_sec{30};
+
+    /// Optional extra CA bundle to trust (PEM). Verification stays on — this adds
+    /// a private/dev CA so a dev cert is trusted without touching the system store.
+    std::string ca_cert_path;
+
+    /// Optional host->IP overrides applied to every request: the socket lands on
+    /// the given address while SNI + certificate verification still use the host
+    /// FQDN. Lets an FQDN resolve to a local address for dev without a hosts entry.
+    std::map<std::string, std::string> host_addr;
 
     /// Convenience: single-server constructor for backward compat.
     ServerConfig() = default;
