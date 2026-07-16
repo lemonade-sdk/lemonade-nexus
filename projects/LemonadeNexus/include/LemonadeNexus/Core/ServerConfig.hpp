@@ -45,9 +45,12 @@ struct ServerConfig {
     // Logging
     std::string log_level{"info"};
 
-    // TLS (optional)
+    // TLS (optional). Manual cert for the public API; the private API uses the
+    // private_tls_* pair when set (its cert covers the private.<seip> FQDN).
     std::string tls_cert_path;
     std::string tls_key_path;
+    std::string private_tls_cert_path;
+    std::string private_tls_key_path;
 
     // ACME certificate provider
     std::string acme_provider{"letsencrypt"}; // "letsencrypt", "letsencrypt_staging", "zerossl"

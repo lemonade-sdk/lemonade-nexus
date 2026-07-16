@@ -638,7 +638,13 @@ int main(int argc, char* argv[]) {
     if (!tunnel_bind_ip.empty()) {
         // Try to get/request ACME cert for the private FQDN
         std::string priv_cert_path, priv_key_path;
-        if (!server_private_fqdn.empty() && config.auto_tls) {
+        if (!config.private_tls_cert_path.empty() && !config.private_tls_key_path.empty()) {
+            // Manual private cert (covers private.<seip>) — parallels --tls-cert-path
+            // for the public API; bypasses ACME.
+            priv_cert_path = config.private_tls_cert_path;
+            priv_key_path  = config.private_tls_key_path;
+            spdlog::info("Private API: using manual TLS cert");
+        } else if (!server_private_fqdn.empty() && config.auto_tls) {
             auto priv_tls = nexus::core::resolve_tls_cert(config, data_root, server_private_fqdn);
             if (!priv_tls.cert_path.empty() && !priv_tls.key_path.empty()) {
                 priv_cert_path = priv_tls.cert_path;

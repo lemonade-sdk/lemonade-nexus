@@ -190,8 +190,10 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-provider <name>     ACME CA provider: letsencrypt (default), letsencrypt_staging, zerossl");
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
-    spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");
-    spdlog::info("  --tls-key-path <path>      Path to TLS private key PEM (manual override)");
+    spdlog::info("  --tls-cert-path <path>     Path to public-API TLS certificate PEM (manual override)");
+    spdlog::info("  --tls-key-path <path>      Path to public-API TLS private key PEM (manual override)");
+    spdlog::info("  --private-tls-cert-path <path> Path to private-API TLS certificate PEM (covers private.<seip>; manual override)");
+    spdlog::info("  --private-tls-key-path <path>  Path to private-API TLS private key PEM (manual override)");
     spdlog::info("  --no-auto-tls              Disable automatic TLS via ACME. The API then serves ONLY if --tls-cert-path/--tls-key-path are provided; otherwise it is withheld (no plaintext fallback)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
@@ -348,6 +350,10 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.tls_cert_path = argv[++i];
         } else if (std::strcmp(argv[i], "--tls-key-path") == 0 && i + 1 < argc) {
             config.tls_key_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--private-tls-cert-path") == 0 && i + 1 < argc) {
+            config.private_tls_cert_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--private-tls-key-path") == 0 && i + 1 < argc) {
+            config.private_tls_key_path = argv[++i];
         } else if (std::strcmp(argv[i], "--require-tee") == 0) {
             config.require_tee_attestation = true;
         } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
