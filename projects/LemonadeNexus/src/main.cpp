@@ -633,6 +633,7 @@ int main(int argc, char* argv[]) {
                                             tls.cert_path, tls.key_path};
 
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
+    bool private_needs_acme = false;   // request + upgrade the private cert in the background
     if (!tunnel_bind_ip.empty()) {
         // Try to get/request ACME cert for the private FQDN
         std::string priv_cert_path, priv_key_path;
@@ -643,13 +644,12 @@ int main(int argc, char* argv[]) {
                 priv_key_path  = priv_tls.key_path;
                 spdlog::info("Private API: using TLS cert for {}", server_private_fqdn);
             } else if (priv_tls.needs_acme_background) {
-                spdlog::info("Private API: no cert for {} -- requesting in background", server_private_fqdn);
-                // Request cert asynchronously — private API starts as HTTP initially,
-                // will need restart to pick up the cert once ACME completes
-                std::thread([&acme, fqdn = server_private_fqdn]() {
-                    std::this_thread::sleep_for(std::chrono::seconds(5));
-                    (void)acme.request_certificate(fqdn);
-                }).detach();
+                // The private API is withheld until its cert issues; the unified
+                // background ACME thread below requests it and upgrades the
+                // listener in place (no restart, no plaintext interim).
+                spdlog::info("Private API: no cert for {} -- requesting + upgrading in background",
+                             server_private_fqdn);
+                private_needs_acme = true;
             }
         }
 
@@ -769,24 +769,35 @@ int main(int argc, char* argv[]) {
     // Route registration is factored into a lambda so it can be re-run if the
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
     // a background ACME cert is issued).
+    // Register every handler's public routes on `pub` and private routes on `priv`.
+    auto register_on = [&](httplib::Server& pub, httplib::Server& priv) {
+        pub.set_pre_routing_handler(rate_limit_handler);
+        priv.set_pre_routing_handler(rate_limit_handler);
+        public_api.register_routes(pub, priv);
+        auth_api.register_routes(pub, priv);
+        tree_api.register_routes(pub, priv);
+        relay_api.register_routes(pub, priv);
+        cert_api.register_routes(pub, priv);
+        admin_api.register_routes(pub, priv);
+        mesh_api.register_routes(pub, priv);
+        routing_api.register_routes(pub, priv);
+        onboard_api.register_routes(pub, priv);
+    };
+    // Re-runnable if the underlying server object is replaced (plain->HTTPS
+    // upgrade after a background ACME cert). Resolves the private server on every
+    // call since upgrade_to_tls swaps the object.
     auto register_public_routes = [&]() {
-        // Resolved on every call: upgrade_to_tls replaces the server object,
-        // invalidating both the registered routes and the pre-routing handler
         auto& private_srv = private_http_server ? private_http_server->server()
                                                 : http_server.server();
-        http_server.server().set_pre_routing_handler(rate_limit_handler);
-        if (private_http_server) {
-            private_srv.set_pre_routing_handler(rate_limit_handler);
-        }
-        public_api.register_routes(http_server.server(), private_srv);
-        auth_api.register_routes(http_server.server(), private_srv);
-        tree_api.register_routes(http_server.server(), private_srv);
-        relay_api.register_routes(http_server.server(), private_srv);
-        cert_api.register_routes(http_server.server(), private_srv);
-        admin_api.register_routes(http_server.server(), private_srv);
-        mesh_api.register_routes(http_server.server(), private_srv);
-        routing_api.register_routes(http_server.server(), private_srv);
-        onboard_api.register_routes(http_server.server(), private_srv);
+        register_on(http_server.server(), private_srv);
+    };
+    // Re-register ONLY the private routes on the (upgraded) private server object,
+    // without touching the live public server: the handlers' public routes land
+    // on a throwaway server that is discarded immediately.
+    auto register_private_routes = [&]() {
+        if (!private_http_server) return;
+        httplib::Server discard;
+        register_on(discard, private_http_server->server());
     };
     register_public_routes();
 
@@ -811,8 +822,8 @@ int main(int argc, char* argv[]) {
         if (private_http_server->is_tls()) {
             private_http_server->start();
         } else {
-            spdlog::warn("Private API withheld: no TLS certificate yet for {} — restart "
-                         "once its cert has been issued (no plaintext fallback)",
+            spdlog::warn("Private API withheld: no TLS certificate yet for {} — it will "
+                         "start once ACME issues one (no plaintext fallback)",
                          server_private_fqdn);
         }
     }
@@ -860,81 +871,83 @@ int main(int argc, char* argv[]) {
     // Background ACME retry -- if no cert yet, retry every 5 minutes
     // ========================================================================
     std::atomic<bool> acme_retry_stop{false};
-    std::thread acme_retry_thread;
-    if (tls.needs_acme_background) {
-        acme_retry_thread = std::thread([&]() {
-            constexpr auto initial_delay  = std::chrono::seconds(30);
-            constexpr auto base_interval  = std::chrono::minutes(5);
-            constexpr auto max_interval   = std::chrono::hours(1);
-            auto current_interval = base_interval;
 
-            spdlog::info("Auto-TLS: background retry starting in 30s for {}", server_fqdn);
-            for (auto elapsed = std::chrono::seconds(0);
-                 elapsed < initial_delay && !acme_retry_stop.load();
-                 elapsed += std::chrono::seconds(1)) {
+    // Obtain a cert for `fqdn` and bring `srv` up over HTTPS in place (hot-reload
+    // if already TLS, else swap the listener to an SSLServer and re-register its
+    // routes). Loops with backoff until issuance or shutdown; never serves
+    // plaintext. `is_private` selects which routes to re-register on upgrade.
+    auto activate_tls = [&](nexus::network::HttpServer& srv, const std::string& fqdn,
+                            const char* label, bool is_private) {
+        constexpr auto initial_delay = std::chrono::seconds(30);
+        constexpr auto base_interval = std::chrono::minutes(5);
+        constexpr auto max_interval  = std::chrono::hours(1);
+        auto current_interval = base_interval;
+
+        spdlog::info("Auto-TLS: background retry starting in 30s for {} ({})", fqdn, label);
+        for (auto e = std::chrono::seconds(0); e < initial_delay && !acme_retry_stop.load();
+             e += std::chrono::seconds(1))
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        while (!acme_retry_stop.load()) {
+            spdlog::info("Auto-TLS: attempting ACME certificate for {} ({})", fqdn, label);
+            auto result = acme.request_certificate(fqdn);
+            if (result.success) {
+                spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
+                              fqdn, result.cert_path, result.key_path);
+                if (srv.is_tls()) {
+                    if (srv.reload_tls_certs(result.cert_path, result.key_path))
+                        spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", fqdn);
+                    else
+                        spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", fqdn);
+                    return;
+                }
+                spdlog::info("Auto-TLS: activating HTTPS for {} ({}) in place...", fqdn, label);
+                srv.stop();
+                if (srv.upgrade_to_tls(result.cert_path, result.key_path)) {
+                    if (is_private) register_private_routes(); else register_public_routes();
+                    srv.start();
+                    spdlog::info("Auto-TLS: HTTPS active for {} ({}) — other services unaffected",
+                                  fqdn, label);
+                    return;
+                }
+                spdlog::error("Auto-TLS: TLS upgrade failed for {} ({}); stays withheld "
+                              "(no plaintext fallback) — will retry", fqdn, label);
+            }
+
+            bool rate_limited = result.error_message.find("rateLimited") != std::string::npos
+                             || result.error_message.find("429") != std::string::npos
+                             || result.error_message.find("too many") != std::string::npos;
+
+            if (rate_limited) {
+                current_interval = max_interval;
+                spdlog::warn("Auto-TLS: rate limited by ACME provider -- backing off to {} minutes",
+                              std::chrono::duration_cast<std::chrono::minutes>(current_interval).count());
+            } else {
+                auto mins = std::chrono::duration_cast<std::chrono::minutes>(current_interval).count();
+                spdlog::warn("Auto-TLS: ACME retry failed for {} -- retrying in {} minutes", fqdn, mins);
+                auto doubled = current_interval * 2;
+                current_interval = doubled > max_interval ? max_interval : doubled;
+            }
+
+            for (auto e = std::chrono::seconds(0);
+                 e < current_interval && !acme_retry_stop.load();
+                 e += std::chrono::seconds(1))
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
 
-            while (!acme_retry_stop.load()) {
-                spdlog::info("Auto-TLS: attempting ACME certificate for {}", server_fqdn);
-                auto result = acme.request_certificate(server_fqdn);
-                if (result.success) {
-                    spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
-                                  server_fqdn, result.cert_path, result.key_path);
-                    // Activate HTTPS in place — start/restart ONLY the HTTP server,
-                    // leaving gossip/DNS/STUN/relay/etc. running. Never tear down the
-                    // whole process, and never fall back to plaintext.
-                    if (http_server.is_tls()) {
-                        // Already HTTPS — hot-swap the cert, no restart needed.
-                        if (http_server.reload_tls_certs(result.cert_path, result.key_path)) {
-                            spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", server_fqdn);
-                        } else {
-                            spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", server_fqdn);
-                        }
-                        break;
-                    }
-                    // Not yet serving (withheld until now) or plain object — swap to
-                    // SSLServer, re-register routes, and bring the listener up.
-                    spdlog::info("Auto-TLS: activating HTTPS on the API server (in place)...");
-                    http_server.stop();
-                    if (http_server.upgrade_to_tls(result.cert_path, result.key_path)) {
-                        register_public_routes();  // server object changed — re-register
-                        http_server.start();
-                        spdlog::info("Auto-TLS: HTTPS active for {} — other services unaffected",
-                                      server_fqdn);
-                        break;
-                    }
-                    // Upgrade failed despite a valid cert — keep the API withheld and
-                    // retry rather than serving plaintext.
-                    spdlog::error("Auto-TLS: TLS upgrade failed for {}; public API stays "
-                                  "withheld (no plaintext fallback) — will retry", server_fqdn);
-                }
+            if (rate_limited) current_interval = base_interval;
+        }
+    };
 
-                bool rate_limited = result.error_message.find("rateLimited") != std::string::npos
-                                 || result.error_message.find("429") != std::string::npos
-                                 || result.error_message.find("too many") != std::string::npos;
-
-                if (rate_limited) {
-                    current_interval = max_interval;
-                    spdlog::warn("Auto-TLS: rate limited by ACME provider -- backing off to {} minutes",
-                                  std::chrono::duration_cast<std::chrono::minutes>(current_interval).count());
-                } else {
-                    auto mins = std::chrono::duration_cast<std::chrono::minutes>(current_interval).count();
-                    spdlog::warn("Auto-TLS: ACME retry failed -- retrying in {} minutes", mins);
-                    auto doubled = current_interval * 2;
-                    current_interval = doubled > max_interval ? max_interval : doubled;
-                }
-
-                for (auto elapsed = std::chrono::seconds(0);
-                     elapsed < current_interval && !acme_retry_stop.load();
-                     elapsed += std::chrono::seconds(1)) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
-
-                if (rate_limited) {
-                    current_interval = base_interval;
-                }
-            }
+    // Bring the public API up first, then the private API — one thread so the
+    // ACME calls stay serialized (shared account/order state), and neither
+    // listener serves plaintext while it waits for its cert.
+    std::thread acme_retry_thread;
+    if (tls.needs_acme_background || private_needs_acme) {
+        acme_retry_thread = std::thread([&]() {
+            if (tls.needs_acme_background)
+                activate_tls(http_server, server_fqdn, "public API", false);
+            if (private_needs_acme && private_http_server)
+                activate_tls(*private_http_server, server_private_fqdn, "private API", true);
         });
     }
 
