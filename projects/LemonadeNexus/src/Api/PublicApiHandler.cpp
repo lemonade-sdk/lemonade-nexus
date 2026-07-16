@@ -52,10 +52,14 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
 
         entries.push_back({
             .endpoint  = our_endpoint,
+            .fqdn      = ctx_.server_fqdn,   // our cert FQDN for verified HTTPS
             .http_port = ctx_.config.http_port,
             .healthy   = true,
         });
 
+        // Peer entries carry no verified FQDN yet (gossip advertises ip:port, and
+        // a peer's SEIP FQDN isn't propagated) — clients skip IP-only peers rather
+        // than connect unverified. Populating peer FQDNs is a follow-up.
         for (const auto& p : peers) {
             entries.push_back({
                 .endpoint  = p.endpoint,

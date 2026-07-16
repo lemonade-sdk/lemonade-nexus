@@ -312,6 +312,7 @@ inline void from_json(const nlohmann::json& j, RelayRegisterResponse& r) {
 
 struct ServerEntry {
     std::string endpoint;
+    std::string fqdn;        // cert FQDN for verified HTTPS ("" if unknown)
     std::string pubkey;
     uint16_t    http_port{0};
     uint64_t    last_seen{0};
@@ -324,12 +325,14 @@ inline void to_json(nlohmann::json& j, const ServerEntry& r) {
         {"http_port", r.http_port},
         {"healthy",   r.healthy},
     };
+    if (!r.fqdn.empty())   j["fqdn"]      = r.fqdn;
     if (!r.pubkey.empty()) j["pubkey"]    = r.pubkey;
     if (r.last_seen > 0)  j["last_seen"] = r.last_seen;
 }
 
 inline void from_json(const nlohmann::json& j, ServerEntry& r) {
     r.endpoint  = j.value("endpoint", "");
+    r.fqdn      = j.value("fqdn", "");
     r.pubkey    = j.value("pubkey", "");
     r.http_port = j.value("http_port", uint16_t{0});
     r.last_seen = j.value("last_seen", uint64_t{0});

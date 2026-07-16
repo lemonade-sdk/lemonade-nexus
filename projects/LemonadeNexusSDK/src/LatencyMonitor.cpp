@@ -46,10 +46,10 @@ struct LatencyMonitor::Impl {
 
     explicit Impl(const LatencyConfig& cfg) : config{cfg} {}
 
-    // Measure RTT to a single endpoint via HTTP GET /api/health
+    // Measure RTT to a single endpoint via HTTPS GET /api/health
     double probe_one(const ServerEndpoint& ep) const {
-        std::string url = (ep.use_tls ? "https://" : "http://") +
-                          ep.host + ":" + std::to_string(ep.port);
+        // Always HTTPS (verified by FQDN); the mesh has no plaintext path.
+        std::string url = "https://" + ep.host + ":" + std::to_string(ep.port);
 
         httplib::Client cli(url);
         cli.set_connection_timeout(0, config.probe_timeout_ms * 1000);  // microseconds

@@ -2,6 +2,12 @@
 # Verifies closed-registration join gating, device link-token mint/join, the
 # token-gated control API, and private-API reachability over the userspace mesh.
 #
+# TODO(tls): this script still assumes plain HTTP (--no-auto-tls). Mesh HTTP is
+# now verified-HTTPS-only (no plaintext, no verify-off), so this needs porting to
+# the TLS flow: serve a cert for a dev FQDN, trust it (CurrentUser Root store or a
+# real Cloudflare dns-01 cert), and point the sidecar at that FQDN. See
+# .idea/local-dev.md §3-4. Until then it will not pass against a current server.
+#
 #   powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 [-BuildDir <path>]
 param([string]$BuildDir = "$PSScriptRoot\..\build")
 $ErrorActionPreference = "Stop"

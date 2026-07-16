@@ -35,29 +35,24 @@ uint64_t now_unix() {
 
 struct HttpResult { bool connected{false}; int status{0}; std::string body; };
 
-/// POST/GET to "host:port", trying HTTPS (no cert verification) then plain
-/// HTTP. Trust is anchored in the pre-pinned root pubkey: the issued cert and
-/// all signatures verify against it, never against the transport. Local dev
-/// runs plain HTTP.
+/// GET/POST to an onboarding server over verified HTTPS. `host` MUST be the
+/// server's certificate FQDN — the cert is verified against the system trust
+/// store and the hostname. `connect_ip`, when set, lands the socket on that
+/// address (httplib hostname->addr map) while still verifying `host`, for an
+/// operator pinning a specific IP. No plaintext, no verification-disabled path.
 HttpResult http_call(const std::string& host, int port, const std::string& method,
-                     const std::string& path, const std::string& body) {
-    auto run = [&](auto& cli) -> HttpResult {
-        cli.set_connection_timeout(3);
-        cli.set_read_timeout(5);
-        httplib::Result r = (method == "GET")
-            ? cli.Get(path.c_str())
-            : cli.Post(path.c_str(), body, "application/json");
-        if (!r) return {false, 0, ""};
-        return {true, r->status, r->body};
-    };
-    {
-        httplib::SSLClient tls(host, port);
-        tls.enable_server_certificate_verification(false);
-        auto res = run(tls);
-        if (res.connected) return res;
-    }
-    httplib::Client plain(host, port);
-    return run(plain);
+                     const std::string& path, const std::string& body,
+                     const std::string& connect_ip = "") {
+    httplib::SSLClient tls(host, port);
+    if (!connect_ip.empty())
+        tls.set_hostname_addr_map({{host, connect_ip}});
+    tls.set_connection_timeout(3);
+    tls.set_read_timeout(5);
+    httplib::Result r = (method == "GET")
+        ? tls.Get(path.c_str())
+        : tls.Post(path.c_str(), body, "application/json");
+    if (!r) return {false, 0, ""};
+    return {true, r->status, r->body};
 }
 
 std::vector<uint8_t> lp_join(const std::vector<std::string>& parts) {
@@ -159,10 +154,11 @@ void merge_config(const std::string& config_path, const std::string& root_hex,
 }
 
 /// Probe candidate targets; return the first "host:port" that accepts onboarding.
-std::string pick_target(const std::vector<std::string>& targets) {
+std::string pick_target(const std::vector<std::string>& targets,
+                        const std::string& connect_ip) {
     for (const auto& t : targets) {
         auto [host, port] = split_hostport(t, 9100);
-        auto r = http_call(host, port, "GET", "/api/onboard/info", "");
+        auto r = http_call(host, port, "GET", "/api/onboard/info", "", connect_ip);
         if (!r.connected || r.status != 200) continue;
         try {
             if (json::parse(r.body).value("accepts_onboarding", false)) return t;
@@ -229,25 +225,27 @@ int run_onboard_server(ServerConfig& config) {
         return 1;
     }
 
-    // Target selection: explicit --onboard-server host:port, else DNS discovery.
+    // Target selection: explicit --onboard-server <fqdn>[:port] (verified by its
+    // certificate FQDN; --onboard-addr optionally pins the connect IP), else DNS
+    // discovery of the region's tier SEIP FQDNs. We connect BY the FQDN — the
+    // cert can't be verified against a bare IP.
     std::vector<std::string> targets;
+    const std::string connect_ip = config.onboard_addr;
     if (!config.onboard_target.empty()) {
         targets.push_back(config.onboard_target);
     } else if (!config.dns_base_domain.empty() && !region.empty()) {
         for (int tier : {1, 2}) {
-            auto host = "tier" + std::to_string(tier) + "." + region + ".seip." +
-                        config.dns_base_domain;
-            for (const auto& ip : resolve_a_records(host))
-                targets.push_back(ip + ":" + std::to_string(config.http_port));
+            targets.push_back("tier" + std::to_string(tier) + "." + region + ".seip." +
+                              config.dns_base_domain + ":" + std::to_string(config.http_port));
         }
     }
     if (targets.empty()) {
-        spdlog::error("Onboard: no target. Pass '--onboard-server <host:port>' or configure "
+        spdlog::error("Onboard: no target. Pass '--onboard-server <fqdn[:port]>' or configure "
                       "DNS discovery (region + dns_base_domain).");
         return 1;
     }
 
-    auto target = pick_target(targets);
+    auto target = pick_target(targets, connect_ip);
     if (target.empty()) {
         spdlog::error("Onboard: no reachable server is accepting onboarding "
                       "(tried {} target(s)).", targets.size());
@@ -262,7 +260,7 @@ int run_onboard_server(ServerConfig& config) {
 
     // 1. Challenge.
     auto ch = http_call(host, port, "POST", "/api/onboard/challenge",
-                        json{{"candidate_pubkey", keys.pub_b64}}.dump());
+                        json{{"candidate_pubkey", keys.pub_b64}}.dump(), connect_ip);
     if (!ch.connected || ch.status != 200) {
         spdlog::error("Onboard: challenge failed ({})", ch.body); return 1;
     }
@@ -280,7 +278,7 @@ int run_onboard_server(ServerConfig& config) {
     // request to our key; mint-time binding ties the token to it.
     if (!config.onboard_token.empty())
         reqbody["enrollment_token"] = config.onboard_token;
-    auto rq = http_call(host, port, "POST", "/api/onboard/request", reqbody.dump());
+    auto rq = http_call(host, port, "POST", "/api/onboard/request", reqbody.dump(), connect_ip);
     if (!rq.connected || rq.status != 200) {
         spdlog::error("Onboard: admission request rejected ({})", rq.body); return 1;
     }
@@ -293,7 +291,7 @@ int run_onboard_server(ServerConfig& config) {
     if (config.onboard_token.empty()) {
         std::printf("  Approve on the genesis:\n");
         std::printf("    curl -H 'Authorization: Bearer <admin-jwt>' -X POST \\\n");
-        std::printf("      http://<genesis>:9101/api/onboard/approve/%s \\\n", request_id.c_str());
+        std::printf("      https://private.<genesis-fqdn>:9101/api/onboard/approve/%s \\\n", request_id.c_str());
         std::printf("      -d '{\"fingerprint\":\"%s\"}'\n", keys.pub_b64.substr(0, 16).c_str());
         std::printf("  (or skip the wait next time: mint a token on the root server with\n");
         std::printf("   --mint-admission-token and pass it via --onboard-token)\n\n");
@@ -308,7 +306,7 @@ int run_onboard_server(ServerConfig& config) {
             lp_join({"ln-onboard-poll:v1", request_id, std::to_string(pts)}));
         auto pl = http_call(host, port, "POST", "/api/onboard/poll",
             json{{"request_id", request_id}, {"candidate_pubkey", keys.pub_b64},
-                 {"timestamp", pts}, {"signature", psig}}.dump());
+                 {"timestamp", pts}, {"signature", psig}}.dump(), connect_ip);
         if (pl.connected && pl.status == 200) {
             auto pj = json::parse(pl.body);
             auto state = pj.value("state", "");
@@ -373,7 +371,7 @@ int run_onboard_server(ServerConfig& config) {
         lp_join({"ln-onboard-ack:v1", request_id, std::to_string(ats)}));
     (void)http_call(host, port, "POST", "/api/onboard/ack",
         json{{"request_id", request_id}, {"candidate_pubkey", keys.pub_b64},
-             {"timestamp", ats}, {"signature", asig}}.dump());
+             {"timestamp", ats}, {"signature", asig}}.dump(), connect_ip);
 
     std::printf("\n====================================================================\n");
     std::printf("  Onboarded as '%s'\n", server_id.c_str());

@@ -90,7 +90,7 @@ struct ExposeMapping {
 struct SidecarConfig {
     std::string host{"127.0.0.1"};
     uint16_t    port{9100};
-    bool        use_tls{false};
+    bool        use_tls{true};
     std::string identity_path;
     std::string data_root{"nexus-sidecar"};
     std::string link_token;
@@ -298,9 +298,10 @@ int main(int argc, char* argv[]) {
     }
 
     lnsdk::ServerConfig sc(cfg.host, cfg.port, cfg.use_tls);
-    // Pin explicitly, or automatically for a TLS-less (local/direct) server whose
-    // advertised SEIP FQDN won't resolve.
-    sc.pin_server = cfg.pin_server || !cfg.use_tls;
+    // Pin only when asked. --server must be a cert FQDN (verification is always
+    // on); pinning keeps the SDK on that FQDN instead of switching to the
+    // server's advertised SEIP FQDN after join.
+    sc.pin_server = cfg.pin_server;
     lnsdk::LemonadeNexusClient client{sc};
     client.set_identity(identity);
     if (!cfg.link_token.empty()) client.set_link_token(cfg.link_token);

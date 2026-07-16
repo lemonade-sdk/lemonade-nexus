@@ -155,7 +155,8 @@ void print_usage(const char* prog) {
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
-    spdlog::info("  --onboard-server [host:port] Join an existing mesh: request admission over its public API, then exit (requires --root-pubkey)");
+    spdlog::info("  --onboard-server [fqdn:port] Join an existing mesh: request admission over its public API (verified HTTPS by FQDN), then exit (requires --root-pubkey)");
+    spdlog::info("  --onboard-addr <ip>        Pin the connect IP while still verifying --onboard-server's cert FQDN (e.g. local dev where the FQDN maps to 127.0.0.1)");
     spdlog::info("  --onboard-id <label>       Requested server ID for onboarding (default: auto-derived)");
     spdlog::info("  --onboard-token <tok>      Single-use enrollment token for immediate admission (or SP_ONBOARD_TOKEN)");
     spdlog::info("  --mint-admission-token     Mint a server-admission enrollment token and exit (root holder only)");
@@ -191,7 +192,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");
     spdlog::info("  --tls-key-path <path>      Path to TLS private key PEM (manual override)");
-    spdlog::info("  --no-auto-tls              Disable automatic TLS certificate via ACME");
+    spdlog::info("  --no-auto-tls              Disable automatic TLS via ACME. The API then serves ONLY if --tls-cert-path/--tls-key-path are provided; otherwise it is withheld (no plaintext fallback)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
@@ -299,8 +300,10 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enrollment_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--onboard-server") == 0) {
             config.onboard_server = true;
-            // Optional positional target ("host:port"); anything starting with '-' is a flag.
+            // Optional positional target ("<fqdn>[:port]"); anything starting with '-' is a flag.
             if (i + 1 < argc && argv[i + 1][0] != '-') config.onboard_target = argv[++i];
+        } else if (std::strcmp(argv[i], "--onboard-addr") == 0 && i + 1 < argc) {
+            config.onboard_addr = argv[++i];
         } else if (std::strcmp(argv[i], "--onboard-id") == 0 && i + 1 < argc) {
             config.onboard_server_id = argv[++i];
         } else if (std::strcmp(argv[i], "--onboard-timeout") == 0 && i + 1 < argc) {

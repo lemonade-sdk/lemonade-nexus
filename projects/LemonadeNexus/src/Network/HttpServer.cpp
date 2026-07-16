@@ -37,10 +37,17 @@ HttpServer::HttpServer(uint16_t port, std::string bind_address,
             spdlog::info("HttpServer: TLS enabled (cert={}, key={})",
                           tls_cert_path, tls_key_path);
         } else {
-            spdlog::warn("HttpServer: TLS cert/key failed to load, falling back to plain HTTP");
+            // TLS was requested but the cert/key won't load. Do NOT serve
+            // plaintext in their place — keep a server object so routes can be
+            // registered, but leave is_tls_ false so the caller withholds the
+            // listener until a valid cert is available (or upgrade_to_tls).
+            spdlog::error("HttpServer: TLS cert/key provided but failed to load — "
+                          "server will not listen until a valid cert is available");
             server_ = std::make_unique<httplib::Server>();
         }
     } else {
+        // No cert yet (e.g. ACME still pending). The object exists for route
+        // registration; the caller gates start() on is_tls().
         server_ = std::make_unique<httplib::Server>();
     }
 }

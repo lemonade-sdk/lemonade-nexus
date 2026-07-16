@@ -299,16 +299,22 @@ file copying. The candidate proves it holds its gossip key, the mesh decides
 whether to admit it, and on approval the root-signed certificate is delivered
 back and installed automatically.
 
-Onboarding **requires the mesh root pubkey up front** (`--root-pubkey`,
+All mesh HTTP runs over **verified, publicly-trusted TLS** — there is no
+plaintext or verification-disabled path. The candidate connects to the genesis
+by its **certificate FQDN** (`<id>.<region>.seip.<domain>`) and verifies the
+cert against the system trust store; `--onboard-server` refuses a bare IP.
+
+Onboarding also **requires the mesh root pubkey up front** (`--root-pubkey`,
 printed by the genesis at `--first-run`). The response can only confirm that
 pinned key — a server that delivers a different root is rejected, so an
 intermediary can never hand the candidate a substitute trust anchor.
 
 ```bash
-# On the new server. Give it a mesh server to contact (or omit the address to
-# discover one via the region's DNS tier records).
+# On the new server. Give it a mesh server FQDN to contact (or omit it to
+# discover one via the region's DNS tier records). --onboard-addr optionally
+# pins the connect IP while still verifying the cert FQDN.
 ./build/projects/LemonadeNexus/lemonade-nexus \
-    --onboard-server <genesis-host>:9100 \
+    --onboard-server <genesis-fqdn>:9100 \
     --root-pubkey <mesh-root-pubkey-hex> \
     --onboard-id aws-use1-a \
     --data-root ./data

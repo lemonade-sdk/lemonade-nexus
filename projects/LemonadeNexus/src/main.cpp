@@ -793,9 +793,28 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Start HTTP servers
     // ========================================================================
-    http_server.start();
+    // Refuse-without-cert: the control-plane APIs serve HTTPS or nothing. A
+    // server with no valid cert is withheld (no plaintext fallback). The public
+    // API is brought up in place by the background ACME thread below once a cert
+    // is issued; the private API picks its cert up on the next restart.
+    if (http_server.is_tls()) {
+        http_server.start();
+    } else if (tls.needs_acme_background) {
+        spdlog::warn("Public API withheld: no TLS certificate yet for {} — it will "
+                     "start once ACME issues one (no plaintext fallback)", server_fqdn);
+    } else {
+        spdlog::error("Public API withheld: no TLS certificate for {} and auto-TLS is off. "
+                      "Provide --tls-cert-path/--tls-key-path or enable auto-TLS "
+                      "(no plaintext fallback).", server_fqdn);
+    }
     if (private_http_server) {
-        private_http_server->start();
+        if (private_http_server->is_tls()) {
+            private_http_server->start();
+        } else {
+            spdlog::warn("Private API withheld: no TLS certificate yet for {} — restart "
+                         "once its cert has been issued (no plaintext fallback)",
+                         server_private_fqdn);
+        }
     }
 
     // ========================================================================
@@ -862,8 +881,9 @@ int main(int argc, char* argv[]) {
                 if (result.success) {
                     spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
                                   server_fqdn, result.cert_path, result.key_path);
-                    // Activate HTTPS in place — restart ONLY the HTTP server, leaving
-                    // gossip/DNS/STUN/relay/etc. running. Never tear down the whole process.
+                    // Activate HTTPS in place — start/restart ONLY the HTTP server,
+                    // leaving gossip/DNS/STUN/relay/etc. running. Never tear down the
+                    // whole process, and never fall back to plaintext.
                     if (http_server.is_tls()) {
                         // Already HTTPS — hot-swap the cert, no restart needed.
                         if (http_server.reload_tls_certs(result.cert_path, result.key_path)) {
@@ -871,21 +891,23 @@ int main(int argc, char* argv[]) {
                         } else {
                             spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", server_fqdn);
                         }
-                    } else {
-                        spdlog::info("Auto-TLS: activating HTTPS on the API server (in place)...");
-                        http_server.stop();
-                        if (http_server.upgrade_to_tls(result.cert_path, result.key_path)) {
-                            register_public_routes();  // server object changed — re-register
-                            http_server.start();
-                            spdlog::info("Auto-TLS: HTTPS active for {} — other services unaffected",
-                                          server_fqdn);
-                        } else {
-                            http_server.start();  // upgrade failed — resume plain HTTP
-                            spdlog::warn("Auto-TLS: TLS upgrade failed for {}; continuing on HTTP",
-                                          server_fqdn);
-                        }
+                        break;
                     }
-                    break;
+                    // Not yet serving (withheld until now) or plain object — swap to
+                    // SSLServer, re-register routes, and bring the listener up.
+                    spdlog::info("Auto-TLS: activating HTTPS on the API server (in place)...");
+                    http_server.stop();
+                    if (http_server.upgrade_to_tls(result.cert_path, result.key_path)) {
+                        register_public_routes();  // server object changed — re-register
+                        http_server.start();
+                        spdlog::info("Auto-TLS: HTTPS active for {} — other services unaffected",
+                                      server_fqdn);
+                        break;
+                    }
+                    // Upgrade failed despite a valid cert — keep the API withheld and
+                    // retry rather than serving plaintext.
+                    spdlog::error("Auto-TLS: TLS upgrade failed for {}; public API stays "
+                                  "withheld (no plaintext fallback) — will retry", server_fqdn);
                 }
 
                 bool rate_limited = result.error_message.find("rateLimited") != std::string::npos

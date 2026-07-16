@@ -99,7 +99,8 @@ struct ServerConfig {
 
     // Onboarding — candidate side (--onboard-server [host:port])
     bool        onboard_server{false};       // run the onboarding client and exit
-    std::string onboard_target;              // optional "host:port" of a mesh server (else DNS discovery)
+    std::string onboard_target;              // optional "<fqdn>[:port]" of a mesh server (else DNS discovery)
+    std::string onboard_addr;                // optional IP to pin the connect to, while still verifying onboard_target's cert (runtime-only)
     std::string onboard_server_id;           // requested DNS label (auto-derived if empty)
     uint32_t    onboard_timeout_sec{900};    // give up waiting for admission after this
     std::string onboard_token;               // single-use enrollment token (runtime-only, never persisted)

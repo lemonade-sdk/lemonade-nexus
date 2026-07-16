@@ -160,8 +160,9 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
     auto port_str = root_http_endpoint.substr(colon_pos + 1);
     auto port = std::atoi(port_str.c_str());
 
-    // POST to root server
-    httplib::Client client(host, port);
+    // POST to root server over verified HTTPS (host must be the root's cert
+    // FQDN); no plaintext, no verification-disabled path.
+    httplib::SSLClient client(host, port);
     client.set_connection_timeout(10);
     client.set_read_timeout(10);
 
