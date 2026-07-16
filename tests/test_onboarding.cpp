@@ -533,6 +533,41 @@ TEST_F(AdmissionServiceTest, VoteRegimeBallotGoverns) {
     EXPECT_TRUE(store.verify(minted->first, in.candidate_pubkey).has_value());
 }
 
+TEST_F(AdmissionServiceTest, VoteRegimeAdminCannotBypassBallot) {
+    // In the vote regime neither approve() nor deny() may resolve a
+    // ballot-governed admission — only the Tier-1 quorum callback can. Otherwise
+    // a root admin could admit (or reject) ahead of the vote and the quorum
+    // would be advisory.
+    make(/*root_is_local=*/true, /*min_tier1=*/0);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_TRUE(r.needs_ballot);
+
+    // Direct admin approve/deny are both rejected with 409 while the ballot governs.
+    auto ap = admission->approve(r.request_id, in.candidate_pubkey, /*supersede=*/false);
+    EXPECT_FALSE(ap.ok);
+    EXPECT_EQ(ap.status, 409);
+    auto dn = admission->deny(r.request_id, "nope");
+    EXPECT_FALSE(dn.ok);
+    EXPECT_EQ(dn.status, 409);
+
+    // Still pending and unissued after both attempts.
+    auto mid = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_EQ(mid->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_TRUE(mid->issued_cert_json.empty());
+
+    // Only the quorum callback resolves it.
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, "");
+    auto after = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(after->decided_by, "ballot");
+}
+
 TEST_F(AdmissionServiceTest, MintRefusedOnNonRootHolder) {
     make(/*root_is_local=*/false);
     EXPECT_FALSE(admission->mint_admission_token("", std::chrono::seconds{600}).has_value());

@@ -460,6 +460,13 @@ ServerAdmissionService::Result ServerAdmissionService::approve(
     auto& a = it->second;
     if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
 
+    // A ballot-governed admission (its decision mode was fixed at creation) is
+    // resolved only by the Tier-1 quorum via on_ballot_decision(). An admin must
+    // not be able to admit ahead of the vote, or the quorum would be advisory.
+    if (!a.ballot_claim_json.empty())
+        return {false, 409, "ballot governs this admission; only a Tier-1 quorum can resolve it",
+                request_id};
+
     // Out-of-band verification duty: admin must echo the candidate's pubkey or
     // its first-16-hex fingerprint.
     const auto fp = a.candidate_pubkey.substr(0, 16);
@@ -479,6 +486,13 @@ ServerAdmissionService::Result ServerAdmissionService::deny(
     if (it == admissions_.end()) return {false, 404, "no such admission", request_id};
     auto& a = it->second;
     if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
+
+    // A ballot-governed admission is resolved only by the Tier-1 quorum; an admin
+    // must not be able to terminate the pending ballot unilaterally.
+    if (!a.ballot_claim_json.empty())
+        return {false, 409, "ballot governs this admission; only a Tier-1 quorum can resolve it",
+                request_id};
+
     a.state = State::Denied;
     a.decision_reason = reason;
     a.decided_by = "admin";
