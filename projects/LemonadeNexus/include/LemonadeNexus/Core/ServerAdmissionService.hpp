@@ -45,6 +45,7 @@ public:
         std::string issued_cert_json;   // set when Approved
         std::string decision_reason;
         std::string decided_by;         // "token" | "admin" | "ballot"
+        std::string decision_mode;      // "sole" | "ballot" — fixed at creation, persisted
         std::string ballot_claim_json;  // candidate self-signed claim (vote regime)
     };
 

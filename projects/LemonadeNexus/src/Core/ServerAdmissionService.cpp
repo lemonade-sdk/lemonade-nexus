@@ -275,7 +275,14 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.tpm_ek_cert      = in.tpm_ek_cert;
     a.source_ip        = in.source_ip;
     a.expires_at       = now + cfg_.request_ttl_sec;
-    if (!is_existing) { a.state = State::Pending; a.created_at = now; }
+    if (!is_existing) {
+        a.state = State::Pending;
+        a.created_at = now;
+        // Fix the decision mode at creation and persist it — a later change in
+        // the eligible-voter count (or a restart) must not turn a ballot-governed
+        // request back into an admin-resolvable one.
+        a.decision_mode = below_vote ? "sole" : "ballot";
+    }
 
     // Token admission (sole-discretion regime only). Consume fail-closed:
     // spend the token BEFORE issuing and require it to actually be removed, so
@@ -460,10 +467,11 @@ ServerAdmissionService::Result ServerAdmissionService::approve(
     auto& a = it->second;
     if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
 
-    // A ballot-governed admission (its decision mode was fixed at creation) is
-    // resolved only by the Tier-1 quorum via on_ballot_decision(). An admin must
-    // not be able to admit ahead of the vote, or the quorum would be advisory.
-    if (!a.ballot_claim_json.empty())
+    // A ballot-governed admission (its decision mode was fixed at creation and
+    // persisted) is resolved only by the Tier-1 quorum via on_ballot_decision().
+    // An admin must not be able to admit ahead of the vote, or the quorum would
+    // be advisory.
+    if (a.decision_mode == "ballot")
         return {false, 409, "ballot governs this admission; only a Tier-1 quorum can resolve it",
                 request_id};
 
@@ -489,7 +497,7 @@ ServerAdmissionService::Result ServerAdmissionService::deny(
 
     // A ballot-governed admission is resolved only by the Tier-1 quorum; an admin
     // must not be able to terminate the pending ballot unilaterally.
-    if (!a.ballot_claim_json.empty())
+    if (a.decision_mode == "ballot")
         return {false, 409, "ballot governs this admission; only a Tier-1 quorum can resolve it",
                 request_id};
 
@@ -531,6 +539,7 @@ void ServerAdmissionService::persist() {
             {"created_at", a.created_at}, {"expires_at", a.expires_at},
             {"issued_cert_json", a.issued_cert_json},
             {"decision_reason", a.decision_reason}, {"decided_by", a.decided_by},
+            {"decision_mode", a.decision_mode}, {"ballot_claim_json", a.ballot_claim_json},
         });
     }
     json root{{"ever_approved", ever_approved_}, {"admissions", arr}};
@@ -562,6 +571,12 @@ void ServerAdmissionService::load() {
             a.issued_cert_json = j.value("issued_cert_json", "");
             a.decision_reason  = j.value("decision_reason", "");
             a.decided_by       = j.value("decided_by", "");
+            a.decision_mode    = j.value("decision_mode", "");
+            a.ballot_claim_json = j.value("ballot_claim_json", "");
+            // Forward-compat: records persisted before decision_mode existed but
+            // that carry a ballot claim are ballot-governed.
+            if (a.decision_mode.empty() && !a.ballot_claim_json.empty())
+                a.decision_mode = "ballot";
             if (!a.request_id.empty()) admissions_[a.request_id] = std::move(a);
         }
     } catch (const std::exception& e) {

@@ -568,6 +568,46 @@ TEST_F(AdmissionServiceTest, VoteRegimeAdminCannotBypassBallot) {
     EXPECT_EQ(after->decided_by, "ballot");
 }
 
+TEST_F(AdmissionServiceTest, BallotDecisionModeSurvivesRestart) {
+    // The ballot gate must be persisted: after a restart, a ballot-governed
+    // admission must still reject direct approve()/deny(), or the quorum bypass
+    // reopens.
+    make(/*root_is_local=*/true, /*min_tier1=*/0);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_TRUE(r.needs_ballot);
+
+    // Simulate a restart: tear down the service and rebuild it from the SAME
+    // data root, so on_start()->load() restores the persisted admission.
+    admission->stop();
+    admission = std::make_unique<core::ServerAdmissionService>(
+        config, *crypto_svc, *kw, *storage_svc, *gossip_svc, nullptr);
+    admission->start();
+
+    // Reloaded as ballot-governed: direct approve/deny still 409.
+    auto ap = admission->approve(r.request_id, in.candidate_pubkey, /*supersede=*/false);
+    EXPECT_FALSE(ap.ok);
+    EXPECT_EQ(ap.status, 409);
+    auto dn = admission->deny(r.request_id, "nope");
+    EXPECT_FALSE(dn.ok);
+    EXPECT_EQ(dn.status, 409);
+
+    auto mid = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_EQ(mid->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_TRUE(mid->issued_cert_json.empty());
+
+    // Only the quorum callback resolves it, even after the restart.
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, "");
+    auto after = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(after->decided_by, "ballot");
+}
+
 TEST_F(AdmissionServiceTest, MintRefusedOnNonRootHolder) {
     make(/*root_is_local=*/false);
     EXPECT_FALSE(admission->mint_admission_token("", std::chrono::seconds{600}).has_value());
