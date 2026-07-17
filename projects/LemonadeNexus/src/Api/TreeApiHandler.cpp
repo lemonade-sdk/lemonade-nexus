@@ -20,6 +20,30 @@
 
 namespace nexus::api {
 
+namespace {
+
+// Caller-scoped JSON view of a tree node. Always redacts the wrapped management
+// private key (secret key material must never leave the server). Reduces the
+// assignment map to the caller's own entry unless `full_assignments` is set —
+// management readers (EditNode) need the whole ACL for read-modify-write group
+// edits, but lesser readers must not see every principal on the node.
+nlohmann::json redact_node_for_caller(const tree::TreeNode& node,
+                                      const std::string& caller_pubkey,
+                                      bool full_assignments) {
+    nlohmann::json j = node;
+    j["wrapped_mgmt_privkey"] = ""; // keep the field present, drop the secret
+    if (!full_assignments) {
+        nlohmann::json own = nlohmann::json::array();
+        for (const auto& a : node.assignments) {
+            if (a.management_pubkey == caller_pubkey) own.push_back(a);
+        }
+        j["assignments"] = std::move(own);
+    }
+    return j;
+}
+
+} // namespace
+
 void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
     using nexus::auth::require_auth;
     using nexus::auth::SessionClaims;
@@ -44,6 +68,30 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (client_pubkey.empty()) {
             error_response(res, "public_key required");
             return;
+        }
+
+        // public_key drives mgmt_pubkey, every ACL principal, and the
+        // is_root_owner check — it MUST be the Ed25519-authenticated identity,
+        // not an unverified body field. Bind it to body.pubkey (already verified
+        // against the challenge signature by ctx_.auth.authenticate above).
+        {
+            constexpr std::string_view ed_prefix = "ed25519:";
+            std::string_view claimed_b64 = client_pubkey;
+            if (claimed_b64.starts_with(ed_prefix)) {
+                claimed_b64.remove_prefix(ed_prefix.size());
+            }
+            bool matches = false;
+            try {
+                matches = crypto::from_base64(claimed_b64) ==
+                          crypto::from_base64(body.value("pubkey", std::string{}));
+            } catch (...) {
+                matches = false;
+            }
+            if (!matches) {
+                error_response(res,
+                    "public_key does not match authenticated identity", 403);
+                return;
+            }
         }
 
         auto node_id = auth_result.user_id;
@@ -356,15 +404,25 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     priv.Get(R"(/api/tree/node/(.+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
+        // Gate the read on an explicit Read grant scoped to this node.
+        if (!ctx_.tree.check_permission(caller_pubkey, node_id,
+                                         acl::Permission::Read)) {
+            error_response(res, "no read permission", 403);
+            return;
+        }
         auto node = ctx_.tree.get_node(node_id);
         if (!node) {
             error_response(res, "node not found", 404);
             return;
         }
-        nlohmann::json j = *node;
-        json_response(res, j);
+        // Management readers get the full ACL (needed for read-modify-write
+        // group edits); everyone else sees only their own assignment.
+        bool full_acl = ctx_.tree.check_permission(caller_pubkey, node_id,
+                                                    acl::Permission::EditNode);
+        json_response(res, redact_node_for_caller(*node, caller_pubkey, full_acl));
     }));
 
     // ========================================================================
@@ -404,10 +462,21 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     priv.Get(R"(/api/tree/children/(.+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto parent_id = req.matches[1].str();
-        auto children = ctx_.tree.get_children(parent_id);
-        nlohmann::json j = children;
+        auto caller_pubkey = normalize_pubkey(claims.pubkey);
+        // Gate enumeration on a Read grant on the parent node.
+        if (!ctx_.tree.check_permission(caller_pubkey, parent_id,
+                                         acl::Permission::Read)) {
+            error_response(res, "no read permission", 403);
+            return;
+        }
+        nlohmann::json j = nlohmann::json::array();
+        for (const auto& child : ctx_.tree.get_children(parent_id)) {
+            bool full_acl = ctx_.tree.check_permission(caller_pubkey, child.id,
+                                                        acl::Permission::EditNode);
+            j.push_back(redact_node_for_caller(child, caller_pubkey, full_acl));
+        }
         json_response(res, j);
     }));
 
@@ -534,9 +603,51 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
+        // Snapshot identity/allocations before removal so we can cascade cleanup.
+        auto doomed = ctx_.tree.get_node(node_id);
+
         if (!ctx_.tree.delete_node_direct(node_id)) {
             error_response(res, "node not found or delete failed", 404);
             return;
+        }
+
+        if (doomed) {
+            // 1. Revoke the device's Ed25519 credential so a deleted device
+            //    cannot silently auto-re-register (node_id is key-deterministic).
+            //    Owner-protection: an owner's key is the mgmt_pubkey of their
+            //    customer group AND every sibling endpoint, so deleting ONE of
+            //    their own devices must NOT blocklist that shared key. Only revoke
+            //    a key that no surviving node still owns — i.e. a linked-device
+            //    key, which owns only the endpoint just deleted.
+            if (!doomed->mgmt_pubkey.empty() &&
+                !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
+                constexpr std::string_view ed_prefix = "ed25519:";
+                std::string_view mk = doomed->mgmt_pubkey;
+                if (mk.starts_with(ed_prefix)) mk.remove_prefix(ed_prefix.size());
+                ctx_.auth.revoke_ed25519(std::string(mk));
+            }
+            // 2. Release the node's IP allocations back to the pools.
+            (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
+            (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
+            (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
+            // 3. Remove the mesh WG peer (mirror the join-time key conversion).
+            if (ctx_.boringtun && !doomed->wg_pubkey.empty()) {
+                std::string peer_wg_key = doomed->wg_pubkey;
+                constexpr std::string_view ed_prefix = "ed25519:";
+                if (peer_wg_key.starts_with(ed_prefix)) {
+                    auto ed_bytes = crypto::from_base64(peer_wg_key.substr(ed_prefix.size()));
+                    if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
+                        crypto::Ed25519PublicKey ed_pk{};
+                        std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
+                        auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
+                        peer_wg_key = crypto::to_base64(
+                            std::span<const uint8_t>(x_pk.data(), x_pk.size()));
+                    }
+                }
+                if (ctx_.boringtun->remove_peer(peer_wg_key)) {
+                    spdlog::info("[TreeApi] removed WG peer for deleted node '{}'", node_id);
+                }
+            }
         }
 
         nlohmann::json resp = {{"success", true}};
@@ -549,12 +660,37 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     priv.Post("/api/ipam/allocate", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto body_opt = parse_body(req, res);
         if (!body_opt) return;
         auto& body = *body_opt;
 
         auto ipam_req = body.get<network::IpamAllocateRequest>();
+
+        if (ipam_req.node_id.empty()) {
+            error_response(res, "node_id required");
+            return;
+        }
+
+        // Ownership + authorization: the caller must administer the target node.
+        // Mirrors the delta path, which maps allocate_ip to EditNode.
+        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey),
+                                         ipam_req.node_id, acl::Permission::EditNode)) {
+            error_response(res, "no allocate permission on node", 403);
+            return;
+        }
+
+        // Bound block size so a single request can't drain a pool. Tunnel is a
+        // fixed /32 and ignores prefix_len.
+        constexpr uint8_t kMinBlockPrefix = 24; // no block larger than a /24
+        constexpr uint8_t kMaxBlockPrefix = 30;
+        if (ipam_req.block_type == "private" || ipam_req.block_type == "shared") {
+            if (ipam_req.prefix_len < kMinBlockPrefix ||
+                ipam_req.prefix_len > kMaxBlockPrefix) {
+                error_response(res, "prefix_len out of range (24-30)");
+                return;
+            }
+        }
 
         ipam::Allocation alloc;
         if (ipam_req.block_type == "tunnel") {

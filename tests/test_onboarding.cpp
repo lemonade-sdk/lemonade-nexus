@@ -507,8 +507,10 @@ TEST_F(AdmissionServiceTest, TokenRetryApprovesExistingPending) {
 }
 
 TEST_F(AdmissionServiceTest, VoteRegimeBallotGoverns) {
-    // At/above the vote threshold the quorum ballot decides; a token is
-    // neither honored nor consumed.
+    // At/above the vote threshold the quorum ballot decides. A presented token
+    // cannot admit — and it IS consumed (burned) at first submission so it can
+    // never be re-spent to bypass the ballot if churn later drops the mesh below
+    // the vote threshold (the H1 restart/regime bypass).
     make(/*root_is_local=*/true, /*min_tier1=*/0);
 
     auto minted = admission->mint_admission_token("", std::chrono::seconds{600});
@@ -528,9 +530,10 @@ TEST_F(AdmissionServiceTest, VoteRegimeBallotGoverns) {
     // The gossip-replicated ballot claim must never carry token material.
     EXPECT_EQ(a->ballot_claim_json.find(minted->first), std::string::npos);
 
-    // Unconsumed: still spendable once the mesh is back below the threshold.
+    // Consumed: the token is burned at first submission and cannot be re-spent
+    // after a later regime drop below the vote threshold (H1).
     core::AdmissionTokenStore store{*storage_svc, *crypto_svc};
-    EXPECT_TRUE(store.verify(minted->first, in.candidate_pubkey).has_value());
+    EXPECT_FALSE(store.verify(minted->first, in.candidate_pubkey).has_value());
 }
 
 TEST_F(AdmissionServiceTest, VoteRegimeAdminCannotBypassBallot) {
@@ -687,6 +690,135 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
 
     admission.stop();
+    gossip.stop();
+    kw.stop();
+    s.stop();
+    c.stop();
+    fs::remove_all(tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Real admission-quorum electorate — regression tests for the forgeable-quorum
+// CRITICAL. The quorum electorate is the ROOT-SIGNED peer set
+// (peer_certificate_is_root_signed), NEVER peers_.size(), and it fails closed
+// when no root anchor is configured. start_admission_ballot() casts the
+// sponsor's self-vote and tallies synchronously, so these need no live UDP.
+// ---------------------------------------------------------------------------
+
+TEST(AdmissionQuorum, NoRootAnchorAdmissionFailsClosed) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_quorum_noroot_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    kw.generate_and_store_identity({});   // the gossip node's own keypair
+
+    // Seed a peer that carries a (self-consistent) certificate. Pre-fix, a null
+    // trust policy made the quorum denominator peers_.size(), so this single
+    // seeded peer plus the sponsor's self-vote could resolve a 75% ballot.
+    // Post-fix, with NO root anchor the attested electorate is empty and
+    // admission MUST fail closed.
+    auto fake = c.ed25519_keygen();
+    auto fake_b64 = b64({fake.public_key.begin(), fake.public_key.end()});
+    nlohmann::json fake_cert{{"server_id", "fake-1"}, {"server_pubkey", fake_b64}};
+    nlohmann::json peers{{"peers", nlohmann::json::array({
+        {{"pubkey", fake_b64}, {"endpoint", "10.0.0.9:9102"},
+         {"certificate_json", fake_cert.dump()}}})}};
+    storage::SignedEnvelope env;
+    env.type = "peer_list";
+    env.data = peers.dump();
+    ASSERT_TRUE(s.write_file("identity", "peers.json", env));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    // Deliberately NO set_root_pubkey() — the genuine shipped default.
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.start();
+
+    bool approved = false;
+    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
+        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
+    });
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    gossip.start_admission_ballot("req-noroot", cand_b64, "worker-1", "", 0.75f);
+
+    // Empty attested electorate (tier1_count == 0) -> Admission fails closed.
+    EXPECT_FALSE(approved);
+
+    gossip.stop();
+    kw.stop();
+    s.stop();
+    c.stop();
+    fs::remove_all(tmp);
+}
+
+TEST(AdmissionQuorum, FabricatedCertPeerExcludedFromElectorate) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_quorum_root_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    kw.generate_and_store_identity({});   // the gossip node's own keypair
+
+    // The mesh root anchor.
+    auto root = c.ed25519_keygen();
+
+    // P1: a genuinely root-signed peer — a member of the electorate.
+    auto p1 = c.ed25519_keygen();
+    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
+    gossip::CertIssueParams params;
+    params.server_pubkey_b64 = p1_b64;
+    params.server_id = "voter-1";
+    auto p1_cert = gossip::issue_server_certificate(
+        params, c, root.private_key, root.public_key);
+    nlohmann::json p1_cj = p1_cert;
+
+    // P2: a fabricated peer whose certificate is NOT root-signed — it must be
+    // excluded from the quorum denominator.
+    auto p2 = c.ed25519_keygen();
+    auto p2_b64 = b64({p2.public_key.begin(), p2.public_key.end()});
+    nlohmann::json p2_cj{{"server_id", "voter-2"}, {"server_pubkey", p2_b64},
+                         {"issuer_pubkey", p2_b64}, {"signature", "AAAA"}};
+
+    nlohmann::json peers{{"peers", nlohmann::json::array({
+        {{"pubkey", p1_b64}, {"endpoint", "10.0.0.1:9102"},
+         {"certificate_json", p1_cj.dump()}},
+        {{"pubkey", p2_b64}, {"endpoint", "10.0.0.2:9102"},
+         {"certificate_json", p2_cj.dump()}}})}};
+    storage::SignedEnvelope env;
+    env.type = "peer_list";
+    env.data = peers.dump();
+    ASSERT_TRUE(s.write_file("identity", "peers.json", env));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);   // real trust anchor
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.start();
+
+    bool approved = false;
+    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
+        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
+    });
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    gossip.start_admission_ballot("req-root", cand_b64, "worker-2", "", 0.75f);
+
+    // Electorate = { P1 } (P2's cert is not root-signed and is excluded).
+    // needed = ceil(1 * 0.75) = 1; the sponsor's self-vote meets it -> Approved.
+    // If P2 were wrongly counted the denominator would be 2, needed = 2, and the
+    // single self-vote would NOT reach quorum — so this asserts the exclusion.
+    EXPECT_TRUE(approved);
+
     gossip.stop();
     kw.stop();
     s.stop();

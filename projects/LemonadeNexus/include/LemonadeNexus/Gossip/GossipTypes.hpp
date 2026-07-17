@@ -54,6 +54,7 @@ struct GossipPeer {
     std::string pubkey;              // base64 Ed25519 public key
     std::string endpoint;            // "ip:port" as observed (UDP source) — used for direct replies
     std::string advertised_endpoint; // "ip:port" the peer says it's reachable at — shared with third parties (the observed source can be a NAT/VPN artifact valid only from our vantage point)
+    bool        advertised_confirmed{false}; // advertised_endpoint matched the observed UDP source at hello time — only then is it safe to relay/seed to third parties
     std::string backbone_endpoint;   // "ip:port" (gossip port, over WG backbone — preferred when available)
     std::string wg_pubkey;           // base64 X25519 mesh public key
     std::string backbone_ip;         // "172.16.0.X" (empty until allocated)

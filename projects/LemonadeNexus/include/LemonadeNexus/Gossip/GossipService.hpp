@@ -82,6 +82,13 @@ public:
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
     [[nodiscard]] std::string our_tunnel_ip() const;
 
+    /// Our own server_id from the installed certificate (nullopt if unenrolled).
+    /// Used by admission to stop a candidate claiming the root's own identity.
+    [[nodiscard]] std::optional<std::string> our_server_id() const {
+        return our_certificate_ ? std::optional<std::string>(our_certificate_->server_id)
+                                : std::nullopt;
+    }
+
     /// Set our backbone IP for inclusion in ServerHello messages.
     void set_our_backbone_ip(const std::string& ip) { our_backbone_ip_ = ip; }
 
@@ -179,9 +186,12 @@ private:
     // Pick up to N random peers for PeerExchange
     [[nodiscard]] std::vector<GossipPeer> random_peers(std::size_t count) const;
 
-    // ServerHello handler
+    // ServerHello handler. signer_pubkey is the packet's cryptographically
+    // authenticated sender key (proven by verify_packet_signature) — used to
+    // enforce proof-of-possession of the certificate identity.
     void handle_server_hello(const asio::ip::udp::endpoint& sender,
-                              const uint8_t* payload, std::size_t payload_len);
+                              const uint8_t* payload, std::size_t payload_len,
+                              const std::string& signer_pubkey);
 
     // TEE challenge/response handlers (mutual verification)
     void handle_tee_challenge(const asio::ip::udp::endpoint& sender,
@@ -197,6 +207,7 @@ private:
     void handle_enrollment_vote_request(const asio::ip::udp::endpoint& sender,
                                          const uint8_t* payload, std::size_t payload_len);
     void handle_enrollment_vote(const asio::ip::udp::endpoint& sender,
+                                 const std::string& sender_pubkey,
                                  const uint8_t* payload, std::size_t payload_len);
 
     /// Broadcast an enrollment vote request to all known Tier1 peers.
@@ -310,6 +321,14 @@ private:
     /// reject attestation tokens/reports whose self-asserted pubkey is not an
     /// enrolled identity (see docs/TEE-Attestation-Hardening-Plan.md).
     [[nodiscard]] bool peer_has_verified_certificate(const std::string& pubkey) const;
+
+    /// Governance-grade electorate test. UNLIKE peer_has_verified_certificate,
+    /// this NEVER fails open: it returns false when no root pubkey is configured,
+    /// so an admission ballot with no attested electorate fails closed. True only
+    /// if `pubkey` is a known, non-revoked peer whose stored certificate belongs
+    /// to it and verifies against the configured root via verify_cert_core (real
+    /// issuer==root check + Ed25519 verify, not the advisory fail-open path).
+    [[nodiscard]] bool peer_certificate_is_root_signed(const std::string& pubkey) const;
 
     /// The TPM Attestation Key pinned in `pubkey`'s enrolled certificate (base64
     /// DER SPKI), or "" if the peer has no verified certificate or no AK enrolled.
@@ -435,6 +454,11 @@ public:
                                 const std::string& server_id,
                                 const std::string& claim_json,
                                 float required_ratio);
+
+    /// Add a server pubkey to the revocation set and persist it. Idempotent.
+    /// The single runtime writer of revoked_servers.json — callers such as the
+    /// admission supersede path must route through here, never write the file.
+    void add_revoked_server(const std::string& server_pubkey);
 };
 
 } // namespace nexus::gossip

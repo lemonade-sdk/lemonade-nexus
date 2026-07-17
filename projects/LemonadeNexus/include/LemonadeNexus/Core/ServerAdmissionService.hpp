@@ -106,7 +106,8 @@ public:
     /// Mint a single-use server-admission token (root holder only — returns
     /// nullopt unless accepts_onboarding()). Empty candidate_pubkey = unbound.
     [[nodiscard]] std::optional<std::pair<std::string, AdmissionTokenRecord>>
-    mint_admission_token(const std::string& candidate_pubkey, std::chrono::seconds ttl);
+    mint_admission_token(const std::string& candidate_pubkey, std::chrono::seconds ttl,
+                         const std::string& server_id = {});
 
     /// Open the governed Tier1 ballot for a request that needs one (called by
     /// the handler after create_request returns, so no lock is held).

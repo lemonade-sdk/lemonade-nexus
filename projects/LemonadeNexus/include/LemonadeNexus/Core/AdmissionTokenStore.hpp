@@ -16,6 +16,7 @@ namespace nexus::core {
 /// A minted server-admission token, optionally bound to one candidate key.
 struct AdmissionTokenRecord {
     std::string candidate_pubkey;  // base64 Ed25519; empty = any candidate
+    std::string server_id;         // requested DNS label; empty = any server_id
     uint64_t    created_at{0};
     uint64_t    expires_at{0};
 };
@@ -34,7 +35,8 @@ public:
     /// surfaces (CLI/API) require a binding; an empty binding is a low-level
     /// primitive for a future authenticated transport.
     [[nodiscard]] std::optional<std::pair<std::string, AdmissionTokenRecord>>
-    mint(const std::string& candidate_pubkey, std::chrono::seconds ttl);
+    mint(const std::string& candidate_pubkey, std::chrono::seconds ttl,
+         const std::string& server_id = {});
 
     /// Look up without consuming. Expired tokens are removed on sight; a bind
     /// mismatch fails WITHOUT removing (an interceptor can't burn a bound token).

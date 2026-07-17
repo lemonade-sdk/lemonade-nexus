@@ -67,7 +67,12 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
     if (!ctx_.server_public_ip.empty())
         seeds.push_back(ctx_.server_public_ip + ":" + std::to_string(ctx_.config.gossip_port));
     for (const auto& p : ctx_.gossip.get_peers()) {
-        const auto& ep = p.advertised_endpoint.empty() ? p.endpoint : p.advertised_endpoint;
+        // Only seed an advertised endpoint that gossip confirmed against the
+        // peer's real UDP source; an unconfirmed advertisement is attacker-
+        // controlled and would poison every future candidate's seed list. Fall
+        // back to the observed source otherwise.
+        const auto& ep = (p.advertised_confirmed && !p.advertised_endpoint.empty())
+                             ? p.advertised_endpoint : p.endpoint;
         if (!ep.empty()) seeds.push_back(ep);
     }
     bundle["seed_peers"] = seeds;
@@ -261,7 +266,10 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         }
         auto ttl = std::chrono::seconds{body->value(
             "ttl_sec", static_cast<uint64_t>(core::AdmissionTokenStore::kDefaultTtl.count()))};
-        auto minted = admission.mint_admission_token(candidate, ttl);
+        // Optional: bind the token to a specific server_id so it can admit only
+        // that identity (a candidate otherwise picks server_id freely).
+        auto token_server_id = body->value("server_id", std::string{});
+        auto minted = admission.mint_admission_token(candidate, ttl, token_server_id);
         if (!minted) {
             error_response(res, "this server does not hold the root key or "
                                 "onboarding is disabled", 503); return;
@@ -269,6 +277,7 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         json_response(res, {{"enrollment_token", minted->first},
                             {"expires_at", minted->second.expires_at},
                             {"candidate_pubkey", minted->second.candidate_pubkey},
+                            {"server_id", minted->second.server_id},
                             {"root_pubkey", ctx_.config.root_pubkey}});
     }));
 }

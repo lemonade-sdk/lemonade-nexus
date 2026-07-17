@@ -791,6 +791,13 @@ int main(int argc, char* argv[]) {
         httplib::Server discard;
         register_on(discard, private_http_server->server());
     };
+    // Re-register ONLY the public routes on the (upgraded) public server object,
+    // without touching the live private server: the handlers' private routes land
+    // on a throwaway server that is discarded immediately.
+    auto reregister_public_routes = [&]() {
+        httplib::Server discard;
+        register_on(http_server.server(), discard);
+    };
     register_public_routes();
 
     // ========================================================================
@@ -896,7 +903,7 @@ int main(int argc, char* argv[]) {
                 spdlog::info("Auto-TLS: activating HTTPS for {} ({}) in place...", fqdn, label);
                 srv.stop();
                 if (srv.upgrade_to_tls(result.cert_path, result.key_path)) {
-                    if (is_private) register_private_routes(); else register_public_routes();
+                    if (is_private) register_private_routes(); else reregister_public_routes();
                     srv.start();
                     spdlog::info("Auto-TLS: HTTPS active for {} ({}) — other services unaffected",
                                   fqdn, label);

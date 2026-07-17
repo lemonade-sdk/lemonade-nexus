@@ -24,6 +24,13 @@ $root = "$env:TEMP\nexus-mesh-$(Get-Random)"
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 Write-Host "root=$root"
 
+# Assertion tracking: CI must fail (exit 1) if any expected security property
+# does not hold, not merely print a diagnostic.
+$script:fail = 0
+function Check($cond, $msg) {
+    if ($cond) { Write-Host "  ok:   $msg" } else { Write-Host "  FAIL: $msg"; $script:fail++ }
+}
+
 # curl, not Invoke-WebRequest: PS 5.1 IWR drops the Authorization header.
 function CtlGet($port, $path) {
     curl.exe -s -H "Authorization: Bearer $TOK" "http://127.0.0.1:$port$path" | ConvertFrom-Json
@@ -87,6 +94,15 @@ $procs += Start-Process $sc -PassThru -WindowStyle Hidden `
 Start-Sleep 8
 $o = CtlGet 9110 "/status"
 Write-Host "OWNER    status=$($o.status) node=$($o.node_id) ip=$($o.tunnel_ip) mesh_up=$($o.mesh_up)"
+Check ($null -ne $o.node_id) "owner sidecar reachable with a valid bearer token"
+
+# Negative auth: every control endpoint requires the bearer (commit af9585c).
+# A missing or wrong token MUST be rejected (401), or the control plane is open.
+$noauth  = curl.exe -s -o NUL -w "%{http_code}" "http://127.0.0.1:9110/status"
+$badauth = curl.exe -s -o NUL -w "%{http_code}" -H "Authorization: Bearer wrong-token" "http://127.0.0.1:9110/status"
+Write-Host "CONTROL AUTH: no-bearer=$noauth wrong-bearer=$badauth (expect 401 each)"
+Check ($noauth  -eq "401") "control API rejects a missing bearer (401)"
+Check ($badauth -eq "401") "control API rejects a wrong bearer (401)"
 
 # 4. mint a device link token via the owner control API
 '{"ttl_sec":600}' | Out-File "$root\mint.json" -Encoding ascii
@@ -100,6 +116,7 @@ $procs += Start-Process $sc -PassThru -WindowStyle Hidden `
 Start-Sleep 6
 $intr = CtlGet 9112 "/status"
 Write-Host "INTRUDER status=$($intr.status) join_failures=$($intr.join_failures) (expect degraded, failures>0)"
+Check ([int]$intr.join_failures -gt 0) "un-tokened intruder rejected under closed registration"
 
 # 6. linked sidecar WITH the token joins the owner's account/group
 $procs += Start-Process $sc -PassThru -WindowStyle Hidden `
@@ -118,13 +135,19 @@ Write-Host "PHONE    status=$($phone.status) node=$($phone.node_id) ip=$($phone.
 $eg = (curl.exe -s -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" --data "@$root\eg.json" http://127.0.0.1:9111/egress) | ConvertFrom-Json
 if (-not $eg.loopback_port) {
     Write-Host "PRIVATE API via mesh: EGRESS FAILED ($($eg | ConvertTo-Json -Compress))"
+    Check $false "phone egressed to the server private API over the mesh"
 } else {
     $lp = $eg.loopback_port
     $code = curl.exe -s -m8 -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" --cacert $privc "https://${PRIVFQDN}:${lp}/api/trust/status"
     Write-Host "PRIVATE API via mesh: HTTP $code (401 = reached JWT-gated private API, private cert verified = SUCCESS)"
+    Check ($code -eq "401") "private API reached over mesh + private cert verified (JWT gate returns 401)"
 }
 
 Write-Host "`n--- server join log ---"
 Select-String -Path "$root\server.log" -Pattern "Join\]|linked device|registration closed" | Select-Object -Last 6 | ForEach-Object { $_.Line }
 Cleanup
-Write-Host "`nDONE. Logs in $root"
+if ($script:fail -gt 0) {
+    Write-Host "`n$($script:fail) CHECK(S) FAILED. Logs in $root"
+    exit 1
+}
+Write-Host "`nALL CHECKS PASSED. Logs in $root"

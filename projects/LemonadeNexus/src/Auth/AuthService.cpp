@@ -64,6 +64,10 @@ AuthResult AuthService::register_ed25519(const nlohmann::json& registration) {
     return ed25519_provider_.register_pubkey(pubkey, user_id);
 }
 
+bool AuthService::revoke_ed25519(const std::string& pubkey_b64) {
+    return ed25519_provider_.revoke_pubkey(pubkey_b64);
+}
+
 bool AuthService::validate_session(std::string_view token) {
     try {
         auto decoded = jwt::decode(std::string(token));

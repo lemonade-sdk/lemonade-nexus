@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 // Forward declarations
 namespace nexus::crypto  { class SodiumCryptoService; }
@@ -53,6 +54,11 @@ public:
     [[nodiscard]] AuthResult register_pubkey(const std::string& pubkey_b64,
                                               const std::string& user_id = "");
 
+    /// Revoke an Ed25519 public key (device deletion). Future authentication
+    /// attempts for this key are rejected. Persisted to
+    /// data/credentials/revoked.json. Idempotent.
+    bool revoke_pubkey(const std::string& pubkey_b64);
+
 private:
     // Derive a deterministic user_id from an Ed25519 public key.
     [[nodiscard]] std::string derive_user_id(const crypto::Ed25519PublicKey& pubkey) const;
@@ -63,6 +69,9 @@ private:
     // Auto-register a new pubkey and return the user_id.
     [[nodiscard]] std::string auto_register(const std::string& pubkey_b64,
                                              const crypto::Ed25519PublicKey& pubkey);
+
+    // True if the pubkey is on the device-revocation blocklist.
+    [[nodiscard]] bool is_revoked(const std::string& pubkey_b64);
 
     // Persist pubkey→user_id mapping to credential file.
     bool save_ed25519_credential(const std::string& user_id, const std::string& pubkey_b64);
@@ -91,6 +100,10 @@ private:
     mutable std::mutex cache_mutex_;
     std::unordered_map<std::string, std::string> pubkey_to_user_;
     std::atomic<bool> cache_loaded_{false};
+
+    // Device-revocation blocklist (deleted devices). Guarded by cache_mutex_,
+    // loaded lazily alongside pubkey_to_user_ from credentials/revoked.json.
+    std::unordered_set<std::string> revoked_pubkeys_;
 
     static constexpr uint32_t kChallengeTtlSec = 60;    // 60 second challenge window
     static constexpr std::size_t kChallengeSize = 32;    // 32 bytes of randomness

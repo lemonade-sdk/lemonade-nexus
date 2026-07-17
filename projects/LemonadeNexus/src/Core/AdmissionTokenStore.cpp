@@ -36,7 +36,8 @@ AdmissionTokenStore::AdmissionTokenStore(storage::FileStorageService& storage,
 }
 
 std::optional<std::pair<std::string, AdmissionTokenRecord>>
-AdmissionTokenStore::mint(const std::string& candidate_pubkey, std::chrono::seconds ttl) {
+AdmissionTokenStore::mint(const std::string& candidate_pubkey, std::chrono::seconds ttl,
+                          const std::string& server_id) {
     if (!candidate_pubkey.empty()) {
         bool valid = false;
         try {   // from_base64 throws on malformed input
@@ -58,12 +59,14 @@ AdmissionTokenStore::mint(const std::string& candidate_pubkey, std::chrono::seco
     auto now = now_epoch_sec();
     AdmissionTokenRecord record{
         .candidate_pubkey = candidate_pubkey,
+        .server_id        = server_id,
         .created_at       = now,
         .expires_at       = now + static_cast<uint64_t>(ttl.count()),
     };
 
     json j = {
         {"candidate_pubkey", record.candidate_pubkey},
+        {"server_id",        record.server_id},
         {"created_at",       record.created_at},
         {"expires_at",       record.expires_at},
     };
@@ -106,6 +109,7 @@ AdmissionTokenStore::verify(std::string_view token,
 
     AdmissionTokenRecord record{
         .candidate_pubkey = j.value("candidate_pubkey", std::string{}),
+        .server_id        = j.value("server_id", std::string{}),
         .created_at       = j.value("created_at", uint64_t{0}),
         .expires_at       = j.value("expires_at", uint64_t{0}),
     };

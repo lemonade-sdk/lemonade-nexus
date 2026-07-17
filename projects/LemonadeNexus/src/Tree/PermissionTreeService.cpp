@@ -198,6 +198,9 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
         return false;
     }
 
+    const std::string deleted_mgmt_pubkey = it->second.mgmt_pubkey;
+    const std::string parent_id           = it->second.parent_id;
+
     if (!it->second.endpoint_identifier.empty()) {
         identifier_index_.erase(it->second.endpoint_identifier);
     }
@@ -206,8 +209,39 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
         spdlog::warn("[{}] delete_node_direct: storage delete failed for '{}'", name(), node_id);
     }
 
+    // Sweep the link-join grants that referenced this device's management key
+    // from its sibling endpoints and its group node, so a deleted device leaves
+    // no dangling ACL. Guard: never strip a node the key legitimately owns
+    // (mgmt_pubkey match) — deleting one of an owner's self-owned devices must
+    // not revoke the owner across the rest of the group.
+    if (!deleted_mgmt_pubkey.empty()) {
+        for (auto& [id, node] : nodes_) {
+            const bool in_scope = (node.parent_id == parent_id) || (id == parent_id);
+            if (!in_scope) continue;
+            if (node.mgmt_pubkey == deleted_mgmt_pubkey) continue; // owner-owned
+            const auto before = node.assignments.size();
+            std::erase_if(node.assignments, [&](const Assignment& a) {
+                return a.management_pubkey == deleted_mgmt_pubkey;
+            });
+            if (node.assignments.size() != before && !persist_node(node)) {
+                spdlog::warn("[{}] delete_node_direct: failed to persist ACL sweep on '{}'",
+                             name(), id);
+            }
+        }
+    }
+
     spdlog::info("[{}] deleted node '{}' directly", name(), node_id);
     return true;
+}
+
+bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {
+    if (mgmt_pubkey.empty()) return false;
+    std::lock_guard lock(mutex_);
+    for (const auto& [id, node] : nodes_) {
+        (void)id;
+        if (node.mgmt_pubkey == mgmt_pubkey) return true;
+    }
+    return false;
 }
 
 bool PermissionTreeService::grant_assignment(const std::string& node_id,

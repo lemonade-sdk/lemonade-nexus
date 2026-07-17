@@ -104,6 +104,17 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
     crypto::Ed25519PublicKey pubkey{};
     std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), pubkey.begin());
 
+    // Reject revoked identities (deleted devices) up front — this also blocks a
+    // deleted device from re-joining via /api/join regardless of open_registration.
+    if (is_revoked(pubkey_b64)) {
+        spdlog::warn("[ed25519] Rejected authentication for revoked pubkey {}",
+                     pubkey_b64.substr(0, 16));
+        return AuthResult{
+            .authenticated = false,
+            .error_message = "This identity has been revoked"
+        };
+    }
+
     // Validate and consume the challenge
     {
         std::lock_guard lock(challenge_mutex_);
@@ -308,6 +319,48 @@ std::string Ed25519AuthProvider::auto_register(const std::string& pubkey_b64,
 }
 
 // ============================================================================
+// Device revocation blocklist
+// ============================================================================
+
+bool Ed25519AuthProvider::is_revoked(const std::string& pubkey_b64) {
+    if (!cache_loaded_.load(std::memory_order_acquire)) {
+        load_credentials_from_disk();
+    }
+    std::lock_guard lock(cache_mutex_);
+    return revoked_pubkeys_.contains(pubkey_b64);
+}
+
+bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
+    if (pubkey_b64.empty()) return false;
+    if (!cache_loaded_.load(std::memory_order_acquire)) {
+        load_credentials_from_disk();
+    }
+
+    std::lock_guard lock(cache_mutex_);
+    revoked_pubkeys_.insert(pubkey_b64);
+
+    // Persist the full blocklist to data/credentials/revoked.json.
+    auto revoked_path = storage_.data_root() / "credentials" / "revoked.json";
+    json arr = json::array();
+    for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
+    try {
+        std::filesystem::create_directories(revoked_path.parent_path());
+        std::ofstream ofs(revoked_path, std::ios::trunc);
+        if (!ofs) {
+            spdlog::error("[ed25519] Failed to open revocation file: {}", revoked_path.string());
+            return false;
+        }
+        ofs << arr.dump(2);
+    } catch (const std::exception& e) {
+        spdlog::error("[ed25519] Exception writing revocation file: {}", e.what());
+        return false;
+    }
+
+    spdlog::info("[ed25519] Revoked pubkey {}", pubkey_b64.substr(0, 16));
+    return true;
+}
+
+// ============================================================================
 // Credential persistence
 // ============================================================================
 
@@ -414,6 +467,23 @@ void Ed25519AuthProvider::load_credentials_from_disk() {
         }
     } catch (const std::exception& e) {
         spdlog::error("[ed25519] Error loading credentials from disk: {}", e.what());
+    }
+
+    // Load the device-revocation blocklist (deleted devices).
+    try {
+        std::ifstream rifs(creds_dir / "revoked.json");
+        if (rifs) {
+            std::ostringstream rss;
+            rss << rifs.rdbuf();
+            auto revoked_data = json::parse(rss.str(), nullptr, false);
+            if (revoked_data.is_array()) {
+                for (const auto& pk : revoked_data) {
+                    if (pk.is_string()) revoked_pubkeys_.insert(pk.get<std::string>());
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("[ed25519] Error loading revocations: {}", e.what());
     }
 
     cache_loaded_.store(true, std::memory_order_release);

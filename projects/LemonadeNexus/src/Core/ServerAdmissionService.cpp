@@ -166,10 +166,11 @@ std::string ServerAdmissionService::issue_challenge(const std::string& candidate
 
 std::optional<std::pair<std::string, AdmissionTokenRecord>>
 ServerAdmissionService::mint_admission_token(const std::string& candidate_pubkey,
-                                             std::chrono::seconds ttl) {
+                                             std::chrono::seconds ttl,
+                                             const std::string& server_id) {
     // Only the root holder may pre-authorize admissions.
     if (!accepts_onboarding()) return std::nullopt;
-    return tokens_.mint(candidate_pubkey, ttl);
+    return tokens_.mint(candidate_pubkey, ttl, server_id);
 }
 
 ServerAdmissionService::Result ServerAdmissionService::create_request(const RequestInput& in) {
@@ -218,12 +219,25 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
             // to capture an unbound token and spend it with its own key.
             if (rec->candidate_pubkey.empty())
                 return {false, 403, "enrollment token is not bound to a candidate key", ""};
+            // A token bound to a server_id may admit only that identity — the
+            // candidate does not get to choose server_id freely.
+            if (!rec->server_id.empty() && rec->server_id != in.server_id)
+                return {false, 403, "enrollment token is bound to a different server_id", ""};
             token_admit = true;
         } else {
+            // Vote regime: the ballot governs and the token cannot admit. Burn it
+            // now regardless — an unspent token must never survive to be re-spent
+            // if churn later drops the mesh below the vote threshold.
+            (void)tokens_.consume(in.enrollment_token, in.candidate_pubkey);
             spdlog::info("[ServerAdmissionService] vote regime — enrollment token "
-                         "ignored; ballot governs");
+                         "consumed and ignored; ballot governs");
         }
     }
+
+    // Never let a candidate claim THIS root server's own identity — our own
+    // certificate is not in get_peers(), so the peer scan below cannot catch it.
+    if (auto self = gossip_.our_server_id(); self && *self == in.server_id)
+        return {false, 409, "server_id is reserved by the root server", ""};
 
     // server_id uniqueness vs enrolled peers — runs before any approval or
     // token consumption so a conflict never burns a token.
@@ -235,6 +249,15 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
                 cj.value("server_pubkey", "") != in.candidate_pubkey)
                 return {false, 409, "server_id already in use by another server", ""};
         } catch (...) {}
+    }
+
+    // Also reject a collision with another in-flight or already-issued admission:
+    // get_peers() only lists peers past ServerHello, so two candidates could race
+    // for one server_id before either cert appears there.
+    for (const auto& [rid, other] : admissions_) {
+        if ((other.state == State::Pending || other.state == State::Approved) &&
+            other.server_id == in.server_id && other.candidate_pubkey != in.candidate_pubkey)
+            return {false, 409, "server_id already claimed by another admission", ""};
     }
 
     // Reuse an existing pending record for this candidate (idempotent retry),
@@ -290,6 +313,14 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     // server_id-uniqueness 409 is already checked above, so the common failure
     // can't burn a token; a rarer issuance failure requires a fresh token.
     if (token_admit) {
+        // A request created under the vote regime is ballot-governed for life
+        // (decision_mode fixed + persisted). If churn later drops the mesh below
+        // the vote threshold, re-submitting the still-unspent token must NOT
+        // re-open it — only the ballot can resolve it.
+        if (a.decision_mode == "ballot") {
+            if (!is_existing) admissions_.erase(request_id);
+            return {false, 409, "ballot governs this admission; a token cannot admit it", ""};
+        }
         if (!tokens_.consume(in.enrollment_token, in.candidate_pubkey)) {
             if (!is_existing) admissions_.erase(request_id);  // no phantom record
             return {false, 403, "enrollment token already used", ""};
@@ -370,6 +401,13 @@ void ServerAdmissionService::on_ballot_decision(const std::string& request_id,
 
 ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
         Admission& a, const std::string& decided_by, bool supersede) {
+    // Defense-in-depth invariant: a ballot-governed admission may only be
+    // resolved by the ballot itself (decided_by=='ballot'). No token or admin
+    // path may reach issuance for it, whatever the current regime.
+    if (a.decision_mode == "ballot" && decided_by != "ballot")
+        return {false, 409, "ballot governs this admission; cannot approve out of band",
+                a.request_id};
+
     // Re-check at issuance: never sign a server certificate unless this server's
     // identity is the configured root anchor. The local identity below would
     // otherwise self-sign a cert peers reject, from a server that shouldn't issue.
@@ -394,15 +432,11 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
                     return {false, 409, "server_id bound to a different pubkey; pass supersede=true",
                             a.request_id};
                 auto old_pk = cj.value("server_pubkey", "");
-                json revoked = json::array();
-                if (auto env = storage_.read_file("identity", "revoked_servers.json"))
-                    try { revoked = json::parse(env->data); } catch (...) {}
-                revoked.push_back(old_pk);
-                storage::SignedEnvelope rev;
-                rev.type = "revocation_list";
-                rev.data = revoked.dump();
-                rev.timestamp = now_unix();
-                (void)storage_.write_file("identity", "revoked_servers.json", rev);
+                // Route the revocation through GossipService so its in-memory
+                // revoked set stays authoritative — a direct file write here is
+                // silently clobbered the next time GossipService persists from
+                // its own (stale) in-memory list.
+                gossip_.add_revoked_server(old_pk);
                 spdlog::warn("[ServerAdmissionService] superseded server_id '{}': revoked old pubkey {}",
                              a.server_id, old_pk);
             }
@@ -542,7 +576,10 @@ void ServerAdmissionService::persist() {
             {"decision_mode", a.decision_mode}, {"ballot_claim_json", a.ballot_claim_json},
         });
     }
-    json root{{"ever_approved", ever_approved_}, {"admissions", arr}};
+    json denied = json::object();
+    for (const auto& [pk, until] : denied_until_) denied[pk] = until;
+    json root{{"ever_approved", ever_approved_}, {"admissions", arr},
+              {"denied_until", denied}};
     storage::SignedEnvelope env;
     env.type = "admissions";
     env.data = root.dump();
@@ -578,6 +615,13 @@ void ServerAdmissionService::load() {
             if (a.decision_mode.empty() && !a.ballot_claim_json.empty())
                 a.decision_mode = "ballot";
             if (!a.request_id.empty()) admissions_[a.request_id] = std::move(a);
+        }
+        // Restore denied-pubkey cooldowns; a restart must not clear an active
+        // denial. Entries whose cooldown already elapsed are dropped.
+        const auto now = now_unix();
+        for (const auto& [pk, until] : root.value("denied_until", json::object()).items()) {
+            if (until.is_number_unsigned() && until.get<uint64_t>() > now)
+                denied_until_[pk] = until.get<uint64_t>();
         }
     } catch (const std::exception& e) {
         spdlog::warn("[ServerAdmissionService] failed to load admissions.json: {}", e.what());
