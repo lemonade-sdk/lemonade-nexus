@@ -372,13 +372,16 @@ std::string resolve_tunnel_ip(
 TlsResolution resolve_tls_cert(
     const ServerConfig& config,
     const std::filesystem::path& data_root,
-    const std::string& server_fqdn)
+    const std::string& server_fqdn,
+    const std::string& manual_cert_path,
+    const std::string& manual_key_path)
 {
     TlsResolution result;
-    result.cert_path = config.tls_cert_path;
-    result.key_path  = config.tls_key_path;
+    result.cert_path = manual_cert_path;
+    result.key_path  = manual_key_path;
 
-    // Auto-TLS: if no manual cert paths, check for existing ACME cert on disk
+    // Auto-TLS: if no manual cert paths, check for an existing ACME cert on disk
+    // for THIS fqdn (never another listener's cert).
     if (result.cert_path.empty() && result.key_path.empty()
         && config.auto_tls && !server_fqdn.empty())
     {

@@ -425,18 +425,8 @@ int main(int argc, char* argv[]) {
                 dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
             }
 
-            // The SEIP hostname is what clients reach the public API at, so it is
-            // the primary public API cert. If it's already on disk, use it; if
-            // not, the unified background ACME thread requests + activates it for
-            // server_seip_fqdn (see public_cert_fqdn below) — no fire-and-forget.
-            if (config.auto_tls) {
-                auto seip_tls = nexus::core::resolve_tls_cert(config, data_root, server_seip_fqdn);
-                if (!seip_tls.cert_path.empty() && !seip_tls.key_path.empty()) {
-                    config.tls_cert_path = seip_tls.cert_path;
-                    config.tls_key_path  = seip_tls.key_path;
-                    spdlog::info("SEIP: using TLS cert for {}", server_seip_fqdn);
-                }
-            }
+            // The public API cert (for the SEIP FQDN) is resolved below via
+            // public_cert_fqdn — no per-FQDN handling needed here.
         }
     }
 
@@ -504,11 +494,8 @@ int main(int argc, char* argv[]) {
     // no public IP). The background ACME thread and renewal use the same target.
     const std::string public_cert_fqdn =
         !server_seip_fqdn.empty() ? server_seip_fqdn : server_fqdn;
-    auto tls = nexus::core::resolve_tls_cert(config, data_root, public_cert_fqdn);
-    if (!tls.cert_path.empty() && !tls.key_path.empty()) {
-        config.tls_cert_path = tls.cert_path;
-        config.tls_key_path  = tls.key_path;
-    }
+    auto tls = nexus::core::resolve_tls_cert(config, data_root, public_cert_fqdn,
+                                             config.tls_cert_path, config.tls_key_path);
 
     // ========================================================================
     // boringtun interface — server-side tunnel endpoint
@@ -636,16 +623,14 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
     bool private_needs_acme = false;   // request + upgrade the private cert in the background
     if (!tunnel_bind_ip.empty()) {
-        // Try to get/request ACME cert for the private FQDN
+        // Resolve the PRIVATE cert independently of the public one — its manual
+        // paths are private_tls_*, and its ACME cert is the one issued for
+        // server_private_fqdn (never the public SEIP cert).
         std::string priv_cert_path, priv_key_path;
-        if (!config.private_tls_cert_path.empty() && !config.private_tls_key_path.empty()) {
-            // Manual private cert (covers private.<seip>) — parallels --tls-cert-path
-            // for the public API; bypasses ACME.
-            priv_cert_path = config.private_tls_cert_path;
-            priv_key_path  = config.private_tls_key_path;
-            spdlog::info("Private API: using manual TLS cert");
-        } else if (!server_private_fqdn.empty() && config.auto_tls) {
-            auto priv_tls = nexus::core::resolve_tls_cert(config, data_root, server_private_fqdn);
+        if (!server_private_fqdn.empty()) {
+            auto priv_tls = nexus::core::resolve_tls_cert(
+                config, data_root, server_private_fqdn,
+                config.private_tls_cert_path, config.private_tls_key_path);
             if (!priv_tls.cert_path.empty() && !priv_tls.key_path.empty()) {
                 priv_cert_path = priv_tls.cert_path;
                 priv_key_path  = priv_tls.key_path;
@@ -963,13 +948,14 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     std::atomic<bool> acme_renewal_stop{false};
     std::thread acme_renewal_thread;
-    if (!public_cert_fqdn.empty() && config.auto_tls && !tls.needs_acme_background) {
+    const bool have_private_fqdn = private_http_server && !server_private_fqdn.empty();
+    if (config.auto_tls && (!public_cert_fqdn.empty() || have_private_fqdn)) {
         acme_renewal_thread = std::thread([&]() {
             constexpr auto initial_delay = std::chrono::hours(1);
             constexpr auto check_interval = std::chrono::hours(24);
 
-            spdlog::info("Auto-TLS: certificate renewal monitor started for {} (checking daily)",
-                          public_cert_fqdn);
+            spdlog::info("Auto-TLS: certificate renewal monitor started (public + private, "
+                         "checking daily)");
 
             for (auto elapsed = std::chrono::seconds(0);
                  elapsed < initial_delay && !acme_renewal_stop.load();
@@ -977,20 +963,24 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            while (!acme_renewal_stop.load()) {
-                auto result = acme.renew_certificate(public_cert_fqdn);
-                if (result.success && !result.cert_path.empty()) {
+            // Renew + hot-reload one listener, but only once it is actually serving
+            // TLS — so certs first obtained by the background issuance path are
+            // covered too (they become is_tls() after the upgrade above).
+            auto renew_one = [&](nexus::network::HttpServer& srv, const std::string& fqdn) {
+                if (fqdn.empty() || !srv.is_tls()) return;
+                auto r = acme.renew_certificate(fqdn);
+                if (r.success && !r.cert_path.empty()) {
                     spdlog::info("Auto-TLS: renewal check complete for {} (cert={})",
-                                  public_cert_fqdn, result.cert_path);
-                    // Hot-reload the running listener so a renewed cert takes
-                    // effect without a restart.
-                    if (http_server.is_tls())
-                        (void)http_server.reload_tls_certs(result.cert_path, result.key_path);
+                                  fqdn, r.cert_path);
+                    (void)srv.reload_tls_certs(r.cert_path, r.key_path);
+                } else if (!r.success) {
+                    spdlog::warn("Auto-TLS: renewal failed for {}: {}", fqdn, r.error_message);
                 }
-                if (!result.success) {
-                    spdlog::warn("Auto-TLS: renewal failed for {}: {}",
-                                  public_cert_fqdn, result.error_message);
-                }
+            };
+
+            while (!acme_renewal_stop.load()) {
+                renew_one(http_server, public_cert_fqdn);
+                if (private_http_server) renew_one(*private_http_server, server_private_fqdn);
 
                 for (auto elapsed = std::chrono::seconds(0);
                      elapsed < check_interval && !acme_renewal_stop.load();

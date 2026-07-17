@@ -45,6 +45,7 @@ add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
 add_nexus_test(test_onboarding        test_onboarding.cpp)
+add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
 
 # Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
 add_nexus_test(test_tls_transport     test_tls_transport.cpp)

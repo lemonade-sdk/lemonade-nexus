@@ -89,11 +89,16 @@ void resolve_server_region(
     ipam::IPAMService& ipam,
     gossip::GossipService& gossip);
 
-/// Resolve TLS certificate paths:
-/// manual override > existing ACME cert on disk > needs_acme_background flag.
+/// Resolve TLS certificate paths for `server_fqdn`:
+/// manual override (the passed cert/key) > existing ACME cert on disk for that
+/// FQDN > needs_acme_background flag. The manual paths are explicit parameters
+/// (NOT read from config) so the public and private listeners resolve
+/// independently — the private listener must never receive the public cert.
 [[nodiscard]] TlsResolution resolve_tls_cert(
     const ServerConfig& config,
     const std::filesystem::path& data_root,
-    const std::string& server_fqdn);
+    const std::string& server_fqdn,
+    const std::string& manual_cert_path = "",
+    const std::string& manual_key_path = "");
 
 } // namespace nexus::core

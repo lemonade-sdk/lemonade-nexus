@@ -40,7 +40,9 @@ trap { Write-Host "ERROR: $_"; Cleanup; exit 1 }
 Get-Process lemonade-nexus,lemonade-nexus-sidecar -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
 Start-Sleep 2
 
-# 1. init the server, derive its SEIP/private FQDNs, and mint a cert covering both.
+# 1. init the server, derive its SEIP/private FQDNs, and mint SEPARATE certs for
+#    the public (SEIP) and private (private.<seip>) listeners — a per-CA check
+#    below then proves each listener presents its own cert, not the other's.
 #    node-id = "server-" + first 16 hex of the identity pubkey (resolve_server_node_id).
 & $srv --first-run --data-root "$root\server" *> "$root\init.log"
 $pubhex   = (Get-Content "$root\server\identity\keypair.pub" -Raw).Trim()
@@ -48,26 +50,28 @@ $nodeId   = "server-" + $pubhex.Substring(0, 16)
 $SEIP     = "$nodeId.$REGION.seip.$DOMAIN"
 $PRIVFQDN = "private.$SEIP"
 Write-Host "SEIP=$SEIP"
-$cert = "$root\cert.pem"; $key = "$root\key.pem"
-& $ossl req -x509 -newkey rsa:2048 -nodes -keyout $key -out $cert -days 2 `
-    -subj "/CN=$SEIP" -addext "subjectAltName=DNS:$SEIP,DNS:$PRIVFQDN" 2>"$root\ossl.log" | Out-Null
+$pubc = "$root\pub.pem"; $pubk = "$root\pub.key"; $privc = "$root\priv.pem"; $privk = "$root\priv.key"; $ca = "$root\ca.pem"
+& $ossl req -x509 -newkey rsa:2048 -nodes -keyout $pubk  -out $pubc  -days 2 -subj "/CN=$SEIP"     -addext "subjectAltName=DNS:$SEIP"     2>"$root\ossl.log"  | Out-Null
+& $ossl req -x509 -newkey rsa:2048 -nodes -keyout $privk -out $privc -days 2 -subj "/CN=$PRIVFQDN" -addext "subjectAltName=DNS:$PRIVFQDN" 2>"$root\ossl2.log" | Out-Null
+Get-Content $pubc,$privc | Set-Content $ca   # trust bundle: sidecars talk to both listeners
 
-# start the server: verified HTTPS only, manual public + private certs, closed registration
+# start the server: verified HTTPS only, INDEPENDENT public + private certs, closed registration
 $procs += Start-Process $srv -PassThru -WindowStyle Hidden `
     -ArgumentList @("--data-root","$root\server","--public-ip","127.0.0.1","--region",$REGION,
-                    "--no-auto-tls","--tls-cert-path",$cert,"--tls-key-path",$key,
-                    "--private-tls-cert-path",$cert,"--private-tls-key-path",$key,
+                    "--no-auto-tls","--tls-cert-path",$pubc,"--tls-key-path",$pubk,
+                    "--private-tls-cert-path",$privc,"--private-tls-key-path",$privk,
                     "--closed-registration","--private-http-port",$PRIV) `
     -RedirectStandardOutput "$root\server.log" -RedirectStandardError "$root\server.err"
 Start-Sleep 5
 # Sanity: the server's published SEIP must match what we built the cert for.
 $logged = (Select-String -Path "$root\server.log" -Pattern "SEIP: published (\S+) ->").Matches.Groups[1].Value | Select-Object -First 1
 if ($logged -and $logged -ne $SEIP) { Write-Host "WARN: server SEIP '$logged' != computed '$SEIP' (region mismatch?)" }
-$health = curl.exe -s -m8 --resolve "${SEIP}:9100:127.0.0.1" --cacert $cert "https://${SEIP}:9100/api/health"
+# Public listener must present the PUBLIC cert (verify with the public CA only).
+$health = curl.exe -s -m8 --resolve "${SEIP}:9100:127.0.0.1" --cacert $pubc "https://${SEIP}:9100/api/health"
 Write-Host "server health: $health"
 
 # TLS flags every sidecar uses to reach the server by its cert FQDN over loopback.
-$tls = @("--server","${SEIP}:9100","--server-addr","127.0.0.1","--ca-cert",$cert,"--pin-server")
+$tls = @("--server","${SEIP}:9100","--server-addr","127.0.0.1","--ca-cert",$ca,"--pin-server")
 
 # 2. a fake local 'lemond' HTTP service the owner exposes to the mesh
 Start-Job -Name svc {
@@ -106,16 +110,18 @@ $phone = CtlGet 9111 "/status"
 Write-Host "PHONE    status=$($phone.status) node=$($phone.node_id) ip=$($phone.tunnel_ip) mesh_up=$($phone.mesh_up)"
 
 # 7. reachability: from the phone, egress to the server private API over the mesh,
-#    then reach it over verified HTTPS by the private.<seip> FQDN. HTTP 401 proves
-#    the mesh path reached the JWT-gated private API.
+#    then reach it over verified HTTPS by the private.<seip> FQDN, verifying with
+#    the PRIVATE CA only — so it also proves the private listener presents its own
+#    cert (not the public one). HTTP 401 proves the mesh path reached the
+#    JWT-gated private API.
 ('{"ip":"10.64.0.1","port":' + $PRIV + '}') | Out-File "$root\eg.json" -Encoding ascii
 $eg = (curl.exe -s -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" --data "@$root\eg.json" http://127.0.0.1:9111/egress) | ConvertFrom-Json
 if (-not $eg.loopback_port) {
     Write-Host "PRIVATE API via mesh: EGRESS FAILED ($($eg | ConvertTo-Json -Compress))"
 } else {
     $lp = $eg.loopback_port
-    $code = curl.exe -s -m8 -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" --cacert $cert "https://${PRIVFQDN}:${lp}/api/trust/status"
-    Write-Host "PRIVATE API via mesh: HTTP $code (401 = reached JWT-gated private API over verified TLS = SUCCESS)"
+    $code = curl.exe -s -m8 -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" --cacert $privc "https://${PRIVFQDN}:${lp}/api/trust/status"
+    Write-Host "PRIVATE API via mesh: HTTP $code (401 = reached JWT-gated private API, private cert verified = SUCCESS)"
 }
 
 Write-Host "`n--- server join log ---"
