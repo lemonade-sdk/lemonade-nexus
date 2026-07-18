@@ -1,31 +1,46 @@
 # Sidecar mesh integration test: nexus server + owner sidecar + linked sidecar.
 # Verifies closed-registration join gating, device link-token mint/join, the
-# token-gated control API, and private-API reachability over the userspace mesh.
+# token-gated control API (incl. no/wrong-bearer 401), and private-API
+# reachability over the userspace mesh.
 #
-# Everything runs over verified HTTPS (the mesh has no plaintext path). The
-# server serves a self-signed cert covering its derived SEIP + private.<seip>
-# FQDNs; the sidecars reach it by the SEIP FQDN, mapped to 127.0.0.1 and trusted
-# via --ca-cert (split-horizon, exactly like a real deployment where the SEIP
-# name resolves to the node). Requires openssl (git ships one).
+# Everything runs over verified HTTPS against a REAL, publicly-trusted ACME cert
+# on the forced SEIP FQDN — there is NO manual/self-signed cert path (the mesh
+# only ever uses ACME-issued public-CA certificates). This is a LOCAL-run
+# template, not a self-contained CI job; it needs real infrastructure:
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 [-BuildDir <path>]
-param([string]$BuildDir = "$PSScriptRoot\..\build")
-$ErrorActionPreference = "Continue"   # openssl writes keygen progress to stderr
+#   1. A domain you control, passed as -Domain (or $env:LN_TEST_DOMAIN). The
+#      server obtains a real cert for its <node>.<region>.seip.<domain> FQDN via
+#      ACME dns-01 — set SP_ACME_PROVIDER=letsencrypt, SP_DNS_PROVIDER=cloudflare
+#      and CLOUDFLARE_API_TOKEN in the environment before running.
+#   2. A hosts entry mapping the derived SEIP + private.<seip> FQDNs to 127.0.0.1
+#      so the sidecars (and curl) reach the local server by its cert FQDN. The
+#      public cert still verifies against the system trust store — split-horizon
+#      DNS, not verification-off. (This is why --server-addr/--ca-cert are gone:
+#      trust is the real public CA; the address comes from DNS/hosts.)
+#
+#   powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 -Domain <your-domain> [-BuildDir <path>]
+param(
+    [string]$BuildDir = "$PSScriptRoot\..\build",
+    [string]$Domain   = $(if ($env:LN_TEST_DOMAIN) { $env:LN_TEST_DOMAIN } else { "" })
+)
+$ErrorActionPreference = "Continue"
+if (-not $Domain) {
+    Write-Host "ERROR: -Domain (a domain you control, with ACME dns-01 configured) is required."
+    Write-Host "       Manual/self-signed certs are no longer supported; the server needs a real ACME cert."
+    exit 2
+}
 $bin  = "$BuildDir\projects"
 $srv  = "$bin\LemonadeNexus\Release\lemonade-nexus.exe"
 $sc   = "$bin\LemonadeNexusSidecar\Release\lemonade-nexus-sidecar.exe"
-$ossl = "C:\Program Files\Git\usr\bin\openssl.exe"
-if (-not (Test-Path $ossl)) { $ossl = (Get-Command openssl -EA SilentlyContinue).Source }
 $PRIV   = 19101   # private API port; NOT 9101 — VS Code may hold 127.0.0.1:9101
 $TOK    = "localtesttoken"   # sidecar control-API bearer (every control endpoint requires it)
 $REGION = "eu-west"
-$DOMAIN = "lemonade-nexus.io"
 $root = "$env:TEMP\nexus-mesh-$(Get-Random)"
 New-Item -ItemType Directory -Force -Path $root | Out-Null
 Write-Host "root=$root"
 
-# Assertion tracking: CI must fail (exit 1) if any expected security property
-# does not hold, not merely print a diagnostic.
+# Assertion tracking: fail (exit 1) if any expected security property does not
+# hold, not merely print a diagnostic.
 $script:fail = 0
 function Check($cond, $msg) {
     if ($cond) { Write-Host "  ok:   $msg" } else { Write-Host "  FAIL: $msg"; $script:fail++ }
@@ -47,38 +62,38 @@ trap { Write-Host "ERROR: $_"; Cleanup; exit 1 }
 Get-Process lemonade-nexus,lemonade-nexus-sidecar -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
 Start-Sleep 2
 
-# 1. init the server, derive its SEIP/private FQDNs, and mint SEPARATE certs for
-#    the public (SEIP) and private (private.<seip>) listeners — a per-CA check
-#    below then proves each listener presents its own cert, not the other's.
+# 1. init the server and derive its SEIP/private FQDNs.
 #    node-id = "server-" + first 16 hex of the identity pubkey (resolve_server_node_id).
 & $srv --first-run --data-root "$root\server" *> "$root\init.log"
 $pubhex   = (Get-Content "$root\server\identity\keypair.pub" -Raw).Trim()
 $nodeId   = "server-" + $pubhex.Substring(0, 16)
-$SEIP     = "$nodeId.$REGION.seip.$DOMAIN"
+$SEIP     = "$nodeId.$REGION.seip.$Domain"
 $PRIVFQDN = "private.$SEIP"
 Write-Host "SEIP=$SEIP"
-$pubc = "$root\pub.pem"; $pubk = "$root\pub.key"; $privc = "$root\priv.pem"; $privk = "$root\priv.key"; $ca = "$root\ca.pem"
-& $ossl req -x509 -newkey rsa:2048 -nodes -keyout $pubk  -out $pubc  -days 2 -subj "/CN=$SEIP"     -addext "subjectAltName=DNS:$SEIP"     2>"$root\ossl.log"  | Out-Null
-& $ossl req -x509 -newkey rsa:2048 -nodes -keyout $privk -out $privc -days 2 -subj "/CN=$PRIVFQDN" -addext "subjectAltName=DNS:$PRIVFQDN" 2>"$root\ossl2.log" | Out-Null
-Get-Content $pubc,$privc | Set-Content $ca   # trust bundle: sidecars talk to both listeners
+Write-Host "NOTE: add a hosts entry mapping '$SEIP' and '$PRIVFQDN' to 127.0.0.1,"
+Write-Host "      and ensure ACME dns-01 is configured (SP_ACME_PROVIDER / SP_DNS_PROVIDER / CLOUDFLARE_API_TOKEN)."
 
-# start the server: verified HTTPS only, INDEPENDENT public + private certs, closed registration
+# start the server: verified HTTPS only (ACME public CA), closed registration.
+# The cert is issued automatically for the SEIP + private.<seip> FQDNs; no
+# manual cert is supplied.
 $procs += Start-Process $srv -PassThru -WindowStyle Hidden `
     -ArgumentList @("--data-root","$root\server","--public-ip","127.0.0.1","--region",$REGION,
-                    "--no-auto-tls","--tls-cert-path",$pubc,"--tls-key-path",$pubk,
-                    "--private-tls-cert-path",$privc,"--private-tls-key-path",$privk,
                     "--closed-registration","--private-http-port",$PRIV) `
     -RedirectStandardOutput "$root\server.log" -RedirectStandardError "$root\server.err"
-Start-Sleep 5
-# Sanity: the server's published SEIP must match what we built the cert for.
+# ACME dns-01 issuance can take a while on first run; wait for the cert to land.
+Start-Sleep 20
+# Sanity: the server's published SEIP must match what we built the FQDN for.
 $logged = (Select-String -Path "$root\server.log" -Pattern "SEIP: published (\S+) ->").Matches.Groups[1].Value | Select-Object -First 1
 if ($logged -and $logged -ne $SEIP) { Write-Host "WARN: server SEIP '$logged' != computed '$SEIP' (region mismatch?)" }
-# Public listener must present the PUBLIC cert (verify with the public CA only).
-$health = curl.exe -s -m8 --resolve "${SEIP}:9100:127.0.0.1" --cacert $pubc "https://${SEIP}:9100/api/health"
+# Public listener serves the real ACME cert; verify against the SYSTEM trust store.
+$health = curl.exe -s -m8 --resolve "${SEIP}:9100:127.0.0.1" "https://${SEIP}:9100/api/health"
 Write-Host "server health: $health"
+Check ($health -match "ok|healthy|status") "public listener serves a valid ACME cert on the SEIP FQDN"
 
-# TLS flags every sidecar uses to reach the server by its cert FQDN over loopback.
-$tls = @("--server","${SEIP}:9100","--server-addr","127.0.0.1","--ca-cert",$ca,"--pin-server")
+# Flags every sidecar uses to reach the server by its cert FQDN. The SEIP FQDN
+# must resolve to the server (hosts entry -> 127.0.0.1 for a local run); trust is
+# the system/public CA, so no --ca-cert / --server-addr.
+$tls = @("--server","${SEIP}:9100","--pin-server")
 
 # 2. a fake local 'lemond' HTTP service the owner exposes to the mesh
 Start-Job -Name svc {
@@ -127,10 +142,9 @@ $phone = CtlGet 9111 "/status"
 Write-Host "PHONE    status=$($phone.status) node=$($phone.node_id) ip=$($phone.tunnel_ip) mesh_up=$($phone.mesh_up)"
 
 # 7. reachability: from the phone, egress to the server private API over the mesh,
-#    then reach it over verified HTTPS by the private.<seip> FQDN, verifying with
-#    the PRIVATE CA only — so it also proves the private listener presents its own
-#    cert (not the public one). HTTP 401 proves the mesh path reached the
-#    JWT-gated private API.
+#    then reach it over verified HTTPS by the private.<seip> FQDN (verified against
+#    the SYSTEM trust store — the private listener presents its own real ACME cert).
+#    HTTP 401 proves the mesh path reached the JWT-gated private API.
 ('{"ip":"10.64.0.1","port":' + $PRIV + '}') | Out-File "$root\eg.json" -Encoding ascii
 $eg = (curl.exe -s -X POST -H "Authorization: Bearer $TOK" -H "Content-Type: application/json" --data "@$root\eg.json" http://127.0.0.1:9111/egress) | ConvertFrom-Json
 if (-not $eg.loopback_port) {
@@ -138,9 +152,9 @@ if (-not $eg.loopback_port) {
     Check $false "phone egressed to the server private API over the mesh"
 } else {
     $lp = $eg.loopback_port
-    $code = curl.exe -s -m8 -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" --cacert $privc "https://${PRIVFQDN}:${lp}/api/trust/status"
-    Write-Host "PRIVATE API via mesh: HTTP $code (401 = reached JWT-gated private API, private cert verified = SUCCESS)"
-    Check ($code -eq "401") "private API reached over mesh + private cert verified (JWT gate returns 401)"
+    $code = curl.exe -s -m8 -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" "https://${PRIVFQDN}:${lp}/api/trust/status"
+    Write-Host "PRIVATE API via mesh: HTTP $code (401 = reached JWT-gated private API, cert verified = SUCCESS)"
+    Check ($code -eq "401") "private API reached over mesh + real cert verified (JWT gate returns 401)"
 }
 
 Write-Host "`n--- server join log ---"

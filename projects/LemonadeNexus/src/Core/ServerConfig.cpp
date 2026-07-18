@@ -36,8 +36,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"rate_limit_rpm",      c.rate_limit_rpm},
         {"rate_limit_burst",    c.rate_limit_burst},
         {"log_level",           c.log_level},
-        {"tls_cert_path",       c.tls_cert_path},
-        {"tls_key_path",        c.tls_key_path},
         {"acme_provider",       c.acme_provider},
         {"acme_eab_kid",        c.acme_eab_kid},
         {"acme_eab_hmac_key",   c.acme_eab_hmac_key},
@@ -45,7 +43,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"public_ip",           c.public_ip},
         {"region",              c.region},
         {"server_hostname",     c.server_hostname},
-        {"auto_tls",            c.auto_tls},
         {"dns_base_domain",     c.dns_base_domain},
         {"dns_seed_discovery",  c.dns_seed_discovery},
         {"dns_ns_hostname",     c.dns_ns_hostname},
@@ -94,8 +91,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("rate_limit_rpm"))      j.at("rate_limit_rpm").get_to(c.rate_limit_rpm);
     if (j.contains("rate_limit_burst"))    j.at("rate_limit_burst").get_to(c.rate_limit_burst);
     if (j.contains("log_level"))           j.at("log_level").get_to(c.log_level);
-    if (j.contains("tls_cert_path"))       j.at("tls_cert_path").get_to(c.tls_cert_path);
-    if (j.contains("tls_key_path"))        j.at("tls_key_path").get_to(c.tls_key_path);
     if (j.contains("acme_provider"))       j.at("acme_provider").get_to(c.acme_provider);
     if (j.contains("acme_eab_kid"))        j.at("acme_eab_kid").get_to(c.acme_eab_kid);
     if (j.contains("acme_eab_hmac_key"))   j.at("acme_eab_hmac_key").get_to(c.acme_eab_hmac_key);
@@ -103,7 +98,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("public_ip"))           j.at("public_ip").get_to(c.public_ip);
     if (j.contains("region"))              j.at("region").get_to(c.region);
     if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
-    if (j.contains("auto_tls"))            j.at("auto_tls").get_to(c.auto_tls);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
     if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
@@ -190,11 +184,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-provider <name>     ACME CA provider: letsencrypt (default), letsencrypt_staging, zerossl");
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
-    spdlog::info("  --tls-cert-path <path>     Path to public-API TLS certificate PEM (manual override)");
-    spdlog::info("  --tls-key-path <path>      Path to public-API TLS private key PEM (manual override)");
-    spdlog::info("  --private-tls-cert-path <path> Path to private-API TLS certificate PEM (covers private.<seip>; manual override)");
-    spdlog::info("  --private-tls-key-path <path>  Path to private-API TLS private key PEM (manual override)");
-    spdlog::info("  --no-auto-tls              Disable automatic TLS via ACME. The API then serves ONLY if --tls-cert-path/--tls-key-path are provided; otherwise it is withheld (no plaintext fallback)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
@@ -342,18 +331,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_kid = argv[++i];
         } else if (std::strcmp(argv[i], "--acme-eab-hmac-key") == 0 && i + 1 < argc) {
             config.acme_eab_hmac_key = argv[++i];
-        } else if (std::strcmp(argv[i], "--no-auto-tls") == 0) {
-            config.auto_tls = false;
         } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
             config.open_registration = false;
-        } else if (std::strcmp(argv[i], "--tls-cert-path") == 0 && i + 1 < argc) {
-            config.tls_cert_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--tls-key-path") == 0 && i + 1 < argc) {
-            config.tls_key_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--private-tls-cert-path") == 0 && i + 1 < argc) {
-            config.private_tls_cert_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--private-tls-key-path") == 0 && i + 1 < argc) {
-            config.private_tls_key_path = argv[++i];
         } else if (std::strcmp(argv[i], "--require-tee") == 0) {
             config.require_tee_attestation = true;
         } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
@@ -405,10 +384,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
-    if (std::getenv("SP_NO_AUTO_TLS"))                   config.auto_tls              = false;
     if (std::getenv("SP_CLOSED_REGISTRATION"))           config.open_registration     = false;
-    if (const char* v = std::getenv("SP_TLS_CERT_PATH")) config.tls_cert_path         = v;
-    if (const char* v = std::getenv("SP_TLS_KEY_PATH"))  config.tls_key_path          = v;
 
     if (const char* v = std::getenv("SP_SEED_PEERS")) {
         // Comma-separated list

@@ -370,21 +370,15 @@ std::string resolve_tunnel_ip(
 }
 
 TlsResolution resolve_tls_cert(
-    const ServerConfig& config,
     const std::filesystem::path& data_root,
-    const std::string& server_fqdn,
-    const std::string& manual_cert_path,
-    const std::string& manual_key_path)
+    const std::string& server_fqdn)
 {
     TlsResolution result;
-    result.cert_path = manual_cert_path;
-    result.key_path  = manual_key_path;
 
-    // Auto-TLS: if no manual cert paths, check for an existing ACME cert on disk
-    // for THIS fqdn (never another listener's cert).
-    if (result.cert_path.empty() && result.key_path.empty()
-        && config.auto_tls && !server_fqdn.empty())
-    {
+    // The cert is always ACME-issued (public CA on the SEIP FQDN). Resolve THIS
+    // FQDN's cert on disk (never another listener's cert); if absent, request it
+    // in the background.
+    if (!server_fqdn.empty()) {
         const auto acme_cert_dir  = data_root / "certs" / server_fqdn;
         const auto acme_cert_file = acme_cert_dir / "fullchain.pem";
         const auto acme_key_file  = acme_cert_dir / "privkey.pem";

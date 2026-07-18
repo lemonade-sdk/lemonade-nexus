@@ -24,7 +24,6 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
             {"cert_path",    ctx_.http_server.tls_cert_path()},
             {"key_path",     ctx_.http_server.tls_key_path()},
             {"server_fqdn",  ctx_.server_fqdn},
-            {"auto_tls",     ctx_.config.auto_tls},
         };
         json_response(res, resp);
     });

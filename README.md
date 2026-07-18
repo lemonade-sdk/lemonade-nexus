@@ -579,8 +579,6 @@ SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| | | `tls_cert_path` | | Path to TLS certificate file |
-| | | `tls_key_path` | | Path to TLS private key file |
 | | `SP_ACME_PROVIDER` | `acme_provider` | `letsencrypt` | ACME provider: `letsencrypt` / `letsencrypt_staging` / `zerossl` |
 | | `ACME_EMAIL` | | | Contact email for ACME registration |
 | | `ZEROSSL_EAB_KID` | | | ZeroSSL External Account Binding key ID |

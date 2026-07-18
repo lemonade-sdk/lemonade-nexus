@@ -89,16 +89,13 @@ void resolve_server_region(
     ipam::IPAMService& ipam,
     gossip::GossipService& gossip);
 
-/// Resolve TLS certificate paths for `server_fqdn`:
-/// manual override (the passed cert/key) > existing ACME cert on disk for that
-/// FQDN > needs_acme_background flag. The manual paths are explicit parameters
-/// (NOT read from config) so the public and private listeners resolve
-/// independently — the private listener must never receive the public cert.
+/// Resolve the TLS certificate paths for `server_fqdn`. The cert is always
+/// ACME-issued (public CA on the SEIP FQDN); this returns the cert on disk for
+/// THIS FQDN, or needs_acme_background=true when it must still be requested.
+/// Each listener resolves its OWN FQDN independently — the private listener
+/// (private.<seip>) never receives the public cert.
 [[nodiscard]] TlsResolution resolve_tls_cert(
-    const ServerConfig& config,
     const std::filesystem::path& data_root,
-    const std::string& server_fqdn,
-    const std::string& manual_cert_path = "",
-    const std::string& manual_key_path = "");
+    const std::string& server_fqdn);
 
 } // namespace nexus::core

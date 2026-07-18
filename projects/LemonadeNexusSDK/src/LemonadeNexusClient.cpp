@@ -149,14 +149,6 @@ struct LemonadeNexusClient::Impl {
         s.consecutive_failures = 0;
     }
 
-    // Apply the optional dev-trust CA and host->addr overrides to any httplib
-    // client (verification stays on). Works for both Client and SSLClient.
-    template <class Client>
-    void apply_tls_opts(Client& cli) const {
-        if (!config.ca_cert_path.empty()) cli.set_ca_cert_path(config.ca_cert_path);
-        if (!config.host_addr.empty()) cli.set_hostname_addr_map(config.host_addr);
-    }
-
     // Build common headers (including Bearer auth when session token is set)
     httplib::Headers auth_headers() const {
         httplib::Headers hdrs;
@@ -174,7 +166,6 @@ struct LemonadeNexusClient::Impl {
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
                 cli.set_write_timeout(config.write_timeout_sec);
-                apply_tls_opts(cli);
 
                 auto rtt_start = std::chrono::steady_clock::now();
                 auto res = cli.Get(path, auth_headers());
@@ -227,7 +218,6 @@ struct LemonadeNexusClient::Impl {
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
                 cli.set_write_timeout(config.write_timeout_sec);
-                apply_tls_opts(cli);
 
                 auto rtt_start = std::chrono::steady_clock::now();
                 auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
@@ -308,12 +298,9 @@ struct LemonadeNexusClient::Impl {
 
         try {
             httplib::SSLClient cli(server_private_fqdn, lp);
-            // The private FQDN lands on the loopback egress; keep any configured
-            // host overrides too, and trust the optional dev CA.
-            auto amap = config.host_addr;
-            amap[server_private_fqdn] = "127.0.0.1";
-            cli.set_hostname_addr_map(amap);
-            if (!config.ca_cert_path.empty()) cli.set_ca_cert_path(config.ca_cert_path);
+            // The private FQDN lands on the loopback egress; SNI + certificate
+            // verification still use the FQDN (against the public CA).
+            cli.set_hostname_addr_map({{server_private_fqdn, "127.0.0.1"}});
             cli.set_connection_timeout(config.connect_timeout_sec);
             cli.set_read_timeout(config.read_timeout_sec);
             httplib::Result res = (std::string(method) == "GET")
@@ -356,7 +343,6 @@ struct LemonadeNexusClient::Impl {
                 httplib::SSLClient cli(server_private_fqdn, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
-                apply_tls_opts(cli);
                 auto res = cli.Get(path, auth_headers());
                 if (res) {
                     status_out = res->status;
@@ -390,7 +376,6 @@ struct LemonadeNexusClient::Impl {
                 httplib::SSLClient cli(server_private_fqdn, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
-                apply_tls_opts(cli);
                 auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
                 if (res) {
                     status_out = res->status;
@@ -458,7 +443,6 @@ struct LemonadeNexusClient::Impl {
                 httplib::Client cli(base_url(s.endpoint));
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
-                apply_tls_opts(cli);
 
                 auto res = cli.Get("/api/health");
                 s.last_health_check_ms = now_ms;

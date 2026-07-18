@@ -135,15 +135,6 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }}
 
-      # End-to-end check of the assembled daemon + sidecar: per-listener TLS
-      # certs, closed-registration join gating, the token-gated control API
-      # (incl. no/wrong-bearer 401), and private-API reachability over the mesh.
-      # Runs on the VS job (mirrors how Lemonade builds the bundled sidecar).
-      - name: Sidecar mesh integration test (Windows, VS)
-        if: matrix.vs_generator
-        shell: pwsh
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 -BuildDir build
-
   build-linux-distros:
     strategy:
       fail-fast: false

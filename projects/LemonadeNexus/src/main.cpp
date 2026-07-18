@@ -494,8 +494,7 @@ int main(int argc, char* argv[]) {
     // no public IP). The background ACME thread and renewal use the same target.
     const std::string public_cert_fqdn =
         !server_seip_fqdn.empty() ? server_seip_fqdn : server_fqdn;
-    auto tls = nexus::core::resolve_tls_cert(config, data_root, public_cert_fqdn,
-                                             config.tls_cert_path, config.tls_key_path);
+    auto tls = nexus::core::resolve_tls_cert(data_root, public_cert_fqdn);
 
     // ========================================================================
     // boringtun interface — server-side tunnel endpoint
@@ -623,14 +622,12 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
     bool private_needs_acme = false;   // request + upgrade the private cert in the background
     if (!tunnel_bind_ip.empty()) {
-        // Resolve the PRIVATE cert independently of the public one — its manual
-        // paths are private_tls_*, and its ACME cert is the one issued for
-        // server_private_fqdn (never the public SEIP cert).
+        // Resolve the PRIVATE cert independently of the public one — its ACME
+        // cert is the one issued for server_private_fqdn (never the public SEIP
+        // cert).
         std::string priv_cert_path, priv_key_path;
         if (!server_private_fqdn.empty()) {
-            auto priv_tls = nexus::core::resolve_tls_cert(
-                config, data_root, server_private_fqdn,
-                config.private_tls_cert_path, config.private_tls_key_path);
+            auto priv_tls = nexus::core::resolve_tls_cert(data_root, server_private_fqdn);
             if (!priv_tls.cert_path.empty() && !priv_tls.key_path.empty()) {
                 priv_cert_path = priv_tls.cert_path;
                 priv_key_path  = priv_tls.key_path;
@@ -813,9 +810,9 @@ int main(int argc, char* argv[]) {
         spdlog::warn("Public API withheld: no TLS certificate yet for {} — it will "
                      "start once ACME issues one (no plaintext fallback)", server_fqdn);
     } else {
-        spdlog::error("Public API withheld: no TLS certificate for {} and auto-TLS is off. "
-                      "Provide --tls-cert-path/--tls-key-path or enable auto-TLS "
-                      "(no plaintext fallback).", server_fqdn);
+        spdlog::error("Public API withheld: no TLS certificate for '{}' and no FQDN to "
+                      "request one for via ACME (needs a public IP / SEIP FQDN; "
+                      "no plaintext fallback).", server_fqdn);
     }
     if (private_http_server) {
         if (private_http_server->is_tls()) {
@@ -956,7 +953,7 @@ int main(int argc, char* argv[]) {
     std::atomic<bool> acme_renewal_stop{false};
     std::thread acme_renewal_thread;
     const bool have_private_fqdn = private_http_server && !server_private_fqdn.empty();
-    if (config.auto_tls && (!public_cert_fqdn.empty() || have_private_fqdn)) {
+    if (!public_cert_fqdn.empty() || have_private_fqdn) {
         acme_renewal_thread = std::thread([&]() {
             constexpr auto initial_delay = std::chrono::hours(1);
             constexpr auto check_interval = std::chrono::hours(24);

@@ -1,8 +1,8 @@
-// resolve_tls_cert must resolve each listener's certificate independently: the
-// private listener's cert comes from its own manual paths or the ACME cert
-// issued for private.<seip> — never the public SEIP cert.
+// resolve_tls_cert must resolve each listener's certificate independently from
+// the ACME cert-on-disk for its OWN FQDN — the private listener's cert
+// (private.<seip>) must never be the public SEIP cert. Certificates are always
+// ACME-issued (public CA on the forced SEIP FQDN); there is no manual-cert path.
 
-#include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
 
 #include <gtest/gtest.h>
@@ -36,13 +36,10 @@ TEST(TlsResolution, PublicAndPrivateResolveIndependently) {
     write_cert(root / "certs" / pub_fqdn,  "PUBLIC");
     write_cert(root / "certs" / priv_fqdn, "PRIVATE");
 
-    core::ServerConfig cfg;
-    cfg.auto_tls = true;   // no manual paths → resolve from the per-FQDN ACME dir
+    auto pub  = core::resolve_tls_cert(root, pub_fqdn);
+    auto priv = core::resolve_tls_cert(root, priv_fqdn);
 
-    auto pub  = core::resolve_tls_cert(cfg, root, pub_fqdn);
-    auto priv = core::resolve_tls_cert(cfg, root, priv_fqdn);
-
-    // Each listener gets its OWN on-disk cert, and they never cross.
+    // Each listener gets its OWN on-disk ACME cert, and they never cross.
     EXPECT_NE(pub.cert_path, priv.cert_path);
     EXPECT_NE(pub.cert_path.find(pub_fqdn), std::string::npos);
     EXPECT_NE(priv.cert_path.find(priv_fqdn), std::string::npos);
@@ -54,23 +51,9 @@ TEST(TlsResolution, PublicAndPrivateResolveIndependently) {
     fs::remove_all(root);
 }
 
-TEST(TlsResolution, ManualPathsOverrideAndDontCross) {
-    core::ServerConfig cfg;
-    cfg.auto_tls = true;
-    // A manual private cert is used as-is, independent of any public cert.
-    auto priv = core::resolve_tls_cert(cfg, fs::temp_directory_path(),
-                                       "private.node.seip.example",
-                                       "/etc/nexus/priv.pem", "/etc/nexus/priv.key");
-    EXPECT_EQ(priv.cert_path, "/etc/nexus/priv.pem");
-    EXPECT_EQ(priv.key_path, "/etc/nexus/priv.key");
-    EXPECT_FALSE(priv.needs_acme_background);
-}
-
 TEST(TlsResolution, NoCertOnDiskRequestsBackground) {
-    core::ServerConfig cfg;
-    cfg.auto_tls = true;
     auto r = core::resolve_tls_cert(
-        cfg, fs::temp_directory_path() / "nexus_no_such_dir_zzz", "no.such.fqdn.example");
+        fs::temp_directory_path() / "nexus_no_such_dir_zzz", "no.such.fqdn.example");
     EXPECT_TRUE(r.cert_path.empty());
     EXPECT_TRUE(r.needs_acme_background);
 }
