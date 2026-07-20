@@ -42,6 +42,10 @@ class GossipService : public core::IService<GossipService>,
                        public IGossipProvider<GossipService> {
     friend class core::IService<GossipService>;
     friend class IGossipProvider<GossipService>;
+    // Test seam: the ballot handlers sit behind packet-signature verification and
+    // a bound socket, neither of which a unit test can drive. Reaching them via a
+    // friend keeps the production surface unchanged (tests/test_onboarding.cpp).
+    friend struct GossipBallotTestAccess;
 
 public:
     GossipService(asio::io_context& io, uint16_t port,
@@ -205,6 +209,7 @@ private:
 
     // Enrollment quorum handlers
     void handle_enrollment_vote_request(const asio::ip::udp::endpoint& sender,
+                                         const std::string& sender_pubkey,
                                          const uint8_t* payload, std::size_t payload_len);
     void handle_enrollment_vote(const asio::ip::udp::endpoint& sender,
                                  const std::string& sender_pubkey,
@@ -415,6 +420,7 @@ private:
     // Quorum-based enrollment
     bool     enrollment_quorum_enabled_{false};
     float    enrollment_quorum_ratio_{0.5f};
+    float    admission_quorum_ratio_{0.75f};   // mirrors ServerConfig default
     uint32_t enrollment_vote_timeout_sec_{60};
     uint32_t enrollment_max_retries_{3};
     std::unordered_map<std::string, EnrollmentBallot> pending_enrollments_;
@@ -440,6 +446,10 @@ public:
     /// Configure enrollment quorum parameters.
     void set_enrollment_config(bool enabled, float ratio,
                                 uint32_t timeout_sec, uint32_t max_retries);
+
+    /// Local floor for ADMISSION ballots. Separate from the enrollment ratio: a
+    /// remote sponsor supplies its own, and we must never accept a lower bar.
+    void set_admission_quorum_ratio(float ratio);
 
     /// Get pending enrollment ballots (for status API).
     [[nodiscard]] std::vector<EnrollmentBallot> pending_enrollments() const;

@@ -114,7 +114,10 @@ public:
     void start_pending_ballot(const std::string& request_id);
 
     /// Ballot decision hook (wired to GossipService's decision callback).
+    /// `candidate_pubkey` is the candidate the BALLOT was about; it must match the
+    /// record, or a ballot for one candidate resolves a record for another.
     void on_ballot_decision(const std::string& request_id, bool approved,
+                            const std::string& candidate_pubkey,
                             const std::string& reason);
 
     /// Candidate polls its request; fills cert bundle when approved.

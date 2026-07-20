@@ -297,22 +297,44 @@ TEST_F(AuthTest, TokenLinkIsNotStandaloneAuth) {
 // --- Ed25519 device revocation ---
 
 namespace {
-// Full challenge-response login for `kp` (the only way to obtain a session).
-auto ed25519_login(auth::AuthService& svc, crypto::SodiumCryptoService& c,
-                   const crypto::Ed25519Keypair& kp) {
-    auto pk_b64 = crypto::to_base64(
-        std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
-    auto challenge_b64 = svc.issue_ed25519_challenge(pk_b64)
+// Full challenge-response login for `kp`, presenting `pk_str` as the pubkey.
+auto ed25519_login_as(auth::AuthService& svc, crypto::SodiumCryptoService& c,
+                      const crypto::Ed25519Keypair& kp, const std::string& pk_str) {
+    auto challenge_b64 = svc.issue_ed25519_challenge(pk_str)
                             .value("challenge", std::string{});
     auto challenge = crypto::from_base64(challenge_b64);
     auto sig = c.ed25519_sign(kp.private_key, std::span<const uint8_t>(challenge));
     return svc.authenticate({
         {"method",    "ed25519"},
-        {"pubkey",    pk_b64},
+        {"pubkey",    pk_str},
         {"challenge", challenge_b64},
         {"signature", crypto::to_base64(
                           std::span<const uint8_t>(sig.data(), sig.size()))},
     });
+}
+
+std::string canonical_b64(const crypto::Ed25519Keypair& kp) {
+    return crypto::to_base64(
+        std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+}
+
+// Full challenge-response login for `kp` (the only way to obtain a session).
+auto ed25519_login(auth::AuthService& svc, crypto::SodiumCryptoService& c,
+                   const crypto::Ed25519Keypair& kp) {
+    return ed25519_login_as(svc, c, kp, canonical_b64(kp));
+}
+
+// The same 32 bytes in url-safe unpadded form. from_base64 accepts both, so an
+// exact-string blocklist keyed on the standard form would miss this one.
+std::string url_safe_unpadded(const std::string& std_b64) {
+    std::string out;
+    for (char ch : std_b64) {
+        if (ch == '=') continue;
+        else if (ch == '+') out.push_back('-');
+        else if (ch == '/') out.push_back('_');
+        else out.push_back(ch);
+    }
+    return out;
 }
 }  // namespace
 
@@ -341,6 +363,45 @@ TEST_F(AuthTest, RevokedKeyInvalidatesExistingSession) {
     ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
 
     // The already-issued JWT must stop validating immediately, not at expiry.
+    EXPECT_FALSE(auth->validate_session_claims(login.session_token).has_value());
+}
+
+// A revoked key must stay revoked in every textual form it can be presented in.
+TEST_F(AuthTest, RevokedKeyCannotReauthenticateUnderAltBase64) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = canonical_b64(kp);
+    auto alt    = url_safe_unpadded(pk_b64);
+    ASSERT_NE(alt, pk_b64);   // the two encodings really are different strings
+
+    ASSERT_TRUE(ed25519_login(*auth, *crypto, kp).authenticated);
+    ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
+
+    auto after = ed25519_login_as(*auth, *crypto, kp, alt);
+    EXPECT_FALSE(after.authenticated);
+    EXPECT_TRUE(after.session_token.empty());
+}
+
+// ...and revoking via the alternate form must block the standard form too.
+TEST_F(AuthTest, RevokingAltBase64BlocksCanonicalForm) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = canonical_b64(kp);
+
+    ASSERT_TRUE(ed25519_login(*auth, *crypto, kp).authenticated);
+    ASSERT_TRUE(auth->revoke_ed25519(url_safe_unpadded(pk_b64)));
+
+    EXPECT_FALSE(ed25519_login(*auth, *crypto, kp).authenticated);
+}
+
+// A session obtained under one encoding dies when the key is revoked under another.
+TEST_F(AuthTest, AltBase64SessionDiesOnCanonicalRevoke) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = canonical_b64(kp);
+
+    auto login = ed25519_login_as(*auth, *crypto, kp, url_safe_unpadded(pk_b64));
+    ASSERT_TRUE(login.authenticated);
+    ASSERT_TRUE(auth->validate_session_claims(login.session_token).has_value());
+
+    ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
     EXPECT_FALSE(auth->validate_session_claims(login.session_token).has_value());
 }
 

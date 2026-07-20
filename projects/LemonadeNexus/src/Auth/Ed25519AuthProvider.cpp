@@ -33,7 +33,11 @@ Ed25519AuthProvider::Ed25519AuthProvider(storage::FileStorageService& storage,
 // Challenge issuance
 // ============================================================================
 
-json Ed25519AuthProvider::issue_challenge(const std::string& pubkey_b64) {
+json Ed25519AuthProvider::issue_challenge(const std::string& raw_pubkey_b64) {
+    // Bind the challenge to the canonical key so do_authenticate's compare can't
+    // be sidestepped by presenting a different encoding of the same key.
+    const auto pubkey_b64 = crypto::canonical_key_b64(raw_pubkey_b64);
+
     // Generate 32 random bytes as the challenge nonce
     std::array<uint8_t, kChallengeSize> nonce{};
     crypto_.random_bytes(std::span<uint8_t>(nonce));
@@ -72,11 +76,11 @@ json Ed25519AuthProvider::issue_challenge(const std::string& pubkey_b64) {
 // ============================================================================
 
 AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
-    const auto pubkey_b64    = credentials.value("pubkey", std::string{});
-    const auto challenge_b64 = credentials.value("challenge", std::string{});
-    const auto signature_b64 = credentials.value("signature", std::string{});
+    const auto raw_pubkey_b64 = credentials.value("pubkey", std::string{});
+    const auto challenge_b64  = credentials.value("challenge", std::string{});
+    const auto signature_b64  = credentials.value("signature", std::string{});
 
-    if (pubkey_b64.empty() || challenge_b64.empty() || signature_b64.empty()) {
+    if (raw_pubkey_b64.empty() || challenge_b64.empty() || signature_b64.empty()) {
         return AuthResult{
             .authenticated = false,
             .error_message = "Missing required fields: pubkey, challenge, signature"
@@ -86,7 +90,7 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
     // Decode the public key
     std::vector<uint8_t> pubkey_bytes;
     try {
-        pubkey_bytes = crypto::from_base64(pubkey_b64);
+        pubkey_bytes = crypto::from_base64(raw_pubkey_b64);
     } catch (const std::exception& e) {
         return AuthResult{
             .authenticated = false,
@@ -103,6 +107,10 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
 
     crypto::Ed25519PublicKey pubkey{};
     std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), pubkey.begin());
+
+    // Canonical form from here down: a variant encoding of the same key would
+    // otherwise miss the revocation set and auto-register as a fresh identity.
+    const auto pubkey_b64 = crypto::to_base64(std::span<const uint8_t>(pubkey));
 
     // Revoked (deleted) devices can't re-authenticate or re-join.
     if (is_pubkey_revoked(pubkey_b64)) {
@@ -258,12 +266,18 @@ std::string Ed25519AuthProvider::auto_register(const std::string& pubkey_b64,
 // Device revocation blocklist
 // ============================================================================
 
+// The blocklist is keyed by canonical form on both insert and query, so the same
+// key in a different encoding cannot slip past the exact-string match.
 bool Ed25519AuthProvider::is_pubkey_revoked(const std::string& pubkey_b64) {
+    if (pubkey_b64.empty()) return false;
     if (!cache_loaded_.load(std::memory_order_acquire)) {
         load_credentials_from_disk();
     }
     std::lock_guard lock(cache_mutex_);
-    return revoked_pubkeys_.contains(pubkey_b64);
+    // Verbatim first, so an undecodable legacy entry still matches, then by bytes.
+    if (revoked_pubkeys_.contains(pubkey_b64)) return true;
+    const auto canon = crypto::canonical_key_b64(pubkey_b64);
+    return !canon.empty() && revoked_pubkeys_.contains(canon);
 }
 
 bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
@@ -273,7 +287,9 @@ bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
     }
 
     std::lock_guard lock(cache_mutex_);
-    revoked_pubkeys_.insert(pubkey_b64);
+    // Never silently drop a revocation: keep the raw string if it won't decode.
+    const auto canon = crypto::canonical_key_b64(pubkey_b64);
+    revoked_pubkeys_.insert(canon.empty() ? pubkey_b64 : canon);
 
     // Persist the full blocklist to data/credentials/revoked.json.
     auto revoked_path = storage_.data_root() / "credentials" / "revoked.json";
@@ -326,13 +342,14 @@ bool Ed25519AuthProvider::save_ed25519_credential(const std::string& user_id,
         file_data["ed25519_pubkeys"] = json::array();
     }
 
-    // Check for duplicate
+    // Duplicate check on key bytes, rewriting any legacy spelling in place — a raw
+    // compare would append a second entry for the same key in another encoding.
     bool found = false;
-    for (const auto& existing : file_data["ed25519_pubkeys"]) {
-        if (existing.value("pubkey", "") == pubkey_b64) {
-            found = true;
-            break;
-        }
+    for (auto& existing : file_data["ed25519_pubkeys"]) {
+        if (crypto::canonical_key_b64(existing.value("pubkey", "")) != pubkey_b64) continue;
+        existing["pubkey"] = pubkey_b64;
+        found = true;
+        break;
     }
 
     if (!found) {
@@ -394,7 +411,9 @@ void Ed25519AuthProvider::load_credentials_from_disk() {
             if (file_data.contains("ed25519_pubkeys") &&
                 file_data["ed25519_pubkeys"].is_array()) {
                 for (const auto& pk_entry : file_data["ed25519_pubkeys"]) {
-                    auto pk = pk_entry.value("pubkey", std::string{});
+                    // Canonicalize on load: files written before canonicalization
+                    // may hold a variant encoding of the same key.
+                    auto pk = crypto::canonical_key_b64(pk_entry.value("pubkey", std::string{}));
                     if (!pk.empty()) {
                         pubkey_to_user_[pk] = user_id;
                     }
@@ -414,7 +433,13 @@ void Ed25519AuthProvider::load_credentials_from_disk() {
             auto revoked_data = json::parse(rss.str(), nullptr, false);
             if (revoked_data.is_array()) {
                 for (const auto& pk : revoked_data) {
-                    if (pk.is_string()) revoked_pubkeys_.insert(pk.get<std::string>());
+                    if (!pk.is_string()) continue;
+                    // Repair pre-canonicalization entries so a revoked key stays
+                    // revoked whichever encoding it was stored in; keep undecodable
+                    // ones verbatim rather than dropping a revocation.
+                    auto raw = pk.get<std::string>();
+                    auto canon = crypto::canonical_key_b64(raw);
+                    revoked_pubkeys_.insert(canon.empty() ? raw : canon);
                 }
             }
         }

@@ -382,12 +382,27 @@ void ServerAdmissionService::start_pending_ballot(const std::string& request_id)
 }
 
 void ServerAdmissionService::on_ballot_decision(const std::string& request_id,
-                                                bool approved, const std::string& reason) {
+                                                bool approved,
+                                                const std::string& candidate_pubkey,
+                                                const std::string& reason) {
     std::lock_guard lock(mu_);
     auto it = admissions_.find(request_id);
     if (it == admissions_.end()) return;   // not one of ours (e.g. legacy enrollment)
     auto& a = it->second;
     if (a.state != State::Pending) return;
+    // A ballot may only resolve the record it is actually about, and only when this
+    // record was governed by a ballot at all — a "sole" record awaits an admin, so
+    // letting a ballot decide it would bypass that gate.
+    if (!candidate_pubkey.empty() && a.candidate_pubkey != candidate_pubkey) {
+        spdlog::warn("[{}] ballot {} candidate does not match its admission record; ignoring",
+                      name(), request_id);
+        return;
+    }
+    if (a.decision_mode != "ballot") {
+        spdlog::warn("[{}] ballot decision for '{}' record {}; ignoring",
+                      name(), a.decision_mode, request_id);
+        return;
+    }
     if (approved) {
         (void)do_approve_locked(a, "ballot", /*supersede=*/false);
     } else {

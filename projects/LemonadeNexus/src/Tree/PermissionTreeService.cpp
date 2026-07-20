@@ -236,10 +236,13 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
 
 bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {
     if (mgmt_pubkey.empty()) return false;
+    // Match on key bytes: this is the owner-protection guard on revocation, so a
+    // spelling mismatch would blocklist an owner's still-in-use key.
+    const auto want = canonical_principal(mgmt_pubkey);
     std::lock_guard lock(mutex_);
     for (const auto& [id, node] : nodes_) {
         (void)id;
-        if (node.mgmt_pubkey == mgmt_pubkey) return true;
+        if (canonical_principal(node.mgmt_pubkey) == want) return true;
     }
     return false;
 }
@@ -307,10 +310,12 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
         return false;
     }
 
-    // Verify signer has the required permission via assignments
+    // Verify signer has the required permission via assignments. Same key-bytes
+    // match as check_permission, or reads and writes disagree on who a principal is.
     bool has_perm = false;
+    const auto signer_canon = canonical_principal(delta.signer_pubkey);
     for (const auto& assignment : check_it->second.assignments) {
-        if (assignment.management_pubkey == delta.signer_pubkey) {
+        if (canonical_principal(assignment.management_pubkey) == signer_canon) {
             for (const auto& perm_str : assignment.permissions) {
                 if (acl::has_permission(string_to_permission(perm_str), required)) {
                     has_perm = true;
@@ -717,8 +722,10 @@ bool PermissionTreeService::do_check_permission(std::string_view signer_pubkey,
         return false;
     }
 
+    // Match on key bytes: stored principals may use either base64 spelling.
+    const auto signer_canon = canonical_principal(signer_pubkey);
     for (const auto& assignment : it->second.assignments) {
-        if (assignment.management_pubkey == signer_pubkey) {
+        if (canonical_principal(assignment.management_pubkey) == signer_canon) {
             for (const auto& perm_str : assignment.permissions) {
                 if (acl::has_permission(string_to_permission(perm_str), perm)) {
                     return true;

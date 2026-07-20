@@ -62,6 +62,13 @@ using Hash256 = std::array<uint8_t, kHash256Size>;
 [[nodiscard]] std::string to_base64(std::span<const uint8_t> data);
 [[nodiscard]] std::vector<uint8_t> from_base64(std::string_view encoded);
 
+// from_base64 accepts standard AND url-safe-unpadded, to_base64 emits only
+// standard — so one key has several textual forms. Any string used as a security
+// identity (revocation, lookup, ACL principal) MUST be canonicalized first,
+// otherwise an exact-string compare is bypassed by re-encoding the same key.
+// Returns empty on undecodable input; strips an optional "ed25519:" prefix.
+[[nodiscard]] std::string canonical_key_b64(std::string_view encoded);
+
 // --- Hex helpers ---
 [[nodiscard]] std::string to_hex(std::span<const uint8_t> data);
 [[nodiscard]] std::vector<uint8_t> from_hex(std::string_view hex);

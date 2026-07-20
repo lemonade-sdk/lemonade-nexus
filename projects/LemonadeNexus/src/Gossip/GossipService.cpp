@@ -590,7 +590,8 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             handle_tee_response(remote_endpoint_, payload, payload_len);
             break;
         case GossipMsgType::EnrollmentVoteRequest:
-            handle_enrollment_vote_request(remote_endpoint_, payload, payload_len);
+            handle_enrollment_vote_request(remote_endpoint_, sender_pubkey_b64,
+                                            payload, payload_len);
             break;
         case GossipMsgType::EnrollmentVote:
             handle_enrollment_vote(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
@@ -1685,45 +1686,50 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
 
         // If quorum enrollment is enabled, start a vote before full admission
         if (enrollment_quorum_enabled_ && !j.value("is_response", false)) {
-            // Check if we already have a pending enrollment for this pubkey
-            std::lock_guard lock(peers_mutex_);
-            bool already_pending = false;
-            for (const auto& [rid, ballot] : pending_enrollments_) {
-                if (ballot.candidate_pubkey == pk &&
-                    ballot.state == EnrollmentBallot::State::Collecting) {
-                    already_pending = true;
-                    break;
+            // Insert under the lock, then broadcast and self-vote with it RELEASED:
+            // both callees take peers_mutex_ themselves and it is not recursive.
+            std::optional<EnrollmentBallot> opened;
+            {
+                std::lock_guard lock(peers_mutex_);
+                bool already_pending = false;
+                for (const auto& [rid, ballot] : pending_enrollments_) {
+                    if (ballot.candidate_pubkey == pk &&
+                        ballot.state == EnrollmentBallot::State::Collecting) {
+                        already_pending = true;
+                        break;
+                    }
+                }
+
+                if (!already_pending) {
+                    // Generate a unique request ID
+                    std::array<uint8_t, 16> request_id_bytes{};
+                    crypto_.random_bytes(std::span<uint8_t>(request_id_bytes));
+                    auto request_id = crypto::to_hex(std::span<const uint8_t>(request_id_bytes));
+
+                    auto now = static_cast<uint64_t>(
+                        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+                    EnrollmentBallot ballot;
+                    ballot.request_id         = request_id;
+                    ballot.candidate_pubkey   = pk;
+                    ballot.candidate_server_id = cert.server_id;
+                    ballot.certificate_json   = j.dump();
+                    ballot.sponsor_pubkey     = crypto::to_base64(keypair_.public_key);
+                    ballot.created_at         = now;
+                    ballot.timeout_at         = now + enrollment_vote_timeout_sec_;
+
+                    pending_enrollments_[request_id] = ballot;
+                    opened = std::move(ballot);
+
+                    spdlog::info("[{}] enrollment quorum started for '{}' (request: {})",
+                                  name(), cert.server_id, request_id.substr(0, 12));
                 }
             }
 
-            if (!already_pending) {
-                // Generate a unique request ID
-                std::array<uint8_t, 16> request_id_bytes{};
-                crypto_.random_bytes(std::span<uint8_t>(request_id_bytes));
-                auto request_id = crypto::to_hex(std::span<const uint8_t>(request_id_bytes));
-
-                auto now = static_cast<uint64_t>(
-                    chrono::system_clock::to_time_t(chrono::system_clock::now()));
-
-                EnrollmentBallot ballot;
-                ballot.request_id         = request_id;
-                ballot.candidate_pubkey   = pk;
-                ballot.candidate_server_id = cert.server_id;
-                ballot.certificate_json   = j.dump();
-                ballot.sponsor_pubkey     = crypto::to_base64(keypair_.public_key);
-                ballot.created_at         = now;
-                ballot.timeout_at         = now + enrollment_vote_timeout_sec_;
-
-                pending_enrollments_[request_id] = ballot;
-
-                spdlog::info("[{}] enrollment quorum started for '{}' (request: {})",
-                              name(), cert.server_id, request_id.substr(0, 12));
-
-                // Broadcast vote request to all peers
-                broadcast_enrollment_vote_request(ballot);
-
+            if (opened) {
+                broadcast_enrollment_vote_request(*opened);
                 // We auto-vote approve since we verified the certificate
-                cast_enrollment_vote(request_id, pk, true, "certificate_valid");
+                cast_enrollment_vote(opened->request_id, pk, true, "certificate_valid");
             }
         }
     } catch (const std::exception& e) {
@@ -1927,6 +1933,11 @@ void GossipService::set_enrollment_config(bool enabled, float ratio,
     }
 }
 
+void GossipService::set_admission_quorum_ratio(float ratio) {
+    std::lock_guard lock(peers_mutex_);
+    admission_quorum_ratio_ = std::clamp(ratio, 0.0f, 1.0f);
+}
+
 std::vector<EnrollmentBallot> GossipService::pending_enrollments() const {
     std::lock_guard lock(peers_mutex_);
     std::vector<EnrollmentBallot> result;
@@ -1955,7 +1966,13 @@ void GossipService::start_admission_ballot(const std::string& request_id,
     ballot.required_ratio      = required_ratio;
     {
         std::lock_guard lock(peers_mutex_);
-        if (pending_enrollments_.contains(request_id)) return;
+        // We sponsor this id, so our ballot is authoritative: a remote vote request
+        // must not pre-empt it by claiming the id first (that would swap in an
+        // attacker-chosen candidate while approval still mints from OUR record).
+        // Re-entry with our own ballot stays a no-op.
+        auto it = pending_enrollments_.find(request_id);
+        if (it != pending_enrollments_.end() &&
+            it->second.sponsor_pubkey == ballot.sponsor_pubkey) return;
         pending_enrollments_[request_id] = ballot;
     }
     broadcast_enrollment_vote_request(ballot);
@@ -1981,10 +1998,11 @@ void GossipService::broadcast_enrollment_vote_request(const EnrollmentBallot& ba
         request["certificate"] = json::parse(ballot.certificate_json);
     }
 
-    // Attach our attestation token if we're Tier1
-    if (trust_policy_ && trust_policy_->our_tier() == core::TrustTier::Tier1) {
-        auto token = trust_policy_->generate_attestation_token(keypair_);
-        request["attestation_token"] = token;
+    // Always attach when a policy is installed: the receiver now hard-rejects a
+    // missing token, and it adjudicates the tier itself. Nothing restricts
+    // sponsoring to Tier1, so a Tier2 sponsor must still be able to open a ballot.
+    if (trust_policy_) {
+        request["attestation_token"] = trust_policy_->generate_attestation_token(keypair_);
     }
 
     auto payload_str = request.dump();
@@ -2077,6 +2095,7 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
 
 void GossipService::handle_enrollment_vote_request(
     const asio::ip::udp::endpoint& sender,
+    const std::string& sender_pubkey,
     const uint8_t* payload, std::size_t payload_len)
 {
     try {
@@ -2089,33 +2108,57 @@ void GossipService::handle_enrollment_vote_request(
 
         if (request_id.empty() || candidate_pubkey.empty()) return;
 
+        // The packet signature authenticates the sender, so the claimed sponsor must
+        // BE the sender. Without this anyone can open a ballot in a sponsor's name.
+        if (sponsor_pubkey.empty() || sponsor_pubkey != sender_pubkey) {
+            spdlog::warn("[{}] enrollment vote request from {} claiming sponsor {} — dropped",
+                          name(), sender_pubkey.substr(0, 12), sponsor_pubkey.substr(0, 12));
+            return;
+        }
+
+        // We open our own ballots locally; a remote one naming us would only serve
+        // to pre-empt ours.
+        if (sponsor_pubkey == crypto::to_base64(keypair_.public_key)) {
+            spdlog::warn("[{}] remote vote request claims us as sponsor — dropped", name());
+            return;
+        }
+
         // Check if we already have this request
         {
             std::lock_guard lock(peers_mutex_);
             if (pending_enrollments_.contains(request_id)) return; // already seen
         }
 
-        // Verify the sponsor's attestation token if trust is enabled
+        // Holding a key is not enrollment: only an enrolled, cert-verified peer may
+        // open a ballot here. No lock held — the predicate takes peers_mutex_.
+        if (!peer_has_verified_certificate(sponsor_pubkey)) {
+            spdlog::warn("[{}] enrollment vote request from non-enrolled sponsor {}",
+                          name(), sponsor_pubkey.substr(0, 12));
+            return;
+        }
+
+        // Under a trust policy the sponsor's attestation is REQUIRED — omitting the
+        // field used to skip the check entirely.
         if (trust_policy_) {
-            if (j.contains("attestation_token")) {
-                auto token = j["attestation_token"].get<core::AttestationToken>();
-                // The token must actually belong to the claimed sponsor, and the
-                // sponsor must be an enrolled, certificate-verified peer. Otherwise
-                // an attacker replays a stolen token under a forged sponsor_pubkey.
-                if (token.server_pubkey != sponsor_pubkey ||
-                    !peer_has_verified_certificate(sponsor_pubkey)) {
-                    spdlog::warn("[{}] enrollment vote request with mismatched/unverified "
-                                  "sponsor token (sponsor={}, token={})", name(),
-                                  sponsor_pubkey.substr(0, 12),
-                                  token.server_pubkey.substr(0, 12));
-                    return;
-                }
-                auto tier = trust_policy_->verify_and_update(sponsor_pubkey, token);
-                if (tier == core::TrustTier::Untrusted) {
-                    spdlog::warn("[{}] enrollment vote request from untrusted sponsor {}",
-                                  name(), sponsor_pubkey.substr(0, 12));
-                    return;
-                }
+            if (!j.contains("attestation_token")) {
+                spdlog::warn("[{}] enrollment vote request without sponsor attestation from {}",
+                              name(), sponsor_pubkey.substr(0, 12));
+                return;
+            }
+            auto token = j["attestation_token"].get<core::AttestationToken>();
+            // The token must belong to the claimed sponsor, else an attacker
+            // replays a stolen token under a forged sponsor_pubkey.
+            if (token.server_pubkey != sponsor_pubkey) {
+                spdlog::warn("[{}] enrollment vote request token belongs to {} not sponsor {}",
+                              name(), token.server_pubkey.substr(0, 12),
+                              sponsor_pubkey.substr(0, 12));
+                return;
+            }
+            auto tier = trust_policy_->verify_and_update(sponsor_pubkey, token);
+            if (tier == core::TrustTier::Untrusted) {
+                spdlog::warn("[{}] enrollment vote request from untrusted sponsor {}",
+                              name(), sponsor_pubkey.substr(0, 12));
+                return;
             }
         }
 
@@ -2204,7 +2247,12 @@ void GossipService::handle_enrollment_vote_request(
             // auto-approve. required_ratio carries the sponsor's quorum threshold.
             ballot.kind = is_admission ? EnrollmentBallot::Kind::Admission
                                        : EnrollmentBallot::Kind::Enrollment;
-            if (is_admission && required_ratio > 0.0f) ballot.required_ratio = required_ratio;
+            // required_ratio is attacker-supplied: it may RAISE our bar, never lower
+            // it. Floor against the ADMISSION ratio (not the lower enrollment one),
+            // and set it even when the field is absent so omitting it can't downgrade.
+            if (is_admission)
+                ballot.required_ratio = std::max(std::clamp(required_ratio, 0.0f, 1.0f),
+                                                 admission_quorum_ratio_);
             pending_enrollments_[request_id] = ballot;
         }
 
@@ -2351,6 +2399,16 @@ void GossipService::handle_enrollment_vote(
             if (it == pending_enrollments_.end()) return;
             if (it->second.state != EnrollmentBallot::State::Collecting) return;
 
+            // The signature covers candidate_pubkey, but matching on request_id
+            // alone let a genuine vote for one candidate be counted toward a ballot
+            // about a different candidate.
+            if (it->second.candidate_pubkey != candidate_pubkey) {
+                spdlog::warn("[{}] vote for candidate {} does not match ballot {} candidate {}",
+                              name(), candidate_pubkey.substr(0, 12), request_id.substr(0, 8),
+                              it->second.candidate_pubkey.substr(0, 12));
+                return;
+            }
+
             // Check for duplicate voter
             for (const auto& v : it->second.votes) {
                 if (v.voter_pubkey == voter_pubkey) return; // already voted
@@ -2397,12 +2455,24 @@ void GossipService::check_enrollment_quorum(const std::string& request_id) {
     // ENROLLMENT (legacy) keeps the advisory cert-verified count. Either way the
     // denominator is drawn from the SAME predicate as the voter-eligibility gate,
     // independent of whether a trust policy is installed.
-    uint32_t tier1_count = 0;
+    // Build the electorate as a SET, computed with no lock held: it is both the
+    // denominator and the filter for stored votes, so a voter that leaves the
+    // electorate (revoked, banned, or self-demoted to Tier2 by re-sending a
+    // ServerHello) stops counting in the numerator at the same instant it stops
+    // counting in the denominator.
+    std::unordered_set<std::string> eligible;
     {
         std::vector<std::string> pubkeys;
         if (trust_policy_) {
-            for (const auto& s : trust_policy_->all_peer_states())
-                if (s.tier == core::TrustTier::Tier1) pubkeys.push_back(s.pubkey);
+            // Mirror the inbound vote gate: admission is Tier1-only, legacy
+            // enrollment also accepts Tier2. Otherwise a vote we accepted is
+            // silently dropped from the tally by the eligibility filter below.
+            for (const auto& s : trust_policy_->all_peer_states()) {
+                const bool tier_ok = is_admission
+                    ? (s.tier == core::TrustTier::Tier1)
+                    : (s.tier == core::TrustTier::Tier1 || s.tier == core::TrustTier::Tier2);
+                if (tier_ok) pubkeys.push_back(s.pubkey);
+            }
         } else {
             std::lock_guard lock(peers_mutex_);
             pubkeys.reserve(peers_.size());
@@ -2411,13 +2481,15 @@ void GossipService::check_enrollment_quorum(const std::string& request_id) {
         for (const auto& pk : pubkeys) {
             const bool ok = is_admission ? peer_certificate_is_root_signed(pk)
                                          : peer_has_verified_certificate(pk);
-            if (ok) ++tier1_count;
+            if (ok) eligible.insert(pk);
         }
     }
 
     // We vote only when eligible, so count ourselves in the denominator too.
-    const uint32_t peer_voter_count = tier1_count;
-    if (self_is_eligible_voter(is_admission)) ++tier1_count;
+    const uint32_t peer_voter_count = static_cast<uint32_t>(eligible.size());
+    if (self_is_eligible_voter(is_admission))
+        eligible.insert(crypto::to_base64(keypair_.public_key));
+    const uint32_t tier1_count = static_cast<uint32_t>(eligible.size());
 
     // An admission is never resolvable by the sponsor alone.
     if (is_admission && peer_voter_count == 0) return;
@@ -2443,6 +2515,9 @@ void GossipService::check_enrollment_quorum(const std::string& request_id) {
             uint32_t approve_count = 0;
             uint32_t reject_count = 0;
             for (const auto& v : ballot.votes) {
+                // Same predicate as the denominator: a stale vote from a voter who
+                // has since lost eligibility must not survive in the numerator.
+                if (!eligible.contains(v.voter_pubkey)) continue;
                 if (v.approve) ++approve_count;
                 else ++reject_count;
             }

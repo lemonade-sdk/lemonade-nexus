@@ -206,6 +206,7 @@ int main(int argc, char* argv[]) {
                                   config.enrollment_quorum_ratio,
                                   config.enrollment_vote_timeout_sec,
                                   config.enrollment_max_retries);
+    gossip.set_admission_quorum_ratio(config.admission_quorum_ratio);
     gossip.set_ipam(&ipam);
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
@@ -705,11 +706,15 @@ int main(int argc, char* argv[]) {
     // resolve through the gossip enrollment machinery; map the outcome back to
     // certificate issuance / denial.
     gossip.set_enrollment_decision_callback(
-        [&admission](const nexus::gossip::EnrollmentBallot& b) {
+        [&admission, &gossip](const nexus::gossip::EnrollmentBallot& b) {
             if (b.kind != nexus::gossip::EnrollmentBallot::Kind::Admission) return;
+            // Only the sponsor holds the matching admission record, so a ballot we
+            // did not open must never resolve one of ours.
+            if (b.sponsor_pubkey !=
+                nexus::crypto::to_base64(gossip.keypair().public_key)) return;
             const bool approved = b.state == nexus::gossip::EnrollmentBallot::State::Approved;
             admission.on_ballot_decision(
-                b.request_id, approved,
+                b.request_id, approved, b.candidate_pubkey,
                 approved ? "" : "admission ballot did not reach quorum");
         });
 

@@ -1,7 +1,10 @@
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
+#include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Core/TeeAttestation.hpp>
+#include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -564,7 +567,7 @@ TEST_F(AdmissionServiceTest, VoteRegimeAdminCannotBypassBallot) {
     EXPECT_TRUE(mid->issued_cert_json.empty());
 
     // Only the quorum callback resolves it.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, "");
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "");
     auto after = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
@@ -604,11 +607,50 @@ TEST_F(AdmissionServiceTest, BallotDecisionModeSurvivesRestart) {
     EXPECT_TRUE(mid->issued_cert_json.empty());
 
     // Only the quorum callback resolves it, even after the restart.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, "");
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "");
     auto after = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
     EXPECT_EQ(after->decided_by, "ballot");
+}
+
+// A record awaiting admin discretion must not be resolvable by a ballot: the
+// request_id is public, so a candidate could otherwise open its own ballot and
+// have honest voters approve away the admin gate.
+TEST_F(AdmissionServiceTest, SoleDiscretionRecordIgnoresBallotDecision) {
+    make(/*root_is_local=*/true, /*min_tier1=*/6);   // above the mesh size -> "sole"
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-3");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_FALSE(r.needs_ballot);   // admin must decide this one
+
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "");
+
+    auto after = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_TRUE(after->issued_cert_json.empty());
+}
+
+// A ballot may only resolve the record it is actually about.
+TEST_F(AdmissionServiceTest, BallotForOtherCandidateIgnored) {
+    make(/*root_is_local=*/true, /*min_tier1=*/0);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-4");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_TRUE(r.needs_ballot);
+
+    auto other = crypto_svc->ed25519_keygen();
+    auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, other_b64, "");
+
+    auto after = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Pending);
 }
 
 TEST_F(AdmissionServiceTest, MintRefusedOnNonRootHolder) {
@@ -928,3 +970,376 @@ TEST(AdmissionQuorum, FabricatedPeerCannotFormElectorate) {
     gossip.stop(); kw.stop(); s.stop(); c.stop();
     fs::remove_all(tmp);
 }
+
+// ---------------------------------------------------------------------------
+// Ballot trust-boundary regressions.
+//
+// The vote handlers sit behind packet-signature verification on a bound socket,
+// which a unit test cannot drive, so reach them through the friend seam. The
+// dispatcher only ever hands these a signature-verified sender key, so supplying
+// `signer` directly provides the same guarantee the wire path does.
+// ---------------------------------------------------------------------------
+
+struct nexus::gossip::GossipBallotTestAccess {
+    static void vote_request(gossip::GossipService& g, const std::string& signer,
+                             const nlohmann::json& body) {
+        auto s = body.dump();
+        g.handle_enrollment_vote_request(asio::ip::udp::endpoint{}, signer,
+            reinterpret_cast<const uint8_t*>(s.data()), s.size());
+    }
+    static void vote(gossip::GossipService& g, const std::string& signer,
+                     const nlohmann::json& body) {
+        auto s = body.dump();
+        g.handle_enrollment_vote(asio::ip::udp::endpoint{}, signer,
+            reinterpret_cast<const uint8_t*>(s.data()), s.size());
+    }
+    static void retally(gossip::GossipService& g, const std::string& rid) {
+        g.check_enrollment_quorum(rid);
+    }
+    static bool has_ballot(gossip::GossipService& g, const std::string& rid) {
+        std::lock_guard lock(g.peers_mutex_);
+        return g.pending_enrollments_.contains(rid);
+    }
+    static std::size_t vote_count(gossip::GossipService& g, const std::string& rid) {
+        std::lock_guard lock(g.peers_mutex_);
+        auto it = g.pending_enrollments_.find(rid);
+        return it == g.pending_enrollments_.end() ? 0 : it->second.votes.size();
+    }
+    static float ratio(gossip::GossipService& g, const std::string& rid) {
+        std::lock_guard lock(g.peers_mutex_);
+        auto it = g.pending_enrollments_.find(rid);
+        return it == g.pending_enrollments_.end() ? -1.0f : it->second.required_ratio;
+    }
+};
+
+namespace {
+
+using Access = nexus::gossip::GossipBallotTestAccess;
+
+// A vote signed exactly the way cast_enrollment_vote signs one.
+nlohmann::json signed_vote(crypto::SodiumCryptoService& c,
+                           const crypto::Ed25519Keypair& voter,
+                           const std::string& rid, const std::string& cand,
+                           bool approve) {
+    auto voter_b64 = b64({voter.public_key.begin(), voter.public_key.end()});
+    const uint64_t ts = 1;
+    const std::string reason = "test";
+    nlohmann::json canonical = {
+        {"approve",          approve},
+        {"candidate_pubkey", cand},
+        {"reason",           reason},
+        {"request_id",       rid},
+        {"timestamp",        ts},
+        {"voter_pubkey",     voter_b64},
+    };
+    auto str = canonical.dump();
+    auto sig = c.ed25519_sign(voter.private_key,
+                              std::vector<uint8_t>(str.begin(), str.end()));
+    return {
+        {"request_id",       rid},
+        {"candidate_pubkey", cand},
+        {"voter_pubkey",     voter_b64},
+        {"approve",          approve},
+        {"reason",           reason},
+        {"timestamp",        ts},
+        {"signature",        crypto::to_base64(sig)},
+    };
+}
+
+// A well-formed admission vote-request body. The claim signature is deliberately
+// junk: these tests assert on ballot ADMISSION, not on candidate verification.
+nlohmann::json vote_request_body(const std::string& rid, const std::string& cand,
+                                 const std::string& sponsor, float ratio) {
+    std::vector<uint8_t> zeros(crypto::kEd25519SignatureSize, 0);
+    return {
+        {"request_id",       rid},
+        {"candidate_pubkey", cand},
+        {"sponsor_pubkey",   sponsor},
+        {"required_ratio",   ratio},
+        {"admission_claim", {
+            {"candidate_pubkey", cand},
+            {"nonce",            "n"},
+            {"region",           "eu-west"},
+            {"tpm_ak_pubkey",    ""},
+            {"server_id",        "worker-x"},
+            {"timestamp",        uint64_t{1}},
+            {"signature",        crypto::to_base64(zeros)},
+        }},
+    };
+}
+
+}  // namespace
+
+// A vote request only ever travels sponsor->voter, so a signer that is not the
+// claimed sponsor must not be able to open a ballot in the sponsor's name.
+TEST(BallotBinding, VoteRequestFromNonSponsorRejected) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_ballot_sponsor_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    (void)kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+
+    // A genuine enrolled sponsor, and an attacker that is also enrolled.
+    auto sponsor = c.ed25519_keygen();
+    auto sponsor_b64 = b64({sponsor.public_key.begin(), sponsor.public_key.end()});
+    auto attacker = c.ed25519_keygen();
+    auto attacker_b64 = b64({attacker.public_key.begin(), attacker.public_key.end()});
+    seed_peers(s, nlohmann::json::array({
+        peer_entry(sponsor_b64, "10.0.0.1:9102", sign_cert(c, root, sponsor_b64, "sponsor")),
+        peer_entry(attacker_b64, "10.0.0.2:9102", sign_cert(c, root, attacker_b64, "attacker")),
+    }));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.start();
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+
+    // Signed by the attacker but claiming the sponsor -> dropped.
+    Access::vote_request(gossip, attacker_b64,
+                         vote_request_body("req-spoof", cand_b64, sponsor_b64, 0.75f));
+    EXPECT_FALSE(Access::has_ballot(gossip, "req-spoof"));
+
+    // Positive control: the real sponsor opens the same ballot.
+    Access::vote_request(gossip, sponsor_b64,
+                         vote_request_body("req-real", cand_b64, sponsor_b64, 0.75f));
+    EXPECT_TRUE(Access::has_ballot(gossip, "req-real"));
+
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+
+// Under a trust policy the sponsor attestation is REQUIRED: omitting the field
+// used to skip the check entirely, and a token owned by another key must not
+// vouch for the claimed sponsor.
+TEST(BallotBinding, MissingSponsorAttestationRejectedUnderTrustPolicy) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_ballot_attest_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    (void)kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+
+    auto sponsor = c.ed25519_keygen();
+    auto sponsor_b64 = b64({sponsor.public_key.begin(), sponsor.public_key.end()});
+    seed_peers(s, nlohmann::json::array({
+        peer_entry(sponsor_b64, "10.0.0.1:9102", sign_cert(c, root, sponsor_b64, "sponsor")),
+    }));
+
+    core::BinaryAttestationService att{c, s};  att.start();
+    core::TeeAttestationService tee{c, s, att};  tee.start();
+    core::TrustPolicyService policy{tee, att, c};  policy.start();
+    // Pre-promote the sponsor: on a machine with no TEE a generated token fails
+    // verification, and verify_and_update then falls back to the peer's standing
+    // tier — which must be above Untrusted for the positive control to pass.
+    policy.set_peer_tier2(sponsor_b64);
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.set_trust_policy(&policy);
+    gossip.start();
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+
+    // No attestation_token at all -> dropped.
+    Access::vote_request(gossip, sponsor_b64,
+                         vote_request_body("req-noattest", cand_b64, sponsor_b64, 0.75f));
+    EXPECT_FALSE(Access::has_ballot(gossip, "req-noattest"));
+
+    // Token owned by a DIFFERENT key, claiming the sponsor -> dropped.
+    auto attacker = c.ed25519_keygen();
+    auto body = vote_request_body("req-wrongtok", cand_b64, sponsor_b64, 0.75f);
+    body["attestation_token"] = policy.generate_attestation_token(attacker);
+    Access::vote_request(gossip, sponsor_b64, body);
+    EXPECT_FALSE(Access::has_ballot(gossip, "req-wrongtok"));
+
+    // Positive control: the sponsor's own token is accepted.
+    auto good = vote_request_body("req-attest", cand_b64, sponsor_b64, 0.75f);
+    good["attestation_token"] = policy.generate_attestation_token(sponsor);
+    Access::vote_request(gossip, sponsor_b64, good);
+    EXPECT_TRUE(Access::has_ballot(gossip, "req-attest"));
+
+    gossip.stop(); policy.stop(); tee.stop(); att.stop();
+    kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+
+// required_ratio arrives from the wire: it may raise our bar, never lower it.
+TEST(BallotBinding, RemoteRequestCannotLowerQuorumRatio) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_ballot_ratio_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    (void)kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+
+    auto sponsor = c.ed25519_keygen();
+    auto sponsor_b64 = b64({sponsor.public_key.begin(), sponsor.public_key.end()});
+    seed_peers(s, nlohmann::json::array({
+        peer_entry(sponsor_b64, "10.0.0.1:9102", sign_cert(c, root, sponsor_b64, "sponsor")),
+    }));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    // Deliberately DIFFERENT ratios: an admission ballot must floor against the
+    // admission bar, not the lower enrollment one.
+    gossip.set_enrollment_config(true, 0.5f, 60, 3);
+    gossip.set_admission_quorum_ratio(0.75f);
+    gossip.start();
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+
+    // A 1% bar would let a single vote decide; it must clamp up to the admission 75%.
+    Access::vote_request(gossip, sponsor_b64,
+                         vote_request_body("req-low", cand_b64, sponsor_b64, 0.01f));
+    ASSERT_TRUE(Access::has_ballot(gossip, "req-low"));
+    EXPECT_FLOAT_EQ(Access::ratio(gossip, "req-low"), 0.75f);
+
+    // Omitting the field entirely must not downgrade to the enrollment ratio either.
+    auto no_ratio = vote_request_body("req-none", cand_b64, sponsor_b64, 0.0f);
+    no_ratio.erase("required_ratio");
+    Access::vote_request(gossip, sponsor_b64, no_ratio);
+    ASSERT_TRUE(Access::has_ballot(gossip, "req-none"));
+    EXPECT_FLOAT_EQ(Access::ratio(gossip, "req-none"), 0.75f);
+
+    // A stricter remote bar is honoured as-is.
+    Access::vote_request(gossip, sponsor_b64,
+                         vote_request_body("req-high", cand_b64, sponsor_b64, 0.9f));
+    ASSERT_TRUE(Access::has_ballot(gossip, "req-high"));
+    EXPECT_FLOAT_EQ(Access::ratio(gossip, "req-high"), 0.9f);
+
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+
+// The vote signature covers candidate_pubkey, but the ballot was matched on
+// request_id alone -- so a genuine vote for one candidate could be counted
+// toward a ballot about a different candidate.
+TEST(BallotBinding, VoteForOtherCandidateNotCounted) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_ballot_cand_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    auto self = kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+
+    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
+    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-c"));
+
+    auto p1 = c.ed25519_keygen();
+    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
+    seed_peers(s, nlohmann::json::array({
+        peer_entry(p1_b64, "10.0.0.1:9102", sign_cert(c, root, p1_b64, "voter-1")),
+    }));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.start();
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    auto other = c.ed25519_keygen();
+    auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
+
+    gossip.start_admission_ballot("req-cand", cand_b64, "worker-1", "", 0.75f);
+    ASSERT_TRUE(Access::has_ballot(gossip, "req-cand"));
+    const auto before = Access::vote_count(gossip, "req-cand");
+
+    // Genuine, correctly signed vote -- for the WRONG candidate.
+    Access::vote(gossip, p1_b64, signed_vote(c, p1, "req-cand", other_b64, true));
+    EXPECT_EQ(Access::vote_count(gossip, "req-cand"), before);
+
+    // The same voter's vote for the ballot's actual candidate is accepted.
+    Access::vote(gossip, p1_b64, signed_vote(c, p1, "req-cand", cand_b64, true));
+    EXPECT_EQ(Access::vote_count(gossip, "req-cand"), before + 1);
+
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+
+// A voter that leaves the electorate must leave the numerator at the same
+// instant: otherwise revoking a voter SHRINKS the denominator while its stale
+// approve survives, and a ballot that was short of quorum suddenly passes.
+TEST(BallotBinding, RevokedVoterStaleVoteStopsCounting) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_ballot_stale_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    auto self = kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+
+    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
+    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-s"));
+
+    auto p1 = c.ed25519_keygen();
+    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
+    auto p2 = c.ed25519_keygen();
+    auto p2_b64 = b64({p2.public_key.begin(), p2.public_key.end()});
+    seed_peers(s, nlohmann::json::array({
+        peer_entry(p1_b64, "10.0.0.1:9102", sign_cert(c, root, p1_b64, "voter-1")),
+        peer_entry(p2_b64, "10.0.0.2:9102", sign_cert(c, root, p2_b64, "voter-2")),
+    }));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.start();
+
+    bool approved = false;
+    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
+        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
+    });
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+
+    // Electorate {self, p1, p2} -> needed ceil(3*0.75) = 3. Sponsor supplies 1.
+    gossip.start_admission_ballot("req-stale", cand_b64, "worker-1", "", 0.75f);
+    ASSERT_FALSE(approved);
+
+    // p1 approves -> 2 of 3. Still short.
+    Access::vote(gossip, p1_b64, signed_vote(c, p1, "req-stale", cand_b64, true));
+    ASSERT_FALSE(approved);
+
+    // Revoking p1 drops the electorate to {self, p2}: needed 2. Counting p1's
+    // stale approve would give 2 and pass the ballot.
+    gossip.add_revoked_server(p1_b64);
+    Access::retally(gossip, "req-stale");
+    EXPECT_FALSE(approved);
+
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+

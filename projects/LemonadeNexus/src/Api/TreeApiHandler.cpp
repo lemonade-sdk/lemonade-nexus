@@ -34,8 +34,9 @@ nlohmann::json redact_node_for_caller(const tree::TreeNode& node,
     j["wrapped_mgmt_privkey"] = ""; // keep the field present, drop the secret
     if (!full_assignments) {
         nlohmann::json own = nlohmann::json::array();
+        const auto caller_canon = tree::canonical_principal(caller_pubkey);
         for (const auto& a : node.assignments) {
-            if (a.management_pubkey == caller_pubkey) own.push_back(a);
+            if (tree::canonical_principal(a.management_pubkey) == caller_canon) own.push_back(a);
         }
         j["assignments"] = std::move(own);
     }
@@ -209,7 +210,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 // account (their key already owns root via /api/auth).
                 bool is_root_owner = false;
                 if (auto root = ctx_.tree.get_node("root")) {
-                    is_root_owner = (root->mgmt_pubkey == norm_pubkey);
+                    is_root_owner = (tree::canonical_principal(root->mgmt_pubkey) ==
+                                     tree::canonical_principal(norm_pubkey));
                 }
                 if (!ctx_.config.open_registration && !is_root_owner &&
                     !ctx_.tree.get_node("customer-" + node_id)) {

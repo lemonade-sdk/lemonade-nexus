@@ -41,6 +41,17 @@ std::vector<uint8_t> from_base64(std::string_view encoded) {
     throw std::runtime_error("Invalid base64 input");
 }
 
+std::string canonical_key_b64(std::string_view encoded) {
+    constexpr std::string_view prefix = "ed25519:";
+    if (encoded.starts_with(prefix)) encoded.remove_prefix(prefix.size());
+    if (encoded.empty()) return {};
+    try {
+        return to_base64(from_base64(encoded));
+    } catch (const std::exception&) {
+        return {};   // undecodable: callers treat empty as "no identity"
+    }
+}
+
 std::string to_hex(std::span<const uint8_t> data) {
     std::string hex(data.size() * 2 + 1, '\0');
     sodium_bin2hex(hex.data(), hex.size(), data.data(), data.size());
