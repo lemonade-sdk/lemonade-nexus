@@ -44,6 +44,23 @@ function Check($cond, $msg) {
     if ($cond) { Write-Host "  ok:   $msg" } else { Write-Host "  FAIL: $msg"; $script:fail++ }
 }
 
+# curl on Windows is Schannel-backed and hard-fails a chain whose CA publishes no
+# CRL ("revocation status is unknown"), which a test CA never does. This disables
+# ONLY the revocation lookup — chain and hostname verification still fail closed.
+$REVOKE = "--ssl-revoke-best-effort"
+
+# Poll instead of sleeping a fixed interval: a cold CI runner is much slower than
+# a dev box, and a fixed sleep silently turns "slow" into "broken".
+function Wait-Url($url, $caFile, $pattern, $timeoutSec) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while ($sw.Elapsed.TotalSeconds -lt $timeoutSec) {
+        $r = curl.exe -s -m5 $REVOKE --cacert $caFile $url 2>$null
+        if ($r -match $pattern) { return @{ ok = $true; secs = [int]$sw.Elapsed.TotalSeconds; body = $r } }
+        Start-Sleep -Milliseconds 500
+    }
+    return @{ ok = $false; secs = [int]$sw.Elapsed.TotalSeconds; body = "" }
+}
+
 # curl, not Invoke-WebRequest: PS 5.1 IWR drops the Authorization header.
 function CtlGet($port, $path) {
     curl.exe -s -H "Authorization: Bearer $TOK" "http://127.0.0.1:$port$path" | ConvertFrom-Json
@@ -53,7 +70,8 @@ $procs = @()
 $script:caThumb = $null
 function Cleanup {
     foreach ($p in $procs) { try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {} }
-    Get-Job | Stop-Job -EA SilentlyContinue; Get-Job | Remove-Job -EA SilentlyContinue
+    # -Force: the svc job blocks in GetContext(), so a plain Stop-Job stalls for minutes.
+    Get-Job | Remove-Job -Force -EA SilentlyContinue
     if ($script:caThumb) {
         Remove-Item "Cert:\LocalMachine\Root\$($script:caThumb)" -Force -EA SilentlyContinue
     }
@@ -109,12 +127,14 @@ $procs += Start-Process $srv -PassThru -WindowStyle Hidden `
     -ArgumentList @("--data-root","$root\server","--public-ip","127.0.0.1","--region",$REGION,
                     "--closed-registration","--private-http-port",$PRIV) `
     -RedirectStandardOutput "$root\server.log" -RedirectStandardError "$root\server.err"
-Start-Sleep 5
-$logged = (Select-String -Path "$root\server.log" -Pattern "SEIP: published (\S+) ->").Matches.Groups[1].Value | Select-Object -First 1
-if ($logged -and $logged -ne $SEIP) { Write-Host "WARN: server SEIP '$logged' != computed '$SEIP'" }
-$health = curl.exe -s -m8 --cacert $ca "https://${SEIP}:9100/api/health"
-Write-Host "server health: $health"
-Check ($health -match "ok|healthy|status") "public listener serves the seeded cert on the SEIP FQDN"
+$h = Wait-Url "https://${SEIP}:9100/api/health" $ca "ok|healthy|status" 60
+$m = (Select-String -Path "$root\server.log" -Pattern "SEIP: published (\S+) ->" -EA SilentlyContinue | Select-Object -First 1)
+if ($m) {
+    $logged = $m.Matches[0].Groups[1].Value
+    if ($logged -ne $SEIP) { Write-Host "WARN: server SEIP '$logged' != computed '$SEIP'" }
+}
+Write-Host "server health after $($h.secs)s: $($h.body)"
+Check $h.ok "public listener serves the seeded cert on the SEIP FQDN"
 
 # Sidecars reach the server by its cert FQDN via hosts + the system trust store.
 $tls = @("--server","${SEIP}:9100","--pin-server")
@@ -173,13 +193,27 @@ if (-not $eg.loopback_port) {
     Check $false "phone egressed to the server private API over the mesh"
 } else {
     $lp = $eg.loopback_port
-    $code = curl.exe -s -m8 -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" --cacert $ca "https://${PRIVFQDN}:${lp}/api/trust/status"
+    $code = curl.exe -s -m8 $REVOKE -o NUL -w "%{http_code}" --resolve "${PRIVFQDN}:${lp}:127.0.0.1" --cacert $ca "https://${PRIVFQDN}:${lp}/api/trust/status"
     Write-Host "PRIVATE API via mesh: HTTP $code (401 = reached JWT-gated private API)"
     Check ($code -eq "401") "private API reached over mesh with its own verified cert"
 }
 
 Write-Host "`n--- server join log ---"
-Select-String -Path "$root\server.log" -Pattern "Join\]|linked device|registration closed" | Select-Object -Last 6 | ForEach-Object { $_.Line }
+Select-String -Path "$root\server.log" -Pattern "Join\]|linked device|registration closed" -EA SilentlyContinue |
+    Select-Object -Last 6 | ForEach-Object { $_.Line }
+
+# On failure the CI temp dir is discarded with the runner, so print enough to
+# diagnose the listeners without reproducing locally.
+if ($script:fail -gt 0) {
+    Write-Host "`n--- server TLS / listener log ---"
+    Select-String -Path "$root\server.log" -Pattern "Auto-TLS|Private API|HttpServer|TLS enabled|listening" -EA SilentlyContinue |
+        Select-Object -Last 20 | ForEach-Object { $_.Line }
+    Write-Host "`n--- server.err ---"
+    Get-Content "$root\server.err" -Tail 20 -EA SilentlyContinue
+    Write-Host "`n--- curl version (TLS backend) ---"
+    curl.exe -V | Select-Object -First 1
+}
+
 Cleanup
 if ($script:fail -gt 0) {
     Write-Host "`n$($script:fail) CHECK(S) FAILED. Logs in $root"
