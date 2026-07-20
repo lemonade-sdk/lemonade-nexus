@@ -49,15 +49,11 @@ public:
     /// Returns JSON: {"challenge":"base64...","expires_at":unix_timestamp}
     [[nodiscard]] nlohmann::json issue_challenge(const std::string& pubkey_b64);
 
-    /// Register an Ed25519 public key with an explicit user_id.
-    /// If user_id is empty, derives one from the pubkey.
-    [[nodiscard]] AuthResult register_pubkey(const std::string& pubkey_b64,
-                                              const std::string& user_id = "");
-
-    /// Revoke an Ed25519 public key (device deletion). Future authentication
-    /// attempts for this key are rejected. Persisted to
-    /// data/credentials/revoked.json. Idempotent.
+    /// Revoke an Ed25519 public key (device deletion); persisted. Idempotent.
     bool revoke_pubkey(const std::string& pubkey_b64);
+
+    /// True if this key is on the device-revocation blocklist.
+    [[nodiscard]] bool is_pubkey_revoked(const std::string& pubkey_b64);
 
 private:
     // Derive a deterministic user_id from an Ed25519 public key.
@@ -69,9 +65,6 @@ private:
     // Auto-register a new pubkey and return the user_id.
     [[nodiscard]] std::string auto_register(const std::string& pubkey_b64,
                                              const crypto::Ed25519PublicKey& pubkey);
-
-    // True if the pubkey is on the device-revocation blocklist.
-    [[nodiscard]] bool is_revoked(const std::string& pubkey_b64);
 
     // Persist pubkey→user_id mapping to credential file.
     bool save_ed25519_credential(const std::string& user_id, const std::string& pubkey_b64);

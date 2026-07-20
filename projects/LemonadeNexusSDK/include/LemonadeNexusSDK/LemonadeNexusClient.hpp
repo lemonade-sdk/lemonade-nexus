@@ -60,10 +60,6 @@ public:
     /// Auto-registers new pubkeys on first use.
     [[nodiscard]] Result<AuthResponse> authenticate_ed25519();
 
-    /// POST /api/auth/register/ed25519 — register Ed25519 pubkey with explicit user_id.
-    /// If user_id is empty, server derives one from the pubkey hash.
-    [[nodiscard]] Result<AuthResponse> register_ed25519(const std::string& user_id = "");
-
     /// POST /api/auth — password authentication (deprecated, stub on server).
     [[nodiscard]] Result<AuthResponse> authenticate(const std::string& username,
                                                      const std::string& password);

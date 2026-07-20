@@ -51,9 +51,6 @@ public:
     /// Issue an Ed25519 challenge nonce for the given pubkey.
     [[nodiscard]] nlohmann::json issue_ed25519_challenge(const std::string& pubkey_b64);
 
-    /// Register an Ed25519 public key (explicit registration).
-    [[nodiscard]] AuthResult register_ed25519(const nlohmann::json& registration);
-
     /// Revoke an Ed25519 identity (e.g. on device deletion): future
     /// authentication attempts for this key are rejected. pubkey_b64 is the raw
     /// base64 key (no "ed25519:" prefix). Idempotent.

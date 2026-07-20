@@ -330,6 +330,10 @@ private:
     /// issuer==root check + Ed25519 verify, not the advisory fail-open path).
     [[nodiscard]] bool peer_certificate_is_root_signed(const std::string& pubkey) const;
 
+    /// Same voter predicate as remote peers, applied to our own identity.
+    /// Gates the local vote AND our slot in the denominator (one electorate).
+    [[nodiscard]] bool self_is_eligible_voter(bool is_admission) const;
+
     /// The TPM Attestation Key pinned in `pubkey`'s enrolled certificate (base64
     /// DER SPKI), or "" if the peer has no verified certificate or no AK enrolled.
     /// This is the trust anchor a TPM quote signature is verified against.

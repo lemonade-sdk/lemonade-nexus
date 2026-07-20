@@ -135,6 +135,15 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }}
 
+      # End-to-end over the assembled daemon + sidecar: per-listener TLS, the
+      # closed-registration join gate, no/wrong-bearer 401s, and the private API
+      # over the mesh. Hermetic — a test CA is seeded into the ACME cache; no
+      # manual-cert support is involved. Runners are elevated by default.
+      - name: Sidecar mesh integration test (Windows, VS)
+        if: matrix.vs_generator
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 -BuildDir build
+
   build-linux-distros:
     strategy:
       fail-fast: false

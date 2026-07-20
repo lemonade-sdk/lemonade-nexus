@@ -55,31 +55,13 @@ std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view 
     return token_link_provider_.consume(token);
 }
 
-AuthResult AuthService::register_ed25519(const nlohmann::json& registration) {
-    auto pubkey = registration.value("pubkey", std::string{});
-    auto user_id = registration.value("user_id", std::string{});
-    if (pubkey.empty()) {
-        return AuthResult{.authenticated = false, .error_message = "Missing pubkey"};
-    }
-    return ed25519_provider_.register_pubkey(pubkey, user_id);
-}
-
 bool AuthService::revoke_ed25519(const std::string& pubkey_b64) {
     return ed25519_provider_.revoke_pubkey(pubkey_b64);
 }
 
 bool AuthService::validate_session(std::string_view token) {
-    try {
-        auto decoded = jwt::decode(std::string(token));
-        auto verifier = jwt::verify()
-            .allow_algorithm(jwt::algorithm::hs256{jwt_secret_})
-            .with_issuer("lemonade-nexus");
-        verifier.verify(decoded);
-        return true;
-    } catch (const std::exception& e) {
-        spdlog::debug("[AuthService] JWT validation failed: {}", e.what());
-        return false;
-    }
+    // One validation path, so revocation can't be bypassed by picking this one.
+    return validate_session_claims(std::string(token)).has_value();
 }
 
 std::optional<SessionClaims> AuthService::validate_session_claims(const std::string& token) {
@@ -128,6 +110,13 @@ std::optional<SessionClaims> AuthService::validate_session_claims(const std::str
                     }
                 }
             }
+        }
+
+        // Revoked (deleted) devices lose existing sessions immediately.
+        if (!claims.pubkey.empty() && ed25519_provider_.is_pubkey_revoked(claims.pubkey)) {
+            spdlog::warn("[AuthService] rejecting session for revoked pubkey {}",
+                         claims.pubkey.substr(0, 16));
+            return std::nullopt;
         }
 
         spdlog::debug("[AuthService] Validated JWT for user '{}' (expires_at={})",

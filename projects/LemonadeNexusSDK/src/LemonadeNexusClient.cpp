@@ -794,54 +794,6 @@ Result<AuthResponse> LemonadeNexusClient::authenticate_ed25519() {
     return result;
 }
 
-Result<AuthResponse> LemonadeNexusClient::register_ed25519(const std::string& user_id) {
-    Result<AuthResponse> result;
-
-    // Copy identity under lock to avoid racing with other threads
-    Identity local_identity;
-    {
-        std::lock_guard lock(impl_->mutex);
-        local_identity = impl_->identity;
-    }
-
-    if (!local_identity.is_valid()) {
-        result.error = "no identity set — call set_identity() first";
-        return result;
-    }
-
-    auto pubkey_b64 = Identity::to_base64(
-        std::span<const uint8_t>(local_identity.public_key()));
-
-    json body;
-    body["pubkey"] = pubkey_b64;
-    if (!user_id.empty()) {
-        body["user_id"] = user_id;
-    }
-
-    int status = 0;
-    auto resp = impl_->http_post("/api/auth/register/ed25519", body, status);
-    result.http_status = status;
-
-    if (!resp) {
-        result.error = "ed25519 registration request failed";
-        return result;
-    }
-
-    result.value.authenticated = resp->value("authenticated", false);
-    result.value.user_id       = resp->value("user_id", "");
-    result.value.session_token = resp->value("session_token", "");
-    result.value.error         = resp->value("error", resp->value("error_message", ""));
-    result.ok = result.value.authenticated;
-
-    if (result.ok) {
-        std::lock_guard lock(impl_->mutex);
-        impl_->session_token = result.value.session_token;
-    } else {
-        result.error = result.value.error;
-    }
-    return result;
-}
-
 Result<AuthResponse> LemonadeNexusClient::authenticate(const std::string& username,
                                                          const std::string& password) {
     Result<AuthResponse> result;

@@ -104,9 +104,8 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
     crypto::Ed25519PublicKey pubkey{};
     std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), pubkey.begin());
 
-    // Reject revoked identities (deleted devices) up front — this also blocks a
-    // deleted device from re-joining via /api/join regardless of open_registration.
-    if (is_revoked(pubkey_b64)) {
+    // Revoked (deleted) devices can't re-authenticate or re-join.
+    if (is_pubkey_revoked(pubkey_b64)) {
         spdlog::warn("[ed25519] Rejected authentication for revoked pubkey {}",
                      pubkey_b64.substr(0, 16));
         return AuthResult{
@@ -209,69 +208,6 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
 }
 
 // ============================================================================
-// Registration
-// ============================================================================
-
-AuthResult Ed25519AuthProvider::register_pubkey(const std::string& pubkey_b64,
-                                                 const std::string& explicit_user_id) {
-    std::vector<uint8_t> pubkey_bytes;
-    try {
-        pubkey_bytes = crypto::from_base64(pubkey_b64);
-    } catch (const std::exception& e) {
-        return AuthResult{
-            .authenticated = false,
-            .error_message = std::string("Invalid pubkey base64: ") + e.what()
-        };
-    }
-
-    if (pubkey_bytes.size() != crypto::kEd25519PublicKeySize) {
-        return AuthResult{
-            .authenticated = false,
-            .error_message = "Ed25519 public key must be 32 bytes"
-        };
-    }
-
-    crypto::Ed25519PublicKey pubkey{};
-    std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), pubkey.begin());
-
-    // Check if already registered
-    auto existing = lookup_user_by_pubkey(pubkey_b64);
-    if (!existing.empty()) {
-        return AuthResult{
-            .authenticated = true,
-            .user_id       = existing,
-            .session_token = generate_jwt(existing, pubkey_b64),
-        };
-    }
-
-    // Derive or use explicit user_id
-    std::string user_id = explicit_user_id.empty()
-        ? derive_user_id(pubkey)
-        : explicit_user_id;
-
-    if (!save_ed25519_credential(user_id, pubkey_b64)) {
-        return AuthResult{
-            .authenticated = false,
-            .error_message = "Failed to persist Ed25519 credential"
-        };
-    }
-
-    {
-        std::lock_guard lock(cache_mutex_);
-        pubkey_to_user_[pubkey_b64] = user_id;
-    }
-
-    spdlog::info("[ed25519] Registered pubkey {} as user '{}'",
-                 pubkey_b64.substr(0, 16), user_id);
-
-    return AuthResult{
-        .authenticated = true,
-        .user_id       = user_id,
-        .session_token = generate_jwt(user_id, pubkey_b64),
-    };
-}
-
-// ============================================================================
 // User ID derivation: hex(sha256(pubkey))[:32]
 // ============================================================================
 
@@ -322,7 +258,7 @@ std::string Ed25519AuthProvider::auto_register(const std::string& pubkey_b64,
 // Device revocation blocklist
 // ============================================================================
 
-bool Ed25519AuthProvider::is_revoked(const std::string& pubkey_b64) {
+bool Ed25519AuthProvider::is_pubkey_revoked(const std::string& pubkey_b64) {
     if (!cache_loaded_.load(std::memory_order_acquire)) {
         load_credentials_from_disk();
     }

@@ -1,3 +1,4 @@
+#include <LemonadeNexus/Auth/AuthMiddleware.hpp>   // complete SessionClaims
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/PasskeyAuthProvider.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
@@ -291,6 +292,56 @@ TEST_F(AuthTest, TokenLinkIsNotStandaloneAuth) {
     auto result = auth->authenticate(req);
     EXPECT_FALSE(result.authenticated);
     EXPECT_NE(result.error_message.find("/api/join"), std::string::npos);
+}
+
+// --- Ed25519 device revocation ---
+
+namespace {
+// Full challenge-response login for `kp` (the only way to obtain a session).
+auto ed25519_login(auth::AuthService& svc, crypto::SodiumCryptoService& c,
+                   const crypto::Ed25519Keypair& kp) {
+    auto pk_b64 = crypto::to_base64(
+        std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+    auto challenge_b64 = svc.issue_ed25519_challenge(pk_b64)
+                            .value("challenge", std::string{});
+    auto challenge = crypto::from_base64(challenge_b64);
+    auto sig = c.ed25519_sign(kp.private_key, std::span<const uint8_t>(challenge));
+    return svc.authenticate({
+        {"method",    "ed25519"},
+        {"pubkey",    pk_b64},
+        {"challenge", challenge_b64},
+        {"signature", crypto::to_base64(
+                          std::span<const uint8_t>(sig.data(), sig.size()))},
+    });
+}
+}  // namespace
+
+TEST_F(AuthTest, RevokedKeyCannotAuthenticate) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = crypto::to_base64(
+        std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+
+    ASSERT_TRUE(ed25519_login(*auth, *crypto, kp).authenticated);
+    ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
+
+    auto after = ed25519_login(*auth, *crypto, kp);
+    EXPECT_FALSE(after.authenticated);
+    EXPECT_TRUE(after.session_token.empty());
+}
+
+TEST_F(AuthTest, RevokedKeyInvalidatesExistingSession) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = crypto::to_base64(
+        std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+
+    auto login = ed25519_login(*auth, *crypto, kp);
+    ASSERT_TRUE(login.authenticated);
+    ASSERT_TRUE(auth->validate_session_claims(login.session_token).has_value());
+
+    ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
+
+    // The already-issued JWT must stop validating immediately, not at expiry.
+    EXPECT_FALSE(auth->validate_session_claims(login.session_token).has_value());
 }
 
 // --- Service interface ---

@@ -757,9 +757,45 @@ TEST(AdmissionQuorum, NoRootAnchorAdmissionFailsClosed) {
     fs::remove_all(tmp);
 }
 
-TEST(AdmissionQuorum, FabricatedCertPeerExcludedFromElectorate) {
+namespace {
+
+void seed_peers(storage::FileStorageService& s, const nlohmann::json& arr) {
+    storage::SignedEnvelope env;
+    env.type = "peer_list";
+    env.data = nlohmann::json{{"peers", arr}}.dump();
+    (void)s.write_file("identity", "peers.json", env);
+}
+
+// Install a certificate as THIS server's own identity cert.
+void seed_own_cert(storage::FileStorageService& s, const gossip::ServerCertificate& cert) {
+    storage::SignedEnvelope env;
+    env.type = "server_cert";
+    env.data = nlohmann::json(cert).dump();
+    (void)s.write_file("identity", "server_cert.json", env);
+}
+
+nlohmann::json peer_entry(const std::string& pk, const std::string& ep,
+                          const nlohmann::json& cert) {
+    return {{"pubkey", pk}, {"endpoint", ep}, {"certificate_json", cert.dump()}};
+}
+
+gossip::ServerCertificate sign_cert(crypto::SodiumCryptoService& c,
+                                    const crypto::Ed25519Keypair& root,
+                                    const std::string& pk_b64,
+                                    const std::string& server_id) {
+    gossip::CertIssueParams p;
+    p.server_pubkey_b64 = pk_b64;
+    p.server_id         = server_id;
+    return gossip::issue_server_certificate(p, c, root.private_key, root.public_key);
+}
+
+}  // namespace
+
+// An eligible sponsor also occupies a denominator slot, so its own vote can
+// never clear the threshold alone.
+TEST(AdmissionQuorum, SponsorAloneCannotSatisfyQuorum) {
     auto tmp = fs::temp_directory_path() /
-               ("nexus_quorum_root_" + std::to_string(getpid()));
+               ("nexus_quorum_sponsor_" + std::to_string(getpid()));
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
@@ -767,40 +803,21 @@ TEST(AdmissionQuorum, FabricatedCertPeerExcludedFromElectorate) {
     crypto::SodiumCryptoService c;  c.start();
     storage::FileStorageService s{tmp};  s.start();
     crypto::KeyWrappingService kw{c, s};  kw.start();
-    kw.generate_and_store_identity({});   // the gossip node's own keypair
-
-    // The mesh root anchor.
+    auto self = kw.generate_and_store_identity({});
     auto root = c.ed25519_keygen();
 
-    // P1: a genuinely root-signed peer — a member of the electorate.
+    // This server is itself a fully eligible voter.
+    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
+    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-1"));
+
+    // ...and exactly one other eligible peer exists.
     auto p1 = c.ed25519_keygen();
     auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
-    gossip::CertIssueParams params;
-    params.server_pubkey_b64 = p1_b64;
-    params.server_id = "voter-1";
-    auto p1_cert = gossip::issue_server_certificate(
-        params, c, root.private_key, root.public_key);
-    nlohmann::json p1_cj = p1_cert;
-
-    // P2: a fabricated peer whose certificate is NOT root-signed — it must be
-    // excluded from the quorum denominator.
-    auto p2 = c.ed25519_keygen();
-    auto p2_b64 = b64({p2.public_key.begin(), p2.public_key.end()});
-    nlohmann::json p2_cj{{"server_id", "voter-2"}, {"server_pubkey", p2_b64},
-                         {"issuer_pubkey", p2_b64}, {"signature", "AAAA"}};
-
-    nlohmann::json peers{{"peers", nlohmann::json::array({
-        {{"pubkey", p1_b64}, {"endpoint", "10.0.0.1:9102"},
-         {"certificate_json", p1_cj.dump()}},
-        {{"pubkey", p2_b64}, {"endpoint", "10.0.0.2:9102"},
-         {"certificate_json", p2_cj.dump()}}})}};
-    storage::SignedEnvelope env;
-    env.type = "peer_list";
-    env.data = peers.dump();
-    ASSERT_TRUE(s.write_file("identity", "peers.json", env));
+    nlohmann::json p1_cj = sign_cert(c, root, p1_b64, "voter-1");
+    seed_peers(s, nlohmann::json::array({peer_entry(p1_b64, "10.0.0.1:9102", p1_cj)}));
 
     gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);   // real trust anchor
+    gossip.set_root_pubkey(root.public_key);
     gossip.set_enrollment_config(true, 0.75f, 60, 3);
     gossip.start();
 
@@ -810,18 +827,104 @@ TEST(AdmissionQuorum, FabricatedCertPeerExcludedFromElectorate) {
     });
 
     auto cand = c.ed25519_keygen();
-    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-    gossip.start_admission_ballot("req-root", cand_b64, "worker-2", "", 0.75f);
+    gossip.start_admission_ballot(
+        "req-sponsor", b64({cand.public_key.begin(), cand.public_key.end()}),
+        "worker-1", "", 0.75f);
 
-    // Electorate = { P1 } (P2's cert is not root-signed and is excluded).
-    // needed = ceil(1 * 0.75) = 1; the sponsor's self-vote meets it -> Approved.
-    // If P2 were wrongly counted the denominator would be 2, needed = 2, and the
-    // single self-vote would NOT reach quorum — so this asserts the exclusion.
-    EXPECT_TRUE(approved);
+    // Electorate = {peer, sponsor} -> needed 2, sponsor supplies only 1.
+    EXPECT_FALSE(approved);
 
-    gossip.stop();
-    kw.stop();
-    s.stop();
-    c.stop();
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+
+// A sponsor that does not satisfy the voter predicate casts no vote at all.
+TEST(AdmissionQuorum, IneligibleSponsorCastsNoVote) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_quorum_inelig_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+    // NOTE: no seed_own_cert() -> this server holds no root-signed certificate.
+
+    auto p1 = c.ed25519_keygen();
+    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
+    nlohmann::json p1_cj = sign_cert(c, root, p1_b64, "voter-1");
+    seed_peers(s, nlohmann::json::array({peer_entry(p1_b64, "10.0.0.1:9102", p1_cj)}));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.start();
+
+    bool approved = false;
+    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
+        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
+    });
+
+    auto cand = c.ed25519_keygen();
+    gossip.start_admission_ballot(
+        "req-inelig", b64({cand.public_key.begin(), cand.public_key.end()}),
+        "worker-2", "", 0.75f);
+
+    bool found = false;
+    for (const auto& bal : gossip.pending_enrollments()) {
+        if (bal.request_id == "req-inelig") { found = true; EXPECT_TRUE(bal.votes.empty()); }
+    }
+    EXPECT_TRUE(found);
+    EXPECT_FALSE(approved);
+
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
+}
+
+// A peer whose cert is not root-signed forms no electorate: at a 10% ratio the
+// sponsor's vote would clear the bar if that peer were counted.
+TEST(AdmissionQuorum, FabricatedPeerCannotFormElectorate) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_quorum_fab_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+    auto self = kw.generate_and_store_identity({});
+    auto root = c.ed25519_keygen();
+
+    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
+    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-3"));
+
+    auto p2 = c.ed25519_keygen();
+    auto p2_b64 = b64({p2.public_key.begin(), p2.public_key.end()});
+    nlohmann::json fake{{"server_id", "voter-x"}, {"server_pubkey", p2_b64},
+                        {"issuer_pubkey", p2_b64}, {"signature", "AAAA"}};
+    seed_peers(s, nlohmann::json::array({peer_entry(p2_b64, "10.0.0.2:9102", fake)}));
+
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key);
+    gossip.set_enrollment_config(true, 0.10f, 60, 3);
+    gossip.start();
+
+    bool approved = false;
+    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
+        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
+    });
+
+    auto cand = c.ed25519_keygen();
+    gossip.start_admission_ballot(
+        "req-fab", b64({cand.public_key.begin(), cand.public_key.end()}),
+        "worker-3", "", 0.10f);
+
+    EXPECT_FALSE(approved);
+
+    gossip.stop(); kw.stop(); s.stop(); c.stop();
     fs::remove_all(tmp);
 }

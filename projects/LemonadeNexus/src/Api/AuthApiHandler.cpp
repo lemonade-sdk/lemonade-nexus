@@ -106,27 +106,8 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
         json_response(res, challenge);
     });
 
-    // POST /api/auth/register/ed25519 — register an Ed25519 public key
-    pub.Post("/api/auth/register/ed25519", [this](const httplib::Request& req, httplib::Response& res) {
-        auto body = parse_body(req, res);
-        if (!body) return;
-
-        auto result = ctx_.auth.register_ed25519(*body);
-
-        // On successful registration, bootstrap or extend root permissions.
-        if (result.authenticated) {
-            ensure_root_node(body->value("pubkey", std::string{}));
-        }
-
-        network::AuthResponse resp{
-            .authenticated = result.authenticated,
-            .user_id       = result.user_id,
-            .session_token = result.session_token,
-            .error         = result.error_message,
-        };
-        nlohmann::json j = resp;
-        json_response(res, j, result.authenticated ? 200 : 400);
-    });
+    // No public key-registration endpoint: identities are auto-registered on a
+    // successful challenge-response in /api/auth (proof of possession required).
 
     // POST /api/link/token (PRIVATE, auth required) — mint a single-use device
     // link token; the joining device passes it to /api/join to be placed under

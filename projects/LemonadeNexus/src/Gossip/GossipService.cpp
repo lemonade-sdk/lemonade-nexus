@@ -1479,6 +1479,30 @@ bool GossipService::peer_certificate_is_root_signed(const std::string& pubkey) c
     }
 }
 
+bool GossipService::self_is_eligible_voter(bool is_admission) const {
+    // peers_ never contains us, so the peer predicates can't answer for us.
+    // Admission needs a root-signed, non-revoked cert (no fail-open).
+    const auto our_pk = crypto::to_base64(keypair_.public_key);
+    if (is_revoked(our_pk)) return false;
+
+    if (is_admission) {
+        if (!has_root_pubkey_ || !our_certificate_) return false;
+        if (our_certificate_->server_pubkey != our_pk) return false;
+        if (!verify_cert_core(*our_certificate_)) return false;
+    } else if (!our_certificate_) {
+        return false;
+    }
+
+    // With a trust policy installed, apply the same tier rule as remote voters.
+    if (trust_policy_) {
+        const auto tier = trust_policy_->our_tier();
+        return is_admission
+            ? (tier == core::TrustTier::Tier1)
+            : (tier == core::TrustTier::Tier1 || tier == core::TrustTier::Tier2);
+    }
+    return true;
+}
+
 std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) const {
     if (pubkey.empty() || is_revoked(pubkey)) return {};
 
@@ -1979,6 +2003,22 @@ void GossipService::broadcast_enrollment_vote_request(const EnrollmentBallot& ba
 void GossipService::cast_enrollment_vote(const std::string& request_id,
                                            const std::string& candidate_pubkey,
                                            bool approve, const std::string& reason) {
+    // Same eligibility gate as inbound votes: a vote we may not cast must not
+    // enter our tally or the wire.
+    bool is_admission = false;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = pending_enrollments_.find(request_id);
+        if (it == pending_enrollments_.end()) return;
+        is_admission = it->second.kind == EnrollmentBallot::Kind::Admission;
+    }
+    if (!self_is_eligible_voter(is_admission)) {
+        spdlog::debug("[{}] not casting {} vote for '{}': this server is not an "
+                      "eligible voter", name(),
+                      is_admission ? "admission" : "enrollment", request_id);
+        return;
+    }
+
     auto now = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
@@ -2374,6 +2414,13 @@ void GossipService::check_enrollment_quorum(const std::string& request_id) {
             if (ok) ++tier1_count;
         }
     }
+
+    // We vote only when eligible, so count ourselves in the denominator too.
+    const uint32_t peer_voter_count = tier1_count;
+    if (self_is_eligible_voter(is_admission)) ++tier1_count;
+
+    // An admission is never resolvable by the sponsor alone.
+    if (is_admission && peer_voter_count == 0) return;
 
     std::optional<EnrollmentBallot> decided;  // snapshot to notify outside the lock
     {
