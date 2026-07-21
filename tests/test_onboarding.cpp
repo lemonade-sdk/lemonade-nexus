@@ -567,7 +567,7 @@ TEST_F(AdmissionServiceTest, VoteRegimeAdminCannotBypassBallot) {
     EXPECT_TRUE(mid->issued_cert_json.empty());
 
     // Only the quorum callback resolves it.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "");
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "", "");
     auto after = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
@@ -607,7 +607,7 @@ TEST_F(AdmissionServiceTest, BallotDecisionModeSurvivesRestart) {
     EXPECT_TRUE(mid->issued_cert_json.empty());
 
     // Only the quorum callback resolves it, even after the restart.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "");
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "", "");
     auto after = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
@@ -626,7 +626,7 @@ TEST_F(AdmissionServiceTest, SoleDiscretionRecordIgnoresBallotDecision) {
     ASSERT_TRUE(r.ok) << r.error;
     ASSERT_FALSE(r.needs_ballot);   // admin must decide this one
 
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "");
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "", "");
 
     auto after = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(after.has_value());
@@ -646,11 +646,68 @@ TEST_F(AdmissionServiceTest, BallotForOtherCandidateIgnored) {
 
     auto other = crypto_svc->ed25519_keygen();
     auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, other_b64, "");
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, other_b64, "", "");
 
     auto after = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(after.has_value());
     EXPECT_EQ(after->state, core::ServerAdmissionService::State::Pending);
+}
+
+// The pending record is what gets minted: peers vote on claim A, the candidate
+// re-submits claim B on the same key, and the old votes would issue B.
+TEST_F(AdmissionServiceTest, PendingAdmissionCannotBeMutated) {
+    make(/*root_is_local=*/true, /*min_tier1=*/0);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-5");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    const auto first_hash = admission->status(r.request_id, in.candidate_pubkey)->claim_hash;
+    ASSERT_FALSE(first_hash.empty());
+
+    // Same key, same pending request, different server_id -> 409, record intact.
+    auto swap = signed_request(cand, "berlin-6");
+    auto r2   = admission->create_request(swap);
+    EXPECT_FALSE(r2.ok);
+    EXPECT_EQ(r2.status, 409);
+
+    auto mid = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(mid.has_value());
+    EXPECT_EQ(mid->server_id, "berlin-5");
+    EXPECT_EQ(mid->claim_hash, first_hash);
+
+    // Region is material too.
+    auto region_swap   = signed_request(cand, "berlin-5");
+    region_swap.region = "ap-south";
+    {
+        auto msg = core::ServerAdmissionService::canonical_request(region_swap);
+        auto sig = crypto_svc->ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
+        region_swap.signature = crypto::to_base64(
+            std::span<const uint8_t>(sig.data(), sig.size()));
+    }
+    EXPECT_EQ(admission->create_request(region_swap).status, 409);
+
+    // An identical re-submission stays an idempotent retry and keeps the hash
+    // voters signed rather than rebinding to the new nonce.
+    auto same = signed_request(cand, "berlin-5");
+    auto r3   = admission->create_request(same);
+    EXPECT_TRUE(r3.ok) << r3.error;
+    EXPECT_EQ(r3.request_id, r.request_id);
+    EXPECT_TRUE(r3.needs_ballot);   // re-arms the ballot
+    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->claim_hash, first_hash);
+
+    // And a ballot that approves some other claim cannot mint this record.
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey,
+                                  "0000000000000000000000000000000000000000000000000000000000000000",
+                                  "");
+    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->state,
+              core::ServerAdmissionService::State::Pending);
+
+    // The claim the quorum actually voted on issues normally.
+    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey,
+                                  first_hash, "");
+    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->state,
+              core::ServerAdmissionService::State::Approved);
 }
 
 TEST_F(AdmissionServiceTest, MintRefusedOnNonRootHolder) {
@@ -787,7 +844,7 @@ TEST(AdmissionQuorum, NoRootAnchorAdmissionFailsClosed) {
 
     auto cand = c.ed25519_keygen();
     auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-    gossip.start_admission_ballot("req-noroot", cand_b64, "worker-1", "", 0.75f);
+    gossip.start_admission_ballot("req-noroot", cand_b64, "worker-1", "", "", 0.75f);
 
     // Empty attested electorate (tier1_count == 0) -> Admission fails closed.
     EXPECT_FALSE(approved);
@@ -871,7 +928,7 @@ TEST(AdmissionQuorum, SponsorAloneCannotSatisfyQuorum) {
     auto cand = c.ed25519_keygen();
     gossip.start_admission_ballot(
         "req-sponsor", b64({cand.public_key.begin(), cand.public_key.end()}),
-        "worker-1", "", 0.75f);
+        "worker-1", "", "", 0.75f);
 
     // Electorate = {peer, sponsor} -> needed 2, sponsor supplies only 1.
     EXPECT_FALSE(approved);
@@ -913,7 +970,7 @@ TEST(AdmissionQuorum, IneligibleSponsorCastsNoVote) {
     auto cand = c.ed25519_keygen();
     gossip.start_admission_ballot(
         "req-inelig", b64({cand.public_key.begin(), cand.public_key.end()}),
-        "worker-2", "", 0.75f);
+        "worker-2", "", "", 0.75f);
 
     bool found = false;
     for (const auto& bal : gossip.pending_enrollments()) {
@@ -963,7 +1020,7 @@ TEST(AdmissionQuorum, FabricatedPeerCannotFormElectorate) {
     auto cand = c.ed25519_keygen();
     gossip.start_admission_ballot(
         "req-fab", b64({cand.public_key.begin(), cand.public_key.end()}),
-        "worker-3", "", 0.10f);
+        "worker-3", "", "", 0.10f);
 
     EXPECT_FALSE(approved);
 
@@ -1031,13 +1088,14 @@ using Access = nexus::gossip::GossipBallotTestAccess;
 nlohmann::json signed_vote(crypto::SodiumCryptoService& c,
                            const crypto::Ed25519Keypair& voter,
                            const std::string& rid, const std::string& cand,
-                           bool approve) {
+                           bool approve, const std::string& claim_hash = "") {
     auto voter_b64 = b64({voter.public_key.begin(), voter.public_key.end()});
     const uint64_t ts = 1;
     const std::string reason = "test";
     nlohmann::json canonical = {
         {"approve",          approve},
         {"candidate_pubkey", cand},
+        {"claim_hash",       claim_hash},
         {"reason",           reason},
         {"request_id",       rid},
         {"timestamp",        ts},
@@ -1053,6 +1111,7 @@ nlohmann::json signed_vote(crypto::SodiumCryptoService& c,
         {"approve",          approve},
         {"reason",           reason},
         {"timestamp",        ts},
+        {"claim_hash",       claim_hash},
         {"signature",        crypto::to_base64(sig)},
     };
 }
@@ -1279,7 +1338,7 @@ TEST(BallotBinding, VoteForOtherCandidateNotCounted) {
     auto other = c.ed25519_keygen();
     auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
 
-    gossip.start_admission_ballot("req-cand", cand_b64, "worker-1", "", 0.75f);
+    gossip.start_admission_ballot("req-cand", cand_b64, "worker-1", "", "", 0.75f);
     ASSERT_TRUE(Access::has_ballot(gossip, "req-cand"));
     const auto before = Access::vote_count(gossip, "req-cand");
 
@@ -1337,7 +1396,7 @@ TEST(BallotBinding, RevokedVoterStaleVoteStopsCounting) {
     auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
 
     // Electorate {self, p1, p2} -> needed ceil(3*0.75) = 3. Sponsor supplies 1.
-    gossip.start_admission_ballot("req-stale", cand_b64, "worker-1", "", 0.75f);
+    gossip.start_admission_ballot("req-stale", cand_b64, "worker-1", "", "", 0.75f);
     ASSERT_FALSE(approved);
 
     // p1 approves -> 2 of 3. Still short.
@@ -1415,4 +1474,123 @@ TEST(NsSlot, OccupiedPreferredSlotNotClaimed) {
     Access::occupy_ns_slot(*rig.gossip, 3, "someone-else");
     rig.gossip->try_claim_ns_slot("203.0.113.10");
     EXPECT_FALSE(rig.gossip->our_ns_slot().has_value());
+}
+
+// ===========================================================================
+// Ballot lifecycle across a restart
+// ===========================================================================
+
+// Ballots are in-memory but the record persists as ballot-governed, so after a
+// restart approve()/deny() refuse it while no ballot exists to resolve it.
+// Driven end to end: real votes, real quorum, no manual decision callback.
+TEST(BallotLifecycle, RestartReopensBallotAndReachesQuorum) {
+    auto tmp = fs::temp_directory_path() /
+               ("nexus_ballot_restart_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
+    fs::create_directories(tmp);
+
+    asio::io_context io;
+    crypto::SodiumCryptoService c;  c.start();
+    storage::FileStorageService s{tmp};  s.start();
+    crypto::KeyWrappingService kw{c, s};  kw.start();
+
+    // Root anchor with its own root-signed cert (an eligible voter); one
+    // enrolled peer makes an electorate of 2.
+    auto root = kw.generate_and_store_identity({});
+    auto root_b64 = b64({root.public_key.begin(), root.public_key.end()});
+    seed_own_cert(s, sign_cert(c, root, root_b64, "genesis"));
+
+    auto p1 = c.ed25519_keygen();
+    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
+    seed_peers(s, nlohmann::json::array({
+        peer_entry(p1_b64, "10.0.0.1:9102", sign_cert(c, root, p1_b64, "voter-1")),
+    }));
+
+    core::ServerConfig config;
+    config.root_pubkey = crypto::to_hex(
+        std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
+    config.onboard_enabled            = true;
+    config.onboard_min_tier1_for_vote = 0;   // always the vote regime
+
+    // Mirrors main.cpp: the callback is the ONLY path from ballot to issuance.
+    auto wire = [&](gossip::GossipService& g, core::ServerAdmissionService& adm) {
+        g.set_enrollment_decision_callback([&adm, &g](const gossip::EnrollmentBallot& b) {
+            if (b.kind != gossip::EnrollmentBallot::Kind::Admission) return;
+            if (b.sponsor_pubkey != crypto::to_base64(g.keypair().public_key)) return;
+            adm.on_ballot_decision(b.request_id,
+                                   b.state == gossip::EnrollmentBallot::State::Approved,
+                                   b.candidate_pubkey, b.claim_hash, "");
+        });
+    };
+
+    auto make_gossip = [&] {
+        auto g = std::make_unique<gossip::GossipService>(io, 0, s, c);
+        g->set_root_pubkey(root.public_key);
+        g->set_enrollment_config(true, 0.75f, 60, 3);
+        g->set_admission_quorum_ratio(0.75f);
+        g->start();
+        return g;
+    };
+
+    auto cand = c.ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    std::string request_id, claim_hash;
+
+    // --- First boot: open a ballot-governed admission ------------------------
+    {
+        auto gossip = make_gossip();
+        core::ServerAdmissionService adm{config, c, kw, s, *gossip, nullptr};
+        wire(*gossip, adm);
+        adm.start();
+
+        core::ServerAdmissionService::RequestInput in;
+        in.candidate_pubkey = cand_b64;
+        in.server_id        = "worker-restart";
+        in.region           = "eu-west";
+        in.nonce            = adm.issue_challenge(cand_b64);
+        in.timestamp        = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
+        in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
+
+        auto r = adm.create_request(in);
+        ASSERT_TRUE(r.ok) << r.error;
+        ASSERT_TRUE(r.needs_ballot);
+        adm.start_pending_ballot(r.request_id);
+        request_id = r.request_id;
+        claim_hash = adm.status(request_id, cand_b64)->claim_hash;
+        ASSERT_TRUE(Access::has_ballot(*gossip, request_id));
+
+        adm.stop();
+        gossip->stop();
+    }
+
+    // --- Restart: fresh gossip (empty ballots) + service from the same root ---
+    auto gossip = make_gossip();
+    ASSERT_FALSE(Access::has_ballot(*gossip, request_id));   // in-memory state is gone
+
+    core::ServerAdmissionService adm{config, c, kw, s, *gossip, nullptr};
+    wire(*gossip, adm);
+    adm.start();
+
+    // The ballot is re-opened by start(), bound to the same claim.
+    ASSERT_TRUE(Access::has_ballot(*gossip, request_id));
+    EXPECT_EQ(adm.status(request_id, cand_b64)->claim_hash, claim_hash);
+    EXPECT_EQ(adm.status(request_id, cand_b64)->state,
+              core::ServerAdmissionService::State::Pending);
+
+    // Electorate {self, peer} = 2 at 0.75 -> needs both. The sponsor voted when
+    // the ballot re-opened; the peer's vote closes the quorum.
+    Access::vote(*gossip, p1_b64, signed_vote(c, p1, request_id, cand_b64, true, claim_hash));
+
+    auto after = adm.status(request_id, cand_b64);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(after->decided_by, "ballot");
+    EXPECT_FALSE(after->issued_cert_json.empty());
+
+    adm.stop(); gossip->stop(); kw.stop(); s.stop(); c.stop();
+    fs::remove_all(tmp);
 }

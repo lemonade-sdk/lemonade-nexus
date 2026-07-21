@@ -1956,6 +1956,7 @@ void GossipService::start_admission_ballot(const std::string& request_id,
                                             const std::string& candidate_pubkey,
                                             const std::string& server_id,
                                             const std::string& claim_json,
+                                            const std::string& claim_hash,
                                             float required_ratio) {
     auto now = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
@@ -1964,6 +1965,7 @@ void GossipService::start_admission_ballot(const std::string& request_id,
     ballot.candidate_pubkey    = candidate_pubkey;
     ballot.candidate_server_id = server_id;
     ballot.admission_claim_json = claim_json;
+    ballot.claim_hash          = claim_hash;
     ballot.sponsor_pubkey      = crypto::to_base64(keypair_.public_key);
     ballot.created_at          = now;
     ballot.timeout_at          = now + enrollment_vote_timeout_sec_;
@@ -1998,6 +2000,8 @@ void GossipService::broadcast_enrollment_vote_request(const EnrollmentBallot& ba
         // Certless candidate: carry its self-signed onboarding claim instead.
         request["admission_claim"] = ballot.admission_claim_json.empty()
             ? json::object() : json::parse(ballot.admission_claim_json);
+        // Advisory: voters recompute it and drop the ballot on a mismatch.
+        request["claim_hash"] = ballot.claim_hash;
         request["required_ratio"] = ballot.required_ratio;
     } else {
         request["certificate"] = json::parse(ballot.certificate_json);
@@ -2029,11 +2033,13 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
     // Same eligibility gate as inbound votes: a vote we may not cast must not
     // enter our tally or the wire.
     bool is_admission = false;
+    std::string claim_hash;
     {
         std::lock_guard lock(peers_mutex_);
         auto it = pending_enrollments_.find(request_id);
         if (it == pending_enrollments_.end()) return;
         is_admission = it->second.kind == EnrollmentBallot::Kind::Admission;
+        claim_hash   = it->second.claim_hash;
     }
     if (!self_is_eligible_voter(is_admission)) {
         spdlog::debug("[{}] not casting {} vote for '{}': this server is not an "
@@ -2045,10 +2051,13 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
     auto now = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
-    // Build canonical vote JSON for signing (sorted keys, excludes signature)
+    // Build canonical vote JSON for signing (sorted keys, excludes signature).
+    // Without claim_hash a signed vote transfers to any later claim under the
+    // same request_id.
     json canonical_vote = {
         {"approve",          approve},
         {"candidate_pubkey", candidate_pubkey},
+        {"claim_hash",       claim_hash},
         {"reason",           reason},
         {"request_id",       request_id},
         {"timestamp",        now},
@@ -2065,6 +2074,7 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
     vote.approve          = approve;
     vote.reason           = reason;
     vote.timestamp        = now;
+    vote.claim_hash       = claim_hash;
     vote.signature        = crypto::to_base64(sig);
 
     // Add to our own ballot
@@ -2084,6 +2094,7 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
         {"approve",          vote.approve},
         {"reason",           vote.reason},
         {"timestamp",        vote.timestamp},
+        {"claim_hash",       vote.claim_hash},
         {"signature",        vote.signature},
     };
     auto payload_str = vote_json.dump();
@@ -2176,6 +2187,7 @@ void GossipService::handle_enrollment_vote_request(
         const bool is_admission = j.contains("admission_claim");
         bool candidate_ok = false;
         std::string server_id;
+        std::string local_claim_hash;
         float required_ratio = 0.0f;
 
         if (is_admission) {
@@ -2221,7 +2233,20 @@ void GossipService::handle_enrollment_vote_request(
                     std::memcpy(sig.data(), sig_bytes.data(), sig.size());
                     candidate_ok = crypto_.ed25519_verify(pk, msg, sig);
                 }
+                // Our own hash of the bytes we verified, so the sponsor can't
+                // dictate the claim identity we sign.
+                local_claim_hash = crypto::to_hex(
+                    crypto_.sha256(std::span<const uint8_t>(msg)));
             } catch (...) { candidate_ok = false; }
+
+            // An advertised hash that isn't the claim we got splits what we
+            // verify from what we sign.
+            if (auto adv = j.value("claim_hash", std::string{});
+                !adv.empty() && adv != local_claim_hash) {
+                spdlog::warn("[{}] admission vote request {} advertises a claim_hash that does "
+                              "not match its claim — dropped", name(), request_id.substr(0, 8));
+                return;
+            }
         } else if (j.contains("certificate")) {
             try {
                 ServerCertificate cert = j["certificate"].get<ServerCertificate>();
@@ -2243,6 +2268,7 @@ void GossipService::handle_enrollment_vote_request(
             ballot.certificate_json    = (!is_admission && j.contains("certificate"))
                                              ? j["certificate"].dump() : "";
             ballot.admission_claim_json = is_admission ? j["admission_claim"].dump() : "";
+            ballot.claim_hash          = local_claim_hash;   // ours, not the sponsor's
             ballot.sponsor_pubkey      = sponsor_pubkey;
             ballot.created_at          = now;
             ballot.timeout_at          = now + enrollment_vote_timeout_sec_;
@@ -2290,6 +2316,7 @@ void GossipService::handle_enrollment_vote(
         auto approve          = j.value("approve", false);
         auto reason           = j.value("reason", "");
         auto timestamp        = j.value("timestamp", uint64_t{0});
+        auto vote_claim_hash  = j.value("claim_hash", "");
         auto signature        = j.value("signature", "");
 
         if (request_id.empty() || voter_pubkey.empty()) return;
@@ -2319,6 +2346,7 @@ void GossipService::handle_enrollment_vote(
         json canonical_vote = {
             {"approve",          approve},
             {"candidate_pubkey", candidate_pubkey},
+            {"claim_hash",       vote_claim_hash},
             {"reason",           reason},
             {"request_id",       request_id},
             {"timestamp",        timestamp},
@@ -2411,6 +2439,14 @@ void GossipService::handle_enrollment_vote(
                 spdlog::warn("[{}] vote for candidate {} does not match ballot {} candidate {}",
                               name(), candidate_pubkey.substr(0, 12), request_id.substr(0, 8),
                               it->second.candidate_pubkey.substr(0, 12));
+                return;
+            }
+
+            // Same for the claim: a vote over claim A must not count toward a
+            // ballot about claim B. Enrollment carries no claim — both are "".
+            if (it->second.claim_hash != vote_claim_hash) {
+                spdlog::warn("[{}] vote on ballot {} is bound to a different claim; dropping",
+                              name(), request_id.substr(0, 8));
                 return;
             }
 

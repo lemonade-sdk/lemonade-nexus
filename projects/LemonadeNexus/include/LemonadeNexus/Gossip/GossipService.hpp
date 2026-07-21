@@ -468,10 +468,13 @@ public:
 
     /// Open a governed ADMISSION ballot for a certless candidate (75% Tier1).
     /// `claim_json` is the candidate's self-signed onboarding claim.
+    /// `claim_hash` binds votes to this claim. Re-entry with our own live
+    /// ballot is a no-op, so callers may re-arm with it after a restart.
     void start_admission_ballot(const std::string& request_id,
                                 const std::string& candidate_pubkey,
                                 const std::string& server_id,
                                 const std::string& claim_json,
+                                const std::string& claim_hash,
                                 float required_ratio);
 
     /// Add a server pubkey to the revocation set and persist it. Idempotent.

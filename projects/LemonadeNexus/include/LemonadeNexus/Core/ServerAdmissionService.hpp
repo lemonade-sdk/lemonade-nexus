@@ -47,6 +47,9 @@ public:
         std::string decided_by;         // "token" | "admin" | "ballot"
         std::string decision_mode;      // "sole" | "ballot" — fixed at creation, persisted
         std::string ballot_claim_json;  // candidate self-signed claim (vote regime)
+        // SHA-256 (hex) of the bytes the candidate signed; votes bind to it and
+        // issuance re-checks it, so a ballot mints only what the quorum approved.
+        std::string claim_hash;
     };
 
     struct Config {
@@ -116,9 +119,16 @@ public:
     /// Ballot decision hook (wired to GossipService's decision callback).
     /// `candidate_pubkey` is the candidate the BALLOT was about; it must match the
     /// record, or a ballot for one candidate resolves a record for another.
+    /// `claim_hash` is the claim the quorum voted on; issuance is refused
+    /// unless it still matches the record.
     void on_ballot_decision(const std::string& request_id, bool approved,
                             const std::string& candidate_pubkey,
+                            const std::string& claim_hash,
                             const std::string& reason);
+
+    /// Re-open ballots for pending ballot-governed admissions (called on start;
+    /// ballots are in-memory, so a restart would leave them unresolvable).
+    void resume_pending_ballots();
 
     /// Candidate polls its request; fills cert bundle when approved.
     [[nodiscard]] std::optional<Admission> status(const std::string& request_id,

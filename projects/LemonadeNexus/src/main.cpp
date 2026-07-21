@@ -714,11 +714,11 @@ int main(int argc, char* argv[]) {
     nexus::core::ServerAdmissionService admission{
         config, crypto, key_wrapping, storage, gossip,
         config.require_tee_attestation ? &trust_policy : nullptr};
-    admission.start();
 
     // Governed-admission ballots (>= onboard_min_tier1_for_vote Tier1 peers)
     // resolve through the gossip enrollment machinery; map the outcome back to
-    // certificate issuance / denial.
+    // certificate issuance / denial. Registered before start() so a ballot
+    // re-opened on startup can't resolve into a missing callback.
     gossip.set_enrollment_decision_callback(
         [&admission, &gossip](const nexus::gossip::EnrollmentBallot& b) {
             if (b.kind != nexus::gossip::EnrollmentBallot::Kind::Admission) return;
@@ -728,9 +728,11 @@ int main(int argc, char* argv[]) {
                 nexus::crypto::to_base64(gossip.keypair().public_key)) return;
             const bool approved = b.state == nexus::gossip::EnrollmentBallot::State::Approved;
             admission.on_ballot_decision(
-                b.request_id, approved, b.candidate_pubkey,
+                b.request_id, approved, b.candidate_pubkey, b.claim_hash,
                 approved ? "" : "admission ballot did not reach quorum");
         });
+
+    admission.start();
 
     // ========================================================================
     // Register CRTP request handlers

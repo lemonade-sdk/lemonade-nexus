@@ -107,6 +107,10 @@ void ServerAdmissionService::on_start() {
                      "certificate of its own — peers cannot verify it and state will not "
                      "sync. Self-enroll once: --enroll-server '<own gossip pubkey>' <server-id>");
     }
+
+    // Ballots are in-memory: a reloaded ballot-governed record has none, and
+    // approve()/deny() refuse it — without this nobody can resolve it.
+    resume_pending_ballots();
 }
 
 void ServerAdmissionService::on_stop() {
@@ -270,6 +274,28 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         }
     }
 
+    // A pending admission is immutable: the record is what gets minted, so
+    // refreshing it lets peers vote on claim A and a cert issue for claim B.
+    // tpm_ek_cert is compared here because the signature doesn't cover it.
+    if (is_existing) {
+        const auto& cur = admissions_[request_id];
+        std::string changed;
+        auto diff = [&changed](const char* f, const std::string& a, const std::string& b) {
+            if (a != b) changed += changed.empty() ? f : std::string(", ") + f;
+        };
+        diff("server_id",     cur.server_id,     in.server_id);
+        diff("region",        cur.region,        in.region);
+        diff("tpm_ak_pubkey", cur.tpm_ak_pubkey, in.tpm_ak_pubkey);
+        diff("tpm_ek_cert",   cur.tpm_ek_cert,   in.tpm_ek_cert);
+        if (!changed.empty()) {
+            spdlog::warn("[ServerAdmissionService] rejected mutation of pending admission {} "
+                         "(changed: {})", request_id, changed);
+            return {false, 409,
+                    "an admission is already pending for this key and cannot be modified; "
+                    "wait for it to be decided or to expire", request_id};
+        }
+    }
+
     // Capacity — only a brand-new, non-token pending record counts against it;
     // cheap self-signed pending spam must not lock out a valid token.
     if (!is_existing && !token_admit) {
@@ -299,6 +325,10 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.source_ip        = in.source_ip;
     a.expires_at       = now + cfg_.request_ttl_sec;
     if (!is_existing) {
+        // Fixed at creation, never refreshed: a retry carries a fresh nonce and
+        // timestamp, so recomputing would drift off the hash voters signed.
+        auto msg = canonical_request(in);
+        a.claim_hash = crypto::to_hex(crypto_.sha256(std::span<const uint8_t>(msg)));
         a.state = State::Pending;
         a.created_at = now;
         // Fix the decision mode at creation and persist it — a later change in
@@ -337,11 +367,14 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         return {true, 200, "", request_id};
     }
 
-    // Non-token retry of an already-pending request: refresh only, no duplicate
-    // ballot.
+    // Non-token retry of an already-pending request. The record is unchanged,
+    // but re-arm a ballot-governed one: ballots are in-memory, so a restart
+    // would leave it unresolvable. start_admission_ballot() is idempotent.
     if (is_existing) {
         persist();
-        return {true, 200, "", request_id};
+        Result r{true, 200, "", request_id};
+        r.needs_ballot = a.decision_mode == "ballot" && !a.ballot_claim_json.empty();
+        return r;
     }
 
     // New record above the vote threshold: defer to a governed Tier1 ballot.
@@ -367,23 +400,42 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
 }
 
 void ServerAdmissionService::start_pending_ballot(const std::string& request_id) {
-    std::string cpk, sid, claim;
+    std::string cpk, sid, claim, chash;
     float ratio;
     {
         std::lock_guard lock(mu_);
         auto it = admissions_.find(request_id);
         if (it == admissions_.end() || it->second.ballot_claim_json.empty()) return;
+        if (it->second.state != State::Pending) return;
         cpk   = it->second.candidate_pubkey;
         sid   = it->second.server_id;
         claim = it->second.ballot_claim_json;
+        chash = it->second.claim_hash;
         ratio = cfg_.admission_quorum_ratio;
     }
-    gossip_.start_admission_ballot(request_id, cpk, sid, claim, ratio);
+    gossip_.start_admission_ballot(request_id, cpk, sid, claim, chash, ratio);
+}
+
+void ServerAdmissionService::resume_pending_ballots() {
+    std::vector<std::string> ids;
+    {
+        std::lock_guard lock(mu_);
+        for (const auto& [rid, a] : admissions_) {
+            if (a.state == State::Pending && a.decision_mode == "ballot" &&
+                !a.ballot_claim_json.empty())
+                ids.push_back(rid);
+        }
+    }
+    for (const auto& rid : ids) start_pending_ballot(rid);   // takes mu_ itself
+    if (!ids.empty())
+        spdlog::info("[ServerAdmissionService] re-opened {} ballot-governed admission(s)",
+                     ids.size());
 }
 
 void ServerAdmissionService::on_ballot_decision(const std::string& request_id,
                                                 bool approved,
                                                 const std::string& candidate_pubkey,
+                                                const std::string& claim_hash,
                                                 const std::string& reason) {
     std::lock_guard lock(mu_);
     auto it = admissions_.find(request_id);
@@ -401,6 +453,12 @@ void ServerAdmissionService::on_ballot_decision(const std::string& request_id,
     if (a.decision_mode != "ballot") {
         spdlog::warn("[{}] ballot decision for '{}' record {}; ignoring",
                       name(), a.decision_mode, request_id);
+        return;
+    }
+    // Mint the claim the quorum voted on, or nothing.
+    if (!claim_hash.empty() && !a.claim_hash.empty() && claim_hash != a.claim_hash) {
+        spdlog::error("[{}] ballot {} approved a different claim than the pending record "
+                      "holds; refusing to issue", name(), request_id);
         return;
     }
     if (approved) {
@@ -589,6 +647,7 @@ void ServerAdmissionService::persist() {
             {"issued_cert_json", a.issued_cert_json},
             {"decision_reason", a.decision_reason}, {"decided_by", a.decided_by},
             {"decision_mode", a.decision_mode}, {"ballot_claim_json", a.ballot_claim_json},
+            {"claim_hash", a.claim_hash},
         });
     }
     json denied = json::object();
@@ -625,6 +684,7 @@ void ServerAdmissionService::load() {
             a.decided_by       = j.value("decided_by", "");
             a.decision_mode    = j.value("decision_mode", "");
             a.ballot_claim_json = j.value("ballot_claim_json", "");
+            a.claim_hash       = j.value("claim_hash", "");
             // Forward-compat: records persisted before decision_mode existed but
             // that carry a ballot claim are ballot-governed.
             if (a.decision_mode.empty() && !a.ballot_claim_json.empty())

@@ -85,6 +85,7 @@ struct EnrollmentVoteData {
     bool        approve{false};
     std::string reason;           // "certificate_valid", "cert_invalid", "revoked", etc.
     uint64_t    timestamp{0};
+    std::string claim_hash;       // admission claim this vote is about ("" = enrollment)
     std::string signature;        // Ed25519 over canonical vote JSON
 };
 
@@ -106,6 +107,9 @@ struct EnrollmentBallot {
     std::string    candidate_server_id;
     std::string    certificate_json;     // full ServerCertificate JSON (Enrollment)
     std::string    admission_claim_json; // candidate's self-signed claim (Admission)
+    // SHA-256 (hex) of the bytes the candidate signed (Admission). Recomputed
+    // by each voter, never taken on the sponsor's word, and signed by each vote.
+    std::string    claim_hash;
     std::string    sponsor_pubkey;       // server that first received ServerHello
     uint64_t       created_at{0};
     uint64_t       timeout_at{0};
