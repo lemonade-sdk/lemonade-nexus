@@ -980,7 +980,11 @@ TEST(AdmissionQuorum, FabricatedPeerCannotFormElectorate) {
 // `signer` directly provides the same guarantee the wire path does.
 // ---------------------------------------------------------------------------
 
-struct nexus::gossip::GossipBallotTestAccess {
+// Defined inside its namespace: a qualified-name definition at global scope
+// (`struct nexus::gossip::GossipBallotTestAccess {...}`) is an MSVC extension
+// that GCC rejects — the friend declaration is not a prior declaration.
+namespace nexus::gossip {
+struct GossipBallotTestAccess {
     static void vote_request(gossip::GossipService& g, const std::string& signer,
                              const nlohmann::json& body) {
         auto s = body.dump();
@@ -1017,6 +1021,7 @@ struct nexus::gossip::GossipBallotTestAccess {
         g.ns_slots_[slot - 1].server_pubkey = holder_pubkey;
     }
 };
+}  // namespace nexus::gossip
 
 namespace {
 
