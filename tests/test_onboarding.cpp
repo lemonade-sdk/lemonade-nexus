@@ -1010,6 +1010,12 @@ struct nexus::gossip::GossipBallotTestAccess {
         auto it = g.pending_enrollments_.find(rid);
         return it == g.pending_enrollments_.end() ? -1.0f : it->second.required_ratio;
     }
+    static void occupy_ns_slot(gossip::GossipService& g, uint8_t slot,
+                               const std::string& holder_pubkey) {
+        std::lock_guard lock(g.peers_mutex_);
+        g.ns_slots_[slot - 1].slot          = slot;
+        g.ns_slots_[slot - 1].server_pubkey = holder_pubkey;
+    }
 };
 
 namespace {
@@ -1343,3 +1349,65 @@ TEST(BallotBinding, RevokedVoterStaleVoteStopsCounting) {
     fs::remove_all(tmp);
 }
 
+
+// ===========================================================================
+// NS slot pinning
+// ===========================================================================
+
+namespace {
+
+// Minimal service stack for slot-claim tests; returns started services.
+struct NsSlotRig {
+    asio::io_context io;
+    crypto::SodiumCryptoService c;
+    std::unique_ptr<storage::FileStorageService> s;
+    std::unique_ptr<crypto::KeyWrappingService> kw;
+    std::unique_ptr<gossip::GossipService> gossip;
+    fs::path tmp;
+
+    explicit NsSlotRig(const std::string& tag) {
+        tmp = fs::temp_directory_path() / (tag + std::to_string(getpid()));
+        fs::remove_all(tmp);
+        fs::create_directories(tmp);
+        c.start();
+        s = std::make_unique<storage::FileStorageService>(tmp);
+        s->start();
+        kw = std::make_unique<crypto::KeyWrappingService>(c, *s);
+        kw->start();
+        (void)kw->generate_and_store_identity({});
+        gossip = std::make_unique<gossip::GossipService>(io, 0, *s, c);
+        gossip->start();
+    }
+    ~NsSlotRig() {
+        gossip->stop(); kw->stop(); s->stop(); c.stop();
+        fs::remove_all(tmp);
+    }
+};
+
+}  // namespace
+
+TEST(NsSlot, AutoClaimsLowestFree) {
+    NsSlotRig rig{"nexus_nsslot_auto_"};
+    rig.gossip->try_claim_ns_slot("203.0.113.10");
+    ASSERT_TRUE(rig.gossip->our_ns_slot().has_value());
+    EXPECT_EQ(*rig.gossip->our_ns_slot(), 1);
+}
+
+TEST(NsSlot, PreferredSlotClaimed) {
+    NsSlotRig rig{"nexus_nsslot_pin_"};
+    rig.gossip->set_preferred_ns_slot(3);
+    rig.gossip->try_claim_ns_slot("203.0.113.10");
+    ASSERT_TRUE(rig.gossip->our_ns_slot().has_value());
+    EXPECT_EQ(*rig.gossip->our_ns_slot(), 3);
+}
+
+// A pinned server must claim its slot or none: the registrar glue points the
+// pinned name at this IP, so falling back to another slot advertises a
+// nameserver record the registry contradicts.
+TEST(NsSlot, OccupiedPreferredSlotNotClaimed) {
+    NsSlotRig rig{"nexus_nsslot_busy_"};
+    rig.gossip->set_preferred_ns_slot(3);
+    Access::occupy_ns_slot(*rig.gossip, 3, "someone-else");
+    rig.gossip->try_claim_ns_slot("203.0.113.10");
+    EXPECT_FALSE(rig.gossip->our_ns_slot().has_value());
+}

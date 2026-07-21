@@ -373,37 +373,6 @@ int main(int argc, char* argv[]) {
 
     acme.set_dns_service(&dns);
 
-    // Publish _config TXT records (gossip-synced)
-    // The NS hostname (e.g. "ns1") is what clients use for DNS discovery.
-    // Also publish under the server node ID for gossip-based discovery.
-    {
-        std::string config_fqdn = nexus::core::build_server_fqdn(
-            config.server_hostname, config.dns_base_domain);
-
-        // Determine the NS hostname prefix (e.g. "ns1" from "ns1.lemonade-nexus.io")
-        std::string ns_prefix;
-        std::string ns_fqdn = config.dns_ns_hostname;
-        if (ns_fqdn.empty() && !config.server_hostname.empty()) {
-            ns_prefix = config.server_hostname;
-        } else if (!ns_fqdn.empty()) {
-            auto dot = ns_fqdn.find('.');
-            ns_prefix = (dot != std::string::npos) ? ns_fqdn.substr(0, dot) : ns_fqdn;
-        }
-
-        // Publish under NS hostname prefix (for client DNS discovery: _config.ns1.domain)
-        if (!ns_prefix.empty()) {
-            dns.publish_port_config(ns_prefix, config_fqdn);
-            spdlog::info("DNS: published _config TXT for {} (host={})", ns_prefix, config_fqdn);
-        }
-
-        // Also publish under server node ID (for gossip-based server discovery)
-        std::string node_id = nexus::core::resolve_server_node_id(storage);
-        if (!node_id.empty() && node_id != ns_prefix) {
-            dns.publish_port_config(node_id, config_fqdn);
-            spdlog::info("DNS: published _config TXT for {} (host={})", node_id, config_fqdn);
-        }
-    }
-
     // Publish SEIP records: <id>.<region>.seip.<domain> for geo-aware discovery
     dns.set_server_region(config.region);
     std::string server_seip_fqdn;
@@ -431,9 +400,54 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    // Publish _config TXT records (gossip-synced). After the SEIP block: host=
+    // is the TLS certificate FQDN (docs/DNS-Discovery.md) that clients connect
+    // to over verified HTTPS, so it must be the SEIP FQDN the cert is issued
+    // for — the srv FQDN is only a cert target when SEIP isn't available (no
+    // public IP), mirroring public_cert_fqdn below.
+    {
+        std::string config_fqdn = !server_seip_fqdn.empty()
+            ? server_seip_fqdn
+            : nexus::core::build_server_fqdn(config.server_hostname, config.dns_base_domain);
+
+        // Determine the NS hostname prefix (e.g. "ns1" from "ns1.lemonade-nexus.io")
+        std::string ns_prefix;
+        std::string ns_fqdn = config.dns_ns_hostname;
+        if (ns_fqdn.empty() && !config.server_hostname.empty()) {
+            ns_prefix = config.server_hostname;
+        } else if (!ns_fqdn.empty()) {
+            auto dot = ns_fqdn.find('.');
+            ns_prefix = (dot != std::string::npos) ? ns_fqdn.substr(0, dot) : ns_fqdn;
+        }
+
+        // Publish under NS hostname prefix (for client DNS discovery: _config.ns1.domain)
+        if (!ns_prefix.empty()) {
+            dns.publish_port_config(ns_prefix, config_fqdn);
+            spdlog::info("DNS: published _config TXT for {} (host={})", ns_prefix, config_fqdn);
+        }
+
+        // Also publish under server node ID (for gossip-based server discovery)
+        std::string node_id = nexus::core::resolve_server_node_id(storage);
+        if (!node_id.empty() && node_id != ns_prefix) {
+            dns.publish_port_config(node_id, config_fqdn);
+            spdlog::info("DNS: published _config TXT for {} (host={})", node_id, config_fqdn);
+        }
+    }
+
     dns.start();
 
-    // NS slot claiming: first 9 servers claim ns1-ns9 for DNS bootstrap
+    // NS slot claiming: first 9 servers claim ns1-ns9 for DNS bootstrap.
+    // An explicit ns<N> identity pins the slot: the registrar's glue points
+    // that exact name at this IP, so claiming any other slot would publish a
+    // nameserver record the registry contradicts.
+    if (!ns_hostname.empty()) {
+        auto dot = ns_hostname.find('.');
+        auto label = ns_hostname.substr(0, dot == std::string::npos ? ns_hostname.size() : dot);
+        if (label.size() == 3 && label.starts_with("ns") &&
+            label[2] >= '1' && label[2] <= '9') {
+            gossip.set_preferred_ns_slot(static_cast<uint8_t>(label[2] - '0'));
+        }
+    }
     gossip.set_our_region(config.region);
     gossip.set_dns_base_domain(config.dns_base_domain);
     if (!server_public_ip.empty()) {
@@ -812,12 +826,13 @@ int main(int argc, char* argv[]) {
     if (http_server.is_tls()) {
         http_server.start();
     } else if (tls.needs_acme_background) {
+        // Name the FQDN the cert is actually requested for (SEIP, srv fallback).
         spdlog::warn("Public API withheld: no TLS certificate yet for {} — it will "
-                     "start once ACME issues one (no plaintext fallback)", server_fqdn);
+                     "start once ACME issues one (no plaintext fallback)", public_cert_fqdn);
     } else {
         spdlog::error("Public API withheld: no TLS certificate for '{}' and no FQDN to "
                       "request one for via ACME (needs a public IP / SEIP FQDN; "
-                      "no plaintext fallback).", server_fqdn);
+                      "no plaintext fallback).", public_cert_fqdn);
     }
     if (private_http_server) {
         if (private_http_server->is_tls()) {

@@ -410,6 +410,7 @@ private:
     std::string                      dns_base_domain_{"lemonade-nexus.io"};
     std::array<NsSlotClaimData, 9>   ns_slots_{};       // slot 0 = ns1, slot 8 = ns9
     std::optional<uint8_t>           our_ns_slot_;
+    uint8_t                          preferred_ns_slot_{0};  // 0 = auto (lowest free)
 
     // Distributed ACL sync (nullptr = ACL sync disabled)
     acl::ACLService*                 acl_{nullptr};
@@ -450,6 +451,10 @@ public:
     /// Local floor for ADMISSION ballots. Separate from the enrollment ratio: a
     /// remote sponsor supplies its own, and we must never accept a lower bar.
     void set_admission_quorum_ratio(float ratio);
+
+    /// Pin the NS slot this server claims (1-9); 0 = auto (lowest free). Set
+    /// when the operator's ns<N> identity matches registrar glue for that name.
+    void set_preferred_ns_slot(uint8_t slot);
 
     /// Get pending enrollment ballots (for status API).
     [[nodiscard]] std::vector<EnrollmentBallot> pending_enrollments() const;

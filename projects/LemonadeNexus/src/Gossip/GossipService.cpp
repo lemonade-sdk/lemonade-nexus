@@ -1938,6 +1938,11 @@ void GossipService::set_admission_quorum_ratio(float ratio) {
     admission_quorum_ratio_ = std::clamp(ratio, 0.0f, 1.0f);
 }
 
+void GossipService::set_preferred_ns_slot(uint8_t slot) {
+    std::lock_guard lock(peers_mutex_);
+    preferred_ns_slot_ = slot > 9 ? 0 : slot;
+}
+
 std::vector<EnrollmentBallot> GossipService::pending_enrollments() const {
     std::lock_guard lock(peers_mutex_);
     std::vector<EnrollmentBallot> result;
@@ -3349,12 +3354,25 @@ void GossipService::try_claim_ns_slot(const std::string& our_public_ip) {
         return;
     }
 
-    // Find the lowest available slot (1-9)
+    // Pinned: claim exactly that slot or none — the registrar's glue points
+    // ns<pin> at us, so holding any other slot advertises a nameserver the
+    // registry contradicts. Otherwise take the lowest available slot (1-9).
     uint8_t chosen_slot = 0;
-    for (uint8_t i = 0; i < 9; ++i) {
-        if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-            chosen_slot = i + 1; // slots are 1-based
-            break;
+    if (preferred_ns_slot_ != 0) {
+        const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+        if (s.slot == 0 || s.server_pubkey.empty()) {
+            chosen_slot = preferred_ns_slot_;
+        } else {
+            spdlog::warn("[{}] pinned NS slot ns{} is held by {}; not claiming a slot",
+                          name(), preferred_ns_slot_, s.server_pubkey.substr(0, 12));
+            return;
+        }
+    } else {
+        for (uint8_t i = 0; i < 9; ++i) {
+            if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                chosen_slot = i + 1; // slots are 1-based
+                break;
+            }
         }
     }
 
@@ -3508,12 +3526,19 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             our_ns_slot_.reset();
             spdlog::warn("[{}] our NS slot ns{} was overwritten by {}, will try to re-claim",
                           name(), claim.slot, claim.server_pubkey);
-            // Find a new free slot
+            // Find a new free slot. Pinned: only the pinned slot is ever ours —
+            // if someone else now holds it, stand down instead of advertising a
+            // slot whose registry glue does not point at us.
             uint8_t new_slot = 0;
-            for (uint8_t i = 0; i < 9; ++i) {
-                if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-                    new_slot = i + 1;
-                    break;
+            if (preferred_ns_slot_ != 0) {
+                const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+                if (s.slot == 0 || s.server_pubkey.empty()) new_slot = preferred_ns_slot_;
+            } else {
+                for (uint8_t i = 0; i < 9; ++i) {
+                    if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                        new_slot = i + 1;
+                        break;
+                    }
                 }
             }
             if (new_slot > 0) {
