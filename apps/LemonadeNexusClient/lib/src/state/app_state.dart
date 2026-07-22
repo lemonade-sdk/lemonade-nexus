@@ -541,8 +541,14 @@ class AppNotifier extends StateNotifier<AppState> {
 
     _log('signIn: start user=$username (connStatus=${state.connectionStatus.name})');
     try {
-      final response = await _sdk.authPassword(username, password);
-      _log('signIn: authPassword authenticated=${response.authenticated}');
+      // Same credential-derived identity as register(): the password never
+      // leaves the device, auth is an Ed25519 challenge-response.
+      final seedB64 = await _sdk.deriveSeed(username, password);
+      final seedBytes = base64Decode(base64.normalize(seedB64));
+      await _sdk.createIdentityFromSeed(seedBytes);
+      await _sdk.setIdentity();
+      final response = await _sdk.authEd25519();
+      _log('signIn: authEd25519 authenticated=${response.authenticated}');
       if (response.authenticated) {
         // Record session/identity but stay on the login view (spinner) until
         // the initial data load completes. isAuthenticated (which gates the
@@ -606,14 +612,15 @@ class AppNotifier extends StateNotifier<AppState> {
     try {
       // First derive seed from credentials (returns base64-encoded 32-byte seed)
       final seedB64 = await _sdk.deriveSeed(username, password);
-      // Decode base64 to raw 32 bytes for identity creation
-      final seedBytes = base64Decode(seedB64);
+      // SDK emits canonical urlsafe base64 without padding; normalize before decoding
+      final seedBytes = base64Decode(base64.normalize(seedB64));
       await _sdk.createIdentityFromSeed(seedBytes);
       // Set identity for client
       await _sdk.setIdentity();
 
-      // Try to authenticate
-      final response = await _sdk.authPassword(username, password);
+      // Ed25519 challenge-response; the server auto-registers unknown
+      // pubkeys on valid proof of possession (password auth is a stub).
+      final response = await _sdk.authEd25519();
       if (response.authenticated) {
         // Stay on the login view (spinner) until the initial data load finishes.
         state = state.copyWith(
