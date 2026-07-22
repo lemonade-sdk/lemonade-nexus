@@ -1,73 +1,121 @@
+# Project-level configuration.
 cmake_minimum_required(VERSION 3.14)
-
 project(lemonade_nexus LANGUAGES CXX)
 
+# The name of the executable created for the application. Change this to change
+# the on-disk name of your application.
 set(BINARY_NAME "lemonade_nexus")
 
-cmake_policy(SET CMP0063 NEW)
+# Explicitly opt in to modern CMake behaviors to avoid warnings with recent
+# versions of CMake.
+cmake_policy(VERSION 3.14...3.25)
 
-set(CMAKE_INSTALL_RPATH "$ORIGIN/lib")
-
-# Configure bundle settings
-set(FLUTTER_TARGET_PLATFORM "windows-x64")
-set(CMAKE_CONFIGURATION_TYPES Debug;Profile;Release CACHE STRING "" FORCE)
-
-# Profile build settings (required by Flutter CMake integration)
+# Define build configuration option.
+get_property(IS_MULTICONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(IS_MULTICONFIG)
+  set(CMAKE_CONFIGURATION_TYPES "Debug;Profile;Release"
+    CACHE STRING "" FORCE)
+else()
+  if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE "Debug" CACHE
+      STRING "Flutter build mode" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+      "Debug" "Profile" "Release")
+  endif()
+endif()
+# Define settings for the Profile build mode.
 set(CMAKE_EXE_LINKER_FLAGS_PROFILE "${CMAKE_EXE_LINKER_FLAGS_RELEASE}")
 set(CMAKE_SHARED_LINKER_FLAGS_PROFILE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE}")
 set(CMAKE_C_FLAGS_PROFILE "${CMAKE_C_FLAGS_RELEASE}")
 set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 
-# Use Unicode for all projects
+# Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
 
 # Compilation settings that should be applied to most targets.
+#
+# Be cautious about adding new options here, as plugins use this function by
+# default. In most cases, you should add new options to specific targets instead
+# of modifying this function.
 function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_features(${TARGET} PUBLIC cxx_std_17)
   target_compile_options(${TARGET} PRIVATE /W4 /WX /wd"4100")
   target_compile_options(${TARGET} PRIVATE /EHsc)
-  target_compile_definitions(${TARGET} PRIVATE "IS_BUILD")
-  target_link_options(${TARGET} PRIVATE "/NXCOMPAT")
-  target_link_options(${TARGET} PRIVATE "/DYNAMICBASE")
-  target_link_options(${TARGET} PRIVATE "/INCREMENTAL:NO")
-  target_link_options(${TARGET} PRIVATE "/SUBSYSTEM:WINDOWS")
+  target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
+  target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
 endfunction()
 
-# Root folder (set by the Flutter tool during `flutter build windows`).
-set(FLUTTER_ROOT "$ENV{FLUTTER_ROOT}")
-if(NOT FLUTTER_ROOT OR FLUTTER_ROOT STREQUAL "")
-  message(FATAL_ERROR "FLUTTER_ROOT is not set. Build via 'flutter build windows', not bare cmake.")
-endif()
-# Normalize path to use forward slashes (required for CMake on Windows)
-file(TO_CMAKE_PATH "${FLUTTER_ROOT}" FLUTTER_ROOT)
-
-# Set up Flutter
+# Flutter library and tool build rules.
 set(FLUTTER_MANAGED_DIR "${CMAKE_CURRENT_SOURCE_DIR}/flutter")
-set(FLUTTER_BIN_DIR "${FLUTTER_ROOT}/bin")
+add_subdirectory(${FLUTTER_MANAGED_DIR})
 
-# Include the Flutter managed directory first
-# This must happen before add_subdirectory(runner) because the runner depends on flutter_assemble
-add_subdirectory(flutter)
+# Application build; see runner/CMakeLists.txt.
+add_subdirectory("runner")
 
-# Add Flutter library (defined in flutter/CMakeLists.txt)
-# Add flutter_wrapper_app library (defined in flutter/CMakeLists.txt)
-# Add flutter_wrapper_plugin library (defined in flutter/CMakeLists.txt)
-# Add flutter_texture_registrar library (defined in flutter/CMakeLists.txt)
 
-# Build the SDK library
-set(SDK_ROOT "${CMAKE_SOURCE_DIR}/../../projects/LemonadeNexusSDK")
-set(SDK_INCLUDE "${SDK_ROOT}/include/LemonadeNexusSDK")
-set(SDK_LIB "${CMAKE_SOURCE_DIR}/../build/windows/lemonade_nexus_sdk.lib")
+# Generated plugin build rules, which manage building the plugins and adding
+# them to the application.
+include(flutter/generated_plugins.cmake)
 
-# Add Windows-specific dependencies
-list(APPEND FLUTTER_LIBRARY windows)
 
-# Include the runner subdirectory where the actual executable is built
-add_subdirectory(runner)
+# === Installation ===
+# Support files are copied into place next to the executable, so that it can
+# run in place. This is done instead of making a separate bundle (as on Linux)
+# so that building and running from within Visual Studio will work.
+set(BUILD_BUNDLE_DIR "$<TARGET_FILE_DIR:${BINARY_NAME}>")
+# Make the "install" step default, as it's required to run.
+set(CMAKE_VS_INCLUDE_INSTALL_TO_DEFAULT_BUILD 1)
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX "${BUILD_BUNDLE_DIR}" CACHE PATH "..." FORCE)
+endif()
 
-# Include the Flutter generated CMake config (must be after add_executable in runner)
-include("${CMAKE_CURRENT_SOURCE_DIR}/flutter/generated_plugins.cmake")
+set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
+set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
-# Add INSTALL target for Flutter compatibility - install to local build directory
-set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/output" CACHE PATH "Install directory" FORCE)
-install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}/runner")
+install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
+  COMPONENT Runtime)
+
+install(FILES "${FLUTTER_ICU_DATA_FILE}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
+  COMPONENT Runtime)
+
+install(FILES "${FLUTTER_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime)
+
+if(PLUGIN_BUNDLED_LIBRARIES)
+  install(FILES "${PLUGIN_BUNDLED_LIBRARIES}"
+    DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+    COMPONENT Runtime)
+endif()
+
+# Copy the native assets provided by the build.dart from all packages.
+set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")
+install(DIRECTORY "${NATIVE_ASSETS_DIR}"
+   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+   COMPONENT Runtime)
+
+# Fully re-copy the assets directory on each build to avoid having stale files
+# from a previous install.
+set(FLUTTER_ASSET_DIR_NAME "flutter_assets")
+install(CODE "
+  file(REMOVE_RECURSE \"${INSTALL_BUNDLE_DATA_DIR}/${FLUTTER_ASSET_DIR_NAME}\")
+  " COMPONENT Runtime)
+install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
+  DESTINATION "${INSTALL_BUNDLE_DATA_DIR}" COMPONENT Runtime)
+
+# Install the AOT library on non-Debug builds only.
+install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
+  CONFIGURATIONS Profile;Release
+  COMPONENT Runtime)
+
+# === Lemonade Nexus SDK ===
+# The FFI DLL is built separately (root CMake locally, CI staging step) into
+# <repo>/build/projects/LemonadeNexusSDK/Release; bundle it next to the exe.
+set(SDK_RELEASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../build/projects/LemonadeNexusSDK/Release")
+if(NOT EXISTS "${SDK_RELEASE_DIR}/lemonade_nexus_sdk.dll")
+  message(WARNING "lemonade_nexus_sdk.dll not found in ${SDK_RELEASE_DIR}; build the native SDK first")
+endif()
+install(FILES "${SDK_RELEASE_DIR}/lemonade_nexus_sdk.dll"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime OPTIONAL)
+# Legacy TUN driver; bundled only if present.
+install(FILES "${SDK_RELEASE_DIR}/wintun.dll"
+  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime OPTIONAL)
