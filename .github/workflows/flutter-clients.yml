@@ -24,6 +24,8 @@ on:
 env:
   BUILD_TYPE: Release
   FLUTTER_VERSION: "3.44.4"
+  # Keep pub downloads inside the workspace so actions/cache can persist them.
+  PUB_CACHE: ${{ github.workspace }}/.pub-cache
 
 jobs:
   macos:
@@ -63,6 +65,13 @@ jobs:
             echo "::error::SDK dylib links Homebrew/local libraries — not self-contained"; exit 1
           fi
 
+      - name: Cache pub dependencies
+        uses: actions/cache@v5
+        with:
+          path: .pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('apps/LemonadeNexusClient/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: ${{ env.FLUTTER_VERSION }}
@@ -77,6 +86,13 @@ jobs:
       - name: Build macOS app
         working-directory: apps/LemonadeNexusClient
         run: flutter build macos --release
+
+      # The Xcode embed phase warns-and-continues when the dylib is missing;
+      # fail loudly here instead of shipping an app that cannot load the SDK.
+      - name: Verify app bundle embeds the SDK dylib
+        run: |
+          app=$(ls -d apps/LemonadeNexusClient/build/macos/Build/Products/Release/*.app | head -n 1)
+          test -f "$app/Contents/Frameworks/liblemonade_nexus_sdk.dylib"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -118,6 +134,17 @@ jobs:
             -DOPENSSL_USE_STATIC_LIBS=ON
           cmake --build build --target LemonadeNexusSDKShared --parallel
 
+      # Windows counterpart of the macOS nm check: the public C API is ~64
+      # ln_* functions; a DLL that built but failed to export them would only
+      # fail at Flutter FFI runtime.
+      - name: Verify SDK DLL exports
+        shell: pwsh
+        run: |
+          $exports = dumpbin /exports build/projects/LemonadeNexusSDK/lemonade_nexus_sdk.dll
+          $n = ($exports | Select-String '\bln_[a-z0-9_]+').Count
+          if ($n -lt 60) { Write-Error "only $n ln_* exports — expected >= 60"; exit 1 }
+          Write-Output "ln_* exports: $n"
+
       # The Windows CMake install step bundles the DLL from a Release/
       # subdir; Ninja is single-config, so stage it there.
       - name: Stage SDK DLL for the runner
@@ -127,6 +154,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path $rel | Out-Null
           Copy-Item "build/projects/LemonadeNexusSDK/lemonade_nexus_sdk.dll" $rel -Force
           Copy-Item "projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h" $rel -Force
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v5
+        with:
+          path: .pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('apps/LemonadeNexusClient/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
 
       - uses: subosito/flutter-action@v2
         with:
@@ -142,6 +176,26 @@ jobs:
       - name: Build Windows app
         working-directory: apps/LemonadeNexusClient
         run: flutter build windows --release
+
+      # The install-step bundle assembly could silently regress (it has
+      # before); assert the runtime-critical pieces made it next to the exe.
+      - name: Verify Windows bundle is complete
+        shell: pwsh
+        run: |
+          $bundle = "apps/LemonadeNexusClient/build/windows/x64/runner/Release"
+          $required = @(
+            "nexus-client.exe",
+            "flutter_windows.dll",
+            "lemonade_nexus_sdk.dll",
+            "data/icudtl.dat",
+            "data/app.so",
+            "data/flutter_assets"
+          )
+          $missing = $required | Where-Object { -not (Test-Path (Join-Path $bundle $_)) }
+          if ($missing) { Write-Error "bundle missing: $($missing -join ', ')"; exit 1 }
+          $plugins = (Get-ChildItem $bundle -Filter '*_plugin.dll').Count
+          if ($plugins -lt 3) { Write-Error "only $plugins plugin DLLs — expected >= 3"; exit 1 }
+          Write-Output "bundle complete ($plugins plugin DLLs)"
 
       - uses: actions/upload-artifact@v4
         with:
