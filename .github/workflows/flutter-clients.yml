@@ -1,14 +1,14 @@
 name: Flutter Desktop Clients
 
 # Builds the self-contained native SDK shared library and the Flutter desktop
-# client (apps/LemonadeNexus) on macOS and Windows, and runs analyze + tests.
+# client (apps/LemonadeNexusClient) on macOS and Windows, and runs analyze + tests.
 # Packaging (DMG / MSIX) is layered on top of these artifacts separately.
 
 on:
   push:
     branches: [main, client-port-flutter]
     paths:
-      - 'apps/LemonadeNexus/**'
+      - 'apps/LemonadeNexusClient/**'
       - 'projects/LemonadeNexusSDK/**'
       - 'projects/LemonadeNexus/src/Boringtun/**'
       - 'cmake/**'
@@ -16,7 +16,7 @@ on:
       - '.github/workflows/flutter-clients.yml'
   pull_request:
     paths:
-      - 'apps/LemonadeNexus/**'
+      - 'apps/LemonadeNexusClient/**'
       - 'projects/LemonadeNexusSDK/**'
       - 'cmake/**'
       - '.github/workflows/flutter-clients.yml'
@@ -68,20 +68,20 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
       - name: Analyze + test
-        working-directory: apps/LemonadeNexus
+        working-directory: apps/LemonadeNexusClient
         run: |
           flutter pub get
           flutter analyze
           flutter test
 
       - name: Build macOS app
-        working-directory: apps/LemonadeNexus
+        working-directory: apps/LemonadeNexusClient
         run: flutter build macos --release
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lemonade-nexus-macos
-          path: apps/LemonadeNexus/build/macos/Build/Products/Release/*.app
+          name: nexus-client-macos
+          path: apps/LemonadeNexusClient/build/macos/Build/Products/Release/*.app
 
   windows:
     runs-on: windows-2022
@@ -133,17 +133,17 @@ jobs:
           flutter-version: ${{ env.FLUTTER_VERSION }}
 
       - name: Analyze + test
-        working-directory: apps/LemonadeNexus
+        working-directory: apps/LemonadeNexusClient
         run: |
           flutter pub get
           flutter analyze
           flutter test
 
       - name: Build Windows app
-        working-directory: apps/LemonadeNexus
+        working-directory: apps/LemonadeNexusClient
         run: flutter build windows --release
 
       - uses: actions/upload-artifact@v4
         with:
-          name: lemonade-nexus-windows
-          path: apps/LemonadeNexus/build/windows/x64/runner/Release/
+          name: nexus-client-windows
+          path: apps/LemonadeNexusClient/build/windows/x64/runner/Release/
