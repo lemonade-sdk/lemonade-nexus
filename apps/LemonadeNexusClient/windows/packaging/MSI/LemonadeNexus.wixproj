@@ -44,7 +44,7 @@
   <ItemGroup>
     <WixCompile Include="Product.wxs" />
     <!-- HarvestedFiles.wxs is generated at build time by heat.exe;
-         see .github/workflows/build-windows-packages.yml. -->
+         see the Build-MSI step in ../build.ps1. -->
     <WixCompile Include="HarvestedFiles.wxs" Condition="Exists('HarvestedFiles.wxs')" />
   </ItemGroup>
 

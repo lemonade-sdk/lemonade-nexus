@@ -232,11 +232,13 @@ function Build-MSIX {
             throw "MSIX creation failed with exit code $LASTEXITCODE"
         }
 
-        # Copy to output directory
+        # Copy to output directory (msix_config.output_path in pubspec.yaml)
         $msixSource = Join-Path $ProjectRoot 'build\windows\msix\nexus-client.msix'
         if (Test-Path $msixSource) {
             Copy-Item $msixSource -Destination $msixOutputDir -Force
             Write-Status "MSIX package created: $(Join-Path $msixOutputDir 'nexus-client.msix')" 'SUCCESS'
+        } else {
+            throw "MSIX not found at $msixSource"
         }
 
     } finally {
@@ -257,8 +259,34 @@ function Build-MSI {
     $wixDir = Join-Path $ProjectRoot 'windows\packaging\MSI'
     $buildDir = Join-Path $ProjectRoot 'build\windows\x64\runner\Release'
 
+    if (-not (Test-Path (Join-Path $buildDir 'nexus-client.exe'))) {
+        throw "Flutter release bundle not found at $buildDir - run the Flutter build first"
+    }
+
     Push-Location $wixDir
     try {
+        # Harvest the Flutter bundle into the ApplicationFiles component group
+        # that Product.wxs references.
+        Write-Status 'Harvesting Flutter bundle with heat...'
+
+        $heatArgs = @(
+            'dir', $buildDir,
+            '-cg', 'ApplicationFiles',
+            '-dr', 'INSTALLFOLDER',
+            '-srd',            # Root files go directly into INSTALLFOLDER
+            '-sreg', '-scom',  # No registry/COM harvesting from binaries
+            '-gg',             # Generate stable component GUIDs now
+            '-var', 'var.BuildDir',
+            '-out', 'HarvestedFiles.wxs'
+        )
+
+        Write-Status "Running: heat $($heatArgs -join ' ')"
+        & 'heat' @heatArgs
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "Heat harvesting failed with exit code $LASTEXITCODE"
+        }
+
         # Compile WiX source files
         Write-Status 'Compiling WiX source files...'
 
@@ -267,7 +295,7 @@ function Build-MSI {
             "-dBuildDir=$buildDir",
             '-out', (Join-Path $msiOutputDir 'obj\'),
             'Product.wxs',
-            'Installer.wxs'
+            'HarvestedFiles.wxs'
         )
 
         New-Directory (Join-Path $msiOutputDir 'obj')
@@ -279,15 +307,16 @@ function Build-MSI {
             throw "Candle compilation failed with exit code $LASTEXITCODE"
         }
 
-        # Link WiX object files
+        # Link WiX object files (WixUIExtension provides WixUI_InstallDir)
         Write-Status 'Linking WiX object files...'
 
         $lightArgs = @(
             '-cultures:en-us',
+            '-ext', 'WixUIExtension',
             '-out', (Join-Path $msiOutputDir 'nexus-client-setup.msi'),
             '-sval',  # Skip validation
             (Join-Path $msiOutputDir 'obj\Product.wixobj'),
-            (Join-Path $msiOutputDir 'obj\Installer.wixobj')
+            (Join-Path $msiOutputDir 'obj\HarvestedFiles.wixobj')
         )
 
         Write-Status "Running: light $($lightArgs -join ' ')"
@@ -316,15 +345,18 @@ function Build-EXE {
 
     $buildDir = Join-Path $ProjectRoot 'build\windows\x64\runner\Release'
 
-    # Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data\)
-    Copy-Item (Join-Path $buildDir '*') -Destination $exeOutputDir -Recurse -Force
+    # The whole Release bundle is the portable app: exe, engine, SDK DLL,
+    # plugin DLLs, and data (flutter_assets, icudtl,
+    # app.so). Stage it under a named folder so the zip extracts cleanly.
+    $stageDir = Join-Path $exeOutputDir 'nexus-client'
+    Remove-Directory $stageDir
+    New-Directory $stageDir
+    Copy-Item (Join-Path $buildDir '*') -Destination $stageDir -Recurse -Force
 
     # Create ZIP archive
     $zipPath = Join-Path $exeOutputDir 'nexus-client-portable.zip'
-    if (Test-Path $exeOutputDir) {
-        Compress-Archive -Path "$exeOutputDir\*" -DestinationPath $zipPath -Force
-        Write-Status "Portable package created: $zipPath" 'SUCCESS'
-    }
+    Compress-Archive -Path $stageDir -DestinationPath $zipPath -Force
+    Write-Status "Portable package created: $zipPath" 'SUCCESS'
 }
 
 # =============================================================================

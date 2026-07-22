@@ -116,6 +116,3 @@ if(NOT EXISTS "${SDK_RELEASE_DIR}/lemonade_nexus_sdk.dll")
 endif()
 install(FILES "${SDK_RELEASE_DIR}/lemonade_nexus_sdk.dll"
   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime OPTIONAL)
-# Legacy TUN driver; bundled only if present.
-install(FILES "${SDK_RELEASE_DIR}/wintun.dll"
-  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}" COMPONENT Runtime OPTIONAL)

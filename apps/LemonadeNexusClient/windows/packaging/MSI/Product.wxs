@@ -3,9 +3,10 @@
   WiX Toolset Product Definition for Lemonade Nexus VPN.
 
   This file owns the Product, directory layout, shortcuts and features.
-  The file payload (ComponentGroup Id="ApplicationFiles") must be harvested
-  from the Flutter bundle with heat.exe at build time; no script does this
-  yet, so the MSI pipeline is not currently functional end to end.
+  The actual file payload is generated at build time by heat.exe into
+  HarvestedFiles.wxs (ComponentGroup Id="ApplicationFiles", DirectoryRef
+  Id="INSTALLFOLDER"). See the Build-MSI step in ../build.ps1 (mirrored
+  in build.bat / build.sh).
 
   Variables expected from candle.exe:
     -dBuildDir=<absolute path to Flutter Release output>

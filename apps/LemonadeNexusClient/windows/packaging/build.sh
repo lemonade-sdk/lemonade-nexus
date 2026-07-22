@@ -70,11 +70,14 @@ build_msi() {
 
     mkdir -p "$MSI_DIR/obj"
 
+    echo "Harvesting Flutter bundle with heat..."
+    heat dir "$BUILD_DIR" -cg ApplicationFiles -dr INSTALLFOLDER -srd -sreg -scom -gg -var var.BuildDir -out "$MSI_DIR/HarvestedFiles.wxs"
+
     echo "Compiling WiX source files..."
-    candle -arch x64 -dBuildDir="$BUILD_DIR" -out "$MSI_DIR/obj/" "$MSI_DIR/Product.wxs"
+    candle -arch x64 -dBuildDir="$BUILD_DIR" -out "$MSI_DIR/obj/" "$MSI_DIR/Product.wxs" "$MSI_DIR/HarvestedFiles.wxs"
 
     echo "Linking WiX object files..."
-    light -cultures:en-us -out "$MSI_DIR/nexus-client-setup.msi" -sval "$MSI_DIR/obj/Product.wixobj"
+    light -cultures:en-us -ext WixUIExtension -out "$MSI_DIR/nexus-client-setup.msi" -sval "$MSI_DIR/obj/Product.wixobj" "$MSI_DIR/obj/HarvestedFiles.wixobj"
 
     echo "MSI installer created successfully."
 }
@@ -83,15 +86,16 @@ build_exe() {
     echo "Creating standalone package..."
 
     BUILD_DIR="$(pwd)/build/windows/x64/runner/Release"
-    EXE_DIR="$(pwd)/build/windows/packages/exe"
+    EXE_DIR="$(pwd)/build/windows/packages/exe/nexus-client"
 
+    # The whole Release bundle is the portable app (exe, engine, SDK DLL,
+    # plugin DLLs, data/).
+    rm -rf "$EXE_DIR"
     mkdir -p "$EXE_DIR"
-
-    # Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data/)
     cp -r "$BUILD_DIR/." "$EXE_DIR/"
 
     echo "Creating ZIP archive..."
-    (cd "$EXE_DIR" && zip -r ../../packages/nexus-client-portable.zip .)
+    (cd "$EXE_DIR/.." && zip -r ../nexus-client-portable.zip nexus-client)
 
     echo "Standalone package created successfully."
 }

@@ -76,20 +76,29 @@ if "%BUILD_TYPE%"=="msi" (
         exit /b 1
     )
 
+    REM Delayed expansion (!VAR!) is required: %VAR% inside this block would
+    REM expand before the set lines run.
     set BUILD_DIR=%cd%\build\windows\x64\runner\Release
     set MSI_DIR=%cd%\windows\packaging\MSI
 
-    mkdir "%MSI_DIR%\obj" 2>nul
+    mkdir "!MSI_DIR!\obj" 2>nul
+
+    echo Harvesting Flutter bundle with heat...
+    heat dir "!BUILD_DIR!" -cg ApplicationFiles -dr INSTALLFOLDER -srd -sreg -scom -gg -var var.BuildDir -out "!MSI_DIR!\HarvestedFiles.wxs"
+    if errorlevel 1 (
+        echo ERROR: Heat harvesting failed
+        exit /b 1
+    )
 
     echo Compiling WiX source files...
-    candle -arch x64 -dBuildDir="%BUILD_DIR%" -out "%MSI_DIR%\obj\" "%MSI_DIR%\Product.wxs" "%MSI_DIR%\Installer.wxs"
+    candle -arch x64 -dBuildDir="!BUILD_DIR!" -out "!MSI_DIR!\obj\" "!MSI_DIR!\Product.wxs" "!MSI_DIR!\HarvestedFiles.wxs"
     if errorlevel 1 (
         echo ERROR: Candle compilation failed
         exit /b 1
     )
 
     echo Linking WiX object files...
-    light -cultures:en-us -out "%MSI_DIR%\nexus-client-setup.msi" -sval "%MSI_DIR%\obj\Product.wixobj" "%MSI_DIR%\obj\Installer.wixobj"
+    light -cultures:en-us -ext WixUIExtension -out "!MSI_DIR!\nexus-client-setup.msi" -sval "!MSI_DIR!\obj\Product.wixobj" "!MSI_DIR!\obj\HarvestedFiles.wixobj"
     if errorlevel 1 (
         echo ERROR: Light linking failed
         exit /b 1
@@ -102,15 +111,18 @@ REM Build standalone EXE
 if "%BUILD_TYPE%"=="exe" (
     echo Creating standalone package...
     set BUILD_DIR=%cd%\build\windows\x64\runner\Release
-    set EXE_DIR=%cd%\build\windows\packages\exe
+    set EXE_DIR=%cd%\build\windows\packagesexe
+exus-client
 
-    mkdir "%EXE_DIR%" 2>nul
+    if exist "!EXE_DIR!" rmdir /s /q "!EXE_DIR!"
+    mkdir "!EXE_DIR!" 2>nul
 
-    REM Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data\)
-    xcopy /E /I /Y "%BUILD_DIR%" "%EXE_DIR%"
+    REM The whole Release bundle is the portable app (exe, engine, SDK DLL,
+    REM plugin DLLs, data\).
+    xcopy /E /I /Y "!BUILD_DIR!\*" "!EXE_DIR!"
 
     echo Creating ZIP archive...
-    powershell -Command "Compress-Archive -Path '%EXE_DIR%\*' -DestinationPath '%cd%\build\windows\packages\nexus-client-portable.zip' -Force"
+    powershell -Command "Compress-Archive -Path '!EXE_DIR!' -DestinationPath '%cd%\build\windows\packages\nexus-client-portable.zip' -Force"
 
     echo Standalone package created successfully.
 )
@@ -133,11 +145,14 @@ if "%BUILD_TYPE%"=="all" (
         set BUILD_DIR=%cd%\build\windows\x64\runner\Release
         set MSI_DIR=%cd%\windows\packaging\MSI
 
-        mkdir "%MSI_DIR%\obj" 2>nul
+        mkdir "!MSI_DIR!\obj" 2>nul
 
-        candle -arch x64 -dBuildDir="%BUILD_DIR%" -out "%MSI_DIR%\obj\" "%MSI_DIR%\Product.wxs" "%MSI_DIR%\Installer.wxs"
+        heat dir "!BUILD_DIR!" -cg ApplicationFiles -dr INSTALLFOLDER -srd -sreg -scom -gg -var var.BuildDir -out "!MSI_DIR!\HarvestedFiles.wxs"
         if not errorlevel 1 (
-            light -cultures:en-us -out "%MSI_DIR%\nexus-client-setup.msi" -sval "%MSI_DIR%\obj\Product.wixobj" "%MSI_DIR%\obj\Installer.wixobj"
+            candle -arch x64 -dBuildDir="!BUILD_DIR!" -out "!MSI_DIR!\obj\" "!MSI_DIR!\Product.wxs" "!MSI_DIR!\HarvestedFiles.wxs"
+            if not errorlevel 1 (
+                light -cultures:en-us -ext WixUIExtension -out "!MSI_DIR!\nexus-client-setup.msi" -sval "!MSI_DIR!\obj\Product.wixobj" "!MSI_DIR!\obj\HarvestedFiles.wixobj"
+            )
         )
     ) else (
         echo WARNING: WiX Toolset not found, skipping MSI build
@@ -146,14 +161,15 @@ if "%BUILD_TYPE%"=="all" (
     REM Standalone
     echo Creating standalone package...
     set BUILD_DIR=%cd%\build\windows\x64\runner\Release
-    set EXE_DIR=%cd%\build\windows\packages\exe
+    set EXE_DIR=%cd%\build\windows\packagesexe
+exus-client
 
-    mkdir "%EXE_DIR%" 2>nul
+    if exist "!EXE_DIR!" rmdir /s /q "!EXE_DIR!"
+    mkdir "!EXE_DIR!" 2>nul
 
-    REM Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data\)
-    xcopy /E /I /Y "%BUILD_DIR%" "%EXE_DIR%" >nul
+    xcopy /E /I /Y "!BUILD_DIR!\*" "!EXE_DIR!" >nul
 
-    powershell -Command "Compress-Archive -Path '%EXE_DIR%\*' -DestinationPath '%cd%\build\windows\packages\nexus-client-portable.zip' -Force"
+    powershell -Command "Compress-Archive -Path '!EXE_DIR!' -DestinationPath '%cd%\build\windows\packages\nexus-client-portable.zip' -Force"
 
     echo All packages created.
 )

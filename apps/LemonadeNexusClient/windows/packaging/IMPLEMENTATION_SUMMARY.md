@@ -2,323 +2,68 @@
 
 ## Overview
 
-This document summarizes the complete Windows packaging implementation for the Lemonade Nexus VPN Flutter client.
+Current state of Windows packaging for the Lemonade Nexus VPN Flutter client.
 
-**Date:** 2026-04-09
-**Version:** 1.0.0.0
-**Status:** COMPLETE
+**Version:** 1.0.0 (from `pubspec.yaml`; MSIX derives its quad version from it)
 
-## Files Created
+## What Exists
 
-### Configuration Files
+### Configuration
 
-| File | Purpose | Status |
-|------|---------|--------|
-| `apps/LemonadeNexusClient/pubspec.yaml` | Updated with msix_config | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/MSIX/AppxManifest.xml` | MSIX package manifest | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/MSIX/msix.yaml` | MSIX build settings | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/MSI/Product.wxs` | WiX product definition | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/MSI/Installer.wxs` | WiX installer config | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/MSI/BuildFiles.wxs` | WiX heat template | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/MSI/LemonadeNexus.wixproj` | WiX MSBuild project | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/signing/sign-config.yaml` | Code signing config | DONE |
+| File | Purpose |
+|------|---------|
+| `apps/LemonadeNexusClient/pubspec.yaml` | `msix_config` for `dart run msix:create` |
+| `windows/packaging/MSIX/AppxManifest.xml` | MSIX manifest reference |
+| `windows/packaging/MSIX/msix.yaml` | MSIX package settings reference |
+| `windows/packaging/MSI/Product.wxs` | WiX product: directories, shortcuts, features |
+| `windows/packaging/MSI/LemonadeNexus.wixproj` | WiX MSBuild project |
+| `windows/packaging/signing/sign-config.yaml` | Code signing configuration |
+
+`HarvestedFiles.wxs` (the `ApplicationFiles` component group with the actual
+file payload) is generated at build time by `heat.exe` from the Flutter
+release bundle — it is not checked in.
 
 ### Build Scripts
 
-| File | Purpose | Status |
-|------|---------|--------|
-| `apps/LemonadeNexusClient/windows/packaging/build.ps1` | PowerShell build script | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/build.bat` | Batch build script | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/build.sh` | Bash build script | DONE |
-
-### CI/CD Workflows
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `.github/workflows/build-windows-packages.yml` | Build on push/PR | DONE |
-| `.github/workflows/release-windows.yml` | Release on tag | DONE |
-
-### Documentation
-
-| File | Purpose | Status |
-|------|---------|--------|
-| `apps/LemonadeNexusClient/windows/packaging/README.md` | Packaging overview | DONE |
-| `apps/LemonadeNexusClient/windows/packaging/PACKAGING.md` | Detailed guide | DONE |
-| `apps/LemonadeNexusClient/assets/README.md` | Asset requirements | DONE |
-| `apps/LemonadeNexusClient/keys/README.md` | Certificate guide | DONE |
-
-### Directory Structure Created
-
-```
-apps/LemonadeNexusClient/
-├── pubspec.yaml (updated)
-├── assets/
-│   └── README.md
-├── keys/
-│   └── README.md
-└── windows/
-    └── packaging/
-        ├── README.md
-        ├── PACKAGING.md
-        ├── build.ps1
-        ├── build.bat
-        ├── build.sh
-        ├── MSIX/
-        │   ├── AppxManifest.xml
-        │   └── msix.yaml
-        ├── MSI/
-        │   ├── Product.wxs
-        │   ├── Installer.wxs
-        │   ├── BuildFiles.wxs
-        │   └── LemonadeNexus.wixproj
-        └── signing/
-            └── sign-config.yaml
-
-.github/workflows/
-├── build-windows-packages.yml
-└── release-windows.yml
-```
-
-## Package Types Supported
-
-### 1. MSIX Package
-
-**Configuration:**
-- Package Name: LemonadeNexus.LemonadeNexusVPN
-- Publisher: CN=Lemonade Nexus, O=Lemonade Nexus, C=US
-- Architecture: x64
-- Min Windows Version: 10.0.17763.0
-
-**Features:**
-- Microsoft Store compatible
-- Clean install/uninstall
-- Automatic updates support
-- Protocol activation (lemonade-nexus://)
-- File type association (.lnxconfig)
-- Startup task configuration
-
-**Output:** `build/windows/msix/nexus-client.msix`
-
-### 2. MSI Installer
-
-**Configuration:**
-- Product Code: {A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
-- Manufacturer: Lemonade Nexus
-- Architecture: x64
-- Install Scope: perMachine
-
-**Features:**
-- Enterprise deployment ready
-- SCCM/Intune compatible
-- Custom install directory
-- Desktop/Start menu shortcuts
-- Auto-start option
-- Service installation
-
-**Output:** `windows/packaging/MSI/nexus-client-setup.msi`
-
-### 3. Portable EXE
-
-**Features:**
-- No installation required
-- Self-contained
-- ZIP archive format
-
-**Output:** `build/windows/packages/nexus-client-portable.zip`
-
-## Code Signing Configuration
-
-### Supported Signing Methods
-
-1. **PFX File**
-   - Local certificate file
-   - Password protected
-
-2. **Certificate Store**
-   - Windows certificate store
-   - Subject name or thumbprint lookup
-
-3. **Azure Key Vault** (configured via sign-config.yaml)
-
-4. **SignPath.io** (configured via sign-config.yaml)
-
-### Timestamp Servers
-
-- Primary: http://timestamp.digicert.com
-- Backup: http://timestamp.sectigo.com
-- Algorithm: SHA-256
-
-## CI/CD Pipeline
-
-### Build Workflow (build-windows-packages.yml)
-
-**Triggers:**
-- Push to main/develop branches
-- Pull requests to main
-
-**Jobs:**
-1. build-msix - Creates MSIX package
-2. build-msi - Creates MSI installer
-3. build-standalone - Creates portable ZIP
-4. build-all - Aggregator job with summary
-
-### Release Workflow (release-windows.yml)
-
-**Triggers:**
-- Tag push (v*)
-- Manual workflow dispatch
-
-**Jobs:**
-1. get-version - Extract version from tag/input
-2. build-windows-packages - Build all packages
-3. sign-packages - Code signing (optional)
-4. create-release - GitHub release with assets
-5. publish-winget - Submit to Winget (optional)
-
-## Build Commands
-
-### PowerShell (Recommended)
-
-```powershell
-cd apps/LemonadeNexusClient
-.\windows\packaging\build.ps1 -BuildType all -Configuration release
-```
-
-### Batch
-
-```batch
-cd appsemonadenexusclient
-windows\packaging\build.bat all release
-```
-
-### Dart/Flutter Direct
-
-```powershell
-# MSIX only
-flutter pub get
-dart run msix:create
-```
-
-### WiX Toolset (MSI)
-
-```powershell
-# Compile
-candle -arch x64 -dBuildDir="path\to\build" Product.wxs Installer.wxs
-
-# Link
-light -out nexus-client-setup.msi Product.wixobj Installer.wixobj
-```
-
-## Required Assets
-
-Before building, create these files in `assets/`:
-
-| File | Size | Format | Required |
-|------|------|--------|----------|
-| app_icon.png | 256x256 | PNG | Yes (MSIX) |
-| app_icon.ico | Multi-size | ICO | Yes (MSI) |
-| splash_screen.png | 620x300 | PNG | Optional |
-| banner.bmp | 493x58 | BMP | Yes (MSI) |
-| dialog.bmp | 493x312 | BMP | Yes (MSI) |
-
-## Environment Variables
-
-### For Building
-
-```bash
-FLUTTER_ROOT=C:/src/flutter  # If not default
-```
-
-### For Signing
-
-```bash
-CERT_PASSWORD=your-password
-CERT_FILE_PATH=path/to/certificate.pfx
-```
-
-### For CI/CD
-
-```yaml
-secrets:
-  CERT_PASSWORD: <pfx-password>
-  CERT_PFX_BASE64: <base64-encoded-pfx>
-  WINGET_TOKEN: <winget-pat>
-```
-
-## Distribution Channels
-
-| Channel | Package | Status |
-|---------|---------|--------|
-| GitHub Releases | MSIX, MSI, ZIP | CONFIGURED |
-| Microsoft Store | MSIX (.appxupload) | READY |
-| Winget | MSIX | AUTO-SUBMIT |
-| SCCM/Intune | MSI | READY |
-| Direct Download | MSIX, MSI, ZIP | CONFIGURED |
-
-## Testing Checklist
-
-### Pre-Build
-
-- [ ] Flutter SDK installed (3.19.0+)
-- [ ] WiX Toolset installed (v3.14)
-- [ ] Windows SDK installed
-- [ ] Assets created in assets/
-- [ ] Certificate available (for signing)
-
-### Post-Build
-
-- [ ] MSIX installs successfully
-- [ ] MSI installs successfully
-- [ ] Portable EXE runs
-- [ ] Signatures valid (if signed)
-- [ ] Shortcuts created correctly
-- [ ] Uninstall works cleanly
-
-## Next Steps
-
-1. **Create Icon Assets**
-   - Design and export app_icon.png
-   - Generate multi-size ICO file
-   - Create MSI bitmaps
-
-2. **Obtain Code Signing Certificate**
-   - Purchase EV certificate (recommended)
-   - Configure in sign-config.yaml
-   - Add to GitHub secrets
-
-3. **Test Build Locally**
-   - Run build.ps1
-   - Test installers
-   - Verify functionality
-
-4. **First Release**
-   - Create git tag (v1.0.0)
-   - Push to trigger release workflow
-   - Verify GitHub release assets
-   - Test Winget submission
-
-## Known Limitations
-
-1. **MSIX Sandbox**
-   - Currently configured for full trust
-   - Sandbox mode requires additional testing
-
-2. **MSI Custom Actions**
-   - CustomActions.dll placeholder
-   - Requires implementation for advanced features
-
-3. **Code Signing**
-   - Self-signed certs trigger SmartScreen warnings
-   - EV certificate recommended for production
-
-## Support
-
-- Documentation: See PACKAGING.md
-- Issues: https://github.com/antmi/lemonade-nexus/issues
-- CI/CD: Check Actions tab for build status
-
-## Version History
-
-| Version | Date | Changes |
-|---------|------|---------|
-| 1.0.0.0 | 2026-04-09 | Initial implementation |
+`build.ps1` (canonical), mirrored by `build.bat` and `build.sh`. Targets:
+
+| Target | Output |
+|--------|--------|
+| `msix` | `build/windows/msix/nexus-client.msix` (copied to `build/windows/packages/msix/`) |
+| `msi` | `build/windows/packages/msi/nexus-client-setup.msi` (ps1) / `windows/packaging/MSI/` (bat, sh) |
+| `exe` | `build/windows/packages/exe/nexus-client-portable.zip` — the full Release bundle |
+| `all` | All of the above |
+
+The MSI flow is: `heat` harvests `build/windows/x64/runner/Release` →
+`candle` compiles `Product.wxs` + `HarvestedFiles.wxs` → `light` links with
+`WixUIExtension`. The MSI installs the client app and shortcuts only — no
+Windows service (the coordination server ships separately).
+
+### CI
+
+`.github/workflows/flutter-clients.yml` builds the raw Windows release bundle
+and verifies its completeness (exe, engine, SDK DLL, assets, plugin
+DLLs). Installer packaging is **not** automated yet; run the scripts locally.
+
+## Bundled Runtime Pieces
+
+Every package carries the full Release bundle produced by
+`flutter build windows --release`: the runner exe, `flutter_windows.dll`,
+`lemonade_nexus_sdk.dll` (self-contained; OpenSSL/sodium/boringtun statically
+embedded), plugin DLLs, and `data/` (flutter_assets, icudtl.dat, app.so).
+
+## Prerequisites
+
+- Flutter SDK (CI pins the version in `flutter-clients.yml`)
+- Built native SDK staged at `build/projects/LemonadeNexusSDK/Release/`
+  (see `docs/Building.md`)
+- WiX Toolset v3 (`heat`/`candle`/`light` on PATH) for MSI
+- Windows SDK SignTool for signing (optional; `sign_msix: false` by default)
+
+## Known Gaps / Next Steps
+
+1. No packaging CI — MSIX/MSI/ZIP are built locally.
+2. Packages are unsigned by default; production needs a code-signing
+   certificate (see `signing/sign-config.yaml`).
+3. MSI UI bitmaps (`banner.bmp`, `dialog.bmp`) use WiX defaults; custom art
+   is optional polish.

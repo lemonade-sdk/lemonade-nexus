@@ -11,10 +11,9 @@ windows/packaging/
 │   └── msix.yaml              # MSIX package settings
 │
 ├── MSI/                       # MSI installer configuration
-│   ├── Product.wxs            # WiX product definition
-│   ├── Installer.wxs          # WiX installer configuration
-│   ├── BuildFiles.wxs         # WiX heat-generated files
+│   ├── Product.wxs            # WiX product definition (shortcuts, features)
 │   └── LemonadeNexus.wixproj  # WiX project file
+│   (HarvestedFiles.wxs is generated at build time by heat.exe — not in git)
 │
 ├── signing/                   # Code signing configuration
 │   └── sign-config.yaml       # Signing settings
@@ -64,16 +63,16 @@ flutter pub get
 
 ### pubspec.yaml
 
-MSIX configuration is in the root `pubspec.yaml`:
+MSIX configuration is in the root `pubspec.yaml` (the package version derives
+from the pubspec `version:` field):
 
 ```yaml
 msix_config:
   display_name: Lemonade Nexus VPN
   publisher_display_name: Lemonade Nexus
   identity_name: LemonadeNexus.LemonadeNexusVPN
-  logo_path: assets\app_icon.png
-  version: 1.0.0.0
-  sign_msix: true
+  architecture: x64
+  sign_msix: false
 ```
 
 ### MSIX Settings
@@ -103,15 +102,14 @@ Edit `windows/packaging/signing/sign-config.yaml` for:
 
 ### GitHub Actions
 
-Workflows are in `.github/workflows/`:
-
-- `build-windows-packages.yml` - Build on push/PR
-- `release-windows.yml` - Release on tag
+`.github/workflows/flutter-clients.yml` builds and sanity-checks the raw
+Windows release bundle on every push/PR touching the client. Installer
+packaging (MSIX/MSI/ZIP) is not automated yet — run the build scripts locally.
 
 ### Environment Variables
 
 ```yaml
-# Required for signing
+# Required for signing (when packaging CI is added)
 CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
 CERT_PFX_BASE64: ${{ secrets.CERT_PFX_BASE64 }}
 ```
@@ -148,7 +146,7 @@ Purchase from trusted CA:
 
 ### GitHub Releases
 
-Packages are automatically uploaded on release tags.
+Attach locally built packages to releases (no release automation yet).
 
 ### Microsoft Store
 
@@ -161,7 +159,7 @@ Packages are automatically uploaded on release tags.
 
 ### Winget
 
-Manifest automatically submitted on release.
+Submit a manifest manually per release (not automated).
 
 ### Enterprise
 
@@ -205,8 +203,7 @@ where signtool
 ## Documentation
 
 - [PACKAGING.md](PACKAGING.md) - Detailed packaging guide
-- [assets/README.md](../assets/README.md) - Asset requirements
-- [keys/README.md](../keys/README.md) - Code signing guide
+- [signing/sign-config.yaml](signing/sign-config.yaml) - Code signing configuration
 
 ## Support
 

@@ -38,18 +38,17 @@ Add-AppxPackage nexus-client-1.0.0.msix
 - Traditional Windows installer
 - SCCM/Intune deployment support
 - Custom installation options
-- Service installation
 - Registry integration
 
-**File:** `nexus-client-setup-<version>.msi`
+**File:** `nexus-client-setup.msi`
 
 **Installation:**
 ```powershell
 # Silent installation
-msiexec /i nexus-client-setup-1.0.0.msi /quiet
+msiexec /i nexus-client-setup.msi /quiet
 
 # Interactive installation
-msiexec /i nexus-client-setup-1.0.0.msi
+msiexec /i nexus-client-setup.msi
 
 # Deploy via SCCM
 # Use the MSI file in your application deployment
@@ -131,12 +130,10 @@ flutter pub get
 
 ### CI/CD Builds
 
-Packages are automatically built on:
-- Push to `main` branch
-- Pull requests to `main`
-- Release tags (v*)
-
-See `.github/workflows/build-windows-packages.yml` and `.github/workflows/release-windows.yml`
+CI (`.github/workflows/flutter-clients.yml`) builds and sanity-checks the raw
+Windows release bundle on every push/PR touching the client, but does not yet
+produce installer packages. MSIX/MSI/portable packages are built locally with
+the scripts above.
 
 ## Code Signing
 
