@@ -47,6 +47,12 @@ void resolve_server_region(
 /// Resolve public IP: config > non-wildcard bind address > ipify auto-detect.
 [[nodiscard]] std::string resolve_public_ip(const ServerConfig& config);
 
+/// TCP connect probe with timeout. Used to sanity-check that our advertised
+/// public IP actually accepts connections (auto-detection measures the egress
+/// path, which is not necessarily the ingress on multihomed/VPN'd hosts).
+[[nodiscard]] bool tcp_connect_check(const std::string& ip, uint16_t port,
+                                     int timeout_sec);
+
 /// Resolve IPv4 (A) records for a hostname via the system resolver (getaddrinfo).
 /// Returns de-duplicated dotted-quad strings; empty on failure.
 [[nodiscard]] std::vector<std::string> resolve_a_records(const std::string& hostname);
@@ -83,10 +89,12 @@ void resolve_server_region(
     ipam::IPAMService& ipam,
     gossip::GossipService& gossip);
 
-/// Resolve TLS certificate paths:
-/// manual override > existing ACME cert on disk > needs_acme_background flag.
+/// Resolve the TLS certificate paths for `server_fqdn`. The cert is always
+/// ACME-issued (public CA on the SEIP FQDN); this returns the cert on disk for
+/// THIS FQDN, or needs_acme_background=true when it must still be requested.
+/// Each listener resolves its OWN FQDN independently — the private listener
+/// (private.<seip>) never receives the public cert.
 [[nodiscard]] TlsResolution resolve_tls_cert(
-    const ServerConfig& config,
     const std::filesystem::path& data_root,
     const std::string& server_fqdn);
 

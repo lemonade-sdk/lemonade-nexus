@@ -213,7 +213,9 @@ std::optional<json> ClientService::http_post(const ServerEndpoint& server,
     const auto host = server.address + ":" + std::to_string(server.http_port);
 
     try {
-        httplib::Client cli(server.address, server.http_port);
+        // Verified HTTPS by the server's cert FQDN (server.address must be an
+        // FQDN); no plaintext, no verification-disabled path.
+        httplib::SSLClient cli(server.address, server.http_port);
         cli.set_connection_timeout(5);   // seconds
         cli.set_read_timeout(10);        // seconds
         cli.set_write_timeout(5);        // seconds
@@ -255,7 +257,9 @@ std::optional<json> ClientService::http_get(const ServerEndpoint& server,
     const auto host = server.address + ":" + std::to_string(server.http_port);
 
     try {
-        httplib::Client cli(server.address, server.http_port);
+        // Verified HTTPS by the server's cert FQDN (server.address must be an
+        // FQDN); no plaintext, no verification-disabled path.
+        httplib::SSLClient cli(server.address, server.http_port);
         cli.set_connection_timeout(5);
         cli.set_read_timeout(10);
 

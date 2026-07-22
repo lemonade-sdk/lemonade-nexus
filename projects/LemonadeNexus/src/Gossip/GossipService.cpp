@@ -10,6 +10,8 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <optional>
+#include <unordered_set>
 
 namespace nexus::gossip {
 
@@ -127,6 +129,9 @@ void GossipService::on_start() {
             }
             if (!our_region_.empty()) {
                 hello["region"] = our_region_;
+            }
+            if (!our_advertised_endpoint_.empty()) {
+                hello["advertised_endpoint"] = our_advertised_endpoint_;
             }
             auto payload_str = hello.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
@@ -575,7 +580,8 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             handle_peer_exchange(remote_endpoint_, payload, payload_len);
             break;
         case GossipMsgType::ServerHello:
-            handle_server_hello(remote_endpoint_, payload, payload_len);
+            handle_server_hello(remote_endpoint_, payload, payload_len,
+                                sender_pubkey_b64);
             break;
         case GossipMsgType::TeeChallenge:
             handle_tee_challenge(remote_endpoint_, payload, payload_len);
@@ -584,10 +590,11 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             handle_tee_response(remote_endpoint_, payload, payload_len);
             break;
         case GossipMsgType::EnrollmentVoteRequest:
-            handle_enrollment_vote_request(remote_endpoint_, payload, payload_len);
+            handle_enrollment_vote_request(remote_endpoint_, sender_pubkey_b64,
+                                            payload, payload_len);
             break;
         case GossipMsgType::EnrollmentVote:
-            handle_enrollment_vote(remote_endpoint_, payload, payload_len);
+            handle_enrollment_vote(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
             break;
         case GossipMsgType::RootKeyRotation:
             handle_root_key_rotation(remote_endpoint_, payload, payload_len);
@@ -822,7 +829,15 @@ void GossipService::handle_peer_exchange(const asio::ip::udp::endpoint& sender,
             for (const auto& p : our_peers) {
                 json peer_j;
                 peer_j["pubkey"]           = p.pubkey;
-                peer_j["endpoint"]         = p.endpoint;
+                // Only relay an advertised endpoint we confirmed against the
+                // peer's real UDP source; an unconfirmed advertisement is
+                // attacker-controlled and would steer third parties at an
+                // arbitrary address (reflection). Fall back to the observed
+                // source otherwise.
+                peer_j["endpoint"]         = (p.advertised_confirmed &&
+                                              !p.advertised_endpoint.empty())
+                                                 ? p.advertised_endpoint
+                                                 : p.endpoint;
                 peer_j["http_port"]        = p.http_port;
                 peer_j["certificate_json"] = p.certificate_json;
                 peers_array.push_back(std::move(peer_j));
@@ -933,6 +948,8 @@ void GossipService::on_gossip_tick() {
             json hello = *our_certificate_;
             if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
             if (!our_region_.empty()) hello["region"] = our_region_;
+            if (!our_advertised_endpoint_.empty())
+                hello["advertised_endpoint"] = our_advertised_endpoint_;
             auto hello_str = hello.dump();
             std::vector<uint8_t> hello_bytes(hello_str.begin(), hello_str.end());
             for (const auto& ep : pending) {
@@ -1031,11 +1048,15 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
 
 void GossipService::load_peers() {
     std::lock_guard lock(peers_mutex_);
-    peers_.clear();
+    // Do NOT clear: seed peers added (with empty pubkey) before start() must
+    // survive so the startup ServerHello reaches them. Merge by endpoint.
+    std::unordered_set<std::string> known_endpoints;
+    for (const auto& p : peers_) known_endpoints.insert(p.endpoint);
 
     auto envelope = storage_.read_file("identity", "peers.json");
     if (!envelope) {
-        spdlog::info("[{}] no peers.json found, starting with empty peer list", name());
+        spdlog::info("[{}] no peers.json found ({} seed peer(s) present)",
+                     name(), peers_.size());
         return;
     }
 
@@ -1048,19 +1069,21 @@ void GossipService::load_peers() {
 
         for (const auto& p : j["peers"]) {
             GossipPeer peer;
-            peer.pubkey           = p.value("pubkey", "");
-            peer.endpoint         = p.value("endpoint", "");
-            peer.http_port        = p.value("http_port", uint16_t{9100});
-            peer.last_seen        = p.value("last_seen", uint64_t{0});
-            peer.reputation       = p.value("reputation", 1.0f);
-            peer.certificate_json = p.value("certificate_json", "");
+            peer.pubkey              = p.value("pubkey", "");
+            peer.endpoint            = p.value("endpoint", "");
+            peer.advertised_endpoint = p.value("advertised_endpoint", "");
+            peer.http_port           = p.value("http_port", uint16_t{9100});
+            peer.last_seen           = p.value("last_seen", uint64_t{0});
+            peer.reputation          = p.value("reputation", 1.0f);
+            peer.certificate_json    = p.value("certificate_json", "");
 
-            if (!peer.pubkey.empty() && !peer.endpoint.empty()) {
+            if (!peer.pubkey.empty() && !peer.endpoint.empty() &&
+                known_endpoints.insert(peer.endpoint).second) {
                 peers_.push_back(std::move(peer));
             }
         }
 
-        spdlog::info("[{}] loaded {} peers from storage", name(), peers_.size());
+        spdlog::info("[{}] {} peer(s) after loading storage", name(), peers_.size());
 
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse peers.json: {}", name(), e.what());
@@ -1074,12 +1097,13 @@ void GossipService::save_peers() {
     json peers_array = json::array();
     for (const auto& p : peers_) {
         json peer_j;
-        peer_j["pubkey"]           = p.pubkey;
-        peer_j["endpoint"]         = p.endpoint;
-        peer_j["http_port"]        = p.http_port;
-        peer_j["last_seen"]        = p.last_seen;
-        peer_j["reputation"]       = p.reputation;
-        peer_j["certificate_json"] = p.certificate_json;
+        peer_j["pubkey"]              = p.pubkey;
+        peer_j["endpoint"]            = p.endpoint;
+        peer_j["advertised_endpoint"] = p.advertised_endpoint;
+        peer_j["http_port"]           = p.http_port;
+        peer_j["last_seen"]           = p.last_seen;
+        peer_j["reputation"]          = p.reputation;
+        peer_j["certificate_json"]    = p.certificate_json;
         peers_array.push_back(std::move(peer_j));
     }
     j["peers"] = std::move(peers_array);
@@ -1312,6 +1336,14 @@ void GossipService::save_revoked_servers() const {
     (void)storage_.write_file("identity", "revoked_servers.json", env);
 }
 
+void GossipService::add_revoked_server(const std::string& server_pubkey) {
+    const std::string pk = normalize_pubkey(server_pubkey);
+    if (pk.empty() || is_revoked(pk)) return;  // idempotent
+    revoked_pubkeys_.push_back(pk);
+    save_revoked_servers();
+    spdlog::warn("[{}] revoked superseded server pubkey {}", name(), pk);
+}
+
 void GossipService::apply_ban(const std::string& pubkey, const MisbehaviorProof& proof) {
     const std::string pk = normalize_pubkey(pubkey);
     if (pk.empty() || is_revoked(pk)) return;  // idempotent
@@ -1417,6 +1449,61 @@ bool GossipService::peer_has_verified_certificate(const std::string& pubkey) con
     }
 }
 
+bool GossipService::peer_certificate_is_root_signed(const std::string& pubkey) const {
+    // Governance-grade electorate test -- NEVER fail-open. With no root pubkey
+    // configured there is no anchor to attest membership, so the answer is false
+    // and the admission electorate is empty (the ballot then fails closed at
+    // tier1_count==0). Requires a stored certificate that (a) belongs to this
+    // pubkey, (b) is not revoked, and (c) verifies against the configured root via
+    // verify_cert_core -- a real issuer==root check + Ed25519 signature verify,
+    // NOT verify_server_certificate, which returns true for any cert when no root
+    // is set. peer_has_verified_certificate uses that fail-open path and is thus
+    // unsafe as a governance gate.
+    if (!has_root_pubkey_) return false;
+    if (pubkey.empty() || is_revoked(pubkey)) return false;
+
+    std::string cert_json;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = std::find_if(peers_.begin(), peers_.end(),
+            [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+        if (it == peers_.end() || it->certificate_json.empty()) return false;
+        cert_json = it->certificate_json;
+    }
+
+    try {
+        auto cert = json::parse(cert_json).get<ServerCertificate>();
+        if (cert.server_pubkey != pubkey) return false;
+        return verify_cert_core(cert);   // root-anchored; no fail-open
+    } catch (...) {
+        return false;
+    }
+}
+
+bool GossipService::self_is_eligible_voter(bool is_admission) const {
+    // peers_ never contains us, so the peer predicates can't answer for us.
+    // Admission needs a root-signed, non-revoked cert (no fail-open).
+    const auto our_pk = crypto::to_base64(keypair_.public_key);
+    if (is_revoked(our_pk)) return false;
+
+    if (is_admission) {
+        if (!has_root_pubkey_ || !our_certificate_) return false;
+        if (our_certificate_->server_pubkey != our_pk) return false;
+        if (!verify_cert_core(*our_certificate_)) return false;
+    } else if (!our_certificate_) {
+        return false;
+    }
+
+    // With a trust policy installed, apply the same tier rule as remote voters.
+    if (trust_policy_) {
+        const auto tier = trust_policy_->our_tier();
+        return is_admission
+            ? (tier == core::TrustTier::Tier1)
+            : (tier == core::TrustTier::Tier1 || tier == core::TrustTier::Tier2);
+    }
+    return true;
+}
+
 std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) const {
     if (pubkey.empty() || is_revoked(pubkey)) return {};
 
@@ -1443,7 +1530,8 @@ std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) cons
 
 void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                                           const uint8_t* payload,
-                                          std::size_t payload_len) {
+                                          std::size_t payload_len,
+                                          const std::string& signer_pubkey) {
     try {
         auto j = json::parse(std::string_view{
             reinterpret_cast<const char*>(payload), payload_len});
@@ -1452,6 +1540,19 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
 
         if (!verify_server_certificate(cert)) {
             spdlog::warn("[{}] rejected ServerHello from {}:{} — invalid certificate",
+                          name(), sender.address().to_string(), sender.port());
+            return;
+        }
+
+        // Proof of possession: the certificate is public, so a valid root
+        // signature alone does not prove the presenter holds cert.server_pubkey's
+        // private key. The packet signer is cryptographically authenticated
+        // (verify_packet_signature in handle_receive), so require it to match the
+        // cert identity before we bind that identity to this endpoint — otherwise
+        // anyone replaying a public cert could hijack a peer's endpoint mapping.
+        if (cert.server_pubkey != signer_pubkey) {
+            spdlog::warn("[{}] rejected ServerHello from {}:{} — cert pubkey does not "
+                          "match packet signer (proof-of-possession failed)",
                           name(), sender.address().to_string(), sender.port());
             return;
         }
@@ -1482,24 +1583,51 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
             std::lock_guard lock(peers_mutex_);
             auto it = std::find_if(peers_.begin(), peers_.end(),
                 [&](const GossipPeer& p) { return p.pubkey == pk; });
+            if (it == peers_.end()) {
+                // A seed peer is added by endpoint with an empty pubkey. Upgrade
+                // it in place on first hello — appending a second entry would
+                // leave a certless duplicate that the re-introduce loop hellos
+                // at every tick, forever.
+                it = std::find_if(peers_.begin(), peers_.end(),
+                    [&](const GossipPeer& p) { return p.pubkey.empty() && p.endpoint == ep; });
+                if (it != peers_.end()) it->pubkey = pk;
+            }
 
+            const auto advertised = j.value("advertised_endpoint", std::string{});
+            // Cross-check the advertised endpoint against the UDP source we
+            // actually observed. Only a match is "source-confirmed" and safe to
+            // relay to third parties / seed; an unconfirmed advertisement is
+            // attacker-controlled (it is not covered by the signed certificate).
+            const bool advertised_confirmed = !advertised.empty() && advertised == ep;
             if (it != peers_.end()) {
                 it->certificate_json = j.dump();
                 it->region = j.value("region", "");
+                if (!advertised.empty()) {
+                    it->advertised_endpoint  = advertised;
+                    it->advertised_confirmed = advertised_confirmed;
+                }
                 it->last_seen = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
             } else {
                 GossipPeer peer;
-                peer.pubkey           = pk;
-                peer.endpoint         = ep;
-                peer.region           = j.value("region", "");
-                peer.http_port        = 9100; // will be updated via peer exchange
-                peer.last_seen        = static_cast<uint64_t>(
+                peer.pubkey             = pk;
+                peer.endpoint           = ep;
+                peer.advertised_endpoint = advertised;
+                peer.advertised_confirmed = advertised_confirmed;
+                peer.region             = j.value("region", "");
+                peer.http_port          = 9100; // will be updated via peer exchange
+                peer.last_seen          = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
-                peer.reputation       = 1.0f;
-                peer.certificate_json = j.dump();
+                peer.reputation         = 1.0f;
+                peer.certificate_json   = j.dump();
                 peers_.push_back(std::move(peer));
             }
+
+            // Heal duplicates persisted before this fix: once this endpoint has
+            // an identified entry, any certless twin is redundant.
+            std::erase_if(peers_, [&](const GossipPeer& p) {
+                return p.pubkey.empty() && p.endpoint == ep;
+            });
         }
 
         spdlog::info("[{}] accepted ServerHello from {} ({})",
@@ -1522,6 +1650,8 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                     json response = *our_certificate_;
                     response["is_response"] = true;
                     response["assigned_tunnel_ip"] = assigned_ip;
+                    if (!our_advertised_endpoint_.empty())
+                        response["advertised_endpoint"] = our_advertised_endpoint_;
                     auto payload_str = response.dump();
                     std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
                     send_packet(sender, GossipMsgType::ServerHello, payload_bytes);
@@ -1532,6 +1662,8 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
         else if (our_certificate_ && !j.value("is_response", false)) {
             json response = *our_certificate_;
             response["is_response"] = true;
+            if (!our_advertised_endpoint_.empty())
+                response["advertised_endpoint"] = our_advertised_endpoint_;
             auto payload_str = response.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
             send_packet(sender, GossipMsgType::ServerHello, payload_bytes);
@@ -1554,45 +1686,50 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
 
         // If quorum enrollment is enabled, start a vote before full admission
         if (enrollment_quorum_enabled_ && !j.value("is_response", false)) {
-            // Check if we already have a pending enrollment for this pubkey
-            std::lock_guard lock(peers_mutex_);
-            bool already_pending = false;
-            for (const auto& [rid, ballot] : pending_enrollments_) {
-                if (ballot.candidate_pubkey == pk &&
-                    ballot.state == EnrollmentBallot::State::Collecting) {
-                    already_pending = true;
-                    break;
+            // Insert under the lock, then broadcast and self-vote with it RELEASED:
+            // both callees take peers_mutex_ themselves and it is not recursive.
+            std::optional<EnrollmentBallot> opened;
+            {
+                std::lock_guard lock(peers_mutex_);
+                bool already_pending = false;
+                for (const auto& [rid, ballot] : pending_enrollments_) {
+                    if (ballot.candidate_pubkey == pk &&
+                        ballot.state == EnrollmentBallot::State::Collecting) {
+                        already_pending = true;
+                        break;
+                    }
+                }
+
+                if (!already_pending) {
+                    // Generate a unique request ID
+                    std::array<uint8_t, 16> request_id_bytes{};
+                    crypto_.random_bytes(std::span<uint8_t>(request_id_bytes));
+                    auto request_id = crypto::to_hex(std::span<const uint8_t>(request_id_bytes));
+
+                    auto now = static_cast<uint64_t>(
+                        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+                    EnrollmentBallot ballot;
+                    ballot.request_id         = request_id;
+                    ballot.candidate_pubkey   = pk;
+                    ballot.candidate_server_id = cert.server_id;
+                    ballot.certificate_json   = j.dump();
+                    ballot.sponsor_pubkey     = crypto::to_base64(keypair_.public_key);
+                    ballot.created_at         = now;
+                    ballot.timeout_at         = now + enrollment_vote_timeout_sec_;
+
+                    pending_enrollments_[request_id] = ballot;
+                    opened = std::move(ballot);
+
+                    spdlog::info("[{}] enrollment quorum started for '{}' (request: {})",
+                                  name(), cert.server_id, request_id.substr(0, 12));
                 }
             }
 
-            if (!already_pending) {
-                // Generate a unique request ID
-                std::array<uint8_t, 16> request_id_bytes{};
-                crypto_.random_bytes(std::span<uint8_t>(request_id_bytes));
-                auto request_id = crypto::to_hex(std::span<const uint8_t>(request_id_bytes));
-
-                auto now = static_cast<uint64_t>(
-                    chrono::system_clock::to_time_t(chrono::system_clock::now()));
-
-                EnrollmentBallot ballot;
-                ballot.request_id         = request_id;
-                ballot.candidate_pubkey   = pk;
-                ballot.candidate_server_id = cert.server_id;
-                ballot.certificate_json   = j.dump();
-                ballot.sponsor_pubkey     = crypto::to_base64(keypair_.public_key);
-                ballot.created_at         = now;
-                ballot.timeout_at         = now + enrollment_vote_timeout_sec_;
-
-                pending_enrollments_[request_id] = ballot;
-
-                spdlog::info("[{}] enrollment quorum started for '{}' (request: {})",
-                              name(), cert.server_id, request_id.substr(0, 12));
-
-                // Broadcast vote request to all peers
-                broadcast_enrollment_vote_request(ballot);
-
+            if (opened) {
+                broadcast_enrollment_vote_request(*opened);
                 // We auto-vote approve since we verified the certificate
-                cast_enrollment_vote(request_id, pk, true, "certificate_valid");
+                cast_enrollment_vote(opened->request_id, pk, true, "certificate_valid");
             }
         }
     } catch (const std::exception& e) {
@@ -1796,6 +1933,16 @@ void GossipService::set_enrollment_config(bool enabled, float ratio,
     }
 }
 
+void GossipService::set_admission_quorum_ratio(float ratio) {
+    std::lock_guard lock(peers_mutex_);
+    admission_quorum_ratio_ = std::clamp(ratio, 0.0f, 1.0f);
+}
+
+void GossipService::set_preferred_ns_slot(uint8_t slot) {
+    std::lock_guard lock(peers_mutex_);
+    preferred_ns_slot_ = slot > 9 ? 0 : slot;
+}
+
 std::vector<EnrollmentBallot> GossipService::pending_enrollments() const {
     std::lock_guard lock(peers_mutex_);
     std::vector<EnrollmentBallot> result;
@@ -1805,20 +1952,66 @@ std::vector<EnrollmentBallot> GossipService::pending_enrollments() const {
     return result;
 }
 
+void GossipService::start_admission_ballot(const std::string& request_id,
+                                            const std::string& candidate_pubkey,
+                                            const std::string& server_id,
+                                            const std::string& claim_json,
+                                            const std::string& claim_hash,
+                                            float required_ratio) {
+    auto now = static_cast<uint64_t>(
+        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+    EnrollmentBallot ballot;
+    ballot.request_id          = request_id;
+    ballot.candidate_pubkey    = candidate_pubkey;
+    ballot.candidate_server_id = server_id;
+    ballot.admission_claim_json = claim_json;
+    ballot.claim_hash          = claim_hash;
+    ballot.sponsor_pubkey      = crypto::to_base64(keypair_.public_key);
+    ballot.created_at          = now;
+    ballot.timeout_at          = now + enrollment_vote_timeout_sec_;
+    ballot.kind                = EnrollmentBallot::Kind::Admission;
+    ballot.required_ratio      = required_ratio;
+    {
+        std::lock_guard lock(peers_mutex_);
+        // We sponsor this id, so our ballot is authoritative: a remote vote request
+        // must not pre-empt it by claiming the id first (that would swap in an
+        // attacker-chosen candidate while approval still mints from OUR record).
+        // Re-entry with our own ballot stays a no-op.
+        auto it = pending_enrollments_.find(request_id);
+        if (it != pending_enrollments_.end() &&
+            it->second.sponsor_pubkey == ballot.sponsor_pubkey) return;
+        pending_enrollments_[request_id] = ballot;
+    }
+    broadcast_enrollment_vote_request(ballot);
+    // Sponsor auto-votes approve (counted only if the sponsor is Tier1).
+    cast_enrollment_vote(request_id, candidate_pubkey, true, "sponsor");
+    check_enrollment_quorum(request_id);
+}
+
 void GossipService::broadcast_enrollment_vote_request(const EnrollmentBallot& ballot) {
     json request = {
         {"request_id",         ballot.request_id},
         {"candidate_pubkey",   ballot.candidate_pubkey},
         {"candidate_server_id", ballot.candidate_server_id},
-        {"certificate",        json::parse(ballot.certificate_json)},
         {"sponsor_pubkey",     ballot.sponsor_pubkey},
         {"timestamp",          ballot.created_at},
     };
+    if (ballot.kind == EnrollmentBallot::Kind::Admission) {
+        // Certless candidate: carry its self-signed onboarding claim instead.
+        request["admission_claim"] = ballot.admission_claim_json.empty()
+            ? json::object() : json::parse(ballot.admission_claim_json);
+        // Advisory: voters recompute it and drop the ballot on a mismatch.
+        request["claim_hash"] = ballot.claim_hash;
+        request["required_ratio"] = ballot.required_ratio;
+    } else {
+        request["certificate"] = json::parse(ballot.certificate_json);
+    }
 
-    // Attach our attestation token if we're Tier1
-    if (trust_policy_ && trust_policy_->our_tier() == core::TrustTier::Tier1) {
-        auto token = trust_policy_->generate_attestation_token(keypair_);
-        request["attestation_token"] = token;
+    // Always attach when a policy is installed: the receiver now hard-rejects a
+    // missing token, and it adjudicates the tier itself. Nothing restricts
+    // sponsoring to Tier1, so a Tier2 sponsor must still be able to open a ballot.
+    if (trust_policy_) {
+        request["attestation_token"] = trust_policy_->generate_attestation_token(keypair_);
     }
 
     auto payload_str = request.dump();
@@ -1837,13 +2030,34 @@ void GossipService::broadcast_enrollment_vote_request(const EnrollmentBallot& ba
 void GossipService::cast_enrollment_vote(const std::string& request_id,
                                            const std::string& candidate_pubkey,
                                            bool approve, const std::string& reason) {
+    // Same eligibility gate as inbound votes: a vote we may not cast must not
+    // enter our tally or the wire.
+    bool is_admission = false;
+    std::string claim_hash;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = pending_enrollments_.find(request_id);
+        if (it == pending_enrollments_.end()) return;
+        is_admission = it->second.kind == EnrollmentBallot::Kind::Admission;
+        claim_hash   = it->second.claim_hash;
+    }
+    if (!self_is_eligible_voter(is_admission)) {
+        spdlog::debug("[{}] not casting {} vote for '{}': this server is not an "
+                      "eligible voter", name(),
+                      is_admission ? "admission" : "enrollment", request_id);
+        return;
+    }
+
     auto now = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
-    // Build canonical vote JSON for signing (sorted keys, excludes signature)
+    // Build canonical vote JSON for signing (sorted keys, excludes signature).
+    // Without claim_hash a signed vote transfers to any later claim under the
+    // same request_id.
     json canonical_vote = {
         {"approve",          approve},
         {"candidate_pubkey", candidate_pubkey},
+        {"claim_hash",       claim_hash},
         {"reason",           reason},
         {"request_id",       request_id},
         {"timestamp",        now},
@@ -1860,6 +2074,7 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
     vote.approve          = approve;
     vote.reason           = reason;
     vote.timestamp        = now;
+    vote.claim_hash       = claim_hash;
     vote.signature        = crypto::to_base64(sig);
 
     // Add to our own ballot
@@ -1879,6 +2094,7 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
         {"approve",          vote.approve},
         {"reason",           vote.reason},
         {"timestamp",        vote.timestamp},
+        {"claim_hash",       vote.claim_hash},
         {"signature",        vote.signature},
     };
     auto payload_str = vote_json.dump();
@@ -1895,6 +2111,7 @@ void GossipService::cast_enrollment_vote(const std::string& request_id,
 
 void GossipService::handle_enrollment_vote_request(
     const asio::ip::udp::endpoint& sender,
+    const std::string& sender_pubkey,
     const uint8_t* payload, std::size_t payload_len)
 {
     try {
@@ -1907,43 +2124,133 @@ void GossipService::handle_enrollment_vote_request(
 
         if (request_id.empty() || candidate_pubkey.empty()) return;
 
+        // The packet signature authenticates the sender, so the claimed sponsor must
+        // BE the sender. Without this anyone can open a ballot in a sponsor's name.
+        if (sponsor_pubkey.empty() || sponsor_pubkey != sender_pubkey) {
+            spdlog::warn("[{}] enrollment vote request from {} claiming sponsor {} — dropped",
+                          name(), sender_pubkey.substr(0, 12), sponsor_pubkey.substr(0, 12));
+            return;
+        }
+
+        // We open our own ballots locally; a remote one naming us would only serve
+        // to pre-empt ours.
+        if (sponsor_pubkey == crypto::to_base64(keypair_.public_key)) {
+            spdlog::warn("[{}] remote vote request claims us as sponsor — dropped", name());
+            return;
+        }
+
         // Check if we already have this request
         {
             std::lock_guard lock(peers_mutex_);
             if (pending_enrollments_.contains(request_id)) return; // already seen
         }
 
-        // Verify the sponsor's attestation token if trust is enabled
+        // Holding a key is not enrollment: only an enrolled, cert-verified peer may
+        // open a ballot here. No lock held — the predicate takes peers_mutex_.
+        if (!peer_has_verified_certificate(sponsor_pubkey)) {
+            spdlog::warn("[{}] enrollment vote request from non-enrolled sponsor {}",
+                          name(), sponsor_pubkey.substr(0, 12));
+            return;
+        }
+
+        // Under a trust policy the sponsor's attestation is REQUIRED — omitting the
+        // field used to skip the check entirely.
         if (trust_policy_) {
-            if (j.contains("attestation_token")) {
-                auto token = j["attestation_token"].get<core::AttestationToken>();
-                // The token must actually belong to the claimed sponsor, and the
-                // sponsor must be an enrolled, certificate-verified peer. Otherwise
-                // an attacker replays a stolen token under a forged sponsor_pubkey.
-                if (token.server_pubkey != sponsor_pubkey ||
-                    !peer_has_verified_certificate(sponsor_pubkey)) {
-                    spdlog::warn("[{}] enrollment vote request with mismatched/unverified "
-                                  "sponsor token (sponsor={}, token={})", name(),
-                                  sponsor_pubkey.substr(0, 12),
-                                  token.server_pubkey.substr(0, 12));
-                    return;
-                }
-                auto tier = trust_policy_->verify_and_update(sponsor_pubkey, token);
-                if (tier == core::TrustTier::Untrusted) {
-                    spdlog::warn("[{}] enrollment vote request from untrusted sponsor {}",
-                                  name(), sponsor_pubkey.substr(0, 12));
-                    return;
-                }
+            if (!j.contains("attestation_token")) {
+                spdlog::warn("[{}] enrollment vote request without sponsor attestation from {}",
+                              name(), sponsor_pubkey.substr(0, 12));
+                return;
+            }
+            auto token = j["attestation_token"].get<core::AttestationToken>();
+            // The token must belong to the claimed sponsor, else an attacker
+            // replays a stolen token under a forged sponsor_pubkey.
+            if (token.server_pubkey != sponsor_pubkey) {
+                spdlog::warn("[{}] enrollment vote request token belongs to {} not sponsor {}",
+                              name(), token.server_pubkey.substr(0, 12),
+                              sponsor_pubkey.substr(0, 12));
+                return;
+            }
+            auto tier = trust_policy_->verify_and_update(sponsor_pubkey, token);
+            if (tier == core::TrustTier::Untrusted) {
+                spdlog::warn("[{}] enrollment vote request from untrusted sponsor {}",
+                              name(), sponsor_pubkey.substr(0, 12));
+                return;
             }
         }
 
-        // Independently verify the candidate's certificate
-        bool cert_valid = false;
+        // Independently verify the candidate before voting. An ADMISSION ballot
+        // (certless governed join) carries the candidate's self-signed onboarding
+        // claim in "admission_claim"; a legacy ENROLLMENT ballot carries a
+        // root-signed "certificate". Read the RIGHT field for each: reading only
+        // "certificate" made every honest voter reject admissions (governed
+        // admission was non-functional).
+        const bool is_admission = j.contains("admission_claim");
+        bool candidate_ok = false;
         std::string server_id;
-        if (j.contains("certificate")) {
+        std::string local_claim_hash;
+        float required_ratio = 0.0f;
+
+        if (is_admission) {
+            // Verify the candidate's self-signed proof-of-possession: it must be
+            // signed by the SAME candidate_pubkey the ballot is about, over the
+            // canonical onboarding-request bytes. This proves the candidate controls
+            // the key WITHOUT trusting the sponsor's say-so (zero-trust: each voter
+            // checks independently). The canonical form MUST byte-match
+            // ServerAdmissionService::canonical_request ("ln-onboard:v1").
+            try {
+                const auto& claim = j["admission_claim"];
+                auto claim_cpk = claim.value("candidate_pubkey", std::string{});
+                auto nonce     = claim.value("nonce", std::string{});
+                auto region    = claim.value("region", std::string{});
+                auto ak        = claim.value("tpm_ak_pubkey", std::string{});
+                auto sig_b64   = claim.value("signature", std::string{});
+                auto ts        = claim.value("timestamp", uint64_t{0});
+                server_id      = claim.value("server_id", std::string{});
+                required_ratio = j.value("required_ratio", 0.0f);
+
+                auto put_lp = [](std::vector<uint8_t>& b, const std::string& s) {
+                    uint32_t n = static_cast<uint32_t>(s.size());
+                    for (int i = 0; i < 4; ++i) b.push_back((n >> (i * 8)) & 0xFF);
+                    b.insert(b.end(), s.begin(), s.end());
+                };
+                std::vector<uint8_t> msg;
+                put_lp(msg, "ln-onboard:v1");
+                put_lp(msg, nonce);
+                put_lp(msg, claim_cpk);
+                put_lp(msg, server_id);
+                put_lp(msg, region);
+                put_lp(msg, ak);
+                put_lp(msg, std::to_string(ts));
+
+                auto pk_bytes  = crypto::from_base64(claim_cpk);
+                auto sig_bytes = crypto::from_base64(sig_b64);
+                if (claim_cpk == candidate_pubkey &&
+                    pk_bytes.size()  == crypto::kEd25519PublicKeySize &&
+                    sig_bytes.size() == crypto::kEd25519SignatureSize) {
+                    crypto::Ed25519PublicKey pk{};
+                    crypto::Ed25519Signature sig{};
+                    std::memcpy(pk.data(), pk_bytes.data(), pk.size());
+                    std::memcpy(sig.data(), sig_bytes.data(), sig.size());
+                    candidate_ok = crypto_.ed25519_verify(pk, msg, sig);
+                }
+                // Our own hash of the bytes we verified, so the sponsor can't
+                // dictate the claim identity we sign.
+                local_claim_hash = crypto::to_hex(
+                    crypto_.sha256(std::span<const uint8_t>(msg)));
+            } catch (...) { candidate_ok = false; }
+
+            // An advertised hash that isn't the claim we got splits what we
+            // verify from what we sign.
+            if (auto adv = j.value("claim_hash", std::string{});
+                !adv.empty() && adv != local_claim_hash) {
+                spdlog::warn("[{}] admission vote request {} advertises a claim_hash that does "
+                              "not match its claim — dropped", name(), request_id.substr(0, 8));
+                return;
+            }
+        } else if (j.contains("certificate")) {
             try {
                 ServerCertificate cert = j["certificate"].get<ServerCertificate>();
-                cert_valid = verify_server_certificate(cert);
+                candidate_ok = verify_server_certificate(cert);
                 server_id = cert.server_id;
             } catch (...) {}
         }
@@ -1958,20 +2265,36 @@ void GossipService::handle_enrollment_vote_request(
             ballot.request_id          = request_id;
             ballot.candidate_pubkey    = candidate_pubkey;
             ballot.candidate_server_id = server_id;
-            ballot.certificate_json    = j.contains("certificate") ? j["certificate"].dump() : "";
+            ballot.certificate_json    = (!is_admission && j.contains("certificate"))
+                                             ? j["certificate"].dump() : "";
+            ballot.admission_claim_json = is_admission ? j["admission_claim"].dump() : "";
+            ballot.claim_hash          = local_claim_hash;   // ours, not the sponsor's
             ballot.sponsor_pubkey      = sponsor_pubkey;
             ballot.created_at          = now;
             ballot.timeout_at          = now + enrollment_vote_timeout_sec_;
+            // Stamp the KIND on the receiver's local copy so is_admission is correct
+            // on EVERY node: an admission ballot must apply the fail-closed genesis
+            // return and root-signed voter eligibility locally, not the enrollment
+            // auto-approve. required_ratio carries the sponsor's quorum threshold.
+            ballot.kind = is_admission ? EnrollmentBallot::Kind::Admission
+                                       : EnrollmentBallot::Kind::Enrollment;
+            // required_ratio is attacker-supplied: it may RAISE our bar, never lower
+            // it. Floor against the ADMISSION ratio (not the lower enrollment one),
+            // and set it even when the field is absent so omitting it can't downgrade.
+            if (is_admission)
+                ballot.required_ratio = std::max(std::clamp(required_ratio, 0.0f, 1.0f),
+                                                 admission_quorum_ratio_);
             pending_enrollments_[request_id] = ballot;
         }
 
         // Cast our vote
-        cast_enrollment_vote(request_id, candidate_pubkey,
-                              cert_valid, cert_valid ? "certificate_valid" : "cert_invalid");
+        cast_enrollment_vote(request_id, candidate_pubkey, candidate_ok,
+                              candidate_ok ? "candidate_verified" : "candidate_invalid");
 
-        spdlog::info("[{}] received enrollment vote request for '{}' — voted {}",
-                      name(), server_id.empty() ? candidate_pubkey.substr(0, 12) : server_id,
-                      cert_valid ? "approve" : "reject");
+        spdlog::info("[{}] received {} vote request for '{}' — voted {}",
+                      name(), is_admission ? "admission" : "enrollment",
+                      server_id.empty() ? candidate_pubkey.substr(0, 12) : server_id,
+                      candidate_ok ? "approve" : "reject");
 
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse enrollment vote request: {}", name(), e.what());
@@ -1980,6 +2303,7 @@ void GossipService::handle_enrollment_vote_request(
 
 void GossipService::handle_enrollment_vote(
     const asio::ip::udp::endpoint& sender,
+    const std::string& sender_pubkey,
     const uint8_t* payload, std::size_t payload_len)
 {
     try {
@@ -1992,14 +2316,37 @@ void GossipService::handle_enrollment_vote(
         auto approve          = j.value("approve", false);
         auto reason           = j.value("reason", "");
         auto timestamp        = j.value("timestamp", uint64_t{0});
+        auto vote_claim_hash  = j.value("claim_hash", "");
         auto signature        = j.value("signature", "");
 
         if (request_id.empty() || voter_pubkey.empty()) return;
+
+        // Packet-level gate: per-source cap + cheap DoS drop, run BEFORE the
+        // per-vote ed25519 verify below. verify_packet_signature already proved the
+        // datagram was signed by sender_pubkey, but key possession is not
+        // enrollment. Require the signing sender to be an enrolled, certificate-
+        // verified, non-revoked peer, and -- since a voter only ever broadcasts its
+        // OWN vote (votes are never relayed; see cast_enrollment_vote) -- require
+        // sender == voter. With the per-voter duplicate check below this caps each
+        // source at exactly one counted vote per ballot and drops fabricated-key
+        // sprays before the expensive signature verify. (Coarse pre-crypto filter;
+        // the authoritative kind-aware admission gate is the root-signed check below.)
+        if (!peer_has_verified_certificate(sender_pubkey)) {
+            spdlog::debug("[{}] dropping enrollment vote from non-enrolled source {}",
+                          name(), sender_pubkey.substr(0, 12));
+            return;
+        }
+        if (sender_pubkey != voter_pubkey) {
+            spdlog::warn("[{}] enrollment vote sender {} != voter {}; dropping", name(),
+                          sender_pubkey.substr(0, 12), voter_pubkey.substr(0, 12));
+            return;
+        }
 
         // Verify the vote signature
         json canonical_vote = {
             {"approve",          approve},
             {"candidate_pubkey", candidate_pubkey},
+            {"claim_hash",       vote_claim_hash},
             {"reason",           reason},
             {"request_id",       request_id},
             {"timestamp",        timestamp},
@@ -2027,11 +2374,53 @@ void GossipService::handle_enrollment_vote(
             return;
         }
 
-        // Only accept votes from Tier1 peers (if trust is enabled)
+        // Determine the ballot kind for vote-eligibility rules.
+        bool is_admission = false;
+        {
+            std::lock_guard lock(peers_mutex_);
+            auto it = pending_enrollments_.find(request_id);
+            if (it != pending_enrollments_.end())
+                is_admission = it->second.kind == EnrollmentBallot::Kind::Admission;
+        }
+
+        // Vote eligibility -- FAIL CLOSED, INDEPENDENT of trust_policy_. A signed
+        // vote proves only that the holder of voter_pubkey produced it; it does NOT
+        // prove voter_pubkey is an admitted member. This is the load-bearing fix:
+        // the old code gated eligibility entirely under `if (trust_policy_)`, so a
+        // null policy (the shipped default) counted fabricated self-signed votes.
+        //
+        //   * ADMISSION (mints a ROOT-SIGNED certificate) counts ONLY voters whose
+        //     certificate is genuinely root-signed and non-revoked. This predicate
+        //     does NOT fail open, so with no root configured NO admission vote is
+        //     ever counted and the ballot cannot resolve Approved.
+        //   * ENROLLMENT (legacy, no cert issued) keeps the advisory cert-verified
+        //     check.
+        // Fabricated voter_pubkeys are absent from peers_ (and unsigned by the
+        // root), so both branches reject them. These helpers lock peers_mutex_
+        // themselves and are called here with NO lock held.
+        if (is_admission) {
+            if (!peer_certificate_is_root_signed(voter_pubkey)) {
+                spdlog::warn("[{}] ignoring admission vote from non-root-certified voter {}",
+                              name(), voter_pubkey.substr(0, 12));
+                return;
+            }
+        } else if (!peer_has_verified_certificate(voter_pubkey)) {
+            spdlog::warn("[{}] ignoring enrollment vote from unverified voter {}",
+                          name(), voter_pubkey.substr(0, 12));
+            return;
+        }
+
+        // When a trust policy IS installed, additionally enforce tier: Admission
+        // requires Tier1 voters only; enrollment accepts Tier1/Tier2 (legacy).
         if (trust_policy_) {
             auto tier = trust_policy_->peer_tier(voter_pubkey);
-            if (tier != core::TrustTier::Tier1 && tier != core::TrustTier::Tier2) {
-                spdlog::debug("[{}] ignoring vote from untrusted peer {}", name(), voter_pubkey.substr(0, 12));
+            const bool ok = is_admission
+                ? (tier == core::TrustTier::Tier1)
+                : (tier == core::TrustTier::Tier1 || tier == core::TrustTier::Tier2);
+            if (!ok) {
+                spdlog::debug("[{}] ignoring {} vote from ineligible peer {}", name(),
+                              is_admission ? "admission" : "enrollment",
+                              voter_pubkey.substr(0, 12));
                 return;
             }
         }
@@ -2042,6 +2431,24 @@ void GossipService::handle_enrollment_vote(
             auto it = pending_enrollments_.find(request_id);
             if (it == pending_enrollments_.end()) return;
             if (it->second.state != EnrollmentBallot::State::Collecting) return;
+
+            // The signature covers candidate_pubkey, but matching on request_id
+            // alone let a genuine vote for one candidate be counted toward a ballot
+            // about a different candidate.
+            if (it->second.candidate_pubkey != candidate_pubkey) {
+                spdlog::warn("[{}] vote for candidate {} does not match ballot {} candidate {}",
+                              name(), candidate_pubkey.substr(0, 12), request_id.substr(0, 8),
+                              it->second.candidate_pubkey.substr(0, 12));
+                return;
+            }
+
+            // Same for the claim: a vote over claim A must not count toward a
+            // ballot about claim B. Enrollment carries no claim — both are "".
+            if (it->second.claim_hash != vote_claim_hash) {
+                spdlog::warn("[{}] vote on ballot {} is bound to a different claim; dropping",
+                              name(), request_id.substr(0, 8));
+                return;
+            }
 
             // Check for duplicate voter
             for (const auto& v : it->second.votes) {
@@ -2068,79 +2475,154 @@ void GossipService::handle_enrollment_vote(
 }
 
 void GossipService::check_enrollment_quorum(const std::string& request_id) {
-    std::lock_guard lock(peers_mutex_);
-    auto it = pending_enrollments_.find(request_id);
-    if (it == pending_enrollments_.end()) return;
-    if (it->second.state != EnrollmentBallot::State::Collecting) return;
+    // Peek the ballot kind under a brief lock so we can pick the right electorate
+    // predicate before computing the denominator (the predicates lock peers_mutex_
+    // themselves; it is non-recursive, so the denominator is computed with NO lock
+    // held).
+    bool is_admission = false;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = pending_enrollments_.find(request_id);
+        if (it == pending_enrollments_.end()) return;
+        if (it->second.state != EnrollmentBallot::State::Collecting) return;
+        is_admission = it->second.kind == EnrollmentBallot::Kind::Admission;
+    }
 
-    auto& ballot = it->second;
-
-    // Count Tier1 peers for quorum calculation
-    uint32_t tier1_count = 0;
-    if (trust_policy_) {
-        auto states = trust_policy_->all_peer_states();
-        for (const auto& s : states) {
-            if (s.tier == core::TrustTier::Tier1) ++tier1_count;
+    // Quorum DENOMINATOR = the attested electorate, NEVER peers_.size() (which an
+    // attacker pads with unauthenticated gossip contacts). ADMISSION counts ONLY
+    // peers holding a genuinely ROOT-SIGNED, non-revoked certificate
+    // (peer_certificate_is_root_signed, which does NOT fail open), so with no root
+    // anchor the electorate is empty and the ballot fails closed at tier1_count==0.
+    // ENROLLMENT (legacy) keeps the advisory cert-verified count. Either way the
+    // denominator is drawn from the SAME predicate as the voter-eligibility gate,
+    // independent of whether a trust policy is installed.
+    // Build the electorate as a SET, computed with no lock held: it is both the
+    // denominator and the filter for stored votes, so a voter that leaves the
+    // electorate (revoked, banned, or self-demoted to Tier2 by re-sending a
+    // ServerHello) stops counting in the numerator at the same instant it stops
+    // counting in the denominator.
+    std::unordered_set<std::string> eligible;
+    {
+        std::vector<std::string> pubkeys;
+        if (trust_policy_) {
+            // Mirror the inbound vote gate: admission is Tier1-only, legacy
+            // enrollment also accepts Tier2. Otherwise a vote we accepted is
+            // silently dropped from the tally by the eligibility filter below.
+            for (const auto& s : trust_policy_->all_peer_states()) {
+                const bool tier_ok = is_admission
+                    ? (s.tier == core::TrustTier::Tier1)
+                    : (s.tier == core::TrustTier::Tier1 || s.tier == core::TrustTier::Tier2);
+                if (tier_ok) pubkeys.push_back(s.pubkey);
+            }
+        } else {
+            std::lock_guard lock(peers_mutex_);
+            pubkeys.reserve(peers_.size());
+            for (const auto& p : peers_) pubkeys.push_back(p.pubkey);
         }
-    } else {
-        tier1_count = static_cast<uint32_t>(peers_.size());
+        for (const auto& pk : pubkeys) {
+            const bool ok = is_admission ? peer_certificate_is_root_signed(pk)
+                                         : peer_has_verified_certificate(pk);
+            if (ok) eligible.insert(pk);
+        }
     }
 
-    // Genesis case: no peers = auto-approve
-    if (tier1_count == 0) {
-        ballot.state = EnrollmentBallot::State::Approved;
-        spdlog::info("[{}] enrollment approved for '{}' (genesis — no peers)",
-                      name(), ballot.candidate_server_id);
-        return;
-    }
+    // We vote only when eligible, so count ourselves in the denominator too.
+    const uint32_t peer_voter_count = static_cast<uint32_t>(eligible.size());
+    if (self_is_eligible_voter(is_admission))
+        eligible.insert(crypto::to_base64(keypair_.public_key));
+    const uint32_t tier1_count = static_cast<uint32_t>(eligible.size());
 
-    // Count approval votes
-    uint32_t approve_count = 0;
-    uint32_t reject_count = 0;
-    for (const auto& v : ballot.votes) {
-        if (v.approve) ++approve_count;
-        else ++reject_count;
-    }
+    // An admission is never resolvable by the sponsor alone.
+    if (is_admission && peer_voter_count == 0) return;
 
-    uint32_t needed = std::max(1u, static_cast<uint32_t>(
-        std::ceil(static_cast<float>(tier1_count) * enrollment_quorum_ratio_)));
+    std::optional<EnrollmentBallot> decided;  // snapshot to notify outside the lock
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = pending_enrollments_.find(request_id);
+        if (it == pending_enrollments_.end()) return;
+        if (it->second.state != EnrollmentBallot::State::Collecting) return;
 
-    if (approve_count >= needed) {
-        ballot.state = EnrollmentBallot::State::Approved;
-        spdlog::info("[{}] enrollment APPROVED for '{}' ({}/{} votes, needed {})",
-                      name(), ballot.candidate_server_id,
-                      approve_count, ballot.votes.size(), needed);
-    } else if (reject_count > tier1_count - needed) {
-        // Impossible to reach quorum even if all remaining vote approve
-        ballot.state = EnrollmentBallot::State::Rejected;
-        spdlog::warn("[{}] enrollment REJECTED for '{}' ({} rejections)",
-                      name(), ballot.candidate_server_id, reject_count);
+        auto& ballot = it->second;
+
+        // Genesis case: no eligible voters = auto-approve. NOT for Admission —
+        // below-quorum admission is handled by sole discretion before any ballot.
+        if (tier1_count == 0) {
+            if (ballot.kind == EnrollmentBallot::Kind::Admission) return;
+            ballot.state = EnrollmentBallot::State::Approved;
+            spdlog::info("[{}] enrollment approved for '{}' (genesis — no peers)",
+                          name(), ballot.candidate_server_id);
+            decided = ballot;
+        } else {
+            uint32_t approve_count = 0;
+            uint32_t reject_count = 0;
+            for (const auto& v : ballot.votes) {
+                // Same predicate as the denominator: a stale vote from a voter who
+                // has since lost eligibility must not survive in the numerator.
+                if (!eligible.contains(v.voter_pubkey)) continue;
+                if (v.approve) ++approve_count;
+                else ++reject_count;
+            }
+
+            const float ratio = ballot.required_ratio > 0.0f
+                ? ballot.required_ratio : enrollment_quorum_ratio_;
+            uint32_t needed = std::max(1u, static_cast<uint32_t>(
+                std::ceil(static_cast<float>(tier1_count) * ratio)));
+
+            if (approve_count >= needed) {
+                ballot.state = EnrollmentBallot::State::Approved;
+                spdlog::info("[{}] {} APPROVED for '{}' ({}/{} votes, needed {})",
+                              name(),
+                              ballot.kind == EnrollmentBallot::Kind::Admission
+                                  ? "admission" : "enrollment",
+                              ballot.candidate_server_id,
+                              approve_count, ballot.votes.size(), needed);
+                decided = ballot;
+            } else if (reject_count > tier1_count - needed) {
+                ballot.state = EnrollmentBallot::State::Rejected;
+                spdlog::warn("[{}] {} REJECTED for '{}' ({} rejections)",
+                              name(),
+                              ballot.kind == EnrollmentBallot::Kind::Admission
+                                  ? "admission" : "enrollment",
+                              ballot.candidate_server_id, reject_count);
+                decided = ballot;
+            }
+        }
     }
+    if (decided && enrollment_decision_cb_) enrollment_decision_cb_(*decided);
 }
 
 void GossipService::expire_enrollment_ballots() {
     auto now = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
-    std::lock_guard lock(peers_mutex_);
-    for (auto& [id, ballot] : pending_enrollments_) {
-        if (ballot.state != EnrollmentBallot::State::Collecting) continue;
-        if (now < ballot.timeout_at) continue;
+    // broadcast_enrollment_vote_request and the decision callback both need to
+    // run without peers_mutex_ held, so gather work under the lock and act after.
+    std::vector<EnrollmentBallot> to_rebroadcast;
+    std::vector<EnrollmentBallot> timed_out;
+    {
+        std::lock_guard lock(peers_mutex_);
+        for (auto& [id, ballot] : pending_enrollments_) {
+            if (ballot.state != EnrollmentBallot::State::Collecting) continue;
+            if (now < ballot.timeout_at) continue;
 
-        if (ballot.retries < enrollment_max_retries_) {
-            // Retry: extend timeout, re-broadcast
-            ballot.retries++;
-            ballot.timeout_at = now + enrollment_vote_timeout_sec_;
-            spdlog::info("[{}] enrollment vote timeout for '{}', retry {}/{}",
-                          name(), ballot.candidate_server_id,
-                          ballot.retries, enrollment_max_retries_);
-            // Re-broadcast will happen on next gossip tick
-        } else {
-            ballot.state = EnrollmentBallot::State::TimedOut;
-            spdlog::warn("[{}] enrollment TIMED OUT for '{}' after {} retries",
-                          name(), ballot.candidate_server_id, enrollment_max_retries_);
+            if (ballot.retries < enrollment_max_retries_) {
+                ballot.retries++;
+                ballot.timeout_at = now + enrollment_vote_timeout_sec_;
+                spdlog::info("[{}] vote timeout for '{}', retry {}/{}",
+                              name(), ballot.candidate_server_id,
+                              ballot.retries, enrollment_max_retries_);
+                to_rebroadcast.push_back(ballot);
+            } else {
+                ballot.state = EnrollmentBallot::State::TimedOut;
+                spdlog::warn("[{}] TIMED OUT for '{}' after {} retries",
+                              name(), ballot.candidate_server_id, enrollment_max_retries_);
+                timed_out.push_back(ballot);
+            }
         }
     }
+    for (const auto& b : to_rebroadcast) broadcast_enrollment_vote_request(b);
+    if (enrollment_decision_cb_)
+        for (const auto& b : timed_out) enrollment_decision_cb_(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -2908,12 +3390,25 @@ void GossipService::try_claim_ns_slot(const std::string& our_public_ip) {
         return;
     }
 
-    // Find the lowest available slot (1-9)
+    // Pinned: claim exactly that slot or none — the registrar's glue points
+    // ns<pin> at us, so holding any other slot advertises a nameserver the
+    // registry contradicts. Otherwise take the lowest available slot (1-9).
     uint8_t chosen_slot = 0;
-    for (uint8_t i = 0; i < 9; ++i) {
-        if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-            chosen_slot = i + 1; // slots are 1-based
-            break;
+    if (preferred_ns_slot_ != 0) {
+        const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+        if (s.slot == 0 || s.server_pubkey.empty()) {
+            chosen_slot = preferred_ns_slot_;
+        } else {
+            spdlog::warn("[{}] pinned NS slot ns{} is held by {}; not claiming a slot",
+                          name(), preferred_ns_slot_, s.server_pubkey.substr(0, 12));
+            return;
+        }
+    } else {
+        for (uint8_t i = 0; i < 9; ++i) {
+            if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                chosen_slot = i + 1; // slots are 1-based
+                break;
+            }
         }
     }
 
@@ -3067,12 +3562,19 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             our_ns_slot_.reset();
             spdlog::warn("[{}] our NS slot ns{} was overwritten by {}, will try to re-claim",
                           name(), claim.slot, claim.server_pubkey);
-            // Find a new free slot
+            // Find a new free slot. Pinned: only the pinned slot is ever ours —
+            // if someone else now holds it, stand down instead of advertising a
+            // slot whose registry glue does not point at us.
             uint8_t new_slot = 0;
-            for (uint8_t i = 0; i < 9; ++i) {
-                if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-                    new_slot = i + 1;
-                    break;
+            if (preferred_ns_slot_ != 0) {
+                const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+                if (s.slot == 0 || s.server_pubkey.empty()) new_slot = preferred_ns_slot_;
+            } else {
+                for (uint8_t i = 0; i < 9; ++i) {
+                    if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                        new_slot = i + 1;
+                        break;
+                    }
                 }
             }
             if (new_slot > 0) {

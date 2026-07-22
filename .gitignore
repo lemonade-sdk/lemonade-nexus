@@ -41,9 +41,8 @@ Thumbs.db
 .swiftpm/
 Package.resolved
 
-# Rust
+# Rust (lock files are committed for reproducible builds)
 target/
-Cargo.lock
 
 # Unwanted files
 .claude/

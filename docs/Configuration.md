@@ -71,9 +71,6 @@ Priority (highest to lowest):
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--tls-cert-path <path>` | `SP_TLS_CERT_PATH` | `tls_cert_path` | | Manual TLS cert |
-| `--tls-key-path <path>` | `SP_TLS_KEY_PATH` | `tls_key_path` | | Manual TLS key |
-| `--no-auto-tls` | `SP_NO_AUTO_TLS` | `auto_tls` | `true` | Disable ACME |
 | `--acme-provider <name>` | `SP_ACME_PROVIDER` | `acme_provider` | `zerossl` | ACME CA |
 | `--acme-eab-kid <kid>` | `SP_ACME_EAB_KID` | `acme_eab_kid` | | ZeroSSL EAB Key ID |
 | `--acme-eab-hmac-key <key>` | `SP_ACME_EAB_HMAC_KEY` | `acme_eab_hmac_key` | | ZeroSSL EAB HMAC |
@@ -100,7 +97,6 @@ Priority (highest to lowest):
   "region": "us-west",
   "dns_base_domain": "lemonade-nexus.io",
   "server_hostname": "ns1",
-  "auto_tls": true,
   "acme_provider": "zerossl",
   "log_level": "info",
   "seed_peers": ["185.x.x.x:9102"]

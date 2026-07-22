@@ -159,6 +159,24 @@ uint16_t BoringtunMesh::tcp_egress(const std::string& dst_ip, uint16_t dst_port)
     return local;
 }
 
+bool BoringtunMesh::tcp_ingress(uint16_t vport, const std::string& target) {
+    if (!impl_->active.load() || !impl_->ns || impl_->tunnel_addr.empty()) return false;
+    if (vport == 0 || target.empty()) return false;
+    if (ns_add_tcp_forward(impl_->ns, impl_->tunnel_addr.c_str(), vport,
+                           target.c_str()) != 0) {
+        spdlog::warn("[BoringtunMesh] ingress {}:{} -> {} failed",
+                     impl_->tunnel_addr, vport, target);
+        return false;
+    }
+    spdlog::info("[BoringtunMesh] ingress {}:{} -> {}",
+                 impl_->tunnel_addr, vport, target);
+    return true;
+}
+
+uint16_t BoringtunMesh::bound_port() const {
+    return impl_->active.load() ? impl_->dp.bound_port() : 0;
+}
+
 StatusResult BoringtunMesh::sync_peers(const std::vector<MeshPeer>& desired) {
     StatusResult result;
     if (!impl_->active.load()) {

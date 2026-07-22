@@ -78,7 +78,12 @@ class _ServersViewState extends ConsumerState<ServersView> {
                   padding: const EdgeInsets.all(24),
                   child: Row(
                     children: [
-                      const SectionHeader(title: 'Mesh Servers', icon: Icons.dns),
+                      const Flexible(
+                        child: SectionHeader(
+                            title: 'Mesh Servers',
+                            icon: Icons.dns,
+                            flexibleTitle: true),
+                      ),
                       const Spacer(),
                       _buildHealthBadge(healthyCount, servers.length),
                       const SizedBox(width: 8),

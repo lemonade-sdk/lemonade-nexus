@@ -18,6 +18,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <functional>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +42,10 @@ class GossipService : public core::IService<GossipService>,
                        public IGossipProvider<GossipService> {
     friend class core::IService<GossipService>;
     friend class IGossipProvider<GossipService>;
+    // Test seam: the ballot handlers sit behind packet-signature verification and
+    // a bound socket, neither of which a unit test can drive. Reaching them via a
+    // friend keeps the production surface unchanged (tests/test_onboarding.cpp).
+    friend struct GossipBallotTestAccess;
 
 public:
     GossipService(asio::io_context& io, uint16_t port,
@@ -81,6 +86,13 @@ public:
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
     [[nodiscard]] std::string our_tunnel_ip() const;
 
+    /// Our own server_id from the installed certificate (nullopt if unenrolled).
+    /// Used by admission to stop a candidate claiming the root's own identity.
+    [[nodiscard]] std::optional<std::string> our_server_id() const {
+        return our_certificate_ ? std::optional<std::string>(our_certificate_->server_id)
+                                : std::nullopt;
+    }
+
     /// Set our backbone IP for inclusion in ServerHello messages.
     void set_our_backbone_ip(const std::string& ip) { our_backbone_ip_ = ip; }
 
@@ -89,6 +101,11 @@ public:
 
     /// Set our WG pubkey for inclusion in ServerHello messages.
     void set_our_wg_pubkey(const std::string& pubkey) { our_wg_pubkey_ = pubkey; }
+
+    /// Set the "ip:port" this server is reachable at, carried in ServerHello so
+    /// peers share it instead of the UDP source they happen to observe. Call
+    /// before start().
+    void set_our_advertised_endpoint(const std::string& ep) { our_advertised_endpoint_ = ep; }
 
     /// Broadcast a backbone IPAM allocation delta to all peers.
     void broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta);
@@ -173,9 +190,12 @@ private:
     // Pick up to N random peers for PeerExchange
     [[nodiscard]] std::vector<GossipPeer> random_peers(std::size_t count) const;
 
-    // ServerHello handler
+    // ServerHello handler. signer_pubkey is the packet's cryptographically
+    // authenticated sender key (proven by verify_packet_signature) — used to
+    // enforce proof-of-possession of the certificate identity.
     void handle_server_hello(const asio::ip::udp::endpoint& sender,
-                              const uint8_t* payload, std::size_t payload_len);
+                              const uint8_t* payload, std::size_t payload_len,
+                              const std::string& signer_pubkey);
 
     // TEE challenge/response handlers (mutual verification)
     void handle_tee_challenge(const asio::ip::udp::endpoint& sender,
@@ -189,8 +209,10 @@ private:
 
     // Enrollment quorum handlers
     void handle_enrollment_vote_request(const asio::ip::udp::endpoint& sender,
+                                         const std::string& sender_pubkey,
                                          const uint8_t* payload, std::size_t payload_len);
     void handle_enrollment_vote(const asio::ip::udp::endpoint& sender,
+                                 const std::string& sender_pubkey,
                                  const uint8_t* payload, std::size_t payload_len);
 
     /// Broadcast an enrollment vote request to all known Tier1 peers.
@@ -305,6 +327,18 @@ private:
     /// enrolled identity (see docs/TEE-Attestation-Hardening-Plan.md).
     [[nodiscard]] bool peer_has_verified_certificate(const std::string& pubkey) const;
 
+    /// Governance-grade electorate test. UNLIKE peer_has_verified_certificate,
+    /// this NEVER fails open: it returns false when no root pubkey is configured,
+    /// so an admission ballot with no attested electorate fails closed. True only
+    /// if `pubkey` is a known, non-revoked peer whose stored certificate belongs
+    /// to it and verifies against the configured root via verify_cert_core (real
+    /// issuer==root check + Ed25519 verify, not the advisory fail-open path).
+    [[nodiscard]] bool peer_certificate_is_root_signed(const std::string& pubkey) const;
+
+    /// Same voter predicate as remote peers, applied to our own identity.
+    /// Gates the local vote AND our slot in the denominator (one electorate).
+    [[nodiscard]] bool self_is_eligible_voter(bool is_admission) const;
+
     /// The TPM Attestation Key pinned in `pubkey`'s enrolled certificate (base64
     /// DER SPKI), or "" if the peer has no verified certificate or no AK enrolled.
     /// This is the trust anchor a TPM quote signature is verified against.
@@ -364,6 +398,7 @@ private:
     std::string                      our_tunnel_ip_;     // assigned by peer or self
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
     std::string                      our_wg_pubkey_;     // base64 X25519
+    std::string                      our_advertised_endpoint_;  // "ip:port" we are reachable at
 
     // Shamir reconstruction: collect submitted shares from peers
     std::mutex                              reconstruction_mutex_;
@@ -375,6 +410,7 @@ private:
     std::string                      dns_base_domain_{"lemonade-nexus.io"};
     std::array<NsSlotClaimData, 9>   ns_slots_{};       // slot 0 = ns1, slot 8 = ns9
     std::optional<uint8_t>           our_ns_slot_;
+    uint8_t                          preferred_ns_slot_{0};  // 0 = auto (lowest free)
 
     // Distributed ACL sync (nullptr = ACL sync disabled)
     acl::ACLService*                 acl_{nullptr};
@@ -385,9 +421,11 @@ private:
     // Quorum-based enrollment
     bool     enrollment_quorum_enabled_{false};
     float    enrollment_quorum_ratio_{0.5f};
+    float    admission_quorum_ratio_{0.75f};   // mirrors ServerConfig default
     uint32_t enrollment_vote_timeout_sec_{60};
     uint32_t enrollment_max_retries_{3};
     std::unordered_map<std::string, EnrollmentBallot> pending_enrollments_;
+    std::function<void(const EnrollmentBallot&)> enrollment_decision_cb_;
 
     // Throttle for proactive Tier-1 re-challenge (pubkey → last challenge unix sec).
     // Only touched from on_gossip_tick (the single gossip-timer thread).
@@ -410,8 +448,39 @@ public:
     void set_enrollment_config(bool enabled, float ratio,
                                 uint32_t timeout_sec, uint32_t max_retries);
 
+    /// Local floor for ADMISSION ballots. Separate from the enrollment ratio: a
+    /// remote sponsor supplies its own, and we must never accept a lower bar.
+    void set_admission_quorum_ratio(float ratio);
+
+    /// Pin the NS slot this server claims (1-9); 0 = auto (lowest free). Set
+    /// when the operator's ns<N> identity matches registrar glue for that name.
+    void set_preferred_ns_slot(uint8_t slot);
+
     /// Get pending enrollment ballots (for status API).
     [[nodiscard]] std::vector<EnrollmentBallot> pending_enrollments() const;
+
+    /// Fired when a ballot leaves Collecting (Approved/Rejected/TimedOut). The
+    /// callback runs outside peers_mutex_ with a snapshot of the ballot.
+    void set_enrollment_decision_callback(
+        std::function<void(const EnrollmentBallot&)> cb) {
+        enrollment_decision_cb_ = std::move(cb);
+    }
+
+    /// Open a governed ADMISSION ballot for a certless candidate (75% Tier1).
+    /// `claim_json` is the candidate's self-signed onboarding claim.
+    /// `claim_hash` binds votes to this claim. Re-entry with our own live
+    /// ballot is a no-op, so callers may re-arm with it after a restart.
+    void start_admission_ballot(const std::string& request_id,
+                                const std::string& candidate_pubkey,
+                                const std::string& server_id,
+                                const std::string& claim_json,
+                                const std::string& claim_hash,
+                                float required_ratio);
+
+    /// Add a server pubkey to the revocation set and persist it. Idempotent.
+    /// The single runtime writer of revoked_servers.json — callers such as the
+    /// admission supersede path must route through here, never write the file.
+    void add_revoked_server(const std::string& server_pubkey);
 };
 
 } // namespace nexus::gossip

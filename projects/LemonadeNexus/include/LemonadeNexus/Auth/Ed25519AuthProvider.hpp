@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 // Forward declarations
 namespace nexus::crypto  { class SodiumCryptoService; }
@@ -48,10 +49,11 @@ public:
     /// Returns JSON: {"challenge":"base64...","expires_at":unix_timestamp}
     [[nodiscard]] nlohmann::json issue_challenge(const std::string& pubkey_b64);
 
-    /// Register an Ed25519 public key with an explicit user_id.
-    /// If user_id is empty, derives one from the pubkey.
-    [[nodiscard]] AuthResult register_pubkey(const std::string& pubkey_b64,
-                                              const std::string& user_id = "");
+    /// Revoke an Ed25519 public key (device deletion); persisted. Idempotent.
+    bool revoke_pubkey(const std::string& pubkey_b64);
+
+    /// True if this key is on the device-revocation blocklist.
+    [[nodiscard]] bool is_pubkey_revoked(const std::string& pubkey_b64);
 
 private:
     // Derive a deterministic user_id from an Ed25519 public key.
@@ -91,6 +93,10 @@ private:
     mutable std::mutex cache_mutex_;
     std::unordered_map<std::string, std::string> pubkey_to_user_;
     std::atomic<bool> cache_loaded_{false};
+
+    // Device-revocation blocklist (deleted devices). Guarded by cache_mutex_,
+    // loaded lazily alongside pubkey_to_user_ from credentials/revoked.json.
+    std::unordered_set<std::string> revoked_pubkeys_;
 
     static constexpr uint32_t kChallengeTtlSec = 60;    // 60 second challenge window
     static constexpr std::size_t kChallengeSize = 32;    // 32 bytes of randomness

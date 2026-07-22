@@ -55,6 +55,8 @@ struct LemonadeNexusClient::Impl {
     Identity     identity;
     std::string  session_token;
     std::string  node_id;
+    std::string  link_token;           // single-use device link token for the next join
+    std::vector<std::pair<uint16_t, std::string>> exposed_services;  // vport -> target
     std::string  server_seip_fqdn;     // e.g. "<id>.<region>.seip.lemonade-nexus.io" — public API after join
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
     std::string  server_tunnel_ip;    // e.g. "10.64.0.1" — HTTPS fallback
@@ -92,15 +94,16 @@ struct LemonadeNexusClient::Impl {
         }
     }
 
-    // Build the base URL for a specific server
+    // Build the base URL for a specific server. Always HTTPS — the mesh has no
+    // plaintext path; `host` must be the server's cert FQDN (verified by
+    // httplib's default trust-store check).
     static std::string base_url(const ServerEndpoint& ep) {
-        return (ep.use_tls ? "https://" : "http://") +
-               ep.host + ":" + std::to_string(ep.port);
+        return "https://" + ep.host + ":" + std::to_string(ep.port);
     }
 
     // Get the current server's base URL
     std::string current_base_url() const {
-        if (server_pool.empty()) return "http://127.0.0.1:9100";
+        if (server_pool.empty()) return "https://127.0.0.1:9100";
         return base_url(server_pool[current_server].endpoint);
     }
 
@@ -261,35 +264,18 @@ struct LemonadeNexusClient::Impl {
         return std::nullopt;
     }
 
-    // --- Private API (HTTPS over WG tunnel via private FQDN) ---
-
-    /// Private API URL: try HTTPS via FQDN, fall back to HTTP on tunnel IP.
-    std::string private_base_url() const {
-        if (!server_private_fqdn.empty()) {
-            return "https://" + server_private_fqdn + ":" + std::to_string(private_port);
-        }
-        if (!server_tunnel_ip.empty()) {
-            return "http://" + server_tunnel_ip + ":" + std::to_string(private_port);
-        }
-        return current_base_url();
-    }
-
-    std::string private_fallback_url() const {
-        if (!server_tunnel_ip.empty()) {
-            return "http://" + server_tunnel_ip + ":" + std::to_string(private_port);
-        }
-        return current_base_url();
-    }
+    // --- Private API (verified HTTPS over the WG tunnel, by private FQDN) ---
 
     // Send a private-API request over the userspace mesh dataplane — the only
     // path to the server's private routes (the server terminates the tunnel in
     // userspace + smoltcp, so there is no OS route to its tunnel IP). Egresses a
     // loopback port bridged through the netstack to the server's private API.
     //
-    // The private API is HTTPS (it carries the private.<server> cert), so we
-    // speak TLS over the loopback bridge with certificate verification disabled:
-    // the cert is for the server FQDN (not 127.0.0.1), and confidentiality is
-    // already provided by the boringtun/Noise mesh plus the loopback hop.
+    // The private API carries the public cert for server_private_fqdn. We connect
+    // BY that FQDN (SNI + certificate verification) while the addr-map lands the
+    // socket on the loopback egress the netstack opened — split-horizon DNS:
+    // verified public TLS over the mesh, with no by-IP or verification-disabled
+    // path.
     //
     // Returns the parsed body if the dataplane served the request (success OR
     // error status); `served` distinguishes "handled" from "not attempted / no
@@ -298,19 +284,23 @@ struct LemonadeNexusClient::Impl {
                                      const std::string& body, int& status_out,
                                      bool& served) {
         served = false;
-        if (!meshplane.is_active() || server_tunnel_ip.empty()) {
+        if (!meshplane.is_active() || server_tunnel_ip.empty() || server_private_fqdn.empty()) {
             spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} SKIP "
-                         "(active={}, server_tunnel_ip='{}')",
-                         method, path, meshplane.is_active(), server_tunnel_ip);
+                         "(active={}, tunnel_ip='{}', fqdn='{}')",
+                         method, path, meshplane.is_active(), server_tunnel_ip,
+                         server_private_fqdn);
             return std::nullopt;
         }
         uint16_t lp = meshplane.tcp_egress(server_tunnel_ip, private_port);
         spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> egress {}:{} = 127.0.0.1:{}",
                       method, path, server_tunnel_ip, private_port, lp);
         if (lp == 0) return std::nullopt;
+
         try {
-            httplib::SSLClient cli("127.0.0.1", lp);
-            cli.enable_server_certificate_verification(false);
+            httplib::SSLClient cli(server_private_fqdn, lp);
+            // The private FQDN lands on the loopback egress; SNI + certificate
+            // verification still use the FQDN (against the public CA).
+            cli.set_hostname_addr_map({{server_private_fqdn, "127.0.0.1"}});
             cli.set_connection_timeout(config.connect_timeout_sec);
             cli.set_read_timeout(config.read_timeout_sec);
             httplib::Result res = (std::string(method) == "GET")
@@ -345,13 +335,14 @@ struct LemonadeNexusClient::Impl {
             auto r = mesh_request("GET", path, "", status_out, served);
             if (served) return r;
         }
-        // Legacy OS-routed paths (kernel tunnel platforms) below.
+        // Legacy OS-routed path (kernel tunnel platforms): verified HTTPS by the
+        // private FQDN, which the OS resolver routes to the tunnel. No by-IP path
+        // (a public cert can't be verified against a raw tunnel IP).
         if (!server_private_fqdn.empty()) {
             try {
                 httplib::SSLClient cli(server_private_fqdn, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
-                cli.enable_server_certificate_verification(false);
                 auto res = cli.Get(path, auth_headers());
                 if (res) {
                     status_out = res->status;
@@ -363,21 +354,6 @@ struct LemonadeNexusClient::Impl {
             } catch (const std::exception& e) {
                 spdlog::debug("[LemonadeNexusClient] private HTTPS GET {} exception: {}", path, e.what());
             }
-        }
-        // Fall back to HTTPS on tunnel IP (skip cert verify)
-        if (!server_tunnel_ip.empty()) {
-            try {
-                httplib::SSLClient cli(server_tunnel_ip, private_port);
-                cli.set_connection_timeout(config.connect_timeout_sec);
-                cli.enable_server_certificate_verification(false);
-                cli.set_read_timeout(config.read_timeout_sec);
-                auto res = cli.Get(path, auth_headers());
-                if (res) {
-                    status_out = res->status;
-                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
-                    try { return json::parse(res->body); } catch (...) { return std::nullopt; }
-                }
-            } catch (...) {}
         }
         // Last resort: public API
         return http_get(path, status_out);
@@ -392,13 +368,14 @@ struct LemonadeNexusClient::Impl {
             auto r = mesh_request("POST", path, body.dump(), status_out, served);
             if (served) return r;
         }
-        // Legacy OS-routed paths (kernel tunnel platforms) below.
+        // Legacy OS-routed path (kernel tunnel platforms): verified HTTPS by the
+        // private FQDN, which the OS resolver routes to the tunnel. No by-IP path
+        // (a public cert can't be verified against a raw tunnel IP).
         if (!server_private_fqdn.empty()) {
             try {
                 httplib::SSLClient cli(server_private_fqdn, private_port);
                 cli.set_connection_timeout(config.connect_timeout_sec);
                 cli.set_read_timeout(config.read_timeout_sec);
-                cli.enable_server_certificate_verification(false);
                 auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
                 if (res) {
                     status_out = res->status;
@@ -413,23 +390,6 @@ struct LemonadeNexusClient::Impl {
                 spdlog::debug("[LemonadeNexusClient] private HTTPS POST {} exception: {}", path, e.what());
             }
         }
-        // Fall back to HTTPS on tunnel IP (skip cert verify)
-        if (!server_tunnel_ip.empty()) {
-            try {
-                httplib::SSLClient cli(server_tunnel_ip, private_port);
-                cli.set_connection_timeout(config.connect_timeout_sec);
-                cli.set_read_timeout(config.read_timeout_sec);
-                cli.enable_server_certificate_verification(false);
-                auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
-                if (res) {
-                    status_out = res->status;
-                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
-                    try { return json::parse(res->body); } catch (...) {
-                        json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
-                    }
-                }
-            } catch (...) {}
-        }
         // Last resort: public API
         return http_post(path, body, status_out);
     }
@@ -442,17 +402,17 @@ struct LemonadeNexusClient::Impl {
         if (!resp || !resp->is_array()) return;
 
         for (const auto& srv : *resp) {
-            std::string host = srv.value("endpoint", "");
             uint16_t port = srv.value("http_port", uint16_t{9100});
 
-            // Parse "host:port" endpoint format if present
-            if (!host.empty()) {
-                auto colon = host.rfind(':');
-                if (colon != std::string::npos) {
-                    host = host.substr(0, colon);
-                }
+            // The public API is verified HTTPS, so we can only add a discovered
+            // server by its certificate FQDN. Skip IP-only entries rather than
+            // connect unverified (no plaintext / verify-off path).
+            std::string host = srv.value("fqdn", "");
+            if (host.empty()) {
+                spdlog::debug("[LemonadeNexusClient] skipping discovered server with no "
+                              "cert FQDN (endpoint={})", srv.value("endpoint", ""));
+                continue;
             }
-            if (host.empty()) continue;
 
             // Check if already in pool
             bool exists = false;
@@ -464,7 +424,7 @@ struct LemonadeNexusClient::Impl {
             }
             if (!exists) {
                 ServerState new_srv;
-                new_srv.endpoint = {host, port, false};
+                new_srv.endpoint = {host, port, true};
                 server_pool.push_back(new_srv);
                 spdlog::info("[LemonadeNexusClient] discovered server {}:{}", host, port);
             }
@@ -569,6 +529,68 @@ std::string LemonadeNexusClient::node_id() const {
 void LemonadeNexusClient::set_node_id(const std::string& id) {
     std::lock_guard lock(impl_->mutex);
     impl_->node_id = id;
+}
+
+void LemonadeNexusClient::set_link_token(const std::string& token) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->link_token = token;
+}
+
+Result<nlohmann::json> LemonadeNexusClient::create_link_token(uint32_t ttl_sec) {
+    Result<nlohmann::json> result;
+    json body = {{"ttl_sec", ttl_sec}};
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/link/token", body, status);
+    result.http_status = status;
+
+    if (!resp) {
+        result.error = "link token request failed (server unreachable)";
+        return result;
+    }
+    if (status != 200) {
+        result.error = resp->value("error", "link token request failed");
+        return result;
+    }
+
+    result.ok    = true;
+    result.value = *resp;
+    return result;
+}
+
+StatusResult LemonadeNexusClient::expose_service(uint16_t vport, const std::string& target) {
+    StatusResult result;
+    if (vport == 0 || target.empty()) {
+        result.error = "vport and target required";
+        return result;
+    }
+    if (!impl_->meshplane.is_active()) {
+        result.error = "mesh dataplane not active — join first";
+        return result;
+    }
+    if (!impl_->meshplane.tcp_ingress(vport, target)) {
+        result.error = "failed to register ingress forward";
+        return result;
+    }
+    {
+        std::lock_guard lock(impl_->mutex);
+        auto& v = impl_->exposed_services;
+        bool known = false;
+        for (const auto& e : v) {
+            if (e.first == vport && e.second == target) { known = true; break; }
+        }
+        if (!known) v.emplace_back(vport, target);
+    }
+    result.ok = true;
+    return result;
+}
+
+std::vector<std::pair<uint16_t, std::string>> LemonadeNexusClient::exposed_services() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->exposed_services;
+}
+
+uint16_t LemonadeNexusClient::open_egress(const std::string& dst_ip, uint16_t dst_port) {
+    return impl_->meshplane.tcp_egress(dst_ip, dst_port);
 }
 
 // ---------------------------------------------------------------------------
@@ -764,54 +786,6 @@ Result<AuthResponse> LemonadeNexusClient::authenticate_ed25519() {
 
     if (result.value.authenticated) {
         result.ok = true;
-        std::lock_guard lock(impl_->mutex);
-        impl_->session_token = result.value.session_token;
-    } else {
-        result.error = result.value.error;
-    }
-    return result;
-}
-
-Result<AuthResponse> LemonadeNexusClient::register_ed25519(const std::string& user_id) {
-    Result<AuthResponse> result;
-
-    // Copy identity under lock to avoid racing with other threads
-    Identity local_identity;
-    {
-        std::lock_guard lock(impl_->mutex);
-        local_identity = impl_->identity;
-    }
-
-    if (!local_identity.is_valid()) {
-        result.error = "no identity set — call set_identity() first";
-        return result;
-    }
-
-    auto pubkey_b64 = Identity::to_base64(
-        std::span<const uint8_t>(local_identity.public_key()));
-
-    json body;
-    body["pubkey"] = pubkey_b64;
-    if (!user_id.empty()) {
-        body["user_id"] = user_id;
-    }
-
-    int status = 0;
-    auto resp = impl_->http_post("/api/auth/register/ed25519", body, status);
-    result.http_status = status;
-
-    if (!resp) {
-        result.error = "ed25519 registration request failed";
-        return result;
-    }
-
-    result.value.authenticated = resp->value("authenticated", false);
-    result.value.user_id       = resp->value("user_id", "");
-    result.value.session_token = resp->value("session_token", "");
-    result.value.error         = resp->value("error", resp->value("error_message", ""));
-    result.ok = result.value.authenticated;
-
-    if (result.ok) {
         std::lock_guard lock(impl_->mutex);
         impl_->session_token = result.value.session_token;
     } else {
@@ -1484,6 +1458,14 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     }
     join_body["wg_pubkey"] = wg_pubkey;
 
+    // Single-use device link token (see set_link_token / create_link_token)
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (!impl_->link_token.empty()) {
+            join_body["link_token"] = impl_->link_token;
+        }
+    }
+
     // Include auth credentials so /api/join can authenticate inline
     if (local_identity.is_valid()) {
         // Get a challenge nonce for Ed25519 auth
@@ -1553,6 +1535,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     {
         std::lock_guard lock(impl_->mutex);
         impl_->node_id = node_id;
+        impl_->link_token.clear();  // consumed server-side on successful join
         // Store server private FQDN for HTTPS over WG tunnel
         // Store server tunnel IP for HTTP fallback
         auto srv_tunnel = resp->value("server_tunnel_ip", std::string{});
@@ -1562,7 +1545,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
 
         // Store SEIP FQDN — this is the server's canonical hostname
         auto srv_seip_fqdn = resp->value("server_seip_fqdn", std::string{});
-        if (!srv_seip_fqdn.empty()) {
+        if (!srv_seip_fqdn.empty() && !impl_->config.pin_server) {
             impl_->server_seip_fqdn = srv_seip_fqdn;
             // Switch public API to use the SEIP hostname (proper cert match)
             auto public_port = static_cast<uint16_t>(impl_->server_pool.empty() ? 9100
@@ -1617,6 +1600,19 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
         if (!impl_->meshplane.start(bt)) {
             spdlog::warn("[LemonadeNexusClient] mesh dataplane start failed");
+        } else {
+            // Re-apply service exposures registered before a re-join
+            std::vector<std::pair<uint16_t, std::string>> exposures;
+            {
+                std::lock_guard lock(impl_->mutex);
+                exposures = impl_->exposed_services;
+            }
+            for (const auto& [vport, target] : exposures) {
+                if (!impl_->meshplane.tcp_ingress(vport, target)) {
+                    spdlog::warn("[LemonadeNexusClient] re-exposing {} -> {} failed",
+                                 vport, target);
+                }
+            }
         }
     }
 

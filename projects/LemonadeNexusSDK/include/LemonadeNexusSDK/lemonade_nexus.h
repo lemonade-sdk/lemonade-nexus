@@ -437,6 +437,23 @@ ln_error_t ln_set_node_id(ln_client_t* client, const char* node_id);
 /** Get the current node ID. Caller must ln_free(). Returns NULL if not set. */
 char* ln_get_node_id(ln_client_t* client);
 
+/** Set a single-use device link token to include in the next ln_join_network. */
+ln_error_t ln_set_link_token(ln_client_t* client, const char* token);
+
+/** Mint a device link token for adding another device to this account's group.
+ *  Requires an established mesh session. Returns {link_token, group_node_id,
+ *  expires_at} JSON. ln_free(*out_json). */
+ln_error_t ln_link_token_create(ln_client_t* client, uint32_t ttl_sec, char** out_json);
+
+/** Publish a local service to mesh peers: our mesh IP:vport bridges to `target`
+ *  ("tcp:127.0.0.1:PORT"). Requires an active mesh; re-applied on re-join. */
+ln_error_t ln_mesh_expose_service(ln_client_t* client, uint16_t vport, const char* target);
+
+/** Open (or reuse) a loopback bridge to a mesh peer's dst_ip:dst_port.
+ *  On success *out_port is the bound 127.0.0.1 port to dial. */
+ln_error_t ln_mesh_open_egress(ln_client_t* client, const char* dst_ip,
+                               uint16_t dst_port, uint16_t* out_port);
+
 #if defined(__GNUC__) || defined(__clang__)
 #  pragma GCC visibility pop
 #endif

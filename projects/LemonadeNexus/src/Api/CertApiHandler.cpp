@@ -137,7 +137,8 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 for (const auto& check_id : {node_id, std::string("customer-") + node_id}) {
                     auto node = ctx_.tree.get_node(check_id);
                     if (node && node->hostname == cert_req.hostname &&
-                        node->mgmt_pubkey == caller_pk) {
+                        tree::canonical_principal(node->mgmt_pubkey) ==
+                            tree::canonical_principal(caller_pk)) {
                         owns_hostname = true;
                         break;
                     }

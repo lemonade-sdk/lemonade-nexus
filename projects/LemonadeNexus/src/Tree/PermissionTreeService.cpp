@@ -198,6 +198,9 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
         return false;
     }
 
+    const std::string deleted_mgmt_pubkey = it->second.mgmt_pubkey;
+    const std::string parent_id           = it->second.parent_id;
+
     if (!it->second.endpoint_identifier.empty()) {
         identifier_index_.erase(it->second.endpoint_identifier);
     }
@@ -206,8 +209,42 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
         spdlog::warn("[{}] delete_node_direct: storage delete failed for '{}'", name(), node_id);
     }
 
+    // Sweep the link-join grants that referenced this device's management key
+    // from its sibling endpoints and its group node, so a deleted device leaves
+    // no dangling ACL. Guard: never strip a node the key legitimately owns
+    // (mgmt_pubkey match) — deleting one of an owner's self-owned devices must
+    // not revoke the owner across the rest of the group.
+    if (!deleted_mgmt_pubkey.empty()) {
+        for (auto& [id, node] : nodes_) {
+            const bool in_scope = (node.parent_id == parent_id) || (id == parent_id);
+            if (!in_scope) continue;
+            if (node.mgmt_pubkey == deleted_mgmt_pubkey) continue; // owner-owned
+            const auto before = node.assignments.size();
+            std::erase_if(node.assignments, [&](const Assignment& a) {
+                return a.management_pubkey == deleted_mgmt_pubkey;
+            });
+            if (node.assignments.size() != before && !persist_node(node)) {
+                spdlog::warn("[{}] delete_node_direct: failed to persist ACL sweep on '{}'",
+                             name(), id);
+            }
+        }
+    }
+
     spdlog::info("[{}] deleted node '{}' directly", name(), node_id);
     return true;
+}
+
+bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {
+    if (mgmt_pubkey.empty()) return false;
+    // Match on key bytes: this is the owner-protection guard on revocation, so a
+    // spelling mismatch would blocklist an owner's still-in-use key.
+    const auto want = canonical_principal(mgmt_pubkey);
+    std::lock_guard lock(mutex_);
+    for (const auto& [id, node] : nodes_) {
+        (void)id;
+        if (canonical_principal(node.mgmt_pubkey) == want) return true;
+    }
+    return false;
 }
 
 bool PermissionTreeService::grant_assignment(const std::string& node_id,
@@ -273,10 +310,12 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
         return false;
     }
 
-    // Verify signer has the required permission via assignments
+    // Verify signer has the required permission via assignments. Same key-bytes
+    // match as check_permission, or reads and writes disagree on who a principal is.
     bool has_perm = false;
+    const auto signer_canon = canonical_principal(delta.signer_pubkey);
     for (const auto& assignment : check_it->second.assignments) {
-        if (assignment.management_pubkey == delta.signer_pubkey) {
+        if (canonical_principal(assignment.management_pubkey) == signer_canon) {
             for (const auto& perm_str : assignment.permissions) {
                 if (acl::has_permission(string_to_permission(perm_str), required)) {
                     has_perm = true;
@@ -683,8 +722,10 @@ bool PermissionTreeService::do_check_permission(std::string_view signer_pubkey,
         return false;
     }
 
+    // Match on key bytes: stored principals may use either base64 spelling.
+    const auto signer_canon = canonical_principal(signer_pubkey);
     for (const auto& assignment : it->second.assignments) {
-        if (assignment.management_pubkey == signer_pubkey) {
+        if (canonical_principal(assignment.management_pubkey) == signer_canon) {
             for (const auto& perm_str : assignment.permissions) {
                 if (acl::has_permission(string_to_permission(perm_str), perm)) {
                     return true;

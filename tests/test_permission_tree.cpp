@@ -213,6 +213,125 @@ TEST_F(PermissionTreeTest, UnknownSignerLacksPermission) {
     EXPECT_FALSE(tree_svc->check_permission(unknown_pub, "root", acl::Permission::Read));
 }
 
+// The SDK spells principals url-safe unpadded while the server spells them
+// standard base64, so BOTH live in stored nodes. Authorization must match on key
+// bytes, or every SDK client 403s the moment the server canonicalizes its claim.
+TEST_F(PermissionTreeTest, PrincipalMatchesAcrossBase64Spellings) {
+    auto kp = crypto_svc->ed25519_keygen();
+    auto std_b64 = crypto::to_base64(kp.public_key);
+    std::string url_b64;
+    for (char ch : std_b64) {
+        if (ch == '=') continue;
+        else if (ch == '+') url_b64.push_back('-');
+        else if (ch == '/') url_b64.push_back('_');
+        else url_b64.push_back(ch);
+    }
+    ASSERT_NE(url_b64, std_b64);
+
+    // Stored the way an SDK client writes it.
+    tree::TreeNode child;
+    child.id = "sdk_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = "ed25519:" + url_b64;
+    child.assignments = {{"ed25519:" + url_b64, {"read", "write"}}};
+    auto create = make_signed_delta("create_node", "sdk_child", child, root_keypair);
+    ASSERT_TRUE(tree_svc->apply_delta(create));
+
+    // Queried the way the server now canonicalizes a JWT claim.
+    EXPECT_TRUE(tree_svc->check_permission("ed25519:" + std_b64, "sdk_child",
+                                            acl::Permission::Read));
+    // ...and the original spelling still works.
+    EXPECT_TRUE(tree_svc->check_permission("ed25519:" + url_b64, "sdk_child",
+                                            acl::Permission::Read));
+    // A different key is still refused.
+    auto other = crypto_svc->ed25519_keygen();
+    EXPECT_FALSE(tree_svc->check_permission("ed25519:" + crypto::to_base64(other.public_key),
+                                            "sdk_child", acl::Permission::Read));
+}
+
+// This is the owner-protection guard on credential revocation: if it misses a
+// surviving node because that node spells the key differently, deleting one device
+// permanently revokes the owner's still-in-use key, with no un-revoke path.
+TEST_F(PermissionTreeTest, MgmtPubkeyInUseMatchesAcrossBase64Spellings) {
+    auto kp = crypto_svc->ed25519_keygen();
+    auto std_b64 = crypto::to_base64(kp.public_key);
+    std::string url_b64;
+    for (char ch : std_b64) {
+        if (ch == '=') continue;
+        else if (ch == '+') url_b64.push_back('-');
+        else if (ch == '/') url_b64.push_back('_');
+        else url_b64.push_back(ch);
+    }
+    ASSERT_NE(url_b64, std_b64);
+
+    tree::TreeNode owned;
+    owned.id = "in_use_node";
+    owned.parent_id = "root";
+    owned.type = tree::NodeType::Customer;
+    owned.mgmt_pubkey = "ed25519:" + url_b64;   // stored the SDK way
+    owned.assignments = {{root_pubkey_str, {"read", "write"}}};
+    ASSERT_TRUE(tree_svc->apply_delta(
+        make_signed_delta("create_node", "in_use_node", owned, root_keypair)));
+
+    // Queried the server way -- must still see the key as in use.
+    EXPECT_TRUE(tree_svc->is_mgmt_pubkey_in_use("ed25519:" + std_b64));
+    EXPECT_TRUE(tree_svc->is_mgmt_pubkey_in_use("ed25519:" + url_b64));
+
+    auto other = crypto_svc->ed25519_keygen();
+    EXPECT_FALSE(tree_svc->is_mgmt_pubkey_in_use(
+        "ed25519:" + crypto::to_base64(other.public_key)));
+}
+
+// Writes must agree with reads: a signer whose stored assignment uses the other
+// spelling has to pass do_apply_delta's authorization too, or owners can read a
+// node but get 403 on every mutation of it.
+TEST_F(PermissionTreeTest, DeltaAuthorizationMatchesAcrossBase64Spellings) {
+    auto kp = crypto_svc->ed25519_keygen();
+    auto std_b64 = crypto::to_base64(kp.public_key);
+    std::string url_b64;
+    for (char ch : std_b64) {
+        if (ch == '=') continue;
+        else if (ch == '+') url_b64.push_back('-');
+        else if (ch == '/') url_b64.push_back('_');
+        else url_b64.push_back(ch);
+    }
+    ASSERT_NE(url_b64, std_b64);
+
+    // Parent grants the key under the STANDARD spelling...
+    tree::TreeNode parent;
+    parent.id = "spell_parent";
+    parent.parent_id = "root";
+    parent.type = tree::NodeType::Customer;
+    parent.mgmt_pubkey = "ed25519:" + std_b64;
+    parent.assignments = {{"ed25519:" + std_b64, {"read", "write", "add_child"}}};
+    ASSERT_TRUE(tree_svc->apply_delta(
+        make_signed_delta("create_node", "spell_parent", parent, root_keypair)));
+
+    // ...and the client signs its delta under the URL-SAFE spelling. Sign with that
+    // spelling in place: the signature covers signer_pubkey.
+    tree::TreeNode child;
+    child.id = "spell_child";
+    child.parent_id = "spell_parent";
+    child.type = tree::NodeType::Endpoint;
+
+    tree::TreeDelta delta;
+    delta.operation      = "create_node";
+    delta.target_node_id = "spell_child";
+    delta.node_data      = child;
+    delta.signer_pubkey  = "ed25519:" + url_b64;
+    delta.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    auto canonical = tree::canonical_delta_json(delta);
+    auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    delta.signature = crypto::to_base64(crypto_svc->ed25519_sign(kp.private_key, msg));
+
+    EXPECT_TRUE(tree_svc->apply_delta(delta));
+    EXPECT_TRUE(tree_svc->get_node("spell_child").has_value());
+}
+
 TEST_F(PermissionTreeTest, DeltaWithInsufficientPermsFails) {
     auto unauthorized_kp = crypto_svc->ed25519_keygen();
 

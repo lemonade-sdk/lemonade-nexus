@@ -41,6 +41,12 @@ void from_json(const json& j, MisbehaviorProof& p) {
 // ---------------------------------------------------------------------------
 
 std::string normalize_pubkey(std::string_view pubkey) {
+    // Key bytes, not spelling: from_base64 accepts several encodings of the same
+    // key, so a raw compare lets a signer equivocate under two spellings and never
+    // collide in the equivocation memory. Fall back to the raw form if undecodable
+    // (such a signer cannot produce a valid signature anyway).
+    auto canon = crypto::canonical_key_b64(pubkey);
+    if (!canon.empty()) return canon;
     if (pubkey.starts_with("ed25519:")) pubkey.remove_prefix(8);
     return std::string(pubkey);
 }

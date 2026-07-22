@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-Generate an Ed25519 root management keypair for Lemonade-Nexus.
+Generate an Ed25519 keypair for Lemonade-Nexus (offline/backup use).
 
-The root keypair is the top of the trust hierarchy:
-  - The PUBLIC key is passed to every server via --root-pubkey (hex)
-  - The PRIVATE key stays on the root management node to sign server certificates
-    via --enroll-server <pubkey> <server-id>
+NOTE: the server cannot import an externally generated keypair. The actual
+mesh root is the genesis server's own identity, created and printed by
+`./lemonade-nexus --first-run` — that identity pubkey (hex) is what every
+server passes as --root-pubkey, and its private key (data/identity/keypair.enc,
+machine-bound) is what signs server certificates during --enroll-server.
+
+Use this script only to pre-generate key material for offline storage or
+future import/rotation tooling.
 
 Usage:
-    python3 generate_root_keypair.py
+    python3 generate_root_keypair.py                 # saves ./root_keypair.json
     python3 generate_root_keypair.py --output /path/to/root_keypair.json
 
 Requirements:
@@ -31,9 +35,20 @@ except ImportError:
 
 def main():
     parser = argparse.ArgumentParser(description="Generate Lemonade-Nexus root Ed25519 keypair")
-    parser.add_argument("--output", "-o", type=str, default=None,
-                        help="Save keypair to JSON file (private key included — keep secure!)")
+    parser.add_argument("--output", "-o", type=str, default="root_keypair.json",
+                        help="Save keypair to JSON file (private key included — keep secure!) "
+                             "(default: %(default)s in the current directory)")
+    parser.add_argument("--force", action="store_true",
+                        help="Overwrite the output file if it already exists")
     args = parser.parse_args()
+
+    out_path = os.path.abspath(args.output)
+    if os.path.exists(out_path) and not args.force:
+        print(f"Error: {out_path} already exists — refusing to overwrite a root keypair.",
+              file=sys.stderr)
+        print("Pass --force to overwrite, or -o <path> for a different location.",
+              file=sys.stderr)
+        sys.exit(1)
 
     # Generate Ed25519 keypair
     signing_key = nacl.signing.SigningKey.generate()
@@ -52,13 +67,12 @@ def main():
         "private_key_base64": privkey_b64,
     }
 
-    if args.output:
-        with open(args.output, "w") as f:
-            json.dump(keypair_data, f, indent=2)
-            f.write("\n")
-        os.chmod(args.output, 0o600)
-        print(f"Keypair saved to: {args.output} (mode 0600)")
-        print()
+    with open(out_path, "w") as f:
+        json.dump(keypair_data, f, indent=2)
+        f.write("\n")
+    os.chmod(out_path, 0o600)
+    print(f"Keypair saved to: {out_path} (mode 0600)")
+    print()
 
     print("=" * 68)
     print("  Lemonade-Nexus Root Management Keypair")
@@ -77,23 +91,17 @@ def main():
     print("Configuration:")
     print("-" * 68)
     print()
-    print("1. On the ROOT server (the one that enrolls other servers):")
-    print("   The root identity is auto-generated on first run.")
-    print("   Just start the server normally — it creates data/identity/.")
+    print("NOTE — offline/backup keypair only:")
+    print("  The server cannot import an externally generated keypair. The mesh")
+    print("  root is the GENESIS server's own identity, created and printed by:")
+    print("    ./lemonade-nexus --first-run")
+    print("  Every server passes THAT identity pubkey (hex) as --root-pubkey.")
+    print("  Passing this script's pubkey as --root-pubkey instead would make")
+    print("  peers reject every certificate the genesis signs.")
     print()
-    print("   To use this key instead of auto-generated, place it in")
-    print("   the data/identity/ directory before first start, or set:")
-    print(f"     export SP_ROOT_PUBKEY={pubkey_hex}")
-    print()
-    print("2. On EVERY server in the mesh:")
-    print(f"   --root-pubkey {pubkey_hex}")
-    print("   or in lemonade-nexus.env:")
-    print(f"     SP_ROOT_PUBKEY={pubkey_hex}")
-    print("   or in lemonade-nexus.json:")
-    print(f'     "root_pubkey": "{pubkey_hex}"')
-    print()
-    print("3. To enroll a new server (run on root server):")
-    print("   ./lemonade-nexus --enroll-server <server-pubkey-hex> <server-id>")
+    print("To enroll a new server (run on the genesis server):")
+    print("  ./lemonade-nexus --enroll-server '<gossip-pubkey-base64>' <server-id>")
+    print("  (the joining server prints its gossip pubkey during --first-run)")
     print()
     print("=" * 68)
 

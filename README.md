@@ -249,51 +249,142 @@ ctest --test-dir build --output-on-failure
 # 277 tests across 14+ test suites
 ```
 
-### Generate Root Keypair
+### Initialize the Server
+
+New servers are set up with `--first-run`:
 
 ```bash
-python3 scripts/generate_root_keypair.py
-# Outputs hex public key for --root-pubkey
+./build/projects/LemonadeNexus/lemonade-nexus --first-run --data-root ./data
 ```
+
+This creates the data directory, generates the server's keypairs, and prints
+the two values you'll need next:
+
+- **Identity pubkey (hex)** — for a genesis server, this is the mesh root
+  pubkey that every server passes as `--root-pubkey`
+- **Gossip pubkey (base64)** — the key a mesh admin enrolls to let this
+  server join an existing mesh
+
+A server won't start until it has been initialized, so a typo'd `--data-root`
+fails fast instead of quietly starting a fresh mesh.
 
 ### Run the Genesis Server
 
-The first server in the mesh needs a root keypair:
+The genesis server anchors the mesh: its identity pubkey from `--first-run`
+is the root of trust for every server that follows.
 
 ```bash
 ./build/projects/LemonadeNexus/lemonade-nexus \
-    --root-pubkey <hex-pubkey> \
+    --root-pubkey <identity-pubkey-hex> \
     --data-root ./data
 ```
 
 On startup it will:
-1. Generate an Ed25519 identity
-2. Self-allocate a tunnel IP from IPAM (e.g. `10.64.0.0`)
+1. Initialize the root key chain from its identity
+2. Self-allocate the gateway tunnel IP (`10.64.0.1`)
 3. Start the public API on `:9100` and private API on `<tunnel_ip>:9101`
 4. Begin listening for gossip peers
 
-### Enroll and Join a Server
+You can also give the genesis its own certificate — handy for DDNS and a
+friendlier node ID — by enrolling its own gossip pubkey:
 
 ```bash
-# 1. On the root server: generate a certificate for the new server
-./build/projects/LemonadeNexus/lemonade-nexus \
-    --enroll-server <new-server-hex-pubkey> <server-id>
+./build/projects/LemonadeNexus/lemonade-nexus --enroll-server '<gossip-pubkey-base64>' <server-id>
+```
 
-# 2. Copy data/identity/server_cert.json to the new server's data/identity/
+### Join a Server (onboarding)
 
-# 3. Start the new server with the root server as a seed peer
+A new server joins by asking an existing one over its public API — no manual
+file copying. The candidate proves it holds its gossip key, the mesh decides
+whether to admit it, and on approval the root-signed certificate is delivered
+back and installed automatically.
+
+All mesh HTTP runs over **verified, publicly-trusted TLS** — there is no
+plaintext or verification-disabled path. The candidate connects to the genesis
+by its **certificate FQDN** (`<id>.<region>.seip.<domain>`) and verifies the
+cert against the system trust store; `--onboard-server` refuses a bare IP.
+
+Onboarding also **requires the mesh root pubkey up front** (`--root-pubkey`,
+printed by the genesis at `--first-run`). The response can only confirm that
+pinned key — a server that delivers a different root is rejected, so an
+intermediary can never hand the candidate a substitute trust anchor.
+
+```bash
+# On the new server. Give it a mesh server FQDN to contact (or omit it to
+# discover one via the region's DNS tier records). --onboard-addr optionally
+# pins the connect IP while still verifying the cert FQDN.
 ./build/projects/LemonadeNexus/lemonade-nexus \
-    --root-pubkey <hex-pubkey> \
-    --seed-peer <root-ip>:9102 \
+    --onboard-server <genesis-fqdn>:9100 \
+    --root-pubkey <mesh-root-pubkey-hex> \
+    --onboard-id aws-use1-a \
     --data-root ./data
 ```
 
-The joining server will:
-1. Connect to the seed peer via gossip
-2. Exchange ServerHello with its certificate
-3. Receive a tunnel IP allocation from the existing peer
-4. Automatically start the private API on the assigned IP
-5. Sync tree state, IPAM, and peer information via gossip
+The command initializes the data directory if needed, prints the candidate's
+key fingerprint, requests admission, waits for the decision, then writes
+`identity/server_cert.json` and records the pinned `root_pubkey` + seed peers
+into the config file before exiting. Start the server normally afterwards:
+
+```bash
+./build/projects/LemonadeNexus/lemonade-nexus --data-root ./data
+```
+
+**How admission is decided**
+
+- **Small mesh (below the Tier-1 vote threshold, default 6):** the genesis
+  server has sole discretion. By default every request waits for an admin to
+  approve it, confirming the candidate's fingerprint out of band:
+
+  ```bash
+  # On the genesis (private API, over the tunnel/loopback; needs an admin JWT)
+  curl -s http://127.0.0.1:9101/api/onboard/pending          # list requests
+  curl -X POST http://127.0.0.1:9101/api/onboard/approve/<request-id> \
+       -H 'Authorization: Bearer <admin-jwt>' \
+       -d '{"fingerprint":"<candidate-fingerprint>"}'
+  ```
+
+  For unattended joins, mint a **single-use enrollment token** on the root
+  server and hand it to the candidate out of band. A valid token admits the
+  request immediately and is consumed; tokens expire (default 10 min, max 1 h).
+  Because the onboarding transport is not authenticated, the token **must be
+  bound to the joining server's gossip pubkey** (printed as its `Gossip pubkey`
+  at `--first-run`) so an intermediary can't capture and spend it:
+
+  ```bash
+  # On the root server (locally; works while the daemon is running)
+  ./lemonade-nexus --mint-admission-token \
+      --token-candidate <candidate-gossip-pubkey-b64>   # required
+  # ...or over the private API with a root-admin JWT:
+  curl -X POST http://127.0.0.1:9101/api/onboard/token \
+       -H 'Authorization: Bearer <admin-jwt>' \
+       -d '{"candidate_pubkey":"<candidate-gossip-pubkey-b64>","ttl_sec":600}'
+
+  # On the joining server (its gossip pubkey must match the token binding)
+  ./lemonade-nexus --onboard-server <genesis-host>:9100 \
+      --root-pubkey <mesh-root-pubkey-hex> --onboard-token adm_...
+  ```
+
+- **Hardened mesh (≥6 Tier-1 servers):** admission requires a 75% vote of the
+  Tier-1 peers (`admission_quorum_ratio`), carried over the gossip layer.
+  Enrollment tokens are not honored in this regime — the quorum governs.
+
+`<server-id>` becomes the server's name across the mesh (DNS records, IPAM), so
+keep it a short, unique, DNS-friendly label like `aws-use1-a`. On cloud hosts
+behind NAT (EC2 and friends), pass `--public-ip <address>` when you start the
+server — it can't be detected from the interface.
+
+### Manual enrollment (fallback)
+
+If you'd rather issue a certificate by hand (e.g. to pin a TPM AK for Tier 1),
+`--enroll-server` still works:
+
+```bash
+# On the genesis: sign a cert for the candidate's gossip pubkey
+./build/projects/LemonadeNexus/lemonade-nexus \
+    --enroll-server '<gossip-pubkey-base64>' <server-id>
+# then copy data/identity/server_cert_<server-id>.json to the new server as
+# data/identity/server_cert.json and start it with --root-pubkey + --seed-peer.
+```
 
 ## Client SDK
 
@@ -463,7 +554,7 @@ SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--root-pubkey <hex>` | `SP_ROOT_PUBKEY` | `root_pubkey` | | Root Ed25519 public key (hex) |
+| `--root-pubkey <hex>` | `SP_ROOT_PUBKEY` | `root_pubkey` | | Mesh root Ed25519 public key (hex) — the genesis server's identity pubkey |
 | `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | Relying Party ID for WebAuthn passkeys |
 | | `SP_JWT_SECRET` | `jwt_secret` | (auto-generated) | JWT signing secret |
 
@@ -488,8 +579,6 @@ SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| | | `tls_cert_path` | | Path to TLS certificate file |
-| | | `tls_key_path` | | Path to TLS private key file |
 | | `SP_ACME_PROVIDER` | `acme_provider` | `letsencrypt` | ACME provider: `letsencrypt` / `letsencrypt_staging` / `zerossl` |
 | | `ACME_EMAIL` | | | Contact email for ACME registration |
 | | `ZEROSSL_EAB_KID` | | | ZeroSSL External Account Binding key ID |
@@ -545,8 +634,9 @@ SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
 
 | CLI Flag | Description |
 |----------|-------------|
-| `--enroll-server <hex> <id>` | Sign a certificate for a new server's pubkey |
-| `--revoke-server <hex>` | Revoke a server by its pubkey |
+| `--first-run` | Initialize the data directory and print onboarding info |
+| `--enroll-server <b64> <id>` | Sign a certificate for a server's base64 gossip pubkey |
+| `--revoke-server <b64>` | Revoke a server by its base64 gossip pubkey |
 | `--add-manifest <path>` | Import a signed release manifest JSON |
 | `--help`, `-h` | Show usage |
 

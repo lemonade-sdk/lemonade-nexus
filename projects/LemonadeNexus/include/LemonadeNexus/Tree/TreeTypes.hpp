@@ -19,6 +19,18 @@ enum class NodeType : uint8_t {
     Relay,
 };
 
+// Compare principals by KEY BYTES, not spelling. The SDK encodes url-safe unpadded
+// while the server encodes standard base64, so both spellings exist in stored
+// nodes — and stored bytes can never be rewritten, since node signatures cover
+// mgmt_pubkey and assignments. Canonicalize at comparison time only.
+// Returns the input unchanged when it is not a decodable "ed25519:<b64>".
+[[nodiscard]] inline std::string canonical_principal(std::string_view s) {
+    constexpr std::string_view pfx = "ed25519:";
+    if (!s.starts_with(pfx)) return std::string(s);
+    auto canon = crypto::canonical_key_b64(s.substr(pfx.size()));
+    return canon.empty() ? std::string(s) : std::string(pfx) + canon;
+}
+
 /// A single permission assignment within a tree node.
 struct Assignment {
     std::string              management_pubkey; // "ed25519:base64..."

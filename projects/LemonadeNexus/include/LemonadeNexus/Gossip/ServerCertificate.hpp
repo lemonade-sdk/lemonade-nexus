@@ -1,5 +1,7 @@
 #pragma once
 
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
@@ -27,6 +29,25 @@ struct ServerCertificate {
 
 /// Canonical JSON for signing (excludes signature field).
 [[nodiscard]] std::string canonical_cert_json(const ServerCertificate& cert);
+
+/// Server IDs become DNS labels, IPAM keys, and filenames.
+[[nodiscard]] bool valid_server_id_label(const std::string& s);
+
+struct CertIssueParams {
+    std::string server_pubkey_b64;  // candidate gossip Ed25519 pubkey (base64)
+    std::string server_id;          // unique DNS label
+    std::string tpm_ak_pubkey;      // optional base64 DER SPKI (Model A pinning)
+    std::string tpm_ek_cert;        // optional PEM
+    uint64_t    expires_at{0};      // 0 = no expiry
+};
+
+/// Build and root-sign a ServerCertificate. The issuer must be the mesh root
+/// keypair — peers verify issuer_pubkey against their configured --root-pubkey.
+[[nodiscard]] ServerCertificate issue_server_certificate(
+    const CertIssueParams& params,
+    crypto::SodiumCryptoService& crypto,
+    const crypto::Ed25519PrivateKey& root_privkey,
+    const crypto::Ed25519PublicKey& root_pubkey);
 
 void to_json(nlohmann::json& j, const ServerCertificate& c);
 void from_json(const nlohmann::json& j, ServerCertificate& c);

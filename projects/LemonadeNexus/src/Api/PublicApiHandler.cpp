@@ -24,7 +24,6 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
             {"cert_path",    ctx_.http_server.tls_cert_path()},
             {"key_path",     ctx_.http_server.tls_key_path()},
             {"server_fqdn",  ctx_.server_fqdn},
-            {"auto_tls",     ctx_.config.auto_tls},
         };
         json_response(res, resp);
     });
@@ -52,13 +51,30 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
 
         entries.push_back({
             .endpoint  = our_endpoint,
+            // Clients reach the public API by the SEIP FQDN (what the cert covers).
+            .fqdn      = !ctx_.server_seip_fqdn.empty() ? ctx_.server_seip_fqdn
+                                                        : ctx_.server_fqdn,
             .http_port = ctx_.config.http_port,
             .healthy   = true,
         });
 
+        // Each peer's SEIP FQDN is <cert.server_id>.<region>.seip.<domain> — the
+        // same name the peer publishes and its cert covers — so clients can reach
+        // it over verified HTTPS. Left empty (and skipped by clients) when the
+        // peer has no cert or region.
         for (const auto& p : peers) {
+            std::string fqdn;
+            if (!p.certificate_json.empty() && !p.region.empty() &&
+                !ctx_.config.dns_base_domain.empty()) {
+                try {
+                    auto sid = nlohmann::json::parse(p.certificate_json).value("server_id", "");
+                    if (!sid.empty())
+                        fqdn = sid + "." + p.region + ".seip." + ctx_.config.dns_base_domain;
+                } catch (...) {}
+            }
             entries.push_back({
                 .endpoint  = p.endpoint,
+                .fqdn      = fqdn,
                 .pubkey    = p.pubkey,
                 .http_port = p.http_port,
                 .last_seen = p.last_seen,

@@ -21,6 +21,10 @@ jobs:
             platform: darwin-arm64
           - os: windows-2022
             platform: windows-x86_64
+          # Mirrors how Lemonade builds the bundled sidecar.
+          - os: windows-2022
+            platform: windows-x86_64-vs
+            vs_generator: true
 
     runs-on: ${{ matrix.os }}
 
@@ -31,9 +35,11 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps
-          key: fetchcontent-${{ matrix.os }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          # Keyed by generator: FetchContent sub-builds record it, and the two
+          # Windows jobs must not restore each other's cache.
+          key: fetchcontent-${{ matrix.os }}-${{ matrix.vs_generator && 'vs' || 'ninja' }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
           restore-keys: |
-            fetchcontent-${{ matrix.os }}-
+            fetchcontent-${{ matrix.os }}-${{ matrix.vs_generator && 'vs' || 'ninja' }}-
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -54,13 +60,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install ninja -y
+          if (-not "${{ matrix.vs_generator }}") { choco install ninja -y }
           New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\vcpkg-binary-cache" | Out-Null
           $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg-binary-cache"
-          vcpkg install openssl:x64-windows-static-md
+          vcpkg install openssl:x64-windows-static
 
+      # VS generator skips vcvars — MSBuild finds the toolchain itself,
+      # matching how Lemonade's parent configure invokes the sub-build
       - name: Set up MSVC environment (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && !matrix.vs_generator
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: "Use D: drive for build (Windows)"
@@ -85,14 +93,24 @@ jobs:
             -DBUILD_TESTING=ON \
             -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
 
-      - name: Configure CMake (Windows)
-        if: runner.os == 'Windows'
+      - name: Configure CMake (Windows, Ninja)
+        if: runner.os == 'Windows' && !matrix.vs_generator
         shell: pwsh
         run: |
-          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static-md"
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
           cmake -B build `
             -G Ninja `
             "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
+            -DBUILD_TESTING=ON `
+            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
+            -DOPENSSL_USE_STATIC_LIBS=ON
+
+      - name: Configure CMake (Windows, Visual Studio)
+        if: matrix.vs_generator
+        shell: pwsh
+        run: |
+          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
+          cmake --preset windows `
             -DBUILD_TESTING=ON `
             "-DOPENSSL_ROOT_DIR=$opensslRoot" `
             -DOPENSSL_USE_STATIC_LIBS=ON
@@ -116,6 +134,15 @@ jobs:
 
       - name: Run tests
         run: ctest --test-dir build --output-on-failure -C ${{ env.BUILD_TYPE }}
+
+      # End-to-end over the assembled daemon + sidecar: per-listener TLS, the
+      # closed-registration join gate, no/wrong-bearer 401s, and the private API
+      # over the mesh. Hermetic — a test CA is seeded into the ACME cache; no
+      # manual-cert support is involved. Runners are elevated by default.
+      - name: Sidecar mesh integration test (Windows, VS)
+        if: matrix.vs_generator
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\sidecar-mesh-test.ps1 -BuildDir build
 
   build-linux-distros:
     strategy:
@@ -141,9 +168,12 @@ jobs:
             platform: linux-x86_64-amzn2023
             # AL2023's defaults are too old for this codebase: GCC 11.5 lacks the
             # <expected> header (need GCC 14, same major as the green Fedora 40
-            # build) and CMake 3.22 is below the 3.25.1 floor (pull current CMake
-            # from PyPI). Symlink GCC 14 as the default cc/g++ on PATH so the
-            # shared Configure step auto-detects it.
+            # build) and CMake 3.22 is below the 3.25.1 floor (pull CMake from
+            # PyPI). PINNED: cmake 4.4.0's gtest_discover_tests emits JSON the
+            # bundled GoogleTestAddTests.cmake can't parse (empty-list parse
+            # error) — pin to a known-good release so an unpinned PyPI bump can't
+            # break the build. Symlink GCC 14 as the default cc/g++ on PATH so
+            # the shared Configure step auto-detects it.
             install_cmd: >-
               dnf install -y ninja-build make gcc14 gcc14-c++ openssl-devel
               pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
@@ -152,7 +182,7 @@ jobs:
               ln -sf /usr/bin/gcc14-gcc /usr/local/bin/cc &&
               ln -sf /usr/bin/gcc14-g++ /usr/local/bin/g++ &&
               ln -sf /usr/bin/gcc14-g++ /usr/local/bin/c++ &&
-              pip3 install cmake
+              pip3 install 'cmake==3.31.6'
 
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
@@ -172,9 +202,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: build/_deps
-          key: fetchcontent-${{ matrix.container }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          # The container tag pins the compiler; `cmake331` marks the pinned
+          # CMake so a toolchain change (or a stale pre-pin cache) can't be
+          # restored into a mismatched build.
+          key: fetchcontent-${{ matrix.container }}-cmake331-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
           restore-keys: |
-            fetchcontent-${{ matrix.container }}-
+            fetchcontent-${{ matrix.container }}-cmake331-
 
       - name: Configure CMake
         run: |

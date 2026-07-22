@@ -1,3 +1,4 @@
+#include <LemonadeNexus/Core/CliModes.hpp>
 #include <LemonadeNexus/Core/Coordinator.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
@@ -23,6 +24,7 @@
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/GovernanceService.hpp>
+#include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/RootKeyChain.hpp>
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
@@ -40,6 +42,7 @@
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
+#include <LemonadeNexus/Api/OnboardApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
 
@@ -69,148 +72,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // --- Print this host's TPM AK pubkey and exit (for enrollment) ---
-    if (config.print_tpm_ak) {
-        auto ak = nexus::core::tpm::export_ak_pubkey_b64();
-        if (!ak) {
-            spdlog::error("No TPM available — cannot export an Attestation Key. "
-                          "(Need /dev/tpmrm0 or a TCTI such as swtpm, on a Linux TPM build.)");
-            return 1;
-        }
-        // Print the raw value to stdout so it can be piped into --enroll-tpm-ak.
-        spdlog::info("TPM AK pubkey (base64 DER SPKI):");
-        std::printf("%s\n", ak->c_str());
-        return 0;
-    }
-
-    // --- Handle enrollment/revocation CLI commands (exit after) ---
-    if (!config.enroll_server_pubkey.empty()) {
-        nexus::crypto::SodiumCryptoService enroll_crypto;
-        enroll_crypto.start();
-        nexus::storage::FileStorageService enroll_storage{std::filesystem::path(config.data_root)};
-        enroll_storage.start();
-        nexus::crypto::KeyWrappingService enroll_kw{enroll_crypto, enroll_storage};
-        enroll_kw.start();
-
-        auto privkey = enroll_kw.unlock_identity({});
-        auto pubkey = enroll_kw.load_identity_pubkey();
-        if (!privkey || !pubkey) {
-            spdlog::error("Cannot enroll: root identity not available. Run server once first to generate identity.");
-            return 1;
-        }
-
-        nexus::gossip::ServerCertificate cert;
-        cert.server_pubkey  = config.enroll_server_pubkey;
-        cert.server_id      = config.enroll_server_id;
-        cert.issued_at      = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
-        cert.expires_at     = 0; // no expiry
-        cert.issuer_pubkey  = nexus::crypto::to_base64(*pubkey);
-
-        // Model A: pin the joining server's TPM Attestation Key into the cert so the
-        // root signature binds identity ↔ AK. The admin is asserting (having validated
-        // the EK→AK chain out of band) that this AK belongs to a genuine TPM.
-        cert.tpm_ak_pubkey = config.enroll_tpm_ak_pubkey;
-        if (!config.enroll_tpm_ek_cert_path.empty()) {
-            std::ifstream ek_f(config.enroll_tpm_ek_cert_path);
-            if (ek_f) {
-                std::string ek_pem((std::istreambuf_iterator<char>(ek_f)),
-                                    std::istreambuf_iterator<char>());
-                cert.tpm_ek_cert = ek_pem;
-                spdlog::info("Enroll: attached EK certificate from {} ({} bytes) — validate the "
-                             "EK→AK chain to the TPM vendor CA before trusting this AK.",
-                             config.enroll_tpm_ek_cert_path, ek_pem.size());
-            } else {
-                spdlog::warn("Enroll: could not read EK cert '{}' — continuing without it",
-                             config.enroll_tpm_ek_cert_path);
-            }
-        }
-        if (cert.tpm_ak_pubkey.empty()) {
-            spdlog::warn("Enroll: no TPM AK pinned (--enroll-tpm-ak) — '{}' will be a Tier-2 "
-                         "certificate and cannot reach Tier 1 under require_tee_attestation.",
-                         config.enroll_server_id);
-        } else {
-            spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",
-                         cert.tpm_ak_pubkey.substr(0, 16), config.enroll_server_id);
-        }
-
-        auto canonical = nexus::gossip::canonical_cert_json(cert);
-        auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
-        auto sig = enroll_crypto.ed25519_sign(*privkey, canonical_bytes);
-        cert.signature = nexus::crypto::to_base64(sig);
-
-        nlohmann::json cert_json = cert;
-        nexus::storage::SignedEnvelope env;
-        env.type = "server_certificate";
-        env.data = cert_json.dump();
-        env.timestamp = cert.issued_at;
-        (void)enroll_storage.write_file("identity", "server_cert.json", env);
-
-        spdlog::info("Enrolled server '{}' (pubkey: {})", cert.server_id, cert.server_pubkey);
-        spdlog::info("Certificate written to {}/identity/server_cert.json", config.data_root);
-        return 0;
-    }
-
-    if (!config.revoke_server_pubkey.empty()) {
-        // Load existing revoked list, append, save
-        nexus::storage::FileStorageService rev_storage{std::filesystem::path(config.data_root)};
-        rev_storage.start();
-
-        nlohmann::json revoked = nlohmann::json::array();
-        auto env = rev_storage.read_file("identity", "revoked_servers.json");
-        if (env) {
-            try { revoked = nlohmann::json::parse(env->data); } catch (...) {}
-        }
-        revoked.push_back(config.revoke_server_pubkey);
-
-        nexus::storage::SignedEnvelope rev_env;
-        rev_env.type = "revocation_list";
-        rev_env.data = revoked.dump();
-        rev_env.timestamp = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
-        (void)rev_storage.write_file("identity", "revoked_servers.json", rev_env);
-
-        spdlog::info("Revoked server pubkey: {}", config.revoke_server_pubkey);
-        rev_storage.stop();
-        return 0;
-    }
-
-    // --- Handle --add-manifest CLI command ---
-    if (!config.add_manifest_path.empty()) {
-        nexus::crypto::SodiumCryptoService manifest_crypto;
-        manifest_crypto.start();
-        nexus::storage::FileStorageService manifest_storage{std::filesystem::path(config.data_root)};
-        manifest_storage.start();
-
-        nexus::core::BinaryAttestationService manifest_attestation{manifest_crypto, manifest_storage};
-        // if release signing pubkey is empty we need to really throw, it should always
-        //be there no matter what, even if our platform doesnt support TEE
-        if (!config.release_signing_pubkey.empty()) {
-            manifest_attestation.set_release_signing_pubkey(config.release_signing_pubkey);
-        }
-
-        try {
-            std::ifstream f(config.add_manifest_path);
-            auto j = nlohmann::json::parse(f);
-            auto manifest = j.get<nexus::core::ReleaseManifest>();
-
-            if (manifest_attestation.add_manifest(manifest)) {
-                spdlog::info("Added release manifest: v{} {} (hash: {})",
-                              manifest.version, manifest.platform, manifest.binary_sha256);
-            } else {
-                spdlog::error("Failed to add manifest (invalid signature?)");
-                return 1;
-            }
-        } catch (const std::exception& e) {
-            spdlog::error("Failed to parse manifest file '{}': {}", config.add_manifest_path, e.what());
-            return 1;
-        }
-
-        manifest_storage.stop();
-        manifest_crypto.stop();
-        return 0;
+    // --- CLI modes (--first-run, --enroll-server, ...) and the
+    // uninitialized-data-dir gate live in Core/CliModes.cpp.
+    if (auto rc = nexus::core::run_cli_mode(config, argv[0])) {
+        return *rc;
     }
 
     const auto http_port   = config.http_port;
@@ -341,6 +206,7 @@ int main(int argc, char* argv[]) {
                                   config.enrollment_quorum_ratio,
                                   config.enrollment_vote_timeout_sec,
                                   config.enrollment_max_retries);
+    gossip.set_admission_quorum_ratio(config.admission_quorum_ratio);
     gossip.set_ipam(&ipam);
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
@@ -349,6 +215,10 @@ int main(int argc, char* argv[]) {
     // Resolve our region + public IP early (reused later for NS/SEIP setup).
     nexus::core::resolve_server_region(config, data_root);
     std::string server_public_ip = nexus::core::resolve_public_ip(config);
+    if (!server_public_ip.empty()) {
+        gossip.set_our_advertised_endpoint(
+            server_public_ip + ":" + std::to_string(gossip_port));
+    }
 
     gossip.start();
 
@@ -503,12 +373,42 @@ int main(int argc, char* argv[]) {
 
     acme.set_dns_service(&dns);
 
-    // Publish _config TXT records (gossip-synced)
-    // The NS hostname (e.g. "ns1") is what clients use for DNS discovery.
-    // Also publish under the server node ID for gossip-based discovery.
+    // Publish SEIP records: <id>.<region>.seip.<domain> for geo-aware discovery
+    dns.set_server_region(config.region);
+    std::string server_seip_fqdn;
+    std::string server_private_fqdn;
     {
-        std::string config_fqdn = nexus::core::build_server_fqdn(
-            config.server_hostname, config.dns_base_domain);
+        auto seip_id = nexus::core::resolve_server_node_id(storage);
+        if (!seip_id.empty() && !config.region.empty() && !server_public_ip.empty()) {
+            server_seip_fqdn = seip_id + "." + config.region + ".seip." + config.dns_base_domain;
+            server_private_fqdn = "private." + server_seip_fqdn;
+
+            dns.publish_seip_records(seip_id, config.region, server_public_ip);
+            spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
+
+            // Publish our tier record so other nodes can discover us by tier+region
+            // (tier<N>.<region>.seip.<domain>). Tier1 = TEE-attested, Tier2 = cert-only.
+            const auto our_tier = trust_policy.our_tier();
+            const int tier_num = (our_tier == nexus::core::TrustTier::Tier1) ? 1
+                               : (our_tier == nexus::core::TrustTier::Tier2) ? 2 : 0;
+            if (tier_num > 0) {
+                dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
+            }
+
+            // The public API cert (for the SEIP FQDN) is resolved below via
+            // public_cert_fqdn — no per-FQDN handling needed here.
+        }
+    }
+
+    // Publish _config TXT records (gossip-synced). After the SEIP block: host=
+    // is the TLS certificate FQDN (docs/DNS-Discovery.md) that clients connect
+    // to over verified HTTPS, so it must be the SEIP FQDN the cert is issued
+    // for — the srv FQDN is only a cert target when SEIP isn't available (no
+    // public IP), mirroring public_cert_fqdn below.
+    {
+        std::string config_fqdn = !server_seip_fqdn.empty()
+            ? server_seip_fqdn
+            : nexus::core::build_server_fqdn(config.server_hostname, config.dns_base_domain);
 
         // Determine the NS hostname prefix (e.g. "ns1" from "ns1.lemonade-nexus.io")
         std::string ns_prefix;
@@ -534,50 +434,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Publish SEIP records: <id>.<region>.seip.<domain> for geo-aware discovery
-    dns.set_server_region(config.region);
-    std::string server_seip_fqdn;
-    std::string server_private_fqdn;
-    {
-        auto seip_id = nexus::core::resolve_server_node_id(storage);
-        if (!seip_id.empty() && !config.region.empty() && !server_public_ip.empty()) {
-            server_seip_fqdn = seip_id + "." + config.region + ".seip." + config.dns_base_domain;
-            server_private_fqdn = "private." + server_seip_fqdn;
-
-            dns.publish_seip_records(seip_id, config.region, server_public_ip);
-            spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
-
-            // Publish our tier record so other nodes can discover us by tier+region
-            // (tier<N>.<region>.seip.<domain>). Tier1 = TEE-attested, Tier2 = cert-only.
-            const auto our_tier = trust_policy.our_tier();
-            const int tier_num = (our_tier == nexus::core::TrustTier::Tier1) ? 1
-                               : (our_tier == nexus::core::TrustTier::Tier2) ? 2 : 0;
-            if (tier_num > 0) {
-                dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
-            }
-
-            // Request ACME cert for the SEIP hostname (public API)
-            if (config.auto_tls) {
-                auto seip_tls = nexus::core::resolve_tls_cert(config, data_root, server_seip_fqdn);
-                if (!seip_tls.cert_path.empty() && !seip_tls.key_path.empty()) {
-                    // Use SEIP cert as the primary public API cert
-                    config.tls_cert_path = seip_tls.cert_path;
-                    config.tls_key_path  = seip_tls.key_path;
-                    spdlog::info("SEIP: using TLS cert for {}", server_seip_fqdn);
-                } else if (seip_tls.needs_acme_background) {
-                    spdlog::info("SEIP: requesting ACME cert for {} in background", server_seip_fqdn);
-                    std::thread([&acme, fqdn = server_seip_fqdn]() {
-                        std::this_thread::sleep_for(std::chrono::seconds(5));
-                        (void)acme.request_certificate(fqdn);
-                    }).detach();
-                }
-            }
-        }
-    }
-
     dns.start();
 
-    // NS slot claiming: first 9 servers claim ns1-ns9 for DNS bootstrap
+    // NS slot claiming: first 9 servers claim ns1-ns9 for DNS bootstrap.
+    // An explicit ns<N> identity pins the slot: the registrar's glue points
+    // that exact name at this IP, so claiming any other slot would publish a
+    // nameserver record the registry contradicts.
+    if (!ns_hostname.empty()) {
+        auto dot = ns_hostname.find('.');
+        auto label = ns_hostname.substr(0, dot == std::string::npos ? ns_hostname.size() : dot);
+        if (label.size() == 3 && label.starts_with("ns") &&
+            label[2] >= '1' && label[2] <= '9') {
+            gossip.set_preferred_ns_slot(static_cast<uint8_t>(label[2] - '0'));
+        }
+    }
     gossip.set_our_region(config.region);
     gossip.set_dns_base_domain(config.dns_base_domain);
     if (!server_public_ip.empty()) {
@@ -634,11 +504,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    auto tls = nexus::core::resolve_tls_cert(config, data_root, server_fqdn);
-    if (!tls.cert_path.empty() && !tls.key_path.empty()) {
-        config.tls_cert_path = tls.cert_path;
-        config.tls_key_path  = tls.key_path;
-    }
+    // Clients reach the public API at the SEIP FQDN, so its certificate must
+    // cover that name (fall back to the srv FQDN only when SEIP isn't set, e.g.
+    // no public IP). The background ACME thread and renewal use the same target.
+    const std::string public_cert_fqdn =
+        !server_seip_fqdn.empty() ? server_seip_fqdn : server_fqdn;
+    auto tls = nexus::core::resolve_tls_cert(data_root, public_cert_fqdn);
 
     // ========================================================================
     // boringtun interface — server-side tunnel endpoint
@@ -764,23 +635,25 @@ int main(int argc, char* argv[]) {
                                             tls.cert_path, tls.key_path};
 
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
+    bool private_needs_acme = false;   // request + upgrade the private cert in the background
     if (!tunnel_bind_ip.empty()) {
-        // Try to get/request ACME cert for the private FQDN
+        // Resolve the PRIVATE cert independently of the public one — its ACME
+        // cert is the one issued for server_private_fqdn (never the public SEIP
+        // cert).
         std::string priv_cert_path, priv_key_path;
-        if (!server_private_fqdn.empty() && config.auto_tls) {
-            auto priv_tls = nexus::core::resolve_tls_cert(config, data_root, server_private_fqdn);
+        if (!server_private_fqdn.empty()) {
+            auto priv_tls = nexus::core::resolve_tls_cert(data_root, server_private_fqdn);
             if (!priv_tls.cert_path.empty() && !priv_tls.key_path.empty()) {
                 priv_cert_path = priv_tls.cert_path;
                 priv_key_path  = priv_tls.key_path;
                 spdlog::info("Private API: using TLS cert for {}", server_private_fqdn);
             } else if (priv_tls.needs_acme_background) {
-                spdlog::info("Private API: no cert for {} -- requesting in background", server_private_fqdn);
-                // Request cert asynchronously — private API starts as HTTP initially,
-                // will need restart to pick up the cert once ACME completes
-                std::thread([&acme, fqdn = server_private_fqdn]() {
-                    std::this_thread::sleep_for(std::chrono::seconds(5));
-                    (void)acme.request_certificate(fqdn);
-                }).detach();
+                // The private API is withheld until its cert issues; the unified
+                // background ACME thread below requests it and upgrades the
+                // listener in place (no restart, no plaintext interim).
+                spdlog::info("Private API: no cert for {} -- requesting + upgrading in background",
+                             server_private_fqdn);
+                private_needs_acme = true;
             }
         }
 
@@ -817,9 +690,6 @@ int main(int argc, char* argv[]) {
                       bridge_target);
     }
 
-    auto& private_srv = private_http_server
-        ? private_http_server->server()
-        : http_server.server();
     if (!private_http_server) {
         spdlog::warn("SECURITY: No tunnel_bind_ip configured — private API routes "
                      "are exposed on the public HTTP server. Set a tunnel IP to "
@@ -837,10 +707,32 @@ int main(int argc, char* argv[]) {
         }
         return httplib::Server::HandlerResponse::Unhandled;
     };
-    http_server.server().set_pre_routing_handler(rate_limit_handler);
-    if (private_http_server) {
-        private_http_server->server().set_pre_routing_handler(rate_limit_handler);
-    }
+
+    // ========================================================================
+    // Server onboarding (admission of new servers over the public API)
+    // ========================================================================
+    nexus::core::ServerAdmissionService admission{
+        config, crypto, key_wrapping, storage, gossip,
+        config.require_tee_attestation ? &trust_policy : nullptr};
+
+    // Governed-admission ballots (>= onboard_min_tier1_for_vote Tier1 peers)
+    // resolve through the gossip enrollment machinery; map the outcome back to
+    // certificate issuance / denial. Registered before start() so a ballot
+    // re-opened on startup can't resolve into a missing callback.
+    gossip.set_enrollment_decision_callback(
+        [&admission, &gossip](const nexus::gossip::EnrollmentBallot& b) {
+            if (b.kind != nexus::gossip::EnrollmentBallot::Kind::Admission) return;
+            // Only the sponsor holds the matching admission record, so a ballot we
+            // did not open must never resolve one of ours.
+            if (b.sponsor_pubkey !=
+                nexus::crypto::to_base64(gossip.keypair().public_key)) return;
+            const bool approved = b.state == nexus::gossip::EnrollmentBallot::State::Approved;
+            admission.on_ballot_decision(
+                b.request_id, approved, b.candidate_pubkey, b.claim_hash,
+                approved ? "" : "admission ballot did not reach quorum");
+        });
+
+    admission.start();
 
     // ========================================================================
     // Register CRTP request handlers
@@ -864,6 +756,7 @@ int main(int argc, char* argv[]) {
         .tee              = tee,
         .trust_policy     = trust_policy,
         .governance       = governance,
+        .admission        = admission,
         .boringtun        = &boringtun_service,
         .dns              = &dns,
         .server_fqdn      = server_fqdn,
@@ -881,28 +774,76 @@ int main(int argc, char* argv[]) {
     nexus::api::AdminApiHandler  admin_api{ctx};
     nexus::api::MeshApiHandler   mesh_api{ctx};
     nexus::api::RoutingApiHandler routing_api{ctx};
+    nexus::api::OnboardApiHandler onboard_api{ctx};
 
     // Route registration is factored into a lambda so it can be re-run if the
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
     // a background ACME cert is issued).
+    // Register every handler's public routes on `pub` and private routes on `priv`.
+    auto register_on = [&](httplib::Server& pub, httplib::Server& priv) {
+        pub.set_pre_routing_handler(rate_limit_handler);
+        priv.set_pre_routing_handler(rate_limit_handler);
+        public_api.register_routes(pub, priv);
+        auth_api.register_routes(pub, priv);
+        tree_api.register_routes(pub, priv);
+        relay_api.register_routes(pub, priv);
+        cert_api.register_routes(pub, priv);
+        admin_api.register_routes(pub, priv);
+        mesh_api.register_routes(pub, priv);
+        routing_api.register_routes(pub, priv);
+        onboard_api.register_routes(pub, priv);
+    };
+    // Re-runnable if the underlying server object is replaced (plain->HTTPS
+    // upgrade after a background ACME cert). Resolves the private server on every
+    // call since upgrade_to_tls swaps the object.
     auto register_public_routes = [&]() {
-        public_api.register_routes(http_server.server(), private_srv);
-        auth_api.register_routes(http_server.server(), private_srv);
-        tree_api.register_routes(http_server.server(), private_srv);
-        relay_api.register_routes(http_server.server(), private_srv);
-        cert_api.register_routes(http_server.server(), private_srv);
-        admin_api.register_routes(http_server.server(), private_srv);
-        mesh_api.register_routes(http_server.server(), private_srv);
-        routing_api.register_routes(http_server.server(), private_srv);
+        auto& private_srv = private_http_server ? private_http_server->server()
+                                                : http_server.server();
+        register_on(http_server.server(), private_srv);
+    };
+    // Re-register ONLY the private routes on the (upgraded) private server object,
+    // without touching the live public server: the handlers' public routes land
+    // on a throwaway server that is discarded immediately.
+    auto register_private_routes = [&]() {
+        if (!private_http_server) return;
+        httplib::Server discard;
+        register_on(discard, private_http_server->server());
+    };
+    // Re-register ONLY the public routes on the (upgraded) public server object,
+    // without touching the live private server: the handlers' private routes land
+    // on a throwaway server that is discarded immediately.
+    auto reregister_public_routes = [&]() {
+        httplib::Server discard;
+        register_on(http_server.server(), discard);
     };
     register_public_routes();
 
     // ========================================================================
     // Start HTTP servers
     // ========================================================================
-    http_server.start();
+    // Refuse-without-cert: the control-plane APIs serve HTTPS or nothing. A
+    // server with no valid cert is withheld (no plaintext fallback). The public
+    // API is brought up in place by the background ACME thread below once a cert
+    // is issued; the private API picks its cert up on the next restart.
+    if (http_server.is_tls()) {
+        http_server.start();
+    } else if (tls.needs_acme_background) {
+        // Name the FQDN the cert is actually requested for (SEIP, srv fallback).
+        spdlog::warn("Public API withheld: no TLS certificate yet for {} — it will "
+                     "start once ACME issues one (no plaintext fallback)", public_cert_fqdn);
+    } else {
+        spdlog::error("Public API withheld: no TLS certificate for '{}' and no FQDN to "
+                      "request one for via ACME (needs a public IP / SEIP FQDN; "
+                      "no plaintext fallback).", public_cert_fqdn);
+    }
     if (private_http_server) {
-        private_http_server->start();
+        if (private_http_server->is_tls()) {
+            private_http_server->start();
+        } else {
+            spdlog::warn("Private API withheld: no TLS certificate yet for {} — it will "
+                         "start once ACME issues one (no plaintext fallback)",
+                         server_private_fqdn);
+        }
     }
 
     // ========================================================================
@@ -921,82 +862,110 @@ int main(int argc, char* argv[]) {
         spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());
     }
 
+    // Public-IP self-check: auto-detection measures the egress path, which on
+    // multihomed/VPN'd hosts is not the ingress peers must reach. Probe our own
+    // public endpoint once the listeners are up and warn if it refuses.
+    if (!server_public_ip.empty()) {
+        std::thread([ip = server_public_ip, port = http_port,
+                     configured = !config.public_ip.empty()]() {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+            if (nexus::core::tcp_connect_check(ip, port, 4)) {
+                spdlog::info("Public IP self-check: {}:{} accepts connections from this host",
+                             ip, port);
+            } else if (configured) {
+                spdlog::warn("Public IP self-check: configured public_ip {}:{} did not accept "
+                             "a connection from this host. This can be a NAT that doesn't "
+                             "hairpin, but verify that peers can actually reach it.", ip, port);
+            } else {
+                spdlog::warn("Public IP self-check: auto-detected public IP {}:{} did not "
+                             "accept a connection. Detection measures the egress path and is "
+                             "often wrong on multihomed/VPN'd hosts — set public_ip explicitly "
+                             "if peers cannot reach this server.", ip, port);
+            }
+        }).detach();
+    }
+
     // ========================================================================
     // Background ACME retry -- if no cert yet, retry every 5 minutes
     // ========================================================================
     std::atomic<bool> acme_retry_stop{false};
-    std::thread acme_retry_thread;
-    if (tls.needs_acme_background) {
-        acme_retry_thread = std::thread([&]() {
-            constexpr auto initial_delay  = std::chrono::seconds(30);
-            constexpr auto base_interval  = std::chrono::minutes(5);
-            constexpr auto max_interval   = std::chrono::hours(1);
-            auto current_interval = base_interval;
 
-            spdlog::info("Auto-TLS: background retry starting in 30s for {}", server_fqdn);
-            for (auto elapsed = std::chrono::seconds(0);
-                 elapsed < initial_delay && !acme_retry_stop.load();
-                 elapsed += std::chrono::seconds(1)) {
+    // Obtain a cert for `fqdn` and bring `srv` up over HTTPS in place (hot-reload
+    // if already TLS, else swap the listener to an SSLServer and re-register its
+    // routes). Loops with backoff until issuance or shutdown; never serves
+    // plaintext. `is_private` selects which routes to re-register on upgrade.
+    auto activate_tls = [&](nexus::network::HttpServer& srv, const std::string& fqdn,
+                            const char* label, bool is_private) {
+        constexpr auto initial_delay = std::chrono::seconds(30);
+        constexpr auto base_interval = std::chrono::minutes(5);
+        constexpr auto max_interval  = std::chrono::hours(1);
+        auto current_interval = base_interval;
+
+        spdlog::info("Auto-TLS: background retry starting in 30s for {} ({})", fqdn, label);
+        for (auto e = std::chrono::seconds(0); e < initial_delay && !acme_retry_stop.load();
+             e += std::chrono::seconds(1))
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        while (!acme_retry_stop.load()) {
+            spdlog::info("Auto-TLS: attempting ACME certificate for {} ({})", fqdn, label);
+            auto result = acme.request_certificate(fqdn);
+            if (result.success) {
+                spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
+                              fqdn, result.cert_path, result.key_path);
+                if (srv.is_tls()) {
+                    if (srv.reload_tls_certs(result.cert_path, result.key_path))
+                        spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", fqdn);
+                    else
+                        spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", fqdn);
+                    return;
+                }
+                spdlog::info("Auto-TLS: activating HTTPS for {} ({}) in place...", fqdn, label);
+                srv.stop();
+                if (srv.upgrade_to_tls(result.cert_path, result.key_path)) {
+                    if (is_private) register_private_routes(); else reregister_public_routes();
+                    srv.start();
+                    spdlog::info("Auto-TLS: HTTPS active for {} ({}) — other services unaffected",
+                                  fqdn, label);
+                    return;
+                }
+                spdlog::error("Auto-TLS: TLS upgrade failed for {} ({}); stays withheld "
+                              "(no plaintext fallback) — will retry", fqdn, label);
+            }
+
+            bool rate_limited = result.error_message.find("rateLimited") != std::string::npos
+                             || result.error_message.find("429") != std::string::npos
+                             || result.error_message.find("too many") != std::string::npos;
+
+            if (rate_limited) {
+                current_interval = max_interval;
+                spdlog::warn("Auto-TLS: rate limited by ACME provider -- backing off to {} minutes",
+                              std::chrono::duration_cast<std::chrono::minutes>(current_interval).count());
+            } else {
+                auto mins = std::chrono::duration_cast<std::chrono::minutes>(current_interval).count();
+                spdlog::warn("Auto-TLS: ACME retry failed for {} -- retrying in {} minutes", fqdn, mins);
+                auto doubled = current_interval * 2;
+                current_interval = doubled > max_interval ? max_interval : doubled;
+            }
+
+            for (auto e = std::chrono::seconds(0);
+                 e < current_interval && !acme_retry_stop.load();
+                 e += std::chrono::seconds(1))
                 std::this_thread::sleep_for(std::chrono::seconds(1));
-            }
 
-            while (!acme_retry_stop.load()) {
-                spdlog::info("Auto-TLS: attempting ACME certificate for {}", server_fqdn);
-                auto result = acme.request_certificate(server_fqdn);
-                if (result.success) {
-                    spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
-                                  server_fqdn, result.cert_path, result.key_path);
-                    // Activate HTTPS in place — restart ONLY the HTTP server, leaving
-                    // gossip/DNS/STUN/relay/etc. running. Never tear down the whole process.
-                    if (http_server.is_tls()) {
-                        // Already HTTPS — hot-swap the cert, no restart needed.
-                        if (http_server.reload_tls_certs(result.cert_path, result.key_path)) {
-                            spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", server_fqdn);
-                        } else {
-                            spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", server_fqdn);
-                        }
-                    } else {
-                        spdlog::info("Auto-TLS: activating HTTPS on the API server (in place)...");
-                        http_server.stop();
-                        if (http_server.upgrade_to_tls(result.cert_path, result.key_path)) {
-                            register_public_routes();  // server object changed — re-register
-                            http_server.start();
-                            spdlog::info("Auto-TLS: HTTPS active for {} — other services unaffected",
-                                          server_fqdn);
-                        } else {
-                            http_server.start();  // upgrade failed — resume plain HTTP
-                            spdlog::warn("Auto-TLS: TLS upgrade failed for {}; continuing on HTTP",
-                                          server_fqdn);
-                        }
-                    }
-                    break;
-                }
+            if (rate_limited) current_interval = base_interval;
+        }
+    };
 
-                bool rate_limited = result.error_message.find("rateLimited") != std::string::npos
-                                 || result.error_message.find("429") != std::string::npos
-                                 || result.error_message.find("too many") != std::string::npos;
-
-                if (rate_limited) {
-                    current_interval = max_interval;
-                    spdlog::warn("Auto-TLS: rate limited by ACME provider -- backing off to {} minutes",
-                                  std::chrono::duration_cast<std::chrono::minutes>(current_interval).count());
-                } else {
-                    auto mins = std::chrono::duration_cast<std::chrono::minutes>(current_interval).count();
-                    spdlog::warn("Auto-TLS: ACME retry failed -- retrying in {} minutes", mins);
-                    auto doubled = current_interval * 2;
-                    current_interval = doubled > max_interval ? max_interval : doubled;
-                }
-
-                for (auto elapsed = std::chrono::seconds(0);
-                     elapsed < current_interval && !acme_retry_stop.load();
-                     elapsed += std::chrono::seconds(1)) {
-                    std::this_thread::sleep_for(std::chrono::seconds(1));
-                }
-
-                if (rate_limited) {
-                    current_interval = base_interval;
-                }
-            }
+    // Bring the public API up first, then the private API — one thread so the
+    // ACME calls stay serialized (shared account/order state), and neither
+    // listener serves plaintext while it waits for its cert.
+    std::thread acme_retry_thread;
+    if (tls.needs_acme_background || private_needs_acme) {
+        acme_retry_thread = std::thread([&]() {
+            if (tls.needs_acme_background)
+                activate_tls(http_server, public_cert_fqdn, "public API", false);
+            if (private_needs_acme && private_http_server)
+                activate_tls(*private_http_server, server_private_fqdn, "private API", true);
         });
     }
 
@@ -1005,12 +974,14 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     std::atomic<bool> acme_renewal_stop{false};
     std::thread acme_renewal_thread;
-    if (!server_fqdn.empty() && config.auto_tls && !tls.needs_acme_background) {
+    const bool have_private_fqdn = private_http_server && !server_private_fqdn.empty();
+    if (!public_cert_fqdn.empty() || have_private_fqdn) {
         acme_renewal_thread = std::thread([&]() {
             constexpr auto initial_delay = std::chrono::hours(1);
             constexpr auto check_interval = std::chrono::hours(24);
 
-            spdlog::info("Auto-TLS: certificate renewal monitor started for {} (checking daily)", server_fqdn);
+            spdlog::info("Auto-TLS: certificate renewal monitor started (public + private, "
+                         "checking daily)");
 
             for (auto elapsed = std::chrono::seconds(0);
                  elapsed < initial_delay && !acme_renewal_stop.load();
@@ -1018,16 +989,24 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
 
-            while (!acme_renewal_stop.load()) {
-                auto result = acme.renew_certificate(server_fqdn);
-                if (result.success && !result.cert_path.empty()) {
+            // Renew + hot-reload one listener, but only once it is actually serving
+            // TLS — so certs first obtained by the background issuance path are
+            // covered too (they become is_tls() after the upgrade above).
+            auto renew_one = [&](nexus::network::HttpServer& srv, const std::string& fqdn) {
+                if (fqdn.empty() || !srv.is_tls()) return;
+                auto r = acme.renew_certificate(fqdn);
+                if (r.success && !r.cert_path.empty()) {
                     spdlog::info("Auto-TLS: renewal check complete for {} (cert={})",
-                                  server_fqdn, result.cert_path);
+                                  fqdn, r.cert_path);
+                    (void)srv.reload_tls_certs(r.cert_path, r.key_path);
+                } else if (!r.success) {
+                    spdlog::warn("Auto-TLS: renewal failed for {}: {}", fqdn, r.error_message);
                 }
-                if (!result.success) {
-                    spdlog::warn("Auto-TLS: renewal failed for {}: {}",
-                                  server_fqdn, result.error_message);
-                }
+            };
+
+            while (!acme_renewal_stop.load()) {
+                renew_one(http_server, public_cert_fqdn);
+                if (private_http_server) renew_one(*private_http_server, server_private_fqdn);
 
                 for (auto elapsed = std::chrono::seconds(0);
                      elapsed < check_interval && !acme_renewal_stop.load();
@@ -1057,6 +1036,7 @@ int main(int argc, char* argv[]) {
         private_http_server->stop();
     }
     http_server.stop();
+    admission.stop();
     ddns.stop();
     dns.stop();
     acme.stop();

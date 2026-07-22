@@ -5,6 +5,7 @@ include(FetchContent)
 # SQLite3 amalgamation — single-file embeddable database
 FetchContent_Declare(sqlite3
     URL https://www.sqlite.org/2024/sqlite-amalgamation-3460100.zip
+    URL_HASH SHA256=77823cb110929c2bcb0f5d48e4833b5c59a8a6e40cdea3936b99e199dbbe5784
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     EXCLUDE_FROM_ALL
 )
@@ -26,5 +27,3 @@ target_compile_definitions(sqlite3_lib PRIVATE
     SQLITE_USE_ALLOCA
 )
 add_library(sqlite3 ALIAS sqlite3_lib)
-
-# Target: sqlite3

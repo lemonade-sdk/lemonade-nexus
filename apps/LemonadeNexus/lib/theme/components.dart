@@ -164,16 +164,35 @@ class LemonBadge extends StatelessWidget {
 class SectionHeader extends StatelessWidget {
   final String title;
   final IconData icon;
-  const SectionHeader({super.key, required this.title, required this.icon});
+
+  /// When true, the title shrinks and ellipsizes instead of overflowing —
+  /// use inside a width-constrained Row (e.g. a header sharing space with a
+  /// badge and action button). Requires the header to sit in a bounded Row.
+  final bool flexibleTitle;
+
+  const SectionHeader({
+    super.key,
+    required this.title,
+    required this.icon,
+    this.flexibleTitle = false,
+  });
 
   @override
   Widget build(BuildContext context) {
+    const titleStyle = TextStyle(fontSize: 16, fontWeight: FontWeight.w600);
     return Row(
       children: [
         Icon(icon, color: AppTheme.lemonYellowDark, size: 18),
         const SizedBox(width: 8),
-        Text(title,
-            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+        if (flexibleTitle)
+          Flexible(
+            child: Text(title,
+                style: titleStyle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis),
+          )
+        else
+          Text(title, style: titleStyle),
       ],
     );
   }

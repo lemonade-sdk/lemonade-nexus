@@ -11,8 +11,14 @@ include(FetchContent)
 # --- Corrosion: CMake integration for Rust ---
 FetchContent_Declare(corrosion
     GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-    GIT_TAG        v0.5.1
+    GIT_TAG        b1fab721655c5c4b1b08a083d3cd29f163af75d0  # v0.5.1
 )
+
+# Probe Rust with the static CRT so Corrosion links libcmt (not msvcrt) under /MT
+if(MSVC AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+    set(ENV{RUSTFLAGS} "-Ctarget-feature=+crt-static")
+endif()
+
 FetchContent_MakeAvailable(corrosion)
 
 # --- Import our wrapper crate ---
@@ -20,6 +26,11 @@ corrosion_import_crate(
     MANIFEST_PATH "${CMAKE_SOURCE_DIR}/crates/boringtun-ffi/Cargo.toml"
     PROFILE       release
 )
+
+# Same crt-static flag for the crate's own build.
+if(MSVC AND NOT CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
+    corrosion_add_target_rustflags(lemonade_boringtun_ffi "-Ctarget-feature=+crt-static")
+endif()
 
 # Expose an INTERFACE target that downstream can link against.
 # Link directly against Corrosion's imported target (lemonade_boringtun_ffi)

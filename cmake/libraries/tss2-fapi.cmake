@@ -35,12 +35,15 @@ if(TARGET tss2::fapi)
     return()
 endif()
 
-if(NOT (UNIX AND NOT APPLE))
-    # Windows / macOS: TPM Feature API unavailable — define a no-op target so the
-    # dependency list still resolves and the rest of the build is unaffected.
+if(LEMONADE_NEXUS_MINIMAL_DEPS OR NOT (UNIX AND NOT APPLE))
+    # No-op target so the dependency list still resolves where FAPI is disabled.
     add_library(tss2_fapi_iface INTERFACE)
     add_library(tss2::fapi ALIAS tss2_fapi_iface)
-    message(STATUS "tss2-fapi: TPM Feature API unavailable on this platform — building without TPM support")
+    if(LEMONADE_NEXUS_MINIMAL_DEPS)
+        message(STATUS "tss2-fapi: disabled by LEMONADE_NEXUS_MINIMAL_DEPS — building without TPM support")
+    else()
+        message(STATUS "tss2-fapi: TPM Feature API unavailable on this platform — building without TPM support")
+    endif()
     return()
 endif()
 

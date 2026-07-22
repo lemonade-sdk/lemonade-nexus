@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace lnsdk {
@@ -58,10 +59,6 @@ public:
     /// Requires a valid identity (call set_identity() first).
     /// Auto-registers new pubkeys on first use.
     [[nodiscard]] Result<AuthResponse> authenticate_ed25519();
-
-    /// POST /api/auth/register/ed25519 — register Ed25519 pubkey with explicit user_id.
-    /// If user_id is empty, server derives one from the pubkey hash.
-    [[nodiscard]] Result<AuthResponse> register_ed25519(const std::string& user_id = "");
 
     /// POST /api/auth — password authentication (deprecated, stub on server).
     [[nodiscard]] Result<AuthResponse> authenticate(const std::string& username,
@@ -345,6 +342,27 @@ public:
 
     /// Set the node ID manually.
     void set_node_id(const std::string& id);
+
+    /// Set a single-use device link token to include in the next join_network
+    /// call (obtained out-of-band from an already-joined device).
+    void set_link_token(const std::string& token);
+
+    /// Mint a device link token so another device can join this account's
+    /// group (requires an established mesh session; calls the private API).
+    /// Response JSON: {link_token, group_node_id, expires_at}.
+    [[nodiscard]] Result<nlohmann::json> create_link_token(uint32_t ttl_sec = 600);
+
+    /// Publish a local service to mesh peers: our mesh IP:vport bridges to
+    /// `target` ("tcp:127.0.0.1:PORT"). Requires an active mesh (join first);
+    /// exposures are remembered and re-applied on re-join.
+    [[nodiscard]] StatusResult expose_service(uint16_t vport, const std::string& target);
+
+    /// Exposures registered via expose_service ({vport, target} pairs).
+    [[nodiscard]] std::vector<std::pair<uint16_t, std::string>> exposed_services() const;
+
+    /// Open (or reuse) a loopback bridge to a mesh peer's dst_ip:dst_port.
+    /// Returns the bound 127.0.0.1 port, or 0 when the mesh is inactive.
+    [[nodiscard]] uint16_t open_egress(const std::string& dst_ip, uint16_t dst_port);
 
 private:
     struct Impl;

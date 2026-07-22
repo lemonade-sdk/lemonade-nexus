@@ -49,6 +49,12 @@ public:
     /// The caller (HTTP handler) is responsible for permission checks.
     bool delete_node_direct(const std::string& node_id);
 
+    /// True if any surviving node has this management pubkey as its owner
+    /// (node.mgmt_pubkey). Used by the delete path to avoid blocklisting an
+    /// owner's key when they delete one of their own (self-owned) devices — the
+    /// owner key still owns their group and sibling endpoints.
+    [[nodiscard]] bool is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const;
+
     /// Grant an assignment (pubkey + permissions) on a node.
     /// Idempotent: no-op if the pubkey already has an assignment.
     /// Used after Ed25519 key registration to give new keys add_child on root.

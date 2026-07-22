@@ -9,9 +9,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -49,8 +51,18 @@ public:
     /// Issue an Ed25519 challenge nonce for the given pubkey.
     [[nodiscard]] nlohmann::json issue_ed25519_challenge(const std::string& pubkey_b64);
 
-    /// Register an Ed25519 public key (explicit registration).
-    [[nodiscard]] AuthResult register_ed25519(const nlohmann::json& registration);
+    /// Revoke an Ed25519 identity (e.g. on device deletion): future
+    /// authentication attempts for this key are rejected. pubkey_b64 is the raw
+    /// base64 key (no "ed25519:" prefix). Idempotent.
+    bool revoke_ed25519(const std::string& pubkey_b64);
+
+    /// Mint a single-use device-link token bound to the owner's Customer group.
+    [[nodiscard]] std::optional<std::pair<std::string, LinkTokenRecord>>
+    mint_link_token(const std::string& owner_user_id, const std::string& owner_pubkey,
+                    const std::string& group_node_id, std::chrono::seconds ttl);
+
+    /// Verify and burn a device-link token (single use).
+    [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token);
 
     /// Validate an existing session token (JWT).
     [[nodiscard]] bool validate_session(std::string_view token);

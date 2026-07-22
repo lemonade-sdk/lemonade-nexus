@@ -1,6 +1,13 @@
 cmake_minimum_required(VERSION 3.25.1)
 include(CreateProject)
 
+# Generated version header (values computed in cmake/version.cmake)
+configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/LemonadeNexus/Core/Version.hpp.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/include/LemonadeNexus/Core/Version.hpp"
+        @ONLY
+)
+
 # OpenSSL::SSL and OpenSSL::Crypto are provided by cmake/libraries/openssl.cmake
 # tss2::fapi provided by cmake/libraries/tss2-fapi.cmake
 # (built from source via ExternalProject_Add — no system/Homebrew dependency).

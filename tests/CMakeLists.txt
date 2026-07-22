@@ -21,6 +21,7 @@ function(add_nexus_test TEST_NAME)
 endfunction()
 
 # --- Unit tests ---
+add_nexus_test(test_version            test_version.cpp)
 add_nexus_test(test_crypto_types       test_crypto_types.cpp)
 add_nexus_test(test_sodium_crypto      test_sodium_crypto.cpp)
 add_nexus_test(test_key_wrapping       test_key_wrapping.cpp)
@@ -43,6 +44,13 @@ add_nexus_test(test_ip_router         test_ip_router.cpp)
 add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_trust             test_trust.cpp)
+add_nexus_test(test_onboarding        test_onboarding.cpp)
+add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
+
+# Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
+add_nexus_test(test_tls_transport     test_tls_transport.cpp)
+target_compile_definitions(test_tls_transport PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
+target_link_libraries(test_tls_transport PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 
@@ -61,6 +69,7 @@ function(add_sdk_test TEST_NAME)
 endfunction()
 
 add_sdk_test(test_routing_pool         test_routing_pool.cpp)
+add_sdk_test(test_mesh_ingress         test_mesh_ingress.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)

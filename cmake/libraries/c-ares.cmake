@@ -5,8 +5,7 @@ include(FetchContent)
 FetchContent_Declare(
     c-ares
     GIT_REPOSITORY https://github.com/c-ares/c-ares.git
-    GIT_TAG        v1.34.6
-    GIT_SHALLOW    TRUE
+    GIT_TAG        3ac47ee46edd8ea40370222f91613fc16c434853  # v1.34.6
 )
 
 # Disable c-ares tools and tests

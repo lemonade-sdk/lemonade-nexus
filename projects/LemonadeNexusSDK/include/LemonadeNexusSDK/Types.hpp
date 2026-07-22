@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -12,16 +13,18 @@ namespace lnsdk {
 // Server configuration
 // ---------------------------------------------------------------------------
 
-/// A single server endpoint (host + port + TLS flag).
+/// A single server endpoint. `host` should be the server's certificate FQDN —
+/// the public API is verified HTTPS by default and the cert can't be verified
+/// against a bare IP.
 struct ServerEndpoint {
     std::string host{"127.0.0.1"};
     uint16_t    port{9100};
-    bool        use_tls{false};
+    bool        use_tls{true};
 };
 
 struct ServerConfig {
-    /// Seed list of servers (at least one).
-    std::vector<ServerEndpoint> servers{{{"127.0.0.1", 9100, false}}};
+    /// Seed list of servers (at least one). Each host must be a cert FQDN.
+    std::vector<ServerEndpoint> servers{{{"127.0.0.1", 9100, true}}};
 
     int  connect_timeout_sec{5};
     int  read_timeout_sec{10};
@@ -30,12 +33,18 @@ struct ServerConfig {
     /// If true, fetch /api/servers on first connect to discover additional servers.
     bool     auto_discover{true};
 
+    /// If true, keep talking to the configured endpoint (an FQDN) after join
+    /// instead of switching the public API to the server's advertised SEIP FQDN.
+    /// The pinned host must still be a cert FQDN; pin an address separately if
+    /// needed (verification is always on).
+    bool     pin_server{false};
+
     /// How often to check server health (seconds). 0 = disabled.
     uint32_t health_check_interval_sec{30};
 
     /// Convenience: single-server constructor for backward compat.
     ServerConfig() = default;
-    ServerConfig(const std::string& host, uint16_t port, bool tls = false)
+    ServerConfig(const std::string& host, uint16_t port, bool tls = true)
         : servers{{host, port, tls}} {}
 };
 

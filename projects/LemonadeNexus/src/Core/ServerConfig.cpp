@@ -36,8 +36,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"rate_limit_rpm",      c.rate_limit_rpm},
         {"rate_limit_burst",    c.rate_limit_burst},
         {"log_level",           c.log_level},
-        {"tls_cert_path",       c.tls_cert_path},
-        {"tls_key_path",        c.tls_key_path},
         {"acme_provider",       c.acme_provider},
         {"acme_eab_kid",        c.acme_eab_kid},
         {"acme_eab_hmac_key",   c.acme_eab_hmac_key},
@@ -45,7 +43,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"public_ip",           c.public_ip},
         {"region",              c.region},
         {"server_hostname",     c.server_hostname},
-        {"auto_tls",            c.auto_tls},
         {"dns_base_domain",     c.dns_base_domain},
         {"dns_seed_discovery",  c.dns_seed_discovery},
         {"dns_ns_hostname",     c.dns_ns_hostname},
@@ -58,6 +55,7 @@ void to_json(json& j, const ServerConfig& c) {
         {"ddns_password",              c.ddns_password},
         {"ddns_update_interval_sec",   c.ddns_update_interval_sec},
         {"ddns_enabled",               c.ddns_enabled},
+        {"open_registration",          c.open_registration},
         {"private_http_port",          c.private_http_port},
         {"require_peer_confirmation",  c.require_peer_confirmation},
         {"enrollment_quorum_ratio",    c.enrollment_quorum_ratio},
@@ -66,6 +64,11 @@ void to_json(json& j, const ServerConfig& c) {
         {"require_tee_attestation",    c.require_tee_attestation},
         {"tee_attestation_validity_sec", c.tee_attestation_validity_sec},
         {"tee_platform_override",      c.tee_platform_override},
+        {"onboard_enabled",            c.onboard_enabled},
+        {"admission_quorum_ratio",     c.admission_quorum_ratio},
+        {"onboard_min_tier1_for_vote", c.onboard_min_tier1_for_vote},
+        {"onboard_request_ttl_sec",    c.onboard_request_ttl_sec},
+        {"onboard_max_pending",        c.onboard_max_pending},
     };
 }
 
@@ -88,8 +91,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("rate_limit_rpm"))      j.at("rate_limit_rpm").get_to(c.rate_limit_rpm);
     if (j.contains("rate_limit_burst"))    j.at("rate_limit_burst").get_to(c.rate_limit_burst);
     if (j.contains("log_level"))           j.at("log_level").get_to(c.log_level);
-    if (j.contains("tls_cert_path"))       j.at("tls_cert_path").get_to(c.tls_cert_path);
-    if (j.contains("tls_key_path"))        j.at("tls_key_path").get_to(c.tls_key_path);
     if (j.contains("acme_provider"))       j.at("acme_provider").get_to(c.acme_provider);
     if (j.contains("acme_eab_kid"))        j.at("acme_eab_kid").get_to(c.acme_eab_kid);
     if (j.contains("acme_eab_hmac_key"))   j.at("acme_eab_hmac_key").get_to(c.acme_eab_hmac_key);
@@ -97,7 +98,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("public_ip"))           j.at("public_ip").get_to(c.public_ip);
     if (j.contains("region"))              j.at("region").get_to(c.region);
     if (j.contains("server_hostname"))     j.at("server_hostname").get_to(c.server_hostname);
-    if (j.contains("auto_tls"))            j.at("auto_tls").get_to(c.auto_tls);
     if (j.contains("dns_base_domain"))     j.at("dns_base_domain").get_to(c.dns_base_domain);
     if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
@@ -110,6 +110,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_password"))              j.at("ddns_password").get_to(c.ddns_password);
     if (j.contains("ddns_update_interval_sec"))   j.at("ddns_update_interval_sec").get_to(c.ddns_update_interval_sec);
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
+    if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
     if (j.contains("require_peer_confirmation"))  j.at("require_peer_confirmation").get_to(c.require_peer_confirmation);
     if (j.contains("enrollment_quorum_ratio"))  j.at("enrollment_quorum_ratio").get_to(c.enrollment_quorum_ratio);
@@ -118,6 +119,11 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("require_tee_attestation"))   j.at("require_tee_attestation").get_to(c.require_tee_attestation);
     if (j.contains("tee_attestation_validity_sec")) j.at("tee_attestation_validity_sec").get_to(c.tee_attestation_validity_sec);
     if (j.contains("tee_platform_override"))     j.at("tee_platform_override").get_to(c.tee_platform_override);
+    if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
+    if (j.contains("admission_quorum_ratio"))    j.at("admission_quorum_ratio").get_to(c.admission_quorum_ratio);
+    if (j.contains("onboard_min_tier1_for_vote")) j.at("onboard_min_tier1_for_vote").get_to(c.onboard_min_tier1_for_vote);
+    if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
+    if (j.contains("onboard_max_pending"))       j.at("onboard_max_pending").get_to(c.onboard_max_pending);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,11 +148,20 @@ void print_usage(const char* prog) {
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
-    spdlog::info("  --enroll-server <hex> <id> Enroll a server: sign cert for pubkey with given ID");
+    spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
+    spdlog::info("  --onboard-server [fqdn:port] Join an existing mesh: request admission over its public API (verified HTTPS by FQDN), then exit (requires --root-pubkey)");
+    spdlog::info("  --onboard-addr <ip>        Pin the connect IP while still verifying --onboard-server's cert FQDN (e.g. local dev where the FQDN maps to 127.0.0.1)");
+    spdlog::info("  --onboard-id <label>       Requested server ID for onboarding (default: auto-derived)");
+    spdlog::info("  --onboard-token <tok>      Single-use enrollment token for immediate admission (or SP_ONBOARD_TOKEN)");
+    spdlog::info("  --mint-admission-token     Mint a server-admission enrollment token and exit (root holder only)");
+    spdlog::info("  --token-candidate <b64>    Required with --mint-admission-token: joining server's gossip pubkey (base64) the token is bound to");
+    spdlog::info("  --token-ttl <sec>          Minted-token lifetime, 60-3600s (default: 600)");
+    spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
+    spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
     spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
     spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
-    spdlog::info("  --revoke-server <hex>      Revoke a server by its pubkey");
+    spdlog::info("  --revoke-server <b64>      Revoke a server by its base64 gossip pubkey");
     spdlog::info("  --add-manifest <path>      Import a signed release manifest JSON");
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
     spdlog::info("  --ddns-password <pass>     Namecheap DDNS password");
@@ -169,9 +184,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-provider <name>     ACME CA provider: letsencrypt (default), letsencrypt_staging, zerossl");
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
-    spdlog::info("  --tls-cert-path <path>     Path to TLS certificate PEM (manual override)");
-    spdlog::info("  --tls-key-path <path>      Path to TLS private key PEM (manual override)");
-    spdlog::info("  --no-auto-tls              Disable automatic TLS certificate via ACME");
+    spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
     spdlog::info("  --tee-platform <name>      Override TEE platform detection (sgx/tdx/sev-snp/secure-enclave)");
@@ -204,6 +217,7 @@ ServerConfig load_config(int argc, char* argv[]) {
             spdlog::warn("Failed to parse config {}: {}", config_path, e.what());
         }
     }
+    config.config_path = config_path;  // remembered for onboarding write-back
 
     // --- Pass 2: CLI overrides ---
     for (int i = 1; i < argc; ++i) {
@@ -245,6 +259,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enroll_tpm_ak_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-tpm-ek-cert") == 0 && i + 1 < argc) {
             config.enroll_tpm_ek_cert_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--first-run") == 0) {
+            config.first_run = true;
         } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
             config.print_tpm_ak = true;
         } else if (std::strcmp(argv[i], "--revoke-server") == 0 && i + 1 < argc) {
@@ -273,6 +289,28 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.require_peer_confirmation = true;
         } else if (std::strcmp(argv[i], "--enrollment-quorum") == 0 && i + 1 < argc) {
             config.enrollment_quorum_ratio = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--onboard-server") == 0) {
+            config.onboard_server = true;
+            // Optional positional target ("<fqdn>[:port]"); anything starting with '-' is a flag.
+            if (i + 1 < argc && argv[i + 1][0] != '-') config.onboard_target = argv[++i];
+        } else if (std::strcmp(argv[i], "--onboard-addr") == 0 && i + 1 < argc) {
+            config.onboard_addr = argv[++i];
+        } else if (std::strcmp(argv[i], "--onboard-id") == 0 && i + 1 < argc) {
+            config.onboard_server_id = argv[++i];
+        } else if (std::strcmp(argv[i], "--onboard-timeout") == 0 && i + 1 < argc) {
+            config.onboard_timeout_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--onboard-token") == 0 && i + 1 < argc) {
+            config.onboard_token = argv[++i];
+        } else if (std::strcmp(argv[i], "--mint-admission-token") == 0) {
+            config.mint_admission_token = true;
+        } else if (std::strcmp(argv[i], "--token-candidate") == 0 && i + 1 < argc) {
+            config.mint_token_candidate = argv[++i];
+        } else if (std::strcmp(argv[i], "--token-ttl") == 0 && i + 1 < argc) {
+            config.mint_token_ttl_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
+        } else if (std::strcmp(argv[i], "--no-onboard") == 0) {
+            config.onboard_enabled = false;
+        } else if (std::strcmp(argv[i], "--admission-quorum") == 0 && i + 1 < argc) {
+            config.admission_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
@@ -293,12 +331,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_kid = argv[++i];
         } else if (std::strcmp(argv[i], "--acme-eab-hmac-key") == 0 && i + 1 < argc) {
             config.acme_eab_hmac_key = argv[++i];
-        } else if (std::strcmp(argv[i], "--no-auto-tls") == 0) {
-            config.auto_tls = false;
-        } else if (std::strcmp(argv[i], "--tls-cert-path") == 0 && i + 1 < argc) {
-            config.tls_cert_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--tls-key-path") == 0 && i + 1 < argc) {
-            config.tls_key_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
+            config.open_registration = false;
         } else if (std::strcmp(argv[i], "--require-tee") == 0) {
             config.require_tee_attestation = true;
         } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
@@ -320,6 +354,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
+    if (const char* v = std::getenv("SP_ONBOARD_TOKEN")) config.onboard_token = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
     if (const char* v = std::getenv("SP_RP_ID"))          config.rp_id       = v;
     if (const char* v = std::getenv("SP_ACME_PROVIDER"))    config.acme_provider   = v;
@@ -349,9 +384,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
-    if (std::getenv("SP_NO_AUTO_TLS"))                   config.auto_tls              = false;
-    if (const char* v = std::getenv("SP_TLS_CERT_PATH")) config.tls_cert_path         = v;
-    if (const char* v = std::getenv("SP_TLS_KEY_PATH"))  config.tls_key_path          = v;
+    if (std::getenv("SP_CLOSED_REGISTRATION"))           config.open_registration     = false;
 
     if (const char* v = std::getenv("SP_SEED_PEERS")) {
         // Comma-separated list
@@ -410,17 +443,11 @@ bool validate_config(const ServerConfig& config) {
         valid = false;
     }
 
-    // Check data root
+    // Check data root (created by --first-run, not here — a plain start against
+    // a missing data dir must be able to fail cleanly without side effects)
     if (config.data_root.empty()) {
         spdlog::error("Config: data_root cannot be empty");
         valid = false;
-    } else {
-        std::error_code ec;
-        std::filesystem::create_directories(config.data_root, ec);
-        if (ec) {
-            spdlog::error("Config: cannot create data_root '{}': {}", config.data_root, ec.message());
-            valid = false;
-        }
     }
 
     // Tier 1 (require_tee_attestation) gates sensitive operations on a verified

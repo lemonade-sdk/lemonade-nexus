@@ -1,0 +1,285 @@
+#include <LemonadeNexus/Api/OnboardApiHandler.hpp>
+
+#include <LemonadeNexus/ACL/Permission.hpp>
+#include <LemonadeNexus/Auth/AuthService.hpp>
+#include <LemonadeNexus/Auth/AuthMiddleware.hpp>
+#include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
+#include <LemonadeNexus/Core/ServerAdmissionService.hpp>
+#include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+
+#include <spdlog/spdlog.h>
+
+#include <chrono>
+#include <cstring>
+#include <span>
+
+namespace nexus::api {
+
+namespace {
+
+using core::ServerAdmissionService;
+
+/// Verify a candidate's signature over the poll/ack canonical bytes.
+bool verify_poll_sig(crypto::SodiumCryptoService& crypto,
+                     const std::string& tag,
+                     const std::string& candidate_pubkey,
+                     const std::string& request_id,
+                     uint64_t timestamp,
+                     const std::string& sig_b64) {
+    auto pk = crypto::from_base64(candidate_pubkey);
+    auto sig = crypto::from_base64(sig_b64);
+    if (pk.size() != crypto::kEd25519PublicKeySize ||
+        sig.size() != crypto::kEd25519SignatureSize) return false;
+    crypto::Ed25519PublicKey pubkey{};
+    crypto::Ed25519Signature signature{};
+    std::memcpy(pubkey.data(), pk.data(), pk.size());
+    std::memcpy(signature.data(), sig.data(), sig.size());
+    auto msg = ServerAdmissionService::canonical_poll(tag, request_id, timestamp);
+    return crypto.ed25519_verify(pubkey, std::span<const uint8_t>(msg), signature);
+}
+
+} // namespace
+
+nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) const {
+    nlohmann::json bundle;
+    bundle["state"] = "approved";
+    bundle["certificate"] = nlohmann::json::parse(cert_json, nullptr, false);
+
+    // Root anchor as hex, sourced from the configured trust anchor — NOT from
+    // whichever local identity handled the request. This is what the candidate
+    // persists as --root-pubkey. (Issuance is gated on being the root holder, so
+    // these coincide, but the anchor is the authoritative source.)
+    bundle["root_pubkey"] = ctx_.config.root_pubkey;
+    // Server mesh WG pubkey (X25519), for the candidate's optional handshake probe.
+    if (auto pk = ctx_.key_wrapping.load_identity_pubkey()) {
+        auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*pk);
+        bundle["wg_server_pubkey"] = crypto::to_base64(
+            std::span<const uint8_t>(x_pk.data(), x_pk.size()));
+    }
+
+    // Seed peers: our own gossip endpoint plus every known peer's endpoint —
+    // preferring what each peer advertises over the UDP source we observed,
+    // which can be a NAT/VPN artifact only reachable from our vantage point.
+    nlohmann::json seeds = nlohmann::json::array();
+    if (!ctx_.server_public_ip.empty())
+        seeds.push_back(ctx_.server_public_ip + ":" + std::to_string(ctx_.config.gossip_port));
+    for (const auto& p : ctx_.gossip.get_peers()) {
+        // Only seed an advertised endpoint that gossip confirmed against the
+        // peer's real UDP source; an unconfirmed advertisement is attacker-
+        // controlled and would poison every future candidate's seed list. Fall
+        // back to the observed source otherwise.
+        const auto& ep = (p.advertised_confirmed && !p.advertised_endpoint.empty())
+                             ? p.advertised_endpoint : p.endpoint;
+        if (!ep.empty()) seeds.push_back(ep);
+    }
+    bundle["seed_peers"] = seeds;
+
+    if (!ctx_.server_public_ip.empty())
+        bundle["wg_endpoint"] =
+            ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
+    // Lets the candidate seed the address it actually reached us on, which may
+    // differ from our self-detected public IP (multihomed/NAT'd genesis).
+    bundle["gossip_port"] = ctx_.config.gossip_port;
+    return bundle;
+}
+
+void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
+    auto& admission = ctx_.admission;
+
+    // Admitting servers into the mesh is a root-admin action; a valid JWT alone
+    // is not enough.
+    auto require_admin = [this](const auth::SessionClaims& claims,
+                                httplib::Response& res) -> bool {
+        if (ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), "root",
+                                       acl::Permission::Admin)) {
+            return true;
+        }
+        error_response(res, "admin authorization required", 403);
+        return false;
+    };
+
+    // ── GET /api/onboard/info (public) ──────────────────────────────────────
+    pub.Get("/api/onboard/info", [this, &admission](const httplib::Request&,
+                                                     httplib::Response& res) {
+        json_response(res, {
+            {"accepts_onboarding", admission.accepts_onboarding()},
+            {"regime",             admission.regime()},
+            {"eligible_voters",    admission.eligible_voter_count()},
+            {"dns_base_domain",    ctx_.config.dns_base_domain},
+            {"server_fqdn",        ctx_.server_fqdn},
+        });
+    });
+
+    // ── POST /api/onboard/challenge (public) ────────────────────────────────
+    pub.Post("/api/onboard/challenge", [this, &admission](const httplib::Request& req,
+                                                          httplib::Response& res) {
+        auto body = parse_body(req, res);
+        if (!body) return;
+        auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
+        if (crypto::from_base64(candidate_pubkey).size() != crypto::kEd25519PublicKeySize) {
+            error_response(res, "candidate_pubkey must be a base64 Ed25519 key"); return;
+        }
+        if (!admission.accepts_onboarding()) {
+            error_response(res, "this server is not accepting onboarding requests", 403); return;
+        }
+        json_response(res, {{"nonce", admission.issue_challenge(candidate_pubkey)},
+                            {"server_id_required", true}});
+    });
+
+    // ── POST /api/onboard/request (public) ──────────────────────────────────
+    pub.Post("/api/onboard/request", [this, &admission](const httplib::Request& req,
+                                                        httplib::Response& res) {
+        auto body = parse_body(req, res);
+        if (!body) return;
+        ServerAdmissionService::RequestInput in;
+        in.candidate_pubkey = body->value("candidate_pubkey", std::string{});
+        in.server_id        = body->value("server_id", std::string{});
+        in.region           = body->value("region", std::string{});
+        in.tpm_ak_pubkey    = body->value("tpm_ak_pubkey", std::string{});
+        in.tpm_ek_cert      = body->value("tpm_ek_cert", std::string{});
+        in.nonce            = body->value("nonce", std::string{});
+        in.timestamp        = body->value("timestamp", uint64_t{0});
+        in.signature        = body->value("signature", std::string{});
+        in.source_ip        = req.remote_addr;
+        in.enrollment_token = body->value("enrollment_token", std::string{});
+        auto r = admission.create_request(in);
+        if (!r.ok) { error_response(res, r.error, r.status); return; }
+        if (r.needs_ballot) admission.start_pending_ballot(r.request_id);
+        json_response(res, {{"request_id", r.request_id}, {"state", "pending"}});
+    });
+
+    // ── POST /api/onboard/poll (public, candidate-signed) ───────────────────
+    pub.Post("/api/onboard/poll", [this, &admission](const httplib::Request& req,
+                                                     httplib::Response& res) {
+        auto body = parse_body(req, res);
+        if (!body) return;
+        auto request_id       = body->value("request_id", std::string{});
+        auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
+        auto timestamp        = body->value("timestamp", uint64_t{0});
+        auto signature        = body->value("signature", std::string{});
+        if (!verify_poll_sig(ctx_.crypto, "ln-onboard-poll:v1", candidate_pubkey,
+                             request_id, timestamp, signature)) {
+            error_response(res, "invalid signature", 401); return;
+        }
+        auto a = admission.status(request_id, candidate_pubkey);
+        if (!a) { error_response(res, "no such admission", 404); return; }
+        if (a->state == ServerAdmissionService::State::Approved) {
+            json_response(res, approved_bundle(a->issued_cert_json)); return;
+        }
+        json_response(res, {{"state", ServerAdmissionService::state_name(a->state)},
+                            {"reason", a->decision_reason}});
+    });
+
+    // ── POST /api/onboard/ack (public, candidate-signed) ────────────────────
+    pub.Post("/api/onboard/ack", [this, &admission](const httplib::Request& req,
+                                                    httplib::Response& res) {
+        auto body = parse_body(req, res);
+        if (!body) return;
+        auto request_id       = body->value("request_id", std::string{});
+        auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
+        auto timestamp        = body->value("timestamp", uint64_t{0});
+        auto signature        = body->value("signature", std::string{});
+        if (!verify_poll_sig(ctx_.crypto, "ln-onboard-ack:v1", candidate_pubkey,
+                             request_id, timestamp, signature)) {
+            error_response(res, "invalid signature", 401); return;
+        }
+        if (!admission.acknowledge(request_id, candidate_pubkey)) {
+            error_response(res, "cannot acknowledge (not approved or unknown)", 409); return;
+        }
+        json_response(res, {{"state", "completed"}});
+    });
+
+    // ── GET /api/onboard/pending (private, JWT) ─────────────────────────────
+    priv.Get("/api/onboard/pending", auth::require_auth(ctx_.auth,
+        [this, &admission, require_admin](const httplib::Request&, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& a : admission.pending()) {
+            arr.push_back({
+                {"request_id", a.request_id},
+                {"server_id", a.server_id},
+                {"region", a.region},
+                {"candidate_pubkey", a.candidate_pubkey},
+                {"fingerprint", a.candidate_pubkey.substr(0, 16)},
+                {"tier1_capable", !a.tpm_ak_pubkey.empty()},
+                {"source_ip", a.source_ip},
+                {"created_at", a.created_at},
+            });
+        }
+        json_response(res, {{"regime", admission.regime()}, {"pending", arr}});
+    }));
+
+    // ── POST /api/onboard/approve/<id> (private, JWT) ───────────────────────
+    priv.Post(R"(/api/onboard/approve/([a-f0-9]+))", auth::require_auth(ctx_.auth,
+        [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
+        auto body = parse_body(req, res);
+        if (!body) return;
+        auto request_id = req.matches[1];
+        auto fp = body->value("pubkey", body->value("fingerprint", std::string{}));
+        bool supersede = body->value("supersede", false);
+        auto r = admission.approve(request_id, fp, supersede);
+        if (!r.ok) { error_response(res, r.error, r.status); return; }
+        json_response(res, {{"state", "approved"}, {"request_id", r.request_id}});
+    }));
+
+    // ── POST /api/onboard/deny/<id> (private, JWT) ──────────────────────────
+    priv.Post(R"(/api/onboard/deny/([a-f0-9]+))", auth::require_auth(ctx_.auth,
+        [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
+        auto body = parse_body(req, res);
+        if (!body) return;
+        auto request_id = req.matches[1];
+        auto reason = body->value("reason", std::string{"denied by admin"});
+        auto r = admission.deny(request_id, reason);
+        if (!r.ok) { error_response(res, r.error, r.status); return; }
+        json_response(res, {{"state", "denied"}, {"request_id", r.request_id}});
+    }));
+
+    // ── POST /api/onboard/token (private, JWT + root admin) ─────────────────
+    // Mints a single-use server-admission enrollment token. The response is a
+    // complete invitation payload (token + root anchor) for out-of-band handoff.
+    priv.Post("/api/onboard/token", auth::require_auth(ctx_.auth,
+        [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
+                           const auth::SessionClaims& claims) {
+        if (!require_admin(claims, res)) return;
+        auto body = parse_body(req, res);
+        if (!body) return;
+        // Candidate binding is mandatory: the token travels the unauthenticated
+        // onboarding transport as a bearer credential, so it must be spendable
+        // only by the intended candidate key.
+        auto candidate = body->value("candidate_pubkey", std::string{});
+        bool valid = false;
+        try {   // from_base64 throws on malformed input
+            valid = crypto::from_base64(candidate).size() ==
+                    crypto::kEd25519PublicKeySize;
+        } catch (...) {}
+        if (!valid) {
+            error_response(res, "candidate_pubkey (base64 Ed25519 gossip key of the "
+                                "joining server) is required"); return;
+        }
+        auto ttl = std::chrono::seconds{body->value(
+            "ttl_sec", static_cast<uint64_t>(core::AdmissionTokenStore::kDefaultTtl.count()))};
+        // Optional: bind the token to a specific server_id so it can admit only
+        // that identity (a candidate otherwise picks server_id freely).
+        auto token_server_id = body->value("server_id", std::string{});
+        auto minted = admission.mint_admission_token(candidate, ttl, token_server_id);
+        if (!minted) {
+            error_response(res, "this server does not hold the root key or "
+                                "onboarding is disabled", 503); return;
+        }
+        json_response(res, {{"enrollment_token", minted->first},
+                            {"expires_at", minted->second.expires_at},
+                            {"candidate_pubkey", minted->second.candidate_pubkey},
+                            {"server_id", minted->second.server_id},
+                            {"root_pubkey", ctx_.config.root_pubkey}});
+    }));
+}
+
+} // namespace nexus::api

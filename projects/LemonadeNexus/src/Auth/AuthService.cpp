@@ -13,7 +13,7 @@ AuthService::AuthService(storage::FileStorageService& storage,
                          std::string jwt_secret)
     : password_provider_{}
     , passkey_provider_{storage, crypto, std::move(rp_id), jwt_secret}
-    , token_link_provider_{}
+    , token_link_provider_{storage, crypto}
     , ed25519_provider_{storage, crypto, jwt_secret}
     , jwt_secret_{std::move(jwt_secret)}
 {
@@ -43,27 +43,25 @@ nlohmann::json AuthService::issue_ed25519_challenge(const std::string& pubkey_b6
     return ed25519_provider_.issue_challenge(pubkey_b64);
 }
 
-AuthResult AuthService::register_ed25519(const nlohmann::json& registration) {
-    auto pubkey = registration.value("pubkey", std::string{});
-    auto user_id = registration.value("user_id", std::string{});
-    if (pubkey.empty()) {
-        return AuthResult{.authenticated = false, .error_message = "Missing pubkey"};
-    }
-    return ed25519_provider_.register_pubkey(pubkey, user_id);
+std::optional<std::pair<std::string, LinkTokenRecord>>
+AuthService::mint_link_token(const std::string& owner_user_id,
+                             const std::string& owner_pubkey,
+                             const std::string& group_node_id,
+                             std::chrono::seconds ttl) {
+    return token_link_provider_.mint(owner_user_id, owner_pubkey, group_node_id, ttl);
+}
+
+std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token) {
+    return token_link_provider_.consume(token);
+}
+
+bool AuthService::revoke_ed25519(const std::string& pubkey_b64) {
+    return ed25519_provider_.revoke_pubkey(pubkey_b64);
 }
 
 bool AuthService::validate_session(std::string_view token) {
-    try {
-        auto decoded = jwt::decode(std::string(token));
-        auto verifier = jwt::verify()
-            .allow_algorithm(jwt::algorithm::hs256{jwt_secret_})
-            .with_issuer("lemonade-nexus");
-        verifier.verify(decoded);
-        return true;
-    } catch (const std::exception& e) {
-        spdlog::debug("[AuthService] JWT validation failed: {}", e.what());
-        return false;
-    }
+    // One validation path, so revocation can't be bypassed by picking this one.
+    return validate_session_claims(std::string(token)).has_value();
 }
 
 std::optional<SessionClaims> AuthService::validate_session_claims(const std::string& token) {
@@ -112,6 +110,13 @@ std::optional<SessionClaims> AuthService::validate_session_claims(const std::str
                     }
                 }
             }
+        }
+
+        // Revoked (deleted) devices lose existing sessions immediately.
+        if (!claims.pubkey.empty() && ed25519_provider_.is_pubkey_revoked(claims.pubkey)) {
+            spdlog::warn("[AuthService] rejecting session for revoked pubkey {}",
+                         claims.pubkey.substr(0, 16));
+            return std::nullopt;
         }
 
         spdlog::debug("[AuthService] Validated JWT for user '{}' (expires_at={})",

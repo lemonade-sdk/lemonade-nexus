@@ -52,7 +52,9 @@ static constexpr std::size_t kGossipSignatureSize = 64; // Ed25519 signature
 
 struct GossipPeer {
     std::string pubkey;              // base64 Ed25519 public key
-    std::string endpoint;            // "ip:port" (gossip port, public internet)
+    std::string endpoint;            // "ip:port" as observed (UDP source) — used for direct replies
+    std::string advertised_endpoint; // "ip:port" the peer says it's reachable at — shared with third parties (the observed source can be a NAT/VPN artifact valid only from our vantage point)
+    bool        advertised_confirmed{false}; // advertised_endpoint matched the observed UDP source at hello time — only then is it safe to relay/seed to third parties
     std::string backbone_endpoint;   // "ip:port" (gossip port, over WG backbone — preferred when available)
     std::string wg_pubkey;           // base64 X25519 mesh public key
     std::string backbone_ip;         // "172.16.0.X" (empty until allocated)
@@ -83,6 +85,7 @@ struct EnrollmentVoteData {
     bool        approve{false};
     std::string reason;           // "certificate_valid", "cert_invalid", "revoked", etc.
     uint64_t    timestamp{0};
+    std::string claim_hash;       // admission claim this vote is about ("" = enrollment)
     std::string signature;        // Ed25519 over canonical vote JSON
 };
 
@@ -95,14 +98,24 @@ struct EnrollmentBallot {
         TimedOut   = 3,
     };
 
+    // Enrollment gates acceptance of an already-root-signed cert; Admission
+    // decides whether to ISSUE a cert to a certless candidate (governed join).
+    enum class Kind : uint8_t { Enrollment = 0, Admission = 1 };
+
     std::string    request_id;
     std::string    candidate_pubkey;
     std::string    candidate_server_id;
-    std::string    certificate_json;     // full ServerCertificate JSON
+    std::string    certificate_json;     // full ServerCertificate JSON (Enrollment)
+    std::string    admission_claim_json; // candidate's self-signed claim (Admission)
+    // SHA-256 (hex) of the bytes the candidate signed (Admission). Recomputed
+    // by each voter, never taken on the sponsor's word, and signed by each vote.
+    std::string    claim_hash;
     std::string    sponsor_pubkey;       // server that first received ServerHello
     uint64_t       created_at{0};
     uint64_t       timeout_at{0};
     State          state{State::Collecting};
+    Kind           kind{Kind::Enrollment};
+    float          required_ratio{0.0f}; // 0 = use configured enrollment ratio
     uint32_t       retries{0};
     std::vector<EnrollmentVoteData> votes;
 };
