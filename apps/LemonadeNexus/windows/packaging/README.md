@@ -189,7 +189,7 @@ flutter build windows
 candle -version
 
 # Check build output exists
-dir build\windows\runner\Release
+dir build\windows\x64\runner\Release
 ```
 
 ### Signing Fails

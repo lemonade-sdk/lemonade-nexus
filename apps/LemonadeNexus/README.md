@@ -95,7 +95,7 @@ flutter build macos --release      # or: flutter build windows --release
 
 Output:
 - macOS: `build/macos/Build/Products/Release/lemonade_nexus.app`
-- Windows: `build/windows/runner/Release/lemonade_nexus.exe`
+- Windows: `build/windows/x64/runner/Release/lemonade_nexus.exe`
 
 ## Packaging
 

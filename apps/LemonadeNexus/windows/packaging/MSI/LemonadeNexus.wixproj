@@ -58,7 +58,7 @@
   <Import Project="$(WixToolsPath)\Wix.targets" />
 
   <PropertyGroup>
-    <BuildDir>$(MSBuildProjectDirectory)\..\..\..\build\windows\runner\Release</BuildDir>
+    <BuildDir>$(MSBuildProjectDirectory)\..\..\..\build\windows\x64\runner\Release</BuildDir>
   </PropertyGroup>
 
   <Target Name="BeforeBuild">

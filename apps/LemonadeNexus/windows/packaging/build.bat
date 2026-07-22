@@ -76,7 +76,7 @@ if "%BUILD_TYPE%"=="msi" (
         exit /b 1
     )
 
-    set BUILD_DIR=%cd%\build\windows\runner\Release
+    set BUILD_DIR=%cd%\build\windows\x64\runner\Release
     set MSI_DIR=%cd%\windows\packaging\MSI
 
     mkdir "%MSI_DIR%\obj" 2>nul
@@ -101,15 +101,13 @@ if "%BUILD_TYPE%"=="msi" (
 REM Build standalone EXE
 if "%BUILD_TYPE%"=="exe" (
     echo Creating standalone package...
-    set BUILD_DIR=%cd%\build\windows\runner\Release
+    set BUILD_DIR=%cd%\build\windows\x64\runner\Release
     set EXE_DIR=%cd%\build\windows\packages\exe
 
     mkdir "%EXE_DIR%" 2>nul
 
-    copy "%BUILD_DIR%\lemonade_nexus.exe" "%EXE_DIR%\" /y
-    copy "%BUILD_DIR%\flutter_windows.dll" "%EXE_DIR%\" /y
-    copy "%BUILD_DIR%\icudtl.dat" "%EXE_DIR%\" /y
-    xcopy /E /I /Y "%BUILD_DIR%\data" "%EXE_DIR%\data"
+    REM Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data\)
+    xcopy /E /I /Y "%BUILD_DIR%" "%EXE_DIR%"
 
     echo Creating ZIP archive...
     powershell -Command "Compress-Archive -Path '%EXE_DIR%\*' -DestinationPath '%cd%\build\windows\packages\lemonade_nexus_portable.zip' -Force"
@@ -132,7 +130,7 @@ if "%BUILD_TYPE%"=="all" (
     echo Creating MSI installer...
     where candle >nul 2>nul
     if not errorlevel 1 (
-        set BUILD_DIR=%cd%\build\windows\runner\Release
+        set BUILD_DIR=%cd%\build\windows\x64\runner\Release
         set MSI_DIR=%cd%\windows\packaging\MSI
 
         mkdir "%MSI_DIR%\obj" 2>nul
@@ -147,15 +145,13 @@ if "%BUILD_TYPE%"=="all" (
 
     REM Standalone
     echo Creating standalone package...
-    set BUILD_DIR=%cd%\build\windows\runner\Release
+    set BUILD_DIR=%cd%\build\windows\x64\runner\Release
     set EXE_DIR=%cd%\build\windows\packages\exe
 
     mkdir "%EXE_DIR%" 2>nul
 
-    copy "%BUILD_DIR%\lemonade_nexus.exe" "%EXE_DIR%\" /y >nul
-    copy "%BUILD_DIR%\flutter_windows.dll" "%EXE_DIR%\" /y >nul
-    copy "%BUILD_DIR%\icudtl.dat" "%EXE_DIR%\" /y >nul
-    xcopy /E /I /Y "%BUILD_DIR%\data" "%EXE_DIR%\data" >nul
+    REM Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data\)
+    xcopy /E /I /Y "%BUILD_DIR%" "%EXE_DIR%" >nul
 
     powershell -Command "Compress-Archive -Path '%EXE_DIR%\*' -DestinationPath '%cd%\build\windows\packages\lemonade_nexus_portable.zip' -Force"
 

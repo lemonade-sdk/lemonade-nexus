@@ -97,7 +97,7 @@ apps/LemonadeNexus/
 - File type association (.lnxconfig)
 - Startup task configuration
 
-**Output:** `build/windows/runner/Release/lemonade_nexus.msix`
+**Output:** `build/windows/msix/lemonade_nexus.msix`
 
 ### 2. MSI Installer
 

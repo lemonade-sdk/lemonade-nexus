@@ -233,7 +233,7 @@ function Build-MSIX {
         }
 
         # Copy to output directory
-        $msixSource = Join-Path $ProjectRoot 'build\windows\runner\Release\lemonade_nexus.msix'
+        $msixSource = Join-Path $ProjectRoot 'build\windows\msix\lemonade_nexus.msix'
         if (Test-Path $msixSource) {
             Copy-Item $msixSource -Destination $msixOutputDir -Force
             Write-Status "MSIX package created: $(Join-Path $msixOutputDir 'lemonade_nexus.msix')" 'SUCCESS'
@@ -255,7 +255,7 @@ function Build-MSI {
     New-Directory $msiOutputDir
 
     $wixDir = Join-Path $ProjectRoot 'windows\packaging\MSI'
-    $buildDir = Join-Path $ProjectRoot 'build\windows\runner\Release'
+    $buildDir = Join-Path $ProjectRoot 'build\windows\x64\runner\Release'
 
     Push-Location $wixDir
     try {
@@ -314,25 +314,10 @@ function Build-EXE {
     $exeOutputDir = Join-Path $OutputDir 'exe'
     New-Directory $exeOutputDir
 
-    $buildDir = Join-Path $ProjectRoot 'build\windows\runner\Release'
+    $buildDir = Join-Path $ProjectRoot 'build\windows\x64\runner\Release'
 
-    # Copy executable and required files
-    $filesToCopy = @(
-        'lemonade_nexus.exe',
-        'flutter_windows.dll',
-        'icudtl.dat',
-        'data\app.so',
-        'data\flutter_assets'
-    )
-
-    foreach ($file in $filesToCopy) {
-        $source = Join-Path $buildDir $file
-        if (Test-Path $source) {
-            $destDir = Join-Path $exeOutputDir (Split-Path $file -Parent)
-            New-Directory $destDir
-            Copy-Item $source -Destination (Join-Path $exeOutputDir $file) -Force
-        }
-    }
+    # Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data\)
+    Copy-Item (Join-Path $buildDir '*') -Destination $exeOutputDir -Recurse -Force
 
     # Create ZIP archive
     $zipPath = Join-Path $exeOutputDir 'lemonade_nexus_portable.zip'

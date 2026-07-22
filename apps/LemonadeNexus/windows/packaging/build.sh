@@ -65,7 +65,7 @@ build_msi() {
         exit 1
     fi
 
-    BUILD_DIR="$(pwd)/build/windows/runner/Release"
+    BUILD_DIR="$(pwd)/build/windows/x64/runner/Release"
     MSI_DIR="$(pwd)/windows/packaging/MSI"
 
     mkdir -p "$MSI_DIR/obj"
@@ -82,15 +82,13 @@ build_msi() {
 build_exe() {
     echo "Creating standalone package..."
 
-    BUILD_DIR="$(pwd)/build/windows/runner/Release"
+    BUILD_DIR="$(pwd)/build/windows/x64/runner/Release"
     EXE_DIR="$(pwd)/build/windows/packages/exe"
 
     mkdir -p "$EXE_DIR"
 
-    cp "$BUILD_DIR/lemonade_nexus.exe" "$EXE_DIR/"
-    cp "$BUILD_DIR/flutter_windows.dll" "$EXE_DIR/"
-    cp "$BUILD_DIR/icudtl.dat" "$EXE_DIR/"
-    cp -r "$BUILD_DIR/data" "$EXE_DIR/"
+    # Bundle is self-contained; copy all of it (exe, engine/plugin/SDK DLLs, data/)
+    cp -r "$BUILD_DIR/." "$EXE_DIR/"
 
     echo "Creating ZIP archive..."
     (cd "$EXE_DIR" && zip -r ../../packages/lemonade_nexus_portable.zip .)
