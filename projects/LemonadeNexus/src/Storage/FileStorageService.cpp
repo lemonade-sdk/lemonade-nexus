@@ -211,6 +211,37 @@ std::optional<SignedEnvelope> FileStorageService::do_read_file(std::string_view 
     }
 }
 
+bool FileStorageService::do_delete_file(std::string_view category, std::string_view file_name) {
+    std::lock_guard lock(mutex_);
+    try {
+        return fs::remove(file_path(category, file_name));
+    } catch (const std::exception& e) {
+        spdlog::error("[{}] delete_file '{}/{}' failed: {}", name(), category, file_name, e.what());
+        return false;
+    }
+}
+
+std::vector<std::string> FileStorageService::do_list_files(std::string_view category) const {
+    std::lock_guard lock(mutex_);
+    std::vector<std::string> files;
+    try {
+        if (!is_safe_path_component(category)) {
+            throw std::runtime_error("invalid category: path traversal rejected");
+        }
+        const auto dir = data_root_ / std::string(category);
+        if (!fs::exists(dir)) return files;
+        for (const auto& entry : fs::directory_iterator(dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".json") {
+                files.push_back(entry.path().stem().string());
+            }
+        }
+        std::sort(files.begin(), files.end());
+    } catch (const std::exception& e) {
+        spdlog::error("[{}] list_files '{}' failed: {}", name(), category, e.what());
+    }
+    return files;
+}
+
 void FileStorageService::do_ensure_directories() {
     const std::array<fs::path, 6> dirs = {
         data_root_ / "tree" / "nodes",

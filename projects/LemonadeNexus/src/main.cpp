@@ -43,6 +43,7 @@
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/OnboardApiHandler.hpp>
+#include <LemonadeNexus/Api/AccountDataApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
 
@@ -775,6 +776,7 @@ int main(int argc, char* argv[]) {
     nexus::api::MeshApiHandler   mesh_api{ctx};
     nexus::api::RoutingApiHandler routing_api{ctx};
     nexus::api::OnboardApiHandler onboard_api{ctx};
+    nexus::api::AccountDataApiHandler account_data_api{ctx};
 
     // Route registration is factored into a lambda so it can be re-run if the
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
@@ -792,6 +794,7 @@ int main(int argc, char* argv[]) {
         mesh_api.register_routes(pub, priv);
         routing_api.register_routes(pub, priv);
         onboard_api.register_routes(pub, priv);
+        account_data_api.register_routes(pub, priv);
     };
     // Re-runnable if the underlying server object is replaced (plain->HTTPS
     // upgrade after a background ACME cert). Resolves the private server on every
