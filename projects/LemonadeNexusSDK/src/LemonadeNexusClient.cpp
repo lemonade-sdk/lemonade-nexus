@@ -1446,8 +1446,13 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
     }
 
-    // Step 2: generate mesh keypair
-    auto [wg_privkey, wg_pubkey] = BoringtunMesh::generate_keypair();
+    // Step 2: derive the mesh keypair from the persisted device identity so it
+    // is stable across launches — the server keys its dataplane peer to this
+    // pubkey, and a fresh key each join would leave a stale peer. Fall back to a
+    // random key only when there is no identity (e.g. password-only join).
+    auto [wg_privkey, wg_pubkey] = local_identity.is_valid()
+        ? BoringtunMesh::derive_keypair(std::span<const uint8_t>(local_identity.private_key()))
+        : BoringtunMesh::generate_keypair();
 
     // Step 3: create endpoint node via the server's composite /api/join endpoint.
     // This endpoint handles node ID generation, parent assignment, IP allocation,

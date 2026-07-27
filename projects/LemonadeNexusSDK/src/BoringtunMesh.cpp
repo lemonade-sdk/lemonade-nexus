@@ -259,4 +259,28 @@ std::pair<std::string, std::string> BoringtunMesh::generate_keypair() {
     return keys;
 }
 
+std::pair<std::string, std::string> BoringtunMesh::derive_keypair(std::span<const uint8_t> seed) {
+    unsigned char priv[32];
+    unsigned char pub[32];
+
+    // Keyed BLAKE2b domain-separates the mesh scalar from any other use of the
+    // same device seed (e.g. ECIES), then apply the standard X25519 clamp.
+    static constexpr unsigned char kCtx[crypto_generichash_KEYBYTES] = {
+        'l','n','-','m','e','s','h','-','x','2','5','5','1','9'};
+    crypto_generichash(priv, sizeof priv, seed.data(), seed.size(), kCtx, sizeof kCtx);
+    priv[0]  &= 248;
+    priv[31] &= 127;
+    priv[31] |= 64;
+    crypto_scalarmult_base(pub, priv);
+
+    char priv_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    char pub_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    sodium_bin2base64(priv_b64, sizeof priv_b64, priv, 32, sodium_base64_VARIANT_ORIGINAL);
+    sodium_bin2base64(pub_b64, sizeof pub_b64, pub, 32, sodium_base64_VARIANT_ORIGINAL);
+
+    std::pair<std::string, std::string> keys{priv_b64, pub_b64};
+    sodium_memzero(priv, sizeof priv);
+    return keys;
+}
+
 } // namespace lnsdk
