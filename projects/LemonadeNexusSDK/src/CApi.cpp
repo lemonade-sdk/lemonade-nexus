@@ -806,6 +806,17 @@ ln_error_t ln_servers(ln_client_t* client, char** out_json) {
 // Trust & attestation
 // ---------------------------------------------------------------------------
 
+ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
+                               const char* path, const char* body_json,
+                               char** out_json) {
+    if (!client || !method || !path || !out_json) return LN_ERR_NULL_ARG;
+    auto r = client->client.call_private_api(method, path,
+                                             body_json ? body_json : "");
+    // r.value is the raw JSON body; return it verbatim so the caller can parse.
+    *out_json = strdup_str(r.ok ? r.value : std::string("{\"error\":\"") + r.error + "\"}");
+    return r.ok ? LN_OK : LN_ERR_CONNECT;
+}
+
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json) {
     if (!client || !out_json) return LN_ERR_NULL_ARG;
     auto result = client->client.get_trust_status();

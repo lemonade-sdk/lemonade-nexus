@@ -951,6 +951,21 @@ class LemonadeNexusSdk {
     return _parseJson<Map<String, dynamic>>(json, (m) => m);
   }
 
+  /// Generic authenticated call to a private-mesh API route (e.g. /api/chats).
+  /// [method] is "GET" or "POST"; [body] is sent as JSON for POST. Returns the
+  /// raw response body decoded as a JSON object. Requires the mesh tunnel.
+  Future<Map<String, dynamic>> privateApiCall(String method, String path,
+      {Map<String, dynamic>? body}) async {
+    _checkDisposed();
+    _checkConnected();
+    final json = _ffi.privateApiCall(
+        _client!, method, path, body == null ? '' : jsonEncode(body));
+    if (json == null) {
+      throw SdkException(LnError.internal, message: '$method $path failed');
+    }
+    return _parseJson<Map<String, dynamic>>(json, (m) => m);
+  }
+
   /// Queries the current connection/session state by [connectionId].
   Future<Map<String, dynamic>> routingConnectionStatus(String connectionId) async {
     _checkDisposed();

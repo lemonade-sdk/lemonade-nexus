@@ -642,11 +642,12 @@ class DnsDiscoveryService {
     required int port,
     required String? hostname,
   }) async {
-    // Try HTTPS first (using hostname for cert CN match), fall back to IP, then HTTP.
+    // HTTPS only — the nexus server serves verified TLS or nothing (PR #8: no
+    // plaintext fallback). Try the hostname (cert CN match) first, then the IP.
     final host = hostname ?? ip;
     final probeTargets = hostname != null
-        ? <(String, String)>[('https', host), ('https', ip), ('http', ip)]
-        : <(String, String)>[('https', ip), ('http', ip)];
+        ? <(String, String)>[('https', host), ('https', ip)]
+        : <(String, String)>[('https', ip)];
 
     for (final (scheme, target) in probeTargets) {
       final uri = Uri.tryParse('$scheme://$target:$port/api/health');

@@ -666,6 +666,21 @@ typedef _LnRoutingRequestDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
+typedef _LnPrivateApiCall = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> method,
+  ffi.Pointer<ffi.Char> path,
+  ffi.Pointer<ffi.Char> bodyJson,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnPrivateApiCallDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> method,
+  ffi.Pointer<ffi.Char> path,
+  ffi.Pointer<ffi.Char> bodyJson,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
 typedef _LnRoutingConnectionStatus = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Char> connectionId,
@@ -847,6 +862,8 @@ class LemonadeNexusFfi {
           _LnRoutingProfileDart>('ln_routing_profile');
   late final _lnRoutingRequest = _lib.lookupFunction<_LnRoutingRequest,
           _LnRoutingRequestDart>('ln_routing_request');
+  late final _lnPrivateApiCall = _lib.lookupFunction<_LnPrivateApiCall,
+          _LnPrivateApiCallDart>('ln_private_api_call');
   late final _lnRoutingConnectionStatus = _lib.lookupFunction<
           _LnRoutingConnectionStatus,
           _LnRoutingConnectionStatusDart>('ln_routing_connection_status');
@@ -1043,6 +1060,29 @@ class LemonadeNexusFfi {
     try {
       final result = _lnAuthToken(client, tokenPtr, outJson);
       malloc.free(tokenPtr);
+      if (result == 0) {
+        return toStringAndFree(outJson.value);
+      }
+      freeString(outJson.value);
+      return null;
+    } finally {
+      calloc.free(outJson);
+    }
+  }
+
+  /// Generic authenticated call to a private-mesh API route ([method] "GET" or
+  /// "POST"). Returns the raw JSON response body, or null on error.
+  String? privateApiCall(
+      LnClientHandle client, String method, String path, String body) {
+    final methodPtr = method.toNativeUtf8().cast<ffi.Char>();
+    final pathPtr = path.toNativeUtf8().cast<ffi.Char>();
+    final bodyPtr = body.toNativeUtf8().cast<ffi.Char>();
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnPrivateApiCall(client, methodPtr, pathPtr, bodyPtr, outJson);
+      malloc.free(methodPtr);
+      malloc.free(pathPtr);
+      malloc.free(bodyPtr);
       if (result == 0) {
         return toStringAndFree(outJson.value);
       }

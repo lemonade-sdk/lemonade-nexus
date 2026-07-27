@@ -1828,6 +1828,23 @@ Result<TrustStatus> LemonadeNexusClient::get_trust_status() {
     }
 }
 
+Result<std::string> LemonadeNexusClient::call_private_api(const std::string& method,
+                                                         const std::string& path,
+                                                         const std::string& body) {
+    std::lock_guard lock(impl_->mutex);
+    int status = 0;
+    std::optional<json> resp;
+    if (method == "GET") {
+        resp = impl_->private_http_get(path, status);
+    } else {  // POST covers create/update/delete
+        json jbody = json::object();
+        if (!body.empty()) { try { jbody = json::parse(body); } catch (...) {} }
+        resp = impl_->private_http_post(path, jbody, status);
+    }
+    if (!resp) return {false, {}, status, "Connection failed"};
+    return {true, resp->dump(), status, ""};
+}
+
 Result<TrustPeerInfo> LemonadeNexusClient::get_trust_peer(const std::string& pubkey) {
     std::lock_guard lock(impl_->mutex);
     int status = 0;

@@ -199,6 +199,7 @@ enum SidebarItem {
   servers,
   certificates,
   relays,
+  account,
   settings,
 }
 
@@ -219,6 +220,8 @@ extension SidebarItemExtension on SidebarItem {
         return 'Certificates';
       case SidebarItem.relays:
         return 'Relays';
+      case SidebarItem.account:
+        return 'Account';
       case SidebarItem.settings:
         return 'Settings';
     }
@@ -240,6 +243,8 @@ extension SidebarItemExtension on SidebarItem {
         return Icons.verified_user;
       case SidebarItem.relays:
         return Icons.wifi_tethering;
+      case SidebarItem.account:
+        return Icons.account_circle_outlined;
       case SidebarItem.settings:
         return Icons.settings;
     }
@@ -992,6 +997,14 @@ class AppNotifier extends StateNotifier<AppState> {
     } catch (e) {
       _log('refreshTrustStatus: FAILED -> $e');
     }
+  }
+
+  /// Generic authenticated call to a private-mesh API route, for views that
+  /// exercise account-data endpoints (e.g. the Account dashboard). Throws on
+  /// failure so the caller can surface the error inline.
+  Future<Map<String, dynamic>> callPrivateApi(String method, String path,
+      {Map<String, dynamic>? body}) {
+    return _sdk.privateApiCall(method, path, body: body);
   }
 
   /// Refresh certificates

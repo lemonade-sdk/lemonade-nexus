@@ -364,6 +364,14 @@ ln_error_t ln_servers(ln_client_t* client, char** out_json);
 /** GET /api/trust/status. Returns JSON with trust tier, peers, etc. */
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json);
 
+/// Generic authenticated call to a private-API route over the mesh.
+/// `method` is "GET" or "POST"; `body_json` is the request body ("" for GET).
+/// On success `*out_json` receives the raw JSON response body (free with
+/// ln_free). Reachable only once the mesh tunnel is up.
+ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
+                               const char* path, const char* body_json,
+                               char** out_json);
+
 /** GET /api/trust/peer/{pubkey}. Returns JSON with peer trust info. */
 ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_json);
 

@@ -15,6 +15,7 @@ import 'network_monitor_view.dart';
 import 'tree_browser_view.dart';
 import 'servers_view.dart';
 import 'certificates_view.dart';
+import 'account_view.dart';
 import 'settings_view.dart';
 
 class MainNavigation extends ConsumerWidget {
@@ -58,6 +59,8 @@ class MainNavigation extends ConsumerWidget {
         return const CertificatesView();
       case SidebarItem.relays:
         return const ServersView();
+      case SidebarItem.account:
+        return const AccountView();
       case SidebarItem.settings:
         return const SettingsView();
     }
