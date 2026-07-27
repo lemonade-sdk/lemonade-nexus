@@ -78,7 +78,7 @@ Requires Visual Studio 2022 Build Tools with C++ workload.
 
 ## Flutter Client App
 
-The desktop client (`apps/LemonadeNexus`) is a Flutter app that talks to the C
+The desktop client (`apps/LemonadeNexusClient`) is a Flutter app that talks to the C
 SDK over FFI. Build the SDK **shared** library first, then run Flutter.
 
 ### macOS
@@ -93,19 +93,19 @@ cmake --build build --target LemonadeNexusSDKShared
 
 # 2. Run / build the app — the Xcode "Embed Lemonade Nexus SDK" build phase
 #    copies and codesigns the dylib into the .app automatically (no manual copy)
-cd apps/LemonadeNexus
+cd apps/LemonadeNexusClient
 flutter pub get
 flutter run -d macos              # development (hot reload)
 flutter build macos --release     # release build
 ```
 
-Output: `apps/LemonadeNexus/build/macos/Build/Products/Release/lemonade_nexus.app`.
+Output: `apps/LemonadeNexusClient/build/macos/Build/Products/Release/nexus-client.app`.
 Set `LN_DEBUG=1` to surface verbose SDK + mesh diagnostics in the console.
 
 ### Windows
 
-See [`apps/LemonadeNexus/README.md`](../apps/LemonadeNexus/README.md) — the
-Windows runner needs the SDK DLL staged into `apps/LemonadeNexus/windows/` before
+See [`apps/LemonadeNexusClient/README.md`](../apps/LemonadeNexusClient/README.md) — the
+Windows runner needs the SDK DLL staged into `apps/LemonadeNexusClient/windows/` before
 `flutter build windows`.
 
 CI builds both desktop targets on every push — see
