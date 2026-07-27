@@ -29,6 +29,7 @@ add_nexus_test(test_file_storage       test_file_storage.cpp)
 add_nexus_test(test_permissions        test_permissions.cpp)
 add_nexus_test(test_permission_tree    test_permission_tree.cpp)
 add_nexus_test(test_account_data       test_account_data.cpp)
+add_nexus_test(test_mesh_rekey         test_mesh_rekey.cpp)
 add_nexus_test(test_routing_identifier test_routing_identifier.cpp)
 add_nexus_test(test_routing_coordination test_routing_coordination.cpp)
 add_nexus_test(test_routing_security  test_routing_security.cpp)
@@ -71,6 +72,7 @@ endfunction()
 
 add_sdk_test(test_routing_pool         test_routing_pool.cpp)
 add_sdk_test(test_mesh_ingress         test_mesh_ingress.cpp)
+add_sdk_test(test_boringtun_keys       test_boringtun_keys.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)

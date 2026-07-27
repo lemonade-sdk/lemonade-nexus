@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
 
+#include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
@@ -309,17 +310,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Allocate tunnel IP (returns existing if already allocated for this node)
         auto alloc = ctx_.ipam.allocate_tunnel_ip(node_id);
 
-        // Store the tunnel IP / current mesh key on the endpoint node. On a
-        // re-join the IP is unchanged but the key may have rotated, so update
-        // when EITHER differs — a stale wg_pubkey here misroutes the peer.
-        std::string prev_wg_pubkey;
+        // Decide what this (re)join does to the stored node and the dataplane
+        // peer. On a re-join the IP is unchanged but the key may have rotated;
+        // plan_mesh_rekey rewrites the node when either changed and identifies
+        // the stale peer to drop below (see MeshRekey.hpp).
+        api::MeshRekeyPlan rekey;
         if (!alloc.base_network.empty()) {
             auto existing_node = ctx_.tree.get_node(node_id);
             if (existing_node) {
-                prev_wg_pubkey = existing_node->wg_pubkey;
                 auto new_wg = body.value("wg_pubkey", existing_node->wg_pubkey);
-                if (existing_node->tunnel_ip != alloc.base_network ||
-                    existing_node->wg_pubkey != new_wg) {
+                rekey = api::plan_mesh_rekey(existing_node->tunnel_ip, alloc.base_network,
+                                             existing_node->wg_pubkey, new_wg);
+                if (rekey.update_node) {
                     tree::TreeNode updated = *existing_node;
                     updated.tunnel_ip = alloc.base_network;
                     updated.wg_pubkey = new_wg;
@@ -347,35 +349,15 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Add the client as a mesh peer on the server interface.
         auto client_wg_pubkey = body.value("wg_pubkey", std::string{});
         if (ctx_.boringtun && !client_wg_pubkey.empty() && !alloc.base_network.empty()) {
-            // The dataplane keys on Curve25519; convert if the client sent an
-            // Ed25519 (ed25519:-prefixed) key, else pass the raw key through.
-            auto to_mesh_key = [](std::string key) -> std::string {
-                constexpr std::string_view ed_prefix = "ed25519:";
-                if (!key.starts_with(ed_prefix)) return key;
-                try {
-                    auto ed_bytes = crypto::from_base64(key.substr(ed_prefix.size()));
-                    if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
-                        crypto::Ed25519PublicKey ed_pk{};
-                        std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
-                        auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
-                        return crypto::to_base64(
-                            std::span<const uint8_t>(x_pk.data(), x_pk.size()));
-                    }
-                } catch (...) {}
-                return key;
-            };
-
-            auto peer_wg_key = to_mesh_key(client_wg_pubkey);
+            auto peer_wg_key = api::normalize_mesh_pubkey(client_wg_pubkey);
 
             // Re-join with a rotated key: drop the stale peer first, or its
             // allowed_ips route shadows the new key and return traffic is
             // encrypted to a dead handshake.
-            if (!prev_wg_pubkey.empty()) {
-                auto prev_key = to_mesh_key(prev_wg_pubkey);
-                if (prev_key != peer_wg_key && ctx_.boringtun->remove_peer(prev_key)) {
-                    spdlog::info("[Join] removed stale WG peer {} for node {}",
-                                 prev_key.substr(0, 12), node_id);
-                }
+            if (rekey.remove_stale_peer &&
+                ctx_.boringtun->remove_peer(rekey.stale_peer_key)) {
+                spdlog::info("[Join] removed stale WG peer {} for node {}",
+                             rekey.stale_peer_key.substr(0, 12), node_id);
             }
 
             if (ctx_.boringtun->add_peer(peer_wg_key, alloc.base_network, "")) {
