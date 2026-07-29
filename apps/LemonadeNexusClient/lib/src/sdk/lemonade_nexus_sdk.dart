@@ -283,6 +283,61 @@ class LemonadeNexusSdk {
   }
 
   // =========================================================================
+  // Account group-key envelopes + device linking
+  // =========================================================================
+
+  /// Generate a fresh account (Cluster) group key (base64).
+  String generateGroupKey() {
+    _checkDisposed();
+    final key = _ffi.groupKeyGenerate();
+    if (key == null) {
+      throw SdkException(LnError.internal, message: 'Failed to generate group key');
+    }
+    return key;
+  }
+
+  /// Seal [groupKey] to a recipient device's Ed25519 public key. Returns the
+  /// envelope `{ephemeral_pubkey, wrapped_key}`.
+  Map<String, dynamic> wrapGroupKey(String recipientPubkey, String groupKey) {
+    _checkDisposed();
+    final json = _ffi.groupKeyWrap(recipientPubkey, groupKey);
+    if (json == null) {
+      throw SdkException(LnError.internal, message: 'Failed to wrap group key');
+    }
+    return _parseJson<Map<String, dynamic>>(json, (m) => m);
+  }
+
+  /// Open a group-key [envelope] with the loaded identity. Returns the group key
+  /// (base64), or null if it isn't addressed to us / is corrupt.
+  String? unwrapGroupKey(Map<String, dynamic> envelope) {
+    _checkDisposed();
+    _checkIdentity();
+    return _ffi.groupKeyUnwrap(_identity!, jsonEncode(envelope));
+  }
+
+  /// Set the single-use device-link token injected into the next joinNetwork.
+  void setLinkToken(String token) {
+    _checkDisposed();
+    _checkConnected();
+    final error = _ffi.setLinkToken(_client!, token);
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'Failed to set link token');
+    }
+  }
+
+  /// Mint a link token so another device can join this account's Cluster.
+  /// Returns `{link_token, group_node_id, expires_at}`. Requires the mesh up.
+  Future<Map<String, dynamic>> createLinkToken({int ttlSec = 600}) async {
+    _checkDisposed();
+    _checkConnected();
+    final json = _ffi.linkTokenCreate(_client!, ttlSec);
+    if (json == null) {
+      throw SdkException(LnError.internal, message: 'Failed to create link token');
+    }
+    return _parseJson<Map<String, dynamic>>(json, (m) => m);
+  }
+
+  // =========================================================================
   // Health
   // =========================================================================
 

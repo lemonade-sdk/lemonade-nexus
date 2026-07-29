@@ -124,6 +124,46 @@ typedef _LnDeriveSeedDart = ffi.Pointer<ffi.Char> Function(
   ffi.Pointer<ffi.Char> password,
 );
 
+// Account group-key envelopes
+typedef _LnGroupKeyGenerate = ffi.Pointer<ffi.Char> Function();
+typedef _LnGroupKeyGenerateDart = ffi.Pointer<ffi.Char> Function();
+typedef _LnGroupKeyWrap = ffi.Pointer<ffi.Char> Function(
+  ffi.Pointer<ffi.Char> recipientPubkey,
+  ffi.Pointer<ffi.Char> groupKey,
+);
+typedef _LnGroupKeyWrapDart = ffi.Pointer<ffi.Char> Function(
+  ffi.Pointer<ffi.Char> recipientPubkey,
+  ffi.Pointer<ffi.Char> groupKey,
+);
+typedef _LnGroupKeyUnwrap = ffi.Pointer<ffi.Char> Function(
+  LnIdentityHandle identity,
+  ffi.Pointer<ffi.Char> envelopeJson,
+);
+typedef _LnGroupKeyUnwrapDart = ffi.Pointer<ffi.Char> Function(
+  LnIdentityHandle identity,
+  ffi.Pointer<ffi.Char> envelopeJson,
+);
+
+// Device linking
+typedef _LnSetLinkToken = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> token,
+);
+typedef _LnSetLinkTokenDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> token,
+);
+typedef _LnLinkTokenCreate = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Uint32 ttlSec,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnLinkTokenCreateDart = int Function(
+  LnClientHandle client,
+  int ttlSec,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
 // Health
 typedef _LnHealth = ffi.Int32 Function(
   LnClientHandle client,
@@ -726,6 +766,16 @@ class LemonadeNexusFfi {
           _LnIdentityFromSeedDart>('ln_identity_from_seed');
   late final _lnDeriveSeed =
       _lib.lookupFunction<_LnDeriveSeed, _LnDeriveSeedDart>('ln_derive_seed');
+  late final _lnGroupKeyGenerate = _lib.lookupFunction<_LnGroupKeyGenerate,
+      _LnGroupKeyGenerateDart>('ln_group_key_generate');
+  late final _lnGroupKeyWrap =
+      _lib.lookupFunction<_LnGroupKeyWrap, _LnGroupKeyWrapDart>('ln_group_key_wrap');
+  late final _lnGroupKeyUnwrap = _lib.lookupFunction<_LnGroupKeyUnwrap,
+      _LnGroupKeyUnwrapDart>('ln_group_key_unwrap');
+  late final _lnSetLinkToken =
+      _lib.lookupFunction<_LnSetLinkToken, _LnSetLinkTokenDart>('ln_set_link_token');
+  late final _lnLinkTokenCreate = _lib.lookupFunction<_LnLinkTokenCreate,
+      _LnLinkTokenCreateDart>('ln_link_token_create');
 
   // Health
   late final _lnHealth =
@@ -992,6 +1042,50 @@ class LemonadeNexusFfi {
     malloc.free(userPtr);
     malloc.free(passPtr);
     return toStringAndFree(result);
+  }
+
+  /// Generate a fresh account group key (base64), or null on failure.
+  String? groupKeyGenerate() => toStringAndFree(_lnGroupKeyGenerate());
+
+  /// Seal [groupKeyB64] to [recipientPubkey]; returns the envelope JSON, or null.
+  String? groupKeyWrap(String recipientPubkey, String groupKeyB64) {
+    final rp = recipientPubkey.toNativeUtf8().cast<ffi.Char>();
+    final gk = groupKeyB64.toNativeUtf8().cast<ffi.Char>();
+    final result = _lnGroupKeyWrap(rp, gk);
+    malloc.free(rp);
+    malloc.free(gk);
+    return toStringAndFree(result);
+  }
+
+  /// Open [envelopeJson] with [identity]'s private key; returns the group key
+  /// (base64), or null if it isn't addressed to us / is corrupt.
+  String? groupKeyUnwrap(LnIdentityHandle identity, String envelopeJson) {
+    final env = envelopeJson.toNativeUtf8().cast<ffi.Char>();
+    final result = _lnGroupKeyUnwrap(identity, env);
+    malloc.free(env);
+    return toStringAndFree(result);
+  }
+
+  /// Set the single-use device-link token injected into the next join_network.
+  LnError setLinkToken(LnClientHandle client, String token) {
+    final t = token.toNativeUtf8().cast<ffi.Char>();
+    final result = _lnSetLinkToken(client, t);
+    malloc.free(t);
+    return LnError.fromCode(result);
+  }
+
+  /// Mint a link token so another device can join this account; returns
+  /// {link_token, group_node_id, expires_at} JSON, or null on failure.
+  String? linkTokenCreate(LnClientHandle client, int ttlSec) {
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnLinkTokenCreate(client, ttlSec, outJson);
+      if (result == 0) return toStringAndFree(outJson.value);
+      freeString(outJson.value);
+      return null;
+    } finally {
+      calloc.free(outJson);
+    }
   }
 
   // =========================================================================

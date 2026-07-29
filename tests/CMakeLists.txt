@@ -73,6 +73,7 @@ endfunction()
 add_sdk_test(test_routing_pool         test_routing_pool.cpp)
 add_sdk_test(test_mesh_ingress         test_mesh_ingress.cpp)
 add_sdk_test(test_boringtun_keys       test_boringtun_keys.cpp)
+add_sdk_test(test_group_key_envelope   test_group_key_envelope.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
