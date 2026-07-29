@@ -1,5 +1,6 @@
-/// @title Account View
-/// @description Verify the account system end to end: identity/session details,
+/// @title Cluster View
+/// @description Manage the connected Cluster (account): its devices — invite a
+/// new one and share the account key with it — plus identity/session details
 /// and the zero-knowledge encrypted-chat round-trip over the private mesh API
 /// (/api/chats, /api/account/keys/*). The server stores opaque blobs it cannot
 /// read; real client-side E2E crypto is a later step, so this view sends a
@@ -12,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
+import '../state/cluster_keyring.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 
@@ -28,6 +30,8 @@ class _AccountViewState extends ConsumerState<AccountView> {
   List<Map<String, dynamic>> _chats = [];
   int _pendingKeys = 0;
   bool _hasEnvelope = false;
+  List<ClusterDevice> _devices = [];
+  bool _isBusyDevices = false;
 
   @override
   void initState() {
@@ -63,12 +67,17 @@ class _AccountViewState extends ConsumerState<AccountView> {
         final e = await notifier.callPrivateApi('GET', '/api/account/keys/envelope');
         hasEnv = !e.containsKey('error');
       } catch (_) {}
+      List<ClusterDevice> devices = _devices;
+      try {
+        devices = await notifier.listClusterDevices();
+      } catch (_) {}
       if (!mounted) return;
       setState(() {
         _chats =
             list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
         _pendingKeys = pending;
         _hasEnvelope = hasEnv;
+        _devices = devices;
         _isLoading = false;
       });
     } catch (e) {
@@ -242,8 +251,9 @@ class _AccountViewState extends ConsumerState<AccountView> {
         children: [
           Row(
             children: [
-              const SectionHeader(
-                  title: 'Account', icon: Icons.account_circle_outlined),
+              SectionHeader(
+                  title: appState.activeCluster?.name ?? 'Cluster',
+                  icon: Icons.account_circle_outlined),
               const Spacer(),
               if (appState.isMeshEnabled) ...[
                 IconButton(
@@ -266,6 +276,8 @@ class _AccountViewState extends ConsumerState<AccountView> {
             _meshOffCard(context)
           else ...[
             _statsRow(),
+            const SizedBox(height: 16),
+            _devicesSection(context),
             const SizedBox(height: 16),
             _chatsSection(context),
           ],
@@ -333,6 +345,245 @@ class _AccountViewState extends ConsumerState<AccountView> {
         ),
       ],
     );
+  }
+
+  // ---- devices --------------------------------------------------------------
+
+  Widget _devicesSection(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final anyPending = _devices.any((d) => d.needsKey);
+    return AppCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Text('Devices',
+                  style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+              const SizedBox(width: 8),
+              Text('${_devices.length}',
+                  style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
+              const Spacer(),
+              if (anyPending)
+                TextButton.icon(
+                  onPressed: _isBusyDevices ? null : _shareKeyWithAll,
+                  icon: const Icon(Icons.key, size: 16),
+                  label: const Text('Share key with all'),
+                ),
+              TextButton.icon(
+                onPressed: _isBusyDevices ? null : _addDevice,
+                icon: const Icon(Icons.add_to_queue, size: 16),
+                label: const Text('Add device'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Each device has its own key. An invitation code lets a new device '
+            'join; it can only read Cluster data once an existing device shares '
+            'the account key with it.',
+            style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 12),
+          if (_devices.isEmpty)
+            Text('No devices listed yet.',
+                style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant))
+          else
+            for (final device in _devices) _deviceRow(context, device),
+        ],
+      ),
+    );
+  }
+
+  Widget _deviceRow(BuildContext context, ClusterDevice device) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          Icon(device.isThisDevice ? Icons.computer : Icons.devices_other,
+              size: 18,
+              color: device.isThisDevice
+                  ? AppTheme.lemonYellowDark
+                  : scheme.onSurfaceVariant),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Flexible(
+                      child: Text(device.hostname,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                              fontSize: 13, fontWeight: FontWeight.w500)),
+                    ),
+                    if (device.isThisDevice) ...[
+                      const SizedBox(width: 6),
+                      const LemonBadge(text: 'THIS DEVICE'),
+                    ],
+                    if (device.needsKey) ...[
+                      const SizedBox(width: 6),
+                      const LemonBadge(
+                          text: 'NEEDS KEY', color: AppTheme.errorColor),
+                    ],
+                  ],
+                ),
+                Text(device.tunnelIp?.isNotEmpty == true ? device.tunnelIp! : device.nodeId,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        color: scheme.onSurfaceVariant)),
+              ],
+            ),
+          ),
+          if (device.needsKey)
+            IconButton(
+              tooltip: 'Share the account key with this device',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.key, size: 16),
+              onPressed: _isBusyDevices ? null : _shareKeyWithAll,
+            ),
+          if (!device.isThisDevice)
+            IconButton(
+              tooltip: 'Remove device',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.delete_outline,
+                  size: 16, color: AppTheme.errorColor),
+              onPressed: _isBusyDevices ? null : () => _removeDevice(device),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Mint an invitation code and show it for transfer to the new device.
+  Future<void> _addDevice() async {
+    setState(() => _isBusyDevices = true);
+    try {
+      final invite =
+          await ref.read(appNotifierProvider.notifier).createDeviceInvite();
+      final code = invite['link_token']?.toString() ?? '';
+      if (code.isEmpty) {
+        _toast(invite['error']?.toString() ?? 'Could not create an invitation',
+            error: true);
+        return;
+      }
+      if (!mounted) return;
+      await _showInviteDialog(code);
+    } catch (e) {
+      _toast('Could not create an invitation: $e', error: true);
+    } finally {
+      if (mounted) setState(() => _isBusyDevices = false);
+    }
+  }
+
+  Future<void> _showInviteDialog(String code) {
+    final scheme = Theme.of(context).colorScheme;
+    return showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: scheme.surface,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: scheme.outline)),
+        title: const Text('Invitation code'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Enter this on the new device via "Have an invitation code?". It '
+              'is single-use and expires in 10 minutes. Come back here to share '
+              'the account key once it has joined.',
+              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SelectableText(code,
+                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton.icon(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: code));
+              _toast('Invitation code copied');
+            },
+            icon: const Icon(Icons.copy, size: 16),
+            label: const Text('Copy'),
+          ),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Done')),
+        ],
+      ),
+    );
+  }
+
+  /// Seal the account key to every device still waiting for it.
+  Future<void> _shareKeyWithAll() async {
+    setState(() => _isBusyDevices = true);
+    try {
+      final count =
+          await ref.read(appNotifierProvider.notifier).provisionPendingDevices();
+      _toast(count == 0
+          ? 'No device was provisioned — this device may not hold the account key yet'
+          : 'Shared the account key with $count device${count == 1 ? '' : 's'}');
+      await _load();
+    } catch (e) {
+      _toast('Could not share the account key: $e', error: true);
+    } finally {
+      if (mounted) setState(() => _isBusyDevices = false);
+    }
+  }
+
+  Future<void> _removeDevice(ClusterDevice device) async {
+    final scheme = Theme.of(context).colorScheme;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: scheme.surface,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: scheme.outline)),
+        title: const Text('Remove device'),
+        content: Text(
+          'Remove "${device.hostname}" from this Cluster and revoke its key. It '
+          'keeps any data it already downloaded — the account key is not '
+          'rotated yet.',
+          style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.errorColor),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() => _isBusyDevices = true);
+    final ok = await ref
+        .read(appNotifierProvider.notifier)
+        .removeClusterDevice(device.nodeId);
+    _toast(ok ? 'Device removed' : 'Could not remove the device', error: !ok);
+    if (mounted) setState(() => _isBusyDevices = false);
+    await _load();
   }
 
   Widget _chatsSection(BuildContext context) {

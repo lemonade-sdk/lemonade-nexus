@@ -116,6 +116,28 @@ class ClusterEntry {
       );
 }
 
+/// A device (Endpoint node) in a Cluster, as reported by the server.
+class ClusterDevice {
+  final String nodeId;
+  final String hostname;
+  final String? tunnelIp;
+
+  /// True while this device has no group-key envelope — it cannot read Cluster
+  /// data until an owner device seals the key to it.
+  final bool needsKey;
+
+  /// True for the device we're running on.
+  final bool isThisDevice;
+
+  const ClusterDevice({
+    required this.nodeId,
+    required this.hostname,
+    required this.needsKey,
+    required this.isThisDevice,
+    this.tunnelIp,
+  });
+}
+
 /// Persists the Clusters this install can reach as a single JSON blob in the OS
 /// secure store. All operations are best-effort — a keystore failure must not
 /// crash the app; it just behaves as if the keyring were empty.

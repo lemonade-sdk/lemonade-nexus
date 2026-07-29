@@ -221,7 +221,7 @@ extension SidebarItemExtension on SidebarItem {
       case SidebarItem.relays:
         return 'Relays';
       case SidebarItem.account:
-        return 'Account';
+        return 'Cluster';
       case SidebarItem.settings:
         return 'Settings';
     }
@@ -1167,6 +1167,75 @@ class AppNotifier extends StateNotifier<AppState> {
   Future<Map<String, dynamic>> callPrivateApi(String method, String path,
       {Map<String, dynamic>? body}) {
     return _sdk.privateApiCall(method, path, body: body);
+  }
+
+  /// [callPrivateApi] for routes that answer with a JSON array.
+  Future<List<Map<String, dynamic>>> callPrivateApiList(String method, String path,
+      {Map<String, dynamic>? body}) {
+    return _sdk.privateApiCallList(method, path, body: body);
+  }
+
+  /// The active Cluster's group node id — this device's endpoint's parent.
+  Future<String?> clusterGroupId() async {
+    final nodeId = state.userId;
+    if (nodeId == null || nodeId.isEmpty) return null;
+    try {
+      final me = await callPrivateApi('GET', '/api/tree/node/$nodeId');
+      final parent = me['parent_id']?.toString();
+      return (parent == null || parent.isEmpty) ? null : parent;
+    } catch (e) {
+      _log('clusterGroupId: $e');
+      return null;
+    }
+  }
+
+  /// Devices (Endpoint nodes) in the active Cluster, each flagged with whether
+  /// it still needs the account group key.
+  Future<List<ClusterDevice>> listClusterDevices() async {
+    final groupId = await clusterGroupId();
+    if (groupId == null) return [];
+    final children = await callPrivateApiList('GET', '/api/tree/children/$groupId');
+
+    Set<String> waiting = {};
+    try {
+      waiting = (await pendingDevices())
+          .map((d) => d['node_id']?.toString() ?? '')
+          .where((id) => id.isNotEmpty)
+          .toSet();
+    } catch (e) {
+      _log('listClusterDevices: pending lookup failed -> $e');
+    }
+
+    final devices = <ClusterDevice>[];
+    for (final node in children) {
+      if ((node['node_type'] ?? node['type'])?.toString().toLowerCase() !=
+          'endpoint') {
+        continue;
+      }
+      final id = node['id']?.toString() ?? '';
+      if (id.isEmpty) continue;
+      devices.add(ClusterDevice(
+        nodeId: id,
+        hostname: (node['hostname'] ?? node['data']?['hostname'])?.toString() ?? id,
+        tunnelIp: (node['tunnel_ip'] ?? node['data']?['tunnel_ip'])?.toString(),
+        needsKey: waiting.contains(id),
+        isThisDevice: id == state.userId,
+      ));
+    }
+    return devices;
+  }
+
+  /// Remove a device from the active Cluster (owner-only; revokes its key).
+  Future<bool> removeClusterDevice(String nodeId) async {
+    try {
+      await callPrivateApi('POST', '/api/tree/node/delete/$nodeId');
+      addActivity(ActivityLevel.info, 'Removed device $nodeId');
+      return true;
+    } catch (e) {
+      _log('removeClusterDevice: $e');
+      addActivity(ActivityLevel.error, 'Could not remove device: $e');
+      return false;
+    }
   }
 
   /// Refresh certificates
