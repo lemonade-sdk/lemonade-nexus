@@ -918,6 +918,25 @@ class LemonadeNexusFfi {
           _LnRoutingConnectionStatus,
           _LnRoutingConnectionStatusDart>('ln_routing_connection_status');
 
+  /// C ABI symbols this Dart layer needs that were added most recently. The
+  /// Dart code ships with the app but the .dll/.dylib/.so is built separately,
+  /// so a stale native library is the usual cause of a missing symbol — and
+  /// because lookups are lazy it would otherwise surface as a raw dlsym error
+  /// deep inside a flow (e.g. joining a Cluster). See [missingSymbols].
+  static const List<String> requiredSymbols = [
+    'ln_set_link_token',
+    'ln_link_token_create',
+    'ln_private_api_call',
+    'ln_group_key_generate',
+    'ln_group_key_wrap',
+    'ln_group_key_unwrap',
+  ];
+
+  /// Required symbols absent from the loaded native library (empty when the
+  /// library is current).
+  List<String> missingSymbols() =>
+      requiredSymbols.where((s) => !_lib.providesSymbol(s)).toList();
+
   /// Creates a new FFI binding instance.
   ///
   /// [libraryPath] - Optional path to the C SDK dynamic library.

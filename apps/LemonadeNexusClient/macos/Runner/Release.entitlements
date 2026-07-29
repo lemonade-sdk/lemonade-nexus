@@ -6,5 +6,12 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- Required for the Keychain-backed secure store (Cluster keyring + session).
+	     Without it a sandboxed app gets errSecMissingEntitlement (-34018) and
+	     cannot persist Cluster keys. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)io.lemonadenexus.lemonadeNexus</string>
+	</array>
 </dict>
 </plist>

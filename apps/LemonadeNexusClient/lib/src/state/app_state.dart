@@ -190,16 +190,16 @@ class ActivityEntry {
 
 enum ActivityLevel { info, success, warning, error }
 
-/// Sidebar navigation items
+/// Sidebar navigation items (declaration order drives the sidebar order).
 enum SidebarItem {
   dashboard,
+  account,
   peers,
   network,
   endpoints,
   servers,
   certificates,
   relays,
-  account,
   settings,
 }
 
@@ -1075,8 +1075,10 @@ class AppNotifier extends StateNotifier<AppState> {
     try {
       final h = await _sdk.health();
       state = state.copyWith(healthStatus: h);
-      _log('refreshHealth: OK (status=${h.status} service=${h.service}) '
-          '-> isServerHealthy=${state.isServerHealthy}');
+      // Runs every 5s — only worth a line when the server is NOT healthy.
+      if (!state.isServerHealthy) {
+        _log('refreshHealth: unhealthy (status=${h.status} service=${h.service})');
+      }
     } catch (e) {
       state = state.copyWith(
         healthStatus: HealthResponse(status: 'error'),

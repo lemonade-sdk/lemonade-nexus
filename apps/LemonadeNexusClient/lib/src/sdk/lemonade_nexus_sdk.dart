@@ -73,6 +73,20 @@ class LemonadeNexusSdk {
     }
   }
 
+  /// Fail fast, and legibly, when the native library predates the Dart layer.
+  /// Symbol lookups are lazy, so without this a stale .dll/.dylib surfaces as a
+  /// raw "Failed to lookup symbol … dlsym" error partway through a flow.
+  void _checkNativeAbi() {
+    final missing = _ffi.missingSymbols();
+    if (missing.isEmpty) return;
+    throw SdkException(
+      LnError.internal,
+      message: 'The native Lemonade Nexus SDK on this device is out of date — '
+          'it is missing ${missing.join(', ')}. Rebuild it from the repo root:\n'
+          '  cmake --build build --target LemonadeNexusSDKShared',
+    );
+  }
+
   /// Parses JSON response and handles errors.
   T _parseJson<T>(String? json, T Function(Map<String, dynamic>) fromJson) {
     if (json == null) {
@@ -142,6 +156,7 @@ class LemonadeNexusSdk {
   /// [port] - Server port number.
   Future<void> connect(String host, int port) async {
     _checkDisposed();
+    _checkNativeAbi();
     _destroyClient();
     _client = _ffi.create(host, port);
     if (_client == ffi.nullptr) {
@@ -155,6 +170,7 @@ class LemonadeNexusSdk {
   /// [port] - Server port number.
   Future<void> connectTls(String host, int port) async {
     _checkDisposed();
+    _checkNativeAbi();
     _destroyClient();
     _client = _ffi.createTls(host, port);
     if (_client == ffi.nullptr) {
