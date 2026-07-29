@@ -7,6 +7,7 @@
 #include <sodium.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <map>
@@ -29,6 +30,24 @@ namespace lnsdk {
 using json = nlohmann::json;
 
 namespace {
+// Private mesh transport timeouts. These bound the TLS handshake + response
+// over the tunnel, so they must be generous enough for a real (possibly lossy)
+// tunnel to complete its handshake round-trips — too tight and valid calls fail
+// with "SSL connection failed". Responsiveness is handled by the breaker below
+// (it stops repeated long waits) and by deferring UI fetches off the transition,
+// NOT by starving the handshake.
+constexpr int     kMeshConnectTimeoutSec  = 5;
+constexpr int     kMeshReadTimeoutSec     = 8;
+// After a mesh failure, fail fast (skip the doomed handshake) for this long so a
+// persistently-down tunnel doesn't re-freeze every periodic caller.
+constexpr int64_t kMeshBreakerCooldownMs  = 8000;
+
+int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 /// Resolve a hostname to its first IPv4 address (dotted string), or "" on
 /// failure. Used to learn the server's mesh IP from its private FQDN (which the
 /// authoritative DNS maps to the in-mesh address, e.g. 10.64.0.1).
@@ -83,6 +102,10 @@ struct LemonadeNexusClient::Impl {
     BoringtunMesh meshplane;
     // The join-assigned dataplane config, kept so callers can inspect it.
     BoringtunConfig boringtun_config;
+
+    // Circuit breaker for the private mesh transport: steady-clock ms until which
+    // private calls fail fast without attempting the SSL handshake (0 = closed).
+    std::atomic<int64_t> mesh_breaker_until_ms{0};
 
     // Mesh P2P orchestrator
     std::unique_ptr<MeshOrchestrator> mesh_orchestrator;
@@ -291,24 +314,36 @@ struct LemonadeNexusClient::Impl {
                          server_private_fqdn);
             return std::nullopt;
         }
+        // Breaker open: a recent mesh call failed, so skip the SSL handshake that
+        // would otherwise block up to the read timeout on a still-down tunnel.
+        int64_t now_ms = steady_now_ms();
+        if (now_ms < mesh_breaker_until_ms.load(std::memory_order_relaxed)) {
+            spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} fail-fast (breaker open)",
+                          method, path);
+            return std::nullopt;
+        }
         uint16_t lp = meshplane.tcp_egress(server_tunnel_ip, private_port);
         spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> egress {}:{} = 127.0.0.1:{}",
                       method, path, server_tunnel_ip, private_port, lp);
-        if (lp == 0) return std::nullopt;
+        if (lp == 0) {
+            mesh_breaker_until_ms.store(now_ms + kMeshBreakerCooldownMs, std::memory_order_relaxed);
+            return std::nullopt;
+        }
 
         try {
             httplib::SSLClient cli(server_private_fqdn, lp);
             // The private FQDN lands on the loopback egress; SNI + certificate
             // verification still use the FQDN (against the public CA).
             cli.set_hostname_addr_map({{server_private_fqdn, "127.0.0.1"}});
-            cli.set_connection_timeout(config.connect_timeout_sec);
-            cli.set_read_timeout(config.read_timeout_sec);
+            cli.set_connection_timeout(kMeshConnectTimeoutSec);
+            cli.set_read_timeout(kMeshReadTimeoutSec);
             httplib::Result res = (std::string(method) == "GET")
                 ? cli.Get(path, auth_headers())
                 : cli.Post(path, auth_headers(), body, "application/json");
             if (res) {
                 served = true;
                 status_out = res->status;
+                mesh_breaker_until_ms.store(0, std::memory_order_relaxed);  // healthy: close breaker
                 spdlog::debug("[LemonadeNexusClient] private(mesh) {} {} -> HTTP {}",
                               method, path, res->status);
                 try { return json::parse(res->body); }
@@ -323,75 +358,28 @@ struct LemonadeNexusClient::Impl {
             spdlog::warn("[LemonadeNexusClient] private(mesh) {} {} EXCEPTION: {}",
                          method, path, e.what());
         }
+        // Failed: open the breaker so subsequent calls fail fast until the cooldown.
+        mesh_breaker_until_ms.store(now_ms + kMeshBreakerCooldownMs, std::memory_order_relaxed);
         return std::nullopt;
     }
 
+    // The private routes live ONLY on the server's private API, reachable ONLY
+    // over the userspace mesh dataplane. There is deliberately no public or
+    // OS-routed fallback: the public API 404s these routes, and the private FQDN
+    // maps to a tunnel IP with no OS route — a fallback only burns a full connect
+    // timeout and logs a misleading 404. If the mesh doesn't serve, fail fast.
     std::optional<json> private_http_get(const std::string& path, int& status_out) {
-        spdlog::debug("[LemonadeNexusClient] private_http_get {} (mesh={}, tunnel={})",
-                       path, meshplane.is_active(), server_tunnel_ip);
-        // Preferred: over the userspace mesh dataplane.
-        {
-            bool served = false;
-            auto r = mesh_request("GET", path, "", status_out, served);
-            if (served) return r;
-        }
-        // Legacy OS-routed path (kernel tunnel platforms): verified HTTPS by the
-        // private FQDN, which the OS resolver routes to the tunnel. No by-IP path
-        // (a public cert can't be verified against a raw tunnel IP).
-        if (!server_private_fqdn.empty()) {
-            try {
-                httplib::SSLClient cli(server_private_fqdn, private_port);
-                cli.set_connection_timeout(config.connect_timeout_sec);
-                cli.set_read_timeout(config.read_timeout_sec);
-                auto res = cli.Get(path, auth_headers());
-                if (res) {
-                    status_out = res->status;
-                    spdlog::debug("[LemonadeNexusClient] private GET {} -> {}", path, res->status);
-                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
-                    try { return json::parse(res->body); } catch (...) { return std::nullopt; }
-                }
-                spdlog::debug("[LemonadeNexusClient] private HTTPS GET {} failed (no response)", path);
-            } catch (const std::exception& e) {
-                spdlog::debug("[LemonadeNexusClient] private HTTPS GET {} exception: {}", path, e.what());
-            }
-        }
-        // Last resort: public API
-        return http_get(path, status_out);
+        bool served = false;
+        auto r = mesh_request("GET", path, "", status_out, served);
+        if (!served) status_out = 0;
+        return served ? r : std::nullopt;
     }
 
     std::optional<json> private_http_post(const std::string& path, const json& body, int& status_out) {
-        spdlog::debug("[LemonadeNexusClient] private_http_post {} (mesh={}, tunnel={})",
-                       path, meshplane.is_active(), server_tunnel_ip);
-        // Preferred: over the userspace mesh dataplane.
-        {
-            bool served = false;
-            auto r = mesh_request("POST", path, body.dump(), status_out, served);
-            if (served) return r;
-        }
-        // Legacy OS-routed path (kernel tunnel platforms): verified HTTPS by the
-        // private FQDN, which the OS resolver routes to the tunnel. No by-IP path
-        // (a public cert can't be verified against a raw tunnel IP).
-        if (!server_private_fqdn.empty()) {
-            try {
-                httplib::SSLClient cli(server_private_fqdn, private_port);
-                cli.set_connection_timeout(config.connect_timeout_sec);
-                cli.set_read_timeout(config.read_timeout_sec);
-                auto res = cli.Post(path, auth_headers(), body.dump(), "application/json");
-                if (res) {
-                    status_out = res->status;
-                    spdlog::debug("[LemonadeNexusClient] private POST {} -> {}", path, res->status);
-                    if (res->status >= 200 && res->status < 300) return json::parse(res->body);
-                    try { return json::parse(res->body); } catch (...) {
-                        json err; err["error"] = "HTTP " + std::to_string(res->status); return err;
-                    }
-                }
-                spdlog::debug("[LemonadeNexusClient] private HTTPS POST {} failed (no response)", path);
-            } catch (const std::exception& e) {
-                spdlog::debug("[LemonadeNexusClient] private HTTPS POST {} exception: {}", path, e.what());
-            }
-        }
-        // Last resort: public API
-        return http_post(path, body, status_out);
+        bool served = false;
+        auto r = mesh_request("POST", path, body.dump(), status_out, served);
+        if (!served) status_out = 0;
+        return served ? r : std::nullopt;
     }
 
     // Discover additional servers via /api/servers
@@ -1606,6 +1594,8 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         if (!impl_->meshplane.start(bt)) {
             spdlog::warn("[LemonadeNexusClient] mesh dataplane start failed");
         } else {
+            // Fresh dataplane — close the breaker so private calls probe at once.
+            impl_->mesh_breaker_until_ms.store(0, std::memory_order_relaxed);
             // Re-apply service exposures registered before a re-join
             std::vector<std::pair<uint16_t, std::string>> exposures;
             {

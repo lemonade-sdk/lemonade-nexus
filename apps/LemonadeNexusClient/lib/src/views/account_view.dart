@@ -74,7 +74,11 @@ class _AccountViewState extends ConsumerState<AccountView> {
     } catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = '$e';
+        // A private-API call throws when the mesh transport can't reach the
+        // server (tunnel still connecting or down). Show an actionable message
+        // instead of the raw exception.
+        _error = 'Could not reach the server over the mesh yet. If the tunnel '
+            'just came up, give it a moment and tap Refresh.';
         _isLoading = false;
       });
     }

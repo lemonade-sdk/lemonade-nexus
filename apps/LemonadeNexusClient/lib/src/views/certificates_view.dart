@@ -31,7 +31,11 @@ class _CertificatesViewState extends ConsumerState<CertificatesView> {
   @override
   void initState() {
     super.initState();
-    _loadCertificates();
+    // Defer the first fetch until after the view paints — the native call is
+    // synchronous and would otherwise block (freeze) the navigation transition.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loadCertificates();
+    });
   }
 
   Future<void> _loadCertificates() async {

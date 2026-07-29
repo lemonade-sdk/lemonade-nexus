@@ -29,7 +29,11 @@ class _ServersViewState extends ConsumerState<ServersView> {
   @override
   void initState() {
     super.initState();
-    _loadServers();
+    // Defer the first fetch until after the view paints — the native call is
+    // synchronous and would otherwise block (freeze) the navigation transition.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loadServers();
+    });
   }
 
   Future<void> _loadServers() async {

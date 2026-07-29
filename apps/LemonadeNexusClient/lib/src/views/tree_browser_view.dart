@@ -54,7 +54,11 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
   @override
   void initState() {
     super.initState();
-    _loadTree();
+    // Defer the first fetch until after the view paints — the native call is
+    // synchronous and would otherwise block (freeze) the navigation transition.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) _loadTree();
+    });
   }
 
   @override
