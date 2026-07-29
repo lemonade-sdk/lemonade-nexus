@@ -7,16 +7,16 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
 import '../platform/settings_store.dart';
 import '../platform/secure_store.dart';
-import '../platform/app_paths.dart';
 import '../services/dns_discovery.dart';
 import '../services/passkey_manager.dart';
+import 'cluster_keyring.dart';
 
 /// Lightweight console logger for connection/state diagnostics.
 /// Mirrors the `[Discovery]`-style tagging used in dns_discovery.dart.
@@ -277,6 +277,12 @@ class AppState {
   final List<ActivityEntry> activityLog;
   final DateTime? connectedSince;
 
+  /// Clusters (accounts) this install can connect to — rendered by the login page.
+  final List<ClusterEntry> clusters;
+
+  /// localId of the Cluster currently connected (null when none).
+  final String? activeClusterId;
+
   const AppState({
     this.connectionStatus = ConnectionStatus.disconnected,
     this.authState = AuthState.initial,
@@ -301,6 +307,8 @@ class AppState {
     this.errorMessage,
     this.activityLog = const [],
     this.connectedSince,
+    this.clusters = const [],
+    this.activeClusterId,
   });
 
   AppState copyWith({
@@ -327,6 +335,10 @@ class AppState {
     String? errorMessage,
     List<ActivityEntry>? activityLog,
     DateTime? connectedSince,
+    List<ClusterEntry>? clusters,
+    String? activeClusterId,
+    // copyWith can't null a field via the ?? pattern; sign-out needs to.
+    bool clearActiveCluster = false,
   }) {
     return AppState(
       connectionStatus: connectionStatus ?? this.connectionStatus,
@@ -352,6 +364,9 @@ class AppState {
       errorMessage: errorMessage ?? this.errorMessage,
       activityLog: activityLog ?? this.activityLog,
       connectedSince: connectedSince ?? this.connectedSince,
+      clusters: clusters ?? this.clusters,
+      activeClusterId:
+          clearActiveCluster ? null : (activeClusterId ?? this.activeClusterId),
     );
   }
 
@@ -376,6 +391,15 @@ class AppState {
   String? get tunnelIP => tunnelStatus?.tunnelIp ?? meshStatus?.tunnelIp;
   MeshStatus? get meshStatus => peerState.meshStatus;
   List<MeshPeer> get meshPeers => peerState.meshPeers;
+
+  /// The Cluster currently connected, if any.
+  ClusterEntry? get activeCluster {
+    if (activeClusterId == null) return null;
+    for (final c in clusters) {
+      if (c.localId == activeClusterId) return c;
+    }
+    return null;
+  }
 }
 
 /// Notifier for managing app state
@@ -384,6 +408,7 @@ class AppNotifier extends StateNotifier<AppState> {
   final SettingsStore _settingsStore = SettingsStore();
   final SecureStore _secureStore = SecureStore();
   final PasskeyManager _passkey = PasskeyManager();
+  final ClusterKeyring _keyring = ClusterKeyring();
 
   // --- Connection recovery ---
   // Periodic health probe that drives auto-reconnect when the connected server
@@ -418,66 +443,38 @@ class AppNotifier extends StateNotifier<AppState> {
     } catch (_) {}
   }
 
-  /// Load persisted preferences, then attempt to restore a prior session.
+  /// Load persisted preferences + the Cluster keyring, then optionally
+  /// reconnect to the last-used Cluster.
   Future<void> _loadPreferences() async {
     final settings = await _settingsStore.load();
     state = state.copyWith(settings: settings);
+    await loadClusters();
     await _restoreSession();
   }
 
   Future<void> _persistSettings() => _settingsStore.save(state.settings);
 
-  Future<void> _persistIdentity() async {
-    try {
-      await _sdk.saveIdentity(await AppPaths.identityFilePath());
-    } catch (_) {
-      // No identity to persist (e.g. password-only auth).
-    }
-  }
-
-  /// Best-effort restore of a previous session (identity + token) on launch.
+  /// Reconnect to the most recently used Cluster when the user asked for it.
+  /// There is no password to re-enter — the identity comes from the keyring —
+  /// so this is purely a convenience; otherwise the login page lists the
+  /// Clusters and the user picks one.
   Future<void> _restoreSession() async {
-    final session = await _secureStore.loadSession();
-    if (session == null) {
-      _log('_restoreSession: no stored session');
+    if (!state.settings.autoConnectOnLaunch) return;
+    final previous = state.clusters
+        .where((c) => c.lastUsed != null)
+        .toList(); // keyring returns most-recent first
+    if (previous.isEmpty) {
+      _log('_restoreSession: no previously connected Cluster');
       return;
     }
-    _log('_restoreSession: restoring user=${session.username} '
-        'host=${state.settings.serverHost}:${state.settings.serverPort} tls=${state.settings.useTls}');
-    try {
-      final s = state.settings;
-      if (s.useTls) {
-        await _sdk.connectTls(s.serverHost, s.serverPort);
-      } else {
-        await _sdk.connect(s.serverHost, s.serverPort);
-      }
-      final idPath = await AppPaths.identityFilePath();
-      if (await File(idPath).exists()) {
-        await _sdk.loadIdentity(idPath);
-        await _sdk.setIdentity();
-      }
-      await _sdk.setSessionToken(session.token);
-      // Stay on the login view until the restored session's data has loaded;
-      // isAuthenticated (which reveals the dashboard) flips only after.
+    _log('_restoreSession: auto-connecting to "${previous.first.name}"');
+    if (!await connectToCluster(previous.first)) {
+      _log('_restoreSession: auto-connect failed; showing the login page');
       state = state.copyWith(
-        connectionStatus: ConnectionStatus.connecting,
-        authState: state.authState.copyWith(
-          username: session.username,
-          userId: session.userId,
-          sessionToken: session.token,
-        ),
+        authState: AuthState.initial,
+        connectionStatus: ConnectionStatus.disconnected,
+        isLoading: false,
       );
-      await _loadIdentity();
-      await _joinNetwork();
-      _log('_restoreSession: connected + identity set, refreshing data');
-      await refreshAllData();
-      state = state.copyWith(
-        connectionStatus: ConnectionStatus.connected,
-        authState: state.authState.copyWith(isAuthenticated: true),
-      );
-    } catch (e) {
-      _log('_restoreSession: FAILED -> $e (clearing stored session)');
-      await _secureStore.clear();
     }
   }
 
@@ -540,140 +537,303 @@ class AppNotifier extends StateNotifier<AppState> {
     addActivity(ActivityLevel.info, 'Disconnected from server');
   }
 
-  /// Sign in with username and password
-  Future<bool> signIn(String username, String password) async {
-    state = state.copyWith(isLoading: true, errorMessage: null);
+  // =========================================================================
+  // Clusters (passwordless accounts)
+  //
+  // A Cluster is an account (a Customer group node). There are no passwords: a
+  // membership IS a device Ed25519 key, kept in the keyring. Three actions —
+  // Register (new Cluster), Join (invite code), Connect (one we already hold).
+  // =========================================================================
 
-    _log('signIn: start user=$username (connStatus=${state.connectionStatus.name})');
-    try {
-      // Same credential-derived identity as register(): the password never
-      // leaves the device, auth is an Ed25519 challenge-response.
-      final seedB64 = await _sdk.deriveSeed(username, password);
-      final seedBytes = base64Decode(base64.normalize(seedB64));
-      await _sdk.createIdentityFromSeed(seedBytes);
-      await _sdk.setIdentity();
-      final response = await _sdk.authEd25519();
-      _log('signIn: authEd25519 authenticated=${response.authenticated}');
-      if (response.authenticated) {
-        // Record session/identity but stay on the login view (spinner) until
-        // the initial data load completes. isAuthenticated (which gates the
-        // dashboard) and isLoading flip only once the connection is established.
-        state = state.copyWith(
-          authState: state.authState.copyWith(
-            username: username,
-            userId: response.userId,
-            sessionToken: response.sessionToken,
-            authenticatedAt: DateTime.now(),
-          ),
-          connectionStatus: ConnectionStatus.connecting,
-        );
+  /// Load the keyring into state; the login page renders this list.
+  Future<void> loadClusters() async {
+    final clusters = await _keyring.load();
+    _log('loadClusters: ${clusters.length} cluster(s)');
+    state = state.copyWith(clusters: clusters);
+  }
 
-        // Set session token for future requests
-        if (response.sessionToken != null) {
-          await _sdk.setSessionToken(response.sessionToken!);
-        }
+  String _randomBase64(int byteCount) {
+    final rng = Random.secure();
+    return base64Encode(List<int>.generate(byteCount, (_) => rng.nextInt(256)));
+  }
 
-        await _loadIdentity();
-        await _joinNetwork();
-        await refreshAllData();
-        await _persistIdentity();
-        if (response.sessionToken != null) {
-          await _secureStore.saveSession(StoredSession(
-            token: response.sessionToken!,
-            username: username,
-            userId: response.userId,
-          ));
-        }
-        // Connection established — reveal the dashboard.
-        state = state.copyWith(
-          authState: state.authState.copyWith(isAuthenticated: true),
-          connectionStatus: ConnectionStatus.connected,
-          isLoading: false,
-        );
-        addActivity(ActivityLevel.success, 'Signed in as $username');
-        return true;
-      } else {
-        state = state.copyWith(
-          errorMessage: response.error ?? 'Authentication failed',
-          isLoading: false,
-        );
-        addActivity(ActivityLevel.error, 'Sign in failed: ${response.error}');
-        return false;
-      }
-    } catch (e) {
+  /// Make [seedB64]'s keypair the active device identity.
+  Future<void> _activateIdentity(String seedB64) async {
+    final seed = Uint8List.fromList(base64Decode(base64.normalize(seedB64)));
+    await _sdk.createIdentityFromSeed(seed);
+    await _sdk.setIdentity();
+  }
+
+  /// Ensure the SDK is connected to a server before an auth/join attempt.
+  Future<bool> _ensureServerConnection({
+    String? host,
+    int? port,
+    bool? useTls,
+  }) async {
+    final s = state.settings;
+    final targetHost = host ?? s.serverHost;
+    final targetPort = port ?? s.serverPort;
+    if (targetHost.isEmpty || targetPort == 0) {
       state = state.copyWith(
-        errorMessage: 'Sign in failed: $e',
+        errorMessage: 'No server available — run discovery first.',
         isLoading: false,
       );
-      addActivity(ActivityLevel.error, 'Sign in failed: $e');
+      return false;
+    }
+    final switching = targetHost != s.serverHost || targetPort != s.serverPort;
+    if (state.isConnected && !switching) return true;
+    return connectToServer(targetHost, targetPort, useTls: useTls ?? s.useTls);
+  }
+
+  /// Shared tail of register/join/connect: Ed25519 auth, mesh join, initial load.
+  /// [clusterName] labels this device's endpoint on the server.
+  Future<bool> _authJoinAndLoad(String clusterName) async {
+    final response = await _sdk.authEd25519();
+    _log('_authJoinAndLoad: authenticated=${response.authenticated}');
+    if (!response.authenticated) {
+      state = state.copyWith(
+        errorMessage: response.error ?? 'Authentication failed',
+        isLoading: false,
+      );
+      return false;
+    }
+    // Stay on the login view (spinner) until the initial load finishes;
+    // isAuthenticated (which reveals the dashboard) flips only after.
+    state = state.copyWith(
+      authState: state.authState.copyWith(
+        username: clusterName,
+        userId: response.userId,
+        sessionToken: response.sessionToken,
+        authenticatedAt: DateTime.now(),
+      ),
+      connectionStatus: ConnectionStatus.connecting,
+    );
+    if (response.sessionToken != null) {
+      await _sdk.setSessionToken(response.sessionToken!);
+      await _secureStore.saveSession(StoredSession(
+        token: response.sessionToken!,
+        username: clusterName,
+        userId: response.userId,
+      ));
+    }
+    await _loadIdentity();
+    await _joinNetwork();
+    await refreshAllData();
+    state = state.copyWith(
+      authState: state.authState.copyWith(isAuthenticated: true),
+      connectionStatus: ConnectionStatus.connected,
+      isLoading: false,
+    );
+    return true;
+  }
+
+  Future<void> _saveActiveCluster(ClusterEntry entry) async {
+    final clusters = await _keyring.upsert(entry);
+    state = state.copyWith(clusters: clusters, activeClusterId: entry.localId);
+  }
+
+  /// Register a brand-new Cluster: fresh device key, join, then generate the
+  /// Cluster group key and seal it to ourselves so relaunches can recover it.
+  Future<bool> registerCluster(String name) async {
+    state = state.copyWith(isLoading: true, errorMessage: null);
+    _log('registerCluster: "$name"');
+    try {
+      if (!await _ensureServerConnection()) return false;
+
+      final seedB64 = _randomBase64(32);
+      await _activateIdentity(seedB64);
+      if (!await _authJoinAndLoad(name)) return false;
+
+      String? groupKey;
+      try {
+        groupKey = _sdk.generateGroupKey();
+        await _provisionGroupKeyTo(_sdk.identityPubkey ?? '', groupKey);
+      } catch (e) {
+        // The key is still held locally; provisioning retries on next connect.
+        _log('registerCluster: self-provision deferred -> $e');
+      }
+
+      final s = state.settings;
+      await _saveActiveCluster(ClusterEntry(
+        localId: _randomBase64(8),
+        name: name,
+        role: 'owner',
+        seedB64: seedB64,
+        groupKeyB64: groupKey,
+        userId: state.userId,
+        serverHost: s.serverHost,
+        serverPort: s.serverPort,
+        useTls: s.useTls,
+        lastUsed: DateTime.now(),
+      ));
+      addActivity(ActivityLevel.success, 'Registered Cluster "$name"');
+      return true;
+    } catch (e) {
+      state = state.copyWith(errorMessage: 'Register failed: $e', isLoading: false);
+      addActivity(ActivityLevel.error, 'Register failed: $e');
       return false;
     }
   }
 
-  /// Register a new user
-  Future<bool> register(String username, String password) async {
+  /// Join an existing Cluster with an invitation code. The device generates its
+  /// own key; the code authorizes placing it in the Cluster. The group key
+  /// arrives separately (an owner device must seal it to us), so this can
+  /// succeed with [ClusterEntry.hasGroupKey] still false.
+  Future<bool> joinCluster(String inviteCode, {String name = 'Cluster'}) async {
     state = state.copyWith(isLoading: true, errorMessage: null);
-
+    _log('joinCluster: name="$name"');
     try {
-      // First derive seed from credentials (returns base64-encoded 32-byte seed)
-      final seedB64 = await _sdk.deriveSeed(username, password);
-      // SDK emits canonical urlsafe base64 without padding; normalize before decoding
-      final seedBytes = base64Decode(base64.normalize(seedB64));
-      await _sdk.createIdentityFromSeed(seedBytes);
-      // Set identity for client
-      await _sdk.setIdentity();
+      if (!await _ensureServerConnection()) return false;
 
-      // Ed25519 challenge-response; the server auto-registers unknown
-      // pubkeys on valid proof of possession (password auth is a stub).
-      final response = await _sdk.authEd25519();
-      if (response.authenticated) {
-        // Stay on the login view (spinner) until the initial data load finishes.
-        state = state.copyWith(
-          authState: state.authState.copyWith(
-            username: username,
-            userId: response.userId,
-            sessionToken: response.sessionToken,
-            authenticatedAt: DateTime.now(),
-          ),
-          connectionStatus: ConnectionStatus.connecting,
-        );
-        if (response.sessionToken != null) {
-          await _sdk.setSessionToken(response.sessionToken!);
-        }
-        await _loadIdentity();
-        await _joinNetwork();
-        await refreshAllData();
-        await _persistIdentity();
-        if (response.sessionToken != null) {
-          await _secureStore.saveSession(StoredSession(
-            token: response.sessionToken!,
-            username: username,
-            userId: response.userId,
-          ));
-        }
-        // Connection established — reveal the dashboard.
-        state = state.copyWith(
-          authState: state.authState.copyWith(isAuthenticated: true),
-          connectionStatus: ConnectionStatus.connected,
-          isLoading: false,
-        );
-        addActivity(ActivityLevel.success, 'Registered as $username');
-        return true;
-      } else {
-        state = state.copyWith(
-          errorMessage: response.error ?? 'Registration failed',
-          isLoading: false,
-        );
-        addActivity(ActivityLevel.error, 'Registration failed: ${response.error}');
+      final seedB64 = _randomBase64(32);
+      await _activateIdentity(seedB64);
+      _sdk.setLinkToken(inviteCode.trim());
+      if (!await _authJoinAndLoad(name)) return false;
+
+      final groupKey = await fetchGroupKey();
+      final s = state.settings;
+      await _saveActiveCluster(ClusterEntry(
+        localId: _randomBase64(8),
+        name: name,
+        role: 'member',
+        seedB64: seedB64,
+        groupKeyB64: groupKey,
+        userId: state.userId,
+        serverHost: s.serverHost,
+        serverPort: s.serverPort,
+        useTls: s.useTls,
+        lastUsed: DateTime.now(),
+      ));
+      addActivity(
+          ActivityLevel.success,
+          groupKey == null
+              ? 'Joined "$name" — waiting for the account key'
+              : 'Joined Cluster "$name"');
+      return true;
+    } catch (e) {
+      state = state.copyWith(errorMessage: 'Join failed: $e', isLoading: false);
+      addActivity(ActivityLevel.error, 'Join failed: $e');
+      return false;
+    }
+  }
+
+  /// Connect to a Cluster already in the keyring.
+  Future<bool> connectToCluster(ClusterEntry entry) async {
+    state = state.copyWith(isLoading: true, errorMessage: null);
+    _log('connectToCluster: "${entry.name}" (${entry.role})');
+    try {
+      if (!await _ensureServerConnection(
+          host: entry.serverHost.isEmpty ? null : entry.serverHost,
+          port: entry.serverPort == 0 ? null : entry.serverPort,
+          useTls: entry.useTls)) {
         return false;
       }
+
+      await _activateIdentity(entry.seedB64);
+      if (!await _authJoinAndLoad(entry.name)) return false;
+
+      // Pick up the group key if an owner provisioned it since last time.
+      final groupKey = entry.groupKeyB64 ?? await fetchGroupKey();
+      await _saveActiveCluster(entry.copyWith(
+        groupKeyB64: groupKey,
+        userId: state.userId ?? entry.userId,
+        lastUsed: DateTime.now(),
+      ));
+      addActivity(ActivityLevel.success, 'Connected to "${entry.name}"');
+      return true;
     } catch (e) {
-      state = state.copyWith(
-        errorMessage: 'Registration failed: $e',
-        isLoading: false,
-      );
-      addActivity(ActivityLevel.error, 'Registration failed: $e');
+      state = state.copyWith(errorMessage: 'Connect failed: $e', isLoading: false);
+      addActivity(ActivityLevel.error, 'Connect failed: $e');
       return false;
+    }
+  }
+
+  /// Forget a Cluster on this device (drops its key; does not touch the server).
+  Future<void> forgetCluster(String localId) async {
+    final clusters = await _keyring.remove(localId);
+    final wasActive = state.activeClusterId == localId;
+    state = state.copyWith(clusters: clusters, clearActiveCluster: wasActive);
+  }
+
+  /// Rename a Cluster locally (display label only).
+  Future<void> renameCluster(String localId, String name) async {
+    for (final c in state.clusters) {
+      if (c.localId == localId) {
+        final clusters = await _keyring.upsert(c.copyWith(name: name));
+        state = state.copyWith(clusters: clusters);
+        return;
+      }
+    }
+  }
+
+  // ---- device linking + group-key provisioning ------------------------------
+
+  /// Mint an invitation code so another device can join the active Cluster.
+  /// Owner-only (needs AddChild on the Cluster) and requires the mesh.
+  Future<Map<String, dynamic>> createDeviceInvite({int ttlSec = 600}) =>
+      _sdk.createLinkToken(ttlSec: ttlSec);
+
+  /// Devices in the active Cluster that have no group-key envelope yet.
+  Future<List<Map<String, dynamic>>> pendingDevices() async {
+    final resp = await callPrivateApi('GET', '/api/account/keys/pending');
+    final list = (resp['pending'] as List?) ?? const [];
+    return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+  }
+
+  /// Seal the Cluster group key to [targetPubkey] and store the envelope. The
+  /// server keeps it opaque — it never sees the key.
+  Future<void> _provisionGroupKeyTo(String targetPubkey, String groupKey,
+      {String keyId = 'gk1'}) async {
+    if (targetPubkey.isEmpty) throw StateError('no target pubkey');
+    final env = _sdk.wrapGroupKey(targetPubkey, groupKey);
+    await callPrivateApi('POST', '/api/account/keys/envelope', body: {
+      'target_pubkey': targetPubkey,
+      'key_id': keyId,
+      'ephemeral_pubkey': env['ephemeral_pubkey'],
+      'wrapped_key': env['wrapped_key'],
+    });
+  }
+
+  /// Provision the group key to every device still waiting for it. Returns the
+  /// number provisioned (0 if this device has no group key to share).
+  Future<int> provisionPendingDevices() async {
+    final groupKey = state.activeCluster?.groupKeyB64;
+    if (groupKey == null || groupKey.isEmpty) {
+      _log('provisionPendingDevices: no group key on this device');
+      return 0;
+    }
+    var provisioned = 0;
+    for (final device in await pendingDevices()) {
+      final pubkey = device['pubkey']?.toString() ?? '';
+      if (pubkey.isEmpty) continue;
+      try {
+        await _provisionGroupKeyTo(pubkey, groupKey);
+        provisioned++;
+        addActivity(ActivityLevel.success,
+            'Shared the account key with ${device['node_id'] ?? 'a device'}');
+      } catch (e) {
+        _log('provisionPendingDevices: failed for $pubkey -> $e');
+      }
+    }
+    return provisioned;
+  }
+
+  /// Fetch + unwrap this device's group-key envelope, persisting it to the
+  /// keyring on success. Returns null if no owner has provisioned us yet.
+  Future<String?> fetchGroupKey() async {
+    try {
+      final env = await callPrivateApi('GET', '/api/account/keys/envelope');
+      if (env.containsKey('error')) return null;
+      final key = _sdk.unwrapGroupKey(env);
+      if (key == null) return null;
+      final active = state.activeCluster;
+      if (active != null && active.groupKeyB64 != key) {
+        await _saveActiveCluster(active.copyWith(groupKeyB64: key));
+      }
+      return key;
+    } catch (e) {
+      _log('fetchGroupKey: unavailable -> $e');
+      return null;
     }
   }
 
@@ -862,11 +1022,13 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Sign out
+  /// Disconnect from the active Cluster and return to the login page. The
+  /// keyring is preserved — the Cluster stays listed for a later Connect.
   Future<void> signOut() async {
     await _secureStore.clear();
     await disconnectFromServer(clearIdentity: true);
     state = state.copyWith(
+      clearActiveCluster: true,
       authState: AuthState.initial,
       peerState: PeerState.initial,
       tunnelStatus: null,

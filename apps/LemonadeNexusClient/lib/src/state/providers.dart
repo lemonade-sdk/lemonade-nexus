@@ -17,6 +17,7 @@ import '../sdk/sdk.dart';
 import '../platform/platform_integration.dart';
 import '../platform/settings_store.dart';
 import 'app_state.dart';
+import 'cluster_keyring.dart';
 
 // =========================================================================
 // SDK Provider
@@ -206,21 +207,28 @@ final treeServiceProvider = Provider<TreeService>((ref) {
 // =========================================================================
 
 /// Authentication service.
-/// Handles all authentication-related operations.
+///
+/// Access is passwordless: a Cluster (account) membership is a device Ed25519
+/// key held in the keyring, so the actions are Register (new Cluster), Join
+/// (invitation code) and Connect (a Cluster already on this device).
 class AuthService {
   final AppNotifier _notifier;
 
   AuthService(this._notifier);
 
-  /// Sign in with username and password.
-  Future<bool> signIn(String username, String password) {
-    return _notifier.signIn(username, password);
-  }
+  /// Register a brand-new Cluster named [name].
+  Future<bool> registerCluster(String name) => _notifier.registerCluster(name);
 
-  /// Register a new user.
-  Future<bool> register(String username, String password) {
-    return _notifier.register(username, password);
-  }
+  /// Join an existing Cluster with an invitation code.
+  Future<bool> joinCluster(String inviteCode, {String name = 'Cluster'}) =>
+      _notifier.joinCluster(inviteCode, name: name);
+
+  /// Connect to a Cluster already in the keyring.
+  Future<bool> connectToCluster(ClusterEntry entry) =>
+      _notifier.connectToCluster(entry);
+
+  /// Clusters this device can connect to.
+  List<ClusterEntry> get clusters => _notifier.currentState.clusters;
 
   /// Sign out.
   Future<void> signOut() => _notifier.signOut();

@@ -1,14 +1,16 @@
 /// @title Login View
-/// @description Passkey-first authentication with region-aware server discovery.
-/// Styled to match the macOS app.
+/// @description Passwordless Cluster picker. A Cluster is an account; a
+/// membership is a device Ed25519 key held in the keyring, so there is nothing
+/// to type to get back in. Three actions: Connect (tap a Cluster card),
+/// Register (a new Cluster) and Join (an invitation code from another device).
 library;
 
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../state/providers.dart';
 import '../state/app_state.dart';
+import '../state/cluster_keyring.dart';
 import '../services/dns_discovery.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
@@ -21,32 +23,21 @@ class LoginView extends ConsumerStatefulWidget {
 }
 
 class _LoginViewState extends ConsumerState<LoginView> {
-  final _formKey = GlobalKey<FormState>();
-  final _usernameController = TextEditingController();
-  final _passwordController = TextEditingController();
-
-  AuthTab _selectedTab = AuthTab.passkey;
   String? _error;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      final notifier = ref.read(appNotifierProvider.notifier);
+      if (!mounted) return;
       final state = ref.read(appNotifierProvider);
+      _notifier.loadClusters();
       if (state.settings.autoDiscoveryEnabled &&
           state.discoveredServers.isEmpty &&
           !state.isDiscovering) {
-        notifier.discoverNearestServer();
+        _notifier.discoverNearestServer();
       }
     });
-  }
-
-  @override
-  void dispose() {
-    _usernameController.dispose();
-    _passwordController.dispose();
-    super.dispose();
   }
 
   AppNotifier get _notifier => ref.read(appNotifierProvider.notifier);
@@ -59,35 +50,6 @@ class _LoginViewState extends ConsumerState<LoginView> {
     }
   }
 
-  Future<void> _handleSignIn() async {
-    if (!_formKey.currentState!.validate()) return;
-    await _run(
-        () => _notifier.signIn(
-            _usernameController.text.trim(), _passwordController.text),
-        'Sign in failed');
-  }
-
-  Future<void> _handleRegister() async {
-    if (!_formKey.currentState!.validate()) return;
-    await _run(
-        () => _notifier.register(
-            _usernameController.text.trim(), _passwordController.text),
-        'Registration failed');
-  }
-
-  Future<void> _handlePasskeySignIn() =>
-      _run(_notifier.signInWithPasskey, 'Passkey sign-in failed');
-
-  Future<void> _handlePasskeyRegister() {
-    final username = _usernameController.text.trim();
-    if (username.isEmpty) {
-      setState(() => _error = 'Please enter a username');
-      return Future.value();
-    }
-    return _run(() => _notifier.registerPasskey(username),
-        'Passkey registration failed');
-  }
-
   @override
   Widget build(BuildContext context) {
     final appState = ref.watch(appNotifierProvider);
@@ -97,7 +59,7 @@ class _LoginViewState extends ConsumerState<LoginView> {
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 380),
-          child: Padding(
+          child: SingleChildScrollView(
             padding: const EdgeInsets.all(24),
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -111,32 +73,36 @@ class _LoginViewState extends ConsumerState<LoginView> {
                     style: TextStyle(fontSize: 14, color: scheme.onSurfaceVariant)),
                 const SizedBox(height: 28),
                 AppCard(
-                  padding: const EdgeInsets.all(24),
-                  child: Form(
-                    key: _formKey,
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        _serverSection(appState),
-                        const SizedBox(height: 20),
-                        _tabSelection(scheme),
-                        const SizedBox(height: 20),
-                        if (_selectedTab == AuthTab.passkey)
-                          _passkeyTab(appState, scheme)
-                        else
-                          _passwordTab(),
-                        if (_error != null) ...[
-                          const SizedBox(height: 16),
-                          _errorBox(_error!),
-                        ],
-                        const SizedBox(height: 16),
-                        if (_selectedTab == AuthTab.passkey)
-                          _passkeyActions(appState)
-                        else
-                          _passwordActions(appState),
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      _serverSection(appState),
+                      const SizedBox(height: 16),
+                      for (final cluster in appState.clusters) ...[
+                        _clusterCard(cluster, appState),
+                        const SizedBox(height: 12),
                       ],
-                    ),
+                      _registerCard(appState),
+                      if (_error != null) ...[
+                        const SizedBox(height: 16),
+                        _errorBox(_error!),
+                      ],
+                      const SizedBox(height: 10),
+                      Center(
+                        child: TextButton(
+                          onPressed: appState.isLoading ? null : _showJoinDialog,
+                          style: TextButton.styleFrom(
+                            foregroundColor: AppTheme.lemonYellow,
+                            visualDensity: VisualDensity.compact,
+                          ),
+                          child: const Text('Have an invitation code?',
+                              style: TextStyle(
+                                  fontSize: 12, fontStyle: FontStyle.italic)),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 24),
@@ -152,7 +118,209 @@ class _LoginViewState extends ConsumerState<LoginView> {
     );
   }
 
-  // ---- server discovery (no manual entry) -----------------------------------
+  // ---- cluster cards --------------------------------------------------------
+
+  Widget _clusterCard(ClusterEntry cluster, AppState appState) {
+    final scheme = Theme.of(context).colorScheme;
+    final busy = appState.isLoading;
+    return Material(
+      color: scheme.surfaceContainerHighest,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: busy ? null : () => _connect(cluster),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+          child: Row(
+            children: [
+              const Icon(Icons.person_outline, size: 44, color: AppTheme.lemonYellow),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(cluster.name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontSize: 19, fontWeight: FontWeight.w500)),
+                    const SizedBox(height: 2),
+                    Text(_subtitleFor(cluster),
+                        style: TextStyle(
+                            fontSize: 12,
+                            fontStyle: FontStyle.italic,
+                            color: scheme.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+              PopupMenuButton<String>(
+                tooltip: 'Cluster options',
+                icon: Icon(Icons.settings, size: 20, color: scheme.onSurfaceVariant),
+                onSelected: (value) {
+                  if (value == 'rename') _showRenameDialog(cluster);
+                  if (value == 'forget') _confirmForget(cluster);
+                },
+                itemBuilder: (_) => const [
+                  PopupMenuItem(value: 'rename', child: Text('Rename')),
+                  PopupMenuItem(
+                      value: 'forget', child: Text('Forget on this device')),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// "Last used …", or the state of a membership with no account key yet.
+  String _subtitleFor(ClusterEntry cluster) {
+    if (!cluster.hasGroupKey && !cluster.isOwner) return 'Waiting for account key';
+    if (cluster.lastUsed == null) return 'Never connected';
+    return 'Last used ${_relativeTime(cluster.lastUsed!)}';
+  }
+
+  Widget _registerCard(AppState appState) {
+    final scheme = Theme.of(context).colorScheme;
+    return Material(
+      color: scheme.surfaceContainerHighest.withValues(alpha: 0.5),
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: appState.isLoading ? null : _showRegisterDialog,
+        child: Container(
+          height: 96,
+          alignment: Alignment.center,
+          child: appState.isLoading
+              ? const SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2))
+              : Icon(Icons.add_circle_outline,
+                  size: 40, color: scheme.onSurfaceVariant),
+        ),
+      ),
+    );
+  }
+
+  // ---- actions --------------------------------------------------------------
+
+  Future<void> _connect(ClusterEntry cluster) =>
+      _run(() => _notifier.connectToCluster(cluster), 'Could not connect');
+
+  Future<void> _showRegisterDialog() async {
+    final name = await _promptText(
+      title: 'New Cluster',
+      message: 'A Cluster is your account. This device becomes its owner — no '
+          'password needed.',
+      label: 'Cluster name',
+      initial: '',
+      action: 'Create',
+    );
+    if (name == null || name.isEmpty) return;
+    await _run(
+        () => _notifier.registerCluster(name), 'Could not create the Cluster');
+  }
+
+  Future<void> _showJoinDialog() async {
+    final result = await showDialog<_JoinRequest>(
+      context: context,
+      builder: (_) => const _JoinDialog(),
+    );
+    if (result == null) return;
+    await _run(() => _notifier.joinCluster(result.code, name: result.name),
+        'Could not join the Cluster');
+  }
+
+  Future<void> _showRenameDialog(ClusterEntry cluster) async {
+    final name = await _promptText(
+      title: 'Rename Cluster',
+      message: 'This label is local to this device.',
+      label: 'Cluster name',
+      initial: cluster.name,
+      action: 'Rename',
+    );
+    if (name == null || name.isEmpty) return;
+    await _notifier.renameCluster(cluster.localId, name);
+  }
+
+  Future<void> _confirmForget(ClusterEntry cluster) async {
+    final scheme = Theme.of(context).colorScheme;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: scheme.surface,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: scheme.outline)),
+        title: const Text('Forget Cluster'),
+        content: Text(
+          'Remove "${cluster.name}" from this device. Its key is deleted here, '
+          'so you would need a new invitation code to come back'
+          '${cluster.isOwner ? ' — and this device owns the Cluster' : ''}.',
+          style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.errorColor),
+            child: const Text('Forget'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await _notifier.forgetCluster(cluster.localId);
+  }
+
+  Future<String?> _promptText({
+    required String title,
+    required String message,
+    required String label,
+    required String initial,
+    required String action,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final controller = TextEditingController(text: initial);
+    return showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: scheme.surface,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: scheme.outline)),
+        title: Text(title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(message,
+                style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              decoration: InputDecoration(labelText: label),
+              onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: Text(action),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---- server discovery -----------------------------------------------------
 
   Widget _serverSection(AppState appState) {
     final scheme = Theme.of(context).colorScheme;
@@ -194,7 +362,8 @@ class _LoginViewState extends ConsumerState<LoginView> {
                         style: const TextStyle(fontSize: 12)),
                     Text(
                       '${servers.length} server${servers.length == 1 ? '' : 's'} found — ${best.latencyMs.round()}ms latency',
-                      style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                      style:
+                          TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
                     ),
                   ],
                 ),
@@ -213,7 +382,6 @@ class _LoginViewState extends ConsumerState<LoginView> {
       );
     }
 
-    // No servers discovered — offer to retry.
     return Column(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
@@ -238,7 +406,8 @@ class _LoginViewState extends ConsumerState<LoginView> {
     final host = s.connectHost ?? s.hostname ?? s.ip;
     final selected = '$host:${s.port}' == currentKey;
     return InkWell(
-      onTap: () => _notifier.connectToServer(host, s.port, useTls: s.scheme == 'https'),
+      onTap: () =>
+          _notifier.connectToServer(host, s.port, useTls: s.scheme == 'https'),
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: Row(
@@ -263,190 +432,6 @@ class _LoginViewState extends ConsumerState<LoginView> {
     );
   }
 
-  // ---- tabs -----------------------------------------------------------------
-
-  Widget _tabSelection(ColorScheme scheme) {
-    return Container(
-      padding: const EdgeInsets.all(2),
-      decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: AuthTab.values.map((tab) {
-          final selected = _selectedTab == tab;
-          return Expanded(
-            child: GestureDetector(
-              onTap: () => setState(() {
-                _selectedTab = tab;
-                _error = null;
-              }),
-              child: Container(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                decoration: BoxDecoration(
-                  color: selected ? AppTheme.lemonYellow : Colors.transparent,
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Center(
-                  child: Text(
-                    tab.label,
-                    style: TextStyle(
-                      color: selected ? Colors.black : scheme.onSurfaceVariant,
-                      fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
-                      fontSize: 13,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          );
-        }).toList(),
-      ),
-    );
-  }
-
-  Widget _passwordTab() {
-    return Column(
-      children: [
-        TextFormField(
-          controller: _usernameController,
-          textInputAction: TextInputAction.next,
-          decoration: const InputDecoration(
-            labelText: 'Username',
-            prefixIcon: Icon(Icons.person_outline, size: 18),
-          ),
-          validator: (v) => (v == null || v.isEmpty) ? 'Enter your username' : null,
-        ),
-        const SizedBox(height: 14),
-        TextFormField(
-          controller: _passwordController,
-          obscureText: true,
-          textInputAction: TextInputAction.done,
-          onFieldSubmitted: (_) => _handleSignIn(),
-          decoration: const InputDecoration(
-            labelText: 'Password',
-            prefixIcon: Icon(Icons.lock_outline, size: 18),
-          ),
-          validator: (v) => (v == null || v.isEmpty) ? 'Enter your password' : null,
-        ),
-      ],
-    );
-  }
-
-  Widget _passkeyTab(AppState appState, ColorScheme scheme) {
-    if (!Platform.isMacOS) {
-      return Column(
-        children: [
-          Icon(Icons.fingerprint, size: 44, color: scheme.onSurfaceVariant),
-          const SizedBox(height: 10),
-          Text('Passkeys are available on macOS.',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
-        ],
-      );
-    }
-
-    return Column(
-      children: [
-        const Icon(Icons.fingerprint, size: 48, color: AppTheme.lemonYellowDark),
-        const SizedBox(height: 12),
-        if (appState.hasStoredPasskey)
-          Text.rich(
-            TextSpan(children: [
-              const TextSpan(text: 'Sign in as '),
-              TextSpan(
-                  text: appState.storedPasskeyUserId ?? 'your account',
-                  style: const TextStyle(fontWeight: FontWeight.w600)),
-              const TextSpan(text: ' using Touch ID.'),
-            ]),
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
-          )
-        else ...[
-          Text('Create a passkey to sign in with Touch ID.',
-              textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant)),
-          const SizedBox(height: 16),
-          TextFormField(
-            controller: _usernameController,
-            decoration: const InputDecoration(
-              labelText: 'Username',
-              prefixIcon: Icon(Icons.person_outline, size: 18),
-            ),
-          ),
-        ],
-      ],
-    );
-  }
-
-  // ---- actions --------------------------------------------------------------
-
-  Widget _passwordActions(AppState appState) {
-    final loading = appState.isLoading;
-    return Row(
-      children: [
-        Expanded(
-          child: ElevatedButton(
-            onPressed: loading ? null : _handleSignIn,
-            child: loading ? _spinner() : const Text('Sign In'),
-          ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: OutlinedButton(
-            onPressed: loading ? null : _handleRegister,
-            child: const Text('Register'),
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _passkeyActions(AppState appState) {
-    if (!Platform.isMacOS) return const SizedBox.shrink();
-    final loading = appState.isLoading;
-    if (appState.hasStoredPasskey) {
-      return Column(
-        children: [
-          SizedBox(
-            width: double.infinity,
-            child: ElevatedButton.icon(
-              onPressed: loading ? null : _handlePasskeySignIn,
-              icon: loading
-                  ? _spinner()
-                  : const Icon(Icons.fingerprint, size: 18),
-              label: const Text('Sign in with Passkey'),
-            ),
-          ),
-          const SizedBox(height: 8),
-          TextButton(
-            onPressed: loading ? null : _notifier.deletePasskey,
-            style: TextButton.styleFrom(
-              foregroundColor: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-            child: const Text('Remove stored passkey', style: TextStyle(fontSize: 11)),
-          ),
-        ],
-      );
-    }
-    return SizedBox(
-      width: double.infinity,
-      child: ElevatedButton.icon(
-        onPressed: loading ? null : _handlePasskeyRegister,
-        icon: loading ? _spinner() : const Icon(Icons.person_add_alt, size: 18),
-        label: const Text('Create Passkey'),
-      ),
-    );
-  }
-
-  Widget _spinner() => const SizedBox(
-        width: 18,
-        height: 18,
-        child: CircularProgressIndicator(
-            strokeWidth: 2,
-            valueColor: AlwaysStoppedAnimation<Color>(Colors.black)),
-      );
-
   Widget _errorBox(String message) {
     return Container(
       padding: const EdgeInsets.all(10),
@@ -468,8 +453,94 @@ class _LoginViewState extends ConsumerState<LoginView> {
   }
 }
 
-enum AuthTab { passkey, password }
+String _relativeTime(DateTime when) {
+  final d = DateTime.now().difference(when);
+  if (d.inMinutes < 1) return 'just now';
+  if (d.inMinutes < 60) {
+    return '${d.inMinutes} minute${d.inMinutes == 1 ? '' : 's'} ago';
+  }
+  if (d.inHours < 24) {
+    return '${d.inHours == 1 ? 'an hour' : '${d.inHours} hours'} ago';
+  }
+  if (d.inDays < 30) return '${d.inDays} day${d.inDays == 1 ? '' : 's'} ago';
+  final months = d.inDays ~/ 30;
+  return '$months month${months == 1 ? '' : 's'} ago';
+}
 
-extension AuthTabExtension on AuthTab {
-  String get label => this == AuthTab.passkey ? 'Passkey' : 'Password';
+class _JoinRequest {
+  final String code;
+  final String name;
+  const _JoinRequest(this.code, this.name);
+}
+
+/// Prompts for an invitation code minted by a device already in the Cluster.
+class _JoinDialog extends StatefulWidget {
+  const _JoinDialog();
+
+  @override
+  State<_JoinDialog> createState() => _JoinDialogState();
+}
+
+class _JoinDialogState extends State<_JoinDialog> {
+  final _codeController = TextEditingController();
+  final _nameController = TextEditingController();
+
+  @override
+  void dispose() {
+    _codeController.dispose();
+    _nameController.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final code = _codeController.text.trim();
+    if (code.isEmpty) return;
+    final name = _nameController.text.trim();
+    Navigator.pop(context, _JoinRequest(code, name.isEmpty ? 'Cluster' : name));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return AlertDialog(
+      backgroundColor: scheme.surface,
+      shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: scheme.outline)),
+      title: const Text('Join a Cluster'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'Add Device on a device already in the Cluster gives you a code. '
+            'This device generates its own key — the code just authorizes it.',
+            style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: _codeController,
+            autofocus: true,
+            decoration: const InputDecoration(
+              labelText: 'Invitation code',
+              hintText: 'lnk_…',
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _nameController,
+            decoration: const InputDecoration(
+              labelText: 'Name for this Cluster (optional)',
+            ),
+            onSubmitted: (_) => _submit(),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+            onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        ElevatedButton(onPressed: _submit, child: const Text('Join')),
+      ],
+    );
+  }
 }
