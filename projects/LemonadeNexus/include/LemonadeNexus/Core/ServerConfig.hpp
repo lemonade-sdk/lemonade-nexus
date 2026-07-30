@@ -84,6 +84,8 @@ struct ServerConfig {
     std::string enroll_tpm_ek_cert_path; // optional path to the joining TPM's EK cert (PEM)
     std::string revoke_server_pubkey;
     bool        print_tpm_ak{false};   // print this host's TPM AK pubkey (base64 DER SPKI) and exit
+    bool        verify_platform{false};    // run the platform evidence probe and exit
+    std::string verify_platform_blob;      // optional: verify a captured HCL blob instead of this host's
 
     // Manifest CLI mode
     std::string add_manifest_path;  // path to a release manifest JSON to import

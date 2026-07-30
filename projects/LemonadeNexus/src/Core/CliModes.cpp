@@ -4,6 +4,7 @@
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
+#include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -41,6 +42,21 @@ int run_print_tpm_ak() {
     spdlog::info("TPM AK pubkey (base64 DER SPKI):");
     std::printf("%s\n", ak->c_str());
     return 0;
+}
+
+int run_verify_platform(const ServerConfig& config) {
+    security::PlatformProbeConfig cfg;
+    cfg.cache_dir = std::filesystem::path(config.data_root) / "attestation";
+    if (!config.verify_platform_blob.empty()) {
+        cfg.hcl_blob_override = config.verify_platform_blob;
+    }
+    const auto result = security::probe_platform(cfg);
+    std::printf("%s", security::format_probe_report(result).c_str());
+    if (result.tier1_capable) {
+        std::printf("\nPin these at enrollment:\n  --enroll-measurement %s\n",
+                    result.measurement_hex.c_str());
+    }
+    return result.tier1_capable ? 0 : 1;
 }
 
 int run_first_run(const ServerConfig& config) {
@@ -382,6 +398,7 @@ std::optional<InitResult> ensure_initialized(const ServerConfig& config) {
 
 std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0) {
     if (config.print_tpm_ak)                      return run_print_tpm_ak();
+    if (config.verify_platform)                   return run_verify_platform(config);
     if (config.first_run)                         return run_first_run(config);
     if (config.onboard_server)                    return run_onboard_server(config);
     if (config.mint_admission_token)              return run_mint_admission_token(config);

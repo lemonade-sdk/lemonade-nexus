@@ -153,6 +153,9 @@ void print_usage(const char* prog) {
     spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
     spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
+    spdlog::info("  --verify-platform [blob]   Verify this host's platform evidence (AMD signature chain,");
+    spdlog::info("                             guest policy, memory-encryption guarantees) and exit.");
+    spdlog::info("                             Optionally verify a captured HCL blob file instead.");
     spdlog::info("  --revoke-server <b64>      Revoke a server by its base64 gossip pubkey");
     spdlog::info("  --add-manifest <path>      Import a signed release manifest JSON");
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
@@ -252,6 +255,9 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.first_run = true;
         } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
             config.print_tpm_ak = true;
+        } else if (std::strcmp(argv[i], "--verify-platform") == 0) {
+            config.verify_platform = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') config.verify_platform_blob = argv[++i];
         } else if (std::strcmp(argv[i], "--revoke-server") == 0 && i + 1 < argc) {
             config.revoke_server_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--add-manifest") == 0 && i + 1 < argc) {
@@ -440,7 +446,8 @@ bool validate_config(const ServerConfig& config) {
     //
     // CLI modes are exempt: --first-run generates the identity these anchor to, and
     // the enroll/onboard/manifest modes exit before any of it is used.
-    const bool cli_mode = config.first_run || config.print_tpm_ak || config.onboard_server ||
+    const bool cli_mode = config.first_run || config.print_tpm_ak || config.verify_platform ||
+                          config.onboard_server ||
                           config.mint_admission_token || !config.enroll_server_pubkey.empty() ||
                           !config.revoke_server_pubkey.empty() || !config.add_manifest_path.empty();
 

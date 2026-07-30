@@ -29,6 +29,7 @@
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 #include <LemonadeNexus/Core/TrustPolicy.hpp>
+#include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
@@ -121,10 +122,21 @@ int main(int argc, char* argv[]) {
     tee.start();
 
     nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
-    // Tier-1 eligibility is granted only by a startup evidence probe that produces
-    // and self-verifies a full chain (Security/PlatformProbe). Until that lands,
-    // nothing calls set_platform_evidence_verified and every host is Tier 2 — which
-    // is the honest answer, since hardware presence was never evidence.
+
+    // Tier-1 eligibility is decided here, once, by producing real platform evidence
+    // and verifying it through the same path a remote peer would use. Nothing else
+    // grants it — in particular, no device node's existence does.
+    {
+        nexus::security::PlatformProbeConfig probe_cfg;
+        probe_cfg.cache_dir = data_root / "attestation";
+        auto probe = nexus::security::probe_platform(probe_cfg);
+        std::istringstream report{nexus::security::format_probe_report(probe)};
+        for (std::string line; std::getline(report, line);) {
+            if (probe.tier1_capable) spdlog::info("{}", line);
+            else                     spdlog::warn("{}", line);
+        }
+        trust_policy.set_platform_evidence_verified(probe.tier1_capable);
+    }
     trust_policy.start();
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
