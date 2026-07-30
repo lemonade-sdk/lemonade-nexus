@@ -57,6 +57,7 @@ struct BoringtunMesh::Impl {
     std::string        server_pubkey;     // never removed by sync_peers
     std::string        tunnel_addr;       // our virtual IP (no prefix), egress source
     std::atomic<bool>  active{false};
+    BoringtunConfig    started_cfg;       // what the live plane was started with
 
     std::mutex                                            egress_mtx;
     std::map<std::pair<std::string, uint16_t>, uint16_t>  egress_cache;
@@ -69,7 +70,19 @@ BoringtunMesh::~BoringtunMesh() {
 }
 
 bool BoringtunMesh::start(const BoringtunConfig& config) {
-    if (impl_->active.load()) return true;
+    if (impl_->active.load()) {
+        const auto& live = impl_->started_cfg;
+        if (live.private_key == config.private_key &&
+            live.tunnel_ip == config.tunnel_ip &&
+            live.server_public_key == config.server_public_key &&
+            live.server_endpoint == config.server_endpoint) {
+            return true;
+        }
+        // A re-join issues a fresh mesh IP/keys. Keeping the old plane would
+        // leave us handshaking with credentials the server has replaced.
+        spdlog::info("[BoringtunMesh] config changed — restarting dataplane");
+        stop();
+    }
     if (config.private_key.empty() || config.public_key.empty()) return false;
 
     UserspaceDataplane::Config dpcfg;
@@ -121,6 +134,7 @@ bool BoringtunMesh::start(const BoringtunConfig& config) {
             static_cast<uint16_t>(config.keepalive ? config.keepalive : 25));
     }
 
+    impl_->started_cfg = config;
     impl_->active = true;
     spdlog::info("[BoringtunMesh] dataplane up: mesh_ip={}, server_peer={}…",
                  impl_->tunnel_addr,
@@ -244,6 +258,30 @@ std::pair<std::string, std::string> BoringtunMesh::generate_keypair() {
     unsigned char priv[32];
     unsigned char pub[32];
     randombytes_buf(priv, sizeof priv);
+    priv[0]  &= 248;
+    priv[31] &= 127;
+    priv[31] |= 64;
+    crypto_scalarmult_base(pub, priv);
+
+    char priv_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    char pub_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    sodium_bin2base64(priv_b64, sizeof priv_b64, priv, 32, sodium_base64_VARIANT_ORIGINAL);
+    sodium_bin2base64(pub_b64, sizeof pub_b64, pub, 32, sodium_base64_VARIANT_ORIGINAL);
+
+    std::pair<std::string, std::string> keys{priv_b64, pub_b64};
+    sodium_memzero(priv, sizeof priv);
+    return keys;
+}
+
+std::pair<std::string, std::string> BoringtunMesh::derive_keypair(std::span<const uint8_t> seed) {
+    unsigned char priv[32];
+    unsigned char pub[32];
+
+    // Keyed BLAKE2b domain-separates the mesh scalar from any other use of the
+    // same device seed (e.g. ECIES), then apply the standard X25519 clamp.
+    static constexpr unsigned char kCtx[crypto_generichash_KEYBYTES] = {
+        'l','n','-','m','e','s','h','-','x','2','5','5','1','9'};
+    crypto_generichash(priv, sizeof priv, seed.data(), seed.size(), kCtx, sizeof kCtx);
     priv[0]  &= 248;
     priv[31] &= 127;
     priv[31] |= 64;

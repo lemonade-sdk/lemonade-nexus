@@ -1,11 +1,13 @@
 #include <LemonadeNexusSDK/lemonade_nexus.h>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
+#include <LemonadeNexusSDK/GroupKey.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <string>
 
 using json = nlohmann::json;
@@ -729,6 +731,42 @@ char* ln_generate_keypair(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Account group-key envelopes
+// ---------------------------------------------------------------------------
+
+char* ln_group_key_generate(void) {
+    auto key = lnsdk::GroupKey::generate();
+    if (key.empty()) return nullptr;
+    return strdup_str(key);
+}
+
+char* ln_group_key_wrap(const char* recipient_ed25519_pubkey, const char* group_key_b64) {
+    if (!recipient_ed25519_pubkey || !group_key_b64) return nullptr;
+    auto env = lnsdk::GroupKey::wrap(recipient_ed25519_pubkey, group_key_b64);
+    if (!env) return nullptr;
+    json j;
+    j["ephemeral_pubkey"] = env->ephemeral_pubkey;
+    j["wrapped_key"]      = env->wrapped_key;
+    return strdup_json(j);
+}
+
+char* ln_group_key_unwrap(const ln_identity_t* identity, const char* envelope_json) {
+    if (!identity || !envelope_json) return nullptr;
+    lnsdk::GroupKeyEnvelope env;
+    try {
+        auto j = json::parse(envelope_json);
+        env.ephemeral_pubkey = j.value("ephemeral_pubkey", std::string{});
+        env.wrapped_key      = j.value("wrapped_key", std::string{});
+    } catch (...) {
+        return nullptr;
+    }
+    auto key = lnsdk::GroupKey::unwrap(
+        std::span<const uint8_t>(identity->identity.private_key()), env);
+    if (!key) return nullptr;
+    return strdup_str(*key);
+}
+
+// ---------------------------------------------------------------------------
 // Identity: seed-based creation
 // ---------------------------------------------------------------------------
 
@@ -805,6 +843,17 @@ ln_error_t ln_servers(ln_client_t* client, char** out_json) {
 // ---------------------------------------------------------------------------
 // Trust & attestation
 // ---------------------------------------------------------------------------
+
+ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
+                               const char* path, const char* body_json,
+                               char** out_json) {
+    if (!client || !method || !path || !out_json) return LN_ERR_NULL_ARG;
+    auto r = client->client.call_private_api(method, path,
+                                             body_json ? body_json : "");
+    // r.value is the raw JSON body; return it verbatim so the caller can parse.
+    *out_json = strdup_str(r.ok ? r.value : std::string("{\"error\":\"") + r.error + "\"}");
+    return r.ok ? LN_OK : LN_ERR_CONNECT;
+}
 
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json) {
     if (!client || !out_json) return LN_ERR_NULL_ARG;

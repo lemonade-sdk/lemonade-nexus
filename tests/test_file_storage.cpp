@@ -186,6 +186,46 @@ TEST_F(FileStorageTest, ReadNonExistentFile) {
     EXPECT_FALSE(read.has_value());
 }
 
+TEST_F(FileStorageTest, DeleteFile) {
+    auto env = make_envelope("chat_blob", R"({"c":"x"})");
+    storage->write_file("chat-abc", "id1.json", env);
+    EXPECT_TRUE(storage->read_file("chat-abc", "id1.json").has_value());
+    EXPECT_TRUE(storage->delete_file("chat-abc", "id1.json"));
+    EXPECT_FALSE(storage->read_file("chat-abc", "id1.json").has_value());
+}
+
+TEST_F(FileStorageTest, DeleteNonExistentFileReturnsFalse) {
+    EXPECT_FALSE(storage->delete_file("chat-abc", "missing.json"));
+}
+
+TEST_F(FileStorageTest, ListFilesPerCategory) {
+    storage->write_file("chat-g1", "b.json", make_envelope("chat_blob", R"({})"));
+    storage->write_file("chat-g1", "a.json", make_envelope("chat_blob", R"({})"));
+    storage->write_file("chat-g2", "z.json", make_envelope("chat_blob", R"({})"));
+
+    auto g1 = storage->list_files("chat-g1");
+    ASSERT_EQ(g1.size(), 2u);
+    EXPECT_EQ(g1[0], "a");   // stems, sorted, no ".json"
+    EXPECT_EQ(g1[1], "b");
+
+    // Isolation: a different category never sees another's files.
+    auto g2 = storage->list_files("chat-g2");
+    ASSERT_EQ(g2.size(), 1u);
+    EXPECT_EQ(g2[0], "z");
+}
+
+TEST_F(FileStorageTest, ListFilesEmptyCategory) {
+    EXPECT_TRUE(storage->list_files("chat-does-not-exist").empty());
+}
+
+TEST_F(FileStorageTest, DeleteAndListFileTraversalRejected) {
+    // The path guard throws inside; delete/list convert that to false/empty,
+    // never touching anything outside the category.
+    EXPECT_FALSE(storage->delete_file("chat-g1", "../../identity/keypair"));
+    EXPECT_FALSE(storage->delete_file("../evil", "x.json"));
+    EXPECT_TRUE(storage->list_files("../evil").empty());
+}
+
 // --- Path traversal protection ---
 
 TEST_F(FileStorageTest, PathTraversalNodeIdRejected) {

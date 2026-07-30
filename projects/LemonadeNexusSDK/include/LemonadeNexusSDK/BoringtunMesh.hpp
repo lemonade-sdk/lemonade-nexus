@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -65,6 +66,11 @@ public:
 
     /// Generate a fresh Curve25519 keypair (base64 {private, public}).
     static std::pair<std::string, std::string> generate_keypair();
+
+    /// Derive a stable Curve25519 mesh keypair from a device seed (base64
+    /// {private, public}), domain-separated from other uses of that seed. The
+    /// same seed always yields the same pair, so re-joins present the same key.
+    static std::pair<std::string, std::string> derive_keypair(std::span<const uint8_t> seed);
 
 private:
     struct Impl;

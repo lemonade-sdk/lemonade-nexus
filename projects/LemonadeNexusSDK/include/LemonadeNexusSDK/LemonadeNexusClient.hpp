@@ -237,6 +237,14 @@ public:
     /// GET /api/trust/status
     [[nodiscard]] Result<TrustStatus> get_trust_status();
 
+    /// Generic authenticated call to a private-API route over the mesh. `method`
+    /// is "GET" or "POST"; `body` is JSON (ignored for GET). Returns the raw
+    /// response body as a JSON string. The session JWT and TLS are applied by
+    /// the private transport, so any authenticated private route is reachable.
+    [[nodiscard]] Result<std::string> call_private_api(const std::string& method,
+                                                       const std::string& path,
+                                                       const std::string& body);
+
     /// GET /api/trust/peer/{pubkey}
     [[nodiscard]] Result<TrustPeerInfo> get_trust_peer(const std::string& pubkey);
 

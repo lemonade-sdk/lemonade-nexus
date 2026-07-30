@@ -339,6 +339,24 @@ ln_identity_t* ln_identity_from_seed(const uint8_t* seed, uint32_t seed_len);
 char* ln_derive_seed(const char* username, const char* password);
 
 /* ------------------------------------------------------------------ */
+/* Account group-key envelopes (zero-knowledge multi-device sharing)   */
+/* ------------------------------------------------------------------ */
+
+/** Generate a fresh 32-byte account group key (base64). Caller must ln_free().
+ *  Returns NULL on failure. */
+char* ln_group_key_generate(void);
+
+/** Seal a group key to a recipient device's Ed25519 public key
+ *  ("ed25519:<b64>" or raw base64). Returns JSON {ephemeral_pubkey, wrapped_key}
+ *  (base64). Caller must ln_free(). Returns NULL on malformed input. */
+char* ln_group_key_wrap(const char* recipient_ed25519_pubkey, const char* group_key_b64);
+
+/** Open a group-key envelope (JSON {ephemeral_pubkey, wrapped_key}) with the
+ *  given identity's private key. Returns the group key (base64). Caller must
+ *  ln_free(). Returns NULL if the envelope is not addressed to us / is corrupt. */
+char* ln_group_key_unwrap(const ln_identity_t* identity, const char* envelope_json);
+
+/* ------------------------------------------------------------------ */
 /* Ed25519 challenge-response authentication                           */
 /* ------------------------------------------------------------------ */
 
@@ -363,6 +381,14 @@ ln_error_t ln_servers(ln_client_t* client, char** out_json);
 
 /** GET /api/trust/status. Returns JSON with trust tier, peers, etc. */
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json);
+
+/// Generic authenticated call to a private-API route over the mesh.
+/// `method` is "GET" or "POST"; `body_json` is the request body ("" for GET).
+/// On success `*out_json` receives the raw JSON response body (free with
+/// ln_free). Reachable only once the mesh tunnel is up.
+ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
+                               const char* path, const char* body_json,
+                               char** out_json);
 
 /** GET /api/trust/peer/{pubkey}. Returns JSON with peer trust info. */
 ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_json);

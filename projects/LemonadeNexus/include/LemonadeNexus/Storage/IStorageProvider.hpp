@@ -43,6 +43,8 @@ struct SignedDelta {
 ///   std::vector<SignedDelta> do_read_deltas_since(uint64_t seq) const
 ///   bool do_write_file(std::string_view category, std::string_view name, const SignedEnvelope&)
 ///   std::optional<SignedEnvelope> do_read_file(std::string_view category, std::string_view name) const
+///   bool do_delete_file(std::string_view category, std::string_view name)
+///   std::vector<std::string> do_list_files(std::string_view category) const
 ///   void do_ensure_directories()
 template <typename Derived>
 class IStorageProvider {
@@ -90,6 +92,15 @@ public:
         return self().do_read_file(category, name);
     }
 
+    [[nodiscard]] bool delete_file(std::string_view category, std::string_view name) {
+        return self().do_delete_file(category, name);
+    }
+
+    /// Stems (no ".json") of the files directly under <category>; empty if absent.
+    [[nodiscard]] std::vector<std::string> list_files(std::string_view category) const {
+        return self().do_list_files(category);
+    }
+
     void ensure_directories() {
         self().do_ensure_directories();
     }
@@ -119,6 +130,8 @@ concept StorageProviderType = requires(T t, const T ct,
     { ct.do_read_deltas_since(seq) } -> std::same_as<std::vector<SignedDelta>>;
     { t.do_write_file(sv, sv, env) } -> std::same_as<bool>;
     { ct.do_read_file(sv, sv) } -> std::same_as<std::optional<SignedEnvelope>>;
+    { t.do_delete_file(sv, sv) } -> std::same_as<bool>;
+    { ct.do_list_files(sv) } -> std::same_as<std::vector<std::string>>;
     { t.do_ensure_directories() } -> std::same_as<void>;
 };
 

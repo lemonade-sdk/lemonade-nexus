@@ -49,6 +49,8 @@ public:
                                       const SignedEnvelope& envelope);
     [[nodiscard]] std::optional<SignedEnvelope> do_read_file(std::string_view category,
                                                               std::string_view name) const;
+    [[nodiscard]] bool do_delete_file(std::string_view category, std::string_view name);
+    [[nodiscard]] std::vector<std::string> do_list_files(std::string_view category) const;
     void do_ensure_directories();
 
     [[nodiscard]] const std::filesystem::path& data_root() const { return data_root_; }
