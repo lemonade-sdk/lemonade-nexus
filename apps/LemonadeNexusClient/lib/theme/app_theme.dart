@@ -8,6 +8,7 @@ class AppTheme {
   static const Color lemonYellow = Color(0xFFFFE135);
   static const Color lemonYellowDark = Color(0xFFE6C71A);
   static const Color lemonGreen = Color(0xFF4CAF50);
+  static const Color lemonLime = Color(0xFF9CCC65);
   static const Color nodeOrange = Color(0xFFFF6B00);
 
   // Status.

@@ -454,10 +454,7 @@ class AppNotifier extends StateNotifier<AppState> {
 
   Future<void> _persistSettings() => _settingsStore.save(state.settings);
 
-  /// Reconnect to the most recently used Cluster when the user asked for it.
-  /// There is no password to re-enter — the identity comes from the keyring —
-  /// so this is purely a convenience; otherwise the login page lists the
-  /// Clusters and the user picks one.
+  /// Reconnect to the most recently used Cluster when auto-connect is on.
   Future<void> _restoreSession() async {
     if (!state.settings.autoConnectOnLaunch) return;
     final previous = state.clusters
@@ -538,11 +535,8 @@ class AppNotifier extends StateNotifier<AppState> {
   }
 
   // =========================================================================
-  // Clusters (passwordless accounts)
-  //
-  // A Cluster is an account (a Customer group node). There are no passwords: a
-  // membership IS a device Ed25519 key, kept in the keyring. Three actions —
-  // Register (new Cluster), Join (invite code), Connect (one we already hold).
+  // Clusters (accounts). A membership is a device Ed25519 key in the keyring —
+  // no passwords. Register (new), Join (invite code), Connect (already held).
   // =========================================================================
 
   /// Load the keyring into state; the login page renders this list.
@@ -597,8 +591,8 @@ class AppNotifier extends StateNotifier<AppState> {
       );
       return false;
     }
-    // Stay on the login view (spinner) until the initial load finishes;
-    // isAuthenticated (which reveals the dashboard) flips only after.
+    // isAuthenticated flips only after the initial load, so the login view
+    // keeps its spinner until the dashboard has data.
     state = state.copyWith(
       authState: state.authState.copyWith(
         username: clusterName,
@@ -617,7 +611,11 @@ class AppNotifier extends StateNotifier<AppState> {
       ));
     }
     await _loadIdentity();
-    await _joinNetwork();
+    // Cluster operations all ride the private mesh API, so bring it up here.
+    if (await _joinNetwork()) {
+      await enableMesh();
+      await _waitForMesh();
+    }
     await refreshAllData();
     state = state.copyWith(
       authState: state.authState.copyWith(isAuthenticated: true),
@@ -627,13 +625,24 @@ class AppNotifier extends StateNotifier<AppState> {
     return true;
   }
 
+  /// The tunnel handshakes asynchronously after enableMesh; private-API loads
+  /// are gated on it being up, so give it a moment before the first refresh.
+  Future<void> _waitForMesh(
+      {Duration timeout = const Duration(seconds: 6)}) async {
+    final deadline = DateTime.now().add(timeout);
+    while (!state.isMeshEnabled && DateTime.now().isBefore(deadline)) {
+      await Future.delayed(const Duration(milliseconds: 400));
+      await refreshMeshStatus();
+    }
+    if (!state.isMeshEnabled) _log('_waitForMesh: timed out, mesh still down');
+  }
+
   Future<void> _saveActiveCluster(ClusterEntry entry) async {
     final clusters = await _keyring.upsert(entry);
     state = state.copyWith(clusters: clusters, activeClusterId: entry.localId);
   }
 
-  /// Register a brand-new Cluster: fresh device key, join, then generate the
-  /// Cluster group key and seal it to ourselves so relaunches can recover it.
+  /// Register a brand-new Cluster; this device owns it and holds the group key.
   Future<bool> registerCluster(String name) async {
     state = state.copyWith(isLoading: true, errorMessage: null);
     _log('registerCluster: "$name"');
@@ -675,10 +684,8 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Join an existing Cluster with an invitation code. The device generates its
-  /// own key; the code authorizes placing it in the Cluster. The group key
-  /// arrives separately (an owner device must seal it to us), so this can
-  /// succeed with [ClusterEntry.hasGroupKey] still false.
+  /// Join an existing Cluster with an invitation code. Can succeed without the
+  /// group key — an owner device must seal it to us separately.
   Future<bool> joinCluster(String inviteCode, {String name = 'Cluster'}) async {
     state = state.copyWith(isLoading: true, errorMessage: null);
     _log('joinCluster: name="$name"');
@@ -768,8 +775,7 @@ class AppNotifier extends StateNotifier<AppState> {
 
   // ---- device linking + group-key provisioning ------------------------------
 
-  /// Mint an invitation code so another device can join the active Cluster.
-  /// Owner-only (needs AddChild on the Cluster) and requires the mesh.
+  /// Mint an invitation code for another device. Owner-only; needs the mesh.
   Future<Map<String, dynamic>> createDeviceInvite({int ttlSec = 600}) =>
       _sdk.createLinkToken(ttlSec: ttlSec);
 
@@ -780,8 +786,7 @@ class AppNotifier extends StateNotifier<AppState> {
     return list.map((e) => Map<String, dynamic>.from(e as Map)).toList();
   }
 
-  /// Seal the Cluster group key to [targetPubkey] and store the envelope. The
-  /// server keeps it opaque — it never sees the key.
+  /// Seal the group key to [targetPubkey]; the server stores it opaquely.
   Future<void> _provisionGroupKeyTo(String targetPubkey, String groupKey,
       {String keyId = 'gk1'}) async {
     if (targetPubkey.isEmpty) throw StateError('no target pubkey');
@@ -1049,14 +1054,15 @@ class AppNotifier extends StateNotifier<AppState> {
   Future<void> refreshAllData() async {
     _log('refreshAllData: meshEnabled=${state.isMeshEnabled} '
         'connStatus=${state.connectionStatus.name} authed=${state.isAuthenticated}');
+    // Mesh status first: the private-API refreshes below are gated on it, and
+    // reading isMeshEnabled before it updates skipped them for the whole session.
+    await refreshMeshStatus();
     await Future.wait([
       refreshHealth(),
       refreshStats(),
       refreshServers(),
-      refreshMeshStatus(),
       // /api/relay/list and /api/trust/status are private-API endpoints reached
-      // through the mesh/routing layer; they 404 on the plain public connection.
-      // Refresh them once the mesh is up.
+      // through the mesh; they 404 on the plain public connection.
       if (state.isMeshEnabled) refreshRelays(),
       if (state.isMeshEnabled) refreshTrustStatus(),
     ]);
@@ -1137,9 +1143,10 @@ class AppNotifier extends StateNotifier<AppState> {
           isMeshEnabled: meshStatus.isUp,
         ),
       );
-      _log('refreshMeshStatus: up=${meshStatus.isUp} '
-          'peers=${meshStatus.peerCount} online=${meshStatus.onlineCount} '
-          'meshIp=${meshStatus.tunnelIp} (${meshPeers.length} peer records)');
+      if (!meshStatus.isUp) {
+        _log('refreshMeshStatus: down (peers=${meshStatus.peerCount} '
+            'online=${meshStatus.onlineCount})');
+      }
     } catch (e) {
       state = state.copyWith(
         peerState: const PeerState(
@@ -1401,7 +1408,21 @@ class AppNotifier extends StateNotifier<AppState> {
   }
 
   /// Region-aware DNS discovery of the nearest server; points settings at it.
-  Future<void> discoverNearestServer() async {
+  /// The server we last used, or null if nothing is remembered.
+  ({String host, int port, bool useTls})? rememberedServer() {
+    for (final c in state.clusters) {
+      if (c.serverHost.isNotEmpty && c.serverPort != 0) {
+        return (host: c.serverHost, port: c.serverPort, useTls: c.useTls);
+      }
+    }
+    final s = state.settings;
+    if (s.serverHost.isEmpty || s.serverHost == 'localhost') return null;
+    return (host: s.serverHost, port: s.serverPort, useTls: s.useTls);
+  }
+
+  /// Sweep DNS for servers (slow — walks every region). Pass [connectToBest]
+  /// false to refresh the list without switching the current connection.
+  Future<void> discoverNearestServer({bool connectToBest = true}) async {
     state = state.copyWith(isDiscovering: true);
     final service = DnsDiscoveryService();
     try {
@@ -1417,6 +1438,10 @@ class AppNotifier extends StateNotifier<AppState> {
         _log('discoverNearestServer: best=${best.displayName} '
             'host=${best.connectHost ?? best.hostname ?? best.ip} '
             'port=${best.port} scheme=${best.scheme}');
+        if (!connectToBest) {
+          _log('discoverNearestServer: list refreshed only (no switch)');
+          return;
+        }
         await connectToServer(
           best.connectHost ?? best.hostname ?? best.ip,
           best.port,

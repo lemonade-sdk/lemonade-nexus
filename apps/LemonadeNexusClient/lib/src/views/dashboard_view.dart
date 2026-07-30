@@ -24,8 +24,15 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
   @override
   void initState() {
     super.initState();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      ref.read(appNotifierProvider.notifier).refreshMeshStatus();
+    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      final notifier = ref.read(appNotifierProvider.notifier);
+      await notifier.refreshMeshStatus();
+      // Trust rides the mesh, so it is skipped when the tunnel isn't up yet.
+      // Backfill it once so the tier shows without a manual refresh.
+      final state = ref.read(appNotifierProvider);
+      if (state.isMeshEnabled && state.trustStatus == null) {
+        await notifier.refreshTrustStatus();
+      }
     });
   }
 
@@ -69,14 +76,7 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
             ],
           ),
           const SizedBox(height: 16),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(child: _networkCard(appState)),
-              const SizedBox(width: 16),
-              Expanded(child: _trustCard(appState)),
-            ],
-          ),
+          _networkCard(appState),
           const SizedBox(height: 24),
           const SectionHeader(title: 'Recent Activity', icon: Icons.list_alt),
           const SizedBox(height: 12),
@@ -197,12 +197,29 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
 
   Widget _serverHealthCard(AppState appState) {
     final h = appState.healthStatus;
+    final trust = appState.trustStatus;
+    final tier = _tierBadge(trust?.trustTier);
     return _card('Server Health', Icons.favorite_outline, [
       if (h != null) ...[
-        _kv('Status', LemonBadge(
-          text: h.status.toUpperCase(),
-          color: appState.isServerHealthy ? AppTheme.lemonGreen : AppTheme.errorColor,
-        )),
+        // Row keeps the badges at their intrinsic width; _kv's Expanded would
+        // otherwise stretch them across the card.
+        _kv(
+          'Status',
+          Row(mainAxisSize: MainAxisSize.min, children: [
+            LemonBadge(
+              text: h.status.toUpperCase(),
+              color: appState.isServerHealthy
+                  ? AppTheme.lemonGreen
+                  : AppTheme.errorColor,
+            ),
+            // Only once trust data has arrived — "not loaded yet" is not the
+            // same as an unknown tier, and shouldn't flash a red badge.
+            if (trust != null) ...[
+              const SizedBox(width: 6),
+              LemonBadge(text: tier.label, color: tier.color),
+            ],
+          ]),
+        ),
         _kv('Service', _mono(h.service.isEmpty ? '—' : h.service)),
         if ((h.dnsBaseDomain ?? '').isNotEmpty)
           _kv('DNS Domain', _mono(h.dnsBaseDomain!, size: 11)),
@@ -246,24 +263,16 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
     ]);
   }
 
-  Widget _trustCard(AppState appState) {
-    final t = appState.trustStatus;
-    return _card('Trust Status', Icons.verified_user_outlined, [
-      if (t != null) ...[
-        _kv('Our Tier', LemonBadge(
-          text: 'TIER ${t.trustTier}',
-          color: t.trustTier == '1' ? AppTheme.lemonGreen : AppTheme.nodeOrange,
-        )),
-        _kv('Trusted Peers', _mono('${t.peerCount}')),
-      ] else
-        // /api/trust/status is a private-API route reached via the mesh layer.
-        _kv('', Text(
-          appState.isMeshEnabled
-              ? 'Trust data unavailable'
-              : 'Enable mesh to view trust status',
-          style: const TextStyle(fontSize: 13, color: AppTheme.nodeOrange),
-        )),
-    ], trailing: StatusDot(isHealthy: appState.trustStatus != null, size: 8));
+  /// The tier arrives either as a number (`our_tier`) or a string ("Tier1"),
+  /// so read the digits out and treat anything else as unknown.
+  ({String label, Color color}) _tierBadge(String? raw) {
+    final tier = int.tryParse(RegExp(r'\d+').firstMatch(raw ?? '')?.group(0) ?? '');
+    return switch (tier) {
+      1 => (label: 'Tier 1', color: AppTheme.lemonGreen),
+      2 => (label: 'Tier 2', color: AppTheme.lemonLime),
+      null || < 1 => (label: 'Tier unknown', color: AppTheme.errorColor),
+      _ => (label: 'Tier $tier', color: AppTheme.lemonYellowDark),
+    };
   }
 
   Widget _activityCard(AppState appState) {

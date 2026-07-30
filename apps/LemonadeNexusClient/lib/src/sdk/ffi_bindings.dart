@@ -918,11 +918,8 @@ class LemonadeNexusFfi {
           _LnRoutingConnectionStatus,
           _LnRoutingConnectionStatusDart>('ln_routing_connection_status');
 
-  /// C ABI symbols this Dart layer needs that were added most recently. The
-  /// Dart code ships with the app but the .dll/.dylib/.so is built separately,
-  /// so a stale native library is the usual cause of a missing symbol — and
-  /// because lookups are lazy it would otherwise surface as a raw dlsym error
-  /// deep inside a flow (e.g. joining a Cluster). See [missingSymbols].
+  /// Recently-added C ABI symbols. The native library is built separately from
+  /// the Dart layer, so these are what a stale build is missing.
   static const List<String> requiredSymbols = [
     'ln_set_link_token',
     'ln_link_token_create',

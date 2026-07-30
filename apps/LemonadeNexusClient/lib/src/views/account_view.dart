@@ -40,11 +40,11 @@ class _AccountViewState extends ConsumerState<AccountView> {
   }
 
   Future<void> _load() async {
+    // Clear first: an early return used to leave a stale error on screen that
+    // no amount of refreshing could shift.
+    setState(() => _error = null);
     if (!ref.read(appNotifierProvider).isMeshEnabled) return;
-    setState(() {
-      _isLoading = true;
-      _error = null;
-    });
+    setState(() => _isLoading = true);
     final notifier = ref.read(appNotifierProvider.notifier);
     try {
       final resp = await notifier.callPrivateApi('GET', '/api/chats');
@@ -62,15 +62,21 @@ class _AccountViewState extends ConsumerState<AccountView> {
       try {
         final p = await notifier.callPrivateApi('GET', '/api/account/keys/pending');
         pending = ((p['pending'] as List?) ?? const []).length;
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[ClusterView] keys/pending failed: $e');
+      }
       try {
-        final e = await notifier.callPrivateApi('GET', '/api/account/keys/envelope');
-        hasEnv = !e.containsKey('error');
-      } catch (_) {}
+        // fetchGroupKey, not a raw GET: it persists the key into the keyring.
+        hasEnv = await notifier.fetchGroupKey() != null;
+      } catch (e) {
+        debugPrint('[ClusterView] fetchGroupKey failed: $e');
+      }
       List<ClusterDevice> devices = _devices;
       try {
         devices = await notifier.listClusterDevices();
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[ClusterView] listClusterDevices failed: $e');
+      }
       if (!mounted) return;
       setState(() {
         _chats =
@@ -80,14 +86,11 @@ class _AccountViewState extends ConsumerState<AccountView> {
         _devices = devices;
         _isLoading = false;
       });
-    } catch (e) {
+    } catch (e, stack) {
+      debugPrint('[ClusterView] load failed: $e\n$stack');
       if (!mounted) return;
       setState(() {
-        // A private-API call throws when the mesh transport can't reach the
-        // server (tunnel still connecting or down). Show an actionable message
-        // instead of the raw exception.
-        _error = 'Could not reach the server over the mesh yet. If the tunnel '
-            'just came up, give it a moment and tap Refresh.';
+        _error = 'Could not load Cluster data: $e';
         _isLoading = false;
       });
     }
@@ -351,7 +354,10 @@ class _AccountViewState extends ConsumerState<AccountView> {
 
   Widget _devicesSection(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    final anyPending = _devices.any((d) => d.needsKey);
+    // Sharing seals OUR copy to another device, so only offer it when we hold
+    // the key, and never for our own row.
+    final weHoldKey = ref.read(appNotifierProvider).activeCluster?.hasGroupKey ?? false;
+    final anyPending = _devices.any((d) => d.needsKey && !d.isThisDevice);
     return AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -364,7 +370,7 @@ class _AccountViewState extends ConsumerState<AccountView> {
               Text('${_devices.length}',
                   style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
               const Spacer(),
-              if (anyPending)
+              if (anyPending && weHoldKey)
                 TextButton.icon(
                   onPressed: _isBusyDevices ? null : _shareKeyWithAll,
                   icon: const Icon(Icons.key, size: 16),
@@ -389,13 +395,13 @@ class _AccountViewState extends ConsumerState<AccountView> {
             Text('No devices listed yet.',
                 style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant))
           else
-            for (final device in _devices) _deviceRow(context, device),
+            for (final device in _devices) _deviceRow(context, device, weHoldKey),
         ],
       ),
     );
   }
 
-  Widget _deviceRow(BuildContext context, ClusterDevice device) {
+  Widget _deviceRow(BuildContext context, ClusterDevice device, bool weHoldKey) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -441,7 +447,14 @@ class _AccountViewState extends ConsumerState<AccountView> {
               ],
             ),
           ),
-          if (device.needsKey)
+          if (device.needsKey && device.isThisDevice)
+            IconButton(
+              tooltip: 'Check for the account key',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.refresh, size: 16),
+              onPressed: _isBusyDevices ? null : _load,
+            )
+          else if (device.needsKey && weHoldKey)
             IconButton(
               tooltip: 'Share the account key with this device',
               visualDensity: VisualDensity.compact,

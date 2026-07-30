@@ -9,6 +9,7 @@ library;
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi' as ffi;
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'ffi_bindings.dart';
@@ -55,9 +56,12 @@ class LemonadeNexusSdk {
   ///
   /// [libraryPath] - Optional path to the C SDK dynamic library.
   /// If not provided, uses platform default naming.
-  LemonadeNexusSdk({String? libraryPath}) {
+  LemonadeNexusSdk({String? libraryPath}) : _libraryPath = libraryPath {
     _ffi = LemonadeNexusFfi(libraryPath: libraryPath);
   }
+
+  /// Kept so a worker isolate can load the same library (see [_privateApiRaw]).
+  final String? _libraryPath;
 
   /// Checks if the SDK is disposed.
   void _checkDisposed() {
@@ -73,9 +77,8 @@ class LemonadeNexusSdk {
     }
   }
 
-  /// Fail fast, and legibly, when the native library predates the Dart layer.
-  /// Symbol lookups are lazy, so without this a stale .dll/.dylib surfaces as a
-  /// raw "Failed to lookup symbol … dlsym" error partway through a flow.
+  /// Symbol lookups are lazy, so without this a stale native library surfaces
+  /// as a raw dlsym error partway through an unrelated flow.
   void _checkNativeAbi() {
     final missing = _ffi.missingSymbols();
     if (missing.isEmpty) return;
@@ -1025,12 +1028,25 @@ class LemonadeNexusSdk {
   /// Generic authenticated call to a private-mesh API route (e.g. /api/chats).
   /// [method] is "GET" or "POST"; [body] is sent as JSON for POST. Returns the
   /// raw response body decoded as a JSON object. Requires the mesh tunnel.
+  /// Run a private-API call on a worker isolate. These ride the mesh tunnel and
+  /// block for the full connect/read timeout when it is down; on the UI isolate
+  /// that freezes the app. The native side guards the client with a mutex.
+  Future<String?> _privateApiRaw(String method, String path, String body) {
+    final address = _client!.address;
+    final libraryPath = _libraryPath;
+    return Isolate.run(() {
+      final bindings = LemonadeNexusFfi(libraryPath: libraryPath);
+      return bindings.privateApiCall(
+          ffi.Pointer<ffi.Void>.fromAddress(address), method, path, body);
+    });
+  }
+
   Future<Map<String, dynamic>> privateApiCall(String method, String path,
       {Map<String, dynamic>? body}) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.privateApiCall(
-        _client!, method, path, body == null ? '' : jsonEncode(body));
+    final json = await _privateApiRaw(
+        method, path, body == null ? '' : jsonEncode(body));
     if (json == null) {
       throw SdkException(LnError.internal, message: '$method $path failed');
     }
@@ -1043,8 +1059,8 @@ class LemonadeNexusSdk {
       {Map<String, dynamic>? body}) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.privateApiCall(
-        _client!, method, path, body == null ? '' : jsonEncode(body));
+    final json = await _privateApiRaw(
+        method, path, body == null ? '' : jsonEncode(body));
     if (json == null) {
       throw SdkException(LnError.internal, message: '$method $path failed');
     }

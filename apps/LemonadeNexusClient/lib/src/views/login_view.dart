@@ -28,15 +28,19 @@ class _LoginViewState extends ConsumerState<LoginView> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      if (!mounted) return;
+      await _notifier.loadClusters();
       if (!mounted) return;
       final state = ref.read(appNotifierProvider);
-      _notifier.loadClusters();
-      if (state.settings.autoDiscoveryEnabled &&
-          state.discoveredServers.isEmpty &&
-          !state.isDiscovering) {
-        _notifier.discoverNearestServer();
+      if (!state.settings.autoDiscoveryEnabled ||
+          state.discoveredServers.isNotEmpty ||
+          state.isDiscovering) {
+        return;
       }
+      // A known server is shown by _serverSection, so only sweep in background.
+      final known = _notifier.rememberedServer();
+      _notifier.discoverNearestServer(connectToBest: known == null);
     });
   }
 
@@ -324,6 +328,46 @@ class _LoginViewState extends ConsumerState<LoginView> {
 
   Widget _serverSection(AppState appState) {
     final scheme = Theme.of(context).colorScheme;
+
+    // Show the last-used server so Clusters are usable before the sweep ends.
+    if (appState.discoveredServers.isEmpty) {
+      final known = _notifier.rememberedServer();
+      if (known != null) {
+        return Row(
+          children: [
+            const StatusDot(isHealthy: true, size: 8),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('${known.host}:${known.port}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(fontSize: 12)),
+                  Text(
+                    appState.isDiscovering
+                        ? 'Last used — looking for closer servers…'
+                        : 'Last used server',
+                    style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+            if (appState.isDiscovering)
+              const SizedBox(
+                  width: 14, height: 14, child: CircularProgressIndicator(strokeWidth: 2))
+            else
+              IconButton(
+                tooltip: 'Find servers',
+                visualDensity: VisualDensity.compact,
+                icon: Icon(Icons.refresh, size: 16, color: scheme.onSurfaceVariant),
+                onPressed: () => _notifier.discoverNearestServer(connectToBest: false),
+              ),
+          ],
+        );
+      }
+    }
 
     if (appState.isDiscovering) {
       return Row(
