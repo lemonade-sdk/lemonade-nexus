@@ -47,7 +47,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"dns_seed_discovery",  c.dns_seed_discovery},
         {"dns_ns_hostname",     c.dns_ns_hostname},
         {"release_signing_pubkey",     c.release_signing_pubkey},
-        {"require_binary_attestation", c.require_binary_attestation},
         {"github_releases_url",        c.github_releases_url},
         {"manifest_fetch_interval_sec", c.manifest_fetch_interval_sec},
         {"minimum_version",            c.minimum_version},
@@ -61,9 +60,6 @@ void to_json(json& j, const ServerConfig& c) {
         {"enrollment_quorum_ratio",    c.enrollment_quorum_ratio},
         {"enrollment_vote_timeout_sec", c.enrollment_vote_timeout_sec},
         {"enrollment_max_retries",     c.enrollment_max_retries},
-        {"require_tee_attestation",    c.require_tee_attestation},
-        {"tee_attestation_validity_sec", c.tee_attestation_validity_sec},
-        {"tee_platform_override",      c.tee_platform_override},
         {"onboard_enabled",            c.onboard_enabled},
         {"admission_quorum_ratio",     c.admission_quorum_ratio},
         {"onboard_min_tier1_for_vote", c.onboard_min_tier1_for_vote},
@@ -102,7 +98,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
     if (j.contains("release_signing_pubkey"))     j.at("release_signing_pubkey").get_to(c.release_signing_pubkey);
-    if (j.contains("require_binary_attestation")) j.at("require_binary_attestation").get_to(c.require_binary_attestation);
     if (j.contains("github_releases_url"))        j.at("github_releases_url").get_to(c.github_releases_url);
     if (j.contains("manifest_fetch_interval_sec")) j.at("manifest_fetch_interval_sec").get_to(c.manifest_fetch_interval_sec);
     if (j.contains("minimum_version"))            j.at("minimum_version").get_to(c.minimum_version);
@@ -116,9 +111,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("enrollment_quorum_ratio"))  j.at("enrollment_quorum_ratio").get_to(c.enrollment_quorum_ratio);
     if (j.contains("enrollment_vote_timeout_sec")) j.at("enrollment_vote_timeout_sec").get_to(c.enrollment_vote_timeout_sec);
     if (j.contains("enrollment_max_retries"))   j.at("enrollment_max_retries").get_to(c.enrollment_max_retries);
-    if (j.contains("require_tee_attestation"))   j.at("require_tee_attestation").get_to(c.require_tee_attestation);
-    if (j.contains("tee_attestation_validity_sec")) j.at("tee_attestation_validity_sec").get_to(c.tee_attestation_validity_sec);
-    if (j.contains("tee_platform_override"))     j.at("tee_platform_override").get_to(c.tee_platform_override);
     if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
     if (j.contains("admission_quorum_ratio"))    j.at("admission_quorum_ratio").get_to(c.admission_quorum_ratio);
     if (j.contains("onboard_min_tier1_for_vote")) j.at("onboard_min_tier1_for_vote").get_to(c.onboard_min_tier1_for_vote);
@@ -167,7 +159,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --ddns-password <pass>     Namecheap DDNS password");
     spdlog::info("  --ddns-enabled             Enable dynamic DNS updates");
     spdlog::info("  --release-signing-pubkey <b64>  Release signing pubkey (base64 Ed25519)");
-    spdlog::info("  --require-attestation      Require binary attestation for credential distribution");
     spdlog::info("  --github-releases-url <url>  GitHub API URL for fetching release manifests");
     spdlog::info("  --manifest-fetch-interval <sec>  How often to fetch manifests (default 3600)");
     spdlog::info("  --minimum-version <semver>   Minimum binary version allowed (e.g. 1.2.0)");
@@ -186,8 +177,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
-    spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
-    spdlog::info("  --tee-platform <name>      Override TEE platform detection (sgx/tdx/sev-snp/secure-enclave)");
     spdlog::info("  --help, -h                 Show this help");
 }
 
@@ -275,8 +264,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.ddns_enabled = true;
         } else if (std::strcmp(argv[i], "--release-signing-pubkey") == 0 && i + 1 < argc) {
             config.release_signing_pubkey = argv[++i];
-        } else if (std::strcmp(argv[i], "--require-attestation") == 0) {
-            config.require_binary_attestation = true;
         } else if (std::strcmp(argv[i], "--github-releases-url") == 0 && i + 1 < argc) {
             config.github_releases_url = argv[++i];
         } else if (std::strcmp(argv[i], "--manifest-fetch-interval") == 0 && i + 1 < argc) {
@@ -333,10 +320,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_hmac_key = argv[++i];
         } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
             config.open_registration = false;
-        } else if (std::strcmp(argv[i], "--require-tee") == 0) {
-            config.require_tee_attestation = true;
-        } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
-            config.tee_platform_override = argv[++i];
         } else if (std::strcmp(argv[i], "--region") == 0 && i + 1 < argc) {
             config.region = argv[++i];
         }
@@ -371,15 +354,12 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;
     if (const char* v = std::getenv("SP_DDNS_PASSWORD"))  config.ddns_password = v;
     if (std::getenv("SP_DDNS_ENABLED"))                   config.ddns_enabled  = true;
-    if (std::getenv("SP_REQUIRE_ATTESTATION"))            config.require_binary_attestation = true;
     if (const char* v = std::getenv("SP_GITHUB_RELEASES_URL"))  config.github_releases_url       = v;
     if (const char* v = std::getenv("SP_MANIFEST_FETCH_INTERVAL")) config.manifest_fetch_interval_sec = static_cast<uint32_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_MINIMUM_VERSION"))      config.minimum_version           = v;
     if (const char* v = std::getenv("SP_PRIVATE_HTTP_PORT")) config.private_http_port = static_cast<uint16_t>(std::atoi(v));
     if (std::getenv("SP_REQUIRE_PEER_CONFIRMATION"))      config.require_peer_confirmation = true;
     if (const char* v = std::getenv("SP_ENROLLMENT_QUORUM")) config.enrollment_quorum_ratio = std::atof(v);
-    if (std::getenv("SP_REQUIRE_TEE"))                   config.require_tee_attestation   = true;
-    if (const char* v = std::getenv("SP_TEE_PLATFORM"))  config.tee_platform_override     = v;
     if (const char* v = std::getenv("SP_REGION"))        config.region                    = v;
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
@@ -450,18 +430,32 @@ bool validate_config(const ServerConfig& config) {
         valid = false;
     }
 
-    // Tier 1 (require_tee_attestation) gates sensitive operations on a verified
-    // binary measurement. Without a release signing pubkey, is_approved_binary()
-    // cannot be evaluated and the binary check is silently skipped — so require it.
-    if (config.require_tee_attestation && config.release_signing_pubkey.empty()) {
-        spdlog::error("Config: require_tee_attestation is set but release_signing_pubkey "
-                       "is empty — Tier1 binary attestation cannot be enforced");
-        valid = false;
-    }
 
-    // Warnings (non-fatal)
-    if (config.root_pubkey.empty()) {
-        spdlog::warn("Config: root_pubkey not set — server enrollment will not be available");
+    // Trust anchors are mandatory for a normal server start. Both used to be
+    // warnings, and both are now load-bearing: without root_pubkey no certificate
+    // can be verified (verify_server_certificate fails closed), and without
+    // release_signing_pubkey no release manifest can be authenticated, so no binary
+    // can ever be approved. A server missing either can never reach Tier 1 — say so
+    // at startup instead of running in a permanently degraded state.
+    //
+    // CLI modes are exempt: --first-run generates the identity these anchor to, and
+    // the enroll/onboard/manifest modes exit before any of it is used.
+    const bool cli_mode = config.first_run || config.print_tpm_ak || config.onboard_server ||
+                          config.mint_admission_token || !config.enroll_server_pubkey.empty() ||
+                          !config.revoke_server_pubkey.empty() || !config.add_manifest_path.empty();
+
+    if (!cli_mode) {
+        if (config.root_pubkey.empty()) {
+            spdlog::error("Config: root_pubkey is required — without it no server certificate "
+                           "can be verified and no peer can be trusted");
+            valid = false;
+        }
+        if (config.release_signing_pubkey.empty()) {
+            spdlog::error("Config: release_signing_pubkey is required — without it no release "
+                           "manifest can be authenticated, so no binary can be approved and "
+                           "this server can never reach Tier 1");
+            valid = false;
+        }
     }
 
     if (config.seed_peers.empty()) {

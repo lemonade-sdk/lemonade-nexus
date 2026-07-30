@@ -118,26 +118,13 @@ int main(int argc, char* argv[]) {
     attestation.start();
 
     nexus::core::TeeAttestationService tee{crypto, storage, attestation};
-    if (!config.tee_platform_override.empty()) {
-        // set_platform_override is now hardware-gated: it can only select a platform
-        // whose device is actually present, or downgrade to None. It can no longer
-        // fabricate TEE capability on a box with no root of trust (hardening plan,
-        // issue 7) — so this is safe to drive from config.
-        tee.set_platform_override(config.tee_platform_override);
-    }
-
     tee.start();
 
-    if (config.require_tee_attestation &&
-        tee.detected_platform() != nexus::core::TeePlatform::Tpm2) {
-        spdlog::warn("require_tee_attestation is set but no TPM 2.0 was detected on this host. "
-                     "This server will operate as Tier 2 (it can VERIFY Tier-1 peers but cannot "
-                     "self-attest). Provision a TPM (/dev/tpmrm0) to become Tier-1 capable.");
-    }
-
     nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
-    // Strict TPM-only Tier 1 is enforced whenever attestation is required.
-    trust_policy.set_require_tpm(config.require_tee_attestation);
+    // Tier-1 eligibility is granted only by a startup evidence probe that produces
+    // and self-verifies a full chain (Security/PlatformProbe). Until that lands,
+    // nothing calls set_platform_evidence_verified and every host is Tier 2 — which
+    // is the honest answer, since hardware presence was never evidence.
     trust_policy.start();
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
@@ -198,9 +185,11 @@ int main(int argc, char* argv[]) {
             gossip.set_root_pubkey(root_pk);
         }
     }
-    if (config.require_tee_attestation) {
-        gossip.set_trust_policy(&trust_policy);
-    }
+    // Always enforced. This used to be gated on require_tee_attestation, which was
+    // itself unreachable (validate_config demanded release_signing_pubkey with it),
+    // so trust_policy_ was null in every real deployment: no challenges sent, no
+    // tokens attached, and verify_message_trust permitted everything.
+    gossip.set_trust_policy(&trust_policy);
     gossip.set_root_key_chain(&root_key_chain);
     gossip.set_governance(&governance);
     gossip.set_enrollment_config(config.require_peer_confirmation,
@@ -277,9 +266,7 @@ int main(int argc, char* argv[]) {
             } catch (...) {}
         }
     }
-    if (config.require_tee_attestation) {
-        ddns.set_trust_policy(&trust_policy);
-    }
+    ddns.set_trust_policy(&trust_policy);
     ddns.start();
 
     // ========================================================================
@@ -714,7 +701,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     nexus::core::ServerAdmissionService admission{
         config, crypto, key_wrapping, storage, gossip,
-        config.require_tee_attestation ? &trust_policy : nullptr};
+        &trust_policy};
 
     // Governed-admission ballots (>= onboard_min_tier1_for_vote Tier1 peers)
     // resolve through the gossip enrollment machinery; map the outcome back to

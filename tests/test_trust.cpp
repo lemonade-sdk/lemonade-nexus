@@ -528,15 +528,16 @@ TEST_F(TrustPolicyTest, PeerStateReturnsCorrectData) {
     EXPECT_GT(state.last_verified, 0u);
 }
 
-TEST_F(TrustPolicyTest, OurTierReflectsTeePlatform) {
-    // Without TEE hardware, our tier should be Tier2
-    // With TEE hardware, it should be Tier1
-    auto tier = policy->our_tier();
-    if (tee->platform_available()) {
-        EXPECT_EQ(tier, core::TrustTier::Tier1);
-    } else {
-        EXPECT_EQ(tier, core::TrustTier::Tier2);
-    }
+TEST_F(TrustPolicyTest, OurTierIgnoresHardwarePresence) {
+    // Detection is not proof: however much TEE hardware this host exposes, our tier
+    // stays Tier2 until a startup evidence probe reports a self-verified chain.
+    EXPECT_EQ(policy->our_tier(), core::TrustTier::Tier2);
+
+    policy->set_platform_evidence_verified(true);
+    EXPECT_EQ(policy->our_tier(), core::TrustTier::Tier1);
+
+    policy->set_platform_evidence_verified(false);
+    EXPECT_EQ(policy->our_tier(), core::TrustTier::Tier2);
 }
 
 TEST_F(TrustPolicyTest, ExpireStalePeersDemotesTier1) {
@@ -713,16 +714,44 @@ TEST_F(TrustIntegrationTest, MutualChallengeResponseFlow) {
     auto sig = crypto_b->ed25519_sign(kp_b.private_key, canonical_bytes);
     report_b.signature = crypto::to_base64(sig);
 
-    // A validates B's response
-    bool result = policy_a->handle_challenge_response(pk_b, report_b);
+    // A validates B's response. No AK is pinned in B's certificate, so there is
+    // nothing to anchor the quote to — this must be rejected on EVERY host,
+    // including one with a real TPM. Hardware presence is not a trust anchor.
+    EXPECT_FALSE(policy_a->handle_challenge_response(pk_b, report_b));
+    EXPECT_NE(policy_a->peer_tier(pk_b), core::TrustTier::Tier1);
+}
 
-    // Without TEE hardware, the report verification will fail (no valid quote)
-    // With TEE hardware, it should succeed
-    if (tee_b->platform_available()) {
-        EXPECT_TRUE(result);
-        EXPECT_EQ(policy_a->peer_tier(pk_b), core::TrustTier::Tier1);
-    } else {
-        EXPECT_FALSE(result);
-        // Still Tier2 (single failure doesn't demote further from Tier2)
-    }
+// Regression: canonical_attestation_json covers server_pubkey, so the field must be
+// populated BEFORE signing. GossipService::handle_tee_challenge assigned it after,
+// which made every TeeResponse fail verification on the peer. The old version of the
+// test above masked it by assigning server_pubkey first, as this one now asserts.
+TEST_F(TrustIntegrationTest, ReportSignatureCoversServerPubkey) {
+    auto pk_b = crypto::to_base64(kp_b.public_key);
+    std::array<uint8_t, 32> nonce{};
+    nonce.fill(7);
+
+    auto signed_report = [&](bool pubkey_before_signing) {
+        auto r = tee_b->generate_report(nonce);
+        if (pubkey_before_signing) r.server_pubkey = pk_b;
+        auto canonical = core::canonical_attestation_json(r);
+        auto bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
+        r.signature = crypto::to_base64(crypto_b->ed25519_sign(kp_b.private_key, bytes));
+        if (!pubkey_before_signing) r.server_pubkey = pk_b;
+        return r;
+    };
+
+    // What a verifier does: recompute the canonical form from the RECEIVED report.
+    // (canonical_attestation_json excludes `signature` itself.)
+    auto verifies = [&](const core::TeeAttestationReport& r) {
+        auto canonical = core::canonical_attestation_json(r);
+        auto bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
+        auto sig_bytes = crypto::from_base64(r.signature);
+        if (sig_bytes.size() != crypto::kEd25519SignatureSize) return false;
+        crypto::Ed25519Signature sig{};
+        std::memcpy(sig.data(), sig_bytes.data(), sig.size());
+        return crypto_b->ed25519_verify(kp_b.public_key, bytes, sig);
+    };
+
+    EXPECT_TRUE(verifies(signed_report(true)));
+    EXPECT_FALSE(verifies(signed_report(false)));  // the shipped bug
 }

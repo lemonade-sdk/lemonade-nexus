@@ -107,12 +107,12 @@ public:
     /// Explicitly set a peer to Tier 2 (certificate-only, e.g., after adding via certificate).
     void set_peer_tier2(const std::string& pubkey);
 
-    /// Strict TPM-only enforcement. When enabled (wired from
-    /// config.require_tee_attestation), Tier 1 is granted ONLY by a verified TPM
-    /// quote (challenge-response) against the cert-pinned AK: legacy structural
-    /// backends no longer promote, and a signed token alone cannot establish Tier 1
-    /// (it may only refresh liveness for a peer already TPM-attested).
-    void set_require_tpm(bool require);
+    /// Record whether THIS host produced and self-verified a full platform evidence
+    /// chain at startup (see Security/PlatformProbe). This is the only thing that can
+    /// make us Tier-1 capable: detection is not proof, so a device node that merely
+    /// opens grants nothing. Defaults to false — a host that never ran the probe, or
+    /// whose probe failed, is Tier 2.
+    void set_platform_evidence_verified(bool verified);
 
     /// Remove a peer from the trust state map entirely.
     void remove_peer(const std::string& pubkey);
@@ -139,7 +139,9 @@ private:
     BinaryAttestationService& binary_attestation_;
     crypto::SodiumCryptoService& crypto_;
 
-    bool require_tpm_{false};  ///< strict TPM-only Tier 1 (see set_require_tpm)
+    /// Set only by a successful startup evidence probe. Never inferred from hardware
+    /// presence. See set_platform_evidence_verified.
+    bool platform_evidence_verified_{false};
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, PeerTrustState> peers_;

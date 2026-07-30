@@ -307,9 +307,14 @@ bool BinaryAttestationService::is_approved_binary(const std::string& sha256_hex)
 
 bool BinaryAttestationService::verify_manifest(const ReleaseManifest& manifest) const {
     if (release_signing_pubkey_b64_.empty()) {
-        // No signing key configured — accept all manifests (development mode)
-        spdlog::debug("[{}] no release signing pubkey configured, accepting manifest", name());
-        return true;
+        // Fail CLOSED. This used to accept every manifest "in development mode",
+        // which meant the default build trusted attacker-authored manifests from
+        // disk, --add-manifest, and any github_releases_url — and an unapproved
+        // binary could then name itself approved.
+        spdlog::warn("[{}] rejecting manifest v{} {}: no release signing pubkey is configured, "
+                      "so no manifest can be authenticated", name(),
+                      manifest.version, manifest.platform);
+        return false;
     }
 
     // Verify signer matches our expected release signing key

@@ -147,8 +147,20 @@ protected:
     std::unique_ptr<core::TeeAttestationService> tee_;
     crypto::Ed25519Keypair id_;            // server identity (Ed25519)
     std::string id_pub_b64_;
+    crypto::Ed25519Keypair rel_;           // release signing key (manifests must be signed)
+    std::string rel_pub_b64_;
     std::string binary_hash_;              // hex SHA-256 of a registered "approved" binary
     fs::path tmp_;
+
+    /// Sign a manifest with the fixture's release key and register it. There is no
+    /// unsigned path: verify_manifest fails closed by design.
+    [[nodiscard]] bool approve(core::ReleaseManifest m) {
+        m.signer_pubkey = rel_pub_b64_;
+        auto canonical = core::canonical_manifest_json(m);
+        auto bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
+        m.signature = crypto::to_base64(crypto_.ed25519_sign(rel_.private_key, bytes));
+        return bin_->add_manifest(m);
+    }
 
     void SetUp() override {
         crypto_.start();
@@ -167,7 +179,15 @@ protected:
         id_pub_b64_ = crypto::to_base64(
             std::span<const uint8_t>(id_.public_key.data(), id_.public_key.size()));
 
-        // Register a manifest so the running "binary" counts as approved.
+        // Register a manifest so the running "binary" counts as approved. The
+        // manifest must be genuinely signed: verify_manifest fails closed when no
+        // release signing key is configured, and there is deliberately no test
+        // bypass for that.
+        rel_ = crypto_.ed25519_keygen();
+        rel_pub_b64_ = crypto::to_base64(
+            std::span<const uint8_t>(rel_.public_key.data(), rel_.public_key.size()));
+        bin_->set_release_signing_pubkey(rel_pub_b64_);
+
         std::array<uint8_t, 32> h{};
         for (size_t i = 0; i < h.size(); ++i) h[i] = uint8_t(0xA0 + i);
         binary_hash_ = crypto::to_hex(std::span<const uint8_t>(h.data(), h.size()));
@@ -176,7 +196,7 @@ protected:
         m.platform = "test";
         m.binary_sha256 = binary_hash_;
         m.timestamp = 1;
-        ASSERT_TRUE(bin_->add_manifest(m));
+        ASSERT_TRUE(approve(m));
     }
     void TearDown() override {
         tee_->stop(); bin_->stop(); storage_->stop(); crypto_.stop();
@@ -377,7 +397,6 @@ TEST_F(TpmAttestTest, PcrValuesMismatchedDigestRejected) {
 
 TEST_F(TpmAttestTest, StrictModeChallengeResponsePromotesToTier1) {
     core::TrustPolicyService tp(*tee_, *bin_, crypto_);
-    tp.set_require_tpm(true);
     tp.start();
 
     auto ak = gen_ec_key();
@@ -395,7 +414,6 @@ TEST_F(TpmAttestTest, StrictModeChallengeResponsePromotesToTier1) {
 
 TEST_F(TpmAttestTest, StrictModeRejectsNonTpmChallengeResponse) {
     core::TrustPolicyService tp(*tee_, *bin_, crypto_);
-    tp.set_require_tpm(true);
     tp.start();
 
     const std::string pk = "peer-legacy";
@@ -411,7 +429,6 @@ TEST_F(TpmAttestTest, StrictModeRejectsNonTpmChallengeResponse) {
 
 TEST_F(TpmAttestTest, StrictModeTokenAloneDoesNotPromote) {
     core::TrustPolicyService tp(*tee_, *bin_, crypto_);
-    tp.set_require_tpm(true);
     tp.start();
 
     // A perfectly valid, signed Tpm2 token (verify_token passes) must NOT by
@@ -459,7 +476,7 @@ TEST_F(TpmAttestTest, SwtpmRoundTripIfAvailable) {
     m.platform = "self";
     m.binary_sha256 = report.binary_hash;
     m.timestamp = 1;
-    ASSERT_TRUE(bin_->add_manifest(m));
+    ASSERT_TRUE(approve(m));
 
     // Sign as the gossip layer would, then verify end-to-end.
     report.server_pubkey = id_pub_b64_;

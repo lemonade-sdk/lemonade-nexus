@@ -151,8 +151,8 @@ int run_enroll(const ServerConfig& config) {
         }
     }
     if (params.tpm_ak_pubkey.empty()) {
-        spdlog::warn("Enroll: no TPM AK pinned (--enroll-tpm-ak) — '{}' will be a Tier-2 "
-                     "certificate and cannot reach Tier 1 under require_tee_attestation.",
+        spdlog::warn("Enroll: no platform binding key pinned (--enroll-tpm-ak) — '{}' will be "
+                     "a Tier-2 certificate and can never reach Tier 1.",
                      config.enroll_server_id);
     } else {
         spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",

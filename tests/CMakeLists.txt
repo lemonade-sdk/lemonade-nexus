@@ -54,6 +54,12 @@ add_nexus_test(test_tls_transport     test_tls_transport.cpp)
 target_compile_definitions(test_tls_transport PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(test_tls_transport PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
+
+# Drives the SNP evidence chain against a real attestation blob + VCEK captured from
+# the live Azure genesis, so it runs with no confidential-compute hardware present.
+add_nexus_test(test_snp_evidence      test_snp_evidence.cpp)
+target_compile_definitions(test_snp_evidence PRIVATE
+    NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---

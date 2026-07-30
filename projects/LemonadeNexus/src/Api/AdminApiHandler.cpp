@@ -184,7 +184,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         network::TrustStatusResponse resp{
             .our_tier     = tier_name(our_tier),
             .our_platform = std::string(core::tee_platform_name(ctx_.tee.detected_platform())),
-            .require_tee  = ctx_.config.require_tee_attestation,
+            .require_tee  = true,  // always enforced; no longer configurable
             .binary_hash  = ctx_.attestation.self_hash(),
             .peer_count   = peer_states.size(),
         };

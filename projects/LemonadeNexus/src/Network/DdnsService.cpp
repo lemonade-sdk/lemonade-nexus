@@ -390,7 +390,9 @@ std::optional<std::string> DdnsService::handle_credential_request(
         return std::nullopt;
     }
 
-    if (attestation_.has_signing_pubkey() && !attestation_.is_approved_binary(binary_hash)) {
+    // Unconditional — a node with no release signing key configured must not become
+    // a node where the binary check silently disappears.
+    if (!attestation_.is_approved_binary(binary_hash)) {
         spdlog::warn("[{}] credential request denied: binary hash '{}' not in approved manifests",
                       name(), binary_hash.substr(0, 16) + "...");
         return std::nullopt;

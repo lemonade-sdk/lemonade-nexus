@@ -1248,9 +1248,15 @@ void GossipService::load_server_certificate() {
 }
 
 bool GossipService::verify_server_certificate(const ServerCertificate& cert) const {
+    // NO fail-open, matching verify_identity_binding below. This previously returned
+    // true unconditionally without a root pubkey, and certificate_ak_pubkey() sources
+    // the trusted platform binding key through here — so an unanchored node would
+    // hand back whatever AK sat in a self-asserted certificate and then verify the
+    // peer's quote against it.
     if (!has_root_pubkey_) {
-        // No root pubkey configured — skip certificate verification
-        return true;
+        spdlog::warn("[{}] certificate rejected: no root pubkey configured, nothing to "
+                      "anchor trust to", name());
+        return false;
     }
     return verify_cert_core(cert);
 }
@@ -1837,12 +1843,17 @@ void GossipService::handle_tee_challenge(const asio::ip::udp::endpoint& sender,
         auto& tee = trust_policy_->tee_attestation_service();
         auto report = tee.generate_report(nonce);
 
-        // Sign the report
+        // Every signed field must be populated BEFORE the canonical form is built:
+        // canonical_attestation_json covers server_pubkey, so assigning it after
+        // signing produced a signature over different bytes and made every response
+        // fail verification on the peer. Nothing but the signature assignment may sit
+        // between canonical_attestation_json() and send_packet().
+        report.server_pubkey = crypto::to_base64(keypair_.public_key);
+
         auto canonical = core::canonical_attestation_json(report);
         auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
         auto sig = crypto_.ed25519_sign(keypair_.private_key, canonical_bytes);
         report.signature = crypto::to_base64(sig);
-        report.server_pubkey = crypto::to_base64(keypair_.public_key);
 
         // Send TEE response
         json response = report;

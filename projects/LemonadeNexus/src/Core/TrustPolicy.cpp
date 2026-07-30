@@ -96,33 +96,23 @@ TrustTier TrustPolicyService::verify_and_update(
     // Verify the token through TeeAttestationService
     bool valid = tee_.verify_token(token);
 
-    // Strict TPM-only: a signed token is a lightweight liveness/identity proof, not
-    // a hardware attestation (it carries no quote). It must NEVER *establish* Tier 1
-    // — only a verified TPM challenge-response can (handle_challenge_response). Here a
-    // valid token may only REFRESH a peer already promoted via a real TPM quote.
-    if (valid && require_tpm_) {
-        bool already_tpm_tier1 =
+    // A signed token is a lightweight liveness/identity proof, not a hardware
+    // attestation (it carries no quote). It must NEVER *establish* Tier 1 — only a
+    // verified challenge-response can (handle_challenge_response). A valid token may
+    // only REFRESH a peer already promoted via a real hardware quote.
+    if (valid) {
+        bool already_tier1 =
             (state.tier == TrustTier::Tier1 && state.platform == TeePlatform::Tpm2);
-        if (token.platform != TeePlatform::Tpm2 || !already_tpm_tier1) {
-            spdlog::debug("[{}] strict mode: valid token from {} does not establish Tier1 "
-                           "(needs a TPM challenge-response first)",
+        if (token.platform != TeePlatform::Tpm2 || !already_tier1) {
+            spdlog::debug("[{}] valid token from {} does not establish Tier1 "
+                           "(needs a hardware-rooted challenge-response first)",
                            name(), pubkey.substr(0, 12) + "...");
             // Not a verification failure — just no promotion. Keep current standing.
             state.last_token_timestamp = std::max(state.last_token_timestamp, token.timestamp);
             return state.tier;
         }
-    }
 
-    if (valid) {
-        // Promotion to Tier 1 (open mode), or liveness refresh for an already
-        // TPM-attested peer (strict mode — guarded above).
-        if (state.tier != TrustTier::Tier1) {
-            spdlog::info("[{}] peer {} promoted to Tier1 (platform: {})",
-                          name(), pubkey.substr(0, 12) + "...",
-                          tee_platform_name(token.platform));
-        }
-        state.tier = TrustTier::Tier1;
-        state.platform = token.platform;
+        // Liveness refresh only — the peer was already Tier 1 via a quote.
         state.last_verified = now_sec();
         state.last_token_timestamp = token.timestamp;
         state.attestation_hash = token.attestation_hash;
@@ -189,24 +179,23 @@ bool TrustPolicyService::handle_challenge_response(
 
     auto& state = get_or_create(pubkey);
 
-    // Strict TPM-only: Tier 1 requires a real TPM quote. Reject the legacy
-    // structural backends (and an empty/None platform) up front, and require the
-    // cert-pinned AK to be present — without it there is nothing to anchor trust to.
-    if (require_tpm_) {
-        if (report.platform != TeePlatform::Tpm2) {
-            spdlog::warn("[{}] strict mode: rejecting challenge response from {} — platform "
-                          "is '{}', only tpm2 grants Tier 1", name(),
-                          pubkey.substr(0, 12) + "...", tee_platform_name(report.platform));
-            state.failed_verifications++;
-            return false;
-        }
-        if (trusted_ak_pubkey.empty()) {
-            spdlog::warn("[{}] strict mode: rejecting TPM challenge response from {} — no AK is "
-                          "pinned in its certificate (re-enroll with the TPM AK)", name(),
-                          pubkey.substr(0, 12) + "...");
-            state.failed_verifications++;
-            return false;
-        }
+    // Tier 1 requires a hardware-signed quote. Reject the legacy structural backends
+    // (and an empty/None platform) up front, and require the cert-pinned AK to be
+    // present — without it there is nothing to anchor trust to. Unconditional: there
+    // is no longer a permissive mode to fall back to.
+    if (report.platform != TeePlatform::Tpm2) {
+        spdlog::warn("[{}] rejecting challenge response from {} — platform is '{}', only a "
+                      "hardware-rooted quote grants Tier 1", name(),
+                      pubkey.substr(0, 12) + "...", tee_platform_name(report.platform));
+        state.failed_verifications++;
+        return false;
+    }
+    if (trusted_ak_pubkey.empty()) {
+        spdlog::warn("[{}] rejecting quote from {} — no AK is pinned in its certificate "
+                      "(re-enroll with the platform binding key)", name(),
+                      pubkey.substr(0, 12) + "...");
+        state.failed_verifications++;
+        return false;
     }
 
     // Verify the TEE report against our challenge nonce. For TPM the signature is
@@ -214,11 +203,11 @@ bool TrustPolicyService::handle_challenge_response(
     bool valid = tee_.verify_report(report, expected_nonce, trusted_ak_pubkey);
 
     if (valid) {
-        // Also verify binary hash is approved
-        bool binary_ok = true;
-        if (binary_attestation_.has_signing_pubkey() && !report.binary_hash.empty()) {
-            binary_ok = binary_attestation_.is_approved_binary(report.binary_hash);
-        }
+        // Unconditional. Both former guards were holes: gating on has_signing_pubkey()
+        // removed the check entirely on a node with no release key, and the
+        // !binary_hash.empty() conjunct let a peer skip it by simply omitting the
+        // field. An absent measurement is a failed measurement.
+        bool binary_ok = binary_attestation_.is_approved_binary(report.binary_hash);
 
         if (binary_ok) {
             state.tier = TrustTier::Tier1;
@@ -281,20 +270,18 @@ PeerTrustState TrustPolicyService::peer_state(const std::string& pubkey) const {
 }
 
 TrustTier TrustPolicyService::our_tier() const {
-    // Strict mode: only a real TPM makes us Tier-1 capable. A box exposing only a
-    // legacy structural backend is Tier 2 — it has no hardware root of trust.
-    if (require_tpm_) {
-        return tee_.detected_platform() == TeePlatform::Tpm2
-                   ? TrustTier::Tier1 : TrustTier::Tier2;
-    }
-    return tee_.platform_available() ? TrustTier::Tier1 : TrustTier::Tier2;
+    // Tier 1 is earned by producing a verifiable evidence chain, never by detecting
+    // hardware. `platform_available()` is deliberately NOT consulted: a TEE device
+    // node that opens proves nothing, and the structural backends it can select have
+    // no hardware root of trust at all.
+    return platform_evidence_verified_ ? TrustTier::Tier1 : TrustTier::Tier2;
 }
 
-void TrustPolicyService::set_require_tpm(bool require) {
+void TrustPolicyService::set_platform_evidence_verified(bool verified) {
     std::lock_guard lock(mutex_);
-    require_tpm_ = require;
-    spdlog::info("[{}] strict TPM-only Tier 1 enforcement: {}", name(),
-                  require ? "ENABLED" : "disabled");
+    platform_evidence_verified_ = verified;
+    spdlog::info("[{}] our Tier-1 eligibility: {}", name(),
+                  verified ? "evidence chain VERIFIED" : "no verified evidence (Tier 2)");
 }
 
 AttestationToken TrustPolicyService::generate_attestation_token(

@@ -296,25 +296,18 @@ bool TeeAttestationService::do_verify_report(
 
         // SGX/TDX/SEV/Apple are STRUCTURAL-ONLY: they check a magic + nonce but have
         // no hardware-signed quote chained to a trusted root, so a structurally-valid
-        // report proves nothing about real TEE hardware. They must never establish
-        // Tier 1 in production — that is enforced separately by TrustPolicy's strict
-        // require_tpm_ mode (set from require_tee_attestation). The warning makes any
-        // reliance on them visible in logs until they are removed or given real
-        // DCAP/SEV-SNP/Apple-CA verification.
+        // report proves nothing about real TEE hardware. They are now UNREACHABLE as a
+        // trust decision — rejected here rather than dispatched. The verify_*_report
+        // implementations are retained (unwired) until the Security/ evidence chain
+        // replaces them; see docs and Security/IEvidenceBackend.hpp.
         case TeePlatform::IntelSgx:
         case TeePlatform::IntelTdx:
         case TeePlatform::AmdSevSnp:
         case TeePlatform::AppleSecureEnclave:
-            spdlog::warn("[{}] verifying a STRUCTURAL-ONLY {} report — NO hardware root "
-                          "of trust; this must not grant Tier 1 (require_tpm_ enforces TPM-only)",
-                          name(), tee_platform_name(report.platform));
-            switch (report.platform) {
-                case TeePlatform::IntelSgx:           return verify_sgx_report(report);
-                case TeePlatform::IntelTdx:           return verify_tdx_report(report);
-                case TeePlatform::AmdSevSnp:          return verify_sev_snp_report(report);
-                case TeePlatform::AppleSecureEnclave: return verify_apple_se_report(report);
-                default:                              return false;
-            }
+            spdlog::warn("[{}] rejecting a STRUCTURAL-ONLY {} report — no hardware root of "
+                          "trust, so it can never grant Tier 1", name(),
+                          tee_platform_name(report.platform));
+            return false;
         case TeePlatform::None:
             return false;
     }
@@ -424,9 +417,10 @@ bool TeeAttestationService::verify_token(const AttestationToken& token) const {
         return false;
     }
 
-    // 5. Verify binary hash matches an approved release
-    if (binary_attestation_.has_signing_pubkey() &&
-        !binary_attestation_.is_approved_binary(token.binary_hash)) {
+    // 5. Verify binary hash matches an approved release. Unconditional: gating this
+    // on has_signing_pubkey() meant the check vanished on any node without a release
+    // key configured, which is the default.
+    if (!binary_attestation_.is_approved_binary(token.binary_hash)) {
         spdlog::warn("[{}] token binary hash not in approved manifests", name());
         return false;
     }

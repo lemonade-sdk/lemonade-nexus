@@ -61,7 +61,6 @@ struct ServerConfig {
 
     // Binary attestation
     std::string release_signing_pubkey;       // base64 Ed25519 pubkey for release manifest verification
-    bool require_binary_attestation{false};   // require matching manifest for credential distribution
 
     // GitHub release manifest fetching (auto-fetch signed manifests for older versions)
     std::string github_releases_url;              // e.g. "https://api.github.com/repos/owner/repo/releases"
@@ -122,10 +121,10 @@ struct ServerConfig {
     uint32_t enrollment_vote_timeout_sec{60};     // vote collection window (seconds)
     uint32_t enrollment_max_retries{3};           // retries before permanent rejection
 
-    // TEE Attestation / Trust
-    bool require_tee_attestation{false};      // require Tier 1 TEE for full mesh participation
-    uint32_t tee_attestation_validity_sec{3600};  // how long a TEE report is valid (default 1h)
-    std::string tee_platform_override;        // force TEE platform detection ("sgx", "tdx", "sev-snp", "secure-enclave")
+    // TEE attestation is not configurable: Tier 1 is granted only by a verified
+    // evidence chain produced at startup, and enforcement is always on. The retired
+    // knobs (require_tee_attestation, tee_platform_override, require_binary_attestation,
+    // tee_attestation_validity_sec) were variously unreachable, inert, or dead.
 };
 
 /// Load config: CLI args > env vars > config file > defaults.
