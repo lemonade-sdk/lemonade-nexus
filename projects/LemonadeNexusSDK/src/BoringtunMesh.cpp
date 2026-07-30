@@ -57,6 +57,7 @@ struct BoringtunMesh::Impl {
     std::string        server_pubkey;     // never removed by sync_peers
     std::string        tunnel_addr;       // our virtual IP (no prefix), egress source
     std::atomic<bool>  active{false};
+    BoringtunConfig    started_cfg;       // what the live plane was started with
 
     std::mutex                                            egress_mtx;
     std::map<std::pair<std::string, uint16_t>, uint16_t>  egress_cache;
@@ -69,7 +70,19 @@ BoringtunMesh::~BoringtunMesh() {
 }
 
 bool BoringtunMesh::start(const BoringtunConfig& config) {
-    if (impl_->active.load()) return true;
+    if (impl_->active.load()) {
+        const auto& live = impl_->started_cfg;
+        if (live.private_key == config.private_key &&
+            live.tunnel_ip == config.tunnel_ip &&
+            live.server_public_key == config.server_public_key &&
+            live.server_endpoint == config.server_endpoint) {
+            return true;
+        }
+        // A re-join issues a fresh mesh IP/keys. Keeping the old plane would
+        // leave us handshaking with credentials the server has replaced.
+        spdlog::info("[BoringtunMesh] config changed — restarting dataplane");
+        stop();
+    }
     if (config.private_key.empty() || config.public_key.empty()) return false;
 
     UserspaceDataplane::Config dpcfg;
@@ -121,6 +134,7 @@ bool BoringtunMesh::start(const BoringtunConfig& config) {
             static_cast<uint16_t>(config.keepalive ? config.keepalive : 25));
     }
 
+    impl_->started_cfg = config;
     impl_->active = true;
     spdlog::info("[BoringtunMesh] dataplane up: mesh_ip={}, server_peer={}…",
                  impl_->tunnel_addr,
