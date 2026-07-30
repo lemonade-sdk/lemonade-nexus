@@ -56,15 +56,8 @@ class _AccountViewState extends ConsumerState<AccountView> {
         return;
       }
       final list = (resp['chats'] as List?) ?? const [];
-      // Best-effort key-envelope status (ignore individual failures).
-      int pending = _pendingKeys;
+      // Best-effort key/device status (ignore individual failures).
       bool hasEnv = _hasEnvelope;
-      try {
-        final p = await notifier.callPrivateApi('GET', '/api/account/keys/pending');
-        pending = ((p['pending'] as List?) ?? const []).length;
-      } catch (e) {
-        debugPrint('[ClusterView] keys/pending failed: $e');
-      }
       try {
         // fetchGroupKey, not a raw GET: it persists the key into the keyring.
         hasEnv = await notifier.fetchGroupKey() != null;
@@ -72,8 +65,11 @@ class _AccountViewState extends ConsumerState<AccountView> {
         debugPrint('[ClusterView] fetchGroupKey failed: $e');
       }
       List<ClusterDevice> devices = _devices;
+      int pending = _pendingKeys;
       try {
         devices = await notifier.listClusterDevices();
+        // Already carries the pending-key flag — no second /keys/pending call.
+        pending = devices.where((d) => d.needsKey).length;
       } catch (e) {
         debugPrint('[ClusterView] listClusterDevices failed: $e');
       }

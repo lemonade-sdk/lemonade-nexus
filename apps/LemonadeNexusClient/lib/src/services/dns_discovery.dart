@@ -637,6 +637,24 @@ class DnsDiscoveryService {
   // Health probe (HTTPS with HTTP fallback)
   // ---------------------------------------------------------------------------
 
+  /// RFC1918 / CGNAT / link-local, including the 10.64/10 mesh plane. Servers
+  /// sometimes publish these alongside their public address, and they are only
+  /// reachable from a LAN or over the mesh — both fast — so a probe that hasn't
+  /// answered quickly never will.
+  static bool _isPrivateAddress(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) return false;
+    final a = int.tryParse(parts[0]);
+    final b = int.tryParse(parts[1]);
+    if (a == null || b == null) return false;
+    if (a == 10 || a == 127) return true;
+    if (a == 172 && b >= 16 && b <= 31) return true;
+    if (a == 192 && b == 168) return true;
+    if (a == 169 && b == 254) return true;
+    if (a == 100 && b >= 64 && b <= 127) return true;
+    return false;
+  }
+
   Future<DiscoveredServer?> _probeServer({
     required String ip,
     required int port,
@@ -649,6 +667,12 @@ class DnsDiscoveryService {
         ? <(String, String)>[('https', host), ('https', ip)]
         : <(String, String)>[('https', ip)];
 
+    final private = _isPrivateAddress(ip);
+    final connectTimeout =
+        private ? const Duration(milliseconds: 1500) : const Duration(seconds: 5);
+    final requestTimeout =
+        private ? const Duration(seconds: 3) : const Duration(seconds: 8);
+
     for (final (scheme, target) in probeTargets) {
       final uri = Uri.tryParse('$scheme://$target:$port/api/health');
       if (uri == null) continue;
@@ -657,14 +681,14 @@ class DnsDiscoveryService {
       // response. The SDK does strict TLS verification, so it must connect by
       // the cert's hostname (CN) rather than the bare IP (which fails to verify).
       final inner = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 5)
+        ..connectionTimeout = connectTimeout
         ..badCertificateCallback = (cert, h, p) => true;
 
       _dlog('[Discovery]   Probe: $uri');
       final stopwatch = Stopwatch()..start();
       try {
-        final req = await inner.getUrl(uri).timeout(const Duration(seconds: 8));
-        final resp = await req.close().timeout(const Duration(seconds: 8));
+        final req = await inner.getUrl(uri).timeout(requestTimeout);
+        final resp = await req.close().timeout(requestTimeout);
         final elapsed = stopwatch.elapsedMicroseconds / 1000.0;
         // Leaf certificate of the peer (NOT a CA in the chain); its CN is the
         // server's real FQDN.
