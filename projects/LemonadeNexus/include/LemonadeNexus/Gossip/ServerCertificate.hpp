@@ -19,11 +19,20 @@ struct ServerCertificate {
     uint64_t    issued_at{0};    // Unix timestamp
     uint64_t    expires_at{0};   // Unix timestamp (0 = no expiry)
     std::string issuer_pubkey;   // base64 Ed25519 public key of signer (root key)
-    // TPM 2.0 root of trust (Model A): the Attestation Key the admin validated
-    // (EK→AK chain) at enrollment. Runtime quote verification checks the TPM
-    // signature against THIS key — making identity ↔ AK ↔ cert one signed unit.
-    std::string tpm_ak_pubkey;   // base64 DER SubjectPublicKeyInfo of the pinned AK ("" = no TPM enrolled)
+    // The platform binding key validated at enrollment: a TPM AK under "tpm2", or
+    // the AMD-vouched HCLAkPub under "snp-vtpm". Runtime quote verification checks
+    // the hardware signature against THIS key — making identity ↔ key ↔ cert one
+    // signed unit. The field name is historical; under snp-vtpm there is no TPM the
+    // operator owns.
+    std::string tpm_ak_pubkey;   // base64 DER SubjectPublicKeyInfo of the pinned key ("" = none)
     std::string tpm_ek_cert;     // optional PEM EK certificate (audit / future model-B re-validation)
+
+    // What kind of evidence this server must present, and what it must say. Root
+    // signed, so it is policy the server cannot choose for itself.
+    std::string platform_class;       // "" (Tier 2), "tpm2", or "snp-vtpm"
+    std::string expected_measurement; // hex SHA-384 SNP launch measurement (snp-vtpm)
+    std::string approved_binary_hash; // hex SHA-256 of the binary approved at enrollment
+
     std::string signature;       // base64 Ed25519 signature by issuer
 };
 
@@ -36,8 +45,11 @@ struct ServerCertificate {
 struct CertIssueParams {
     std::string server_pubkey_b64;  // candidate gossip Ed25519 pubkey (base64)
     std::string server_id;          // unique DNS label
-    std::string tpm_ak_pubkey;      // optional base64 DER SPKI (Model A pinning)
+    std::string tpm_ak_pubkey;      // optional base64 DER SPKI (platform binding key)
     std::string tpm_ek_cert;        // optional PEM
+    std::string platform_class;     // "", "tpm2", "snp-vtpm"
+    std::string expected_measurement;
+    std::string approved_binary_hash;
     uint64_t    expires_at{0};      // 0 = no expiry
 };
 

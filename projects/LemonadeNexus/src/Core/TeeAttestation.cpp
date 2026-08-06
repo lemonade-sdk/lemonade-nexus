@@ -1,6 +1,8 @@
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 
+#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
@@ -49,8 +51,10 @@ void TeeAttestationService::on_start() {
     detected_platform_ = detect_tee_platform();
 
     if (detected_platform_ != TeePlatform::None) {
-        spdlog::info("[{}] TEE platform detected: {} — this server is Tier 1 capable",
-                      name(), tee_platform_name(detected_platform_));
+        // Detection is not capability. Tier 1 comes from the startup evidence probe
+        // (Security/PlatformProbe) and nothing else.
+        spdlog::info("[{}] TEE hardware present: {}", name(),
+                      tee_platform_name(detected_platform_));
 
         // Generate initial attestation report with a random nonce
         std::array<uint8_t, 32> startup_nonce{};
@@ -67,8 +71,7 @@ void TeeAttestationService::on_start() {
                           name(), report_hash_.substr(0, 16));
         }
     } else {
-        spdlog::warn("[{}] no TEE hardware detected — this server will operate as Tier 2 "
-                      "(certificate-only, hole punching only)", name());
+        spdlog::info("[{}] no TEE hardware present", name());
     }
 
     spdlog::info("[{}] started (platform: {})", name(), tee_platform_name(detected_platform_));
@@ -197,12 +200,17 @@ TeeAttestationReport TeeAttestationService::do_generate_report(
     // The prover does not need obfuscation: security comes from the *verifier*
     // checking a hardware-signed TPM quote against a cert-pinned AK, not from
     // hiding this code. See docs/TEE-Attestation-Hardening-Plan.md §6.
+    if (evidence_platform() == TeePlatform::SnpVtpm) {
+        return generate_snp_vtpm_report(nonce);
+    }
+
     switch (detected_platform_) {
         case TeePlatform::Tpm2:              return generate_tpm_report(nonce);
         case TeePlatform::IntelSgx:          return generate_sgx_report(nonce);
         case TeePlatform::IntelTdx:          return generate_tdx_report(nonce);
         case TeePlatform::AmdSevSnp:         return generate_sev_snp_report(nonce);
         case TeePlatform::AppleSecureEnclave: return generate_apple_se_report(nonce);
+        case TeePlatform::SnpVtpm:
         case TeePlatform::None:
             break;
     }
@@ -213,7 +221,7 @@ TeeAttestationReport TeeAttestationService::do_generate_report(
     report.nonce = nonce;
     report.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count());
-    report.binary_hash = binary_attestation_.self_hash();
+    report.binary_hash = binary_attestation_.measured_hash();
     return report;
 }
 // Verification rules — see docs/TEE-Attestation-Hardening-Plan.md.
@@ -225,7 +233,7 @@ TeeAttestationReport TeeAttestationService::do_generate_report(
 bool TeeAttestationService::do_verify_report(
     const TeeAttestationReport& report,
     const std::array<uint8_t, 32>& expected_nonce,
-    const std::string& trusted_ak_pubkey) {
+    const PeerPlatformBinding& binding) {
 
     // 1. Check nonce binding
     if (report.nonce != expected_nonce) {
@@ -289,10 +297,13 @@ bool TeeAttestationService::do_verify_report(
     }
 
     switch (report.platform) {
+        case TeePlatform::SnpVtpm:
+            return verify_snp_vtpm_report(report, expected_nonce, binding);
+
         case TeePlatform::Tpm2:
             // The only backend with a real hardware root of trust: the quote
             // signature is checked against the cert-pinned AK, not report.ak_pubkey.
-            return verify_tpm_report(report, expected_nonce, trusted_ak_pubkey);
+            return verify_tpm_report(report, expected_nonce, binding.ak_pubkey);
 
         // SGX/TDX/SEV/Apple are STRUCTURAL-ONLY: they check a magic + nonce but have
         // no hardware-signed quote chained to a trusted root, so a structurally-valid
@@ -325,30 +336,31 @@ AttestationToken TeeAttestationService::generate_token(
 
     AttestationToken token;
     token.server_pubkey = crypto::to_base64(keypair.public_key);
-    token.platform = detected_platform_;
-    token.binary_hash = binary_attestation_.self_hash();
+    token.platform = evidence_platform();
+    token.binary_hash = binary_attestation_.measured_hash();
     token.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count());
 
+    // A cached report from before set_evidence_source() names the wrong platform,
+    // and a peer's refresh check compares platforms — so stale-by-platform counts
+    // as stale.
+    const bool stale =
+        !cached_report_ ||
+        cached_report_->platform != token.platform ||
+        token.timestamp - cached_report_->timestamp > kTeeReportMaxAgeSec / 2;
+    if (stale) {
+        std::array<uint8_t, 32> fresh_nonce{};
+        crypto_.random_bytes(fresh_nonce);
+        cached_report_ = do_generate_report(fresh_nonce);
+        if (cached_report_) {
+            auto canonical = canonical_attestation_json(*cached_report_);
+            auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
+            report_hash_ = crypto::to_hex(crypto_.sha256(canonical_bytes));
+        }
+    }
     if (cached_report_) {
         token.attestation_hash = report_hash_;
         token.attestation_timestamp = cached_report_->timestamp;
-
-        // Check if we need to refresh the underlying TEE report
-        if (token.timestamp - cached_report_->timestamp > kTeeReportMaxAgeSec / 2) {
-            // Report is getting stale — regenerate
-            std::array<uint8_t, 32> fresh_nonce{};
-            crypto_.random_bytes(fresh_nonce);
-            cached_report_ = do_generate_report(fresh_nonce);
-            if (cached_report_) {
-                auto canonical = canonical_attestation_json(*cached_report_);
-                auto canonical_bytes = std::vector<uint8_t>(canonical.begin(), canonical.end());
-                auto hash = crypto_.sha256(canonical_bytes);
-                report_hash_ = crypto::to_hex(hash);
-                token.attestation_hash = report_hash_;
-                token.attestation_timestamp = cached_report_->timestamp;
-            }
-        }
     }
 
     // Sign the token
@@ -464,6 +476,136 @@ void TeeAttestationService::set_identity_pubkey(const std::string& pubkey_b64) {
     identity_pubkey_b64_ = pubkey_b64;
 }
 
+void TeeAttestationService::set_evidence_source(security::EvidenceProfile profile,
+                                                 std::filesystem::path cache_dir,
+                                                 std::string product) {
+    std::lock_guard lock(mutex_);
+    evidence_profile_   = profile;
+    evidence_cache_dir_ = std::move(cache_dir);
+    evidence_product_   = std::move(product);
+    spdlog::info("[{}] evidence source: {}", name(),
+                  security::evidence_profile_name(profile));
+}
+
+TeePlatform TeeAttestationService::evidence_platform() const {
+    return evidence_profile_ == security::EvidenceProfile::SnpVtpm ? TeePlatform::SnpVtpm
+                                                                   : detected_platform_;
+}
+
+// ---------------------------------------------------------------------------
+// snp-vtpm backend
+// ---------------------------------------------------------------------------
+
+TeeAttestationReport TeeAttestationService::generate_snp_vtpm_report(
+    const std::array<uint8_t, 32>& nonce) {
+
+    TeeAttestationReport report;
+    report.platform = TeePlatform::SnpVtpm;
+    report.nonce = nonce;
+    report.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
+        chrono::system_clock::now().time_since_epoch()).count());
+
+    security::EvidenceProduceConfig cfg;
+    cfg.cache_dir = evidence_cache_dir_;
+    cfg.product   = evidence_product_;
+    if (!identity_pubkey_b64_.empty()) {
+        try {
+            cfg.identity_pubkey = crypto::from_base64(identity_pubkey_b64_);
+        } catch (...) {}
+    }
+
+    std::string why;
+    auto evidence = security::produce_snp_vtpm_evidence(cfg, nonce, &why);
+    if (!evidence) {
+        spdlog::warn("[{}] could not produce snp-vtpm evidence: {}", name(), why);
+        return report;  // no evidence → the verifier rejects, which is correct
+    }
+
+    report.binary_hash = evidence->binary_sha256;
+    report.evidence    = security::encode_snp_vtpm_evidence(*evidence);
+    report.evidence_sha256 = crypto::to_hex(crypto_.sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(report.evidence.data()), report.evidence.size())));
+    return report;
+}
+
+bool TeeAttestationService::verify_snp_vtpm_report(const TeeAttestationReport& report,
+                                                    const std::array<uint8_t, 32>& expected_nonce,
+                                                    const PeerPlatformBinding& binding) const {
+    if (!binding.platform_class.empty() && binding.platform_class != "snp-vtpm") {
+        spdlog::warn("[{}] peer presented snp-vtpm evidence but its certificate enrolls '{}'",
+                      name(), binding.platform_class);
+        return false;
+    }
+
+    // Only the digest is inside the identity signature, so the bundle is worth
+    // nothing until it matches — however it reached us, inline or fetched.
+    if (report.evidence_sha256.empty()) {
+        spdlog::warn("[{}] snp-vtpm report carries no evidence digest", name());
+        return false;
+    }
+    if (report.evidence.empty()) {
+        spdlog::warn("[{}] snp-vtpm evidence {} was not delivered with the report and no "
+                      "out-of-band retrieval is wired up yet", name(),
+                      report.evidence_sha256.substr(0, 16));
+        return false;
+    }
+    const auto digest = crypto::to_hex(crypto_.sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(report.evidence.data()), report.evidence.size())));
+    if (digest != report.evidence_sha256) {
+        spdlog::warn("[{}] snp-vtpm evidence does not match the digest the peer signed", name());
+        return false;
+    }
+
+    auto evidence = security::decode_snp_vtpm_evidence(report.evidence);
+    if (!evidence) {
+        spdlog::warn("[{}] snp-vtpm report carries no decodable evidence", name());
+        return false;
+    }
+
+    std::vector<uint8_t> identity;
+    try {
+        identity = crypto::from_base64(report.server_pubkey);
+    } catch (...) {
+        return false;
+    }
+
+    security::EvidenceRequirements req;
+    req.expected_measurement_hex = binding.expected_measurement;
+    req.expected_ak_spki_b64     = binding.ak_pubkey;
+
+    auto verdict = security::verify_snp_vtpm_evidence(*evidence, expected_nonce, identity, req);
+    if (!verdict.ok) {
+        spdlog::warn("[{}] snp-vtpm evidence rejected: {}", name(), verdict.failure);
+        return false;
+    }
+
+    // The IMA-confirmed measurement is the only binary hash worth acting on; the
+    // report's own field is a claim the peer wrote.
+    if (verdict.binary_sha256 != report.binary_hash) {
+        spdlog::warn("[{}] snp-vtpm report claims a binary hash the IMA log does not support",
+                      name());
+        return false;
+    }
+    if (!binding.approved_binary_hash.empty() &&
+        binding.approved_binary_hash != verdict.binary_sha256) {
+        spdlog::warn("[{}] peer is running a binary other than the one approved at its "
+                      "enrollment", name());
+        return false;
+    }
+    if (!binary_attestation_.is_approved_binary(verdict.binary_sha256)) {
+        spdlog::warn("[{}] snp-vtpm binary measurement is not in any approved manifest", name());
+        return false;
+    }
+
+    if (verdict.ima_replayed_in_sha1_bank) {
+        spdlog::warn("[{}] peer's IMA log replays only in the SHA-1 bank — its binary "
+                      "measurement is only as strong as SHA-1 collision resistance", name());
+    }
+    spdlog::debug("[{}] snp-vtpm evidence verified (measurement {}...)", name(),
+                   verdict.measurement_hex.substr(0, 16));
+    return true;
+}
+
 // ===========================================================================
 // PLATFORM BACKENDS
 // ===========================================================================
@@ -480,7 +622,7 @@ TeeAttestationReport TeeAttestationService::generate_sgx_report(
     report.nonce = nonce;
     report.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count());
-    report.binary_hash = binary_attestation_.self_hash();
+    report.binary_hash = binary_attestation_.measured_hash();
 
 #if defined(__linux__) && (defined(__x86_64__) || defined(__i386__))
     // Intel SGX DCAP quote generation
@@ -580,7 +722,7 @@ TeeAttestationReport TeeAttestationService::generate_tdx_report(
     report.nonce = nonce;
     report.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count());
-    report.binary_hash = binary_attestation_.self_hash();
+    report.binary_hash = binary_attestation_.measured_hash();
 
 #if defined(__linux__)
     // Intel TDX: open /dev/tdx-guest, use TDX_CMD_GET_REPORT ioctl
@@ -649,7 +791,7 @@ TeeAttestationReport TeeAttestationService::generate_sev_snp_report(
     report.nonce = nonce;
     report.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count());
-    report.binary_hash = binary_attestation_.self_hash();
+    report.binary_hash = binary_attestation_.measured_hash();
 
 #if defined(__linux__)
     // AMD SEV-SNP: open /dev/sev-guest, use SNP_GET_REPORT ioctl
@@ -731,7 +873,7 @@ TeeAttestationReport TeeAttestationService::generate_apple_se_report(
     report.nonce = nonce;
     report.timestamp = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
         chrono::system_clock::now().time_since_epoch()).count());
-    report.binary_hash = binary_attestation_.self_hash();
+    report.binary_hash = binary_attestation_.measured_hash();
 
 #if defined(__APPLE__)
     // Apple Secure Enclave attestation via Security.framework

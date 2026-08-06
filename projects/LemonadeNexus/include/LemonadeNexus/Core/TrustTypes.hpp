@@ -77,6 +77,7 @@ enum class TeePlatform : uint8_t {
     AmdSevSnp         = 3,  ///< AMD SEV-SNP (VM-level encrypted)
     AppleSecureEnclave = 4, ///< Apple Secure Enclave (macOS bare-metal)
     Tpm2              = 5,  ///< TPM 2.0 hardware-signed quote (real root of trust)
+    SnpVtpm           = 6,  ///< SEV-SNP behind a paravisor: AMD -> HCLAkPub -> vTPM quote
 };
 
 [[nodiscard]] inline std::string_view tee_platform_name(TeePlatform p) {
@@ -87,6 +88,7 @@ enum class TeePlatform : uint8_t {
         case TeePlatform::AmdSevSnp:         return "sev-snp";
         case TeePlatform::AppleSecureEnclave: return "secure-enclave";
         case TeePlatform::Tpm2:              return "tpm2";
+        case TeePlatform::SnpVtpm:           return "snp-vtpm";
     }
     return "unknown";
 }
@@ -97,8 +99,29 @@ enum class TeePlatform : uint8_t {
     if (s == "sev-snp")         return TeePlatform::AmdSevSnp;
     if (s == "secure-enclave")  return TeePlatform::AppleSecureEnclave;
     if (s == "tpm2")            return TeePlatform::Tpm2;
+    if (s == "snp-vtpm")        return TeePlatform::SnpVtpm;
     return TeePlatform::None;
 }
+
+/// What a peer's enrolled certificate says its platform must be. Everything here
+/// is root-signed, so it is policy the peer cannot choose for itself — which is
+/// the only reason any of it is worth checking against.
+struct PeerPlatformBinding {
+    /// "" (nothing enrolled), "tpm2", or "snp-vtpm".
+    std::string platform_class;
+    /// The platform binding key: for tpm2 the AK, for snp-vtpm the HCLAkPub AMD
+    /// vouched for. Base64 DER SubjectPublicKeyInfo.
+    std::string ak_pubkey;
+    /// Hex SHA-384 SNP launch measurement pinned at enrollment (snp-vtpm).
+    std::string expected_measurement;
+    /// Hex SHA-256 of the binary the operator approved at enrollment.
+    std::string approved_binary_hash;
+
+    [[nodiscard]] bool empty() const {
+        return platform_class.empty() && ak_pubkey.empty() &&
+               expected_measurement.empty() && approved_binary_hash.empty();
+    }
+};
 
 // ---------------------------------------------------------------------------
 // TEE Attestation Report — platform-agnostic container for TEE proof
@@ -124,7 +147,25 @@ struct TeeAttestationReport {
     std::vector<uint8_t> tpm_signature;  ///< raw TPMT_SIGNATURE over tpms_attest
     std::string          ak_pubkey;      ///< base64 DER SPKI AK pub — HINT ONLY; must match cert-pinned AK
     std::vector<uint8_t> pcr_values;     ///< concatenated selected PCR values (to recompute pcrDigest)
+
+    // --- snp-vtpm evidence (TeePlatform::SnpVtpm) ---
+    // The chain from the AMD root to a fresh vTPM quote, encoded by
+    // Security/EvidenceSnpVtpm. Nothing in it is believed until the AMD signature
+    // and the quote signature both check out.
+    //
+    // Only `evidence_sha256` is covered by the identity signature. The bundle
+    // itself is bulk: it carries the IMA log, which grows without bound on a host
+    // that is really measuring executables, so it cannot be assumed to fit a
+    // datagram. A receiver must therefore check the digest before believing a
+    // bundle, whether it arrived inline or was fetched.
+    std::string          evidence;
+    std::string          evidence_sha256;  ///< hex SHA-256 of `evidence`
 };
+
+/// Largest `evidence` we will put inline in a gossip datagram. Well under
+/// GossipService's 65000-byte payload ceiling, leaving room for the rest of the
+/// report and avoiding IP fragmentation on ordinary paths.
+inline constexpr std::size_t kMaxInlineEvidenceBytes = 16384;
 
 /// Canonical JSON for signing (excludes signature field).
 [[nodiscard]] std::string canonical_attestation_json(const TeeAttestationReport& r);

@@ -16,58 +16,6 @@ using json = nlohmann::json;
 // JSON serialization
 // ---------------------------------------------------------------------------
 
-void to_json(json& j, const ServerConfig& c) {
-    j = json{
-        {"http_port",           c.http_port},
-        {"udp_port",            c.udp_port},
-        {"gossip_port",         c.gossip_port},
-        {"stun_port",           c.stun_port},
-        {"relay_port",          c.relay_port},
-        {"dns_port",            c.dns_port},
-        {"public_dns_port",     c.public_dns_port},
-        {"bind_address",        c.bind_address},
-        {"wg_interface",        c.wg_interface},
-        {"data_root",           c.data_root},
-        {"rp_id",               c.rp_id},
-        {"jwt_secret",          c.jwt_secret},
-        {"root_pubkey",         c.root_pubkey},
-        {"seed_peers",          c.seed_peers},
-        {"gossip_interval_sec", c.gossip_interval_sec},
-        {"rate_limit_rpm",      c.rate_limit_rpm},
-        {"rate_limit_burst",    c.rate_limit_burst},
-        {"log_level",           c.log_level},
-        {"acme_provider",       c.acme_provider},
-        {"acme_eab_kid",        c.acme_eab_kid},
-        {"acme_eab_hmac_key",   c.acme_eab_hmac_key},
-        {"dns_provider",        c.dns_provider},
-        {"public_ip",           c.public_ip},
-        {"region",              c.region},
-        {"server_hostname",     c.server_hostname},
-        {"dns_base_domain",     c.dns_base_domain},
-        {"dns_seed_discovery",  c.dns_seed_discovery},
-        {"dns_ns_hostname",     c.dns_ns_hostname},
-        {"release_signing_pubkey",     c.release_signing_pubkey},
-        {"github_releases_url",        c.github_releases_url},
-        {"manifest_fetch_interval_sec", c.manifest_fetch_interval_sec},
-        {"minimum_version",            c.minimum_version},
-        {"ddns_domain",                c.ddns_domain},
-        {"ddns_password",              c.ddns_password},
-        {"ddns_update_interval_sec",   c.ddns_update_interval_sec},
-        {"ddns_enabled",               c.ddns_enabled},
-        {"open_registration",          c.open_registration},
-        {"private_http_port",          c.private_http_port},
-        {"require_peer_confirmation",  c.require_peer_confirmation},
-        {"enrollment_quorum_ratio",    c.enrollment_quorum_ratio},
-        {"enrollment_vote_timeout_sec", c.enrollment_vote_timeout_sec},
-        {"enrollment_max_retries",     c.enrollment_max_retries},
-        {"onboard_enabled",            c.onboard_enabled},
-        {"admission_quorum_ratio",     c.admission_quorum_ratio},
-        {"onboard_min_tier1_for_vote", c.onboard_min_tier1_for_vote},
-        {"onboard_request_ttl_sec",    c.onboard_request_ttl_sec},
-        {"onboard_max_pending",        c.onboard_max_pending},
-    };
-}
-
 void from_json(const json& j, ServerConfig& c) {
     if (j.contains("http_port"))           j.at("http_port").get_to(c.http_port);
     if (j.contains("udp_port"))            j.at("udp_port").get_to(c.udp_port);
@@ -83,7 +31,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("jwt_secret"))          j.at("jwt_secret").get_to(c.jwt_secret);
     if (j.contains("root_pubkey"))         j.at("root_pubkey").get_to(c.root_pubkey);
     if (j.contains("seed_peers"))          j.at("seed_peers").get_to(c.seed_peers);
-    if (j.contains("gossip_interval_sec")) j.at("gossip_interval_sec").get_to(c.gossip_interval_sec);
     if (j.contains("rate_limit_rpm"))      j.at("rate_limit_rpm").get_to(c.rate_limit_rpm);
     if (j.contains("rate_limit_burst"))    j.at("rate_limit_burst").get_to(c.rate_limit_burst);
     if (j.contains("log_level"))           j.at("log_level").get_to(c.log_level);
@@ -150,7 +97,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --token-ttl <sec>          Minted-token lifetime, 60-3600s (default: 600)");
     spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
     spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
-    spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
+    spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's platform binding key (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
     spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
     spdlog::info("  --verify-platform [blob]   Verify this host's platform evidence (AMD signature chain,");

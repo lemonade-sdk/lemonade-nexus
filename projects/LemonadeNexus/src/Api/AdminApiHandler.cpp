@@ -119,8 +119,8 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         network::DdnsStatusResponse resp{
             .has_credentials = ctx_.ddns.has_credentials(),
             .last_ip         = ctx_.ddns.last_ip(),
-            .binary_hash     = ctx_.attestation.self_hash(),
-            .binary_approved = ctx_.attestation.is_approved_binary(ctx_.attestation.self_hash()),
+            .binary_hash     = ctx_.attestation.diagnostic_self_hash(),
+            .binary_approved = ctx_.attestation.is_approved_binary(ctx_.attestation.diagnostic_self_hash()),
         };
         nlohmann::json j = resp;
         json_response(res, j);
@@ -143,8 +143,8 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
         auto manifests = ctx_.attestation.get_manifests();
         network::AttestationManifestsResponse resp{
-            .self_hash                   = ctx_.attestation.self_hash(),
-            .self_approved               = ctx_.attestation.is_approved_binary(ctx_.attestation.self_hash()),
+            .self_hash                   = ctx_.attestation.diagnostic_self_hash(),
+            .self_approved               = ctx_.attestation.is_approved_binary(ctx_.attestation.diagnostic_self_hash()),
             .github_url                  = ctx_.config.github_releases_url,
             .minimum_version             = ctx_.config.minimum_version,
             .manifest_fetch_interval_sec = ctx_.config.manifest_fetch_interval_sec,
@@ -185,7 +185,7 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .our_tier     = tier_name(our_tier),
             .our_platform = std::string(core::tee_platform_name(ctx_.tee.detected_platform())),
             .require_tee  = true,  // always enforced; no longer configurable
-            .binary_hash  = ctx_.attestation.self_hash(),
+            .binary_hash  = ctx_.attestation.diagnostic_self_hash(),
             .peer_count   = peer_states.size(),
         };
         resp.peers.reserve(peer_states.size());

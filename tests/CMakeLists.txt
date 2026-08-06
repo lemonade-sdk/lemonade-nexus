@@ -60,6 +60,12 @@ add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 add_nexus_test(test_snp_evidence      test_snp_evidence.cpp)
 target_compile_definitions(test_snp_evidence PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
+# The links above the AMD signature: the quote under HCLAkPub, the evidence
+# binding, and the IMA replay.
+add_nexus_test(test_evidence_chain    test_evidence_chain.cpp)
+target_compile_definitions(test_evidence_chain PRIVATE
+    NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---

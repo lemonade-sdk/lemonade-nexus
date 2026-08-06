@@ -4,8 +4,10 @@
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/Core/ITeeAttestationProvider.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -56,7 +58,18 @@ public:
     /// identity as well as the nonce + binary hash. Set once the identity is loaded.
     void set_identity_pubkey(const std::string& pubkey_b64);
 
+    /// Record what the startup platform probe proved this host can produce. Only a
+    /// verified snp-vtpm chain makes us emit snp-vtpm evidence; nothing here is
+    /// inferred from hardware presence.
+    void set_evidence_source(security::EvidenceProfile profile,
+                              std::filesystem::path cache_dir,
+                              std::string product);
+
 private:
+    /// The platform we actually produce evidence for. Detection is a fallback that
+    /// reaches no root of trust; a verified profile wins.
+    [[nodiscard]] TeePlatform evidence_platform() const;
+
     void on_start();
     void on_stop();
     [[nodiscard]] static constexpr std::string_view name() { return "TeeAttestationService"; }
@@ -65,7 +78,7 @@ private:
     [[nodiscard]] TeeAttestationReport do_generate_report(const std::array<uint8_t, 32>& nonce);
     [[nodiscard]] bool do_verify_report(const TeeAttestationReport& report,
                                          const std::array<uint8_t, 32>& expected_nonce,
-                                         const std::string& trusted_ak_pubkey);
+                                         const PeerPlatformBinding& binding);
     [[nodiscard]] bool do_platform_available() const;
     [[nodiscard]] TeePlatform do_detected_platform() const;
 
@@ -91,6 +104,13 @@ private:
                                           const std::array<uint8_t, 32>& expected_nonce,
                                           const std::string& trusted_ak_pubkey) const;
 
+    // snp-vtpm backend — Security/EvidenceSnpVtpm, same prover/verifier split.
+    [[nodiscard]] TeeAttestationReport generate_snp_vtpm_report(
+        const std::array<uint8_t, 32>& nonce);
+    [[nodiscard]] bool verify_snp_vtpm_report(const TeeAttestationReport& report,
+                                               const std::array<uint8_t, 32>& expected_nonce,
+                                               const PeerPlatformBinding& binding) const;
+
     crypto::SodiumCryptoService& crypto_;
     storage::FileStorageService& storage_;
     BinaryAttestationService& binary_attestation_;
@@ -99,6 +119,10 @@ private:
     std::optional<TeeAttestationReport> cached_report_;
     std::string report_hash_;       // hex SHA-256 of cached_report_ canonical JSON
     std::string identity_pubkey_b64_; // our enrolled Ed25519 identity (for TPM qualifyingData)
+
+    security::EvidenceProfile evidence_profile_{security::EvidenceProfile::None};
+    std::filesystem::path     evidence_cache_dir_;
+    std::string               evidence_product_{"Milan"};
     mutable std::mutex mutex_;
 };
 

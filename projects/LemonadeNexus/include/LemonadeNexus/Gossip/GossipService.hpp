@@ -339,10 +339,11 @@ private:
     /// Gates the local vote AND our slot in the denominator (one electorate).
     [[nodiscard]] bool self_is_eligible_voter(bool is_admission) const;
 
-    /// The TPM Attestation Key pinned in `pubkey`'s enrolled certificate (base64
-    /// DER SPKI), or "" if the peer has no verified certificate or no AK enrolled.
-    /// This is the trust anchor a TPM quote signature is verified against.
-    [[nodiscard]] std::string certificate_ak_pubkey(const std::string& pubkey) const;
+    /// The platform policy pinned in `pubkey`'s enrolled certificate: binding key,
+    /// expected launch measurement, approved binary. Empty if the peer has no
+    /// certificate that verifies under our root. This is what a quote is checked
+    /// against — nothing the peer sends may substitute for it.
+    [[nodiscard]] core::PeerPlatformBinding certificate_binding(const std::string& pubkey) const;
 
     // Load the server certificate and root pubkey
     void load_server_certificate();

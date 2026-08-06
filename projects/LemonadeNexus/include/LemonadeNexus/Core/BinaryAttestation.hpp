@@ -61,11 +61,25 @@ public:
     BinaryAttestationService(crypto::SodiumCryptoService& crypto,
                               storage::FileStorageService& storage);
 
-    /// Get the SHA-256 hash of our own binary (computed at startup).
-    [[nodiscard]] const std::string& self_hash() const { return self_hash_; }
+    /// SHA-256 of our own executable, read off disk at startup.
+    ///
+    /// DIAGNOSTIC ONLY — this is the measured party choosing its own measurement.
+    /// A modified binary reports whatever it likes, so nothing that decides trust
+    /// may consume it. Use measured_hash() for that.
+    [[nodiscard]] const std::string& diagnostic_self_hash() const { return self_hash_; }
+
+    /// The measurement a remote verifier will accept: what the kernel recorded for
+    /// this executable in the IMA log, anchored in PCR 10 and therefore inside a
+    /// hardware-signed quote.
+    ///
+    /// Empty on any host that cannot measure us (no IMA, no Linux). That is a
+    /// refusal, not a fallback: an absent measurement is a failed measurement, and
+    /// every gate downstream rejects it.
+    [[nodiscard]] const std::string& measured_hash() const { return measured_hash_; }
 
     /// Check if a binary hash matches any signed release manifest.
     /// Respects minimum_version — manifests below the floor are rejected.
+    /// An empty hash is never approved.
     [[nodiscard]] bool is_approved_binary(const std::string& sha256_hex) const;
 
     /// Verify a release manifest's Ed25519 signature against the release signing pubkey.
@@ -115,6 +129,9 @@ private:
     /// Compute SHA-256 of our own executable binary.
     [[nodiscard]] std::string compute_self_hash();
 
+    /// Look up the kernel's IMA measurement of our own executable.
+    [[nodiscard]] std::string compute_measured_hash();
+
     /// Load all manifests from data/releases/*.json
     void load_manifests();
 
@@ -137,6 +154,7 @@ private:
     storage::FileStorageService& storage_;
 
     std::string self_hash_;
+    std::string measured_hash_;
     std::string release_signing_pubkey_b64_;  // base64 Ed25519
     std::vector<ReleaseManifest> manifests_;
     mutable std::mutex mutex_;

@@ -146,6 +146,132 @@ TEST(Onboarding, RequestSignatureRoundTrip) {
     c.stop();
 }
 
+TEST(Onboarding, EveryPlatformEvidenceFieldIsSigned) {
+    // A peer that could edit any of these after signing would be choosing its own
+    // platform policy. Each must break the signature on its own.
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto cand = make_key(c);
+
+    core::ServerAdmissionService::RequestInput in;
+    in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
+    in.server_id      = "berlin-2";
+    in.region         = "eu-west";
+    in.tpm_ak_pubkey  = "QUs=";
+    in.platform_class = "snp-vtpm";
+    in.measurement    = std::string(96, 'a');
+    in.binary_hash    = std::string(64, 'b');
+    in.evidence_sha256 = std::string(64, 'c');
+    in.nonce          = "bm9uY2U=";
+    in.timestamp      = 1751328000;
+
+    const auto msg = core::ServerAdmissionService::canonical_request(in);
+    const auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
+
+    auto breaks = [&](core::ServerAdmissionService::RequestInput edited) {
+        auto m = core::ServerAdmissionService::canonical_request(edited);
+        return !c.ed25519_verify(cand.public_key, std::span<const uint8_t>(m), sig);
+    };
+    { auto e = in; e.platform_class  = "tpm2";              EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.measurement     = std::string(96, 'f'); EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.binary_hash     = std::string(64, 'f'); EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.evidence_sha256 = std::string(64, 'f'); EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.tpm_ak_pubkey   = "b3RoZXI=";           EXPECT_TRUE(breaks(e)); }
+    c.stop();
+}
+
+TEST(Onboarding, RequestCanonicalIsTaggedV2) {
+    // A v1 client signs different bytes; the tag makes that a signature failure
+    // rather than a silently narrower set of fields.
+    core::ServerAdmissionService::RequestInput in;
+    in.nonce = "n";
+    const auto msg = core::ServerAdmissionService::canonical_request(in);
+    const std::string text(msg.begin(), msg.end());
+    EXPECT_NE(text.find("ln-onboard:v2"), std::string::npos);
+    EXPECT_EQ(text.find("ln-onboard:v1"), std::string::npos);
+}
+
+TEST(Onboarding, BallotClaimReproducesTheSignedBytesExactly) {
+    // The claim is what a remote voter re-derives the canonical form from. If the
+    // round trip lost a field, every honest voter would verify different bytes than
+    // the candidate signed — which is how the v1 copies drifted apart.
+    core::ServerAdmissionService::RequestInput in;
+    in.candidate_pubkey = "Y2FuZA==";
+    in.server_id       = "tokyo-1";
+    in.region          = "ap-northeast";
+    in.tpm_ak_pubkey   = "QUs=";
+    in.platform_class  = "snp-vtpm";
+    in.measurement     = std::string(96, 'a');
+    in.binary_hash     = std::string(64, 'b');
+    in.evidence_sha256 = std::string(64, 'c');
+    in.nonce           = "bm9uY2U=";
+    in.timestamp       = 1751328000;
+    in.signature       = "c2ln";
+
+    const auto claim = core::ServerAdmissionService::claim_from_request(in);
+    const auto back  = core::ServerAdmissionService::request_from_claim(claim);
+
+    EXPECT_EQ(core::ServerAdmissionService::canonical_request(in),
+              core::ServerAdmissionService::canonical_request(back));
+    EXPECT_EQ(back.signature, in.signature);
+    // The bundle itself is deliberately absent: it is several kilobytes and the
+    // claim is gossip-replicated. evidence_sha256 carries the binding instead.
+    EXPECT_FALSE(claim.contains("evidence"));
+    EXPECT_FALSE(claim.contains("enrollment_token"));
+}
+
+TEST(Onboarding, CertificatePlatformPolicyIsSigned) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = make_key(c);
+    auto cand = make_key(c);
+
+    gossip::CertIssueParams p;
+    p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    p.server_id            = "snp-node";
+    p.tpm_ak_pubkey        = "QUstUElOTkVE";
+    p.platform_class       = "snp-vtpm";
+    p.expected_measurement = std::string(96, 'a');
+    p.approved_binary_hash = std::string(64, 'b');
+
+    auto cert = gossip::issue_server_certificate(p, c, root.private_key, root.public_key);
+    const auto canonical = gossip::canonical_cert_json(cert);
+    EXPECT_NE(canonical.find("snp-vtpm"), std::string::npos);
+    EXPECT_NE(canonical.find(p.expected_measurement), std::string::npos);
+    EXPECT_NE(canonical.find(p.approved_binary_hash), std::string::npos);
+
+    // Downgrading the policy must invalidate the root signature, or a peer could
+    // strip the measurement pin and present any Azure CVM.
+    auto sig = crypto::from_base64(cert.signature);
+    crypto::Ed25519Signature sigv{};
+    ASSERT_EQ(sig.size(), sigv.size());
+    std::memcpy(sigv.data(), sig.data(), sig.size());
+
+    auto downgraded = cert;
+    downgraded.expected_measurement.clear();
+    const auto tampered = gossip::canonical_cert_json(downgraded);
+    EXPECT_FALSE(c.ed25519_verify(
+        root.public_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(tampered.data()),
+                                 tampered.size()),
+        sigv));
+    c.stop();
+}
+
+TEST(Onboarding, CertificateJsonCarriesThePlatformPolicy) {
+    gossip::ServerCertificate cert;
+    cert.server_pubkey        = "cGs=";
+    cert.platform_class       = "snp-vtpm";
+    cert.expected_measurement = std::string(96, 'a');
+    cert.approved_binary_hash = std::string(64, 'b');
+
+    nlohmann::json j = cert;
+    auto back = j.get<gossip::ServerCertificate>();
+    EXPECT_EQ(back.platform_class, cert.platform_class);
+    EXPECT_EQ(back.expected_measurement, cert.expected_measurement);
+    EXPECT_EQ(back.approved_binary_hash, cert.approved_binary_hash);
+}
+
 TEST(Onboarding, PollSignatureIsDomainSeparated) {
     // poll and ack share a shape but must not be cross-usable (distinct tags).
     auto poll = core::ServerAdmissionService::canonical_poll("ln-onboard-poll:v1", "rid", 42);

@@ -49,7 +49,9 @@ struct SnpVerifyResult {
 /// Verify the AMD signature chain over `report`:
 ///   1. ECDSA P-384 / SHA-384 over the report's first 0x2A0 bytes, under the VCEK.
 ///   2. VCEK -> ASK -> ARK, with the ARK checked against the compiled-in AMD root.
-/// `vcek_der` is the leaf from AMD KDS; `chain_pem` carries ASK and ARK.
+/// `vcek_der` is the leaf from AMD KDS (per chip and TCB, so it cannot be pinned).
+/// `chain_pem` carries ASK and ARK; leave it EMPTY to use the compiled-in pair,
+/// which is the normal case — both are fixed per product.
 [[nodiscard]] SnpVerifyResult verify_snp_signature(const SnpReport& report,
                                                     std::span<const uint8_t> vcek_der,
                                                     std::string_view chain_pem);
@@ -65,5 +67,9 @@ struct SnpVerifyResult {
 
 /// Compiled-in AMD root keys, by product. Never fetched at runtime.
 [[nodiscard]] std::string_view pinned_amd_root(std::string_view product);
+
+/// Compiled-in ASK + ARK for a product, in the order verify_snp_signature wants.
+/// Empty for a product we have no pinned material for.
+[[nodiscard]] std::string pinned_amd_chain(std::string_view product);
 
 }  // namespace nexus::security

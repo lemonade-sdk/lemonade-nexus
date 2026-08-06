@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
+
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
@@ -74,28 +76,35 @@ BinaryAttestationService::BinaryAttestationService(
 // ---------------------------------------------------------------------------
 
 void BinaryAttestationService::on_start() {
-    // Compute our binary hash
     self_hash_ = compute_self_hash();
+    measured_hash_ = compute_measured_hash();
     if (self_hash_.empty()) {
-        //Throw error that there is no binary hash because even again if we are testing,
-        // or are hacked we dont allow it to not exist even without TEE it means this is unnoficial.
         spdlog::warn("[{}] could not compute self binary hash", name());
     } else {
-        spdlog::info("[{}] binary SHA-256: {}", name(), self_hash_);
+        spdlog::info("[{}] binary SHA-256 (diagnostic, self-computed): {}", name(), self_hash_);
+    }
+    if (measured_hash_.empty()) {
+        spdlog::warn("[{}] no IMA measurement of this executable — the running binary cannot be "
+                      "proven to a peer, so this node cannot reach Tier 1", name());
+    } else {
+        spdlog::info("[{}] IMA-measured binary SHA-256: {}", name(), measured_hash_);
+        if (measured_hash_ != self_hash_ && !self_hash_.empty()) {
+            spdlog::warn("[{}] the kernel measured a DIFFERENT hash than we compute for our own "
+                          "file (measured {}, self {}) — the file on disk changed after exec",
+                          name(), measured_hash_.substr(0, 16), self_hash_.substr(0, 16));
+        }
     }
 
     // Load approved manifests from disk
     load_manifests();
 
-    // Check if our own binary is in the approved list
-    if (!self_hash_.empty() && !manifests_.empty()) {
-        if (is_approved_binary(self_hash_)) {
+    const std::string& reportable = measured_hash_.empty() ? self_hash_ : measured_hash_;
+    if (!reportable.empty() && !manifests_.empty()) {
+        if (is_approved_binary(reportable)) {
             spdlog::info("[{}] our binary matches an approved release manifest", name());
         } else {
             spdlog::warn("[{}] our binary does NOT match any approved release manifest "
                           "(this may be a development build)", name());
-            // we need access to a api client to log the attempt of loading a binary that is not approved.
-            //basically we get to log they're IP, MAC, HOST, and any other information we deem "needed" in order to obtain a good blacklist.
         }
     }
 
@@ -194,6 +203,35 @@ std::string BinaryAttestationService::compute_self_hash() {
     return hex;
 }
 
+std::string BinaryAttestationService::compute_measured_hash() {
+    // Unlike compute_self_hash(), the answer here is not ours to choose: the kernel
+    // hashed the file at exec() and extended PCR 10 with the result. Absent IMA
+    // there is no measurement, and we do not substitute one.
+    const auto log_text = security::read_ima_ascii_log();
+    if (log_text.empty()) return {};
+
+    const auto log = security::parse_ima_ascii(log_text);
+    if (!log) {
+        spdlog::warn("[{}] the IMA measurement log did not parse", name());
+        return {};
+    }
+    const auto path = security::running_executable_path();
+    if (path.empty()) return {};
+
+    const auto entry = security::ima_entry_for_path(*log, path);
+    if (!entry) {
+        spdlog::warn("[{}] IMA is enabled but carries no measurement of '{}' — the policy is "
+                      "not measuring executables", name(), path);
+        return {};
+    }
+    if (entry->file_hash_algo != "sha256") {
+        spdlog::warn("[{}] IMA measured '{}' with '{}', not sha256 (boot with ima_hash=sha256)",
+                      name(), path, entry->file_hash_algo);
+        return {};
+    }
+    return entry->file_hash_hex;
+}
+
 // ---------------------------------------------------------------------------
 // Manifest management
 // ---------------------------------------------------------------------------
@@ -286,6 +324,11 @@ bool BinaryAttestationService::add_manifest(const ReleaseManifest& manifest) {
 }
 
 bool BinaryAttestationService::is_approved_binary(const std::string& sha256_hex) const {
+    // An absent measurement is a failed measurement. Without this, a manifest that
+    // happened to carry an empty binary_sha256 would approve every peer that simply
+    // omitted the field.
+    if (sha256_hex.empty()) return false;
+
     std::lock_guard lock(mutex_);
     for (const auto& m : manifests_) {
         if (m.binary_sha256 == sha256_hex) {
@@ -660,7 +703,8 @@ void BinaryAttestationService::on_fetch_tick() {
     auto new_count = fetch_github_manifests();
     if (new_count > 0) {
         // Re-check our own binary against newly fetched manifests
-        if (!self_hash_.empty() && is_approved_binary(self_hash_)) {
+        const std::string& reportable = measured_hash_.empty() ? self_hash_ : measured_hash_;
+        if (!reportable.empty() && is_approved_binary(reportable)) {
             spdlog::info("[{}] our binary now matches an approved manifest after GitHub fetch", name());
         }
     }

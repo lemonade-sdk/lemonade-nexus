@@ -31,6 +31,17 @@ uint64_t now_unix() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+/// Is the pubkey being enrolled this host's own gossip key?
+bool enrolling_self(storage::FileStorageService& storage, const std::string& pubkey_b64) {
+    auto kp_env = storage.read_file("identity", "keypair.json");
+    if (!kp_env) return false;
+    try {
+        return nlohmann::json::parse(kp_env->data).value("public_key", "") == pubkey_b64;
+    } catch (...) {
+        return false;
+    }
+}
+
 int run_print_tpm_ak() {
     auto ak = tpm::export_ak_pubkey_b64();
     if (!ak) {
@@ -52,10 +63,6 @@ int run_verify_platform(const ServerConfig& config) {
     }
     const auto result = security::probe_platform(cfg);
     std::printf("%s", security::format_probe_report(result).c_str());
-    if (result.tier1_capable) {
-        std::printf("\nPin these at enrollment:\n  --enroll-measurement %s\n",
-                    result.measurement_hex.c_str());
-    }
     return result.tier1_capable ? 0 : 1;
 }
 
@@ -152,6 +159,28 @@ int run_enroll(const ServerConfig& config) {
     params.tpm_ak_pubkey     = config.enroll_tpm_ak_pubkey;
     params.expires_at        = 0;
 
+    // Self-enrollment is the only manual path that can prove anything: we are the
+    // host being enrolled, so run the probe and take the policy from what actually
+    // verified. Nothing is typed in — an operator cannot pin a measurement this
+    // host does not produce, and cannot forget to pin one it does.
+    const bool self_enroll = enrolling_self(enroll_storage, config.enroll_server_pubkey);
+    if (self_enroll) {
+        security::PlatformProbeConfig probe_cfg;
+        probe_cfg.cache_dir = std::filesystem::path(config.data_root) / "attestation";
+        const auto probe = security::probe_platform(probe_cfg);
+        if (probe.tier1_capable) {
+            params.platform_class       = std::string(evidence_profile_name(probe.profile));
+            params.tpm_ak_pubkey        = probe.ak_pub_b64;
+            params.expected_measurement = probe.measurement_hex;
+            params.approved_binary_hash = probe.binary_sha256;
+            spdlog::info("Enroll: platform evidence verified — issuing a '{}' certificate",
+                         params.platform_class);
+        } else {
+            spdlog::warn("Enroll: no verified platform evidence on this host ({}) — issuing a "
+                         "Tier-2 certificate", probe.failure);
+        }
+    }
+
     if (!config.enroll_tpm_ek_cert_path.empty()) {
         std::ifstream ek_f(config.enroll_tpm_ek_cert_path);
         if (ek_f) {
@@ -166,13 +195,11 @@ int run_enroll(const ServerConfig& config) {
                          config.enroll_tpm_ek_cert_path);
         }
     }
-    if (params.tpm_ak_pubkey.empty()) {
-        spdlog::warn("Enroll: no platform binding key pinned (--enroll-tpm-ak) — '{}' will be "
-                     "a Tier-2 certificate and can never reach Tier 1.",
+    if (params.platform_class.empty()) {
+        spdlog::warn("Enroll: '{}' gets a Tier-2 certificate. Only a host that proves its own "
+                     "platform can hold a Tier-1 one — self-enroll there, or let it join "
+                     "through --onboard-server, which verifies evidence at admission.",
                      config.enroll_server_id);
-    } else {
-        spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",
-                     params.tpm_ak_pubkey.substr(0, 16), config.enroll_server_id);
     }
 
     auto cert = gossip::issue_server_certificate(params, enroll_crypto, *privkey, *pubkey);
@@ -187,15 +214,9 @@ int run_enroll(const ServerConfig& config) {
     // (gossip, DDNS, and node-id resolution all read it), so only install
     // there when enrolling our own gossip pubkey. Certs issued for other
     // servers go to a sibling file the admin copies to the joining server.
-    std::string cert_file = "server_cert_" + config.enroll_server_id + ".json";
-    if (auto kp_env = enroll_storage.read_file("identity", "keypair.json")) {
-        try {
-            auto kp_j = nlohmann::json::parse(kp_env->data);
-            if (kp_j.value("public_key", "") == config.enroll_server_pubkey) {
-                cert_file = "server_cert.json";
-            }
-        } catch (...) {}
-    }
+    const std::string cert_file = self_enroll
+        ? "server_cert.json"
+        : "server_cert_" + config.enroll_server_id + ".json";
 
     if (!enroll_storage.write_file("identity", cert_file, env)) {
         spdlog::error("Failed to write certificate to {}/identity/{}",
@@ -204,7 +225,7 @@ int run_enroll(const ServerConfig& config) {
     }
 
     spdlog::info("Enrolled server '{}' (pubkey: {})", cert.server_id, cert.server_pubkey);
-    if (cert_file == "server_cert.json") {
+    if (self_enroll) {
         spdlog::info("Enrolled our own gossip pubkey — installed as this server's "
                      "certificate: {}/identity/server_cert.json", config.data_root);
     } else {

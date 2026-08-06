@@ -2,6 +2,9 @@
 
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/IService.hpp>
+#include <LemonadeNexus/Core/TrustTypes.hpp>
+
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <cstdint>
@@ -38,6 +41,13 @@ public:
         std::string region;
         std::string tpm_ak_pubkey;      // optional (Tier1-capable cert)
         std::string tpm_ek_cert;        // optional
+        // Platform evidence the candidate claimed and we verified before issuing.
+        std::string platform_class;     // "", "tpm2", "snp-vtpm"
+        std::string measurement;        // hex SNP launch measurement
+        std::string binary_hash;        // hex SHA-256, IMA-confirmed at approval
+        std::string evidence_sha256;    // hex; signed by the candidate, binds `evidence`
+        std::string evidence;           // the bundle itself — stored, never gossiped
+        std::string challenge_nonce;    // the nonce the evidence quote is bound to
         std::string source_ip;
         State       state{State::Pending};
         uint64_t    created_at{0};
@@ -90,6 +100,14 @@ public:
         std::string region;
         std::string tpm_ak_pubkey;
         std::string tpm_ek_cert;
+        std::string platform_class;
+        std::string measurement;
+        std::string binary_hash;
+        /// Hex SHA-256 of `evidence`. The digest rather than the bundle is what the
+        /// candidate signs, so the several-kilobyte bundle never has to travel in
+        /// the gossip-replicated ballot claim while staying bound to the signature.
+        std::string evidence_sha256;
+        std::string evidence;     // full bundle, HTTP only; checked against the digest
         std::string nonce;        // echoed from the challenge
         uint64_t    timestamp{0};
         std::string signature;    // base64 Ed25519 over the canonical request
@@ -145,8 +163,18 @@ public:
                                  bool supersede);
     [[nodiscard]] Result deny(const std::string& request_id, const std::string& reason);
 
-    /// Canonical bytes a candidate signs for create_request (tag "ln-onboard:v1").
+    /// Canonical bytes a candidate signs for create_request (tag "ln-onboard:v2").
+    /// The ONE definition: the onboarding client and every ballot voter call this
+    /// rather than open-coding the field order, which is how v1 drifted.
     [[nodiscard]] static std::vector<uint8_t> canonical_request(const RequestInput& in);
+
+    /// Rebuild the signed input from a gossiped ballot claim, so a voter recomputes
+    /// exactly the bytes the candidate signed.
+    [[nodiscard]] static RequestInput request_from_claim(const nlohmann::json& claim);
+
+    /// The claim a ballot carries. Excludes the evidence bundle (too large for
+    /// gossip) and the enrollment token (a bearer credential).
+    [[nodiscard]] static nlohmann::json claim_from_request(const RequestInput& in);
     /// Canonical bytes a candidate signs for status/ack (tag "ln-onboard-poll:v1").
     [[nodiscard]] static std::vector<uint8_t> canonical_poll(const std::string& tag,
                                                              const std::string& request_id,
@@ -158,6 +186,11 @@ private:
     void load();
     [[nodiscard]] Result do_approve_locked(Admission& a, const std::string& decided_by,
                                            bool supersede);
+    /// Check the platform evidence a candidate submitted and derive the policy to
+    /// bake into its certificate. nullopt = refuse to issue; the reason lands in
+    /// `a.decision_reason`.
+    [[nodiscard]] std::optional<PeerPlatformBinding> verify_admission_evidence(
+        Admission& a) const;
     [[nodiscard]] bool verify_sig(const std::string& pubkey_b64,
                                   const std::vector<uint8_t>& msg,
                                   const std::string& sig_b64) const;

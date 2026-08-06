@@ -6,6 +6,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
+#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <spdlog/spdlog.h>
@@ -64,15 +65,52 @@ ServerAdmissionService::ServerAdmissionService(
 }
 
 std::vector<uint8_t> ServerAdmissionService::canonical_request(const RequestInput& in) {
+    // The tag is versioned so a v1 client fails loudly on signature verification
+    // instead of quietly signing a different set of fields.
     std::vector<uint8_t> buf;
-    put_lp(buf, "ln-onboard:v1");
+    put_lp(buf, "ln-onboard:v2");
     put_lp(buf, in.nonce);
     put_lp(buf, in.candidate_pubkey);
     put_lp(buf, in.server_id);
     put_lp(buf, in.region);
     put_lp(buf, in.tpm_ak_pubkey);
+    put_lp(buf, in.platform_class);
+    put_lp(buf, in.measurement);
+    put_lp(buf, in.binary_hash);
+    put_lp(buf, in.evidence_sha256);
     put_lp(buf, std::to_string(in.timestamp));
     return buf;
+}
+
+nlohmann::json ServerAdmissionService::claim_from_request(const RequestInput& in) {
+    return {{"candidate_pubkey", in.candidate_pubkey},
+            {"server_id",        in.server_id},
+            {"region",           in.region},
+            {"tpm_ak_pubkey",    in.tpm_ak_pubkey},
+            {"platform_class",   in.platform_class},
+            {"measurement",      in.measurement},
+            {"binary_hash",      in.binary_hash},
+            {"evidence_sha256",  in.evidence_sha256},
+            {"nonce",            in.nonce},
+            {"timestamp",        in.timestamp},
+            {"signature",        in.signature}};
+}
+
+ServerAdmissionService::RequestInput ServerAdmissionService::request_from_claim(
+        const nlohmann::json& claim) {
+    RequestInput in;
+    in.candidate_pubkey = claim.value("candidate_pubkey", std::string{});
+    in.server_id        = claim.value("server_id", std::string{});
+    in.region           = claim.value("region", std::string{});
+    in.tpm_ak_pubkey    = claim.value("tpm_ak_pubkey", std::string{});
+    in.platform_class   = claim.value("platform_class", std::string{});
+    in.measurement      = claim.value("measurement", std::string{});
+    in.binary_hash      = claim.value("binary_hash", std::string{});
+    in.evidence_sha256  = claim.value("evidence_sha256", std::string{});
+    in.nonce            = claim.value("nonce", std::string{});
+    in.timestamp        = claim.value("timestamp", uint64_t{0});
+    in.signature        = claim.value("signature", std::string{});
+    return in;
 }
 
 std::vector<uint8_t> ServerAdmissionService::canonical_poll(
@@ -202,6 +240,16 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     nonces_.erase(in.candidate_pubkey);
     nonce_values_.erase(in.candidate_pubkey);
 
+    // The signature covers evidence_sha256, not the bundle, so tie the two here or
+    // the bundle we store and later verify is not the one that was signed for.
+    if (!in.evidence.empty() || !in.evidence_sha256.empty()) {
+        const auto digest = crypto::to_hex(crypto_.sha256(
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(in.evidence.data()),
+                                     in.evidence.size())));
+        if (in.evidence.empty() || digest != in.evidence_sha256)
+            return {false, 400, "evidence does not match the signed evidence_sha256", ""};
+    }
+
     // Denied-pubkey cooldown.
     if (auto it = denied_until_.find(in.candidate_pubkey);
         it != denied_until_.end() && it->second > now)
@@ -283,10 +331,14 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         auto diff = [&changed](const char* f, const std::string& a, const std::string& b) {
             if (a != b) changed += changed.empty() ? f : std::string(", ") + f;
         };
-        diff("server_id",     cur.server_id,     in.server_id);
-        diff("region",        cur.region,        in.region);
-        diff("tpm_ak_pubkey", cur.tpm_ak_pubkey, in.tpm_ak_pubkey);
-        diff("tpm_ek_cert",   cur.tpm_ek_cert,   in.tpm_ek_cert);
+        diff("server_id",       cur.server_id,       in.server_id);
+        diff("region",          cur.region,          in.region);
+        diff("tpm_ak_pubkey",   cur.tpm_ak_pubkey,   in.tpm_ak_pubkey);
+        diff("tpm_ek_cert",     cur.tpm_ek_cert,     in.tpm_ek_cert);
+        diff("platform_class",  cur.platform_class,  in.platform_class);
+        diff("measurement",     cur.measurement,     in.measurement);
+        diff("binary_hash",     cur.binary_hash,     in.binary_hash);
+        diff("evidence_sha256", cur.evidence_sha256, in.evidence_sha256);
         if (!changed.empty()) {
             spdlog::warn("[ServerAdmissionService] rejected mutation of pending admission {} "
                          "(changed: {})", request_id, changed);
@@ -322,6 +374,12 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.region           = in.region;
     a.tpm_ak_pubkey    = in.tpm_ak_pubkey;
     a.tpm_ek_cert      = in.tpm_ek_cert;
+    a.platform_class   = in.platform_class;
+    a.measurement      = in.measurement;
+    a.binary_hash      = in.binary_hash;
+    a.evidence_sha256  = in.evidence_sha256;
+    a.evidence         = in.evidence;
+    a.challenge_nonce  = in.nonce;
     a.source_ip        = in.source_ip;
     a.expires_at       = now + cfg_.request_ttl_sec;
     if (!is_existing) {
@@ -383,11 +441,7 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     // deliberately excluded — the claim is gossip-replicated and must never
     // carry token material.
     if (!below_vote) {
-        json claim{{"candidate_pubkey", in.candidate_pubkey}, {"server_id", in.server_id},
-                   {"region", in.region}, {"tpm_ak_pubkey", in.tpm_ak_pubkey},
-                   {"nonce", in.nonce}, {"timestamp", in.timestamp},
-                   {"signature", in.signature}};
-        a.ballot_claim_json = claim.dump();
+        a.ballot_claim_json = claim_from_request(in).dump();
     }
 
     persist();
@@ -516,11 +570,24 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
         } catch (...) {}
     }
 
+    // Verify the evidence BEFORE minting, so a Tier-1-class certificate is never
+    // issued on the strength of an unchecked claim. A candidate that presents no
+    // evidence gets a Tier-2 certificate rather than a rejection — that path is
+    // still how a plain server joins.
+    auto binding = verify_admission_evidence(a);
+    if (!binding) {
+        return {false, 403, "platform evidence did not verify: " + a.decision_reason,
+                a.request_id};
+    }
+
     gossip::CertIssueParams params;
     params.server_pubkey_b64 = a.candidate_pubkey;
     params.server_id         = a.server_id;
-    params.tpm_ak_pubkey     = a.tpm_ak_pubkey;
+    params.tpm_ak_pubkey     = binding->ak_pubkey;
     params.tpm_ek_cert       = a.tpm_ek_cert;
+    params.platform_class    = binding->platform_class;
+    params.expected_measurement = binding->expected_measurement;
+    params.approved_binary_hash = binding->approved_binary_hash;
     params.expires_at        = 0;  // no expiry (renewal machinery is a follow-up)
 
     auto cert = gossip::issue_server_certificate(params, crypto_, *root_sk, *root_pk);
@@ -530,10 +597,62 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
     a.decided_by       = decided_by;
     ever_approved_     = true;
 
-    spdlog::info("[ServerAdmissionService] approved '{}' (server_id '{}', by {}, tier {})",
+    spdlog::info("[ServerAdmissionService] approved '{}' (server_id '{}', by {}, platform '{}')",
                  a.request_id, a.server_id, decided_by,
-                 a.tpm_ak_pubkey.empty() ? "2" : "1-capable");
+                 binding->platform_class.empty() ? "tier-2" : binding->platform_class);
     return {true, 200, "", a.request_id};
+}
+
+std::optional<PeerPlatformBinding> ServerAdmissionService::verify_admission_evidence(
+        Admission& a) const {
+    PeerPlatformBinding binding;
+
+    if (a.platform_class.empty() && a.evidence.empty()) {
+        binding.ak_pubkey = a.tpm_ak_pubkey;   // legacy tpm2 enrollment, admin-validated
+        if (!binding.ak_pubkey.empty()) binding.platform_class = "tpm2";
+        return binding;
+    }
+
+    if (a.platform_class != "snp-vtpm") {
+        a.decision_reason = "unknown platform_class '" + a.platform_class + "'";
+        return std::nullopt;
+    }
+
+    auto evidence = security::decode_snp_vtpm_evidence(a.evidence);
+    if (!evidence) {
+        a.decision_reason = "the snp-vtpm evidence bundle did not decode";
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> identity;
+    std::vector<uint8_t> nonce;
+    try {
+        identity = crypto::from_base64(a.candidate_pubkey);
+        nonce    = crypto::from_base64(a.challenge_nonce);
+    } catch (...) {
+        a.decision_reason = "candidate key or challenge nonce is not base64";
+        return std::nullopt;
+    }
+
+    // The quote is bound to the challenge nonce this admission was issued, so an
+    // evidence bundle captured from another node's join cannot be replayed here.
+    security::EvidenceRequirements req;
+    req.expected_measurement_hex = a.measurement;
+    auto verdict = security::verify_snp_vtpm_evidence(*evidence, nonce, identity, req);
+    if (!verdict.ok) {
+        a.decision_reason = verdict.failure;
+        return std::nullopt;
+    }
+    if (verdict.binary_sha256 != a.binary_hash) {
+        a.decision_reason = "the claimed binary hash is not the one the IMA log records";
+        return std::nullopt;
+    }
+
+    binding.platform_class       = "snp-vtpm";
+    binding.ak_pubkey            = verdict.ak_spki_b64;
+    binding.expected_measurement = verdict.measurement_hex;
+    binding.approved_binary_hash = verdict.binary_sha256;
+    return binding;
 }
 
 std::optional<ServerAdmissionService::Admission> ServerAdmissionService::status(
@@ -642,6 +761,9 @@ void ServerAdmissionService::persist() {
             {"request_id", a.request_id}, {"candidate_pubkey", a.candidate_pubkey},
             {"server_id", a.server_id}, {"region", a.region},
             {"tpm_ak_pubkey", a.tpm_ak_pubkey}, {"tpm_ek_cert", a.tpm_ek_cert},
+            {"platform_class", a.platform_class}, {"measurement", a.measurement},
+            {"binary_hash", a.binary_hash}, {"evidence_sha256", a.evidence_sha256},
+            {"evidence", a.evidence}, {"challenge_nonce", a.challenge_nonce},
             {"source_ip", a.source_ip}, {"state", static_cast<int>(a.state)},
             {"created_at", a.created_at}, {"expires_at", a.expires_at},
             {"issued_cert_json", a.issued_cert_json},
@@ -675,6 +797,12 @@ void ServerAdmissionService::load() {
             a.region           = j.value("region", "");
             a.tpm_ak_pubkey    = j.value("tpm_ak_pubkey", "");
             a.tpm_ek_cert      = j.value("tpm_ek_cert", "");
+            a.platform_class   = j.value("platform_class", "");
+            a.measurement      = j.value("measurement", "");
+            a.binary_hash      = j.value("binary_hash", "");
+            a.evidence_sha256  = j.value("evidence_sha256", "");
+            a.evidence         = j.value("evidence", "");
+            a.challenge_nonce  = j.value("challenge_nonce", "");
             a.source_ip        = j.value("source_ip", "");
             a.state            = static_cast<State>(j.value("state", 0));
             a.created_at       = j.value("created_at", 0ULL);

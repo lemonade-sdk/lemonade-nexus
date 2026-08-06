@@ -222,7 +222,9 @@ done:
     return out;
 }
 
-// PCR selection: SHA-256 bank, PCRs 0,1,7,23.
+// PCR selection: SHA-256 bank, PCRs 0,1,7 (measured boot) and 10 (IMA). PCR 23
+// is deliberately absent — it is resettable by the guest, so quoting it measures
+// nothing.
 TPML_PCR_SELECTION pcr_selection() {
     TPML_PCR_SELECTION sel{};
     sel.count = 1;
@@ -234,7 +236,7 @@ TPML_PCR_SELECTION pcr_selection() {
     set_bit(0);
     set_bit(1);
     set_bit(7);
-    set_bit(23);
+    set_bit(10);
     return sel;
 }
 
@@ -303,7 +305,7 @@ TeeAttestationReport TeeAttestationService::generate_tpm_report(
     report.platform = TeePlatform::Tpm2;
     report.nonce = nonce;
     report.timestamp = now_sec();
-    report.binary_hash = binary_attestation_.self_hash();
+    report.binary_hash = binary_attestation_.measured_hash();
 
 #ifdef LEMONADE_HAVE_TPM_FAPI
     // qualifyingData = SHA256(nonce ‖ server_pubkey ‖ binary_hash). The hardware
@@ -333,18 +335,12 @@ TeeAttestationReport TeeAttestationService::generate_tpm_report(
     if (ak == ESYS_TR_NONE) return report;
     report.ak_pubkey = ak_spki;  // hint only; the verifier uses the cert-pinned AK
 
-    // Reflect the binary measurement into application PCR 23 (reset then extend so
-    // it is measured, not merely self-declared). Reset may be denied by locality
-    // policy — best-effort; the cryptographic binding is via qualifyingData.
-    if (bin_meas.size() == 32) {
-        Esys_PCR_Reset(sess.esys, ESYS_TR_PCR23, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE);
-        TPML_DIGEST_VALUES digests{};
-        digests.count = 1;
-        digests.digests[0].hashAlg = TPM2_ALG_SHA256;
-        std::memcpy(digests.digests[0].digest.sha256, bin_meas.data(), 32);
-        Esys_PCR_Extend(sess.esys, ESYS_TR_PCR23, ESYS_TR_PASSWORD, ESYS_TR_NONE,
-                        ESYS_TR_NONE, &digests);
-    }
+    // There used to be a PCR 23 reset+extend here, writing our own binary hash
+    // into a resettable application PCR and quoting it. It is gone on purpose: a
+    // measurement the measured party chooses, placed in a PCR the measured party
+    // can reset, is not a measurement — and one that LOOKS checked is worse than
+    // none. The real measurement is the kernel's IMA entry in PCR 10, which the
+    // guest cannot rewind (see Security/MeasurementIma and Security/EvidenceSnpVtpm).
 
     // Quote.
     TPM2B_DATA qualifying{};

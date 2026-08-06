@@ -194,6 +194,38 @@ TEST(TrustTypesTest, CanonicalAttestationJsonIsDeterministic) {
     EXPECT_EQ(a.find("\"signature\""), std::string::npos);
 }
 
+// The evidence bundle carries the IMA log and so has no bounded size; it cannot be
+// assumed to fit a datagram. Binding it by DIGEST means the identity signature
+// stays over a small fixed value while still naming exactly one bundle, so the
+// bundle can travel separately without weakening anything.
+TEST(TrustTypesTest, CanonicalAttestationBindsEvidenceByDigestNotByValue) {
+    core::TeeAttestationReport r;
+    r.server_pubkey = "pk";
+    r.evidence_sha256 = std::string(64, 'a');
+    r.evidence = "{\"profile\":\"snp-vtpm\"}";
+
+    const auto with_bundle = core::canonical_attestation_json(r);
+
+    // Dropping the bulk must NOT change what was signed.
+    auto without = r;
+    without.evidence.clear();
+    EXPECT_EQ(core::canonical_attestation_json(without), with_bundle);
+
+    // Changing which bundle is meant MUST change it.
+    auto other = r;
+    other.evidence_sha256 = std::string(64, 'b');
+    EXPECT_NE(core::canonical_attestation_json(other), with_bundle);
+
+    EXPECT_EQ(with_bundle.find("snp-vtpm"), std::string::npos);
+}
+
+TEST(TrustTypesTest, InlineEvidenceBudgetLeavesRoomInAGossipDatagram) {
+    // GossipService::send_packet drops anything over 65000 bytes outright, and
+    // payload_length is a uint16_t, so the budget has to leave room for the rest
+    // of the report as well as avoid IP fragmentation on ordinary paths.
+    EXPECT_LT(core::kMaxInlineEvidenceBytes, 65000u);
+}
+
 TEST(TrustTypesTest, CanonicalTokenJsonIsDeterministic) {
     core::AttestationToken t;
     t.server_pubkey = "pk";
@@ -292,21 +324,21 @@ TEST_F(TeeAttestationTest, GenerateTokenProducesSignedToken) {
     EXPECT_EQ(token.server_pubkey, crypto::to_base64(kp.public_key));
     EXPECT_GT(token.timestamp, 0u);
     EXPECT_FALSE(token.signature.empty());
-    EXPECT_FALSE(token.binary_hash.empty());
+    // binary_hash carries the IMA measurement, so it is empty wherever the kernel
+    // does not measure us. It is deliberately NOT backfilled from our own hash of
+    // our own file — see BinaryAttestationService::diagnostic_self_hash.
+    EXPECT_EQ(token.binary_hash, attestation->measured_hash());
 }
 
-TEST_F(TeeAttestationTest, VerifyOwnTokenSucceeds) {
-    // If we have TEE hardware, our own token should verify
-    // If not, the token will have platform=None and verification should fail
+TEST_F(TeeAttestationTest, VerifyOwnTokenFailsWithoutAnApprovedMeasurement) {
+    // A token is not self-validating: it carries a binary measurement, and
+    // verification requires that measurement to be in a signed release manifest.
+    // No manifest is registered here, and on a host without IMA there is no
+    // measurement at all — either way the answer is no.
     auto kp = crypto->ed25519_keygen();
     auto token = tee->generate_token(kp);
 
-    if (tee->platform_available()) {
-        EXPECT_TRUE(tee->verify_token(token));
-    } else {
-        // Without TEE, token has platform=None → verification fails (by design)
-        EXPECT_FALSE(tee->verify_token(token));
-    }
+    EXPECT_FALSE(tee->verify_token(token));
 }
 
 TEST_F(TeeAttestationTest, VerifyTokenRejectsExpired) {

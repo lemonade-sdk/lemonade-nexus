@@ -1,11 +1,16 @@
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 
+#include <LemonadeNexus/Core/TrustTypes.hpp>
+#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 #include <iterator>
+#include <random>
 #include <span>
 #include <vector>
 
@@ -46,10 +51,37 @@ PlatformDiagnostics gather_diagnostics() {
     return d;
 }
 
-/// Read the paravisor's attestation blob out of vTPM NV. Unauthenticated by design
-/// on Azure — anything in the guest that can open the TPM can read it, which is
-/// exactly why the blob alone is not proof of anything.
-std::vector<uint8_t> read_hcl_from_nv() {
+/// VCEK is per chip and per TCB, so cache it under both.
+fs::path vcek_cache_path(const fs::path& cache_dir, const SnpReport& r) {
+    const auto& t = r.reported_tcb;
+    return cache_dir / "vcek" /
+           (r.chip_id_hex().substr(0, 32) + "-" + std::to_string(t.bootloader) + "." +
+            std::to_string(t.tee) + "." + std::to_string(t.snp) + "." +
+            std::to_string(t.microcode) + ".der");
+}
+
+PlatformProbeResult no(PlatformProbeResult r, std::string why) {
+    r.tier1_capable = false;
+    r.failure = std::move(why);
+    return r;
+}
+
+}  // namespace
+
+std::string_view evidence_profile_name(EvidenceProfile p) {
+    switch (p) {
+        case EvidenceProfile::SnpVtpm:   return "snp-vtpm";
+        case EvidenceProfile::SnpDirect: return "snp-direct";
+        case EvidenceProfile::None:      break;
+    }
+    return "none";
+}
+
+// ---------------------------------------------------------------------------
+// Platform I/O
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> read_hcl_nv_blob() {
 #if defined(__linux__) && defined(LEMONADE_HAVE_TPM_FAPI)
     TSS2_TCTI_CONTEXT* tcti = nullptr;
     ESYS_CONTEXT* esys = nullptr;
@@ -109,24 +141,16 @@ std::vector<uint8_t> read_hcl_from_nv() {
 #endif
 }
 
-/// VCEK is per chip and per TCB, so cache it under both.
-fs::path vcek_cache_path(const PlatformProbeConfig& cfg, const SnpReport& r) {
-    const auto& t = r.reported_tcb;
-    return cfg.cache_dir / "vcek" /
-           (r.chip_id_hex().substr(0, 32) + "-" + std::to_string(t.bootloader) + "." +
-            std::to_string(t.tee) + "." + std::to_string(t.snp) + "." +
-            std::to_string(t.microcode) + ".der");
-}
-
-std::vector<uint8_t> fetch_vcek(const PlatformProbeConfig& cfg, const SnpReport& r) {
-    const auto cached = vcek_cache_path(cfg, r);
+std::vector<uint8_t> fetch_vcek(const fs::path& cache_dir, const SnpReport& r,
+                                 const std::string& product, bool allow_network) {
+    const auto cached = vcek_cache_path(cache_dir, r);
     if (auto bytes = read_file(cached); !bytes.empty()) {
         spdlog::debug("[probe] using cached VCEK {}", cached.string());
         return bytes;
     }
-    if (!cfg.allow_network) return {};
+    if (!allow_network) return {};
 
-    const std::string url = vcek_kds_url(r, cfg.product);
+    const std::string url = vcek_kds_url(r, product);
     const auto path_start = url.find('/', url.find("//") + 2);
     if (path_start == std::string::npos) return {};
 
@@ -152,21 +176,20 @@ std::vector<uint8_t> fetch_vcek(const PlatformProbeConfig& cfg, const SnpReport&
     }
 }
 
-/// ASK + ARK, cached next to the VCEK. Trust does not come from this fetch — the
-/// verifier re-checks the root against the compiled-in one.
-std::string fetch_amd_chain(const PlatformProbeConfig& cfg) {
-    const auto cached = cfg.cache_dir / "vcek" / (cfg.product + "-cert-chain.pem");
+std::string fetch_amd_chain(const fs::path& cache_dir, const std::string& product,
+                             bool allow_network) {
+    const auto cached = cache_dir / "vcek" / (product + "-cert-chain.pem");
     if (auto bytes = read_file(cached); !bytes.empty()) {
         return std::string(bytes.begin(), bytes.end());
     }
-    if (!cfg.allow_network) return {};
+    if (!allow_network) return {};
 
     try {
         httplib::SSLClient client("kdsintf.amd.com", 443);
         client.set_connection_timeout(10);
         client.set_read_timeout(30);
         client.set_follow_location(true);
-        auto res = client.Get("/vcek/v1/" + cfg.product + "/cert_chain");
+        auto res = client.Get("/vcek/v1/" + product + "/cert_chain");
         if (!res || res->status != 200) {
             spdlog::warn("[probe] AMD KDS returned {} for the certificate chain",
                           res ? std::to_string(res->status) : "no response");
@@ -181,80 +204,96 @@ std::string fetch_amd_chain(const PlatformProbeConfig& cfg) {
     }
 }
 
-PlatformProbeResult no(PlatformProbeResult r, std::string why) {
-    r.tier1_capable = false;
-    r.failure = std::move(why);
-    return r;
-}
-
-}  // namespace
-
-std::string_view evidence_profile_name(EvidenceProfile p) {
-    switch (p) {
-        case EvidenceProfile::SnpVtpm:   return "snp-vtpm";
-        case EvidenceProfile::SnpDirect: return "snp-direct";
-        case EvidenceProfile::None:      break;
-    }
-    return "none";
-}
+// ---------------------------------------------------------------------------
+// The probe
+// ---------------------------------------------------------------------------
 
 PlatformProbeResult probe_platform(const PlatformProbeConfig& cfg) {
     PlatformProbeResult out;
     out.diagnostics = gather_diagnostics();
 
-    // 1. Obtain the platform's attestation blob.
-    std::vector<uint8_t> blob;
+    // Offline mode: a blob captured elsewhere, verified as far as a blob can be.
+    // No quote is possible, so this can confirm the platform was genuine but can
+    // never make THIS host Tier-1 capable.
     if (!cfg.hcl_blob_override.empty()) {
-        blob = read_file(cfg.hcl_blob_override);
+        const auto blob = read_file(cfg.hcl_blob_override);
         if (blob.empty()) {
             return no(std::move(out),
                       "could not read the HCL blob from " + cfg.hcl_blob_override.string());
         }
-    } else {
-        blob = read_hcl_from_nv();
-        if (blob.empty()) {
-            return no(std::move(out),
-                      "no platform evidence source: vTPM NV index 0x01400001 is absent or "
-                      "unreadable, and no /dev/sev-guest backend is implemented yet");
+        auto hcl = parse_hcl_blob(blob);
+        if (!hcl) return no(std::move(out), "the attestation blob is malformed or inconsistent");
+        out.profile = EvidenceProfile::SnpVtpm;
+
+        auto vcek = fetch_vcek(cfg.cache_dir, hcl->snp, cfg.product, cfg.allow_network);
+        if (vcek.empty()) {
+            return no(std::move(out), "no VCEK for this chip and TCB (AMD KDS unreachable and "
+                                       "nothing cached), so the report cannot be verified");
         }
+        if (pinned_amd_root(cfg.product).empty()) {
+            return no(std::move(out), "no compiled-in AMD root for product '" + cfg.product + "'");
+        }
+        const std::string chain = fetch_amd_chain(cfg.cache_dir, cfg.product, cfg.allow_network);
+        if (chain.empty()) {
+            return no(std::move(out), "no AMD certificate chain available for this product");
+        }
+        if (auto sig = verify_snp_signature(hcl->snp, vcek, chain); !sig.ok) {
+            return no(std::move(out), "AMD signature check failed: " + sig.failure);
+        }
+        if (auto pol = verify_snp_policy(hcl->snp, cfg.policy); !pol.ok) {
+            return no(std::move(out), "platform policy check failed: " + pol.failure);
+        }
+
+        out.measurement_hex = hcl->snp.measurement_hex();
+        out.chip_id_hex     = hcl->snp.chip_id_hex();
+        out.tcb             = hcl->snp.reported_tcb.to_string();
+        out.policy_summary  = snp_report_summary(hcl->snp);
+        out.ak_pub_b64      = rsa_spki_b64(hcl->ak.modulus, hcl->ak.exponent);
+        return no(std::move(out),
+                  "verified a captured blob, not this host: no fresh quote was produced, so "
+                  "this run grants no Tier-1 capability");
     }
 
-    // 2. Structure, and the AMD-signed binding to the vTPM AK.
-    auto hcl = parse_hcl_blob(blob);
-    if (!hcl) return no(std::move(out), "the attestation blob is malformed or inconsistent");
+    // Live: produce real evidence against a random nonce, then verify it through
+    // exactly the path a remote peer would use. Anything less is detection.
+    std::array<uint8_t, 32> nonce{};
+    {
+        std::random_device rd;
+        for (auto& b : nonce) b = static_cast<uint8_t>(rd() & 0xFF);
+    }
+
+    EvidenceProduceConfig prod;
+    prod.cache_dir       = cfg.cache_dir;
+    prod.product         = cfg.product;
+    prod.allow_network   = cfg.allow_network;
+    prod.identity_pubkey = cfg.identity_pubkey;
+
+    std::string why;
+    auto evidence = produce_snp_vtpm_evidence(prod, nonce, &why);
+    if (!evidence) {
+        return no(std::move(out), why.empty() ? "no platform evidence source on this host" : why);
+    }
     out.profile = EvidenceProfile::SnpVtpm;
+    out.evidence_bytes = encode_snp_vtpm_evidence(*evidence).size();
 
-    // 3. The AMD signature. Until this passes we have only parsed a blob that
-    //    claims to be from AMD.
-    auto vcek = fetch_vcek(cfg, hcl->snp);
-    if (vcek.empty()) {
-        return no(std::move(out), "no VCEK for this chip and TCB (AMD KDS unreachable and "
-                                   "nothing cached), so the report cannot be verified");
-    }
-    if (pinned_amd_root(cfg.product).empty()) {
-        return no(std::move(out), "no compiled-in AMD root for product '" + cfg.product + "'");
-    }
-    // The ASK is an intermediate, so it is safe to transport: verify_snp_signature
-    // independently requires the chain's root to be the compiled-in ARK, so a
-    // spoofed KDS buys nothing.
-    const std::string chain = fetch_amd_chain(cfg);
-    if (chain.empty()) {
-        return no(std::move(out), "no AMD certificate chain available for this product");
-    }
-    if (auto sig = verify_snp_signature(hcl->snp, vcek, chain); !sig.ok) {
-        return no(std::move(out), "AMD signature check failed: " + sig.failure);
-    }
+    EvidenceRequirements req;
+    req.policy                  = cfg.policy;
+    req.expected_measurement_hex = cfg.policy.expected_measurement_hex;
+    req.require_ima             = cfg.require_ima;
 
-    // 4. Guest policy: this is where "pause the VM and dump memory" is ruled out.
-    if (auto pol = verify_snp_policy(hcl->snp, cfg.policy); !pol.ok) {
-        return no(std::move(out), "platform policy check failed: " + pol.failure);
-    }
+    auto verdict = verify_snp_vtpm_evidence(*evidence, nonce, cfg.identity_pubkey, req);
+    out.measurement_hex = verdict.measurement_hex;
+    out.ak_pub_b64      = verdict.ak_spki_b64;
+    out.binary_sha256   = verdict.binary_sha256;
+    out.chip_id_hex     = verdict.chip_id_hex;
+    out.tcb             = verdict.tcb;
+    out.policy_summary  = verdict.report_summary;
+    out.ima_sha1_bank   = verdict.ima_replayed_in_sha1_bank;
+    out.quote_verified  = verdict.quote_verified;
+    if (!verdict.ok) return no(std::move(out), verdict.failure);
 
+    out.binary_measured = !verdict.binary_sha256.empty();
     out.tier1_capable   = true;
-    out.measurement_hex = hcl->snp.measurement_hex();
-    out.chip_id_hex     = hcl->snp.chip_id_hex();
-    out.tcb             = hcl->snp.reported_tcb.to_string();
-    out.policy_summary  = snp_report_summary(hcl->snp);
     return out;
 }
 
@@ -266,7 +305,20 @@ std::string format_probe_report(const PlatformProbeResult& r) {
     s += evidence_profile_name(r.profile);
     s += ")\n";
     if (!r.tier1_capable) s += "  reason:      " + r.failure + "\n";
+    s += std::string("  fresh quote: ") + (r.quote_verified ? "yes" : "no") + "\n";
     if (!r.measurement_hex.empty()) s += "  measurement: " + r.measurement_hex + "\n";
+    if (!r.ak_pub_b64.empty())      s += "  binding key: " + r.ak_pub_b64 + "\n";
+    if (!r.binary_sha256.empty())   s += "  binary (IMA):" + r.binary_sha256 + "\n";
+    if (r.evidence_bytes > 0) {
+        s += "  evidence:    " + std::to_string(r.evidence_bytes) + " bytes";
+        s += r.evidence_bytes > core::kMaxInlineEvidenceBytes
+                 ? "  (OVER the inline gossip budget — needs out-of-band retrieval)\n"
+                 : "\n";
+    }
+    if (r.ima_sha1_bank) {
+        s += "  WARNING: the IMA log replays only in the SHA-1 PCR bank, so log integrity "
+             "rests on SHA-1.\n           Boot the guest with ima_template_hash_algo=sha256.\n";
+    }
     if (!r.chip_id_hex.empty())     s += "  chip id:     " + r.chip_id_hex + "\n";
     if (!r.tcb.empty())             s += "  tcb:         " + r.tcb + "\n";
     if (!r.policy_summary.empty())  s += "  report:      " + r.policy_summary + "\n";

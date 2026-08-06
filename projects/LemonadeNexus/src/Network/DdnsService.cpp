@@ -132,7 +132,7 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
     // Build the request
     json request;
     request["server_certificate"] = our_cert_json;
-    request["binary_hash"] = attestation_.self_hash();
+    request["binary_hash"] = attestation_.measured_hash();
 
     // Sign the request to prove we own the private key
     auto request_str = request.dump();

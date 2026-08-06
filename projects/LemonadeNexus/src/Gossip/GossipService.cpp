@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/MisbehaviorDetector.hpp>
+#include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 
@@ -1228,6 +1229,18 @@ void GossipService::load_server_certificate() {
         } catch (const std::exception& e) {
             spdlog::warn("[{}] failed to parse server certificate: {}", name(), e.what());
         }
+        // A certificate written before platform_class/expected_measurement/
+        // approved_binary_hash joined the canonical form still PARSES (from_json is
+        // all `if (contains)`) and then fails verify_cert_core on the signature.
+        // Say so here, or it gets debugged as a root-key mismatch.
+        std::lock_guard lock(peers_mutex_);
+        if (our_certificate_ && our_certificate_->platform_class.empty() &&
+            !our_certificate_->tpm_ak_pubkey.empty()) {
+            spdlog::warn("[{}] our certificate predates the platform_class schema — its "
+                          "signature will not verify against the current canonical form. "
+                          "Re-enroll: --enroll-server <own gossip pubkey> <server-id> "
+                          "--enroll-platform-class <class> --enroll-measurement <hex>", name());
+        }
     } else {
         spdlog::warn("[{}] no server certificate found — gossip peer verification will be limited", name());
     }
@@ -1249,10 +1262,10 @@ void GossipService::load_server_certificate() {
 
 bool GossipService::verify_server_certificate(const ServerCertificate& cert) const {
     // NO fail-open, matching verify_identity_binding below. This previously returned
-    // true unconditionally without a root pubkey, and certificate_ak_pubkey() sources
-    // the trusted platform binding key through here — so an unanchored node would
-    // hand back whatever AK sat in a self-asserted certificate and then verify the
-    // peer's quote against it.
+    // true unconditionally without a root pubkey, and certificate_binding() sources
+    // the trusted platform policy through here — so an unanchored node would hand
+    // back whatever sat in a self-asserted certificate and then verify the peer's
+    // quote against it.
     if (!has_root_pubkey_) {
         spdlog::warn("[{}] certificate rejected: no root pubkey configured, nothing to "
                       "anchor trust to", name());
@@ -1510,7 +1523,7 @@ bool GossipService::self_is_eligible_voter(bool is_admission) const {
     return true;
 }
 
-std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) const {
+core::PeerPlatformBinding GossipService::certificate_binding(const std::string& pubkey) const {
     if (pubkey.empty() || is_revoked(pubkey)) return {};
 
     std::string cert_json;
@@ -1524,11 +1537,17 @@ std::string GossipService::certificate_ak_pubkey(const std::string& pubkey) cons
 
     try {
         auto cert = json::parse(cert_json).get<ServerCertificate>();
-        // Only return the AK from a certificate that actually belongs to this
-        // pubkey and verifies under our root — otherwise the AK is not trustworthy.
+        // Only honour a certificate that actually belongs to this pubkey and
+        // verifies under our root — otherwise the policy inside it is unanchored.
         if (cert.server_pubkey != pubkey) return {};
         if (!verify_server_certificate(cert)) return {};
-        return cert.tpm_ak_pubkey;
+
+        core::PeerPlatformBinding b;
+        b.platform_class       = cert.platform_class;
+        b.ak_pubkey            = cert.tpm_ak_pubkey;
+        b.expected_measurement = cert.expected_measurement;
+        b.approved_binary_hash = cert.approved_binary_hash;
+        return b;
     } catch (...) {
         return {};
     }
@@ -1843,6 +1862,20 @@ void GossipService::handle_tee_challenge(const asio::ip::udp::endpoint& sender,
         auto& tee = trust_policy_->tee_attestation_service();
         auto report = tee.generate_report(nonce);
 
+        // The evidence bundle carries the IMA log, which grows without bound on a
+        // host that is really measuring executables — at ~193 bytes per entry a
+        // datagram runs out at a few hundred entries, and send_packet then drops
+        // the whole response. Only the digest is signed, so dropping the bundle
+        // here does not invalidate anything; the peer refuses and says why, which
+        // is a diagnosable failure instead of a silent one.
+        if (report.evidence.size() > core::kMaxInlineEvidenceBytes) {
+            spdlog::warn("[{}] evidence for this challenge is {} bytes, over the {}-byte inline "
+                          "budget — sending the digest only; the peer cannot promote us until "
+                          "out-of-band evidence retrieval exists", name(),
+                          report.evidence.size(), core::kMaxInlineEvidenceBytes);
+            report.evidence.clear();
+        }
+
         // Every signed field must be populated BEFORE the canonical form is built:
         // canonical_attestation_json covers server_pubkey, so assigning it after
         // signing produced a signature over different bytes and made every response
@@ -1897,11 +1930,10 @@ void GossipService::handle_tee_response(const asio::ip::udp::endpoint& sender,
             return;
         }
 
-        // The TPM quote signature must verify against the AK pinned in this peer's
-        // enrolled certificate — never the AK hint carried inside the report itself.
-        auto trusted_ak = certificate_ak_pubkey(report.server_pubkey);
+        // The quote is checked against the policy pinned in this peer's enrolled
+        // certificate — never against anything carried inside the report itself.
         bool accepted = trust_policy_->handle_challenge_response(
-            report.server_pubkey, report, trusted_ak);
+            report.server_pubkey, report, certificate_binding(report.server_pubkey));
 
         if (accepted) {
             spdlog::info("[{}] peer {}:{} (pk: {}...) promoted to Tier1 via TEE challenge",
@@ -2206,36 +2238,18 @@ void GossipService::handle_enrollment_vote_request(
             // signed by the SAME candidate_pubkey the ballot is about, over the
             // canonical onboarding-request bytes. This proves the candidate controls
             // the key WITHOUT trusting the sponsor's say-so (zero-trust: each voter
-            // checks independently). The canonical form MUST byte-match
-            // ServerAdmissionService::canonical_request ("ln-onboard:v1").
+            // checks independently).
             try {
                 const auto& claim = j["admission_claim"];
-                auto claim_cpk = claim.value("candidate_pubkey", std::string{});
-                auto nonce     = claim.value("nonce", std::string{});
-                auto region    = claim.value("region", std::string{});
-                auto ak        = claim.value("tpm_ak_pubkey", std::string{});
-                auto sig_b64   = claim.value("signature", std::string{});
-                auto ts        = claim.value("timestamp", uint64_t{0});
-                server_id      = claim.value("server_id", std::string{});
+                const auto in = core::ServerAdmissionService::request_from_claim(claim);
+                server_id      = in.server_id;
                 required_ratio = j.value("required_ratio", 0.0f);
 
-                auto put_lp = [](std::vector<uint8_t>& b, const std::string& s) {
-                    uint32_t n = static_cast<uint32_t>(s.size());
-                    for (int i = 0; i < 4; ++i) b.push_back((n >> (i * 8)) & 0xFF);
-                    b.insert(b.end(), s.begin(), s.end());
-                };
-                std::vector<uint8_t> msg;
-                put_lp(msg, "ln-onboard:v1");
-                put_lp(msg, nonce);
-                put_lp(msg, claim_cpk);
-                put_lp(msg, server_id);
-                put_lp(msg, region);
-                put_lp(msg, ak);
-                put_lp(msg, std::to_string(ts));
+                const auto msg = core::ServerAdmissionService::canonical_request(in);
 
-                auto pk_bytes  = crypto::from_base64(claim_cpk);
-                auto sig_bytes = crypto::from_base64(sig_b64);
-                if (claim_cpk == candidate_pubkey &&
+                auto pk_bytes  = crypto::from_base64(in.candidate_pubkey);
+                auto sig_bytes = crypto::from_base64(in.signature);
+                if (in.candidate_pubkey == candidate_pubkey &&
                     pk_bytes.size()  == crypto::kEd25519PublicKeySize &&
                     sig_bytes.size() == crypto::kEd25519SignatureSize) {
                     crypto::Ed25519PublicKey pk{};

@@ -14,6 +14,11 @@ std::string canonical_attestation_json(const TeeAttestationReport& r) {
     json j;
     j["ak_pubkey"]      = r.ak_pubkey;
     j["binary_hash"]    = r.binary_hash;
+    // The DIGEST of the evidence, not the evidence. The bundle is far too large to
+    // ride a gossip datagram once IMA is really measuring, so it may be fetched
+    // out of band — binding it by hash keeps the identity signature over a fixed
+    // small value while still pinning exactly which bundle is meant.
+    j["evidence_sha256"] = r.evidence_sha256;
     j["nonce"]          = json::binary(std::vector<uint8_t>(r.nonce.begin(), r.nonce.end()));
     j["pcr_values"]     = json::binary(r.pcr_values);
     j["platform"]       = static_cast<uint8_t>(r.platform);
@@ -36,6 +41,8 @@ void to_json(json& j, const TeeAttestationReport& r) {
         {"binary_hash",    r.binary_hash},
         {"signature",      r.signature},
         {"ak_pubkey",      r.ak_pubkey},
+        {"evidence",         r.evidence},
+        {"evidence_sha256",  r.evidence_sha256},
         {"pcr_values",     json::binary(r.pcr_values)},
         {"tpm_signature",  json::binary(r.tpm_signature)},
         {"tpms_attest",    json::binary(r.tpms_attest)},
@@ -49,6 +56,8 @@ void from_json(const json& j, TeeAttestationReport& r) {
     if (j.contains("binary_hash"))   j.at("binary_hash").get_to(r.binary_hash);
     if (j.contains("signature"))     j.at("signature").get_to(r.signature);
     if (j.contains("ak_pubkey"))     j.at("ak_pubkey").get_to(r.ak_pubkey);
+    if (j.contains("evidence"))        j.at("evidence").get_to(r.evidence);
+    if (j.contains("evidence_sha256")) j.at("evidence_sha256").get_to(r.evidence_sha256);
 
     if (j.contains("quote") && j["quote"].is_binary())             r.quote = j["quote"].get_binary();
     if (j.contains("pcr_values") && j["pcr_values"].is_binary())   r.pcr_values = j["pcr_values"].get_binary();

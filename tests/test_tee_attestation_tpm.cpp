@@ -244,6 +244,15 @@ protected:
     }
 };
 
+// The root-signed platform policy a verifier applies. For the tpm2 path only the
+// binding key matters.
+core::PeerPlatformBinding pinned_ak(const std::string& spki_b64) {
+    core::PeerPlatformBinding b;
+    b.platform_class = "tpm2";
+    b.ak_pubkey = spki_b64;
+    return b;
+}
+
 std::array<uint8_t, 32> fixed_nonce(uint8_t seed) {
     std::array<uint8_t, 32> n{};
     for (auto& b : n) b = seed;
@@ -262,7 +271,7 @@ TEST_F(TpmAttestTest, ValidQuoteVerifiesAgainstPinnedAk) {
     auto sig = sign_tpmt(ak->pkey, attest);
     auto report = make_report(nonce, attest, sig, ak->spki_b64);
 
-    EXPECT_TRUE(tee_->verify_report(report, nonce, ak->spki_b64));
+    EXPECT_TRUE(tee_->verify_report(report, nonce, pinned_ak(ak->spki_b64)));
 }
 
 // --- The anti-injection core: extraData must equal qualifyingData -----------
@@ -276,7 +285,7 @@ TEST_F(TpmAttestTest, TamperedExtraDataRejected) {
     auto sig = sign_tpmt(ak->pkey, attest);
     auto report = make_report(nonce, attest, sig, ak->spki_b64);
 
-    EXPECT_FALSE(tee_->verify_report(report, nonce, ak->spki_b64));
+    EXPECT_FALSE(tee_->verify_report(report, nonce, pinned_ak(ak->spki_b64)));
 }
 
 // --- The trust anchor: signature must verify against the CERT-PINNED AK ------
@@ -291,7 +300,7 @@ TEST_F(TpmAttestTest, AkMismatchRejected) {
     // ak_pubkey hint = signer (self-asserted), but we verify against the pinned key.
     auto report = make_report(nonce, attest, sig, signer->spki_b64);
 
-    EXPECT_FALSE(tee_->verify_report(report, nonce, pinned->spki_b64));
+    EXPECT_FALSE(tee_->verify_report(report, nonce, pinned_ak(pinned->spki_b64)));
 }
 
 TEST_F(TpmAttestTest, EmptyTrustedAkRejected) {
@@ -302,7 +311,7 @@ TEST_F(TpmAttestTest, EmptyTrustedAkRejected) {
     auto sig = sign_tpmt(ak->pkey, attest);
     auto report = make_report(nonce, attest, sig, ak->spki_b64);
 
-    EXPECT_FALSE(tee_->verify_report(report, nonce, /*trusted_ak=*/""));
+    EXPECT_FALSE(tee_->verify_report(report, nonce, pinned_ak("")));
 }
 
 // --- Freshness / nonce / signature gates in do_verify_report ----------------
@@ -315,7 +324,7 @@ TEST_F(TpmAttestTest, WrongNonceRejected) {
     auto sig = sign_tpmt(ak->pkey, attest);
     auto report = make_report(nonce, attest, sig, ak->spki_b64);
 
-    EXPECT_FALSE(tee_->verify_report(report, fixed_nonce(0x56), ak->spki_b64));
+    EXPECT_FALSE(tee_->verify_report(report, fixed_nonce(0x56), pinned_ak(ak->spki_b64)));
 }
 
 TEST_F(TpmAttestTest, EmptyReportSignatureRejected) {
@@ -327,7 +336,7 @@ TEST_F(TpmAttestTest, EmptyReportSignatureRejected) {
     auto report = make_report(nonce, attest, sig, ak->spki_b64);
     report.signature.clear();  // mandatory signature missing
 
-    EXPECT_FALSE(tee_->verify_report(report, nonce, ak->spki_b64));
+    EXPECT_FALSE(tee_->verify_report(report, nonce, pinned_ak(ak->spki_b64)));
 }
 
 // --- Binary measurement gate (unconditional) --------------------------------
@@ -361,7 +370,7 @@ TEST_F(TpmAttestTest, UnapprovedBinaryRejected) {
     auto s = crypto_.ed25519_sign(id_.private_key, cb);
     r.signature = crypto::to_base64(std::span<const uint8_t>(s.data(), s.size()));
 
-    EXPECT_FALSE(tee_->verify_report(r, nonce, ak->spki_b64));
+    EXPECT_FALSE(tee_->verify_report(r, nonce, pinned_ak(ak->spki_b64)));
 }
 
 // --- PCR digest binding ------------------------------------------------------
@@ -377,7 +386,7 @@ TEST_F(TpmAttestTest, PcrValuesMatchingDigestAccepted) {
     auto sig = sign_tpmt(ak->pkey, attest);
     auto report = make_report(nonce, attest, sig, ak->spki_b64, pcr_values);
 
-    EXPECT_TRUE(tee_->verify_report(report, nonce, ak->spki_b64));
+    EXPECT_TRUE(tee_->verify_report(report, nonce, pinned_ak(ak->spki_b64)));
 }
 
 TEST_F(TpmAttestTest, PcrValuesMismatchedDigestRejected) {
@@ -390,7 +399,7 @@ TEST_F(TpmAttestTest, PcrValuesMismatchedDigestRejected) {
     std::vector<uint8_t> pcr_values(128, 0xCD);
     auto report = make_report(nonce, attest, sig, ak->spki_b64, pcr_values);
 
-    EXPECT_FALSE(tee_->verify_report(report, nonce, ak->spki_b64));
+    EXPECT_FALSE(tee_->verify_report(report, nonce, pinned_ak(ak->spki_b64)));
 }
 
 // --- TrustPolicy strict-mode enforcement ------------------------------------
@@ -407,7 +416,7 @@ TEST_F(TpmAttestTest, StrictModeChallengeResponsePromotesToTier1) {
     auto sig = sign_tpmt(ak->pkey, attest);
     auto report = make_report(nonce, attest, sig, ak->spki_b64);
 
-    EXPECT_TRUE(tp.handle_challenge_response(pk, report, ak->spki_b64));
+    EXPECT_TRUE(tp.handle_challenge_response(pk, report, pinned_ak(ak->spki_b64)));
     EXPECT_EQ(tp.peer_tier(pk), core::TrustTier::Tier1);
     tp.stop();
 }
@@ -422,7 +431,7 @@ TEST_F(TpmAttestTest, StrictModeRejectsNonTpmChallengeResponse) {
     r.platform = core::TeePlatform::AmdSevSnp;  // legacy structural backend
     r.nonce = nonce;
     r.timestamp = uint64_t(std::time(nullptr));
-    EXPECT_FALSE(tp.handle_challenge_response(pk, r, "some-ak"));
+    EXPECT_FALSE(tp.handle_challenge_response(pk, r, pinned_ak("some-ak")));
     EXPECT_NE(tp.peer_tier(pk), core::TrustTier::Tier1);
     tp.stop();
 }
@@ -466,7 +475,20 @@ TEST_F(TpmAttestTest, SwtpmRoundTripIfAvailable) {
     auto report = tee_->generate_report(nonce);
     ASSERT_EQ(report.platform, core::TeePlatform::Tpm2);
     ASSERT_FALSE(report.tpms_attest.empty());
-    ASSERT_FALSE(report.binary_hash.empty());
+
+    // The report carries the KERNEL's measurement of this binary, so on a host
+    // where IMA is not measuring executables there is none — and we no longer
+    // substitute our own hash of our own file. That must fail closed, not pass.
+    if (report.binary_hash.empty()) {
+        EXPECT_TRUE(bin_->measured_hash().empty());
+        report.server_pubkey = id_pub_b64_;
+        auto c = core::canonical_attestation_json(report);
+        std::vector<uint8_t> b(c.begin(), c.end());
+        report.signature = crypto::to_base64(crypto_.ed25519_sign(id_.private_key, b));
+        EXPECT_FALSE(tee_->verify_report(report, nonce, pinned_ak(*ak)));
+        GTEST_SKIP() << "IMA is not measuring this executable, so there is no measurement to "
+                        "round-trip (boot with ima_policy=tcb and run as root)";
+    }
 
     // Approve the actually-running binary (the quote's qualifyingData is bound to
     // report.binary_hash, so we must NOT change it here) and set our identity (the
@@ -485,5 +507,5 @@ TEST_F(TpmAttestTest, SwtpmRoundTripIfAvailable) {
     auto s = crypto_.ed25519_sign(id_.private_key, cb);
     report.signature = crypto::to_base64(std::span<const uint8_t>(s.data(), s.size()));
 
-    EXPECT_TRUE(tee_->verify_report(report, nonce, *ak));
+    EXPECT_TRUE(tee_->verify_report(report, nonce, pinned_ak(*ak)));
 }

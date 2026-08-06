@@ -134,15 +134,9 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
                                                         httplib::Response& res) {
         auto body = parse_body(req, res);
         if (!body) return;
-        ServerAdmissionService::RequestInput in;
-        in.candidate_pubkey = body->value("candidate_pubkey", std::string{});
-        in.server_id        = body->value("server_id", std::string{});
-        in.region           = body->value("region", std::string{});
-        in.tpm_ak_pubkey    = body->value("tpm_ak_pubkey", std::string{});
+        auto in = ServerAdmissionService::request_from_claim(*body);
         in.tpm_ek_cert      = body->value("tpm_ek_cert", std::string{});
-        in.nonce            = body->value("nonce", std::string{});
-        in.timestamp        = body->value("timestamp", uint64_t{0});
-        in.signature        = body->value("signature", std::string{});
+        in.evidence         = body->value("evidence", std::string{});
         in.source_ip        = req.remote_addr;
         in.enrollment_token = body->value("enrollment_token", std::string{});
         auto r = admission.create_request(in);

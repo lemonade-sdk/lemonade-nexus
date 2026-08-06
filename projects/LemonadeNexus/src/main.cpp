@@ -136,6 +136,10 @@ int main(int argc, char* argv[]) {
             else                     spdlog::warn("{}", line);
         }
         trust_policy.set_platform_evidence_verified(probe.tier1_capable);
+        if (probe.tier1_capable) {
+            tee.set_evidence_source(probe.profile, data_root / "attestation",
+                                     probe_cfg.product);
+        }
     }
     trust_policy.start();
 

@@ -35,7 +35,7 @@ TrustPolicyService::TrustPolicyService(
 // ---------------------------------------------------------------------------
 
 void TrustPolicyService::on_start() {
-    spdlog::info("[{}] started (our TEE platform: {}, our tier: {})",
+    spdlog::info("[{}] started (TEE hardware present: {}, our tier: {})",
                   name(),
                   tee_platform_name(tee_.detected_platform()),
                   our_tier() == TrustTier::Tier1 ? "Tier1" : "Tier2");
@@ -101,9 +101,10 @@ TrustTier TrustPolicyService::verify_and_update(
     // verified challenge-response can (handle_challenge_response). A valid token may
     // only REFRESH a peer already promoted via a real hardware quote.
     if (valid) {
-        bool already_tier1 =
-            (state.tier == TrustTier::Tier1 && state.platform == TeePlatform::Tpm2);
-        if (token.platform != TeePlatform::Tpm2 || !already_tier1) {
+        const bool rooted = state.platform == TeePlatform::Tpm2 ||
+                            state.platform == TeePlatform::SnpVtpm;
+        bool already_tier1 = state.tier == TrustTier::Tier1 && rooted;
+        if (token.platform != state.platform || !already_tier1) {
             spdlog::debug("[{}] valid token from {} does not establish Tier1 "
                            "(needs a hardware-rooted challenge-response first)",
                            name(), pubkey.substr(0, 12) + "...");
@@ -162,7 +163,7 @@ std::array<uint8_t, 32> TrustPolicyService::challenge_peer(const std::string& pu
 bool TrustPolicyService::handle_challenge_response(
     const std::string& pubkey,
     const TeeAttestationReport& report,
-    const std::string& trusted_ak_pubkey) {
+    const PeerPlatformBinding& binding) {
 
     std::lock_guard lock(mutex_);
 
@@ -180,17 +181,20 @@ bool TrustPolicyService::handle_challenge_response(
     auto& state = get_or_create(pubkey);
 
     // Tier 1 requires a hardware-signed quote. Reject the legacy structural backends
-    // (and an empty/None platform) up front, and require the cert-pinned AK to be
-    // present — without it there is nothing to anchor trust to. Unconditional: there
-    // is no longer a permissive mode to fall back to.
-    if (report.platform != TeePlatform::Tpm2) {
+    // (and an empty/None platform) up front. Unconditional: there is no longer a
+    // permissive mode to fall back to.
+    const bool rooted = report.platform == TeePlatform::Tpm2 ||
+                        report.platform == TeePlatform::SnpVtpm;
+    if (!rooted) {
         spdlog::warn("[{}] rejecting challenge response from {} — platform is '{}', only a "
                       "hardware-rooted quote grants Tier 1", name(),
                       pubkey.substr(0, 12) + "...", tee_platform_name(report.platform));
         state.failed_verifications++;
         return false;
     }
-    if (trusted_ak_pubkey.empty()) {
+    // A tpm2 quote has no anchor but the enrolled AK. snp-vtpm anchors in the AMD
+    // root instead, so an unpinned AK there narrows the claim rather than voiding it.
+    if (report.platform == TeePlatform::Tpm2 && binding.ak_pubkey.empty()) {
         spdlog::warn("[{}] rejecting quote from {} — no AK is pinned in its certificate "
                       "(re-enroll with the platform binding key)", name(),
                       pubkey.substr(0, 12) + "...");
@@ -198,9 +202,7 @@ bool TrustPolicyService::handle_challenge_response(
         return false;
     }
 
-    // Verify the TEE report against our challenge nonce. For TPM the signature is
-    // checked against the cert-pinned AK (trusted_ak_pubkey), not report.ak_pubkey.
-    bool valid = tee_.verify_report(report, expected_nonce, trusted_ak_pubkey);
+    bool valid = tee_.verify_report(report, expected_nonce, binding);
 
     if (valid) {
         // Unconditional. Both former guards were holes: gating on has_signing_pubkey()

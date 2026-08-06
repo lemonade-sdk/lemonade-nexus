@@ -7,6 +7,9 @@
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
+#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+#include <LemonadeNexus/Security/HclReport.hpp>
+#include <LemonadeNexus/Security/TpmQuote.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <httplib.h>
@@ -153,6 +156,31 @@ void merge_config(const std::string& config_path, const std::string& root_hex,
     out << j.dump(2) << "\n";
 }
 
+/// Produce platform evidence bound to the admission challenge nonce, so the bundle
+/// the root server verifies cannot be one captured from another node's join.
+std::optional<security::SnpVtpmEvidence> collect_onboarding_evidence(
+        const ServerConfig& config, const std::string& our_pubkey_b64,
+        const std::string& nonce_b64) {
+    security::EvidenceProduceConfig cfg;
+    cfg.cache_dir = std::filesystem::path(config.data_root) / "attestation";
+    try {
+        cfg.identity_pubkey = crypto::from_base64(our_pubkey_b64);
+    } catch (...) {
+        return std::nullopt;
+    }
+    std::vector<uint8_t> nonce;
+    try {
+        nonce = crypto::from_base64(nonce_b64);
+    } catch (...) {
+        return std::nullopt;
+    }
+
+    std::string why;
+    auto ev = security::produce_snp_vtpm_evidence(cfg, nonce, &why);
+    if (!ev) spdlog::debug("Onboard: no platform evidence ({})", why);
+    return ev;
+}
+
 /// Probe candidate targets; return the first "host:port" that accepts onboarding.
 std::string pick_target(const std::vector<std::string>& targets,
                         const std::string& connect_ip) {
@@ -254,10 +282,6 @@ int run_onboard_server(ServerConfig& config) {
     auto [host, port] = split_hostport(target, 9100);
     spdlog::info("Onboard: requesting admission from {} as '{}'", target, server_id);
 
-    // Optional Tier1 evidence.
-    std::string tpm_ak;
-    // (AK export is a follow-up hookup; Tier2 cert by default.)
-
     // 1. Challenge.
     auto ch = http_call(host, port, "POST", "/api/onboard/challenge",
                         json{{"candidate_pubkey", keys.pub_b64}}.dump(), connect_ip);
@@ -266,18 +290,43 @@ int run_onboard_server(ServerConfig& config) {
     }
     std::string nonce = json::parse(ch.body).value("nonce", "");
 
-    // 2. Signed request.
-    uint64_t ts = now_unix();
-    auto req_sig = sign_b64(crypto, keys.priv,
-        lp_join({"ln-onboard:v1", nonce, keys.pub_b64, server_id, region, tpm_ak,
-                 std::to_string(ts)}));
-    json reqbody{{"candidate_pubkey", keys.pub_b64}, {"server_id", server_id},
-                 {"region", region}, {"tpm_ak_pubkey", tpm_ak}, {"nonce", nonce},
-                 {"timestamp", ts}, {"signature", req_sig}};
+    // 2. Platform evidence, bound to the challenge nonce so this bundle admits only
+    //    this join. Absent evidence is a Tier-2 certificate, not a failure.
+    ServerAdmissionService::RequestInput in;
+    in.candidate_pubkey = keys.pub_b64;
+    in.server_id        = server_id;
+    in.region           = region;
+    in.nonce            = nonce;
+    in.timestamp        = now_unix();
+
+    if (auto ev = collect_onboarding_evidence(config, keys.pub_b64, nonce)) {
+        in.platform_class  = "snp-vtpm";
+        in.evidence        = security::encode_snp_vtpm_evidence(*ev);
+        in.binary_hash     = ev->binary_sha256;
+        in.evidence_sha256 = crypto::to_hex(crypto.sha256(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(in.evidence.data()), in.evidence.size())));
+        if (auto blob = security::parse_hcl_blob(ev->hcl_blob)) {
+            in.measurement   = blob->snp.measurement_hex();
+            in.tpm_ak_pubkey = security::rsa_spki_b64(blob->ak.modulus, blob->ak.exponent);
+        }
+        spdlog::info("Onboard: attaching snp-vtpm evidence (measurement {}...)",
+                     in.measurement.substr(0, 16));
+    } else {
+        spdlog::warn("Onboard: no platform evidence on this host — requesting a Tier-2 "
+                     "certificate");
+    }
+
+    // 3. Signed request.
+    in.signature = sign_b64(crypto, keys.priv,
+                            ServerAdmissionService::canonical_request(in));
+    json reqbody = ServerAdmissionService::claim_from_request(in);
+    reqbody["tpm_ek_cert"] = "";
+    reqbody["evidence"]    = in.evidence;
     // Deliberately outside the signed canonical: nonce+PoP already bind the
     // request to our key; mint-time binding ties the token to it.
     if (!config.onboard_token.empty())
         reqbody["enrollment_token"] = config.onboard_token;
+    const uint64_t ts = in.timestamp;
     auto rq = http_call(host, port, "POST", "/api/onboard/request", reqbody.dump(), connect_ip);
     if (!rq.connected || rq.status != 200) {
         spdlog::error("Onboard: admission request rejected ({})", rq.body); return 1;

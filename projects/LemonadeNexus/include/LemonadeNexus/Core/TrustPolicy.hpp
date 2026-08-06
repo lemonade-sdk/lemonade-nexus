@@ -72,13 +72,14 @@ public:
 
     /// Handle a TEE report sent in response to our challenge.
     /// Returns true if the report is valid and the peer is promoted to Tier 1.
-    /// `trusted_ak_pubkey` is the TPM AK pinned in the peer's enrolled certificate
-    /// (base64 DER SPKI); under strict mode the hardware quote signature is verified
-    /// against it. This is the ONLY path that establishes Tier 1.
+    /// `binding` is the platform policy pinned in the peer's root-signed
+    /// certificate; hardware signatures are verified against keys from there, never
+    /// against keys carried inside the report. This is the ONLY path that
+    /// establishes Tier 1.
     [[nodiscard]] bool handle_challenge_response(
         const std::string& pubkey,
         const TeeAttestationReport& report,
-        const std::string& trusted_ak_pubkey = {});
+        const PeerPlatformBinding& binding = {});
 
     // -----------------------------------------------------------------------
     // Trust state queries
