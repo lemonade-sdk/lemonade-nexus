@@ -115,6 +115,18 @@ enum class ConsensusFailure : uint16_t {
     InvalidSignature,
     InsufficientQuorum,
     ProposalDigestMismatch,
+    // Service-level failures. Values append only; earlier values are stable.
+    NotSynced,
+    StaleView,
+    ViewTooFar,
+    WrongLeader,
+    JustifyInvalid,
+    ParentQcMismatch,
+    MissingParent,
+    Equivocation,
+    PendingLimit,
+    NotLeader,
+    StorageRejected,
 };
 
 [[nodiscard]] Digest proposal_digest(const Proposal& proposal);
