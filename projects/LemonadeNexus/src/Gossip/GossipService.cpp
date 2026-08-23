@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -33,6 +34,12 @@ GossipService::GossipService(asio::io_context& io, uint16_t port,
     , crypto_{crypto}
     , port_{port}
 {
+    // A security envelope can approach the datagram limit. The default
+    // socket buffers on some platforms (macOS: 9 KiB send) reject such a
+    // datagram at the kernel, so both buffers are raised to the packet size.
+    asio::error_code ec;
+    socket_.set_option(asio::socket_base::send_buffer_size(2 * 65536), ec);
+    socket_.set_option(asio::socket_base::receive_buffer_size(4 * 65536), ec);
 }
 
 void GossipService::set_root_pubkey(const crypto::Ed25519PublicKey& pk) {
@@ -629,6 +636,9 @@ void GossipService::handle_receive(std::size_t bytes_received) {
             break;
         case GossipMsgType::MisbehaviorProofBroadcast:
             handle_misbehavior_proof(remote_endpoint_, payload, payload_len);
+            break;
+        case GossipMsgType::SecurityEnvelope:
+            handle_security_envelope(header.sender_pubkey, payload, payload_len);
             break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
@@ -3652,6 +3662,95 @@ void GossipService::register_ns_slot_in_dns(const NsSlotClaimData& claim) {
     dns_->add_nameserver(ns_fqdn, claim.server_ip);
     spdlog::debug("[{}] registered DNS NS record: {} -> {}",
                    name(), ns_fqdn, claim.server_ip);
+}
+
+// ---------------------------------------------------------------------------
+// Security transport (ISecurityTransport)
+// ---------------------------------------------------------------------------
+//
+// The packet signature is the only authentication applied here. No trust-tier
+// check, no parse, no forward: the security layer binds the envelope to the
+// signer and decides every fan-out, so gossip cannot amplify a hostile message.
+
+void GossipService::set_security_sink(security::SecuritySink sink) {
+    security_sink_ = std::move(sink);
+}
+
+bool GossipService::find_peer_endpoint_by_pubkey(std::string_view b64,
+                                                 asio::ip::udp::endpoint& out) const {
+    std::lock_guard lock(peers_mutex_);
+    for (const auto& p : peers_) {
+        // Canonical compare: the same key has several base64 spellings.
+        if (crypto::canonical_key_b64(p.pubkey) != b64) continue;
+        auto ep = parse_endpoint(p.endpoint);
+        if (!ep) return false;
+        out = *ep;
+        return true;
+    }
+    return false;
+}
+
+void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
+                                             const uint8_t* payload, std::size_t len) {
+    if (len > security::constants::kMaxSecurityMessageBytes) {
+        // A peer can repeat this at line rate; keep the log from becoming the
+        // amplifier.
+        ++security_drops_since_warn_;
+        const auto now = chrono::steady_clock::now();
+        if (now - security_drop_warn_at_ >= chrono::seconds(10)) {
+            spdlog::warn("[{}] dropped {} oversized security envelope(s), latest {} bytes from {}:{}",
+                          name(), security_drops_since_warn_, len,
+                          remote_endpoint_.address().to_string(), remote_endpoint_.port());
+            security_drop_warn_at_ = now;
+            security_drops_since_warn_ = 0;
+        }
+        return;
+    }
+
+    if (!security_sink_) {
+        spdlog::debug("[{}] security envelope dropped: no sink", name());
+        return;
+    }
+
+    security::NodeId sender{};
+    std::memcpy(sender.bytes.data(), sender_pubkey, sender.bytes.size());
+    security_sink_(sender, std::span<const uint8_t>{payload, len});
+}
+
+bool GossipService::send_to(const security::NodeId& peer,
+                            std::span<const uint8_t> envelope) {
+    if (envelope.size() > security::constants::kMaxSecurityMessageBytes) return false;
+    if (peer.bytes == keypair_.public_key) return false;
+
+    asio::ip::udp::endpoint target;
+    if (!find_peer_endpoint_by_pubkey(crypto::to_base64(peer.bytes), target)) return false;
+
+    send_packet(target, GossipMsgType::SecurityEnvelope,
+                std::vector<uint8_t>(envelope.begin(), envelope.end()));
+    return true;
+}
+
+std::size_t GossipService::broadcast(std::span<const uint8_t> envelope) {
+    if (envelope.size() > security::constants::kMaxSecurityMessageBytes) return 0;
+
+    // Snapshot under the lock, send with it released (send_packet is not to be
+    // called under peers_mutex_).
+    std::vector<asio::ip::udp::endpoint> targets;
+    {
+        const auto our_b64 = crypto::to_base64(keypair_.public_key);
+        std::lock_guard lock(peers_mutex_);
+        targets.reserve(peers_.size());
+        for (const auto& p : peers_) {
+            if (crypto::canonical_key_b64(p.pubkey) == our_b64) continue;
+            if (auto ep = parse_endpoint(p.endpoint)) targets.push_back(*ep);
+        }
+    }
+
+    const std::vector<uint8_t> payload(envelope.begin(), envelope.end());
+    for (const auto& ep : targets) {
+        send_packet(ep, GossipMsgType::SecurityEnvelope, payload);
+    }
+    return targets.size();
 }
 
 } // namespace nexus::gossip

@@ -100,6 +100,9 @@ public:
 
     [[nodiscard]] HotStuffState state() const;
     [[nodiscard]] View current_view() const { return current_view_; }
+    [[nodiscard]] NodeId leader_of(View view) const {
+        return config_.leader_order[view % config_.leader_order.size()];
+    }
     [[nodiscard]] bool synced() const { return synced_; }
     [[nodiscard]] bool usable() const { return !failed_; }
     [[nodiscard]] const std::vector<EquivocationRecord>& equivocation_evidence() const {

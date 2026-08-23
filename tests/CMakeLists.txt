@@ -17,7 +17,9 @@ function(add_nexus_test TEST_NAME)
     if(WIN32)
         target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
     endif()
-    gtest_discover_tests(${TEST_NAME})
+    # Listing a large binary on a loaded machine can exceed the 5 s default;
+    # a timeout deletes the executable and registers a NOT_BUILT placeholder.
+    gtest_discover_tests(${TEST_NAME} DISCOVERY_TIMEOUT 120)
 endfunction()
 
 # --- Unit tests ---
@@ -67,6 +69,7 @@ add_nexus_test(test_evidence_chain    test_evidence_chain.cpp)
 target_compile_definitions(test_evidence_chain PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
+add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp)
 
 # --- Security overhaul tests (mirror include/LemonadeNexus/Security/) ---
 add_nexus_test(test_security_policy
@@ -93,6 +96,9 @@ add_nexus_test(test_security_hotstuff
     security/consensus/hotstuff_restart.cpp)
 add_nexus_test(test_security_integration
     security/integration/first_path.cpp)
+add_nexus_test(test_security_transport
+    security/transport/codec.cpp
+    security/transport/router.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
@@ -117,7 +123,9 @@ function(add_sdk_test TEST_NAME)
     if(WIN32)
         target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
     endif()
-    gtest_discover_tests(${TEST_NAME})
+    # Listing a large binary on a loaded machine can exceed the 5 s default;
+    # a timeout deletes the executable and registers a NOT_BUILT placeholder.
+    gtest_discover_tests(${TEST_NAME} DISCOVERY_TIMEOUT 120)
 endfunction()
 
 add_sdk_test(test_routing_pool         test_routing_pool.cpp)

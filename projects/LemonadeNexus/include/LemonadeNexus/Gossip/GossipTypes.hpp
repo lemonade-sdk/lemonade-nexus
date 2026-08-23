@@ -34,6 +34,7 @@ enum class GossipMsgType : uint8_t {
     BackboneIpamSync      = 0x13, // "backbone IP allocate/release — server mesh IPAM sync"
     NsSlotClaim           = 0x14, // "democratic NS slot claim — ns1-ns9 bootstrap nameservers"
     MisbehaviorProofBroadcast = 0x15, // "proof a peer equivocated — verify and ban the accused"
+    SecurityEnvelope      = 0x16,  // opaque security-protocol envelope; routed to SecurityRuntime, never relayed
 };
 
 #pragma pack(push, 1)

@@ -8,6 +8,7 @@
 #include <LemonadeNexus/Gossip/IGossipProvider.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
+#include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
@@ -15,6 +16,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -39,7 +41,8 @@ struct MisbehaviorProof;  // Gossip/MisbehaviorDetector.hpp
 ///
 /// Peers are loaded from and saved to identity/peers.json via FileStorageService.
 class GossipService : public core::IService<GossipService>,
-                       public IGossipProvider<GossipService> {
+                       public IGossipProvider<GossipService>,
+                       public security::ISecurityTransport {
     friend class core::IService<GossipService>;
     friend class IGossipProvider<GossipService>;
     // Test seam: the ballot handlers sit behind packet-signature verification and
@@ -131,6 +134,19 @@ public:
     /// Access the Ed25519 keypair (needed by TrustPolicy for token generation).
     [[nodiscard]] const crypto::Ed25519Keypair& keypair() const { return keypair_; }
 
+    // ISecurityTransport. Gossip is transport only for the security protocol:
+    // the packet signature authenticates the sender, the byte bound applies,
+    // and the bytes go to the sink unparsed. Nothing here decides security
+    // truth and nothing here relays an envelope.
+
+    /// Receiver for inbound security envelopes. Runs on the io thread during
+    /// packet dispatch; the span is valid only for the call. Call before start().
+    void set_security_sink(security::SecuritySink sink);
+
+    [[nodiscard]] bool send_to(const security::NodeId& peer,
+                               std::span<const uint8_t> envelope) override;
+    std::size_t broadcast(std::span<const uint8_t> envelope) override;
+
     // IService
     void on_start();
     void on_stop();
@@ -186,6 +202,15 @@ private:
 
     // Verify an incoming packet's Ed25519 signature
     [[nodiscard]] bool verify_packet_signature(const uint8_t* data, std::size_t total_len) const;
+
+    // Security envelope: sender_pubkey is the signature-verified packet signer.
+    void handle_security_envelope(const uint8_t* sender_pubkey,
+                                  const uint8_t* payload, std::size_t len);
+
+    // Endpoint of the peer whose canonical base64 key equals `b64`. Takes
+    // peers_mutex_ internally.
+    [[nodiscard]] bool find_peer_endpoint_by_pubkey(std::string_view b64,
+                                                    asio::ip::udp::endpoint& out) const;
 
     // Pick up to N random peers for PeerExchange
     [[nodiscard]] std::vector<GossipPeer> random_peers(std::size_t count) const;
@@ -431,6 +456,12 @@ private:
     // Throttle for proactive Tier-1 re-challenge (pubkey → last challenge unix sec).
     // Only touched from on_gossip_tick (the single gossip-timer thread).
     std::unordered_map<std::string, uint64_t> last_rechallenge_;
+
+    // Security transport: inbound sink and the oversize-drop log throttle
+    // (both touched only from handle_receive on the io thread).
+    security::SecuritySink                security_sink_;
+    std::chrono::steady_clock::time_point security_drop_warn_at_{};
+    uint64_t                              security_drops_since_warn_{0};
 
 public:
     /// Set the ACL service for distributed permission sync.

@@ -145,6 +145,21 @@ inline constexpr uint64_t kMaxFutureViewDistance = 64;
 inline constexpr std::size_t kMaxPendingProposals = 128;
 inline constexpr std::size_t kMaxQcSignatures = kMaxActiveTier1;
 
+// --- Security transport bounds (applied before any parse or crypto work) ----
+
+inline constexpr uint8_t kSecurityWireVersion = 1;
+inline constexpr std::size_t kMaxSecurityMessageBytes = 60000;
+inline constexpr std::size_t kMaxPlatformEvidenceWireBytes = 56 * 1024;
+inline constexpr std::size_t kMaxDkgPayloadBytes = 4096;
+inline constexpr std::size_t kMaxFrostPayloadBytes = 1024;
+inline constexpr std::size_t kMaxCiphersuiteNameBytes = 64;
+
+// Per-peer message budget: a member cannot drive the router faster than this.
+inline constexpr uint32_t kSecurityPeerMessagesPerWindow = 256;
+inline constexpr uint64_t kSecurityFloodWindowMs = 1000;
+inline constexpr std::size_t kSecurityTrackedPeers = 512;
+inline constexpr std::size_t kSecurityDedupeWindow = 4096;
+
 // --- Compile-time checks against the architecture tables --------------------
 
 static_assert(max_byzantine_faults(5) == 1 && consensus_quorum(5) == 4);
