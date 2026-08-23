@@ -1,0 +1,962 @@
+#!/usr/bin/env bash
+#
+# nexus-attest-profile
+#
+# Collect Linux, Azure confidential-VM, vTPM, measured-boot, IMA, Nexus,
+# and runtime evidence for the Lemonade Nexus Tier 1 attestation profile.
+#
+# This collector does not decide trust. A remote Nexus verifier must examine
+# the evidence against the approved profile in the verified Nexus binary.
+#
+# Recommended use:
+#
+#   sudo ./nexus-attest-profile reference \
+#       --nexus-binary /usr/local/bin/nexus \
+#       --service nexus.service
+#
+#   sudo ./nexus-attest-profile evidence \
+#       --challenge /path/to/challenge.bin \
+#       --nexus-binary /usr/local/bin/nexus \
+#       --service nexus.service
+#
+# The --challenge value can also be an even-length hexadecimal string.
+#
+# Azure AMD CVM defaults:
+#   Attestation report NV index: 0x01400001
+#   vTPM AK certificate index:   0x01C101D0
+#   vTPM AK persistent handle:   0x81000003
+#
+# The script records missing capabilities instead of stopping early.
+#
+
+set -uo pipefail
+IFS=$'\n\t'
+umask 077
+
+PROGRAM="nexus-attest-profile"
+VERSION="0.1.0"
+
+MODE=""
+OUT_DIR=""
+NEXUS_BINARY="${NEXUS_BINARY:-/usr/local/bin/nexus}"
+NEXUS_SERVICE="${NEXUS_SERVICE:-nexus.service}"
+CHALLENGE_INPUT=""
+
+AZURE_ATTESTATION_REPORT_INDEX="${AZURE_ATTESTATION_REPORT_INDEX:-0x01400001}"
+AZURE_AK_CERT_INDEX="${AZURE_AK_CERT_INDEX:-0x01C101D0}"
+AZURE_AK_HANDLE="${AZURE_AK_HANDLE:-0x81000003}"
+
+PCR_LIST="${NEXUS_PCR_LIST:-sha256:0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23}"
+
+STATUS_FILE=""
+ERROR_DIR=""
+START_UTC="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  nexus-attest-profile reference [options]
+  nexus-attest-profile evidence --challenge <hex-or-file> [options]
+
+Modes:
+  reference
+      Collect a known-good host profile.
+      The collector generates a random local quote challenge.
+
+  evidence
+      Collect live attestation evidence.
+      A caller-supplied challenge is required.
+
+Options:
+  --challenge VALUE
+      A binary challenge file or an even-length hexadecimal string.
+      Required in evidence mode.
+
+  --nexus-binary PATH
+      Nexus executable path.
+      Default: /usr/local/bin/nexus
+
+  --service NAME
+      systemd service name.
+      Default: nexus.service
+
+  --out DIR
+      Output directory.
+      Default: ./nexus-attestation-<mode>-<UTC timestamp>
+
+  --pcr-list LIST
+      tpm2-tools PCR selection.
+      Default: sha256:0,1,...,23
+
+  --help
+      Show this help.
+
+Environment overrides:
+  NEXUS_BINARY
+  NEXUS_SERVICE
+  NEXUS_PCR_LIST
+  AZURE_ATTESTATION_REPORT_INDEX
+  AZURE_AK_CERT_INDEX
+  AZURE_AK_HANDLE
+EOF
+}
+
+log() {
+    printf '%s\n' "$*" >&2
+}
+
+record() {
+    local item="$1"
+    local state="$2"
+    local detail="${3:-}"
+    detail="${detail//$'\t'/ }"
+    detail="${detail//$'\n'/ }"
+    printf '%s\t%s\t%s\n' "$item" "$state" "$detail" >> "$STATUS_FILE"
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+safe_name() {
+    printf '%s' "$1" | tr -cs 'A-Za-z0-9._-' '_'
+}
+
+run_text() {
+    local item="$1"
+    local outfile="$2"
+    shift 2
+
+    local errfile="$ERROR_DIR/$(safe_name "$item").stderr"
+    local rc=0
+
+    # Capture the command status directly. "$?" after a completed "if" block
+    # reports the status of the block, which is zero, not the failed command.
+    "$@" >"$outfile" 2>"$errfile" || rc=$?
+
+    if (( rc == 0 )); then
+        record "$item" "ok" "$outfile"
+        [[ -s "$errfile" ]] || rm -f "$errfile"
+        return 0
+    fi
+
+    record "$item" "error" "exit=$rc stderr=$errfile"
+    return "$rc"
+}
+
+run_shell_text() {
+    local item="$1"
+    local outfile="$2"
+    local command="$3"
+    local errfile="$ERROR_DIR/$(safe_name "$item").stderr"
+    local rc=0
+
+    bash -o pipefail -c "$command" >"$outfile" 2>"$errfile" || rc=$?
+
+    if (( rc == 0 )); then
+        record "$item" "ok" "$outfile"
+        [[ -s "$errfile" ]] || rm -f "$errfile"
+        return 0
+    fi
+
+    record "$item" "error" "exit=$rc stderr=$errfile"
+    return "$rc"
+}
+
+copy_file() {
+    local item="$1"
+    local source="$2"
+    local dest="$3"
+
+    if [[ ! -e "$source" ]]; then
+        record "$item" "missing" "$source"
+        return 1
+    fi
+
+    if cp -- "$source" "$dest" 2>"$ERROR_DIR/$(safe_name "$item").stderr"; then
+        record "$item" "ok" "$dest"
+        rm -f "$ERROR_DIR/$(safe_name "$item").stderr"
+        return 0
+    fi
+
+    record "$item" "error" "$source"
+    return 1
+}
+
+hash_file_if_present() {
+    local file="$1"
+    local outfile="$2"
+
+    if [[ -f "$file" ]]; then
+        sha256sum -- "$file" > "$outfile" 2>/dev/null || true
+    fi
+}
+
+parse_args() {
+    if [[ $# -lt 1 ]]; then
+        usage >&2
+        exit 2
+    fi
+
+    MODE="$1"
+    shift
+
+    case "$MODE" in
+        reference|evidence)
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            log "ERROR: Unknown mode: $MODE"
+            usage >&2
+            exit 2
+            ;;
+    esac
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --challenge)
+                [[ $# -ge 2 ]] || { log "ERROR: --challenge needs a value."; exit 2; }
+                CHALLENGE_INPUT="$2"
+                shift 2
+                ;;
+            --nexus-binary)
+                [[ $# -ge 2 ]] || { log "ERROR: --nexus-binary needs a value."; exit 2; }
+                NEXUS_BINARY="$2"
+                shift 2
+                ;;
+            --service)
+                [[ $# -ge 2 ]] || { log "ERROR: --service needs a value."; exit 2; }
+                NEXUS_SERVICE="$2"
+                shift 2
+                ;;
+            --out)
+                [[ $# -ge 2 ]] || { log "ERROR: --out needs a value."; exit 2; }
+                OUT_DIR="$2"
+                shift 2
+                ;;
+            --pcr-list)
+                [[ $# -ge 2 ]] || { log "ERROR: --pcr-list needs a value."; exit 2; }
+                PCR_LIST="$2"
+                shift 2
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                log "ERROR: Unknown option: $1"
+                usage >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    if [[ "$MODE" == "evidence" && -z "$CHALLENGE_INPUT" ]]; then
+        log "ERROR: evidence mode requires --challenge."
+        exit 2
+    fi
+}
+
+make_output_tree() {
+    if [[ -z "$OUT_DIR" ]]; then
+        OUT_DIR="./nexus-attestation-${MODE}-$(date -u +'%Y%m%dT%H%M%SZ')"
+    fi
+
+    mkdir -p \
+        "$OUT_DIR" \
+        "$OUT_DIR/platform" \
+        "$OUT_DIR/tpm" \
+        "$OUT_DIR/boot" \
+        "$OUT_DIR/ima" \
+        "$OUT_DIR/nexus" \
+        "$OUT_DIR/runtime" \
+        "$OUT_DIR/system" \
+        "$OUT_DIR/tools" \
+        "$OUT_DIR/azure" \
+        "$OUT_DIR/errors"
+
+    STATUS_FILE="$OUT_DIR/status.tsv"
+    ERROR_DIR="$OUT_DIR/errors"
+    : > "$STATUS_FILE"
+}
+
+prepare_challenge() {
+    local challenge_file="$OUT_DIR/challenge.bin"
+
+    if [[ "$MODE" == "reference" && -z "$CHALLENGE_INPUT" ]]; then
+        if dd if=/dev/urandom of="$challenge_file" bs=32 count=1 status=none; then
+            record "challenge" "ok" "generated 32 random bytes"
+        else
+            record "challenge" "error" "could not generate random challenge"
+            return 1
+        fi
+    elif [[ -f "$CHALLENGE_INPUT" ]]; then
+        if cp -- "$CHALLENGE_INPUT" "$challenge_file"; then
+            record "challenge" "ok" "copied binary challenge"
+        else
+            record "challenge" "error" "could not copy challenge"
+            return 1
+        fi
+    else
+        local hex="${CHALLENGE_INPUT#0x}"
+
+        if [[ ! "$hex" =~ ^[0-9A-Fa-f]+$ ]]; then
+            record "challenge" "error" "challenge is not a file or hex string"
+            return 1
+        fi
+
+        if (( ${#hex} % 2 != 0 )); then
+            record "challenge" "error" "hex challenge has an odd character count"
+            return 1
+        fi
+
+        if (( ${#hex} == 0 || ${#hex} > 128 )); then
+            record "challenge" "error" "challenge must contain 1 to 64 bytes"
+            return 1
+        fi
+
+        if ! printf '%s' "$hex" | xxd -r -p > "$challenge_file"; then
+            record "challenge" "error" "could not decode hex challenge"
+            return 1
+        fi
+
+        record "challenge" "ok" "decoded hexadecimal challenge"
+    fi
+
+    sha256sum "$challenge_file" > "$OUT_DIR/challenge.sha256"
+}
+
+collect_tool_versions() {
+    {
+        printf 'collector=%s\n' "$VERSION"
+        printf 'bash=%s\n' "$BASH_VERSION"
+        printf 'date=%s\n' "$(date --version 2>/dev/null | head -n1 || true)"
+    } > "$OUT_DIR/tools/collector.txt"
+
+    local tool
+    for tool in \
+        tpm2_getcap tpm2_pcrread tpm2_quote tpm2_readpublic tpm2_nvread \
+        tpm2_eventlog tpm2_checkquote \
+        systemctl systemd-analyze mokutil openssl sha256sum curl jq python3 \
+        readelf getcap lsattr findmnt
+    do
+        if have "$tool"; then
+            {
+                printf 'path=%s\n' "$(command -v "$tool")"
+                "$tool" --version 2>&1 | head -n 5 || true
+            } > "$OUT_DIR/tools/${tool}.txt"
+            record "tool:$tool" "ok" "$(command -v "$tool")"
+        else
+            record "tool:$tool" "missing" ""
+        fi
+    done
+}
+
+collect_system() {
+    copy_file "system:os-release" "/etc/os-release" "$OUT_DIR/system/os-release" || true
+    copy_file "system:proc-version" "/proc/version" "$OUT_DIR/system/proc-version.txt" || true
+    copy_file "system:cmdline" "/proc/cmdline" "$OUT_DIR/system/kernel-command-line.txt" || true
+
+    run_text "system:uname" "$OUT_DIR/system/uname.txt" uname -a || true
+    run_text "system:hostname" "$OUT_DIR/system/hostname.txt" hostnamectl || true
+    run_text "system:lscpu" "$OUT_DIR/system/lscpu.txt" lscpu || true
+    run_text "system:lsmod" "$OUT_DIR/system/lsmod.txt" lsmod || true
+    run_text "system:mounts" "$OUT_DIR/system/mounts.txt" findmnt -a || true
+
+    if [[ -r /proc/config.gz ]]; then
+        if have gzip; then
+            run_shell_text "system:kernel-config" "$OUT_DIR/system/kernel-config.txt" \
+                "gzip -cd /proc/config.gz" || true
+        fi
+    elif [[ -r "/boot/config-$(uname -r)" ]]; then
+        copy_file "system:kernel-config" "/boot/config-$(uname -r)" \
+            "$OUT_DIR/system/kernel-config.txt" || true
+    else
+        record "system:kernel-config" "missing" ""
+    fi
+
+    local kernel
+    for kernel in \
+        "/boot/vmlinuz-$(uname -r)" \
+        "/usr/lib/modules/$(uname -r)/vmlinuz"
+    do
+        if [[ -f "$kernel" ]]; then
+            sha256sum -- "$kernel" >> "$OUT_DIR/system/kernel-images.sha256" 2>/dev/null || true
+        fi
+    done
+
+    if [[ -d /sys/kernel/security ]]; then
+        run_shell_text "system:securityfs" "$OUT_DIR/system/securityfs.txt" \
+            "find /sys/kernel/security -maxdepth 3 -type f -o -type d | sort" || true
+    else
+        record "system:securityfs" "missing" "/sys/kernel/security"
+    fi
+
+    if [[ -r /sys/kernel/security/lockdown ]]; then
+        copy_file "system:lockdown" "/sys/kernel/security/lockdown" \
+            "$OUT_DIR/system/kernel-lockdown.txt" || true
+    else
+        record "system:lockdown" "missing" ""
+    fi
+
+    {
+        for key in \
+            kernel.kptr_restrict \
+            kernel.dmesg_restrict \
+            kernel.yama.ptrace_scope \
+            kernel.unprivileged_bpf_disabled \
+            fs.suid_dumpable
+        do
+            sysctl "$key" 2>/dev/null || true
+        done
+    } > "$OUT_DIR/system/security-sysctls.txt"
+    record "system:security-sysctls" "ok" "$OUT_DIR/system/security-sysctls.txt"
+
+    if have dmesg; then
+        run_shell_text "system:security-dmesg" "$OUT_DIR/system/security-dmesg.txt" \
+            "dmesg 2>/dev/null | grep -Ei 'SEV|SNP|TPM|IMA|secure boot|lockdown' || true" || true
+    fi
+}
+
+collect_secure_boot() {
+    if have mokutil; then
+        run_text "boot:mokutil" "$OUT_DIR/boot/secure-boot.txt" mokutil --sb-state || true
+    else
+        record "boot:mokutil" "missing" ""
+    fi
+
+    local found=0
+    local efivar
+    for efivar in /sys/firmware/efi/efivars/SecureBoot-*; do
+        [[ -e "$efivar" ]] || continue
+        found=1
+        cp -- "$efivar" "$OUT_DIR/boot/$(basename "$efivar").bin" 2>/dev/null || true
+    done
+
+    if (( found )); then
+        record "boot:secureboot-efivar" "ok" "$OUT_DIR/boot"
+    else
+        record "boot:secureboot-efivar" "missing" ""
+    fi
+}
+
+collect_boot_log() {
+    local bin="/sys/kernel/security/tpm0/binary_bios_measurements"
+    local ascii="/sys/kernel/security/tpm0/ascii_bios_measurements"
+
+    if copy_file "boot:event-log-binary" "$bin" \
+        "$OUT_DIR/boot/binary_bios_measurements" ; then
+
+        if have tpm2_eventlog; then
+            run_text "boot:event-log-parsed" "$OUT_DIR/boot/eventlog.yaml" \
+                tpm2_eventlog "$OUT_DIR/boot/binary_bios_measurements" || true
+        fi
+    fi
+
+    copy_file "boot:event-log-ascii" "$ascii" \
+        "$OUT_DIR/boot/ascii_bios_measurements.txt" || true
+}
+
+collect_ima() {
+    local ima_base="/sys/kernel/security/integrity/ima"
+
+    copy_file "ima:ascii-runtime" \
+        "$ima_base/ascii_runtime_measurements" \
+        "$OUT_DIR/ima/ascii_runtime_measurements" || true
+
+    copy_file "ima:binary-runtime" \
+        "$ima_base/binary_runtime_measurements" \
+        "$OUT_DIR/ima/binary_runtime_measurements" || true
+
+    copy_file "ima:measurement-count" \
+        "$ima_base/runtime_measurements_count" \
+        "$OUT_DIR/ima/runtime_measurements_count.txt" || true
+
+    copy_file "ima:violations" \
+        "$ima_base/violations" \
+        "$OUT_DIR/ima/violations.txt" || true
+
+    copy_file "ima:policy" \
+        "/sys/kernel/security/ima/policy" \
+        "$OUT_DIR/ima/policy.txt" || true
+
+    hash_file_if_present "$OUT_DIR/ima/policy.txt" "$OUT_DIR/ima/policy.sha256"
+    hash_file_if_present "$OUT_DIR/ima/ascii_runtime_measurements" \
+        "$OUT_DIR/ima/ascii_runtime_measurements.sha256"
+    hash_file_if_present "$OUT_DIR/ima/binary_runtime_measurements" \
+        "$OUT_DIR/ima/binary_runtime_measurements.sha256"
+}
+
+collect_tpm_inventory() {
+    if ! have tpm2_getcap; then
+        record "tpm:inventory" "missing" "tpm2-tools"
+        return
+    fi
+
+    run_text "tpm:properties-fixed" "$OUT_DIR/tpm/properties-fixed.txt" \
+        tpm2_getcap properties-fixed || true
+
+    run_text "tpm:properties-variable" "$OUT_DIR/tpm/properties-variable.txt" \
+        tpm2_getcap properties-variable || true
+
+    run_text "tpm:algorithms" "$OUT_DIR/tpm/algorithms.txt" \
+        tpm2_getcap algorithms || true
+
+    run_text "tpm:pcrs" "$OUT_DIR/tpm/pcr-capabilities.txt" \
+        tpm2_getcap pcrs || true
+
+    run_text "tpm:handles-persistent" "$OUT_DIR/tpm/persistent-handles.txt" \
+        tpm2_getcap handles-persistent || true
+
+    run_text "tpm:handles-nv-index" "$OUT_DIR/tpm/nv-handles.txt" \
+        tpm2_getcap handles-nv-index || true
+
+    if have tpm2_pcrread; then
+        run_text "tpm:pcrread" "$OUT_DIR/tpm/pcr-read.txt" \
+            tpm2_pcrread "$PCR_LIST" || true
+    fi
+}
+
+collect_azure_report() {
+    if ! have tpm2_nvread; then
+        record "azure:attestation-report" "missing" "tpm2_nvread"
+        return
+    fi
+
+    local report="$OUT_DIR/azure/attestation-report.bin"
+    local err="$ERROR_DIR/azure_attestation_report.stderr"
+
+    if tpm2_nvread -C o "$AZURE_ATTESTATION_REPORT_INDEX" -o "$report" \
+        >"$OUT_DIR/azure/attestation-report-nvread.txt" 2>"$err"; then
+        record "azure:attestation-report" "ok" "$report"
+        [[ -s "$err" ]] || rm -f "$err"
+
+        if have python3; then
+            python3 - "$report" "$OUT_DIR/azure" <<'PY'
+import json
+import pathlib
+import struct
+import sys
+
+report_path = pathlib.Path(sys.argv[1])
+out_dir = pathlib.Path(sys.argv[2])
+data = report_path.read_bytes()
+
+info = {
+    "total_size": len(data),
+}
+
+if len(data) >= 32:
+    sig, version, report_size, request_type, status = struct.unpack_from("<IIIII", data, 0)
+    info.update({
+        "signature_u32_le": f"0x{sig:08x}",
+        "version": version,
+        "report_size": report_size,
+        "request_type": request_type,
+        "status": status,
+    })
+
+# Azure documents a 32-byte header and a 1184-byte AMD SEV-SNP payload.
+if len(data) >= 32 + 1184:
+    payload = data[32:32 + 1184]
+    (out_dir / "snp-hardware-report.bin").write_bytes(payload)
+    runtime = data[32 + 1184:]
+    if runtime:
+        (out_dir / "runtime-data.bin").write_bytes(runtime)
+
+(out_dir / "attestation-report-header.json").write_text(
+    json.dumps(info, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+            record "azure:attestation-report-parse" "ok" \
+                "$OUT_DIR/azure/attestation-report-header.json"
+        fi
+    else
+        record "azure:attestation-report" "error" "index=$AZURE_ATTESTATION_REPORT_INDEX"
+    fi
+
+    local akcert="$OUT_DIR/azure/vtpm-ak-cert.bin"
+    err="$ERROR_DIR/azure_ak_cert.stderr"
+
+    if tpm2_nvread -C o "$AZURE_AK_CERT_INDEX" -o "$akcert" \
+        >"$OUT_DIR/azure/vtpm-ak-cert-nvread.txt" 2>"$err"; then
+        record "azure:ak-cert" "ok" "$akcert"
+        [[ -s "$err" ]] || rm -f "$err"
+    else
+        record "azure:ak-cert" "error" "index=$AZURE_AK_CERT_INDEX"
+    fi
+
+    if have curl; then
+        if curl -fsS --max-time 3 \
+            -H 'Metadata:true' \
+            'http://169.254.169.254/metadata/THIM/amd/certification' \
+            -o "$OUT_DIR/azure/vcek-imds.json" \
+            2>"$ERROR_DIR/azure_vcek_imds.stderr"; then
+
+            record "azure:vcek-imds" "ok" "$OUT_DIR/azure/vcek-imds.json"
+
+            if have python3; then
+                python3 - "$OUT_DIR/azure/vcek-imds.json" "$OUT_DIR/azure/vcek.pem" <<'PY'
+import json
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+dest = pathlib.Path(sys.argv[2])
+
+try:
+    obj = json.loads(source.read_text(encoding="utf-8"))
+    values = []
+    for key in ("vcekCert", "certificateChain"):
+        value = obj.get(key)
+        if isinstance(value, str) and value:
+            values.append(value.rstrip())
+    if values:
+        dest.write_text("\n".join(values) + "\n", encoding="utf-8")
+except Exception:
+    pass
+PY
+            fi
+        else
+            record "azure:vcek-imds" "error" "IMDS endpoint unavailable"
+        fi
+
+        if curl -fsS --max-time 3 \
+            -H 'Metadata:true' \
+            'http://169.254.169.254/metadata/instance?api-version=2021-02-01' \
+            -o "$OUT_DIR/azure/instance-metadata.json" \
+            2>"$ERROR_DIR/azure_instance_metadata.stderr"; then
+            record "azure:instance-metadata" "ok" "$OUT_DIR/azure/instance-metadata.json"
+        else
+            record "azure:instance-metadata" "error" "IMDS endpoint unavailable"
+        fi
+    else
+        record "azure:imds" "missing" "curl"
+    fi
+}
+
+collect_ak_and_quote() {
+    if ! have tpm2_readpublic; then
+        record "tpm:ak-public" "missing" "tpm2_readpublic"
+        return
+    fi
+
+    run_text "tpm:ak-public" "$OUT_DIR/tpm/ak-readpublic.txt" \
+        tpm2_readpublic \
+            -c "$AZURE_AK_HANDLE" \
+            -f pem \
+            -o "$OUT_DIR/tpm/ak-public.pem" \
+            -n "$OUT_DIR/tpm/ak-name.bin" || true
+
+    if ! have tpm2_quote; then
+        record "tpm:quote" "missing" "tpm2_quote"
+        return
+    fi
+
+    local err="$ERROR_DIR/tpm_quote.stderr"
+
+    if tpm2_quote \
+        -c "$AZURE_AK_HANDLE" \
+        -l "$PCR_LIST" \
+        -q "$OUT_DIR/challenge.bin" \
+        -m "$OUT_DIR/tpm/quote.msg" \
+        -s "$OUT_DIR/tpm/quote.sig" \
+        -o "$OUT_DIR/tpm/quote.pcrs" \
+        -g sha256 \
+        >"$OUT_DIR/tpm/quote.txt" 2>"$err"; then
+
+        record "tpm:quote" "ok" "$OUT_DIR/tpm/quote.msg"
+        [[ -s "$err" ]] || rm -f "$err"
+    else
+        record "tpm:quote" "error" "AK=$AZURE_AK_HANDLE PCRS=$PCR_LIST"
+    fi
+}
+
+collect_nexus_binary() {
+    if [[ ! -e "$NEXUS_BINARY" ]]; then
+        record "nexus:binary" "missing" "$NEXUS_BINARY"
+        return
+    fi
+
+    readlink -f -- "$NEXUS_BINARY" > "$OUT_DIR/nexus/binary-path.txt" 2>/dev/null || \
+        printf '%s\n' "$NEXUS_BINARY" > "$OUT_DIR/nexus/binary-path.txt"
+
+    sha256sum -- "$NEXUS_BINARY" > "$OUT_DIR/nexus/nexus.sha256" 2>/dev/null || true
+    stat -- "$NEXUS_BINARY" > "$OUT_DIR/nexus/binary-stat.txt" 2>/dev/null || true
+
+    if have getcap; then
+        getcap -v -- "$NEXUS_BINARY" > "$OUT_DIR/nexus/binary-capabilities.txt" 2>/dev/null || true
+    fi
+
+    if have readelf; then
+        readelf -h -l -d -n -- "$NEXUS_BINARY" > "$OUT_DIR/nexus/readelf.txt" 2>/dev/null || true
+    fi
+
+    "$NEXUS_BINARY" --version > "$OUT_DIR/nexus/version.txt" 2>&1 || true
+
+    record "nexus:binary" "ok" "$OUT_DIR/nexus/nexus.sha256"
+}
+
+collect_service() {
+    if ! have systemctl; then
+        record "runtime:systemd" "missing" "systemctl"
+        return
+    fi
+
+    run_text "runtime:service-cat" "$OUT_DIR/runtime/service-unit.txt" \
+        systemctl cat "$NEXUS_SERVICE" || true
+
+    local props=(
+        Id LoadState ActiveState SubState MainPID FragmentPath User Group
+        NoNewPrivileges CapabilityBoundingSet AmbientCapabilities
+        PrivateTmp ProtectSystem ProtectHome ProtectKernelTunables
+        ProtectKernelModules ProtectControlGroups RestrictNamespaces
+        RestrictRealtime LockPersonality MemoryDenyWriteExecute
+        RestrictAddressFamilies SystemCallFilter SystemCallArchitectures
+        DynamicUser UMask DevicePolicy RestrictSUIDSGID ProtectProc ProcSubset
+    )
+
+    local args=()
+    local p
+    for p in "${props[@]}"; do
+        args+=("-p" "$p")
+    done
+
+    run_text "runtime:service-properties" "$OUT_DIR/runtime/service-properties.txt" \
+        systemctl show "${args[@]}" "$NEXUS_SERVICE" || true
+
+    if have systemd-analyze; then
+        SYSTEMD_COLORS=0 systemd-analyze security "$NEXUS_SERVICE" \
+            >"$OUT_DIR/runtime/systemd-security.txt" 2>"$ERROR_DIR/systemd_security.stderr" || true
+    fi
+
+    local pid
+    pid="$(systemctl show -p MainPID --value "$NEXUS_SERVICE" 2>/dev/null || true)"
+
+    if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )) && [[ -d "/proc/$pid" ]]; then
+        printf '%s\n' "$pid" > "$OUT_DIR/runtime/main-pid.txt"
+
+        copy_file "runtime:proc-status" "/proc/$pid/status" \
+            "$OUT_DIR/runtime/proc-status.txt" || true
+
+        copy_file "runtime:proc-maps" "/proc/$pid/maps" \
+            "$OUT_DIR/runtime/proc-maps.txt" || true
+
+        readlink -f "/proc/$pid/exe" > "$OUT_DIR/runtime/proc-exe.txt" 2>/dev/null || true
+
+        # Hash each file-backed mapping once. This describes the executable
+        # files that the running process currently maps.
+        if [[ -r "/proc/$pid/maps" ]]; then
+            awk '
+                NF >= 6 && $6 ~ /^\// {
+                    path=$6
+                    sub(/ \(deleted\)$/, "", path)
+                    print path
+                }
+            ' "/proc/$pid/maps" | sort -u > "$OUT_DIR/runtime/mapped-files.txt"
+
+            : > "$OUT_DIR/runtime/mapped-files.sha256"
+            while IFS= read -r mapped; do
+                [[ -f "$mapped" ]] || continue
+                sha256sum -- "$mapped" >> "$OUT_DIR/runtime/mapped-files.sha256" 2>/dev/null || true
+            done < "$OUT_DIR/runtime/mapped-files.txt"
+        fi
+
+        record "runtime:process" "ok" "pid=$pid"
+    else
+        record "runtime:process" "missing" "service has no active MainPID"
+    fi
+}
+
+collect_security_runtime() {
+    {
+        printf 'uid=%s\n' "$(id -u)"
+        printf 'euid=%s\n' "$EUID"
+        printf 'user=%s\n' "$(id -un 2>/dev/null || true)"
+        printf 'apparmor_enabled=%s\n' "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null || true)"
+        printf 'selinux_enforce=%s\n' "$(cat /sys/fs/selinux/enforce 2>/dev/null || true)"
+        printf 'lockdown=%s\n' "$(cat /sys/kernel/security/lockdown 2>/dev/null || true)"
+    } > "$OUT_DIR/runtime/security-state.txt"
+
+    if have aa-status; then
+        aa-status > "$OUT_DIR/runtime/apparmor-status.txt" 2>&1 || true
+    fi
+
+    if have sestatus; then
+        sestatus > "$OUT_DIR/runtime/selinux-status.txt" 2>&1 || true
+    fi
+
+    record "runtime:security-state" "ok" "$OUT_DIR/runtime/security-state.txt"
+}
+
+write_readme() {
+    cat > "$OUT_DIR/README.txt" <<EOF
+Lemonade Nexus attestation evidence
+===================================
+
+Collector version: $VERSION
+Mode:              $MODE
+Started UTC:       $START_UTC
+Nexus binary:      $NEXUS_BINARY
+Nexus service:     $NEXUS_SERVICE
+PCR selection:     $PCR_LIST
+
+This directory contains collected evidence only.
+
+The collector does not decide whether this host is Tier 1 eligible.
+A remote Nexus verifier must:
+
+1. Examine the Azure SEV-SNP report and endorsement chain.
+2. Bind the vTPM attestation key to the SEV-SNP report.
+3. Verify the TPM quote with the caller challenge.
+4. Replay the measured-boot event log.
+5. Replay the IMA log and compare it with quoted PCR 10.
+6. Compare boot, runtime, binary, and policy measurements with the approved profile.
+7. Check node identity, incarnation, epoch, and Nexus security rules.
+
+Missing evidence appears in status.tsv.
+Command errors appear in errors/.
+EOF
+}
+
+finalize_manifest() {
+    # Hash all current evidence before the manifest is created.
+    (
+        cd "$OUT_DIR" || exit 1
+        find . -type f \
+            ! -name 'SHA256SUMS' \
+            ! -name 'manifest.json' \
+            -print0 |
+            sort -z |
+            xargs -0 -r sha256sum
+    ) > "$OUT_DIR/SHA256SUMS"
+
+    if have python3; then
+        python3 - "$OUT_DIR" "$MODE" "$VERSION" "$START_UTC" \
+            "$NEXUS_BINARY" "$NEXUS_SERVICE" "$PCR_LIST" <<'PY'
+import csv
+import hashlib
+import json
+import pathlib
+import socket
+import sys
+
+root = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+version = sys.argv[3]
+started = sys.argv[4]
+nexus_binary = sys.argv[5]
+nexus_service = sys.argv[6]
+pcr_list = sys.argv[7]
+
+statuses = []
+status_path = root / "status.tsv"
+if status_path.exists():
+    with status_path.open("r", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f, delimiter="\t")
+        for row in reader:
+            if not row:
+                continue
+            row += [""] * (3 - len(row))
+            statuses.append({
+                "item": row[0],
+                "state": row[1],
+                "detail": row[2],
+            })
+
+challenge_sha256 = None
+challenge_path = root / "challenge.bin"
+if challenge_path.exists():
+    challenge_sha256 = hashlib.sha256(challenge_path.read_bytes()).hexdigest()
+
+manifest = {
+    "schema": "lemonade-nexus-attestation-collector-v1",
+    "collector_version": version,
+    "mode": mode,
+    "started_utc": started,
+    "finished_utc": __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "hostname": socket.gethostname(),
+    "nexus_binary": nexus_binary,
+    "nexus_service": nexus_service,
+    "pcr_selection": pcr_list,
+    "challenge_sha256": challenge_sha256,
+    "status": statuses,
+}
+
+(root / "manifest.json").write_text(
+    json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+    encoding="utf-8",
+)
+PY
+        record "manifest" "ok" "$OUT_DIR/manifest.json"
+    else
+        record "manifest" "missing" "python3"
+    fi
+
+    # Recreate the checksum list so it includes the final manifest and status.
+    (
+        cd "$OUT_DIR" || exit 1
+        find . -type f \
+            ! -name 'SHA256SUMS' \
+            -print0 |
+            sort -z |
+            xargs -0 -r sha256sum
+    ) > "$OUT_DIR/SHA256SUMS"
+
+    chmod -R go-rwx "$OUT_DIR" 2>/dev/null || true
+}
+
+main() {
+    parse_args "$@"
+    make_output_tree
+
+    log "$PROGRAM $VERSION"
+    log "Mode: $MODE"
+    log "Output: $OUT_DIR"
+
+    if (( EUID != 0 )); then
+        record "collector:privilege" "warning" \
+            "not root; TPM, IMA, event-log, or process evidence can be incomplete"
+        log "NOTE: Run with sudo for the most complete evidence."
+    else
+        record "collector:privilege" "ok" "root"
+    fi
+
+    if ! have xxd; then
+        record "tool:xxd" "missing" "required only for hexadecimal --challenge input"
+        if [[ "$MODE" == "evidence" && ! -f "$CHALLENGE_INPUT" ]]; then
+            log "ERROR: xxd is required for a hexadecimal challenge."
+            exit 2
+        fi
+    fi
+
+    prepare_challenge || {
+        log "ERROR: Could not prepare the challenge."
+        exit 2
+    }
+
+    collect_tool_versions
+    collect_system
+    collect_secure_boot
+    collect_boot_log
+    collect_ima
+    collect_tpm_inventory
+    collect_azure_report
+    collect_ak_and_quote
+    collect_nexus_binary
+    collect_service
+    collect_security_runtime
+    write_readme
+    finalize_manifest
+
+    log "Collection complete: $OUT_DIR"
+    log "Review manifest.json and status.tsv first."
+}
+
+main "$@"
