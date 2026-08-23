@@ -92,6 +92,8 @@ add_nexus_test(test_security_hotstuff
     security/consensus/hotstuff_votes.cpp
     security/consensus/hotstuff_restart.cpp)
 endif()
+add_nexus_test(test_security_genesis
+    security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
     security/authority/authority_object.cpp
     security/authority/nonce_commitment.cpp)

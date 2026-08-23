@@ -29,8 +29,9 @@ using ConsensusRulesetVersion = uint16_t;
 inline constexpr std::size_t kDigestSize = 32;
 using Digest = std::array<uint8_t, kDigestSize>;
 
-// The network identity is the digest of the bootstrap certificate; Genesis
-// fixes it once and every later object binds to it.
+// The network identity derives from the genesis identity and the compiled
+// rulesets (see Genesis/BootstrapCertificate.hpp). Genesis fixes it once and
+// every later object binds to it.
 using NetworkId = Digest;
 
 inline constexpr std::size_t kNonceSize = 32;
