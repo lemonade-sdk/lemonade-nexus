@@ -8,6 +8,7 @@
 // Construct this type only from finalized consensus state.
 
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>
+#include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <cstdint>
@@ -33,6 +34,27 @@ struct AuthorityObject {
     Digest finalized_state_digest{};
     Digest consensus_certificate_digest{};
 };
+
+/// The only constructor path from consensus: the finalized state digest and
+/// the certificate digest come from the commit itself, so an object can never
+/// claim a state its certificate did not finalize. For the main authority
+/// key, key_generation equals the epoch.
+[[nodiscard]] inline AuthorityObject make_authority_object(const ConsensusCommit& commit,
+                                                           const NetworkId& network_id,
+                                                           AuthorityOperation operation,
+                                                           OperationId operation_id,
+                                                           const Digest& previous_state_digest) {
+    AuthorityObject object;
+    object.network_id = network_id;
+    object.epoch = commit.epoch;
+    object.key_generation = commit.epoch;
+    object.operation = operation;
+    object.operation_id = operation_id;
+    object.previous_state_digest = previous_state_digest;
+    object.finalized_state_digest = commit.proposed_state_root;
+    object.consensus_certificate_digest = commit.qc_digest;
+    return object;
+}
 
 [[nodiscard]] inline Digest authority_object_digest(const AuthorityObject& object) {
     CanonicalEncoder encoder("lemonade-nexus/authority-object:v1");
