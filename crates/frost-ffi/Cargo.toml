@@ -1,0 +1,23 @@
+[package]
+name = "lemonade-frost-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lemonade_frost_ffi"
+# rlib alongside staticlib so `cargo test` can link the unit tests.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Pinned per the security architecture (section 12). Default features carry
+# "serialization" (package serialize/deserialize) and "cheater-detection"
+# (aggregate identifies the culprit share).
+frost-ed25519 = "=2.2.0"
+# OsRng needs the getrandom backend. frost uses the same rand_core 0.6.
+rand_core = { version = "0.6", features = ["getrandom"] }
+# Explicit wipe of secrets on handle free. Same major as frost-core's.
+zeroize = "1"
+
+[dev-dependencies]
+# Proves aggregated signatures verify as plain Ed25519.
+ed25519-dalek = "=2.2.0"

@@ -70,6 +70,7 @@ include(libraries/c-ares)
 include(libraries/sqlite3)
 include(libraries/boringtun)
 include(libraries/virtual-netstack)
+include(libraries/frost)
 
 #-----------------------------------------------------------------------------
 # Projects

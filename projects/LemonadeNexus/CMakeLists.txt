@@ -28,6 +28,7 @@ create_project(LemonadeNexus DEPENDENCIES
         sqlite3
         boringtun-ffi
         virtual-netstack
+        frost-ffi
 )
 
 target_compile_definitions(LemonadeNexus PUBLIC
