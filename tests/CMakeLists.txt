@@ -86,23 +86,25 @@ add_nexus_test(test_security_epoch
     security/epoch/epoch_state.cpp
     security/epoch/transition.cpp
     security/epoch/epoch_manager.cpp)
-# Temporary guard: the HotStuff service sources land from a parallel task.
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/security/consensus/hotstuff_restart.cpp)
 add_nexus_test(test_security_hotstuff
     security/consensus/consensus_store.cpp
     security/consensus/hotstuff_safety.cpp
     security/consensus/hotstuff_votes.cpp
     security/consensus/hotstuff_restart.cpp)
-endif()
+add_nexus_test(test_security_integration
+    security/integration/first_path.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
     security/authority/authority_object.cpp
-    security/authority/nonce_commitment.cpp)
+    security/authority/nonce_commitment.cpp
+    security/authority/dkg_session.cpp
+    security/authority/signing.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
-    security/attestation/linux_profile.cpp)
+    security/attestation/linux_profile.cpp
+    security/attestation/service.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)

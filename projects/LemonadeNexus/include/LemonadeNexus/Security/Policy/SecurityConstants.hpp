@@ -101,6 +101,11 @@ inline constexpr uint64_t kTargetEpochSeconds = 3600;
 inline constexpr uint64_t kReattestIntervalSeconds = 900;
 inline constexpr uint64_t kFinalAttestMaxAgeSeconds = 300;
 
+// Tier 1 attestation is expensive; the budget binds to node identity and
+// epoch, never to an IP address (architecture 16). Initial value; a tuning
+// item.
+inline constexpr uint32_t kMaxTier1AttestAttemptsPerEpoch = 4;
+
 // --- HotStuff safety rules --------------------------------------------------
 
 inline constexpr std::size_t kHotStuffChainLength = 3;
