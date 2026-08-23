@@ -75,6 +75,7 @@ add_nexus_test(test_security_policy
     security/policy/tier1_eligibility.cpp
     security/policy/canonical_encoding.cpp)
 add_nexus_test(test_secure_buffer      test_secure_buffer.cpp)
+add_nexus_test(test_frost_provider     test_frost_provider.cpp)
 add_nexus_test(test_security_consensus
     security/consensus/consensus_types.cpp
     security/consensus/quorum_certificate.cpp
@@ -83,7 +84,8 @@ add_nexus_test(test_security_consensus
 add_nexus_test(test_security_epoch
     security/epoch/tier1_selector.cpp
     security/epoch/epoch_state.cpp
-    security/epoch/transition.cpp)
+    security/epoch/transition.cpp
+    security/epoch/epoch_manager.cpp)
 # Temporary guard: the HotStuff service sources land from a parallel task.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/security/consensus/hotstuff_restart.cpp)
 add_nexus_test(test_security_hotstuff
