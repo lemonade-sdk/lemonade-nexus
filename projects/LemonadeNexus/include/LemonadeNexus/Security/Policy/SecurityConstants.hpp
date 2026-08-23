@@ -33,6 +33,7 @@ inline constexpr uint16_t kQcFormatVersion = 1;
 // --- Domain-separation strings ----------------------------------------------
 
 inline constexpr std::string_view kBftProtocolDomain = "LEMONADE-NEXUS-HOTSTUFF-V1";
+inline constexpr std::string_view kFrostCiphersuite = "FROST(Ed25519, SHA-512)";
 inline constexpr std::string_view kTier1AttestDomain = "LEMONADE-NEXUS-T1-ATTEST-V1";
 inline constexpr std::string_view kTier1SelectDomain = "LEMONADE-NEXUS-T1-SELECT-V1";
 inline constexpr std::string_view kLeaderOrderDomain = "LEMONADE-NEXUS-HOTSTUFF-LEADER-V1";

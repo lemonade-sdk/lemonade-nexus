@@ -84,6 +84,17 @@ add_nexus_test(test_security_epoch
     security/epoch/tier1_selector.cpp
     security/epoch/epoch_state.cpp
     security/epoch/transition.cpp)
+# Temporary guard: the HotStuff service sources land from a parallel task.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/security/consensus/hotstuff_restart.cpp)
+add_nexus_test(test_security_hotstuff
+    security/consensus/consensus_store.cpp
+    security/consensus/hotstuff_safety.cpp
+    security/consensus/hotstuff_votes.cpp
+    security/consensus/hotstuff_restart.cpp)
+endif()
+add_nexus_test(test_security_authority
+    security/authority/authority_object.cpp
+    security/authority/nonce_commitment.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
