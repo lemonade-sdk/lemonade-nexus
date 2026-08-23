@@ -87,6 +87,32 @@ implementation. These are now defined in code:
   `sync_to_certified(view_floor)`. A corrupt file makes the service unusable.
   Corrupt is never treated as absent.
 
+## 3a. Live cutover progress
+
+### M1 — Security transport wiring (done)
+
+| Piece | Files | Tests |
+|---|---|---|
+| Transport contract | `Transport/SecurityTransport.hpp` (`ISecurityTransport`, `SecuritySink`) | — |
+| Wire codec | `Transport/SecurityCodec` — hand-written fixed layouts, length-prefixed fields with explicit maxima, no nesting, no generic parser | `transport/codec.cpp` (11) |
+| Pairwise seal | `Transport/PairwiseSeal` — X25519 sealed box to the recipient identity for DKG round-2 packages | in router tests |
+| Router | `Transport/SecurityRouter` — bound, per-peer budget, decode, sender binding (envelope and body), compiled rulesets, network, epoch window, dedupe, then one service; carries service answers back to the wire | `transport/router.cpp` (5, includes a five-node mesh over encoded envelopes) |
+| Gossip path | `GossipMsgType::SecurityEnvelope = 0x16`; `GossipService` implements `ISecurityTransport` and delivers to one sink; signature-only authentication, size bound, no parse, no relay | `test_gossip_security_transport.cpp` (9) |
+
+Transport bounds are compiled constants (`kMaxSecurityMessageBytes = 60000`,
+per-kind payload maxima, `kSecurityPeerMessagesPerWindow = 256` per second,
+`kSecurityDedupeWindow = 4096`).
+
+Message classes on the wire: `AttestationChallenge`, `AttestationEvidence`,
+`HotStuffProposal` (with its justify certificate), `HotStuffVote`,
+`HotStuffTimeout`, `DkgBroadcast`, `DkgPairwise` (sealed), `FrostCommitment`,
+`FrostSignatureShare`, `EpochAnnouncement`.
+
+The router reports protocol outcomes through `ISecurityEvents`; the lifecycle
+driver (M2) decides what happens next. Evidence production behind
+`IEvidenceProducer` is not wired yet: a node without a producer answers no
+challenge and stays ineligible.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
