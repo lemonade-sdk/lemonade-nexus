@@ -68,6 +68,13 @@ target_compile_definitions(test_evidence_chain PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 
+# --- Security overhaul tests (mirror include/LemonadeNexus/Security/) ---
+add_nexus_test(test_security_policy
+    security/policy/quorum.cpp
+    security/policy/tier1_target.cpp
+    security/policy/tier1_eligibility.cpp
+    security/policy/canonical_encoding.cpp)
+
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
     add_executable(${TEST_NAME} ${ARGN})
