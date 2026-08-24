@@ -166,6 +166,45 @@ attestation, deterministic selection, HotStuff finality, and per-epoch FROST
 keys. `tests/test_legacy_removal.cpp` proves retired wire types and removed
 endpoints cannot affect mesh state.
 
+An adversarial review of the M3 test files (23 agents, 3 lenses, refute-style
+verification) drove one production fix and a hardening pass:
+
+- **`handle_ns_slot_claim` was ungated.** It parsed the claim signature and
+  never verified it, and mutated `ns_slots_` (which feeds DNS NS
+  registration) from unauthenticated ingress. It now verifies the claim
+  signature against the claimant key and requires
+  `peer_certificate_is_root_signed(claimant)`. The gate binds to the
+  CLAIMANT, not the forwarding sender, because claims travel epidemically.
+- The retired range `0x07`–`0x10` is pinned by a `static_assert` in
+  `GossipTypes.hpp`: every live enumerator must stay outside it.
+- The poll/ack domain-separation tags moved to `kOnboardPollTag` /
+  `kOnboardAckTag` constants; the endpoints and the test share them.
+- The drop-by-type tests now inject payloads their controls PROVE a live
+  type accepts from the same (certified) sender, so the type byte is the
+  only discriminating variable; the mesh-attached test gained a real
+  positive control (a verified `ServerHello` fires the peer-certified
+  callback and the genesis authority spends an attestation challenge).
+- New admission negatives: nonce replay, stale timestamp, server_id-bound
+  tokens, the approve-time evidence gate, denial cooldown across restart,
+  pending-capacity 429 with the token carve-out, acknowledge lifecycle,
+  status ownership, the reserved root server_id, and approve-time supersede
+  with revocation of the old key.
+- The cooldown-across-restart test caught a real bug:
+  `ServerAdmissionService::load()` iterated `root.value(...)` temporaries
+  directly in range-fors. Under C++20 the temporary dies at the end of the
+  range-init expression (P2718 extends it only in C++23), so the restore
+  loops read destroyed objects — in practice a restart silently cleared
+  every active denial cooldown. Both loops now materialize locals first; a
+  codebase sweep found no other instance of the pattern.
+
+Known residual gaps, carried to M5/M7: the `AclDelta` / `DnsRecordSync` /
+`BackboneIpamSync` cert gates share the exact `DeltaResponse` rule but have
+no wire-level test of their own (their handlers also verify inner delta
+signatures); `handle_misbehavior_proof` is verified only at the function
+level (`test_misbehavior_detector.cpp`), not through hostile wire packets;
+hostile `ServerHello` variants (forged cert, packet-signer mismatch) have no
+dedicated negative wire test.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
