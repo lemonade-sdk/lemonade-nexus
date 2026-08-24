@@ -205,6 +205,32 @@ level (`test_misbehavior_detector.cpp`), not through hostile wire packets;
 hostile `ServerHello` variants (forged cert, packet-signer mismatch) have no
 dedicated negative wire test.
 
+### M4 — Real multi-node development mesh (in progress)
+
+`scripts/dev-mesh.sh` runs five separate `lemonade-nexus` processes on
+localhost with real UDP transport: node 0 first-runs as the mesh root and
+pinned genesis anchor, enrolls all five identities, and the harness copies
+the root-signed certificates to the joining nodes — the same file movement
+an operator performs. No code path was added for the harness; it drives the
+shipped binary through its normal configuration.
+
+On hardware without SEV-SNP the run proves the fail-closed path end to end
+across processes: the anchor enters `GenesisCollecting`, admits the
+certified peers, sends real attestation challenges over UDP, receives
+evidence, and records FAILING verdicts from the real verifier. Founding
+never happens, no epoch activates, and all five processes stay healthy.
+The first run recorded five failing verdicts and zero foundings.
+
+The security driver now logs its phase transitions and genesis verdicts
+(`set_phase`, INFO level) — the security plane was previously silent, which
+made multi-process behavior unobservable for operators and tests alike.
+
+Still open for M4: the positive Genesis path needs five Tier 1-capable
+(SEV-SNP + vTPM + anchored IMA) hosts — no local machine or the current
+test server qualifies, and the profile will not be weakened to compensate;
+the test server (10.10.12.40) remains the target for Tier-2, ineligible-peer,
+and transport testing against a real network.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
