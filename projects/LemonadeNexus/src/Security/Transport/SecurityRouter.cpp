@@ -424,9 +424,14 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
     if (!evidence.has_value()) {
         return drop(DropReason::NoService);
     }
-    const SecurityMessage out =
+    SecurityMessage out =
         compose(SecurityMessageKind::AttestationEvidence, *evidence, challenge.epoch);
-    (void)send(from, out);
+    if (from == runtime_.self()) {
+        // Loopback attestation: this node examines its own evidence.
+        (void)deliver_local(std::move(out));
+    } else {
+        (void)send(from, out);
+    }
     return delivered();
 }
 

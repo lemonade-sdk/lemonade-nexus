@@ -100,6 +100,8 @@ add_nexus_test(test_security_integration
 add_nexus_test(test_security_transport
     security/transport/codec.cpp
     security/transport/router.cpp)
+add_nexus_test(test_security_lifecycle
+    security/lifecycle/driver.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
