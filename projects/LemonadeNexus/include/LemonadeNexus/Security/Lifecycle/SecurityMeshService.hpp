@@ -59,6 +59,13 @@ public:
     [[nodiscard]] static constexpr std::string_view name() { return "SecurityMeshService"; }
 
     [[nodiscard]] const SecurityDriver& driver() const { return driver_; }
+
+    /// True when `node` is in the current epoch's frozen Tier 1 set. The mesh
+    /// decided that; consumers only read it.
+    [[nodiscard]] bool is_current_member(const NodeId& node) const {
+        const EpochManager* epochs = runtime_.epochs();
+        return epochs != nullptr && epochs->current().tier1_members.contains(node);
+    }
     [[nodiscard]] SecurityRuntime& runtime() { return runtime_; }
 
 private:

@@ -106,8 +106,6 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
                                                      httplib::Response& res) {
         json_response(res, {
             {"accepts_onboarding", admission.accepts_onboarding()},
-            {"regime",             admission.regime()},
-            {"eligible_voters",    admission.eligible_voter_count()},
             {"dns_base_domain",    ctx_.config.dns_base_domain},
             {"server_fqdn",        ctx_.server_fqdn},
         });
@@ -141,7 +139,6 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         in.enrollment_token = body->value("enrollment_token", std::string{});
         auto r = admission.create_request(in);
         if (!r.ok) { error_response(res, r.error, r.status); return; }
-        if (r.needs_ballot) admission.start_pending_ballot(r.request_id);
         json_response(res, {{"request_id", r.request_id}, {"state", "pending"}});
     });
 
@@ -204,7 +201,7 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
                 {"created_at", a.created_at},
             });
         }
-        json_response(res, {{"regime", admission.regime()}, {"pending", arr}});
+        json_response(res, {{"pending", arr}});
     }));
 
     // ── POST /api/onboard/approve/<id> (private, JWT) ───────────────────────

@@ -270,8 +270,8 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
 // Credential distribution: root server side
 // ---------------------------------------------------------------------------
 
-void DdnsService::set_trust_policy(core::TrustPolicyService* policy) {
-    trust_policy_ = policy;
+void DdnsService::set_tier1_gate(std::function<bool(std::string_view)> gate) {
+    tier1_gate_ = std::move(gate);
 }
 
 std::optional<std::string> DdnsService::handle_credential_request(
@@ -279,23 +279,20 @@ std::optional<std::string> DdnsService::handle_credential_request(
     const crypto::Ed25519PrivateKey& root_privkey,
     const crypto::Ed25519PublicKey& root_pubkey) {
 
-    // Zero-trust: if trust policy is active, verify the requesting server is Tier 1
-    if (trust_policy_) {
-        // Extract server pubkey from the certificate to check trust tier
-        auto cert_json_str = request.value("server_certificate", "");
+    // Only a current Tier 1 member may draw DNS credentials. The mesh
+    // security system decides membership; an unset gate denies.
+    {
+        std::string server_pk;
+        const auto cert_json_str = request.value("server_certificate", "");
         if (!cert_json_str.empty()) {
             try {
-                auto cert_j = json::parse(cert_json_str);
-                auto server_pk = cert_j.value("server_pubkey", "");
-                if (!server_pk.empty() &&
-                    !trust_policy_->authorize(server_pk, core::TrustOperation::CredentialRequest)) {
-                    spdlog::warn("[{}] credential request denied: server {} not authorized (requires Tier 1)",
-                                  name(), server_pk.substr(0, 12) + "...");
-                    return std::nullopt;
-                }
+                server_pk = json::parse(cert_json_str).value("server_pubkey", "");
             } catch (...) {
-                // Will be caught by the certificate parsing below
             }
+        }
+        if (server_pk.empty() || !tier1_gate_ || !tier1_gate_(server_pk)) {
+            spdlog::warn("[{}] credential request denied: not a current Tier 1 member", name());
+            return std::nullopt;
         }
     }
 

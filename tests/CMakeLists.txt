@@ -28,7 +28,6 @@ add_nexus_test(test_crypto_types       test_crypto_types.cpp)
 add_nexus_test(test_sodium_crypto      test_sodium_crypto.cpp)
 add_nexus_test(test_key_wrapping       test_key_wrapping.cpp)
 add_nexus_test(test_file_storage       test_file_storage.cpp)
-add_nexus_test(test_permissions        test_permissions.cpp)
 add_nexus_test(test_permission_tree    test_permission_tree.cpp)
 add_nexus_test(test_account_data       test_account_data.cpp)
 add_nexus_test(test_mesh_rekey         test_mesh_rekey.cpp)
@@ -47,15 +46,12 @@ add_nexus_test(test_wg_wire_protocol  test_wg_wire_protocol.cpp)
 add_nexus_test(test_ip_router         test_ip_router.cpp)
 add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
-add_nexus_test(test_trust             test_trust.cpp)
-add_nexus_test(test_onboarding        test_onboarding.cpp)
 add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
 
 # Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
 add_nexus_test(test_tls_transport     test_tls_transport.cpp)
 target_compile_definitions(test_tls_transport PRIVATE CPPHTTPLIB_OPENSSL_SUPPORT)
 target_link_libraries(test_tls_transport PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-add_nexus_test(test_tee_attestation_tpm test_tee_attestation_tpm.cpp)
 
 # Drives the SNP evidence chain against a real attestation blob + VCEK captured from
 # the live Azure genesis, so it runs with no confidential-compute hardware present.

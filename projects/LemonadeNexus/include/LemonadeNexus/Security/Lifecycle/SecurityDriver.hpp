@@ -66,6 +66,10 @@ public:
     [[nodiscard]] std::optional<EpochId> current_epoch() const;
     [[nodiscard]] Height last_committed_height() const { return last_committed_height_; }
 
+    /// True when this node is in the current epoch's frozen Tier 1 set. The
+    /// mesh decided that; this is a read, never a decision.
+    [[nodiscard]] bool is_tier1_member() const;
+
     // --- ISecurityEvents ---
     void on_vote_sent(const Vote&, const NodeId&) override {}
     void on_certificate(const QuorumCertificate& certificate) override;

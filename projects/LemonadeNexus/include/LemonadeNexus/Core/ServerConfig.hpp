@@ -88,7 +88,6 @@ struct ServerConfig {
     std::string enroll_tpm_ak_pubkey;  // base64 DER SPKI platform binding key to pin in the cert
     std::string enroll_tpm_ek_cert_path; // optional path to the joining TPM's EK cert (PEM)
     std::string revoke_server_pubkey;
-    bool        print_tpm_ak{false};   // print this host's TPM AK pubkey (base64 DER SPKI) and exit
     bool        verify_platform{false};    // run the platform evidence probe and exit
     std::string verify_platform_blob;      // optional: verify a captured HCL blob instead of this host's
 
@@ -111,8 +110,6 @@ struct ServerConfig {
     bool        mint_admission_token{false};       // CLI mode: mint an enrollment token and exit (runtime-only)
     std::string mint_token_candidate;              // optional base64 candidate key to bind (runtime-only)
     uint32_t    mint_token_ttl_sec{600};           // minted-token TTL (runtime-only)
-    float       admission_quorum_ratio{0.75f};     // Tier1 vote fraction for admission ballots
-    uint32_t    onboard_min_tier1_for_vote{6};     // switch from sole-discretion to voting at this many Tier1s
     uint32_t    onboard_request_ttl_sec{3600};     // pending admission lifetime
     uint32_t    onboard_max_pending{8};            // cap on concurrent pending admissions
 
@@ -123,10 +120,6 @@ struct ServerConfig {
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
 
     // Quorum-based enrollment
-    bool     require_peer_confirmation{false};    // require Tier1 peer votes before full admission
-    float    enrollment_quorum_ratio{0.5f};       // fraction of Tier1 peers needed (default 50%)
-    uint32_t enrollment_vote_timeout_sec{60};     // vote collection window (seconds)
-    uint32_t enrollment_max_retries{3};           // retries before permanent rejection
 
     // TEE attestation is not configurable: Tier 1 is granted only by a verified
     // evidence chain produced at startup, and enforcement is always on. The retired

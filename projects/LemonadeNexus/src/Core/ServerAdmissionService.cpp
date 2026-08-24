@@ -1,7 +1,6 @@
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 
 #include <LemonadeNexus/Core/ServerConfig.hpp>
-#include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -52,16 +51,13 @@ ServerAdmissionService::ServerAdmissionService(
         crypto::SodiumCryptoService& crypto,
         crypto::KeyWrappingService& key_wrapping,
         storage::FileStorageService& storage,
-        gossip::GossipService& gossip,
-        TrustPolicyService* trust_policy)
+        gossip::GossipService& gossip)
     : config_(config), crypto_(crypto), key_wrapping_(key_wrapping),
-      storage_(storage), gossip_(gossip), trust_policy_(trust_policy),
+      storage_(storage), gossip_(gossip),
       tokens_(storage, crypto) {
-    cfg_.enabled                = config.onboard_enabled;
-    cfg_.admission_quorum_ratio  = config.admission_quorum_ratio;
-    cfg_.min_tier1_for_vote      = config.onboard_min_tier1_for_vote;
-    cfg_.request_ttl_sec         = config.onboard_request_ttl_sec;
-    cfg_.max_pending             = config.onboard_max_pending;
+    cfg_.enabled         = config.onboard_enabled;
+    cfg_.request_ttl_sec = config.onboard_request_ttl_sec;
+    cfg_.max_pending     = config.onboard_max_pending;
 }
 
 std::vector<uint8_t> ServerAdmissionService::canonical_request(const RequestInput& in) {
@@ -145,10 +141,6 @@ void ServerAdmissionService::on_start() {
                      "certificate of its own — peers cannot verify it and state will not "
                      "sync. Self-enroll once: --enroll-server '<own gossip pubkey>' <server-id>");
     }
-
-    // Ballots are in-memory: a reloaded ballot-governed record has none, and
-    // approve()/deny() refuse it — without this nobody can resolve it.
-    resume_pending_ballots();
 }
 
 void ServerAdmissionService::on_stop() {
@@ -160,24 +152,6 @@ bool ServerAdmissionService::accepts_onboarding() const {
     // local identity actually holds the root key — not merely one that has a
     // root_pubkey configured (every enrolled server does).
     return cfg_.enabled && !config_.root_pubkey.empty() && is_root_key_holder_;
-}
-
-uint32_t ServerAdmissionService::eligible_voter_count() const {
-    if (trust_policy_) {
-        uint32_t n = 0;
-        for (const auto& s : trust_policy_->all_peer_states())
-            if (s.tier == TrustTier::Tier1) ++n;
-        return n;
-    }
-    // Reduced assurance: without a trust policy, count cert-verified enrolled peers.
-    uint32_t n = 0;
-    for (const auto& p : gossip_.get_peers())
-        if (!p.certificate_json.empty()) ++n;
-    return n;
-}
-
-std::string ServerAdmissionService::regime() const {
-    return eligible_voter_count() >= cfg_.min_tier1_for_vote ? "vote" : "sole_discretion";
 }
 
 bool ServerAdmissionService::verify_sig(const std::string& pubkey_b64,
@@ -255,35 +229,23 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         it != denied_until_.end() && it->second > now)
         return {false, 429, "this identity was recently denied; try again later", ""};
 
-    // Enrollment token: below the vote threshold a valid token admits
-    // immediately; in the vote regime the quorum ballot governs and the token
-    // is neither honored nor consumed.
-    const bool below_vote = eligible_voter_count() < cfg_.min_tier1_for_vote;
+    // Enrollment token: a valid, candidate-bound token admits immediately.
     bool token_admit = false;
     if (!in.enrollment_token.empty()) {
-        if (below_vote) {
-            auto rec = tokens_.verify(in.enrollment_token, in.candidate_pubkey);
-            if (!rec)
-                return {false, 403, "invalid, expired, or already-used enrollment token", ""};
-            // The onboarding transport is not authenticated (cert verification
-            // is disabled and plain HTTP is permitted), so a bearer token must
-            // be bound to the candidate key — an intermediary must not be able
-            // to capture an unbound token and spend it with its own key.
-            if (rec->candidate_pubkey.empty())
-                return {false, 403, "enrollment token is not bound to a candidate key", ""};
-            // A token bound to a server_id may admit only that identity — the
-            // candidate does not get to choose server_id freely.
-            if (!rec->server_id.empty() && rec->server_id != in.server_id)
-                return {false, 403, "enrollment token is bound to a different server_id", ""};
-            token_admit = true;
-        } else {
-            // Vote regime: the ballot governs and the token cannot admit. Burn it
-            // now regardless — an unspent token must never survive to be re-spent
-            // if churn later drops the mesh below the vote threshold.
-            (void)tokens_.consume(in.enrollment_token, in.candidate_pubkey);
-            spdlog::info("[ServerAdmissionService] vote regime — enrollment token "
-                         "consumed and ignored; ballot governs");
-        }
+        auto rec = tokens_.verify(in.enrollment_token, in.candidate_pubkey);
+        if (!rec)
+            return {false, 403, "invalid, expired, or already-used enrollment token", ""};
+        // The onboarding transport is not authenticated (cert verification
+        // is disabled and plain HTTP is permitted), so a bearer token must
+        // be bound to the candidate key — an intermediary must not be able
+        // to capture an unbound token and spend it with its own key.
+        if (rec->candidate_pubkey.empty())
+            return {false, 403, "enrollment token is not bound to a candidate key", ""};
+        // A token bound to a server_id may admit only that identity — the
+        // candidate does not get to choose server_id freely.
+        if (!rec->server_id.empty() && rec->server_id != in.server_id)
+            return {false, 403, "enrollment token is bound to a different server_id", ""};
+        token_admit = true;
     }
 
     // Never let a candidate claim THIS root server's own identity — our own
@@ -323,8 +285,8 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     }
 
     // A pending admission is immutable: the record is what gets minted, so
-    // refreshing it lets peers vote on claim A and a cert issue for claim B.
-    // tpm_ek_cert is compared here because the signature doesn't cover it.
+    // refreshing it would let the admin verify claim A and a cert issue for
+    // claim B. tpm_ek_cert is compared here because the signature doesn't cover it.
     if (is_existing) {
         const auto& cur = admissions_[request_id];
         std::string changed;
@@ -383,32 +345,20 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.source_ip        = in.source_ip;
     a.expires_at       = now + cfg_.request_ttl_sec;
     if (!is_existing) {
-        // Fixed at creation, never refreshed: a retry carries a fresh nonce and
-        // timestamp, so recomputing would drift off the hash voters signed.
-        auto msg = canonical_request(in);
-        a.claim_hash = crypto::to_hex(crypto_.sha256(std::span<const uint8_t>(msg)));
         a.state = State::Pending;
         a.created_at = now;
-        // Fix the decision mode at creation and persist it — a later change in
-        // the eligible-voter count (or a restart) must not turn a ballot-governed
-        // request back into an admin-resolvable one.
-        a.decision_mode = below_vote ? "sole" : "ballot";
+        // Every admission is sole-discretion: the gossip admission ballot is
+        // gone. Tier-1 authority lives in the mesh security system; this grants
+        // transport membership only. "ballot" survives only in old records.
+        a.decision_mode = "sole";
     }
 
-    // Token admission (sole-discretion regime only). Consume fail-closed:
-    // spend the token BEFORE issuing and require it to actually be removed, so
-    // a delete failure can never leave a reusable bearer credential. The
-    // server_id-uniqueness 409 is already checked above, so the common failure
-    // can't burn a token; a rarer issuance failure requires a fresh token.
+    // Token admission. Consume fail-closed: spend the token BEFORE issuing and
+    // require it to actually be removed, so a delete failure can never leave a
+    // reusable bearer credential. The server_id-uniqueness 409 is already
+    // checked above, so the common failure can't burn a token; a rarer
+    // issuance failure requires a fresh token.
     if (token_admit) {
-        // A request created under the vote regime is ballot-governed for life
-        // (decision_mode fixed + persisted). If churn later drops the mesh below
-        // the vote threshold, re-submitting the still-unspent token must NOT
-        // re-open it — only the ballot can resolve it.
-        if (a.decision_mode == "ballot") {
-            if (!is_existing) admissions_.erase(request_id);
-            return {false, 409, "ballot governs this admission; a token cannot admit it", ""};
-        }
         if (!tokens_.consume(in.enrollment_token, in.candidate_pubkey)) {
             if (!is_existing) admissions_.erase(request_id);  // no phantom record
             return {false, 403, "enrollment token already used", ""};
@@ -425,116 +375,20 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         return {true, 200, "", request_id};
     }
 
-    // Non-token retry of an already-pending request. The record is unchanged,
-    // but re-arm a ballot-governed one: ballots are in-memory, so a restart
-    // would leave it unresolvable. start_admission_ballot() is idempotent.
+    // Non-token retry of an already-pending request: the record is unchanged.
     if (is_existing) {
         persist();
-        Result r{true, 200, "", request_id};
-        r.needs_ballot = a.decision_mode == "ballot" && !a.ballot_claim_json.empty();
-        return r;
-    }
-
-    // New record above the vote threshold: defer to a governed Tier1 ballot.
-    // Store the candidate's self-signed claim so peers can verify it; the
-    // handler kicks the ballot after this call returns. The enrollment token is
-    // deliberately excluded — the claim is gossip-replicated and must never
-    // carry token material.
-    if (!below_vote) {
-        a.ballot_claim_json = claim_from_request(in).dump();
+        return {true, 200, "", request_id};
     }
 
     persist();
-    spdlog::info("[ServerAdmissionService] pending admission '{}' for server_id '{}' (regime={})",
-                 request_id, in.server_id, regime());
-
-    Result r{true, 200, "", request_id};
-    r.needs_ballot = !below_vote;
-    return r;
-}
-
-void ServerAdmissionService::start_pending_ballot(const std::string& request_id) {
-    std::string cpk, sid, claim, chash;
-    float ratio;
-    {
-        std::lock_guard lock(mu_);
-        auto it = admissions_.find(request_id);
-        if (it == admissions_.end() || it->second.ballot_claim_json.empty()) return;
-        if (it->second.state != State::Pending) return;
-        cpk   = it->second.candidate_pubkey;
-        sid   = it->second.server_id;
-        claim = it->second.ballot_claim_json;
-        chash = it->second.claim_hash;
-        ratio = cfg_.admission_quorum_ratio;
-    }
-    gossip_.start_admission_ballot(request_id, cpk, sid, claim, chash, ratio);
-}
-
-void ServerAdmissionService::resume_pending_ballots() {
-    std::vector<std::string> ids;
-    {
-        std::lock_guard lock(mu_);
-        for (const auto& [rid, a] : admissions_) {
-            if (a.state == State::Pending && a.decision_mode == "ballot" &&
-                !a.ballot_claim_json.empty())
-                ids.push_back(rid);
-        }
-    }
-    for (const auto& rid : ids) start_pending_ballot(rid);   // takes mu_ itself
-    if (!ids.empty())
-        spdlog::info("[ServerAdmissionService] re-opened {} ballot-governed admission(s)",
-                     ids.size());
-}
-
-void ServerAdmissionService::on_ballot_decision(const std::string& request_id,
-                                                bool approved,
-                                                const std::string& candidate_pubkey,
-                                                const std::string& claim_hash,
-                                                const std::string& reason) {
-    std::lock_guard lock(mu_);
-    auto it = admissions_.find(request_id);
-    if (it == admissions_.end()) return;   // not one of ours (e.g. legacy enrollment)
-    auto& a = it->second;
-    if (a.state != State::Pending) return;
-    // A ballot may only resolve the record it is actually about, and only when this
-    // record was governed by a ballot at all — a "sole" record awaits an admin, so
-    // letting a ballot decide it would bypass that gate.
-    if (!candidate_pubkey.empty() && a.candidate_pubkey != candidate_pubkey) {
-        spdlog::warn("[{}] ballot {} candidate does not match its admission record; ignoring",
-                      name(), request_id);
-        return;
-    }
-    if (a.decision_mode != "ballot") {
-        spdlog::warn("[{}] ballot decision for '{}' record {}; ignoring",
-                      name(), a.decision_mode, request_id);
-        return;
-    }
-    // Mint the claim the quorum voted on, or nothing.
-    if (!claim_hash.empty() && !a.claim_hash.empty() && claim_hash != a.claim_hash) {
-        spdlog::error("[{}] ballot {} approved a different claim than the pending record "
-                      "holds; refusing to issue", name(), request_id);
-        return;
-    }
-    if (approved) {
-        (void)do_approve_locked(a, "ballot", /*supersede=*/false);
-    } else {
-        a.state = State::Denied;
-        a.decision_reason = reason;
-        a.decided_by = "ballot";
-        denied_until_[a.candidate_pubkey] = now_unix() + cfg_.denied_cooldown_sec;
-    }
-    persist();
+    spdlog::info("[ServerAdmissionService] pending admission '{}' for server_id '{}'",
+                 request_id, in.server_id);
+    return {true, 200, "", request_id};
 }
 
 ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
         Admission& a, const std::string& decided_by, bool supersede) {
-    // Defense-in-depth invariant: a ballot-governed admission may only be
-    // resolved by the ballot itself (decided_by=='ballot'). No token or admin
-    // path may reach issuance for it, whatever the current regime.
-    if (a.decision_mode == "ballot" && decided_by != "ballot")
-        return {false, 409, "ballot governs this admission; cannot approve out of band",
-                a.request_id};
-
     // Re-check at issuance: never sign a server certificate unless this server's
     // identity is the configured root anchor. The local identity below would
     // otherwise self-sign a cert peers reject, from a server that shouldn't issue.
@@ -693,14 +547,6 @@ ServerAdmissionService::Result ServerAdmissionService::approve(
     auto& a = it->second;
     if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
 
-    // A ballot-governed admission (its decision mode was fixed at creation and
-    // persisted) is resolved only by the Tier-1 quorum via on_ballot_decision().
-    // An admin must not be able to admit ahead of the vote, or the quorum would
-    // be advisory.
-    if (a.decision_mode == "ballot")
-        return {false, 409, "ballot governs this admission; only a Tier-1 quorum can resolve it",
-                request_id};
-
     // Out-of-band verification duty: admin must echo the candidate's pubkey or
     // its first-16-hex fingerprint.
     const auto fp = a.candidate_pubkey.substr(0, 16);
@@ -720,12 +566,6 @@ ServerAdmissionService::Result ServerAdmissionService::deny(
     if (it == admissions_.end()) return {false, 404, "no such admission", request_id};
     auto& a = it->second;
     if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
-
-    // A ballot-governed admission is resolved only by the Tier-1 quorum; an admin
-    // must not be able to terminate the pending ballot unilaterally.
-    if (a.decision_mode == "ballot")
-        return {false, 409, "ballot governs this admission; only a Tier-1 quorum can resolve it",
-                request_id};
 
     a.state = State::Denied;
     a.decision_reason = reason;
@@ -768,8 +608,7 @@ void ServerAdmissionService::persist() {
             {"created_at", a.created_at}, {"expires_at", a.expires_at},
             {"issued_cert_json", a.issued_cert_json},
             {"decision_reason", a.decision_reason}, {"decided_by", a.decided_by},
-            {"decision_mode", a.decision_mode}, {"ballot_claim_json", a.ballot_claim_json},
-            {"claim_hash", a.claim_hash},
+            {"decision_mode", a.decision_mode},
         });
     }
     json denied = json::object();
@@ -811,11 +650,10 @@ void ServerAdmissionService::load() {
             a.decision_reason  = j.value("decision_reason", "");
             a.decided_by       = j.value("decided_by", "");
             a.decision_mode    = j.value("decision_mode", "");
-            a.ballot_claim_json = j.value("ballot_claim_json", "");
-            a.claim_hash       = j.value("claim_hash", "");
-            // Forward-compat: records persisted before decision_mode existed but
-            // that carry a ballot claim are ballot-governed.
-            if (a.decision_mode.empty() && !a.ballot_claim_json.empty())
+            // Historical records: "ballot" decisions load as the facts they are
+            // (new records only ever write "sole"). Pre-decision_mode records
+            // that carried a ballot claim keep their ballot labeling.
+            if (a.decision_mode.empty() && !j.value("ballot_claim_json", std::string{}).empty())
                 a.decision_mode = "ballot";
             if (!a.request_id.empty()) admissions_[a.request_id] = std::move(a);
         }

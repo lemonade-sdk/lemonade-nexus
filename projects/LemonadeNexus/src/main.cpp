@@ -23,12 +23,7 @@
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
-#include <LemonadeNexus/Core/GovernanceService.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
-#include <LemonadeNexus/Core/RootKeyChain.hpp>
-#include <LemonadeNexus/Core/TeeAttestation.hpp>
-#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
-#include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
@@ -120,30 +115,8 @@ int main(int argc, char* argv[]) {
     }
     attestation.start();
 
-    nexus::core::TeeAttestationService tee{crypto, storage, attestation};
-    tee.start();
-
-    nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
-
-    // Tier-1 eligibility is decided here, once, by producing real platform evidence
-    // and verifying it through the same path a remote peer would use. Nothing else
-    // grants it — in particular, no device node's existence does.
-    {
-        nexus::security::PlatformProbeConfig probe_cfg;
-        probe_cfg.cache_dir = data_root / "attestation";
-        auto probe = nexus::security::probe_platform(probe_cfg);
-        std::istringstream report{nexus::security::format_probe_report(probe)};
-        for (std::string line; std::getline(report, line);) {
-            if (probe.tier1_capable) spdlog::info("{}", line);
-            else                     spdlog::warn("{}", line);
-        }
-        trust_policy.set_platform_evidence_verified(probe.tier1_capable);
-        if (probe.tier1_capable) {
-            tee.set_evidence_source(probe.profile, data_root / "attestation",
-                                     probe_cfg.product);
-        }
-    }
-    trust_policy.start();
+    // The old TEE/trust services are gone: attestation, eligibility, and
+    // Tier 1 authority live in the mesh security system.
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
     tree.start();
@@ -151,9 +124,6 @@ int main(int argc, char* argv[]) {
     nexus::ipam::IPAMService ipam{storage};
     ipam.start();
 
-    nexus::core::RootKeyChainService root_key_chain{crypto, storage};
-    root_key_chain.set_io_context(coordinator.io_context());
-    root_key_chain.start();
 
     // Load or auto-generate server identity keypair
     auto root_privkey = key_wrapping.unlock_identity({});
@@ -164,32 +134,7 @@ int main(int argc, char* argv[]) {
         root_privkey = generated.private_key;
         root_pubkey  = generated.public_key;
     }
-    if (root_privkey && root_pubkey) {
-        nexus::crypto::Ed25519Keypair root_kp;
-        root_kp.private_key = *root_privkey;
-        root_kp.public_key = *root_pubkey;
-        root_key_chain.initialize_genesis(root_kp);
 
-        // If the tree has a root node with a different pubkey (e.g. identity was
-        // regenerated after keypair files were lost), update it automatically.
-        auto identity_pk = "ed25519:" + nexus::crypto::to_base64(
-            std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
-        auto root_node = tree.get_node("root");
-        if (root_node && root_node->mgmt_pubkey != identity_pk) {
-            spdlog::warn("Root node pubkey mismatch — updating to match new server identity");
-            spdlog::info("  old: {}", root_node->mgmt_pubkey);
-            spdlog::info("  new: {}", identity_pk);
-            auto updated = *root_node;
-            updated.mgmt_pubkey = identity_pk;
-            for (auto& a : updated.assignments) {
-                a.management_pubkey = identity_pk;
-            }
-            tree.update_node_direct("root", updated);
-        }
-    }
-
-    nexus::core::GovernanceService governance{crypto, storage, root_key_chain};
-    governance.start();
 
     // ========================================================================
     // Gossip (depends on storage + crypto, uses io_context)
@@ -203,18 +148,6 @@ int main(int argc, char* argv[]) {
             gossip.set_root_pubkey(root_pk);
         }
     }
-    // Always enforced. This used to be gated on require_tee_attestation, which was
-    // itself unreachable (validate_config demanded release_signing_pubkey with it),
-    // so trust_policy_ was null in every real deployment: no challenges sent, no
-    // tokens attached, and verify_message_trust permitted everything.
-    gossip.set_trust_policy(&trust_policy);
-    gossip.set_root_key_chain(&root_key_chain);
-    gossip.set_governance(&governance);
-    gossip.set_enrollment_config(config.require_peer_confirmation,
-                                  config.enrollment_quorum_ratio,
-                                  config.enrollment_vote_timeout_sec,
-                                  config.enrollment_max_retries);
-    gossip.set_admission_quorum_ratio(config.admission_quorum_ratio);
     gossip.set_ipam(&ipam);
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
@@ -253,12 +186,6 @@ int main(int argc, char* argv[]) {
         }).detach();
     }
 
-    // Bind our identity into the TPM quote's qualifyingData. Use the very keypair
-    // gossip signs TEE reports with, so report.server_pubkey matches what the prover
-    // hashes into the quote (and what a verifier recomputes).
-    tee.set_identity_pubkey(nexus::crypto::to_base64(
-        std::span<const uint8_t>(gossip.keypair().public_key.data(),
-                                 gossip.keypair().public_key.size())));
 
     // ========================================================================
     // New security lifecycle (gossip is its transport; the old trust system
@@ -311,7 +238,17 @@ int main(int argc, char* argv[]) {
             } catch (...) {}
         }
     }
-    ddns.set_trust_policy(&trust_policy);
+    // The mesh security system answers Tier 1 membership; an unset gate
+    // denies inside DdnsService.
+    ddns.set_tier1_gate([&security_mesh](std::string_view server_pk_b64) {
+        if (!security_mesh) return false;
+        const auto bytes = nexus::crypto::from_base64(
+            nexus::crypto::canonical_key_b64(server_pk_b64));
+        if (bytes.size() != nexus::crypto::kEd25519PublicKeySize) return false;
+        nexus::security::NodeId node;
+        std::memcpy(node.bytes.data(), bytes.data(), bytes.size());
+        return security_mesh->is_current_member(node);
+    });
     ddns.start();
 
     // ========================================================================
@@ -419,14 +356,14 @@ int main(int argc, char* argv[]) {
             dns.publish_seip_records(seip_id, config.region, server_public_ip);
             spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
 
-            // Publish our tier record so other nodes can discover us by tier+region
-            // (tier<N>.<region>.seip.<domain>). Tier1 = TEE-attested, Tier2 = cert-only.
-            const auto our_tier = trust_policy.our_tier();
-            const int tier_num = (our_tier == nexus::core::TrustTier::Tier1) ? 1
-                               : (our_tier == nexus::core::TrustTier::Tier2) ? 2 : 0;
-            if (tier_num > 0) {
-                dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
-            }
+            // Tier 1 = current epoch membership in the mesh security system.
+            // Every enrolled server is at least Tier 2 transport.
+            const int tier_num =
+                (security_mesh &&
+                 security_mesh->is_current_member(
+                     nexus::security::NodeId{gossip.keypair().public_key}))
+                    ? 1 : 2;
+            dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
 
             // The public API cert (for the SEIP FQDN) is resolved below via
             // public_cert_fqdn — no per-FQDN handling needed here.
@@ -745,25 +682,8 @@ int main(int argc, char* argv[]) {
     // Server onboarding (admission of new servers over the public API)
     // ========================================================================
     nexus::core::ServerAdmissionService admission{
-        config, crypto, key_wrapping, storage, gossip,
-        &trust_policy};
+        config, crypto, key_wrapping, storage, gossip};
 
-    // Governed-admission ballots (>= onboard_min_tier1_for_vote Tier1 peers)
-    // resolve through the gossip enrollment machinery; map the outcome back to
-    // certificate issuance / denial. Registered before start() so a ballot
-    // re-opened on startup can't resolve into a missing callback.
-    gossip.set_enrollment_decision_callback(
-        [&admission, &gossip](const nexus::gossip::EnrollmentBallot& b) {
-            if (b.kind != nexus::gossip::EnrollmentBallot::Kind::Admission) return;
-            // Only the sponsor holds the matching admission record, so a ballot we
-            // did not open must never resolve one of ours.
-            if (b.sponsor_pubkey !=
-                nexus::crypto::to_base64(gossip.keypair().public_key)) return;
-            const bool approved = b.state == nexus::gossip::EnrollmentBallot::State::Approved;
-            admission.on_ballot_decision(
-                b.request_id, approved, b.candidate_pubkey, b.claim_hash,
-                approved ? "" : "admission ballot did not reach quorum");
-        });
 
     admission.start();
 
@@ -786,9 +706,6 @@ int main(int argc, char* argv[]) {
         .relay_discovery  = relay_discovery,
         .routing          = routing,
         .attestation      = attestation,
-        .tee              = tee,
-        .trust_policy     = trust_policy,
-        .governance       = governance,
         .admission        = admission,
         .boringtun        = &boringtun_service,
         .dns              = &dns,
@@ -1083,12 +1000,8 @@ int main(int argc, char* argv[]) {
         security_mesh->stop();  // uses gossip as transport: stop it first
     }
     gossip.stop();
-    governance.stop();
-    root_key_chain.stop();
     ipam.stop();
     tree.stop();
-    trust_policy.stop();
-    tee.stop();
     attestation.stop();
     key_wrapping.stop();
     acl_service.stop();

@@ -55,13 +55,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
     if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
-    if (j.contains("require_peer_confirmation"))  j.at("require_peer_confirmation").get_to(c.require_peer_confirmation);
-    if (j.contains("enrollment_quorum_ratio"))  j.at("enrollment_quorum_ratio").get_to(c.enrollment_quorum_ratio);
-    if (j.contains("enrollment_vote_timeout_sec")) j.at("enrollment_vote_timeout_sec").get_to(c.enrollment_vote_timeout_sec);
-    if (j.contains("enrollment_max_retries"))   j.at("enrollment_max_retries").get_to(c.enrollment_max_retries);
     if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
-    if (j.contains("admission_quorum_ratio"))    j.at("admission_quorum_ratio").get_to(c.admission_quorum_ratio);
-    if (j.contains("onboard_min_tier1_for_vote")) j.at("onboard_min_tier1_for_vote").get_to(c.onboard_min_tier1_for_vote);
     if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
     if (j.contains("onboard_max_pending"))       j.at("onboard_max_pending").get_to(c.onboard_max_pending);
 }
@@ -101,7 +95,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
     spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's platform binding key (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
-    spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
     spdlog::info("  --verify-platform [blob]   Verify this host's platform evidence (AMD signature chain,");
     spdlog::info("                             guest policy, memory-encryption guarantees) and exit.");
     spdlog::info("                             Optionally verify a captured HCL blob file instead.");
@@ -116,7 +109,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --minimum-version <semver>   Minimum binary version allowed (e.g. 1.2.0)");
     spdlog::info("  --private-http-port <N>      Private API port (default: 9101)");
     spdlog::info("  --require-peer-confirmation  Require peer quorum before full enrollment");
-    spdlog::info("  --enrollment-quorum <ratio>  Fraction of Tier1 peers needed (default 0.5)");
     spdlog::info("  --dns-port <N>             Internal DNS listen port (default: 5335, NAT-mapped from public)");
     spdlog::info("  --public-dns-port <N>      DNS port advertised to clients (default: 53)");
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
@@ -204,8 +196,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enroll_tpm_ek_cert_path = argv[++i];
         } else if (std::strcmp(argv[i], "--first-run") == 0) {
             config.first_run = true;
-        } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
-            config.print_tpm_ak = true;
         } else if (std::strcmp(argv[i], "--verify-platform") == 0) {
             config.verify_platform = true;
             if (i + 1 < argc && argv[i + 1][0] != '-') config.verify_platform_blob = argv[++i];
@@ -229,10 +219,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.minimum_version = argv[++i];
         } else if (std::strcmp(argv[i], "--private-http-port") == 0 && i + 1 < argc) {
             config.private_http_port = static_cast<uint16_t>(std::atoi(argv[++i]));
-        } else if (std::strcmp(argv[i], "--require-peer-confirmation") == 0) {
-            config.require_peer_confirmation = true;
-        } else if (std::strcmp(argv[i], "--enrollment-quorum") == 0 && i + 1 < argc) {
-            config.enrollment_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--onboard-server") == 0) {
             config.onboard_server = true;
             // Optional positional target ("<fqdn>[:port]"); anything starting with '-' is a flag.
@@ -253,8 +239,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.mint_token_ttl_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--no-onboard") == 0) {
             config.onboard_enabled = false;
-        } else if (std::strcmp(argv[i], "--admission-quorum") == 0 && i + 1 < argc) {
-            config.admission_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
@@ -316,8 +300,6 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_MANIFEST_FETCH_INTERVAL")) config.manifest_fetch_interval_sec = static_cast<uint32_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_MINIMUM_VERSION"))      config.minimum_version           = v;
     if (const char* v = std::getenv("SP_PRIVATE_HTTP_PORT")) config.private_http_port = static_cast<uint16_t>(std::atoi(v));
-    if (std::getenv("SP_REQUIRE_PEER_CONFIRMATION"))      config.require_peer_confirmation = true;
-    if (const char* v = std::getenv("SP_ENROLLMENT_QUORUM")) config.enrollment_quorum_ratio = std::atof(v);
     if (const char* v = std::getenv("SP_REGION"))        config.region                    = v;
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
@@ -398,7 +380,7 @@ bool validate_config(const ServerConfig& config) {
     //
     // CLI modes are exempt: --first-run generates the identity these anchor to, and
     // the enroll/onboard/manifest modes exit before any of it is used.
-    const bool cli_mode = config.first_run || config.print_tpm_ak || config.verify_platform ||
+    const bool cli_mode = config.first_run || config.verify_platform ||
                           config.onboard_server ||
                           config.mint_admission_token || !config.enroll_server_pubkey.empty() ||
                           !config.revoke_server_pubkey.empty() || !config.add_manifest_path.empty();

@@ -18,15 +18,17 @@
 namespace nexus::crypto { class SodiumCryptoService; class KeyWrappingService; }
 namespace nexus::storage { class FileStorageService; }
 namespace nexus::gossip { class GossipService; }
-namespace nexus::core { struct ServerConfig; class TrustPolicyService; }
+namespace nexus::core { struct ServerConfig; }
 
 namespace nexus::core {
 
-/// Governs admission of a new SERVER to the mesh. A candidate proves possession
-/// of its gossip key (challenge → signed request), the request parks as a
-/// PendingAdmission, and the root-key holder decides (sole discretion below the
-/// vote threshold, governed ballot above). On approval the root key signs a
-/// ServerCertificate the candidate collects and installs — no manual file copy.
+/// Governs admission of a new SERVER. A candidate proves possession of its
+/// gossip key (challenge → signed request), the request parks as a
+/// PendingAdmission, and the root-key holder decides — admin approve/deny or a
+/// pre-minted single-use token. Approval mints only the root-signed Tier-2
+/// TRANSPORT certificate: this is operator provisioning, not mesh authority.
+/// Tier-1 authority lives in the mesh security system (SecurityRuntime /
+/// HotStuff / FROST); the old gossip admission ballot is gone.
 class ServerAdmissionService : public IService<ServerAdmissionService> {
     friend class IService<ServerAdmissionService>;
 
@@ -54,18 +56,12 @@ public:
         uint64_t    expires_at{0};
         std::string issued_cert_json;   // set when Approved
         std::string decision_reason;
-        std::string decided_by;         // "token" | "admin" | "ballot"
-        std::string decision_mode;      // "sole" | "ballot" — fixed at creation, persisted
-        std::string ballot_claim_json;  // candidate self-signed claim (vote regime)
-        // SHA-256 (hex) of the bytes the candidate signed; votes bind to it and
-        // issuance re-checks it, so a ballot mints only what the quorum approved.
-        std::string claim_hash;
+        std::string decided_by;         // "token" | "admin" ("ballot" in historical records)
+        std::string decision_mode;      // always "sole" now ("ballot" in historical records)
     };
 
     struct Config {
         bool     enabled{true};
-        float    admission_quorum_ratio{0.75f};
-        uint32_t min_tier1_for_vote{6};
         uint32_t request_ttl_sec{3600};
         uint32_t max_pending{8};
         uint32_t nonce_ttl_sec{300};
@@ -76,8 +72,7 @@ public:
                            crypto::SodiumCryptoService& crypto,
                            crypto::KeyWrappingService& key_wrapping,
                            storage::FileStorageService& storage,
-                           gossip::GossipService& gossip,
-                           TrustPolicyService* trust_policy);
+                           gossip::GossipService& gossip);
 
     // --- IService ---
     void on_start();
@@ -86,10 +81,6 @@ public:
 
     /// True when this server holds the root key and onboarding is enabled.
     [[nodiscard]] bool accepts_onboarding() const;
-
-    /// "sole_discretion" or "vote" given the current eligible-voter count.
-    [[nodiscard]] std::string regime() const;
-    [[nodiscard]] uint32_t eligible_voter_count() const;
 
     /// Issue a single-use challenge nonce (base64) for a candidate pubkey.
     [[nodiscard]] std::string issue_challenge(const std::string& candidate_pubkey);
@@ -104,8 +95,8 @@ public:
         std::string measurement;
         std::string binary_hash;
         /// Hex SHA-256 of `evidence`. The digest rather than the bundle is what the
-        /// candidate signs, so the several-kilobyte bundle never has to travel in
-        /// the gossip-replicated ballot claim while staying bound to the signature.
+        /// candidate signs, so the several-kilobyte bundle stays out of the signed
+        /// canonical while remaining bound to the signature.
         std::string evidence_sha256;
         std::string evidence;     // full bundle, HTTP only; checked against the digest
         std::string nonce;        // echoed from the challenge
@@ -116,12 +107,11 @@ public:
     };
     struct Result {
         bool ok{false}; int status{200}; std::string error; std::string request_id;
-        bool needs_ballot{false};  // caller should invoke start_pending_ballot()
     };
 
     /// Verify PoP + caps, create (or idempotently refresh) a PendingAdmission.
-    /// Below the vote threshold a valid enrollment token admits immediately;
-    /// in the vote regime the ballot governs and tokens are ignored.
+    /// A valid bound enrollment token admits immediately; otherwise an admin
+    /// resolves it via approve()/deny().
     [[nodiscard]] Result create_request(const RequestInput& in);
 
     /// Mint a single-use server-admission token (root holder only — returns
@@ -129,24 +119,6 @@ public:
     [[nodiscard]] std::optional<std::pair<std::string, AdmissionTokenRecord>>
     mint_admission_token(const std::string& candidate_pubkey, std::chrono::seconds ttl,
                          const std::string& server_id = {});
-
-    /// Open the governed Tier1 ballot for a request that needs one (called by
-    /// the handler after create_request returns, so no lock is held).
-    void start_pending_ballot(const std::string& request_id);
-
-    /// Ballot decision hook (wired to GossipService's decision callback).
-    /// `candidate_pubkey` is the candidate the BALLOT was about; it must match the
-    /// record, or a ballot for one candidate resolves a record for another.
-    /// `claim_hash` is the claim the quorum voted on; issuance is refused
-    /// unless it still matches the record.
-    void on_ballot_decision(const std::string& request_id, bool approved,
-                            const std::string& candidate_pubkey,
-                            const std::string& claim_hash,
-                            const std::string& reason);
-
-    /// Re-open ballots for pending ballot-governed admissions (called on start;
-    /// ballots are in-memory, so a restart would leave them unresolvable).
-    void resume_pending_ballots();
 
     /// Candidate polls its request; fills cert bundle when approved.
     [[nodiscard]] std::optional<Admission> status(const std::string& request_id,
@@ -164,16 +136,17 @@ public:
     [[nodiscard]] Result deny(const std::string& request_id, const std::string& reason);
 
     /// Canonical bytes a candidate signs for create_request (tag "ln-onboard:v2").
-    /// The ONE definition: the onboarding client and every ballot voter call this
+    /// The ONE definition: the onboarding client and this server both call this
     /// rather than open-coding the field order, which is how v1 drifted.
     [[nodiscard]] static std::vector<uint8_t> canonical_request(const RequestInput& in);
 
-    /// Rebuild the signed input from a gossiped ballot claim, so a voter recomputes
+    /// Rebuild the signed input from a request body, so the receiver recomputes
     /// exactly the bytes the candidate signed.
     [[nodiscard]] static RequestInput request_from_claim(const nlohmann::json& claim);
 
-    /// The claim a ballot carries. Excludes the evidence bundle (too large for
-    /// gossip) and the enrollment token (a bearer credential).
+    /// The self-signed claim an onboarding request body carries. Excludes the
+    /// evidence bundle (bound by digest, sent alongside) and the enrollment
+    /// token (a bearer credential, never part of the signed canonical).
     [[nodiscard]] static nlohmann::json claim_from_request(const RequestInput& in);
     /// Canonical bytes a candidate signs for status/ack (tag "ln-onboard-poll:v1").
     [[nodiscard]] static std::vector<uint8_t> canonical_poll(const std::string& tag,
@@ -200,7 +173,6 @@ private:
     crypto::KeyWrappingService&    key_wrapping_;
     storage::FileStorageService&   storage_;
     gossip::GossipService&         gossip_;
-    TrustPolicyService*            trust_policy_{nullptr};
     Config                         cfg_;
     AdmissionTokenStore            tokens_;
 

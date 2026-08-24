@@ -3,7 +3,6 @@
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
-#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
@@ -42,18 +41,6 @@ bool enrolling_self(storage::FileStorageService& storage, const std::string& pub
     }
 }
 
-int run_print_tpm_ak() {
-    auto ak = tpm::export_ak_pubkey_b64();
-    if (!ak) {
-        spdlog::error("No TPM available — cannot export an Attestation Key. "
-                      "(Need /dev/tpmrm0 or a TCTI such as swtpm, on a Linux TPM build.)");
-        return 1;
-    }
-    // Print the raw value to stdout so it can be piped into --enroll-tpm-ak.
-    spdlog::info("TPM AK pubkey (base64 DER SPKI):");
-    std::printf("%s\n", ak->c_str());
-    return 0;
-}
 
 int run_verify_platform(const ServerConfig& config) {
     security::PlatformProbeConfig cfg;
@@ -418,7 +405,6 @@ std::optional<InitResult> ensure_initialized(const ServerConfig& config) {
 }
 
 std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0) {
-    if (config.print_tpm_ak)                      return run_print_tpm_ak();
     if (config.verify_platform)                   return run_verify_platform(config);
     if (config.first_run)                         return run_first_run(config);
     if (config.onboard_server)                    return run_onboard_server(config);

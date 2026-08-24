@@ -1,10 +1,9 @@
 #pragma once
 
-#include <LemonadeNexus/Core/TrustTypes.hpp>
-
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nexus::gossip {
 
@@ -19,16 +18,9 @@ enum class GossipMsgType : uint8_t {
     AntiEntropy   = 0x04,  // "let's compare full state"
     PeerExchange  = 0x05,  // "here are peers I know"
     ServerHello   = 0x06,  // "here's my server certificate"
-    TeeChallenge  = 0x07,  // "prove you have TEE hardware" (nonce challenge)
-    TeeResponse   = 0x08,  // "here's my TEE attestation report" (challenge response)
-    EnrollmentVoteRequest = 0x09, // "new server presented cert, cast your vote"
-    EnrollmentVote        = 0x0A, // "I approve/reject server X"
-    RootKeyRotation       = 0x0B, // "root key rotated, here's the new chain entry"
-    ShamirShareOffer      = 0x0C, // "here's your encrypted Shamir share of the root key"
-    ShamirShareSubmit     = 0x0D, // "submitting my share for root key reconstruction"
-    PeerHealthReport      = 0x0E, // "here's my view of peer uptime/health"
-    GovernanceProposal    = 0x0F, // "I propose changing protocol parameter X to Y"
-    GovernanceVote        = 0x10, // "I approve/reject governance proposal P"
+    // 0x07-0x10 retired (old network-authority protocol: TEE challenge/response,
+    // enrollment votes, root-key rotation, Shamir shares, peer health,
+    // governance). Reserved forever — never reuse these values.
     AclDelta              = 0x11, // "ACL grant/revoke — distributed permission sync"
     DnsRecordSync         = 0x12, // "DNS record add/remove — distributed authoritative DNS"
     BackboneIpamSync      = 0x13, // "backbone IP allocate/release — server mesh IPAM sync"
@@ -64,7 +56,6 @@ struct GossipPeer {
     uint64_t    last_seen{0};        // Unix timestamp
     float       reputation{1.0f};
     std::string certificate_json;    // serialized ServerCertificate (may be empty)
-    core::TrustTier trust_tier{core::TrustTier::Untrusted};  // zero-trust tier
 };
 
 struct GossipDigest {
@@ -75,7 +66,9 @@ struct GossipDigest {
 };
 
 // ---------------------------------------------------------------------------
-// Quorum-based enrollment
+// Quorum-based enrollment — NO wire use any more (the vote message types are
+// retired). Kept only because ServerAdmissionService still compiles against
+// these; their reduction is a later stage.
 // ---------------------------------------------------------------------------
 
 /// A single signed vote for/against a server enrollment.
@@ -119,54 +112,6 @@ struct EnrollmentBallot {
     float          required_ratio{0.0f}; // 0 = use configured enrollment ratio
     uint32_t       retries{0};
     std::vector<EnrollmentVoteData> votes;
-};
-
-// ---------------------------------------------------------------------------
-// Democratic governance — Tier1 parameter changes
-// ---------------------------------------------------------------------------
-
-/// Goverable protocol parameters (the only ones that can change via vote).
-enum class GovernableParam : uint8_t {
-    RotationIntervalSec = 0x01,  // root key rotation interval
-    ShamirQuorumRatio   = 0x02,  // Shamir K = ceil(N * ratio)
-    MinTier1Uptime      = 0x03,  // minimum uptime for Tier1 authority
-};
-
-/// A governance proposal to change a protocol parameter.
-struct GovernanceProposalData {
-    std::string       proposal_id;       // unique ID (UUID or hash)
-    std::string       proposer_pubkey;   // Tier1 peer that proposed the change
-    GovernableParam   parameter;         // which parameter to change
-    std::string       new_value;         // proposed new value (serialized)
-    std::string       old_value;         // current value at proposal time (safety check)
-    std::string       rationale;         // human-readable reason for the change
-    uint64_t          created_at{0};     // Unix timestamp
-    uint64_t          expires_at{0};     // vote window end
-    std::string       signature;         // Ed25519 over canonical JSON (excludes this field)
-};
-
-/// A single signed vote on a governance proposal.
-struct GovernanceVoteData {
-    std::string proposal_id;      // matches the proposal
-    std::string voter_pubkey;     // Tier1 peer casting the vote
-    bool        approve{false};
-    std::string reason;           // optional reason
-    uint64_t    timestamp{0};
-    std::string signature;        // Ed25519 over canonical vote JSON
-};
-
-/// Tracks a governance proposal with collected votes.
-struct GovernanceBallot {
-    enum class State : uint8_t {
-        Collecting = 0,
-        Approved   = 1,
-        Rejected   = 2,
-        TimedOut   = 3,
-    };
-
-    GovernanceProposalData          proposal;
-    State                           state{State::Collecting};
-    std::vector<GovernanceVoteData> votes;
 };
 
 // ---------------------------------------------------------------------------

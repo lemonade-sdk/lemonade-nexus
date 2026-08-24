@@ -39,6 +39,11 @@ NodeId SecurityDriver::genesis_id() const {
     return id;
 }
 
+bool SecurityDriver::is_tier1_member() const {
+    const EpochManager* epochs = runtime_.epochs();
+    return epochs != nullptr && epochs->current().tier1_members.contains(config_.self);
+}
+
 std::optional<EpochId> SecurityDriver::current_epoch() const {
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
