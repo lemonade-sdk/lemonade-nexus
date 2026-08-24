@@ -482,6 +482,86 @@ std::variant<Proposal, ConsensusFailure> HotStuffService::make_proposal(
     return proposal;
 }
 
+std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
+    const Proposal& proposal, const QuorumCertificate& justify,
+    const QuorumCertificate& certifying, std::vector<ConsensusCommit>& commits_out) {
+    if (failed_) return ConsensusFailure::NotSynced;
+    if (proposal.security_ruleset != config_.security_ruleset ||
+        proposal.consensus_ruleset != config_.consensus_ruleset) {
+        return ConsensusFailure::RulesetMismatch;
+    }
+    if (proposal.network_id != config_.network_id) return ConsensusFailure::NetworkMismatch;
+    if (proposal.epoch != config_.epoch) return ConsensusFailure::EpochMismatch;
+    if (qc_digest(justify) != proposal.justify_qc_digest) return ConsensusFailure::JustifyInvalid;
+    if (proposal.parent_digest != justify.proposal_digest) {
+        return ConsensusFailure::ParentQcMismatch;
+    }
+    const QcValidationContext context{config_.consensus_ruleset, config_.network_id,
+                                      config_.epoch, config_.quorum};
+    if (!is_genesis_justify(justify) &&
+        validate_quorum_certificate(justify, context, config_.vote_keys)) {
+        return ConsensusFailure::JustifyInvalid;
+    }
+
+    const Digest digest = proposal_digest(proposal);
+    // Only a certified block enters: an uncertified tail could not affect
+    // safety, but nothing unproven belongs in chain state.
+    if (certifying.proposal_digest != digest ||
+        validate_quorum_certificate(certifying, context, config_.vote_keys)) {
+        return ConsensusFailure::JustifyInvalid;
+    }
+
+    if (proposal.parent_digest == config_.genesis_digest) {
+        if (proposal.height != 1) return ConsensusFailure::ParentQcMismatch;
+    } else if (const auto parent = blocks_.find(proposal.parent_digest);
+               parent != blocks_.end()) {
+        if (proposal.height != parent->second.proposal.height + 1) {
+            return ConsensusFailure::ParentQcMismatch;
+        }
+    } else if (!anchor_adopted_ && blocks_.empty()) {
+        // The sync anchor: the ancestors below it were committed before the
+        // restart and are gone. The block's own quorum certificate, already
+        // validated above, proves the content at its declared height.
+        anchor_adopted_ = true;
+    } else {
+        return ConsensusFailure::MissingParent;
+    }
+
+    if (const auto seen = accepted_by_view_.find(proposal.view);
+        seen != accepted_by_view_.end() && seen->second != digest) {
+        return ConsensusFailure::Equivocation;
+    }
+    if (!blocks_.contains(digest) && pending_count() >= constants::kMaxPendingProposals) {
+        return ConsensusFailure::PendingLimit;
+    }
+
+    blocks_[digest] = BlockRecord{proposal, justify, digest};
+    qc_by_block_[justify.proposal_digest] = justify;
+    qc_by_block_[digest] = certifying;
+    accepted_by_view_[proposal.view] = digest;
+    advance_high_qc(justify);
+    advance_high_qc(certifying);
+    apply_chain_rules(certifying, commits_out);
+    return std::nullopt;
+}
+
+std::vector<std::pair<Proposal, QuorumCertificate>> HotStuffService::uncommitted_chain() const {
+    std::vector<std::pair<Proposal, QuorumCertificate>> chain;
+    const Digest* cursor = &high_qc_.proposal_digest;
+    while (*cursor != config_.genesis_digest) {
+        const auto block = blocks_.find(*cursor);
+        if (block == blocks_.end() ||
+            block->second.proposal.height <= last_committed_height_) {
+            break;
+        }
+        chain.emplace_back(block->second.proposal, block->second.justify);
+        cursor = &block->second.proposal.parent_digest;
+        if (chain.size() >= constants::kMaxSyncChainBlocks) break;
+    }
+    std::reverse(chain.begin(), chain.end());
+    return chain;
+}
+
 TimeoutVote HotStuffService::make_timeout_vote() const {
     if (failed_ || !synced_) {
         throw std::logic_error("HotStuffService: not synced");

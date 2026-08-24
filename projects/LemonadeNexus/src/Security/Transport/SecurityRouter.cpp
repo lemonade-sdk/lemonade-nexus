@@ -247,7 +247,11 @@ RouteResult SecurityRouter::route_sync_request(const SyncRequest& request, const
     if (consensus == nullptr || epochs == nullptr || request.epoch != epochs->current().id) {
         return drop(DropReason::NoService);
     }
-    SyncResponse response{consensus->state().high_qc};
+    SyncResponse response;
+    response.high_qc = consensus->state().high_qc;
+    for (auto& [proposal, justify] : consensus->uncommitted_chain()) {
+        response.chain.push_back(ProposalMessage{std::move(proposal), std::move(justify)});
+    }
     (void)send(from, compose(SecurityMessageKind::SyncResponse, response, request.epoch));
     return delivered();
 }
@@ -269,6 +273,34 @@ RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, co
         const auto failure = validate_quorum_certificate(qc, context, epochs->current_vote_keys());
         if (failure.has_value()) {
             return drop(DropReason::ServiceRejected, code(*failure));
+        }
+    }
+    // The chain entries are certified facts: block k by block k+1's justify,
+    // the last block by the high certificate. Adjacency is checked here; the
+    // service validates every certificate before adoption.
+    HotStuffService* consensus = runtime_.consensus();
+    if (consensus != nullptr && !response.chain.empty()) {
+        for (std::size_t i = 0; i + 1 < response.chain.size(); ++i) {
+            if (response.chain[i + 1].justify.proposal_digest !=
+                proposal_digest(response.chain[i].proposal)) {
+                return drop(DropReason::ServiceRejected,
+                            code(ConsensusFailure::ParentQcMismatch));
+            }
+        }
+        if (!genesis_form &&
+            qc.proposal_digest != proposal_digest(response.chain.back().proposal)) {
+            return drop(DropReason::ServiceRejected, code(ConsensusFailure::JustifyInvalid));
+        }
+        std::vector<ConsensusCommit> commits;
+        for (std::size_t i = 0; i < response.chain.size(); ++i) {
+            const QuorumCertificate& certifying =
+                i + 1 < response.chain.size() ? response.chain[i + 1].justify : qc;
+            (void)consensus->adopt_certified_block(response.chain[i].proposal,
+                                                   response.chain[i].justify, certifying,
+                                                   commits);
+        }
+        if (!commits.empty()) {
+            events_.on_commits(commits);
         }
     }
     events_.on_sync_certificate(qc, from);

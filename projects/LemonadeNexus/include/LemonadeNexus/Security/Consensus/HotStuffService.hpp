@@ -100,6 +100,17 @@ public:
 
     [[nodiscard]] HotStuffState state() const;
     [[nodiscard]] View current_view() const { return current_view_; }
+    /// Adopts one certified block into chain state without voting: restart
+    /// recovery replays facts, it never re-decides them. `certifying` must be
+    /// a valid certificate over exactly this block.
+    [[nodiscard]] std::optional<ConsensusFailure> adopt_certified_block(
+        const Proposal& proposal, const QuorumCertificate& justify,
+        const QuorumCertificate& certifying, std::vector<ConsensusCommit>& commits_out);
+
+    /// The chain above the last committed block, oldest first, each with its
+    /// justify. The last entry is the block the high certificate certifies.
+    [[nodiscard]] std::vector<std::pair<Proposal, QuorumCertificate>> uncommitted_chain() const;
+
     [[nodiscard]] NodeId leader_of(View view) const {
         return config_.leader_order[view % config_.leader_order.size()];
     }
@@ -150,6 +161,10 @@ private:
     std::set<std::tuple<View, Height, Digest>> formed_qcs_;
     std::map<View, std::map<NodeId, TimeoutVote>> timeouts_by_view_;
     std::set<View> formed_tcs_;
+
+    // One parentless adoption is allowed after a restart: the sync anchor.
+    // Its quorum certificate proves the content; everything above it links.
+    bool anchor_adopted_ = false;
 
     std::vector<EquivocationRecord> evidence_;
 };

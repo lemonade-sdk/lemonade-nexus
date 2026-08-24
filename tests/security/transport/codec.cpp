@@ -213,7 +213,10 @@ std::vector<SecurityMessage> all_kinds() {
     messages.push_back(envelope(SecurityMessageKind::BootstrapCertificate, bootstrap));
 
     messages.push_back(envelope(SecurityMessageKind::SyncRequest, SyncRequest{7}));
-    messages.push_back(envelope(SecurityMessageKind::SyncResponse, SyncResponse{certificate(4)}));
+    SyncResponse sync_response;
+    sync_response.high_qc = certificate(4);
+    sync_response.chain.push_back(proposal_message());
+    messages.push_back(envelope(SecurityMessageKind::SyncResponse, sync_response));
 
     return messages;
 }
@@ -344,6 +347,15 @@ TEST(SecurityCodec, DkgRoundAndKindMustAgree) {
     auto invalid = dkg_message(DkgRound::Round1Broadcast);
     invalid.round = static_cast<DkgRound>(3);
     EXPECT_FALSE(kind_of(SecurityBody{invalid}).has_value());
+}
+
+TEST(SecurityCodec, SyncChainIsBounded) {
+    SyncResponse response;
+    response.high_qc = certificate(4);
+    for (std::size_t i = 0; i <= constants::kMaxSyncChainBlocks; ++i) {
+        response.chain.push_back(proposal_message());
+    }
+    EXPECT_TRUE(encode_security_message(envelope(SecurityMessageKind::SyncResponse, response)).empty());
 }
 
 TEST(SecurityCodec, FoundingMemberCountIsBounded) {

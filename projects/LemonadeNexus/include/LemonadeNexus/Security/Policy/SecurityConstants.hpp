@@ -160,6 +160,10 @@ inline constexpr uint64_t kSecurityFloodWindowMs = 1000;
 inline constexpr std::size_t kSecurityTrackedPeers = 512;
 inline constexpr std::size_t kSecurityDedupeWindow = 4096;
 
+// The uncommitted chain is at most a few blocks in chained HotStuff; the
+// sync reply is bounded well above that and well below the envelope limit.
+inline constexpr std::size_t kMaxSyncChainBlocks = 8;
+
 // --- Compile-time checks against the architecture tables --------------------
 
 static_assert(max_byzantine_faults(5) == 1 && consensus_quorum(5) == 4);

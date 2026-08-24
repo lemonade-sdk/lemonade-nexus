@@ -512,7 +512,8 @@ TEST_F(RouterMesh, SyncResponseCarriesAValidatedCertificate) {
     EXPECT_EQ(qc_digest(asker->events.sync_certificates.back()), qc_digest(qc1));
 
     // A forged certificate never surfaces.
-    SyncResponse forged{qc1};
+    SyncResponse forged;
+    forged.high_qc = qc1;
     forged.high_qc.signers[0].signature[0] ^= 0x01;
     const auto bad = holder->router->compose(SecurityMessageKind::SyncResponse, forged, 1);
     EXPECT_EQ(asker->deliver(holder->id, encode_security_message(bad), mesh.now_ms).dropped,

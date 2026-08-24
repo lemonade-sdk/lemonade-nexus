@@ -298,7 +298,19 @@ bool encode_sync_request(Writer& w, const SyncRequest& s) {
 }
 
 bool encode_sync_response(Writer& w, const SyncResponse& s) {
-    return encode_certificate(w, s.high_qc);
+    if (!encode_certificate(w, s.high_qc)) {
+        return false;
+    }
+    if (s.chain.size() > constants::kMaxSyncChainBlocks) {
+        return false;
+    }
+    w.u16(static_cast<uint16_t>(s.chain.size()));
+    for (const auto& block : s.chain) {
+        if (!encode_proposal(w, block)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // --- Decoders ---------------------------------------------------------------
@@ -461,7 +473,25 @@ bool decode_bootstrap(Reader& r, BootstrapCertificate& c) {
 
 bool decode_sync_request(Reader& r, SyncRequest& s) { return r.u64(s.epoch); }
 
-bool decode_sync_response(Reader& r, SyncResponse& s) { return decode_certificate(r, s.high_qc); }
+bool decode_sync_response(Reader& r, SyncResponse& s) {
+    if (!decode_certificate(r, s.high_qc)) {
+        return false;
+    }
+    uint16_t count = 0;
+    if (!r.u16(count)) {
+        return false;
+    }
+    if (count > constants::kMaxSyncChainBlocks) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    s.chain.resize(count);
+    for (auto& block : s.chain) {
+        if (!decode_proposal(r, block)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
     switch (kind) {

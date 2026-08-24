@@ -50,14 +50,21 @@ struct SyncRequest {
     EpochId epoch = 0;
 };
 
-struct SyncResponse {
-    QuorumCertificate high_qc;
-};
+struct SyncResponse;  // defined after ProposalMessage
+
 
 /// A proposal always travels with the certificate it extends.
 struct ProposalMessage {
     Proposal proposal;
     QuorumCertificate justify;
+};
+
+struct SyncResponse {
+    QuorumCertificate high_qc;
+    /// The responder's uncommitted chain, oldest first: block k is certified
+    /// by block k+1's justify, the last block by high_qc. A restarted node
+    /// rebuilds chain state from these certified facts.
+    std::vector<ProposalMessage> chain;
 };
 
 /// The activated epoch, announced by its members. Receivers validate it

@@ -6,13 +6,17 @@
 // other step — founding, DKG, certificates, consensus, handoff — runs the
 // real code over the wire.
 
+#include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <gtest/gtest.h>
 #include <sodium.h>
 
 #include <deque>
+#include <fstream>
 #include <filesystem>
 #include <memory>
 #include <unistd.h>
@@ -117,6 +121,11 @@ struct Node {
     nexus::crypto::Ed25519Keypair identity;
     NodeId id;
     fs::path dir;
+    // The wrapping stack persists the epoch vote key at rest, so a restarted
+    // node can resume voting after its certified sync.
+    std::unique_ptr<nexus::crypto::SodiumCryptoService> crypto;
+    std::unique_ptr<nexus::storage::FileStorageService> file_storage;
+    std::unique_ptr<nexus::crypto::KeyWrappingService> wrapping;
     std::unique_ptr<SecurityRuntime> runtime;
     std::unique_ptr<PairwiseSealer> sealer;
     std::unique_ptr<MemoryTransport> transport;
@@ -180,9 +189,29 @@ struct DriverMesh : ::testing::Test {
         for (std::size_t i = 0; i < nodes.size(); ++i) {
             Node* node = nodes[i].get();
             node->dir = root / ("node" + std::to_string(i));
+            node->crypto = std::make_unique<nexus::crypto::SodiumCryptoService>();
+            node->crypto->start();
+            node->file_storage = std::make_unique<nexus::storage::FileStorageService>(
+                (node->dir / "data").string());
+            node->file_storage->start();
+            node->wrapping = std::make_unique<nexus::crypto::KeyWrappingService>(
+                *node->crypto, *node->file_storage);
+            node->wrapping->start();
             build_node(*node);
             mesh.nodes[node->id] = node;
         }
+    }
+
+    // Rebuilds the runtime-side objects from the node's directories, as a
+    // process restart would.
+    void restart_node(Node& node) {
+        node.driver.reset();
+        node.router.reset();
+        node.store.reset();
+        node.runtime.reset();
+        node.sealer.reset();
+        node.transport.reset();
+        build_node(node);
     }
 
     void build_node(Node& node) {
@@ -198,7 +227,7 @@ struct DriverMesh : ::testing::Test {
         if (&node == genesis_node) {
             node.genesis = std::make_unique<GenesisService>(network);
         }
-        node.store = std::make_unique<EpochStore>(node.dir / "security", nullptr);
+        node.store = std::make_unique<EpochStore>(node.dir / "security", node.wrapping.get());
         SecurityDriverConfig driver_config;
         driver_config.self = node.id;
         driver_config.identity = node.identity;
@@ -209,7 +238,14 @@ struct DriverMesh : ::testing::Test {
         node.events.target = node.driver.get();
     }
 
-    void TearDown() override { fs::remove_all(root); }
+    void TearDown() override {
+        for (auto& node : nodes) {
+            if (node->wrapping) node->wrapping->stop();
+            if (node->file_storage) node->file_storage->stop();
+            if (node->crypto) node->crypto->stop();
+        }
+        fs::remove_all(root);
+    }
 
     void bootstrap() {
         for (auto& node : nodes) node->driver->start(mesh.now_ms);
@@ -356,6 +392,51 @@ TEST_F(DriverMesh, TimedHandoffRotatesToEpochTwo) {
     // Epoch 2 keeps committing under the new vote keys.
     const Height before = founders[0]->driver->last_committed_height();
     run_until_committed(before + 1);
+}
+
+TEST_F(DriverMesh, RestartSyncsToACertifiedFloorBeforeVoting) {
+    bootstrap();
+    run_until_committed(2);
+    Node* victim = founders[0];
+    const Height committed_before = victim->driver->last_committed_height();
+
+    restart_node(*victim);
+    victim->driver->start(mesh.now_ms);
+
+    // The stored epoch and safety state came back; voting stays blocked
+    // until quorum-certified state sets the view floor.
+    ASSERT_EQ(victim->driver->phase(), DriverPhase::Syncing);
+    ASSERT_NE(victim->runtime->consensus(), nullptr);
+    EXPECT_TRUE(victim->runtime->consensus()->usable());
+    EXPECT_FALSE(victim->runtime->consensus()->synced());
+    EXPECT_EQ(victim->driver->current_epoch(), 1u);
+
+    // The sync request went out during start; the answers carry validated
+    // certificates and finish the sync.
+    mesh.pump();
+    EXPECT_EQ(victim->driver->phase(), DriverPhase::Active);
+    EXPECT_TRUE(victim->runtime->consensus()->synced());
+
+    // The mesh keeps committing with the restarted member voting again.
+    run_until_committed(committed_before + 2);
+    EXPECT_GE(victim->driver->last_committed_height(), committed_before + 2);
+}
+
+TEST_F(DriverMesh, CorruptEpochStateFailsClosed) {
+    bootstrap();
+    Node* victim = founders[0];
+    restart_node(*victim);
+    {
+        std::ofstream out(victim->store->directory() / "epoch-current.json");
+        out << "{corrupt";
+    }
+    victim->driver->start(mesh.now_ms);
+    EXPECT_EQ(victim->driver->phase(), DriverPhase::Failed);
+    EXPECT_EQ(victim->runtime->epochs(), nullptr);
+
+    // A failed driver does nothing on tick and answers no protocol traffic.
+    victim->driver->tick(mesh.now_ms + 1000);
+    EXPECT_EQ(victim->driver->phase(), DriverPhase::Failed);
 }
 
 }  // namespace
