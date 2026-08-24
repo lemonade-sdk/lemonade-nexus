@@ -4,12 +4,26 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <sodium.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 
 namespace nexus::security {
 
 namespace {
+
+[[nodiscard]] const char* phase_name(DriverPhase p) {
+    switch (p) {
+        case DriverPhase::Failed:            return "Failed";
+        case DriverPhase::Idle:              return "Idle";
+        case DriverPhase::GenesisCollecting: return "GenesisCollecting";
+        case DriverPhase::FoundingDkg:       return "FoundingDkg";
+        case DriverPhase::AwaitingBootstrap: return "AwaitingBootstrap";
+        case DriverPhase::Syncing:           return "Syncing";
+        case DriverPhase::Active:            return "Active";
+    }
+    return "?";
+}
 
 [[nodiscard]] std::size_t sync_responses_needed(std::size_t members) {
     // One honest answer is enough to raise the floor; f + 1 distinct answers
@@ -31,6 +45,20 @@ SecurityDriver::SecurityDriver(SecurityDriverConfig config, SecurityRuntime& run
 
 bool SecurityDriver::genesis_node() const {
     return config_.identity.public_key == config_.genesis_public_key;
+}
+
+void SecurityDriver::set_phase(DriverPhase next, const char* reason) {
+    if (phase_ == next) {
+        return;
+    }
+    if (next == DriverPhase::Failed) {
+        spdlog::warn("[security] phase {} -> {}: {}", phase_name(phase_), phase_name(next),
+                     reason);
+    } else {
+        spdlog::info("[security] phase {} -> {}: {}", phase_name(phase_), phase_name(next),
+                     reason);
+    }
+    phase_ = next;
 }
 
 NodeId SecurityDriver::genesis_id() const {
@@ -66,7 +94,7 @@ void SecurityDriver::start(uint64_t now_ms) {
     // Corrupt durable state can hide an epoch this node already acted in.
     // Never continue as if fresh.
     if (corrupt(bootstrap) || corrupt(epoch)) {
-        phase_ = DriverPhase::Failed;
+        set_phase(DriverPhase::Failed, "durable security state is corrupt");
         return;
     }
 
@@ -78,7 +106,7 @@ void SecurityDriver::start(uint64_t now_ms) {
             vote_pubs_mine_[id] = vote_key->public_key;
         }
         if (!runtime_.restore_epoch(std::move(*stored), std::move(vote_key))) {
-            phase_ = DriverPhase::Failed;
+            set_phase(DriverPhase::Failed, "durable epoch state did not restore");
             return;
         }
         epoch_started_ms_ = now_ms;
@@ -86,13 +114,16 @@ void SecurityDriver::start(uint64_t now_ms) {
         if (member && runtime_.consensus() != nullptr && !runtime_.consensus()->synced()) {
             begin_sync(now_ms);
         } else {
-            phase_ = DriverPhase::Active;
+            set_phase(DriverPhase::Active, "restored durable epoch");
         }
         return;
     }
 
-    phase_ = genesis_node() && genesis_ != nullptr ? DriverPhase::GenesisCollecting
-                                                   : DriverPhase::Idle;
+    if (genesis_node() && genesis_ != nullptr) {
+        set_phase(DriverPhase::GenesisCollecting, "this identity is the genesis anchor");
+    } else {
+        set_phase(DriverPhase::Idle, "no durable epoch; awaiting the mesh");
+    }
 }
 
 void SecurityDriver::on_peer(const NodeId& peer, uint64_t now_ms) {
@@ -111,6 +142,8 @@ void SecurityDriver::issue_genesis_challenge(const NodeId& peer) {
     if (!challenge.has_value()) {
         return;  // The attestation budget for this identity is spent.
     }
+    spdlog::debug("[security] genesis challenge -> {}",
+                  crypto::to_hex(std::span<const uint8_t>(peer.bytes.data(), 8)));
     (void)router_.send(peer,
                        router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, 1));
 }
@@ -163,7 +196,7 @@ void SecurityDriver::tick(uint64_t now_ms) {
 // --- Sync --------------------------------------------------------------------
 
 void SecurityDriver::begin_sync(uint64_t now_ms) {
-    phase_ = DriverPhase::Syncing;
+    set_phase(DriverPhase::Syncing, "member with unsynced chain; requesting the certified floor");
     sync_started_ms_ = now_ms;
     best_synced_view_ = 0;
     any_sync_response_ = false;
@@ -192,7 +225,7 @@ void SecurityDriver::finish_sync() {
     if (consensus != nullptr) {
         consensus->sync_to_certified(best_synced_view_);
     }
-    phase_ = DriverPhase::Active;
+    set_phase(DriverPhase::Active, "synced to the certified floor");
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
 }
@@ -220,6 +253,7 @@ void SecurityDriver::send_founding() {
         founding.members.emplace_back(node, founder_vote_keys_.at(node));
     }
     founding.attestation_root = genesis_attestation_root(*founders);
+    spdlog::info("[security] genesis founding: {} attested founders", founders->size());
     for (const auto& node : founders->members()) {
         (void)router_.send(node,
                            router_.compose(SecurityMessageKind::GenesisFounding, founding, 1));
@@ -243,7 +277,7 @@ void SecurityDriver::on_genesis_founding(const GenesisFounding& founding, const 
         return;
     }
     founding_ = founding;
-    phase_ = DriverPhase::FoundingDkg;
+    set_phase(DriverPhase::FoundingDkg, "founding received; starting the epoch-1 DKG");
     start_founding_dkg();
 }
 
@@ -256,7 +290,7 @@ void SecurityDriver::start_founding_dkg() {
     }
     auto set = Tier1Set::from_nodes(ids);
     if (!set.has_value()) {
-        phase_ = DriverPhase::Idle;
+        set_phase(DriverPhase::Idle, "founding set is not a valid Tier 1 set");
         return;
     }
     DkgConfiguration dkg;
@@ -270,7 +304,7 @@ void SecurityDriver::start_founding_dkg() {
     dkg.self = config_.self;
     auto broadcast = runtime_.authority().start_dkg(std::move(dkg));
     if (!broadcast.has_value()) {
-        phase_ = DriverPhase::Idle;
+        set_phase(DriverPhase::Idle, "epoch-1 DKG refused to start");
         return;
     }
     (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *broadcast, 1));
@@ -293,7 +327,8 @@ void SecurityDriver::on_dkg_complete(EpochId target) {
                              digest.size(), config_.identity.private_key.data());
         (void)router_.send(genesis_id(),
                            router_.compose(SecurityMessageKind::DkgTranscriptAttest, attest, 1));
-        phase_ = DriverPhase::AwaitingBootstrap;
+        set_phase(DriverPhase::AwaitingBootstrap,
+                  "DKG transcript attested; awaiting the bootstrap certificate");
         return;
     }
     EpochManager* epochs = runtime_.epochs();
@@ -310,7 +345,7 @@ void SecurityDriver::on_dkg_failed(DkgFailure, std::optional<NodeId> culprit) {
         // Await a fresh founding round; nothing was activated.
         founding_.reset();
         pending_dkg_.reset();
-        phase_ = DriverPhase::Idle;
+        set_phase(DriverPhase::Idle, "founding DKG failed; awaiting a fresh round");
         return;
     }
     EpochManager* epochs = runtime_.epochs();
@@ -346,7 +381,7 @@ void SecurityDriver::on_dkg_transcript_attest(const DkgTranscriptAttest& attest)
         router_.compose(SecurityMessageKind::BootstrapCertificate, *certificate, 1));
     // Genesis unilateral authority ends here; this node continues as an
     // ordinary server.
-    phase_ = DriverPhase::Idle;
+    set_phase(DriverPhase::Idle, "bootstrap certificate issued; genesis authority ends");
 }
 
 void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certificate,
@@ -369,7 +404,7 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     if (!runtime_.adopt_epoch_one(certificate, config_.genesis_public_key, std::move(*founders),
                                   std::move(vote_keys), std::move(pending_dkg_),
                                   std::move(own_key))) {
-        phase_ = DriverPhase::Idle;
+        set_phase(DriverPhase::Idle, "epoch-1 adoption failed");
         return;
     }
     pending_dkg_.reset();
@@ -379,7 +414,7 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     (void)store_.append_authority({1, certificate.authority_public_key,
                                    certificate.tier1_set_digest,
                                    certificate.dkg_transcript_digest});
-    phase_ = DriverPhase::Active;
+    set_phase(DriverPhase::Active, "epoch 1 adopted and active");
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
     announce_epoch(checkpoint);
@@ -416,6 +451,9 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
         if (!genesis_->record_verdict(verdict)) {
             return;
         }
+        spdlog::info("[security] genesis verdict for {}: {}",
+                     crypto::to_hex(std::span<const uint8_t>(verdict.node_id.bytes.data(), 8)),
+                     verdict.passed ? "PASSED" : "failed");
         if (verdict.passed) {
             founder_vote_keys_[verdict.node_id] = evidence.epoch_vote_key;
             founder_evidence_digests_[verdict.node_id] = verdict.evidence_digest;

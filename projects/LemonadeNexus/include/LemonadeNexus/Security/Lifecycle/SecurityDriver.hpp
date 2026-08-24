@@ -90,6 +90,7 @@ public:
 
 private:
     [[nodiscard]] NodeId genesis_id() const;
+    void set_phase(DriverPhase next, const char* reason);
     [[nodiscard]] EpochVoteKey take_own_vote_key(EpochId epoch);
     void issue_genesis_challenge(const NodeId& peer);
     void send_founding();
