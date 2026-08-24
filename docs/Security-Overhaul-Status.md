@@ -113,6 +113,29 @@ driver (M2) decides what happens next. Evidence production behind
 `IEvidenceProducer` is not wired yet: a node without a producer answers no
 challenge and stays ineligible.
 
+### M2 — SecurityRuntime server lifecycle integration (done)
+
+| Piece | Files | Tests |
+|---|---|---|
+| Bootstrap and sync messages | `GenesisFounding`, `DkgTranscriptAttest`, `BootstrapCertificate`, `SyncRequest`, `SyncResponse` in the codec and router; `GenesisService` requires all founders' signed transcript attestations before it signs | codec, router, genesis suites |
+| Durable epoch state | `Epoch/EpochStore` — bootstrap certificate, current epoch with vote keys and checkpoint, authority history, own vote key wrapped (machine binding) | `epoch/epoch_store.cpp` |
+| Evidence prover | `Attestation/PlatformEvidenceProducer` — answers only challenges for this identity, binds the epoch vote key, empty platform bundle on a host without a platform path, signs last | `attestation/producer.cpp` |
+| Lifecycle driver | `Lifecycle/SecurityDriver` — genesis bootstrap, tick-paced proposing, pacemaker timeouts, re-attestation and epoch cadence, committed-handoff activation, restart recovery | `lifecycle/driver.cpp` (5) |
+| Restart sync | `SyncResponse` carries the responder's uncommitted chain; `HotStuffService::adopt_certified_block` accepts certified facts without voting, one parentless anchor on an empty chain; voting waits for the certified floor | lifecycle + `hotstuff_safety` |
+| Server wiring | `Lifecycle/SecurityMeshService` (IService: timers, sink, peer hook), `ServerConfig.genesis_pubkey` (pinned bootstrap anchor; empty = not configured), `main.cpp` construction and ordered shutdown, `GossipService::set_peer_certified_callback` | `test_security_mesh_service.cpp` (real UDP, honest failed-verdict path) |
+
+Driver design rules: proposals originate only from `tick` (time-paced, never
+certificate-triggered), verdicts carry the epoch they are FOR (a final
+challenge names the target epoch), corrupt durable state fails the driver
+permanently, and a node without a platform path answers with an empty bundle
+that the verifier fails.
+
+Known M2 scope cuts, to close in M4/M5: the eligible pool for rotation is
+derived from locally recorded re-attestation verdicts (divergent pools fail
+the DKG set digest and retry; consensus-finalized eligibility is the fix),
+incarnations are constant 1 pending the 23.B rule, and `EpochAnnouncement`
+is informational only.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
