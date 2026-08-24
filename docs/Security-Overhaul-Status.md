@@ -136,6 +136,36 @@ the DKG set digest and retry; consensus-finalized eligibility is the fix),
 incarnations are constant 1 pending the 23.B rule, and `EpochAnnouncement`
 is informational only.
 
+### M3 — Old network authority removal (done)
+
+Deleted outright: `GovernanceService`, `RootKeyChainService` (rotation and
+Shamir distribution), `ShamirSecretSharing`, `TrustPolicyService`,
+`TeeAttestationService`, `TeeAttestationTpm` (the Model-A TPM path and its
+`--print-tpm-ak` CLI mode), the gossip wire types `0x07`–`0x10` (TEE
+challenge/response, enrollment votes, root-key rotation, Shamir shares, peer
+health, governance — values reserved forever), the `AttestationToken`
+rolling-trust layer, the admission ballots, the `/api/trust/*`,
+`/api/enrollment/*`, and `/api/governance/*` endpoints, and the operator
+quorum knobs (`admission_quorum_ratio`, `enrollment_*`,
+`require_peer_confirmation`, `onboard_min_tier1_for_vote`).
+
+Re-pointed: gossip state-mutating ingress now requires a root-signed peer
+certificate (never fail-open, no tokens, no Tier-1 decisions in gossip);
+DNS credential distribution asks the mesh security system for Tier 1
+membership (an unset gate denies); the published tier record derives from
+current epoch membership.
+
+Documented residuals, replaced when the epoch authority signs membership
+credentials: the root-signed `ServerCertificate` stays as the Tier-2
+TRANSPORT credential; admission stays sole-discretion (admin or single-use
+token) and grants transport membership only; `TrustTypes` shrank to the
+evidence-pinning remnants (`kMaxInlineEvidenceBytes`, `PeerPlatformBinding`).
+
+One active security system remains: Tier 1 authority exists only through
+attestation, deterministic selection, HotStuff finality, and per-epoch FROST
+keys. `tests/test_legacy_removal.cpp` proves retired wire types and removed
+endpoints cannot affect mesh state.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
