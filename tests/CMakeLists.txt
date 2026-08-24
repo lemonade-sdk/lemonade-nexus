@@ -88,7 +88,8 @@ add_nexus_test(test_security_epoch
     security/epoch/tier1_selector.cpp
     security/epoch/epoch_state.cpp
     security/epoch/transition.cpp
-    security/epoch/epoch_manager.cpp)
+    security/epoch/epoch_manager.cpp
+    security/epoch/epoch_store.cpp)
 add_nexus_test(test_security_hotstuff
     security/consensus/consensus_store.cpp
     security/consensus/hotstuff_safety.cpp
@@ -110,7 +111,8 @@ add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
     security/attestation/linux_profile.cpp
-    security/attestation/service.cpp)
+    security/attestation/service.cpp
+    security/attestation/producer.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
