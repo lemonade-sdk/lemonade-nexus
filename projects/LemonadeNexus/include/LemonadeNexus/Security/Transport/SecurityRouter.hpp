@@ -12,6 +12,7 @@
 // Outbound: the services tell the router what to send and to whom. The
 // transport never fans out on its own.
 
+#include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
 #include <LemonadeNexus/Security/SecurityRuntime.hpp>
 #include <LemonadeNexus/Security/Transport/PairwiseSeal.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
@@ -60,17 +61,16 @@ public:
     virtual void on_dkg_complete(EpochId) {}
     virtual void on_dkg_failed(DkgFailure, std::optional<NodeId>) {}
     virtual void on_authority_signature(const AuthoritySignature&) {}
-    virtual void on_attestation_verdict(const AttestationVerdict&) {}
+    /// The evidence rides along: a passing verdict also carries the epoch
+    /// vote key the node bound.
+    virtual void on_attestation_verdict(const AttestationVerdict&, const AttestationEvidence&) {}
     virtual void on_epoch_announcement(const EpochAnnouncement&, const NodeId&) {}
-};
-
-/// Produces this node's evidence for a challenge. A node without a platform
-/// path produces nothing and stays ineligible; nothing here fabricates.
-class IEvidenceProducer {
-public:
-    virtual ~IEvidenceProducer() = default;
-    [[nodiscard]] virtual std::optional<AttestationEvidence> produce(
-        const AttestationChallenge& challenge) = 0;
+    virtual void on_genesis_founding(const GenesisFounding&, const NodeId&) {}
+    virtual void on_dkg_transcript_attest(const DkgTranscriptAttest&) {}
+    virtual void on_bootstrap_certificate(const BootstrapCertificate&, const NodeId&) {}
+    /// A validated certificate from a peer: proof the network reached its
+    /// view. The driver derives the restart view floor from these.
+    virtual void on_sync_certificate(const QuorumCertificate&, const NodeId&) {}
 };
 
 struct SecurityRouterConfig {
@@ -114,6 +114,8 @@ private:
     RouteResult route_challenge(const AttestationChallenge& challenge, const NodeId& from);
     RouteResult route_evidence(const AttestationEvidence& evidence);
     RouteResult route_announcement(const EpochAnnouncement& announcement, const NodeId& from);
+    RouteResult route_sync_request(const SyncRequest& request, const NodeId& from);
+    RouteResult route_sync_response(const SyncResponse& response, const NodeId& from);
 
     struct PeerBudget {
         uint64_t window_start_ms = 0;

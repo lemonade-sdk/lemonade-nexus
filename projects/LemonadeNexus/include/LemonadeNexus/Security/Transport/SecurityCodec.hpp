@@ -15,6 +15,8 @@
 #include <LemonadeNexus/Security/Authority/DkgSession.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochAuthority.hpp>
+#include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
+#include <LemonadeNexus/Security/Genesis/GenesisMessages.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <cstdint>
@@ -35,6 +37,21 @@ enum class SecurityMessageKind : uint16_t {
     FrostCommitment = 8,
     FrostSignatureShare = 9,
     EpochAnnouncement = 10,
+    GenesisFounding = 11,
+    DkgTranscriptAttest = 12,
+    BootstrapCertificate = 13,
+    SyncRequest = 14,
+    SyncResponse = 15,
+};
+
+/// A restarted node asks for quorum-certified state; the answer carries the
+/// responder's high certificate, which proves the view the network reached.
+struct SyncRequest {
+    EpochId epoch = 0;
+};
+
+struct SyncResponse {
+    QuorumCertificate high_qc;
 };
 
 /// A proposal always travels with the certificate it extends.
@@ -59,7 +76,12 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   DkgMessage,
                                   FrostCommitmentMessage,
                                   FrostShareMessage,
-                                  EpochAnnouncement>;
+                                  EpochAnnouncement,
+                                  GenesisFounding,
+                                  DkgTranscriptAttest,
+                                  BootstrapCertificate,
+                                  SyncRequest,
+                                  SyncResponse>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

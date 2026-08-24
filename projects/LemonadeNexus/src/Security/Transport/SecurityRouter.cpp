@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
 
+#include <LemonadeNexus/Security/Consensus/QuorumValidation.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <sodium.h>
@@ -122,6 +123,8 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.header.sender == authenticated_sender;
             } else if constexpr (std::is_same_v<T, AttestationEvidence>) {
                 return body.node_id == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, DkgTranscriptAttest>) {
+                return body.node == authenticated_sender;
             } else {
                 return true;
             }
@@ -131,10 +134,17 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
 
 bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
     const EpochManager* epochs = runtime_.epochs();
+    const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
+                                message.kind == SecurityMessageKind::DkgTranscriptAttest ||
+                                message.kind == SecurityMessageKind::BootstrapCertificate;
     if (epochs == nullptr) {
         // Before Epoch 1 only bootstrap traffic exists: challenges, evidence,
-        // and the Epoch 1 DKG.
+        // the Epoch 1 DKG, and the Genesis exchange.
         return message.epoch <= 1;
+    }
+    if (bootstrap_kind) {
+        // Genesis authority ended at Epoch 1 activation.
+        return false;
     }
     const EpochId current = epochs->current().id;
     if (message.epoch == current) {
@@ -206,8 +216,56 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
             return route_share(std::get<FrostShareMessage>(message.body));
         case SecurityMessageKind::EpochAnnouncement:
             return route_announcement(std::get<EpochAnnouncement>(message.body), message.sender);
+        case SecurityMessageKind::GenesisFounding:
+            events_.on_genesis_founding(std::get<GenesisFounding>(message.body), message.sender);
+            return delivered();
+        case SecurityMessageKind::DkgTranscriptAttest:
+            events_.on_dkg_transcript_attest(std::get<DkgTranscriptAttest>(message.body));
+            return delivered();
+        case SecurityMessageKind::BootstrapCertificate:
+            events_.on_bootstrap_certificate(std::get<BootstrapCertificate>(message.body),
+                                             message.sender);
+            return delivered();
+        case SecurityMessageKind::SyncRequest:
+            return route_sync_request(std::get<SyncRequest>(message.body), message.sender);
+        case SecurityMessageKind::SyncResponse:
+            return route_sync_response(std::get<SyncResponse>(message.body), message.sender);
     }
     return drop(DropReason::UnknownKind);
+}
+
+RouteResult SecurityRouter::route_sync_request(const SyncRequest& request, const NodeId& from) {
+    HotStuffService* consensus = runtime_.consensus();
+    const EpochManager* epochs = runtime_.epochs();
+    if (consensus == nullptr || epochs == nullptr || request.epoch != epochs->current().id) {
+        return drop(DropReason::NoService);
+    }
+    SyncResponse response{consensus->state().high_qc};
+    (void)send(from, compose(SecurityMessageKind::SyncResponse, response, request.epoch));
+    return delivered();
+}
+
+RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, const NodeId& from) {
+    const EpochManager* epochs = runtime_.epochs();
+    if (epochs == nullptr) {
+        return drop(DropReason::NoService);
+    }
+    const EpochState& current = epochs->current();
+    const QuorumCertificate& qc = response.high_qc;
+    // A certificate is self-certifying: valid signatures from the frozen
+    // membership prove the view. The genesis form proves only view 0.
+    const bool genesis_form = qc.signers.empty() && qc.view == 0 && qc.height == 0 &&
+                              qc.epoch == current.id && qc.network_id == current.network_id;
+    if (!genesis_form) {
+        const QcValidationContext context{constants::kConsensusRulesetVersion, current.network_id,
+                                          current.id, current.consensus_quorum};
+        const auto failure = validate_quorum_certificate(qc, context, epochs->current_vote_keys());
+        if (failure.has_value()) {
+            return drop(DropReason::ServiceRejected, code(*failure));
+        }
+    }
+    events_.on_sync_certificate(qc, from);
+    return delivered();
 }
 
 RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
@@ -367,7 +425,7 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
 
 RouteResult SecurityRouter::route_evidence(const AttestationEvidence& evidence) {
     const AttestationVerdict verdict = runtime_.attestation().receive_evidence(evidence);
-    events_.on_attestation_verdict(verdict);
+    events_.on_attestation_verdict(verdict, evidence);
     return delivered();
 }
 

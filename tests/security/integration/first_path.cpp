@@ -77,6 +77,21 @@ struct DkgRun {
     Digest transcript{};
 };
 
+DkgTranscriptAttest signed_transcript_attest(const Node& node, const Tier1Set& founders,
+                                             const Digest& transcript,
+                                             const nexus::crypto::Ed25519PublicKey& group) {
+    DkgTranscriptAttest attest;
+    attest.epoch = 1;
+    attest.participant_set_digest = founders.digest();
+    attest.transcript_digest = transcript;
+    attest.group_public_key = group;
+    attest.node = node.id;
+    const Digest digest = dkg_transcript_attest_digest(attest);
+    crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         node.identity_priv.data());
+    return attest;
+}
+
 // Runs one dealerless DKG across the runtimes of the given participants.
 DkgRun run_dkg(std::vector<Node*> participants, const NetworkId& network, EpochId target) {
     std::vector<NodeId> ids;
@@ -277,6 +292,11 @@ TEST_F(FirstPath, GenesisToEpochTwo) {
     // --- Genesis signs the one bootstrap certificate; its authority ends. ---
     std::sort(verdicts.begin(), verdicts.end(),
               [](const auto& a, const auto& b) { return a.node_id < b.node_id; });
+    for (Node* node : founders) {
+        ASSERT_TRUE(genesis.record_transcript_attest(signed_transcript_attest(
+            *node, founding_set, dkg_1.transcript, dkg_1.results[0].group_public_key)));
+    }
+    ASSERT_TRUE(genesis.transcript_agreed());
     const auto certificate = genesis.finalize_epoch_one(
         dkg_1.results[0].group_public_key, dkg_1.transcript, attestation_root(verdicts),
         genesis_priv);

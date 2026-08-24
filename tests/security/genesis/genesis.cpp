@@ -10,6 +10,7 @@ using nexus::security::AttestationVerdict;
 using nexus::security::BootstrapCertificate;
 using nexus::security::bootstrap_certificate_signing_digest;
 using nexus::security::derive_network_id;
+using nexus::security::dkg_transcript_attest_digest;
 using nexus::security::Digest;
 using nexus::security::GenesisService;
 using nexus::security::NetworkId;
@@ -51,6 +52,46 @@ struct GenesisFixture : ::testing::Test {
             ASSERT_TRUE(service->record_verdict(verdict_for(id, true)));
         }
     }
+
+    struct Founder {
+        nexus::crypto::Ed25519PublicKey pub{};
+        nexus::crypto::Ed25519PrivateKey priv{};
+        NodeId id;
+    };
+
+    // Founders with real identity keys, so they can sign transcript attests.
+    void admit_real_founders(std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) {
+            Founder founder;
+            crypto_sign_keypair(founder.pub.data(), founder.priv.data());
+            founder.id.bytes = founder.pub;
+            ASSERT_TRUE(service->admit_candidate(founder.id));
+            ASSERT_TRUE(service->record_verdict(verdict_for(founder.id, true)));
+            founders.push_back(founder);
+        }
+    }
+
+    nexus::security::DkgTranscriptAttest attest_from(const Founder& founder, const Digest& transcript,
+                                                     const nexus::crypto::Ed25519PublicKey& group) {
+        nexus::security::DkgTranscriptAttest attest;
+        attest.epoch = 1;
+        attest.participant_set_digest = service->founding_set()->digest();
+        attest.transcript_digest = transcript;
+        attest.group_public_key = group;
+        attest.node = founder.id;
+        const Digest digest = dkg_transcript_attest_digest(attest);
+        crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(),
+                             digest.size(), founder.priv.data());
+        return attest;
+    }
+
+    void attest_all(const Digest& transcript, const nexus::crypto::Ed25519PublicKey& group) {
+        for (const auto& founder : founders) {
+            ASSERT_TRUE(service->record_transcript_attest(attest_from(founder, transcript, group)));
+        }
+    }
+
+    std::vector<Founder> founders;
 
     nexus::crypto::Ed25519PublicKey genesis_pub{};
     nexus::crypto::Ed25519PrivateKey genesis_priv{};
@@ -112,8 +153,51 @@ TEST_F(GenesisFixture, FinalizeBeforeQuorumRefused) {
     EXPECT_FALSE(service->finalized());
 }
 
+TEST_F(GenesisFixture, TranscriptAttestRules) {
+    admit_real_founders(constants::kBootstrapThreshold);
+    nexus::crypto::Ed25519PublicKey group{};
+    group.fill(0x77);
+    Digest transcript;
+    transcript.fill(0x55);
+
+    // A non-founder, a bad signature, and a wrong epoch are refused.
+    Founder outsider;
+    crypto_sign_keypair(outsider.pub.data(), outsider.priv.data());
+    outsider.id.bytes = outsider.pub;
+    EXPECT_FALSE(service->record_transcript_attest(attest_from(outsider, transcript, group)));
+
+    auto forged = attest_from(founders[0], transcript, group);
+    forged.identity_signature[0] ^= 0x01;
+    EXPECT_FALSE(service->record_transcript_attest(forged));
+
+    auto wrong_epoch = attest_from(founders[0], transcript, group);
+    wrong_epoch.epoch = 2;
+    EXPECT_FALSE(service->record_transcript_attest(wrong_epoch));
+
+    // Four agreeing founders and one dissenting: no agreement, no certificate.
+    for (std::size_t i = 0; i + 1 < founders.size(); ++i) {
+        ASSERT_TRUE(service->record_transcript_attest(attest_from(founders[i], transcript, group)));
+    }
+    Digest other;
+    other.fill(0x56);
+    ASSERT_TRUE(service->record_transcript_attest(attest_from(founders.back(), other, group)));
+    EXPECT_FALSE(service->transcript_agreed());
+    EXPECT_FALSE(service->finalize_epoch_one(group, transcript, Digest{}, genesis_priv).has_value());
+
+    // The dissenter re-attests the agreed transcript.
+    ASSERT_TRUE(service->record_transcript_attest(attest_from(founders.back(), transcript, group)));
+    EXPECT_TRUE(service->transcript_agreed());
+
+    // Genesis signs only what the founders attested.
+    nexus::crypto::Ed25519PublicKey other_group{};
+    other_group.fill(0x78);
+    EXPECT_FALSE(service->finalize_epoch_one(other_group, transcript, Digest{}, genesis_priv).has_value());
+    EXPECT_FALSE(service->finalize_epoch_one(group, other, Digest{}, genesis_priv).has_value());
+    EXPECT_TRUE(service->finalize_epoch_one(group, transcript, Digest{}, genesis_priv).has_value());
+}
+
 TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
-    admit_passing(constants::kBootstrapThreshold);
+    admit_real_founders(constants::kBootstrapThreshold);
 
     nexus::crypto::Ed25519PublicKey authority{};
     authority.fill(0x77);
@@ -121,6 +205,7 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
     dkg_digest.fill(0x55);
     Digest attestation_root;
     attestation_root.fill(0x66);
+    attest_all(dkg_digest, authority);
 
     const auto certificate =
         service->finalize_epoch_one(authority, dkg_digest, attestation_root, genesis_priv);
@@ -146,7 +231,8 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
     // Genesis authority is over: nothing mutates any more.
     EXPECT_TRUE(service->finalized());
     EXPECT_FALSE(service->admit_candidate(node(0xEE)));
-    EXPECT_FALSE(service->record_verdict(verdict_for(node(0x10), true)));
+    EXPECT_FALSE(service->record_verdict(verdict_for(founders[0].id, true)));
+    EXPECT_FALSE(service->record_transcript_attest(attest_from(founders[0], dkg_digest, authority)));
     EXPECT_FALSE(
         service->finalize_epoch_one(authority, dkg_digest, attestation_root, genesis_priv)
             .has_value());

@@ -254,6 +254,53 @@ bool encode_announcement(Writer& w, const EpochAnnouncement& a) {
     return true;
 }
 
+bool encode_founding(Writer& w, const GenesisFounding& f) {
+    if (f.members.size() > constants::kMaxActiveTier1) {
+        return false;
+    }
+    w.u64(f.epoch);
+    w.u16(static_cast<uint16_t>(f.members.size()));
+    for (const auto& [node, vote_key] : f.members) {
+        put_node(w, node);
+        w.fixed(vote_key);
+    }
+    w.fixed(f.attestation_root);
+    return true;
+}
+
+bool encode_transcript_attest(Writer& w, const DkgTranscriptAttest& a) {
+    w.u64(a.epoch);
+    w.fixed(a.participant_set_digest);
+    w.fixed(a.transcript_digest);
+    w.fixed(a.group_public_key);
+    put_node(w, a.node);
+    w.fixed(a.identity_signature);
+    return true;
+}
+
+bool encode_bootstrap(Writer& w, const BootstrapCertificate& c) {
+    w.fixed(c.network_id);
+    w.u64(c.epoch);
+    w.fixed(c.tier1_set_digest);
+    w.u64(c.authority_threshold);
+    w.fixed(c.authority_public_key);
+    w.fixed(c.dkg_transcript_digest);
+    w.fixed(c.attestation_root);
+    w.u16(c.security_ruleset);
+    w.u16(c.consensus_ruleset);
+    w.fixed(c.genesis_signature);
+    return true;
+}
+
+bool encode_sync_request(Writer& w, const SyncRequest& s) {
+    w.u64(s.epoch);
+    return true;
+}
+
+bool encode_sync_response(Writer& w, const SyncResponse& s) {
+    return encode_certificate(w, s.high_qc);
+}
+
 // --- Decoders ---------------------------------------------------------------
 
 bool get_node(Reader& r, NodeId& node) { return r.fixed(node.bytes); }
@@ -378,6 +425,44 @@ bool decode_announcement(Reader& r, EpochAnnouncement& a) {
            r.fixed(a.handoff_certificate_digest);
 }
 
+bool decode_founding(Reader& r, GenesisFounding& f) {
+    uint16_t count = 0;
+    if (!(r.u64(f.epoch) && r.u16(count))) {
+        return false;
+    }
+    if (count > constants::kMaxActiveTier1) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    f.members.resize(count);
+    for (auto& [node, vote_key] : f.members) {
+        if (!(get_node(r, node) && r.fixed(vote_key))) {
+            return false;
+        }
+    }
+    return r.fixed(f.attestation_root);
+}
+
+bool decode_transcript_attest(Reader& r, DkgTranscriptAttest& a) {
+    return r.u64(a.epoch) && r.fixed(a.participant_set_digest) && r.fixed(a.transcript_digest) &&
+           r.fixed(a.group_public_key) && get_node(r, a.node) && r.fixed(a.identity_signature);
+}
+
+bool decode_bootstrap(Reader& r, BootstrapCertificate& c) {
+    uint64_t threshold = 0;
+    if (!(r.fixed(c.network_id) && r.u64(c.epoch) && r.fixed(c.tier1_set_digest) &&
+          r.u64(threshold) && r.fixed(c.authority_public_key) && r.fixed(c.dkg_transcript_digest) &&
+          r.fixed(c.attestation_root) && r.u16(c.security_ruleset) &&
+          r.u16(c.consensus_ruleset) && r.fixed(c.genesis_signature))) {
+        return false;
+    }
+    c.authority_threshold = static_cast<std::size_t>(threshold);
+    return true;
+}
+
+bool decode_sync_request(Reader& r, SyncRequest& s) { return r.u64(s.epoch); }
+
+bool decode_sync_response(Reader& r, SyncResponse& s) { return decode_certificate(r, s.high_qc); }
+
 bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
     switch (kind) {
         case SecurityMessageKind::AttestationChallenge: {
@@ -435,13 +520,43 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(a);
             return true;
         }
+        case SecurityMessageKind::GenesisFounding: {
+            GenesisFounding f;
+            if (!decode_founding(r, f)) return false;
+            body = std::move(f);
+            return true;
+        }
+        case SecurityMessageKind::DkgTranscriptAttest: {
+            DkgTranscriptAttest a;
+            if (!decode_transcript_attest(r, a)) return false;
+            body = std::move(a);
+            return true;
+        }
+        case SecurityMessageKind::BootstrapCertificate: {
+            BootstrapCertificate c;
+            if (!decode_bootstrap(r, c)) return false;
+            body = std::move(c);
+            return true;
+        }
+        case SecurityMessageKind::SyncRequest: {
+            SyncRequest s;
+            if (!decode_sync_request(r, s)) return false;
+            body = std::move(s);
+            return true;
+        }
+        case SecurityMessageKind::SyncResponse: {
+            SyncResponse s;
+            if (!decode_sync_response(r, s)) return false;
+            body = std::move(s);
+            return true;
+        }
     }
     return r.fail(CodecError::UnknownKind);
 }
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::EpochAnnouncement);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::SyncResponse);
 }
 
 }  // namespace
@@ -472,8 +587,18 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::FrostCommitment;
             } else if constexpr (std::is_same_v<T, FrostShareMessage>) {
                 return SecurityMessageKind::FrostSignatureShare;
-            } else {
+            } else if constexpr (std::is_same_v<T, EpochAnnouncement>) {
                 return SecurityMessageKind::EpochAnnouncement;
+            } else if constexpr (std::is_same_v<T, GenesisFounding>) {
+                return SecurityMessageKind::GenesisFounding;
+            } else if constexpr (std::is_same_v<T, DkgTranscriptAttest>) {
+                return SecurityMessageKind::DkgTranscriptAttest;
+            } else if constexpr (std::is_same_v<T, BootstrapCertificate>) {
+                return SecurityMessageKind::BootstrapCertificate;
+            } else if constexpr (std::is_same_v<T, SyncRequest>) {
+                return SecurityMessageKind::SyncRequest;
+            } else {
+                return SecurityMessageKind::SyncResponse;
             }
         },
         body);
@@ -505,8 +630,18 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_commitment(body, value);
             } else if constexpr (std::is_same_v<T, FrostShareMessage>) {
                 return encode_share(body, value);
-            } else {
+            } else if constexpr (std::is_same_v<T, EpochAnnouncement>) {
                 return encode_announcement(body, value);
+            } else if constexpr (std::is_same_v<T, GenesisFounding>) {
+                return encode_founding(body, value);
+            } else if constexpr (std::is_same_v<T, DkgTranscriptAttest>) {
+                return encode_transcript_attest(body, value);
+            } else if constexpr (std::is_same_v<T, BootstrapCertificate>) {
+                return encode_bootstrap(body, value);
+            } else if constexpr (std::is_same_v<T, SyncRequest>) {
+                return encode_sync_request(body, value);
+            } else {
+                return encode_sync_response(body, value);
             }
         },
         message.body);

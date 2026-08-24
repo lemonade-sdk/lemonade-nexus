@@ -180,6 +180,41 @@ std::vector<SecurityMessage> all_kinds() {
     a.handoff_certificate_digest = digest(0x76);
     messages.push_back(envelope(SecurityMessageKind::EpochAnnouncement, a));
 
+    GenesisFounding founding;
+    founding.epoch = 1;
+    for (uint8_t i = 1; i <= 5; ++i) {
+        nexus::crypto::Ed25519PublicKey vote_key{};
+        vote_key.fill(static_cast<uint8_t>(0x80 + i));
+        founding.members.emplace_back(node(i), vote_key);
+    }
+    founding.attestation_root = digest(0x91);
+    messages.push_back(envelope(SecurityMessageKind::GenesisFounding, founding));
+
+    DkgTranscriptAttest attest;
+    attest.epoch = 1;
+    attest.participant_set_digest = digest(0x92);
+    attest.transcript_digest = digest(0x93);
+    attest.group_public_key.fill(0x94);
+    attest.node = node(0x01);
+    attest.identity_signature = signature(0x95);
+    messages.push_back(envelope(SecurityMessageKind::DkgTranscriptAttest, attest));
+
+    BootstrapCertificate bootstrap;
+    bootstrap.network_id = digest(0xAA);
+    bootstrap.epoch = 1;
+    bootstrap.tier1_set_digest = digest(0x92);
+    bootstrap.authority_threshold = 5;
+    bootstrap.authority_public_key.fill(0x94);
+    bootstrap.dkg_transcript_digest = digest(0x93);
+    bootstrap.attestation_root = digest(0x91);
+    bootstrap.security_ruleset = constants::kSecurityRulesetVersion;
+    bootstrap.consensus_ruleset = constants::kConsensusRulesetVersion;
+    bootstrap.genesis_signature = signature(0x96);
+    messages.push_back(envelope(SecurityMessageKind::BootstrapCertificate, bootstrap));
+
+    messages.push_back(envelope(SecurityMessageKind::SyncRequest, SyncRequest{7}));
+    messages.push_back(envelope(SecurityMessageKind::SyncResponse, SyncResponse{certificate(4)}));
+
     return messages;
 }
 
@@ -309,6 +344,14 @@ TEST(SecurityCodec, DkgRoundAndKindMustAgree) {
     auto invalid = dkg_message(DkgRound::Round1Broadcast);
     invalid.round = static_cast<DkgRound>(3);
     EXPECT_FALSE(kind_of(SecurityBody{invalid}).has_value());
+}
+
+TEST(SecurityCodec, FoundingMemberCountIsBounded) {
+    GenesisFounding founding;
+    for (std::size_t i = 0; i <= constants::kMaxActiveTier1; ++i) {
+        founding.members.emplace_back(node(static_cast<uint8_t>(i)), nexus::crypto::Ed25519PublicKey{});
+    }
+    EXPECT_TRUE(encode_security_message(envelope(SecurityMessageKind::GenesisFounding, founding)).empty());
 }
 
 TEST(SecurityCodec, KindMustMatchBody) {

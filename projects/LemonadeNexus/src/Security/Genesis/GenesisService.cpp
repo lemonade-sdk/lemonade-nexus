@@ -55,6 +55,49 @@ std::optional<Tier1Set> GenesisService::founding_set() const {
     return Tier1Set::from_nodes(std::move(qualifying));
 }
 
+bool GenesisService::record_transcript_attest(const DkgTranscriptAttest& attest) {
+    if (finalized_ || attest.epoch != 1) {
+        return false;
+    }
+    const auto founders = founding_set();
+    if (!founders.has_value() || !founders->contains(attest.node) ||
+        attest.participant_set_digest != founders->digest()) {
+        return false;
+    }
+    // The founder's node identity is its public key: the signature proves
+    // this founder observed this transcript.
+    const Digest digest = dkg_transcript_attest_digest(attest);
+    if (crypto_sign_verify_detached(attest.identity_signature.data(), digest.data(),
+                                    digest.size(), attest.node.bytes.data()) != 0) {
+        return false;
+    }
+    transcript_attests_[attest.node] = attest;
+    return true;
+}
+
+bool GenesisService::transcript_agreed() const {
+    const auto founders = founding_set();
+    if (!founders.has_value()) {
+        return false;
+    }
+    const DkgTranscriptAttest* first = nullptr;
+    for (const auto& node : founders->members()) {
+        const auto it = transcript_attests_.find(node);
+        if (it == transcript_attests_.end()) {
+            return false;
+        }
+        if (first == nullptr) {
+            first = &it->second;
+            continue;
+        }
+        if (it->second.transcript_digest != first->transcript_digest ||
+            it->second.group_public_key != first->group_public_key) {
+            return false;
+        }
+    }
+    return first != nullptr;
+}
+
 std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     const crypto::Ed25519PublicKey& epoch_one_authority_key,
     const Digest& dkg_transcript_digest,
@@ -65,6 +108,16 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     }
     const auto founders = founding_set();
     if (!founders.has_value()) {
+        return std::nullopt;
+    }
+    // Genesis certifies only what every founder attested: the same
+    // transcript and the same group key it is asked to sign.
+    if (!transcript_agreed()) {
+        return std::nullopt;
+    }
+    const auto& agreed = transcript_attests_.at(founders->members().front());
+    if (agreed.transcript_digest != dkg_transcript_digest ||
+        agreed.group_public_key != epoch_one_authority_key) {
         return std::nullopt;
     }
 

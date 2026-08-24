@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Epoch/Tier1Set.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
+#include <LemonadeNexus/Security/Genesis/GenesisMessages.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <map>
@@ -43,9 +44,16 @@ public:
     /// deterministic when more than the threshold qualify.
     [[nodiscard]] std::optional<Tier1Set> founding_set() const;
 
+    /// Records a founder's signed attestation of the DKG transcript. Refused
+    /// for a non-founder, a bad identity signature, or an epoch other than 1.
+    [[nodiscard]] bool record_transcript_attest(const DkgTranscriptAttest& attest);
+
+    /// True when every founder attested one transcript and one group key.
+    [[nodiscard]] bool transcript_agreed() const;
+
     /// Signs the one bootstrap certificate and ends Genesis authority.
-    /// Returns nullopt when the quorum is not ready or Genesis already
-    /// finalized.
+    /// Requires the quorum, the agreed transcript, and matching inputs.
+    /// Returns nullopt otherwise or when Genesis already finalized.
     [[nodiscard]] std::optional<BootstrapCertificate> finalize_epoch_one(
         const crypto::Ed25519PublicKey& epoch_one_authority_key,
         const Digest& dkg_transcript_digest,
@@ -58,6 +66,7 @@ private:
     NetworkId network_id_;
     std::set<NodeId> candidates_;
     std::map<NodeId, AttestationVerdict> verdicts_;
+    std::map<NodeId, DkgTranscriptAttest> transcript_attests_;
     bool finalized_ = false;
 };
 

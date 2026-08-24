@@ -45,7 +45,13 @@ struct RecordingEvents : ISecurityEvents {
         dkg_failed.push_back(failure);
     }
     void on_authority_signature(const AuthoritySignature& s) override { signatures.push_back(s); }
-    void on_attestation_verdict(const AttestationVerdict& v) override { verdicts.push_back(v); }
+    void on_attestation_verdict(const AttestationVerdict& v, const AttestationEvidence&) override {
+        verdicts.push_back(v);
+    }
+    std::vector<QuorumCertificate> sync_certificates;
+    void on_sync_certificate(const QuorumCertificate& qc, const NodeId&) override {
+        sync_certificates.push_back(qc);
+    }
     void on_vote_sent(const Vote& v, const NodeId& to) override { votes_sent.emplace_back(v, to); }
 };
 
@@ -116,6 +122,22 @@ void MemoryMesh::pump() {
         queue.pop_front();
         nodes.at(item.to)->deliver(item.from, item.bytes, now_ms);
     }
+}
+
+
+DkgTranscriptAttest signed_transcript_attest(const Node& node, const Tier1Set& founders,
+                                             const Digest& transcript,
+                                             const nexus::crypto::Ed25519PublicKey& group) {
+    DkgTranscriptAttest attest;
+    attest.epoch = 1;
+    attest.participant_set_digest = founders.digest();
+    attest.transcript_digest = transcript;
+    attest.group_public_key = group;
+    attest.node = node.id;
+    const Digest digest = dkg_transcript_attest_digest(attest);
+    crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         node.identity_priv.data());
+    return attest;
 }
 
 AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch) {
@@ -210,6 +232,11 @@ struct RouterMesh : ::testing::Test {
         ASSERT_EQ(results.size(), kFounders);
         Digest root_digest;
         root_digest.fill(0x01);
+        for (Node* node : founders) {
+            ASSERT_TRUE(genesis.record_transcript_attest(signed_transcript_attest(
+                *node, *founding_set, results[0].transcript_digest,
+                results[0].group_public_key)));
+        }
         certificate = *genesis.finalize_epoch_one(results[0].group_public_key,
                                                   results[0].transcript_digest, root_digest,
                                                   genesis_priv);
@@ -466,6 +493,31 @@ TEST_F(RouterMesh, ChallengeWithoutProducerYieldsNoEvidence) {
     const auto wrong = a->router->compose(SecurityMessageKind::AttestationChallenge, misaddressed, 1);
     EXPECT_EQ(b->deliver(a->id, encode_security_message(wrong), mesh.now_ms).dropped,
               DropReason::SenderMismatch);
+}
+
+TEST_F(RouterMesh, SyncResponseCarriesAValidatedCertificate) {
+    bootstrap_epoch_one();
+    Node* proposer = node_for(founders[0]->runtime->consensus()->leader_of(
+        founders[0]->runtime->consensus()->current_view()));
+    const QuorumCertificate qc1 = round_over_wire(proposer, 0x10);
+    Node* holder = proposer;  // round_over_wire moved `proposer` to the certificate holder
+    Node* asker = founders[0] == holder ? founders[1] : founders[0];
+
+    // The holder answers a sync request with its high certificate; the
+    // asker validates it under the epoch vote keys before it surfaces.
+    const auto request = asker->router->compose(SecurityMessageKind::SyncRequest, SyncRequest{1}, 1);
+    EXPECT_TRUE(holder->deliver(asker->id, encode_security_message(request), mesh.now_ms).delivered);
+    mesh.pump();
+    ASSERT_FALSE(asker->events.sync_certificates.empty());
+    EXPECT_EQ(qc_digest(asker->events.sync_certificates.back()), qc_digest(qc1));
+
+    // A forged certificate never surfaces.
+    SyncResponse forged{qc1};
+    forged.high_qc.signers[0].signature[0] ^= 0x01;
+    const auto bad = holder->router->compose(SecurityMessageKind::SyncResponse, forged, 1);
+    EXPECT_EQ(asker->deliver(holder->id, encode_security_message(bad), mesh.now_ms).dropped,
+              DropReason::ServiceRejected);
+    EXPECT_EQ(asker->events.sync_certificates.size(), 1u);
 }
 
 }  // namespace
