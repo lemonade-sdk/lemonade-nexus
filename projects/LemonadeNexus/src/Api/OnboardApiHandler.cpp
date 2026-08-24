@@ -151,7 +151,7 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
         auto timestamp        = body->value("timestamp", uint64_t{0});
         auto signature        = body->value("signature", std::string{});
-        if (!verify_poll_sig(ctx_.crypto, "ln-onboard-poll:v1", candidate_pubkey,
+        if (!verify_poll_sig(ctx_.crypto, core::kOnboardPollTag, candidate_pubkey,
                              request_id, timestamp, signature)) {
             error_response(res, "invalid signature", 401); return;
         }
@@ -173,7 +173,7 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
         auto timestamp        = body->value("timestamp", uint64_t{0});
         auto signature        = body->value("signature", std::string{});
-        if (!verify_poll_sig(ctx_.crypto, "ln-onboard-ack:v1", candidate_pubkey,
+        if (!verify_poll_sig(ctx_.crypto, core::kOnboardAckTag, candidate_pubkey,
                              request_id, timestamp, signature)) {
             error_response(res, "invalid signature", 401); return;
         }

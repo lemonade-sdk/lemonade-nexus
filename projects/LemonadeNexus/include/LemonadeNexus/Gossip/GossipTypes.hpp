@@ -29,6 +29,29 @@ enum class GossipMsgType : uint8_t {
     SecurityEnvelope      = 0x16,  // opaque security-protocol envelope; routed to SecurityRuntime, never relayed
 };
 
+// Compile-time pin on the retired range: a new enumerator inside [0x07, 0x10]
+// would revive wire values the removed authority protocol used, and old peers
+// would misparse it. Every live enumerator must stay outside the range.
+namespace detail {
+constexpr bool outside_retired_range(GossipMsgType t) {
+    const auto v = static_cast<uint8_t>(t);
+    return v < 0x07 || v > 0x10;
+}
+}  // namespace detail
+static_assert(detail::outside_retired_range(GossipMsgType::Digest) &&
+              detail::outside_retired_range(GossipMsgType::DeltaRequest) &&
+              detail::outside_retired_range(GossipMsgType::DeltaResponse) &&
+              detail::outside_retired_range(GossipMsgType::AntiEntropy) &&
+              detail::outside_retired_range(GossipMsgType::PeerExchange) &&
+              detail::outside_retired_range(GossipMsgType::ServerHello) &&
+              detail::outside_retired_range(GossipMsgType::AclDelta) &&
+              detail::outside_retired_range(GossipMsgType::DnsRecordSync) &&
+              detail::outside_retired_range(GossipMsgType::BackboneIpamSync) &&
+              detail::outside_retired_range(GossipMsgType::NsSlotClaim) &&
+              detail::outside_retired_range(GossipMsgType::MisbehaviorProofBroadcast) &&
+              detail::outside_retired_range(GossipMsgType::SecurityEnvelope),
+              "gossip wire values 0x07-0x10 are retired and reserved forever");
+
 #pragma pack(push, 1)
 struct GossipPacketHeader {
     uint16_t      magic;            // kGossipMagic

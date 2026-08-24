@@ -22,6 +22,13 @@ namespace nexus::core { struct ServerConfig; }
 
 namespace nexus::core {
 
+/// Domain-separation tags for the candidate-signed poll and ack endpoints.
+/// Both endpoints sign one canonical shape (canonical_poll); the tag is the
+/// only field keeping a captured poll signature unusable as an ack. Every
+/// verifier must use these constants — never a re-typed literal.
+inline constexpr const char* kOnboardPollTag = "ln-onboard-poll:v1";
+inline constexpr const char* kOnboardAckTag  = "ln-onboard-ack:v1";
+
 /// Governs admission of a new SERVER. A candidate proves possession of its
 /// gossip key (challenge → signed request), the request parks as a
 /// PendingAdmission, and the root-key holder decides — admin approve/deny or a

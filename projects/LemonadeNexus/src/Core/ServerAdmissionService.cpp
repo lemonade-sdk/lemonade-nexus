@@ -628,7 +628,12 @@ void ServerAdmissionService::load() {
     try {
         auto root = json::parse(env->data);
         ever_approved_ = root.value("ever_approved", false);
-        for (const auto& j : root.value("admissions", json::array())) {
+        // Materialized locals, not `root.value(...)` inline in the range-for:
+        // value() returns a temporary that dies at the end of the range-init
+        // expression under C++20 (P2718 extends it only in C++23), so
+        // iterating it directly is use-after-destroy.
+        const json arr = root.value("admissions", json::array());
+        for (const auto& j : arr) {
             Admission a;
             a.request_id       = j.value("request_id", "");
             a.candidate_pubkey = j.value("candidate_pubkey", "");
@@ -660,7 +665,8 @@ void ServerAdmissionService::load() {
         // Restore denied-pubkey cooldowns; a restart must not clear an active
         // denial. Entries whose cooldown already elapsed are dropped.
         const auto now = now_unix();
-        for (const auto& [pk, until] : root.value("denied_until", json::object()).items()) {
+        const json denied = root.value("denied_until", json::object());
+        for (const auto& [pk, until] : denied.items()) {
             if (until.is_number_unsigned() && until.get<uint64_t>() > now)
                 denied_until_[pk] = until.get<uint64_t>();
         }

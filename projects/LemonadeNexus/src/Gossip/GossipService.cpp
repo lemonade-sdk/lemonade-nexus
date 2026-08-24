@@ -1945,6 +1945,53 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             return;
         }
 
+        // NS slots decide which hosts the registry advertises as nameservers,
+        // so a claim is state-mutating ingress. Claims travel epidemically, so
+        // the gate binds to the CLAIMANT, not the forwarding sender: the claim
+        // signature proves the claimant wrote these fields, and the claimant's
+        // stored certificate proves the root enrolled it. No cert, no slot.
+        {
+            json sign_payload;
+            sign_payload["slot"]          = claim.slot;
+            sign_payload["server_pubkey"] = claim.server_pubkey;
+            sign_payload["server_ip"]     = claim.server_ip;
+            sign_payload["region"]        = claim.region;
+            sign_payload["timestamp"]     = claim.timestamp;
+            const auto sign_data = sign_payload.dump();
+
+            bool sig_ok = false;
+            try {
+                const auto pk  = crypto::from_base64(claim.server_pubkey);
+                const auto sig = crypto::from_base64(claim.signature);
+                if (pk.size() == crypto::kEd25519PublicKeySize &&
+                    sig.size() == crypto::kEd25519SignatureSize) {
+                    crypto::Ed25519PublicKey pubkey{};
+                    crypto::Ed25519Signature signature{};
+                    std::memcpy(pubkey.data(), pk.data(), pk.size());
+                    std::memcpy(signature.data(), sig.data(), sig.size());
+                    sig_ok = crypto_.ed25519_verify(
+                        pubkey,
+                        std::span<const uint8_t>(
+                            reinterpret_cast<const uint8_t*>(sign_data.data()),
+                            sign_data.size()),
+                        signature);
+                }
+            } catch (...) {}
+            if (!sig_ok) {
+                spdlog::warn("[{}] DENIED NS slot claim for ns{} from {}:{} — claim "
+                              "signature does not verify against the claimant key",
+                              name(), claim.slot, sender.address().to_string(),
+                              sender.port());
+                return;
+            }
+        }
+        if (!peer_certificate_is_root_signed(claim.server_pubkey)) {
+            spdlog::warn("[{}] DENIED NS slot claim for ns{} from {}:{} — claimant is "
+                          "not a cert-verified enrolled peer", name(), claim.slot,
+                          sender.address().to_string(), sender.port());
+            return;
+        }
+
         std::lock_guard lock(peers_mutex_);
 
         auto& existing = ns_slots_[claim.slot - 1];
