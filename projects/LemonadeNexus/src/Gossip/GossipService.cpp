@@ -1719,6 +1719,17 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
             send_tee_challenge(sender, pk);
         }
 
+        // The certificate verified and the packet signer proved possession of
+        // pk. Report the contact; the security layer decides what follows.
+        if (peer_certified_cb_) {
+            auto pk_bytes = crypto::from_base64(pk);
+            if (pk_bytes.size() == crypto::kEd25519PublicKeySize) {
+                security::NodeId peer_id{};
+                std::memcpy(peer_id.bytes.data(), pk_bytes.data(), pk_bytes.size());
+                peer_certified_cb_(peer_id);
+            }
+        }
+
         // If quorum enrollment is enabled, start a vote before full admission
         if (enrollment_quorum_enabled_ && !j.value("is_response", false)) {
             // Insert under the lock, then broadcast and self-vote with it RELEASED:
@@ -3674,6 +3685,11 @@ void GossipService::register_ns_slot_in_dns(const NsSlotClaimData& claim) {
 
 void GossipService::set_security_sink(security::SecuritySink sink) {
     security_sink_ = std::move(sink);
+}
+
+void GossipService::set_peer_certified_callback(
+    std::function<void(const security::NodeId&)> cb) {
+    peer_certified_cb_ = std::move(cb);
 }
 
 bool GossipService::find_peer_endpoint_by_pubkey(std::string_view b64,

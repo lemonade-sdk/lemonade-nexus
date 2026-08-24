@@ -143,6 +143,11 @@ public:
     /// packet dispatch; the span is valid only for the call. Call before start().
     void set_security_sink(security::SecuritySink sink);
 
+    /// Reports the peer whose certificate just verified in handle_server_hello
+    /// (the peer's raw Ed25519 identity key). Transport reports contact; it
+    /// decides nothing. Runs on the io thread, outside peers_mutex_.
+    void set_peer_certified_callback(std::function<void(const security::NodeId&)> cb);
+
     [[nodiscard]] bool send_to(const security::NodeId& peer,
                                std::span<const uint8_t> envelope) override;
     std::size_t broadcast(std::span<const uint8_t> envelope) override;
@@ -460,6 +465,7 @@ private:
     // Security transport: inbound sink and the oversize-drop log throttle
     // (both touched only from handle_receive on the io thread).
     security::SecuritySink                security_sink_;
+    std::function<void(const security::NodeId&)> peer_certified_cb_;
     std::chrono::steady_clock::time_point security_drop_warn_at_{};
     uint64_t                              security_drops_since_warn_{0};
 

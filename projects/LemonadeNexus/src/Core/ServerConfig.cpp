@@ -30,6 +30,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("rp_id"))               j.at("rp_id").get_to(c.rp_id);
     if (j.contains("jwt_secret"))          j.at("jwt_secret").get_to(c.jwt_secret);
     if (j.contains("root_pubkey"))         j.at("root_pubkey").get_to(c.root_pubkey);
+    if (j.contains("genesis_pubkey"))      j.at("genesis_pubkey").get_to(c.genesis_pubkey);
     if (j.contains("seed_peers"))          j.at("seed_peers").get_to(c.seed_peers);
     if (j.contains("rate_limit_rpm"))      j.at("rate_limit_rpm").get_to(c.rate_limit_rpm);
     if (j.contains("rate_limit_burst"))    j.at("rate_limit_burst").get_to(c.rate_limit_burst);
@@ -86,6 +87,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
+    spdlog::info("  --genesis-pubkey <b64>     Pinned Genesis bootstrap anchor (base64 Ed25519); its authority ends at Epoch 1 activation");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
     spdlog::info("  --onboard-server [fqdn:port] Join an existing mesh: request admission over its public API (verified HTTPS by FQDN), then exit (requires --root-pubkey)");
@@ -189,6 +191,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.seed_peers.push_back(argv[++i]);
         } else if (std::strcmp(argv[i], "--root-pubkey") == 0 && i + 1 < argc) {
             config.root_pubkey = argv[++i];
+        } else if (std::strcmp(argv[i], "--genesis-pubkey") == 0 && i + 1 < argc) {
+            config.genesis_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--rp-id") == 0 && i + 1 < argc) {
             config.rp_id = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-server") == 0 && i + 2 < argc) {
@@ -290,6 +294,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
     if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
+    if (const char* v = std::getenv("SP_GENESIS_PUBKEY")) config.genesis_pubkey = v;
     if (const char* v = std::getenv("SP_ONBOARD_TOKEN")) config.onboard_token = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
     if (const char* v = std::getenv("SP_RP_ID"))          config.rp_id       = v;

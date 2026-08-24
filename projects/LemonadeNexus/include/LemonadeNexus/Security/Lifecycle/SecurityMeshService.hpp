@@ -1,0 +1,138 @@
+#pragma once
+
+// The ownership shell around the new security stack.
+//
+// This service owns the runtime, the router, the store, the evidence
+// producer, and the driver, wires them to the gossip transport, and paces the
+// driver from a timer. It makes no security decision: it is ownership,
+// timers, and wiring. Everything security runs on the io thread — the
+// transport sink, the peer-certified callback, and the tick.
+
+#include <LemonadeNexus/Core/IService.hpp>
+#include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
+#include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
+#include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
+#include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
+#include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
+#include <LemonadeNexus/Security/SecurityRuntime.hpp>
+#include <LemonadeNexus/Security/Transport/PairwiseSeal.hpp>
+#include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
+
+#include <asio.hpp>
+
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <string_view>
+#include <vector>
+
+namespace nexus::security {
+
+// Liveness pacing only: the tick drives retries and windows inside the
+// driver and never affects the validity of any message.
+inline constexpr uint64_t kDriverTickMs = 100;
+
+struct SecurityMeshConfig {
+    std::filesystem::path data_root;
+    // The pinned bootstrap anchor. Verification only; its authority ends at
+    // Epoch 1 activation (architecture 18).
+    crypto::Ed25519PublicKey genesis_public_key{};
+    // The gossip identity keypair: the node identity on the security wire.
+    crypto::Ed25519Keypair identity{};
+    LinuxAttestationProfile profile;
+};
+
+class SecurityMeshService : public core::IService<SecurityMeshService> {
+    friend class core::IService<SecurityMeshService>;
+
+public:
+    SecurityMeshService(asio::io_context& io, const SecurityMeshConfig& config,
+                        gossip::GossipService& transport,
+                        crypto::KeyWrappingService* wrapping);
+
+    void on_start();
+    void on_stop();
+    [[nodiscard]] static constexpr std::string_view name() { return "SecurityMeshService"; }
+
+    [[nodiscard]] const SecurityDriver& driver() const { return driver_; }
+    [[nodiscard]] SecurityRuntime& runtime() { return runtime_; }
+
+private:
+    // The router needs its events sink at construction and the driver needs
+    // the router. The proxy breaks the cycle.
+    struct EventsProxy final : ISecurityEvents {
+        ISecurityEvents* target = nullptr;
+        void on_vote_sent(const Vote& v, const NodeId& n) override {
+            if (target) target->on_vote_sent(v, n);
+        }
+        void on_certificate(const QuorumCertificate& q) override {
+            if (target) target->on_certificate(q);
+        }
+        void on_timeout_certificate(const TimeoutCertificate& t) override {
+            if (target) target->on_timeout_certificate(t);
+        }
+        void on_commits(const std::vector<ConsensusCommit>& c) override {
+            if (target) target->on_commits(c);
+        }
+        void on_dkg_round1_complete(EpochId e) override {
+            if (target) target->on_dkg_round1_complete(e);
+        }
+        void on_dkg_complete(EpochId e) override {
+            if (target) target->on_dkg_complete(e);
+        }
+        void on_dkg_failed(DkgFailure f, std::optional<NodeId> c) override {
+            if (target) target->on_dkg_failed(f, c);
+        }
+        void on_authority_signature(const AuthoritySignature& s) override {
+            if (target) target->on_authority_signature(s);
+        }
+        void on_attestation_verdict(const AttestationVerdict& v,
+                                    const AttestationEvidence& e) override {
+            if (target) target->on_attestation_verdict(v, e);
+        }
+        void on_epoch_announcement(const EpochAnnouncement& a, const NodeId& n) override {
+            if (target) target->on_epoch_announcement(a, n);
+        }
+        void on_genesis_founding(const GenesisFounding& f, const NodeId& n) override {
+            if (target) target->on_genesis_founding(f, n);
+        }
+        void on_dkg_transcript_attest(const DkgTranscriptAttest& a) override {
+            if (target) target->on_dkg_transcript_attest(a);
+        }
+        void on_bootstrap_certificate(const BootstrapCertificate& c, const NodeId& n) override {
+            if (target) target->on_bootstrap_certificate(c, n);
+        }
+        void on_sync_certificate(const QuorumCertificate& q, const NodeId& n) override {
+            if (target) target->on_sync_certificate(q, n);
+        }
+    };
+
+    [[nodiscard]] uint64_t now_ms() const;
+    void arm_timer();
+
+    SecurityMeshConfig config_;
+    gossip::GossipService& transport_;
+
+    // Construction order is load-bearing: the router takes the producer's
+    // address, and the producer's vote-key source calls into the driver.
+    SecurityRuntime runtime_;
+    PairwiseSealer sealer_;
+    EpochStore store_;
+    // Only the node whose identity IS the pinned anchor holds the one-shot
+    // Genesis authority.
+    std::unique_ptr<GenesisService> genesis_;
+    EventsProxy events_;
+    SecurityRouter router_;
+    PlatformEvidenceProducer producer_;
+    SecurityDriver driver_;
+
+    asio::steady_timer timer_;
+    std::chrono::steady_clock::time_point started_at_{};
+    bool running_ = false;
+};
+
+}  // namespace nexus::security

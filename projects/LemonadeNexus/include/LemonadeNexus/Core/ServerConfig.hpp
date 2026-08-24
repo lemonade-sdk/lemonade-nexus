@@ -34,6 +34,12 @@ struct ServerConfig {
     // Server identity
     std::string root_pubkey; // hex Ed25519 pubkey of the root management key
 
+    // Pinned Genesis bootstrap anchor (base64 Ed25519) for the new security
+    // lifecycle. A verification anchor only: its authority ends at Epoch 1
+    // activation (architecture 18). Empty = the new security system is not
+    // configured on this node.
+    std::string genesis_pubkey;
+
     // Gossip
     std::vector<std::string> seed_peers; // ["host:port", ...]
 

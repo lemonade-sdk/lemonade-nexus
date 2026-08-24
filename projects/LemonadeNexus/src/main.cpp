@@ -29,6 +29,7 @@
 #include <LemonadeNexus/Core/TeeAttestation.hpp>
 #include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
 #include <LemonadeNexus/Core/TrustPolicy.hpp>
+#include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
@@ -60,6 +61,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 
@@ -257,6 +259,33 @@ int main(int argc, char* argv[]) {
     tee.set_identity_pubkey(nexus::crypto::to_base64(
         std::span<const uint8_t>(gossip.keypair().public_key.data(),
                                  gossip.keypair().public_key.size())));
+
+    // ========================================================================
+    // New security lifecycle (gossip is its transport; the old trust system
+    // stays constructed and is not consulted by it)
+    // ========================================================================
+    // Runs only with a pinned Genesis anchor: no assumed authority, no local
+    // override, no fallback. Constructed after gossip.start() because the
+    // gossip identity keypair exists only then; declared after gossip so it is
+    // destroyed first.
+    std::optional<nexus::security::SecurityMeshService> security_mesh;
+    if (!config.genesis_pubkey.empty()) {
+        const auto genesis_bytes = nexus::crypto::from_base64(
+            nexus::crypto::canonical_key_b64(config.genesis_pubkey));
+        if (genesis_bytes.size() != nexus::crypto::kEd25519PublicKeySize) {
+            spdlog::error("Config: genesis_pubkey is not a base64 Ed25519 public key");
+            return 1;
+        }
+        nexus::security::SecurityMeshConfig mesh_config;
+        mesh_config.data_root = data_root;
+        std::memcpy(mesh_config.genesis_public_key.data(), genesis_bytes.data(),
+                    genesis_bytes.size());
+        mesh_config.identity = gossip.keypair();
+        mesh_config.profile.security_ruleset =
+            nexus::security::constants::kSecurityRulesetVersion;
+        security_mesh.emplace(coordinator.io_context(), mesh_config, gossip, &key_wrapping);
+        security_mesh->start();
+    }
 
     // ========================================================================
     // Dynamic DNS
@@ -1050,6 +1079,9 @@ int main(int argc, char* argv[]) {
     relay_discovery.stop();
     relay.stop();
     stun.stop();
+    if (security_mesh) {
+        security_mesh->stop();  // uses gossip as transport: stop it first
+    }
     gossip.stop();
     governance.stop();
     root_key_chain.stop();

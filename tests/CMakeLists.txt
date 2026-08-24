@@ -70,6 +70,7 @@ target_compile_definitions(test_evidence_chain PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp)
+add_nexus_test(test_security_mesh_service test_security_mesh_service.cpp)
 
 # --- Security overhaul tests (mirror include/LemonadeNexus/Security/) ---
 add_nexus_test(test_security_policy
