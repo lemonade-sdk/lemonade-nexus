@@ -370,4 +370,51 @@ TEST_F(HotStuffSafety, StoredStateMatchesVoteAtEveryStep) {
     }
 }
 
+TEST_F(HotStuffSafety, AdoptCertifiedBlocksAnchorOnceAndRebuildChainState) {
+    make_service(0);
+    const auto chain = harness.build_chain(5);
+    std::vector<ConsensusCommit> commits;
+
+    // A tampered certificate never anchors, and the anchor is not consumed.
+    auto forged = harness.qc_for(chain[1].proposal);
+    forged.signers[0].signature[0] ^= 1;
+    EXPECT_EQ(service->adopt_certified_block(chain[1].proposal, chain[1].justify, forged, commits),
+              ConsensusFailure::JustifyInvalid);
+
+    // b2 anchors parentless on the empty chain with its valid certificate.
+    EXPECT_EQ(service->adopt_certified_block(chain[1].proposal, chain[1].justify,
+                                             harness.qc_for(chain[1].proposal), commits),
+              std::nullopt);
+
+    // Exactly one anchor: a second parentless block is refused.
+    EXPECT_EQ(service->adopt_certified_block(chain[3].proposal, chain[3].justify,
+                                             harness.qc_for(chain[3].proposal), commits),
+              ConsensusFailure::MissingParent);
+
+    // The blocks above the anchor link normally; the three-chain commits b2.
+    EXPECT_EQ(service->adopt_certified_block(chain[2].proposal, chain[2].justify,
+                                             harness.qc_for(chain[2].proposal), commits),
+              std::nullopt);
+    EXPECT_EQ(service->adopt_certified_block(chain[3].proposal, chain[3].justify,
+                                             harness.qc_for(chain[3].proposal), commits),
+              std::nullopt);
+    ASSERT_FALSE(commits.empty());
+    EXPECT_EQ(commits.back().height, 2u);
+    EXPECT_EQ(commits.back().proposal_digest, chain[1].digest);
+    EXPECT_EQ(service->state().high_qc.view, 4u);
+
+    // Adoption never voted; a live proposal above the adopted views does.
+    const auto r5 = feed(chain[4]);
+    ASSERT_FALSE(r5.rejected.has_value());
+    ASSERT_TRUE(r5.vote.has_value());
+    EXPECT_EQ(r5.vote->view, 5u);
+
+    // The sync answer this replica would give: the chain above the committed
+    // height, ending at the block the high certificate certifies.
+    const auto out = service->uncommitted_chain();
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(nexus::security::proposal_digest(out.front().first), chain[2].digest);
+    EXPECT_EQ(nexus::security::proposal_digest(out.back().first), chain[3].digest);
+}
+
 }  // namespace

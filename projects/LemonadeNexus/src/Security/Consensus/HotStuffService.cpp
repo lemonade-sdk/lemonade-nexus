@@ -518,14 +518,13 @@ std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
         if (proposal.height != parent->second.proposal.height + 1) {
             return ConsensusFailure::ParentQcMismatch;
         }
-    } else if (!anchor_adopted_ && blocks_.empty()) {
-        // The sync anchor: the ancestors below it were committed before the
-        // restart and are gone. The block's own quorum certificate, already
-        // validated above, proves the content at its declared height.
-        anchor_adopted_ = true;
-    } else {
+    } else if (anchor_adopted_ || !blocks_.empty()) {
         return ConsensusFailure::MissingParent;
     }
+    // Reaching here parentless means this is the sync anchor: the ancestors
+    // below it were committed before the restart and are gone. The block's
+    // own quorum certificate, already validated above, proves the content at
+    // its declared height. The flag is consumed only on acceptance, below.
 
     if (const auto seen = accepted_by_view_.find(proposal.view);
         seen != accepted_by_view_.end() && seen->second != digest) {
@@ -535,6 +534,10 @@ std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
         return ConsensusFailure::PendingLimit;
     }
 
+    if (proposal.parent_digest != config_.genesis_digest &&
+        !blocks_.contains(proposal.parent_digest)) {
+        anchor_adopted_ = true;
+    }
     blocks_[digest] = BlockRecord{proposal, justify, digest};
     qc_by_block_[justify.proposal_digest] = justify;
     qc_by_block_[digest] = certifying;
