@@ -316,9 +316,6 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
     if (result.rejected.has_value()) {
         return drop(DropReason::ServiceRejected, code(*result.rejected));
     }
-    if (!result.commits.empty()) {
-        events_.on_commits(result.commits);
-    }
     if (result.vote.has_value()) {
         // Chained HotStuff: the vote goes to the leader of the next view,
         // who forms the certificate and proposes on it.
@@ -331,6 +328,12 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
             (void)send(next_leader, vote);
         }
         events_.on_vote_sent(*result.vote, next_leader);
+    }
+    // Commits fire LAST and nothing touches `consensus` after them: a
+    // committed handoff activates the next epoch, which destroys this
+    // service instance.
+    if (!result.commits.empty()) {
+        events_.on_commits(result.commits);
     }
     return delivered();
 }
