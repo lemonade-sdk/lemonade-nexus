@@ -47,6 +47,7 @@ add_nexus_test(test_ip_router         test_ip_router.cpp)
 add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
+add_nexus_test(test_onboarding        test_onboarding.cpp)
 
 # Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
 add_nexus_test(test_tls_transport     test_tls_transport.cpp)
@@ -65,6 +66,7 @@ add_nexus_test(test_evidence_chain    test_evidence_chain.cpp)
 target_compile_definitions(test_evidence_chain PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
+add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
 add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp)
 add_nexus_test(test_security_mesh_service test_security_mesh_service.cpp)
 
