@@ -100,6 +100,7 @@ struct ConsensusCommit {
     View view;
     Digest proposal_digest;
     Digest proposed_state_root;
+    Digest transitions_digest{};
     Digest qc_digest;
 };
 

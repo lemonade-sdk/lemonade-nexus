@@ -112,6 +112,7 @@ namespace {
                 {"view", commit.view},
                 {"proposal_digest", crypto::to_base64(commit.proposal_digest)},
                 {"proposed_state_root", crypto::to_base64(commit.proposed_state_root)},
+                {"transitions_digest", crypto::to_base64(commit.transitions_digest)},
                 {"qc_digest", crypto::to_base64(commit.qc_digest)}};
 }
 
@@ -122,6 +123,8 @@ namespace {
     if (!read_u64(document, "height", commit.height)) return std::nullopt;
     if (!read_u64(document, "view", commit.view)) return std::nullopt;
     if (!read_digest(document, "proposal_digest", commit.proposal_digest)) return std::nullopt;
+    // Informational field; an older record without it loads as zero.
+    (void)read_digest(document, "transitions_digest", commit.transitions_digest);
     if (!read_digest(document, "proposed_state_root", commit.proposed_state_root)) {
         return std::nullopt;
     }

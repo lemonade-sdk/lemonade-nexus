@@ -143,9 +143,9 @@ bool EpochManager::record_final_attestation(const AttestationVerdict& verdict) {
         transition_->phase != EpochTransitionPhase::GeneratingAuthorityKey) {
         return false;
     }
-    // The current epoch issues the final challenges; a verdict from another
-    // epoch context proves nothing about this handoff.
-    if (verdict.epoch != current_.id) {
+    // A final challenge is FOR the target epoch: its evidence binds the
+    // next-epoch vote key (architecture 11.2), so the verdict must name it.
+    if (verdict.epoch != transition_->to_epoch) {
         return false;
     }
     auto& selected = transition_->selected_members;

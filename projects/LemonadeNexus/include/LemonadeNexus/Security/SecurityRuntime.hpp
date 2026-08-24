@@ -13,6 +13,7 @@
 #include <LemonadeNexus/Security/Consensus/ConsensusStore.hpp>
 #include <LemonadeNexus/Security/Consensus/HotStuffService.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochManager.hpp>
+#include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 
 #include <filesystem>
@@ -50,6 +51,13 @@ public:
                                        std::map<NodeId, crypto::Ed25519PublicKey> vote_keys,
                                        std::optional<DkgResult> own_dkg,
                                        std::optional<EpochVoteKey> own_vote_key);
+
+    /// Re-enters a stored epoch after a restart. Consensus resumes from the
+    /// durable safety state and stays unsynced until a certified view floor
+    /// arrives (architecture 11.12). The FROST share died with the process,
+    /// so authority signing stays unavailable until the next epoch (12.11).
+    [[nodiscard]] bool restore_epoch(StoredEpoch stored,
+                                     std::optional<EpochVoteKey> own_vote_key);
 
     /// Activates the prepared next epoch: the EpochManager transition must be
     /// Ready and authorized. Installs the new share and restarts consensus

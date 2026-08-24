@@ -315,6 +315,7 @@ void HotStuffService::apply_chain_rules(const QuorumCertificate& justify,
         commit.view = record->proposal.view;
         commit.proposal_digest = record->digest;
         commit.proposed_state_root = record->proposal.proposed_state_root;
+        commit.transitions_digest = record->proposal.transitions_digest;
         commit.qc_digest = qc_digest(certifying->second);
         commits.push_back(commit);
         committed_digests_.insert(record->digest);

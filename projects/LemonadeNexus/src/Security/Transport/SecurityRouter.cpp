@@ -195,6 +195,13 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
     return dispatch(message);
 }
 
+RouteResult SecurityRouter::deliver_local(SecurityMessage message) {
+    if (message.sender != runtime_.self()) {
+        return drop(DropReason::SenderMismatch);
+    }
+    return dispatch(message);
+}
+
 RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
     switch (message.kind) {
         case SecurityMessageKind::AttestationChallenge:

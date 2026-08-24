@@ -79,7 +79,7 @@ struct EpochManagerFixture : ::testing::Test {
         ASSERT_TRUE(manager->prepare_next_epoch(*eligible, 6));
         if (target == EpochTransitionPhase::Attesting) return;
         for (const auto& member : manager->transition()->selected_members) {
-            ASSERT_TRUE(manager->record_final_attestation(passing(member, 1)));
+            ASSERT_TRUE(manager->record_final_attestation(passing(member, 2)));
         }
         if (target == EpochTransitionPhase::GeneratingVoteKeys) return;
         for (const auto& member : manager->transition()->selected_members) {
@@ -128,14 +128,14 @@ TEST_F(EpochManagerFixture, FailedFinalAttestationPullsNextRankedCandidate) {
     const auto original = manager->transition()->selected_members;
     const NodeId failed = original.front();
 
-    ASSERT_TRUE(manager->record_final_attestation(failing(failed, 1)));
+    ASSERT_TRUE(manager->record_final_attestation(failing(failed, 2)));
     const auto& replaced = manager->transition()->selected_members;
     ASSERT_EQ(replaced.size(), 5u);
     EXPECT_EQ(std::find(replaced.begin(), replaced.end(), failed), replaced.end());
     EXPECT_EQ(manager->transition()->phase, EpochTransitionPhase::Attesting);
 
     // The removed member cannot re-enter through a later passing verdict.
-    EXPECT_FALSE(manager->record_final_attestation(passing(failed, 1)));
+    EXPECT_FALSE(manager->record_final_attestation(passing(failed, 2)));
 }
 
 TEST_F(EpochManagerFixture, SilentDkgParticipantReplacementRestartsDkg) {
@@ -158,7 +158,7 @@ TEST_F(EpochManagerFixture, ExhaustedReplacementsBelowMinimumAborts) {
     ASSERT_TRUE(manager->prepare_next_epoch(*tight, 6));
     const NodeId failed = manager->transition()->selected_members.front();
 
-    ASSERT_TRUE(manager->record_final_attestation(failing(failed, 1)));
+    ASSERT_TRUE(manager->record_final_attestation(failing(failed, 2)));
     EXPECT_EQ(manager->transition()->phase, EpochTransitionPhase::Aborted);
     EXPECT_EQ(manager->transition()->failure,
               EpochTransitionFailure::EligiblePoolBelowMinimum);
@@ -179,8 +179,8 @@ TEST_F(EpochManagerFixture, GuardsRefuseOutOfOrderInput) {
 
     // Wrong challenge epoch, unknown node, zero inputs.
     const NodeId member = manager->transition()->selected_members.front();
-    EXPECT_FALSE(manager->record_final_attestation(passing(member, 2)));
-    EXPECT_FALSE(manager->record_final_attestation(passing(node(0xEE), 1)));
+    EXPECT_FALSE(manager->record_final_attestation(passing(member, 1)));
+    EXPECT_FALSE(manager->record_final_attestation(passing(node(0xEE), 2)));
     EXPECT_FALSE(manager->record_vote_key(member, nexus::crypto::Ed25519PublicKey{}));
 
     // DKG result only lands in its phase, and only with real values.

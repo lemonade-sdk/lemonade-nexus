@@ -91,6 +91,10 @@ public:
     [[nodiscard]] SecurityMessage compose(SecurityMessageKind kind, SecurityBody body,
                                           EpochId epoch) const;
 
+    /// Applies an own message through the same dispatch as inbound traffic.
+    /// The gates do not run: the message never crossed the wire.
+    RouteResult deliver_local(SecurityMessage message);
+
     [[nodiscard]] bool send(const NodeId& to, const SecurityMessage& message);
     std::size_t broadcast(const SecurityMessage& message);
 

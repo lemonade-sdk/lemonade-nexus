@@ -106,6 +106,20 @@ bool SecurityRuntime::adopt_epoch_one(const BootstrapCertificate& certificate,
                            bootstrap_certificate_signing_digest(certificate));
 }
 
+bool SecurityRuntime::restore_epoch(StoredEpoch stored,
+                                    std::optional<EpochVoteKey> own_vote_key) {
+    if (epochs_.has_value()) {
+        return false;
+    }
+    const bool member = stored.state.tier1_members.contains(config_.self);
+    const Digest checkpoint = stored.checkpoint;
+    epochs_.emplace(std::move(stored.state), std::move(stored.vote_keys));
+    if (!member || !own_vote_key.has_value()) {
+        return true;
+    }
+    return start_consensus(std::move(*own_vote_key), checkpoint);
+}
+
 bool SecurityRuntime::activate_next_epoch(std::optional<DkgResult> own_dkg,
                                           std::optional<EpochVoteKey> own_vote_key,
                                           const Digest& previous_checkpoint) {

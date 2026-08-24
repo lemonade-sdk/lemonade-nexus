@@ -396,7 +396,7 @@ TEST_F(FirstPath, GenesisToEpochTwo) {
         EpochManager* epochs = node->runtime->epochs();
         ASSERT_TRUE(epochs->prepare_next_epoch(founding_set, kFounders));
         for (Node* member : founders) {
-            ASSERT_TRUE(epochs->record_final_attestation(passing_verdict(member->id, 1)));
+            ASSERT_TRUE(epochs->record_final_attestation(passing_verdict(member->id, 2)));
             ASSERT_TRUE(epochs->record_vote_key(member->id, vote_keys_2.at(member->id)));
         }
         ASSERT_TRUE(epochs->record_dkg_result(dkg_2.results[0].group_public_key, dkg_2.transcript));
