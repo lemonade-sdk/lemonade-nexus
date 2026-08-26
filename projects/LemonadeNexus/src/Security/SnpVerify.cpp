@@ -36,6 +36,10 @@ struct OpenSslFree {
     void operator()(unsigned char* p) const { OPENSSL_free(p); }
 };
 
+struct OpenSslCharFree {
+    void operator()(char* p) const { OPENSSL_free(p); }
+};
+
 SnpVerifyResult fail(std::string why) { return {false, std::move(why)}; }
 SnpVerifyResult pass() { return {true, {}}; }
 
@@ -418,6 +422,23 @@ std::string amd_crl_kds_url(std::string_view product) {
     std::snprintf(buf, sizeof(buf), "https://kdsintf.amd.com/vcek/v1/%.*s/crl",
                   static_cast<int>(product.size()), product.data());
     return buf;
+}
+
+std::vector<std::string> amd_crl_revoked_serials(std::string_view crl_bytes) {
+    std::vector<std::string> serials;
+    CrlPtr crl = parse_crl(crl_bytes);
+    if (!crl) return serials;
+    STACK_OF(X509_REVOKED)* revoked = X509_CRL_get_REVOKED(crl.get());
+    for (int i = 0; i < sk_X509_REVOKED_num(revoked); ++i) {
+        const X509_REVOKED* entry = sk_X509_REVOKED_value(revoked, i);
+        if (entry == nullptr) continue;
+        BIGNUM* bn = ASN1_INTEGER_to_BN(X509_REVOKED_get0_serialNumber(entry), nullptr);
+        if (bn == nullptr) continue;
+        std::unique_ptr<char, OpenSslCharFree> hex{BN_bn2hex(bn)};
+        BN_free(bn);
+        if (hex) serials.emplace_back(hex.get());
+    }
+    return serials;
 }
 
 SnpVerifyResult verify_snp_revocation(std::span<const uint8_t> vcek_der,

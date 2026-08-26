@@ -972,3 +972,34 @@ TEST_F(ProviderBoundaryTest, NoCompiledProviderIsReadyUnderTheShippedProfile) {
                   Tier1Eligibility::Ineligible);
     }
 }
+
+// A CRL that actually revokes something. The listing logic is exercised here;
+// the end-to-end revoked-VCEK path cannot be, because it needs a CRL signed by
+// AMD's own key that names our fixture VCEK, and AMD's real Milan list revokes
+// nothing today.
+TEST(AmdRevocation, RevokedSerialsAreRead) {
+    const auto serials =
+        nexus::security::amd_crl_revoked_serials(fixture_text("revoking_crl.pem"));
+    ASSERT_EQ(serials.size(), 1u);
+    EXPECT_EQ(serials.front(), "DEADBEEF");
+
+    // AMD's real list names nothing revoked, and an unparsable list names
+    // nothing either. The two are indistinguishable here, which is exactly why
+    // this accessor is not a revocation check.
+    EXPECT_TRUE(nexus::security::amd_crl_revoked_serials(real_milan_crl()).empty());
+    EXPECT_TRUE(nexus::security::amd_crl_revoked_serials("not a crl").empty());
+}
+
+// Listing a serial is not authority to revoke. A CRL from another issuer is
+// refused whether or not it names anything, so an attacker cannot revoke a
+// competitor's endorsement by publishing their own list.
+TEST(AmdRevocation, AForeignListCannotRevokeAnything) {
+    const std::string revoking = fixture_text("revoking_crl.pem");
+    ASSERT_FALSE(nexus::security::amd_crl_revoked_serials(revoking).empty());
+
+    const auto result = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({revoking}, kInsideCrlWindow));
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.failure.find("no cached revocation list is signed"), std::string::npos)
+        << result.failure;
+}

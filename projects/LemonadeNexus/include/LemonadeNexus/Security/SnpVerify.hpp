@@ -127,6 +127,16 @@ using AmdRevocationSource = std::function<AmdRevocationState()>;
 /// verifier never reaches the network itself.
 [[nodiscard]] std::string amd_crl_kds_url(std::string_view product);
 
+/// The serial numbers a CRL lists as revoked, uppercase hex, in file order.
+///
+/// This is an ACCESSOR, not a decision. It reads a list; it does not check who
+/// signed it or whether it has expired. verify_snp_revocation does both before
+/// it consults the same entries. Use this for operator diagnostics — "which
+/// endorsements does the list I just fetched name" — never as a revocation
+/// check. An unparsable CRL yields no serials, which is why the emptiness of
+/// this result means nothing on its own.
+[[nodiscard]] std::vector<std::string> amd_crl_revoked_serials(std::string_view crl_bytes);
+
 /// Check guest policy, VMPL, TCB floor and measurement. Independent of the
 /// signature check so failures are separable in logs.
 [[nodiscard]] SnpVerifyResult verify_snp_policy(const SnpReport& report,

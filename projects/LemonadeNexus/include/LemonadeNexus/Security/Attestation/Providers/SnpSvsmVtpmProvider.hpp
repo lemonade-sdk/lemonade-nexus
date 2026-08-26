@@ -1,43 +1,22 @@
 #pragma once
 
-// AMD SEV-SNP with a COCONUT-SVSM vTPM at VMPL0.
+// AMD SEV-SNP with a COCONUT-SVSM vTPM.
 //
-// This is the intended Tier 1 shape:
+// Unimplemented on purpose: the SVSM service binding is read from real evidence,
+// never guessed. readiness() refuses, so SVSM evidence fails closed rather than
+// passing under an assumed format.
 //
-//   SVSM  = VMPL0                      most privileged inside the guest
-//   Linux = VMPL1 or higher            strictly less privileged than the SVSM
+// Two traps for whoever implements it:
 //
-// VMPL is a privilege level and lower is more privileged, so "Linux runs above
-// VMPL0" is the correct statement. The SVSM and its vTPM sit inside the SNP
-// boundary and the hypervisor sits outside both. This replaces the host-side
-// swtpm, which is not an approved Tier 1 TPM source because the host owns its
-// private state.
+// The VMPL rule inverts against AzureSnpVtpmProvider. Lower VMPL is more
+// privileged, and here the SVSM holds VMPL0 while Linux runs above it, so a
+// guest-requested report recorded at VMPL0 proves no SVSM was there. The
+// evidence must prove both halves: SVSM at VMPL0, guest above it
+// (VmplPolicy::RequireAboveVmpl0).
 //
-// The provider is DELIBERATELY UNIMPLEMENTED. The SVSM service-manifest format
-// and the exact binding from the SNP report to the vTPM AK are not invented
-// here: they will be read from real evidence captured on an approved SVSM host
-// (1.1 section 6.4). Until then readiness() returns ProviderUnsupported and the
-// provider proves nothing, so a node presenting SVSM evidence fails closed
-// rather than passing under a guessed format.
-//
-// When real evidence arrives, the chain to implement is:
-//
-//   AMD endorsement -> SNP report -> approved SVSM launch measurement
-//     -> SVSM service binding -> vTPM AK -> fresh TPM quote
-//     -> measured boot + IMA
-//
-// The VMPL rule inverts against AzureSnpVtpmProvider and must not be copied.
-// There the paravisor owns VMPL0 and requests the report, so
-// VmplPolicy::RequireVmpl0 is right. Here a guest-requested report recorded at
-// VMPL0 would prove the OPPOSITE of what is wanted: it would mean the guest
-// holds the most privileged level and no SVSM runs beneath it. The evidence
-// model must prove both halves:
-//
-//   the approved SVSM holds VMPL0
-//   the Linux guest runs at VMPL > 0    (VmplPolicy::RequireAboveVmpl0)
-//
-// How the SVSM attestation response carries the first half is exactly what the
-// captured evidence must settle. It is not guessed here.
+// Do not reuse Azure HCL bytes as a stand-in format. HCL binds its AK through a
+// paravisor runtime-data hash; if SVSM binds differently the mismatch is silent,
+// and a bundle would verify against a rule the platform never enforced.
 
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProvider.hpp>
 

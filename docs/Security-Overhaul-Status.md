@@ -1,7 +1,7 @@
 # Security Overhaul Status
 
 **Branch:** `tier-security-overhaul`
-**Baseline:** Security Architecture Final Draft 1.1 (supersedes Final Draft 1.0)
+**Baseline:** Security Architecture Final Draft 1.1 (the only architecture revision; 1.0 is removed)
 **Structure reference:** `.idea/lemonade-nexus-security-class-structure.md`
 **Updated:** 2026-08-26
 
@@ -394,18 +394,104 @@ measurement pin being checked before the quote — the control that stops a gues
 choosing its own `REPORT_DATA` from naming an AK it holds, and the reason a
 profile may only be pinned from a host already known good.
 
+### M8 — Network binding, VMPL policy, and the revocation cache (done)
+
+**`network_id` is inside the attestation context.** Network separation rested on
+`SecurityEnvelope` alone, and transport authentication is not trust: a node
+enrolled in one Nexus network could answer another network's challenge with the
+same identity, the same platform and the same fresh quote. `network_id` now
+enters `AttestationChallenge`, `AttestationEvidence`, both digests and the wire
+codec. The quote commits to `challenge_digest`, so it commits to the mesh that
+asked. The full bound context is:
+
+```text
+network_id  profile_id  profile_ruleset  security_ruleset  consensus_ruleset
+node_id  node_key  incarnation  epoch  nonce  policy_digest
+```
+
+`AttestationService` takes its network explicitly rather than defaulting: an
+all-zero network is a real value, and a service that silently used one would
+accept a challenge from any mesh that did the same. A cross-network answer
+reports `NetworkMismatch` rather than surfacing as a digest mismatch.
+
+**VMPL is provider-specific.** `SnpPolicyRequirements::require_vmpl0` was a
+boolean defaulted true, with a comment claiming the recorded level must be 0
+either way. That is wrong for the SVSM shape:
+
+```text
+SVSM  = VMPL0                 most privileged inside the guest
+Linux = VMPL1 or higher       strictly less privileged than the SVSM
+```
+
+VMPL is a privilege level and lower is more privileged, so the Linux guest runs
+*above* VMPL0. `VmplPolicy` replaces the boolean with `Unconstrained` (the new
+default, so no profile inherits a rule it did not choose), `RequireVmpl0` for a
+paravisor or a native guest requesting its own report, and `RequireAboveVmpl0`
+for the SVSM shape, where a guest-requested report recorded at VMPL0 would prove
+the opposite of what is wanted. `LinuxAttestationProfileV1` pins `RequireVmpl0`.
+
+**`tier1_capable()` is informational.** It states that a provider's *design* can
+satisfy Tier 1. It is not consulted by `AttestationVerifier` and not consulted
+by `Tier1EligibilityPolicy`. Pinned by tests: a capable provider that is not
+ready produces no claim and no eligibility; a capable, ready provider missing
+one required claim is still ineligible; and eligibility does not read the flag
+at all, which is why the flag must never be relied on as a control. What
+actually stops `SnpDirectBootProvider` is a claim it cannot produce.
+
+**The AMD revocation cache.** `AmdRevocationCache` is the missing producer: one
+file per AMD product under `data_root/security/revocation`, written through a
+temporary and renamed so a crash cannot leave a truncated list. Fetching and
+storage stay apart from cryptographic validation — the cache hands over what it
+holds and `verify_snp_revocation` decides. Storing garbage stores garbage the
+verifier refuses, and a filesystem timestamp never substitutes for the signed
+`nextUpdate`.
+
+`AmdRevocationState` carries every cached list rather than one. A mesh spans
+silicon generations and a verifier does not know which one a peer runs until it
+resolves that peer's chain, so it is handed all of them and uses the one that
+verifies under the chain in hand. A list for another product verifies under
+neither the ARK nor the ASK there, which rejects the wrong product without
+anyone naming a product.
+
+A refresh outage leaves the last good bytes in place until their own
+`nextUpdate` passes. New Tier 1 attestation then fails closed. Membership is
+decided once, at selection, so nothing here reaches back into a frozen epoch.
+
+`tests/fixtures/amd_milan_crl.der` is the real KDS list for Milan, signed by
+ARK-Milan and valid 2026-08-19 to 2026-10-04. Against fixed timestamps it makes
+the accepting, expired and not-yet-valid branches all testable under a genuine
+AMD signature.
+
 #### Known gaps
 
-* **No CRL cache producer.** `SecurityMeshService` installs no
-  `AmdRevocationSource`, so revocation data is absent and new Tier 1 attestation
-  fails closed on it. Intended until a cache producer lands.
-* **The accepting revocation branch is untested off platform.** A CRL this chain
-  accepts must be signed by AMD's own key, and the captured fixtures predate any
-  published CRL. Every refusing branch is covered.
+* **The end-to-end revoked-VCEK path is untestable off platform.** It needs a
+  CRL signed by AMD's own key that names our fixture VCEK, and AMD's real Milan
+  list revokes nothing today. The listing logic is covered through
+  `amd_crl_revoked_serials()`, and a foreign list that *does* revoke a serial is
+  covered as a refusal — publishing your own CRL does not revoke anyone.
+* **No CRL fetcher.** The cache stores and serves; nothing populates it yet.
+  Refreshing from `amd_crl_kds_url()` is operator tooling, deliberately outside
+  the verified binary's network surface.
 * **`uptime_valid` and `mesh_health_valid` still have no producer.** The agreed
   definitions are recorded on `Tier1MeshFacts`; both stay false and both keep a
   node ineligible. A locally computed answer would be a self-report wearing
   another name, so none was written.
+* **`SnpSvsmVtpmProvider` stays fail-closed.** No manifest schema is invented,
+  and Azure HCL bytes are not reused as a stand-in SVSM format. The capture from
+  `.40` should carry as much of the following as the live implementation
+  supplies, and only the observed binding gets implemented:
+
+  ```text
+  SNP report
+  SVSM attestation response
+  service manifest
+  certificates
+  vTPM identity or AK
+  fresh TPM quote
+  ```
+
+  The required chain is AMD endorsement → SNP instance → approved SVSM instance
+  → SVSM-bound vTPM identity → fresh TPM quote.
 
 ## 4. Test host
 

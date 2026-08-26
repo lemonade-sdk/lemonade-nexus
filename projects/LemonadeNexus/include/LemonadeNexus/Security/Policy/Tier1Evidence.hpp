@@ -40,10 +40,11 @@ struct Tier1MeshFacts {
     /// never changes a current epoch's member count or quorum.
     bool uptime_valid{false};
 
-    /// Quorum-observed protocol participation (1.1 section 13.2): synchronized
-    /// to current finalized state, recent authenticated observations from the
-    /// required mesh quorum, no unresolved duplicate incarnation, and no
-    /// unresolved equivocation evidence. Local load averages are not an input.
+    /// Mesh-observed protocol participation, as required from the quorum (1.1
+    /// section 13.2): synchronized to current finalized state, recent
+    /// authenticated observations from the required mesh quorum, no unresolved
+    /// duplicate incarnation, and no unresolved equivocation evidence. Local
+    /// load, ping latency and self-reported health are not inputs.
     ///
     /// The observation encoding must be deterministic and finalized before it
     /// can affect next-epoch membership, which is why no producer exists yet:
