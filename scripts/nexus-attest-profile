@@ -276,6 +276,7 @@ make_output_tree() {
         "$OUT_DIR/system" \
         "$OUT_DIR/tools" \
         "$OUT_DIR/azure" \
+        "$OUT_DIR/snp" \
         "$OUT_DIR/errors"
 
     STATUS_FILE="$OUT_DIR/status.tsv"
@@ -462,6 +463,18 @@ collect_boot_log() {
 
 collect_ima() {
     local ima_base="/sys/kernel/security/integrity/ima"
+    [[ -d "$ima_base" ]] || ima_base="/sys/kernel/security/ima"
+
+    # A measurement log holding only boot_aggregate means no policy is
+    # measuring anything, so no binary on this host is IMA-anchored.
+    local count
+    count=$(wc -l < "$ima_base/ascii_runtime_measurements" 2>/dev/null || echo 0)
+    if [[ "$count" -le 1 ]]; then
+        record "ima:policy-active" "missing" \
+            "log holds $count entries (boot_aggregate only): no measuring policy"
+    else
+        record "ima:policy-active" "ok" "$count measured entries"
+    fi
 
     copy_file "ima:ascii-runtime" \
         "$ima_base/ascii_runtime_measurements" \
@@ -518,6 +531,209 @@ collect_tpm_inventory() {
         run_text "tpm:pcrread" "$OUT_DIR/tpm/pcr-read.txt" \
             tpm2_pcrread "$PCR_LIST" || true
     fi
+}
+
+# --- Native SEV-SNP (non-Azure) --------------------------------------------
+#
+# A guest without a paravisor reads its own attestation report through the
+# kernel TSM configfs interface. The guest chooses REPORT_DATA, so the report
+# proves only what the guest asked the PSP to sign. It carries no vTPM binding
+# of its own: on a paravisor host that binding comes from the HCL runtime data.
+# The collector records this difference instead of hiding it.
+
+snp_kds_product() {
+    local family model
+    family=$(awk -F': ' '/^cpu family/ {print $2; exit}' /proc/cpuinfo)
+    model=$(awk -F': ' '/^model\t/ {print $2; exit}' /proc/cpuinfo)
+    [[ -z "${family:-}" || -z "${model:-}" ]] && return 1
+    if [[ "$family" == "25" ]]; then
+        if (( model >= 16 )); then printf 'Genoa'; else printf 'Milan'; fi
+    elif [[ "$family" == "26" ]]; then
+        printf 'Turin'
+    else
+        return 1
+    fi
+}
+
+collect_snp_native() {
+    local tsm="/sys/kernel/config/tsm/report"
+
+    if [[ ! -d "$tsm" ]]; then
+        record "snp:tsm-interface" "missing" "$tsm"
+        return
+    fi
+    record "snp:tsm-interface" "ok" "$tsm"
+
+    local entry="$tsm/nexus$$"
+    if ! mkdir "$entry" 2>"$ERROR_DIR/snp_tsm_mkdir.stderr"; then
+        record "snp:tsm-entry" "error" "cannot create $entry (root required)"
+        return
+    fi
+
+    # REPORT_DATA is exactly 64 bytes. SHA-512 of the challenge fills it and
+    # binds this report to the caller's challenge.
+    local inblob="$OUT_DIR/snp/report-data.bin"
+    if have openssl; then
+        openssl dgst -sha512 -binary "$OUT_DIR/challenge.bin" > "$inblob" 2>/dev/null
+    fi
+    if [[ ! -s "$inblob" ]]; then
+        record "snp:report-data" "error" "could not derive REPORT_DATA"
+        rmdir "$entry" 2>/dev/null
+        return
+    fi
+    record "snp:report-data" "ok" "sha512(challenge)"
+
+    if ! cat "$inblob" > "$entry/inblob" 2>"$ERROR_DIR/snp_inblob.stderr"; then
+        record "snp:inblob" "error" "write failed"
+        rmdir "$entry" 2>/dev/null
+        return
+    fi
+
+    if cat "$entry/outblob" > "$OUT_DIR/snp/attestation-report.bin" \
+        2>"$ERROR_DIR/snp_outblob.stderr"; then
+        record "snp:attestation-report" "ok" \
+            "$(wc -c < "$OUT_DIR/snp/attestation-report.bin") bytes"
+    else
+        record "snp:attestation-report" "error" "outblob read failed"
+    fi
+
+    # An empty auxblob means the host served no VCEK chain; the verifier must
+    # fetch it from the AMD key server instead.
+    if cat "$entry/auxblob" > "$OUT_DIR/snp/auxblob.bin" 2>/dev/null; then
+        if [[ -s "$OUT_DIR/snp/auxblob.bin" ]]; then
+            record "snp:auxblob" "ok" "$(wc -c < "$OUT_DIR/snp/auxblob.bin") bytes"
+        else
+            record "snp:auxblob" "missing" "host served no certificate chain"
+        fi
+    fi
+
+    local field
+    for field in provider privlevel privlevel_floor generation; do
+        [[ -r "$entry/$field" ]] || continue
+        cat "$entry/$field" > "$OUT_DIR/snp/$field.txt" 2>/dev/null || true
+    done
+    record "snp:provider" "ok" "$(cat "$OUT_DIR/snp/provider.txt" 2>/dev/null)"
+
+    rmdir "$entry" 2>/dev/null || true
+
+    # The report is the ground truth for the launch measurement, the chip
+    # identity, and the TCB the VCEK must match.
+    if have python3 && [[ -s "$OUT_DIR/snp/attestation-report.bin" ]]; then
+        python3 - "$OUT_DIR/snp/attestation-report.bin" "$OUT_DIR/snp" <<'PY'
+import json, pathlib, struct, sys
+d = pathlib.Path(sys.argv[1]).read_bytes()
+out = pathlib.Path(sys.argv[2])
+if len(d) >= 0x2A0:
+    ver, gsvn = struct.unpack_from("<II", d, 0)
+    policy, = struct.unpack_from("<Q", d, 8)
+    vmpl, sigalgo = struct.unpack_from("<II", d, 0x30)
+    cur_tcb, = struct.unpack_from("<Q", d, 0x38)
+    plat, = struct.unpack_from("<Q", d, 0x40)
+    rep_tcb, = struct.unpack_from("<Q", d, 0x180)
+    tcb = lambda v: {
+        "bootloader": v & 0xFF, "tee": (v >> 8) & 0xFF,
+        "snp": (v >> 48) & 0xFF, "microcode": (v >> 56) & 0xFF,
+        "raw_hex": f"0x{v:016x}",
+    }
+    info = {
+        "version": ver, "guest_svn": gsvn, "policy_hex": f"0x{policy:016x}",
+        "policy_debug_allowed": bool(policy >> 19 & 1),
+        "policy_migrate_ma_allowed": bool(policy >> 18 & 1),
+        "vmpl": vmpl, "signature_algo": sigalgo,
+        "current_tcb": tcb(cur_tcb), "reported_tcb": tcb(rep_tcb),
+        "platform_info_hex": f"0x{plat:016x}",
+        "report_data_hex": d[0x50:0x90].hex(),
+        "measurement_hex": d[0x90:0xC0].hex(),
+        "host_data_hex": d[0xC0:0xE0].hex(),
+        "report_id_hex": d[0x140:0x160].hex(),
+        "chip_id_hex": d[0x1A0:0x1E0].hex(),
+        "firmware": f"{d[0x1EA]}.{d[0x1E9]}.build{d[0x1E8]}",
+        "signature_present": any(d[0x2A0:0x4A0]),
+    }
+    (out / "report-fields.json").write_text(
+        json.dumps(info, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out / "chip-id.txt").write_text(info["chip_id_hex"] + "\n", encoding="utf-8")
+    (out / "measurement.txt").write_text(info["measurement_hex"] + "\n", encoding="utf-8")
+    t = info["reported_tcb"]
+    (out / "vcek-query.txt").write_text(
+        "blSPL=%02d&teeSPL=%02d&snpSPL=%02d&ucodeSPL=%02d\n"
+        % (t["bootloader"], t["tee"], t["snp"], t["microcode"]), encoding="utf-8")
+PY
+        record "snp:report-parse" "ok" "$OUT_DIR/snp/report-fields.json"
+    fi
+
+    # Fetch the VCEK the report's own chip id and TCB name. Without it the
+    # report signature cannot be checked at all.
+    local product
+    if ! product="$(snp_kds_product)"; then
+        record "snp:kds-product" "missing" "unrecognized CPU family"
+        return
+    fi
+    record "snp:kds-product" "ok" "$product"
+
+    if ! have curl; then
+        record "snp:vcek" "missing" "curl"
+        return
+    fi
+
+    local chip query
+    chip="$(cat "$OUT_DIR/snp/chip-id.txt" 2>/dev/null)"
+    query="$(cat "$OUT_DIR/snp/vcek-query.txt" 2>/dev/null)"
+    if [[ -n "$chip" && -n "$query" ]]; then
+        if curl -fsS --max-time 15 \
+            "https://kdsintf.amd.com/vcek/v1/$product/$chip?$query" \
+            -o "$OUT_DIR/snp/vcek.der" 2>"$ERROR_DIR/snp_vcek.stderr"; then
+            record "snp:vcek" "ok" "$(wc -c < "$OUT_DIR/snp/vcek.der") bytes from AMD KDS"
+        else
+            record "snp:vcek" "error" "KDS fetch failed for $product"
+        fi
+    fi
+
+    if curl -fsS --max-time 15 \
+        "https://kdsintf.amd.com/vcek/v1/$product/cert_chain" \
+        -o "$OUT_DIR/snp/amd_cert_chain.pem" 2>"$ERROR_DIR/snp_chain.stderr"; then
+        record "snp:amd-cert-chain" "ok" "ASK and ARK for $product"
+    else
+        record "snp:amd-cert-chain" "error" "KDS chain fetch failed"
+    fi
+}
+
+# --- vTPM trust boundary ----------------------------------------------------
+#
+# A vTPM only carries weight when it lives inside the guest's confidential
+# boundary. A guest that runs at VMPL0 has no service module below it, so its
+# vTPM belongs to the host and the hypervisor can forge every quote it makes.
+# This records the fact; it does not decide the outcome.
+
+collect_vtpm_boundary() {
+    local out="$OUT_DIR/platform/vtpm-boundary.txt"
+    {
+        printf 'guest_vmpl_from_dmesg: '
+        dmesg 2>/dev/null | grep -oE 'SNP running at VMPL[0-9]+' | tail -1 || printf 'unknown'
+        printf '\n'
+        printf 'tsm_privlevel: %s\n' "$(cat "$OUT_DIR/snp/privlevel.txt" 2>/dev/null)"
+        printf 'tpm_driver: %s\n' \
+            "$(readlink -f /sys/class/tpm/tpm0/device/driver 2>/dev/null | xargs -r basename)"
+        printf 'tpm_hid: %s\n' "$(cat /sys/class/tpm/tpm0/device/hid 2>/dev/null)"
+        printf 'tpm_manufacturer: '
+        if have tpm2_getcap; then
+            tpm2_getcap properties-fixed 2>/dev/null | \
+                grep -A2 TPM2_PT_MANUFACTURER | grep value | head -1
+        else
+            printf 'unknown\n'
+        fi
+        printf 'ek_certificate_present: '
+        if have tpm2_getcap && tpm2_getcap handles-nv-index 2>/dev/null | grep -q 0x1c0000; then
+            printf 'yes\n'
+        else
+            printf 'no\n'
+        fi
+        printf 'qemu_fw_cfg_present: '
+        [[ -d /sys/firmware/qemu_fw_cfg ]] && printf 'yes\n' || printf 'no\n'
+        printf 'svsm_in_dmesg: '
+        dmesg 2>/dev/null | grep -qi svsm && printf 'yes\n' || printf 'no\n'
+    } > "$out" 2>/dev/null
+    record "platform:vtpm-boundary" "ok" "$out"
 }
 
 collect_azure_report() {
@@ -645,12 +861,38 @@ collect_ak_and_quote() {
         return
     fi
 
-    run_text "tpm:ak-public" "$OUT_DIR/tpm/ak-readpublic.txt" \
-        tpm2_readpublic \
+    local ak_context="$AZURE_AK_HANDLE"
+
+    if tpm2_readpublic \
             -c "$AZURE_AK_HANDLE" \
             -f pem \
             -o "$OUT_DIR/tpm/ak-public.pem" \
-            -n "$OUT_DIR/tpm/ak-name.bin" || true
+            -n "$OUT_DIR/tpm/ak-name.bin" \
+            >"$OUT_DIR/tpm/ak-readpublic.txt" 2>"$ERROR_DIR/tpm_ak_readpublic.stderr"; then
+        record "tpm:ak-public" "ok" "persistent handle $AZURE_AK_HANDLE"
+    else
+        # No pre-provisioned AK. Create a transient one so the quote path can
+        # still be exercised. An AK created here carries no certificate, so it
+        # proves possession of a key and nothing about the platform.
+        record "tpm:ak-public" "missing" "no AK at $AZURE_AK_HANDLE"
+
+        if ! have tpm2_createek || ! have tpm2_createak; then
+            record "tpm:ak-transient" "missing" "tpm2_createek/tpm2_createak"
+            return
+        fi
+        if tpm2_createek -c "$OUT_DIR/tpm/ek.ctx" -G rsa -u "$OUT_DIR/tpm/ek.pub" \
+                >"$OUT_DIR/tpm/createek.txt" 2>"$ERROR_DIR/tpm_createek.stderr" &&
+           tpm2_createak -C "$OUT_DIR/tpm/ek.ctx" -c "$OUT_DIR/tpm/ak.ctx" \
+                -G ecc -g sha256 -s ecdsa \
+                -u "$OUT_DIR/tpm/ak-public.pem" -f pem -n "$OUT_DIR/tpm/ak-name.bin" \
+                >"$OUT_DIR/tpm/createak.txt" 2>"$ERROR_DIR/tpm_createak.stderr"; then
+            ak_context="$OUT_DIR/tpm/ak.ctx"
+            record "tpm:ak-transient" "ok" "created, uncertified"
+        else
+            record "tpm:ak-transient" "error" "AK creation failed"
+            return
+        fi
+    fi
 
     if ! have tpm2_quote; then
         record "tpm:quote" "missing" "tpm2_quote"
@@ -660,7 +902,7 @@ collect_ak_and_quote() {
     local err="$ERROR_DIR/tpm_quote.stderr"
 
     if tpm2_quote \
-        -c "$AZURE_AK_HANDLE" \
+        -c "$ak_context" \
         -l "$PCR_LIST" \
         -q "$OUT_DIR/challenge.bin" \
         -m "$OUT_DIR/tpm/quote.msg" \
@@ -672,7 +914,7 @@ collect_ak_and_quote() {
         record "tpm:quote" "ok" "$OUT_DIR/tpm/quote.msg"
         [[ -s "$err" ]] || rm -f "$err"
     else
-        record "tpm:quote" "error" "AK=$AZURE_AK_HANDLE PCRS=$PCR_LIST"
+        record "tpm:quote" "error" "AK=$ak_context PCRS=$PCR_LIST"
     fi
 }
 
@@ -947,8 +1189,10 @@ main() {
     collect_boot_log
     collect_ima
     collect_tpm_inventory
+    collect_snp_native
     collect_azure_report
     collect_ak_and_quote
+    collect_vtpm_boundary
     collect_nexus_binary
     collect_service
     collect_security_runtime
