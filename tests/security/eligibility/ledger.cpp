@@ -499,3 +499,111 @@ TEST(GenesisFacts, OneMissingFounderObservationDeniesTheFact) {
     EXPECT_EQ(evidence.continuity_observers, constants::kBootstrapThreshold - 2);
     EXPECT_FALSE(evidence.uptime_valid);
 }
+
+// --- partition and disagreement -------------------------------------------
+//
+// A partition is not a fault. Observers on the far side simply say nothing, and
+// a fact that needs a quorum is denied rather than guessed at. What must never
+// happen is a fact appearing on one side of a split.
+
+TEST_F(LedgerTest, APartitionBelowQuorumDeniesBothFacts) {
+    // Three of five reachable: below the quorum of four.
+    give_continuity(3);
+    give_participation(3);
+    const auto evidence = ledger_.evaluate(candidate_.id, 1, context_);
+    EXPECT_EQ(evidence.continuity_observers, 3u);
+    EXPECT_FALSE(evidence.uptime_valid);
+    EXPECT_FALSE(evidence.mesh_health_valid);
+}
+
+TEST_F(LedgerTest, APartitionAtQuorumStillMakesTheFacts) {
+    give_continuity(context_.quorum);
+    give_participation(context_.quorum);
+    const auto evidence = ledger_.evaluate(candidate_.id, 1, context_);
+    EXPECT_TRUE(evidence.uptime_valid);
+    EXPECT_TRUE(evidence.mesh_health_valid);
+}
+
+// Two nodes with different views of the same candidate reach different answers,
+// and that is safe: neither answer is authority. Selection runs on the frozen
+// set consensus finalized, so a local view that disagrees loses.
+TEST_F(LedgerTest, NodesMayDisagreeBeforeConsensusWithoutHarm) {
+    EligibilityLedger optimistic;
+    EligibilityLedger pessimistic;
+    for (std::size_t i = 0; i < members_.size(); ++i) {
+        const auto first = attestation(members_[i], candidate_, 0x10, 100);
+        const auto second = attestation(members_[i], candidate_, 0x11, 200);
+        EXPECT_EQ(optimistic.record(first, context_), ObservationOutcome::Accepted);
+        EXPECT_EQ(optimistic.record(second, context_), ObservationOutcome::Accepted);
+        if (i < 2) {  // this node only heard from two observers
+            EXPECT_EQ(pessimistic.record(first, context_), ObservationOutcome::Accepted);
+            EXPECT_EQ(pessimistic.record(second, context_), ObservationOutcome::Accepted);
+        }
+    }
+    EXPECT_TRUE(optimistic.evaluate(candidate_.id, 1, context_).uptime_valid);
+    EXPECT_FALSE(pessimistic.evaluate(candidate_.id, 1, context_).uptime_valid);
+
+    // Both are derived from the same rule over different inputs, so once the
+    // observations converge the answers converge too.
+    for (std::size_t i = 2; i < context_.quorum; ++i) {
+        EXPECT_EQ(pessimistic.record(attestation(members_[i], candidate_, 0x10, 100), context_),
+                  ObservationOutcome::Accepted);
+        EXPECT_EQ(pessimistic.record(attestation(members_[i], candidate_, 0x11, 200), context_),
+                  ObservationOutcome::Accepted);
+    }
+    EXPECT_TRUE(pessimistic.evaluate(candidate_.id, 1, context_).uptime_valid);
+}
+
+// A candidate that becomes healthy after the eligible set is frozen does not
+// join the epoch being prepared. Freezing is what makes selection deterministic,
+// so a late arrival waits for the next one.
+TEST_F(LedgerTest, HealthArrivingAfterTheFreezeDoesNotChangeTheFrozenSet) {
+    give_continuity(context_.quorum - 1);
+    give_participation(context_.quorum - 1);
+    const auto at_freeze = ledger_.evaluate(candidate_.id, 1, context_);
+    ASSERT_FALSE(at_freeze.uptime_valid);
+
+    // The set is frozen from `at_freeze`. The last observer reports afterwards,
+    // so the ledger's answer changes — but the frozen copy does not.
+    const std::size_t last = context_.quorum - 1;
+    EXPECT_EQ(ledger_.record(attestation(members_[last], candidate_, 0x10, 100), context_),
+              ObservationOutcome::Accepted);
+    EXPECT_EQ(ledger_.record(attestation(members_[last], candidate_, 0x11, 200), context_),
+              ObservationOutcome::Accepted);
+    EXPECT_EQ(ledger_.record(participation(members_[last], candidate_, 300), context_),
+              ObservationOutcome::Accepted);
+
+    EXPECT_TRUE(ledger_.evaluate(candidate_.id, 1, context_).uptime_valid);
+    EXPECT_FALSE(at_freeze.uptime_valid);
+}
+
+// A current member that becomes unhealthy is not removed from the epoch it is
+// already in. Membership is frozen; the fault denies its NEXT selection.
+TEST_F(LedgerTest, AFaultDoesNotShrinkTheCurrentEpoch) {
+    const std::vector<NodeId> before = context_.observers;
+    ledger_.record_fault(members_[0].id, ObjectiveFault::Equivocation);
+
+    EXPECT_EQ(context_.observers, before);
+    EXPECT_EQ(context_.quorum, constants::consensus_quorum(5));
+    // The faulty member can still be observed about, and its own observations
+    // still count: consensus safety already bounds what a faulty member can do.
+    give_continuity(context_.quorum);
+    EXPECT_TRUE(ledger_.evaluate(candidate_.id, 1, context_).uptime_valid);
+    // Its own next-epoch health is denied.
+    EXPECT_FALSE(ledger_.evaluate(members_[0].id, 1, context_).mesh_health_valid);
+}
+
+// An observer that restarts keeps its identity and its place in the set. Its
+// own height restarts from whatever it syncs to, and the monotonic rule means
+// it cannot contribute again until it is past what it already said.
+TEST_F(LedgerTest, AnObserverRestartCannotReplayItsOldStatements) {
+    EXPECT_EQ(ledger_.record(attestation(members_[0], candidate_, 0x10, 500), context_),
+              ObservationOutcome::Accepted);
+    // After a restart it re-syncs and re-observes. A statement at the height it
+    // had before is refused; only genuine progress counts.
+    EXPECT_EQ(ledger_.record(attestation(members_[0], candidate_, 0x11, 500), context_),
+              ObservationOutcome::NotNewerThanHeld);
+    EXPECT_EQ(ledger_.record(attestation(members_[0], candidate_, 0x11, 501), context_),
+              ObservationOutcome::Accepted);
+    EXPECT_EQ(ledger_.evaluate(candidate_.id, 1, context_).continuity_observers, 1u);
+}

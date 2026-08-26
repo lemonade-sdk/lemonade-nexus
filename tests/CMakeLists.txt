@@ -125,6 +125,11 @@ add_nexus_test(test_security_authority
 add_nexus_test(test_security_eligibility
     security/eligibility/ledger.cpp
     security/eligibility/store.cpp)
+# Deterministic measurement across the Tier 1 population table. Records what
+# the protocol costs at 5 and at 31; asserts invariants only, never a tuned
+# threshold.
+add_nexus_test(test_security_scale
+    security/simulation/scale.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
