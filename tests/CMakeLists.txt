@@ -14,6 +14,8 @@ function(add_nexus_test TEST_NAME)
         ASIO_STANDALONE
         ASIO_NO_DEPRECATED
     )
+    # Shared test-only headers live under tests/support.
+    target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     if(WIN32)
         target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
     endif()
@@ -126,7 +128,11 @@ add_nexus_test(test_security_attestation
     security/attestation/linux_profile.cpp
     security/attestation/service.cpp
     security/attestation/producer.cpp
+    security/attestation/providers.cpp
     security/attestation/tier1_path.cpp)
+# providers.cpp runs the substitution negatives against the captured SNP blob.
+target_compile_definitions(test_security_attestation PRIVATE
+    NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
