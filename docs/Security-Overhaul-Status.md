@@ -493,6 +493,98 @@ AMD signature.
   The required chain is AMD endorsement → SNP instance → approved SVSM instance
   → SVSM-bound vTPM identity → fresh TPM quote.
 
+### M9 — Mesh eligibility facts, conformance, fuzzing and measurement (done)
+
+**`uptime_valid` and `mesh_health_valid` have producers.** Both are built from
+signed statements by current Tier 1 members, never from anything a node says
+about itself. `Security/Eligibility/` holds the observation type, the pure
+ledger that turns observations into facts, and the durable store.
+
+An observation binds network, epoch, subject, subject incarnation, kind, the
+attestation the observer verified, the observer's quorum-certified height, the
+finalized state it held, and the observer identity. Nothing carries a
+wall-clock time: a peer-supplied timestamp is a value an adversary picks.
+
+```text
+uptime_valid
+    = a consensus quorum of distinct observers, each having verified
+      kMinContinuityObservations distinct attestations of the same subject at
+      the same incarnation in this epoch
+
+mesh_health_valid
+    = a consensus quorum of distinct observers reporting participation at the
+      current epoch and incarnation, AND no unresolved objective fault
+```
+
+Distinct challenge nonces make distinct evidence digests, so two of them are
+two real rounds; the local re-attest cadence is what puts an interval between
+them without trusting a peer's clock. A changed incarnation restarts the count.
+
+Objective faults are proved, not judged: duplicate incarnation, equivocation,
+invalid consensus behavior. Any unresolved fault denies health.
+
+**Byzantine observers.** Observers are deduplicated by node identity, so a
+cloned member counts once. An observer cannot rewind its height, observe
+itself, sign as another, or contribute from outside the frozen set. One
+observer never makes a fact, and a partition below quorum denies rather than
+guesses.
+
+**Genesis.** Before Epoch 1 there is no prior quorum, so the founding set
+observes itself: every founder must be seen by every other. That is the mutual
+attestation and mutual connectivity the bootstrap rules require, and since no
+node observes itself the bar is one less than the founding set. The bootstrap
+threshold stays five.
+
+**Expiry and rollback.** Observations are epoch-scoped and affect next-epoch
+eligibility only, so a node stays eligible while the mesh keeps seeing it and
+nothing here can shrink a frozen epoch. `EligibilityStore` writes
+crash-atomically, reports damage as `Corrupt` rather than `Absent`, and
+re-verifies every signature on load — an edited file cannot assert a fact no
+observer signed, and a renamed file cannot be served as another epoch's.
+
+**VMPL is an explicit choice.** A Tier 1-capable profile that never chose a
+`VmplPolicy` is incomplete. Choosing `Unconstrained` explicitly still completes;
+forgetting does not, and the profile digest distinguishes the two.
+
+**AMD CRL operational flow.** `scripts/nexus-refresh-amd-crl` fetches one
+product's KDS list and installs it atomically into the layout
+`AmdRevocationCache` reads. It shape-checks that the response parses as a CRL so
+a captive portal cannot overwrite a good entry, and decides nothing else. A
+fetch failure keeps the existing entry; revocation data then expires on its own
+signed `nextUpdate`, after which new Tier 1 attestation fails closed.
+
+**Provider conformance.** `tests/support/provider_conformance.hpp` is the
+contract every Tier 1-capable provider satisfies: wrong network, node, epoch,
+incarnation, ruleset, profile ruleset or challenge all refuse, and claims stay
+self-consistent. It asserts claims and failures only, never eligibility. It
+found one real inconsistency — the verifier set `attestation_profile_valid`
+before recording which provider was examining.
+
+**Fuzzing.** Nine targets over the parsers that read attacker-controlled bytes.
+A deterministic corpus drives them inside the normal suite so they stay
+exercised on every build; `NEXUS_BUILD_FUZZERS=ON` builds each as a libFuzzer
+binary, and fails at configure time on a toolchain without libFuzzer rather
+than at link.
+
+**Scale measurement.** `security/simulation/scale.cpp` records quorum,
+authority threshold, proposals, votes, commits, view changes under leader
+failure, QC signature bytes, encoded proposal size, DKG traffic and FROST
+traffic for every population from 5 to 31. It asserts invariants only. No
+constant is tuned.
+
+#### Known gaps
+
+* **The ledger is not yet wired into the driver.** `SecurityDriver` still builds
+  its next-epoch pool from local re-attestation results. The facts, their store
+  and their tests exist; replacing the driver's local pool with a
+  consensus-finalized eligible set is the next step, and until then the mesh
+  facts are computed but not consumed in production.
+* **No participation producer.** `ObservationKind::Participation` has no emitter
+  in the driver yet, so mesh health has evidence plumbing but no live source.
+* **The end-to-end revoked-VCEK path stays untestable off platform**, as before.
+* **`SnpSvsmVtpmProvider` remains fail-closed** with no parser, awaiting real
+  `.40` evidence.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
