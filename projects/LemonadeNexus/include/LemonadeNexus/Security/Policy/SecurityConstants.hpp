@@ -106,6 +106,24 @@ inline constexpr uint64_t kFinalAttestMaxAgeSeconds = 300;
 // item.
 inline constexpr uint32_t kMaxTier1AttestAttemptsPerEpoch = 4;
 
+// --- Mesh eligibility observations ------------------------------------------
+
+// Distinct attestations one observer must have verified before it counts
+// toward continuity. Two rounds, and because an observer only issues a
+// challenge every kReattestIntervalSeconds, two of them span at least one
+// interval without anyone trusting a peer's clock.
+inline constexpr std::size_t kMinContinuityObservations = 2;
+
+// Observations expire at the epoch boundary and affect the NEXT epoch's
+// eligibility only. A node stays eligible while the mesh keeps seeing it, never
+// because it was healthy once; and nothing here can shrink a frozen epoch.
+inline constexpr uint64_t kObservationValidityEpochs = 1;
+
+// Distinct attestations kept per observer per subject. Well above the rounds
+// one epoch can hold, so it bounds memory against a flooding observer without
+// ever being reached by honest cadence.
+inline constexpr std::size_t kMaxContinuityAttestations = 8;
+
 // --- HotStuff safety rules --------------------------------------------------
 
 inline constexpr std::size_t kHotStuffChainLength = 3;

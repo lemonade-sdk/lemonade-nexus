@@ -122,6 +122,9 @@ add_nexus_test(test_security_authority
     security/authority/nonce_commitment.cpp
     security/authority/dkg_session.cpp
     security/authority/signing.cpp)
+add_nexus_test(test_security_eligibility
+    security/eligibility/ledger.cpp
+    security/eligibility/store.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
