@@ -122,6 +122,90 @@ ajxCW3Seiws6r1Zm+tCuVbMiNtpS9ThjNX4uve5thyfE2DgoxRFvY1CsoF5M
 -----END CERTIFICATE-----
 )";
 
+/// AMD Root Key, Genoa (EPYC 9004 / Zen 4). Self-signed, valid to 2047.
+/// SHA-256 fingerprint 4C:65:98:D1:9C:18:71:9C:5D:FD:4A:7D:33:5F:67:4E:
+///                     5B:FE:1D:8F:80:0C:EA:2C:F2:70:C1:0D:10:3D:B2:F1
+/// Compiled in on purpose: a root fetched at runtime is not a root.
+constexpr std::string_view kArkGenoa = R"(-----BEGIN CERTIFICATE-----
+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
+/wMz1R1BHg==
+-----END CERTIFICATE-----
+)";
+
+/// AMD SEV Signing Key, Genoa. Issued by the ARK above; the only intermediate
+/// a Genoa VCEK chains through.
+constexpr std::string_view kAskGenoa = R"(-----BEGIN CERTIFICATE-----
+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
+-----END CERTIFICATE-----
+)";
+
 std::vector<X509Ptr> parse_pem_chain(std::string_view pem) {
     std::vector<X509Ptr> out;
     BioPtr bio{BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()))};
@@ -155,14 +239,22 @@ bool same_cert(X509* a, X509* b) { return a && b && X509_cmp(a, b) == 0; }
 
 }  // namespace
 
+std::span<const std::string_view> pinned_amd_products() {
+    // Turin joins this list when we have silicon to test against.
+    static constexpr std::string_view kProducts[] = {"Milan", "Genoa"};
+    return kProducts;
+}
+
 std::string_view pinned_amd_root(std::string_view product) {
     if (product == "Milan") return kArkMilan;
-    return {};  // Genoa/Turin roots get added when we have silicon to test against
+    if (product == "Genoa") return kArkGenoa;
+    return {};
 }
 
 std::string pinned_amd_chain(std::string_view product) {
-    if (product != "Milan") return {};
-    return std::string(kAskMilan) + std::string(kArkMilan);
+    if (product == "Milan") return std::string(kAskMilan) + std::string(kArkMilan);
+    if (product == "Genoa") return std::string(kAskGenoa) + std::string(kArkGenoa);
+    return {};
 }
 
 std::string vcek_kds_url(const SnpReport& report, std::string_view product) {
@@ -193,19 +285,46 @@ SnpVerifyResult verify_snp_signature(const SnpReport& report,
     if (!vcek) return fail("VCEK is not a DER certificate");
 
     // --- chain: expect ASK then ARK ----------------------------------------
-    // An empty chain means "use the pinned one", which is the normal case: both
+    // An empty chain means "use the pinned ones", which is the normal case: both
     // certificates are fixed per product, so shipping them with every piece of
     // evidence spends bandwidth to deliver something we already refuse to trust
     // on arrival.
-    auto chain = parse_pem_chain(chain_pem.empty() ? pinned_amd_chain("Milan") : chain_pem);
+    //
+    // The report never names its silicon generation, so the product is resolved
+    // by matching the root rather than by trusting a claim. A supplied chain
+    // must root in one of the compiled-in AMD roots; an empty chain tries each
+    // pinned pair. Either way the root comes from this binary, so an unknown
+    // generation fails closed instead of widening what is trusted.
+    std::vector<X509Ptr> chain;
+    if (chain_pem.empty()) {
+        for (const auto product : pinned_amd_products()) {
+            auto candidate = parse_pem_chain(pinned_amd_chain(product));
+            if (candidate.size() >= 2 && X509_check_issued(candidate[0].get(),
+                                                            vcek.get()) == X509_V_OK) {
+                chain = std::move(candidate);
+                break;
+            }
+        }
+        if (chain.size() < 2) {
+            return fail("no compiled-in AMD chain issued this VCEK");
+        }
+    } else {
+        chain = parse_pem_chain(chain_pem);
+    }
     if (chain.size() < 2) return fail("certificate chain must carry ASK and ARK");
     X509* ask = chain[0].get();
     X509* ark = chain[1].get();
 
-    auto pinned = parse_pem_chain(pinned_amd_root("Milan"));
-    if (pinned.empty()) return fail("no compiled-in AMD root for this product");
-    if (!same_cert(ark, pinned[0].get())) {
-        return fail("chain root is not the compiled-in AMD root key");
+    bool root_is_pinned = false;
+    for (const auto product : pinned_amd_products()) {
+        auto pinned = parse_pem_chain(pinned_amd_root(product));
+        if (!pinned.empty() && same_cert(ark, pinned[0].get())) {
+            root_is_pinned = true;
+            break;
+        }
+    }
+    if (!root_is_pinned) {
+        return fail("chain root is not a compiled-in AMD root key");
     }
 
     StorePtr store{X509_STORE_new()};

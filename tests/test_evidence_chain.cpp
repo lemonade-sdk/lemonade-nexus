@@ -678,18 +678,26 @@ TEST(EvidenceVerifyTest, AbsentChainFallsBackToThePinnedAskAndArk) {
 }
 
 TEST(EvidenceVerifyTest, PinnedChainMatchesTheOneAmdPublishes) {
-    // If AMD ever rotates the ASK this fails loudly rather than quietly falling
-    // back to whatever a peer sends.
-    const auto pinned = pinned_amd_chain("Milan");
-    ASSERT_FALSE(pinned.empty());
-    const auto from_kds = read_fixture_text("amd_milan_cert_chain.pem");
+    // If AMD ever rotates an ASK this fails loudly rather than quietly falling
+    // back to whatever a peer sends. Both generations we hold material for are
+    // compared against the bytes the AMD key server published.
     auto strip = [](std::string s) {
         std::string out;
         for (char c : s) if (c != '\n' && c != '\r' && c != ' ') out.push_back(c);
         return out;
     };
-    EXPECT_EQ(strip(pinned), strip(from_kds));
-    EXPECT_TRUE(pinned_amd_chain("Genoa").empty());
+
+    const auto milan = pinned_amd_chain("Milan");
+    ASSERT_FALSE(milan.empty());
+    EXPECT_EQ(strip(milan), strip(read_fixture_text("amd_milan_cert_chain.pem")));
+
+    const auto genoa = pinned_amd_chain("Genoa");
+    ASSERT_FALSE(genoa.empty());
+    EXPECT_EQ(strip(genoa), strip(read_fixture_text("amd_genoa_cert_chain.pem")));
+
+    // A generation we hold no root for stays empty, so it fails closed instead
+    // of borrowing another generation's root.
+    EXPECT_TRUE(pinned_amd_chain("Turin").empty());
 }
 
 TEST(EvidenceVerifyTest, ASuppliedChainWithAForgedRootIsStillRejected) {

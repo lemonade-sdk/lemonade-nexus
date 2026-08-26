@@ -65,6 +65,9 @@ struct SnpVerifyResult {
 /// `product` is the silicon generation ("Milan", "Genoa", ...).
 [[nodiscard]] std::string vcek_kds_url(const SnpReport& report, std::string_view product);
 
+/// Every silicon generation this binary carries root material for.
+[[nodiscard]] std::span<const std::string_view> pinned_amd_products();
+
 /// Compiled-in AMD root keys, by product. Never fetched at runtime.
 [[nodiscard]] std::string_view pinned_amd_root(std::string_view product);
 
