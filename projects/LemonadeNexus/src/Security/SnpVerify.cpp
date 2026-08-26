@@ -424,7 +424,7 @@ SnpVerifyResult verify_snp_revocation(std::span<const uint8_t> vcek_der,
                                        std::string_view chain_pem,
                                        const AmdRevocationState& state) {
     if (vcek_der.empty()) return fail("no VCEK supplied");
-    if (state.crl.empty()) {
+    if (state.crls.empty()) {
         return fail("no cached AMD revocation list; new attestation cannot be checked "
                     "for revoked endorsement");
     }
@@ -442,37 +442,44 @@ SnpVerifyResult verify_snp_revocation(std::span<const uint8_t> vcek_der,
     X509* ask = chain[0].get();
     X509* ark = chain[1].get();
 
-    CrlPtr crl = parse_crl(state.crl);
-    if (!crl) return fail("the revocation list is not a PEM or DER CRL");
-
     // AMD signs the product CRL with the ARK or the ASK depending on what it
     // revokes. Either is acceptable BECAUSE both came from the chain above,
-    // which already had to root in a compiled-in AMD key.
-    const bool signed_by_ark = X509_CRL_verify(crl.get(), X509_get0_pubkey(ark)) == 1;
-    const bool signed_by_ask = X509_CRL_verify(crl.get(), X509_get0_pubkey(ask)) == 1;
-    if (!signed_by_ark && !signed_by_ask) {
-        return fail("the revocation list is not signed by this VCEK's AMD chain");
+    // which already had to root in a compiled-in AMD key. A list for another
+    // product verifies under neither, which is how the wrong product is
+    // rejected without anyone naming a product.
+    CrlPtr matching;
+    for (const auto& bytes : state.crls) {
+        CrlPtr crl = parse_crl(bytes);
+        if (!crl) continue;
+        if (X509_CRL_verify(crl.get(), X509_get0_pubkey(ark)) == 1 ||
+            X509_CRL_verify(crl.get(), X509_get0_pubkey(ask)) == 1) {
+            matching = std::move(crl);
+            break;
+        }
+    }
+    if (!matching) {
+        return fail("no cached revocation list is signed by this VCEK's AMD chain");
     }
 
     // An expired CRL proves nothing about today. Refusing it is what stops a
     // hypervisor pinning a node to a stale list that predates a revocation.
     time_t now = static_cast<time_t>(state.now_unix);  // X509_cmp_time wants a mutable pointer
-    const ASN1_TIME* next = X509_CRL_get0_nextUpdate(crl.get());
+    const ASN1_TIME* next = X509_CRL_get0_nextUpdate(matching.get());
     if (next == nullptr) {
         return fail("the revocation list carries no nextUpdate, so it cannot expire");
     }
     if (X509_cmp_time(next, &now) <= 0) {
         return fail("the cached revocation list expired; refresh it before new attestation");
     }
-    if (const ASN1_TIME* last = X509_CRL_get0_lastUpdate(crl.get());
+    if (const ASN1_TIME* last = X509_CRL_get0_lastUpdate(matching.get());
         last != nullptr && X509_cmp_time(last, &now) > 0) {
         return fail("the revocation list is not valid yet");
     }
 
-    if (serial_is_revoked(crl.get(), X509_get0_serialNumber(ask))) {
+    if (serial_is_revoked(matching.get(), X509_get0_serialNumber(ask))) {
         return fail("AMD revoked the signing key that issued this VCEK");
     }
-    if (serial_is_revoked(crl.get(), X509_get0_serialNumber(vcek.get()))) {
+    if (serial_is_revoked(matching.get(), X509_get0_serialNumber(vcek.get()))) {
         return fail("AMD revoked this VCEK");
     }
     return pass();

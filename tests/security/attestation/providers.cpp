@@ -11,6 +11,7 @@
 // tier1_path.cpp. This file covers what only the provider boundary can get
 // wrong.
 
+#include <LemonadeNexus/Security/Attestation/AmdRevocationCache.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Attestation/Providers/AzureSnpVtpmProvider.hpp>
 #include <LemonadeNexus/Security/Attestation/Providers/SnpDirectBootProvider.hpp>
@@ -621,11 +622,10 @@ TEST_F(ProviderBoundaryTest, TheLaunchMeasurementPinIsCheckedBeforeTheQuote) {
 // The check runs immediately after the signature and before guest policy, so a
 // revoked chain never reaches the parts of the report it vouched for.
 //
-// Every branch here is a refusal. The accepting branch cannot be tested off
-// platform: a CRL that this chain accepts must be signed by AMD's own key, and
-// the captured fixtures predate any published CRL. A KDS outage still cannot
-// shrink a live epoch, because membership is frozen once selected and only NEW
-// attestation consults revocation.
+// amd_milan_crl.der is the real KDS list for Milan, signed by ARK-Milan and
+// valid from 2026-08-19 to 2026-10-04. The timestamps below are fixed rather
+// than read from the clock, so the accepting and expired branches both stay
+// testable after that window closes.
 
 namespace {
 
@@ -637,13 +637,210 @@ LinuxAttestationProfile profile_requiring_revocation() {
     return profile;
 }
 
-constexpr int64_t kSomeTimeIn2026 = 1'774'000'000;
+constexpr int64_t kInsideCrlWindow  = 1'788'220'800;  // 2026-09-01
+constexpr int64_t kBeforeCrlWindow  = 1'785'542'400;  // 2026-08-01
+constexpr int64_t kAfterCrlWindow   = 1'793'491'200;  // 2026-11-01
+
+nexus::security::AmdRevocationState revocation(std::vector<std::string> crls, int64_t now) {
+    nexus::security::AmdRevocationState state;
+    state.crls = std::move(crls);
+    state.now_unix = now;
+    return state;
+}
+
+std::string real_milan_crl() { return fixture_text("amd_milan_crl.der"); }
+
+std::vector<uint8_t> milan_vcek() { return fixture_bytes("vcek_milan.der"); }
 
 }  // namespace
 
-TEST_F(ProviderBoundaryTest, AbsentRevocationDataFailsClosed) {
+// The accepting path. A genuine AMD-signed list, inside its validity window,
+// naming no revoked serial.
+TEST(AmdRevocation, AValidCachedListAccepts) {
+    const auto result = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({real_milan_crl()}, kInsideCrlWindow));
+    EXPECT_TRUE(result.ok) << result.failure;
+}
+
+TEST(AmdRevocation, AnExpiredListIsRefused) {
+    const auto result = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({real_milan_crl()}, kAfterCrlWindow));
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.failure.find("expired"), std::string::npos) << result.failure;
+}
+
+TEST(AmdRevocation, AListThatIsNotValidYetIsRefused) {
+    const auto result = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({real_milan_crl()}, kBeforeCrlWindow));
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.failure.find("not valid yet"), std::string::npos) << result.failure;
+}
+
+TEST(AmdRevocation, AbsentDataAndAbsentClockBothFailClosed) {
+    const auto no_data = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({}, kInsideCrlWindow));
+    EXPECT_FALSE(no_data.ok);
+    EXPECT_NE(no_data.failure.find("no cached AMD revocation list"), std::string::npos);
+
+    const auto no_clock = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({real_milan_crl()}, 0));
+    EXPECT_FALSE(no_clock.ok);
+    EXPECT_NE(no_clock.failure.find("no trusted clock"), std::string::npos);
+}
+
+// The attacker's own list: correctly formed, currently valid, signed by a key
+// that is not in this VCEK's AMD chain. Accepting it would let a host supply a
+// list that revokes nothing.
+TEST(AmdRevocation, AListFromAnotherIssuerIsRefused) {
+    const auto result = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({fixture_text("foreign_crl.pem")}, kInsideCrlWindow));
+    EXPECT_FALSE(result.ok);
+    EXPECT_NE(result.failure.find("no cached revocation list is signed"), std::string::npos)
+        << result.failure;
+}
+
+TEST(AmdRevocation, MalformedDataIsRefused) {
+    for (const char* junk : {"not a crl", "-----BEGIN X509 CRL-----\nAAAA\n", "\x30\x82\xff"}) {
+        const auto result = nexus::security::verify_snp_revocation(
+            milan_vcek(), {}, revocation({junk}, kInsideCrlWindow));
+        EXPECT_FALSE(result.ok) << junk;
+    }
+}
+
+// A mesh spans silicon generations, so a verifier is handed every list it
+// holds. The one that belongs to this VCEK's chain is the one that decides;
+// lists for other products cannot verify there, and junk beside a good list
+// does not spoil it.
+TEST(AmdRevocation, TheListForThisChainIsTheOneUsed) {
+    const auto mixed = nexus::security::verify_snp_revocation(
+        milan_vcek(), {},
+        revocation({fixture_text("foreign_crl.pem"), "not a crl", real_milan_crl()},
+                   kInsideCrlWindow));
+    EXPECT_TRUE(mixed.ok) << mixed.failure;
+
+    // Without the list for this chain, nothing else in the set helps.
+    const auto without = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, revocation({fixture_text("foreign_crl.pem"), "not a crl"},
+                                     kInsideCrlWindow));
+    EXPECT_FALSE(without.ok);
+}
+
+// --- the cache: storage only, no trust decisions --------------------------------
+
+TEST(AmdRevocationCache, StoresAndReloadsWhatItWasGiven) {
+    const fs::path root = fs::temp_directory_path() /
+                          ("nexus_crl_" + std::to_string(::getpid()));
+    fs::remove_all(root);
+    nexus::security::AmdRevocationCache cache{root};
+
+    EXPECT_FALSE(cache.load("Milan").has_value());
+    EXPECT_TRUE(cache.state(kInsideCrlWindow).crls.empty());
+
+    ASSERT_TRUE(cache.store("Milan", real_milan_crl(), kInsideCrlWindow));
+    const auto cached = cache.load("Milan");
+    ASSERT_TRUE(cached.has_value());
+    EXPECT_EQ(cached->bytes, real_milan_crl());
+    EXPECT_EQ(cached->stored_unix, kInsideCrlWindow);
+
+    // What the cache hands a verifier is accepted by it.
+    const auto state = cache.state(kInsideCrlWindow);
+    ASSERT_EQ(state.crls.size(), 1u);
+    EXPECT_TRUE(nexus::security::verify_snp_revocation(milan_vcek(), {}, state).ok);
+
+    fs::remove_all(root);
+}
+
+// The cache stores bytes. It does not decide whether they are any good, which
+// is what keeps a fetch failure from looking like a cryptographic result.
+TEST(AmdRevocationCache, StoresWithoutValidating) {
+    const fs::path root = fs::temp_directory_path() /
+                          ("nexus_crl_junk_" + std::to_string(::getpid()));
+    fs::remove_all(root);
+    nexus::security::AmdRevocationCache cache{root};
+
+    EXPECT_TRUE(cache.store("Milan", "not a crl at all", kInsideCrlWindow));
+    const auto state = cache.state(kInsideCrlWindow);
+    ASSERT_EQ(state.crls.size(), 1u);
+    // Stored, and refused by the verifier. Nothing was weakened by caching it.
+    EXPECT_FALSE(nexus::security::verify_snp_revocation(milan_vcek(), {}, state).ok);
+
+    // A product with no compiled-in root has no chain to check a list against.
+    EXPECT_FALSE(cache.store("Turin", real_milan_crl(), kInsideCrlWindow));
+    EXPECT_FALSE(cache.load("Turin").has_value());
+    EXPECT_FALSE(cache.store("Milan", "", kInsideCrlWindow));
+
+    fs::remove_all(root);
+}
+
+// A refresh that never happens leaves the last good bytes in place. New Tier 1
+// attestation fails closed once they expire; nothing here reaches back into an
+// epoch that was already frozen, because membership is decided once, at
+// selection, and this code runs only when new evidence is examined.
+TEST(AmdRevocationCache, AFetchOutageOnlyAffectsNewAttestation) {
+    const fs::path root = fs::temp_directory_path() /
+                          ("nexus_crl_outage_" + std::to_string(::getpid()));
+    fs::remove_all(root);
+    nexus::security::AmdRevocationCache cache{root};
+    ASSERT_TRUE(cache.store("Milan", real_milan_crl(), kInsideCrlWindow));
+
+    // While the cached list is current, attestation proceeds with no network.
+    EXPECT_TRUE(nexus::security::verify_snp_revocation(
+                    milan_vcek(), {}, cache.state(kInsideCrlWindow)).ok);
+
+    // The outage continues past the list's own nextUpdate. New attestation now
+    // fails closed rather than trusting a list that predates any revocation.
+    const auto stale = nexus::security::verify_snp_revocation(
+        milan_vcek(), {}, cache.state(kAfterCrlWindow));
+    EXPECT_FALSE(stale.ok);
+    EXPECT_NE(stale.failure.find("expired"), std::string::npos) << stale.failure;
+
+    fs::remove_all(root);
+}
+
+TEST(AmdRevocationCache, TheSourceReadsTheClockItWasGiven) {
+    const fs::path root = fs::temp_directory_path() /
+                          ("nexus_crl_clock_" + std::to_string(::getpid()));
+    fs::remove_all(root);
+    nexus::security::AmdRevocationCache cache{root};
+    ASSERT_TRUE(cache.store("Milan", real_milan_crl(), kInsideCrlWindow));
+
+    int64_t now = kInsideCrlWindow;
+    const auto source = cache.source([&now] { return now; });
+    EXPECT_TRUE(nexus::security::verify_snp_revocation(milan_vcek(), {}, source()).ok);
+    now = kAfterCrlWindow;
+    EXPECT_FALSE(nexus::security::verify_snp_revocation(milan_vcek(), {}, source()).ok);
+
+    // No clock at all fails closed rather than defaulting to "now".
+    const auto blind = cache.source({});
+    EXPECT_FALSE(nexus::security::verify_snp_revocation(milan_vcek(), {}, blind()).ok);
+
+    fs::remove_all(root);
+}
+
+// End to end through a provider: the profile demands revocation, the cache
+// supplies a current list, and the chain reaches the quote instead of stopping
+// at the revocation gate.
+TEST_F(ProviderBoundaryTest, ACurrentCachedListLetsTheChainProceed) {
     const LinuxAttestationProfile profile = profile_requiring_revocation();
     ASSERT_TRUE(profile_is_complete(profile));
+    challenge_.policy_digest = profile_digest(profile);
+    evidence_ = answer(challenge_);
+    evidence_.platform = real_platform_bundle();
+    sign_evidence();
+
+    const auto verifier = AttestationVerifier(profile, [] {
+        return revocation({real_milan_crl()}, kInsideCrlWindow);
+    });
+    const auto verdict = verifier.examine(challenge_, evidence_);
+    EXPECT_NE(verdict.failure, AttestationFailure::EndorsementRevoked);
+    // Revocation passed, so the AMD half of the platform claim is proved. The
+    // bundle still fails later, at the quote it has no key for.
+    EXPECT_TRUE(verdict.claims.hardware_confidentiality_valid);
+    EXPECT_FALSE(verdict.passed);
+}
+
+TEST_F(ProviderBoundaryTest, AbsentRevocationDataFailsClosed) {
+    const LinuxAttestationProfile profile = profile_requiring_revocation();
     challenge_.policy_digest = profile_digest(profile);
     evidence_ = answer(challenge_);
     evidence_.platform = real_platform_bundle();
@@ -660,29 +857,7 @@ TEST_F(ProviderBoundaryTest, AbsentRevocationDataFailsClosed) {
               Tier1Eligibility::Ineligible);
 }
 
-TEST_F(ProviderBoundaryTest, RevocationWithoutATrustedClockFailsClosed) {
-    const LinuxAttestationProfile profile = profile_requiring_revocation();
-    challenge_.policy_digest = profile_digest(profile);
-    evidence_ = answer(challenge_);
-    evidence_.platform = real_platform_bundle();
-    sign_evidence();
-
-    // A CRL with no clock to check it against. An expired list would look
-    // exactly like a current one, which is what a stale-list replay needs.
-    const auto verifier = AttestationVerifier(profile, [] {
-        nexus::security::AmdRevocationState state;
-        state.crl = fixture_text("foreign_crl.pem");
-        state.now_unix = 0;
-        return state;
-    });
-    EXPECT_EQ(verifier.examine(challenge_, evidence_).failure,
-              AttestationFailure::EndorsementRevoked);
-}
-
-TEST_F(ProviderBoundaryTest, ARevocationListFromAnotherIssuerIsRefused) {
-    // The attacker's own CRL: correctly formed, currently valid, and signed by
-    // a key that is not in this VCEK's AMD chain. Accepting it would let a host
-    // supply a list that revokes nothing.
+TEST_F(ProviderBoundaryTest, AnExpiredListStopsNewAttestation) {
     const LinuxAttestationProfile profile = profile_requiring_revocation();
     challenge_.policy_digest = profile_digest(profile);
     evidence_ = answer(challenge_);
@@ -690,32 +865,12 @@ TEST_F(ProviderBoundaryTest, ARevocationListFromAnotherIssuerIsRefused) {
     sign_evidence();
 
     const auto verifier = AttestationVerifier(profile, [] {
-        nexus::security::AmdRevocationState state;
-        state.crl = fixture_text("foreign_crl.pem");
-        state.now_unix = kSomeTimeIn2026;
-        return state;
+        return revocation({real_milan_crl()}, kAfterCrlWindow);
     });
-    EXPECT_EQ(verifier.examine(challenge_, evidence_).failure,
-              AttestationFailure::EndorsementRevoked);
-}
-
-TEST_F(ProviderBoundaryTest, UnparsableRevocationDataIsRefused) {
-    const LinuxAttestationProfile profile = profile_requiring_revocation();
-    challenge_.policy_digest = profile_digest(profile);
-    evidence_ = answer(challenge_);
-    evidence_.platform = real_platform_bundle();
-    sign_evidence();
-
-    for (const char* junk : {"not a crl", "-----BEGIN X509 CRL-----\nAAAA\n"}) {
-        const auto verifier = AttestationVerifier(profile, [junk] {
-            nexus::security::AmdRevocationState state;
-            state.crl = junk;
-            state.now_unix = kSomeTimeIn2026;
-            return state;
-        });
-        EXPECT_EQ(verifier.examine(challenge_, evidence_).failure,
-                  AttestationFailure::EndorsementRevoked) << junk;
-    }
+    const auto verdict = verifier.examine(challenge_, evidence_);
+    EXPECT_EQ(verdict.failure, AttestationFailure::EndorsementRevoked);
+    EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
+              Tier1Eligibility::Ineligible);
 }
 
 // The requirement is compiled into the profile and bound into its digest, so a
@@ -730,87 +885,90 @@ TEST_F(ProviderBoundaryTest, TheRevocationRequirementIsPartOfTheProfileIdentity)
                     .require_endorsement_revocation);
 }
 
-// --- network separation --------------------------------------------------------
+// --- tier1_capable() is informational -------------------------------------------
 //
-// Transport authenticates the envelope, but transport authentication is not
-// trust. Without network_id inside the signed attestation context, a node
-// enrolled in one Nexus network could answer another network's challenge with
-// the same identity, the same platform and the same fresh quote.
+// tier1_capable() says a provider's DESIGN can satisfy Tier 1. It is not an
+// authorization result, it is not consulted by AttestationVerifier, and it is
+// not consulted by Tier1EligibilityPolicy. Only verified claims plus mesh facts
+// produce eligibility. These tests pin that so the flag cannot drift into the
+// decision path.
 
-TEST_F(ProviderBoundaryTest, TheNetworkIsBoundIntoTheChallengeDigest) {
-    const Digest base = challenge_digest(challenge_);
-    auto elsewhere = challenge_;
-    elsewhere.network_id = patterned<32>(0xB0);
-    ASSERT_NE(elsewhere.network_id, challenge_.network_id);
-    EXPECT_NE(challenge_digest(elsewhere), base);
+TEST_F(ProviderBoundaryTest, ACapableProviderThatIsNotReadyConfersNothing) {
+    // The dangerous shape: a provider that could satisfy Tier 1 and would
+    // report every claim, but is not ready to decide. Readiness wins.
+    for (const auto refusal : {AttestationFailure::ProviderUnsupported,
+                               AttestationFailure::ProfileIncomplete}) {
+        auto provider = std::make_shared<ScriptedProvider>(
+            kTier1AttestationProfileId, every_platform_claim(), profile_digest(profile_));
+        provider->tier1_capable_ = true;
+        provider->refusal_ = refusal;
+
+        const auto verdict = examine_with(provider);
+        ASSERT_TRUE(provider->tier1_capable());
+        EXPECT_FALSE(verdict.passed);
+        EXPECT_EQ(verdict.failure, refusal);
+        // examine() never ran, so no claim was produced.
+        EXPECT_EQ(nexus::security::missing_platform_claims(verdict.claims).size(), 11u);
+        EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
+                  Tier1Eligibility::Ineligible);
+    }
 }
 
-TEST_F(ProviderBoundaryTest, TheNetworkIsBoundIntoTheSignedEvidenceDigest) {
-    const Digest base = evidence_signing_digest(evidence_);
-    auto elsewhere = evidence_;
-    elsewhere.network_id = patterned<32>(0xB0);
-    EXPECT_NE(evidence_signing_digest(elsewhere), base);
-}
+TEST_F(ProviderBoundaryTest, ACapableReadyProviderStillNeedsEveryClaim) {
+    VerifiedPlatformClaims claims = every_platform_claim();
+    claims.boot_integrity_valid = false;
 
-TEST_F(ProviderBoundaryTest, EvidenceForAnotherNetworkIsRejected) {
-    evidence_.network_id = patterned<32>(0xB0);
-    sign_evidence();
+    auto provider = std::make_shared<ScriptedProvider>(
+        kTier1AttestationProfileId, claims, profile_digest(profile_));
+    provider->tier1_capable_ = true;
+    provider->refusal_.reset();  // ready
 
-    const auto verdict = examine();
-    EXPECT_FALSE(verdict.passed);
-    EXPECT_EQ(verdict.failure, AttestationFailure::NetworkMismatch);
-    // Nothing the platform could prove is recorded: the answer was not for us.
-    EXPECT_FALSE(verdict.claims.hardware_confidentiality_valid);
+    const auto verdict = examine_with(provider);
+    ASSERT_TRUE(provider->tier1_capable());
+    ASSERT_FALSE(provider->readiness().has_value());
+    EXPECT_TRUE(verdict.passed);  // the provider reported no failing step
     EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
               Tier1Eligibility::Ineligible);
 }
 
-// The whole point of binding the network: a bundle built correctly for another
-// mesh cannot be relabelled into this one, because the challenge it answered
-// committed to that mesh's identity. Re-signing does not help.
-TEST_F(ProviderBoundaryTest, CrossNetworkReplayFailsEvenWhenResigned) {
-    AttestationChallenge foreign = challenge_;
-    foreign.network_id = patterned<32>(0xB0);
-    AttestationEvidence for_foreign = answer(foreign);
-    sign(for_foreign);
+// The flag is not an input to eligibility. A provider that declared itself
+// incapable but proved every claim is still eligible, which is why the flag
+// must never be relied on as a control: what actually stops a provider is a
+// claim it cannot produce. SnpDirectBootProvider is refused because it cannot
+// prove runtime integrity, not because of this flag.
+TEST_F(ProviderBoundaryTest, EligibilityDoesNotConsultTierOneCapable) {
+    auto incapable = std::make_shared<ScriptedProvider>(
+        kTier1AttestationProfileId, every_platform_claim(), profile_digest(profile_));
+    incapable->tier1_capable_ = false;
 
-    // Straight replay: the bundle still names the other mesh.
-    EXPECT_EQ(AttestationVerifier(profile_).examine(challenge_, for_foreign).failure,
-              AttestationFailure::NetworkMismatch);
-
-    // Relabelled to this mesh and re-signed. The challenge digest it carries was
-    // computed under the other network's challenge, so it answers nothing here.
-    for_foreign.network_id = challenge_.network_id;
-    sign(for_foreign);
-    EXPECT_EQ(AttestationVerifier(profile_).examine(challenge_, for_foreign).failure,
-              AttestationFailure::ChallengeMismatch);
+    const auto verdict = examine_with(incapable);
+    ASSERT_FALSE(incapable->tier1_capable());
+    EXPECT_TRUE(nexus::security::all_platform_claims_proved(verdict.claims));
+    EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
+              Tier1Eligibility::Eligible);
 }
 
-// Every field of the attestation context is separately bound. Changing any one
-// of them changes the digest a quote has to commit to.
-TEST_F(ProviderBoundaryTest, TheWholeAttestationContextIsBound) {
-    const Digest base = challenge_digest(challenge_);
-    struct Case {
-        const char* label;
-        std::function<void(AttestationChallenge&)> mutate;
-    };
-    const Case cases[] = {
-        {"network_id",       [](AttestationChallenge& c) { c.network_id[0] ^= 1; }},
-        {"profile_id",       [](AttestationChallenge& c) {
-             c.profile_id = AttestationProfileId::SnpSvsmVtpm; }},
-        {"profile_ruleset",  [](AttestationChallenge& c) { c.profile_ruleset += 1; }},
-        {"security_ruleset", [](AttestationChallenge& c) { c.security_ruleset += 1; }},
-        {"consensus_ruleset",[](AttestationChallenge& c) { c.consensus_ruleset += 1; }},
-        {"node_id",          [](AttestationChallenge& c) { c.node_id.bytes[0] ^= 1; }},
-        {"node_key",         [](AttestationChallenge& c) { c.node_key[0] ^= 1; }},
-        {"incarnation",      [](AttestationChallenge& c) { c.incarnation += 1; }},
-        {"epoch",            [](AttestationChallenge& c) { c.epoch += 1; }},
-        {"nonce",            [](AttestationChallenge& c) { c.nonce[0] ^= 1; }},
-        {"policy_digest",    [](AttestationChallenge& c) { c.policy_digest[0] ^= 1; }},
-    };
-    for (const auto& entry : cases) {
-        AttestationChallenge mutated = challenge_;
-        entry.mutate(mutated);
-        EXPECT_NE(challenge_digest(mutated), base) << entry.label;
+// Every compiled provider obeys the invariant today: capable or not, none of
+// them is ready, so none can produce a claim and none can confer Tier 1.
+TEST_F(ProviderBoundaryTest, NoCompiledProviderIsReadyUnderTheShippedProfile) {
+    const LinuxAttestationProfile shipped = nexus::security::linux_attestation_profile_v1();
+    const auto providers = nexus::security::compiled_providers(shipped);
+    ASSERT_EQ(providers.size(), 3u);
+
+    for (const auto& provider : providers) {
+        const auto refusal = provider->readiness();
+        ASSERT_TRUE(refusal.has_value())
+            << nexus::security::attestation_profile_id_name(provider->profile_id());
+
+        auto local = challenge_;
+        local.profile_id = provider->profile_id();
+        local.policy_digest = provider->policy_digest();
+        auto reply = answer(local);
+        sign(reply);
+        const auto verdict = AttestationVerifier(shipped).examine(local, reply);
+        EXPECT_EQ(verdict.failure, *refusal)
+            << nexus::security::attestation_profile_id_name(provider->profile_id());
+        EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
+                  Tier1Eligibility::Ineligible);
     }
 }

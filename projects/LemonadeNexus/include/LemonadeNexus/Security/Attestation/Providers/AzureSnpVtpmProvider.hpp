@@ -18,17 +18,7 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProvider.hpp>
 
-#include <functional>
-
 namespace nexus::security {
-
-/// Where the cached AMD CRL and the current time come from.
-///
-/// The verifier reaches no network and reads no clock of its own, so the same
-/// evidence and the same revocation state always give the same verdict. Unset
-/// means no revocation data: under a profile that requires the check, every
-/// candidate whose AMD signature verifies is then refused.
-using AmdRevocationSource = std::function<AmdRevocationState()>;
 
 class AzureSnpVtpmProvider final : public PlatformEvidenceProvider {
 public:

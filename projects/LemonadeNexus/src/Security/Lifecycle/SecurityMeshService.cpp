@@ -1,5 +1,9 @@
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 
+#include <LemonadeNexus/Security/Attestation/AmdRevocationCache.hpp>
+
+#include <chrono>
+
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
@@ -32,10 +36,17 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           .network_id = mesh_network_id(config),
           .consensus_directory = config.data_root / "security" / "consensus",
           .profile = config.profile,
-          // No CRL cache exists yet, so revocation data is absent and new Tier 1
-          // attestation fails closed on it. That is the intended state until a
-          // cache producer lands; it never touches a live epoch.
-          .amd_revocation = {},
+          // The cache hands over whatever is on disk; verify_snp_revocation
+          // decides whether it is any good. With nothing cached the state is
+          // empty and new Tier 1 attestation fails closed on it, which never
+          // touches an already frozen epoch.
+          .amd_revocation =
+              AmdRevocationCache(config.data_root / "security" / "revocation")
+                  .source([] {
+                      return static_cast<int64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                                      .count());
+                  }),
           // Called only while consensus runs, long after the driver exists.
           .transition_validator =
               [this](const Digest& transitions_digest) {

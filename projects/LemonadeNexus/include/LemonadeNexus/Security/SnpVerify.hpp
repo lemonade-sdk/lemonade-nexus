@@ -8,6 +8,7 @@
 
 #include <LemonadeNexus/Security/SnpReport.hpp>
 
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -89,18 +90,30 @@ struct SnpVerifyResult {
 /// The verifier does no network I/O: the caller supplies what it fetched, and
 /// the validity window inside the CRL decides whether it may still be used.
 struct AmdRevocationState {
-    /// The KDS CRL, PEM or DER. Empty means nothing is cached.
-    std::string crl;
+    /// Every KDS CRL this node holds, PEM or DER, one per AMD product. A mesh
+    /// spans silicon generations, so the verifier is handed all of them and
+    /// uses the one that verifies under the chain that issued the VCEK in
+    /// hand. A list for another product cannot verify there, so offering it is
+    /// not a way to widen anything. Empty means nothing is cached.
+    std::vector<std::string> crls;
     /// Wall-clock seconds since the epoch. Zero means the caller has no trusted
     /// clock, which fails closed: a CRL cannot be checked for expiry without
     /// one, and an expired CRL is what an attacker would want replayed.
     int64_t now_unix{0};
 };
 
+/// Where the cached AMD CRL and the current time come from.
+///
+/// The verifier reaches no network and reads no clock of its own, so the same
+/// evidence and the same revocation state always give the same verdict. Unset
+/// means no revocation data: under a profile that requires the check, every
+/// candidate whose AMD signature verifies is then refused.
+using AmdRevocationSource = std::function<AmdRevocationState()>;
+
 /// Check the VCEK and the ASK that issued it against AMD's CRL.
 ///
-/// Fails closed on absent, unparsable, wrongly signed or expired revocation
-/// data. That gates NEW attestation only: an epoch's membership is frozen once
+/// Fails closed when no supplied list verifies under this VCEK's chain, and
+/// when the one that does is unparsable or expired. That gates NEW attestation only: an epoch's membership is frozen once
 /// selected, so a KDS outage cannot shrink a live quorum (architecture 1.1
 /// section 11).
 ///
