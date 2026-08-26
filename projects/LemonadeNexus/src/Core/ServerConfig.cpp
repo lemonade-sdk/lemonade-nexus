@@ -153,6 +153,10 @@ ServerConfig load_config(int argc, char* argv[]) {
     config.config_path = config_path;  // remembered for onboarding write-back
 
     // --- Pass 2: CLI overrides ---
+    // Whether the operator pinned a trust anchor on the command line. Pass 3
+    // leaves those alone when they did.
+    bool root_pubkey_from_cli = false;
+    bool genesis_pubkey_from_cli = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
@@ -183,8 +187,10 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.seed_peers.push_back(argv[++i]);
         } else if (std::strcmp(argv[i], "--root-pubkey") == 0 && i + 1 < argc) {
             config.root_pubkey = argv[++i];
+            root_pubkey_from_cli = true;
         } else if (std::strcmp(argv[i], "--genesis-pubkey") == 0 && i + 1 < argc) {
             config.genesis_pubkey = argv[++i];
+            genesis_pubkey_from_cli = true;
         } else if (std::strcmp(argv[i], "--rp-id") == 0 && i + 1 < argc) {
             config.rp_id = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-server") == 0 && i + 2 < argc) {
@@ -267,6 +273,12 @@ ServerConfig load_config(int argc, char* argv[]) {
     }
 
     // --- Pass 3: environment variable overrides ---
+    //
+    // The trust anchors are exempt from this pass when the operator named them
+    // on the command line. Everything else may be overridden by the
+    // environment, but letting an environment variable silently replace an
+    // explicitly pinned root or genesis key would redirect who this server
+    // trusts without the command that started it saying so.
     if (const char* v = std::getenv("SP_LOG_LEVEL"))   config.log_level   = v;
     if (const char* v = std::getenv("SP_HTTP_PORT"))    config.http_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_UDP_PORT"))     config.udp_port    = static_cast<uint16_t>(std::atoi(v));
@@ -277,8 +289,21 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_WG_INTERFACE")) config.wg_interface = v;
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
-    if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
-    if (const char* v = std::getenv("SP_GENESIS_PUBKEY")) config.genesis_pubkey = v;
+    if (const char* v = std::getenv("SP_ROOT_PUBKEY")) {
+        if (root_pubkey_from_cli) {
+            spdlog::warn("Config: ignoring SP_ROOT_PUBKEY — --root-pubkey was given explicitly");
+        } else {
+            config.root_pubkey = v;
+        }
+    }
+    if (const char* v = std::getenv("SP_GENESIS_PUBKEY")) {
+        if (genesis_pubkey_from_cli) {
+            spdlog::warn("Config: ignoring SP_GENESIS_PUBKEY — --genesis-pubkey was given "
+                         "explicitly");
+        } else {
+            config.genesis_pubkey = v;
+        }
+    }
     if (const char* v = std::getenv("SP_ONBOARD_TOKEN")) config.onboard_token = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
     if (const char* v = std::getenv("SP_RP_ID"))          config.rp_id       = v;

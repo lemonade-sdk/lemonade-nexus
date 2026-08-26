@@ -278,6 +278,9 @@ private:
     /// root via verify_cert_core (real issuer==root check + Ed25519 verify).
     [[nodiscard]] bool peer_certificate_is_root_signed(const std::string& pubkey) const;
 
+    /// Same check for callers that already hold peers_mutex_.
+    [[nodiscard]] bool peer_certificate_is_root_signed_locked(const std::string& pubkey) const;
+
     // Load the server certificate and root pubkey
     void load_server_certificate();
 

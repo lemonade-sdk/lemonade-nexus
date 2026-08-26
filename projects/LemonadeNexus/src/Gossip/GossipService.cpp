@@ -189,6 +189,17 @@ void GossipService::do_add_peer(std::string_view endpoint, std::string_view pubk
             chrono::system_clock::to_time_t(chrono::system_clock::now()));
         spdlog::debug("[{}] updated peer {} at {}", name(), pubkey, endpoint);
     } else {
+        // Peer exchange accepts entries from unauthenticated senders, so the
+        // table has to be bounded or a stranger can grow it without limit.
+        // Certified peers are the mesh and are never refused; uncertified ones
+        // share a cap. Refusing an unknown entry costs nothing: a real peer
+        // re-announces, and a certified one takes the branch above.
+        if (peers_.size() >= kMaxTrackedPeers &&
+            !peer_certificate_is_root_signed_locked(std::string(pubkey))) {
+            spdlog::debug("[{}] refusing peer {} — the peer table is at its cap of {}",
+                           name(), pubkey, kMaxTrackedPeers);
+            return;
+        }
         GossipPeer peer;
         peer.pubkey = std::string(pubkey);
         peer.endpoint = std::string(endpoint);
@@ -1306,12 +1317,17 @@ bool GossipService::peer_certificate_is_root_signed(const std::string& pubkey) c
     // certificate that (a) belongs to this pubkey, (b) is not revoked, and
     // (c) verifies against the configured root via verify_cert_core (real
     // issuer==root check + Ed25519 signature verify).
+    std::lock_guard lock(peers_mutex_);
+    return peer_certificate_is_root_signed_locked(pubkey);
+}
+
+bool GossipService::peer_certificate_is_root_signed_locked(const std::string& pubkey) const {
+    // Callers already hold peers_mutex_.
     if (!has_root_pubkey_) return false;
     if (pubkey.empty() || is_revoked(pubkey)) return false;
 
     std::string cert_json;
     {
-        std::lock_guard lock(peers_mutex_);
         auto it = std::find_if(peers_.begin(), peers_.end(),
             [&](const GossipPeer& p) { return p.pubkey == pubkey; });
         if (it == peers_.end() || it->certificate_json.empty()) return false;

@@ -23,10 +23,12 @@
 
 #include <asio.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
@@ -62,9 +64,17 @@ public:
 
     /// True when `node` is in the current epoch's frozen Tier 1 set. The mesh
     /// decided that; consumers only read it.
+    ///
+    /// Answered from a snapshot under a lock, NOT from the live EpochManager.
+    /// Callers reach this from other threads — the HTTP worker serving a DDNS
+    /// credential request is one — while the io thread destroys and rebuilds
+    /// that manager on every epoch activation. Reading it directly is a race.
+    /// The snapshot is refreshed on the io thread each tick, so it trails a
+    /// membership change by at most one tick.
     [[nodiscard]] bool is_current_member(const NodeId& node) const {
-        const EpochManager* epochs = runtime_.epochs();
-        return epochs != nullptr && epochs->current().tier1_members.contains(node);
+        std::lock_guard lock(members_mutex_);
+        return std::find(current_members_.begin(), current_members_.end(), node) !=
+               current_members_.end();
     }
     [[nodiscard]] SecurityRuntime& runtime() { return runtime_; }
 
@@ -140,6 +150,14 @@ private:
     asio::steady_timer timer_;
     std::chrono::steady_clock::time_point started_at_{};
     bool running_ = false;
+
+    /// Cross-thread view of current Tier 1 membership. Written on the io thread
+    /// by refresh_members(), read by is_current_member() from any thread.
+    mutable std::mutex members_mutex_;
+    std::vector<NodeId> current_members_;
+
+    /// Copy the live membership into the snapshot. io thread only.
+    void refresh_members();
 };
 
 }  // namespace nexus::security

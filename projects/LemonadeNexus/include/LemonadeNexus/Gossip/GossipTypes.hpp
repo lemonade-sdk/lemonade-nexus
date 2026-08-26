@@ -11,6 +11,12 @@ static constexpr uint16_t kGossipMagic   = 0x4C47; // "LG"
 static constexpr uint8_t  kGossipVersion = 0x01;
 static constexpr uint16_t kDefaultGossipPort = 9102;
 
+/// Cap on peers this node will track. Peer exchange takes entries from
+/// unauthenticated senders, so without a cap a stranger can grow the table
+/// until the process runs out of memory. A peer holding a root-signed
+/// certificate is mesh membership and is never refused by this cap.
+static constexpr std::size_t kMaxTrackedPeers = 512;
+
 enum class GossipMsgType : uint8_t {
     Digest        = 0x01,  // "here's my latest state"
     DeltaRequest  = 0x02,  // "send me deltas since seq N"

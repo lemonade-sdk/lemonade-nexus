@@ -75,7 +75,19 @@ void SecurityMeshService::on_start() {
         [this](const NodeId& peer) { driver_.on_peer(peer, now_ms()); });
 
     driver_.start(now_ms());
+    refresh_members();
     arm_timer();
+}
+
+void SecurityMeshService::refresh_members() {
+    // io thread only. Membership changes when an epoch activates, so copying it
+    // each tick keeps the cross-thread snapshot at most one tick stale.
+    std::vector<NodeId> members;
+    if (const EpochManager* epochs = runtime_.epochs(); epochs != nullptr) {
+        members = epochs->current().tier1_members.members();
+    }
+    std::lock_guard lock(members_mutex_);
+    current_members_ = std::move(members);
 }
 
 void SecurityMeshService::arm_timer() {
@@ -85,6 +97,7 @@ void SecurityMeshService::arm_timer() {
             return;
         }
         driver_.tick(now_ms());
+        refresh_members();
         arm_timer();
     });
 }
