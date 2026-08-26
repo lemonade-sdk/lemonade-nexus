@@ -85,6 +85,7 @@ add_nexus_test(test_security_policy
     security/policy/quorum.cpp
     security/policy/tier1_target.cpp
     security/policy/tier1_eligibility.cpp
+    security/policy/tier1_evidence.cpp
     security/policy/canonical_encoding.cpp)
 add_nexus_test(test_secure_buffer      test_secure_buffer.cpp)
 add_nexus_test(test_frost_provider     test_frost_provider.cpp)
@@ -110,7 +111,8 @@ add_nexus_test(test_security_transport
     security/transport/codec.cpp
     security/transport/router.cpp)
 add_nexus_test(test_security_lifecycle
-    security/lifecycle/driver.cpp)
+    security/lifecycle/driver.cpp
+    security/lifecycle/adversarial.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
