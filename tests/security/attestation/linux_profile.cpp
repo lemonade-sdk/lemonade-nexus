@@ -28,7 +28,7 @@ LinuxAttestationProfile base_profile() {
     profile.profile_version = 1;
     profile.snp.require_debug_disabled = true;
     profile.snp.require_no_migration_agent = true;
-    profile.snp.vmpl_policy = nexus::security::VmplPolicy::RequireVmpl0;
+    profile.vmpl_policy = nexus::security::VmplPolicy::RequireVmpl0;
     profile.snp.min_tcb = {2, 0, 6, 55};
     profile.snp.expected_measurement_hex = "aa11";
     profile.required_ak_spki_b64 = "QUsx";
@@ -52,8 +52,9 @@ const ProfileMutation kProfileMutations[] = {
      [](LinuxAttestationProfile& p) { p.snp.require_debug_disabled = false; }},
     {"snp.require_no_migration_agent",
      [](LinuxAttestationProfile& p) { p.snp.require_no_migration_agent = false; }},
-    {"snp.vmpl_policy", [](LinuxAttestationProfile& p) {
-         p.snp.vmpl_policy = nexus::security::VmplPolicy::RequireAboveVmpl0; }},
+    {"vmpl_policy", [](LinuxAttestationProfile& p) {
+         p.vmpl_policy = nexus::security::VmplPolicy::RequireAboveVmpl0; }},
+    {"vmpl_policy unchosen", [](LinuxAttestationProfile& p) { p.vmpl_policy.reset(); }},
     {"snp.min_tcb.bootloader", [](LinuxAttestationProfile& p) { p.snp.min_tcb.bootloader += 1; }},
     {"snp.min_tcb.tee", [](LinuxAttestationProfile& p) { p.snp.min_tcb.tee += 1; }},
     {"snp.min_tcb.snp", [](LinuxAttestationProfile& p) { p.snp.min_tcb.snp += 1; }},
@@ -172,7 +173,7 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
     // The HCL/paravisor shape. Not a global rule: an SVSM profile pins
     // RequireAboveVmpl0 instead, because there the guest is not the most
     // privileged component.
-    EXPECT_EQ(v1.snp.vmpl_policy, nexus::security::VmplPolicy::RequireVmpl0);
+    EXPECT_EQ(v1.vmpl_policy, nexus::security::VmplPolicy::RequireVmpl0);
 
     EXPECT_FALSE(profile_is_complete(v1));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoPinnedLaunchMeasurement));
@@ -256,3 +257,25 @@ TEST(LinuxAttestationProfileCompleteness, PinnedAkIsNotAProfilePrerequisite) {
 }
 
 }  // namespace
+
+// Unconstrained accepts a report requested at any privilege level. That may be
+// right for a self-probe; for Tier 1 it must be a decision. A profile that
+// never chose is incomplete, so forgetting cannot silently accept everything.
+TEST(LinuxAttestationProfileCompleteness, ATierOneProfileMustChooseAVmplPolicy) {
+    LinuxAttestationProfile profile = complete_profile();
+    ASSERT_TRUE(profile_is_complete(profile));
+
+    profile.vmpl_policy.reset();
+    EXPECT_FALSE(profile_is_complete(profile));
+    EXPECT_TRUE(has_gap(profile, ProfileGap::NoVmplPolicy));
+
+    // Choosing Unconstrained explicitly is a choice, so it completes.
+    profile.vmpl_policy = nexus::security::VmplPolicy::Unconstrained;
+    EXPECT_TRUE(profile_is_complete(profile));
+
+    // Chosen-Unconstrained and unchosen must not share a digest: a build that
+    // forgot could otherwise answer a challenge issued by one that decided.
+    LinuxAttestationProfile unchosen = profile;
+    unchosen.vmpl_policy.reset();
+    EXPECT_NE(profile_digest(unchosen), profile_digest(profile));
+}

@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/SnpVerify.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -44,6 +45,14 @@ struct LinuxAttestationProfile {
     /// list pins no boot state and leaves the prerequisite unproven.
     std::vector<std::pair<uint32_t, std::string>> expected_pcrs;
 
+    /// The VMPL rule this profile applies, copied into SnpPolicyRequirements
+    /// when evidence is examined.
+    ///
+    /// Unset is not a policy. Unconstrained accepts a report requested at any
+    /// level, which for Tier 1 must be a decision rather than an oversight, so
+    /// a profile that never chose is incomplete and refuses every candidate.
+    std::optional<VmplPolicy> vmpl_policy;
+
     bool require_no_new_privs{true};
     bool require_seccomp{true};
 
@@ -64,6 +73,7 @@ enum class ProfileGap : uint16_t {
     NoTcbFloor,
     NoApprovedBinary,
     NoImaPolicyDigest,
+    NoVmplPolicy,
     SecurityRulesetMismatch,
 };
 

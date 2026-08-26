@@ -32,6 +32,10 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
 
     EvidenceRequirements requirements;
     requirements.policy = profile_.snp;
+    // readiness() has already refused an unchosen policy, so the fallback is
+    // unreachable; it exists so no caller can read an uninitialised rule.
+    requirements.policy.vmpl_policy =
+        profile_.vmpl_policy.value_or(VmplPolicy::Unconstrained);
     requirements.expected_ak_spki_b64 = profile_.required_ak_spki_b64;
     requirements.require_ima = profile_.enforce_ima_policy;
     requirements.expected_pcrs = profile_.expected_pcrs;

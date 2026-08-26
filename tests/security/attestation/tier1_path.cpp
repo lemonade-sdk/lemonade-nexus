@@ -407,7 +407,7 @@ TEST_F(Tier1PathTest, NoProfileRelaxationSurvivesThePolicyDigestCheck) {
         {"migration agent allowed",
          [](LinuxAttestationProfile& p) { p.snp.require_no_migration_agent = false; }},
         {"vmpl policy relaxed", [](LinuxAttestationProfile& p) {
-             p.snp.vmpl_policy = nexus::security::VmplPolicy::Unconstrained; }},
+             p.vmpl_policy = nexus::security::VmplPolicy::Unconstrained; }},
         {"tcb floor lowered", [](LinuxAttestationProfile& p) { p.snp.min_tcb.microcode -= 1; }},
         {"ima policy not enforced",
          [](LinuxAttestationProfile& p) { p.enforce_ima_policy = false; }},

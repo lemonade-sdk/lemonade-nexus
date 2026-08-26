@@ -28,6 +28,8 @@ std::string_view profile_gap_name(ProfileGap gap) {
             return "no approved binary digest: no release can ever be approved";
         case ProfileGap::NoImaPolicyDigest:
             return "IMA enforcement is on but no policy digest is pinned";
+        case ProfileGap::NoVmplPolicy:
+            return "no VMPL policy chosen: which level may request a report is undecided";
         case ProfileGap::SecurityRulesetMismatch:
             return "profile security_ruleset is not the compiled ruleset";
     }
@@ -54,6 +56,9 @@ std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile) {
     if (profile.enforce_ima_policy && profile.ima_policy_digest == Digest{}) {
         gaps.push_back(ProfileGap::NoImaPolicyDigest);
     }
+    if (!profile.vmpl_policy.has_value()) {
+        gaps.push_back(ProfileGap::NoVmplPolicy);
+    }
     if (profile.security_ruleset != constants::kSecurityRulesetVersion) {
         gaps.push_back(ProfileGap::SecurityRulesetMismatch);
     }
@@ -73,8 +78,8 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     profile.snp.require_debug_disabled = true;
     profile.snp.require_no_migration_agent = true;
     // The HCL/paravisor shape: the paravisor owns VMPL0 and requests the
-    // report. A different provider pins a different level.
-    profile.snp.vmpl_policy = VmplPolicy::RequireVmpl0;
+    // report. A different provider chooses a different level.
+    profile.vmpl_policy = VmplPolicy::RequireVmpl0;
 
     profile.enforce_ima_policy = true;
     profile.require_no_new_privs = true;
@@ -94,7 +99,11 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
     // memory is hashed, so layout and padding cannot leak into the digest.
     add_bool(encoder, profile.snp.require_debug_disabled);
     add_bool(encoder, profile.snp.require_no_migration_agent);
-    encoder.add_u16(static_cast<uint16_t>(profile.snp.vmpl_policy));
+    // Encoded as "chosen or not" plus the choice, so a profile that never
+    // chose cannot share a digest with one that chose Unconstrained.
+    add_bool(encoder, profile.vmpl_policy.has_value());
+    encoder.add_u16(static_cast<uint16_t>(
+        profile.vmpl_policy.value_or(VmplPolicy::Unconstrained)));
     encoder.add_u16(profile.snp.min_tcb.bootloader);
     encoder.add_u16(profile.snp.min_tcb.tee);
     encoder.add_u16(profile.snp.min_tcb.snp);
