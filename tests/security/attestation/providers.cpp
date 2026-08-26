@@ -21,6 +21,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Policy/Tier1Evidence.hpp>
 
+#include "support/provider_conformance.hpp"
 #include "support/tpm_quote_fixtures.hpp"
 
 #include <gtest/gtest.h>
@@ -1002,4 +1003,48 @@ TEST(AmdRevocation, AForeignListCannotRevokeAnything) {
     EXPECT_FALSE(result.ok);
     EXPECT_NE(result.failure.find("no cached revocation list is signed"), std::string::npos)
         << result.failure;
+}
+
+// --- the shared provider contract ------------------------------------------------
+//
+// Every Tier 1-capable provider answers to the same set of refusals. A new
+// provider supplies a challenge, an answer and a verifier, and inherits the
+// contract without restating it.
+
+TEST_F(ProviderBoundaryTest, AzureSnpVtpmSatisfiesTheProviderContract) {
+    nexus_test::ConformanceSubject subject;
+    subject.name = "AzureSnpVtpmProvider";
+    subject.profile_id = AttestationProfileId::AzureSnpVtpm;
+    subject.verifier = [this] { return AttestationVerifier(profile_); };
+    subject.challenge = [this] { return issue(kTier1AttestationProfileId); };
+    subject.answer = [this](const AttestationChallenge& challenge) {
+        AttestationEvidence evidence = answer(challenge);
+        evidence.platform = real_platform_bundle();
+        sign(evidence);
+        return evidence;
+    };
+    subject.resign = [this](AttestationEvidence& evidence) { sign(evidence); };
+
+    nexus_test::run_provider_conformance(subject);
+}
+
+// The unimplemented providers are not Tier 1-capable in practice yet, but the
+// contract still holds for them: not ready means no claim and no pass.
+TEST_F(ProviderBoundaryTest, UnimplementedProvidersSatisfyTheContractByRefusing) {
+    for (const auto id : {AttestationProfileId::SnpSvsmVtpm,
+                          AttestationProfileId::SnpDirectBoot}) {
+        nexus_test::ConformanceSubject subject;
+        subject.name = std::string(nexus::security::attestation_profile_id_name(id));
+        subject.profile_id = id;
+        subject.verifier = [this] { return AttestationVerifier(profile_); };
+        subject.challenge = [this, id] { return issue(id); };
+        subject.answer = [this](const AttestationChallenge& challenge) {
+            AttestationEvidence evidence = answer(challenge);
+            sign(evidence);
+            return evidence;
+        };
+        subject.resign = [this](AttestationEvidence& evidence) { sign(evidence); };
+
+        nexus_test::run_provider_conformance(subject);
+    }
 }

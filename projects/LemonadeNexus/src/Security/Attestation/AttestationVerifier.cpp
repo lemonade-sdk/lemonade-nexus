@@ -131,6 +131,11 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return fail(AttestationFailure::ProviderUnknown);
     }
     verdict.policy_digest = provider->policy_digest();
+    // Named before any claim is set: a claim carried by a verdict that names no
+    // provider is a claim from nowhere, and platform_claims_are_consistent
+    // refuses the whole set for exactly that reason.
+    verdict.claims.profile_id = provider->profile_id();
+    verdict.claims.profile_ruleset = provider->profile_ruleset();
 
     // 2. The provider must be able to decide before anything is examined. A
     //    profile that pins nothing, or a provider with no implemented evidence
@@ -215,8 +220,6 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     }
 
     // The neutral claims. Each one names a check above that ran and held.
-    verdict.claims.profile_id = provider->profile_id();
-    verdict.claims.profile_ruleset = provider->profile_ruleset();
     verdict.claims.security_ruleset_binding_valid = true;
     verdict.claims.epoch_binding_valid = true;
     verdict.claims.node_identity_binding_valid = true;
