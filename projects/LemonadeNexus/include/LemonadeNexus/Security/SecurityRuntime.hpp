@@ -25,6 +25,9 @@ namespace nexus::security {
 
 struct SecurityRuntimeConfig {
     NodeId self;
+    /// The mesh this runtime belongs to. Bound into every attestation challenge
+    /// so evidence cannot cross networks.
+    NetworkId network_id{};
     std::filesystem::path consensus_directory;
     LinuxAttestationProfile profile;
 

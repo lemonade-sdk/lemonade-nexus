@@ -29,6 +29,7 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
       transport_(transport),
       runtime_(SecurityRuntimeConfig{
           .self = self_id(config),
+          .network_id = mesh_network_id(config),
           .consensus_directory = config.data_root / "security" / "consensus",
           .profile = config.profile,
           // No CRL cache exists yet, so revocation data is absent and new Tier 1

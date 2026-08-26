@@ -21,6 +21,12 @@ namespace nexus::security {
 
 /// The challenge the current Tier 1 set issues for one attestation attempt.
 struct AttestationChallenge {
+    /// Which mesh is asking. Transport authenticates the envelope, but transport
+    /// authentication is not trust: without this inside the signed context, a
+    /// node enrolled in one Nexus network could answer another network's
+    /// challenge with the same identity and the same platform.
+    NetworkId network_id{};
+
     Nonce nonce{};
     NodeId node_id{};
     crypto::Ed25519PublicKey node_key{};
@@ -46,6 +52,11 @@ struct AttestationChallenge {
 /// The bundle a candidate returns. It contains evidence only; it never
 /// contains a trusted eligibility result.
 struct AttestationEvidence {
+    /// The network this bundle was built for. Stated rather than inferred, so a
+    /// cross-network answer is diagnosed as such instead of surfacing as a
+    /// digest mismatch.
+    NetworkId network_id{};
+
     Digest challenge_digest{};
     NodeId node_id{};
     IncarnationId incarnation{};
@@ -110,6 +121,8 @@ enum class AttestationFailure : uint16_t {
     /// The hardware endorsement is revoked, or revocation data is missing or
     /// expired so the question cannot be answered. Both fail closed.
     EndorsementRevoked,
+    /// The bundle answers for a different Nexus network.
+    NetworkMismatch,
 };
 
 /// The bounded result of one verification. It states facts about one candidate

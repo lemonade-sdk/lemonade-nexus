@@ -29,6 +29,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -174,6 +175,7 @@ protected:
 
     [[nodiscard]] AttestationChallenge issue(AttestationProfileId id) const {
         AttestationChallenge challenge;
+        challenge.network_id = patterned<32>(0xA0);
         challenge.nonce = patterned<32>(0x11);
         challenge.node_id.bytes = patterned<32>(0x22);
         challenge.node_key = node_pk_;
@@ -189,6 +191,7 @@ protected:
 
     [[nodiscard]] static AttestationEvidence answer(const AttestationChallenge& challenge) {
         AttestationEvidence evidence;
+        evidence.network_id = challenge.network_id;
         evidence.challenge_digest = challenge_digest(challenge);
         evidence.node_id = challenge.node_id;
         evidence.incarnation = challenge.incarnation;
@@ -725,4 +728,89 @@ TEST_F(ProviderBoundaryTest, TheRevocationRequirementIsPartOfTheProfileIdentity)
     // The shipped Tier 1 profile demands it.
     EXPECT_TRUE(nexus::security::linux_attestation_profile_v1()
                     .require_endorsement_revocation);
+}
+
+// --- network separation --------------------------------------------------------
+//
+// Transport authenticates the envelope, but transport authentication is not
+// trust. Without network_id inside the signed attestation context, a node
+// enrolled in one Nexus network could answer another network's challenge with
+// the same identity, the same platform and the same fresh quote.
+
+TEST_F(ProviderBoundaryTest, TheNetworkIsBoundIntoTheChallengeDigest) {
+    const Digest base = challenge_digest(challenge_);
+    auto elsewhere = challenge_;
+    elsewhere.network_id = patterned<32>(0xB0);
+    ASSERT_NE(elsewhere.network_id, challenge_.network_id);
+    EXPECT_NE(challenge_digest(elsewhere), base);
+}
+
+TEST_F(ProviderBoundaryTest, TheNetworkIsBoundIntoTheSignedEvidenceDigest) {
+    const Digest base = evidence_signing_digest(evidence_);
+    auto elsewhere = evidence_;
+    elsewhere.network_id = patterned<32>(0xB0);
+    EXPECT_NE(evidence_signing_digest(elsewhere), base);
+}
+
+TEST_F(ProviderBoundaryTest, EvidenceForAnotherNetworkIsRejected) {
+    evidence_.network_id = patterned<32>(0xB0);
+    sign_evidence();
+
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::NetworkMismatch);
+    // Nothing the platform could prove is recorded: the answer was not for us.
+    EXPECT_FALSE(verdict.claims.hardware_confidentiality_valid);
+    EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
+              Tier1Eligibility::Ineligible);
+}
+
+// The whole point of binding the network: a bundle built correctly for another
+// mesh cannot be relabelled into this one, because the challenge it answered
+// committed to that mesh's identity. Re-signing does not help.
+TEST_F(ProviderBoundaryTest, CrossNetworkReplayFailsEvenWhenResigned) {
+    AttestationChallenge foreign = challenge_;
+    foreign.network_id = patterned<32>(0xB0);
+    AttestationEvidence for_foreign = answer(foreign);
+    sign(for_foreign);
+
+    // Straight replay: the bundle still names the other mesh.
+    EXPECT_EQ(AttestationVerifier(profile_).examine(challenge_, for_foreign).failure,
+              AttestationFailure::NetworkMismatch);
+
+    // Relabelled to this mesh and re-signed. The challenge digest it carries was
+    // computed under the other network's challenge, so it answers nothing here.
+    for_foreign.network_id = challenge_.network_id;
+    sign(for_foreign);
+    EXPECT_EQ(AttestationVerifier(profile_).examine(challenge_, for_foreign).failure,
+              AttestationFailure::ChallengeMismatch);
+}
+
+// Every field of the attestation context is separately bound. Changing any one
+// of them changes the digest a quote has to commit to.
+TEST_F(ProviderBoundaryTest, TheWholeAttestationContextIsBound) {
+    const Digest base = challenge_digest(challenge_);
+    struct Case {
+        const char* label;
+        std::function<void(AttestationChallenge&)> mutate;
+    };
+    const Case cases[] = {
+        {"network_id",       [](AttestationChallenge& c) { c.network_id[0] ^= 1; }},
+        {"profile_id",       [](AttestationChallenge& c) {
+             c.profile_id = AttestationProfileId::SnpSvsmVtpm; }},
+        {"profile_ruleset",  [](AttestationChallenge& c) { c.profile_ruleset += 1; }},
+        {"security_ruleset", [](AttestationChallenge& c) { c.security_ruleset += 1; }},
+        {"consensus_ruleset",[](AttestationChallenge& c) { c.consensus_ruleset += 1; }},
+        {"node_id",          [](AttestationChallenge& c) { c.node_id.bytes[0] ^= 1; }},
+        {"node_key",         [](AttestationChallenge& c) { c.node_key[0] ^= 1; }},
+        {"incarnation",      [](AttestationChallenge& c) { c.incarnation += 1; }},
+        {"epoch",            [](AttestationChallenge& c) { c.epoch += 1; }},
+        {"nonce",            [](AttestationChallenge& c) { c.nonce[0] ^= 1; }},
+        {"policy_digest",    [](AttestationChallenge& c) { c.policy_digest[0] ^= 1; }},
+    };
+    for (const auto& entry : cases) {
+        AttestationChallenge mutated = challenge_;
+        entry.mutate(mutated);
+        EXPECT_NE(challenge_digest(mutated), base) << entry.label;
+    }
 }

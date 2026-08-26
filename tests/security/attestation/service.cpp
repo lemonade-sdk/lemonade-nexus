@@ -20,6 +20,12 @@ NodeId node(uint8_t byte) {
     return id;
 }
 
+nexus::security::NetworkId network(uint8_t byte) {
+    nexus::security::NetworkId id{};
+    id.fill(byte);
+    return id;
+}
+
 nexus::crypto::Ed25519PublicKey key(uint8_t byte) {
     nexus::crypto::Ed25519PublicKey value{};
     value.fill(byte);
@@ -27,7 +33,7 @@ nexus::crypto::Ed25519PublicKey key(uint8_t byte) {
 }
 
 TEST(AttestationService, ChallengeBindsPolicyEpochAndIdentity) {
-    AttestationService service{LinuxAttestationProfile{}};
+    AttestationService service{network(0xA0), LinuxAttestationProfile{}};
     const auto challenge = service.create_challenge(node(0x01), key(0x11), 3, 9);
     ASSERT_TRUE(challenge.has_value());
     EXPECT_EQ(challenge->policy_digest, service.policy_digest());
@@ -44,7 +50,7 @@ TEST(AttestationService, ChallengeBindsPolicyEpochAndIdentity) {
 }
 
 TEST(AttestationService, BudgetBindsToNodeAndEpoch) {
-    AttestationService service{LinuxAttestationProfile{}};
+    AttestationService service{network(0xA0), LinuxAttestationProfile{}};
     for (uint32_t i = 0; i < constants::kMaxTier1AttestAttemptsPerEpoch; ++i) {
         EXPECT_TRUE(service.create_challenge(node(0x01), key(0x11), 1, 9).has_value());
     }
@@ -57,7 +63,7 @@ TEST(AttestationService, BudgetBindsToNodeAndEpoch) {
 }
 
 TEST(AttestationService, EvidenceWithoutChallengeFails) {
-    AttestationService service{LinuxAttestationProfile{}};
+    AttestationService service{network(0xA0), LinuxAttestationProfile{}};
     AttestationEvidence evidence;
     evidence.node_id = node(0x01);
     const auto verdict = service.receive_evidence(evidence);
@@ -70,6 +76,7 @@ TEST(AttestationService, EvidenceWithoutChallengeFails) {
 /// is empty, so the verdict fails later — consumption is what is under test.
 AttestationEvidence answer(const nexus::security::AttestationChallenge& challenge) {
     AttestationEvidence evidence;
+    evidence.network_id = challenge.network_id;
     evidence.challenge_digest = nexus::security::challenge_digest(challenge);
     evidence.node_id = challenge.node_id;
     evidence.incarnation = challenge.incarnation;
@@ -82,7 +89,7 @@ AttestationEvidence answer(const nexus::security::AttestationChallenge& challeng
 }
 
 TEST(AttestationService, ChallengeIsConsumedByOneAnswer) {
-    AttestationService service{LinuxAttestationProfile{}};
+    AttestationService service{network(0xA0), LinuxAttestationProfile{}};
     const auto challenge = service.create_challenge(node(0x01), key(0x11), 1, 9);
     ASSERT_TRUE(challenge.has_value());
 
@@ -102,7 +109,7 @@ TEST(AttestationService, ChallengeIsConsumedByOneAnswer) {
 // pending challenge, and the honest answer that follows would find nothing
 // outstanding — attestation denial of service by anyone who knows a node ID.
 TEST(AttestationService, StaleEvidenceDoesNotConsumeTheLiveChallenge) {
-    AttestationService service{LinuxAttestationProfile{}};
+    AttestationService service{network(0xA0), LinuxAttestationProfile{}};
     const auto stale = service.create_challenge(node(0x01), key(0x11), 1, 9);
     ASSERT_TRUE(stale.has_value());
     const AttestationEvidence stale_answer = answer(*stale);
@@ -120,6 +127,33 @@ TEST(AttestationService, StaleEvidenceDoesNotConsumeTheLiveChallenge) {
     const auto verdict = service.receive_evidence(answer(*live));
     EXPECT_NE(verdict.failure, AttestationFailure::ChallengeMismatch);
     EXPECT_TRUE(service.verdict(node(0x01)).has_value());
+}
+
+// Two meshes, one node identity, one platform. A bundle built for the first
+// mesh must not answer the second, and the answer must be diagnosable as a
+// cross-network attempt rather than as a replay.
+TEST(AttestationService, EvidenceDoesNotCrossNetworks) {
+    AttestationService here{network(0xA0), LinuxAttestationProfile{}};
+    AttestationService elsewhere{network(0xB0), LinuxAttestationProfile{}};
+    ASSERT_NE(here.network_id(), elsewhere.network_id());
+
+    const auto foreign = elsewhere.create_challenge(node(0x01), key(0x11), 1, 9);
+    ASSERT_TRUE(foreign.has_value());
+    const AttestationEvidence for_elsewhere = answer(*foreign);
+
+    // Our own challenge is outstanding for the same node, same incarnation,
+    // same epoch. Only the network differs.
+    const auto ours = here.create_challenge(node(0x01), key(0x11), 1, 9);
+    ASSERT_TRUE(ours.has_value());
+    EXPECT_EQ(ours->incarnation, foreign->incarnation);
+    EXPECT_EQ(ours->epoch, foreign->epoch);
+
+    EXPECT_EQ(here.receive_evidence(for_elsewhere).failure,
+              AttestationFailure::ChallengeMismatch);
+    // The foreign bundle answered nothing, so it consumed nothing.
+    EXPECT_FALSE(here.verdict(node(0x01)).has_value());
+    EXPECT_NE(here.receive_evidence(answer(*ours)).failure,
+              AttestationFailure::ChallengeMismatch);
 }
 
 }  // namespace

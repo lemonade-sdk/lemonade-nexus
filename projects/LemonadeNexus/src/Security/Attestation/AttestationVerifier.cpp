@@ -167,8 +167,15 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return fail(AttestationFailure::RulesetMismatch);
     }
 
-    // 6. The evidence must name the epoch the challenge was issued for. The
-    //    epoch is inside challenge_digest too, so step 7 would catch a wrong
+    // 6. The evidence must answer for this mesh. network_id is inside
+    //    challenge_digest, so step 8 would catch a foreign answer anyway, but
+    //    it would read as a replay. Naming it keeps the two apart.
+    if (evidence.network_id != challenge.network_id) {
+        return fail(AttestationFailure::NetworkMismatch);
+    }
+
+    // 7. The evidence must name the epoch the challenge was issued for. The
+    //    epoch is inside challenge_digest too, so step 8 would catch a wrong
     //    one anyway — but it would report a digest mismatch, which reads as a
     //    replay rather than as an answer from the wrong epoch. Naming it first
     //    keeps the two diagnosable apart.
@@ -176,22 +183,22 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return fail(AttestationFailure::EpochMismatch);
     }
 
-    // 7. The evidence must answer this challenge.
+    // 8. The evidence must answer this challenge.
     if (evidence.challenge_digest != challenge_digest(challenge)) {
         return fail(AttestationFailure::ChallengeMismatch);
     }
 
-    // 8. A valid attestation for node A must never authorize node B.
+    // 9. A valid attestation for node A must never authorize node B.
     if (evidence.node_id != challenge.node_id) {
         return fail(AttestationFailure::IdentityMismatch);
     }
 
-    // 9. Only the current incarnation may attest.
+    // 10. Only the current incarnation may attest.
     if (evidence.incarnation != challenge.incarnation) {
         return fail(AttestationFailure::IncarnationStale);
     }
 
-    // 10. Size bound before any hash or parse of the bundle. An oversized bundle
+    // 11. Size bound before any hash or parse of the bundle. An oversized bundle
     //    gets no evidence digest, so this failure stays cheap by construction.
     if (platform_evidence_size(evidence.platform) > kMaxPlatformEvidenceBytes) {
         return fail(AttestationFailure::EvidenceOversized);
@@ -199,7 +206,7 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
 
     verdict.evidence_digest = evidence_signing_digest(evidence);
 
-    // 11. The node identity binds the epoch vote key.
+    // 12. The node identity binds the epoch vote key.
     if (crypto_sign_verify_detached(evidence.identity_signature.data(),
                                     verdict.evidence_digest.data(),
                                     verdict.evidence_digest.size(),
@@ -215,7 +222,7 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     verdict.claims.node_identity_binding_valid = true;
     verdict.claims.incarnation_binding_valid = true;
 
-    // 12. The platform chain, whichever profile owns it.
+    // 13. The platform chain, whichever profile owns it.
     const PlatformVerification platform = provider->examine(challenge, evidence);
     verdict.claims.hardware_confidentiality_valid =
         platform.claims.hardware_confidentiality_valid;

@@ -10,6 +10,7 @@ namespace nexus::security {
 Digest challenge_digest(const AttestationChallenge& challenge) {
     CanonicalEncoder encoder(constants::kTier1AttestDomain);
     encoder.add_string("challenge");
+    encoder.add_bytes(challenge.network_id);
     encoder.add_bytes(challenge.nonce);
     encoder.add_bytes(challenge.node_id.bytes);
     encoder.add_bytes(challenge.node_key);
@@ -43,6 +44,7 @@ Digest platform_bundle_digest(const SnpVtpmEvidence& platform) {
 Digest evidence_signing_digest(const AttestationEvidence& evidence) {
     CanonicalEncoder encoder(constants::kTier1AttestDomain);
     encoder.add_string("evidence");
+    encoder.add_bytes(evidence.network_id);
     encoder.add_bytes(evidence.challenge_digest);
     encoder.add_bytes(evidence.node_id.bytes);
     encoder.add_u64(evidence.incarnation);

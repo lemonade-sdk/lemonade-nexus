@@ -21,8 +21,13 @@ namespace nexus::security {
 
 class AttestationService {
 public:
-    explicit AttestationService(LinuxAttestationProfile profile,
-                                AmdRevocationSource revocation = {});
+    /// `network_id` is stated, never defaulted: an all-zero network is a real
+    /// value, and a service that silently used one would accept a challenge
+    /// from any mesh that did the same.
+    AttestationService(NetworkId network_id, LinuxAttestationProfile profile,
+                       AmdRevocationSource revocation = {});
+
+    [[nodiscard]] const NetworkId& network_id() const { return network_id_; }
 
     /// Issues a fresh challenge for one attempt. Returns nullopt when the
     /// node spent its attestation budget for this epoch.
@@ -42,6 +47,7 @@ public:
     [[nodiscard]] uint32_t attempts(const NodeId& node, EpochId epoch) const;
 
 private:
+    NetworkId network_id_;
     LinuxAttestationProfile profile_;
     Digest policy_digest_;
     AttestationVerifier verifier_;

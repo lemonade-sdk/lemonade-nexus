@@ -115,6 +115,7 @@ private:
 void put_node(Writer& w, const NodeId& node) { w.fixed(node.bytes); }
 
 bool encode_challenge(Writer& w, const AttestationChallenge& c) {
+    w.fixed(c.network_id);
     w.fixed(c.nonce);
     put_node(w, c.node_id);
     w.fixed(c.node_key);
@@ -129,6 +130,7 @@ bool encode_challenge(Writer& w, const AttestationChallenge& c) {
 }
 
 bool encode_evidence(Writer& w, const AttestationEvidence& e) {
+    w.fixed(e.network_id);
     w.fixed(e.challenge_digest);
     put_node(w, e.node_id);
     w.u64(e.incarnation);
@@ -340,7 +342,8 @@ bool get_profile_id(Reader& r, AttestationProfileId& id) {
 }
 
 bool decode_challenge(Reader& r, AttestationChallenge& c) {
-    return r.fixed(c.nonce) && get_node(r, c.node_id) && r.fixed(c.node_key) &&
+    return r.fixed(c.network_id) && r.fixed(c.nonce) && get_node(r, c.node_id) &&
+           r.fixed(c.node_key) &&
            r.u64(c.incarnation) && r.u64(c.epoch) && r.u16(c.security_ruleset) &&
            r.u16(c.consensus_ruleset) && get_profile_id(r, c.profile_id) &&
            r.u16(c.profile_ruleset) && r.fixed(c.policy_digest);
@@ -348,7 +351,8 @@ bool decode_challenge(Reader& r, AttestationChallenge& c) {
 
 bool decode_evidence(Reader& r, AttestationEvidence& e) {
     std::vector<uint8_t> platform;
-    if (!(r.fixed(e.challenge_digest) && get_node(r, e.node_id) && r.u64(e.incarnation) &&
+    if (!(r.fixed(e.network_id) && r.fixed(e.challenge_digest) &&
+          get_node(r, e.node_id) && r.u64(e.incarnation) &&
           r.u64(e.epoch) && r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) &&
           get_profile_id(r, e.profile_id) && r.u16(e.profile_ruleset) &&
           r.fixed(e.epoch_vote_key) &&

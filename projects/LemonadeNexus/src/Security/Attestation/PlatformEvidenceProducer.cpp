@@ -72,6 +72,7 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     }
 
     AttestationEvidence evidence;
+    evidence.network_id = challenge.network_id;
     evidence.challenge_digest = challenge_digest(challenge);
     evidence.node_id.bytes = sources_.identity.public_key;
     evidence.incarnation = challenge.incarnation;

@@ -6,9 +6,10 @@
 
 namespace nexus::security {
 
-AttestationService::AttestationService(LinuxAttestationProfile profile,
+AttestationService::AttestationService(NetworkId network_id, LinuxAttestationProfile profile,
                                        AmdRevocationSource revocation)
-    : profile_(std::move(profile)),
+    : network_id_(network_id),
+      profile_(std::move(profile)),
       policy_digest_(profile_digest(profile_)),
       verifier_(profile_, std::move(revocation)) {}
 
@@ -22,6 +23,7 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     ++used;
 
     AttestationChallenge challenge;
+    challenge.network_id = network_id_;
     randombytes_buf(challenge.nonce.data(), challenge.nonce.size());
     challenge.node_id = node;
     challenge.node_key = node_key;
