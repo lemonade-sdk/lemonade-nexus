@@ -51,6 +51,16 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
         return std::nullopt;
     }
 
+    // This producer builds one evidence format. A challenge naming any other
+    // profile goes unanswered rather than being answered with the wrong shape.
+    if (challenge.profile_id != kTier1AttestationProfileId ||
+        challenge.profile_ruleset != kAttestationProfileRulesetVersion) {
+        spdlog::debug("[producer] challenge names profile {} ruleset {}; not answered",
+                      attestation_profile_id_name(challenge.profile_id),
+                      challenge.profile_ruleset);
+        return std::nullopt;
+    }
+
     // No vote key, no attestation. Nothing is fabricated.
     std::optional<crypto::Ed25519PublicKey> vote_key;
     if (sources_.vote_key_for_epoch) {
@@ -68,6 +78,8 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     evidence.epoch = challenge.epoch;
     evidence.security_ruleset = constants::kSecurityRulesetVersion;
     evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
+    evidence.profile_id = challenge.profile_id;
+    evidence.profile_ruleset = challenge.profile_ruleset;
     evidence.epoch_vote_key = *vote_key;
     evidence.platform = platform_bundle(evidence.challenge_digest);
 

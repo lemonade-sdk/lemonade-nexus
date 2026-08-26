@@ -11,9 +11,11 @@ namespace {
 
 Tier1EvidenceState all_valid() {
     Tier1EvidenceState state;
+    state.platform_profile_valid = true;
     state.node_identity_valid = true;
     state.certificate_valid = true;
     state.snp_valid = true;
+    state.tcb_valid = true;
     state.vtpm_valid = true;
     state.quote_fresh = true;
     state.boot_state_valid = true;
@@ -33,9 +35,11 @@ struct FieldCase {
 };
 
 constexpr FieldCase kFields[] = {
+    {Tier1Prerequisite::PlatformProfile, &Tier1EvidenceState::platform_profile_valid},
     {Tier1Prerequisite::NodeIdentity, &Tier1EvidenceState::node_identity_valid},
     {Tier1Prerequisite::Certificate, &Tier1EvidenceState::certificate_valid},
     {Tier1Prerequisite::ConfidentialCompute, &Tier1EvidenceState::snp_valid},
+    {Tier1Prerequisite::PlatformTcb, &Tier1EvidenceState::tcb_valid},
     {Tier1Prerequisite::Vtpm, &Tier1EvidenceState::vtpm_valid},
     {Tier1Prerequisite::AttestationFreshness, &Tier1EvidenceState::quote_fresh},
     {Tier1Prerequisite::BootState, &Tier1EvidenceState::boot_state_valid},
@@ -57,7 +61,7 @@ TEST(Tier1Eligibility, DefaultStateIsIneligible) {
     // Fail closed: evidence that was never collected is failed evidence.
     const Tier1EvidenceState state;
     EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
-    EXPECT_EQ(Tier1EligibilityPolicy::failed_prerequisites(state).size(), 13u);
+    EXPECT_EQ(Tier1EligibilityPolicy::failed_prerequisites(state).size(), 15u);
 }
 
 TEST(Tier1Eligibility, AnySingleFailedPrerequisiteGivesIneligible) {

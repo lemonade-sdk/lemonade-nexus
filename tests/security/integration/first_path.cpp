@@ -54,6 +54,7 @@ AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch) {
 
 Tier1EvidenceState all_prerequisites_pass() {
     Tier1EvidenceState state;
+    state.platform_profile_valid = state.tcb_valid = true;
     state.node_identity_valid = state.certificate_valid = true;
     state.snp_valid = state.vtpm_valid = state.quote_fresh = true;
     state.boot_state_valid = state.binary_valid = state.ima_valid = true;

@@ -7,7 +7,9 @@
 namespace nexus::security {
 
 AttestationService::AttestationService(LinuxAttestationProfile profile)
-    : profile_(std::move(profile)), policy_digest_(profile_digest(profile_)) {}
+    : profile_(std::move(profile)),
+      policy_digest_(profile_digest(profile_)),
+      verifier_(profile_) {}
 
 std::optional<AttestationChallenge> AttestationService::create_challenge(
     const NodeId& node, const crypto::Ed25519PublicKey& node_key,
@@ -25,6 +27,11 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     challenge.incarnation = incarnation;
     challenge.epoch = epoch;
     challenge.security_ruleset = constants::kSecurityRulesetVersion;
+    challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
+    // The challenge names the profile. A candidate answers under this one or it
+    // answers nothing: there is no negotiation and no weaker second choice.
+    challenge.profile_id = kTier1AttestationProfileId;
+    challenge.profile_ruleset = kAttestationProfileRulesetVersion;
     challenge.policy_digest = policy_digest_;
 
     // A new challenge replaces any unanswered one: only the latest is live.
@@ -33,20 +40,29 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
 }
 
 AttestationVerdict AttestationService::receive_evidence(const AttestationEvidence& evidence) {
+    AttestationVerdict rejected;
+    rejected.node_id = evidence.node_id;
+    rejected.incarnation = evidence.incarnation;
+    rejected.epoch = evidence.epoch;
+    rejected.policy_digest = policy_digest_;
+    rejected.failure = AttestationFailure::ChallengeMismatch;
+
     const auto pending = pending_.find(evidence.node_id);
     if (pending == pending_.end()) {
-        AttestationVerdict verdict;
-        verdict.node_id = evidence.node_id;
-        verdict.incarnation = evidence.incarnation;
-        verdict.policy_digest = policy_digest_;
-        verdict.passed = false;
-        verdict.failure = AttestationFailure::ChallengeMismatch;
-        return verdict;
+        return rejected;
+    }
+
+    // The challenge is one-shot, but only a bundle that actually answers it may
+    // consume it. A stale or hostile bundle that names the right node otherwise
+    // cancels the live challenge, and the honest answer that follows then finds
+    // nothing pending. Match first, consume second.
+    if (evidence.challenge_digest != challenge_digest(pending->second)) {
+        return rejected;
     }
     const AttestationChallenge challenge = pending->second;
     pending_.erase(pending);
 
-    AttestationVerdict verdict = verifier_.examine(challenge, evidence, profile_);
+    AttestationVerdict verdict = verifier_.examine(challenge, evidence);
     verdicts_[evidence.node_id] = verdict;
     return verdict;
 }

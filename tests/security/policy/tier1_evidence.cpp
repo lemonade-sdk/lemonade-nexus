@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <utility>
 
 using nexus::security::AttestationFailure;
 using nexus::security::AttestationVerdict;
@@ -24,22 +25,29 @@ using nexus::security::tier1_prerequisite_name;
 
 namespace {
 
-/// A verdict with every attestation link proved.
+/// A verdict with every platform claim proved by an approved provider.
 AttestationVerdict complete_verdict() {
     AttestationVerdict verdict;
     verdict.passed = true;
     verdict.failure = AttestationFailure::None;
     verdict.epoch = 7;
     verdict.incarnation = 3;
-    verdict.links.identity_signature_valid = true;
-    verdict.links.snp_signature_valid = true;
-    verdict.links.snp_policy_valid = true;
-    verdict.links.vtpm_bound = true;
-    verdict.links.quote_fresh = true;
-    verdict.links.boot_state_valid = true;
-    verdict.links.ima_anchored = true;
-    verdict.links.binary_approved = true;
-    verdict.links.runtime_profile_valid = true;
+    verdict.claims.profile_id = nexus::security::kTier1AttestationProfileId;
+    verdict.claims.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
+    verdict.claims.hardware_confidentiality_valid = true;
+    verdict.claims.platform_identity_valid = true;
+    verdict.claims.evidence_freshness_valid = true;
+    verdict.claims.node_identity_binding_valid = true;
+    verdict.claims.incarnation_binding_valid = true;
+    verdict.claims.epoch_binding_valid = true;
+    verdict.claims.security_ruleset_binding_valid = true;
+    verdict.claims.boot_integrity_valid = true;
+    verdict.claims.tcb_valid = true;
+    verdict.claims.attestation_profile_valid = true;
+    verdict.claims.ima_anchored = true;
+    verdict.claims.binary_approved = true;
+    verdict.claims.runtime_profile_enforced = true;
+    verdict.claims.runtime_integrity_valid = true;
     return verdict;
 }
 
@@ -98,42 +106,76 @@ TEST(Tier1Evidence, NoPrerequisiteIsInferredFromPassed) {
     EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
 }
 
-TEST(Tier1Evidence, EveryAttestationLinkIsSeparatelyRequired) {
+TEST(Tier1Evidence, EveryPlatformClaimIsSeparatelyRequired) {
     const auto facts = complete_facts();
-    {
-        auto v = complete_verdict(); v.links.identity_signature_valid = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::NodeIdentity));
+    struct Case {
+        const char* label;
+        bool nexus::security::VerifiedPlatformClaims::* claim;
+        Tier1Prerequisite prerequisite;
+    };
+    using Claims = nexus::security::VerifiedPlatformClaims;
+    const Case cases[] = {
+        {"profile", &Claims::attestation_profile_valid, Tier1Prerequisite::PlatformProfile},
+        {"ruleset", &Claims::security_ruleset_binding_valid,
+         Tier1Prerequisite::PlatformProfile},
+        {"identity", &Claims::node_identity_binding_valid, Tier1Prerequisite::NodeIdentity},
+        {"snp", &Claims::hardware_confidentiality_valid,
+         Tier1Prerequisite::ConfidentialCompute},
+        {"tcb", &Claims::tcb_valid, Tier1Prerequisite::PlatformTcb},
+        {"vtpm", &Claims::platform_identity_valid, Tier1Prerequisite::Vtpm},
+        {"freshness", &Claims::evidence_freshness_valid,
+         Tier1Prerequisite::AttestationFreshness},
+        {"boot", &Claims::boot_integrity_valid, Tier1Prerequisite::BootState},
+        {"epoch binding", &Claims::epoch_binding_valid, Tier1Prerequisite::Epoch},
+        {"incarnation binding", &Claims::incarnation_binding_valid,
+         Tier1Prerequisite::Incarnation},
+    };
+    for (const auto& entry : cases) {
+        auto v = complete_verdict();
+        v.claims.*entry.claim = false;
+        EXPECT_TRUE(fails(v, facts, entry.prerequisite)) << entry.label;
+        EXPECT_EQ(tier1_eligibility(v, facts), Tier1Eligibility::Ineligible) << entry.label;
     }
-    {   // Either half of the SNP proof is enough to lose it.
-        auto v = complete_verdict(); v.links.snp_signature_valid = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::ConfidentialCompute));
-        v = complete_verdict(); v.links.snp_policy_valid = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::ConfidentialCompute));
+}
+
+// The three runtime prerequisites are separate. One composite runtime claim
+// cannot tell them apart, so each sub-fact is dropped with the composite.
+TEST(Tier1Evidence, EachRuntimeStepIsSeparatelyRequired) {
+    const auto facts = complete_facts();
+    using Claims = nexus::security::VerifiedPlatformClaims;
+    const std::pair<bool Claims::*, Tier1Prerequisite> steps[] = {
+        {&Claims::ima_anchored, Tier1Prerequisite::RuntimeMeasurements},
+        {&Claims::binary_approved, Tier1Prerequisite::NexusBinary},
+        {&Claims::runtime_profile_enforced, Tier1Prerequisite::RuntimeSecurityProfile},
+    };
+    for (const auto& [field, prerequisite] : steps) {
+        auto v = complete_verdict();
+        v.claims.*field = false;
+        v.claims.runtime_integrity_valid = false;  // the conjunction follows
+        EXPECT_TRUE(fails(v, facts, prerequisite));
+        EXPECT_EQ(tier1_eligibility(v, facts), Tier1Eligibility::Ineligible);
     }
-    {
-        auto v = complete_verdict(); v.links.vtpm_bound = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::Vtpm));
-    }
-    {
-        auto v = complete_verdict(); v.links.quote_fresh = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::AttestationFreshness));
-    }
-    {
-        auto v = complete_verdict(); v.links.boot_state_valid = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::BootState));
-    }
-    {
-        auto v = complete_verdict(); v.links.binary_approved = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::NexusBinary));
-    }
-    {
-        auto v = complete_verdict(); v.links.ima_anchored = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::RuntimeMeasurements));
-    }
-    {
-        auto v = complete_verdict(); v.links.runtime_profile_valid = false;
-        EXPECT_TRUE(fails(v, facts, Tier1Prerequisite::RuntimeSecurityProfile));
-    }
+}
+
+// A provider that reports runtime integrity without the steps behind it is
+// broken, not persuasive. Its whole claim set is refused rather than trusted
+// in part.
+TEST(Tier1Evidence, InconsistentClaimsProveNothing) {
+    auto v = complete_verdict();
+    v.claims.ima_anchored = false;  // runtime_integrity_valid stays true
+
+    const Tier1EvidenceState state = tier1_evidence_state(v, complete_facts());
+    EXPECT_EQ(Tier1EligibilityPolicy::failed_prerequisites(state).size(), 15u);
+    EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
+}
+
+// Claims with no provider behind them are claims from nowhere.
+TEST(Tier1Evidence, ClaimsWithoutAProviderProveNothing) {
+    auto v = complete_verdict();
+    v.claims.profile_id = nexus::security::AttestationProfileId::Unknown;
+
+    const Tier1EvidenceState state = tier1_evidence_state(v, complete_facts());
+    EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
 }
 
 TEST(Tier1Evidence, EveryMeshFactIsSeparatelyRequired) {
@@ -197,7 +239,8 @@ TEST(Tier1Evidence, UnproducedPrerequisitesKeepANodeIneligible) {
 }
 
 TEST(Tier1Evidence, EveryPrerequisiteNamesItself) {
-    for (const auto p : {Tier1Prerequisite::NodeIdentity, Tier1Prerequisite::Certificate,
+    for (const auto p : {Tier1Prerequisite::PlatformProfile, Tier1Prerequisite::PlatformTcb,
+                         Tier1Prerequisite::NodeIdentity, Tier1Prerequisite::Certificate,
                          Tier1Prerequisite::ConfidentialCompute, Tier1Prerequisite::Vtpm,
                          Tier1Prerequisite::AttestationFreshness, Tier1Prerequisite::BootState,
                          Tier1Prerequisite::NexusBinary, Tier1Prerequisite::RuntimeMeasurements,

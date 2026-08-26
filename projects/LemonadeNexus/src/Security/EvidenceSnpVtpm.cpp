@@ -547,6 +547,7 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
         return deny(std::move(v), "platform policy check failed: " + pol.failure);
     }
     v.snp_policy_valid = true;
+    v.tcb_valid = hcl->snp.reported_tcb.at_least(policy.min_tcb);
 
     // --- the enrolled vTPM, when one was pinned ------------------------------
     if (!req.expected_ak_spki_b64.empty()) {

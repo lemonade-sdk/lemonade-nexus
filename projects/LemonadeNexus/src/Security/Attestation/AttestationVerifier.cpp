@@ -1,11 +1,15 @@
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 
+#include <LemonadeNexus/Security/Attestation/Providers/AzureSnpVtpmProvider.hpp>
+#include <LemonadeNexus/Security/Attestation/Providers/SnpDirectBootProvider.hpp>
+#include <LemonadeNexus/Security/Attestation/Providers/SnpSvsmVtpmProvider.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <sodium.h>
 
 #include <algorithm>
 #include <string_view>
+#include <utility>
 
 namespace nexus::security {
 
@@ -72,14 +76,39 @@ AttestationFailure map_platform_failure(const EvidenceVerdict& verdict) {
     return AttestationFailure::ImaMeasurementInvalid;
 }
 
+ProviderSet compiled_providers(LinuxAttestationProfile profile) {
+    ProviderSet providers;
+    providers.push_back(std::make_shared<AzureSnpVtpmProvider>(std::move(profile)));
+    providers.push_back(std::make_shared<SnpSvsmVtpmProvider>());
+    providers.push_back(std::make_shared<SnpDirectBootProvider>());
+    return providers;
+}
+
+AttestationVerifier::AttestationVerifier(LinuxAttestationProfile profile)
+    : providers_(compiled_providers(std::move(profile))) {}
+
+AttestationVerifier::AttestationVerifier(ProviderSet providers)
+    : providers_(std::move(providers)) {}
+
+const PlatformEvidenceProvider* AttestationVerifier::provider_for(
+    AttestationProfileId id) const {
+    if (id == AttestationProfileId::Unknown) {
+        return nullptr;
+    }
+    for (const auto& provider : providers_) {
+        if (provider && provider->profile_id() == id) {
+            return provider.get();
+        }
+    }
+    return nullptr;
+}
+
 AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& challenge,
-                                                const AttestationEvidence& evidence,
-                                                const LinuxAttestationProfile& profile) const {
+                                                 const AttestationEvidence& evidence) const {
     AttestationVerdict verdict;
     verdict.node_id = challenge.node_id;
     verdict.epoch = challenge.epoch;
     verdict.incarnation = challenge.incarnation;
-    verdict.policy_digest = profile_digest(profile);
 
     const auto fail = [&verdict](AttestationFailure failure) {
         verdict.passed = false;
@@ -87,28 +116,53 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return verdict;
     };
 
-    // 0. The profile must be able to decide. A profile that pins no launch
-    // measurement, no TCB floor or no approved binary would accept a platform
-    // it never examined, so an incomplete profile rejects everyone. This runs
-    // first: no later check means anything under a policy that decides nothing.
-    if (!profile_is_complete(profile)) {
-        return fail(AttestationFailure::ProfileIncomplete);
+    // 1. One compiled provider must own this profile. An unknown ID has none,
+    //    which is how a profile this binary does not implement fails closed.
+    const PlatformEvidenceProvider* provider = provider_for(challenge.profile_id);
+    if (provider == nullptr) {
+        // No provider ran, so no policy was applied. The digest stays empty
+        // rather than echoing what the challenge asked for.
+        return fail(AttestationFailure::ProviderUnknown);
+    }
+    verdict.policy_digest = provider->policy_digest();
+
+    // 2. The provider must be able to decide before anything is examined. A
+    //    profile that pins nothing, or a provider with no implemented evidence
+    //    format, would otherwise accept a platform it never looked at.
+    if (const auto refusal = provider->readiness(); refusal.has_value()) {
+        return fail(*refusal);
     }
 
-    // 1. The challenge must be for THIS compiled policy.
-    if (challenge.policy_digest != verdict.policy_digest) {
+    // 3. The bundle must answer under the profile the challenge named. Without
+    //    this, evidence built for a weaker provider could answer a stronger
+    //    challenge, which is the downgrade path of 1.1 section 31.
+    if (evidence.profile_id != challenge.profile_id) {
+        return fail(AttestationFailure::ProfileIdMismatch);
+    }
+    if (challenge.profile_ruleset != provider->profile_ruleset() ||
+        evidence.profile_ruleset != provider->profile_ruleset()) {
+        return fail(AttestationFailure::ProfileRulesetMismatch);
+    }
+
+    // 4. Same profile, same pinned values. A challenge issued under another
+    //    build of this profile applies a different bar, and this verifier
+    //    cannot evaluate it. Ahead of the challenge digest deliberately: the
+    //    digest would fail too, but "wrong policy" is the useful diagnosis.
+    if (challenge.policy_digest != provider->policy_digest()) {
         return fail(AttestationFailure::RulesetMismatch);
     }
+    verdict.claims.attestation_profile_valid = true;
 
-    // 2. Both sides must run the compiled rulesets.
+    // 5. Both sides must run the compiled rulesets.
     if (challenge.security_ruleset != constants::kSecurityRulesetVersion ||
+        challenge.consensus_ruleset != constants::kConsensusRulesetVersion ||
         evidence.security_ruleset != constants::kSecurityRulesetVersion ||
         evidence.consensus_ruleset != constants::kConsensusRulesetVersion) {
         return fail(AttestationFailure::RulesetMismatch);
     }
 
-    // 3. The evidence must name the epoch the challenge was issued for. The
-    //    epoch is inside challenge_digest too, so check 4 would catch a wrong
+    // 6. The evidence must name the epoch the challenge was issued for. The
+    //    epoch is inside challenge_digest too, so step 7 would catch a wrong
     //    one anyway — but it would report a digest mismatch, which reads as a
     //    replay rather than as an answer from the wrong epoch. Naming it first
     //    keeps the two diagnosable apart.
@@ -116,77 +170,68 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return fail(AttestationFailure::EpochMismatch);
     }
 
-    // 4. The evidence must answer this challenge.
+    // 7. The evidence must answer this challenge.
     if (evidence.challenge_digest != challenge_digest(challenge)) {
         return fail(AttestationFailure::ChallengeMismatch);
     }
 
-    // 4. A valid attestation for node A must never authorize node B.
+    // 8. A valid attestation for node A must never authorize node B.
     if (evidence.node_id != challenge.node_id) {
         return fail(AttestationFailure::IdentityMismatch);
     }
 
-    // 5. Only the current incarnation may attest.
+    // 9. Only the current incarnation may attest.
     if (evidence.incarnation != challenge.incarnation) {
         return fail(AttestationFailure::IncarnationStale);
     }
 
-    // 6. Size bound before any hash or parse of the bundle (architecture 7.3).
-    //    An oversized bundle gets no evidence digest, so this failure stays
-    //    cheap by construction.
+    // 10. Size bound before any hash or parse of the bundle. An oversized bundle
+    //    gets no evidence digest, so this failure stays cheap by construction.
     if (platform_evidence_size(evidence.platform) > kMaxPlatformEvidenceBytes) {
         return fail(AttestationFailure::EvidenceOversized);
     }
 
     verdict.evidence_digest = evidence_signing_digest(evidence);
 
-    // 7. The node identity binds the epoch vote key (architecture 11.2).
+    // 11. The node identity binds the epoch vote key.
     if (crypto_sign_verify_detached(evidence.identity_signature.data(),
                                     verdict.evidence_digest.data(),
                                     verdict.evidence_digest.size(),
                                     challenge.node_key.data()) != 0) {
         return fail(AttestationFailure::IdentitySignatureInvalid);
     }
-    verdict.links.identity_signature_valid = true;
 
-    // 8. The platform chain: SNP -> vTPM -> quote -> measured runtime. The
-    //    quote nonce is the challenge digest, so the quote answers THIS
-    //    challenge as THIS identity.
-    EvidenceRequirements requirements;
-    requirements.policy = profile.snp;
-    requirements.expected_ak_spki_b64 = profile.required_ak_spki_b64;
-    requirements.require_ima = profile.enforce_ima_policy;
-    requirements.expected_pcrs = profile.expected_pcrs;
-    requirements.require_no_new_privs = profile.require_no_new_privs;
-    requirements.require_seccomp = profile.require_seccomp;
-    if (profile.enforce_ima_policy && profile.ima_policy_digest != Digest{}) {
-        requirements.expected_ima_policy_sha256 = hex_of(profile.ima_policy_digest);
+    // The neutral claims. Each one names a check above that ran and held.
+    verdict.claims.profile_id = provider->profile_id();
+    verdict.claims.profile_ruleset = provider->profile_ruleset();
+    verdict.claims.security_ruleset_binding_valid = true;
+    verdict.claims.epoch_binding_valid = true;
+    verdict.claims.node_identity_binding_valid = true;
+    verdict.claims.incarnation_binding_valid = true;
+
+    // 12. The platform chain, whichever profile owns it.
+    const PlatformVerification platform = provider->examine(challenge, evidence);
+    verdict.claims.hardware_confidentiality_valid =
+        platform.claims.hardware_confidentiality_valid;
+    verdict.claims.platform_identity_valid   = platform.claims.platform_identity_valid;
+    verdict.claims.evidence_freshness_valid  = platform.claims.evidence_freshness_valid;
+    verdict.claims.boot_integrity_valid      = platform.claims.boot_integrity_valid;
+    verdict.claims.runtime_integrity_valid   = platform.claims.runtime_integrity_valid;
+    verdict.claims.tcb_valid                 = platform.claims.tcb_valid;
+    verdict.claims.ima_anchored              = platform.claims.ima_anchored;
+    verdict.claims.binary_approved           = platform.claims.binary_approved;
+    verdict.claims.runtime_profile_enforced  = platform.claims.runtime_profile_enforced;
+
+    if (platform.failure != AttestationFailure::None) {
+        return fail(platform.failure);
     }
 
-    const EvidenceVerdict platform = verify_snp_vtpm_evidence(
-        evidence.platform, evidence.challenge_digest, challenge.node_key, requirements);
-
-    // Record what the platform proved even on the failing path: a caller
-    // building a Tier 1 state needs the links that DID hold, and the ones that
-    // did not stay false.
-    verdict.links.snp_signature_valid    = platform.snp_signature_valid;
-    verdict.links.snp_policy_valid       = platform.snp_policy_valid;
-    verdict.links.vtpm_bound             = platform.ak_bound_to_report;
-    verdict.links.quote_fresh            = platform.quote_bound_to_challenge;
-    verdict.links.boot_state_valid       = platform.boot_state_valid;
-    verdict.links.ima_anchored           = platform.ima_anchored;
-    verdict.links.runtime_profile_valid  = platform.runtime_profile_valid;
-
-    if (!platform.ok) {
-        return fail(map_platform_failure(platform));
+    // A provider that returns no failure but inconsistent claims has a bug
+    // rather than a proof. Trusting it would let a required claim be true with
+    // nothing behind it, so the verdict refuses instead.
+    if (!platform_claims_are_consistent(verdict.claims)) {
+        return fail(AttestationFailure::ProviderUnsupported);
     }
-
-    // 9. The IMA-anchored binary must be on the approved release list. The
-    //    platform chain has no list input, so the check lives here.
-    if (!binary_approved(profile, platform.binary_sha256)) {
-        return fail(AttestationFailure::BinaryMeasurementInvalid);
-    }
-    verdict.links.binary_approved = true;
 
     verdict.passed = true;
     verdict.failure = AttestationFailure::None;

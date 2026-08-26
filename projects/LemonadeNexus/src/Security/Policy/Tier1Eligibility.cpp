@@ -10,9 +10,11 @@ struct PrerequisiteCheck {
 };
 
 constexpr PrerequisiteCheck kChecks[] = {
+    {Tier1Prerequisite::PlatformProfile, &Tier1EvidenceState::platform_profile_valid},
     {Tier1Prerequisite::NodeIdentity, &Tier1EvidenceState::node_identity_valid},
     {Tier1Prerequisite::Certificate, &Tier1EvidenceState::certificate_valid},
     {Tier1Prerequisite::ConfidentialCompute, &Tier1EvidenceState::snp_valid},
+    {Tier1Prerequisite::PlatformTcb, &Tier1EvidenceState::tcb_valid},
     {Tier1Prerequisite::Vtpm, &Tier1EvidenceState::vtpm_valid},
     {Tier1Prerequisite::AttestationFreshness, &Tier1EvidenceState::quote_fresh},
     {Tier1Prerequisite::BootState, &Tier1EvidenceState::boot_state_valid},

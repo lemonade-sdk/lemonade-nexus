@@ -64,6 +64,9 @@ protected:
         challenge_.incarnation = 3;
         challenge_.epoch = 9;
         challenge_.security_ruleset = constants::kSecurityRulesetVersion;
+        challenge_.consensus_ruleset = constants::kConsensusRulesetVersion;
+        challenge_.profile_id = nexus::security::kTier1AttestationProfileId;
+        challenge_.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
         challenge_.policy_digest = profile_digest(profile_);
     }
 
@@ -88,14 +91,13 @@ protected:
     }
 
     [[nodiscard]] AttestationVerdict examine(const AttestationEvidence& evidence) const {
-        return verifier_.examine(challenge_, evidence, profile_);
+        return AttestationVerifier(profile_).examine(challenge_, evidence);
     }
 
     nexus::crypto::Ed25519Keypair identity_;
     nexus::crypto::Ed25519PublicKey vote_pk_{};
     LinuxAttestationProfile profile_;
     AttestationChallenge challenge_;
-    AttestationVerifier verifier_;
 };
 
 // --- Refusals -----------------------------------------------------------------

@@ -61,6 +61,9 @@ protected:
         challenge_.incarnation = 3;
         challenge_.epoch = 9;
         challenge_.security_ruleset = constants::kSecurityRulesetVersion;
+        challenge_.consensus_ruleset = constants::kConsensusRulesetVersion;
+        challenge_.profile_id = nexus::security::kTier1AttestationProfileId;
+        challenge_.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
         challenge_.policy_digest = profile_digest(profile_);
 
         evidence_.challenge_digest = challenge_digest(challenge_);
@@ -69,6 +72,8 @@ protected:
         evidence_.epoch = challenge_.epoch;
         evidence_.security_ruleset = constants::kSecurityRulesetVersion;
         evidence_.consensus_ruleset = constants::kConsensusRulesetVersion;
+        evidence_.profile_id = challenge_.profile_id;
+        evidence_.profile_ruleset = challenge_.profile_ruleset;
         evidence_.epoch_vote_key = patterned<32>(0x07);
         // The platform bundle stays empty: garbage the platform chain rejects.
         sign_evidence();
@@ -81,8 +86,10 @@ protected:
                   0);
     }
 
+    // Built per call: a test may retune profile_ first, and the compiled
+    // provider set is derived from it.
     [[nodiscard]] AttestationVerdict examine() const {
-        return verifier_.examine(challenge_, evidence_, profile_);
+        return AttestationVerifier(profile_).examine(challenge_, evidence_);
     }
 
     nexus::crypto::Ed25519PublicKey node_pk_{};
@@ -90,7 +97,6 @@ protected:
     LinuxAttestationProfile profile_;
     AttestationChallenge challenge_;
     AttestationEvidence evidence_;
-    AttestationVerifier verifier_;
 };
 
 // --- Rejection order: break one link at a time -------------------------------

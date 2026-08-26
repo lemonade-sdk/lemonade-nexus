@@ -16,6 +16,12 @@ Digest challenge_digest(const AttestationChallenge& challenge) {
     encoder.add_u64(challenge.incarnation);
     encoder.add_u64(challenge.epoch);
     encoder.add_u16(challenge.security_ruleset);
+    encoder.add_u16(challenge.consensus_ruleset);
+    // The profile identity is inside the challenge digest, so the TPM quote
+    // that commits to that digest commits to the profile too. Evidence built
+    // under a different profile cannot produce this value.
+    encoder.add_u16(static_cast<uint16_t>(challenge.profile_id));
+    encoder.add_u16(challenge.profile_ruleset);
     encoder.add_bytes(challenge.policy_digest);
     return encoder.digest();
 }
@@ -43,6 +49,8 @@ Digest evidence_signing_digest(const AttestationEvidence& evidence) {
     encoder.add_u64(evidence.epoch);
     encoder.add_u16(evidence.security_ruleset);
     encoder.add_u16(evidence.consensus_ruleset);
+    encoder.add_u16(static_cast<uint16_t>(evidence.profile_id));
+    encoder.add_u16(evidence.profile_ruleset);
     encoder.add_bytes(evidence.epoch_vote_key);
     encoder.add_bytes(platform_bundle_digest(evidence.platform));
     return encoder.digest();

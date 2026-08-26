@@ -1443,6 +1443,8 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
         evidence.epoch = challenge.epoch;
         evidence.security_ruleset = constants::kSecurityRulesetVersion;
         evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
+        evidence.profile_id = challenge.profile_id;
+        evidence.profile_ruleset = challenge.profile_ruleset;
         evidence.epoch_vote_key = *signer.driver->vote_key_for_epoch(1);
         evidence.platform.hcl_blob.assign(64, 0xA5);
         evidence.platform.tpms_attest.assign(48, 0x5A);
@@ -1499,15 +1501,15 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     EXPECT_EQ(stale.failure, AttestationFailure::ChallengeMismatch);
     EXPECT_EQ(stale.evidence_digest, Digest{});
 
-    // KNOWN GAP, documented rather than asserted away: receive_evidence takes
-    // the pending challenge out before it judges the bundle, so a bundle that
-    // matches nothing still cancels the outstanding challenge. The honest
-    // answer that follows finds no challenge to answer.
+    // The replay above answered nothing, so it consumed nothing. The honest
+    // answer to the live challenge still finds it outstanding — otherwise any
+    // peer that knows a node ID could deny that node attestation by replaying
+    // one stale bundle per challenge.
     const AttestationEvidence honest_late = build_evidence(*second, *prover);
-    const AttestationVerdict cancelled =
+    const AttestationVerdict survived =
         verifier->runtime->attestation().receive_evidence(honest_late);
-    EXPECT_EQ(cancelled.failure, AttestationFailure::ChallengeMismatch)
-        << "a stale bundle no longer cancels the live challenge; tighten this test";
+    EXPECT_NE(survived.failure, AttestationFailure::ChallengeMismatch);
+    EXPECT_NE(survived.evidence_digest, Digest{});
 
     // Positive control: a bundle built for a challenge that no replay touched
     // clears the challenge, identity, incarnation and signature checks again.

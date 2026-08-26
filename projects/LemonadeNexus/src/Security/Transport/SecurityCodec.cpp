@@ -121,6 +121,9 @@ bool encode_challenge(Writer& w, const AttestationChallenge& c) {
     w.u64(c.incarnation);
     w.u64(c.epoch);
     w.u16(c.security_ruleset);
+    w.u16(c.consensus_ruleset);
+    w.u16(static_cast<uint16_t>(c.profile_id));
+    w.u16(c.profile_ruleset);
     w.fixed(c.policy_digest);
     return true;
 }
@@ -132,6 +135,8 @@ bool encode_evidence(Writer& w, const AttestationEvidence& e) {
     w.u64(e.epoch);
     w.u16(e.security_ruleset);
     w.u16(e.consensus_ruleset);
+    w.u16(static_cast<uint16_t>(e.profile_id));
+    w.u16(e.profile_ruleset);
     w.fixed(e.epoch_vote_key);
     const std::string platform = encode_snp_vtpm_evidence(e.platform);
     if (!w.bytes({reinterpret_cast<const uint8_t*>(platform.data()), platform.size()},
@@ -318,16 +323,35 @@ bool encode_sync_response(Writer& w, const SyncResponse& s) {
 
 bool get_node(Reader& r, NodeId& node) { return r.fixed(node.bytes); }
 
+// A profile ID this binary does not name is refused here rather than folded
+// into Unknown: folding would make a corrupted or hostile value re-encode as a
+// different one, which is a silent reinterpretation. Unknown itself still
+// decodes, and the verifier refuses it with ProviderUnknown.
+bool get_profile_id(Reader& r, AttestationProfileId& id) {
+    uint16_t raw = 0;
+    if (!r.u16(raw)) return false;
+    const auto candidate = static_cast<AttestationProfileId>(raw);
+    if (candidate != AttestationProfileId::Unknown &&
+        !is_known_attestation_profile_id(candidate)) {
+        return r.fail(CodecError::BadValue);
+    }
+    id = candidate;
+    return true;
+}
+
 bool decode_challenge(Reader& r, AttestationChallenge& c) {
     return r.fixed(c.nonce) && get_node(r, c.node_id) && r.fixed(c.node_key) &&
            r.u64(c.incarnation) && r.u64(c.epoch) && r.u16(c.security_ruleset) &&
-           r.fixed(c.policy_digest);
+           r.u16(c.consensus_ruleset) && get_profile_id(r, c.profile_id) &&
+           r.u16(c.profile_ruleset) && r.fixed(c.policy_digest);
 }
 
 bool decode_evidence(Reader& r, AttestationEvidence& e) {
     std::vector<uint8_t> platform;
     if (!(r.fixed(e.challenge_digest) && get_node(r, e.node_id) && r.u64(e.incarnation) &&
-          r.u64(e.epoch) && r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) && r.fixed(e.epoch_vote_key) &&
+          r.u64(e.epoch) && r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) &&
+          get_profile_id(r, e.profile_id) && r.u16(e.profile_ruleset) &&
+          r.fixed(e.epoch_vote_key) &&
           r.bytes(platform, constants::kMaxPlatformEvidenceWireBytes))) {
         return false;
     }

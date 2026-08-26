@@ -118,6 +118,9 @@ protected:
         challenge.incarnation = 4;
         challenge.epoch = 12;
         challenge.security_ruleset = constants::kSecurityRulesetVersion;
+        challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
+        challenge.profile_id = nexus::security::kTier1AttestationProfileId;
+        challenge.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
         challenge.policy_digest = profile_digest(profile);
         return challenge;
     }
@@ -133,6 +136,8 @@ protected:
         evidence.epoch = challenge.epoch;
         evidence.security_ruleset = constants::kSecurityRulesetVersion;
         evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
+        evidence.profile_id = challenge.profile_id;
+        evidence.profile_ruleset = challenge.profile_ruleset;
         evidence.epoch_vote_key = patterned<32>(0x33);
         evidence.platform.hcl_blob.assign(64, 0xA5);
         evidence.platform.tpms_attest.assign(48, 0x5A);
@@ -155,7 +160,7 @@ protected:
     void sign_evidence() { sign_with(evidence_, node_sk_); }
 
     [[nodiscard]] AttestationVerdict examine() const {
-        return verifier_.examine(challenge_, evidence_, profile_);
+        return AttestationVerifier(profile_).examine(challenge_, evidence_);
     }
 
     nexus::crypto::Ed25519PublicKey node_pk_{};
@@ -165,7 +170,6 @@ protected:
     LinuxAttestationProfile profile_;
     AttestationChallenge challenge_;
     AttestationEvidence evidence_;
-    AttestationVerifier verifier_;
 };
 
 // --- 0. The profile must be able to decide -------------------------------------
@@ -212,7 +216,7 @@ TEST_F(Tier1PathTest, EvidenceAnsweringAnEarlierChallengeIsRejected) {
     reissued.nonce = patterned<32>(0x44);
     ASSERT_NE(challenge_digest(reissued), challenge_digest(challenge_));
 
-    const auto verdict = verifier_.examine(reissued, evidence_, profile_);
+    const auto verdict = AttestationVerifier(profile_).examine(reissued, evidence_);
     EXPECT_FALSE(verdict.passed);
     EXPECT_EQ(verdict.failure, AttestationFailure::ChallengeMismatch);
     // Step 3 returns before step 6 assigns the digest, so the bundle is never
@@ -301,14 +305,14 @@ TEST_F(Tier1PathTest, EvidenceFromAnotherEpochReportsEpochMismatch) {
     // Evidence for the next epoch, examined against this one.
     AttestationEvidence for_next = answer(next_epoch);
     sign_with(for_next, node_sk_);
-    const auto forward = verifier_.examine(challenge_, for_next, profile_);
+    const auto forward = AttestationVerifier(profile_).examine(challenge_, for_next);
     EXPECT_FALSE(forward.passed);
     EXPECT_EQ(forward.failure, AttestationFailure::EpochMismatch);
     // The verdict reports the epoch of the challenge the verifier applied.
     EXPECT_EQ(forward.epoch, challenge_.epoch);
 
     // The rejection is symmetric: this epoch's answer fails against the next.
-    const auto reverse = verifier_.examine(next_epoch, evidence_, profile_);
+    const auto reverse = AttestationVerifier(profile_).examine(next_epoch, evidence_);
     EXPECT_FALSE(reverse.passed);
     EXPECT_EQ(reverse.failure, AttestationFailure::EpochMismatch);
     EXPECT_EQ(reverse.epoch, next_epoch.epoch);
@@ -326,7 +330,7 @@ TEST_F(Tier1PathTest, RightEpochWithTheWrongChallengeStillFails) {
     for_other.epoch = challenge_.epoch;   // correct epoch, wrong challenge
     sign_with(for_other, node_sk_);
 
-    const auto verdict = verifier_.examine(challenge_, for_other, profile_);
+    const auto verdict = AttestationVerifier(profile_).examine(challenge_, for_other);
     EXPECT_FALSE(verdict.passed);
     EXPECT_EQ(verdict.failure, AttestationFailure::ChallengeMismatch);
 }
@@ -422,7 +426,7 @@ TEST_F(Tier1PathTest, NoProfileRelaxationSurvivesThePolicyDigestCheck) {
         AttestationEvidence evidence = answer(challenge);
         sign_with(evidence, node_sk_);
 
-        const auto verdict = verifier_.examine(challenge, evidence, profile_);
+        const auto verdict = AttestationVerifier(profile_).examine(challenge, evidence);
         EXPECT_FALSE(verdict.passed) << relaxation.name;
         EXPECT_EQ(verdict.failure, AttestationFailure::RulesetMismatch) << relaxation.name;
     }

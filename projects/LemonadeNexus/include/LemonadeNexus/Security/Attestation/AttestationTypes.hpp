@@ -6,10 +6,12 @@
 // verifiers. They prove facts; they never grant authority. The verdict feeds
 // Tier1EligibilityPolicy, which decides eligibility elsewhere.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, sections 5.5,
-// 7.2, 7.3, 7.5 and 11.2.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 5.2,
+// 9, 25 and 31.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationProfileId.hpp>
+#include <LemonadeNexus/Security/Attestation/VerifiedPlatformClaims.hpp>
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
@@ -25,6 +27,14 @@ struct AttestationChallenge {
     IncarnationId incarnation{};
     EpochId epoch{};
     SecurityRulesetVersion security_ruleset{};
+    ConsensusRulesetVersion consensus_ruleset{};
+
+    /// Which provider must answer, and under which version of its rules. The
+    /// candidate cannot choose: a challenge names one profile, and evidence
+    /// built for any other profile answers nothing (1.1 section 31).
+    AttestationProfileId profile_id{AttestationProfileId::Unknown};
+    AttestationProfileRuleset profile_ruleset{};
+
     Digest policy_digest{};
 };
 
@@ -44,6 +54,14 @@ struct AttestationEvidence {
     EpochId epoch{};
     SecurityRulesetVersion security_ruleset{};
     ConsensusRulesetVersion consensus_ruleset{};
+
+    /// Which profile this bundle was built for. Stated by the prover and signed
+    /// with the rest, so evidence encoded for provider A cannot be replayed as
+    /// provider B, and a candidate cannot request a weaker profile than the one
+    /// its challenge names.
+    AttestationProfileId profile_id{AttestationProfileId::Unknown};
+    AttestationProfileRuleset profile_ruleset{};
+
     crypto::Ed25519PublicKey epoch_vote_key{};
     SnpVtpmEvidence platform;
     crypto::Ed25519Signature identity_signature{};
@@ -79,6 +97,16 @@ enum class AttestationFailure : uint16_t {
     /// The compiled profile leaves a prerequisite unpinned, so it cannot tell a
     /// good platform from a bad one. Appended last: the values above are stable.
     ProfileIncomplete,
+
+    /// No compiled provider claims this profile ID.
+    ProviderUnknown,
+    /// A compiled provider claims the ID but cannot verify evidence yet, so it
+    /// proves nothing rather than guessing at a format.
+    ProviderUnsupported,
+    /// The bundle answers with a different profile than the challenge named.
+    ProfileIdMismatch,
+    /// Same profile, different rules. Old evidence cannot answer new rules.
+    ProfileRulesetMismatch,
 };
 
 /// The bounded result of one verification. It states facts about one candidate
@@ -89,23 +117,15 @@ struct AttestationVerdict {
     IncarnationId incarnation{};
     Digest policy_digest{};
     Digest evidence_digest{};
+    /// True when no step failed. It is a summary, never an input: Tier 1 reads
+    /// `claims`, so a verdict that somehow passed without proving anything
+    /// still confers nothing.
     bool passed{false};
     AttestationFailure failure{AttestationFailure::None};
 
-    /// Per-link facts, carried so Tier 1 eligibility can be decided from named
-    /// prerequisites instead of from `passed` alone. A link that never ran stays
+    /// What a provider actually proved. A step that never ran leaves its claim
     /// false, which is what makes an unproven prerequisite fail closed.
-    struct Links {
-        bool identity_signature_valid{false};
-        bool snp_signature_valid{false};
-        bool snp_policy_valid{false};
-        bool vtpm_bound{false};
-        bool quote_fresh{false};
-        bool boot_state_valid{false};
-        bool ima_anchored{false};
-        bool binary_approved{false};
-        bool runtime_profile_valid{false};
-    } links;
+    VerifiedPlatformClaims claims;
 };
 
 }  // namespace nexus::security

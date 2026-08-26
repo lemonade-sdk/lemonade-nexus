@@ -12,9 +12,11 @@
 namespace nexus::security {
 
 enum class Tier1Prerequisite : uint16_t {
+    PlatformProfile,
     NodeIdentity,
     Certificate,
     ConfidentialCompute,
+    PlatformTcb,
     Vtpm,
     AttestationFreshness,
     BootState,
@@ -28,10 +30,16 @@ enum class Tier1Prerequisite : uint16_t {
 };
 
 struct Tier1EvidenceState {
+    /// An approved provider, at the compiled ruleset, verified this candidate.
+    /// Without it nothing below was produced by a profile Tier 1 accepts, so a
+    /// downgrade to a weaker provider stops here rather than at each fact.
+    bool platform_profile_valid = false;
+
     bool node_identity_valid = false;
     bool certificate_valid = false;
 
     bool snp_valid = false;
+    bool tcb_valid = false;
     bool vtpm_valid = false;
     bool quote_fresh = false;
 

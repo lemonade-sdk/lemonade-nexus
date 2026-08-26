@@ -160,6 +160,10 @@ struct EvidenceVerdict {
     /// false and Tier 1 eligibility fails closed.
     bool snp_signature_valid{false};
     bool snp_policy_valid{false};
+    /// The reported TCB is at or above the required floor. Evaluated on its own
+    /// rather than borrowed from snp_policy_valid, which also covers guest
+    /// policy and the launch measurement.
+    bool tcb_valid{false};
     bool ak_bound_to_report{false};
     bool quote_bound_to_challenge{false};
     bool boot_state_valid{false};
