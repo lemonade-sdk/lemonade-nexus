@@ -121,7 +121,7 @@ SigningStart AuthorityService::open_session(SigningSessionId session_id,
     }
 
     // The signer examines the finalized certificate before it creates a
-    // share (architecture 11.10). A FROST signature never replaces one.
+    // share (architecture 20). A FROST signature never replaces one.
     if (qc_digest(certificate) != object.consensus_certificate_digest) {
         return fail(SigningFailure::CertificateMismatch);
     }

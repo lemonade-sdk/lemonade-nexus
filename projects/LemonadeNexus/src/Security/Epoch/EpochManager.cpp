@@ -144,7 +144,7 @@ bool EpochManager::record_final_attestation(const AttestationVerdict& verdict) {
         return false;
     }
     // A final challenge is FOR the target epoch: its evidence binds the
-    // next-epoch vote key (architecture 11.2), so the verdict must name it.
+    // next-epoch vote key (architecture 18), so the verdict must name it.
     if (verdict.epoch != transition_->to_epoch) {
         return false;
     }
@@ -160,7 +160,7 @@ bool EpochManager::record_final_attestation(const AttestationVerdict& verdict) {
     }
 
     // A failed prerequisite is final for this handoff: the member leaves and
-    // the next hash-ranked candidate takes its place (architecture 8.5).
+    // the next hash-ranked candidate takes its place (architecture 22).
     removed_candidates_.insert(verdict.node_id);
     selected.erase(std::remove(selected.begin(), selected.end(), verdict.node_id),
                    selected.end());

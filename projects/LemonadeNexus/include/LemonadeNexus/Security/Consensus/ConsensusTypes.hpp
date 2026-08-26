@@ -8,7 +8,7 @@
 // Every digest goes through CanonicalEncoder under kBftProtocolDomain with a
 // kind string as the second field, so no two message kinds can ever collide.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, section 11.
+// Architecture reference: Security Architecture Final Draft 1.1, section 17.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>

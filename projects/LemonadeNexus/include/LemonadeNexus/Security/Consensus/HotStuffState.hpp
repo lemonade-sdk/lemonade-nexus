@@ -7,8 +7,8 @@
 // closed: one malformed field yields no state at all, never a partial one —
 // a partial state is how a node forgets a vote it already cast.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, sections
-// 11.6 and 11.12.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 18
+// and 19.
 
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>

@@ -1,6 +1,6 @@
 #pragma once
 
-// The challenge and evidence exchange (class structure 11, architecture 7).
+// The challenge and evidence exchange (class structure 11, architecture 9).
 //
 // The service issues one-shot challenges, runs the verifier on the evidence
 // that answers them, and keeps the latest verdict per node. It applies the

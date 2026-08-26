@@ -14,7 +14,7 @@ struct QuorumRow {
     std::size_t authority;
 };
 
-// The exact tables from Security Architecture Final Draft 1.0, sections 9.2
+// The exact tables from Security Architecture Final Draft 1.1, sections 16
 // and 9.3.
 constexpr QuorumRow kRows[] = {
     {5, 1, 4, 5},   {6, 1, 5, 5},   {7, 2, 5, 5},    {8, 2, 6, 6},

@@ -6,8 +6,7 @@
 // view. Every write is crash-atomic, every load fails closed, and a stored
 // value never moves backwards.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, section
-// 11.12.
+// Architecture reference: Security Architecture Final Draft 1.1, section 19.
 
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Consensus/HotStuffState.hpp>

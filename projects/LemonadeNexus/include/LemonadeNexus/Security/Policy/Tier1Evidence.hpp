@@ -20,6 +20,11 @@ namespace nexus::security {
 
 /// What the mesh knows and attestation does not.
 ///
+/// No platform provider may set any of these. VerifiedPlatformClaims carries no
+/// field for them, so a provider cannot express one even by mistake: a platform
+/// proves what its hardware attests, and how a node has behaved on the mesh is
+/// not that.
+///
 /// `uptime_valid` and `mesh_health_valid` have NO producer in the tree yet.
 /// They are carried here rather than dropped so the gap stays visible and fails
 /// closed: leaving them false makes a node ineligible until something real
@@ -28,10 +33,21 @@ struct Tier1MeshFacts {
     /// The candidate holds a root-signed transport certificate.
     bool certificate_valid{false};
 
-    /// The candidate has been continuously present long enough to be selected.
+    /// Mesh-observed continuity, NOT /proc/uptime and not a node self-report.
+    /// The agreed rule (1.1 section 13.1) is the same incarnation, at least two
+    /// mesh-recognized attestations, and an observation interval of at least
+    /// REATTEST_INTERVAL_SECONDS. It affects next-epoch eligibility only and
+    /// never changes a current epoch's member count or quorum.
     bool uptime_valid{false};
 
-    /// The mesh itself is healthy enough to admit a new Tier 1 member.
+    /// Quorum-observed protocol participation (1.1 section 13.2): synchronized
+    /// to current finalized state, recent authenticated observations from the
+    /// required mesh quorum, no unresolved duplicate incarnation, and no
+    /// unresolved equivocation evidence. Local load averages are not an input.
+    ///
+    /// The observation encoding must be deterministic and finalized before it
+    /// can affect next-epoch membership, which is why no producer exists yet:
+    /// a locally computed answer would be a self-report wearing another name.
     bool mesh_health_valid{false};
 
     /// The epoch and incarnation the mesh currently considers live. A verdict

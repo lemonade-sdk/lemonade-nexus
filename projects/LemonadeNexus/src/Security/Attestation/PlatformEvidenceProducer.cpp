@@ -24,7 +24,7 @@ bool PlatformEvidenceProducer::platform_available() const {
 
 SnpVtpmEvidence PlatformEvidenceProducer::platform_bundle(const Digest& nonce) const {
     // The challenge digest is the quote nonce, so one quote binds the node
-    // identity, the incarnation, the epoch and the policy (architecture 5.5).
+    // identity, the incarnation, the epoch and the policy (architecture 9).
     EvidenceProduceConfig config;
     config.cache_dir = sources_.cache_directory;
     config.identity_pubkey.assign(sources_.identity.public_key.begin(),
@@ -84,7 +84,7 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     evidence.platform = platform_bundle(evidence.challenge_digest);
 
     // Sign last. The identity binds the vote key and every other field
-    // above, the platform bundle included (architecture 11.2).
+    // above, the platform bundle included (architecture 18).
     const Digest digest = evidence_signing_digest(evidence);
     crypto_sign_detached(evidence.identity_signature.data(), nullptr, digest.data(),
                          digest.size(), sources_.identity.private_key.data());

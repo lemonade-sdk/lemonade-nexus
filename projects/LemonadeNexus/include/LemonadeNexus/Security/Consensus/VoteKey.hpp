@@ -7,7 +7,7 @@
 // with the epoch — a restored snapshot cannot vote into the next one. The
 // private part lives in guarded memory and is wiped when the object goes away.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, section 11.2.
+// Architecture reference: Security Architecture Final Draft 1.1, section 18.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SecureBuffer.hpp>

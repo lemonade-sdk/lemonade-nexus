@@ -1,6 +1,6 @@
 #pragma once
 
-// Deterministic hash-ranked Tier 1 selection (architecture 8.3).
+// Deterministic hash-ranked Tier 1 selection (architecture 15).
 //
 // The selector is pure: no network, no local randomness, no operator input,
 // no mutable state. The seed comes from the current epoch authority key,
@@ -20,7 +20,7 @@ class Tier1Selector {
 public:
     /// Every eligible node, sorted ascending by (score, node_id). The full
     /// ranking exists so a failed selectee is replaced by the next
-    /// hash-ranked candidate (architecture 8.5). The eligible set MUST be
+    /// hash-ranked candidate (architecture 22). The eligible set MUST be
     /// frozen before ranking, so a candidate cannot re-time its entry to
     /// shop for a better score.
     [[nodiscard]] static std::vector<NodeId> rank(

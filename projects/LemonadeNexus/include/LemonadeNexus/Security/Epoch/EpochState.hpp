@@ -3,7 +3,7 @@
 // The activated security state for one epoch.
 //
 // The thresholds come from the frozen member count at activation. An offline
-// or failed member reduces liveness, never these values (architecture 8.4).
+// or failed member reduces liveness, never these values (architecture 16).
 // The struct is immutable after activation: there are no mutating helpers,
 // and membership changes only through the next atomic epoch transition.
 

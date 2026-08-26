@@ -1,9 +1,9 @@
 # Security Overhaul Status
 
 **Branch:** `tier-security-overhaul`
-**Baseline:** `.idea/lemonade-nexus-security-architecture-final-draft-1.0.md` (Final Draft 1.0)
+**Baseline:** Security Architecture Final Draft 1.1 (supersedes Final Draft 1.0)
 **Structure reference:** `.idea/lemonade-nexus-security-class-structure.md`
-**Updated:** 2026-08-23
+**Updated:** 2026-08-26
 
 This document records the state of the security foundation, the protocol
 details the implementation fixed, and the next implementation tasks.
@@ -317,6 +317,96 @@ satisfy the compiled profile. Zero qualify today: this host fails on the vTPM
 binding above, and no other candidate exists. The bootstrap threshold stays at
 five and the profile stays as it is.
 
+### M7 — Revision 1.1 attestation provider boundary (done)
+
+Revision 1.1 of the architecture separates *proving platform facts* from
+*deciding Tier 1*. Nexus verified one evidence format and returned a pass flag,
+so a second confidential-computing platform would have meant either a second
+eligibility path or a weaker shared one. The boundary is now:
+
+```text
+PlatformEvidenceProvider -> VerifiedPlatformClaims -> Tier1EligibilityPolicy
+```
+
+**The claim model.** `VerifiedPlatformClaims` carries the eleven facts Revision
+1.1 requires, plus the three steps behind runtime integrity, because Tier 1
+names three separate runtime prerequisites and one composite claim cannot tell
+them apart. A claim is true only when a verifier step ran and held. Claims that
+contradict their own steps, or that name no provider, are refused whole rather
+than trusted in part.
+
+**The provider interface.** `PlatformEvidenceProvider` identifies its compiled
+profile, states whether it can decide, and returns claims. It cannot select
+Tier 1, change quorum, grant authority, or set a required claim true because
+its platform has no equivalent mechanism. `AttestationVerifier` keeps the
+provider-neutral checks — profile dispatch, challenge, node, incarnation, epoch,
+identity signature — and merges what the provider proved.
+
+**Providers.**
+
+| Profile ID | Provider | State |
+|---|---|---|
+| `snp-hcl-vtpm` | `AzureSnpVtpmProvider` | Implemented. The existing SNP/HCL/vTPM chain, moved unchanged behind the boundary. |
+| `snp-svsm-vtpm` | `SnpSvsmVtpmProvider` | Declared, refuses. The SVSM service-manifest format is not invented; it waits on real evidence from an approved SVSM host. |
+| `snp-direct-boot` | `SnpDirectBootProvider` | Declared, refuses, and **not Tier 1 capable**. No protected runtime measurement accumulator exists on a TPM-less measured boot, so implementing its evidence format will not change that. |
+| `tdx` | none | Named so the enum stays stable. No provider. |
+
+`SnpSvsmVtpmProvider` carries one warning that must not be lost: under SVSM the
+guest Linux runs at VMPL1 or lower, so `SnpPolicyRequirements::require_vmpl0`
+cannot be applied to a guest-requested report. Which component requests the
+report, and at which VMPL, is part of what captured SVSM evidence must settle.
+
+**Profile binding.** `attestation_profile_id` and `attestation_profile_ruleset`
+are inside the challenge digest and the signed evidence digest. Evidence built
+for one profile cannot answer a challenge for another, a candidate cannot
+request a weaker profile than the one it was challenged under, and a profile ID
+this binary does not name is refused at the parser rather than folded into
+`Unknown`.
+
+**Eligibility.** `Tier1EligibilityPolicy` reads claims, never
+`AttestationVerdict::passed`, and gained two prerequisites the claim model made
+nameable: an approved platform profile, and the TCB floor as its own fact
+rather than a side effect of the guest policy check. Fifteen prerequisites,
+conjunction, fail closed.
+
+**Hardening closed alongside it.**
+
+* **Challenge consumption.** A bundle that answers no live challenge no longer
+  cancels one. Any peer that knew a node ID could otherwise deny that node
+  attestation by replaying one stale bundle per challenge.
+* **AMD revocation.** The VCEK and its issuing ASK are checked against a cached
+  KDS CRL, verified under the same chain that had to root in a compiled-in AMD
+  key, and refused when expired. The check runs immediately after the AMD
+  signature and before guest policy. Absent, unparsable, wrongly signed and
+  expired data all fail closed, as does having no trusted clock. This gates NEW
+  attestation only: epoch membership is frozen once selected, so a KDS outage
+  cannot shrink a live quorum.
+* **Runtime integrity is not a self-report.** `runtime_integrity_valid` is the
+  conjunction of IMA anchoring, an approved binary, and the runtime profile.
+  The self-reported `no_new_privs` and seccomp fields count only alongside a
+  log that replays into a quoted PCR and a binary on the approved list.
+
+**Tests.** `tests/security/attestation/providers.cpp` (24) covers dispatch,
+downgrade and substitution. Three run against the captured SNP report: a
+structurally perfect quote under a key AMD never vouched for (the host `swtpm`
+and foreign-vTPM case), a quote with no SNP report behind it, and the launch
+measurement pin being checked before the quote — the control that stops a guest
+choosing its own `REPORT_DATA` from naming an AK it holds, and the reason a
+profile may only be pinned from a host already known good.
+
+#### Known gaps
+
+* **No CRL cache producer.** `SecurityMeshService` installs no
+  `AmdRevocationSource`, so revocation data is absent and new Tier 1 attestation
+  fails closed on it. Intended until a cache producer lands.
+* **The accepting revocation branch is untested off platform.** A CRL this chain
+  accepts must be signed by AMD's own key, and the captured fixtures predate any
+  published CRL. Every refusing branch is covered.
+* **`uptime_valid` and `mesh_health_valid` still have no producer.** The agreed
+  definitions are recorded on `Tier1MeshFacts`; both stay false and both keep a
+  node ineligible. A locally computed answer would be a self-report wearing
+  another name, so none was written.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
@@ -327,12 +417,10 @@ the correct result.
 
 ## 5. Old trust model
 
-The old trust model stays active: `TrustPolicyService`, `GovernanceService`,
-`RootKeyChainService` with Shamir shares, `ServerAdmissionService` ballots,
-and the gossip handlers that serve them. The new foundation is not yet wired
-to gossip or to `main.cpp`. Two security systems are not active at the same
-time because the new one has no network path yet. The removal happens when
-the replacement path exists (task 3 below).
+Removed in M3. `TrustPolicyService`, `GovernanceService`, `RootKeyChainService`
+with Shamir shares, `ServerAdmissionService` ballots, and the gossip handlers
+that served them are gone. `tests/test_legacy_removal.cpp` fails the build if
+any of them returns.
 
 ## 6. Next implementation tasks
 

@@ -38,7 +38,7 @@ struct AttestationChallenge {
     Digest policy_digest{};
 };
 
-/// The challenge value C from architecture 5.5. The prover uses this digest as
+/// The challenge value C from architecture 9. The prover uses this digest as
 /// the nonce input of evidence_binding(), so one TPM quote transitively binds
 /// the node identity, the incarnation, the epoch and the attestation policy.
 [[nodiscard]] Digest challenge_digest(const AttestationChallenge& challenge);
@@ -67,7 +67,7 @@ struct AttestationEvidence {
     crypto::Ed25519Signature identity_signature{};
 };
 
-/// Preimage of the identity signature. The chain from architecture 11.2: the
+/// Preimage of the identity signature. The chain from architecture 18: the
 /// quote binds the platform to the node identity, and this signature binds the
 /// epoch vote key to that identity. The platform bundle enters as one digest —
 /// a CanonicalEncoder digest over the canonical wire form from

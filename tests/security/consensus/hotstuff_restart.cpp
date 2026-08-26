@@ -18,7 +18,7 @@ using nexus::security::FileConsensusStore;
 
 namespace fs = std::filesystem;
 
-// Restart behavior over a real FileConsensusStore (architecture 11.12).
+// Restart behavior over a real FileConsensusStore (architecture 19).
 class HotStuffRestart : public ::testing::Test {
 protected:
     void SetUp() override {

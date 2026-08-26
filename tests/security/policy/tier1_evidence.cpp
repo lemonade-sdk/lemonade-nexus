@@ -251,3 +251,45 @@ TEST(Tier1Evidence, EveryPrerequisiteNamesItself) {
         EXPECT_NE(tier1_prerequisite_name(p), "unknown prerequisite");
     }
 }
+
+// --- the mesh/platform split -----------------------------------------------
+
+// A platform provider proves what its hardware attests. How a node has behaved
+// on the mesh is not that, and no provider may supply it. VerifiedPlatformClaims
+// carries no field for either fact, so this is a structural property; the test
+// pins the consequence.
+TEST(Tier1Evidence, NoProviderCanSupplyAMeshFact) {
+    const AttestationVerdict verdict = complete_verdict();
+
+    Tier1MeshFacts without_uptime = complete_facts();
+    without_uptime.uptime_valid = false;
+    EXPECT_TRUE(fails(verdict, without_uptime, Tier1Prerequisite::Uptime));
+    EXPECT_EQ(tier1_eligibility(verdict, without_uptime), Tier1Eligibility::Ineligible);
+
+    Tier1MeshFacts without_health = complete_facts();
+    without_health.mesh_health_valid = false;
+    EXPECT_TRUE(fails(verdict, without_health, Tier1Prerequisite::MeshHealth));
+    EXPECT_EQ(tier1_eligibility(verdict, without_health), Tier1Eligibility::Ineligible);
+
+    Tier1MeshFacts without_certificate = complete_facts();
+    without_certificate.certificate_valid = false;
+    EXPECT_TRUE(fails(verdict, without_certificate, Tier1Prerequisite::Certificate));
+}
+
+// Runtime integrity does not rest on the self-reported no_new_privs and seccomp
+// fields. They count only alongside an IMA log anchored in a quoted PCR and a
+// binary on the approved release list, so a process claiming a hardened runtime
+// while its binary is unmeasured proves nothing.
+TEST(Tier1Evidence, ASelfReportedRuntimeProfileIsNotTheTrustBasis) {
+    AttestationVerdict verdict = complete_verdict();
+    verdict.claims.ima_anchored = false;
+    verdict.claims.binary_approved = false;
+    verdict.claims.runtime_integrity_valid = false;
+    ASSERT_TRUE(verdict.claims.runtime_profile_enforced);
+
+    const Tier1EvidenceState state = tier1_evidence_state(verdict, complete_facts());
+    EXPECT_TRUE(state.runtime_profile_valid);
+    EXPECT_FALSE(state.ima_valid);
+    EXPECT_FALSE(state.binary_valid);
+    EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
+}

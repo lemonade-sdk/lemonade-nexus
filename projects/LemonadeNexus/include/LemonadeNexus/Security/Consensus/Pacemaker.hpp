@@ -5,7 +5,7 @@
 // Timeout values affect liveness only. They never enter message validity or
 // the safety quorum.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, section 11.8.
+// Architecture reference: Security Architecture Final Draft 1.1, section 17.
 
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 

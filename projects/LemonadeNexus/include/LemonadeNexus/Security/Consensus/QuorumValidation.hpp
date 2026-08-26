@@ -6,8 +6,8 @@
 // rejects the whole certificate. The quorum in the context comes from the
 // FROZEN epoch population N(E) — validation never counts reachable nodes.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, sections
-// 9.5, 11.4, and 11.8.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 17
+// and 18.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>

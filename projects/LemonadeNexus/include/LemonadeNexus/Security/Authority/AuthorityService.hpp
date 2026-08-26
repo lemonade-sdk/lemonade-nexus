@@ -1,6 +1,6 @@
 #pragma once
 
-// The per-epoch authority protocol (architecture 11.10, 12.11 - 12.13).
+// The per-epoch authority protocol (architecture 20 and 21).
 //
 // The service owns the current epoch key share and the signing sessions. It
 // signs one shape only, AuthorityObject, and only after it has examined the
@@ -97,7 +97,7 @@ public:
     /// Installs the epoch group and this node's share. Refuses a DKG result
     /// for another epoch or participant set. On success the previous share is
     /// destroyed and every open session is dropped: old shares cannot sign
-    /// for the new epoch (architecture 12.14).
+    /// for the new epoch (architecture 22).
     [[nodiscard]] bool install_epoch(AuthorityEpochContext context, DkgResult dkg);
 
     /// Destroys the share and every open session. A node that leaves the

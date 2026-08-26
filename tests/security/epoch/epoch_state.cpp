@@ -106,7 +106,7 @@ struct ThresholdRow {
     std::size_t authority;
 };
 
-// The exact rows from Security Architecture Final Draft 1.0, sections 9.2
+// The exact rows from Security Architecture Final Draft 1.1, sections 16
 // and 9.3.
 constexpr ThresholdRow kRows[] = {
     {5, 4, 5},

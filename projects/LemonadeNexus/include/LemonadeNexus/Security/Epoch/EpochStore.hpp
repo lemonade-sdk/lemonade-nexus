@@ -6,7 +6,7 @@
 // certificate, the current epoch state with its vote keys and checkpoint,
 // the history of epoch authority keys, and this node's own epoch vote key
 // wrapped at rest. FROST shares are never stored: a restart destroys the
-// share, and the mesh tolerates that loss (architecture 12.11).
+// share, and the mesh tolerates that loss (architecture 20).
 //
 // Every write is crash-atomic. A corrupt file is reported as Corrupt, never
 // as absent: a node must not treat lost epoch state as a fresh start.

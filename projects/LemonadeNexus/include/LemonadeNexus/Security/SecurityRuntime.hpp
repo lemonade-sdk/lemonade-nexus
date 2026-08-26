@@ -66,7 +66,7 @@ public:
 
     /// Re-enters a stored epoch after a restart. Consensus resumes from the
     /// durable safety state and stays unsynced until a certified view floor
-    /// arrives (architecture 11.12). The FROST share died with the process,
+    /// arrives (architecture 19). The FROST share died with the process,
     /// so authority signing stays unavailable until the next epoch (12.11).
     [[nodiscard]] bool restore_epoch(StoredEpoch stored,
                                      std::optional<EpochVoteKey> own_vote_key);

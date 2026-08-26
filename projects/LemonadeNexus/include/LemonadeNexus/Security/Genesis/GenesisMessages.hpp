@@ -5,7 +5,7 @@
 // Genesis names the founders it verified; each founder attests the DKG
 // transcript it observed under its own identity key; Genesis signs the one
 // bootstrap certificate only when all founders attested the same transcript
-// and the same group key (architecture 12.7, 18).
+// and the same group key (architecture 14 and 20).
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>

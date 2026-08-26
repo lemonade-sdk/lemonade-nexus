@@ -7,7 +7,8 @@
 // fabricates: a host without a platform path returns an empty platform
 // bundle, which the verifier fails.
 //
-// Architecture reference: sections 5.5, 7.1, 7.3 and 11.2.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 9,
+// 18 and 25.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
@@ -29,7 +30,7 @@ struct EvidenceProducerSources {
     /// Path of the nexus binary for the IMA measurement lookup. The platform
     /// prover resolves the running executable itself today; this value is
     /// never written into a bundle, because a self-declared path is the
-    /// self-attestation that architecture 6.1 forbids.
+    /// self-attestation that architecture 5.1 forbids.
     std::string nexus_binary_path;
 };
 

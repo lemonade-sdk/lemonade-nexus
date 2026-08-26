@@ -1,6 +1,6 @@
 #pragma once
 
-// One live incarnation of a node identity (architecture 13.4).
+// One live incarnation of a node identity (architecture 23).
 //
 // A snapshot restore can create two live copies of one old node state. The
 // mesh allows only one current incarnation for a node identity, so a

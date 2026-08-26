@@ -13,8 +13,8 @@
 //   - A justify QC is evidence: it must validate, or be the genesis anchor.
 //   - The parent IS the justified block (REQUIRE_PARENT_QC).
 //
-// Architecture reference: Security Architecture Final Draft 1.0, sections
-// 11.3 to 11.7, 11.9, and 11.12.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 17,
+// 18 and 19.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusStore.hpp>

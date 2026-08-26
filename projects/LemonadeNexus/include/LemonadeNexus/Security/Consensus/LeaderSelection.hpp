@@ -6,7 +6,7 @@
 // finalized checkpoint, and the epoch. Every correct node computes the same
 // order; no operator selects a leader.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, section 11.5.
+// Architecture reference: Security Architecture Final Draft 1.1, section 17.
 
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 

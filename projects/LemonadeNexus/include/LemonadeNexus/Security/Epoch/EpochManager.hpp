@@ -1,6 +1,6 @@
 #pragma once
 
-// The atomic epoch handoff (architecture 8.5).
+// The atomic epoch handoff (architecture 22).
 //
 // The manager answers one question: what security state is Nexus in now. It
 // drives the transition phases — select, final-attest, vote keys, DKG, ready,

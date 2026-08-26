@@ -1,6 +1,6 @@
 #pragma once
 
-// One explicit epoch transition object (architecture 8.5).
+// One explicit epoch transition object (architecture 22).
 //
 // The old epoch stays authoritative until the transition is complete. A
 // partial transition must never activate: ready_for_activation is the one

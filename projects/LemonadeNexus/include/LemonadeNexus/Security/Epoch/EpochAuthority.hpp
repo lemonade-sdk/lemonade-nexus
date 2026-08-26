@@ -1,6 +1,6 @@
 #pragma once
 
-// The finalized epoch authority record (architecture 12.9).
+// The finalized epoch authority record (architecture 20).
 //
 // The previous epoch authorizes this record. After activation the group
 // public key is authoritative only for its own epoch; historical keys stay

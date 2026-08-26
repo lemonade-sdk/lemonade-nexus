@@ -7,8 +7,8 @@
 // Changing a value that alters deterministic security behavior requires a new
 // ruleset version and a new verified release — never a configuration file.
 //
-// Architecture reference: Security Architecture Final Draft 1.0, sections 2,
-// 8.6, 9, 11, and 25.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 2,
+// 13, 16, 17 and 20.
 
 #include <array>
 #include <cstddef>
@@ -102,7 +102,7 @@ inline constexpr uint64_t kReattestIntervalSeconds = 900;
 inline constexpr uint64_t kFinalAttestMaxAgeSeconds = 300;
 
 // Tier 1 attestation is expensive; the budget binds to node identity and
-// epoch, never to an IP address (architecture 16). Initial value; a tuning
+// epoch, never to an IP address (architecture 24). Initial value; a tuning
 // item.
 inline constexpr uint32_t kMaxTier1AttestAttemptsPerEpoch = 4;
 

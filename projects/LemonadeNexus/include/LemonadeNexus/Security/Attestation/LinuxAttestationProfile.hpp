@@ -7,7 +7,8 @@
 // an operator input here would let one host weaken the bar every verifier
 // applies. A new profile requires a new verified release.
 //
-// Architecture reference: sections 22 and 23.A.
+// Architecture reference: Security Architecture Final Draft 1.1, sections 5.4
+// and 31.
 
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Security/SnpVerify.hpp>
@@ -28,7 +29,7 @@ struct LinuxAttestationProfile {
     /// Base64 DER SPKI of the enrolled vTPM attestation key. Empty pins none.
     std::string required_ak_spki_b64;
 
-    /// Digest of the required IMA policy (architecture 6.3). Bound into the
+    /// Digest of the required IMA policy (architecture 10.2). Bound into the
     /// profile digest now; enforcement waits on an evidence field the platform
     /// chain does not carry yet.
     Digest ima_policy_digest{};

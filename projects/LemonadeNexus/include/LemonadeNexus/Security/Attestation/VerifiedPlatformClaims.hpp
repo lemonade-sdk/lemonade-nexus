@@ -60,10 +60,21 @@ struct VerifiedPlatformClaims {
     // Tier 1 names three separate runtime prerequisites. One composite claim
     // cannot tell them apart, so the steps stay visible here and
     // runtime_integrity_valid is exactly their conjunction.
+    //
+    // That conjunction is also what keeps runtime integrity off a self-report.
+    // A process can claim any no_new_privs and seccomp state it likes, so
+    // runtime_profile_enforced alone proves nothing — but it counts only
+    // alongside an IMA log that replays into a quoted PCR and a binary on the
+    // approved release list. The protected accumulator is the trust basis; the
+    // self-report only narrows what an already-approved binary is doing
+    // (1.1 section 10.2).
     bool ima_anchored{false};
     bool binary_approved{false};
     bool runtime_profile_enforced{false};
 };
+
+/// There is deliberately no uptime or mesh-health field here. Those are mesh
+/// facts (see Tier1MeshFacts); a platform provider cannot express one.
 
 [[nodiscard]] std::string_view platform_claim_name(PlatformClaim claim);
 

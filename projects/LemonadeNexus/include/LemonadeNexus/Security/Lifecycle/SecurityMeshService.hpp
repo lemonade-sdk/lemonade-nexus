@@ -41,7 +41,7 @@ inline constexpr uint64_t kDriverTickMs = 100;
 struct SecurityMeshConfig {
     std::filesystem::path data_root;
     // The pinned bootstrap anchor. Verification only; its authority ends at
-    // Epoch 1 activation (architecture 18).
+    // Epoch 1 activation (architecture 14).
     crypto::Ed25519PublicKey genesis_public_key{};
     // The gossip identity keypair: the node identity on the security wire.
     crypto::Ed25519Keypair identity{};

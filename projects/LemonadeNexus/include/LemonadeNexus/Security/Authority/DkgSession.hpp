@@ -1,6 +1,6 @@
 #pragma once
 
-// One dealerless DKG for one target epoch (architecture 12.5 - 12.7).
+// One dealerless DKG for one target epoch (architecture 20).
 //
 // The session binds every message to the network, the target epoch, the
 // frozen participant set, the sender identity and incarnation, and the round.
@@ -128,7 +128,7 @@ public:
 
     /// The participant whose provably invalid message failed the session, when
     /// the failure is attributable. The current epoch records this evidence
-    /// and replaces the participant (architecture 8.5).
+    /// and replaces the participant (architecture 22).
     [[nodiscard]] std::optional<NodeId> culprit() const { return culprit_; }
 
     /// Digest of the finalized round-1 transcript. Valid once round 1 is
