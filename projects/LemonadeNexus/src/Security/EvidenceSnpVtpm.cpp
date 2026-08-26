@@ -532,6 +532,18 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
     }
     v.snp_signature_valid = true;
 
+    // --- revocation: AMD's signature is not enough if AMD withdrew it --------
+    // Gated, because the startup self-probe and first enrollment run before any
+    // CRL is cached. Tier 1 sets the flag, and then absent or expired
+    // revocation data fails closed rather than being skipped.
+    if (req.require_revocation_check) {
+        if (auto rev = verify_snp_revocation(ev.vcek_der, ev.amd_chain_pem, req.revocation);
+            !rev.ok) {
+            return deny(std::move(v), "AMD revocation check failed: " + rev.failure);
+        }
+        v.endorsement_not_revoked = true;
+    }
+
     // parse_hcl_blob already refused unless sha256(runtime data) equals the
     // signed REPORT_DATA, so AMD has vouched for which vTPM key belongs to this
     // launch. That is the whole vTPM binding: without it a quote proves only

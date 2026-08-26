@@ -28,6 +28,11 @@ struct SecurityRuntimeConfig {
     std::filesystem::path consensus_directory;
     LinuxAttestationProfile profile;
 
+    /// Supplies the cached AMD CRL and the current time to the attestation
+    /// providers. Unset means no revocation data, which fails new Tier 1
+    /// attestation closed under a profile that requires the check.
+    AmdRevocationSource amd_revocation;
+
     /// Passed to every epoch's consensus service. It answers whether a proposed
     /// transition is one this node also arrived at, so a handoff gathers its
     /// quorum only from nodes that independently agree. Unset refuses every

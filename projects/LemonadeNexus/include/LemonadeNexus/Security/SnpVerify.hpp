@@ -56,6 +56,36 @@ struct SnpVerifyResult {
                                                     std::span<const uint8_t> vcek_der,
                                                     std::string_view chain_pem);
 
+/// AMD revocation state, as cached from the KDS CRL endpoint for one product.
+///
+/// The verifier does no network I/O: the caller supplies what it fetched, and
+/// the validity window inside the CRL decides whether it may still be used.
+struct AmdRevocationState {
+    /// The KDS CRL, PEM or DER. Empty means nothing is cached.
+    std::string crl;
+    /// Wall-clock seconds since the epoch. Zero means the caller has no trusted
+    /// clock, which fails closed: a CRL cannot be checked for expiry without
+    /// one, and an expired CRL is what an attacker would want replayed.
+    int64_t now_unix{0};
+};
+
+/// Check the VCEK and the ASK that issued it against AMD's CRL.
+///
+/// Fails closed on absent, unparsable, wrongly signed or expired revocation
+/// data. That gates NEW attestation only: an epoch's membership is frozen once
+/// selected, so a KDS outage cannot shrink a live quorum (architecture 1.1
+/// section 11).
+///
+/// `chain_pem` follows verify_snp_signature: empty uses the compiled-in pair
+/// whose ASK issued this VCEK.
+[[nodiscard]] SnpVerifyResult verify_snp_revocation(std::span<const uint8_t> vcek_der,
+                                                     std::string_view chain_pem,
+                                                     const AmdRevocationState& state);
+
+/// The CRL for one product. Fetched and cached by the operator's tooling; the
+/// verifier never reaches the network itself.
+[[nodiscard]] std::string amd_crl_kds_url(std::string_view product);
+
 /// Check guest policy, VMPL, TCB floor and measurement. Independent of the
 /// signature check so failures are separable in logs.
 [[nodiscard]] SnpVerifyResult verify_snp_policy(const SnpReport& report,

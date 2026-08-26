@@ -46,6 +46,11 @@ struct LinuxAttestationProfile {
     bool require_no_new_privs{true};
     bool require_seccomp{true};
 
+    /// AMD's signature over an endorsement it has since withdrawn is worth
+    /// nothing. Tier 1 demands a current CRL; absent or expired revocation data
+    /// fails NEW attestation, and never shrinks a live epoch (1.1 section 11).
+    bool require_endorsement_revocation{true};
+
     SecurityRulesetVersion security_ruleset{};
 };
 

@@ -116,6 +116,7 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
 
     add_bool(encoder, profile.require_no_new_privs);
     add_bool(encoder, profile.require_seccomp);
+    add_bool(encoder, profile.require_endorsement_revocation);
     encoder.add_u16(profile.security_ruleset);
     return encoder.digest();
 }

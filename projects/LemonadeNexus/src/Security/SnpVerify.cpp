@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <ctime>
 #include <memory>
 
 namespace nexus::security {
@@ -27,6 +28,8 @@ using StackPtr     = std::unique_ptr<STACK_OF(X509), Free<STACK_OF(X509), [](STA
 using SigPtr       = std::unique_ptr<ECDSA_SIG, Free<ECDSA_SIG, ECDSA_SIG_free>>;
 using MdCtxPtr     = std::unique_ptr<EVP_MD_CTX, Free<EVP_MD_CTX, EVP_MD_CTX_free>>;
 using BioPtr       = std::unique_ptr<BIO, Free<BIO, BIO_free_all>>;
+using CrlPtr       = std::unique_ptr<X509_CRL, Free<X509_CRL, X509_CRL_free>>;
+using AsnTimePtr   = std::unique_ptr<ASN1_TIME, Free<ASN1_TIME, ASN1_TIME_free>>;
 
 /// OPENSSL_free is a macro, so it cannot be named in a decltype deleter.
 struct OpenSslFree {
@@ -237,6 +240,83 @@ SigPtr ecdsa_sig_from_snp(std::span<const uint8_t> sig_field) {
 
 bool same_cert(X509* a, X509* b) { return a && b && X509_cmp(a, b) == 0; }
 
+/// PEM first, then DER. AMD serves DER; operator tooling often stores PEM.
+CrlPtr parse_crl(std::string_view bytes) {
+    if (bytes.empty()) return nullptr;
+    BioPtr bio{BIO_new_mem_buf(bytes.data(), static_cast<int>(bytes.size()))};
+    if (bio) {
+        if (X509_CRL* pem = PEM_read_bio_X509_CRL(bio.get(), nullptr, nullptr, nullptr)) {
+            return CrlPtr{pem};
+        }
+    }
+    const auto* p = reinterpret_cast<const unsigned char*>(bytes.data());
+    return CrlPtr{d2i_X509_CRL(nullptr, &p, static_cast<long>(bytes.size()))};
+}
+
+/// Resolve the ASK + ARK that issued `vcek`.
+///
+/// An empty chain means "use the pinned ones", which is the normal case: both
+/// certificates are fixed per product, so shipping them with every piece of
+/// evidence spends bandwidth to deliver something we already refuse to trust
+/// on arrival.
+///
+/// The report never names its silicon generation, so the product is resolved by
+/// matching the root rather than by trusting a claim. A supplied chain must
+/// root in one of the compiled-in AMD roots; an empty chain tries each pinned
+/// pair. Either way the root comes from this binary, so an unknown generation
+/// fails closed instead of widening what is trusted.
+std::vector<X509Ptr> resolve_amd_chain(X509* vcek, std::string_view chain_pem,
+                                       std::string& why) {
+    std::vector<X509Ptr> chain;
+    if (chain_pem.empty()) {
+        for (const auto product : pinned_amd_products()) {
+            auto candidate = parse_pem_chain(pinned_amd_chain(product));
+            if (candidate.size() >= 2 &&
+                X509_check_issued(candidate[0].get(), vcek) == X509_V_OK) {
+                chain = std::move(candidate);
+                break;
+            }
+        }
+        if (chain.size() < 2) {
+            why = "no compiled-in AMD chain issued this VCEK";
+            return {};
+        }
+    } else {
+        chain = parse_pem_chain(chain_pem);
+    }
+    if (chain.size() < 2) {
+        why = "certificate chain must carry ASK and ARK";
+        return {};
+    }
+
+    bool root_is_pinned = false;
+    for (const auto product : pinned_amd_products()) {
+        auto pinned = parse_pem_chain(pinned_amd_root(product));
+        if (!pinned.empty() && same_cert(chain[1].get(), pinned[0].get())) {
+            root_is_pinned = true;
+            break;
+        }
+    }
+    if (!root_is_pinned) {
+        why = "chain root is not a compiled-in AMD root key";
+        return {};
+    }
+    return chain;
+}
+
+/// True when `serial` appears in the CRL's revoked list.
+bool serial_is_revoked(X509_CRL* crl, const ASN1_INTEGER* serial) {
+    if (!serial) return false;
+    STACK_OF(X509_REVOKED)* revoked = X509_CRL_get_REVOKED(crl);
+    for (int i = 0; i < sk_X509_REVOKED_num(revoked); ++i) {
+        const X509_REVOKED* entry = sk_X509_REVOKED_value(revoked, i);
+        if (entry && ASN1_INTEGER_cmp(X509_REVOKED_get0_serialNumber(entry), serial) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace
 
 std::span<const std::string_view> pinned_amd_products() {
@@ -285,47 +365,11 @@ SnpVerifyResult verify_snp_signature(const SnpReport& report,
     if (!vcek) return fail("VCEK is not a DER certificate");
 
     // --- chain: expect ASK then ARK ----------------------------------------
-    // An empty chain means "use the pinned ones", which is the normal case: both
-    // certificates are fixed per product, so shipping them with every piece of
-    // evidence spends bandwidth to deliver something we already refuse to trust
-    // on arrival.
-    //
-    // The report never names its silicon generation, so the product is resolved
-    // by matching the root rather than by trusting a claim. A supplied chain
-    // must root in one of the compiled-in AMD roots; an empty chain tries each
-    // pinned pair. Either way the root comes from this binary, so an unknown
-    // generation fails closed instead of widening what is trusted.
-    std::vector<X509Ptr> chain;
-    if (chain_pem.empty()) {
-        for (const auto product : pinned_amd_products()) {
-            auto candidate = parse_pem_chain(pinned_amd_chain(product));
-            if (candidate.size() >= 2 && X509_check_issued(candidate[0].get(),
-                                                            vcek.get()) == X509_V_OK) {
-                chain = std::move(candidate);
-                break;
-            }
-        }
-        if (chain.size() < 2) {
-            return fail("no compiled-in AMD chain issued this VCEK");
-        }
-    } else {
-        chain = parse_pem_chain(chain_pem);
-    }
-    if (chain.size() < 2) return fail("certificate chain must carry ASK and ARK");
+    std::string why;
+    std::vector<X509Ptr> chain = resolve_amd_chain(vcek.get(), chain_pem, why);
+    if (chain.size() < 2) return fail(why);
     X509* ask = chain[0].get();
     X509* ark = chain[1].get();
-
-    bool root_is_pinned = false;
-    for (const auto product : pinned_amd_products()) {
-        auto pinned = parse_pem_chain(pinned_amd_root(product));
-        if (!pinned.empty() && same_cert(ark, pinned[0].get())) {
-            root_is_pinned = true;
-            break;
-        }
-    }
-    if (!root_is_pinned) {
-        return fail("chain root is not a compiled-in AMD root key");
-    }
 
     StorePtr store{X509_STORE_new()};
     if (!store || X509_STORE_add_cert(store.get(), ark) != 1) {
@@ -366,6 +410,71 @@ SnpVerifyResult verify_snp_signature(const SnpReport& report,
                                     report.raw.data(), kSnpSignedLen);
     if (rc != 1) return fail("attestation report signature is not valid under the VCEK");
 
+    return pass();
+}
+
+std::string amd_crl_kds_url(std::string_view product) {
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "https://kdsintf.amd.com/vcek/v1/%.*s/crl",
+                  static_cast<int>(product.size()), product.data());
+    return buf;
+}
+
+SnpVerifyResult verify_snp_revocation(std::span<const uint8_t> vcek_der,
+                                       std::string_view chain_pem,
+                                       const AmdRevocationState& state) {
+    if (vcek_der.empty()) return fail("no VCEK supplied");
+    if (state.crl.empty()) {
+        return fail("no cached AMD revocation list; new attestation cannot be checked "
+                    "for revoked endorsement");
+    }
+    if (state.now_unix <= 0) {
+        return fail("no trusted clock, so the revocation list cannot be checked for expiry");
+    }
+
+    const unsigned char* p = vcek_der.data();
+    X509Ptr vcek{d2i_X509(nullptr, &p, static_cast<long>(vcek_der.size()))};
+    if (!vcek) return fail("VCEK is not a DER certificate");
+
+    std::string why;
+    std::vector<X509Ptr> chain = resolve_amd_chain(vcek.get(), chain_pem, why);
+    if (chain.size() < 2) return fail(why);
+    X509* ask = chain[0].get();
+    X509* ark = chain[1].get();
+
+    CrlPtr crl = parse_crl(state.crl);
+    if (!crl) return fail("the revocation list is not a PEM or DER CRL");
+
+    // AMD signs the product CRL with the ARK or the ASK depending on what it
+    // revokes. Either is acceptable BECAUSE both came from the chain above,
+    // which already had to root in a compiled-in AMD key.
+    const bool signed_by_ark = X509_CRL_verify(crl.get(), X509_get0_pubkey(ark)) == 1;
+    const bool signed_by_ask = X509_CRL_verify(crl.get(), X509_get0_pubkey(ask)) == 1;
+    if (!signed_by_ark && !signed_by_ask) {
+        return fail("the revocation list is not signed by this VCEK's AMD chain");
+    }
+
+    // An expired CRL proves nothing about today. Refusing it is what stops a
+    // hypervisor pinning a node to a stale list that predates a revocation.
+    time_t now = static_cast<time_t>(state.now_unix);  // X509_cmp_time wants a mutable pointer
+    const ASN1_TIME* next = X509_CRL_get0_nextUpdate(crl.get());
+    if (next == nullptr) {
+        return fail("the revocation list carries no nextUpdate, so it cannot expire");
+    }
+    if (X509_cmp_time(next, &now) <= 0) {
+        return fail("the cached revocation list expired; refresh it before new attestation");
+    }
+    if (const ASN1_TIME* last = X509_CRL_get0_lastUpdate(crl.get());
+        last != nullptr && X509_cmp_time(last, &now) > 0) {
+        return fail("the revocation list is not valid yet");
+    }
+
+    if (serial_is_revoked(crl.get(), X509_get0_serialNumber(ask))) {
+        return fail("AMD revoked the signing key that issued this VCEK");
+    }
+    if (serial_is_revoked(crl.get(), X509_get0_serialNumber(vcek.get()))) {
+        return fail("AMD revoked this VCEK");
+    }
     return pass();
 }
 

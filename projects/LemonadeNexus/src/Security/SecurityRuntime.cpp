@@ -9,7 +9,7 @@ namespace nexus::security {
 
 SecurityRuntime::SecurityRuntime(SecurityRuntimeConfig config)
     : config_(std::move(config)),
-      attestation_(config_.profile),
+      attestation_(config_.profile, config_.amd_revocation),
       authority_(config_.self, commitments_),
       consensus_store_(config_.consensus_directory) {}
 

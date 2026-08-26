@@ -514,6 +514,10 @@ LinuxAttestationProfile profile_for_the_captured_host() {
     profile.snp.expected_measurement_hex = captured_measurement_hex();
     profile.ima_policy_digest.fill(0x60);
     profile.approved_binary_sha256 = {kApprovedBinary};
+    // The captured fixture predates any cached CRL, and revocation is checked
+    // right after the AMD signature. Leaving it on here would stop every test
+    // below at the same step; the revocation rule has its own tests instead.
+    profile.require_endorsement_revocation = false;
     return profile;
 }
 
@@ -606,4 +610,119 @@ TEST_F(ProviderBoundaryTest, TheLaunchMeasurementPinIsCheckedBeforeTheQuote) {
     EXPECT_FALSE(verdict.claims.hardware_confidentiality_valid);
     // The AMD signature held; only the pinned launch state did not.
     EXPECT_FALSE(verdict.claims.tcb_valid);
+}
+
+// --- AMD revocation ------------------------------------------------------------
+//
+// AMD's signature over an endorsement it has since withdrawn is worth nothing.
+// The check runs immediately after the signature and before guest policy, so a
+// revoked chain never reaches the parts of the report it vouched for.
+//
+// Every branch here is a refusal. The accepting branch cannot be tested off
+// platform: a CRL that this chain accepts must be signed by AMD's own key, and
+// the captured fixtures predate any published CRL. A KDS outage still cannot
+// shrink a live epoch, because membership is frozen once selected and only NEW
+// attestation consults revocation.
+
+namespace {
+
+/// A profile that demands current revocation data, matching the captured host
+/// in every other respect.
+LinuxAttestationProfile profile_requiring_revocation() {
+    LinuxAttestationProfile profile = profile_for_the_captured_host();
+    profile.require_endorsement_revocation = true;
+    return profile;
+}
+
+constexpr int64_t kSomeTimeIn2026 = 1'774'000'000;
+
+}  // namespace
+
+TEST_F(ProviderBoundaryTest, AbsentRevocationDataFailsClosed) {
+    const LinuxAttestationProfile profile = profile_requiring_revocation();
+    ASSERT_TRUE(profile_is_complete(profile));
+    challenge_.policy_digest = profile_digest(profile);
+    evidence_ = answer(challenge_);
+    evidence_.platform = real_platform_bundle();
+    sign_evidence();
+
+    // No source installed at all: the operator cached nothing.
+    const auto verdict = AttestationVerifier(profile).examine(challenge_, evidence_);
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::EndorsementRevoked);
+    // The AMD signature held; the question of whether AMD stands behind it did
+    // not get an answer, and an unanswered question is a refusal.
+    EXPECT_FALSE(verdict.claims.hardware_confidentiality_valid);
+    EXPECT_EQ(tier1_eligibility(verdict, complete_facts(verdict)),
+              Tier1Eligibility::Ineligible);
+}
+
+TEST_F(ProviderBoundaryTest, RevocationWithoutATrustedClockFailsClosed) {
+    const LinuxAttestationProfile profile = profile_requiring_revocation();
+    challenge_.policy_digest = profile_digest(profile);
+    evidence_ = answer(challenge_);
+    evidence_.platform = real_platform_bundle();
+    sign_evidence();
+
+    // A CRL with no clock to check it against. An expired list would look
+    // exactly like a current one, which is what a stale-list replay needs.
+    const auto verifier = AttestationVerifier(profile, [] {
+        nexus::security::AmdRevocationState state;
+        state.crl = fixture_text("foreign_crl.pem");
+        state.now_unix = 0;
+        return state;
+    });
+    EXPECT_EQ(verifier.examine(challenge_, evidence_).failure,
+              AttestationFailure::EndorsementRevoked);
+}
+
+TEST_F(ProviderBoundaryTest, ARevocationListFromAnotherIssuerIsRefused) {
+    // The attacker's own CRL: correctly formed, currently valid, and signed by
+    // a key that is not in this VCEK's AMD chain. Accepting it would let a host
+    // supply a list that revokes nothing.
+    const LinuxAttestationProfile profile = profile_requiring_revocation();
+    challenge_.policy_digest = profile_digest(profile);
+    evidence_ = answer(challenge_);
+    evidence_.platform = real_platform_bundle();
+    sign_evidence();
+
+    const auto verifier = AttestationVerifier(profile, [] {
+        nexus::security::AmdRevocationState state;
+        state.crl = fixture_text("foreign_crl.pem");
+        state.now_unix = kSomeTimeIn2026;
+        return state;
+    });
+    EXPECT_EQ(verifier.examine(challenge_, evidence_).failure,
+              AttestationFailure::EndorsementRevoked);
+}
+
+TEST_F(ProviderBoundaryTest, UnparsableRevocationDataIsRefused) {
+    const LinuxAttestationProfile profile = profile_requiring_revocation();
+    challenge_.policy_digest = profile_digest(profile);
+    evidence_ = answer(challenge_);
+    evidence_.platform = real_platform_bundle();
+    sign_evidence();
+
+    for (const char* junk : {"not a crl", "-----BEGIN X509 CRL-----\nAAAA\n"}) {
+        const auto verifier = AttestationVerifier(profile, [junk] {
+            nexus::security::AmdRevocationState state;
+            state.crl = junk;
+            state.now_unix = kSomeTimeIn2026;
+            return state;
+        });
+        EXPECT_EQ(verifier.examine(challenge_, evidence_).failure,
+                  AttestationFailure::EndorsementRevoked) << junk;
+    }
+}
+
+// The requirement is compiled into the profile and bound into its digest, so a
+// build that dropped it could not answer a challenge issued by one that kept it.
+TEST_F(ProviderBoundaryTest, TheRevocationRequirementIsPartOfTheProfileIdentity) {
+    LinuxAttestationProfile without = profile_requiring_revocation();
+    without.require_endorsement_revocation = false;
+    EXPECT_NE(profile_digest(without), profile_digest(profile_requiring_revocation()));
+
+    // The shipped Tier 1 profile demands it.
+    EXPECT_TRUE(nexus::security::linux_attestation_profile_v1()
+                    .require_endorsement_revocation);
 }

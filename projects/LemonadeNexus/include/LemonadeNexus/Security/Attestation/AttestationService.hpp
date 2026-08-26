@@ -21,7 +21,8 @@ namespace nexus::security {
 
 class AttestationService {
 public:
-    explicit AttestationService(LinuxAttestationProfile profile);
+    explicit AttestationService(LinuxAttestationProfile profile,
+                                AmdRevocationSource revocation = {});
 
     /// Issues a fresh challenge for one attempt. Returns nullopt when the
     /// node spent its attestation budget for this epoch.

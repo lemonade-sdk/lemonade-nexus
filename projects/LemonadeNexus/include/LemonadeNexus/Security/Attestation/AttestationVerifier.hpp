@@ -17,6 +17,7 @@
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProvider.hpp>
+#include <LemonadeNexus/Security/Attestation/Providers/AzureSnpVtpmProvider.hpp>
 
 #include <cstddef>
 #include <memory>
@@ -47,12 +48,16 @@ using ProviderSet = std::vector<std::shared_ptr<PlatformEvidenceProvider>>;
 /// The compiled provider set for `profile`. This is the whole registry: what
 /// the verified binary constructs here is what can satisfy Tier 1. Nothing
 /// loads a provider from configuration, and nothing removes one at runtime.
-[[nodiscard]] ProviderSet compiled_providers(LinuxAttestationProfile profile);
+[[nodiscard]] ProviderSet compiled_providers(LinuxAttestationProfile profile,
+                                             AmdRevocationSource revocation = {});
 
 class AttestationVerifier {
 public:
-    /// The compiled provider set for `profile`.
-    explicit AttestationVerifier(LinuxAttestationProfile profile);
+    /// The compiled provider set for `profile`. `revocation` supplies the
+    /// cached AMD CRL and the current time; without it a profile that requires
+    /// a revocation check refuses every candidate that reaches that step.
+    explicit AttestationVerifier(LinuxAttestationProfile profile,
+                                 AmdRevocationSource revocation = {});
 
     /// An explicit provider set. This is a test seam for unknown, unsupported
     /// and substituted providers. Production uses the constructor above; there

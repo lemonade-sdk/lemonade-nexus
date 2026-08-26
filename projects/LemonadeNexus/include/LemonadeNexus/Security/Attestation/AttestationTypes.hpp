@@ -107,6 +107,9 @@ enum class AttestationFailure : uint16_t {
     ProfileIdMismatch,
     /// Same profile, different rules. Old evidence cannot answer new rules.
     ProfileRulesetMismatch,
+    /// The hardware endorsement is revoked, or revocation data is missing or
+    /// expired so the question cannot be answered. Both fail closed.
+    EndorsementRevoked,
 };
 
 /// The bounded result of one verification. It states facts about one candidate

@@ -6,10 +6,11 @@
 
 namespace nexus::security {
 
-AttestationService::AttestationService(LinuxAttestationProfile profile)
+AttestationService::AttestationService(LinuxAttestationProfile profile,
+                                       AmdRevocationSource revocation)
     : profile_(std::move(profile)),
       policy_digest_(profile_digest(profile_)),
-      verifier_(profile_) {}
+      verifier_(profile_, std::move(revocation)) {}
 
 std::optional<AttestationChallenge> AttestationService::create_challenge(
     const NodeId& node, const crypto::Ed25519PublicKey& node_key,

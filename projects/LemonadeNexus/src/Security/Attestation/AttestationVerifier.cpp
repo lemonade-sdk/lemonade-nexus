@@ -41,6 +41,9 @@ AttestationFailure map_platform_failure(const EvidenceVerdict& verdict) {
     // it splits the chain at "the quote held". Failure-string prefixes refine
     // each half; an unknown string maps to the most severe failure of its half.
     if (!verdict.quote_verified) {
+        if (why.starts_with("AMD revocation check failed")) {
+            return AttestationFailure::EndorsementRevoked;
+        }
         if (why.starts_with("the quote is not bound to this challenge")) {
             return AttestationFailure::ChallengeMismatch;
         }
@@ -76,16 +79,19 @@ AttestationFailure map_platform_failure(const EvidenceVerdict& verdict) {
     return AttestationFailure::ImaMeasurementInvalid;
 }
 
-ProviderSet compiled_providers(LinuxAttestationProfile profile) {
+ProviderSet compiled_providers(LinuxAttestationProfile profile,
+                               AmdRevocationSource revocation) {
     ProviderSet providers;
-    providers.push_back(std::make_shared<AzureSnpVtpmProvider>(std::move(profile)));
+    providers.push_back(
+        std::make_shared<AzureSnpVtpmProvider>(std::move(profile), std::move(revocation)));
     providers.push_back(std::make_shared<SnpSvsmVtpmProvider>());
     providers.push_back(std::make_shared<SnpDirectBootProvider>());
     return providers;
 }
 
-AttestationVerifier::AttestationVerifier(LinuxAttestationProfile profile)
-    : providers_(compiled_providers(std::move(profile))) {}
+AttestationVerifier::AttestationVerifier(LinuxAttestationProfile profile,
+                                         AmdRevocationSource revocation)
+    : providers_(compiled_providers(std::move(profile), std::move(revocation))) {}
 
 AttestationVerifier::AttestationVerifier(ProviderSet providers)
     : providers_(std::move(providers)) {}

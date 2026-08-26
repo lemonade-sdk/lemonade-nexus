@@ -109,6 +109,12 @@ struct EvidenceProduceConfig {
 
 struct EvidenceRequirements {
     SnpPolicyRequirements policy;
+
+    /// AMD revocation state. Enforced only when `require_revocation_check` is
+    /// set, so the startup self-probe and first enrollment can run without a
+    /// cached CRL while Tier 1 attestation cannot.
+    bool require_revocation_check{false};
+    AmdRevocationState revocation;
     /// Hex SHA-384 launch measurement pinned at enrollment. Empty accepts any,
     /// which is only right for the startup self-probe and first enrollment.
     std::string expected_measurement_hex;
@@ -159,6 +165,9 @@ struct EvidenceVerdict {
     /// actually passes, so a bundle that stops early leaves every later link
     /// false and Tier 1 eligibility fails closed.
     bool snp_signature_valid{false};
+    /// AMD has not revoked this VCEK or the key that issued it, checked against
+    /// a CRL that is signed by this chain and has not expired.
+    bool endorsement_not_revoked{false};
     bool snp_policy_valid{false};
     /// The reported TCB is at or above the required floor. Evaluated on its own
     /// rather than borrowed from snp_policy_valid, which also covers guest

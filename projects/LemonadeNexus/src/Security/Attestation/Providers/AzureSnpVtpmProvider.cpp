@@ -6,8 +6,11 @@
 
 namespace nexus::security {
 
-AzureSnpVtpmProvider::AzureSnpVtpmProvider(LinuxAttestationProfile profile)
-    : profile_(std::move(profile)), policy_digest_(profile_digest(profile_)) {}
+AzureSnpVtpmProvider::AzureSnpVtpmProvider(LinuxAttestationProfile profile,
+                                            AmdRevocationSource revocation)
+    : profile_(std::move(profile)),
+      revocation_(std::move(revocation)),
+      policy_digest_(profile_digest(profile_)) {}
 
 std::optional<AttestationFailure> AzureSnpVtpmProvider::readiness() const {
     if (!profile_is_complete(profile_)) {
@@ -34,6 +37,10 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
     requirements.expected_pcrs = profile_.expected_pcrs;
     requirements.require_no_new_privs = profile_.require_no_new_privs;
     requirements.require_seccomp = profile_.require_seccomp;
+    requirements.require_revocation_check = profile_.require_endorsement_revocation;
+    if (revocation_) {
+        requirements.revocation = revocation_();
+    }
     if (profile_.enforce_ima_policy && profile_.ima_policy_digest != Digest{}) {
         requirements.expected_ima_policy_sha256 = hex_of(profile_.ima_policy_digest);
     }

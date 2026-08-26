@@ -28,13 +28,18 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
     : config_(config),
       transport_(transport),
       runtime_(SecurityRuntimeConfig{
-          self_id(config),
-          config.data_root / "security" / "consensus",
-          config.profile,
+          .self = self_id(config),
+          .consensus_directory = config.data_root / "security" / "consensus",
+          .profile = config.profile,
+          // No CRL cache exists yet, so revocation data is absent and new Tier 1
+          // attestation fails closed on it. That is the intended state until a
+          // cache producer lands; it never touches a live epoch.
+          .amd_revocation = {},
           // Called only while consensus runs, long after the driver exists.
-          [this](const Digest& transitions_digest) {
-              return transitions_digest == driver_.pending_handoff_digest();
-          }}),
+          .transition_validator =
+              [this](const Digest& transitions_digest) {
+                  return transitions_digest == driver_.pending_handoff_digest();
+              }}),
       sealer_(config.identity.private_key),
       store_(config.data_root / "security", wrapping),
       genesis_(config.identity.public_key == config.genesis_public_key
