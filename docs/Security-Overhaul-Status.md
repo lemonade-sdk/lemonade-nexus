@@ -231,6 +231,92 @@ test server qualifies, and the profile will not be weakened to compensate;
 the test server (10.10.12.40) remains the target for Tier-2, ineligible-peer,
 and transport testing against a real network.
 
+### M6 — Attestation against real SEV-SNP silicon (in progress)
+
+The test host `uwb-nx0-mesh-root` (10.10.12.40) was rebuilt as a native
+SEV-SNP guest on AMD EPYC 9354 (Genoa) with a vTPM. It was collected again on
+2026-08-26 in both collector modes. Full detail, including what regressed,
+lives in `docs/attestation/test-host-capabilities.md`. The earlier negative
+collection is retained as the record of the host before the change.
+
+**The SEV-SNP evidence is genuine and now verifiable by the shipped binary.**
+Three properties were checked off-host against the archived bytes and are now
+pinned by tests:
+
+* The AMD chain validates: VCEK ← ASK (`SEV-Genoa`) ← ARK (`ARK-Genoa`).
+* The report signature verifies under the VCEK: ECDSA P-384 over SHA-384 of
+  report bytes `0x000`–`0x2A0`.
+* `REPORT_DATA` equals `SHA-512(challenge)`, so the report is bound to a fresh
+  challenge. A `reference` run of the same guest carries the same launch
+  measurement and a different binding.
+
+Changes this drove:
+
+* **The AMD root pin is no longer Milan-only.** `verify_snp_signature` hard-coded
+  `"Milan"` for both the pinned chain and the pinned root, so a valid Genoa chain
+  was rejected outright. The real Genoa ARK and ASK are now compiled in, and the
+  product is resolved by matching the chain against the compiled-in roots rather
+  than by trusting any claim. A generation we hold no root for still fails
+  closed — it never borrows another generation's root.
+* **`tests/test_snp_genoa.cpp`** drives real hardware bytes. These are the first
+  tests in the tree that assert the AMD chain *accepts* evidence; every other SNP
+  test asserts a rejection. It also covers the negatives that matter: a tampered
+  measurement, a tampered `REPORT_DATA`, the wrong VCEK, a Milan chain against a
+  Genoa report, an absent VCEK, a TCB floor above the platform, and a wrong
+  pinned measurement.
+* **Profile completeness is explicit and fails closed.** `LinuxAttestationProfile`
+  gained `profile_gaps()`, `profile_is_complete()` and `profile_gap_name()`.
+  `AttestationVerifier::examine` now checks completeness **first** and returns the
+  new `AttestationFailure::ProfileIncomplete`. Previously an unpinned profile
+  failed by accident at the last step, with a misleading
+  `BinaryMeasurementInvalid`.
+* **`linux_attestation_profile_v1()` is the named compiled profile**, and
+  `main.cpp` uses it instead of a default-constructed struct. It fixes the rules
+  (debug denied, migration agent denied, VMPL0, IMA enforced, `no_new_privs`,
+  seccomp) and deliberately pins **no** launch measurement, TCB floor, IMA policy
+  digest or approved binary, because those values may only be read from a host
+  that already satisfies the rules. Until such a host exists every candidate
+  fails with `ProfileIncomplete`, and the server logs each gap at startup. This
+  is the intended behavior: pinning values observed on an unqualified host would
+  make the profile decide nothing.
+
+#### Why this host cannot be Tier 1 Genesis yet
+
+The guest runs at **VMPL0** with no SVSM and no paravisor, and its vTPM is a
+host-side `swtpm` attached by QEMU with no EK certificate. The vTPM therefore
+sits outside the SEV-SNP boundary: a hostile hypervisor can forge any quote it
+produces, including PCR contents. Measured-boot and IMA evidence taken from it
+prove nothing against the threat model SEV-SNP exists to address.
+
+This is exactly the binding the compiled chain requires and the reason it
+requires it. Under a paravisor the vTPM lives inside the guest boundary and the
+SNP report's runtime data publishes `HCLAkPub`, so the hardware vouches for the
+vTPM key. This host publishes no such binding, so its evidence is refused.
+
+Two host changes would resolve it, and both are the operator's call:
+
+1. Run a **COCONUT-SVSM vTPM** at VMPL0 with the guest at VMPL1 or above, so the
+   vTPM lives inside the confidential boundary and the SNP report can bind it.
+2. Use **SNP measured direct boot** — kernel, initrd and command line inside the
+   launch measurement, with a dm-verity root hash pinned on that command line —
+   so software integrity rests on the SNP measurement and needs no vTPM.
+
+Secondary gaps on the same host, none of which decide the question: Secure Boot
+is off, no IMA policy is loaded (`CONFIG_IMA_WRITE_POLICY` is unset and the
+kernel command line carries no `ima_policy=`, so nothing is measured), the boot
+chain runs through GRUB from an unmeasured LVM volume, and no Nexus binary is
+installed.
+
+The profile must not be relaxed to accept an unbound vTPM. Accepting one would
+let any hypervisor mint a passing Tier 1 node.
+
+#### M4 positive-path status
+
+Unchanged and blocked. The positive Genesis path needs **five** hosts that
+satisfy the compiled profile. Zero qualify today: this host fails on the vTPM
+binding above, and no other candidate exists. The bootstrap threshold stays at
+five and the profile stays as it is.
+
 ## 4. Test host
 
 See `docs/attestation/test-host-capabilities.md`. The first test host
