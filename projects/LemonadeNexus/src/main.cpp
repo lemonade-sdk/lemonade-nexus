@@ -24,6 +24,7 @@
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
+#include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
@@ -208,8 +209,18 @@ int main(int argc, char* argv[]) {
         std::memcpy(mesh_config.genesis_public_key.data(), genesis_bytes.data(),
                     genesis_bytes.size());
         mesh_config.identity = gossip.keypair();
-        mesh_config.profile.security_ruleset =
-            nexus::security::constants::kSecurityRulesetVersion;
+        // The named profile, not a default-constructed one. It is currently
+        // incomplete by design, so every attestation fails with
+        // ProfileIncomplete until a qualifying host supplies the pinned values.
+        mesh_config.profile = nexus::security::linux_attestation_profile_v1();
+        if (!nexus::security::profile_is_complete(mesh_config.profile)) {
+            for (const auto gap : nexus::security::profile_gaps(mesh_config.profile)) {
+                spdlog::warn("Attestation profile v{} is incomplete: {}",
+                             mesh_config.profile.profile_version,
+                             nexus::security::profile_gap_name(gap));
+            }
+            spdlog::warn("No node can reach Tier 1 until the profile pins these values.");
+        }
         security_mesh.emplace(coordinator.io_context(), mesh_config, gossip, &key_wrapping);
         security_mesh->start();
     }

@@ -81,6 +81,14 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return verdict;
     };
 
+    // 0. The profile must be able to decide. A profile that pins no launch
+    // measurement, no TCB floor or no approved binary would accept a platform
+    // it never examined, so an incomplete profile rejects everyone. This runs
+    // first: no later check means anything under a policy that decides nothing.
+    if (!profile_is_complete(profile)) {
+        return fail(AttestationFailure::ProfileIncomplete);
+    }
+
     // 1. The challenge must be for THIS compiled policy.
     if (challenge.policy_digest != verdict.policy_digest) {
         return fail(AttestationFailure::RulesetMismatch);

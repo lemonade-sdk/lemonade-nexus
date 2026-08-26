@@ -46,9 +46,14 @@ protected:
         ASSERT_GE(sodium_init(), 0);
         ASSERT_EQ(crypto_sign_keypair(node_pk_.data(), node_sk_.data()), 0);
 
-        profile_.profile_version = 1;
+        // A COMPLETE profile: examine() refuses everything under an incomplete
+        // one, so every check below would otherwise be unreachable.
+        profile_ = nexus::security::linux_attestation_profile_v1();
+        profile_.snp.min_tcb = {2, 0, 6, 55};
+        profile_.snp.expected_measurement_hex = std::string(96, 'a');
+        profile_.ima_policy_digest.fill(0x60);
         profile_.approved_binary_sha256 = {kApprovedBinary};
-        profile_.security_ruleset = constants::kSecurityRulesetVersion;
+        ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
 
         challenge_.nonce = patterned<32>(0x01);
         challenge_.node_id.bytes = patterned<32>(0x02);

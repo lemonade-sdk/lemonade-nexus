@@ -1,7 +1,9 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -118,6 +120,135 @@ TEST(LinuxAttestationProfile, ListBoundariesCannotShift) {
     joined.approved_binary_sha256 = {"abcd"};
 
     EXPECT_NE(profile_digest(split), profile_digest(joined));
+}
+
+// --- Completeness -------------------------------------------------------------
+//
+// A profile that leaves a prerequisite unpinned cannot tell a good platform
+// from a bad one. Completeness is therefore a property the verifier checks
+// before anything else, and these tests pin which gaps it must notice.
+
+using nexus::security::ProfileGap;
+using nexus::security::profile_gaps;
+using nexus::security::profile_is_complete;
+using nexus::security::linux_attestation_profile_v1;
+
+namespace {
+
+/// base_profile() carries a stale ruleset; the completeness rule compares
+/// against the compiled one, so align it here.
+LinuxAttestationProfile complete_profile() {
+    LinuxAttestationProfile profile = base_profile();
+    profile.security_ruleset = nexus::security::constants::kSecurityRulesetVersion;
+    return profile;
+}
+
+bool has_gap(const LinuxAttestationProfile& profile, ProfileGap gap) {
+    const auto gaps = profile_gaps(profile);
+    return std::find(gaps.begin(), gaps.end(), gap) != gaps.end();
+}
+
+}  // namespace
+
+TEST(LinuxAttestationProfileCompleteness, AFullyPinnedProfileIsComplete) {
+    EXPECT_TRUE(profile_is_complete(complete_profile()));
+    EXPECT_TRUE(profile_gaps(complete_profile()).empty());
+}
+
+TEST(LinuxAttestationProfileCompleteness, ADefaultProfileIsIncomplete) {
+    // The default-constructed profile pins nothing. It must never read as usable.
+    EXPECT_FALSE(profile_is_complete(LinuxAttestationProfile{}));
+}
+
+// The shipped v1 profile fixes the rules but pins no observed values, because
+// no qualifying host has supplied them yet. It must fail closed, by design.
+TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
+    const auto v1 = linux_attestation_profile_v1();
+    EXPECT_EQ(v1.profile_version, 1u);
+    EXPECT_EQ(v1.security_ruleset, nexus::security::constants::kSecurityRulesetVersion);
+    EXPECT_TRUE(v1.snp.require_debug_disabled);
+    EXPECT_TRUE(v1.snp.require_no_migration_agent);
+    EXPECT_TRUE(v1.snp.require_vmpl0);
+
+    EXPECT_FALSE(profile_is_complete(v1));
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoPinnedLaunchMeasurement));
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoTcbFloor));
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoApprovedBinary));
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoImaPolicyDigest));
+    // The rules it DOES fix are already right, so these are not gaps.
+    EXPECT_FALSE(has_gap(v1, ProfileGap::ProfileVersionUnset));
+    EXPECT_FALSE(has_gap(v1, ProfileGap::SecurityRulesetMismatch));
+}
+
+TEST(LinuxAttestationProfileCompleteness, EachUnpinnedPrerequisiteIsItsOwnGap) {
+    {   // No launch measurement: any SNP guest image would pass.
+        auto p = complete_profile();
+        p.snp.expected_measurement_hex.clear();
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::NoPinnedLaunchMeasurement));
+    }
+    {   // An all-zero TCB floor accepts every firmware level, so it is no floor.
+        auto p = complete_profile();
+        p.snp.min_tcb = {};
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::NoTcbFloor));
+    }
+    {   // One non-zero component is still a floor.
+        auto p = complete_profile();
+        p.snp.min_tcb = {0, 0, 0, 1};
+        EXPECT_FALSE(has_gap(p, ProfileGap::NoTcbFloor));
+    }
+    {
+        auto p = complete_profile();
+        p.approved_binary_sha256.clear();
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::NoApprovedBinary));
+    }
+    {
+        auto p = complete_profile();
+        p.profile_version = 0;
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::ProfileVersionUnset));
+    }
+    {
+        auto p = complete_profile();
+        p.security_ruleset = nexus::security::constants::kSecurityRulesetVersion + 1;
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::SecurityRulesetMismatch));
+    }
+}
+
+// The IMA policy digest is required only while IMA enforcement is on. Turning
+// enforcement off removes the gap, and that is a weaker profile — not an
+// incomplete one — so the distinction has to stay visible.
+TEST(LinuxAttestationProfileCompleteness, ImaPolicyDigestTracksEnforcement) {
+    auto p = complete_profile();
+    p.ima_policy_digest = Digest{};
+    p.enforce_ima_policy = true;
+    EXPECT_TRUE(has_gap(p, ProfileGap::NoImaPolicyDigest));
+
+    p.enforce_ima_policy = false;
+    EXPECT_FALSE(has_gap(p, ProfileGap::NoImaPolicyDigest));
+}
+
+TEST(LinuxAttestationProfileCompleteness, EveryGapNamesItself) {
+    for (const auto gap : {ProfileGap::ProfileVersionUnset,
+                           ProfileGap::NoPinnedLaunchMeasurement,
+                           ProfileGap::NoTcbFloor,
+                           ProfileGap::NoApprovedBinary,
+                           ProfileGap::NoImaPolicyDigest,
+                           ProfileGap::SecurityRulesetMismatch}) {
+        EXPECT_FALSE(nexus::security::profile_gap_name(gap).empty());
+        EXPECT_NE(nexus::security::profile_gap_name(gap), "unknown gap");
+    }
+}
+
+// An attestation key is pinned per enrolled node, not once for the mesh, so its
+// absence must NOT make the profile incomplete.
+TEST(LinuxAttestationProfileCompleteness, PinnedAkIsNotAProfilePrerequisite) {
+    auto p = complete_profile();
+    p.required_ak_spki_b64.clear();
+    EXPECT_TRUE(profile_is_complete(p));
 }
 
 }  // namespace

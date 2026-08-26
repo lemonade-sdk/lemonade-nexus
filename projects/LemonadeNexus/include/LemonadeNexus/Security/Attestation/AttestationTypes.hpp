@@ -73,6 +73,9 @@ enum class AttestationFailure : uint16_t {
     IncarnationStale,
     EpochMismatch,
     EvidenceOversized,
+    /// The compiled profile leaves a prerequisite unpinned, so it cannot tell a
+    /// good platform from a bad one. Appended last: the values above are stable.
+    ProfileIncomplete,
 };
 
 /// The bounded result of one verification. It states facts about one candidate
