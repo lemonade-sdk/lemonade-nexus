@@ -14,9 +14,32 @@
 
 namespace nexus::security {
 
+/// What VMPL must have requested an SNP report.
+///
+/// VMPL is a privilege level, not a quality score: lower is more privileged.
+/// Which level is correct depends on WHO requests the report in a given
+/// platform shape, so this is a provider decision and never a global rule.
+enum class VmplPolicy : uint16_t {
+    /// Any level. Correct only for a startup self-probe; it proves nothing
+    /// about who asked, so a Tier 1 profile must not leave it here.
+    Unconstrained,
+
+    /// The report must be recorded at VMPL0. Right when the component that
+    /// requests it is the most privileged one in the guest: a paravisor that
+    /// owns the boundary, or a native guest requesting its own report.
+    RequireVmpl0,
+
+    /// The report must be recorded ABOVE VMPL0, which proves something more
+    /// privileged exists below the requester. This is the SVSM shape: the SVSM
+    /// holds VMPL0 and Linux runs higher, so a guest-requested report recorded
+    /// at VMPL0 would mean no SVSM was there.
+    RequireAboveVmpl0,
+};
+
 /// Policy a verifier demands of the attesting platform. The defaults are the
-/// Tier-1 bar: memory encryption that actually survives a hypervisor with a
-/// debugger, and a report the guest could not have requested for itself.
+/// Tier-1 bar for the properties that are the same everywhere: memory
+/// encryption that survives a hypervisor with a debugger, and no migration
+/// agent. VMPL is deliberately NOT among them — see VmplPolicy.
 struct SnpPolicyRequirements {
     /// DEBUG=1 lets the hypervisor read guest state — it defeats the entire
     /// "pause the VM and dump memory" property. Never optional.
@@ -25,10 +48,15 @@ struct SnpPolicyRequirements {
     /// A migration agent can move the guest out of its encryption boundary.
     bool require_no_migration_agent{true};
 
-    /// Under a paravisor the report is requested at VMPL0 by the paravisor itself;
-    /// a guest that could request its own would be at VMPL0 too. Either way the
-    /// recorded level must be 0.
-    bool require_vmpl0{true};
+    /// Which privilege level must have requested the report.
+    ///
+    /// There is no single right answer, so there is no default that is right
+    /// everywhere. Under a paravisor the paravisor requests the report at VMPL0.
+    /// A native guest that requests its own report is itself at VMPL0. But under
+    /// an SVSM the SVSM holds VMPL0 and the Linux guest runs at a numerically
+    /// HIGHER VMPL, so demanding 0 of a guest-requested report there would
+    /// reject exactly the shape Tier 1 wants. The provider decides.
+    VmplPolicy vmpl_policy{VmplPolicy::Unconstrained};
 
     /// Minimum security-patch levels. A report below the floor means the platform
     /// is running firmware with known issues.

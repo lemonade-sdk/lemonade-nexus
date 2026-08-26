@@ -72,7 +72,9 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     // here and never read from a host.
     profile.snp.require_debug_disabled = true;
     profile.snp.require_no_migration_agent = true;
-    profile.snp.require_vmpl0 = true;
+    // The HCL/paravisor shape: the paravisor owns VMPL0 and requests the
+    // report. A different provider pins a different level.
+    profile.snp.vmpl_policy = VmplPolicy::RequireVmpl0;
 
     profile.enforce_ima_policy = true;
     profile.require_no_new_privs = true;
@@ -92,7 +94,7 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
     // memory is hashed, so layout and padding cannot leak into the digest.
     add_bool(encoder, profile.snp.require_debug_disabled);
     add_bool(encoder, profile.snp.require_no_migration_agent);
-    add_bool(encoder, profile.snp.require_vmpl0);
+    encoder.add_u16(static_cast<uint16_t>(profile.snp.vmpl_policy));
     encoder.add_u16(profile.snp.min_tcb.bootloader);
     encoder.add_u16(profile.snp.min_tcb.tee);
     encoder.add_u16(profile.snp.min_tcb.snp);

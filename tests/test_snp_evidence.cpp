@@ -216,10 +216,34 @@ TEST_F(SnpEvidenceTest, MigrationAgentIsRejected) {
     EXPECT_FALSE(verify_snp_policy(h.snp, {}).ok);
 }
 
-TEST_F(SnpEvidenceTest, NonZeroVmplIsRejected) {
-    auto h = parsed();
-    h.snp.vmpl = 2;
-    EXPECT_FALSE(verify_snp_policy(h.snp, {}).ok);
+// VMPL is a privilege level, not a quality score, and which level is correct
+// depends on WHO requests the report. There is deliberately no default that is
+// right everywhere: a paravisor or a native guest requests at VMPL0, while
+// under an SVSM the SVSM holds VMPL0 and Linux runs above it. Demanding 0 of a
+// guest-requested report there would reject exactly the shape Tier 1 wants.
+TEST_F(SnpEvidenceTest, VmplPolicyIsProviderSpecific) {
+    auto at_zero = parsed();
+    at_zero.snp.vmpl = 0;
+    auto above_zero = parsed();
+    above_zero.snp.vmpl = 2;
+
+    SnpPolicyRequirements paravisor;
+    paravisor.vmpl_policy = VmplPolicy::RequireVmpl0;
+    EXPECT_TRUE(verify_snp_policy(at_zero.snp, paravisor).ok);
+    EXPECT_FALSE(verify_snp_policy(above_zero.snp, paravisor).ok);
+
+    SnpPolicyRequirements under_svsm;
+    under_svsm.vmpl_policy = VmplPolicy::RequireAboveVmpl0;
+    EXPECT_TRUE(verify_snp_policy(above_zero.snp, under_svsm).ok);
+    // A guest that holds VMPL0 has nothing more privileged beneath it, so no
+    // SVSM was there.
+    EXPECT_FALSE(verify_snp_policy(at_zero.snp, under_svsm).ok);
+
+    // The default proves nothing about who asked, which is why a Tier 1 profile
+    // must pin one of the two above.
+    EXPECT_TRUE(verify_snp_policy(at_zero.snp, {}).ok);
+    EXPECT_TRUE(verify_snp_policy(above_zero.snp, {}).ok);
+    EXPECT_EQ(SnpPolicyRequirements{}.vmpl_policy, VmplPolicy::Unconstrained);
 }
 
 TEST_F(SnpEvidenceTest, TcbBelowFloorIsRejected) {

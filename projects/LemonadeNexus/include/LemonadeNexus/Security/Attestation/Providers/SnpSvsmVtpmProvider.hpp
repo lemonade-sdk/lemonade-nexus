@@ -2,10 +2,16 @@
 
 // AMD SEV-SNP with a COCONUT-SVSM vTPM at VMPL0.
 //
-// This is the intended Tier 1 shape: the SVSM and its vTPM run at VMPL0 inside
-// the SNP boundary, Linux runs at VMPL1 or lower, and the hypervisor is outside
-// both. It replaces the host-side swtpm, which is not an approved Tier 1 TPM
-// source because the host owns its private state.
+// This is the intended Tier 1 shape:
+//
+//   SVSM  = VMPL0                      most privileged inside the guest
+//   Linux = VMPL1 or higher            strictly less privileged than the SVSM
+//
+// VMPL is a privilege level and lower is more privileged, so "Linux runs above
+// VMPL0" is the correct statement. The SVSM and its vTPM sit inside the SNP
+// boundary and the hypervisor sits outside both. This replaces the host-side
+// swtpm, which is not an approved Tier 1 TPM source because the host owns its
+// private state.
 //
 // The provider is DELIBERATELY UNIMPLEMENTED. The SVSM service-manifest format
 // and the exact binding from the SNP report to the vTPM AK are not invented
@@ -20,11 +26,18 @@
 //     -> SVSM service binding -> vTPM AK -> fresh TPM quote
 //     -> measured boot + IMA
 //
-// One rule inverts against AzureSnpVtpmProvider and must not be copied: under
-// SVSM the guest Linux runs at VMPL1 or lower, so SnpPolicyRequirements
-// require_vmpl0 cannot be applied to a guest-requested report. Which component
-// requests the report, and at which VMPL, is part of what the captured
-// evidence must settle.
+// The VMPL rule inverts against AzureSnpVtpmProvider and must not be copied.
+// There the paravisor owns VMPL0 and requests the report, so
+// VmplPolicy::RequireVmpl0 is right. Here a guest-requested report recorded at
+// VMPL0 would prove the OPPOSITE of what is wanted: it would mean the guest
+// holds the most privileged level and no SVSM runs beneath it. The evidence
+// model must prove both halves:
+//
+//   the approved SVSM holds VMPL0
+//   the Linux guest runs at VMPL > 0    (VmplPolicy::RequireAboveVmpl0)
+//
+// How the SVSM attestation response carries the first half is exactly what the
+// captured evidence must settle. It is not guessed here.
 
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProvider.hpp>
 

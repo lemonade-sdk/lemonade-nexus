@@ -28,7 +28,7 @@ LinuxAttestationProfile base_profile() {
     profile.profile_version = 1;
     profile.snp.require_debug_disabled = true;
     profile.snp.require_no_migration_agent = true;
-    profile.snp.require_vmpl0 = true;
+    profile.snp.vmpl_policy = nexus::security::VmplPolicy::RequireVmpl0;
     profile.snp.min_tcb = {2, 0, 6, 55};
     profile.snp.expected_measurement_hex = "aa11";
     profile.required_ak_spki_b64 = "QUsx";
@@ -52,7 +52,8 @@ const ProfileMutation kProfileMutations[] = {
      [](LinuxAttestationProfile& p) { p.snp.require_debug_disabled = false; }},
     {"snp.require_no_migration_agent",
      [](LinuxAttestationProfile& p) { p.snp.require_no_migration_agent = false; }},
-    {"snp.require_vmpl0", [](LinuxAttestationProfile& p) { p.snp.require_vmpl0 = false; }},
+    {"snp.vmpl_policy", [](LinuxAttestationProfile& p) {
+         p.snp.vmpl_policy = nexus::security::VmplPolicy::RequireAboveVmpl0; }},
     {"snp.min_tcb.bootloader", [](LinuxAttestationProfile& p) { p.snp.min_tcb.bootloader += 1; }},
     {"snp.min_tcb.tee", [](LinuxAttestationProfile& p) { p.snp.min_tcb.tee += 1; }},
     {"snp.min_tcb.snp", [](LinuxAttestationProfile& p) { p.snp.min_tcb.snp += 1; }},
@@ -168,7 +169,10 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
     EXPECT_EQ(v1.security_ruleset, nexus::security::constants::kSecurityRulesetVersion);
     EXPECT_TRUE(v1.snp.require_debug_disabled);
     EXPECT_TRUE(v1.snp.require_no_migration_agent);
-    EXPECT_TRUE(v1.snp.require_vmpl0);
+    // The HCL/paravisor shape. Not a global rule: an SVSM profile pins
+    // RequireAboveVmpl0 instead, because there the guest is not the most
+    // privileged component.
+    EXPECT_EQ(v1.snp.vmpl_policy, nexus::security::VmplPolicy::RequireVmpl0);
 
     EXPECT_FALSE(profile_is_complete(v1));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoPinnedLaunchMeasurement));

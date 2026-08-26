@@ -486,9 +486,23 @@ SnpVerifyResult verify_snp_policy(const SnpReport& report, const SnpPolicyRequir
         return fail("guest policy allows a migration agent — the guest can be moved "
                     "out of its encryption boundary");
     }
-    if (req.require_vmpl0 && report.vmpl != 0) {
-        return fail("report was requested at VMPL " + std::to_string(report.vmpl) +
-                    ", expected VMPL 0");
+    switch (req.vmpl_policy) {
+        case VmplPolicy::Unconstrained:
+            break;
+        case VmplPolicy::RequireVmpl0:
+            if (report.vmpl != 0) {
+                return fail("report was requested at VMPL " + std::to_string(report.vmpl) +
+                            ", expected VMPL 0");
+            }
+            break;
+        case VmplPolicy::RequireAboveVmpl0:
+            // A guest-requested report recorded at VMPL0 means the guest holds
+            // the most privileged level, so nothing runs beneath it.
+            if (report.vmpl == 0) {
+                return fail("report was requested at VMPL 0, so no more privileged "
+                            "component exists below the guest");
+            }
+            break;
     }
     if (!report.reported_tcb.at_least(req.min_tcb)) {
         return fail("platform TCB [" + report.reported_tcb.to_string() +
