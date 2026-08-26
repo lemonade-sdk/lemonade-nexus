@@ -60,6 +60,13 @@ add_nexus_test(test_snp_evidence      test_snp_evidence.cpp)
 target_compile_definitions(test_snp_evidence PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
+# Real SEV-SNP bytes from our own Genoa host: the only tests that assert the
+# AMD chain ACCEPTS evidence rather than rejecting it.
+add_nexus_test(test_snp_genoa         test_snp_genoa.cpp)
+target_compile_definitions(test_snp_genoa PRIVATE
+    NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+target_link_libraries(test_snp_genoa PRIVATE OpenSSL::Crypto)
+
 # The links above the AMD signature: the quote under HCLAkPub, the evidence
 # binding, and the IMA replay.
 add_nexus_test(test_evidence_chain    test_evidence_chain.cpp)
@@ -67,6 +74,9 @@ target_compile_definitions(test_evidence_chain PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
+# Hostile packets at the real wire boundary: cert-gated sync, ServerHello
+# proof-of-possession, misbehavior proofs, and NS slot claim laundering.
+add_nexus_test(test_gossip_ingress_security test_gossip_ingress_security.cpp)
 add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp)
 add_nexus_test(test_security_mesh_service test_security_mesh_service.cpp)
 
@@ -113,7 +123,8 @@ add_nexus_test(test_security_attestation
     security/attestation/verifier.cpp
     security/attestation/linux_profile.cpp
     security/attestation/service.cpp
-    security/attestation/producer.cpp)
+    security/attestation/producer.cpp
+    security/attestation/tier1_path.cpp)
 
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
