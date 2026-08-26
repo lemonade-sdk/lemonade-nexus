@@ -65,6 +65,7 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     evidence.challenge_digest = challenge_digest(challenge);
     evidence.node_id.bytes = sources_.identity.public_key;
     evidence.incarnation = challenge.incarnation;
+    evidence.epoch = challenge.epoch;
     evidence.security_ruleset = constants::kSecurityRulesetVersion;
     evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
     evidence.epoch_vote_key = *vote_key;

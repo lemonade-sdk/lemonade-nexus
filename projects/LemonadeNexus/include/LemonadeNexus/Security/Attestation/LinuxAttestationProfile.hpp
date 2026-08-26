@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace nexus::security {
@@ -36,6 +37,11 @@ struct LinuxAttestationProfile {
     /// Hex SHA-256 digests from the approved release ledger. The measured
     /// binary must match one of them; an empty list approves none.
     std::vector<std::string> approved_binary_sha256;
+
+    /// Approved boot state: one pinned hex value per quoted PCR. The TPM quote
+    /// covers these, so they are attested facts rather than claims. An empty
+    /// list pins no boot state and leaves the prerequisite unproven.
+    std::vector<std::pair<uint32_t, std::string>> expected_pcrs;
 
     bool require_no_new_privs{true};
     bool require_seccomp{true};

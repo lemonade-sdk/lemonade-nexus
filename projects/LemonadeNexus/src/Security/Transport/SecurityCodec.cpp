@@ -129,6 +129,7 @@ bool encode_evidence(Writer& w, const AttestationEvidence& e) {
     w.fixed(e.challenge_digest);
     put_node(w, e.node_id);
     w.u64(e.incarnation);
+    w.u64(e.epoch);
     w.u16(e.security_ruleset);
     w.u16(e.consensus_ruleset);
     w.fixed(e.epoch_vote_key);
@@ -326,7 +327,7 @@ bool decode_challenge(Reader& r, AttestationChallenge& c) {
 bool decode_evidence(Reader& r, AttestationEvidence& e) {
     std::vector<uint8_t> platform;
     if (!(r.fixed(e.challenge_digest) && get_node(r, e.node_id) && r.u64(e.incarnation) &&
-          r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) && r.fixed(e.epoch_vote_key) &&
+          r.u64(e.epoch) && r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) && r.fixed(e.epoch_vote_key) &&
           r.bytes(platform, constants::kMaxPlatformEvidenceWireBytes))) {
         return false;
     }

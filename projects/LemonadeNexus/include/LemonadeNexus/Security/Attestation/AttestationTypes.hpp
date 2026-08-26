@@ -39,6 +39,9 @@ struct AttestationEvidence {
     Digest challenge_digest{};
     NodeId node_id{};
     IncarnationId incarnation{};
+    /// The epoch this evidence answers. Stated explicitly so a cross-epoch
+    /// answer is diagnosed as such instead of surfacing as a digest mismatch.
+    EpochId epoch{};
     SecurityRulesetVersion security_ruleset{};
     ConsensusRulesetVersion consensus_ruleset{};
     crypto::Ed25519PublicKey epoch_vote_key{};
@@ -88,6 +91,21 @@ struct AttestationVerdict {
     Digest evidence_digest{};
     bool passed{false};
     AttestationFailure failure{AttestationFailure::None};
+
+    /// Per-link facts, carried so Tier 1 eligibility can be decided from named
+    /// prerequisites instead of from `passed` alone. A link that never ran stays
+    /// false, which is what makes an unproven prerequisite fail closed.
+    struct Links {
+        bool identity_signature_valid{false};
+        bool snp_signature_valid{false};
+        bool snp_policy_valid{false};
+        bool vtpm_bound{false};
+        bool quote_fresh{false};
+        bool boot_state_valid{false};
+        bool ima_anchored{false};
+        bool binary_approved{false};
+        bool runtime_profile_valid{false};
+    } links;
 };
 
 }  // namespace nexus::security

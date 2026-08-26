@@ -66,6 +66,7 @@ protected:
         evidence_.challenge_digest = challenge_digest(challenge_);
         evidence_.node_id = challenge_.node_id;
         evidence_.incarnation = challenge_.incarnation;
+        evidence_.epoch = challenge_.epoch;
         evidence_.security_ruleset = constants::kSecurityRulesetVersion;
         evidence_.consensus_ruleset = constants::kConsensusRulesetVersion;
         evidence_.epoch_vote_key = patterned<32>(0x07);
@@ -309,6 +310,23 @@ const MappingCase kMappingCases[] = {
      AttestationFailure::BinaryMeasurementInvalid},
     {"the claimed binary measurement is not what the kernel recorded for that path", true,
      AttestationFailure::BinaryMeasurementInvalid},
+    // Boot state: the quote covers these PCRs, so a mismatch is an attested
+    // fact about the wrong boot chain.
+    {"the boot measurement does not match the approved value for PCR 4", true,
+     AttestationFailure::BootMeasurementInvalid},
+    {"the boot measurement is incomplete: the quote does not cover PCR 7", true,
+     AttestationFailure::BootMeasurementInvalid},
+    // Runtime profile.
+    {"the runtime profile is wrong: no_new_privs is not set", true,
+     AttestationFailure::RuntimeProfileInvalid},
+    {"the runtime profile is wrong: seccomp is not active", true,
+     AttestationFailure::RuntimeProfileInvalid},
+    // The IMA policy behind the log.
+    {"the IMA policy digest is not the approved one", true,
+     AttestationFailure::ImaMeasurementInvalid},
+    {"the IMA policy digest is absent, so the measuring policy cannot be checked against "
+     "the approved one",
+     true, AttestationFailure::ImaMeasurementInvalid},
 };
 
 TEST(MapPlatformFailure, CoversEveryFailureClassTheChainProduces) {

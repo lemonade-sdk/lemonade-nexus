@@ -17,6 +17,8 @@
 #if defined(__linux__) && defined(LEMONADE_HAVE_TPM_FAPI)
 #include <tss2/tss2_esys.h>
 #include <tss2/tss2_tctildr.h>
+#include <openssl/evp.h>
+#include <sys/prctl.h>
 #endif
 
 namespace nexus::security {
@@ -69,6 +71,9 @@ std::string encode_snp_vtpm_evidence(const SnpVtpmEvidence& ev) {
     j["binary_path"]   = ev.binary_path;
     j["binary_sha256"] = ev.binary_sha256;
     j["ima_unavailable"] = ev.ima_unavailable;
+    j["ima_policy_sha256"]     = ev.ima_policy_sha256;
+    j["runtime_no_new_privs"]  = ev.runtime_no_new_privs;
+    j["runtime_seccomp_mode"]  = ev.runtime_seccomp_mode;
     return j.dump();
 }
 
@@ -89,6 +94,9 @@ std::optional<SnpVtpmEvidence> decode_snp_vtpm_evidence(std::string_view text) {
         ev.binary_path   = j.value("binary_path", "");
         ev.binary_sha256 = j.value("binary_sha256", "");
         ev.ima_unavailable = j.value("ima_unavailable", "");
+        ev.ima_policy_sha256    = j.value("ima_policy_sha256", "");
+        ev.runtime_no_new_privs = j.value("runtime_no_new_privs", "");
+        ev.runtime_seccomp_mode = j.value("runtime_seccomp_mode", "");
         return ev;
     } catch (const std::exception&) {
         return std::nullopt;
@@ -102,6 +110,23 @@ std::optional<SnpVtpmEvidence> decode_snp_vtpm_evidence(std::string_view text) {
 #if defined(__linux__) && defined(LEMONADE_HAVE_TPM_FAPI)
 
 namespace {
+
+/// securityfs and procfs report size 0, so read to EOF rather than seeking.
+std::string read_text_file(const char* path) {
+    std::ifstream f(path);
+    if (!f) return {};
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+std::vector<uint8_t> sha256_bytes(std::span<const uint8_t> data) {
+    std::vector<uint8_t> out(EVP_MAX_MD_SIZE);
+    unsigned len = 0;
+    if (EVP_Digest(data.data(), data.size(), out.data(), &len, EVP_sha256(), nullptr) != 1) {
+        return {};
+    }
+    out.resize(len);
+    return out;
+}
 
 /// RAII for the ESYS context + TCTI.
 struct EsysSession {
@@ -349,6 +374,36 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
     // ev.ima_unavailable says why, for diagnostics only.
     ev.ima_log     = read_ima_ascii_log();
     ev.binary_path = running_executable_path();
+
+    // The IMA policy the kernel is enforcing. Most builds leave
+    // CONFIG_IMA_READ_POLICY off, so this is usually unreadable — the field
+    // then stays empty and a verifier that pins a policy digest refuses the
+    // bundle. Absent evidence is failed evidence.
+    if (auto policy = read_text_file("/sys/kernel/security/ima/policy"); !policy.empty()) {
+        const auto digest = sha256_bytes(
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(policy.data()),
+                                     policy.size()));
+        if (!digest.empty()) ev.ima_policy_sha256 = crypto::to_hex(digest);
+    }
+
+    // Runtime state of this process. Self-reported: see the caveat on the
+    // fields themselves.
+    {
+        const int nnp = prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0);
+        if (nnp >= 0) ev.runtime_no_new_privs = nnp ? "1" : "0";
+
+        const auto status = read_text_file("/proc/self/status");
+        const auto at = status.find("Seccomp:");
+        if (at != std::string::npos) {
+            const auto line_end = status.find('\n', at);
+            const auto value = status.substr(at + 8, line_end - at - 8);
+            const auto first = value.find_first_of("0123456789");
+            if (first != std::string::npos) {
+                const auto last = value.find_first_not_of("0123456789", first);
+                ev.runtime_seccomp_mode = value.substr(first, last - first);
+            }
+        }
+    }
     if (ev.ima_log.empty()) {
         std::error_code ec;
         const bool present =
@@ -475,6 +530,13 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
     if (auto sig = verify_snp_signature(hcl->snp, ev.vcek_der, ev.amd_chain_pem); !sig.ok) {
         return deny(std::move(v), "AMD signature check failed: " + sig.failure);
     }
+    v.snp_signature_valid = true;
+
+    // parse_hcl_blob already refused unless sha256(runtime data) equals the
+    // signed REPORT_DATA, so AMD has vouched for which vTPM key belongs to this
+    // launch. That is the whole vTPM binding: without it a quote proves only
+    // that some TPM somewhere signed something.
+    v.ak_bound_to_report = !v.ak_spki_b64.empty();
 
     // --- guest policy: where "pause the VM and dump memory" is ruled out ------
     SnpPolicyRequirements policy = req.policy;
@@ -484,6 +546,7 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
     if (auto pol = verify_snp_policy(hcl->snp, policy); !pol.ok) {
         return deny(std::move(v), "platform policy check failed: " + pol.failure);
     }
+    v.snp_policy_valid = true;
 
     // --- the enrolled vTPM, when one was pinned ------------------------------
     if (!req.expected_ak_spki_b64.empty()) {
@@ -519,6 +582,8 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
                                    "binary measurement");
     }
 
+    v.quote_bound_to_challenge = true;
+
     const auto hash_alg = tpmt_signature_hash_alg(ev.tpm_signature);
     if (!hash_alg) return deny(std::move(v), "the quote signature has no readable hash algorithm");
     if (!quote_pcr_digest_matches(*quote, ev.pcr_values, *hash_alg)) {
@@ -529,6 +594,28 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
     // policy rules out a hypervisor reading guest state, and it just answered our
     // challenge live. The binary is a separate question.
     v.quote_verified = true;
+
+    // --- boot state: the quoted PCRs must be the pinned ones -----------------
+    // The quote covers these values, so unlike the runtime fields below they are
+    // hardware facts. An unpinned list checks nothing, so it leaves the link
+    // false and Tier 1 eligibility fails closed on it.
+    if (!req.expected_pcrs.empty()) {
+        for (const auto& [index, want_hex] : req.expected_pcrs) {
+            const uint16_t bank = *hash_alg;
+            auto quoted = quote_pcr_value(*quote, bank, index, ev.pcr_values);
+            if (!quoted) {
+                return deny(std::move(v), "the boot measurement is incomplete: the quote does "
+                                           "not cover PCR " + std::to_string(index));
+            }
+            std::vector<uint8_t> want;
+            try { want = crypto::from_hex(want_hex); } catch (...) {}
+            if (want.empty() || want != *quoted) {
+                return deny(std::move(v), "the boot measurement does not match the approved "
+                                           "value for PCR " + std::to_string(index));
+            }
+        }
+        v.boot_state_valid = true;
+    }
 
     // --- the binary measurement, anchored in a PCR ---------------------------
     if (req.require_ima) {
@@ -570,8 +657,38 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
                                        "recorded for that path");
         }
         v.binary_sha256 = entry->file_hash_hex;
+        v.ima_anchored = true;
+        v.binary_measured = true;
     } else {
         v.binary_sha256 = ev.binary_sha256;
+    }
+
+    // --- the IMA policy the kernel is enforcing ------------------------------
+    // A log that replays correctly proves the entries are real. It does not
+    // prove the policy measured everything it should have, which is what this
+    // pins.
+    if (!req.expected_ima_policy_sha256.empty()) {
+        if (ev.ima_policy_sha256.empty()) {
+            return deny(std::move(v), "the IMA policy digest is absent, so the measuring policy "
+                                       "cannot be checked against the approved one");
+        }
+        if (ev.ima_policy_sha256 != req.expected_ima_policy_sha256) {
+            return deny(std::move(v), "the IMA policy digest is not the approved one");
+        }
+    }
+
+    // --- runtime profile -----------------------------------------------------
+    // Self-reported, and only meaningful because the binary reporting it is
+    // IMA-measured and on the approved list. See SnpVtpmEvidence.
+    if (req.require_no_new_privs || req.require_seccomp) {
+        if (req.require_no_new_privs && ev.runtime_no_new_privs != "1") {
+            return deny(std::move(v), "the runtime profile is wrong: no_new_privs is not set");
+        }
+        if (req.require_seccomp &&
+            (ev.runtime_seccomp_mode.empty() || ev.runtime_seccomp_mode == "0")) {
+            return deny(std::move(v), "the runtime profile is wrong: seccomp is not active");
+        }
+        v.runtime_profile_valid = true;
     }
 
     v.ok = true;

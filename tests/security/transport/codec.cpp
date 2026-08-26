@@ -316,7 +316,8 @@ TEST(SecurityCodec, LengthFieldsAreBoundedBeforeAllocation) {
     auto bytes = encode_security_message(message);
     ASSERT_FALSE(bytes.empty());
     constexpr std::size_t kEnvelopeHeader = 1 + 2 + 2 + 2 + 32 + 8 + 32 + 4;
-    constexpr std::size_t kEvidenceFixed = 32 + 32 + 8 + 2 + 2 + 32;
+    // challenge_digest, node_id, incarnation, epoch, both rulesets, vote key.
+    constexpr std::size_t kEvidenceFixed = 32 + 32 + 8 + 8 + 2 + 2 + 32;
     const std::size_t length_offset = kEnvelopeHeader + kEvidenceFixed;
     for (int i = 0; i < 4; ++i) bytes[length_offset + static_cast<std::size_t>(i)] = 0xFF;
     EXPECT_EQ(std::get<CodecError>(decode_security_message(bytes)), CodecError::LengthTooLarge);

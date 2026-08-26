@@ -28,6 +28,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <string_view>
 #include <vector>
 
@@ -60,6 +61,23 @@ struct SnpVtpmEvidence {
     /// Why the prover could not measure its own binary. Diagnostic only — a
     /// verifier rejects on the ABSENT measurement, never on this string.
     std::string          ima_unavailable;
+
+    /// Hex SHA-256 of the IMA policy the kernel is enforcing. The kernel does not
+    /// publish the active policy on every build, so an absent value fails the
+    /// check rather than skipping it.
+    std::string          ima_policy_sha256;
+
+    /// Runtime state of the process that produced this bundle: "1" or "0" for
+    /// no_new_privs, and the numeric seccomp mode.
+    ///
+    /// These are SELF-REPORTED. No TPM quote covers them, so they are worth
+    /// exactly as much as the binary that reports them: the identity signature
+    /// binds them, and the binary carrying that identity is IMA-measured and
+    /// must appear on the approved release list. A modified binary could lie
+    /// here, and a modified binary is already rejected. Do not read these as
+    /// hardware-attested facts.
+    std::string          runtime_no_new_privs;
+    std::string          runtime_seccomp_mode;
 
     [[nodiscard]] bool empty() const { return hcl_blob.empty() || tpms_attest.empty(); }
 };
@@ -100,6 +118,20 @@ struct EvidenceRequirements {
     /// An IMA log that replays to the quoted PCR 10 is what makes the binary
     /// measurement non-self-chosen. Off only for the platform-only probe.
     bool require_ima{true};
+
+    /// Boot state. Each entry pins one quoted PCR to a hex value. The quote
+    /// covers these PCRs, so unlike the runtime fields below they are hardware
+    /// facts. Empty pins none, which is only right for a first enrollment.
+    std::vector<std::pair<uint32_t, std::string>> expected_pcrs;
+
+    /// Hex SHA-256 of the IMA policy the prover must be enforcing. Empty pins
+    /// none.
+    std::string expected_ima_policy_sha256;
+
+    /// Runtime profile. See the caveat on the evidence fields: these are
+    /// self-reported by an approved binary, not attested by hardware.
+    bool require_no_new_privs{false};
+    bool require_seccomp{false};
 };
 
 struct EvidenceVerdict {
@@ -121,6 +153,19 @@ struct EvidenceVerdict {
     /// integrity rests on SHA-1 collision resistance. Fixed by booting the guest
     /// with ima_template_hash_algo=sha256.
     bool ima_replayed_in_sha1_bank{false};
+
+    /// Per-link outcomes, so a caller can build a Tier 1 evidence state without
+    /// re-deriving anything from `failure`. Each stays false until its link
+    /// actually passes, so a bundle that stops early leaves every later link
+    /// false and Tier 1 eligibility fails closed.
+    bool snp_signature_valid{false};
+    bool snp_policy_valid{false};
+    bool ak_bound_to_report{false};
+    bool quote_bound_to_challenge{false};
+    bool boot_state_valid{false};
+    bool ima_anchored{false};
+    bool binary_measured{false};
+    bool runtime_profile_valid{false};
 
     explicit operator bool() const { return ok; }
 };

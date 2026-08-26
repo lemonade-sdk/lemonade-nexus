@@ -130,6 +130,7 @@ protected:
         evidence.challenge_digest = challenge_digest(challenge);
         evidence.node_id = challenge.node_id;
         evidence.incarnation = challenge.incarnation;
+        evidence.epoch = challenge.epoch;
         evidence.security_ruleset = constants::kSecurityRulesetVersion;
         evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
         evidence.epoch_vote_key = patterned<32>(0x33);
@@ -289,11 +290,10 @@ TEST_F(Tier1PathTest, IncarnationMustMatchExactlyInBothDirections) {
 
 // --- 5. The epoch ---------------------------------------------------------------
 
-TEST_F(Tier1PathTest, EvidenceFromAnotherEpochIsRejectedThroughTheChallengeDigest) {
-    // examine() performs no direct epoch comparison. The epoch reaches the
-    // verifier only through challenge_digest(), so a cross-epoch answer
-    // surfaces as ChallengeMismatch and AttestationFailure::EpochMismatch stays
-    // unreachable from this path.
+TEST_F(Tier1PathTest, EvidenceFromAnotherEpochReportsEpochMismatch) {
+    // The evidence names its epoch, and examine() compares it before the
+    // challenge digest. A cross-epoch answer is therefore diagnosed as such
+    // instead of surfacing as a digest mismatch, which would read as a replay.
     AttestationChallenge next_epoch = challenge_;
     next_epoch.epoch = challenge_.epoch + 1;
     ASSERT_NE(challenge_digest(next_epoch), challenge_digest(challenge_));
@@ -303,16 +303,32 @@ TEST_F(Tier1PathTest, EvidenceFromAnotherEpochIsRejectedThroughTheChallengeDiges
     sign_with(for_next, node_sk_);
     const auto forward = verifier_.examine(challenge_, for_next, profile_);
     EXPECT_FALSE(forward.passed);
-    EXPECT_EQ(forward.failure, AttestationFailure::ChallengeMismatch);
-    EXPECT_NE(forward.failure, AttestationFailure::EpochMismatch);
+    EXPECT_EQ(forward.failure, AttestationFailure::EpochMismatch);
     // The verdict reports the epoch of the challenge the verifier applied.
     EXPECT_EQ(forward.epoch, challenge_.epoch);
 
     // The rejection is symmetric: this epoch's answer fails against the next.
     const auto reverse = verifier_.examine(next_epoch, evidence_, profile_);
     EXPECT_FALSE(reverse.passed);
-    EXPECT_EQ(reverse.failure, AttestationFailure::ChallengeMismatch);
+    EXPECT_EQ(reverse.failure, AttestationFailure::EpochMismatch);
     EXPECT_EQ(reverse.epoch, next_epoch.epoch);
+}
+
+// The epoch is inside challenge_digest as well, so an answer that names the
+// right epoch but answers a different challenge still fails — one field cannot
+// be used to bypass the other.
+TEST_F(Tier1PathTest, RightEpochWithTheWrongChallengeStillFails) {
+    AttestationChallenge other = challenge_;
+    other.nonce[0] ^= 0xFF;
+    ASSERT_NE(challenge_digest(other), challenge_digest(challenge_));
+
+    AttestationEvidence for_other = answer(other);
+    for_other.epoch = challenge_.epoch;   // correct epoch, wrong challenge
+    sign_with(for_other, node_sk_);
+
+    const auto verdict = verifier_.examine(challenge_, for_other, profile_);
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::ChallengeMismatch);
 }
 
 // --- 6. Both sides must run the compiled rulesets --------------------------------

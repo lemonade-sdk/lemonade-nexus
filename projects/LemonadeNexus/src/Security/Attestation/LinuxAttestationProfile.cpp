@@ -108,6 +108,12 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
         encoder.add_string(binary_sha256);
     }
 
+    encoder.add_u64(profile.expected_pcrs.size());
+    for (const auto& [index, value_hex] : profile.expected_pcrs) {
+        encoder.add_u32(index);
+        encoder.add_string(value_hex);
+    }
+
     add_bool(encoder, profile.require_no_new_privs);
     add_bool(encoder, profile.require_seccomp);
     encoder.add_u16(profile.security_ruleset);

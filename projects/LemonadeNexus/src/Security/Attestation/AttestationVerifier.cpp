@@ -58,6 +58,12 @@ AttestationFailure map_platform_failure(const EvidenceVerdict& verdict) {
     }
 
     // The platform proved itself; the failure is in the runtime measurements.
+    if (why.starts_with("the boot measurement")) {
+        return AttestationFailure::BootMeasurementInvalid;
+    }
+    if (why.starts_with("the runtime profile is wrong")) {
+        return AttestationFailure::RuntimeProfileInvalid;
+    }
     if (why.starts_with("the IMA log carries no measurement") ||
         why.starts_with("the claimed binary measurement") ||
         why.starts_with("the platform is verified but its binary is not measured")) {
@@ -101,7 +107,16 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
         return fail(AttestationFailure::RulesetMismatch);
     }
 
-    // 3. The evidence must answer this challenge.
+    // 3. The evidence must name the epoch the challenge was issued for. The
+    //    epoch is inside challenge_digest too, so check 4 would catch a wrong
+    //    one anyway — but it would report a digest mismatch, which reads as a
+    //    replay rather than as an answer from the wrong epoch. Naming it first
+    //    keeps the two diagnosable apart.
+    if (evidence.epoch != challenge.epoch) {
+        return fail(AttestationFailure::EpochMismatch);
+    }
+
+    // 4. The evidence must answer this challenge.
     if (evidence.challenge_digest != challenge_digest(challenge)) {
         return fail(AttestationFailure::ChallengeMismatch);
     }
@@ -132,6 +147,7 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
                                     challenge.node_key.data()) != 0) {
         return fail(AttestationFailure::IdentitySignatureInvalid);
     }
+    verdict.links.identity_signature_valid = true;
 
     // 8. The platform chain: SNP -> vTPM -> quote -> measured runtime. The
     //    quote nonce is the challenge digest, so the quote answers THIS
@@ -140,9 +156,27 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     requirements.policy = profile.snp;
     requirements.expected_ak_spki_b64 = profile.required_ak_spki_b64;
     requirements.require_ima = profile.enforce_ima_policy;
+    requirements.expected_pcrs = profile.expected_pcrs;
+    requirements.require_no_new_privs = profile.require_no_new_privs;
+    requirements.require_seccomp = profile.require_seccomp;
+    if (profile.enforce_ima_policy && profile.ima_policy_digest != Digest{}) {
+        requirements.expected_ima_policy_sha256 = hex_of(profile.ima_policy_digest);
+    }
 
     const EvidenceVerdict platform = verify_snp_vtpm_evidence(
         evidence.platform, evidence.challenge_digest, challenge.node_key, requirements);
+
+    // Record what the platform proved even on the failing path: a caller
+    // building a Tier 1 state needs the links that DID hold, and the ones that
+    // did not stay false.
+    verdict.links.snp_signature_valid    = platform.snp_signature_valid;
+    verdict.links.snp_policy_valid       = platform.snp_policy_valid;
+    verdict.links.vtpm_bound             = platform.ak_bound_to_report;
+    verdict.links.quote_fresh            = platform.quote_bound_to_challenge;
+    verdict.links.boot_state_valid       = platform.boot_state_valid;
+    verdict.links.ima_anchored           = platform.ima_anchored;
+    verdict.links.runtime_profile_valid  = platform.runtime_profile_valid;
+
     if (!platform.ok) {
         return fail(map_platform_failure(platform));
     }
@@ -152,6 +186,7 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     if (!binary_approved(profile, platform.binary_sha256)) {
         return fail(AttestationFailure::BinaryMeasurementInvalid);
     }
+    verdict.links.binary_approved = true;
 
     verdict.passed = true;
     verdict.failure = AttestationFailure::None;

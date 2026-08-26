@@ -40,6 +40,7 @@ Digest evidence_signing_digest(const AttestationEvidence& evidence) {
     encoder.add_bytes(evidence.challenge_digest);
     encoder.add_bytes(evidence.node_id.bytes);
     encoder.add_u64(evidence.incarnation);
+    encoder.add_u64(evidence.epoch);
     encoder.add_u16(evidence.security_ruleset);
     encoder.add_u16(evidence.consensus_ruleset);
     encoder.add_bytes(evidence.epoch_vote_key);
