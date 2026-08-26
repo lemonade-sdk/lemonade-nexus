@@ -137,6 +137,48 @@ add_nexus_test(test_security_attestation
 target_compile_definitions(test_security_attestation PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 
+# --- Parser fuzzing ---
+#
+# The targets run two ways. corpus_replay drives them from a fixed corpus in
+# the normal suite, so they stay compiled and exercised on every build. With
+# NEXUS_BUILD_FUZZERS=ON and a clang that has libFuzzer, each target also
+# builds as its own fuzzer binary.
+add_nexus_test(test_fuzz_corpus fuzz/corpus_replay.cpp)
+
+option(NEXUS_BUILD_FUZZERS "Build libFuzzer targets for the security parsers" OFF)
+if(NEXUS_BUILD_FUZZERS)
+    # AppleClang ships no libFuzzer runtime. Detect it here so the failure is a
+    # clear message at configure time rather than a missing archive at link.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_FLAGS "-fsanitize=fuzzer")
+    check_cxx_source_compiles(
+        "#include <cstdint>\n#include <cstddef>\n
+         extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t*, size_t) { return 0; }"
+        NEXUS_HAVE_LIBFUZZER)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(NOT NEXUS_HAVE_LIBFUZZER)
+        message(FATAL_ERROR
+            "NEXUS_BUILD_FUZZERS=ON but this toolchain has no libFuzzer runtime. "
+            "Use a clang built with compiler-rt fuzzer support "
+            "(AppleClang does not ship one). The targets still run from a fixed "
+            "corpus in test_fuzz_corpus without it.")
+    endif()
+    set(NEXUS_FUZZ_TARGETS
+        security_envelope snp_report hcl_blob tpm_quote tpmt_signature
+        ima_log amd_crl amd_certificate platform_evidence_json)
+    foreach(target ${NEXUS_FUZZ_TARGETS})
+        add_executable(fuzz_${target} fuzz/libfuzzer_main.cpp)
+        target_link_libraries(fuzz_${target} PRIVATE LemonadeNexus)
+        target_include_directories(fuzz_${target} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(fuzz_${target} PRIVATE
+            ASIO_STANDALONE ASIO_NO_DEPRECATED
+            NEXUS_FUZZ_TARGET=fuzz_${target})
+        target_compile_options(fuzz_${target} PRIVATE
+            -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer)
+        target_link_options(fuzz_${target} PRIVATE -fsanitize=fuzzer,address,undefined)
+    endforeach()
+endif()
+
 # --- SDK tests (link against LemonadeNexusSDK) ---
 function(add_sdk_test TEST_NAME)
     add_executable(${TEST_NAME} ${ARGN})
