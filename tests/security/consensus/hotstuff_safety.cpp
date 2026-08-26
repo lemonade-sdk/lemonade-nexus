@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <vector>
 
@@ -415,6 +416,67 @@ TEST_F(HotStuffSafety, AdoptCertifiedBlocksAnchorOnceAndRebuildChainState) {
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(nexus::security::proposal_digest(out.front().first), chain[2].digest);
     EXPECT_EQ(nexus::security::proposal_digest(out.back().first), chain[3].digest);
+}
+
+
+// --- A handoff must be agreed, not announced -----------------------------------
+//
+// A proposal carries its transition only as a digest, so consensus cannot read
+// it. A replica that votes anyway authorizes a handoff it never evaluated: the
+// commit then means different things on different nodes, and only the proposer
+// activates. That splits the mesh across two epochs. These pin the refusal.
+
+class HotStuffTransitions : public ::testing::Test {
+protected:
+    /// A replica whose view of a pending transition is exactly `validator`.
+    void make_service(std::size_t self_index,
+                      std::function<bool(const Digest&)> validator) {
+        auto config = harness.config_for(self_index);
+        config.transition_validator = std::move(validator);
+        service.emplace(std::move(config), clone_key(harness.keys[self_index]), store);
+    }
+
+    Harness harness{4};
+    RecordingStore store;
+    std::optional<HotStuffService> service;
+};
+
+TEST_F(HotStuffTransitions, ProposalCarryingAnUnknownTransitionIsRefused) {
+    // This replica has arrived at no transition at all.
+    make_service(1, [](const Digest&) { return false; });
+    const auto chain = harness.build_chain(1);
+    const auto result = service->receive_proposal(chain[0].proposal, chain[0].justify);
+    EXPECT_EQ(result.rejected, ConsensusFailure::TransitionUnknown);
+    EXPECT_FALSE(result.vote.has_value());
+}
+
+TEST_F(HotStuffTransitions, AReplicaWithNoValidatorRefusesEveryTransition) {
+    make_service(1, nullptr);   // nothing can be evaluated
+    const auto chain = harness.build_chain(1);
+    EXPECT_EQ(service->receive_proposal(chain[0].proposal, chain[0].justify).rejected,
+              ConsensusFailure::TransitionUnknown);
+}
+
+// An ordinary block carries no transition, so the rule does not touch it: it
+// still votes on a replica that can evaluate nothing.
+TEST_F(HotStuffTransitions, AnOrdinaryBlockNeedsNoValidator) {
+    make_service(1, nullptr);
+    auto chain = harness.build_chain(1);
+    chain[0].proposal.transitions_digest = Digest{};
+    const auto result = service->receive_proposal(chain[0].proposal, chain[0].justify);
+    EXPECT_NE(result.rejected, ConsensusFailure::TransitionUnknown);
+}
+
+// The positive control: the same proposal a replica DOES recognise is voted
+// for, so the refusals above are the rule and not a broken proposal.
+TEST_F(HotStuffTransitions, ARecognisedTransitionIsVotedFor) {
+    const auto chain = harness.build_chain(1);
+    const Digest expected = chain[0].proposal.transitions_digest;
+    make_service(1, [expected](const Digest& d) { return d == expected; });
+
+    const auto result = service->receive_proposal(chain[0].proposal, chain[0].justify);
+    ASSERT_FALSE(result.rejected.has_value());
+    ASSERT_TRUE(result.vote.has_value());
 }
 
 }  // namespace

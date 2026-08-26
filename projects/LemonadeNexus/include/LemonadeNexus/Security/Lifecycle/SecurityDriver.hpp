@@ -88,6 +88,12 @@ public:
                                   const NodeId& from) override;
     void on_sync_certificate(const QuorumCertificate& certificate, const NodeId& from) override;
 
+    /// The handoff this node has independently prepared, or an empty digest
+    /// when it has none. Consensus asks this before voting for a proposal
+    /// that carries a transition, so a handoff commits only when a quorum
+    /// arrived at the same one.
+    [[nodiscard]] Digest pending_handoff_digest() const;
+
 private:
     [[nodiscard]] NodeId genesis_id() const;
     void set_phase(DriverPhase next, const char* reason);
@@ -105,7 +111,7 @@ private:
     void do_activate(const Digest& checkpoint);
     void persist_current_epoch(const Digest& checkpoint);
     void announce_epoch(const Digest& checkpoint);
-    [[nodiscard]] Digest pending_handoff_digest() const;
+
     [[nodiscard]] Digest genesis_attestation_root(const Tier1Set& founders) const;
 
     SecurityDriverConfig config_;

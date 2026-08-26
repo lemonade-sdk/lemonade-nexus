@@ -235,6 +235,11 @@ struct FirstPath : ::testing::Test {
             SecurityRuntimeConfig config;
             config.self = node->id;
             config.consensus_directory = node->dir;
+            // This test drives the runtime directly, with no driver to hold a
+            // pending handoff. Every replica here has agreed to the transition
+            // the test proposes; the refusal rule itself lives in
+            // tests/security/consensus/hotstuff_safety.cpp.
+            config.transition_validator = [](const Digest&) { return true; };
             node->runtime = std::make_unique<SecurityRuntime>(config);
             nodes.push_back(std::move(node));
         }

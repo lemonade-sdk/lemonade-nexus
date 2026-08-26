@@ -43,6 +43,7 @@ bool SecurityRuntime::start_consensus(EpochVoteKey own_vote_key, const Digest& p
     config.vote_keys = epochs_->current_vote_keys();
     config.quorum = current.consensus_quorum;
     config.self = config_.self;
+    config.transition_validator = config_.transition_validator;
 
     consensus_ = std::make_unique<HotStuffService>(std::move(config), std::move(own_vote_key),
                                                    consensus_store_);

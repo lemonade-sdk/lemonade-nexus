@@ -24,6 +24,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -43,6 +44,18 @@ struct HotStuffConfig {
     std::map<NodeId, crypto::Ed25519PublicKey> vote_keys;
     std::size_t quorum;
     NodeId self;
+
+    /// Decides whether a proposed state transition is one this node has
+    /// independently arrived at.
+    ///
+    /// A proposal carries its transition only as a digest. Consensus cannot
+    /// read it, so without this the replicas vote for a handoff none of them
+    /// evaluated: the commit then means different things on different nodes,
+    /// and only the proposer activates. That splits the mesh across two epochs.
+    ///
+    /// Unset means no transition can be evaluated, so any non-empty digest is
+    /// refused. An empty digest is an ordinary block and always passes.
+    std::function<bool(const Digest& transitions_digest)> transition_validator;
 };
 
 struct ProposalResult {

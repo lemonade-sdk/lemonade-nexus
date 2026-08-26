@@ -27,9 +27,14 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
                                          crypto::KeyWrappingService* wrapping)
     : config_(config),
       transport_(transport),
-      runtime_(SecurityRuntimeConfig{self_id(config),
-                                     config.data_root / "security" / "consensus",
-                                     config.profile}),
+      runtime_(SecurityRuntimeConfig{
+          self_id(config),
+          config.data_root / "security" / "consensus",
+          config.profile,
+          // Called only while consensus runs, long after the driver exists.
+          [this](const Digest& transitions_digest) {
+              return transitions_digest == driver_.pending_handoff_digest();
+          }}),
       sealer_(config.identity.private_key),
       store_(config.data_root / "security", wrapping),
       genesis_(config.identity.public_key == config.genesis_public_key

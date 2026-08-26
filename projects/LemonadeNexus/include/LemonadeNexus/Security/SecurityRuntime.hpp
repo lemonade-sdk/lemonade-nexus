@@ -17,6 +17,7 @@
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -26,6 +27,12 @@ struct SecurityRuntimeConfig {
     NodeId self;
     std::filesystem::path consensus_directory;
     LinuxAttestationProfile profile;
+
+    /// Passed to every epoch's consensus service. It answers whether a proposed
+    /// transition is one this node also arrived at, so a handoff gathers its
+    /// quorum only from nodes that independently agree. Unset refuses every
+    /// non-empty transition.
+    std::function<bool(const Digest& transitions_digest)> transition_validator;
 };
 
 class SecurityRuntime {

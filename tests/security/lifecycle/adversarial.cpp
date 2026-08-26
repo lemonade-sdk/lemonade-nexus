@@ -367,6 +367,12 @@ struct AdversarialMesh : ::testing::Test {
         runtime_config.self = node.id;
         runtime_config.consensus_directory = node.dir / "consensus";
         runtime_config.profile = complete_profile();
+        // Mirrors production: a replica votes for a handoff only when it has
+        // independently arrived at the same one. Node addresses are stable, and
+        // the driver exists long before consensus runs.
+        runtime_config.transition_validator = [&node](const Digest& transitions_digest) {
+            return node.driver && transitions_digest == node.driver->pending_handoff_digest();
+        };
         node.runtime = std::make_unique<SecurityRuntime>(runtime_config);
         node.sealer = std::make_unique<PairwiseSealer>(node.identity.private_key);
         node.transport = std::make_unique<MemoryTransport>(mesh, node.id);
@@ -646,15 +652,26 @@ TEST_F(AdversarialMesh, CorruptConsensusSafetyStateIsPermanentlyUnusable) {
     EXPECT_EQ(control->driver->phase(), DriverPhase::Active);
     EXPECT_TRUE(control->runtime->consensus()->synced());
 
-    // The failed node answers nothing, however long the mesh runs at it, while
-    // the control votes again on the same traffic. The wait is generous: the
-    // pacemaker backs off while the mesh runs one member short.
-    for (int i = 0; i < 400 && control->events.votes_sent.empty(); ++i) step(1);
-    EXPECT_FALSE(control->events.votes_sent.empty())
-        << "the restored control never voted; the comparison would be empty";
+    // One envelope, both nodes: the failed service refuses it as unsynced, the
+    // restored one counts it. The mechanism is live; only the corrupt node is
+    // out of the protocol.
+    Node* peer = founders[2];
+    const Vote probe = signed_vote(*peer, 1, 1,
+                                   control->runtime->consensus()->current_view(), filled(0x6B));
+    const auto probe_message = peer->router->compose(SecurityMessageKind::HotStuffVote, probe, 1);
+
+    const RouteResult refused = send_envelope(*peer, *victim, probe_message);
+    EXPECT_EQ(refused.dropped, DropReason::ServiceRejected);
+    ASSERT_TRUE(refused.service_code.has_value());
+    EXPECT_EQ(*refused.service_code, static_cast<uint16_t>(ConsensusFailure::NotSynced));
+    EXPECT_TRUE(send_envelope(*peer, *control, probe_message).delivered);
+
+    // The failed node answers nothing, however long the mesh runs at it.
+    step(40);
     EXPECT_EQ(victim->driver->phase(), DriverPhase::Failed);
     EXPECT_TRUE(victim->events.votes_sent.empty());
     EXPECT_FALSE(victim->runtime->consensus()->usable());
+    EXPECT_FALSE(victim->runtime->consensus()->synced());
 }
 
 // --- 2. Partitions ----------------------------------------------------------
@@ -1114,7 +1131,7 @@ TEST_F(AdversarialMesh, InvalidDkgRoundOneDataNeverActivatesAnEpoch) {
     expect_no_conflicting_commits();
 }
 
-TEST_F(AdversarialMesh, TamperedDkgRoundTwoPackageSplitsTheHandoff) {
+TEST_F(AdversarialMesh, TamperedDkgRoundTwoPackageNeverSplitsTheEpoch) {
     bootstrap();
     run_until_committed(1);
     const auto epoch_one_group = *founders[0]->runtime->authority().group_public_key();
@@ -1157,21 +1174,25 @@ TEST_F(AdversarialMesh, TamperedDkgRoundTwoPackageSplitsTheHandoff) {
         if (founder != tamperer) EXPECT_FALSE(finished_epoch_two(founder));
     }
 
-    // KNOWN GAP, documented rather than asserted away: that one member reaches
-    // Ready alone and then rotates alone. A proposal carries the handoff only
-    // as an opaque transitions digest, and receive_proposal never checks it
-    // against the receiver's own transition, so the mesh finalizes a handoff
-    // that only the proposer understands.
-    for (int i = 0; i < 200 && tamperer->driver->current_epoch() == 1u; ++i) step(1);
-    EXPECT_EQ(tamperer->driver->current_epoch(), 2u)
-        << "a lone Ready member no longer rotates by itself; tighten this test";
-    EXPECT_EQ(*tamperer->runtime->authority().key_epoch(), 2u);
-    EXPECT_NE(*tamperer->runtime->authority().group_public_key(), epoch_one_group);
+    // The member whose own DKG finished reaches Ready alone. It must NOT be
+    // able to rotate on that: a proposal carries its handoff as an opaque
+    // digest, and a replica that cannot match it against a transition of its
+    // own refuses to vote. Without that rule the honest four would authorize a
+    // handoff only the proposer understood, and the mesh would split across two
+    // epochs. Run well past the point where a lone rotation used to happen.
+    for (int i = 0; i < 200; ++i) step(1);
+    EXPECT_EQ(tamperer->driver->current_epoch(), 1u)
+        << "a lone Ready member rotated by itself and split the mesh";
+    EXPECT_EQ(*tamperer->runtime->authority().key_epoch(), 1u);
+    EXPECT_EQ(*tamperer->runtime->authority().group_public_key(), epoch_one_group);
+
+    // Every member is still in the same epoch under the same authority key.
     for (Node* founder : founders) {
-        if (founder == tamperer) continue;
         EXPECT_EQ(founder->driver->current_epoch(), 1u);
         EXPECT_EQ(*founder->runtime->authority().key_epoch(), 1u);
+        EXPECT_EQ(*founder->runtime->authority().group_public_key(), epoch_one_group);
     }
+    expect_no_conflicting_commits();
 
     // Positive control: the four members left in epoch 1 are exactly a quorum
     // and keep finalizing under the epoch-1 authority key.

@@ -218,6 +218,12 @@ struct DriverMesh : ::testing::Test {
         SecurityRuntimeConfig runtime_config;
         runtime_config.self = node.id;
         runtime_config.consensus_directory = node.dir / "consensus";
+        // Mirrors production: a replica votes for a handoff only when it has
+        // independently arrived at the same one. Node addresses are stable, and
+        // the driver exists long before consensus runs.
+        runtime_config.transition_validator = [&node](const Digest& transitions_digest) {
+            return node.driver && transitions_digest == node.driver->pending_handoff_digest();
+        };
         node.runtime = std::make_unique<SecurityRuntime>(runtime_config);
         node.sealer = std::make_unique<PairwiseSealer>(node.identity.private_key);
         node.transport = std::make_unique<MemoryTransport>(mesh, node.id);

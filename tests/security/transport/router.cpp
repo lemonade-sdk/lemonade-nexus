@@ -167,6 +167,11 @@ struct RouterMesh : ::testing::Test {
             SecurityRuntimeConfig config;
             config.self = node->id;
             config.consensus_directory = node->dir;
+            // These nodes model replicas that already arrived at whatever
+            // transition a proposal carries, so transport is the only thing
+            // under test here. The refusal rule has its own coverage in
+            // hotstuff_safety.cpp; production installs the real pending handoff.
+            config.transition_validator = [](const Digest&) { return true; };
             node->runtime = std::make_unique<SecurityRuntime>(config);
             node->sealer = std::make_unique<PairwiseSealer>(node->identity_priv);
             node->transport = std::make_unique<MemoryTransport>(mesh, node->id);

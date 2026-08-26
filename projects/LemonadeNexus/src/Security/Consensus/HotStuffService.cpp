@@ -189,6 +189,20 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
         result.rejected = ConsensusFailure::WrongLeader;
         return result;
     }
+    // 7b. A transition must be one this node also arrived at. A vote is what
+    //     authorizes a handoff, so voting for a transition this node cannot
+    //     evaluate would let the proposer decide the next epoch alone. The
+    //     proposal is refused outright rather than accepted without a vote:
+    //     the handoff must gather its quorum from nodes that independently
+    //     agree, or not commit at all.
+    if (proposal.transitions_digest != Digest{}) {
+        if (!config_.transition_validator ||
+            !config_.transition_validator(proposal.transitions_digest)) {
+            result.rejected = ConsensusFailure::TransitionUnknown;
+            return result;
+        }
+    }
+
     const Digest digest = proposal_digest(proposal);
 
     // 8. Two conflicting proposals for one view are objective evidence (11.6).

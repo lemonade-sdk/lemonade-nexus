@@ -128,6 +128,9 @@ enum class ConsensusFailure : uint16_t {
     PendingLimit,
     NotLeader,
     StorageRejected,
+    /// The proposal carries a state transition this node has not itself
+    /// arrived at, so it cannot authorize it.
+    TransitionUnknown,
 };
 
 [[nodiscard]] Digest proposal_digest(const Proposal& proposal);

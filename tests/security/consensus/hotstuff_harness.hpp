@@ -105,6 +105,12 @@ public:
         config.vote_keys = vote_keys;
         config.quorum = quorum;
         config.self = members[self_index];
+        // These replicas model nodes that already arrived at whatever
+        // transition a proposal carries, so the safety rules under test are
+        // the only thing that can reject one. The refusal rule itself is
+        // covered by TransitionUnknown tests in hotstuff_safety.cpp, and
+        // production installs the driver's real pending handoff.
+        config.transition_validator = [](const Digest&) { return true; };
         return config;
     }
 
