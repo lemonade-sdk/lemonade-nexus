@@ -173,7 +173,8 @@ if(NEXUS_BUILD_FUZZERS)
     endif()
     set(NEXUS_FUZZ_TARGETS
         security_envelope snp_report hcl_blob tpm_quote tpmt_signature
-        ima_log amd_crl amd_certificate platform_evidence_json)
+        ima_log amd_crl amd_certificate platform_evidence_json
+        eligibility_observation participation_response)
     foreach(target ${NEXUS_FUZZ_TARGETS})
         add_executable(fuzz_${target} fuzz/libfuzzer_main.cpp)
         target_link_libraries(fuzz_${target} PRIVATE LemonadeNexus)

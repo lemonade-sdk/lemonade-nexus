@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# Builds and runs the security parser fuzzers under Linux Clang with libFuzzer.
+#
+# AppleClang ships no libFuzzer runtime, so the real fuzz binaries cannot be
+# built on a Mac. The deterministic corpus in test_fuzz_corpus runs everywhere
+# and keeps the targets compiled and exercised; this script is how the targets
+# get run as actual fuzzers.
+#
+# Everything happens inside the container: the host needs a working container
+# runtime and nothing else.
+#
+#   scripts/nexus-run-fuzzers                 # every target, 60 s each
+#   scripts/nexus-run-fuzzers 300             # every target, 300 s each
+#   scripts/nexus-run-fuzzers 300 amd_crl     # one target
+#
+# Exit codes: 0 clean, 1 usage, 2 no container runtime, 3 a target found a
+# crash (its reproducer is left in artifacts/fuzz/).
+
+set -euo pipefail
+
+readonly SECONDS_PER_TARGET="${1:-60}"
+readonly ONLY_TARGET="${2:-}"
+readonly ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly ARTIFACTS="${ROOT}/artifacts/fuzz"
+
+readonly TARGETS=(
+    security_envelope
+    snp_report
+    hcl_blob
+    tpm_quote
+    tpmt_signature
+    ima_log
+    amd_crl
+    amd_certificate
+    platform_evidence_json
+    eligibility_observation
+    participation_response
+)
+
+if ! [[ "${SECONDS_PER_TARGET}" =~ ^[0-9]+$ ]]; then
+    echo "usage: $(basename "$0") [seconds-per-target] [target]" >&2
+    echo "targets: ${TARGETS[*]}" >&2
+    exit 1
+fi
+
+selected=("${TARGETS[@]}")
+if [[ -n "${ONLY_TARGET}" ]]; then
+    if [[ ! " ${TARGETS[*]} " == *" ${ONLY_TARGET} "* ]]; then
+        echo "unknown target: ${ONLY_TARGET}" >&2
+        echo "targets: ${TARGETS[*]}" >&2
+        exit 1
+    fi
+    selected=("${ONLY_TARGET}")
+fi
+
+runtime=""
+for candidate in docker podman; do
+    if command -v "${candidate}" >/dev/null 2>&1 && "${candidate}" info >/dev/null 2>&1; then
+        runtime="${candidate}"
+        break
+    fi
+done
+if [[ -z "${runtime}" ]]; then
+    echo "no working container runtime (need docker or podman)" >&2
+    exit 2
+fi
+
+mkdir -p "${ARTIFACTS}"
+
+# -max_total_time bounds the run; -rss_limit_mb turns a runaway
+# allocation into a reported failure instead of an OOM kill, which is the whole
+# point of fuzzing an allocator boundary.
+read -r -d '' SCRIPT <<INNER || true
+set -euo pipefail
+cd /src
+cmake -S . -B build-fuzz \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
+    -DNEXUS_BUILD_FUZZERS=ON >/dev/null
+for target in ${selected[*]}; do
+    cmake --build build-fuzz --target "fuzz_\${target}" -j "\$(nproc)" >/dev/null
+done
+status=0
+for target in ${selected[*]}; do
+    echo "=== \${target} ==="
+    mkdir -p "artifacts/fuzz/\${target}"
+    ./build-fuzz/tests/"fuzz_\${target}" \
+        -max_total_time=${SECONDS_PER_TARGET} \
+        -rss_limit_mb=2048 \
+        -max_len=65536 \
+        -artifact_prefix="artifacts/fuzz/\${target}/" \
+        "artifacts/fuzz/\${target}" || status=3
+done
+exit \${status}
+INNER
+
+"${runtime}" run --rm \
+    -v "${ROOT}:/src" \
+    -w /src \
+    docker.io/library/debian:bookworm \
+    bash -c "apt-get update -qq && apt-get install -y -qq clang cmake ninja-build git \
+        pkg-config libssl-dev >/dev/null && ${SCRIPT}"
