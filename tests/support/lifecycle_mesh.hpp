@@ -1,7 +1,8 @@
 #pragma once
 
-// The six-node memory mesh the lifecycle tests run on: one Genesis server and
-// five founders, exchanging only encoded envelopes, paced only by tick().
+// The memory mesh the lifecycle tests run on: one Genesis server, five
+// founders, and two Tier 2 reserves, exchanging only encoded envelopes and
+// paced only by tick().
 //
 // The attestation verifier's positive path needs a confidential VM, so verdicts
 // are injected through the driver's own event entry point; every other step —
@@ -34,6 +35,9 @@ namespace constants = nexus::security::constants;
 namespace fs = std::filesystem;
 
 constexpr std::size_t kFounders = 5;
+/// Tier 2 servers: authenticated mesh members that hold no epoch role. They
+/// exist to prove a node can qualify for Tier 1 without already being Tier 1.
+constexpr std::size_t kReserves = 2;
 
 struct Node;
 
@@ -135,6 +139,12 @@ struct EventsProxy : ISecurityEvents {
     void on_genesis_eligibility_attest(const GenesisEligibilityAttest& a) override {
         if (target) target->on_genesis_eligibility_attest(a);
     }
+    void on_participation_challenge(const ParticipationChallenge& c, const NodeId& n) override {
+        if (target) target->on_participation_challenge(c, n);
+    }
+    void on_participation_response(const ParticipationResponse& r) override {
+        if (target) target->on_participation_response(r);
+    }
 };
 
 struct Node {
@@ -225,7 +235,7 @@ struct DriverMesh : ::testing::Test {
         fs::create_directories(root);
 
         // Node 0 is Genesis: its identity IS the pinned genesis key.
-        for (std::size_t i = 0; i < kFounders + 1; ++i) {
+        for (std::size_t i = 0; i < kFounders + kReserves + 1; ++i) {
             auto node = std::make_unique<Node>();
             crypto_sign_keypair(node->identity.public_key.data(),
                                 node->identity.private_key.data());
@@ -233,7 +243,10 @@ struct DriverMesh : ::testing::Test {
             nodes.push_back(std::move(node));
         }
         genesis_node = nodes[0].get();
-        for (std::size_t i = 1; i < nodes.size(); ++i) founders.push_back(nodes[i].get());
+        for (std::size_t i = 1; i <= kFounders; ++i) founders.push_back(nodes[i].get());
+        for (std::size_t i = kFounders + 1; i < nodes.size(); ++i) {
+            reserves.push_back(nodes[i].get());
+        }
         network = derive_network_id(genesis_node->identity.public_key,
                                     constants::kSecurityRulesetVersion,
                                     constants::kConsensusRulesetVersion);
@@ -371,11 +384,25 @@ struct DriverMesh : ::testing::Test {
         EXPECT_EQ(genesis_node->runtime->epochs(), nullptr);
     }
 
-    void step(int count) {
+    void step(int count) { step(count, founders); }
+
+    void step(int count, const std::vector<Node*>& online) {
         for (int i = 0; i < count; ++i) {
             mesh.now_ms += 200;
-            for (Node* founder : founders) founder->driver->tick(mesh.now_ms);
+            for (Node* node : online) node->driver->tick(mesh.now_ms);
             mesh.pump();
+        }
+    }
+
+    /// Steps until the chain commits again. Continuity counts statements at
+    /// strictly newer certified heights, so a round that lands at the height
+    /// the last one used says nothing new; with a member offline the next
+    /// commit waits on a view timeout, which no fixed step count can promise.
+    void advance_commit(const std::vector<Node*>& online, int max_steps = 400) {
+        const Height start = online.front()->driver->last_committed_height();
+        for (int i = 0; i < max_steps; ++i) {
+            step(1, online);
+            if (online.front()->driver->last_committed_height() > start) return;
         }
     }
 
@@ -395,15 +422,54 @@ struct DriverMesh : ::testing::Test {
     // signs an observation about it. One verifier's word is not a fact; the
     // quorum forms from the published statements.
     void reattest_round(uint8_t round, EpochId epoch = 1, IncarnationId incarnation = 1) {
-        for (Node* founder : founders) {
-            for (Node* member : founders) {
-                if (member == founder) continue;
-                founder->driver->on_attestation_verdict(
-                    passing_verdict(member->id, epoch, round, incarnation),
-                    evidence_for(member->id, *member->driver->vote_key_for_epoch(epoch)));
+        attest_subjects(round, founders, epoch, incarnation);
+    }
+
+    /// Injects the verdicts a confidential host would produce, into every
+    /// current member, for each named subject.
+    void attest_subjects(uint8_t round, const std::vector<Node*>& subjects,
+                         const std::vector<Node*>& observers, EpochId epoch = 1,
+                         IncarnationId incarnation = 1) {
+        for (Node* observer : observers) {
+            for (Node* subject : subjects) {
+                if (subject == observer) continue;
+                observer->driver->on_attestation_verdict(
+                    passing_verdict(subject->id, epoch, round, incarnation),
+                    evidence_for(subject->id, *subject->driver->vote_key_for_epoch(epoch)));
             }
         }
         mesh.pump();
+    }
+
+    void attest_subjects(uint8_t round, const std::vector<Node*>& subjects, EpochId epoch = 1,
+                         IncarnationId incarnation = 1) {
+        attest_subjects(round, subjects, founders, epoch, incarnation);
+    }
+
+    /// The reserves become reachable to the current members. Reachability is
+    /// not eligibility: the cadence decides what to ask them for.
+    void introduce_reserves() {
+        for (Node* founder : founders) {
+            for (Node* reserve : reserves) {
+                founder->driver->on_peer(reserve->id, mesh.now_ms);
+            }
+        }
+    }
+
+    /// Advances past the re-attestation interval so the cadence fires: an
+    /// attestation challenge to every certified peer, and a participation
+    /// challenge to the ones that hold no epoch vote key. The reserves answer
+    /// over the wire; the verdicts are injected because the positive
+    /// attestation path needs a confidential VM.
+    void run_reattest_cadence(uint8_t round, const std::vector<Node*>& subjects,
+                              const std::vector<Node*>& online = {}) {
+        const std::vector<Node*>& members = online.empty() ? founders : online;
+        mesh.now_ms += constants::kReattestIntervalSeconds * 1000;
+        for (Node* node : members) node->driver->tick(mesh.now_ms);
+        for (Node* reserve : reserves) reserve->driver->tick(mesh.now_ms);
+        mesh.pump();
+        attest_subjects(round, subjects, members);
+        advance_commit(members);
     }
 
     // One member re-attests under a second incarnation inside a frozen epoch.
@@ -440,7 +506,7 @@ struct DriverMesh : ::testing::Test {
     void prepare_handoff(int max_steps = 120) {
         for (uint8_t round = 1; round <= constants::kMinContinuityObservations; ++round) {
             reattest_round(round);
-            step(6);
+            advance_commit(founders);
         }
         mesh.now_ms += constants::kTargetEpochSeconds * 1000;
         for (int i = 0; i < max_steps; ++i) {
@@ -459,6 +525,7 @@ struct DriverMesh : ::testing::Test {
     std::vector<std::unique_ptr<Node>> nodes;
     Node* genesis_node = nullptr;
     std::vector<Node*> founders;
+    std::vector<Node*> reserves;
 };
 
 }  // namespace lifecycle_test

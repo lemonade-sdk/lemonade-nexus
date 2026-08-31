@@ -255,6 +255,12 @@ struct EventsProxy : ISecurityEvents {
     void on_genesis_eligibility_attest(const GenesisEligibilityAttest& a) override {
         if (target) target->on_genesis_eligibility_attest(a);
     }
+    void on_participation_challenge(const ParticipationChallenge& c, const NodeId& n) override {
+        if (target) target->on_participation_challenge(c, n);
+    }
+    void on_participation_response(const ParticipationResponse& r) override {
+        if (target) target->on_participation_response(r);
+    }
 };
 
 struct Node {

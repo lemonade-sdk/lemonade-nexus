@@ -306,6 +306,142 @@ TEST_F(ServiceMesh, ReplayUnderAnotherSubjectOrNetworkIsRefused) {
     EXPECT_EQ(services[3]->accept(*observation), ObservationOutcome::Accepted);
 }
 
+// --- Claim provenance --------------------------------------------------------
+
+// A claim set is only ever as good as the observer that signed it. Every way of
+// moving one somewhere it was not verified breaks the signature, and the
+// binding covers the subject, incarnation, epoch, network, evidence digest,
+// profile and every claim bit.
+TEST_F(ServiceMesh, ClaimsCannotBeMovedOffTheObservationThatCarriesThem) {
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto signed_by_zero = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(signed_by_zero.has_value());
+
+    // Fabricated claims under a valid observer signature: changing them leaves
+    // the signature over the old ones, so the statement no longer verifies.
+    auto fabricated = *signed_by_zero;
+    fabricated.claims.tcb_valid = false;
+    EXPECT_EQ(services[2]->accept(fabricated), ObservationOutcome::SignatureInvalid);
+
+    // Copied onto another node.
+    auto other_subject = *signed_by_zero;
+    other_subject.subject = ids[3];
+    EXPECT_EQ(services[2]->accept(other_subject), ObservationOutcome::SignatureInvalid);
+
+    // Copied onto another incarnation.
+    auto other_incarnation = *signed_by_zero;
+    other_incarnation.subject_incarnation = 2;
+    EXPECT_EQ(services[2]->accept(other_incarnation), ObservationOutcome::SignatureInvalid);
+
+    // Copied onto another network.
+    auto other_network = *signed_by_zero;
+    other_network.network_id.fill(0xAA);
+    EXPECT_EQ(services[2]->accept(other_network), ObservationOutcome::WrongNetwork);
+
+    // The same evidence digest with altered claims.
+    auto altered = *signed_by_zero;
+    altered.claims.profile_ruleset += 1;
+    EXPECT_EQ(altered.attestation_digest, signed_by_zero->attestation_digest);
+    EXPECT_EQ(services[2]->accept(altered), ObservationOutcome::SignatureInvalid);
+
+    // Relayed under another observer's identity.
+    auto relayed = *signed_by_zero;
+    relayed.observer = ids[4];
+    EXPECT_EQ(services[2]->accept(relayed), ObservationOutcome::SignatureInvalid);
+
+    EXPECT_EQ(services[2]->accept(*signed_by_zero), ObservationOutcome::Accepted);
+}
+
+// A claim set that contradicts its own structure is a bug rather than a proof,
+// and a participation observation carries no platform claims at all.
+TEST_F(ServiceMesh, StructurallyImpossibleClaimsAreRefused) {
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+
+    // Runtime integrity without its three steps behind it.
+    auto inconsistent = *observation;
+    inconsistent.claims.ima_anchored = false;
+    inconsistent = sign_observation(inconsistent, keys[0]);
+    EXPECT_EQ(services[2]->accept(inconsistent), ObservationOutcome::MalformedForKind);
+
+    // Claims with no provider naming itself.
+    auto anonymous = *observation;
+    anonymous.claims.profile_id = AttestationProfileId::Unknown;
+    anonymous = sign_observation(anonymous, keys[0]);
+    EXPECT_EQ(services[2]->accept(anonymous), ObservationOutcome::MalformedForKind);
+
+    // A vote proves participation and nothing about hardware.
+    auto participation = *observation;
+    participation.kind = ObservationKind::Participation;
+    participation.attestation_digest = Digest{};
+    participation = sign_observation(participation, keys[0]);
+    EXPECT_EQ(services[2]->accept(participation), ObservationOutcome::MalformedForKind);
+}
+
+// --- The Tier 2 participation exchange ---------------------------------------
+
+// The answer must be to a challenge this observer issued, under the subject's
+// own identity key, naming the finalized state the challenge named.
+TEST_F(ServiceMesh, AParticipationResponseIsBoundToItsChallenge) {
+    ParticipationChallenge challenge;
+    challenge.network_id = network;
+    challenge.epoch = kEpoch;
+    challenge.security_ruleset = constants::kSecurityRulesetVersion;
+    challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
+    challenge.node_id = ids[1];
+    challenge.incarnation = 1;
+    challenge.nonce.fill(0x2B);
+    challenge.finalized_height = 12;
+    challenge.finalized_state = reference(0xC0);
+    challenge.observer = ids[0];
+
+    const auto answer = answer_participation_challenge(challenge, keys[1]);
+    EXPECT_EQ(verify_participation_response(answer, challenge), ParticipationFailure::None);
+
+    // Answered by the wrong node.
+    const auto impostor = answer_participation_challenge(challenge, keys[2]);
+    EXPECT_EQ(verify_participation_response(impostor, challenge),
+              ParticipationFailure::IdentityMismatch);
+
+    // A fresh nonce is a different challenge, so an old answer does not fit it.
+    auto replayed = challenge;
+    replayed.nonce.fill(0x2C);
+    EXPECT_EQ(verify_participation_response(answer, replayed),
+              ParticipationFailure::ChallengeMismatch);
+
+    // Every binding, one at a time.
+    const auto broken = [&](auto mutate) {
+        auto response = answer;
+        mutate(response);
+        return verify_participation_response(response, challenge);
+    };
+    EXPECT_EQ(broken([](auto& r) { r.network_id.fill(0xAA); }),
+              ParticipationFailure::NetworkMismatch);
+    EXPECT_EQ(broken([](auto& r) { r.epoch += 1; }), ParticipationFailure::EpochMismatch);
+    EXPECT_EQ(broken([](auto& r) { r.security_ruleset += 1; }),
+              ParticipationFailure::RulesetMismatch);
+    EXPECT_EQ(broken([](auto& r) { r.incarnation += 1; }),
+              ParticipationFailure::IncarnationMismatch);
+    EXPECT_EQ(broken([](auto& r) { r.finalized_height += 1; }),
+              ParticipationFailure::StateMismatch);
+    EXPECT_EQ(broken([this](auto& r) { r.finalized_state = reference(0xC1); }),
+              ParticipationFailure::StateMismatch);
+    EXPECT_EQ(broken([](auto& r) { r.identity_signature[0] ^= 0x01; }),
+              ParticipationFailure::SignatureInvalid);
+
+    // The service will only act on a challenge it issued itself, anchored to
+    // state it holds.
+    EXPECT_TRUE(services[0]->observe_participation_response(answer, challenge, 12,
+                                                            reference(0xC0)));
+    EXPECT_FALSE(services[2]->observe_participation_response(answer, challenge, 12,
+                                                             reference(0xC0)))
+        << "the challenge names another observer";
+    EXPECT_FALSE(services[0]->observe_participation_response(answer, challenge, 13,
+                                                             reference(0xC0)))
+        << "anchored to state this observer does not hold";
+}
+
 // --- What a node will release ------------------------------------------------
 
 // One observer never makes a fact, however much it says.
