@@ -38,6 +38,11 @@ struct BootstrapCertificate {
     /// certificate cannot admit a founder the founding set refused.
     Digest founding_eligibility_digest{};
 
+    /// The founders' epoch-1 BFT vote keys, as one digest. This is the anchor a
+    /// later candidate verifies a supplied key listing against: membership by
+    /// tier1_set_digest, keys by this, both under the pinned genesis signature.
+    Digest vote_key_set_digest{};
+
     SecurityRulesetVersion security_ruleset = 0;
     ConsensusRulesetVersion consensus_ruleset = 0;
 

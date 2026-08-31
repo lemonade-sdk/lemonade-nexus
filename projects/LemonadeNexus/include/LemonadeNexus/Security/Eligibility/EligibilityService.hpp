@@ -55,6 +55,9 @@ struct FinalizedEligibility {
     /// The certificate that committed it.
     Digest consensus_reference{};
     Height height{};
+    /// The committed state root at that height. The next-epoch plan anchors
+    /// its checkpoint here, so every honest node names the same one.
+    Digest state_root{};
     EpochId next_epoch{};
 };
 

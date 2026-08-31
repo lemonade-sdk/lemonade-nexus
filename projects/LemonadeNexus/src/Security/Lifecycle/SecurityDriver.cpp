@@ -532,9 +532,13 @@ void SecurityDriver::on_dkg_transcript_attest(const DkgTranscriptAttest& attest)
         return;
     }
     const auto founders = genesis_->founding_set();
+    std::map<NodeId, crypto::Ed25519PublicKey> founder_keys;
+    for (const auto& node : founders->members()) {
+        founder_keys[node] = founder_vote_keys_.at(node);
+    }
     const auto certificate = genesis_->finalize_epoch_one(
         attest.group_public_key, attest.transcript_digest, genesis_attestation_root(*founders),
-        config_.identity.private_key);
+        vote_key_set_digest(founder_keys), config_.identity.private_key);
     if (!certificate.has_value()) {
         return;
     }
@@ -813,8 +817,8 @@ void SecurityDriver::challenge_participation(const NodeId& candidate) {
     randombytes_buf(challenge.nonce.data(), challenge.nonce.size());
     // The observer names the finalized state, so it knows the value the answer
     // is anchored to without taking the candidate's word for anything.
-    challenge.finalized_height = last_committed_height_;
-    challenge.finalized_state = last_committed_root_;
+    challenge.anchor_height = last_committed_height_;
+    challenge.anchor_state = last_committed_root_;
     challenge.observer = config_.self;
 
     pending_participation_[candidate] = challenge;
@@ -858,7 +862,7 @@ void SecurityDriver::on_participation_response(const ParticipationResponse& resp
     pending_participation_.erase(pending);
 
     if (auto observation = eligibility_.observe_participation_response(
-            response, challenge, challenge.finalized_height, challenge.finalized_state)) {
+            response, challenge, challenge.anchor_height, challenge.anchor_state)) {
         publish(*observation, epochs->current().id);
     }
 }
@@ -968,8 +972,11 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
         // finalizes and never selects — availability, never authority.
         const Digest eligibility = pending_eligibility_digest();
         if (eligibility != Digest{} && commit.transitions_digest == eligibility) {
-            eligibility_.finalize({commit.transitions_digest, commit.qc_digest, commit.height,
-                                   epochs->current().id + 1});
+            eligibility_.finalize({.commitment = commit.transitions_digest,
+                                   .consensus_reference = commit.qc_digest,
+                                   .height = commit.height,
+                                   .state_root = commit.proposed_state_root,
+                                   .next_epoch = epochs->current().id + 1});
             continue;
         }
         const Digest handoff = pending_handoff_digest();

@@ -13,10 +13,12 @@
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Authority/AuthorityService.hpp>
 #include <LemonadeNexus/Security/Authority/DkgSession.hpp>
+#include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityObservation.hpp>
 #include <LemonadeNexus/Security/Eligibility/ParticipationProof.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochAuthority.hpp>
+#include <LemonadeNexus/Security/Epoch/NextEpochPlan.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisMessages.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
@@ -48,6 +50,10 @@ enum class SecurityMessageKind : uint16_t {
     GenesisEligibilityAttest = 17,
     ParticipationChallenge = 18,
     ParticipationResponse = 19,
+    NextEpochPlanProof = 20,
+    CandidateStateReady = 21,
+    ReadinessProof = 22,
+    EpochHandoffProof = 23,
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -81,6 +87,46 @@ struct EpochAnnouncement {
     Digest handoff_certificate_digest{};
 };
 
+/// The finalized plan, delivered to a selected candidate with everything it
+/// needs to verify the finality itself: the three-chain proof, and the current
+/// membership's vote keys, checkable against the anchored set digests. A hint
+/// wrapped around a proof — the proof decides.
+struct NextEpochPlanProof {
+    NextEpochPlan plan;
+    CommitProof proof;
+    /// The current epoch's frozen vote keys, one per member.
+    std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>> current_vote_keys;
+};
+
+/// A pending candidate's objective statement that it acquired current
+/// certified state: the quorum certificate it verified, at or above the plan's
+/// checkpoint, signed under its identity. A node that never synced holds no
+/// valid current-epoch certificate to present.
+struct CandidateStateReadyMsg {
+    NetworkId network_id{};
+    Digest plan_digest{};
+    NodeId node{};
+    IncarnationId incarnation{};
+    QuorumCertificate verified_qc;
+    crypto::Ed25519Signature identity_signature{};
+};
+
+[[nodiscard]] Digest candidate_state_ready_digest(const CandidateStateReadyMsg& message);
+
+/// The finalized readiness set with its commit proof. Receiving it authorizes
+/// exactly one thing: joining the DKG session it names.
+struct ReadinessProofMsg {
+    CandidateReadiness readiness;
+    CommitProof proof;
+};
+
+/// The finalized handoff with its commit proof. Verifying it is the one and
+/// only activation path for a node that was not in the old epoch.
+struct EpochHandoffProofMsg {
+    EpochHandoff handoff;
+    CommitProof proof;
+};
+
 using SecurityBody = std::variant<AttestationChallenge,
                                   AttestationEvidence,
                                   ProposalMessage,
@@ -98,7 +144,11 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   EligibilityObservation,
                                   GenesisEligibilityAttest,
                                   ParticipationChallenge,
-                                  ParticipationResponse>;
+                                  ParticipationResponse,
+                                  NextEpochPlanProof,
+                                  CandidateStateReadyMsg,
+                                  ReadinessProofMsg,
+                                  EpochHandoffProofMsg>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

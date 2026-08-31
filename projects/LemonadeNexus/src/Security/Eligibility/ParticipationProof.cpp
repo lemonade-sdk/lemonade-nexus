@@ -24,8 +24,8 @@ Digest participation_challenge_digest(const ParticipationChallenge& challenge) {
     encoder.add_bytes(challenge.node_id.bytes);
     encoder.add_u64(challenge.incarnation);
     encoder.add_bytes(challenge.nonce);
-    encoder.add_u64(challenge.finalized_height);
-    encoder.add_bytes(challenge.finalized_state);
+    encoder.add_u64(challenge.anchor_height);
+    encoder.add_bytes(challenge.anchor_state);
     encoder.add_bytes(challenge.observer.bytes);
     return encoder.digest();
 }
@@ -42,8 +42,8 @@ Digest participation_response_signing_digest(const ParticipationResponse& respon
     encoder.add_u16(response.consensus_ruleset);
     encoder.add_bytes(response.node_id.bytes);
     encoder.add_u64(response.incarnation);
-    encoder.add_u64(response.finalized_height);
-    encoder.add_bytes(response.finalized_state);
+    encoder.add_u64(response.anchor_height);
+    encoder.add_bytes(response.anchor_state);
     return encoder.digest();
 }
 
@@ -57,8 +57,8 @@ ParticipationResponse answer_participation_challenge(const ParticipationChalleng
     response.consensus_ruleset = challenge.consensus_ruleset;
     response.node_id.bytes = identity.public_key;
     response.incarnation = challenge.incarnation;
-    response.finalized_height = challenge.finalized_height;
-    response.finalized_state = challenge.finalized_state;
+    response.anchor_height = challenge.anchor_height;
+    response.anchor_state = challenge.anchor_state;
 
     const Digest digest = participation_response_signing_digest(response);
     crypto_sign_detached(response.identity_signature.data(), nullptr, digest.data(), digest.size(),
@@ -75,7 +75,7 @@ std::string_view participation_failure_name(ParticipationFailure failure) {
         case ParticipationFailure::RulesetMismatch:     return "wrong ruleset";
         case ParticipationFailure::IdentityMismatch:    return "wrong node identity";
         case ParticipationFailure::IncarnationMismatch: return "wrong incarnation";
-        case ParticipationFailure::StateMismatch:       return "wrong finalized state";
+        case ParticipationFailure::AnchorMismatch:      return "wrong anchor";
         case ParticipationFailure::SignatureInvalid:    return "signature invalid";
     }
     return "unknown failure";
@@ -102,9 +102,9 @@ ParticipationFailure verify_participation_response(const ParticipationResponse& 
     if (response.incarnation != challenge.incarnation) {
         return ParticipationFailure::IncarnationMismatch;
     }
-    if (response.finalized_height != challenge.finalized_height ||
-        response.finalized_state != challenge.finalized_state) {
-        return ParticipationFailure::StateMismatch;
+    if (response.anchor_height != challenge.anchor_height ||
+        response.anchor_state != challenge.anchor_state) {
+        return ParticipationFailure::AnchorMismatch;
     }
     // Last, because it is the expensive one, and because a mismatch above is a
     // better diagnosis than a broken signature.

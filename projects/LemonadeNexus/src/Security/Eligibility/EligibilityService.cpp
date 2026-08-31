@@ -179,7 +179,7 @@ std::optional<EligibilityObservation> EligibilityService::observe_participation_
         challenge.consensus_ruleset != constants::kConsensusRulesetVersion) {
         return std::nullopt;
     }
-    if (challenge.finalized_height != height || challenge.finalized_state != state_reference) {
+    if (challenge.anchor_height != height || challenge.anchor_state != state_reference) {
         return std::nullopt;
     }
     if (verify_participation_response(response, challenge) != ParticipationFailure::None) {

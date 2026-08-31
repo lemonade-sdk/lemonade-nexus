@@ -59,6 +59,17 @@ bool EpochManager::prepare_next_epoch(const Tier1Set& frozen_eligible,
     return true;
 }
 
+std::vector<NodeId> EpochManager::preview_selection(const Tier1Set& frozen_eligible,
+                                                    std::size_t admitted_server_count) const {
+    const auto outcome = tier1_target_outcome(admitted_server_count, frozen_eligible.size());
+    if (outcome.active_target < constants::kMinActiveTier1) {
+        return {};
+    }
+    const auto ranked = Tier1Selector::rank(frozen_eligible, current_.authority_public_key,
+                                            current_.id + 1);
+    return {ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(outcome.active_target)};
+}
+
 void EpochManager::drop_participant_state(const NodeId& node) {
     final_verdicts_.erase(node);
     next_vote_keys_.erase(node);
@@ -212,6 +223,19 @@ bool EpochManager::record_vote_key(const NodeId& node, const crypto::Ed25519Publ
     if (existing != next_vote_keys_.end()) {
         // Idempotent for the same key; a changed key mid-handoff is refused.
         return existing->second == key;
+    }
+    // One key, one node, one epoch. A key another member already registered
+    // would let two identities vote as one; a key reused from the current
+    // epoch would outlive the epoch its lifetime rule promises.
+    for (const auto& [other, other_key] : next_vote_keys_) {
+        if (other_key == key) {
+            return false;
+        }
+    }
+    for (const auto& [other, other_key] : current_vote_keys_) {
+        if (other_key == key) {
+            return false;
+        }
     }
     next_vote_keys_[node] = key;
     recompute_phase();

@@ -579,6 +579,42 @@ std::vector<std::pair<Proposal, QuorumCertificate>> HotStuffService::uncommitted
     return chain;
 }
 
+std::optional<CommitProof> HotStuffService::commit_proof(const Digest& proposal_digest) const {
+    const auto committed = blocks_.find(proposal_digest);
+    if (committed == blocks_.end() || !committed_digests_.contains(proposal_digest)) {
+        return std::nullopt;
+    }
+    // Walk down from the child: each child's justify certifies its parent
+    // under the strict rule, so the links identify themselves.
+    const auto child_of = [this](const Digest& parent) -> const BlockRecord* {
+        for (const auto& [digest, record] : blocks_) {
+            if (record.proposal.parent_digest == parent &&
+                record.justify.proposal_digest == parent) {
+                return &record;
+            }
+        }
+        return nullptr;
+    };
+    const BlockRecord* child = child_of(proposal_digest);
+    if (child == nullptr) {
+        return std::nullopt;
+    }
+    const BlockRecord* grandchild = child_of(child->digest);
+    if (grandchild == nullptr) {
+        return std::nullopt;
+    }
+    const auto certifying = qc_by_block_.find(grandchild->digest);
+    if (certifying == qc_by_block_.end()) {
+        return std::nullopt;
+    }
+    CommitProof proof;
+    proof.chain.push_back({committed->second.proposal, committed->second.justify});
+    proof.chain.push_back({child->proposal, child->justify});
+    proof.chain.push_back({grandchild->proposal, grandchild->justify});
+    proof.certifying = certifying->second;
+    return proof;
+}
+
 TimeoutVote HotStuffService::make_timeout_vote() const {
     if (failed_ || !synced_) {
         throw std::logic_error("HotStuffService: not synced");

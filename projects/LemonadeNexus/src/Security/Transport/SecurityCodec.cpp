@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
 
+#include <LemonadeNexus/Security/CanonicalEncoding.hpp>
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
@@ -295,6 +296,7 @@ bool encode_bootstrap(Writer& w, const BootstrapCertificate& c) {
     w.fixed(c.dkg_transcript_digest);
     w.fixed(c.attestation_root);
     w.fixed(c.founding_eligibility_digest);
+    w.fixed(c.vote_key_set_digest);
     w.u16(c.security_ruleset);
     w.u16(c.consensus_ruleset);
     w.fixed(c.genesis_signature);
@@ -326,8 +328,8 @@ bool encode_participation_challenge(Writer& w, const ParticipationChallenge& c) 
     put_node(w, c.node_id);
     w.u64(c.incarnation);
     w.fixed(c.nonce);
-    w.u64(c.finalized_height);
-    w.fixed(c.finalized_state);
+    w.u64(c.anchor_height);
+    w.fixed(c.anchor_state);
     put_node(w, c.observer);
     return true;
 }
@@ -340,10 +342,131 @@ bool encode_participation_response(Writer& w, const ParticipationResponse& r) {
     w.u16(r.consensus_ruleset);
     put_node(w, r.node_id);
     w.u64(r.incarnation);
-    w.u64(r.finalized_height);
-    w.fixed(r.finalized_state);
+    w.u64(r.anchor_height);
+    w.fixed(r.anchor_state);
     w.fixed(r.identity_signature);
     return true;
+}
+
+bool encode_next_epoch_plan(Writer& w, const NextEpochPlan& p) {
+    if (p.selected.size() > constants::kMaxActiveTier1) {
+        return false;
+    }
+    w.fixed(p.network_id);
+    w.u64(p.current_epoch);
+    w.u64(p.next_epoch);
+    w.u32(p.attempt);
+    w.u64(p.checkpoint_height);
+    w.fixed(p.checkpoint_state_root);
+    w.fixed(p.eligibility_commitment);
+    w.fixed(p.selection_seed);
+    w.u16(static_cast<uint16_t>(p.selected.size()));
+    for (const auto& node : p.selected) {
+        put_node(w, node);
+        const auto incarnation = p.incarnations.find(node);
+        w.u64(incarnation != p.incarnations.end() ? incarnation->second : 0);
+    }
+    w.u16(p.security_ruleset);
+    w.u16(p.consensus_ruleset);
+    w.u16(static_cast<uint16_t>(p.profile_id));
+    w.u16(p.profile_ruleset);
+    return true;
+}
+
+bool encode_committed_block(Writer& w, const CommittedBlock& b) {
+    return encode_proposal(w, ProposalMessage{b.proposal, b.justify});
+}
+
+bool encode_commit_proof(Writer& w, const CommitProof& p) {
+    if (p.chain.size() != 3) {
+        return false;
+    }
+    for (const auto& block : p.chain) {
+        if (!encode_committed_block(w, block)) {
+            return false;
+        }
+    }
+    return encode_certificate(w, p.certifying);
+}
+
+bool encode_plan_proof(Writer& w, const NextEpochPlanProof& m) {
+    if (m.current_vote_keys.size() > constants::kMaxActiveTier1) {
+        return false;
+    }
+    if (!encode_next_epoch_plan(w, m.plan) || !encode_commit_proof(w, m.proof)) {
+        return false;
+    }
+    w.u16(static_cast<uint16_t>(m.current_vote_keys.size()));
+    for (const auto& [node, key] : m.current_vote_keys) {
+        put_node(w, node);
+        w.fixed(key);
+    }
+    return true;
+}
+
+bool encode_state_ready(Writer& w, const CandidateStateReadyMsg& m) {
+    w.fixed(m.network_id);
+    w.fixed(m.plan_digest);
+    put_node(w, m.node);
+    w.u64(m.incarnation);
+    if (!encode_certificate(w, m.verified_qc)) {
+        return false;
+    }
+    w.fixed(m.identity_signature);
+    return true;
+}
+
+bool encode_readiness(Writer& w, const CandidateReadiness& r) {
+    if (r.entries.size() > constants::kMaxActiveTier1) {
+        return false;
+    }
+    w.fixed(r.network_id);
+    w.fixed(r.plan_digest);
+    w.u64(r.next_epoch);
+    w.u16(static_cast<uint16_t>(r.entries.size()));
+    for (const auto& entry : r.entries) {
+        put_node(w, entry.node);
+        w.u64(entry.incarnation);
+        w.fixed(entry.evidence_digest);
+        w.fixed(entry.vote_key);
+    }
+    return true;
+}
+
+bool encode_readiness_proof(Writer& w, const ReadinessProofMsg& m) {
+    return encode_readiness(w, m.readiness) && encode_commit_proof(w, m.proof);
+}
+
+bool encode_handoff(Writer& w, const EpochHandoff& h) {
+    if (h.members.size() > constants::kMaxActiveTier1) {
+        return false;
+    }
+    w.fixed(h.network_id);
+    w.u64(h.from_epoch);
+    w.u64(h.to_epoch);
+    w.fixed(h.plan_digest);
+    w.u16(static_cast<uint16_t>(h.members.size()));
+    for (const auto& node : h.members) {
+        put_node(w, node);
+        const auto incarnation = h.incarnations.find(node);
+        w.u64(incarnation != h.incarnations.end() ? incarnation->second : 0);
+        const auto key = h.vote_keys.find(node);
+        if (key == h.vote_keys.end()) {
+            return false;
+        }
+        w.fixed(key->second);
+    }
+    w.fixed(h.group_public_key);
+    w.fixed(h.dkg_transcript_digest);
+    w.u64(h.key_generation);
+    w.fixed(h.attestation_root);
+    w.u16(h.security_ruleset);
+    w.u16(h.consensus_ruleset);
+    return true;
+}
+
+bool encode_handoff_proof(Writer& w, const EpochHandoffProofMsg& m) {
+    return encode_handoff(w, m.handoff) && encode_commit_proof(w, m.proof);
 }
 
 bool encode_genesis_eligibility_attest(Writer& w, const GenesisEligibilityAttest& a) {
@@ -547,6 +670,7 @@ bool decode_bootstrap(Reader& r, BootstrapCertificate& c) {
     if (!(r.fixed(c.network_id) && r.u64(c.epoch) && r.fixed(c.tier1_set_digest) &&
           r.u64(threshold) && r.fixed(c.authority_public_key) && r.fixed(c.dkg_transcript_digest) &&
           r.fixed(c.attestation_root) && r.fixed(c.founding_eligibility_digest) &&
+          r.fixed(c.vote_key_set_digest) &&
           r.u16(c.security_ruleset) && r.u16(c.consensus_ruleset) &&
           r.fixed(c.genesis_signature))) {
         return false;
@@ -584,15 +708,147 @@ bool decode_observation(Reader& r, EligibilityObservation& o) {
 bool decode_participation_challenge(Reader& r, ParticipationChallenge& c) {
     return r.fixed(c.network_id) && r.u64(c.epoch) && r.u16(c.security_ruleset) &&
            r.u16(c.consensus_ruleset) && get_node(r, c.node_id) && r.u64(c.incarnation) &&
-           r.fixed(c.nonce) && r.u64(c.finalized_height) && r.fixed(c.finalized_state) &&
+           r.fixed(c.nonce) && r.u64(c.anchor_height) && r.fixed(c.anchor_state) &&
            get_node(r, c.observer);
 }
 
 bool decode_participation_response(Reader& r, ParticipationResponse& p) {
     return r.fixed(p.challenge_digest) && r.fixed(p.network_id) && r.u64(p.epoch) &&
            r.u16(p.security_ruleset) && r.u16(p.consensus_ruleset) && get_node(r, p.node_id) &&
-           r.u64(p.incarnation) && r.u64(p.finalized_height) && r.fixed(p.finalized_state) &&
+           r.u64(p.incarnation) && r.u64(p.anchor_height) && r.fixed(p.anchor_state) &&
            r.fixed(p.identity_signature);
+}
+
+bool decode_next_epoch_plan(Reader& r, NextEpochPlan& p) {
+    uint16_t count = 0;
+    if (!(r.fixed(p.network_id) && r.u64(p.current_epoch) && r.u64(p.next_epoch) &&
+          r.u32(p.attempt) && r.u64(p.checkpoint_height) && r.fixed(p.checkpoint_state_root) &&
+          r.fixed(p.eligibility_commitment) && r.fixed(p.selection_seed) && r.u16(count))) {
+        return false;
+    }
+    if (count > constants::kMaxActiveTier1) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        NodeId node;
+        uint64_t incarnation = 0;
+        if (!(get_node(r, node) && r.u64(incarnation))) {
+            return false;
+        }
+        p.selected.push_back(node);
+        p.incarnations[node] = incarnation;
+    }
+    uint16_t profile = 0;
+    if (!(r.u16(p.security_ruleset) && r.u16(p.consensus_ruleset) && r.u16(profile) &&
+          r.u16(p.profile_ruleset))) {
+        return false;
+    }
+    const auto named = static_cast<AttestationProfileId>(profile);
+    if (named != AttestationProfileId::Unknown && !is_known_attestation_profile_id(named)) {
+        return r.fail(CodecError::BadValue);
+    }
+    p.profile_id = named;
+    return true;
+}
+
+bool decode_committed_block(Reader& r, CommittedBlock& b) {
+    ProposalMessage message;
+    if (!decode_proposal(r, message)) {
+        return false;
+    }
+    b.proposal = std::move(message.proposal);
+    b.justify = std::move(message.justify);
+    return true;
+}
+
+bool decode_commit_proof(Reader& r, CommitProof& p) {
+    p.chain.resize(3);
+    for (auto& block : p.chain) {
+        if (!decode_committed_block(r, block)) {
+            return false;
+        }
+    }
+    return decode_certificate(r, p.certifying);
+}
+
+bool decode_plan_proof(Reader& r, NextEpochPlanProof& m) {
+    if (!(decode_next_epoch_plan(r, m.plan) && decode_commit_proof(r, m.proof))) {
+        return false;
+    }
+    uint16_t count = 0;
+    if (!r.u16(count)) {
+        return false;
+    }
+    if (count > constants::kMaxActiveTier1) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        NodeId node;
+        nexus::crypto::Ed25519PublicKey key{};
+        if (!(get_node(r, node) && r.fixed(key))) {
+            return false;
+        }
+        m.current_vote_keys.emplace_back(node, key);
+    }
+    return true;
+}
+
+bool decode_state_ready(Reader& r, CandidateStateReadyMsg& m) {
+    return r.fixed(m.network_id) && r.fixed(m.plan_digest) && get_node(r, m.node) &&
+           r.u64(m.incarnation) && decode_certificate(r, m.verified_qc) &&
+           r.fixed(m.identity_signature);
+}
+
+bool decode_readiness(Reader& r, CandidateReadiness& out) {
+    uint16_t count = 0;
+    if (!(r.fixed(out.network_id) && r.fixed(out.plan_digest) && r.u64(out.next_epoch) &&
+          r.u16(count))) {
+        return false;
+    }
+    if (count > constants::kMaxActiveTier1) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    out.entries.resize(count);
+    for (auto& entry : out.entries) {
+        if (!(get_node(r, entry.node) && r.u64(entry.incarnation) &&
+              r.fixed(entry.evidence_digest) && r.fixed(entry.vote_key))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool decode_readiness_proof(Reader& r, ReadinessProofMsg& m) {
+    return decode_readiness(r, m.readiness) && decode_commit_proof(r, m.proof);
+}
+
+bool decode_handoff(Reader& r, EpochHandoff& h) {
+    uint16_t count = 0;
+    if (!(r.fixed(h.network_id) && r.u64(h.from_epoch) && r.u64(h.to_epoch) &&
+          r.fixed(h.plan_digest) && r.u16(count))) {
+        return false;
+    }
+    if (count > constants::kMaxActiveTier1) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        NodeId node;
+        uint64_t incarnation = 0;
+        nexus::crypto::Ed25519PublicKey key{};
+        if (!(get_node(r, node) && r.u64(incarnation) && r.fixed(key))) {
+            return false;
+        }
+        h.members.push_back(node);
+        h.incarnations[node] = incarnation;
+        h.vote_keys[node] = key;
+    }
+    return r.fixed(h.group_public_key) && r.fixed(h.dkg_transcript_digest) &&
+           r.u64(h.key_generation) && r.fixed(h.attestation_root) &&
+           r.u16(h.security_ruleset) && r.u16(h.consensus_ruleset);
+}
+
+bool decode_handoff_proof(Reader& r, EpochHandoffProofMsg& m) {
+    return decode_handoff(r, m.handoff) && decode_commit_proof(r, m.proof);
 }
 
 bool decode_genesis_eligibility_attest(Reader& r, GenesisEligibilityAttest& a) {
@@ -733,16 +989,50 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(p);
             return true;
         }
+        case SecurityMessageKind::NextEpochPlanProof: {
+            NextEpochPlanProof m;
+            if (!decode_plan_proof(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::CandidateStateReady: {
+            CandidateStateReadyMsg m;
+            if (!decode_state_ready(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::ReadinessProof: {
+            ReadinessProofMsg m;
+            if (!decode_readiness_proof(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::EpochHandoffProof: {
+            EpochHandoffProofMsg m;
+            if (!decode_handoff_proof(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
     }
     return r.fail(CodecError::UnknownKind);
 }
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::ParticipationResponse);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::EpochHandoffProof);
 }
 
 }  // namespace
+
+Digest candidate_state_ready_digest(const CandidateStateReadyMsg& message) {
+    CanonicalEncoder encoder("lemonade-nexus/candidate-state-ready:v1");
+    encoder.add_bytes(message.network_id);
+    encoder.add_bytes(message.plan_digest);
+    encoder.add_bytes(message.node.bytes);
+    encoder.add_u64(message.incarnation);
+    encoder.add_bytes(qc_digest(message.verified_qc));
+    return encoder.digest();
+}
 
 std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
     return std::visit(
@@ -788,8 +1078,16 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::GenesisEligibilityAttest;
             } else if constexpr (std::is_same_v<T, ParticipationChallenge>) {
                 return SecurityMessageKind::ParticipationChallenge;
-            } else {
+            } else if constexpr (std::is_same_v<T, ParticipationResponse>) {
                 return SecurityMessageKind::ParticipationResponse;
+            } else if constexpr (std::is_same_v<T, NextEpochPlanProof>) {
+                return SecurityMessageKind::NextEpochPlanProof;
+            } else if constexpr (std::is_same_v<T, CandidateStateReadyMsg>) {
+                return SecurityMessageKind::CandidateStateReady;
+            } else if constexpr (std::is_same_v<T, ReadinessProofMsg>) {
+                return SecurityMessageKind::ReadinessProof;
+            } else {
+                return SecurityMessageKind::EpochHandoffProof;
             }
         },
         body);
@@ -839,8 +1137,16 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_genesis_eligibility_attest(body, value);
             } else if constexpr (std::is_same_v<T, ParticipationChallenge>) {
                 return encode_participation_challenge(body, value);
-            } else {
+            } else if constexpr (std::is_same_v<T, ParticipationResponse>) {
                 return encode_participation_response(body, value);
+            } else if constexpr (std::is_same_v<T, NextEpochPlanProof>) {
+                return encode_plan_proof(body, value);
+            } else if constexpr (std::is_same_v<T, CandidateStateReadyMsg>) {
+                return encode_state_ready(body, value);
+            } else if constexpr (std::is_same_v<T, ReadinessProofMsg>) {
+                return encode_readiness_proof(body, value);
+            } else {
+                return encode_handoff_proof(body, value);
             }
         },
         message.body);

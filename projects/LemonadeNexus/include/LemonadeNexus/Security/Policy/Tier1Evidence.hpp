@@ -25,10 +25,9 @@ namespace nexus::security {
 /// proves what its hardware attests, and how a node has behaved on the mesh is
 /// not that.
 ///
-/// `uptime_valid` and `mesh_health_valid` have NO producer in the tree yet.
-/// They are carried here rather than dropped so the gap stays visible and fails
-/// closed: leaving them false makes a node ineligible until something real
-/// fills them in.
+/// Both mesh facts are produced by EligibilityService from signed observations
+/// that a witness threshold of the current committee agreed on, and both stay
+/// false until that threshold is met.
 struct Tier1MeshFacts {
     /// The candidate holds a root-signed transport certificate.
     bool certificate_valid{false};
@@ -40,15 +39,16 @@ struct Tier1MeshFacts {
     /// never changes a current epoch's member count or quorum.
     bool uptime_valid{false};
 
-    /// Mesh-observed protocol participation, as required from the quorum (1.1
-    /// section 13.2): synchronized to current finalized state, recent
-    /// authenticated observations from the required mesh quorum, no unresolved
-    /// duplicate incarnation, and no unresolved equivocation evidence. Local
+    /// Mesh-observed protocol participation: the witness threshold saw the
+    /// subject alive, authenticated, and speaking the current network, epoch,
+    /// incarnation and rulesets, with no unresolved objective fault. Local
     /// load, ping latency and self-reported health are not inputs.
     ///
-    /// The observation encoding must be deterministic and finalized before it
-    /// can affect next-epoch membership, which is why no producer exists yet:
-    /// a locally computed answer would be a self-report wearing another name.
+    /// It is NOT a synchronization proof. A current member's votes do happen to
+    /// prove it holds current consensus state, but a candidate proves
+    /// participation by answering a challenge, and echoing an anchor is receipt
+    /// rather than possession. Security-state possession is proved separately,
+    /// once, during next-epoch adoption (CandidateStateProof).
     bool mesh_health_valid{false};
 
     /// The epoch and incarnation the mesh currently considers live. A verdict

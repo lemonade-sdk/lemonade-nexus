@@ -82,6 +82,16 @@ public:
     /// the node identity key and grants nothing.
     virtual void on_participation_challenge(const ParticipationChallenge&, const NodeId&) {}
     virtual void on_participation_response(const ParticipationResponse&) {}
+    /// The adoption exchange. Every one of these carries a finalized commit
+    /// proof (or, for state-ready, a certificate) that the driver verifies in
+    /// full before acting; the router only delivers.
+    virtual void on_next_epoch_plan(const NextEpochPlanProof&) {}
+    virtual void on_candidate_state_ready(const CandidateStateReadyMsg&) {}
+    virtual void on_readiness_proof(const ReadinessProofMsg&) {}
+    virtual void on_epoch_handoff_proof(const EpochHandoffProofMsg&) {}
+    /// A sync response arriving before this node holds any epoch state: the
+    /// pending-candidate recovery path.
+    virtual void on_candidate_sync_response(const SyncResponse&, const NodeId&) {}
     /// A validated certificate from a peer: proof the network reached its
     /// view. The driver derives the restart view floor from these.
     virtual void on_sync_certificate(const QuorumCertificate&, const NodeId&) {}

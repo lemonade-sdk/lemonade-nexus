@@ -392,8 +392,8 @@ TEST_F(ServiceMesh, AParticipationResponseIsBoundToItsChallenge) {
     challenge.node_id = ids[1];
     challenge.incarnation = 1;
     challenge.nonce.fill(0x2B);
-    challenge.finalized_height = 12;
-    challenge.finalized_state = reference(0xC0);
+    challenge.anchor_height = 12;
+    challenge.anchor_state = reference(0xC0);
     challenge.observer = ids[0];
 
     const auto answer = answer_participation_challenge(challenge, keys[1]);
@@ -423,10 +423,10 @@ TEST_F(ServiceMesh, AParticipationResponseIsBoundToItsChallenge) {
               ParticipationFailure::RulesetMismatch);
     EXPECT_EQ(broken([](auto& r) { r.incarnation += 1; }),
               ParticipationFailure::IncarnationMismatch);
-    EXPECT_EQ(broken([](auto& r) { r.finalized_height += 1; }),
-              ParticipationFailure::StateMismatch);
-    EXPECT_EQ(broken([this](auto& r) { r.finalized_state = reference(0xC1); }),
-              ParticipationFailure::StateMismatch);
+    EXPECT_EQ(broken([](auto& r) { r.anchor_height += 1; }),
+              ParticipationFailure::AnchorMismatch);
+    EXPECT_EQ(broken([this](auto& r) { r.anchor_state = reference(0xC1); }),
+              ParticipationFailure::AnchorMismatch);
     EXPECT_EQ(broken([](auto& r) { r.identity_signature[0] ^= 0x01; }),
               ParticipationFailure::SignatureInvalid);
 
@@ -522,7 +522,11 @@ TEST_F(ServiceMesh, FinalizationIsRequiredBeforeAnyPool) {
     EXPECT_FALSE(services[0]->frozen_pool(kNext).has_value());
 
     const Digest commitment = eligibility_commitment_digest(services[0]->compute_state(kNext));
-    services[0]->finalize({commitment, reference(0xC0), 12, kNext});
+    services[0]->finalize({.commitment = commitment,
+                           .consensus_reference = reference(0xC0),
+                           .height = 12,
+                           .state_root = reference(0xC1),
+                           .next_epoch = kNext});
     const auto pool = services[0]->frozen_pool(kNext);
     ASSERT_TRUE(pool.has_value());
     EXPECT_EQ(pool->size(), kMembers);
@@ -537,7 +541,11 @@ TEST_F(ServiceMesh, FinalizationIsRequiredBeforeAnyPool) {
 TEST_F(ServiceMesh, AStateThatNoLongerMatchesReleasesNothing) {
     observe_everything();
     const Digest commitment = eligibility_commitment_digest(services[0]->compute_state(kNext));
-    services[0]->finalize({commitment, reference(0xC0), 12, kNext});
+    services[0]->finalize({.commitment = commitment,
+                           .consensus_reference = reference(0xC0),
+                           .height = 12,
+                           .state_root = reference(0xC1),
+                           .next_epoch = kNext});
     ASSERT_TRUE(services[0]->frozen_pool(kNext).has_value());
 
     services[0]->record_fault(ids[3], ObjectiveFault::Equivocation);
@@ -573,7 +581,11 @@ TEST_F(ServiceMesh, AFaultDeniesEligibilityAndOutlivesARestart) {
 TEST_F(ServiceMesh, RestartRestoresObservationsButNeverFinality) {
     observe_everything();
     const Digest before = eligibility_commitment_digest(services[0]->compute_state(kNext));
-    services[0]->finalize({before, reference(0xC0), 12, kNext});
+    services[0]->finalize({.commitment = before,
+                           .consensus_reference = reference(0xC0),
+                           .height = 12,
+                           .state_root = reference(0xC1),
+                           .next_epoch = kNext});
     ASSERT_TRUE(services[0]->frozen_pool(kNext).has_value());
     const std::size_t held = services[0]->ledger().size();
 

@@ -17,6 +17,7 @@
 // 18 and 19.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusStore.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Consensus/HotStuffState.hpp>
@@ -123,6 +124,11 @@ public:
     /// The chain above the last committed block, oldest first, each with its
     /// justify. The last entry is the block the high certificate certifies.
     [[nodiscard]] std::vector<std::pair<Proposal, QuorumCertificate>> uncommitted_chain() const;
+
+    /// The portable three-chain proof for a committed block, when the blocks
+    /// and certificates behind it are still held. A node outside the epoch
+    /// verifies this instead of trusting the sender.
+    [[nodiscard]] std::optional<CommitProof> commit_proof(const Digest& proposal_digest) const;
 
     [[nodiscard]] NodeId leader_of(View view) const {
         return config_.leader_order[view % config_.leader_order.size()];

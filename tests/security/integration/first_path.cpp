@@ -12,6 +12,7 @@
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>
 #include <LemonadeNexus/Security/Consensus/LeaderSelection.hpp>
 #include <LemonadeNexus/Security/Consensus/VoteKey.hpp>
+#include <LemonadeNexus/Security/Epoch/NextEpochPlan.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Policy/Tier1Eligibility.hpp>
@@ -324,7 +325,7 @@ TEST_F(FirstPath, GenesisToEpochTwo) {
     ASSERT_TRUE(genesis.eligibility_agreed());
     const auto certificate = genesis.finalize_epoch_one(
         dkg_1.results[0].group_public_key, dkg_1.transcript, attestation_root(verdicts),
-        genesis_priv);
+        vote_key_set_digest(vote_keys_1), genesis_priv);
     ASSERT_TRUE(certificate.has_value());
     ASSERT_TRUE(verify_bootstrap_certificate(*certificate, genesis_pub));
     EXPECT_TRUE(genesis.finalized());

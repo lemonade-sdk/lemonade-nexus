@@ -70,6 +70,7 @@ public:
         const crypto::Ed25519PublicKey& epoch_one_authority_key,
         const Digest& dkg_transcript_digest,
         const Digest& attestation_root,
+        const Digest& vote_key_set_digest,
         const crypto::Ed25519PrivateKey& genesis_private_key);
 
     [[nodiscard]] bool finalized() const { return finalized_; }

@@ -150,6 +150,7 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     const crypto::Ed25519PublicKey& epoch_one_authority_key,
     const Digest& dkg_transcript_digest,
     const Digest& attestation_root,
+    const Digest& vote_key_set_digest,
     const crypto::Ed25519PrivateKey& genesis_private_key) {
     if (finalized_) {
         return std::nullopt;
@@ -186,6 +187,7 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     certificate.dkg_transcript_digest = dkg_transcript_digest;
     certificate.attestation_root = attestation_root;
     certificate.founding_eligibility_digest = *eligibility;
+    certificate.vote_key_set_digest = vote_key_set_digest;
     certificate.security_ruleset = constants::kSecurityRulesetVersion;
     certificate.consensus_ruleset = constants::kConsensusRulesetVersion;
 

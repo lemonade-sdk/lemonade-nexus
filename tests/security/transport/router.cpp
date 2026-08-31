@@ -261,6 +261,7 @@ struct RouterMesh : ::testing::Test {
         }
         certificate = *genesis.finalize_epoch_one(results[0].group_public_key,
                                                   results[0].transcript_digest, root_digest,
+                                                  vote_key_set_digest(vote_keys_1),
                                                   genesis_priv);
         for (std::size_t i = 0; i < kFounders; ++i) {
             ASSERT_TRUE(founders[i]->runtime->adopt_epoch_one(certificate, genesis_pub,

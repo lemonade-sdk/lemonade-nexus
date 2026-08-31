@@ -45,8 +45,15 @@ public:
     /// is dropped and the DKG restarts.
     [[nodiscard]] bool replace_participant(const NodeId& node, EpochTransitionFailure reason);
 
+    /// The members prepare_next_epoch would select from this pool, without
+    /// mutating anything. The plan commits this list; prepare then reproduces
+    /// it, so selection is stated once and checked twice.
+    [[nodiscard]] std::vector<NodeId> preview_selection(const Tier1Set& frozen_eligible,
+                                                        std::size_t admitted_server_count) const;
+
     /// Records the epoch BFT vote key a selected member registered. One key
-    /// per member; a changed key mid-handoff is refused.
+    /// per member; a changed key mid-handoff is refused, as is a key another
+    /// member already registered or one reused from the current epoch.
     [[nodiscard]] bool record_vote_key(const NodeId& node, const crypto::Ed25519PublicKey& key);
 
     /// Records the fresh DKG outcome for the next epoch group.

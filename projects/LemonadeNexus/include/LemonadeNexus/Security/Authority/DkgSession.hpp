@@ -56,6 +56,14 @@ struct DkgConfiguration {
     std::size_t threshold = 0;
 
     NodeId self;
+
+    /// What every message of this session must carry in place of the bare
+    /// participant-set digest. For an epoch transition this is the finalized
+    /// readiness digest, which binds the plan, the attempt, the selected set
+    /// and the registered vote keys all at once — so a replay from a failed
+    /// attempt names a session nobody is running. Zero means the participant
+    /// set digest itself, which is the Genesis form.
+    Digest session_binding{};
 };
 
 enum class DkgPhase : uint16_t {
@@ -101,6 +109,13 @@ struct DkgResult {
 class DkgSession {
 public:
     explicit DkgSession(DkgConfiguration configuration);
+
+    /// The digest every message of this session carries: the configured
+    /// session binding, or the bare participant-set digest at Genesis.
+    [[nodiscard]] Digest session_digest() const {
+        return config_.session_binding != Digest{} ? config_.session_binding
+                                                   : config_.participants.digest();
+    }
 
     /// Runs FROST part 1. Returns the own round-1 broadcast, or nullopt with
     /// failure() set.

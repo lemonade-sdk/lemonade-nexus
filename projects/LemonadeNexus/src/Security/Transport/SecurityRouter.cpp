@@ -133,6 +133,8 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.observer == authenticated_sender;
             } else if constexpr (std::is_same_v<T, ParticipationResponse>) {
                 return body.node_id == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, CandidateStateReadyMsg>) {
+                return body.node == authenticated_sender;
             } else {
                 return true;
             }
@@ -148,6 +150,20 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
     const bool participation_kind =
         message.kind == SecurityMessageKind::ParticipationChallenge ||
         message.kind == SecurityMessageKind::ParticipationResponse;
+    // What a pending candidate exchanges before it holds epoch state. Each of
+    // these carries or answers a finalized proof the driver verifies in full;
+    // passing the window is delivery, never belief.
+    const bool adoption_kind =
+        message.kind == SecurityMessageKind::NextEpochPlanProof ||
+        message.kind == SecurityMessageKind::CandidateStateReady ||
+        message.kind == SecurityMessageKind::ReadinessProof ||
+        message.kind == SecurityMessageKind::EpochHandoffProof ||
+        message.kind == SecurityMessageKind::AttestationChallenge ||
+        message.kind == SecurityMessageKind::AttestationEvidence ||
+        message.kind == SecurityMessageKind::DkgBroadcast ||
+        message.kind == SecurityMessageKind::DkgPairwise ||
+        message.kind == SecurityMessageKind::SyncRequest ||
+        message.kind == SecurityMessageKind::SyncResponse;
     const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
                                 message.kind == SecurityMessageKind::DkgTranscriptAttest ||
                                 message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
@@ -156,7 +172,7 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
         // Before Epoch 1 only bootstrap traffic exists: challenges, evidence,
         // the Epoch 1 DKG, and the Genesis exchange. A Tier 2 candidate also
         // answers participation challenges for the epoch the mesh is in.
-        return message.epoch <= 1 || participation_kind;
+        return message.epoch <= 1 || participation_kind || adoption_kind;
     }
     if (bootstrap_kind) {
         // Genesis authority ended at Epoch 1 activation.
@@ -268,6 +284,18 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
         case SecurityMessageKind::ParticipationResponse:
             events_.on_participation_response(std::get<ParticipationResponse>(message.body));
             return delivered();
+        case SecurityMessageKind::NextEpochPlanProof:
+            events_.on_next_epoch_plan(std::get<NextEpochPlanProof>(message.body));
+            return delivered();
+        case SecurityMessageKind::CandidateStateReady:
+            events_.on_candidate_state_ready(std::get<CandidateStateReadyMsg>(message.body));
+            return delivered();
+        case SecurityMessageKind::ReadinessProof:
+            events_.on_readiness_proof(std::get<ReadinessProofMsg>(message.body));
+            return delivered();
+        case SecurityMessageKind::EpochHandoffProof:
+            events_.on_epoch_handoff_proof(std::get<EpochHandoffProofMsg>(message.body));
+            return delivered();
     }
     return drop(DropReason::UnknownKind);
 }
@@ -290,7 +318,11 @@ RouteResult SecurityRouter::route_sync_request(const SyncRequest& request, const
 RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, const NodeId& from) {
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
-        return drop(DropReason::NoService);
+        // A pending candidate holds no epoch state to validate against; the
+        // driver validates against the plan's anchored membership instead.
+        // Peer data is recovery input, never authority.
+        events_.on_candidate_sync_response(response, from);
+        return delivered();
     }
     const EpochState& current = epochs->current();
     const QuorumCertificate& qc = response.high_qc;

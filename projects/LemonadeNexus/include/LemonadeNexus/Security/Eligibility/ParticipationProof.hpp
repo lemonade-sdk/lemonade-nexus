@@ -16,10 +16,17 @@
 // dedicated challenge-response that binds everything required, and nothing
 // else: it is not a health protocol and carries no load, latency or score.
 //
-// The observer chooses the finalized state reference, so it knows it
-// independently, and the candidate's signature binds its identity to that point
-// in finalized history. A response harvested elsewhere answers no challenge
-// this observer issued.
+// What this proves, exactly: the candidate holds its identity key, is live now,
+// and answered a challenge bound to this network, epoch, incarnation and
+// ruleset at a named point in the observer's finalized history. A response
+// harvested elsewhere answers no challenge this observer issued.
+//
+// What it does NOT prove: that the candidate holds or verified that finalized
+// state. The observer supplies the anchor and the candidate signs over it, so a
+// signed echo is receipt and nothing more. Security-state possession is a
+// separate fact, proved separately at adoption time — see CandidateStateProof.
+// Calling this exchange a synchronization proof would be exactly the silent
+// upgrade the split exists to prevent.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
@@ -42,12 +49,12 @@ struct ParticipationChallenge {
 
     Nonce nonce{};
 
-    /// The finalized state the observer holds: its own quorum-certified height
-    /// and the committed state root there. The candidate binds its answer to
-    /// this, so the observation cannot be replayed against another point in
-    /// history or another mesh.
-    Height finalized_height{};
-    Digest finalized_state{};
+    /// The observer's own quorum-certified height and committed state root: an
+    /// anchor, not a question. The candidate binds its answer to this so the
+    /// observation cannot be replayed against another point in history or
+    /// another mesh. Echoing it proves receipt, never possession.
+    Height anchor_height{};
+    Digest anchor_state{};
 
     NodeId observer{};
 };
@@ -67,8 +74,8 @@ struct ParticipationResponse {
     NodeId node_id{};
     IncarnationId incarnation{};
 
-    Height finalized_height{};
-    Digest finalized_state{};
+    Height anchor_height{};
+    Digest anchor_state{};
 
     crypto::Ed25519Signature identity_signature{};
 };
@@ -92,8 +99,8 @@ enum class ParticipationFailure : uint16_t {
     RulesetMismatch,
     IdentityMismatch,
     IncarnationMismatch,
-    /// The answer names finalized state other than the one the challenge did.
-    StateMismatch,
+    /// The answer names an anchor other than the one the challenge did.
+    AnchorMismatch,
     SignatureInvalid,
 };
 

@@ -59,7 +59,7 @@ DkgMessage DkgSession::make_message(DkgRound round, const NodeId& recipient,
     DkgMessage message;
     message.network_id = config_.network_id;
     message.target_epoch = config_.target_epoch;
-    message.participant_set_digest = config_.participants.digest();
+    message.participant_set_digest = session_digest();
     message.sender = config_.self;
     message.sender_incarnation = config_.incarnations.at(config_.self);
     message.round = round;
@@ -112,7 +112,7 @@ DkgFailure DkgSession::check_binding(const DkgMessage& message, DkgRound expecte
     if (message.target_epoch != config_.target_epoch) {
         return DkgFailure::WrongEpoch;
     }
-    if (message.participant_set_digest != config_.participants.digest()) {
+    if (message.participant_set_digest != session_digest()) {
         return DkgFailure::WrongParticipantSet;
     }
     if (!index_of_.contains(message.sender)) {
@@ -265,7 +265,7 @@ bool DkgSession::finish() {
 
     DkgResult result;
     result.target_epoch = config_.target_epoch;
-    result.participant_set_digest = config_.participants.digest();
+    result.participant_set_digest = session_digest();
     result.transcript_digest = *transcript_digest();
     result.group_public_key = outcome.value->group_public_key;
     result.public_key_package = std::move(outcome.value->public_key_package);

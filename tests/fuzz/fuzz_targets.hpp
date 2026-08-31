@@ -180,8 +180,8 @@ inline const nexus::security::ParticipationChallenge& fuzz_participation_challen
         value.node_id.bytes.fill(0x02);
         value.incarnation = 1;
         value.nonce.fill(0x3D);
-        value.finalized_height = 42;
-        value.finalized_state.fill(0xC0);
+        value.anchor_height = 42;
+        value.anchor_state.fill(0xC0);
         value.observer.bytes = fuzz_observer_key().public_key;
         return value;
     }();
