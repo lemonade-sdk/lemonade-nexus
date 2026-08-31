@@ -640,3 +640,131 @@ any of them returns.
     payloads, and the attestation evidence envelope.
 12. **Provision a SEV-SNP host** for the first compiled Linux profile
     (architecture 22, 23.A) and run `nexus-attest-profile reference` there.
+
+
+## M10 — Tier 2 eligibility and the witness bar
+
+The live eligibility path shipped in M9 had two defects the integration
+exposed. Both are fixed.
+
+### Tier 2 can now qualify for Tier 1
+
+The only participation producer was an accepted HotStuff vote, which only a
+current member can make. A node therefore had to be Tier 1 already to prove it
+was fit for Tier 1.
+
+The vote path is unchanged and remains the stronger proof: it is signed under
+the epoch vote key the mesh froze, names the network, epoch and consensus
+ruleset, and votes at a height the observer can compare against its own
+finalized floor. A second path joins it for candidates that hold no vote key —
+`Security/Eligibility/ParticipationProof.hpp`, message kinds 18 and 19:
+
+```
+current Tier 1 observer
+    -- ParticipationChallenge: nonce, network, epoch, rulesets, node,
+       incarnation, and the observer's own finalized height and state root
+candidate
+    -- ParticipationResponse: the challenge digest and every binding,
+       signed under the candidate's identity key
+observer
+    -- match before consume, verify, then sign a Participation observation
+```
+
+No existing exchange proved enough. Attestation evidence binds identity,
+incarnation, epoch and ruleset but says nothing about finalized state, and it is
+already what continuity counts. A sync request is unsigned. Gossip and WireGuard
+authenticate a transport, which is not an authorization result.
+
+Candidates enter the eligibility state through the observations themselves
+rather than a local peer list, bounded at `f + 1` distinct observers, so all
+honest nodes converge on the same candidate set and a Byzantine minority cannot
+inject subjects nobody has seen.
+
+### The witness bar excludes the subject from its own committee
+
+The bar was a full consensus quorum of external observers. A subject never
+witnesses itself, so a member was one short of its own committee by
+construction: at every population, `f` offline members made continuity
+unreachable for everyone while HotStuff still held its quorum. At N = 5 that
+was a single offline node.
+
+```
+Q = ConsensusQuorum(N)
+subject in the current committee: Q - 1 external witnesses
+subject outside it:               Q   external witnesses
+floor:                            f + 1
+```
+
+`Q - 1 = N - f - 1` is exactly what remains with `f` offline and the subject
+excluded, and it exceeds `f` at every population in the table — 3 against 1 at
+N = 5, 20 against 10 at N = 31 — so the adversary alone can never make a fact.
+A candidate outside the committee gets the full quorum, but it spends no witness
+on itself, so `N - f = Q` members remain and it is reachable too. Both kinds of
+subject stay provable exactly while consensus has its quorum and both stop one
+member later.
+
+This is a witness rule, not a consensus rule. `ConsensusQuorum(N)` is untouched;
+the state these facts feed is still finalized by a full HotStuff quorum, which
+is what makes two honest nodes agree on it.
+
+### Claim provenance
+
+Platform claims travel inside signed observations so honest replicas compute one
+deterministic state. `observe_attestation` now takes only a subject and reads
+the verdict this node's own verifier recorded, so there is no parameter left for
+a caller to sign a claim set it did not verify. Fabricated claims, claims copied
+onto another node, incarnation or network, the same evidence digest with claims
+altered, and an observation relayed under another observer's identity all break
+the signature.
+
+### `certificate_valid`
+
+Sourced from `GossipService::peer_is_root_certified`, which requires a
+configured root anchor (never fail-open), a stored certificate belonging to that
+pubkey, issuer equal to the root, an unexpired `expires_at`, a non-revoked
+identity, and an Ed25519 signature over the canonical certificate under the root
+key — with proof of possession enforced at `handle_server_hello`, where the
+packet signer must equal the certificate identity.
+
+It means ordinary authenticated server identity. It is one prerequisite of
+fifteen and implies none of the others.
+
+**Gap:** the certificate binds to the root anchor rather than to `network_id`
+explicitly. With one root per deployment that is sound, but an explicit network
+field would be a strict improvement.
+
+### Known gap: a selected Tier 2 node cannot yet join the next epoch
+
+A candidate can become finalized-eligible and be selected into the next-epoch
+set. It cannot yet take up the role, because the handoff protocol has no path
+for a non-member:
+
+- `maybe_start_next_dkg` requires an `EpochManager` transition, which only
+  current members have, so a selected candidate never joins the target-epoch
+  DKG;
+- `activate_next_epoch` builds the new state from that transition, so there is
+  no adoption path for a node that was not in the previous epoch.
+
+Closing it needs a quorum-gated adoption path — a selected node learning the
+target participant set, joining the DKG, and adopting the epoch on agreeing
+announcements from current members. That is where a mistake would grant
+authority, so it is left as its own milestone rather than added under this one.
+`Tier2Path.ProvingParticipationGrantsNoAuthority` pins the boundary as it
+stands: a candidate that has proved everything holds no consensus, no authority
+key, no epoch state and no membership.
+
+### Fuzzing
+
+Two targets past the codec: an observation through every rule that judges it,
+and a participation answer against a challenge the observer holds, both reached
+with genuinely signed messages plus bit-flips and truncations.
+`scripts/nexus-run-fuzzers` builds and runs the real fuzz binaries under Linux
+Clang in a container. AppleClang ships no libFuzzer runtime, so on a Mac only
+the deterministic corpus runs.
+
+### Measurement
+
+`security/simulation/eligibility_scale.cpp` records, for every population from
+5 to 31, the witness bar for each kind of subject, whether each fact still forms
+with one, `f` and `f + 1` members offline, and what expiry, participation loss,
+candidate restart and a proved fault do to it. Assertions are invariants only.
