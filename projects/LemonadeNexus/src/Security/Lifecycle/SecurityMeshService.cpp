@@ -50,7 +50,7 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           // Called only while consensus runs, long after the driver exists.
           .transition_validator =
               [this](const Digest& transitions_digest) {
-                  return transitions_digest == driver_.pending_handoff_digest();
+                  return driver_.accepts_transition(transitions_digest);
               }}),
       sealer_(config.identity.private_key),
       store_(config.data_root / "security", wrapping),
@@ -67,7 +67,18 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           [this](EpochId epoch) { return driver_.vote_key_for_epoch(epoch); },
           config.data_root / "security" / "attestation-cache",
           {}}),
-      driver_(SecurityDriverConfig{self_id(config), config.identity, config.genesis_public_key},
+      driver_(SecurityDriverConfig{
+                  .self = self_id(config),
+                  .identity = config.identity,
+                  .genesis_public_key = config.genesis_public_key,
+                  // The transport certificate is a mesh fact, and the gossip
+                  // layer is where the root signature was already checked. The
+                  // security layer reads that answer; it does not re-derive it
+                  // and it cannot override it.
+                  .certificate_source =
+                      [this](const NodeId& node) {
+                          return transport_.peer_is_root_certified(node);
+                      }},
               runtime_, router_, store_, genesis_.get()),
       timer_(io) {
     events_.target = &driver_;

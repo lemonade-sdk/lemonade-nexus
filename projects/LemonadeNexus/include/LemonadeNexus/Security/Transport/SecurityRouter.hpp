@@ -54,6 +54,11 @@ class ISecurityEvents {
 public:
     virtual ~ISecurityEvents() = default;
     virtual void on_vote_sent(const Vote&, const NodeId&) {}
+    /// A vote the local replica validated: correct network, epoch and consensus
+    /// ruleset, signed under the epoch vote key the mesh froze for that member,
+    /// at a stated height. That is the participation proof — the subject
+    /// asserted none of it, and nothing about it is a health score.
+    virtual void on_vote_accepted(const Vote&) {}
     virtual void on_certificate(const QuorumCertificate&) {}
     virtual void on_timeout_certificate(const TimeoutCertificate&) {}
     virtual void on_commits(const std::vector<ConsensusCommit>&) {}
@@ -68,6 +73,10 @@ public:
     virtual void on_genesis_founding(const GenesisFounding&, const NodeId&) {}
     virtual void on_dkg_transcript_attest(const DkgTranscriptAttest&) {}
     virtual void on_bootstrap_certificate(const BootstrapCertificate&, const NodeId&) {}
+    /// One observer's signed statement about one candidate. The ledger decides
+    /// whether it counts; the router only carries it.
+    virtual void on_eligibility_observation(const EligibilityObservation&) {}
+    virtual void on_genesis_eligibility_attest(const GenesisEligibilityAttest&) {}
     /// A validated certificate from a peer: proof the network reached its
     /// view. The driver derives the restart view floor from these.
     virtual void on_sync_certificate(const QuorumCertificate&, const NodeId&) {}

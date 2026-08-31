@@ -12,6 +12,7 @@ using nexus::security::bootstrap_certificate_signing_digest;
 using nexus::security::derive_network_id;
 using nexus::security::dkg_transcript_attest_digest;
 using nexus::security::Digest;
+using nexus::security::genesis_eligibility_attest_digest;
 using nexus::security::GenesisService;
 using nexus::security::NetworkId;
 using nexus::security::NodeId;
@@ -91,6 +92,33 @@ struct GenesisFixture : ::testing::Test {
         }
     }
 
+    nexus::security::GenesisEligibilityAttest eligibility_from(const Founder& founder,
+                                                                const Digest& state) {
+        nexus::security::GenesisEligibilityAttest attest;
+        attest.epoch = 1;
+        attest.founding_state_digest = state;
+        attest.node = founder.id;
+        const Digest digest = genesis_eligibility_attest_digest(attest);
+        crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(),
+                             digest.size(), founder.priv.data());
+        return attest;
+    }
+
+    void attest_eligibility_all(const Digest& state) {
+        for (const auto& founder : founders) {
+            ASSERT_TRUE(service->record_eligibility_attest(eligibility_from(founder, state)));
+        }
+    }
+
+    // The founding eligibility every founder computes in the real flow. The
+    // value is opaque to Genesis: it only checks that all five signed the same
+    // one.
+    Digest founding_state() const {
+        Digest state;
+        state.fill(0x3C);
+        return state;
+    }
+
     std::vector<Founder> founders;
 
     nexus::crypto::Ed25519PublicKey genesis_pub{};
@@ -153,8 +181,64 @@ TEST_F(GenesisFixture, FinalizeBeforeQuorumRefused) {
     EXPECT_FALSE(service->finalized());
 }
 
+// Genesis names who it verified; the founders decide who qualifies. Without a
+// unanimous founding eligibility transcript there is no certificate, and
+// Genesis has no way to supply one of its own.
+TEST_F(GenesisFixture, FoundingEligibilityMustBeUnanimous) {
+    admit_real_founders(constants::kBootstrapThreshold);
+    nexus::crypto::Ed25519PublicKey group{};
+    group.fill(0x77);
+    Digest transcript;
+    transcript.fill(0x55);
+    attest_all(transcript, group);
+
+    // The DKG transcript alone is not enough.
+    EXPECT_FALSE(service->eligibility_agreed());
+    EXPECT_FALSE(
+        service->finalize_epoch_one(group, transcript, Digest{}, genesis_priv).has_value());
+
+    // A non-founder and a forged signature are refused.
+    Founder outsider;
+    crypto_sign_keypair(outsider.pub.data(), outsider.priv.data());
+    outsider.id.bytes = outsider.pub;
+    EXPECT_FALSE(service->record_eligibility_attest(eligibility_from(outsider, founding_state())));
+    auto forged = eligibility_from(founders[0], founding_state());
+    forged.identity_signature[0] ^= 0x01;
+    EXPECT_FALSE(service->record_eligibility_attest(forged));
+
+    // Four agreeing and one dissenting is not agreement. The bootstrap
+    // threshold is five and it does not bend.
+    for (std::size_t i = 0; i + 1 < founders.size(); ++i) {
+        ASSERT_TRUE(service->record_eligibility_attest(eligibility_from(founders[i],
+                                                                        founding_state())));
+    }
+    Digest dissenting;
+    dissenting.fill(0x3D);
+    ASSERT_TRUE(service->record_eligibility_attest(eligibility_from(founders.back(), dissenting)));
+    EXPECT_FALSE(service->eligibility_agreed());
+    EXPECT_FALSE(
+        service->finalize_epoch_one(group, transcript, Digest{}, genesis_priv).has_value());
+
+    // Once every founder signs the same transcript the certificate carries it.
+    ASSERT_TRUE(service->record_eligibility_attest(eligibility_from(founders.back(),
+                                                                    founding_state())));
+    EXPECT_TRUE(service->eligibility_agreed());
+    const auto certificate =
+        service->finalize_epoch_one(group, transcript, Digest{}, genesis_priv);
+    ASSERT_TRUE(certificate.has_value());
+    EXPECT_EQ(certificate->founding_eligibility_digest, founding_state());
+    EXPECT_TRUE(verify_bootstrap_certificate(*certificate, genesis_pub));
+
+    // And the certificate is bound to it: a substituted transcript breaks the
+    // Genesis signature.
+    auto tampered = *certificate;
+    tampered.founding_eligibility_digest = dissenting;
+    EXPECT_FALSE(verify_bootstrap_certificate(tampered, genesis_pub));
+}
+
 TEST_F(GenesisFixture, TranscriptAttestRules) {
     admit_real_founders(constants::kBootstrapThreshold);
+    attest_eligibility_all(founding_state());
     nexus::crypto::Ed25519PublicKey group{};
     group.fill(0x77);
     Digest transcript;
@@ -206,6 +290,7 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
     Digest attestation_root;
     attestation_root.fill(0x66);
     attest_all(dkg_digest, authority);
+    attest_eligibility_all(founding_state());
 
     const auto certificate =
         service->finalize_epoch_one(authority, dkg_digest, attestation_root, genesis_priv);
@@ -233,6 +318,8 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
     EXPECT_FALSE(service->admit_candidate(node(0xEE)));
     EXPECT_FALSE(service->record_verdict(verdict_for(founders[0].id, true)));
     EXPECT_FALSE(service->record_transcript_attest(attest_from(founders[0], dkg_digest, authority)));
+    EXPECT_FALSE(service->record_eligibility_attest(eligibility_from(founders[0],
+                                                                     founding_state())));
     EXPECT_FALSE(
         service->finalize_epoch_one(authority, dkg_digest, attestation_root, genesis_priv)
             .has_value());

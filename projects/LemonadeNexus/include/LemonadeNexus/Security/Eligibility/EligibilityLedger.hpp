@@ -19,6 +19,7 @@
 
 #include <cstddef>
 #include <map>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <vector>
@@ -79,6 +80,13 @@ struct MeshFactEvidence {
     std::size_t participation_observers{0};
     std::size_t quorum_required{0};
     bool fault_recorded{false};
+
+    /// The platform claims a quorum of observers agreed on, left default when
+    /// no single claim set reached the quorum. A quorum is a strict majority,
+    /// so at most one claim set can ever qualify.
+    VerifiedPlatformClaims platform_claims;
+    /// Observers holding that claim set.
+    std::size_t claim_observers{0};
 };
 
 class EligibilityLedger {
@@ -93,9 +101,19 @@ public:
     /// the epoch: it is evidence, not an opinion, so there is no appeal here.
     void record_fault(const NodeId& subject, ObjectiveFault fault);
 
+    /// Adds a restored fault set. Faults only accumulate: a proved fault has no
+    /// transition back, so nothing here can drop one.
+    void merge_faults(const std::map<NodeId, std::set<ObjectiveFault>>& faults);
+
     [[nodiscard]] MeshFactEvidence evaluate(const NodeId& subject,
                                             IncarnationId incarnation,
                                             const MeshFactContext& context) const;
+
+    /// The incarnation a quorum of observers attributes to `subject`, or
+    /// nullopt when no single value has one. A node never attests itself, so
+    /// which incarnation is live is a mesh fact like any other.
+    [[nodiscard]] std::optional<IncarnationId> quorum_incarnation(
+        const NodeId& subject, const MeshFactContext& context) const;
 
     /// The two mesh facts for one candidate. Everything else in Tier1MeshFacts
     /// comes from elsewhere; this fills in only what the mesh observed.

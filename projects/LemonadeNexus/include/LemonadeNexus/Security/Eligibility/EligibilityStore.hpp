@@ -15,6 +15,8 @@
 #include <LemonadeNexus/Security/Eligibility/EligibilityLedger.hpp>
 
 #include <filesystem>
+#include <map>
+#include <set>
 #include <variant>
 #include <vector>
 
@@ -38,6 +40,17 @@ public:
 
     /// Removes stored observations for epochs before `epoch`.
     void discard_before(EpochId epoch);
+
+    /// Proved faults, which are NOT epoch-scoped. A fault is a fact about a
+    /// node identity, so it outlives the epoch that proved it and there is no
+    /// transition back: nothing here clears one.
+    [[nodiscard]] bool store_faults(const std::map<NodeId, std::set<ObjectiveFault>>& faults);
+
+    /// Loads the fault file. Absent means no fault was ever proved; Corrupt
+    /// means the file exists and cannot be believed, which the caller must fail
+    /// closed on rather than read as "no faults".
+    [[nodiscard]] std::variant<std::map<NodeId, std::set<ObjectiveFault>>, EligibilityLoadResult>
+    load_faults() const;
 
     [[nodiscard]] const std::filesystem::path& directory() const { return directory_; }
 

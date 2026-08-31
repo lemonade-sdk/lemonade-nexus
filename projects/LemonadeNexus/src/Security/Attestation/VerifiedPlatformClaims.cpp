@@ -25,7 +25,63 @@ constexpr ClaimField kRequired[] = {
     {PlatformClaim::AttestationProfile, &VerifiedPlatformClaims::attestation_profile_valid},
 };
 
+// Every claim, in declaration order. One list defines the digest order and the
+// wire bit order, so the two can never drift apart.
+constexpr bool VerifiedPlatformClaims::* kAllClaims[] = {
+    &VerifiedPlatformClaims::hardware_confidentiality_valid,
+    &VerifiedPlatformClaims::platform_identity_valid,
+    &VerifiedPlatformClaims::evidence_freshness_valid,
+    &VerifiedPlatformClaims::node_identity_binding_valid,
+    &VerifiedPlatformClaims::incarnation_binding_valid,
+    &VerifiedPlatformClaims::epoch_binding_valid,
+    &VerifiedPlatformClaims::security_ruleset_binding_valid,
+    &VerifiedPlatformClaims::boot_integrity_valid,
+    &VerifiedPlatformClaims::runtime_integrity_valid,
+    &VerifiedPlatformClaims::tcb_valid,
+    &VerifiedPlatformClaims::attestation_profile_valid,
+    &VerifiedPlatformClaims::ima_anchored,
+    &VerifiedPlatformClaims::binary_approved,
+    &VerifiedPlatformClaims::runtime_profile_enforced,
+};
+
+static_assert(sizeof(kAllClaims) / sizeof(kAllClaims[0]) == 14,
+              "kPlatformClaimBitMask names exactly these claims");
+
 }  // namespace
+
+void encode_platform_claims(CanonicalEncoder& encoder, const VerifiedPlatformClaims& claims) {
+    encoder.add_u16(static_cast<uint16_t>(claims.profile_id));
+    encoder.add_u16(claims.profile_ruleset);
+    for (const auto field : kAllClaims) {
+        encoder.add_u16(claims.*field ? 1 : 0);
+    }
+}
+
+uint16_t platform_claim_bits(const VerifiedPlatformClaims& claims) {
+    uint16_t bits = 0;
+    uint16_t position = 0;
+    for (const auto field : kAllClaims) {
+        if (claims.*field) {
+            bits |= static_cast<uint16_t>(1u << position);
+        }
+        ++position;
+    }
+    return bits;
+}
+
+VerifiedPlatformClaims platform_claims_from_bits(AttestationProfileId profile_id,
+                                                  AttestationProfileRuleset profile_ruleset,
+                                                  uint16_t bits) {
+    VerifiedPlatformClaims claims;
+    claims.profile_id = profile_id;
+    claims.profile_ruleset = profile_ruleset;
+    uint16_t position = 0;
+    for (const auto field : kAllClaims) {
+        claims.*field = (bits & static_cast<uint16_t>(1u << position)) != 0;
+        ++position;
+    }
+    return claims;
+}
 
 std::string_view platform_claim_name(PlatformClaim claim) {
     switch (claim) {

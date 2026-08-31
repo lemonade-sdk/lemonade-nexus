@@ -23,6 +23,7 @@ Digest bootstrap_certificate_signing_digest(const BootstrapCertificate& certific
     encoder.add_bytes(certificate.authority_public_key);
     encoder.add_bytes(certificate.dkg_transcript_digest);
     encoder.add_bytes(certificate.attestation_root);
+    encoder.add_bytes(certificate.founding_eligibility_digest);
     encoder.add_u16(certificate.security_ruleset);
     encoder.add_u16(certificate.consensus_ruleset);
     return encoder.digest();

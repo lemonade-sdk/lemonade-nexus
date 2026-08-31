@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/Authority/AuthorityService.hpp>
 #include <LemonadeNexus/Security/Authority/DkgSession.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
+#include <LemonadeNexus/Security/Eligibility/EligibilityObservation.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochAuthority.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisMessages.hpp>
@@ -42,6 +43,8 @@ enum class SecurityMessageKind : uint16_t {
     BootstrapCertificate = 13,
     SyncRequest = 14,
     SyncResponse = 15,
+    EligibilityObservation = 16,
+    GenesisEligibilityAttest = 17,
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -88,7 +91,9 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   DkgTranscriptAttest,
                                   BootstrapCertificate,
                                   SyncRequest,
-                                  SyncResponse>;
+                                  SyncResponse,
+                                  EligibilityObservation,
+                                  GenesisEligibilityAttest>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

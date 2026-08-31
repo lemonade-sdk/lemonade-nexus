@@ -33,6 +33,11 @@ struct BootstrapCertificate {
     Digest dkg_transcript_digest{};
     Digest attestation_root{};
 
+    /// The founding eligibility state every founder independently computed and
+    /// signed. Genesis can only copy the value the founders agreed on, so the
+    /// certificate cannot admit a founder the founding set refused.
+    Digest founding_eligibility_digest{};
+
     SecurityRulesetVersion security_ruleset = 0;
     ConsensusRulesetVersion consensus_ruleset = 0;
 

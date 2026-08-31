@@ -140,6 +140,19 @@ DkgTranscriptAttest signed_transcript_attest(const Node& node, const Tier1Set& f
     return attest;
 }
 
+// The founding eligibility transcript each founder signs. Its value is opaque
+// to Genesis, which only checks that all five signed the same one.
+GenesisEligibilityAttest signed_eligibility_attest(const Node& node, const Digest& state) {
+    GenesisEligibilityAttest attest;
+    attest.epoch = 1;
+    attest.founding_state_digest = state;
+    attest.node = node.id;
+    const Digest digest = genesis_eligibility_attest_digest(attest);
+    crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         node.identity_priv.data());
+    return attest;
+}
+
 AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch) {
     AttestationVerdict verdict;
     verdict.node_id = id;
@@ -237,10 +250,14 @@ struct RouterMesh : ::testing::Test {
         ASSERT_EQ(results.size(), kFounders);
         Digest root_digest;
         root_digest.fill(0x01);
+        Digest founding_eligibility;
+        founding_eligibility.fill(0x3C);
         for (Node* node : founders) {
             ASSERT_TRUE(genesis.record_transcript_attest(signed_transcript_attest(
                 *node, *founding_set, results[0].transcript_digest,
                 results[0].group_public_key)));
+            ASSERT_TRUE(genesis.record_eligibility_attest(
+                signed_eligibility_attest(*node, founding_eligibility)));
         }
         certificate = *genesis.finalize_epoch_one(results[0].group_public_key,
                                                   results[0].transcript_digest, root_digest,

@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Security/Eligibility/EligibilityLedger.hpp>
 
+#include <LemonadeNexus/Security/Eligibility/EligibilityState.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <algorithm>
@@ -58,8 +59,20 @@ ObservationOutcome EligibilityLedger::record(const EligibilityObservation& obser
         context.observers.end()) {
         return ObservationOutcome::ObserverNotInTier1;
     }
-    if (observation.kind == ObservationKind::Attestation &&
-        observation.attestation_digest == Digest{}) {
+    if (observation.kind == ObservationKind::Attestation) {
+        if (observation.attestation_digest == Digest{}) {
+            return ObservationOutcome::MalformedForKind;
+        }
+        // Claims that contradict their own structure are a bug, not a proof.
+        if (!platform_claims_are_consistent(observation.claims)) {
+            return ObservationOutcome::MalformedForKind;
+        }
+    } else if (observation.attestation_digest != Digest{} ||
+               platform_claim_bits(observation.claims) != 0 ||
+               observation.claims.profile_id != AttestationProfileId::Unknown) {
+        // A vote proves participation and nothing about hardware. An
+        // observation that carries platform claims under this kind is
+        // malformed rather than generous.
         return ObservationOutcome::MalformedForKind;
     }
     // Cheap checks first; the signature is the expensive one.
@@ -106,6 +119,12 @@ void EligibilityLedger::record_fault(const NodeId& subject, ObjectiveFault fault
     faults_[subject].insert(fault);
 }
 
+void EligibilityLedger::merge_faults(const std::map<NodeId, std::set<ObjectiveFault>>& faults) {
+    for (const auto& [subject, kinds] : faults) {
+        faults_[subject].insert(kinds.begin(), kinds.end());
+    }
+}
+
 MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
                                               IncarnationId incarnation,
                                               const MeshFactContext& context) const {
@@ -117,6 +136,9 @@ MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
     if (context.quorum == 0) {
         return evidence;
     }
+
+    // Claim sets seen for this subject, by digest: count and one exemplar.
+    std::map<Digest, std::pair<std::size_t, VerifiedPlatformClaims>> claim_counts;
 
     // Deduplicated by observer identity: the map key holds one entry per
     // observer, so a cloned member speaking twice still counts once.
@@ -138,8 +160,21 @@ MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
             if (record.attestations.size() >= constants::kMinContinuityObservations) {
                 ++evidence.continuity_observers;
             }
+            auto& seen = claim_counts[platform_claims_digest(record.latest.claims)];
+            ++seen.first;
+            seen.second = record.latest.claims;
         } else {
             ++evidence.participation_observers;
+        }
+    }
+
+    // The platform half is a quorum fact too. A quorum is a strict majority, so
+    // at most one claim set can reach it and the winner is unambiguous.
+    for (const auto& [digest, entry] : claim_counts) {
+        if (entry.first >= context.quorum) {
+            evidence.platform_claims = entry.second;
+            evidence.claim_observers = entry.first;
+            break;
         }
     }
 
@@ -147,6 +182,31 @@ MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
     evidence.mesh_health_valid =
         !evidence.fault_recorded && evidence.participation_observers >= context.quorum;
     return evidence;
+}
+
+std::optional<IncarnationId> EligibilityLedger::quorum_incarnation(
+    const NodeId& subject, const MeshFactContext& context) const {
+    if (context.quorum == 0) {
+        return std::nullopt;
+    }
+    // By observer identity, so one observer speaking of both kinds counts once.
+    std::map<IncarnationId, std::set<NodeId>> observers;
+    for (const auto& [key, record] : records_) {
+        if (key.epoch != context.epoch || key.subject != subject) {
+            continue;
+        }
+        if (std::find(context.observers.begin(), context.observers.end(), key.observer) ==
+            context.observers.end()) {
+            continue;
+        }
+        observers[record.incarnation].insert(key.observer);
+    }
+    for (const auto& [incarnation, seen] : observers) {
+        if (seen.size() >= context.quorum) {
+            return incarnation;
+        }
+    }
+    return std::nullopt;
 }
 
 void EligibilityLedger::fill(Tier1MeshFacts& facts, const NodeId& subject,

@@ -17,6 +17,7 @@ namespace {
         case DriverPhase::Failed:            return "Failed";
         case DriverPhase::Idle:              return "Idle";
         case DriverPhase::GenesisCollecting: return "GenesisCollecting";
+        case DriverPhase::GenesisEligibility: return "GenesisEligibility";
         case DriverPhase::FoundingDkg:       return "FoundingDkg";
         case DriverPhase::AwaitingBootstrap: return "AwaitingBootstrap";
         case DriverPhase::Syncing:           return "Syncing";
@@ -41,7 +42,13 @@ SecurityDriver::SecurityDriver(SecurityDriverConfig config, SecurityRuntime& run
       runtime_(runtime),
       router_(router),
       store_(store),
-      genesis_(genesis) {}
+      genesis_(genesis),
+      eligibility_(derive_network_id(config_.genesis_public_key,
+                                     constants::kSecurityRulesetVersion,
+                                     constants::kConsensusRulesetVersion),
+                   config_.self, config_.identity, store.directory() / "eligibility") {
+    eligibility_.set_certificate_source(config_.certificate_source);
+}
 
 bool SecurityDriver::genesis_node() const {
     return config_.identity.public_key == config_.genesis_public_key;
@@ -109,6 +116,14 @@ void SecurityDriver::start(uint64_t now_ms) {
             set_phase(DriverPhase::Failed, "durable epoch state did not restore");
             return;
         }
+        // Observations come back so the node can keep contributing, but the
+        // finality that made them authoritative does not: it has to be reached
+        // again through the mesh. That is what stops a rolled-back snapshot
+        // from selecting the next epoch off its own disk.
+        if (!enter_eligibility_epoch(id, runtime_.epochs()->current().tier1_members)) {
+            set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
+            return;
+        }
         epoch_started_ms_ = now_ms;
         last_progress_ms_ = now_ms;
         if (member && runtime_.consensus() != nullptr && !runtime_.consensus()->synced()) {
@@ -124,6 +139,19 @@ void SecurityDriver::start(uint64_t now_ms) {
     } else {
         set_phase(DriverPhase::Idle, "no durable epoch; awaiting the mesh");
     }
+}
+
+bool SecurityDriver::enter_eligibility_epoch(EpochId epoch, const Tier1Set& members) {
+    return eligibility_.enter_epoch(epoch, members.members()) != EligibilityRestore::Corrupt;
+}
+
+bool SecurityDriver::epoch_aged(uint64_t now_ms) const {
+    return now_ms - epoch_started_ms_ >= constants::kTargetEpochSeconds * 1000;
+}
+
+void SecurityDriver::publish(const EligibilityObservation& observation, EpochId epoch) {
+    (void)router_.broadcast(
+        router_.compose(SecurityMessageKind::EligibilityObservation, observation, epoch));
 }
 
 void SecurityDriver::on_peer(const NodeId& peer, uint64_t now_ms) {
@@ -189,6 +217,7 @@ void SecurityDriver::tick(uint64_t now_ms) {
 
     if (phase_ == DriverPhase::Active && runtime_.epochs() != nullptr &&
         runtime_.epochs()->current().tier1_members.contains(config_.self)) {
+        drain_objective_faults();
         run_epoch_cadence(now_ms);
     }
 }
@@ -277,7 +306,134 @@ void SecurityDriver::on_genesis_founding(const GenesisFounding& founding, const 
         return;
     }
     founding_ = founding;
-    set_phase(DriverPhase::FoundingDkg, "founding received; starting the epoch-1 DKG");
+
+    // The founding set observes itself before anything is generated. Genesis
+    // names who was verified; it does not get to say who qualifies, so the
+    // founders establish that among themselves first.
+    std::vector<NodeId> founders;
+    for (const auto& [node, key] : founding.members) {
+        founders.push_back(node);
+    }
+    if (eligibility_.enter_genesis(std::move(founders)) == EligibilityRestore::Corrupt) {
+        set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
+        return;
+    }
+    set_phase(DriverPhase::GenesisEligibility,
+              "founding received; running the mutual eligibility round");
+    begin_founding_observations();
+}
+
+void SecurityDriver::begin_founding_observations() {
+    // Continuity counts distinct attestations, so each founder is challenged
+    // the compiled minimum number of times.
+    //
+    // These name epoch 0, the bootstrap window. The founding round is not
+    // Epoch 1 work, and spending Epoch 1's per-node attestation budget here
+    // would leave the first epoch's re-attestation cadence short of it.
+    for (const auto& [node, key] : founding_->members) {
+        if (node == config_.self) {
+            continue;
+        }
+        for (std::size_t round = 0; round < constants::kMinContinuityObservations; ++round) {
+            crypto::Ed25519PublicKey node_key{};
+            node_key = node.bytes;
+            auto challenge = runtime_.attestation().create_challenge(node, node_key, 1, 0);
+            if (!challenge.has_value()) {
+                break;
+            }
+            (void)router_.send(
+                node, router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, 0));
+        }
+    }
+}
+
+void SecurityDriver::record_founding_observation(const AttestationVerdict& verdict) {
+    eligibility_.record_verdict(verdict);
+    // Before Epoch 1 nothing is certified, so the round counter stands in for
+    // the certified height an established epoch would supply.
+    ++founding_round_;
+    const Digest reference = founding_->attestation_root;
+    if (auto observation =
+            eligibility_.observe_attestation(verdict, founding_round_, reference)) {
+        publish(*observation, 0);
+    }
+    // At Genesis the participation fact is the same exchange: the subject
+    // answered an authenticated challenge bound to this network, this epoch and
+    // the compiled rulesets. There is no consensus yet to speak on.
+    if (verdict.passed) {
+        ParticipationProof proof;
+        proof.network_id = eligibility_.context().network_id;
+        proof.epoch = 0;
+        proof.consensus_ruleset = constants::kConsensusRulesetVersion;
+        proof.subject = verdict.node_id;
+        proof.incarnation = verdict.incarnation;
+        proof.subject_height = founding_round_;
+        if (auto observation =
+                eligibility_.observe_participation(proof, founding_round_, reference)) {
+            publish(*observation, 0);
+        }
+    }
+    maybe_attest_founding_eligibility();
+}
+
+void SecurityDriver::maybe_attest_founding_eligibility() {
+    if (phase_ != DriverPhase::GenesisEligibility || founding_eligibility_digest_ != Digest{}) {
+        return;
+    }
+    if (!eligibility_.mutual_round_complete()) {
+        return;
+    }
+    founding_eligibility_digest_ = eligibility_state_digest(eligibility_.compute_state(1));
+
+    GenesisEligibilityAttest attest;
+    attest.epoch = 1;
+    attest.founding_state_digest = founding_eligibility_digest_;
+    attest.node = config_.self;
+    const Digest digest = genesis_eligibility_attest_digest(attest);
+    crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         config_.identity.private_key.data());
+
+    founding_eligibility_attests_[config_.self] = founding_eligibility_digest_;
+    (void)router_.broadcast(
+        router_.compose(SecurityMessageKind::GenesisEligibilityAttest, attest, 1));
+    (void)router_.send(genesis_id(),
+                       router_.compose(SecurityMessageKind::GenesisEligibilityAttest, attest, 1));
+    on_genesis_eligibility_attest(attest);
+}
+
+void SecurityDriver::on_genesis_eligibility_attest(const GenesisEligibilityAttest& attest) {
+    if (genesis_ != nullptr && genesis_node() && !genesis_->finalized()) {
+        (void)genesis_->record_eligibility_attest(attest);
+        return;
+    }
+    if (phase_ != DriverPhase::GenesisEligibility || !founding_.has_value() || attest.epoch != 1) {
+        return;
+    }
+    const bool founder =
+        std::any_of(founding_->members.begin(), founding_->members.end(),
+                    [&](const auto& entry) { return entry.first == attest.node; });
+    if (!founder) {
+        return;
+    }
+    const Digest digest = genesis_eligibility_attest_digest(attest);
+    if (crypto_sign_verify_detached(attest.identity_signature.data(), digest.data(), digest.size(),
+                                    attest.node.bytes.data()) != 0) {
+        return;
+    }
+    founding_eligibility_attests_[attest.node] = attest.founding_state_digest;
+
+    // Every founder, and the same transcript from each. One disagreement stops
+    // the bootstrap: the threshold does not bend to reach a quorum.
+    if (founding_eligibility_digest_ == Digest{} ||
+        founding_eligibility_attests_.size() != founding_->members.size()) {
+        return;
+    }
+    for (const auto& [node, value] : founding_eligibility_attests_) {
+        if (value != founding_eligibility_digest_) {
+            return;
+        }
+    }
+    set_phase(DriverPhase::FoundingDkg, "founding eligibility agreed; starting the epoch-1 DKG");
     start_founding_dkg();
 }
 
@@ -341,10 +497,13 @@ void SecurityDriver::on_dkg_complete(EpochId target) {
 
 void SecurityDriver::on_dkg_failed(DkgFailure, std::optional<NodeId> culprit) {
     runtime_.authority().abandon_dkg();
-    if (phase_ == DriverPhase::FoundingDkg || phase_ == DriverPhase::AwaitingBootstrap) {
+    if (phase_ == DriverPhase::GenesisEligibility || phase_ == DriverPhase::FoundingDkg ||
+        phase_ == DriverPhase::AwaitingBootstrap) {
         // Await a fresh founding round; nothing was activated.
         founding_.reset();
         pending_dkg_.reset();
+        founding_eligibility_digest_ = Digest{};
+        founding_eligibility_attests_.clear();
         set_phase(DriverPhase::Idle, "founding DKG failed; awaiting a fresh round");
         return;
     }
@@ -390,6 +549,11 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
         !founding_.has_value() || !pending_dkg_.has_value() || runtime_.epochs() != nullptr) {
         return;
     }
+    // Genesis may only certify the founding eligibility the founders computed.
+    // A certificate naming anything else is refused rather than adopted.
+    if (certificate.founding_eligibility_digest != founding_eligibility_digest_) {
+        return;
+    }
     std::vector<NodeId> ids;
     std::map<NodeId, crypto::Ed25519PublicKey> vote_keys;
     for (const auto& [node, key] : founding_->members) {
@@ -414,6 +578,10 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     (void)store_.append_authority({1, certificate.authority_public_key,
                                    certificate.tier1_set_digest,
                                    certificate.dkg_transcript_digest});
+    if (!enter_eligibility_epoch(1, runtime_.epochs()->current().tier1_members)) {
+        set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
+        return;
+    }
     set_phase(DriverPhase::Active, "epoch 1 adopted and active");
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
@@ -464,12 +632,24 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
         return;
     }
 
+    if (phase_ == DriverPhase::GenesisEligibility) {
+        record_founding_observation(verdict);
+        return;
+    }
+
     EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
         return;
     }
     if (verdict.epoch == epochs->current().id) {
-        reattest_results_[verdict.node_id] = {verdict.epoch, verdict.passed};
+        // Local re-attestation creates a candidate observation and nothing
+        // more. One verifier's word is not a mesh fact: the statement is signed
+        // and published, and a quorum of observers is what makes it count.
+        eligibility_.record_verdict(verdict);
+        if (auto observation = eligibility_.observe_attestation(verdict, last_committed_height_,
+                                                                last_committed_root_)) {
+            publish(*observation, epochs->current().id);
+        }
         return;
     }
     const EpochTransition* transition = epochs->transition();
@@ -505,24 +685,15 @@ void SecurityDriver::run_epoch_cadence(uint64_t now_ms) {
         }
     }
 
-    const bool epoch_over = now_ms - epoch_started_ms_ >= constants::kTargetEpochSeconds * 1000;
-    if (!epoch_over) {
+    if (!epoch_aged(now_ms)) {
         return;
     }
     if (epochs->transition() == nullptr ||
         epochs->transition()->phase == EpochTransitionPhase::Aborted) {
-        // The eligible pool: members whose re-attestation in this epoch
-        // passed, and this node. Divergent local pools fail the DKG set
-        // digest and retry; consensus-finalized eligibility is a follow-up.
-        std::vector<NodeId> eligible{config_.self};
-        for (const auto& member : current.tier1_members.members()) {
-            const auto it = reattest_results_.find(member);
-            if (member != config_.self && it != reattest_results_.end() &&
-                it->second.first == current.id && it->second.second) {
-                eligible.push_back(member);
-            }
-        }
-        auto pool = Tier1Set::from_nodes(eligible);
+        // The pool comes from the eligibility state a quorum finalized, never
+        // from what this node happens to hold. Until that commitment commits
+        // there is no pool, and selection simply waits.
+        const auto pool = eligibility_.frozen_pool(current.id + 1);
         if (!pool.has_value() || !epochs->prepare_next_epoch(*pool, pool->size())) {
             return;
         }
@@ -590,6 +761,47 @@ void SecurityDriver::progress(uint64_t now_ms) { last_progress_ms_ = now_ms; }
 
 void SecurityDriver::on_certificate(const QuorumCertificate&) { progress(now_ms_); }
 
+void SecurityDriver::on_vote_accepted(const Vote& vote) {
+    const EpochManager* epochs = runtime_.epochs();
+    const HotStuffService* consensus = runtime_.consensus();
+    // An observer that has not synced holds no floor to measure against, so it
+    // cannot say whether anyone else is current.
+    if (phase_ != DriverPhase::Active || epochs == nullptr || consensus == nullptr ||
+        !consensus->synced()) {
+        return;
+    }
+    ParticipationProof proof;
+    proof.network_id = vote.network_id;
+    proof.epoch = vote.epoch;
+    proof.consensus_ruleset = vote.consensus_ruleset;
+    proof.subject = vote.voter;
+    proof.incarnation = 1;
+    proof.subject_height = vote.height;
+    if (auto observation = eligibility_.observe_participation(proof, last_committed_height_,
+                                                              last_committed_root_)) {
+        publish(*observation, epochs->current().id);
+    }
+}
+
+void SecurityDriver::on_eligibility_observation(const EligibilityObservation& observation) {
+    (void)eligibility_.accept(observation);
+    maybe_attest_founding_eligibility();
+}
+
+void SecurityDriver::drain_objective_faults() {
+    const HotStuffService* consensus = runtime_.consensus();
+    if (consensus == nullptr) {
+        return;
+    }
+    // Equivocation is two signed messages from one node for one view. It is
+    // proved, so it is recorded; nothing here judges a peer.
+    const auto& evidence = consensus->equivocation_evidence();
+    for (std::size_t i = consumed_equivocations_; i < evidence.size(); ++i) {
+        eligibility_.record_fault(evidence[i].node, ObjectiveFault::Equivocation);
+    }
+    consumed_equivocations_ = evidence.size();
+}
+
 void SecurityDriver::on_timeout_certificate(const TimeoutCertificate&) { progress(now_ms_); }
 
 Digest SecurityDriver::pending_handoff_digest() const {
@@ -607,13 +819,47 @@ Digest SecurityDriver::pending_handoff_digest() const {
     return encoder.digest();
 }
 
+Digest SecurityDriver::pending_eligibility_digest() const {
+    const EpochManager* epochs = runtime_.epochs();
+    if (phase_ != DriverPhase::Active || epochs == nullptr) {
+        return Digest{};
+    }
+    // Only at a boundary, only before a transition exists, and only once. A
+    // finalized state is not proposed again.
+    if (!epoch_aged(now_ms_) || eligibility_.finalized() != nullptr) {
+        return Digest{};
+    }
+    if (epochs->transition() != nullptr &&
+        epochs->transition()->phase != EpochTransitionPhase::Aborted) {
+        return Digest{};
+    }
+    return eligibility_commitment_digest(eligibility_.compute_state(epochs->current().id + 1));
+}
+
+bool SecurityDriver::accepts_transition(const Digest& transitions_digest) const {
+    if (transitions_digest == Digest{}) {
+        return true;
+    }
+    const Digest handoff = pending_handoff_digest();
+    if (handoff != Digest{} && transitions_digest == handoff) {
+        return true;
+    }
+    const Digest eligibility = pending_eligibility_digest();
+    return eligibility != Digest{} && transitions_digest == eligibility;
+}
+
 void SecurityDriver::maybe_propose(View view) {
     HotStuffService* consensus = runtime_.consensus();
     if (consensus == nullptr || !consensus->synced() || view <= last_proposed_view_ ||
         consensus->current_view() != view || consensus->leader_of(view) != config_.self) {
         return;
     }
-    const Digest transitions = pending_handoff_digest();
+    // A boundary produces two transitions in order: the eligibility state that
+    // decides who may serve, then the handoff that installs them.
+    const Digest handoff = pending_handoff_digest();
+    const Digest transitions = handoff != Digest{} ? handoff : pending_eligibility_digest();
+    // The transition is inside the state root, so finalizing the block
+    // finalizes the eligibility state it names.
     CanonicalEncoder root("lemonade-nexus/state-root:v1");
     root.add_bytes(last_committed_root_);
     root.add_bytes(transitions);
@@ -631,13 +877,28 @@ void SecurityDriver::maybe_propose(View view) {
 
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
     progress(now_ms_);
-    const Digest expected_handoff = pending_handoff_digest();
     for (const auto& commit : commits) {
         pacemaker_.on_committed_block();
         last_committed_root_ = commit.proposed_state_root;
         last_committed_height_ = commit.height;
-        if (expected_handoff != Digest{} && commit.transitions_digest == expected_handoff) {
-            EpochManager* epochs = runtime_.epochs();
+        if (commit.transitions_digest == Digest{}) {
+            continue;
+        }
+        EpochManager* epochs = runtime_.epochs();
+        if (epochs == nullptr) {
+            continue;
+        }
+        // A committed eligibility commitment is the finalized state. A node
+        // that arrived at different facts recognizes nothing here, so it never
+        // finalizes and never selects — availability, never authority.
+        const Digest eligibility = pending_eligibility_digest();
+        if (eligibility != Digest{} && commit.transitions_digest == eligibility) {
+            eligibility_.finalize({commit.transitions_digest, commit.qc_digest, commit.height,
+                                   epochs->current().id + 1});
+            continue;
+        }
+        const Digest handoff = pending_handoff_digest();
+        if (handoff != Digest{} && commit.transitions_digest == handoff) {
             if (epochs->record_handoff_authorization(commit.qc_digest)) {
                 do_activate(commit.qc_digest);
             }
@@ -670,7 +931,12 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     (void)store_.append_authority({to_epoch, epochs->current().authority_public_key,
                                    epochs->current().participant_set_digest, dkg_digest});
     store_.discard_vote_key(old_epoch);
-    reattest_results_.clear();
+    // Observations expire at the boundary: the new epoch's members are the new
+    // observers, and continuity has to be re-established under them.
+    if (!enter_eligibility_epoch(to_epoch, epochs->current().tier1_members)) {
+        set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
+        return;
+    }
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
     last_proposed_view_ = 0;

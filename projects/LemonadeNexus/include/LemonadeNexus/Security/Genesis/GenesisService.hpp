@@ -44,6 +44,18 @@ public:
     /// deterministic when more than the threshold qualify.
     [[nodiscard]] std::optional<Tier1Set> founding_set() const;
 
+    /// Records a founder's signed founding eligibility transcript. Refused for
+    /// a non-founder, a bad identity signature, or an epoch other than 1.
+    [[nodiscard]] bool record_eligibility_attest(const GenesisEligibilityAttest& attest);
+
+    /// True when every founder signed the same founding eligibility state.
+    /// Genesis compares; it never computes the state, so it cannot name a
+    /// founder eligible that the founding set did not.
+    [[nodiscard]] bool eligibility_agreed() const;
+
+    /// The agreed founding eligibility digest, once every founder signed one.
+    [[nodiscard]] std::optional<Digest> founding_eligibility_digest() const;
+
     /// Records a founder's signed attestation of the DKG transcript. Refused
     /// for a non-founder, a bad identity signature, or an epoch other than 1.
     [[nodiscard]] bool record_transcript_attest(const DkgTranscriptAttest& attest);
@@ -67,6 +79,7 @@ private:
     std::set<NodeId> candidates_;
     std::map<NodeId, AttestationVerdict> verdicts_;
     std::map<NodeId, DkgTranscriptAttest> transcript_attests_;
+    std::map<NodeId, GenesisEligibilityAttest> eligibility_attests_;
     bool finalized_ = false;
 };
 

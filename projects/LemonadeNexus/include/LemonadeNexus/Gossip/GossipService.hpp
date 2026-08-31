@@ -138,6 +138,11 @@ public:
                                std::span<const uint8_t> envelope) override;
     std::size_t broadcast(std::span<const uint8_t> envelope) override;
 
+    /// Whether this peer holds a root-signed transport certificate. One of the
+    /// Tier 1 prerequisites, and the transport is where the root signature was
+    /// already verified. Reports an answer; it grants nothing.
+    [[nodiscard]] bool peer_is_root_certified(const security::NodeId& peer) const;
+
     // IService
     void on_start();
     void on_stop();

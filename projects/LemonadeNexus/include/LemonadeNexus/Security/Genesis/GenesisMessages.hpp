@@ -32,6 +32,27 @@ struct DkgTranscriptAttest {
     crypto::Ed25519Signature identity_signature{};
 };
 
+/// A founder's signed statement of the founding eligibility transcript it
+/// computed. Genesis relays agreement; it never computes the transcript itself,
+/// so it cannot name a founder eligible that the founders did not.
+struct GenesisEligibilityAttest {
+    EpochId epoch = 1;
+    /// The eligibility state digest the founder derived from the mutual
+    /// observation round.
+    Digest founding_state_digest{};
+    NodeId node;
+    crypto::Ed25519Signature identity_signature{};
+};
+
+[[nodiscard]] inline Digest genesis_eligibility_attest_digest(
+    const GenesisEligibilityAttest& attest) {
+    CanonicalEncoder encoder("lemonade-nexus/genesis-eligibility-attest:v1");
+    encoder.add_u64(attest.epoch);
+    encoder.add_bytes(attest.founding_state_digest);
+    encoder.add_bytes(attest.node.bytes);
+    return encoder.digest();
+}
+
 [[nodiscard]] inline Digest dkg_transcript_attest_digest(const DkgTranscriptAttest& attest) {
     CanonicalEncoder encoder("lemonade-nexus/dkg-transcript-attest:v1");
     encoder.add_u64(attest.epoch);

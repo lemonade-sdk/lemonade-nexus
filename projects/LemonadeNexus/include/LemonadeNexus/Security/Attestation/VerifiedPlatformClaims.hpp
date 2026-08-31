@@ -16,6 +16,7 @@
 // 5.2 and 5.5.
 
 #include <LemonadeNexus/Security/Attestation/AttestationProfileId.hpp>
+#include <LemonadeNexus/Security/CanonicalEncoding.hpp>
 
 #include <cstdint>
 #include <string_view>
@@ -85,6 +86,23 @@ struct VerifiedPlatformClaims {
 /// True when every required claim holds. NOT an eligibility decision: Tier 1
 /// also needs mesh facts, which no provider may supply.
 [[nodiscard]] bool all_platform_claims_proved(const VerifiedPlatformClaims& claims);
+
+/// Appends the profile identity and every claim, in declaration order. Used
+/// wherever a claim set is digested or signed, so one encoding defines what
+/// "the same claims" means.
+void encode_platform_claims(CanonicalEncoder& encoder, const VerifiedPlatformClaims& claims);
+
+/// The claim booleans as a bitmask, in declaration order. The wire form: an
+/// observation carries what its observer verified, and a quorum of matching
+/// claim sets is what makes a platform fact.
+[[nodiscard]] uint16_t platform_claim_bits(const VerifiedPlatformClaims& claims);
+
+[[nodiscard]] VerifiedPlatformClaims platform_claims_from_bits(
+    AttestationProfileId profile_id, AttestationProfileRuleset profile_ruleset, uint16_t bits);
+
+/// Every bit the mask may set. A value outside it is refused rather than
+/// masked: a bit this binary does not name must not decode to one it does.
+inline constexpr uint16_t kPlatformClaimBitMask = 0x3FFF;
 
 /// Structural rules a provider must not break:
 ///   - no claim is true unless a provider identified itself,

@@ -14,6 +14,7 @@
 // Architecture reference: Security Architecture Final Draft 1.1, section 13.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/VerifiedPlatformClaims.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <cstdint>
@@ -51,6 +52,15 @@ struct EligibilityObservation {
     /// rounds — that is what makes continuity countable without a clock.
     /// Empty for a Participation observation.
     Digest attestation_digest{};
+
+    /// What the observer's verifier proved about the subject's platform.
+    ///
+    /// Platform facts travel here for the same reason mesh facts do: a node
+    /// never attests itself, so every correct node has to learn them from the
+    /// observers. A quorum agreeing on one claim set is what makes the platform
+    /// half of eligibility deterministic. Default for a Participation
+    /// observation — a vote proves nothing about hardware.
+    VerifiedPlatformClaims claims;
 
     /// The observer's own quorum-certified height, and the finalized state it
     /// held there. Height is monotonic and certified by a quorum, so an

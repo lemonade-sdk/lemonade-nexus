@@ -125,6 +125,10 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.node_id == authenticated_sender;
             } else if constexpr (std::is_same_v<T, DkgTranscriptAttest>) {
                 return body.node == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, EligibilityObservation>) {
+                return body.observer == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, GenesisEligibilityAttest>) {
+                return body.node == authenticated_sender;
             } else {
                 return true;
             }
@@ -136,6 +140,7 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
     const EpochManager* epochs = runtime_.epochs();
     const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
                                 message.kind == SecurityMessageKind::DkgTranscriptAttest ||
+                                message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
                                 message.kind == SecurityMessageKind::BootstrapCertificate;
     if (epochs == nullptr) {
         // Before Epoch 1 only bootstrap traffic exists: challenges, evidence,
@@ -237,6 +242,14 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
             return route_sync_request(std::get<SyncRequest>(message.body), message.sender);
         case SecurityMessageKind::SyncResponse:
             return route_sync_response(std::get<SyncResponse>(message.body), message.sender);
+        case SecurityMessageKind::EligibilityObservation:
+            events_.on_eligibility_observation(
+                std::get<EligibilityObservation>(message.body));
+            return delivered();
+        case SecurityMessageKind::GenesisEligibilityAttest:
+            events_.on_genesis_eligibility_attest(
+                std::get<GenesisEligibilityAttest>(message.body));
+            return delivered();
     }
     return drop(DropReason::UnknownKind);
 }
@@ -347,6 +360,10 @@ RouteResult SecurityRouter::route_vote(const Vote& vote) {
     if (const auto* failure = std::get_if<ConsensusFailure>(&outcome)) {
         return drop(DropReason::ServiceRejected, code(*failure));
     }
+    // The vote validated, so its sender proved everything a participation
+    // observation asserts. Reported before the certificate, which may activate
+    // the next epoch and destroy this service.
+    events_.on_vote_accepted(vote);
     if (const auto* certificate = std::get_if<QuorumCertificate>(&outcome)) {
         events_.on_certificate(*certificate);
     }

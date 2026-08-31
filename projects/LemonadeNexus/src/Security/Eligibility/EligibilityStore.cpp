@@ -62,6 +62,9 @@ template <std::size_t N>
         {"subject_incarnation", o.subject_incarnation},
         {"kind", static_cast<uint16_t>(o.kind)},
         {"attestation_digest", hex_of(o.attestation_digest)},
+        {"profile_id", static_cast<uint16_t>(o.claims.profile_id)},
+        {"profile_ruleset", o.claims.profile_ruleset},
+        {"claim_bits", platform_claim_bits(o.claims)},
         {"height", o.height},
         {"state_reference", hex_of(o.state_reference)},
         {"observer", hex_of(o.observer.bytes)},
@@ -94,6 +97,26 @@ template <std::size_t N>
         return false;
     }
     o.kind = static_cast<ObservationKind>(kind);
+
+    uint64_t profile_id = 0;
+    uint64_t profile_ruleset = 0;
+    uint64_t claim_bits = 0;
+    if (!(j.contains("profile_id") && read_u64(j["profile_id"], profile_id) &&
+          j.contains("profile_ruleset") && read_u64(j["profile_ruleset"], profile_ruleset) &&
+          j.contains("claim_bits") && read_u64(j["claim_bits"], claim_bits))) {
+        return false;
+    }
+    // A profile or claim bit this binary does not name is refused, never
+    // folded: a stored value must decode to what was signed or to nothing.
+    const auto named = static_cast<AttestationProfileId>(profile_id);
+    if (profile_id > UINT16_MAX || profile_ruleset > UINT16_MAX ||
+        (claim_bits & ~static_cast<uint64_t>(kPlatformClaimBitMask)) != 0 ||
+        (named != AttestationProfileId::Unknown && !is_known_attestation_profile_id(named))) {
+        return false;
+    }
+    o.claims = platform_claims_from_bits(
+        named, static_cast<AttestationProfileRuleset>(profile_ruleset),
+        static_cast<uint16_t>(claim_bits));
 
     if (!j.contains("attestations") || !j["attestations"].is_array()) return false;
     if (j["attestations"].size() > constants::kMaxContinuityAttestations) return false;
@@ -210,6 +233,66 @@ std::variant<std::monostate, EligibilityLoadResult> EligibilityStore::load(
         return EligibilityLoadResult::Corrupt;
     }
     return std::monostate{};
+}
+
+bool EligibilityStore::store_faults(const std::map<NodeId, std::set<ObjectiveFault>>& faults) {
+    if (faults.size() > kMaxStoredRecords) {
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(directory_, ec);
+    if (ec) {
+        return false;
+    }
+    json entries = json::array();
+    for (const auto& [node, kinds] : faults) {
+        json values = json::array();
+        for (const auto fault : kinds) {
+            values.push_back(static_cast<uint16_t>(fault));
+        }
+        entries.push_back(json{{"node", crypto::to_hex(node.bytes)}, {"faults", std::move(values)}});
+    }
+    const json document{{"format", kFormatVersion}, {"faults", std::move(entries)}};
+    return write_atomic(directory_ / "faults.json", document.dump());
+}
+
+std::variant<std::map<NodeId, std::set<ObjectiveFault>>, EligibilityLoadResult>
+EligibilityStore::load_faults() const {
+    std::ifstream in(directory_ / "faults.json");
+    if (!in) {
+        return EligibilityLoadResult::Absent;
+    }
+    const std::string text{std::istreambuf_iterator<char>(in),
+                           std::istreambuf_iterator<char>()};
+    const json document = json::parse(text, nullptr, false);
+    if (!document.is_object() || !document.contains("format") ||
+        !document["format"].is_number_unsigned() ||
+        document["format"].get<uint32_t>() != kFormatVersion || !document.contains("faults") ||
+        !document["faults"].is_array() || document["faults"].size() > kMaxStoredRecords) {
+        return EligibilityLoadResult::Corrupt;
+    }
+
+    std::map<NodeId, std::set<ObjectiveFault>> faults;
+    for (const auto& entry : document["faults"]) {
+        NodeId node;
+        if (!entry.is_object() || !entry.contains("node") || !read_hex(entry["node"], node.bytes) ||
+            !entry.contains("faults") || !entry["faults"].is_array()) {
+            return EligibilityLoadResult::Corrupt;
+        }
+        std::set<ObjectiveFault> kinds;
+        for (const auto& value : entry["faults"]) {
+            uint64_t raw = 0;
+            if (!read_u64(value, raw) ||
+                raw > static_cast<uint64_t>(ObjectiveFault::InvalidConsensusBehavior)) {
+                return EligibilityLoadResult::Corrupt;
+            }
+            kinds.insert(static_cast<ObjectiveFault>(raw));
+        }
+        if (kinds.empty() || !faults.emplace(node, std::move(kinds)).second) {
+            return EligibilityLoadResult::Corrupt;
+        }
+    }
+    return faults;
 }
 
 void EligibilityStore::discard_before(EpochId epoch) {

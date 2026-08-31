@@ -93,6 +93,17 @@ DkgTranscriptAttest signed_transcript_attest(const Node& node, const Tier1Set& f
     return attest;
 }
 
+GenesisEligibilityAttest signed_eligibility_attest(const Node& node, const Digest& state) {
+    GenesisEligibilityAttest attest;
+    attest.epoch = 1;
+    attest.founding_state_digest = state;
+    attest.node = node.id;
+    const Digest digest = genesis_eligibility_attest_digest(attest);
+    crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         node.identity_priv.data());
+    return attest;
+}
+
 // Runs one dealerless DKG across the runtimes of the given participants.
 DkgRun run_dkg(std::vector<Node*> participants, const NetworkId& network, EpochId target) {
     std::vector<NodeId> ids;
@@ -298,11 +309,19 @@ TEST_F(FirstPath, GenesisToEpochTwo) {
     // --- Genesis signs the one bootstrap certificate; its authority ends. ---
     std::sort(verdicts.begin(), verdicts.end(),
               [](const auto& a, const auto& b) { return a.node_id < b.node_id; });
+    // The founders agree on one founding eligibility transcript before Genesis
+    // may certify anything: Genesis names who it verified, the founders decide
+    // who qualifies.
+    Digest founding_eligibility;
+    founding_eligibility.fill(0x3C);
     for (Node* node : founders) {
         ASSERT_TRUE(genesis.record_transcript_attest(signed_transcript_attest(
             *node, founding_set, dkg_1.transcript, dkg_1.results[0].group_public_key)));
+        ASSERT_TRUE(genesis.record_eligibility_attest(
+            signed_eligibility_attest(*node, founding_eligibility)));
     }
     ASSERT_TRUE(genesis.transcript_agreed());
+    ASSERT_TRUE(genesis.eligibility_agreed());
     const auto certificate = genesis.finalize_epoch_one(
         dkg_1.results[0].group_public_key, dkg_1.transcript, attestation_root(verdicts),
         genesis_priv);

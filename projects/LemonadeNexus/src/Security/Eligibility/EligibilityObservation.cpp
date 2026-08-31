@@ -24,6 +24,7 @@ Digest observation_signing_digest(const EligibilityObservation& observation) {
     encoder.add_u64(observation.subject_incarnation);
     encoder.add_u16(static_cast<uint16_t>(observation.kind));
     encoder.add_bytes(observation.attestation_digest);
+    encode_platform_claims(encoder, observation.claims);
     encoder.add_u64(observation.height);
     encoder.add_bytes(observation.state_reference);
     encoder.add_bytes(observation.observer.bytes);

@@ -13,11 +13,13 @@
 
 #include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
 #include <LemonadeNexus/Security/Consensus/Pacemaker.hpp>
+#include <LemonadeNexus/Security/Eligibility/EligibilityService.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
 #include <LemonadeNexus/Security/SecurityRuntime.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
 
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -28,6 +30,10 @@ enum class DriverPhase : uint16_t {
     Failed,
     Idle,
     GenesisCollecting,
+    /// Founders observing each other, before any DKG. The founding eligibility
+    /// transcript comes out of this round and every founder must sign the same
+    /// one.
+    GenesisEligibility,
     FoundingDkg,
     AwaitingBootstrap,
     Syncing,
@@ -39,6 +45,11 @@ struct SecurityDriverConfig {
     crypto::Ed25519Keypair identity;
     crypto::Ed25519PublicKey genesis_public_key{};
     uint64_t sync_window_ms = 2000;
+
+    /// Answers whether a candidate holds a root-signed transport certificate.
+    /// One of the Tier 1 prerequisites, and the mesh knows it rather than the
+    /// platform. Unset leaves the fact false and nobody becomes eligible.
+    std::function<bool(const NodeId&)> certificate_source;
 };
 
 class SecurityDriver final : public ISecurityEvents {
@@ -87,12 +98,27 @@ public:
     void on_bootstrap_certificate(const BootstrapCertificate& certificate,
                                   const NodeId& from) override;
     void on_sync_certificate(const QuorumCertificate& certificate, const NodeId& from) override;
+    void on_vote_accepted(const Vote& vote) override;
+    void on_eligibility_observation(const EligibilityObservation& observation) override;
+    void on_genesis_eligibility_attest(const GenesisEligibilityAttest& attest) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
     /// that carries a transition, so a handoff commits only when a quorum
     /// arrived at the same one.
     [[nodiscard]] Digest pending_handoff_digest() const;
+
+    /// The eligibility state this node would finalize at this epoch boundary,
+    /// or an empty digest when it is not at one. Finalizing it is what turns
+    /// local observations into the pool every honest node selects from.
+    [[nodiscard]] Digest pending_eligibility_digest() const;
+
+    /// Whether this node independently arrived at the proposed transition. The
+    /// one entry point consensus uses; it accepts a handoff or an eligibility
+    /// commitment and nothing else.
+    [[nodiscard]] bool accepts_transition(const Digest& transitions_digest) const;
+
+    [[nodiscard]] const EligibilityService& eligibility() const { return eligibility_; }
 
 private:
     [[nodiscard]] NodeId genesis_id() const;
@@ -113,6 +139,17 @@ private:
     void announce_epoch(const Digest& checkpoint);
 
     [[nodiscard]] Digest genesis_attestation_root(const Tier1Set& founders) const;
+
+    /// Installs the frozen observer set for `epoch` and restores durable
+    /// observations. Corrupt eligibility state fails the driver: lost history
+    /// is never a clean slate.
+    [[nodiscard]] bool enter_eligibility_epoch(EpochId epoch, const Tier1Set& members);
+    [[nodiscard]] bool epoch_aged(uint64_t now_ms) const;
+    void publish(const EligibilityObservation& observation, EpochId epoch);
+    void begin_founding_observations();
+    void record_founding_observation(const AttestationVerdict& verdict);
+    void maybe_attest_founding_eligibility();
+    void drain_objective_faults();
 
     SecurityDriverConfig config_;
     SecurityRuntime& runtime_;
@@ -136,6 +173,13 @@ private:
     // Founder-side bootstrap state.
     std::optional<GenesisFounding> founding_;
     std::optional<DkgResult> pending_dkg_;
+    /// The founding eligibility state this node computed and signed. The
+    /// bootstrap certificate must name exactly this value or it is refused.
+    Digest founding_eligibility_digest_{};
+    std::map<NodeId, Digest> founding_eligibility_attests_;
+    /// Before Epoch 1 there is no certified height, so the founding round
+    /// counts its own rounds to keep observation heights monotonic.
+    Height founding_round_ = 0;
 
     // Consensus driving.
     Pacemaker pacemaker_;
@@ -153,7 +197,10 @@ private:
     // Epoch cadence.
     uint64_t epoch_started_ms_ = 0;
     uint64_t last_reattest_ms_ = 0;
-    std::map<NodeId, std::pair<EpochId, bool>> reattest_results_;
+
+    // Mesh eligibility. The next-epoch pool comes from here and nowhere else.
+    EligibilityService eligibility_;
+    std::size_t consumed_equivocations_ = 0;
 };
 
 }  // namespace nexus::security

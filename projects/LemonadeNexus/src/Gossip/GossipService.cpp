@@ -2190,6 +2190,10 @@ void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
     security_sink_(sender, std::span<const uint8_t>{payload, len});
 }
 
+bool GossipService::peer_is_root_certified(const security::NodeId& peer) const {
+    return peer_certificate_is_root_signed(crypto::to_base64(peer.bytes));
+}
+
 bool GossipService::send_to(const security::NodeId& peer,
                             std::span<const uint8_t> envelope) {
     if (envelope.size() > security::constants::kMaxSecurityMessageBytes) return false;

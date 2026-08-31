@@ -55,6 +55,54 @@ std::optional<Tier1Set> GenesisService::founding_set() const {
     return Tier1Set::from_nodes(std::move(qualifying));
 }
 
+bool GenesisService::record_eligibility_attest(const GenesisEligibilityAttest& attest) {
+    if (finalized_ || attest.epoch != 1) {
+        return false;
+    }
+    const auto founders = founding_set();
+    if (!founders.has_value() || !founders->contains(attest.node)) {
+        return false;
+    }
+    const Digest digest = genesis_eligibility_attest_digest(attest);
+    if (crypto_sign_verify_detached(attest.identity_signature.data(), digest.data(), digest.size(),
+                                    attest.node.bytes.data()) != 0) {
+        return false;
+    }
+    eligibility_attests_[attest.node] = attest;
+    return true;
+}
+
+std::optional<Digest> GenesisService::founding_eligibility_digest() const {
+    const auto founders = founding_set();
+    if (!founders.has_value()) {
+        return std::nullopt;
+    }
+    // Every founder, and the same digest from each. A missing founder is not a
+    // smaller quorum: the bootstrap threshold does not move.
+    const Digest* agreed = nullptr;
+    for (const auto& node : founders->members()) {
+        const auto it = eligibility_attests_.find(node);
+        if (it == eligibility_attests_.end()) {
+            return std::nullopt;
+        }
+        if (agreed == nullptr) {
+            agreed = &it->second.founding_state_digest;
+            continue;
+        }
+        if (it->second.founding_state_digest != *agreed) {
+            return std::nullopt;
+        }
+    }
+    if (agreed == nullptr || *agreed == Digest{}) {
+        return std::nullopt;
+    }
+    return *agreed;
+}
+
+bool GenesisService::eligibility_agreed() const {
+    return founding_eligibility_digest().has_value();
+}
+
 bool GenesisService::record_transcript_attest(const DkgTranscriptAttest& attest) {
     if (finalized_ || attest.epoch != 1) {
         return false;
@@ -120,6 +168,13 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
         agreed.group_public_key != epoch_one_authority_key) {
         return std::nullopt;
     }
+    // And only the founding eligibility every founder independently computed.
+    // Without it Genesis would be asserting who qualifies, which is exactly the
+    // authority that ends here.
+    const auto eligibility = founding_eligibility_digest();
+    if (!eligibility.has_value()) {
+        return std::nullopt;
+    }
 
     BootstrapCertificate certificate;
     certificate.network_id = network_id_;
@@ -130,6 +185,7 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     certificate.authority_public_key = epoch_one_authority_key;
     certificate.dkg_transcript_digest = dkg_transcript_digest;
     certificate.attestation_root = attestation_root;
+    certificate.founding_eligibility_digest = *eligibility;
     certificate.security_ruleset = constants::kSecurityRulesetVersion;
     certificate.consensus_ruleset = constants::kConsensusRulesetVersion;
 

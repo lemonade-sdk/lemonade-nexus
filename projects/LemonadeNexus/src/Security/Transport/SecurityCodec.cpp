@@ -294,9 +294,35 @@ bool encode_bootstrap(Writer& w, const BootstrapCertificate& c) {
     w.fixed(c.authority_public_key);
     w.fixed(c.dkg_transcript_digest);
     w.fixed(c.attestation_root);
+    w.fixed(c.founding_eligibility_digest);
     w.u16(c.security_ruleset);
     w.u16(c.consensus_ruleset);
     w.fixed(c.genesis_signature);
+    return true;
+}
+
+bool encode_observation(Writer& w, const EligibilityObservation& o) {
+    w.fixed(o.network_id);
+    w.u64(o.epoch);
+    put_node(w, o.subject);
+    w.u64(o.subject_incarnation);
+    w.u16(static_cast<uint16_t>(o.kind));
+    w.fixed(o.attestation_digest);
+    w.u16(static_cast<uint16_t>(o.claims.profile_id));
+    w.u16(o.claims.profile_ruleset);
+    w.u16(platform_claim_bits(o.claims));
+    w.u64(o.height);
+    w.fixed(o.state_reference);
+    put_node(w, o.observer);
+    w.fixed(o.signature);
+    return true;
+}
+
+bool encode_genesis_eligibility_attest(Writer& w, const GenesisEligibilityAttest& a) {
+    w.u64(a.epoch);
+    w.fixed(a.founding_state_digest);
+    put_node(w, a.node);
+    w.fixed(a.identity_signature);
     return true;
 }
 
@@ -492,12 +518,44 @@ bool decode_bootstrap(Reader& r, BootstrapCertificate& c) {
     uint64_t threshold = 0;
     if (!(r.fixed(c.network_id) && r.u64(c.epoch) && r.fixed(c.tier1_set_digest) &&
           r.u64(threshold) && r.fixed(c.authority_public_key) && r.fixed(c.dkg_transcript_digest) &&
-          r.fixed(c.attestation_root) && r.u16(c.security_ruleset) &&
-          r.u16(c.consensus_ruleset) && r.fixed(c.genesis_signature))) {
+          r.fixed(c.attestation_root) && r.fixed(c.founding_eligibility_digest) &&
+          r.u16(c.security_ruleset) && r.u16(c.consensus_ruleset) &&
+          r.fixed(c.genesis_signature))) {
         return false;
     }
     c.authority_threshold = static_cast<std::size_t>(threshold);
     return true;
+}
+
+bool decode_observation(Reader& r, EligibilityObservation& o) {
+    uint16_t kind = 0;
+    AttestationProfileId profile = AttestationProfileId::Unknown;
+    uint16_t profile_ruleset = 0;
+    uint16_t claim_bits = 0;
+    if (!(r.fixed(o.network_id) && r.u64(o.epoch) && get_node(r, o.subject) &&
+          r.u64(o.subject_incarnation) && r.u16(kind) && r.fixed(o.attestation_digest) &&
+          get_profile_id(r, profile) && r.u16(profile_ruleset) && r.u16(claim_bits) &&
+          r.u64(o.height) && r.fixed(o.state_reference) && get_node(r, o.observer) &&
+          r.fixed(o.signature))) {
+        return false;
+    }
+    // An unnamed kind, profile or claim bit is refused rather than folded into
+    // a named one: folding would let a hostile value re-encode as something the
+    // sender never signed.
+    if (kind > static_cast<uint16_t>(ObservationKind::Participation)) {
+        return r.fail(CodecError::BadValue);
+    }
+    if ((claim_bits & ~kPlatformClaimBitMask) != 0) {
+        return r.fail(CodecError::BadValue);
+    }
+    o.kind = static_cast<ObservationKind>(kind);
+    o.claims = platform_claims_from_bits(profile, profile_ruleset, claim_bits);
+    return true;
+}
+
+bool decode_genesis_eligibility_attest(Reader& r, GenesisEligibilityAttest& a) {
+    return r.u64(a.epoch) && r.fixed(a.founding_state_digest) && get_node(r, a.node) &&
+           r.fixed(a.identity_signature);
 }
 
 bool decode_sync_request(Reader& r, SyncRequest& s) { return r.u64(s.epoch); }
@@ -609,13 +667,25 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(s);
             return true;
         }
+        case SecurityMessageKind::EligibilityObservation: {
+            EligibilityObservation o;
+            if (!decode_observation(r, o)) return false;
+            body = std::move(o);
+            return true;
+        }
+        case SecurityMessageKind::GenesisEligibilityAttest: {
+            GenesisEligibilityAttest a;
+            if (!decode_genesis_eligibility_attest(r, a)) return false;
+            body = std::move(a);
+            return true;
+        }
     }
     return r.fail(CodecError::UnknownKind);
 }
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::SyncResponse);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::GenesisEligibilityAttest);
 }
 
 }  // namespace
@@ -656,8 +726,12 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::BootstrapCertificate;
             } else if constexpr (std::is_same_v<T, SyncRequest>) {
                 return SecurityMessageKind::SyncRequest;
-            } else {
+            } else if constexpr (std::is_same_v<T, SyncResponse>) {
                 return SecurityMessageKind::SyncResponse;
+            } else if constexpr (std::is_same_v<T, EligibilityObservation>) {
+                return SecurityMessageKind::EligibilityObservation;
+            } else {
+                return SecurityMessageKind::GenesisEligibilityAttest;
             }
         },
         body);
@@ -699,8 +773,12 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_bootstrap(body, value);
             } else if constexpr (std::is_same_v<T, SyncRequest>) {
                 return encode_sync_request(body, value);
-            } else {
+            } else if constexpr (std::is_same_v<T, SyncResponse>) {
                 return encode_sync_response(body, value);
+            } else if constexpr (std::is_same_v<T, EligibilityObservation>) {
+                return encode_observation(body, value);
+            } else {
+                return encode_genesis_eligibility_attest(body, value);
             }
         },
         message.body);
