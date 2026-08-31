@@ -218,8 +218,8 @@ TEST_F(Tier2Path, OneOfflineMemberDoesNotDenyTheRestAtFive) {
         EXPECT_TRUE(eligible_in(*founders[0], subject->id, 2));
     }
 
-    // The reserves face the full quorum and only four members are online, so
-    // they fall one witness short. Correct: they are not part of the committee.
+    // The reserves face the full quorum, and because they spend no witness on
+    // themselves the four members still online are exactly enough.
     for (Node* reserve : reserves) {
         const auto evidence = evidence_for_subject(*founders[0], *reserve);
         EXPECT_EQ(evidence.quorum_required, constants::consensus_quorum(kFounders));

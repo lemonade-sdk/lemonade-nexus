@@ -132,7 +132,8 @@ add_nexus_test(test_security_eligibility
 # the protocol costs at 5 and at 31; asserts invariants only, never a tuned
 # threshold.
 add_nexus_test(test_security_scale
-    security/simulation/scale.cpp)
+    security/simulation/scale.cpp
+    security/simulation/eligibility_scale.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
