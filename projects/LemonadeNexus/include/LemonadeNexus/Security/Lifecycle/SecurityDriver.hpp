@@ -101,6 +101,9 @@ public:
     void on_vote_accepted(const Vote& vote) override;
     void on_eligibility_observation(const EligibilityObservation& observation) override;
     void on_genesis_eligibility_attest(const GenesisEligibilityAttest& attest) override;
+    void on_participation_challenge(const ParticipationChallenge& challenge,
+                                    const NodeId& from) override;
+    void on_participation_response(const ParticipationResponse& response) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
@@ -147,6 +150,7 @@ private:
     [[nodiscard]] bool epoch_aged(uint64_t now_ms) const;
     void publish(const EligibilityObservation& observation, EpochId epoch);
     void begin_founding_observations();
+    void challenge_participation(const NodeId& candidate);
     void record_founding_observation(const AttestationVerdict& verdict);
     void maybe_attest_founding_eligibility();
     void drain_objective_faults();
@@ -201,6 +205,12 @@ private:
     // Mesh eligibility. The next-epoch pool comes from here and nowhere else.
     EligibilityService eligibility_;
     std::size_t consumed_equivocations_ = 0;
+    /// Peers whose transport certificate the mesh verified. Tier 2 candidates
+    /// are challenged from here; the list decides nothing on its own.
+    std::set<NodeId> certified_peers_;
+    /// Outstanding participation challenges, one per candidate. Matched before
+    /// the challenge is consumed, so a replayed answer cannot deny a live one.
+    std::map<NodeId, ParticipationChallenge> pending_participation_;
 };
 
 }  // namespace nexus::security

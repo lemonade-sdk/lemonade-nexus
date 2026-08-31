@@ -8,9 +8,9 @@
 // Tier1EligibilityPolicy combines with platform claims.
 //
 // Two rules shape everything here. One observer never makes a fact, so both
-// facts need a quorum of the current Tier 1 set. And observers are deduplicated
-// by node identity, so a cloned member counts once no matter how many copies
-// speak.
+// facts need a witness threshold drawn from the current Tier 1 committee. And
+// observers are deduplicated by node identity, so a cloned member counts once
+// no matter how many copies speak.
 //
 // Architecture reference: Security Architecture Final Draft 1.1, section 13.
 
@@ -50,21 +50,48 @@ struct MeshFactContext {
     /// Members entitled to observe. Frozen for the epoch, so the set an
     /// observation is judged against cannot shift under it.
     std::vector<NodeId> observers;
-    /// How many distinct observers make a fact.
+    /// The observing committee's quorum. NOT the witness bar on its own: a
+    /// subject that belongs to the committee cannot witness itself, so its bar
+    /// is one lower. See witness_threshold().
     std::size_t quorum{};
 };
 
+/// How many distinct external observers a fact about `subject` needs.
+///
+/// A node never witnesses itself, so a subject that belongs to the observing
+/// committee is one member short of it by construction. Demanding the full
+/// quorum from the rest would mean every other member has to be online: at any
+/// population, f offline members make continuity unreachable for everyone while
+/// HotStuff still holds its quorum. The rule therefore excludes the subject
+/// from its own committee.
+///
+///   subject in the committee: quorum - 1 external witnesses
+///   subject outside it:       quorum external witnesses
+///
+/// Safety. With at most f Byzantine members, quorum - 1 = N - f - 1 witnesses
+/// still exceed f at every population the table produces, so the adversary
+/// alone can never make a fact — at N = 5 that is 3 witnesses against 1 fault,
+/// at N = 31 it is 20 against 10. The floor at f + 1 keeps the property true
+/// below the compiled minimum population. A candidate outside the committee
+/// gets no discount: it is not part of the authority that produces these facts.
+///
+/// This is an eligibility witness rule and not a consensus rule. The state
+/// these facts feed is still finalized by a full HotStuff quorum, which is what
+/// makes two honest nodes agree on it; ConsensusQuorum is untouched.
+[[nodiscard]] std::size_t witness_threshold(const MeshFactContext& context,
+                                            const NodeId& subject);
+
 /// The established-epoch context: the frozen Tier 1 set observes, and the
-/// compiled consensus quorum is the bar.
+/// compiled consensus quorum is the committee bar.
 [[nodiscard]] MeshFactContext established_fact_context(const NetworkId& network_id,
                                                         EpochId epoch,
                                                         std::vector<NodeId> members);
 
 /// The Genesis context. Before Epoch 1 there is no Tier 1 quorum to observe
-/// anything, so the founding set observes itself: every founder must be seen by
-/// every other founder. That is the mutual attestation and mutual connectivity
-/// the bootstrap rules require, and since no node observes itself the bar is
-/// one less than the founding set. The bootstrap threshold is unchanged.
+/// anything, so the founding set observes itself and the committee is the whole
+/// founding set. With the self-exclusion above that means every founder must be
+/// seen by every other founder — the mutual attestation and mutual connectivity
+/// the bootstrap rules require. The bootstrap threshold is unchanged.
 [[nodiscard]] MeshFactContext genesis_fact_context(const NetworkId& network_id,
                                                     std::vector<NodeId> founders);
 
@@ -125,6 +152,15 @@ public:
     void expire_before(EpochId epoch);
 
     [[nodiscard]] std::size_t size() const { return records_.size(); }
+
+    /// Subjects at least `min_observers` distinct observers have stated
+    /// something about in `epoch`, sorted.
+    ///
+    /// Candidates arrive this way rather than from a local peer list: the
+    /// statements are broadcast and durable, so all honest nodes converge on
+    /// the same set. The bound keeps a Byzantine minority from injecting
+    /// subjects nobody else has seen.
+    [[nodiscard]] std::vector<NodeId> subjects(EpochId epoch, std::size_t min_observers) const;
 
     /// One observer's accumulated view of one subject, in a form that survives
     /// a restart. The latest statement carries the signature; the digests are

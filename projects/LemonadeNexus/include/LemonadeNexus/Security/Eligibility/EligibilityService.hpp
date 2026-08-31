@@ -18,6 +18,7 @@
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityState.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityStore.hpp>
+#include <LemonadeNexus/Security/Eligibility/ParticipationProof.hpp>
 #include <LemonadeNexus/Security/Epoch/Tier1Set.hpp>
 
 #include <functional>
@@ -29,10 +30,13 @@ namespace nexus::security {
 
 /// What one authenticated security-plane message proved about its sender.
 ///
-/// The caller assembles this from a consensus vote the local replica already
-/// validated: the vote is signed under the epoch vote key the mesh froze for
-/// that member, names the network, epoch and consensus ruleset, and votes at a
-/// height. The subject asserts none of it, and no field here is a health score.
+/// There are two ways to fill this in and they produce the same fact. For a
+/// current Tier 1 member the caller assembles it from a consensus vote the
+/// local replica already validated — signed under the epoch vote key the mesh
+/// froze, naming the network, epoch and consensus ruleset, at a height. For a
+/// candidate that holds no vote key it comes from a verified participation
+/// response. The subject asserts none of it either way, and no field here is a
+/// health score.
 struct ParticipationProof {
     NetworkId network_id{};
     EpochId epoch{};
@@ -81,17 +85,30 @@ public:
     /// evidence of a duplicate incarnation, and record it as a fault.
     void record_verdict(const AttestationVerdict& verdict);
 
-    /// Signs this node's statement that it verified a fresh attestation from
-    /// the subject. Returns nullopt when nothing is provable — a failing
-    /// verdict, this node itself, or a subject outside the observed set.
+    /// Signs this node's statement about the attestation it verified for
+    /// `subject`.
+    ///
+    /// The claims come from the verdict this node's own verifier produced and
+    /// recorded, never from a value a caller supplies: an observer may sign
+    /// platform claims only for evidence it verified itself, and there is no
+    /// path here that relays someone else's. Returns nullopt when nothing is
+    /// provable.
     [[nodiscard]] std::optional<EligibilityObservation> observe_attestation(
-        const AttestationVerdict& verdict, Height height, const Digest& state_reference);
+        const NodeId& subject, Height height, const Digest& state_reference);
 
     /// Signs this node's statement that the subject participated. Every fact in
     /// the proof is checked against the current context first; a proof that
     /// fails any of them yields no observation.
     [[nodiscard]] std::optional<EligibilityObservation> observe_participation(
         const ParticipationProof& proof, Height height, const Digest& state_reference);
+
+    /// The candidate path: verifies one participation response against the
+    /// challenge that provoked it, then signs the same observation a validated
+    /// vote would produce. Holding no epoch vote key is not a disqualification;
+    /// it only means the subject cannot prove participation by voting.
+    [[nodiscard]] std::optional<EligibilityObservation> observe_participation_response(
+        const ParticipationResponse& response, const ParticipationChallenge& challenge,
+        Height height, const Digest& state_reference);
 
     /// Records an observation from any observer, including this node's own.
     [[nodiscard]] ObservationOutcome accept(const EligibilityObservation& observation);
@@ -127,8 +144,19 @@ public:
     [[nodiscard]] const EligibilityLedger& ledger() const { return ledger_; }
     [[nodiscard]] const EligibilityStore& store() const { return store_; }
 
+    /// Every node the state judges: the current committee plus any subject
+    /// enough observers have spoken about. Sorted.
+    [[nodiscard]] std::vector<NodeId> candidates() const;
+
+    /// True when this node may witness at all. Only a current committee member
+    /// signs observations.
+    [[nodiscard]] bool is_observer() const { return observed(self_); }
+
 private:
     [[nodiscard]] bool observed(const NodeId& node) const;
+    [[nodiscard]] std::optional<EligibilityObservation> sign_participation(
+        const NodeId& subject, IncarnationId incarnation, Height height,
+        const Digest& state_reference);
     [[nodiscard]] EligibilityRestore install(EpochId epoch, MeshFactContext context);
 
     NetworkId network_id_;

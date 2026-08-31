@@ -156,6 +156,9 @@ void SecurityDriver::publish(const EligibilityObservation& observation, EpochId 
 
 void SecurityDriver::on_peer(const NodeId& peer, uint64_t now_ms) {
     now_ms_ = now_ms;
+    // The transport verified this peer's certificate. That makes it reachable
+    // and nothing more; the cadence decides what to ask it for.
+    certified_peers_.insert(peer);
     if (phase_ == DriverPhase::GenesisCollecting && genesis_ != nullptr &&
         !genesis_->finalized()) {
         (void)genesis_->admit_candidate(peer);
@@ -354,7 +357,7 @@ void SecurityDriver::record_founding_observation(const AttestationVerdict& verdi
     ++founding_round_;
     const Digest reference = founding_->attestation_root;
     if (auto observation =
-            eligibility_.observe_attestation(verdict, founding_round_, reference)) {
+            eligibility_.observe_attestation(verdict.node_id, founding_round_, reference)) {
         publish(*observation, 0);
     }
     // At Genesis the participation fact is the same exchange: the subject
@@ -646,8 +649,8 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
         // more. One verifier's word is not a mesh fact: the statement is signed
         // and published, and a quorum of observers is what makes it count.
         eligibility_.record_verdict(verdict);
-        if (auto observation = eligibility_.observe_attestation(verdict, last_committed_height_,
-                                                                last_committed_root_)) {
+        if (auto observation = eligibility_.observe_attestation(
+                verdict.node_id, last_committed_height_, last_committed_root_)) {
             publish(*observation, epochs->current().id);
         }
         return;
@@ -669,18 +672,29 @@ void SecurityDriver::run_epoch_cadence(uint64_t now_ms) {
     if (epochs->transition() == nullptr &&
         now_ms - last_reattest_ms_ >= constants::kReattestIntervalSeconds * 1000) {
         last_reattest_ms_ = now_ms;
+        // Members and certified Tier 2 peers alike: a node must be able to
+        // prove eligibility for Tier 1 without already being Tier 1.
+        std::set<NodeId> subjects(certified_peers_.begin(), certified_peers_.end());
         for (const auto& member : current.tier1_members.members()) {
-            if (member == config_.self) {
+            subjects.insert(member);
+        }
+        for (const auto& subject : subjects) {
+            if (subject == config_.self) {
                 continue;
             }
-            crypto::Ed25519PublicKey member_key{};
-            member_key = member.bytes;
+            crypto::Ed25519PublicKey subject_key{};
+            subject_key = subject.bytes;
             auto challenge =
-                runtime_.attestation().create_challenge(member, member_key, 1, current.id);
+                runtime_.attestation().create_challenge(subject, subject_key, 1, current.id);
             if (challenge.has_value()) {
                 (void)router_.send(
-                    member, router_.compose(SecurityMessageKind::AttestationChallenge,
-                                            *challenge, current.id));
+                    subject, router_.compose(SecurityMessageKind::AttestationChallenge,
+                                             *challenge, current.id));
+            }
+            // A current member proves participation by voting. A candidate
+            // holds no vote key, so it answers a challenge instead.
+            if (!current.tier1_members.contains(subject)) {
+                challenge_participation(subject);
             }
         }
     }
@@ -786,6 +800,67 @@ void SecurityDriver::on_vote_accepted(const Vote& vote) {
 void SecurityDriver::on_eligibility_observation(const EligibilityObservation& observation) {
     (void)eligibility_.accept(observation);
     maybe_attest_founding_eligibility();
+}
+
+void SecurityDriver::challenge_participation(const NodeId& candidate) {
+    ParticipationChallenge challenge;
+    challenge.network_id = runtime_.epochs()->current().network_id;
+    challenge.epoch = runtime_.epochs()->current().id;
+    challenge.security_ruleset = constants::kSecurityRulesetVersion;
+    challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
+    challenge.node_id = candidate;
+    challenge.incarnation = 1;
+    randombytes_buf(challenge.nonce.data(), challenge.nonce.size());
+    // The observer names the finalized state, so it knows the value the answer
+    // is anchored to without taking the candidate's word for anything.
+    challenge.finalized_height = last_committed_height_;
+    challenge.finalized_state = last_committed_root_;
+    challenge.observer = config_.self;
+
+    pending_participation_[candidate] = challenge;
+    (void)router_.send(candidate,
+                       router_.compose(SecurityMessageKind::ParticipationChallenge, challenge,
+                                       challenge.epoch));
+}
+
+void SecurityDriver::on_participation_challenge(const ParticipationChallenge& challenge,
+                                                const NodeId& from) {
+    // A node answers only a challenge naming itself, and only under its own
+    // identity key. Answering grants nothing: it is evidence for an observer.
+    if (challenge.node_id != config_.self || from == config_.self) {
+        return;
+    }
+    if (challenge.security_ruleset != constants::kSecurityRulesetVersion ||
+        challenge.consensus_ruleset != constants::kConsensusRulesetVersion) {
+        return;
+    }
+    const ParticipationResponse response =
+        answer_participation_challenge(challenge, config_.identity);
+    (void)router_.send(from, router_.compose(SecurityMessageKind::ParticipationResponse, response,
+                                             challenge.epoch));
+}
+
+void SecurityDriver::on_participation_response(const ParticipationResponse& response) {
+    const EpochManager* epochs = runtime_.epochs();
+    if (phase_ != DriverPhase::Active || epochs == nullptr) {
+        return;
+    }
+    const auto pending = pending_participation_.find(response.node_id);
+    if (pending == pending_participation_.end()) {
+        return;
+    }
+    // Match before consume, so a replayed answer cannot spend the challenge a
+    // live one is still coming for.
+    if (response.challenge_digest != participation_challenge_digest(pending->second)) {
+        return;
+    }
+    const ParticipationChallenge challenge = pending->second;
+    pending_participation_.erase(pending);
+
+    if (auto observation = eligibility_.observe_participation_response(
+            response, challenge, challenge.finalized_height, challenge.finalized_state)) {
+        publish(*observation, epochs->current().id);
+    }
 }
 
 void SecurityDriver::drain_objective_faults() {

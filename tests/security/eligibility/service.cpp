@@ -133,8 +133,8 @@ struct ServiceMesh : ::testing::Test {
             for (const std::size_t j : subjects) {
                 if (i == j) continue;
                 services[i]->record_verdict(verdict_for(ids[j], round));
-                auto observation = services[i]->observe_attestation(verdict_for(ids[j], round),
-                                                                    round, reference(round));
+                auto observation =
+                    services[i]->observe_attestation(ids[j], round, reference(round));
                 ASSERT_TRUE(observation.has_value());
                 publish(*observation);
             }
@@ -212,9 +212,11 @@ TEST_F(ServiceMesh, ParticipationRefusesEveryMismatchedBinding) {
     auto wrong_incarnation = proof_for(ids[1], 5, 7);
     EXPECT_FALSE(services[0]->observe_participation(wrong_incarnation, 5, reference(1)));
 
+    // A subject outside the committee is fine — that is a Tier 2 candidate,
+    // and it has to be able to prove participation before it is selected.
     NodeId outsider;
     outsider.bytes.fill(0x99);
-    EXPECT_FALSE(services[0]->observe_participation(proof_for(outsider, 5), 5, reference(1)));
+    EXPECT_TRUE(services[0]->observe_participation(proof_for(outsider, 5), 5, reference(1)));
 
     // A node cannot say that it participated correctly.
     EXPECT_FALSE(services[0]->observe_participation(proof_for(ids[0], 5), 5, reference(1)));
@@ -222,19 +224,34 @@ TEST_F(ServiceMesh, ParticipationRefusesEveryMismatchedBinding) {
     EXPECT_TRUE(services[0]->observe_participation(proof_for(ids[1], 5), 5, reference(1)));
 }
 
-// A failing verdict proves nothing, and neither does one with no evidence
-// digest behind it.
-TEST_F(ServiceMesh, AttestationObservationsNeedSomethingToPointAt) {
+// An observer signs claims only for evidence its own verifier produced. There
+// is no parameter to pass a claim set in, so a fabricated or relayed one has no
+// way to reach the wire: with nothing recorded there is nothing to sign.
+TEST_F(ServiceMesh, AnObserverSignsOnlyClaimsItVerifiedItself) {
+    EXPECT_FALSE(services[0]->observe_attestation(ids[1], 1, reference(1)));
+
+    // A failing verdict is not recorded, so it still leaves nothing to sign.
     auto failed = verdict_for(ids[1], 1);
     failed.passed = false;
-    EXPECT_FALSE(services[0]->observe_attestation(failed, 1, reference(1)));
+    services[0]->record_verdict(failed);
+    EXPECT_FALSE(services[0]->observe_attestation(ids[1], 1, reference(1)));
 
+    // A passing verdict with no evidence behind it proves no attestation ran.
     auto empty = verdict_for(ids[1], 1);
     empty.evidence_digest = Digest{};
-    EXPECT_FALSE(services[0]->observe_attestation(empty, 1, reference(1)));
+    services[0]->record_verdict(empty);
+    EXPECT_FALSE(services[0]->observe_attestation(ids[1], 1, reference(1)));
 
-    EXPECT_FALSE(services[0]->observe_attestation(verdict_for(ids[0], 1), 1, reference(1)));
-    EXPECT_TRUE(services[0]->observe_attestation(verdict_for(ids[1], 1), 1, reference(1)));
+    // A node never witnesses itself, however much it verified.
+    services[0]->record_verdict(verdict_for(ids[0], 1));
+    EXPECT_FALSE(services[0]->observe_attestation(ids[0], 1, reference(1)));
+
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    const auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
+    ASSERT_TRUE(observation.has_value());
+    // The signed claims are the ones the verifier produced, byte for byte.
+    EXPECT_EQ(platform_claims_digest(observation->claims),
+              platform_claims_digest(complete_claims()));
 }
 
 // --- What a node will accept -------------------------------------------------
@@ -264,7 +281,8 @@ TEST_F(ServiceMesh, AClonedObserverCountsOnce) {
 // An observation replayed under another subject or another network is a
 // different statement, and the signature no longer covers it.
 TEST_F(ServiceMesh, ReplayUnderAnotherSubjectOrNetworkIsRefused) {
-    auto observation = services[0]->observe_attestation(verdict_for(ids[1], 1), 1, reference(1));
+    services[0]->record_verdict(verdict_for(ids[1], 1));
+    auto observation = services[0]->observe_attestation(ids[1], 1, reference(1));
     ASSERT_TRUE(observation.has_value());
 
     auto moved = *observation;
@@ -342,7 +360,8 @@ TEST_F(ServiceMesh, PlatformClaimsNeedAQuorumToo) {
     for (const std::size_t i : {1u, 2u}) {
         auto verdict = verdict_for(ids[0], 5);
         verdict.claims = partial;
-        auto observation = services[i]->observe_attestation(verdict, 20, reference(20));
+        services[i]->record_verdict(verdict);
+        auto observation = services[i]->observe_attestation(ids[0], 20, reference(20));
         ASSERT_TRUE(observation.has_value());
         publish(*observation);
     }
@@ -453,7 +472,10 @@ TEST_F(ServiceMesh, CorruptDurableStateIsReportedAsCorrupt) {
 TEST_F(ServiceMesh, TheGenesisContextRequiresEveryOtherFounder) {
     for (std::size_t i = 0; i < kMembers; ++i) {
         ASSERT_NE(services[i]->enter_genesis(ids), EligibilityRestore::Corrupt);
-        EXPECT_EQ(services[i]->context().quorum, kMembers - 1);
+        // The committee is the whole founding set; self-exclusion puts each
+        // founder's bar at every other founder.
+        EXPECT_EQ(services[i]->context().quorum, kMembers);
+        EXPECT_EQ(witness_threshold(services[i]->context(), ids[i]), kMembers - 1);
         EXPECT_EQ(services[i]->context().epoch, 0u);
     }
     EXPECT_FALSE(services[0]->mutual_round_complete());

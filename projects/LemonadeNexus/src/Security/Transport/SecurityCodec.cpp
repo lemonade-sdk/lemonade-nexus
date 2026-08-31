@@ -318,6 +318,34 @@ bool encode_observation(Writer& w, const EligibilityObservation& o) {
     return true;
 }
 
+bool encode_participation_challenge(Writer& w, const ParticipationChallenge& c) {
+    w.fixed(c.network_id);
+    w.u64(c.epoch);
+    w.u16(c.security_ruleset);
+    w.u16(c.consensus_ruleset);
+    put_node(w, c.node_id);
+    w.u64(c.incarnation);
+    w.fixed(c.nonce);
+    w.u64(c.finalized_height);
+    w.fixed(c.finalized_state);
+    put_node(w, c.observer);
+    return true;
+}
+
+bool encode_participation_response(Writer& w, const ParticipationResponse& r) {
+    w.fixed(r.challenge_digest);
+    w.fixed(r.network_id);
+    w.u64(r.epoch);
+    w.u16(r.security_ruleset);
+    w.u16(r.consensus_ruleset);
+    put_node(w, r.node_id);
+    w.u64(r.incarnation);
+    w.u64(r.finalized_height);
+    w.fixed(r.finalized_state);
+    w.fixed(r.identity_signature);
+    return true;
+}
+
 bool encode_genesis_eligibility_attest(Writer& w, const GenesisEligibilityAttest& a) {
     w.u64(a.epoch);
     w.fixed(a.founding_state_digest);
@@ -553,6 +581,20 @@ bool decode_observation(Reader& r, EligibilityObservation& o) {
     return true;
 }
 
+bool decode_participation_challenge(Reader& r, ParticipationChallenge& c) {
+    return r.fixed(c.network_id) && r.u64(c.epoch) && r.u16(c.security_ruleset) &&
+           r.u16(c.consensus_ruleset) && get_node(r, c.node_id) && r.u64(c.incarnation) &&
+           r.fixed(c.nonce) && r.u64(c.finalized_height) && r.fixed(c.finalized_state) &&
+           get_node(r, c.observer);
+}
+
+bool decode_participation_response(Reader& r, ParticipationResponse& p) {
+    return r.fixed(p.challenge_digest) && r.fixed(p.network_id) && r.u64(p.epoch) &&
+           r.u16(p.security_ruleset) && r.u16(p.consensus_ruleset) && get_node(r, p.node_id) &&
+           r.u64(p.incarnation) && r.u64(p.finalized_height) && r.fixed(p.finalized_state) &&
+           r.fixed(p.identity_signature);
+}
+
 bool decode_genesis_eligibility_attest(Reader& r, GenesisEligibilityAttest& a) {
     return r.u64(a.epoch) && r.fixed(a.founding_state_digest) && get_node(r, a.node) &&
            r.fixed(a.identity_signature);
@@ -679,13 +721,25 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(a);
             return true;
         }
+        case SecurityMessageKind::ParticipationChallenge: {
+            ParticipationChallenge c;
+            if (!decode_participation_challenge(r, c)) return false;
+            body = std::move(c);
+            return true;
+        }
+        case SecurityMessageKind::ParticipationResponse: {
+            ParticipationResponse p;
+            if (!decode_participation_response(r, p)) return false;
+            body = std::move(p);
+            return true;
+        }
     }
     return r.fail(CodecError::UnknownKind);
 }
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::GenesisEligibilityAttest);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::ParticipationResponse);
 }
 
 }  // namespace
@@ -730,8 +784,12 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::SyncResponse;
             } else if constexpr (std::is_same_v<T, EligibilityObservation>) {
                 return SecurityMessageKind::EligibilityObservation;
-            } else {
+            } else if constexpr (std::is_same_v<T, GenesisEligibilityAttest>) {
                 return SecurityMessageKind::GenesisEligibilityAttest;
+            } else if constexpr (std::is_same_v<T, ParticipationChallenge>) {
+                return SecurityMessageKind::ParticipationChallenge;
+            } else {
+                return SecurityMessageKind::ParticipationResponse;
             }
         },
         body);
@@ -777,8 +835,12 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_sync_response(body, value);
             } else if constexpr (std::is_same_v<T, EligibilityObservation>) {
                 return encode_observation(body, value);
-            } else {
+            } else if constexpr (std::is_same_v<T, GenesisEligibilityAttest>) {
                 return encode_genesis_eligibility_attest(body, value);
+            } else if constexpr (std::is_same_v<T, ParticipationChallenge>) {
+                return encode_participation_challenge(body, value);
+            } else {
+                return encode_participation_response(body, value);
             }
         },
         message.body);

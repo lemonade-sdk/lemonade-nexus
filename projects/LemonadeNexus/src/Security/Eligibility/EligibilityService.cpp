@@ -89,8 +89,19 @@ void EligibilityService::record_verdict(const AttestationVerdict& verdict) {
 }
 
 std::optional<EligibilityObservation> EligibilityService::observe_attestation(
-    const AttestationVerdict& verdict, Height height, const Digest& state_reference) {
-    if (!verdict.passed || verdict.node_id == self_ || !observed(verdict.node_id)) {
+    const NodeId& subject, Height height, const Digest& state_reference) {
+    // Only a current committee member witnesses, and never itself.
+    if (!is_observer() || subject == self_) {
+        return std::nullopt;
+    }
+    // The claims come from what this node's own verifier produced. There is no
+    // parameter here a caller could use to sign a claim set it did not verify.
+    const auto held = verdicts_.find(subject);
+    if (held == verdicts_.end()) {
+        return std::nullopt;
+    }
+    const AttestationVerdict& verdict = held->second;
+    if (!verdict.passed || verdict.node_id != subject) {
         return std::nullopt;
     }
     // Continuity counts distinct attestations, so a statement without one
@@ -131,7 +142,10 @@ std::optional<EligibilityObservation> EligibilityService::observe_participation(
     if (proof.consensus_ruleset != constants::kConsensusRulesetVersion) {
         return std::nullopt;
     }
-    if (proof.subject == self_ || !observed(proof.subject)) {
+    // Only a current committee member witnesses, and never itself. The subject
+    // need not be one: a candidate has to be able to prove participation before
+    // it is selected, or Tier 1 could only ever be renewed and never entered.
+    if (!is_observer() || proof.subject == self_) {
         return std::nullopt;
     }
     const auto held = incarnations_.find(proof.subject);
@@ -146,12 +160,49 @@ std::optional<EligibilityObservation> EligibilityService::observe_participation(
         proof.subject_height > height + constants::kMaxFutureViewDistance) {
         return std::nullopt;
     }
+    return sign_participation(proof.subject, proof.incarnation, height, state_reference);
+}
 
+std::optional<EligibilityObservation> EligibilityService::observe_participation_response(
+    const ParticipationResponse& response, const ParticipationChallenge& challenge,
+    Height height, const Digest& state_reference) {
+    if (!is_observer() || response.node_id == self_) {
+        return std::nullopt;
+    }
+    // The challenge must be one this node issued, for this network and epoch,
+    // naming the finalized state this node holds.
+    if (challenge.observer != self_ || challenge.network_id != context_.network_id ||
+        challenge.epoch != context_.epoch) {
+        return std::nullopt;
+    }
+    if (challenge.security_ruleset != constants::kSecurityRulesetVersion ||
+        challenge.consensus_ruleset != constants::kConsensusRulesetVersion) {
+        return std::nullopt;
+    }
+    if (challenge.finalized_height != height || challenge.finalized_state != state_reference) {
+        return std::nullopt;
+    }
+    if (verify_participation_response(response, challenge) != ParticipationFailure::None) {
+        return std::nullopt;
+    }
+    // A subject this node has attested must answer at the incarnation it
+    // attested; one it has not yet attested answers at the frozen incarnation.
+    const auto held = incarnations_.find(response.node_id);
+    const IncarnationId expected = held != incarnations_.end() ? held->second : kFrozenIncarnation;
+    if (response.incarnation != expected) {
+        return std::nullopt;
+    }
+    return sign_participation(response.node_id, response.incarnation, height, state_reference);
+}
+
+std::optional<EligibilityObservation> EligibilityService::sign_participation(
+    const NodeId& subject, IncarnationId incarnation, Height height,
+    const Digest& state_reference) {
     EligibilityObservation observation;
     observation.network_id = context_.network_id;
     observation.epoch = context_.epoch;
-    observation.subject = proof.subject;
-    observation.subject_incarnation = proof.incarnation;
+    observation.subject = subject;
+    observation.subject_incarnation = incarnation;
     observation.kind = ObservationKind::Participation;
     observation.height = height;
     observation.state_reference = state_reference;
@@ -197,7 +248,7 @@ EligibilityState EligibilityService::compute_state(EpochId next_epoch) const {
     // bootstrap window, epoch 0, not the epoch being founded.
     const EpochId verdict_epoch = context_.epoch;
 
-    for (const NodeId& subject : observers->members()) {
+    for (const NodeId& subject : candidates()) {
         EligibilityRecord record;
         record.subject = subject;
         // Every input is a mesh fact. A node never attests itself, so reading
@@ -237,6 +288,18 @@ EligibilityState EligibilityService::compute_state(EpochId next_epoch) const {
         state.records.push_back(record);
     }
     return state;
+}
+
+std::vector<NodeId> EligibilityService::candidates() const {
+    std::set<NodeId> all(context_.observers.begin(), context_.observers.end());
+    // A subject a Byzantine minority alone named is not a candidate: f + 1
+    // distinct observers must have spoken about it.
+    const std::size_t minimum =
+        constants::max_byzantine_faults(context_.observers.size()) + 1;
+    for (const NodeId& subject : ledger_.subjects(context_.epoch, minimum)) {
+        all.insert(subject);
+    }
+    return {all.begin(), all.end()};
 }
 
 bool EligibilityService::mutual_round_complete() const {

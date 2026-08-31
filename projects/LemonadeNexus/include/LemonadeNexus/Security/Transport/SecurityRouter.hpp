@@ -77,6 +77,11 @@ public:
     /// whether it counts; the router only carries it.
     virtual void on_eligibility_observation(const EligibilityObservation&) {}
     virtual void on_genesis_eligibility_attest(const GenesisEligibilityAttest&) {}
+    /// A current Tier 1 member asks a candidate to prove it is a live
+    /// participant anchored to finalized state. The answer proves possession of
+    /// the node identity key and grants nothing.
+    virtual void on_participation_challenge(const ParticipationChallenge&, const NodeId&) {}
+    virtual void on_participation_response(const ParticipationResponse&) {}
     /// A validated certificate from a peer: proof the network reached its
     /// view. The driver derives the restart view floor from these.
     virtual void on_sync_certificate(const QuorumCertificate&, const NodeId&) {}

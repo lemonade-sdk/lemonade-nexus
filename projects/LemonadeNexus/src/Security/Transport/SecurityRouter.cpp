@@ -129,6 +129,10 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.observer == authenticated_sender;
             } else if constexpr (std::is_same_v<T, GenesisEligibilityAttest>) {
                 return body.node == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, ParticipationChallenge>) {
+                return body.observer == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, ParticipationResponse>) {
+                return body.node_id == authenticated_sender;
             } else {
                 return true;
             }
@@ -138,14 +142,21 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
 
 bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
     const EpochManager* epochs = runtime_.epochs();
+    // A candidate outside the current epoch has no epoch state to place an
+    // epoch number against. It answers the challenge; the observer, which does
+    // have that state, decides whether the answer counts for anything.
+    const bool participation_kind =
+        message.kind == SecurityMessageKind::ParticipationChallenge ||
+        message.kind == SecurityMessageKind::ParticipationResponse;
     const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
                                 message.kind == SecurityMessageKind::DkgTranscriptAttest ||
                                 message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
                                 message.kind == SecurityMessageKind::BootstrapCertificate;
     if (epochs == nullptr) {
         // Before Epoch 1 only bootstrap traffic exists: challenges, evidence,
-        // the Epoch 1 DKG, and the Genesis exchange.
-        return message.epoch <= 1;
+        // the Epoch 1 DKG, and the Genesis exchange. A Tier 2 candidate also
+        // answers participation challenges for the epoch the mesh is in.
+        return message.epoch <= 1 || participation_kind;
     }
     if (bootstrap_kind) {
         // Genesis authority ended at Epoch 1 activation.
@@ -249,6 +260,13 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
         case SecurityMessageKind::GenesisEligibilityAttest:
             events_.on_genesis_eligibility_attest(
                 std::get<GenesisEligibilityAttest>(message.body));
+            return delivered();
+        case SecurityMessageKind::ParticipationChallenge:
+            events_.on_participation_challenge(
+                std::get<ParticipationChallenge>(message.body), message.sender);
+            return delivered();
+        case SecurityMessageKind::ParticipationResponse:
+            events_.on_participation_response(std::get<ParticipationResponse>(message.body));
             return delivered();
     }
     return drop(DropReason::UnknownKind);

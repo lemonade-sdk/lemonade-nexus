@@ -37,11 +37,23 @@ MeshFactContext genesis_fact_context(const NetworkId& network_id,
     MeshFactContext context;
     context.network_id = network_id;
     context.epoch = 0;
-    // Every founder must be seen by every other founder. No node observes
-    // itself, so the bar is one less than the founding set.
-    context.quorum = founders.empty() ? 0 : founders.size() - 1;
+    // Before Epoch 1 there is no BFT quorum: the committee is the whole
+    // founding set. Self-exclusion then puts the bar at every other founder.
+    context.quorum = founders.size();
     context.observers = std::move(founders);
     return context;
+}
+
+std::size_t witness_threshold(const MeshFactContext& context, const NodeId& subject) {
+    const bool in_committee =
+        std::find(context.observers.begin(), context.observers.end(), subject) !=
+        context.observers.end();
+    if (!in_committee) {
+        return context.quorum;
+    }
+    // One honest witness must always be out of the adversary's reach.
+    const std::size_t floor = constants::max_byzantine_faults(context.observers.size()) + 1;
+    return std::max(context.quorum > 0 ? context.quorum - 1 : 0, floor);
 }
 
 ObservationOutcome EligibilityLedger::record(const EligibilityObservation& observation,
@@ -129,11 +141,11 @@ MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
                                               IncarnationId incarnation,
                                               const MeshFactContext& context) const {
     MeshFactEvidence evidence;
-    evidence.quorum_required = context.quorum;
+    evidence.quorum_required = witness_threshold(context, subject);
     evidence.fault_recorded = faults_.contains(subject);
 
-    // A quorum of zero would make both facts true on no evidence at all.
-    if (context.quorum == 0) {
+    // A bar of zero would make both facts true on no evidence at all.
+    if (evidence.quorum_required == 0) {
         return evidence;
     }
 
@@ -171,22 +183,23 @@ MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
     // The platform half is a quorum fact too. A quorum is a strict majority, so
     // at most one claim set can reach it and the winner is unambiguous.
     for (const auto& [digest, entry] : claim_counts) {
-        if (entry.first >= context.quorum) {
+        if (entry.first >= evidence.quorum_required) {
             evidence.platform_claims = entry.second;
             evidence.claim_observers = entry.first;
             break;
         }
     }
 
-    evidence.uptime_valid = evidence.continuity_observers >= context.quorum;
-    evidence.mesh_health_valid =
-        !evidence.fault_recorded && evidence.participation_observers >= context.quorum;
+    evidence.uptime_valid = evidence.continuity_observers >= evidence.quorum_required;
+    evidence.mesh_health_valid = !evidence.fault_recorded &&
+                                 evidence.participation_observers >= evidence.quorum_required;
     return evidence;
 }
 
 std::optional<IncarnationId> EligibilityLedger::quorum_incarnation(
     const NodeId& subject, const MeshFactContext& context) const {
-    if (context.quorum == 0) {
+    const std::size_t required = witness_threshold(context, subject);
+    if (required == 0) {
         return std::nullopt;
     }
     // By observer identity, so one observer speaking of both kinds counts once.
@@ -202,7 +215,7 @@ std::optional<IncarnationId> EligibilityLedger::quorum_incarnation(
         observers[record.incarnation].insert(key.observer);
     }
     for (const auto& [incarnation, seen] : observers) {
-        if (seen.size() >= context.quorum) {
+        if (seen.size() >= required) {
             return incarnation;
         }
     }
@@ -215,6 +228,23 @@ void EligibilityLedger::fill(Tier1MeshFacts& facts, const NodeId& subject,
     const MeshFactEvidence evidence = evaluate(subject, incarnation, context);
     facts.uptime_valid = evidence.uptime_valid;
     facts.mesh_health_valid = evidence.mesh_health_valid;
+}
+
+std::vector<NodeId> EligibilityLedger::subjects(EpochId epoch,
+                                                std::size_t min_observers) const {
+    std::map<NodeId, std::set<NodeId>> observers;
+    for (const auto& [key, record] : records_) {
+        if (key.epoch == epoch) {
+            observers[key.subject].insert(key.observer);
+        }
+    }
+    std::vector<NodeId> named;
+    for (const auto& [subject, seen] : observers) {
+        if (seen.size() >= min_observers) {
+            named.push_back(subject);
+        }
+    }
+    return named;
 }
 
 void EligibilityLedger::expire_before(EpochId epoch) {

@@ -425,8 +425,11 @@ TEST(GenesisFacts, EveryFounderMustBeSeenByEveryOther) {
     for (const auto& founder : founders) ids.push_back(founder.id);
     const MeshFactContext context = genesis_fact_context(network(), ids);
 
-    // Mutual: no node observes itself, so the bar is one less than the set.
-    EXPECT_EQ(context.quorum, constants::kBootstrapThreshold - 1);
+    // The committee is the whole founding set; no node observes itself, so the
+    // bar every founder actually faces is one less. The bootstrap threshold is
+    // unchanged either way.
+    EXPECT_EQ(context.quorum, constants::kBootstrapThreshold);
+    EXPECT_EQ(witness_threshold(context, ids.front()), constants::kBootstrapThreshold - 1);
     EXPECT_EQ(context.epoch, 0u);
 
     EligibilityLedger ledger;
@@ -606,4 +609,125 @@ TEST_F(LedgerTest, AnObserverRestartCannotReplayItsOldStatements) {
     EXPECT_EQ(ledger_.record(attestation(members_[0], candidate_, 0x11, 501), context_),
               ObservationOutcome::Accepted);
     EXPECT_EQ(ledger_.evaluate(candidate_.id, 1, context_).continuity_observers, 1u);
+}
+
+// --- The witness threshold ---------------------------------------------------
+
+// A node never witnesses itself, so a member is one short of its own committee
+// by construction. Demanding the full quorum from the rest would mean every
+// other member has to be online, at every population — one offline node would
+// make continuity unreachable for everyone while HotStuff still had its quorum.
+TEST(WitnessThreshold, ASubjectIsExcludedFromItsOwnCommittee) {
+    for (const std::size_t members : {5u, 7u, 10u, 13u, 16u, 19u, 22u, 25u, 28u, 31u}) {
+        std::vector<NodeId> ids;
+        for (std::size_t i = 0; i < members; ++i) {
+            NodeId id;
+            id.bytes.fill(static_cast<uint8_t>(i + 1));
+            ids.push_back(id);
+        }
+        const MeshFactContext context = established_fact_context(network(), 1, ids);
+        const std::size_t quorum = constants::consensus_quorum(members);
+        const std::size_t faults = constants::max_byzantine_faults(members);
+        ASSERT_EQ(context.quorum, quorum) << members;
+
+        // A current member: one below the committee quorum.
+        const std::size_t member_bar = witness_threshold(context, ids.front());
+        EXPECT_EQ(member_bar, quorum - 1) << members;
+
+        // Reachable: with f members offline and the subject excluded, exactly
+        // that many honest witnesses remain.
+        EXPECT_EQ(members - 1 - faults, member_bar) << members;
+
+        // Unforgeable: the Byzantine set alone can never reach it.
+        EXPECT_GT(member_bar, faults) << members;
+
+        // A candidate outside the committee gets no discount. It is not part of
+        // the authority that produces these facts, and all N members can
+        // witness it, so the full quorum stays reachable.
+        NodeId outsider;
+        outsider.bytes.fill(0xFE);
+        EXPECT_EQ(witness_threshold(context, outsider), quorum) << members;
+        EXPECT_EQ(members - faults, quorum) << members;
+    }
+}
+
+// The rule is a witness rule and not a consensus rule: it changes what makes a
+// mesh fact, never what makes a certificate.
+TEST(WitnessThreshold, ConsensusQuorumIsUntouched) {
+    for (const std::size_t members : {5u, 7u, 10u, 31u}) {
+        std::vector<NodeId> ids;
+        for (std::size_t i = 0; i < members; ++i) {
+            NodeId id;
+            id.bytes.fill(static_cast<uint8_t>(i + 1));
+            ids.push_back(id);
+        }
+        const MeshFactContext context = established_fact_context(network(), 1, ids);
+        EXPECT_EQ(context.quorum, constants::consensus_quorum(members));
+        EXPECT_GT(2 * constants::consensus_quorum(members), members);
+    }
+}
+
+// At N = 5 one offline member must not deny continuity to the four that remain,
+// because four is still a HotStuff quorum.
+TEST_F(LedgerTest, OneOfflineMemberDoesNotDenyTheRestAtFive) {
+    ASSERT_EQ(members_.size(), 5u);
+    ASSERT_EQ(context_.quorum, 4u);
+    // members_[4] is offline: it observes nobody and nobody observes it.
+    const NodeId subject = members_[0].id;
+    EXPECT_EQ(witness_threshold(context_, subject), 3u);
+
+    Height height = 100;
+    for (std::size_t i = 1; i < 4; ++i) {
+        for (uint8_t round = 0; round < constants::kMinContinuityObservations; ++round) {
+            ASSERT_EQ(ledger_.record(attestation(members_[i], members_[0],
+                                                 static_cast<uint8_t>(0x30 + round), ++height),
+                                     context_),
+                      ObservationOutcome::Accepted);
+        }
+        ASSERT_EQ(ledger_.record(participation(members_[i], members_[0], ++height), context_),
+                  ObservationOutcome::Accepted);
+    }
+
+    const auto evidence = ledger_.evaluate(subject, 1, context_);
+    EXPECT_EQ(evidence.continuity_observers, 3u);
+    EXPECT_EQ(evidence.participation_observers, 3u);
+    EXPECT_EQ(evidence.quorum_required, 3u);
+    EXPECT_TRUE(evidence.uptime_valid);
+    EXPECT_TRUE(evidence.mesh_health_valid);
+}
+
+// Three is not enough. Below the threshold the facts stay false, so a minority
+// cannot manufacture a state the mesh would have to act on.
+TEST_F(LedgerTest, ThreeObserversCannotManufactureAFactForAnOutsideCandidate) {
+    Node candidate = make_node();
+    EXPECT_EQ(witness_threshold(context_, candidate.id), 4u);
+
+    Height height = 200;
+    for (std::size_t i = 0; i < 3; ++i) {
+        for (uint8_t round = 0; round < constants::kMinContinuityObservations; ++round) {
+            ASSERT_EQ(ledger_.record(attestation(members_[i], candidate,
+                                                 static_cast<uint8_t>(0x40 + round), ++height),
+                                     context_),
+                      ObservationOutcome::Accepted);
+        }
+        ASSERT_EQ(ledger_.record(participation(members_[i], candidate, ++height), context_),
+                  ObservationOutcome::Accepted);
+    }
+    auto evidence = ledger_.evaluate(candidate.id, 1, context_);
+    EXPECT_EQ(evidence.quorum_required, 4u);
+    EXPECT_FALSE(evidence.uptime_valid);
+    EXPECT_FALSE(evidence.mesh_health_valid);
+
+    // The fourth observer completes it.
+    for (uint8_t round = 0; round < constants::kMinContinuityObservations; ++round) {
+        ASSERT_EQ(ledger_.record(attestation(members_[3], candidate,
+                                             static_cast<uint8_t>(0x40 + round), ++height),
+                                 context_),
+                  ObservationOutcome::Accepted);
+    }
+    ASSERT_EQ(ledger_.record(participation(members_[3], candidate, ++height), context_),
+              ObservationOutcome::Accepted);
+    evidence = ledger_.evaluate(candidate.id, 1, context_);
+    EXPECT_TRUE(evidence.uptime_valid);
+    EXPECT_TRUE(evidence.mesh_health_valid);
 }
