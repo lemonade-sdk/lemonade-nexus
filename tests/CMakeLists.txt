@@ -114,6 +114,7 @@ add_nexus_test(test_security_transport
     security/transport/router.cpp)
 add_nexus_test(test_security_lifecycle
     security/lifecycle/driver.cpp
+    security/lifecycle/eligibility_path.cpp
     security/lifecycle/adversarial.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
@@ -124,7 +125,8 @@ add_nexus_test(test_security_authority
     security/authority/signing.cpp)
 add_nexus_test(test_security_eligibility
     security/eligibility/ledger.cpp
-    security/eligibility/store.cpp)
+    security/eligibility/store.cpp
+    security/eligibility/service.cpp)
 # Deterministic measurement across the Tier 1 population table. Records what
 # the protocol costs at 5 and at 31; asserts invariants only, never a tuned
 # threshold.
