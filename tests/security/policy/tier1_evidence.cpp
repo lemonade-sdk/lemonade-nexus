@@ -293,3 +293,30 @@ TEST(Tier1Evidence, ASelfReportedRuntimeProfileIsNotTheTrustBasis) {
     EXPECT_FALSE(state.binary_valid);
     EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
 }
+
+// A root-signed transport certificate is a mesh membership fact: it says the
+// peer is an authenticated server this deployment's root vouched for. It is one
+// of fifteen prerequisites and it implies none of the others, so on its own it
+// confers no eligibility and therefore no authority.
+TEST(Tier1Evidence, ACertificateAloneConfersNothing) {
+    AttestationVerdict nothing_proved;
+    nothing_proved.passed = true;
+    Tier1MeshFacts facts;
+    facts.certificate_valid = true;
+
+    const Tier1EvidenceState state = tier1_evidence_state(nothing_proved, facts);
+    EXPECT_TRUE(state.certificate_valid);
+    EXPECT_EQ(Tier1EligibilityPolicy::evaluate(state), Tier1Eligibility::Ineligible);
+
+    // Every other prerequisite is still outstanding.
+    const auto failed = Tier1EligibilityPolicy::failed_prerequisites(state);
+    EXPECT_EQ(failed.size(), 14u);
+    EXPECT_TRUE(std::find(failed.begin(), failed.end(), Tier1Prerequisite::Certificate) ==
+                failed.end());
+
+    // And removing it from an otherwise complete state is what makes it a
+    // prerequisite rather than a formality.
+    auto without = complete_facts();
+    without.certificate_valid = false;
+    EXPECT_EQ(tier1_eligibility(complete_verdict(), without), Tier1Eligibility::Ineligible);
+}
