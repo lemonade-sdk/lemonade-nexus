@@ -76,6 +76,9 @@ struct GossipBallotTestAccess {
 
 namespace {
 
+// Certificates bind to a network id; one value serves every fixture.
+inline const std::string kTestNetworkHex(64, 'a');
+
 struct Node {
     fs::path dir;
     std::unique_ptr<crypto::SodiumCryptoService>   crypto;
@@ -277,8 +280,10 @@ protected:
     // node whose set_root_pubkey matches.
     std::string issue_cert(const std::string& server_pubkey_b64,
                            const std::string& server_id,
-                           const crypto::Ed25519Keypair& root_kp) {
+                           const crypto::Ed25519Keypair& root_kp,
+                           const std::string& network_hex = kTestNetworkHex) {
         gossip::CertIssueParams p;
+        p.network_id        = network_hex;
         p.server_pubkey_b64 = server_pubkey_b64;
         p.server_id         = server_id;
         return nlohmann::json(
@@ -440,7 +445,7 @@ TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertVerifiedSender) {
                 {peer_entry(certified_b64, "127.0.0.1:9", cert_json)}));
         },
         [&](Node& n) {
-            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
             n.gossip->set_acl(n.acl.get());
         });
 
@@ -489,7 +494,7 @@ TEST_F(GossipIngressSecurityTest, DnsRecordSyncRequiresCertVerifiedSender) {
                 {peer_entry(certified_b64, "127.0.0.1:9", cert_json)}));
         },
         [&](Node& n) {
-            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
             n.gossip->set_dns(n.dns.get());
         });
 
@@ -536,7 +541,7 @@ TEST_F(GossipIngressSecurityTest, BackboneIpamSyncRequiresCertVerifiedSender) {
                 {peer_entry(certified_b64, "127.0.0.1:9", cert_json)}));
         },
         [&](Node& n) {
-            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
             n.gossip->set_ipam(n.ipam.get());
         });
 
@@ -589,7 +594,7 @@ TEST_F(GossipIngressSecurityTest, HostileMisbehaviorProofDoesNotBanTheAccused) {
             seed_peers(*n.storage, nlohmann::json::array(
                 {peer_entry(victim_b64, "127.0.0.1:9", cert_json)}));
         },
-        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); });
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
 
     ASSERT_TRUE(a.has_peer(victim_b64));
     ASSERT_TRUE(a.certified_peer(victim_b64));
@@ -656,7 +661,7 @@ TEST_F(GossipIngressSecurityTest, ServerHelloRejectsCertificateFromForeignRoot) 
     const auto honest_b64   = crypto::to_base64(honest.public_key);
 
     auto& a = make_node("a", /*seed=*/{}, [&](Node& n) {
-        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
         Node* raw = &n;
         n.gossip->set_peer_certified_callback(
             [raw](const security::NodeId& id) { raw->certified.push_back(id); });
@@ -689,6 +694,86 @@ TEST_F(GossipIngressSecurityTest, ServerHelloRejectsCertificateFromForeignRoot) 
     EXPECT_FALSE(a.has_peer(imposter_b64));
 }
 
+// (5c) Two deployments sharing a root key by accident are still two networks.
+// A certificate that is valid in every other way — same root, same node key,
+// correct proof of possession — validates nowhere outside the network it names,
+// and a certificate naming no network validates nowhere at all.
+TEST_F(GossipIngressSecurityTest, ServerHelloRejectsCertificateFromForeignNetwork) {
+    auto root_kp = kc->ed25519_keygen();
+    auto foreign = kc->ed25519_keygen();
+    auto honest  = kc->ed25519_keygen();
+    const auto foreign_b64 = crypto::to_base64(foreign.public_key);
+    const auto honest_b64  = crypto::to_base64(honest.public_key);
+
+    auto& a = make_node("a", /*seed=*/{}, [&](Node& n) {
+        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_network_id(kTestNetworkHex);
+        Node* raw = &n;
+        n.gossip->set_peer_certified_callback(
+            [raw](const security::NodeId& id) { raw->certified.push_back(id); });
+    });
+
+    // Same root key, another network: root-signed and self-presented, and
+    // still refused.
+    const std::string other_network(64, 'b');
+    const auto foreign_cert = issue_cert(foreign_b64, "peer-foreign", root_kp, other_network);
+    inject(build_packet(foreign, gossip::GossipMsgType::ServerHello,
+                        bytes_of(foreign_cert)),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(a.certified.empty());
+    EXPECT_FALSE(a.certified_peer(foreign_b64));
+
+    // A certificate that names no network at all: equally dead. There is no
+    // acceptance path for unbound certificates.
+    const auto unbound_cert = issue_cert(foreign_b64, "peer-unbound", root_kp, "");
+    inject(build_packet(foreign, gossip::GossipMsgType::ServerHello,
+                        bytes_of(unbound_cert)),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(a.certified.empty());
+
+    // Control: the same shape on this network is accepted.
+    const auto good_cert = issue_cert(honest_b64, "peer-honest", root_kp);
+    inject(build_packet(honest, gossip::GossipMsgType::ServerHello,
+                        bytes_of(good_cert)),
+           a);
+    ASSERT_TRUE(pump_until([&] { return !a.certified.empty(); }));
+    EXPECT_TRUE(a.certified_peer(honest_b64));
+    EXPECT_FALSE(a.certified_peer(foreign_b64));
+}
+
+// (5d) Re-signing a foreign-network certificate's network field does not help:
+// the field is inside the canonical signed form, so an edited copy fails the
+// root signature instead of the network check.
+TEST_F(GossipIngressSecurityTest, EditedNetworkFieldBreaksTheRootSignature) {
+    auto root_kp = kc->ed25519_keygen();
+    auto node_kp = kc->ed25519_keygen();
+    const auto node_b64 = crypto::to_base64(node_kp.public_key);
+
+    auto& a = make_node("a", /*seed=*/{}, [&](Node& n) {
+        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_network_id(kTestNetworkHex);
+        Node* raw = &n;
+        n.gossip->set_peer_certified_callback(
+            [raw](const security::NodeId& id) { raw->certified.push_back(id); });
+    });
+
+    // Issued for another network, then edited to claim this one. The holder
+    // itself presents it, so proof of possession holds; the signature does not.
+    const std::string other_network(64, 'b');
+    auto cert = nlohmann::json::parse(
+                    issue_cert(node_b64, "peer-edited", root_kp, other_network))
+                    .get<gossip::ServerCertificate>();
+    cert.network_id = kTestNetworkHex;
+    inject(build_packet(node_kp, gossip::GossipMsgType::ServerHello,
+                        bytes_of(nlohmann::json(cert).dump())),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(a.certified.empty());
+    EXPECT_FALSE(a.certified_peer(node_b64));
+}
+
 // (5b) A certificate is public, so a valid root signature alone proves nothing
 // about who is presenting it. A packet signer whose key differs from
 // cert.server_pubkey must be refused: the replayer must not bind the cert
@@ -703,7 +788,7 @@ TEST_F(GossipIngressSecurityTest, ServerHelloRequiresProofOfPossession) {
     const auto replayer_b64 = crypto::to_base64(replayer.public_key);
 
     auto& a = make_node("a", /*seed=*/{}, [&](Node& n) {
-        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
         Node* raw = &n;
         n.gossip->set_peer_certified_callback(
             [raw](const security::NodeId& id) { raw->certified.push_back(id); });
@@ -772,7 +857,7 @@ TEST_F(GossipIngressSecurityTest, CertifiedForwarderCannotLaunderUncertifiedNsCl
                            issue_cert(claimant_b64, "peer-claimant", root_kp)),
             }));
         },
-        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); });
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
 
     // The outsider is a known peer with no certificate, so only enrolment —
     // not reachability — separates it from the claimant.
@@ -819,7 +904,7 @@ TEST_F(GossipIngressSecurityTest, NsClaimSignatureMustBindTheNamedClaimant) {
                            issue_cert(claimant_b64, "peer-claimant", root_kp)),
             }));
         },
-        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); });
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
 
     ASSERT_TRUE(a.certified_peer(signer_b64));
     ASSERT_TRUE(a.certified_peer(claimant_b64));

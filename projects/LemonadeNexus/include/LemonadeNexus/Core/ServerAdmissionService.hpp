@@ -41,6 +41,10 @@ class ServerAdmissionService : public IService<ServerAdmissionService> {
 
 public:
     enum class State : uint8_t { Pending, Approved, Denied, Expired, Completed };
+
+    /// The network every issued certificate binds to, as hex. Approval refuses
+    /// to issue until this is set: an unbound certificate validates nowhere.
+    void set_network_id(const std::string& network_hex) { network_id_hex_ = network_hex; }
     [[nodiscard]] static const char* state_name(State s);
 
     struct Admission {
@@ -193,6 +197,7 @@ private:
     std::unordered_map<std::string, std::string> nonce_values_; // candidate_pubkey -> nonce
     std::unordered_map<std::string, uint64_t>  denied_until_; // candidate_pubkey -> cooldown end
     bool ever_approved_{false};
+    std::string network_id_hex_;
 };
 
 } // namespace nexus::core

@@ -12,6 +12,11 @@ namespace nexus::gossip {
 /// Signed certificate proving a server is authorized to participate in gossip.
 /// Issued by the root management key holder (admin).
 struct ServerCertificate {
+    /// The Nexus network this certificate belongs to, as the hex of the derived
+    /// 32-byte network id. Root-signed with everything else: a certificate from
+    /// another network fails validation even under the same root key, and there
+    /// is no acceptance path for a certificate without one.
+    std::string network_id;
     std::string server_pubkey;   // base64 Ed25519 public key of the server
     std::string wg_pubkey;       // base64 X25519 mesh public key (derived from Ed25519)
     std::string server_id;       // human-readable identifier (e.g. "us-east-1")
@@ -43,6 +48,7 @@ struct ServerCertificate {
 [[nodiscard]] bool valid_server_id_label(const std::string& s);
 
 struct CertIssueParams {
+    std::string network_id;         // hex of the derived network id (required)
     std::string server_pubkey_b64;  // candidate gossip Ed25519 pubkey (base64)
     std::string server_id;          // unique DNS label
     std::string tpm_ak_pubkey;      // optional base64 DER SPKI (platform binding key)

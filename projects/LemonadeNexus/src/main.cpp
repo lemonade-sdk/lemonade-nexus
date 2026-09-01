@@ -208,6 +208,12 @@ int main(int argc, char* argv[]) {
         mesh_config.data_root = data_root;
         std::memcpy(mesh_config.genesis_public_key.data(), genesis_bytes.data(),
                     genesis_bytes.size());
+        // Certificates bind to the derived network id. The gossip gate never
+        // fails open, so without this no certificate validates.
+        gossip.set_network_id(nexus::crypto::to_hex(nexus::security::derive_network_id(
+            mesh_config.genesis_public_key,
+            nexus::security::constants::kSecurityRulesetVersion,
+            nexus::security::constants::kConsensusRulesetVersion)));
         mesh_config.identity = gossip.keypair();
         // The named profile, not a default-constructed one. It is currently
         // incomplete by design, so every attestation fails with
@@ -694,8 +700,18 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     nexus::core::ServerAdmissionService admission{
         config, crypto, key_wrapping, storage, gossip};
-
-
+    if (!config.genesis_pubkey.empty()) {
+        const auto genesis_bytes = nexus::crypto::from_base64(
+            nexus::crypto::canonical_key_b64(config.genesis_pubkey));
+        if (genesis_bytes.size() == nexus::crypto::kEd25519PublicKeySize) {
+            nexus::crypto::Ed25519PublicKey genesis_pk{};
+            std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
+            admission.set_network_id(nexus::crypto::to_hex(
+                nexus::security::derive_network_id(
+                    genesis_pk, nexus::security::constants::kSecurityRulesetVersion,
+                    nexus::security::constants::kConsensusRulesetVersion)));
+        }
+    }
     admission.start();
 
     // ========================================================================

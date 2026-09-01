@@ -46,6 +46,10 @@ void GossipService::set_root_pubkey(const crypto::Ed25519PublicKey& pk) {
     has_root_pubkey_ = true;
 }
 
+void GossipService::set_network_id(const std::string& network_hex) {
+    expected_network_id_ = network_hex;
+}
+
 // ---------------------------------------------------------------------------
 // IService lifecycle
 // ---------------------------------------------------------------------------
@@ -1157,6 +1161,15 @@ bool GossipService::verify_identity_binding(const ServerCertificate& cert) const
 }
 
 bool GossipService::verify_cert_core(const ServerCertificate& cert) const {
+    // The certificate must name THIS network. Two deployments sharing a root
+    // key by accident are still two networks, and a certificate with no
+    // network at all validates nowhere — there is no unbound acceptance path.
+    if (expected_network_id_.empty() || cert.network_id != expected_network_id_) {
+        spdlog::warn("[{}] certificate network binding rejected for {}", name(),
+                     cert.server_id);
+        return false;
+    }
+
     // Check issuer matches our root pubkey
     auto issuer_bytes = crypto::from_base64(cert.issuer_pubkey);
     if (issuer_bytes.size() != crypto::kEd25519PublicKeySize) {

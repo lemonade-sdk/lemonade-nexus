@@ -434,7 +434,12 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
                 a.request_id};
     }
 
+    if (network_id_hex_.empty()) {
+        return {false, 503, "no network id configured; certificates cannot be issued",
+                a.request_id};
+    }
     gossip::CertIssueParams params;
+    params.network_id        = network_id_hex_;
     params.server_pubkey_b64 = a.candidate_pubkey;
     params.server_id         = a.server_id;
     params.tpm_ak_pubkey     = binding->ak_pubkey;

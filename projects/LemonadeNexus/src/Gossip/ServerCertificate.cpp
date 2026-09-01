@@ -9,6 +9,7 @@ using json = nlohmann::json;
 
 void to_json(json& j, const ServerCertificate& c) {
     j = json{
+        {"network_id",     c.network_id},
         {"server_pubkey",  c.server_pubkey},
         {"wg_pubkey",      c.wg_pubkey},
         {"server_id",      c.server_id},
@@ -26,6 +27,7 @@ void to_json(json& j, const ServerCertificate& c) {
 }
 
 void from_json(const json& j, ServerCertificate& c) {
+    if (j.contains("network_id"))     j.at("network_id").get_to(c.network_id);
     if (j.contains("server_pubkey"))  j.at("server_pubkey").get_to(c.server_pubkey);
     if (j.contains("wg_pubkey"))      j.at("wg_pubkey").get_to(c.wg_pubkey);
     if (j.contains("server_id"))      j.at("server_id").get_to(c.server_id);
@@ -48,6 +50,7 @@ std::string canonical_cert_json(const ServerCertificate& cert) {
     // mismatch rather than a weaker policy.
     json j;
     j["approved_binary_hash"] = cert.approved_binary_hash;
+    j["network_id"]           = cert.network_id;
     j["endpoint_hint"]        = cert.endpoint_hint;
     j["expected_measurement"] = cert.expected_measurement;
     j["expires_at"]           = cert.expires_at;
@@ -78,6 +81,7 @@ ServerCertificate issue_server_certificate(
     const crypto::Ed25519PublicKey& root_pubkey)
 {
     ServerCertificate cert;
+    cert.network_id    = params.network_id;
     cert.server_pubkey = params.server_pubkey_b64;
     cert.server_id     = params.server_id;
     cert.issued_at     = static_cast<uint64_t>(

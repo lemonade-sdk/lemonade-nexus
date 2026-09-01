@@ -3,7 +3,9 @@
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
+#include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -140,7 +142,24 @@ int run_enroll(const ServerConfig& config) {
         }
     }
 
+    if (config.genesis_pubkey.empty()) {
+        spdlog::error("Cannot enroll: certificates bind to the network id, which derives "
+                      "from genesis_pubkey; configure it first.");
+        return 1;
+    }
+    const auto genesis_bytes =
+        crypto::from_base64(crypto::canonical_key_b64(config.genesis_pubkey));
+    if (genesis_bytes.size() != crypto::kEd25519PublicKeySize) {
+        spdlog::error("Cannot enroll: genesis_pubkey is not a base64 Ed25519 public key");
+        return 1;
+    }
+    crypto::Ed25519PublicKey genesis_pk{};
+    std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
+
     gossip::CertIssueParams params;
+    params.network_id = crypto::to_hex(security::derive_network_id(
+        genesis_pk, security::constants::kSecurityRulesetVersion,
+        security::constants::kConsensusRulesetVersion));
     params.server_pubkey_b64 = config.enroll_server_pubkey;
     params.server_id         = config.enroll_server_id;
     params.tpm_ak_pubkey     = config.enroll_tpm_ak_pubkey;

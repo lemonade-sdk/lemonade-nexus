@@ -54,6 +54,11 @@ public:
     /// Set the root management pubkey for certificate verification.
     void set_root_pubkey(const crypto::Ed25519PublicKey& pk);
 
+    /// The Nexus network this node belongs to, as hex. Certificate validation
+    /// requires it and rejects a certificate for any other network — the gate
+    /// never fails open, so with no network configured no certificate is valid.
+    void set_network_id(const std::string& network_hex);
+
     /// True once a root-of-trust pubkey has been configured.
     [[nodiscard]] bool has_root_pubkey() const { return has_root_pubkey_; }
 
@@ -309,6 +314,7 @@ private:
     // Server enrollment
     std::optional<ServerCertificate> our_certificate_;
     crypto::Ed25519PublicKey         root_pubkey_{};
+    std::string                      expected_network_id_;
     bool                             has_root_pubkey_{false};
     std::vector<std::string>         revoked_pubkeys_;
 

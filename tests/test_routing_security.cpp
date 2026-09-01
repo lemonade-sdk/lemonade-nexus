@@ -58,6 +58,9 @@ TEST(ConnectionTicket, SignVerifyRoundTrip) {
     c.stop();
 }
 
+// Certificates bind to a network id; one value serves the fixtures here.
+inline const std::string kTestNetworkHex(64, 'a');
+
 // ── verify_identity_binding (strict, no fail-open) ──────────────────────────
 
 class IdentityBindingTest : public ::testing::Test {
@@ -76,7 +79,10 @@ protected:
         s = std::make_unique<storage::FileStorageService>(dir); s->start();
         g = std::make_unique<gossip::GossipService>(io, 0, *s, *c);
         root = c->ed25519_keygen();
-        if (with_root) g->set_root_pubkey(root.public_key);
+        if (with_root) {
+            g->set_root_pubkey(root.public_key);
+            g->set_network_id(kTestNetworkHex);
+        }
     }
     void TearDown() override {
         if (g) g->stop(); if (s) s->stop(); if (c) c->stop();
@@ -84,6 +90,7 @@ protected:
     }
     gossip::ServerCertificate signed_cert() {
         gossip::ServerCertificate cert;
+        cert.network_id = kTestNetworkHex;
         cert.server_id = "infer-x";
         cert.server_pubkey = crypto::to_base64(c->ed25519_keygen().public_key);
         cert.wg_pubkey = crypto::to_base64(c->x25519_keygen().public_key);

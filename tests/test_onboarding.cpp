@@ -46,6 +46,9 @@ struct GossipBallotTestAccess {
 
 namespace {
 
+// Certificates bind to a network id; one value serves every fixture.
+inline const std::string kTestNetworkHex(64, 'a');
+
 crypto::Ed25519Keypair make_key(crypto::SodiumCryptoService& c) {
     return c.ed25519_keygen();
 }
@@ -102,6 +105,7 @@ TEST(Onboarding, CertificateIssueAndVerify) {
     auto cand = make_key(c);
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     p.server_id = "berlin-2";
 
@@ -134,6 +138,7 @@ TEST(Onboarding, CertificateTierCapability) {
     auto root = make_key(c);
     auto cand = make_key(c);
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     p.server_id = "tpm-node";
     p.tpm_ak_pubkey = "QUstUElOTkVE";  // non-empty → Tier1-capable
@@ -152,6 +157,7 @@ TEST(Onboarding, CertificatePlatformPolicyIsSigned) {
     auto cand = make_key(c);
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     p.server_id            = "snp-node";
     p.tpm_ak_pubkey        = "QUstUElOTkVE";
@@ -470,8 +476,10 @@ protected:
         config.onboard_enabled = true;
 
         gossip_svc = std::make_unique<gossip::GossipService>(io, 0, *storage_svc, *crypto_svc);
+        gossip_svc->set_network_id(kTestNetworkHex);
         admission  = std::make_unique<core::ServerAdmissionService>(
             config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
+        admission->set_network_id(kTestNetworkHex);
         admission->start();  // on_start() computes is_root_key_holder_
     }
 
@@ -480,6 +488,7 @@ protected:
         admission->stop();
         admission = std::make_unique<core::ServerAdmissionService>(
             config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
+        admission->set_network_id(kTestNetworkHex);
         admission->start();
     }
 
@@ -1109,6 +1118,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     auto other = c.ed25519_keygen();
     auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
     gossip::CertIssueParams cp;
+    cp.network_id = kTestNetworkHex;
     cp.server_pubkey_b64 = other_b64;
     cp.server_id         = "berlin-2";
     nlohmann::json cert  = gossip::issue_server_certificate(cp, c, root.private_key,
@@ -1122,7 +1132,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     ASSERT_TRUE(s.write_file("identity", "peers.json", env));
 
     gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
+    gossip.set_root_pubkey(root.public_key); gossip.set_network_id(kTestNetworkHex);
     gossip.start();  // load_peers() pulls in the seeded certified peer
 
     core::ServerConfig config;
@@ -1130,6 +1140,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
     config.onboard_enabled = true;
     core::ServerAdmissionService admission{config, c, kw, s, gossip};
+    admission.set_network_id(kTestNetworkHex);
     admission.start();
 
     auto cand     = c.ed25519_keygen();
@@ -1200,6 +1211,7 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
         boot.stop();
     }
     gossip::CertIssueParams cp;
+    cp.network_id = kTestNetworkHex;
     cp.server_pubkey_b64 = self_b64;
     cp.server_id         = "rootsrv";
     auto self_cert = gossip::issue_server_certificate(cp, c, root.private_key,
@@ -1210,7 +1222,7 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
     ASSERT_TRUE(s.write_file("identity", "server_cert.json", cert_env));
 
     gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
+    gossip.set_root_pubkey(root.public_key); gossip.set_network_id(kTestNetworkHex);
     gossip.start();
     ASSERT_TRUE(gossip.our_server_id().has_value());
 
@@ -1219,6 +1231,7 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
     config.onboard_enabled = true;
     core::ServerAdmissionService admission{config, c, kw, s, gossip};
+    admission.set_network_id(kTestNetworkHex);
     admission.start();
 
     auto cand     = c.ed25519_keygen();
@@ -1272,7 +1285,7 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
     auto root = kw.generate_and_store_identity({});
 
     gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
+    gossip.set_root_pubkey(root.public_key); gossip.set_network_id(kTestNetworkHex);
     gossip.start();
 
     core::ServerConfig config;
@@ -1280,6 +1293,7 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
     config.onboard_enabled = true;
     core::ServerAdmissionService admission{config, c, kw, s, gossip};
+    admission.set_network_id(kTestNetworkHex);
     admission.start();
 
     auto cand     = c.ed25519_keygen();
@@ -1305,6 +1319,7 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
     auto old_holder = c.ed25519_keygen();
     auto old_b64 = b64({old_holder.public_key.begin(), old_holder.public_key.end()});
     gossip::CertIssueParams cp;
+    cp.network_id = kTestNetworkHex;
     cp.server_pubkey_b64 = old_b64;
     cp.server_id         = "berlin-2";
     nlohmann::json old_cert = gossip::issue_server_certificate(cp, c, root.private_key,

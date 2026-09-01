@@ -61,6 +61,9 @@ struct GossipBallotTestAccess {
 
 namespace {
 
+// Certificates bind to a network id; one value serves every fixture.
+inline const std::string kTestNetworkHex(64, 'a');
+
 // The retired wire range. Reserved forever; a packet of any of these types
 // must die in the dispatcher, never reach a handler.
 constexpr uint8_t kRetiredFirst = 0x07;
@@ -341,6 +344,7 @@ TEST_F(LegacyRemovalTest, RetiredTypeFromCertifiedPeerIsEquallyDead) {
     auto root_kp = b.crypto->ed25519_keygen();
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b.pubkey_b64();
     p.server_id         = "peer-b";
     const auto cert_json = nlohmann::json(
@@ -353,7 +357,7 @@ TEST_F(LegacyRemovalTest, RetiredTypeFromCertifiedPeerIsEquallyDead) {
             seed_peers(*n.storage, nlohmann::json::array(
                 {peer_entry(b.pubkey_b64(), b.endpoint(), cert_json)}));
         },
-        [&](gossip::GossipService& g) { g.set_root_pubkey(root_kp.public_key); });
+        [&](gossip::GossipService& g) { g.set_root_pubkey(root_kp.public_key); g.set_network_id(kTestNetworkHex); });
 
     // The payload is a delta the control below PROVES this certified sender
     // can apply; under the retired types it must change nothing. If a
@@ -388,6 +392,7 @@ TEST_F(LegacyRemovalTest, StateMutatingSyncRequiresRootSignedCertificate) {
     auto root_kp = b.crypto->ed25519_keygen();
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b.pubkey_b64();
     p.server_id         = "peer-b";
     const auto cert_json = nlohmann::json(
@@ -400,7 +405,7 @@ TEST_F(LegacyRemovalTest, StateMutatingSyncRequiresRootSignedCertificate) {
             seed_peers(*n.storage, nlohmann::json::array(
                 {peer_entry(b.pubkey_b64(), b.endpoint(), cert_json)}));
         },
-        [&](gossip::GossipService& g) { g.set_root_pubkey(root_kp.public_key); });
+        [&](gossip::GossipService& g) { g.set_root_pubkey(root_kp.public_key); g.set_network_id(kTestNetworkHex); });
 
     // A known peer WITHOUT a certificate: peer-list membership is not trust.
     auto unenrolled = b.crypto->ed25519_keygen();
@@ -437,6 +442,7 @@ TEST_F(LegacyRemovalTest, RetiredTypesDoNotTouchSecurityState) {
     auto root_kp = b.crypto->ed25519_keygen();
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b.pubkey_b64();
     p.server_id         = "peer-b";
     const auto cert_json = nlohmann::json(
@@ -445,7 +451,7 @@ TEST_F(LegacyRemovalTest, RetiredTypesDoNotTouchSecurityState) {
 
     auto& a = make_node("a", /*with_sink=*/false, /*seed=*/{},
                         [&](gossip::GossipService& g) {
-                            g.set_root_pubkey(root_kp.public_key);
+                            g.set_root_pubkey(root_kp.public_key); g.set_network_id(kTestNetworkHex);
                         });
     peer_all();
     make_mesh(a, a.pubkey());  // A's own identity is the pinned anchor
@@ -499,6 +505,7 @@ TEST_F(LegacyRemovalTest, NsSlotClaimRequiresCertifiedClaimant) {
     auto root_kp = b.crypto->ed25519_keygen();
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b.pubkey_b64();
     p.server_id         = "peer-b";
     const auto cert_json = nlohmann::json(
@@ -511,7 +518,7 @@ TEST_F(LegacyRemovalTest, NsSlotClaimRequiresCertifiedClaimant) {
             seed_peers(*n.storage, nlohmann::json::array(
                 {peer_entry(b.pubkey_b64(), b.endpoint(), cert_json)}));
         },
-        [&](gossip::GossipService& g) { g.set_root_pubkey(root_kp.public_key); });
+        [&](gossip::GossipService& g) { g.set_root_pubkey(root_kp.public_key); g.set_network_id(kTestNetworkHex); });
 
     // A claim exactly as try_claim_ns_slot signs one: canonical JSON of the
     // claim fields, signed by the claimant, msgpack on the wire.
