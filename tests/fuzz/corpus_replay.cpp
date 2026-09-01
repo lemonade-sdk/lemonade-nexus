@@ -145,6 +145,104 @@ std::vector<std::vector<uint8_t>> eligibility_corpus(Rng& rng) {
     return corpus;
 }
 
+/// A genuinely signed three-chain proof around one plan, so the mutations land
+/// inside the commit-proof verifier rather than bouncing off the codec.
+std::vector<std::vector<uint8_t>> adoption_corpus(Rng& rng) {
+    std::vector<std::vector<uint8_t>> corpus;
+    const auto& keys = nexus_fuzz::fuzz_vote_keys();
+    const auto& context = nexus_fuzz::fuzz_fact_context();
+
+    nexus::security::NextEpochPlan plan;
+    plan.network_id = nexus_fuzz::fuzz_network();
+    plan.current_epoch = 7;
+    plan.next_epoch = 8;
+    plan.attempt = 0;
+    plan.checkpoint_height = 3;
+    plan.checkpoint_state_root.fill(0xC7);
+    plan.eligibility_commitment.fill(0xE1);
+    plan.selection_seed.fill(0x51);
+    for (const auto& [node, key] : keys) {
+        plan.selected.push_back(node);
+        plan.incarnations[node] = 1;
+    }
+    plan.security_ruleset = constants::kSecurityRulesetVersion;
+    plan.consensus_ruleset = constants::kConsensusRulesetVersion;
+    plan.profile_id = nexus::security::kTier1AttestationProfileId;
+    plan.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
+    const auto plan_digest = nexus::security::next_epoch_plan_digest(plan);
+
+    // Three chained blocks with real quorum certificates over each.
+    nexus::security::CommitProof proof;
+    nexus::security::Digest parent{};
+    parent.fill(0x00);
+    nexus::security::QuorumCertificate justify{};
+    justify.qc_format_version = constants::kQcFormatVersion;
+    justify.consensus_ruleset = constants::kConsensusRulesetVersion;
+    justify.network_id = plan.network_id;
+    justify.epoch = 7;
+    for (uint8_t i = 0; i < 3; ++i) {
+        nexus::security::Proposal proposal{};
+        proposal.security_ruleset = constants::kSecurityRulesetVersion;
+        proposal.consensus_ruleset = constants::kConsensusRulesetVersion;
+        proposal.network_id = plan.network_id;
+        proposal.epoch = 7;
+        proposal.height = 10 + i;
+        proposal.view = 10 + i;
+        proposal.leader = keys.begin()->first;
+        proposal.parent_digest = parent;
+        proposal.justify_qc_digest.fill(static_cast<uint8_t>(0x10 + i));
+        proposal.previous_state_root.fill(static_cast<uint8_t>(0x20 + i));
+        proposal.proposed_state_root.fill(static_cast<uint8_t>(0x21 + i));
+        proposal.transitions_digest = i == 0 ? plan_digest : nexus::security::Digest{};
+        proof.chain.push_back({proposal, justify});
+
+        const auto digest = nexus::security::proposal_digest(proposal);
+        nexus::security::QuorumCertificate qc{};
+        qc.qc_format_version = constants::kQcFormatVersion;
+        qc.consensus_ruleset = constants::kConsensusRulesetVersion;
+        qc.network_id = plan.network_id;
+        qc.epoch = 7;
+        qc.height = proposal.height;
+        qc.view = proposal.view;
+        qc.proposal_digest = digest;
+        for (const auto& [node, key] : keys) {
+            nexus::security::Vote vote{};
+            vote.consensus_ruleset = constants::kConsensusRulesetVersion;
+            vote.network_id = plan.network_id;
+            vote.epoch = 7;
+            vote.height = proposal.height;
+            vote.view = proposal.view;
+            vote.proposal_digest = digest;
+            vote.voter = node;
+            const auto signing = nexus::security::vote_signing_digest(vote);
+            crypto_sign_detached(vote.signature.data(), nullptr, signing.data(),
+                                 signing.size(), key.private_key.data());
+            qc.signers.push_back({node, vote.signature});
+        }
+        parent = digest;
+        justify = qc;
+    }
+    proof.certifying = justify;
+
+    nexus::security::NextEpochPlanProof package;
+    package.plan = plan;
+    package.proof = proof;
+    for (const auto& [node, key] : keys) {
+        package.current_vote_keys.emplace_back(node, key.public_key);
+    }
+
+    nexus::security::SecurityMessage envelope;
+    envelope.kind = nexus::security::SecurityMessageKind::NextEpochPlanProof;
+    envelope.security_ruleset = constants::kSecurityRulesetVersion;
+    envelope.consensus_ruleset = constants::kConsensusRulesetVersion;
+    envelope.network_id = plan.network_id;
+    envelope.epoch = 7;
+    envelope.sender = keys.begin()->first;
+    envelope.body = package;
+    mutate_into(corpus, nexus::security::encode_security_message(envelope), rng);
+    return corpus;
+}
+
 /// A valid message with one byte corrupted is the input most likely to reach
 /// deep parser state, so the corpus carries those too.
 std::vector<std::vector<uint8_t>> near_miss_corpus(Rng& rng) {
@@ -188,6 +286,7 @@ TEST(FuzzCorpus, EveryTargetSurvivesTheCorpus) {
     for (auto& input : random_corpus(rng, 256)) corpus.push_back(std::move(input));
     for (auto& input : near_miss_corpus(rng)) corpus.push_back(std::move(input));
     for (auto& input : eligibility_corpus(rng)) corpus.push_back(std::move(input));
+    for (auto& input : adoption_corpus(rng)) corpus.push_back(std::move(input));
 
     for (const auto& target : nexus_fuzz::kTargets) {
         for (const auto& input : corpus) {

@@ -13,7 +13,10 @@
 // stay compiled and exercised on every build rather than rotting until someone
 // remembers to run a fuzzer.
 
+#include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
+#include <LemonadeNexus/Security/Consensus/VoteKey.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityLedger.hpp>
+#include <LemonadeNexus/Security/Epoch/NextEpochPlan.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Eligibility/ParticipationProof.hpp>
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
@@ -232,6 +235,78 @@ inline void fuzz_participation_response(Bytes input) {
     }
 }
 
+/// Five deterministic epoch vote keys, so fuzzed certificates can carry real
+/// signatures and the verifiers run their full depth.
+inline const std::map<nexus::security::NodeId, nexus::security::EpochVoteKey>&
+fuzz_vote_keys() {
+    static const auto keys = [] {
+        std::map<nexus::security::NodeId, nexus::security::EpochVoteKey> out;
+        for (uint8_t i = 1; i <= 5; ++i) {
+            nexus::security::NodeId id;
+            id.bytes.fill(i);
+            out[id] = nexus::security::make_epoch_vote_key(7, id);
+        }
+        return out;
+    }();
+    return keys;
+}
+
+inline const std::map<nexus::security::NodeId, nexus::crypto::Ed25519PublicKey>&
+fuzz_vote_pubs() {
+    static const auto pubs = [] {
+        std::map<nexus::security::NodeId, nexus::crypto::Ed25519PublicKey> out;
+        for (const auto& [node, key] : fuzz_vote_keys()) {
+            out[node] = key.public_key;
+        }
+        return out;
+    }();
+    return pubs;
+}
+
+/// The adoption records and their commit-proof verification, from hostile
+/// bytes. Nothing here can create authority: the verifiers return verdicts
+/// the fuzzer discards, and every refused input must simply return.
+inline void fuzz_adoption_proof(Bytes input) {
+    const auto decoded = nexus::security::decode_security_message(input);
+    if (!std::holds_alternative<nexus::security::SecurityMessage>(decoded)) {
+        return;
+    }
+    const auto& message = std::get<nexus::security::SecurityMessage>(decoded);
+    const nexus::security::QcValidationContext context{
+        nexus::security::constants::kConsensusRulesetVersion, fuzz_network(), 7,
+        nexus::security::constants::consensus_quorum(5)};
+
+    if (const auto* plan = std::get_if<nexus::security::NextEpochPlanProof>(&message.body)) {
+        const auto digest = nexus::security::next_epoch_plan_digest(plan->plan);
+        (void)nexus::security::verify_commit_proof(digest, plan->proof, context,
+                                                   fuzz_vote_pubs());
+        std::map<nexus::security::NodeId, nexus::crypto::Ed25519PublicKey> keys;
+        for (const auto& [node, key] : plan->current_vote_keys) {
+            keys[node] = key;
+        }
+        (void)nexus::security::vote_key_set_digest(keys);
+    }
+    if (const auto* ready =
+            std::get_if<nexus::security::CandidateStateReadyMsg>(&message.body)) {
+        (void)nexus::security::candidate_state_ready_digest(*ready);
+        (void)nexus::security::validate_quorum_certificate(ready->verified_qc, context,
+                                                           fuzz_vote_pubs());
+    }
+    if (const auto* readiness =
+            std::get_if<nexus::security::ReadinessProofMsg>(&message.body)) {
+        const auto digest =
+            nexus::security::candidate_readiness_digest(readiness->readiness);
+        (void)nexus::security::verify_commit_proof(digest, readiness->proof, context,
+                                                   fuzz_vote_pubs());
+    }
+    if (const auto* handoff =
+            std::get_if<nexus::security::EpochHandoffProofMsg>(&message.body)) {
+        const auto digest = nexus::security::epoch_handoff_digest(handoff->handoff);
+        (void)nexus::security::verify_commit_proof(digest, handoff->proof, context,
+                                                   fuzz_vote_pubs());
+    }
+}
+
 struct Target {
     const char* name;
     void (*run)(Bytes);
@@ -249,6 +324,7 @@ inline constexpr Target kTargets[] = {
     {"platform_evidence_json", &fuzz_platform_evidence_json},
     {"eligibility_observation", &fuzz_eligibility_observation},
     {"participation_response", &fuzz_participation_response},
+    {"adoption_proof", &fuzz_adoption_proof},
 };
 
 }  // namespace nexus_fuzz

@@ -36,6 +36,7 @@ readonly TARGETS=(
     platform_evidence_json
     eligibility_observation
     participation_response
+    adoption_proof
 )
 
 if ! [[ "${SECONDS_PER_TARGET}" =~ ^[0-9]+$ ]]; then

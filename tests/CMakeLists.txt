@@ -135,7 +135,8 @@ add_nexus_test(test_security_eligibility
 # threshold.
 add_nexus_test(test_security_scale
     security/simulation/scale.cpp
-    security/simulation/eligibility_scale.cpp)
+    security/simulation/eligibility_scale.cpp
+    security/simulation/adoption_scale.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
     security/attestation/verifier.cpp
@@ -177,7 +178,7 @@ if(NEXUS_BUILD_FUZZERS)
     set(NEXUS_FUZZ_TARGETS
         security_envelope snp_report hcl_blob tpm_quote tpmt_signature
         ima_log amd_crl amd_certificate platform_evidence_json
-        eligibility_observation participation_response)
+        eligibility_observation participation_response adoption_proof)
     foreach(target ${NEXUS_FUZZ_TARGETS})
         add_executable(fuzz_${target} fuzz/libfuzzer_main.cpp)
         target_link_libraries(fuzz_${target} PRIVATE LemonadeNexus)
