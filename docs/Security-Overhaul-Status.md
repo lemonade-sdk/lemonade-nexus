@@ -768,3 +768,58 @@ the deterministic corpus runs.
 5 to 31, the witness bar for each kind of subject, whether each fact still forms
 with one, `f` and `f + 1` members offline, and what expiry, participation loss,
 candidate restart and a proved fault do to it. Assertions are invariants only.
+
+
+## M11 — Tier 2 role adoption
+
+The final gap is closed: a selected Tier 2 node can take up its next-epoch
+role, with no authority before the finalized handoff.
+
+### The boundary pipeline
+
+One epoch boundary now finalizes four records in order, each a pure function
+of finalized inputs, each committed as a HotStuff transitions digest through
+the existing model:
+
+```
+eligibility state  ->  NextEpochPlan  ->  CandidateReadiness  ->  EpochHandoff
+```
+
+A replica votes only for the stage it independently derived. An unknown
+transition now WITHHOLDS the vote and tracks the block — rejecting it
+partitioned a diverging replica permanently, which one DKG failure turned
+into a liveness collapse.
+
+### The newcomer ladder
+
+CommitProof makes a commit portable: the three-chain plus the certificate
+over the grandchild, verifiable by anyone holding the frozen membership and
+vote keys. A candidate anchors at the bootstrap certificate (which now
+commits the founders' vote-key set digest), verifies the plan proof, enters
+PendingNextEpoch, syncs to the plan checkpoint through the ordinary sync
+path (requests are idempotent and retried), presents its verified QC as the
+state-possession statement, creates its vote key only after sync, attests
+fresh, appears in the finalized readiness set, joins the DKG under the
+readiness session binding, and activates only on the verified handoff proof.
+Participants broadcast signed transcript attests so a current member outside
+the ceremony adopts the outcome the whole ceremony signed.
+
+### Certificates bind to the network
+
+ServerCertificate.network_id is inside the canonical signed form. Validation
+never fails open; same root + wrong network fails; an edited field breaks
+the root signature; issuance refuses without a network id everywhere.
+
+### Known gaps
+
+- A candidate anchors only at the bootstrap certificate, so adoption is
+  verifiable from epoch 1. Walking later epochs needs the handoff-chain
+  anchor (each handoff commits the next vote-key set; the verification code
+  exists) — wiring that walk is follow-up work.
+- The final attestation binds network, node, incarnation, target epoch,
+  rulesets and profile in the challenge; the plan digest is bound at the
+  readiness stage rather than inside the attestation challenge itself.
+- The live driver mesh exercises the full ladder at N = 5 with reserves;
+  the cross-population table exercises the real records and verifiers at
+  every N but not the full driver.
+- Real libFuzzer runs still need the Linux container (no local daemon).
