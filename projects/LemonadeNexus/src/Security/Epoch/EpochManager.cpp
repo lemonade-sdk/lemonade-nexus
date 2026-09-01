@@ -60,14 +60,65 @@ bool EpochManager::prepare_next_epoch(const Tier1Set& frozen_eligible,
 }
 
 std::vector<NodeId> EpochManager::preview_selection(const Tier1Set& frozen_eligible,
-                                                    std::size_t admitted_server_count) const {
+                                                    std::size_t admitted_server_count,
+                                                    const std::set<NodeId>& excluded) const {
     const auto outcome = tier1_target_outcome(admitted_server_count, frozen_eligible.size());
     if (outcome.active_target < constants::kMinActiveTier1) {
         return {};
     }
     const auto ranked = Tier1Selector::rank(frozen_eligible, current_.authority_public_key,
                                             current_.id + 1);
-    return {ranked.begin(), ranked.begin() + static_cast<std::ptrdiff_t>(outcome.active_target)};
+    std::vector<NodeId> selected;
+    for (const auto& node : ranked) {
+        if (selected.size() == outcome.active_target) {
+            break;
+        }
+        if (!excluded.contains(node)) {
+            selected.push_back(node);
+        }
+    }
+    // A pool that cannot fill the target after exclusions selects nothing:
+    // the epoch holds rather than shrinking below its own plan.
+    if (selected.size() < constants::kMinActiveTier1) {
+        return {};
+    }
+    return selected;
+}
+
+bool EpochManager::prepare_planned_epoch(const Tier1Set& frozen_eligible,
+                                         const std::vector<NodeId>& planned) {
+    if (transition_active() || planned.size() < constants::kMinActiveTier1) {
+        return false;
+    }
+    for (const auto& node : planned) {
+        if (!frozen_eligible.contains(node)) {
+            return false;
+        }
+    }
+    auto selected_set = Tier1Set::from_nodes(planned);
+    if (!selected_set.has_value()) {
+        return false;
+    }
+
+    rank_ = Tier1Selector::rank(frozen_eligible, current_.authority_public_key,
+                                current_.id + 1);
+
+    EpochTransition transition;
+    transition.from_epoch = current_.id;
+    transition.to_epoch = current_.id + 1;
+    transition.phase = EpochTransitionPhase::Attesting;
+    transition.selected_members = planned;
+    transition.participant_set_digest = selected_set->digest();
+    transition.next_consensus_quorum = constants::consensus_quorum(planned.size());
+    transition.next_authority_threshold = constants::authority_threshold(planned.size());
+
+    transition_ = std::move(transition);
+    removed_candidates_.clear();
+    final_verdicts_.clear();
+    next_vote_keys_.clear();
+    authorized_ = false;
+    authorization_certificate_digest_ = Digest{};
+    return true;
 }
 
 void EpochManager::drop_participant_state(const NodeId& node) {

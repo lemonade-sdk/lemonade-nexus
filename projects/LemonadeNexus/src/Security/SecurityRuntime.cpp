@@ -161,4 +161,48 @@ bool SecurityRuntime::activate_next_epoch(std::optional<DkgResult> own_dkg,
     return start_consensus(std::move(*own_vote_key), previous_checkpoint);
 }
 
+bool SecurityRuntime::adopt_epoch_from_handoff(const EpochHandoff& handoff,
+                                               std::optional<DkgResult> own_dkg,
+                                               std::optional<EpochVoteKey> own_vote_key,
+                                               const Digest& previous_checkpoint) {
+    if (epochs_.has_value()) {
+        return false;
+    }
+    if (handoff.network_id != config_.network_id ||
+        handoff.security_ruleset != constants::kSecurityRulesetVersion ||
+        handoff.consensus_ruleset != constants::kConsensusRulesetVersion) {
+        return false;
+    }
+    auto members = Tier1Set::from_nodes(handoff.members);
+    if (!members.has_value() || members->size() < constants::kMinActiveTier1 ||
+        !members->contains(config_.self)) {
+        return false;
+    }
+    for (const auto& node : members->members()) {
+        if (!handoff.vote_keys.contains(node)) {
+            return false;
+        }
+    }
+    // The DKG outcome this node produced must be the one the handoff names.
+    // A handoff naming another group key describes an epoch this node cannot
+    // serve, so it is refused rather than partially adopted.
+    if (!own_dkg.has_value() || !own_vote_key.has_value() ||
+        own_dkg->group_public_key != handoff.group_public_key ||
+        own_dkg->transcript_digest != handoff.dkg_transcript_digest) {
+        return false;
+    }
+    if (own_vote_key->public_key != handoff.vote_keys.at(config_.self)) {
+        return false;
+    }
+
+    EpochState next = make_epoch_state(handoff.to_epoch, handoff.network_id, std::move(*members),
+                                       handoff.group_public_key, handoff.attestation_root);
+    epochs_.emplace(std::move(next), handoff.vote_keys);
+    if (!authority_.install_epoch(authority_context(), std::move(*own_dkg))) {
+        epochs_.reset();
+        return false;
+    }
+    return start_consensus(std::move(*own_vote_key), previous_checkpoint);
+}
+
 }  // namespace nexus::security

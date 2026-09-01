@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
 
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>
+#include <LemonadeNexus/Security/Consensus/QuorumValidation.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <sodium.h>
@@ -16,6 +17,7 @@ namespace {
     switch (p) {
         case DriverPhase::Failed:            return "Failed";
         case DriverPhase::Idle:              return "Idle";
+        case DriverPhase::PendingNextEpoch:  return "PendingNextEpoch";
         case DriverPhase::GenesisCollecting: return "GenesisCollecting";
         case DriverPhase::GenesisEligibility: return "GenesisEligibility";
         case DriverPhase::FoundingDkg:       return "FoundingDkg";
@@ -490,6 +492,12 @@ void SecurityDriver::on_dkg_complete(EpochId target) {
                   "DKG transcript attested; awaiting the bootstrap certificate");
         return;
     }
+    if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value() &&
+        target == adoption_->plan.next_epoch) {
+        // The share is prepared material and nothing more: it becomes usable
+        // only at the finalized handoff.
+        return;
+    }
     EpochManager* epochs = runtime_.epochs();
     if (epochs != nullptr && epochs->transition() != nullptr &&
         target == epochs->transition()->to_epoch) {
@@ -510,14 +518,23 @@ void SecurityDriver::on_dkg_failed(DkgFailure, std::optional<NodeId> culprit) {
         set_phase(DriverPhase::Idle, "founding DKG failed; awaiting a fresh round");
         return;
     }
+    // A candidate's session failing resets it to pending; a fresh plan
+    // renames or replaces it.
+    if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value()) {
+        adoption_->dkg_authorized = false;
+        pending_dkg_.reset();
+        return;
+    }
     EpochManager* epochs = runtime_.epochs();
     if (epochs != nullptr && epochs->transition() != nullptr) {
+        // The selected set is a finalized plan now, so membership cannot change
+        // under it. A failed participant means a NEW plan — next attempt, next
+        // hash-ranked replacement, fresh DKG. Nothing of this attempt survives.
         if (culprit.has_value()) {
-            (void)epochs->replace_participant(*culprit, EpochTransitionFailure::DkgFailed);
-        } else {
-            epochs->abort_transition(EpochTransitionFailure::DkgFailed);
+            boundary_failed_.insert(*culprit);
         }
         pending_dkg_.reset();
+        abandon_boundary("DKG failed; a new plan replaces the attempt");
     }
 }
 
@@ -552,6 +569,13 @@ void SecurityDriver::on_dkg_transcript_attest(const DkgTranscriptAttest& attest)
 
 void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certificate,
                                               const NodeId& from) {
+    // Every node keeps the verified certificate as its trust anchor: the
+    // pinned genesis signature is what a later candidate verifies a supplied
+    // membership listing against. Storing it grants nothing.
+    if (!anchor_.has_value() &&
+        verify_bootstrap_certificate(certificate, config_.genesis_public_key)) {
+        anchor_ = certificate;
+    }
     if (from != genesis_id() || phase_ != DriverPhase::AwaitingBootstrap ||
         !founding_.has_value() || !pending_dkg_.has_value() || runtime_.epochs() != nullptr) {
         return;
@@ -602,6 +626,14 @@ std::optional<crypto::Ed25519PublicKey> SecurityDriver::vote_key_for_epoch(Epoch
     if (known != vote_pubs_mine_.end()) {
         return known->second;
     }
+    // A candidate creates its next-epoch key only after the plan is verified
+    // and the security state is synchronized. Before that there is nothing to
+    // register a key against, and answering a final-attest challenge early
+    // would bind a key to a preparation that was never authorized.
+    if (adoption_.has_value() && epoch == adoption_->plan.next_epoch &&
+        !adoption_->state_synced) {
+        return std::nullopt;
+    }
     EpochVoteKey key = make_epoch_vote_key(epoch, config_.self);
     vote_pubs_mine_[epoch] = key.public_key;
     (void)store_.store_vote_key(key);
@@ -612,6 +644,12 @@ std::optional<crypto::Ed25519PublicKey> SecurityDriver::vote_key_for_epoch(Epoch
 EpochVoteKey SecurityDriver::take_own_vote_key(EpochId epoch) {
     (void)vote_key_for_epoch(epoch);
     auto it = vote_keys_mine_.find(epoch);
+    if (it == vote_keys_mine_.end()) {
+        // The public half exists but the private half was already consumed, or
+        // creation was refused. An empty key fails every later check closed
+        // instead of erasing through an end iterator.
+        return EpochVoteKey{};
+    }
     EpochVoteKey key = std::move(it->second);
     vote_keys_mine_.erase(it);
     return key;
@@ -663,6 +701,7 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
     if (transition != nullptr && verdict.epoch == transition->to_epoch) {
         (void)epochs->record_final_attestation(verdict);
         if (verdict.passed) {
+            final_verdict_ms_[verdict.node_id] = now_ms_;
             (void)epochs->record_vote_key(verdict.node_id, evidence.epoch_vote_key);
         }
         maybe_start_next_dkg();
@@ -703,35 +742,9 @@ void SecurityDriver::run_epoch_cadence(uint64_t now_ms) {
         }
     }
 
-    if (!epoch_aged(now_ms)) {
-        return;
-    }
-    if (epochs->transition() == nullptr ||
-        epochs->transition()->phase == EpochTransitionPhase::Aborted) {
-        // The pool comes from the eligibility state a quorum finalized, never
-        // from what this node happens to hold. Until that commitment commits
-        // there is no pool, and selection simply waits.
-        const auto pool = eligibility_.frozen_pool(current.id + 1);
-        if (!pool.has_value() || !epochs->prepare_next_epoch(*pool, pool->size())) {
-            return;
-        }
-        const EpochId target = epochs->transition()->to_epoch;
-        for (const auto& member : epochs->transition()->selected_members) {
-            if (member == config_.self) {
-                attest_self_for(target);
-                continue;
-            }
-            crypto::Ed25519PublicKey member_key{};
-            member_key = member.bytes;
-            auto challenge =
-                runtime_.attestation().create_challenge(member, member_key, 1, target);
-            if (challenge.has_value()) {
-                (void)router_.send(member,
-                                   router_.compose(SecurityMessageKind::AttestationChallenge,
-                                                   *challenge, target));
-            }
-        }
-    }
+    // Selection now waits on two commitments in order: the finalized
+    // eligibility state, then the finalized plan derived from it. Both travel
+    // through maybe_propose; nothing here prepares anything locally.
 }
 
 void SecurityDriver::attest_self_for(EpochId epoch) {
@@ -751,21 +764,26 @@ void SecurityDriver::maybe_start_next_dkg() {
         runtime_.authority().dkg() != nullptr || pending_dkg_.has_value()) {
         return;
     }
+    // No readiness commit, no DKG. Current HotStuff authorizes the session;
+    // one member deciding a candidate is ready authorizes nothing.
+    if (!readiness_.has_value() || !plan_.has_value()) {
+        return;
+    }
     auto set = Tier1Set::from_nodes(transition->selected_members);
     if (!set.has_value()) {
         return;
-    }
-    std::map<NodeId, IncarnationId> incarnations;
-    for (const auto& node : transition->selected_members) {
-        incarnations[node] = 1;
     }
     DkgConfiguration dkg;
     dkg.network_id = epochs->current().network_id;
     dkg.target_epoch = transition->to_epoch;
     dkg.participants = std::move(*set);
-    dkg.incarnations = std::move(incarnations);
+    dkg.incarnations = plan_->incarnations;
     dkg.threshold = transition->next_authority_threshold;
     dkg.self = config_.self;
+    // The binding folds plan, attempt, selected set and registered keys into
+    // every message: a replay from a failed attempt names a session nobody
+    // is running.
+    dkg.session_binding = candidate_readiness_digest(*readiness_);
     auto broadcast = runtime_.authority().start_dkg(std::move(dkg));
     if (broadcast.has_value()) {
         (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *broadcast,
@@ -884,18 +902,141 @@ void SecurityDriver::drain_objective_faults() {
 void SecurityDriver::on_timeout_certificate(const TimeoutCertificate&) { progress(now_ms_); }
 
 Digest SecurityDriver::pending_handoff_digest() const {
+    const auto handoff = derive_handoff();
+    return handoff.has_value() ? epoch_handoff_digest(*handoff) : Digest{};
+}
+
+std::optional<NextEpochPlan> SecurityDriver::derive_plan() const {
     const EpochManager* epochs = runtime_.epochs();
-    if (epochs == nullptr || epochs->transition() == nullptr ||
+    const auto* finalized = eligibility_.finalized();
+    if (epochs == nullptr || finalized == nullptr) {
+        return std::nullopt;
+    }
+    const auto pool = eligibility_.frozen_pool(finalized->next_epoch);
+    if (!pool.has_value()) {
+        return std::nullopt;
+    }
+    const auto selected =
+        epochs->preview_selection(*pool, pool->size(), boundary_failed_);
+    if (selected.empty()) {
+        return std::nullopt;
+    }
+    NextEpochPlan plan;
+    plan.network_id = epochs->current().network_id;
+    plan.current_epoch = epochs->current().id;
+    plan.next_epoch = finalized->next_epoch;
+    plan.attempt = plans_committed_;
+    plan.checkpoint_height = finalized->height;
+    plan.checkpoint_state_root = finalized->state_root;
+    plan.eligibility_commitment = finalized->commitment;
+    plan.selection_seed = epochs->current().authority_public_key;
+    plan.selected = selected;
+    for (const auto& node : selected) {
+        plan.incarnations[node] = 1;
+    }
+    plan.security_ruleset = constants::kSecurityRulesetVersion;
+    plan.consensus_ruleset = constants::kConsensusRulesetVersion;
+    plan.profile_id = kTier1AttestationProfileId;
+    plan.profile_ruleset = kAttestationProfileRulesetVersion;
+    return plan;
+}
+
+std::optional<CandidateReadiness> SecurityDriver::derive_readiness() const {
+    const EpochManager* epochs = runtime_.epochs();
+    if (epochs == nullptr || !plan_.has_value() || epochs->transition() == nullptr ||
+        epochs->transition()->phase != EpochTransitionPhase::GeneratingAuthorityKey) {
+        return std::nullopt;
+    }
+    CandidateReadiness readiness;
+    readiness.network_id = plan_->network_id;
+    readiness.plan_digest = next_epoch_plan_digest(*plan_);
+    readiness.next_epoch = plan_->next_epoch;
+    const auto& verdicts = epochs->final_verdicts();
+    const auto& keys = epochs->next_vote_keys();
+    for (const auto& node : epochs->transition()->selected_members) {
+        const auto verdict = verdicts.find(node);
+        const auto key = keys.find(node);
+        if (verdict == verdicts.end() || !verdict->second.passed || key == keys.end()) {
+            return std::nullopt;
+        }
+        // Readiness rests on a FRESH final attestation. A verdict past the
+        // compiled age names a platform state nobody has seen recently, so the
+        // set is not proposable until re-attestation renews it.
+        const auto seen = final_verdict_ms_.find(node);
+        if (seen == final_verdict_ms_.end() ||
+            now_ms_ - seen->second > constants::kFinalAttestMaxAgeSeconds * 1000) {
+            return std::nullopt;
+        }
+        // A selected node from outside the current epoch must have proved it
+        // acquired current certified state; a current member proves the same
+        // fact continuously by voting.
+        if (!epochs->current().tier1_members.contains(node) && node != config_.self &&
+            !state_ready_.contains(node)) {
+            return std::nullopt;
+        }
+        const auto incarnation = plan_->incarnations.find(node);
+        if (incarnation == plan_->incarnations.end()) {
+            // A selected node the plan does not name: the transition diverged
+            // from its plan, so nothing here is proposable.
+            return std::nullopt;
+        }
+        readiness.entries.push_back({node, incarnation->second,
+                                     verdict->second.evidence_digest, key->second});
+    }
+    std::sort(readiness.entries.begin(), readiness.entries.end());
+    return readiness;
+}
+
+std::optional<EpochHandoff> SecurityDriver::derive_handoff() const {
+    const EpochManager* epochs = runtime_.epochs();
+    if (epochs == nullptr || !plan_.has_value() || epochs->transition() == nullptr ||
         epochs->transition()->phase != EpochTransitionPhase::Ready) {
+        return std::nullopt;
+    }
+    const EpochTransition& transition = *epochs->transition();
+    EpochHandoff handoff;
+    handoff.network_id = plan_->network_id;
+    handoff.from_epoch = transition.from_epoch;
+    handoff.to_epoch = transition.to_epoch;
+    handoff.plan_digest = next_epoch_plan_digest(*plan_);
+    handoff.members = transition.selected_members;
+    for (const auto& node : transition.selected_members) {
+        const auto incarnation = plan_->incarnations.find(node);
+        handoff.incarnations[node] =
+            incarnation != plan_->incarnations.end() ? incarnation->second : 1;
+    }
+    handoff.vote_keys = epochs->next_vote_keys();
+    handoff.group_public_key = transition.next_authority_key;
+    handoff.dkg_transcript_digest = transition.dkg_transcript_digest;
+    handoff.key_generation = transition.to_epoch;
+    handoff.attestation_root = transition.attestation_root;
+    handoff.security_ruleset = constants::kSecurityRulesetVersion;
+    handoff.consensus_ruleset = constants::kConsensusRulesetVersion;
+    return handoff;
+}
+
+Digest SecurityDriver::pending_plan_digest() const {
+    const EpochManager* epochs = runtime_.epochs();
+    if (phase_ != DriverPhase::Active || epochs == nullptr || plan_.has_value()) {
         return Digest{};
     }
-    const EpochTransition& t = *epochs->transition();
-    CanonicalEncoder encoder("lemonade-nexus/handoff:v1");
-    encoder.add_u64(t.to_epoch);
-    encoder.add_bytes(t.participant_set_digest);
-    encoder.add_bytes(t.next_authority_key);
-    encoder.add_bytes(t.dkg_transcript_digest);
-    return encoder.digest();
+    if (!epoch_aged(now_ms_)) {
+        return Digest{};
+    }
+    if (epochs->transition() != nullptr &&
+        epochs->transition()->phase != EpochTransitionPhase::Aborted) {
+        return Digest{};
+    }
+    const auto plan = derive_plan();
+    return plan.has_value() ? next_epoch_plan_digest(*plan) : Digest{};
+}
+
+Digest SecurityDriver::pending_readiness_digest() const {
+    if (readiness_.has_value()) {
+        return Digest{};
+    }
+    const auto readiness = derive_readiness();
+    return readiness.has_value() ? candidate_readiness_digest(*readiness) : Digest{};
 }
 
 Digest SecurityDriver::pending_eligibility_digest() const {
@@ -919,12 +1060,15 @@ bool SecurityDriver::accepts_transition(const Digest& transitions_digest) const 
     if (transitions_digest == Digest{}) {
         return true;
     }
-    const Digest handoff = pending_handoff_digest();
-    if (handoff != Digest{} && transitions_digest == handoff) {
-        return true;
+    // One stage is pending at a time; a replica votes only for the stage it
+    // independently arrived at.
+    for (const Digest pending : {pending_handoff_digest(), pending_readiness_digest(),
+                                 pending_plan_digest(), pending_eligibility_digest()}) {
+        if (pending != Digest{} && transitions_digest == pending) {
+            return true;
+        }
     }
-    const Digest eligibility = pending_eligibility_digest();
-    return eligibility != Digest{} && transitions_digest == eligibility;
+    return false;
 }
 
 void SecurityDriver::maybe_propose(View view) {
@@ -933,10 +1077,13 @@ void SecurityDriver::maybe_propose(View view) {
         consensus->current_view() != view || consensus->leader_of(view) != config_.self) {
         return;
     }
-    // A boundary produces two transitions in order: the eligibility state that
-    // decides who may serve, then the handoff that installs them.
-    const Digest handoff = pending_handoff_digest();
-    const Digest transitions = handoff != Digest{} ? handoff : pending_eligibility_digest();
+    // A boundary produces four transitions in order: the eligibility state,
+    // the plan selected from it, the readiness set proved under the plan, and
+    // the handoff that activates. Exactly one is pending at a time.
+    Digest transitions = pending_handoff_digest();
+    if (transitions == Digest{}) transitions = pending_readiness_digest();
+    if (transitions == Digest{}) transitions = pending_plan_digest();
+    if (transitions == Digest{}) transitions = pending_eligibility_digest();
     // The transition is inside the state root, so finalizing the block
     // finalizes the eligibility state it names.
     CanonicalEncoder root("lemonade-nexus/state-root:v1");
@@ -967,9 +1114,9 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
         if (epochs == nullptr) {
             continue;
         }
-        // A committed eligibility commitment is the finalized state. A node
-        // that arrived at different facts recognizes nothing here, so it never
-        // finalizes and never selects — availability, never authority.
+        // A committed stage is finalized state. A node that arrived at
+        // different facts recognizes nothing here, so it never advances and
+        // never selects — availability, never authority.
         const Digest eligibility = pending_eligibility_digest();
         if (eligibility != Digest{} && commit.transitions_digest == eligibility) {
             eligibility_.finalize({.commitment = commit.transitions_digest,
@@ -979,12 +1126,114 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
                                    .next_epoch = epochs->current().id + 1});
             continue;
         }
+        const Digest plan = pending_plan_digest();
+        if (plan != Digest{} && commit.transitions_digest == plan) {
+            on_plan_committed(commit);
+            continue;
+        }
+        const Digest readiness = pending_readiness_digest();
+        if (readiness != Digest{} && commit.transitions_digest == readiness) {
+            on_readiness_committed(commit);
+            continue;
+        }
         const Digest handoff = pending_handoff_digest();
         if (handoff != Digest{} && commit.transitions_digest == handoff) {
+            const auto record = derive_handoff();
             if (epochs->record_handoff_authorization(commit.qc_digest)) {
+                // The newcomers activate from this exact proof; it goes out
+                // before this member's own state moves on.
+                const auto proof = runtime_.consensus() != nullptr
+                                       ? runtime_.consensus()->commit_proof(commit.proposal_digest)
+                                       : std::nullopt;
+                if (record.has_value() && proof.has_value()) {
+                    broadcast_proof(SecurityMessageKind::EpochHandoffProof,
+                                    EpochHandoffProofMsg{*record, *proof},
+                                    epochs->current().id);
+                }
                 do_activate(commit.qc_digest);
             }
         }
+    }
+}
+
+void SecurityDriver::on_plan_committed(const ConsensusCommit& commit) {
+    EpochManager* epochs = runtime_.epochs();
+    auto plan = derive_plan();
+    if (!plan.has_value()) {
+        return;
+    }
+    const auto pool = eligibility_.frozen_pool(plan->next_epoch);
+    if (!pool.has_value() || !epochs->prepare_planned_epoch(*pool, plan->selected)) {
+        return;
+    }
+    plan_ = std::move(plan);
+    ++plans_committed_;
+    state_ready_.clear();
+
+    // The plan travels to the selected candidates with its commit proof, so a
+    // node outside this epoch can verify the finality itself.
+    if (HotStuffService* consensus = runtime_.consensus()) {
+        if (auto proof = consensus->commit_proof(commit.proposal_digest)) {
+            plan_proof_ = *proof;
+            NextEpochPlanProof package;
+            package.plan = *plan_;
+            package.proof = *proof;
+            for (const auto& [node, key] : epochs->current_vote_keys()) {
+                package.current_vote_keys.emplace_back(node, key);
+            }
+            broadcast_proof(SecurityMessageKind::NextEpochPlanProof, package,
+                            epochs->current().id);
+        }
+    }
+
+    // Final-attestation challenges to every selected node, this one included.
+    const EpochId target = plan_->next_epoch;
+    for (const auto& member : plan_->selected) {
+        if (member == config_.self) {
+            attest_self_for(target);
+            continue;
+        }
+        crypto::Ed25519PublicKey member_key{};
+        member_key = member.bytes;
+        auto challenge = runtime_.attestation().create_challenge(member, member_key, 1, target);
+        if (challenge.has_value()) {
+            (void)router_.send(member,
+                               router_.compose(SecurityMessageKind::AttestationChallenge,
+                                               *challenge, target));
+        }
+    }
+}
+
+void SecurityDriver::on_readiness_committed(const ConsensusCommit& commit) {
+    auto readiness = derive_readiness();
+    if (!readiness.has_value()) {
+        return;
+    }
+    readiness_ = std::move(readiness);
+    if (HotStuffService* consensus = runtime_.consensus()) {
+        if (auto proof = consensus->commit_proof(commit.proposal_digest)) {
+            readiness_proof_ = *proof;
+            broadcast_proof(SecurityMessageKind::ReadinessProof,
+                            ReadinessProofMsg{*readiness_, *proof},
+                            runtime_.epochs()->current().id);
+        }
+    }
+    maybe_start_next_dkg();
+}
+
+void SecurityDriver::broadcast_proof(SecurityMessageKind kind, SecurityBody body, EpochId epoch) {
+    (void)router_.broadcast(router_.compose(kind, std::move(body), epoch));
+}
+
+void SecurityDriver::abandon_boundary(const char* reason) {
+    spdlog::info("[security] boundary abandoned: {}", reason);
+    plan_.reset();
+    readiness_.reset();
+    state_ready_.clear();
+    final_verdict_ms_.clear();
+    EpochManager* epochs = runtime_.epochs();
+    if (epochs != nullptr && epochs->transition() != nullptr) {
+        epochs->abort_transition(EpochTransitionFailure::DkgFailed);
     }
 }
 
@@ -1013,6 +1262,12 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     (void)store_.append_authority({to_epoch, epochs->current().authority_public_key,
                                    epochs->current().participant_set_digest, dkg_digest});
     store_.discard_vote_key(old_epoch);
+    plan_.reset();
+    readiness_.reset();
+    state_ready_.clear();
+    boundary_failed_.clear();
+    final_verdict_ms_.clear();
+    plans_committed_ = 0;
     // Observations expire at the boundary: the new epoch's members are the new
     // observers, and continuity has to be re-established under them.
     if (!enter_eligibility_epoch(to_epoch, epochs->current().tier1_members)) {
@@ -1052,6 +1307,285 @@ void SecurityDriver::announce_epoch(const Digest& checkpoint) {
     announcement.handoff_certificate_digest = checkpoint;
     (void)router_.broadcast(router_.compose(SecurityMessageKind::EpochAnnouncement, announcement,
                                             current.id));
+}
+
+// --- Candidate adoption ------------------------------------------------------
+
+bool SecurityDriver::candidate_verify_proof(const Digest& transitions_digest,
+                                            const CommitProof& proof) const {
+    if (!adoption_.has_value()) {
+        return false;
+    }
+    const QcValidationContext context{constants::kConsensusRulesetVersion,
+                                      adoption_->plan.network_id, adoption_->plan.current_epoch,
+                                      constants::consensus_quorum(
+                                          adoption_->current_members.size())};
+    return verify_commit_proof(transitions_digest, proof, context,
+                               adoption_->current_vote_keys) == CommitProofFailure::None;
+}
+
+void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
+    // Members ignore this: their plan came from their own commit. Only a node
+    // with no epoch state adopts, and only into the pending role.
+    if (runtime_.epochs() != nullptr ||
+        (phase_ != DriverPhase::Idle && phase_ != DriverPhase::PendingNextEpoch)) {
+        return;
+    }
+    const NextEpochPlan& plan = package.plan;
+    if (!anchor_.has_value() || plan.current_epoch != anchor_->epoch) {
+        // The anchor names the epoch it can vouch for. Without one — or across
+        // epochs this node has no verified chain to — nothing here is
+        // verifiable, so nothing is adopted.
+        return;
+    }
+    if (plan.network_id != derive_network_id(config_.genesis_public_key,
+                                             constants::kSecurityRulesetVersion,
+                                             constants::kConsensusRulesetVersion)) {
+        return;
+    }
+    if (plan.security_ruleset != constants::kSecurityRulesetVersion ||
+        plan.consensus_ruleset != constants::kConsensusRulesetVersion ||
+        plan.profile_id != kTier1AttestationProfileId ||
+        plan.profile_ruleset != kAttestationProfileRulesetVersion ||
+        plan.next_epoch != plan.current_epoch + 1) {
+        return;
+    }
+    // The plan must name this node at its live incarnation.
+    const auto incarnation = plan.incarnations.find(config_.self);
+    const bool named = std::find(plan.selected.begin(), plan.selected.end(), config_.self) !=
+                       plan.selected.end();
+    if (!named || incarnation == plan.incarnations.end() || incarnation->second != 1) {
+        return;
+    }
+    // A later attempt for the same boundary replaces a held plan; anything
+    // else that differs from the held plan is stale or hostile and ignored.
+    if (adoption_.has_value() && plan.attempt <= adoption_->plan.attempt) {
+        return;
+    }
+
+    // The supplied membership must hash to what the anchor committed — both
+    // the set and the vote keys — before a single certificate is judged.
+    std::vector<NodeId> members;
+    std::map<NodeId, crypto::Ed25519PublicKey> keys;
+    for (const auto& [node, key] : package.current_vote_keys) {
+        members.push_back(node);
+        keys[node] = key;
+    }
+    const auto member_set = Tier1Set::from_nodes(members);
+    if (!member_set.has_value() || member_set->digest() != anchor_->tier1_set_digest ||
+        vote_key_set_digest(keys) != anchor_->vote_key_set_digest) {
+        return;
+    }
+
+    CandidateAdoption adoption;
+    adoption.plan = plan;
+    adoption.plan_digest = next_epoch_plan_digest(plan);
+    adoption.current_members = member_set->members();
+    adoption.current_vote_keys = std::move(keys);
+    const QcValidationContext context{constants::kConsensusRulesetVersion, plan.network_id,
+                                      plan.current_epoch,
+                                      constants::consensus_quorum(
+                                          adoption.current_members.size())};
+    if (verify_commit_proof(adoption.plan_digest, package.proof, context,
+                            adoption.current_vote_keys) != CommitProofFailure::None) {
+        return;
+    }
+
+    adoption_ = std::move(adoption);
+    pending_dkg_.reset();
+    set_phase(DriverPhase::PendingNextEpoch,
+              "named in a finalized plan; preparing for the next epoch");
+    // Recovery input comes from the mesh; finality stays the authority.
+    (void)router_.broadcast(router_.compose(SecurityMessageKind::SyncRequest,
+                                            SyncRequest{plan.current_epoch},
+                                            plan.current_epoch));
+}
+
+void SecurityDriver::on_candidate_sync_response(const SyncResponse& response,
+                                                const NodeId& from) {
+    if (phase_ != DriverPhase::PendingNextEpoch || !adoption_.has_value() ||
+        adoption_->state_synced) {
+        return;
+    }
+    // The peer supplied bytes; the certificate decides. Valid signatures from
+    // the anchored membership prove the chain reached this height.
+    const QcValidationContext context{constants::kConsensusRulesetVersion,
+                                      adoption_->plan.network_id, adoption_->plan.current_epoch,
+                                      constants::consensus_quorum(
+                                          adoption_->current_members.size())};
+    if (validate_quorum_certificate(response.high_qc, context,
+                                    adoption_->current_vote_keys).has_value()) {
+        return;
+    }
+    if (response.high_qc.height < adoption_->plan.checkpoint_height) {
+        return;  // Certified, but before the plan's checkpoint: keep syncing.
+    }
+    adoption_->state_synced = true;
+    adoption_->verified_qc = response.high_qc;
+
+    // The objective statement: this node holds a certified current-epoch
+    // object it verified itself. Signed, so nobody can claim it on this
+    // node's behalf.
+    CandidateStateReadyMsg ready;
+    ready.network_id = adoption_->plan.network_id;
+    ready.plan_digest = adoption_->plan_digest;
+    ready.node = config_.self;
+    const auto own_incarnation = adoption_->plan.incarnations.find(config_.self);
+    if (own_incarnation == adoption_->plan.incarnations.end()) {
+        return;
+    }
+    ready.incarnation = own_incarnation->second;
+    ready.verified_qc = adoption_->verified_qc;
+    const Digest digest = candidate_state_ready_digest(ready);
+    crypto_sign_detached(ready.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         config_.identity.private_key.data());
+    (void)router_.broadcast(router_.compose(SecurityMessageKind::CandidateStateReady, ready,
+                                            adoption_->plan.current_epoch));
+}
+
+void SecurityDriver::on_candidate_state_ready(const CandidateStateReadyMsg& message) {
+    // Member side: record that a selected outside candidate proved it acquired
+    // current certified state. One entry per candidate; the readiness commit is
+    // what turns the set into authority to run a DKG.
+    EpochManager* epochs = runtime_.epochs();
+    if (phase_ != DriverPhase::Active || epochs == nullptr || !plan_.has_value()) {
+        return;
+    }
+    if (message.network_id != plan_->network_id || message.plan_digest != next_epoch_plan_digest(*plan_)) {
+        return;
+    }
+    const auto incarnation = plan_->incarnations.find(message.node);
+    const bool selected = std::find(plan_->selected.begin(), plan_->selected.end(),
+                                    message.node) != plan_->selected.end();
+    if (!selected || incarnation == plan_->incarnations.end() ||
+        incarnation->second != message.incarnation) {
+        return;
+    }
+    const Digest digest = candidate_state_ready_digest(message);
+    if (crypto_sign_verify_detached(message.identity_signature.data(), digest.data(),
+                                    digest.size(), message.node.bytes.data()) != 0) {
+        return;
+    }
+    // The presented certificate must be a real current-epoch certificate at or
+    // above the plan's checkpoint, judged under this member's own frozen keys.
+    const QcValidationContext context{constants::kConsensusRulesetVersion,
+                                      epochs->current().network_id, epochs->current().id,
+                                      epochs->current().consensus_quorum};
+    if (validate_quorum_certificate(message.verified_qc, context,
+                                    epochs->current_vote_keys()).has_value() ||
+        message.verified_qc.height < plan_->checkpoint_height) {
+        return;
+    }
+    state_ready_.insert(message.node);
+}
+
+void SecurityDriver::on_readiness_proof(const ReadinessProofMsg& message) {
+    if (phase_ != DriverPhase::PendingNextEpoch || !adoption_.has_value() ||
+        adoption_->dkg_authorized) {
+        return;
+    }
+    const CandidateReadiness& readiness = message.readiness;
+    if (readiness.network_id != adoption_->plan.network_id ||
+        readiness.plan_digest != adoption_->plan_digest ||
+        readiness.next_epoch != adoption_->plan.next_epoch) {
+        return;
+    }
+    const Digest digest = candidate_readiness_digest(readiness);
+    if (!candidate_verify_proof(digest, message.proof)) {
+        return;
+    }
+    // The finalized set must name this node with the key it registered.
+    const auto own_key = vote_pubs_mine_.find(adoption_->plan.next_epoch);
+    const auto planned_incarnation = adoption_->plan.incarnations.find(config_.self);
+    const auto self_entry =
+        std::find_if(readiness.entries.begin(), readiness.entries.end(),
+                     [this](const ReadinessEntry& entry) { return entry.node == config_.self; });
+    if (self_entry == readiness.entries.end() || own_key == vote_pubs_mine_.end() ||
+        planned_incarnation == adoption_->plan.incarnations.end() ||
+        self_entry->vote_key != own_key->second ||
+        self_entry->incarnation != planned_incarnation->second) {
+        return;
+    }
+
+    adoption_->dkg_authorized = true;
+    adoption_->readiness_digest = digest;
+
+    // Current-epoch finality authorized exactly this preparation, so the
+    // candidate now joins the future epoch's DKG. That makes it a participant
+    // of a key ceremony, not a member of anything.
+    auto set = Tier1Set::from_nodes(adoption_->plan.selected);
+    if (!set.has_value()) {
+        return;
+    }
+    DkgConfiguration dkg;
+    dkg.network_id = adoption_->plan.network_id;
+    dkg.target_epoch = adoption_->plan.next_epoch;
+    dkg.participants = std::move(*set);
+    dkg.incarnations = adoption_->plan.incarnations;
+    dkg.threshold = constants::authority_threshold(adoption_->plan.selected.size());
+    dkg.self = config_.self;
+    dkg.session_binding = digest;
+    auto broadcast = runtime_.authority().start_dkg(std::move(dkg));
+    if (broadcast.has_value()) {
+        (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *broadcast,
+                                                adoption_->plan.next_epoch));
+    }
+}
+
+void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message) {
+    if (phase_ != DriverPhase::PendingNextEpoch || !adoption_.has_value()) {
+        return;
+    }
+    const EpochHandoff& handoff = message.handoff;
+    if (handoff.network_id != adoption_->plan.network_id ||
+        handoff.from_epoch != adoption_->plan.current_epoch ||
+        handoff.to_epoch != adoption_->plan.next_epoch ||
+        handoff.plan_digest != adoption_->plan_digest) {
+        return;
+    }
+    // Take the DKG result only when a completed session holds one; a handoff
+    // arriving before the ceremony finished proves an epoch this node cannot
+    // serve yet.
+    if (!pending_dkg_.has_value()) {
+        pending_dkg_ = runtime_.authority().take_dkg_result();
+    }
+    if (!pending_dkg_.has_value()) {
+        return;
+    }
+    if (handoff.group_public_key != pending_dkg_->group_public_key ||
+        handoff.dkg_transcript_digest != pending_dkg_->transcript_digest) {
+        return;
+    }
+    // The finalized proof is the activation authority. Announcements and the
+    // sender's word count for nothing here.
+    if (!candidate_verify_proof(epoch_handoff_digest(handoff), message.proof)) {
+        return;
+    }
+
+    EpochVoteKey own_key = take_own_vote_key(handoff.to_epoch);
+    const Digest checkpoint = qc_digest(message.proof.chain[1].justify);
+    if (!runtime_.adopt_epoch_from_handoff(handoff, std::move(pending_dkg_), std::move(own_key),
+                                           checkpoint)) {
+        set_phase(DriverPhase::Failed, "verified handoff did not adopt");
+        return;
+    }
+    pending_dkg_.reset();
+    adoption_.reset();
+    persist_current_epoch(checkpoint);
+    (void)store_.append_authority({handoff.to_epoch, handoff.group_public_key,
+                                   runtime_.epochs()->current().participant_set_digest,
+                                   handoff.dkg_transcript_digest});
+    if (!enter_eligibility_epoch(handoff.to_epoch,
+                                 runtime_.epochs()->current().tier1_members)) {
+        set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
+        return;
+    }
+    set_phase(DriverPhase::Active, "finalized handoff verified; the new epoch role begins");
+    epoch_started_ms_ = now_ms_;
+    last_progress_ms_ = now_ms_;
+    last_proposed_view_ = 0;
+    last_committed_root_ = Digest{};
+    last_committed_height_ = 0;
 }
 
 }  // namespace nexus::security

@@ -48,3 +48,4 @@ target/
 .claude/
 *.bak
 dmg/
+build-asan/

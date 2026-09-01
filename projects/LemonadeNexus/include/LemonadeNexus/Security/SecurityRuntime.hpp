@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/Consensus/HotStuffService.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochManager.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
+#include <LemonadeNexus/Security/Epoch/NextEpochPlan.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 
 #include <filesystem>
@@ -80,6 +81,17 @@ public:
     [[nodiscard]] bool activate_next_epoch(std::optional<DkgResult> own_dkg,
                                            std::optional<EpochVoteKey> own_vote_key,
                                            const Digest& previous_checkpoint);
+
+    /// Enters an epoch this node was selected into without having been in the
+    /// one before it — the newcomer activation path. The caller has already
+    /// verified the finalized handoff proof; this installs exactly what the
+    /// handoff names and refuses anything that disagrees with the DKG outcome
+    /// this node holds. Before this call the node had no epoch state at all,
+    /// so there is no old role to overlap with.
+    [[nodiscard]] bool adopt_epoch_from_handoff(const EpochHandoff& handoff,
+                                                std::optional<DkgResult> own_dkg,
+                                                std::optional<EpochVoteKey> own_vote_key,
+                                                const Digest& previous_checkpoint);
 
 private:
     [[nodiscard]] bool start_consensus(EpochVoteKey own_vote_key, const Digest& previous_checkpoint);

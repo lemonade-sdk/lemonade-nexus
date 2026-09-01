@@ -45,11 +45,20 @@ public:
     /// is dropped and the DKG restarts.
     [[nodiscard]] bool replace_participant(const NodeId& node, EpochTransitionFailure reason);
 
-    /// The members prepare_next_epoch would select from this pool, without
-    /// mutating anything. The plan commits this list; prepare then reproduces
-    /// it, so selection is stated once and checked twice.
-    [[nodiscard]] std::vector<NodeId> preview_selection(const Tier1Set& frozen_eligible,
-                                                        std::size_t admitted_server_count) const;
+    /// The members selection would pick from this pool, without mutating
+    /// anything. `excluded` names candidates this boundary already proved
+    /// unable to serve; the next hash-ranked entries take their places. The
+    /// plan commits this list, so selection is stated once and checked by
+    /// every replica.
+    [[nodiscard]] std::vector<NodeId> preview_selection(
+        const Tier1Set& frozen_eligible, std::size_t admitted_server_count,
+        const std::set<NodeId>& excluded = {}) const;
+
+    /// Opens the transition for a finalized plan: the selected list the plan
+    /// committed, verified to come from this pool. The full ranking is kept so
+    /// a later replacement still follows the deterministic order.
+    [[nodiscard]] bool prepare_planned_epoch(const Tier1Set& frozen_eligible,
+                                             const std::vector<NodeId>& planned);
 
     /// Records the epoch BFT vote key a selected member registered. One key
     /// per member; a changed key mid-handoff is refused, as is a key another
@@ -78,6 +87,9 @@ public:
     }
     [[nodiscard]] const std::map<NodeId, crypto::Ed25519PublicKey>& next_vote_keys() const {
         return next_vote_keys_;
+    }
+    [[nodiscard]] const std::map<NodeId, AttestationVerdict>& final_verdicts() const {
+        return final_verdicts_;
     }
     [[nodiscard]] bool target_shortfall() const { return target_shortfall_; }
     [[nodiscard]] bool reserve_shortfall() const { return reserve_shortfall_; }

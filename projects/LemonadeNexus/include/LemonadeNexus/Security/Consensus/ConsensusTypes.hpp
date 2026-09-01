@@ -128,8 +128,8 @@ enum class ConsensusFailure : uint16_t {
     PendingLimit,
     NotLeader,
     StorageRejected,
-    /// The proposal carries a state transition this node has not itself
-    /// arrived at, so it cannot authorize it.
+    /// Retired: an unknown transition now withholds the vote instead of
+    /// rejecting the block. The value stays; earlier values are stable.
     TransitionUnknown,
 };
 

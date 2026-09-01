@@ -29,6 +29,10 @@ namespace nexus::security {
 enum class DriverPhase : uint16_t {
     Failed,
     Idle,
+    /// Named in a finalized next-epoch plan and preparing for that epoch.
+    /// Permission to prepare, and nothing else: no vote, no share, no DKG for
+    /// any current epoch, no Tier 1 API.
+    PendingNextEpoch,
     GenesisCollecting,
     /// Founders observing each other, before any DKG. The founding eligibility
     /// transcript comes out of this round and every founder must sign the same
@@ -104,6 +108,11 @@ public:
     void on_participation_challenge(const ParticipationChallenge& challenge,
                                     const NodeId& from) override;
     void on_participation_response(const ParticipationResponse& response) override;
+    void on_next_epoch_plan(const NextEpochPlanProof& package) override;
+    void on_candidate_state_ready(const CandidateStateReadyMsg& message) override;
+    void on_readiness_proof(const ReadinessProofMsg& message) override;
+    void on_epoch_handoff_proof(const EpochHandoffProofMsg& message) override;
+    void on_candidate_sync_response(const SyncResponse& response, const NodeId& from) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
@@ -115,6 +124,16 @@ public:
     /// or an empty digest when it is not at one. Finalizing it is what turns
     /// local observations into the pool every honest node selects from.
     [[nodiscard]] Digest pending_eligibility_digest() const;
+
+    /// The next-epoch plan this node derives from the finalized eligibility
+    /// state, or an empty digest outside a boundary. Committing it is what
+    /// authorizes selected candidates to prepare.
+    [[nodiscard]] Digest pending_plan_digest() const;
+
+    /// The readiness set this node has verified for the committed plan, or an
+    /// empty digest until every selected member proved preparation. Committing
+    /// it is what authorizes the next-epoch DKG.
+    [[nodiscard]] Digest pending_readiness_digest() const;
 
     /// Whether this node independently arrived at the proposed transition. The
     /// one entry point consensus uses; it accepts a handoff or an eligibility
@@ -137,6 +156,15 @@ private:
     void finish_sync();
     void run_epoch_cadence(uint64_t now_ms);
     void attest_self_for(EpochId epoch);
+    [[nodiscard]] std::optional<NextEpochPlan> derive_plan() const;
+    [[nodiscard]] std::optional<CandidateReadiness> derive_readiness() const;
+    [[nodiscard]] std::optional<EpochHandoff> derive_handoff() const;
+    void on_plan_committed(const ConsensusCommit& commit);
+    void on_readiness_committed(const ConsensusCommit& commit);
+    void abandon_boundary(const char* reason);
+    void broadcast_proof(SecurityMessageKind kind, SecurityBody body, EpochId epoch);
+    [[nodiscard]] bool candidate_verify_proof(const Digest& transitions_digest,
+                                              const CommitProof& proof) const;
     void do_activate(const Digest& checkpoint);
     void persist_current_epoch(const Digest& checkpoint);
     void announce_epoch(const Digest& checkpoint);
@@ -204,6 +232,35 @@ private:
 
     // Mesh eligibility. The next-epoch pool comes from here and nowhere else.
     EligibilityService eligibility_;
+
+    // Member-side boundary pipeline. The committed plan, the freshness clock
+    // for final verdicts, the state-ready and failed sets, and the finalized
+    // readiness. All reset at activation or abandonment.
+    std::optional<NextEpochPlan> plan_;
+    CommitProof plan_proof_;
+    uint32_t plans_committed_ = 0;
+    std::set<NodeId> boundary_failed_;
+    std::map<NodeId, uint64_t> final_verdict_ms_;
+    std::set<NodeId> state_ready_;
+    std::optional<CandidateReadiness> readiness_;
+    CommitProof readiness_proof_;
+
+    // Candidate-side adoption state: everything this node verified for the
+    // plan that names it. Grants nothing; it is what preparation runs on.
+    struct CandidateAdoption {
+        NextEpochPlan plan;
+        Digest plan_digest{};
+        std::vector<NodeId> current_members;
+        std::map<NodeId, crypto::Ed25519PublicKey> current_vote_keys;
+        bool state_synced = false;
+        QuorumCertificate verified_qc{};
+        bool dkg_authorized = false;
+        Digest readiness_digest{};
+    };
+    std::optional<CandidateAdoption> adoption_;
+    /// The pinned-genesis anchor a candidate verifies membership listings
+    /// against. Stored only after its signature verified.
+    std::optional<BootstrapCertificate> anchor_;
     std::size_t consumed_equivocations_ = 0;
     /// Peers whose transport certificate the mesh verified. Tier 2 candidates
     /// are challenged from here; the list decides nothing on its own.

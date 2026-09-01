@@ -265,7 +265,7 @@ bool DkgSession::finish() {
 
     DkgResult result;
     result.target_epoch = config_.target_epoch;
-    result.participant_set_digest = session_digest();
+    result.participant_set_digest = config_.participants.digest();
     result.transcript_digest = *transcript_digest();
     result.group_public_key = outcome.value->group_public_key;
     result.public_key_package = std::move(outcome.value->public_key_package);

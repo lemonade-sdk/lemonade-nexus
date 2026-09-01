@@ -441,20 +441,29 @@ protected:
     std::optional<HotStuffService> service;
 };
 
-TEST_F(HotStuffTransitions, ProposalCarryingAnUnknownTransitionIsRefused) {
-    // This replica has arrived at no transition at all.
+TEST_F(HotStuffTransitions, AnUnknownTransitionWithholdsTheVoteButTracksTheBlock) {
+    // This replica has arrived at no transition at all. The vote is what
+    // authorizes, so none is cast — but the block enters chain state, or the
+    // replica would partition itself by its own disagreement while a quorum
+    // that did derive the transition commits it regardless.
     make_service(1, [](const Digest&) { return false; });
-    const auto chain = harness.build_chain(1);
+    const auto chain = harness.build_chain(2);
     const auto result = service->receive_proposal(chain[0].proposal, chain[0].justify);
-    EXPECT_EQ(result.rejected, ConsensusFailure::TransitionUnknown);
+    EXPECT_TRUE(result.transition_refused);
     EXPECT_FALSE(result.vote.has_value());
+    EXPECT_FALSE(result.rejected.has_value());
+
+    // The chain continues over the withheld block: the child is not an orphan.
+    const auto child = service->receive_proposal(chain[1].proposal, chain[1].justify);
+    EXPECT_NE(child.rejected, ConsensusFailure::MissingParent);
 }
 
-TEST_F(HotStuffTransitions, AReplicaWithNoValidatorRefusesEveryTransition) {
+TEST_F(HotStuffTransitions, AReplicaWithNoValidatorWithholdsEveryTransitionVote) {
     make_service(1, nullptr);   // nothing can be evaluated
     const auto chain = harness.build_chain(1);
-    EXPECT_EQ(service->receive_proposal(chain[0].proposal, chain[0].justify).rejected,
-              ConsensusFailure::TransitionUnknown);
+    const auto result = service->receive_proposal(chain[0].proposal, chain[0].justify);
+    EXPECT_TRUE(result.transition_refused);
+    EXPECT_FALSE(result.vote.has_value());
 }
 
 // An ordinary block carries no transition, so the rule does not touch it: it
@@ -464,7 +473,7 @@ TEST_F(HotStuffTransitions, AnOrdinaryBlockNeedsNoValidator) {
     auto chain = harness.build_chain(1);
     chain[0].proposal.transitions_digest = Digest{};
     const auto result = service->receive_proposal(chain[0].proposal, chain[0].justify);
-    EXPECT_NE(result.rejected, ConsensusFailure::TransitionUnknown);
+    EXPECT_FALSE(result.transition_refused);
 }
 
 // The positive control: the same proposal a replica DOES recognise is voted

@@ -67,6 +67,12 @@ struct ProposalResult {
     // The vote-once or safe-node rule withheld the vote. This is normal
     // protocol behavior; the proposal still entered chain state.
     bool safe_node_refused = false;
+    // The proposal carries a transition this node has not independently
+    // arrived at, so the vote is withheld — a vote is what authorizes. The
+    // block still enters chain state: refusing to track a certified chain
+    // would partition this replica by its own disagreement, while a quorum
+    // that DID derive the transition commits it regardless.
+    bool transition_refused = false;
 };
 
 // Two signed messages from one node for one (epoch, view).

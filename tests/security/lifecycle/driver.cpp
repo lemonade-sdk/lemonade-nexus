@@ -62,7 +62,18 @@ TEST_F(DriverMesh, TimedHandoffRotatesToEpochTwo) {
                                                     evidence_for(member->id, *vote_key));
         }
     }
-    mesh.pump();  // The epoch-2 DKG runs over the wire.
+    // The readiness set must commit before any DKG starts, so the ceremony is
+    // tick-paced now: readiness commit -> DKG over the wire -> Ready.
+    mesh.pump();
+    for (int i = 0; i < 200; ++i) {
+        step(1);
+        const bool ready = std::all_of(founders.begin(), founders.end(), [](Node* f) {
+            return f->runtime->epochs() != nullptr &&
+                   f->runtime->epochs()->transition() != nullptr &&
+                   f->runtime->epochs()->transition()->phase == EpochTransitionPhase::Ready;
+        });
+        if (ready) break;
+    }
     for (Node* founder : founders) {
         ASSERT_NE(founder->runtime->epochs()->transition(), nullptr);
         EXPECT_EQ(founder->runtime->epochs()->transition()->phase, EpochTransitionPhase::Ready);

@@ -192,14 +192,14 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
     // 7b. A transition must be one this node also arrived at. A vote is what
     //     authorizes a handoff, so voting for a transition this node cannot
     //     evaluate would let the proposer decide the next epoch alone. The
-    //     proposal is refused outright rather than accepted without a vote:
-    //     the handoff must gather its quorum from nodes that independently
-    //     agree, or not commit at all.
+    //     vote is withheld — but the block is tracked. A replica that refused
+    //     to store a certified chain would partition itself by its own
+    //     disagreement, and the transition still commits only if a quorum
+    //     independently derived it.
     if (proposal.transitions_digest != Digest{}) {
         if (!config_.transition_validator ||
             !config_.transition_validator(proposal.transitions_digest)) {
-            result.rejected = ConsensusFailure::TransitionUnknown;
-            return result;
+            result.transition_refused = true;
         }
     }
 
@@ -247,7 +247,11 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
     // 11. Lock and commit.
     apply_chain_rules(justify, result.commits);
 
-    // 12. Vote-once and safe-node rule (11.6).
+    // 12. Vote-once and safe-node rule (11.6), and the withheld transition
+    //     vote from 7b: the chain state is in; only the authorization is not.
+    if (result.transition_refused) {
+        return result;
+    }
     const bool safe = proposal.view > last_voted_view_ &&
                       (extends_locked(proposal) || justify.view > locked_qc_.view);
     if (!safe) {
