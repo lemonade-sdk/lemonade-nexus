@@ -8,7 +8,7 @@ namespace {
 
 inline constexpr std::string_view kPlanDomain = "lemonade-nexus/next-epoch-plan:v1";
 inline constexpr std::string_view kReadinessDomain = "lemonade-nexus/candidate-readiness:v1";
-inline constexpr std::string_view kHandoffDomain = "lemonade-nexus/epoch-handoff:v2";
+inline constexpr std::string_view kHandoffDomain = "lemonade-nexus/epoch-handoff:v3";
 inline constexpr std::string_view kVoteKeySetDomain = "lemonade-nexus/vote-key-set:v1";
 
 }  // namespace
@@ -57,6 +57,7 @@ Digest epoch_handoff_digest(const EpochHandoff& handoff) {
     encoder.add_u64(handoff.from_epoch);
     encoder.add_u64(handoff.to_epoch);
     encoder.add_bytes(handoff.plan_digest);
+    encoder.add_bytes(handoff.previous_anchor);
     encoder.add_u64(handoff.members.size());
     for (const auto& node : handoff.members) {
         encoder.add_bytes(node.bytes);

@@ -89,6 +89,13 @@ struct EpochHandoff {
     EpochId to_epoch{};
     Digest plan_digest{};
 
+    /// The from-epoch's own authority anchor: the bootstrap certificate's
+    /// signing digest for epoch 1, the previous finalized handoff's digest
+    /// after that. Chains every handoff to its predecessor, so a verifier
+    /// walking from Genesis rejects a gap, a fork, or a reordering by
+    /// construction.
+    Digest previous_anchor{};
+
     /// The new epoch, in full: membership, incarnations, and BFT vote keys.
     std::vector<NodeId> members;
     std::map<NodeId, IncarnationId> incarnations;

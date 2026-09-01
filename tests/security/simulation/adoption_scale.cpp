@@ -9,6 +9,8 @@
 
 #include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/VoteKey.hpp>
+
+#include "support/committee.hpp"
 #include <LemonadeNexus/Security/Epoch/NextEpochPlan.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
@@ -21,6 +23,7 @@
 #include <vector>
 
 using namespace nexus::security;
+using committee_test::Committee;
 namespace constants = nexus::security::constants;
 
 namespace {
@@ -33,86 +36,6 @@ NetworkId network() {
     id.fill(0x5E);
     return id;
 }
-
-/// One epoch at one population: members, real vote keys, and the machinery to
-/// sign real certificates over real proposals.
-struct Committee {
-    explicit Committee(std::size_t size) {
-        for (std::size_t i = 0; i < size; ++i) {
-            NodeId id;
-            id.bytes.fill(static_cast<uint8_t>(i + 1));
-            members.push_back(id);
-            keys[id] = make_epoch_vote_key(kEpoch, id);
-            pubs[id] = keys[id].public_key;
-        }
-        quorum = constants::consensus_quorum(size);
-    }
-
-    [[nodiscard]] QuorumCertificate certify(const Proposal& proposal) const {
-        const Digest digest = proposal_digest(proposal);
-        QuorumCertificate qc{};
-        qc.qc_format_version = constants::kQcFormatVersion;
-        qc.consensus_ruleset = constants::kConsensusRulesetVersion;
-        qc.network_id = network();
-        qc.epoch = kEpoch;
-        qc.height = proposal.height;
-        qc.view = proposal.view;
-        qc.proposal_digest = digest;
-        // Exactly the quorum signs, so the proof carries no slack an attacker
-        // could trim from.
-        std::size_t signed_count = 0;
-        for (const auto& node : members) {
-            if (signed_count == quorum) break;
-            Vote vote{};
-            vote.consensus_ruleset = constants::kConsensusRulesetVersion;
-            vote.network_id = network();
-            vote.epoch = kEpoch;
-            vote.height = proposal.height;
-            vote.view = proposal.view;
-            vote.proposal_digest = digest;
-            vote.voter = node;
-            const auto signing = vote_signing_digest(vote);
-            crypto_sign_detached(vote.signature.data(), nullptr, signing.data(),
-                                 signing.size(), keys.at(node).private_key.data());
-            qc.signers.push_back({node, vote.signature});
-            ++signed_count;
-        }
-        return qc;
-    }
-
-    /// A real three-chain proof over a block carrying `transitions`.
-    [[nodiscard]] CommitProof prove(const Digest& transitions) const {
-        CommitProof proof;
-        Digest parent{};
-        QuorumCertificate justify{};
-        justify.qc_format_version = constants::kQcFormatVersion;
-        justify.consensus_ruleset = constants::kConsensusRulesetVersion;
-        justify.network_id = network();
-        justify.epoch = kEpoch;
-        for (uint8_t i = 0; i < 3; ++i) {
-            Proposal proposal{};
-            proposal.security_ruleset = constants::kSecurityRulesetVersion;
-            proposal.consensus_ruleset = constants::kConsensusRulesetVersion;
-            proposal.network_id = network();
-            proposal.epoch = kEpoch;
-            proposal.height = 20 + i;
-            proposal.view = 20 + i;
-            proposal.leader = members.front();
-            proposal.parent_digest = parent;
-            proposal.transitions_digest = i == 0 ? transitions : Digest{};
-            proof.chain.push_back({proposal, justify});
-            parent = proposal_digest(proposal);
-            justify = certify(proposal);
-        }
-        proof.certifying = justify;
-        return proof;
-    }
-
-    std::vector<NodeId> members;
-    std::map<NodeId, EpochVoteKey> keys;
-    std::map<NodeId, nexus::crypto::Ed25519PublicKey> pubs;
-    std::size_t quorum{};
-};
 
 NextEpochPlan plan_for(const Committee& committee) {
     NextEpochPlan plan;
@@ -179,7 +102,7 @@ struct Row {
 };
 
 Row measure(std::size_t size) {
-    Committee committee{size};
+    Committee committee{size, kEpoch, network()};
     Row row;
     row.members = size;
     row.quorum = committee.quorum;
@@ -278,7 +201,7 @@ TEST(AdoptionScale, MeasureAcrossTheTierOneTable) {
 TEST(AdoptionScale, ReplacementFollowsTheRankAtEverySize) {
     ASSERT_GE(sodium_init(), 0);
     for (const std::size_t members : kPopulations) {
-        Committee committee{members};
+        Committee committee{members, kEpoch, network()};
         const auto plan = plan_for(committee);
 
         // Attempt 1, excluding the first selected node, is a different plan
@@ -303,7 +226,7 @@ TEST(AdoptionScale, ReplacementFollowsTheRankAtEverySize) {
 // The handoff digest is sensitive to every field that decides what activates.
 TEST(AdoptionScale, TheHandoffDigestBindsEverything) {
     ASSERT_GE(sodium_init(), 0);
-    Committee committee{5};
+    Committee committee{5, kEpoch, network()};
     const auto plan_digest = next_epoch_plan_digest(plan_for(committee));
     const auto base = handoff_for(committee, plan_digest);
     const auto base_digest = epoch_handoff_digest(base);

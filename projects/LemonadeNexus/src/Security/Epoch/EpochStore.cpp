@@ -21,6 +21,8 @@ using json = nlohmann::json;
 constexpr const char* kBootstrapFile = "bootstrap-certificate.json";
 constexpr const char* kEpochFile = "epoch-current.json";
 constexpr const char* kHistoryFile = "authority-history.json";
+constexpr const char* kAnchorFile = "authority-anchor.json";
+constexpr const char* kChainFile = "handoff-chain.json";
 
 template <std::size_t N>
 std::string b64(const std::array<uint8_t, N>& bytes) {
@@ -300,6 +302,138 @@ EpochStore::load_authority_history() const {
         records.push_back(r);
     }
     return records;
+}
+
+// --- Verified authority anchor ----------------------------------------------
+
+bool EpochStore::store_authority_anchor(const VerifiedEpochAuthority& anchor) {
+    json j;
+    j["network_id"] = b64(anchor.network_id);
+    j["epoch"] = anchor.epoch;
+    json members = json::array();
+    for (const auto& node : anchor.members) {
+        json entry;
+        entry["node"] = b64(node.bytes);
+        const auto incarnation = anchor.incarnations.find(node);
+        entry["incarnation"] =
+            incarnation != anchor.incarnations.end() ? incarnation->second : 0;
+        const auto key = anchor.vote_keys.find(node);
+        if (key == anchor.vote_keys.end()) {
+            return false;
+        }
+        entry["vote_key"] = b64(key->second);
+        members.push_back(entry);
+    }
+    j["members"] = members;
+    j["consensus_quorum"] = static_cast<uint64_t>(anchor.consensus_quorum);
+    j["authority_threshold"] = static_cast<uint64_t>(anchor.authority_threshold);
+    j["security_ruleset"] = anchor.security_ruleset;
+    j["consensus_ruleset"] = anchor.consensus_ruleset;
+    j["group_public_key"] = b64(anchor.group_public_key);
+    j["key_generation"] = anchor.key_generation;
+    j["attestation_root"] = b64(anchor.attestation_root);
+    j["checkpoint"] = b64(anchor.checkpoint);
+    j["previous_anchor"] = b64(anchor.previous_anchor);
+    j["anchor_digest"] = b64(anchor.anchor_digest);
+    // The record binds its own digest: a byte changed at rest loads as
+    // Corrupt, never as a different anchor.
+    j["record_digest"] = b64(verified_epoch_authority_digest(anchor));
+    return write_atomic(directory_ / kAnchorFile, j.dump());
+}
+
+std::variant<VerifiedEpochAuthority, EpochLoadResult> EpochStore::load_authority_anchor() const {
+    const auto text = read_all(directory_ / kAnchorFile);
+    if (!text.has_value()) {
+        return EpochLoadResult::Absent;
+    }
+    const json j = json::parse(*text, nullptr, false);
+    if (!j.is_object() || !j.contains("members") || !j["members"].is_array()) {
+        return EpochLoadResult::Corrupt;
+    }
+    VerifiedEpochAuthority anchor;
+    uint64_t quorum = 0;
+    uint64_t threshold = 0;
+    if (!(j.contains("network_id") && from_b64(j["network_id"], anchor.network_id) &&
+          j.contains("epoch") && get_u64(j["epoch"], anchor.epoch) &&
+          j.contains("consensus_quorum") && get_u64(j["consensus_quorum"], quorum) &&
+          j.contains("authority_threshold") && get_u64(j["authority_threshold"], threshold) &&
+          j.contains("security_ruleset") && get_u16(j["security_ruleset"], anchor.security_ruleset) &&
+          j.contains("consensus_ruleset") &&
+          get_u16(j["consensus_ruleset"], anchor.consensus_ruleset) &&
+          j.contains("group_public_key") &&
+          from_b64(j["group_public_key"], anchor.group_public_key) &&
+          j.contains("key_generation") && get_u64(j["key_generation"], anchor.key_generation) &&
+          j.contains("attestation_root") && from_b64(j["attestation_root"], anchor.attestation_root) &&
+          j.contains("checkpoint") && from_b64(j["checkpoint"], anchor.checkpoint) &&
+          j.contains("previous_anchor") && from_b64(j["previous_anchor"], anchor.previous_anchor) &&
+          j.contains("anchor_digest") && from_b64(j["anchor_digest"], anchor.anchor_digest))) {
+        return EpochLoadResult::Corrupt;
+    }
+    anchor.consensus_quorum = static_cast<std::size_t>(quorum);
+    anchor.authority_threshold = static_cast<std::size_t>(threshold);
+    for (const auto& entry : j["members"]) {
+        NodeId node;
+        uint64_t incarnation = 0;
+        nexus::crypto::Ed25519PublicKey key{};
+        if (!(entry.is_object() && entry.contains("node") && from_b64(entry["node"], node.bytes) &&
+              entry.contains("incarnation") && get_u64(entry["incarnation"], incarnation) &&
+              entry.contains("vote_key") && from_b64(entry["vote_key"], key))) {
+            return EpochLoadResult::Corrupt;
+        }
+        anchor.members.push_back(node);
+        anchor.incarnations[node] = incarnation;
+        anchor.vote_keys[node] = key;
+    }
+    Digest recorded{};
+    if (!j.contains("record_digest") || !from_b64(j["record_digest"], recorded) ||
+        recorded != verified_epoch_authority_digest(anchor)) {
+        return EpochLoadResult::Corrupt;
+    }
+    return anchor;
+}
+
+// --- Handoff chain links -----------------------------------------------------
+
+bool EpochStore::append_chain_link(std::span<const uint8_t> encoded) {
+    std::vector<std::vector<uint8_t>> links;
+    auto existing = load_chain_links();
+    if (std::get_if<EpochLoadResult>(&existing) != nullptr) {
+        if (std::get<EpochLoadResult>(existing) == EpochLoadResult::Corrupt) {
+            return false;
+        }
+    } else {
+        links = std::move(std::get<std::vector<std::vector<uint8_t>>>(existing));
+    }
+    links.emplace_back(encoded.begin(), encoded.end());
+    json j = json::array();
+    for (const auto& link : links) {
+        j.push_back(crypto::to_base64(link));
+    }
+    return write_atomic(directory_ / kChainFile, j.dump());
+}
+
+std::variant<std::vector<std::vector<uint8_t>>, EpochLoadResult>
+EpochStore::load_chain_links() const {
+    const auto text = read_all(directory_ / kChainFile);
+    if (!text.has_value()) {
+        return EpochLoadResult::Absent;
+    }
+    const json j = json::parse(*text, nullptr, false);
+    if (!j.is_array()) {
+        return EpochLoadResult::Corrupt;
+    }
+    std::vector<std::vector<uint8_t>> links;
+    for (const auto& entry : j) {
+        if (!entry.is_string()) {
+            return EpochLoadResult::Corrupt;
+        }
+        auto bytes = crypto::from_base64(entry.get<std::string>());
+        if (bytes.empty()) {
+            return EpochLoadResult::Corrupt;
+        }
+        links.push_back(std::move(bytes));
+    }
+    return links;
 }
 
 // --- Own vote key -----------------------------------------------------------

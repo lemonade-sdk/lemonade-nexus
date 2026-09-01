@@ -101,7 +101,8 @@ add_nexus_test(test_security_epoch
     security/epoch/epoch_state.cpp
     security/epoch/transition.cpp
     security/epoch/epoch_manager.cpp
-    security/epoch/epoch_store.cpp)
+    security/epoch/epoch_store.cpp
+    security/epoch/authority_chain.cpp)
 add_nexus_test(test_security_hotstuff
     security/consensus/consensus_store.cpp
     security/consensus/hotstuff_safety.cpp

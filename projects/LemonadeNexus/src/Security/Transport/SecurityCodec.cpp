@@ -449,6 +449,7 @@ bool encode_handoff(Writer& w, const EpochHandoff& h) {
     w.u64(h.from_epoch);
     w.u64(h.to_epoch);
     w.fixed(h.plan_digest);
+    w.fixed(h.previous_anchor);
     w.u16(static_cast<uint16_t>(h.members.size()));
     for (const auto& node : h.members) {
         put_node(w, node);
@@ -846,7 +847,7 @@ bool decode_readiness_proof(Reader& r, ReadinessProofMsg& m) {
 bool decode_handoff(Reader& r, EpochHandoff& h) {
     uint16_t count = 0;
     if (!(r.fixed(h.network_id) && r.u64(h.from_epoch) && r.u64(h.to_epoch) &&
-          r.fixed(h.plan_digest) && r.u16(count))) {
+          r.fixed(h.plan_digest) && r.fixed(h.previous_anchor) && r.u16(count))) {
         return false;
     }
     if (count > constants::kMaxActiveTier1) {

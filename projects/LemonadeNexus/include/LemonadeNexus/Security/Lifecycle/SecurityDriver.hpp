@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
 #include <LemonadeNexus/Security/Consensus/Pacemaker.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityService.hpp>
+#include <LemonadeNexus/Security/Epoch/AuthorityChain.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
 #include <LemonadeNexus/Security/SecurityRuntime.hpp>
@@ -84,6 +85,12 @@ public:
     /// True when this node is in the current epoch's frozen Tier 1 set. The
     /// mesh decided that; this is a read, never a decision.
     [[nodiscard]] bool is_tier1_member() const;
+
+    /// The verified epoch authority this node holds, or nullptr before any
+    /// verification reached one. A read of derived facts, never a grant.
+    [[nodiscard]] const VerifiedEpochAuthority* verified_authority() const {
+        return authority_.has_value() ? &*authority_ : nullptr;
+    }
 
     // --- ISecurityEvents ---
     void on_vote_sent(const Vote&, const NodeId&) override {}
@@ -172,6 +179,11 @@ private:
     void broadcast_transcript_attest(EpochId target);
     void maybe_adopt_attested_transcript();
     void abandon_boundary(const char* reason);
+    /// Sets and persists the verified authority anchor.
+    void install_authority(VerifiedEpochAuthority authority);
+    /// Advances the anchor through any stored links past it. Local recovery
+    /// only: every link is re-verified before it counts.
+    void catch_up_authority_from_store();
     void broadcast_proof(SecurityMessageKind kind, SecurityBody body, EpochId epoch);
     [[nodiscard]] bool candidate_verify_proof(const Digest& transitions_digest,
                                               const CommitProof& proof) const;
@@ -273,6 +285,11 @@ private:
     /// The pinned-genesis anchor a candidate verifies membership listings
     /// against. Stored only after its signature verified.
     std::optional<BootstrapCertificate> anchor_;
+    /// The one verified epoch authority this node holds: from the Genesis
+    /// certificate for Epoch 1, advanced by one verified finalized handoff
+    /// per epoch after that. Grants nothing; it is what everything else is
+    /// verified against.
+    std::optional<VerifiedEpochAuthority> authority_;
     std::size_t consumed_equivocations_ = 0;
     /// Peers whose transport certificate the mesh verified. Tier 2 candidates
     /// are challenged from here; the list decides nothing on its own.

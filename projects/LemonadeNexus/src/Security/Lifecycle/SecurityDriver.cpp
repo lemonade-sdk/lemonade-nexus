@@ -91,23 +91,70 @@ std::optional<EpochId> SecurityDriver::current_epoch() const {
 
 // --- Lifecycle ---------------------------------------------------------------
 
+void SecurityDriver::install_authority(VerifiedEpochAuthority authority) {
+    authority_ = std::move(authority);
+    (void)store_.store_authority_anchor(*authority_);
+}
+
+void SecurityDriver::catch_up_authority_from_store() {
+    if (!authority_.has_value()) {
+        return;
+    }
+    auto links = store_.load_chain_links();
+    const auto* stored = std::get_if<std::vector<std::vector<uint8_t>>>(&links);
+    if (stored == nullptr) {
+        return;  // Absent or corrupt: nothing to advance through.
+    }
+    // A stale anchor next to newer stored links happens when the anchor file
+    // was rolled back. Every link is re-verified from the anchor forward, so
+    // a modified link advances nothing.
+    for (const auto& bytes : *stored) {
+        auto decoded = decode_security_message(bytes);
+        const auto* message = std::get_if<SecurityMessage>(&decoded);
+        if (message == nullptr) {
+            continue;
+        }
+        const auto* link = std::get_if<EpochHandoffProofMsg>(&message->body);
+        if (link == nullptr || link->handoff.from_epoch != authority_->epoch) {
+            continue;
+        }
+        auto advanced = advance_epoch_authority(*authority_, link->handoff, link->proof);
+        if (auto* next = std::get_if<VerifiedEpochAuthority>(&advanced)) {
+            install_authority(std::move(*next));
+        }
+    }
+}
+
 void SecurityDriver::start(uint64_t now_ms) {
     now_ms_ = now_ms;
 
     auto bootstrap = store_.load_bootstrap();
     auto epoch = store_.load_epoch();
+    auto anchor = store_.load_authority_anchor();
     const auto corrupt = [](const auto& loaded) {
         const auto* result = std::get_if<EpochLoadResult>(&loaded);
         return result != nullptr && *result == EpochLoadResult::Corrupt;
     };
     // Corrupt durable state can hide an epoch this node already acted in.
     // Never continue as if fresh.
-    if (corrupt(bootstrap) || corrupt(epoch)) {
+    if (corrupt(bootstrap) || corrupt(epoch) || corrupt(anchor)) {
         set_phase(DriverPhase::Failed, "durable security state is corrupt");
         return;
     }
+    if (auto* verified = std::get_if<VerifiedEpochAuthority>(&anchor)) {
+        authority_ = std::move(*verified);
+        catch_up_authority_from_store();
+    }
 
     if (auto* stored = std::get_if<StoredEpoch>(&epoch)) {
+        if (authority_.has_value() && authority_->epoch > stored->state.id) {
+            // The verified chain has moved past the stored epoch: this node's
+            // membership is history, and resuming it could only replay a
+            // finished role. It continues as an ordinary Tier 2 server; the
+            // stale state costs availability and grants nothing.
+            set_phase(DriverPhase::Idle, "stored epoch superseded by the verified chain");
+            return;
+        }
         const EpochId id = stored->state.id;
         const bool member = stored->state.tier1_members.contains(config_.self);
         auto vote_key = store_.load_vote_key(id, config_.self);
@@ -698,6 +745,11 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     (void)store_.append_authority({1, certificate.authority_public_key,
                                    certificate.tier1_set_digest,
                                    certificate.dkg_transcript_digest});
+    // The verified chain starts here: Epoch 1 under the pinned signature.
+    if (auto epoch_one = verify_epoch_one_authority(certificate, config_.genesis_public_key,
+                                                    founding_->members)) {
+        install_authority(std::move(*epoch_one));
+    }
     if (!enter_eligibility_epoch(1, runtime_.epochs()->current().tier1_members)) {
         set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
         return;
@@ -1146,12 +1198,18 @@ std::optional<EpochHandoff> SecurityDriver::derive_handoff() const {
         epochs->transition()->phase != EpochTransitionPhase::Ready) {
         return std::nullopt;
     }
+    // No verified anchor for the current epoch, no handoff: the record must
+    // name its predecessor, and a guess would just fail every verifier.
+    if (!authority_.has_value() || authority_->epoch != epochs->current().id) {
+        return std::nullopt;
+    }
     const EpochTransition& transition = *epochs->transition();
     EpochHandoff handoff;
     handoff.network_id = plan_->network_id;
     handoff.from_epoch = transition.from_epoch;
     handoff.to_epoch = transition.to_epoch;
     handoff.plan_digest = next_epoch_plan_digest(*plan_);
+    handoff.previous_anchor = authority_->anchor_digest;
     handoff.members = transition.selected_members;
     for (const auto& node : transition.selected_members) {
         const auto incarnation = plan_->incarnations.find(node);
@@ -1299,9 +1357,18 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
                                        ? runtime_.consensus()->commit_proof(commit.proposal_digest)
                                        : std::nullopt;
                 if (record.has_value() && proof.has_value()) {
-                    broadcast_proof(SecurityMessageKind::EpochHandoffProof,
-                                    EpochHandoffProofMsg{*record, *proof},
-                                    epochs->current().id);
+                    const auto message = router_.compose(
+                        SecurityMessageKind::EpochHandoffProof,
+                        EpochHandoffProofMsg{*record, *proof}, epochs->current().id);
+                    (void)router_.broadcast(message);
+                    // The finalized handoff is the next chain link. The same
+                    // verification a stranger runs advances this member's own
+                    // anchor — nothing here is taken on this node's word.
+                    auto advanced = advance_epoch_authority(*authority_, *record, *proof);
+                    if (auto* next = std::get_if<VerifiedEpochAuthority>(&advanced)) {
+                        (void)store_.append_chain_link(encode_security_message(message));
+                        install_authority(std::move(*next));
+                    }
                 }
                 do_activate(commit.qc_digest);
             }
@@ -1491,15 +1558,22 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
         return;
     }
     const NextEpochPlan& plan = package.plan;
-    if (!anchor_.has_value() || plan.current_epoch != anchor_->epoch) {
-        // The anchor names the epoch it can vouch for. Without one — or across
-        // epochs this node has no verified chain to — nothing here is
-        // verifiable, so nothing is adopted.
-        return;
-    }
     if (plan.network_id != derive_network_id(config_.genesis_public_key,
                                              constants::kSecurityRulesetVersion,
                                              constants::kConsensusRulesetVersion)) {
+        return;
+    }
+    // Establish the verified authority for the plan's epoch. Epoch 1 derives
+    // from the pinned Genesis certificate plus the supplied listing; every
+    // later epoch must already have been reached through the verified
+    // handoff chain. No listing, announcement, or plan invents an epoch.
+    if (!authority_.has_value() && anchor_.has_value() && plan.current_epoch == anchor_->epoch) {
+        if (auto epoch_one = verify_epoch_one_authority(*anchor_, config_.genesis_public_key,
+                                                        package.current_vote_keys)) {
+            install_authority(std::move(*epoch_one));
+        }
+    }
+    if (!authority_.has_value() || authority_->epoch != plan.current_epoch) {
         return;
     }
     if (plan.security_ruleset != constants::kSecurityRulesetVersion ||
@@ -1522,29 +1596,23 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
         return;
     }
 
-    // The supplied membership must hash to what the anchor committed — both
-    // the set and the vote keys — before a single certificate is judged.
-    std::vector<NodeId> members;
+    // The supplied listing is a hint; the verified authority decides. It must
+    // match exactly before a single certificate is judged.
     std::map<NodeId, crypto::Ed25519PublicKey> keys;
     for (const auto& [node, key] : package.current_vote_keys) {
-        members.push_back(node);
         keys[node] = key;
     }
-    const auto member_set = Tier1Set::from_nodes(members);
-    if (!member_set.has_value() || member_set->digest() != anchor_->tier1_set_digest ||
-        vote_key_set_digest(keys) != anchor_->vote_key_set_digest) {
+    if (keys != authority_->vote_keys) {
         return;
     }
 
     CandidateAdoption adoption;
     adoption.plan = plan;
     adoption.plan_digest = next_epoch_plan_digest(plan);
-    adoption.current_members = member_set->members();
-    adoption.current_vote_keys = std::move(keys);
+    adoption.current_members = authority_->members;
+    adoption.current_vote_keys = authority_->vote_keys;
     const QcValidationContext context{constants::kConsensusRulesetVersion, plan.network_id,
-                                      plan.current_epoch,
-                                      constants::consensus_quorum(
-                                          adoption.current_members.size())};
+                                      plan.current_epoch, authority_->consensus_quorum};
     if (verify_commit_proof(adoption.plan_digest, package.proof, context,
                             adoption.current_vote_keys) != CommitProofFailure::None) {
         return;
@@ -1716,9 +1784,16 @@ void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message)
         handoff.dkg_transcript_digest != pending_dkg_->transcript_digest) {
         return;
     }
-    // The finalized proof is the activation authority. Announcements and the
-    // sender's word count for nothing here.
-    if (!candidate_verify_proof(epoch_handoff_digest(handoff), message.proof)) {
+    // The finalized proof is the activation authority: the same chain-link
+    // verification any stranger runs — linkage, membership, key hygiene, and
+    // the commit proof under the old epoch's frozen keys. Announcements and
+    // the sender's word count for nothing here.
+    if (!authority_.has_value() || authority_->epoch != adoption_->plan.current_epoch) {
+        return;
+    }
+    auto advanced = advance_epoch_authority(*authority_, handoff, message.proof);
+    auto* next_authority = std::get_if<VerifiedEpochAuthority>(&advanced);
+    if (next_authority == nullptr) {
         return;
     }
 
@@ -1729,6 +1804,11 @@ void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message)
         set_phase(DriverPhase::Failed, "verified handoff did not adopt");
         return;
     }
+    // The link that activated this node joins its chain record, so it can
+    // serve the walk to the next stranger.
+    (void)store_.append_chain_link(encode_security_message(
+        router_.compose(SecurityMessageKind::EpochHandoffProof, message, handoff.to_epoch)));
+    install_authority(std::move(*next_authority));
     pending_dkg_.reset();
     adoption_.reset();
     persist_current_epoch(checkpoint);

@@ -13,12 +13,14 @@
 
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Security/Consensus/VoteKey.hpp>
+#include <LemonadeNexus/Security/Epoch/AuthorityChain.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochState.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <span>
 #include <variant>
 #include <vector>
 
@@ -56,6 +58,20 @@ public:
     [[nodiscard]] bool append_authority(const EpochAuthorityRecord& record);
     [[nodiscard]] std::variant<std::vector<EpochAuthorityRecord>, EpochLoadResult>
     load_authority_history() const;
+
+    /// The latest verified authority anchor, so a restart resumes the chain
+    /// walk from here instead of Genesis. The record binds its own digest; a
+    /// mismatch loads as Corrupt, never as a different anchor.
+    [[nodiscard]] bool store_authority_anchor(const VerifiedEpochAuthority& anchor);
+    [[nodiscard]] std::variant<VerifiedEpochAuthority, EpochLoadResult>
+    load_authority_anchor() const;
+
+    /// The verified handoff links this node holds, as encoded wire envelopes,
+    /// oldest first. Loading returns bytes; the caller re-decodes and
+    /// re-verifies — the store never vouches for chain content.
+    [[nodiscard]] bool append_chain_link(std::span<const uint8_t> encoded);
+    [[nodiscard]] std::variant<std::vector<std::vector<uint8_t>>, EpochLoadResult>
+    load_chain_links() const;
 
     [[nodiscard]] bool store_vote_key(const EpochVoteKey& key);
     [[nodiscard]] std::optional<EpochVoteKey> load_vote_key(EpochId epoch, const NodeId& node) const;
