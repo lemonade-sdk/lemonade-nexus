@@ -51,9 +51,15 @@ struct MemoryMesh {
     std::map<NodeId, Node*> nodes;
     std::deque<Queued> queue;
     uint64_t now_ms = 1000;
+    /// Decoded copies of adoption traffic, so a hostile test can mutate a
+    /// genuine package instead of guessing at one.
+    std::vector<NextEpochPlanProof> captured_plans;
+    std::vector<ReadinessProofMsg> captured_readiness;
+    std::vector<EpochHandoffProofMsg> captured_handoffs;
     // Unreachable nodes: nothing is delivered to or from them. Offline is a
     // transport fact, not a protocol one.
     std::set<NodeId> offline;
+    void capture(std::span<const uint8_t> bytes);
     // Nodes whose transport certificate no longer verifies against the root.
     // The mesh knows this, not the platform, so it lives here. The per-observer
     // map lets one node see the answer differently, which is what a
@@ -188,6 +194,21 @@ struct Node {
     }
 };
 
+inline void MemoryMesh::capture(std::span<const uint8_t> bytes) {
+    const auto decoded = decode_security_message(bytes);
+    if (!std::holds_alternative<SecurityMessage>(decoded)) {
+        return;
+    }
+    const auto& message = std::get<SecurityMessage>(decoded);
+    if (const auto* plan = std::get_if<NextEpochPlanProof>(&message.body)) {
+        captured_plans.push_back(*plan);
+    } else if (const auto* readiness = std::get_if<ReadinessProofMsg>(&message.body)) {
+        captured_readiness.push_back(*readiness);
+    } else if (const auto* handoff = std::get_if<EpochHandoffProofMsg>(&message.body)) {
+        captured_handoffs.push_back(*handoff);
+    }
+}
+
 inline void MemoryMesh::pump() {
     while (!queue.empty()) {
         Queued item = std::move(queue.front());
@@ -195,6 +216,7 @@ inline void MemoryMesh::pump() {
         if (offline.contains(item.from) || offline.contains(item.to)) {
             continue;
         }
+        capture(item.bytes);
         nodes.at(item.to)->deliver(item.from, item.bytes, now_ms);
     }
 }

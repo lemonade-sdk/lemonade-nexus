@@ -221,7 +221,11 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
     if (!epoch_in_window(message)) {
         return drop(DropReason::EpochOutOfWindow);
     }
-    if (!remember(envelope)) {
+    // A sync request has no nonce, so a retry is byte-identical to the first
+    // ask. It is an idempotent query answered only to its sender and paid for
+    // by the per-peer budget, so it skips the replay window rather than
+    // starving a restarted node of its own retries.
+    if (message.kind != SecurityMessageKind::SyncRequest && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
     return dispatch(message);

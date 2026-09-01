@@ -187,6 +187,17 @@ void SecurityDriver::tick(uint64_t now_ms) {
         return;
     }
 
+    if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value() &&
+        !adoption_->state_synced &&
+        now_ms - sync_started_ms_ >= config_.sync_window_ms) {
+        // Recovery input can be lost; the ask repeats until certified state
+        // answers it. Repeating costs nothing and authorizes nothing.
+        sync_started_ms_ = now_ms;
+        (void)router_.broadcast(router_.compose(SecurityMessageKind::SyncRequest,
+                                                SyncRequest{adoption_->plan.current_epoch},
+                                                adoption_->plan.current_epoch));
+    }
+
     if (phase_ == DriverPhase::Syncing) {
         const bool window_over = now_ms - sync_started_ms_ >= config_.sync_window_ms;
         if (any_sync_response_ && window_over) {
@@ -1042,6 +1053,13 @@ std::optional<CandidateReadiness> SecurityDriver::derive_readiness() const {
         if (verdict == verdicts.end() || !verdict->second.passed || key == keys.end()) {
             return std::nullopt;
         }
+        // The final attestation must have proved every required claim through
+        // the provider-neutral path. A verdict that somehow passed without
+        // them confers no readiness.
+        if (!platform_claims_are_consistent(verdict->second.claims) ||
+            !all_platform_claims_proved(verdict->second.claims)) {
+            return std::nullopt;
+        }
         // Readiness rests on a FRESH final attestation. A verdict past the
         // compiled age names a platform state nobody has seen recently, so the
         // set is not proposable until re-attestation renews it.
@@ -1478,6 +1496,7 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
 
     adoption_ = std::move(adoption);
     pending_dkg_.reset();
+    sync_started_ms_ = now_ms_;
     set_phase(DriverPhase::PendingNextEpoch,
               "named in a finalized plan; preparing for the next epoch");
     // Recovery input comes from the mesh; finality stays the authority.
