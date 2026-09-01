@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <variant>
 #include <vector>
 
@@ -116,6 +117,13 @@ public:
     [[nodiscard]] std::optional<DkgResult> take_dkg_result();
     void abandon_dkg();
 
+    /// Records that an authenticated sender broadcast round-1 material for a
+    /// target epoch. Kept with or without a session, so every current member
+    /// — ceremony participant or not — attributes a stalled DKG to the same
+    /// silent participants. An observation, never an acceptance.
+    void observe_round1(const DkgMessage& message);
+    [[nodiscard]] std::set<NodeId> round1_seen(EpochId target_epoch) const;
+
     // --- Signing ---
 
     /// Opens a signing session as the initiator with a fresh random id.
@@ -172,6 +180,9 @@ private:
     std::map<NodeId, crypto::ParticipantIndex> index_of_;
 
     std::unique_ptr<DkgSession> dkg_;
+    /// Round-1 broadcasters per target epoch. Bounded: two epochs of history,
+    /// and each set stops growing at twice the largest Tier 1 population.
+    std::map<EpochId, std::set<NodeId>> round1_seen_;
     std::map<SigningSessionId, OpenSession> sessions_;
 };
 

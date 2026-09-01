@@ -235,6 +235,8 @@ void SecurityDriver::tick(uint64_t now_ms) {
         return;
     }
 
+    maybe_request_chain();
+
     if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value() &&
         !adoption_->state_synced &&
         now_ms - sync_started_ms_ >= config_.sync_window_ms) {
@@ -282,8 +284,34 @@ void SecurityDriver::tick(uint64_t now_ms) {
     if (phase_ == DriverPhase::Active && runtime_.epochs() != nullptr &&
         runtime_.epochs()->current().tier1_members.contains(config_.self)) {
         drain_objective_faults();
+        maybe_fail_stalled_dkg(now_ms);
         run_epoch_cadence(now_ms);
     }
+}
+
+void SecurityDriver::maybe_fail_stalled_dkg(uint64_t now_ms) {
+    EpochManager* epochs = runtime_.epochs();
+    const EpochTransition* transition = epochs->transition();
+    if (transition == nullptr ||
+        transition->phase != EpochTransitionPhase::GeneratingAuthorityKey ||
+        !readiness_.has_value() || dkg_authorized_ms_ == 0 ||
+        now_ms - dkg_authorized_ms_ < constants::kDkgStallSeconds * 1000) {
+        return;
+    }
+    // A participant that claimed readiness and then never spoke affects
+    // liveness only: the attempt fails, its silence — observed identically by
+    // every member from the broadcast traffic — excludes it, and the
+    // deterministic replacement runs under a fresh plan and a fresh DKG.
+    // Nothing of this attempt survives into the next one.
+    const auto seen = runtime_.authority().round1_seen(transition->to_epoch);
+    for (const auto& node : transition->selected_members) {
+        if (node != config_.self && !seen.contains(node)) {
+            boundary_failed_.insert(node);
+        }
+    }
+    runtime_.authority().abandon_dkg();
+    pending_dkg_.reset();
+    abandon_boundary("DKG stalled past the compiled window; the attempt is replaced");
 }
 
 // --- Sync --------------------------------------------------------------------
@@ -528,6 +556,7 @@ void SecurityDriver::start_founding_dkg() {
         set_phase(DriverPhase::Idle, "epoch-1 DKG refused to start");
         return;
     }
+    runtime_.authority().observe_round1(*broadcast);
     (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *broadcast, 1));
 }
 
@@ -745,9 +774,11 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     (void)store_.append_authority({1, certificate.authority_public_key,
                                    certificate.tier1_set_digest,
                                    certificate.dkg_transcript_digest});
-    // The verified chain starts here: Epoch 1 under the pinned signature.
+    // The verified chain starts here: Epoch 1 under the pinned signature. The
+    // base listing persists beside it, so this node can serve the walk.
     if (auto epoch_one = verify_epoch_one_authority(certificate, config_.genesis_public_key,
                                                     founding_->members)) {
+        (void)store_.store_chain_base(founding_->members);
         install_authority(std::move(*epoch_one));
     }
     if (!enter_eligibility_epoch(1, runtime_.epochs()->current().tier1_members)) {
@@ -978,6 +1009,7 @@ void SecurityDriver::maybe_start_next_dkg() {
     dkg.session_binding = candidate_readiness_digest(*readiness_);
     auto broadcast = runtime_.authority().start_dkg(std::move(dkg));
     if (broadcast.has_value()) {
+        runtime_.authority().observe_round1(*broadcast);
         (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *broadcast,
                                                 transition->to_epoch));
     }
@@ -1434,6 +1466,7 @@ void SecurityDriver::on_readiness_committed(const ConsensusCommit& commit) {
         return;
     }
     readiness_ = std::move(readiness);
+    dkg_authorized_ms_ = now_ms_;
     if (HotStuffService* consensus = runtime_.consensus()) {
         if (auto proof = consensus->commit_proof(commit.proposal_digest)) {
             readiness_proof_ = *proof;
@@ -1453,6 +1486,7 @@ void SecurityDriver::abandon_boundary(const char* reason) {
     spdlog::info("[security] boundary abandoned: {}", reason);
     plan_.reset();
     readiness_.reset();
+    dkg_authorized_ms_ = 0;
     state_ready_.clear();
     final_verdict_ms_.clear();
     transition_attests_.clear();
@@ -1494,6 +1528,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     final_verdict_ms_.clear();
     transition_attests_.clear();
     plans_committed_ = 0;
+    dkg_authorized_ms_ = 0;
     // Observations expire at the boundary: the new epoch's members are the new
     // observers, and continuity has to be re-established under them.
     if (!enter_eligibility_epoch(to_epoch, epochs->current().tier1_members)) {
@@ -1535,6 +1570,124 @@ void SecurityDriver::announce_epoch(const Digest& checkpoint) {
                                             current.id));
 }
 
+// --- The authority chain over the wire ---------------------------------------
+
+void SecurityDriver::on_epoch_announcement(const EpochAnnouncement& announcement,
+                                           const NodeId&) {
+    // A hint and nothing more: it can prompt a question, never an answer.
+    chain_hint_epoch_ = std::max(chain_hint_epoch_, announcement.authority.epoch);
+}
+
+void SecurityDriver::maybe_request_chain() {
+    // Only a node with no current epoch state walks; members are at the head
+    // by construction. Genesis is a one-shot authority, not a walker.
+    if (runtime_.epochs() != nullptr || phase_ != DriverPhase::Idle || genesis_node()) {
+        return;
+    }
+    const EpochId have = authority_.has_value() ? authority_->epoch : 0;
+    // With a verified authority and no hint of anything newer, there is
+    // nothing to ask for. With none at all, the ask itself is the start.
+    if (authority_.has_value() && chain_hint_epoch_ <= have) {
+        return;
+    }
+    if (now_ms_ - chain_request_ms_ < config_.sync_window_ms) {
+        return;
+    }
+    chain_request_ms_ = now_ms_;
+    (void)router_.broadcast(router_.compose(SecurityMessageKind::AuthorityChainRequest,
+                                            AuthorityChainRequest{have}, have));
+}
+
+void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& request,
+                                                const NodeId& from) {
+    // Serving is a bounded read of local records; it grants nothing and
+    // asserts nothing the page's own proofs do not carry.
+    AuthorityChainPage page;
+    EpochId next_from = request.have_epoch;
+    if (request.have_epoch == 0) {
+        auto certificate = store_.load_bootstrap();
+        auto base = store_.load_chain_base();
+        const auto* cert = std::get_if<BootstrapCertificate>(&certificate);
+        const auto* listing =
+            std::get_if<std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>>(&base);
+        if (cert == nullptr || listing == nullptr) {
+            return;
+        }
+        page.has_base = true;
+        page.base_certificate = *cert;
+        page.base_vote_keys = *listing;
+        next_from = 1;
+    }
+    auto links = store_.load_chain_links();
+    if (const auto* stored = std::get_if<std::vector<std::vector<uint8_t>>>(&links)) {
+        for (const auto& bytes : *stored) {
+            if (page.links.size() >= constants::kMaxHandoffChainLinks) {
+                break;
+            }
+            auto decoded = decode_security_message(bytes);
+            const auto* message = std::get_if<SecurityMessage>(&decoded);
+            if (message == nullptr) {
+                continue;
+            }
+            const auto* link = std::get_if<EpochHandoffProofMsg>(&message->body);
+            if (link == nullptr || link->handoff.from_epoch != next_from) {
+                continue;
+            }
+            page.links.push_back(*link);
+            ++next_from;
+        }
+    }
+    if (!page.has_base && page.links.empty()) {
+        return;
+    }
+    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, page,
+                                             authority_.has_value() ? authority_->epoch : 0));
+}
+
+void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) {
+    // Candidate data from a peer. Everything is verified from the pinned
+    // Genesis key and the advancing anchor; a page that proves nothing
+    // changes nothing.
+    if (runtime_.epochs() != nullptr) {
+        return;
+    }
+    const EpochId before = authority_.has_value() ? authority_->epoch : 0;
+    if (!authority_.has_value() && page.has_base) {
+        if (auto base = verify_epoch_one_authority(page.base_certificate,
+                                                   config_.genesis_public_key,
+                                                   page.base_vote_keys)) {
+            anchor_ = page.base_certificate;
+            (void)store_.store_bootstrap(page.base_certificate);
+            (void)store_.store_chain_base(page.base_vote_keys);
+            install_authority(std::move(*base));
+        }
+    }
+    if (!authority_.has_value()) {
+        return;
+    }
+    for (const auto& link : page.links) {
+        if (link.handoff.from_epoch != authority_->epoch) {
+            continue;
+        }
+        auto advanced = advance_epoch_authority(*authority_, link.handoff, link.proof);
+        auto* next = std::get_if<VerifiedEpochAuthority>(&advanced);
+        if (next == nullptr) {
+            break;
+        }
+        (void)store_.append_chain_link(encode_security_message(router_.compose(
+            SecurityMessageKind::EpochHandoffProof, link, link.handoff.to_epoch)));
+        install_authority(std::move(*next));
+    }
+    if (authority_->epoch > before) {
+        // Progress: ask the same server for the next page right away.
+        chain_request_ms_ = now_ms_;
+        (void)router_.send(from,
+                           router_.compose(SecurityMessageKind::AuthorityChainRequest,
+                                           AuthorityChainRequest{authority_->epoch},
+                                           authority_->epoch));
+    }
+}
+
 // --- Candidate adoption ------------------------------------------------------
 
 bool SecurityDriver::candidate_verify_proof(const Digest& transitions_digest,
@@ -1570,10 +1723,14 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
     if (!authority_.has_value() && anchor_.has_value() && plan.current_epoch == anchor_->epoch) {
         if (auto epoch_one = verify_epoch_one_authority(*anchor_, config_.genesis_public_key,
                                                         package.current_vote_keys)) {
+            (void)store_.store_chain_base(package.current_vote_keys);
             install_authority(std::move(*epoch_one));
         }
     }
     if (!authority_.has_value() || authority_->epoch != plan.current_epoch) {
+        // Behind the chain: remember the hint so the walk starts. The plan
+        // itself confers nothing and is dropped, not believed.
+        chain_hint_epoch_ = std::max(chain_hint_epoch_, plan.current_epoch);
         return;
     }
     if (plan.security_ruleset != constants::kSecurityRulesetVersion ||
@@ -1619,6 +1776,7 @@ void SecurityDriver::on_next_epoch_plan(const NextEpochPlanProof& package) {
     }
 
     adoption_ = std::move(adoption);
+    runtime_.authority().abandon_dkg();
     pending_dkg_.reset();
     sync_started_ms_ = now_ms_;
     set_phase(DriverPhase::PendingNextEpoch,
@@ -1755,6 +1913,7 @@ void SecurityDriver::on_readiness_proof(const ReadinessProofMsg& message) {
     dkg.session_binding = digest;
     auto broadcast = runtime_.authority().start_dkg(std::move(dkg));
     if (broadcast.has_value()) {
+        runtime_.authority().observe_round1(*broadcast);
         (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *broadcast,
                                                 adoption_->plan.next_epoch));
     }

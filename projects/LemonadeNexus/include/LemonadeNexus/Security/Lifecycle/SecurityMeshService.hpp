@@ -126,6 +126,44 @@ private:
         void on_sync_certificate(const QuorumCertificate& q, const NodeId& n) override {
             if (target) target->on_sync_certificate(q, n);
         }
+        void on_vote_accepted(const Vote& v) override {
+            if (target) target->on_vote_accepted(v);
+        }
+        void on_eligibility_observation(const EligibilityObservation& o) override {
+            if (target) target->on_eligibility_observation(o);
+        }
+        void on_genesis_eligibility_attest(const GenesisEligibilityAttest& a) override {
+            if (target) target->on_genesis_eligibility_attest(a);
+        }
+        void on_participation_challenge(const ParticipationChallenge& c,
+                                        const NodeId& n) override {
+            if (target) target->on_participation_challenge(c, n);
+        }
+        void on_participation_response(const ParticipationResponse& r) override {
+            if (target) target->on_participation_response(r);
+        }
+        void on_next_epoch_plan(const NextEpochPlanProof& p) override {
+            if (target) target->on_next_epoch_plan(p);
+        }
+        void on_candidate_state_ready(const CandidateStateReadyMsg& m) override {
+            if (target) target->on_candidate_state_ready(m);
+        }
+        void on_readiness_proof(const ReadinessProofMsg& m) override {
+            if (target) target->on_readiness_proof(m);
+        }
+        void on_epoch_handoff_proof(const EpochHandoffProofMsg& m) override {
+            if (target) target->on_epoch_handoff_proof(m);
+        }
+        void on_candidate_sync_response(const SyncResponse& s, const NodeId& n) override {
+            if (target) target->on_candidate_sync_response(s, n);
+        }
+        void on_authority_chain_request(const AuthorityChainRequest& r,
+                                        const NodeId& n) override {
+            if (target) target->on_authority_chain_request(r, n);
+        }
+        void on_authority_chain_page(const AuthorityChainPage& p, const NodeId& n) override {
+            if (target) target->on_authority_chain_page(p, n);
+        }
     };
 
     [[nodiscard]] uint64_t now_ms() const;

@@ -103,7 +103,7 @@ public:
     void on_authority_signature(const AuthoritySignature&) override {}
     void on_attestation_verdict(const AttestationVerdict& verdict,
                                 const AttestationEvidence& evidence) override;
-    void on_epoch_announcement(const EpochAnnouncement&, const NodeId&) override {}
+    void on_epoch_announcement(const EpochAnnouncement& announcement, const NodeId& from) override;
     void on_genesis_founding(const GenesisFounding& founding, const NodeId& from) override;
     void on_dkg_transcript_attest(const DkgTranscriptAttest& attest) override;
     void on_bootstrap_certificate(const BootstrapCertificate& certificate,
@@ -120,6 +120,9 @@ public:
     void on_readiness_proof(const ReadinessProofMsg& message) override;
     void on_epoch_handoff_proof(const EpochHandoffProofMsg& message) override;
     void on_candidate_sync_response(const SyncResponse& response, const NodeId& from) override;
+    void on_authority_chain_request(const AuthorityChainRequest& request,
+                                    const NodeId& from) override;
+    void on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
@@ -164,6 +167,10 @@ private:
     void send_founding();
     void start_founding_dkg();
     void maybe_start_next_dkg();
+    /// Fails an authorized DKG that sat incomplete past the compiled window
+    /// and excludes the participants whose round-1 silence every member
+    /// observed. Liveness recovery; nothing here activates anything.
+    void maybe_fail_stalled_dkg(uint64_t now_ms);
     void maybe_propose(View view);
     void progress(uint64_t now_ms);
     void begin_sync(uint64_t now_ms);
@@ -184,6 +191,9 @@ private:
     /// Advances the anchor through any stored links past it. Local recovery
     /// only: every link is re-verified before it counts.
     void catch_up_authority_from_store();
+    /// Asks the mesh for chain links when something hints this node is
+    /// behind. The ask is idempotent and free of authority.
+    void maybe_request_chain();
     void broadcast_proof(SecurityMessageKind kind, SecurityBody body, EpochId epoch);
     [[nodiscard]] bool candidate_verify_proof(const Digest& transitions_digest,
                                               const CommitProof& proof) const;
@@ -266,6 +276,8 @@ private:
     std::set<NodeId> state_ready_;
     std::optional<CandidateReadiness> readiness_;
     CommitProof readiness_proof_;
+    /// When the readiness commit authorized the ceremony; zero outside one.
+    uint64_t dkg_authorized_ms_ = 0;
     /// Ceremony participants' signed outcomes, for members outside it.
     std::map<NodeId, DkgTranscriptAttest> transition_attests_;
 
@@ -290,6 +302,10 @@ private:
     /// per epoch after that. Grants nothing; it is what everything else is
     /// verified against.
     std::optional<VerifiedEpochAuthority> authority_;
+    /// The highest epoch any announcement or plan has named. A hint that can
+    /// prompt a chain request; it never becomes state by itself.
+    EpochId chain_hint_epoch_ = 0;
+    uint64_t chain_request_ms_ = 0;
     std::size_t consumed_equivocations_ = 0;
     /// Peers whose transport certificate the mesh verified. Tier 2 candidates
     /// are challenged from here; the list decides nothing on its own.

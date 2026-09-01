@@ -23,6 +23,7 @@ constexpr const char* kEpochFile = "epoch-current.json";
 constexpr const char* kHistoryFile = "authority-history.json";
 constexpr const char* kAnchorFile = "authority-anchor.json";
 constexpr const char* kChainFile = "handoff-chain.json";
+constexpr const char* kChainBaseFile = "chain-base.json";
 
 template <std::size_t N>
 std::string b64(const std::array<uint8_t, N>& bytes) {
@@ -434,6 +435,43 @@ EpochStore::load_chain_links() const {
         links.push_back(std::move(bytes));
     }
     return links;
+}
+
+// --- Epoch-1 chain base ------------------------------------------------------
+
+bool EpochStore::store_chain_base(
+    const std::vector<std::pair<NodeId, nexus::crypto::Ed25519PublicKey>>& listing) {
+    json j = json::array();
+    for (const auto& [node, key] : listing) {
+        json entry;
+        entry["node"] = b64(node.bytes);
+        entry["vote_key"] = b64(key);
+        j.push_back(entry);
+    }
+    return write_atomic(directory_ / kChainBaseFile, j.dump());
+}
+
+std::variant<std::vector<std::pair<NodeId, nexus::crypto::Ed25519PublicKey>>, EpochLoadResult>
+EpochStore::load_chain_base() const {
+    const auto text = read_all(directory_ / kChainBaseFile);
+    if (!text.has_value()) {
+        return EpochLoadResult::Absent;
+    }
+    const json j = json::parse(*text, nullptr, false);
+    if (!j.is_array()) {
+        return EpochLoadResult::Corrupt;
+    }
+    std::vector<std::pair<NodeId, nexus::crypto::Ed25519PublicKey>> listing;
+    for (const auto& entry : j) {
+        NodeId node;
+        nexus::crypto::Ed25519PublicKey key{};
+        if (!(entry.is_object() && entry.contains("node") && from_b64(entry["node"], node.bytes) &&
+              entry.contains("vote_key") && from_b64(entry["vote_key"], key))) {
+            return EpochLoadResult::Corrupt;
+        }
+        listing.emplace_back(node, key);
+    }
+    return listing;
 }
 
 // --- Own vote key -----------------------------------------------------------

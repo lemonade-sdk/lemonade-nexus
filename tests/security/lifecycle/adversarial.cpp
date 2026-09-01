@@ -280,6 +280,12 @@ struct EventsProxy : ISecurityEvents {
     void on_candidate_sync_response(const SyncResponse& s, const NodeId& n) override {
         if (target) target->on_candidate_sync_response(s, n);
     }
+    void on_authority_chain_request(const AuthorityChainRequest& r, const NodeId& n) override {
+        if (target) target->on_authority_chain_request(r, n);
+    }
+    void on_authority_chain_page(const AuthorityChainPage& p, const NodeId& n) override {
+        if (target) target->on_authority_chain_page(p, n);
+    }
 };
 
 struct Node {

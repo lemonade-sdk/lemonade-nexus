@@ -150,6 +150,14 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
     const bool participation_kind =
         message.kind == SecurityMessageKind::ParticipationChallenge ||
         message.kind == SecurityMessageKind::ParticipationResponse;
+    // The chain exchange names epochs inside its verified content, not in the
+    // envelope: a fresh node cannot know the current epoch, and a server
+    // answers about history. Passing the window is delivery, never belief.
+    const bool chain_kind = message.kind == SecurityMessageKind::AuthorityChainRequest ||
+                            message.kind == SecurityMessageKind::AuthorityChainPage;
+    if (chain_kind) {
+        return true;
+    }
     // What a pending candidate exchanges before it holds epoch state. Each of
     // these carries or answers a finalized proof the driver verifies in full;
     // passing the window is delivery, never belief.
@@ -225,7 +233,9 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
     // ask. It is an idempotent query answered only to its sender and paid for
     // by the per-peer budget, so it skips the replay window rather than
     // starving a restarted node of its own retries.
-    if (message.kind != SecurityMessageKind::SyncRequest && !remember(envelope)) {
+    const bool idempotent_ask = message.kind == SecurityMessageKind::SyncRequest ||
+                                message.kind == SecurityMessageKind::AuthorityChainRequest;
+    if (!idempotent_ask && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
     return dispatch(message);
@@ -299,6 +309,14 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
             return delivered();
         case SecurityMessageKind::EpochHandoffProof:
             events_.on_epoch_handoff_proof(std::get<EpochHandoffProofMsg>(message.body));
+            return delivered();
+        case SecurityMessageKind::AuthorityChainRequest:
+            events_.on_authority_chain_request(std::get<AuthorityChainRequest>(message.body),
+                                               message.sender);
+            return delivered();
+        case SecurityMessageKind::AuthorityChainPage:
+            events_.on_authority_chain_page(std::get<AuthorityChainPage>(message.body),
+                                            message.sender);
             return delivered();
     }
     return drop(DropReason::UnknownKind);
@@ -440,6 +458,10 @@ RouteResult SecurityRouter::route_timeout(const TimeoutVote& vote) {
 }
 
 RouteResult SecurityRouter::route_dkg(DkgMessage& message) {
+    // Round-1 speech is recorded before any session check: a member outside
+    // the ceremony still learns who spoke, which is what lets every member
+    // attribute a stalled DKG to the same silent participants.
+    runtime_.authority().observe_round1(message);
     DkgSession* dkg = runtime_.authority().dkg();
     if (dkg == nullptr) {
         return drop(DropReason::NoService);

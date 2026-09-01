@@ -474,6 +474,34 @@ bool encode_handoff_proof(Writer& w, const EpochHandoffProofMsg& m) {
     return encode_handoff(w, m.handoff) && encode_commit_proof(w, m.proof);
 }
 
+bool encode_chain_request(Writer& w, const AuthorityChainRequest& c) {
+    w.u64(c.have_epoch);
+    return true;
+}
+
+bool encode_chain_page(Writer& w, const AuthorityChainPage& p) {
+    if (p.base_vote_keys.size() > constants::kMaxActiveTier1 ||
+        p.links.size() > constants::kMaxHandoffChainLinks) {
+        return false;
+    }
+    w.u16(p.has_base ? 1 : 0);
+    if (p.has_base) {
+        encode_bootstrap(w, p.base_certificate);
+        w.u16(static_cast<uint16_t>(p.base_vote_keys.size()));
+        for (const auto& [node, key] : p.base_vote_keys) {
+            put_node(w, node);
+            w.fixed(key);
+        }
+    }
+    w.u16(static_cast<uint16_t>(p.links.size()));
+    for (const auto& link : p.links) {
+        if (!encode_handoff_proof(w, link)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool encode_genesis_eligibility_attest(Writer& w, const GenesisEligibilityAttest& a) {
     w.u64(a.epoch);
     w.fixed(a.founding_state_digest);
@@ -873,6 +901,53 @@ bool decode_handoff_proof(Reader& r, EpochHandoffProofMsg& m) {
     return decode_handoff(r, m.handoff) && decode_commit_proof(r, m.proof);
 }
 
+bool decode_chain_request(Reader& r, AuthorityChainRequest& c) { return r.u64(c.have_epoch); }
+
+bool decode_chain_page(Reader& r, AuthorityChainPage& p) {
+    uint16_t has_base = 0;
+    if (!r.u16(has_base) || has_base > 1) {
+        return r.fail(CodecError::BadValue);
+    }
+    p.has_base = has_base == 1;
+    if (p.has_base) {
+        if (!decode_bootstrap(r, p.base_certificate)) {
+            return false;
+        }
+        uint16_t base_count = 0;
+        if (!r.u16(base_count)) {
+            return false;
+        }
+        if (base_count > constants::kMaxActiveTier1) {
+            return r.fail(CodecError::CountTooLarge);
+        }
+        for (uint16_t i = 0; i < base_count; ++i) {
+            NodeId node;
+            nexus::crypto::Ed25519PublicKey key{};
+            if (!(get_node(r, node) && r.fixed(key))) {
+                return false;
+            }
+            p.base_vote_keys.emplace_back(node, key);
+        }
+    }
+    uint16_t count = 0;
+    if (!r.u16(count)) {
+        return false;
+    }
+    // Bounded before the loop: a claimed count never drives allocation or
+    // signature parsing past the compiled page limit.
+    if (count > constants::kMaxHandoffChainLinks) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    for (uint16_t i = 0; i < count; ++i) {
+        EpochHandoffProofMsg link;
+        if (!decode_handoff_proof(r, link)) {
+            return false;
+        }
+        p.links.push_back(std::move(link));
+    }
+    return true;
+}
+
 bool decode_genesis_eligibility_attest(Reader& r, GenesisEligibilityAttest& a) {
     return r.u64(a.epoch) && r.fixed(a.founding_state_digest) && get_node(r, a.node) &&
            r.fixed(a.identity_signature);
@@ -1035,13 +1110,25 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(m);
             return true;
         }
+        case SecurityMessageKind::AuthorityChainRequest: {
+            AuthorityChainRequest m;
+            if (!decode_chain_request(r, m)) return false;
+            body = m;
+            return true;
+        }
+        case SecurityMessageKind::AuthorityChainPage: {
+            AuthorityChainPage m;
+            if (!decode_chain_page(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
     }
     return r.fail(CodecError::UnknownKind);
 }
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::EpochHandoffProof);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::AuthorityChainPage);
 }
 
 }  // namespace
@@ -1108,8 +1195,12 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::CandidateStateReady;
             } else if constexpr (std::is_same_v<T, ReadinessProofMsg>) {
                 return SecurityMessageKind::ReadinessProof;
-            } else {
+            } else if constexpr (std::is_same_v<T, EpochHandoffProofMsg>) {
                 return SecurityMessageKind::EpochHandoffProof;
+            } else if constexpr (std::is_same_v<T, AuthorityChainRequest>) {
+                return SecurityMessageKind::AuthorityChainRequest;
+            } else {
+                return SecurityMessageKind::AuthorityChainPage;
             }
         },
         body);
@@ -1167,8 +1258,12 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_state_ready(body, value);
             } else if constexpr (std::is_same_v<T, ReadinessProofMsg>) {
                 return encode_readiness_proof(body, value);
-            } else {
+            } else if constexpr (std::is_same_v<T, EpochHandoffProofMsg>) {
                 return encode_handoff_proof(body, value);
+            } else if constexpr (std::is_same_v<T, AuthorityChainRequest>) {
+                return encode_chain_request(body, value);
+            } else {
+                return encode_chain_page(body, value);
             }
         },
         message.body);

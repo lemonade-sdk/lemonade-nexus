@@ -95,6 +95,11 @@ public:
     /// A validated certificate from a peer: proof the network reached its
     /// view. The driver derives the restart view floor from these.
     virtual void on_sync_certificate(const QuorumCertificate&, const NodeId&) {}
+    /// The handoff-chain exchange. The request is answered from local
+    /// records; the page is candidate data the driver verifies from its own
+    /// trusted anchor, link by link.
+    virtual void on_authority_chain_request(const AuthorityChainRequest&, const NodeId&) {}
+    virtual void on_authority_chain_page(const AuthorityChainPage&, const NodeId&) {}
 };
 
 struct SecurityRouterConfig {

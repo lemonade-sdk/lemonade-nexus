@@ -84,6 +84,25 @@ std::optional<DkgResult> AuthorityService::take_dkg_result() {
 
 void AuthorityService::abandon_dkg() { dkg_.reset(); }
 
+void AuthorityService::observe_round1(const DkgMessage& message) {
+    if (message.round != DkgRound::Round1Broadcast) {
+        return;
+    }
+    auto& seen = round1_seen_[message.target_epoch];
+    if (seen.size() < 2 * constants::kMaxActiveTier1) {
+        seen.insert(message.sender);
+    }
+    // Two epochs of history; older ones cannot stall anything anymore.
+    while (round1_seen_.size() > 2) {
+        round1_seen_.erase(round1_seen_.begin());
+    }
+}
+
+std::set<NodeId> AuthorityService::round1_seen(EpochId target_epoch) const {
+    const auto it = round1_seen_.find(target_epoch);
+    return it == round1_seen_.end() ? std::set<NodeId>{} : it->second;
+}
+
 SigningStart AuthorityService::start_signing(const AuthorityObject& object,
                                              const QuorumCertificate& certificate,
                                              std::vector<NodeId> signer_set) {

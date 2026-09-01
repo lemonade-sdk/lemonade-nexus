@@ -73,6 +73,14 @@ public:
     [[nodiscard]] std::variant<std::vector<std::vector<uint8_t>>, EpochLoadResult>
     load_chain_links() const;
 
+    /// The epoch-1 member and vote-key listing the bootstrap certificate
+    /// commits to by digest — the base a chain page serves to fresh nodes.
+    [[nodiscard]] bool store_chain_base(
+        const std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>& listing);
+    [[nodiscard]] std::variant<std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>,
+                               EpochLoadResult>
+    load_chain_base() const;
+
     [[nodiscard]] bool store_vote_key(const EpochVoteKey& key);
     [[nodiscard]] std::optional<EpochVoteKey> load_vote_key(EpochId epoch, const NodeId& node) const;
     void discard_vote_key(EpochId epoch);

@@ -101,6 +101,12 @@ inline constexpr uint64_t kTargetEpochSeconds = 3600;
 inline constexpr uint64_t kReattestIntervalSeconds = 900;
 inline constexpr uint64_t kFinalAttestMaxAgeSeconds = 300;
 
+// How long an authorized next-epoch DKG may sit incomplete before the attempt
+// fails and the deterministic replacement runs. Liveness only: a stall never
+// activates anything, and the silent participants are excluded from the next
+// attempt by their own observed silence.
+inline constexpr uint64_t kDkgStallSeconds = 120;
+
 // Tier 1 attestation is expensive; the budget binds to node identity and
 // epoch, never to an IP address (architecture 24). Initial value; a tuning
 // item.
@@ -181,6 +187,12 @@ inline constexpr std::size_t kSecurityDedupeWindow = 4096;
 // The uncommitted chain is at most a few blocks in chained HotStuff; the
 // sync reply is bounded well above that and well below the envelope limit.
 inline constexpr std::size_t kMaxSyncChainBlocks = 8;
+
+// Handoff-chain links per page. A link at the largest population is under
+// 10 KB on the wire, so four keep the page inside the envelope limit with the
+// epoch-1 base beside them. A longer history is fetched page by page; nothing
+// accepts one attacker-sized chain object.
+inline constexpr std::size_t kMaxHandoffChainLinks = 4;
 
 // --- Compile-time checks against the architecture tables --------------------
 
