@@ -53,12 +53,13 @@ TEST_F(DriverMesh, TimedHandoffRotatesToEpochTwo) {
         ASSERT_EQ(founder->runtime->epochs()->transition()->to_epoch, 2u);
     }
 
-    // Injected final verdicts for the target epoch, binding epoch-2 vote keys.
+    // Injected final verdicts for the target epoch, binding epoch-2 vote keys
+    // and the committed plan's exact attestation context.
     for (Node* member : founders) {
         const auto vote_key = member->driver->vote_key_for_epoch(2);
         ASSERT_TRUE(vote_key.has_value());
         for (Node* founder : founders) {
-            founder->driver->on_attestation_verdict(passing_verdict(member->id, 2),
+            founder->driver->on_attestation_verdict(final_verdict(latest_plan(), member->id),
                                                     evidence_for(member->id, *vote_key));
         }
     }

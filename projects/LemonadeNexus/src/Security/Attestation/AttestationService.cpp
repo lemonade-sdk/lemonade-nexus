@@ -15,7 +15,17 @@ AttestationService::AttestationService(NetworkId network_id, LinuxAttestationPro
 
 std::optional<AttestationChallenge> AttestationService::create_challenge(
     const NodeId& node, const crypto::Ed25519PublicKey& node_key,
-    IncarnationId incarnation, EpochId epoch) {
+    IncarnationId incarnation, EpochId epoch, AttestationPurpose purpose,
+    const Digest& context) {
+    // A final challenge with no bound context would recreate the reusable
+    // attestation this binding exists to remove; an eligibility challenge with
+    // a caller-chosen context would let the caller relabel one.
+    if (purpose == AttestationPurpose::FinalEpochReadiness && context == Digest{}) {
+        return std::nullopt;
+    }
+    if (purpose == AttestationPurpose::Eligibility && context != Digest{}) {
+        return std::nullopt;
+    }
     auto& used = attempts_[{epoch, node}];
     if (used >= constants::kMaxTier1AttestAttemptsPerEpoch) {
         return std::nullopt;
@@ -36,6 +46,11 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     challenge.profile_id = kTier1AttestationProfileId;
     challenge.profile_ruleset = kAttestationProfileRulesetVersion;
     challenge.policy_digest = policy_digest_;
+    challenge.purpose = purpose;
+    challenge.context_digest =
+        purpose == AttestationPurpose::Eligibility
+            ? eligibility_attestation_context(network_id_, epoch, node, incarnation)
+            : context;
 
     // A new challenge replaces any unanswered one: only the latest is live.
     pending_[node] = challenge;
@@ -47,6 +62,8 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
     rejected.node_id = evidence.node_id;
     rejected.incarnation = evidence.incarnation;
     rejected.epoch = evidence.epoch;
+    rejected.purpose = evidence.purpose;
+    rejected.context_digest = evidence.context_digest;
     rejected.policy_digest = policy_digest_;
     rejected.failure = AttestationFailure::ChallengeMismatch;
 

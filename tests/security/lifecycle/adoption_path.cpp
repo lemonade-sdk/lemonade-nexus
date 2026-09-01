@@ -66,7 +66,7 @@ struct AdoptionPath : DriverMesh {
                 << "selected node cannot register a key yet";
             for (Node* member : online) {
                 member->driver->on_attestation_verdict(
-                    passing_verdict(id, target, round),
+                    final_verdict(latest_plan(), id, round),
                     evidence_for(id, *vote_key));
             }
         }

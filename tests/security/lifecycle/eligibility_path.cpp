@@ -25,7 +25,7 @@ TEST_F(EligibilityPath, LocalAttestationAloneCannotCreateEligibility) {
         for (Node* member : founders) {
             if (member == lone) continue;
             lone->driver->on_attestation_verdict(
-                passing_verdict(member->id, 1, round),
+                eligibility_verdict(network, member->id, 1, round),
                 evidence_for(member->id, *member->driver->vote_key_for_epoch(1)));
         }
         mesh.pump();
@@ -405,7 +405,7 @@ TEST_F(EligibilityPath, EpochFreezeSurvivesEveryKindOfMemberFailure) {
             for (Node* member : founders) {
                 if (member == observer || member == silent) continue;
                 observer->driver->on_attestation_verdict(
-                    passing_verdict(member->id, 1, round),
+                    eligibility_verdict(network, member->id, 1, round),
                     evidence_for(member->id, *member->driver->vote_key_for_epoch(1)));
             }
         }

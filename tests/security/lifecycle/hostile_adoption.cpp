@@ -197,7 +197,7 @@ TEST_F(HostileAdoption, StaleOrClaimlessFinalAttestationBlocksReadiness) {
     // Claimless verdicts for everyone: passed, but proving nothing.
     for (const auto& id : transition->selected_members) {
         Node* selected = mesh.nodes.at(id);
-        auto verdict = passing_verdict(id, 2, 9);
+        auto verdict = final_verdict(latest_plan(), id, 9);
         verdict.claims = VerifiedPlatformClaims{};
         for (Node* member : online) {
             member->driver->on_attestation_verdict(
@@ -218,7 +218,7 @@ TEST_F(HostileAdoption, StaleOrClaimlessFinalAttestationBlocksReadiness) {
         Node* selected = mesh.nodes.at(id);
         for (Node* member : online) {
             member->driver->on_attestation_verdict(
-                passing_verdict(id, 2, 10),
+                final_verdict(latest_plan(), id, 10),
                 evidence_for(id, *selected->driver->vote_key_for_epoch(2)));
         }
     }
@@ -243,7 +243,7 @@ TEST_F(HostileAdoption, TheHandoffProofDecidesActivationExactlyOnce) {
         Node* selected = mesh.nodes.at(id);
         for (Node* member : online) {
             member->driver->on_attestation_verdict(
-                passing_verdict(id, 2, 9),
+                final_verdict(latest_plan(), id, 9),
                 evidence_for(id, *selected->driver->vote_key_for_epoch(2)));
         }
     }
@@ -285,8 +285,8 @@ TEST_F(HostileAdoption, VoteKeyRegistrationRefusesReuseAndDuplicates) {
     const NodeId first = transition->selected_members[0];
     const NodeId second = transition->selected_members[1];
 
-    ASSERT_TRUE(epochs->record_final_attestation(passing_verdict(first, 2, 9)));
-    ASSERT_TRUE(epochs->record_final_attestation(passing_verdict(second, 2, 9)));
+    ASSERT_TRUE(epochs->record_final_attestation(final_verdict(latest_plan(), first, 9)));
+    ASSERT_TRUE(epochs->record_final_attestation(final_verdict(latest_plan(), second, 9)));
 
     nexus::crypto::Ed25519PublicKey key_a{};
     key_a.fill(0xA1);

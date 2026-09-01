@@ -19,6 +19,30 @@
 
 namespace nexus::security {
 
+/// What one attestation is FOR. The purpose and its context digest are inside
+/// the challenge digest, the evidence signing digest and (transitively) the
+/// TPM quote, so evidence produced for one purpose can never satisfy another.
+enum class AttestationPurpose : uint16_t {
+    /// Ordinary mesh eligibility: the rolling re-attestation cadence. The
+    /// context binds network, epoch, node and incarnation.
+    Eligibility = 1,
+    /// The fresh final attestation for one finalized next-epoch plan. The
+    /// context binds the plan digest, the attempt and the selected set, so a
+    /// replacement attempt needs a new attestation by construction.
+    FinalEpochReadiness = 2,
+};
+
+/// The canonical context for an ordinary eligibility attestation.
+[[nodiscard]] Digest eligibility_attestation_context(const NetworkId& network_id, EpochId epoch,
+                                                     const NodeId& node,
+                                                     IncarnationId incarnation);
+
+/// The canonical context for one plan's final attestation. `selected_set_digest`
+/// is the Tier1Set digest of the plan's selected members.
+[[nodiscard]] Digest final_readiness_attestation_context(
+    const NetworkId& network_id, EpochId next_epoch, const Digest& plan_digest, uint32_t attempt,
+    const Digest& selected_set_digest, const NodeId& node, IncarnationId incarnation);
+
 /// The challenge the current Tier 1 set issues for one attestation attempt.
 struct AttestationChallenge {
     /// Which mesh is asking. Transport authenticates the envelope, but transport
@@ -42,6 +66,11 @@ struct AttestationChallenge {
     AttestationProfileRuleset profile_ruleset{};
 
     Digest policy_digest{};
+
+    /// What this attestation is for, and the exact context it answers. Both are
+    /// inside challenge_digest(), so the quote commits to them.
+    AttestationPurpose purpose{AttestationPurpose::Eligibility};
+    Digest context_digest{};
 };
 
 /// The challenge value C from architecture 9. The prover uses this digest as
@@ -72,6 +101,11 @@ struct AttestationEvidence {
     /// its challenge names.
     AttestationProfileId profile_id{AttestationProfileId::Unknown};
     AttestationProfileRuleset profile_ruleset{};
+
+    /// Echoed from the challenge and signed with the rest, so a bundle built
+    /// for one purpose or context cannot be relabelled as another.
+    AttestationPurpose purpose{AttestationPurpose::Eligibility};
+    Digest context_digest{};
 
     crypto::Ed25519PublicKey epoch_vote_key{};
     SnpVtpmEvidence platform;
@@ -123,6 +157,14 @@ enum class AttestationFailure : uint16_t {
     EndorsementRevoked,
     /// The bundle answers for a different Nexus network.
     NetworkMismatch,
+    /// The bundle answers for a different purpose than the challenge named.
+    PurposeMismatch,
+    /// Same purpose, different bound context: another plan, attempt, or
+    /// selected set. Old evidence cannot answer a new context.
+    ContextMismatch,
+    /// A final-readiness challenge with no context bound. Never issued; a
+    /// hostile one proves nothing.
+    ContextUnbound,
 };
 
 /// The bounded result of one verification. It states facts about one candidate
@@ -131,6 +173,11 @@ struct AttestationVerdict {
     NodeId node_id{};
     EpochId epoch{};
     IncarnationId incarnation{};
+    /// The purpose and context the answered challenge bound. Consumers match
+    /// these against what they expect: an eligibility verdict confers no
+    /// final readiness, and the reverse.
+    AttestationPurpose purpose{AttestationPurpose::Eligibility};
+    Digest context_digest{};
     Digest policy_digest{};
     Digest evidence_digest{};
     /// True when no step failed. It is a summary, never an input: Tier 1 reads

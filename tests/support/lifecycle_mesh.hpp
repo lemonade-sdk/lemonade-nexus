@@ -245,7 +245,9 @@ inline VerifiedPlatformClaims complete_claims() {
 }
 
 // `round` distinguishes two verifications of the same node. Continuity counts
-// distinct attestations, so the digests must differ between rounds.
+// distinct attestations, so the digests must differ between rounds. The
+// verdict carries no context; the fixture helpers bind one, because the
+// driver refuses a verdict whose purpose or context does not match.
 inline AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch, uint8_t round = 0,
                                           IncarnationId incarnation = 1) {
     AttestationVerdict verdict;
@@ -260,6 +262,27 @@ inline AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch, uint8
     verdict.evidence_digest[0] = static_cast<uint8_t>(0xA0 + round);
     verdict.evidence_digest[1] = static_cast<uint8_t>(epoch + 1);
     verdict.evidence_digest[2] = static_cast<uint8_t>(incarnation);
+    return verdict;
+}
+
+// What the real service would produce for an ordinary eligibility exchange.
+inline AttestationVerdict eligibility_verdict(const NetworkId& network, const NodeId& id,
+                                              EpochId epoch, uint8_t round = 0,
+                                              IncarnationId incarnation = 1) {
+    AttestationVerdict verdict = passing_verdict(id, epoch, round, incarnation);
+    verdict.context_digest = eligibility_attestation_context(network, epoch, id, incarnation);
+    return verdict;
+}
+
+// What the real service would produce for one plan's final attestation.
+inline AttestationVerdict final_verdict(const NextEpochPlan& plan, const NodeId& id,
+                                        uint8_t round = 0) {
+    const auto incarnation = plan.incarnations.find(id);
+    AttestationVerdict verdict = passing_verdict(
+        id, plan.next_epoch, round,
+        incarnation != plan.incarnations.end() ? incarnation->second : 1);
+    verdict.purpose = AttestationPurpose::FinalEpochReadiness;
+    verdict.context_digest = SecurityDriver::plan_attest_context(plan, id);
     return verdict;
 }
 
@@ -381,7 +404,8 @@ struct DriverMesh : ::testing::Test {
                     // Epoch 0 is the bootstrap window: the founding round is
                     // not Epoch 1 work and does not spend its budget.
                     observer->driver->on_attestation_verdict(
-                        passing_verdict(subject->id, 0, static_cast<uint8_t>(round + 1)),
+                        eligibility_verdict(network, subject->id, 0,
+                                            static_cast<uint8_t>(round + 1)),
                         evidence_for(subject->id, *subject->driver->vote_key_for_epoch(1)));
                 }
             }
@@ -401,7 +425,7 @@ struct DriverMesh : ::testing::Test {
         // Injected verdicts stand in for the confidential-VM positive path.
         for (Node* founder : founders) {
             genesis_node->driver->on_attestation_verdict(
-                passing_verdict(founder->id, 1),
+                eligibility_verdict(network, founder->id, 1),
                 evidence_for(founder->id, *founder->driver->vote_key_for_epoch(1)));
         }
         mesh.pump();  // The founding reaches the founders; the mutual round starts.
@@ -478,7 +502,7 @@ struct DriverMesh : ::testing::Test {
             for (Node* subject : subjects) {
                 if (subject == observer) continue;
                 observer->driver->on_attestation_verdict(
-                    passing_verdict(subject->id, epoch, round, incarnation),
+                    eligibility_verdict(network, subject->id, epoch, round, incarnation),
                     evidence_for(subject->id, *subject->driver->vote_key_for_epoch(epoch)));
             }
         }
@@ -488,6 +512,30 @@ struct DriverMesh : ::testing::Test {
     void attest_subjects(uint8_t round, const std::vector<Node*>& subjects, EpochId epoch = 1,
                          IncarnationId incarnation = 1) {
         attest_subjects(round, subjects, founders, epoch, incarnation);
+    }
+
+    /// The plan the members most recently committed and broadcast. Final
+    /// attestation binds to it, so the injected verdicts must name it too.
+    [[nodiscard]] const NextEpochPlan& latest_plan() const {
+        EXPECT_FALSE(mesh.captured_plans.empty());
+        return mesh.captured_plans.back().plan;
+    }
+
+    /// Injects the fresh final-attestation verdicts for the committed plan
+    /// into each observer, bound to that plan's exact context.
+    void final_attest_subjects(uint8_t round, const std::vector<Node*>& subjects,
+                               const std::vector<Node*>& observers) {
+        const NextEpochPlan plan = latest_plan();
+        for (Node* observer : observers) {
+            for (Node* subject : subjects) {
+                if (subject == observer) continue;
+                observer->driver->on_attestation_verdict(
+                    final_verdict(plan, subject->id, round),
+                    evidence_for(subject->id,
+                                 *subject->driver->vote_key_for_epoch(plan.next_epoch)));
+            }
+        }
+        mesh.pump();
     }
 
     /// The reserves become reachable to the current members. Reachability is
@@ -524,7 +572,7 @@ struct DriverMesh : ::testing::Test {
         for (Node* founder : founders) {
             if (founder == &subject) continue;
             founder->driver->on_attestation_verdict(
-                passing_verdict(subject.id, epoch, round, incarnation),
+                eligibility_verdict(network, subject.id, epoch, round, incarnation),
                 evidence_for(subject.id, *subject.driver->vote_key_for_epoch(epoch)));
         }
         mesh.pump();

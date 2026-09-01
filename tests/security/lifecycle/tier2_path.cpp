@@ -347,18 +347,18 @@ TEST_F(Tier2Path, GenesisRoundsDoNotSpendEpochOneBudget) {
     nexus::crypto::Ed25519PublicKey key{};
     key = subject->id.bytes;
     for (uint32_t i = 0; i < constants::kMaxTier1AttestAttemptsPerEpoch; ++i) {
-        EXPECT_TRUE(observer->runtime->attestation().create_challenge(subject->id, key, 1, 1))
+        EXPECT_TRUE(observer->runtime->attestation().create_challenge(subject->id, key, 1, 1, AttestationPurpose::Eligibility))
             << "attempt " << i;
     }
-    EXPECT_FALSE(observer->runtime->attestation().create_challenge(subject->id, key, 1, 1))
+    EXPECT_FALSE(observer->runtime->attestation().create_challenge(subject->id, key, 1, 1, AttestationPurpose::Eligibility))
         << "and the budget is a real bound";
 
     // Epoch-0 evidence cannot answer an Epoch 1 challenge: the epoch is inside
     // the challenge digest the prover has to bind.
     const auto epoch_zero =
-        founders[2]->runtime->attestation().create_challenge(subject->id, key, 1, 0);
+        founders[2]->runtime->attestation().create_challenge(subject->id, key, 1, 0, AttestationPurpose::Eligibility);
     const auto epoch_one =
-        founders[3]->runtime->attestation().create_challenge(subject->id, key, 1, 1);
+        founders[3]->runtime->attestation().create_challenge(subject->id, key, 1, 1, AttestationPurpose::Eligibility);
     ASSERT_TRUE(epoch_zero.has_value() && epoch_one.has_value());
     EXPECT_NE(challenge_digest(*epoch_zero), challenge_digest(*epoch_one));
 }

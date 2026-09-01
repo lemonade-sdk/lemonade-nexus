@@ -171,7 +171,8 @@ void SecurityDriver::on_peer(const NodeId& peer, uint64_t now_ms) {
 void SecurityDriver::issue_genesis_challenge(const NodeId& peer) {
     crypto::Ed25519PublicKey peer_key{};
     peer_key = peer.bytes;
-    auto challenge = runtime_.attestation().create_challenge(peer, peer_key, 1, 1);
+    auto challenge = runtime_.attestation().create_challenge(peer, peer_key, 1, 1,
+                                                             AttestationPurpose::Eligibility);
     if (!challenge.has_value()) {
         return;  // The attestation budget for this identity is spent.
     }
@@ -353,7 +354,8 @@ void SecurityDriver::begin_founding_observations() {
         for (std::size_t round = 0; round < constants::kMinContinuityObservations; ++round) {
             crypto::Ed25519PublicKey node_key{};
             node_key = node.bytes;
-            auto challenge = runtime_.attestation().create_challenge(node, node_key, 1, 0);
+            auto challenge = runtime_.attestation().create_challenge(
+                node, node_key, 1, 0, AttestationPurpose::Eligibility);
             if (!challenge.has_value()) {
                 break;
             }
@@ -744,10 +746,27 @@ EpochVoteKey SecurityDriver::take_own_vote_key(EpochId epoch) {
 
 // --- Attestation and the epoch cadence --------------------------------------
 
+bool SecurityDriver::eligibility_verdict_ok(const AttestationVerdict& verdict) const {
+    // The verdict must have been produced for the ordinary eligibility purpose
+    // and its canonical context. Final-readiness evidence relabelled as
+    // eligibility names a different context and dies here. The network comes
+    // from the pinned genesis key: it exists before any epoch does.
+    const NetworkId network = derive_network_id(config_.genesis_public_key,
+                                                constants::kSecurityRulesetVersion,
+                                                constants::kConsensusRulesetVersion);
+    return verdict.purpose == AttestationPurpose::Eligibility &&
+           verdict.context_digest ==
+               eligibility_attestation_context(network, verdict.epoch, verdict.node_id,
+                                               verdict.incarnation);
+}
+
 void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
                                             const AttestationEvidence& evidence) {
     if (phase_ == DriverPhase::GenesisCollecting && genesis_ != nullptr &&
         !genesis_->finalized()) {
+        if (!eligibility_verdict_ok(verdict)) {
+            return;
+        }
         if (!genesis_->record_verdict(verdict)) {
             return;
         }
@@ -765,6 +784,9 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
     }
 
     if (phase_ == DriverPhase::GenesisEligibility) {
+        if (!eligibility_verdict_ok(verdict)) {
+            return;
+        }
         record_founding_observation(verdict);
         return;
     }
@@ -774,6 +796,9 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
         return;
     }
     if (verdict.epoch == epochs->current().id) {
+        if (!eligibility_verdict_ok(verdict)) {
+            return;
+        }
         // Local re-attestation creates a candidate observation and nothing
         // more. One verifier's word is not a mesh fact: the statement is signed
         // and published, and a quorum of observers is what makes it count.
@@ -786,6 +811,14 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
     }
     const EpochTransition* transition = epochs->transition();
     if (transition != nullptr && verdict.epoch == transition->to_epoch) {
+        // Final readiness accepts only evidence produced for exactly this
+        // plan, attempt and selected set. An ordinary eligibility verdict —
+        // or one for a superseded plan — names a different context.
+        if (verdict.purpose != AttestationPurpose::FinalEpochReadiness ||
+            !plan_.has_value() ||
+            verdict.context_digest != plan_attest_context(*plan_, verdict.node_id)) {
+            return;
+        }
         (void)epochs->record_final_attestation(verdict);
         if (verdict.passed) {
             final_verdict_ms_[verdict.node_id] = now_ms_;
@@ -814,8 +847,8 @@ void SecurityDriver::run_epoch_cadence(uint64_t now_ms) {
             }
             crypto::Ed25519PublicKey subject_key{};
             subject_key = subject.bytes;
-            auto challenge =
-                runtime_.attestation().create_challenge(subject, subject_key, 1, current.id);
+            auto challenge = runtime_.attestation().create_challenge(
+                subject, subject_key, 1, current.id, AttestationPurpose::Eligibility);
             if (challenge.has_value()) {
                 (void)router_.send(
                     subject, router_.compose(SecurityMessageKind::AttestationChallenge,
@@ -834,10 +867,23 @@ void SecurityDriver::run_epoch_cadence(uint64_t now_ms) {
     // through maybe_propose; nothing here prepares anything locally.
 }
 
-void SecurityDriver::attest_self_for(EpochId epoch) {
-    auto challenge =
-        runtime_.attestation().create_challenge(config_.self, config_.identity.public_key, 1,
-                                                epoch);
+Digest SecurityDriver::plan_attest_context(const NextEpochPlan& plan, const NodeId& node) {
+    const auto set = Tier1Set::from_nodes(plan.selected);
+    const auto incarnation = plan.incarnations.find(node);
+    if (!set.has_value() || incarnation == plan.incarnations.end()) {
+        // No canonical context exists; an empty digest fails every later
+        // check closed, starting with challenge creation itself.
+        return Digest{};
+    }
+    return final_readiness_attestation_context(plan.network_id, plan.next_epoch,
+                                               next_epoch_plan_digest(plan), plan.attempt,
+                                               set->digest(), node, incarnation->second);
+}
+
+void SecurityDriver::attest_self_for(EpochId epoch, const Digest& context) {
+    auto challenge = runtime_.attestation().create_challenge(
+        config_.self, config_.identity.public_key, 1, epoch,
+        AttestationPurpose::FinalEpochReadiness, context);
     if (challenge.has_value()) {
         (void)router_.deliver_local(
             router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, epoch));
@@ -1058,6 +1104,12 @@ std::optional<CandidateReadiness> SecurityDriver::derive_readiness() const {
         // them confers no readiness.
         if (!platform_claims_are_consistent(verdict->second.claims) ||
             !all_platform_claims_proved(verdict->second.claims)) {
+            return std::nullopt;
+        }
+        // And it must have been produced for exactly this plan's context —
+        // the second layer of the binding, checked where readiness forms.
+        if (verdict->second.purpose != AttestationPurpose::FinalEpochReadiness ||
+            verdict->second.context_digest != plan_attest_context(*plan_, node)) {
             return std::nullopt;
         }
         // Readiness rests on a FRESH final attestation. A verdict past the
@@ -1288,15 +1340,19 @@ void SecurityDriver::on_plan_committed(const ConsensusCommit& commit) {
     }
 
     // Final-attestation challenges to every selected node, this one included.
+    // Each challenge binds the plan context, so the answer commits to exactly
+    // this plan, attempt and selected set — not merely to the target epoch.
     const EpochId target = plan_->next_epoch;
     for (const auto& member : plan_->selected) {
+        const Digest context = plan_attest_context(*plan_, member);
         if (member == config_.self) {
-            attest_self_for(target);
+            attest_self_for(target, context);
             continue;
         }
         crypto::Ed25519PublicKey member_key{};
         member_key = member.bytes;
-        auto challenge = runtime_.attestation().create_challenge(member, member_key, 1, target);
+        auto challenge = runtime_.attestation().create_challenge(
+            member, member_key, 1, target, AttestationPurpose::FinalEpochReadiness, context);
         if (challenge.has_value()) {
             (void)router_.send(member,
                                router_.compose(SecurityMessageKind::AttestationChallenge,

@@ -139,6 +139,7 @@ add_nexus_test(test_security_scale
     security/simulation/adoption_scale.cpp)
 add_nexus_test(test_security_attestation
     security/attestation/challenge.cpp
+    security/attestation/context_binding.cpp
     security/attestation/verifier.cpp
     security/attestation/linux_profile.cpp
     security/attestation/service.cpp

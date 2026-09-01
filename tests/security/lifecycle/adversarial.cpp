@@ -139,6 +139,10 @@ struct MemoryMesh {
 
     void heal() { side.clear(); }
 
+    /// The last finalized plan broadcast, decoded, so a test can rebuild the
+    /// exact attestation context the members bound.
+    std::optional<NextEpochPlanProof> captured_plan;
+
     void pump();
 };
 
@@ -309,6 +313,12 @@ void MemoryMesh::pump() {
     while (!queue.empty()) {
         Queued item = std::move(queue.front());
         queue.pop_front();
+        const auto decoded = decode_security_message(item.bytes);
+        if (const auto* message = std::get_if<SecurityMessage>(&decoded)) {
+            if (const auto* plan = std::get_if<NextEpochPlanProof>(&message->body)) {
+                captured_plan = *plan;
+            }
+        }
         nodes.at(item.to)->deliver(item.from, item.bytes, now_ms);
     }
 }
@@ -337,14 +347,18 @@ VerifiedPlatformClaims complete_claims() {
 }
 
 // `round` distinguishes two verifications of the same node. Continuity counts
-// distinct attestations, so the digests must differ between rounds.
-AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch, uint8_t round = 0) {
+// distinct attestations, so the digests must differ between rounds. The
+// context binds what the driver checks: an eligibility exchange for this
+// network, epoch and node.
+AttestationVerdict passing_verdict(const NetworkId& network, const NodeId& id, EpochId epoch,
+                                   uint8_t round = 0) {
     AttestationVerdict verdict;
     verdict.node_id = id;
     verdict.epoch = epoch;
     verdict.incarnation = 1;
     verdict.passed = true;
     verdict.claims = complete_claims();
+    verdict.context_digest = eligibility_attestation_context(network, epoch, id, 1);
     // Distinct per node, epoch and round, and never all-zero: an empty
     // evidence digest proves no attestation ran and is refused as such.
     verdict.evidence_digest.fill(id.bytes[0]);
@@ -484,7 +498,7 @@ struct AdversarialMesh : ::testing::Test {
                     // Epoch 0 is the bootstrap window: the founding round is
                     // not Epoch 1 work and does not spend its budget.
                     observer->driver->on_attestation_verdict(
-                        passing_verdict(subject->id, 0, static_cast<uint8_t>(round + 1)),
+                        passing_verdict(network, subject->id, 0, static_cast<uint8_t>(round + 1)),
                         evidence_for(subject->id, *subject->driver->vote_key_for_epoch(1)));
                 }
             }
@@ -505,7 +519,7 @@ struct AdversarialMesh : ::testing::Test {
         for (Node* founder : founders) {
             const auto vote_key = founder->driver->vote_key_for_epoch(1);
             ASSERT_TRUE(vote_key.has_value());
-            genesis_node->driver->on_attestation_verdict(passing_verdict(founder->id, 1),
+            genesis_node->driver->on_attestation_verdict(passing_verdict(network, founder->id, 1),
                                                          evidence_for(founder->id, *vote_key));
         }
         mesh.pump();  // The founding reaches the founders; the mutual round starts.
@@ -547,7 +561,7 @@ struct AdversarialMesh : ::testing::Test {
             for (Node* member : founders) {
                 if (member == founder) continue;
                 founder->driver->on_attestation_verdict(
-                    passing_verdict(member->id, epoch, round),
+                    passing_verdict(network, member->id, epoch, round),
                     evidence_for(member->id, *member->driver->vote_key_for_epoch(epoch)));
             }
         }
@@ -575,13 +589,20 @@ struct AdversarialMesh : ::testing::Test {
         }
     }
 
-    // Final verdicts for the target epoch; these start the epoch-2 DKG.
+    // Final verdicts for the target epoch; these start the epoch-2 DKG. The
+    // committed plan travels as a broadcast proof, so the mesh captured it;
+    // the injected verdicts must bind its exact attestation context.
     void inject_final_verdicts() {
+        ASSERT_TRUE(mesh.captured_plan.has_value());
+        const NextEpochPlan& plan = mesh.captured_plan->plan;
         for (Node* member : founders) {
             const auto vote_key = member->driver->vote_key_for_epoch(2);
             EXPECT_TRUE(vote_key.has_value());
+            AttestationVerdict verdict = passing_verdict(network, member->id, 2);
+            verdict.purpose = AttestationPurpose::FinalEpochReadiness;
+            verdict.context_digest = SecurityDriver::plan_attest_context(plan, member->id);
             for (Node* founder : founders) {
-                founder->driver->on_attestation_verdict(passing_verdict(member->id, 2),
+                founder->driver->on_attestation_verdict(verdict,
                                                         evidence_for(member->id, *vote_key));
             }
         }
@@ -1554,6 +1575,8 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
         evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
         evidence.profile_id = challenge.profile_id;
         evidence.profile_ruleset = challenge.profile_ruleset;
+        evidence.purpose = challenge.purpose;
+        evidence.context_digest = challenge.context_digest;
         evidence.epoch_vote_key = *signer.driver->vote_key_for_epoch(1);
         evidence.platform.hcl_blob.assign(64, 0xA5);
         evidence.platform.tpms_attest.assign(48, 0x5A);
@@ -1569,7 +1592,7 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     };
 
     auto first = verifier->runtime->attestation().create_challenge(
-        prover->id, prover->identity.public_key, 1, 1);
+        prover->id, prover->identity.public_key, 1, 1, AttestationPurpose::Eligibility);
     ASSERT_TRUE(first.has_value());
     const AttestationEvidence answer = build_evidence(*first, *prover);
 
@@ -1602,7 +1625,7 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     // A later challenge carries a fresh nonce, so the old bundle cannot answer
     // it either.
     auto second = verifier->runtime->attestation().create_challenge(
-        prover->id, prover->identity.public_key, 1, 1);
+        prover->id, prover->identity.public_key, 1, 1, AttestationPurpose::Eligibility);
     ASSERT_TRUE(second.has_value());
     ASSERT_NE(challenge_digest(*second), challenge_digest(*first));
     const AttestationVerdict stale = verifier->runtime->attestation().receive_evidence(answer);
@@ -1623,7 +1646,7 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     // Positive control: a bundle built for a challenge that no replay touched
     // clears the challenge, identity, incarnation and signature checks again.
     auto third = verifier->runtime->attestation().create_challenge(
-        prover->id, prover->identity.public_key, 1, 1);
+        prover->id, prover->identity.public_key, 1, 1, AttestationPurpose::Eligibility);
     ASSERT_TRUE(third.has_value());
     const AttestationVerdict current =
         verifier->runtime->attestation().receive_evidence(build_evidence(*third, *prover));
@@ -1636,7 +1659,8 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     // A fresh prover keeps this clear of the per-epoch challenge budget.
     Node* second_prover = founders[3];
     auto wire_challenge = verifier->runtime->attestation().create_challenge(
-        second_prover->id, second_prover->identity.public_key, 1, 1);
+        second_prover->id, second_prover->identity.public_key, 1, 1,
+        AttestationPurpose::Eligibility);
     ASSERT_TRUE(wire_challenge.has_value());
     AttestationEvidence relabelled = build_evidence(*wire_challenge, *second_prover);
     relabelled.node_id = founders[2]->id;

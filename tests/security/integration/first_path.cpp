@@ -48,6 +48,11 @@ AttestationVerdict passing_verdict(const NodeId& id, EpochId epoch) {
     verdict.node_id = id;
     verdict.epoch = epoch;
     verdict.incarnation = 1;
+    // Epoch 0 and 1 verdicts here feed Genesis; epoch 2 feeds the manager's
+    // final-attestation record, which requires the final purpose.
+    if (epoch >= 2) {
+        verdict.purpose = nexus::security::AttestationPurpose::FinalEpochReadiness;
+    }
     verdict.passed = true;
     verdict.evidence_digest.fill(id.bytes[0]);
     return verdict;

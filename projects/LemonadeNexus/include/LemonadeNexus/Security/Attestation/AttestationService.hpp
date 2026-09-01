@@ -31,9 +31,15 @@ public:
 
     /// Issues a fresh challenge for one attempt. Returns nullopt when the
     /// node spent its attestation budget for this epoch.
+    ///
+    /// The purpose decides the context: Eligibility computes its canonical
+    /// context here and `context` must stay empty; FinalEpochReadiness must
+    /// supply the plan-bound context and an empty one is refused. There is no
+    /// unbound final challenge.
     [[nodiscard]] std::optional<AttestationChallenge> create_challenge(
         const NodeId& node, const crypto::Ed25519PublicKey& node_key,
-        IncarnationId incarnation, EpochId epoch);
+        IncarnationId incarnation, EpochId epoch, AttestationPurpose purpose,
+        const Digest& context = {});
 
     /// Examines evidence against the pending challenge for its node. The
     /// challenge is consumed: a second answer to the same challenge fails.

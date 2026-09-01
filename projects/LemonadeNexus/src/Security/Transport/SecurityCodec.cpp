@@ -127,6 +127,8 @@ bool encode_challenge(Writer& w, const AttestationChallenge& c) {
     w.u16(static_cast<uint16_t>(c.profile_id));
     w.u16(c.profile_ruleset);
     w.fixed(c.policy_digest);
+    w.u16(static_cast<uint16_t>(c.purpose));
+    w.fixed(c.context_digest);
     return true;
 }
 
@@ -140,6 +142,8 @@ bool encode_evidence(Writer& w, const AttestationEvidence& e) {
     w.u16(e.consensus_ruleset);
     w.u16(static_cast<uint16_t>(e.profile_id));
     w.u16(e.profile_ruleset);
+    w.u16(static_cast<uint16_t>(e.purpose));
+    w.fixed(e.context_digest);
     w.fixed(e.epoch_vote_key);
     const std::string platform = encode_snp_vtpm_evidence(e.platform);
     if (!w.bytes({reinterpret_cast<const uint8_t*>(platform.data()), platform.size()},
@@ -518,12 +522,28 @@ bool get_profile_id(Reader& r, AttestationProfileId& id) {
     return true;
 }
 
+// A purpose this binary does not name is refused, not folded: the value picks
+// which context rules apply, so a silent reinterpretation would pick them for
+// the attacker.
+bool get_purpose(Reader& r, AttestationPurpose& purpose) {
+    uint16_t raw = 0;
+    if (!r.u16(raw)) return false;
+    const auto candidate = static_cast<AttestationPurpose>(raw);
+    if (candidate != AttestationPurpose::Eligibility &&
+        candidate != AttestationPurpose::FinalEpochReadiness) {
+        return r.fail(CodecError::BadValue);
+    }
+    purpose = candidate;
+    return true;
+}
+
 bool decode_challenge(Reader& r, AttestationChallenge& c) {
     return r.fixed(c.network_id) && r.fixed(c.nonce) && get_node(r, c.node_id) &&
            r.fixed(c.node_key) &&
            r.u64(c.incarnation) && r.u64(c.epoch) && r.u16(c.security_ruleset) &&
            r.u16(c.consensus_ruleset) && get_profile_id(r, c.profile_id) &&
-           r.u16(c.profile_ruleset) && r.fixed(c.policy_digest);
+           r.u16(c.profile_ruleset) && r.fixed(c.policy_digest) &&
+           get_purpose(r, c.purpose) && r.fixed(c.context_digest);
 }
 
 bool decode_evidence(Reader& r, AttestationEvidence& e) {
@@ -532,6 +552,7 @@ bool decode_evidence(Reader& r, AttestationEvidence& e) {
           get_node(r, e.node_id) && r.u64(e.incarnation) &&
           r.u64(e.epoch) && r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) &&
           get_profile_id(r, e.profile_id) && r.u16(e.profile_ruleset) &&
+          get_purpose(r, e.purpose) && r.fixed(e.context_digest) &&
           r.fixed(e.epoch_vote_key) &&
           r.bytes(platform, constants::kMaxPlatformEvidenceWireBytes))) {
         return false;

@@ -210,6 +210,11 @@ bool EpochManager::record_final_attestation(const AttestationVerdict& verdict) {
     if (verdict.epoch != transition_->to_epoch) {
         return false;
     }
+    // And FOR final readiness. An eligibility verdict is a different
+    // statement; the driver also matches the bound plan context.
+    if (verdict.purpose != AttestationPurpose::FinalEpochReadiness) {
+        return false;
+    }
     auto& selected = transition_->selected_members;
     if (std::find(selected.begin(), selected.end(), verdict.node_id) == selected.end()) {
         return false;

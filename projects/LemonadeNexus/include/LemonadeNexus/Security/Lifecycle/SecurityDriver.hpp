@@ -140,6 +140,13 @@ public:
     /// commitment and nothing else.
     [[nodiscard]] bool accepts_transition(const Digest& transitions_digest) const;
 
+    /// The canonical final-attestation context for one selected node under
+    /// one plan, or an empty digest when the plan does not name the node.
+    /// Pure derivation; public so a verifier of captured traffic can rebuild
+    /// the exact value a challenge bound.
+    [[nodiscard]] static Digest plan_attest_context(const NextEpochPlan& plan,
+                                                    const NodeId& node);
+
     [[nodiscard]] const EligibilityService& eligibility() const { return eligibility_; }
 
 private:
@@ -155,7 +162,8 @@ private:
     void begin_sync(uint64_t now_ms);
     void finish_sync();
     void run_epoch_cadence(uint64_t now_ms);
-    void attest_self_for(EpochId epoch);
+    void attest_self_for(EpochId epoch, const Digest& context);
+    [[nodiscard]] bool eligibility_verdict_ok(const AttestationVerdict& verdict) const;
     [[nodiscard]] std::optional<NextEpochPlan> derive_plan() const;
     [[nodiscard]] std::optional<CandidateReadiness> derive_readiness() const;
     [[nodiscard]] std::optional<EpochHandoff> derive_handoff() const;

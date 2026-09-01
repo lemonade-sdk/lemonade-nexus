@@ -37,6 +37,7 @@ AttestationVerdict passing(const NodeId& id, nexus::security::EpochId epoch) {
     AttestationVerdict verdict;
     verdict.node_id = id;
     verdict.epoch = epoch;
+    verdict.purpose = nexus::security::AttestationPurpose::FinalEpochReadiness;
     verdict.passed = true;
     verdict.evidence_digest.fill(id.bytes[0]);
     return verdict;
@@ -46,6 +47,7 @@ AttestationVerdict failing(const NodeId& id, nexus::security::EpochId epoch) {
     AttestationVerdict verdict;
     verdict.node_id = id;
     verdict.epoch = epoch;
+    verdict.purpose = nexus::security::AttestationPurpose::FinalEpochReadiness;
     verdict.passed = false;
     verdict.failure = AttestationFailure::SnpInvalid;
     return verdict;

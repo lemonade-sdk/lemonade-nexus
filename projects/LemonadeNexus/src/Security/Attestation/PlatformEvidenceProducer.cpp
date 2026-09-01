@@ -81,6 +81,8 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
     evidence.profile_id = challenge.profile_id;
     evidence.profile_ruleset = challenge.profile_ruleset;
+    evidence.purpose = challenge.purpose;
+    evidence.context_digest = challenge.context_digest;
     evidence.epoch_vote_key = *vote_key;
     evidence.platform = platform_bundle(evidence.challenge_digest);
 

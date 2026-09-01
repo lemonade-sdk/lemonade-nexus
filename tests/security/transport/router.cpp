@@ -502,7 +502,7 @@ TEST_F(RouterMesh, ChallengeWithoutProducerYieldsNoEvidence) {
     Node* a = founders[0];
     Node* b = founders[1];
 
-    auto challenge = a->runtime->attestation().create_challenge(b->id, b->identity_pub, 1, 1);
+    auto challenge = a->runtime->attestation().create_challenge(b->id, b->identity_pub, 1, 1, AttestationPurpose::Eligibility);
     ASSERT_TRUE(challenge.has_value());
     const auto envelope = a->router->compose(SecurityMessageKind::AttestationChallenge, *challenge, 1);
     // No producer is wired: B cannot answer, and nothing is fabricated.
