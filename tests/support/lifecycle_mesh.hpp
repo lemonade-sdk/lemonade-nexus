@@ -51,6 +51,9 @@ struct MemoryMesh {
     std::map<NodeId, Node*> nodes;
     std::deque<Queued> queue;
     uint64_t now_ms = 1000;
+    // Unreachable nodes: nothing is delivered to or from them. Offline is a
+    // transport fact, not a protocol one.
+    std::set<NodeId> offline;
     // Nodes whose transport certificate no longer verifies against the root.
     // The mesh knows this, not the platform, so it lives here. The per-observer
     // map lets one node see the answer differently, which is what a
@@ -145,6 +148,21 @@ struct EventsProxy : ISecurityEvents {
     void on_participation_response(const ParticipationResponse& r) override {
         if (target) target->on_participation_response(r);
     }
+    void on_next_epoch_plan(const NextEpochPlanProof& p) override {
+        if (target) target->on_next_epoch_plan(p);
+    }
+    void on_candidate_state_ready(const CandidateStateReadyMsg& m) override {
+        if (target) target->on_candidate_state_ready(m);
+    }
+    void on_readiness_proof(const ReadinessProofMsg& m) override {
+        if (target) target->on_readiness_proof(m);
+    }
+    void on_epoch_handoff_proof(const EpochHandoffProofMsg& m) override {
+        if (target) target->on_epoch_handoff_proof(m);
+    }
+    void on_candidate_sync_response(const SyncResponse& s, const NodeId& n) override {
+        if (target) target->on_candidate_sync_response(s, n);
+    }
 };
 
 struct Node {
@@ -174,6 +192,9 @@ inline void MemoryMesh::pump() {
     while (!queue.empty()) {
         Queued item = std::move(queue.front());
         queue.pop_front();
+        if (offline.contains(item.from) || offline.contains(item.to)) {
+            continue;
+        }
         nodes.at(item.to)->deliver(item.from, item.bytes, now_ms);
     }
 }
@@ -282,6 +303,7 @@ struct DriverMesh : ::testing::Test {
     void build_node(Node& node) {
         SecurityRuntimeConfig runtime_config;
         runtime_config.self = node.id;
+        runtime_config.network_id = network;
         runtime_config.consensus_directory = node.dir / "consensus";
         // Mirrors production: a replica votes for a handoff only when it has
         // independently arrived at the same one. Node addresses are stable, and

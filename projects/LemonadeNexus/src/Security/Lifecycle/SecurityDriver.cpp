@@ -495,7 +495,9 @@ void SecurityDriver::on_dkg_complete(EpochId target) {
     if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value() &&
         target == adoption_->plan.next_epoch) {
         // The share is prepared material and nothing more: it becomes usable
-        // only at the finalized handoff.
+        // only at the finalized handoff. The attest travels so members outside
+        // the ceremony can adopt the outcome the participants agree on.
+        broadcast_transcript_attest(target);
         return;
     }
     EpochManager* epochs = runtime_.epochs();
@@ -503,7 +505,56 @@ void SecurityDriver::on_dkg_complete(EpochId target) {
         target == epochs->transition()->to_epoch) {
         (void)epochs->record_dkg_result(pending_dkg_->group_public_key,
                                         pending_dkg_->transcript_digest);
+        broadcast_transcript_attest(target);
     }
+}
+
+void SecurityDriver::broadcast_transcript_attest(EpochId target) {
+    if (!pending_dkg_.has_value()) {
+        return;
+    }
+    DkgTranscriptAttest attest;
+    attest.epoch = target;
+    attest.participant_set_digest = pending_dkg_->participant_set_digest;
+    attest.transcript_digest = pending_dkg_->transcript_digest;
+    attest.group_public_key = pending_dkg_->group_public_key;
+    attest.node = config_.self;
+    const Digest digest = dkg_transcript_attest_digest(attest);
+    crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
+                         config_.identity.private_key.data());
+    (void)router_.broadcast(
+        router_.compose(SecurityMessageKind::DkgTranscriptAttest, attest, target));
+}
+
+void SecurityDriver::maybe_adopt_attested_transcript() {
+    EpochManager* epochs = runtime_.epochs();
+    const EpochTransition* transition = epochs != nullptr ? epochs->transition() : nullptr;
+    if (transition == nullptr || transition->phase != EpochTransitionPhase::GeneratingAuthorityKey) {
+        return;
+    }
+    // Every selected participant, and the same outcome from each — the Genesis
+    // rule, applied to a transition. A member outside the ceremony adopts what
+    // the whole ceremony signed, or nothing.
+    const DkgTranscriptAttest* agreed = nullptr;
+    for (const auto& node : transition->selected_members) {
+        const auto it = transition_attests_.find(node);
+        if (it == transition_attests_.end() ||
+            it->second.participant_set_digest != transition->participant_set_digest) {
+            return;
+        }
+        if (agreed == nullptr) {
+            agreed = &it->second;
+            continue;
+        }
+        if (it->second.transcript_digest != agreed->transcript_digest ||
+            it->second.group_public_key != agreed->group_public_key) {
+            return;
+        }
+    }
+    if (agreed == nullptr) {
+        return;
+    }
+    (void)epochs->record_dkg_result(agreed->group_public_key, agreed->transcript_digest);
 }
 
 void SecurityDriver::on_dkg_failed(DkgFailure, std::optional<NodeId> culprit) {
@@ -539,6 +590,31 @@ void SecurityDriver::on_dkg_failed(DkgFailure, std::optional<NodeId> culprit) {
 }
 
 void SecurityDriver::on_dkg_transcript_attest(const DkgTranscriptAttest& attest) {
+    // The transition form: a ceremony participant attests the outcome so a
+    // current member outside the ceremony can adopt it once every participant
+    // signed the same one.
+    EpochManager* epochs = runtime_.epochs();
+    if (epochs != nullptr) {
+        const EpochTransition* transition = epochs->transition();
+        if (transition == nullptr || attest.epoch != transition->to_epoch ||
+            !plan_.has_value()) {
+            return;
+        }
+        const bool selected = std::find(transition->selected_members.begin(),
+                                        transition->selected_members.end(),
+                                        attest.node) != transition->selected_members.end();
+        if (!selected) {
+            return;
+        }
+        const Digest digest = dkg_transcript_attest_digest(attest);
+        if (crypto_sign_verify_detached(attest.identity_signature.data(), digest.data(),
+                                        digest.size(), attest.node.bytes.data()) != 0) {
+            return;
+        }
+        transition_attests_[attest.node] = attest;
+        maybe_adopt_attested_transcript();
+        return;
+    }
     if (genesis_ == nullptr || !genesis_node() || genesis_->finalized()) {
         return;
     }
@@ -767,6 +843,13 @@ void SecurityDriver::maybe_start_next_dkg() {
     // No readiness commit, no DKG. Current HotStuff authorizes the session;
     // one member deciding a candidate is ready authorizes nothing.
     if (!readiness_.has_value() || !plan_.has_value()) {
+        return;
+    }
+    // Only a selected participant runs the ceremony. A current member outside
+    // the next set follows it through the signed transcript attests instead —
+    // a session it is not part of would only misread the traffic as failure.
+    if (std::find(transition->selected_members.begin(), transition->selected_members.end(),
+                  config_.self) == transition->selected_members.end()) {
         return;
     }
     auto set = Tier1Set::from_nodes(transition->selected_members);
@@ -1231,6 +1314,7 @@ void SecurityDriver::abandon_boundary(const char* reason) {
     readiness_.reset();
     state_ready_.clear();
     final_verdict_ms_.clear();
+    transition_attests_.clear();
     EpochManager* epochs = runtime_.epochs();
     if (epochs != nullptr && epochs->transition() != nullptr) {
         epochs->abort_transition(EpochTransitionFailure::DkgFailed);
@@ -1267,6 +1351,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     state_ready_.clear();
     boundary_failed_.clear();
     final_verdict_ms_.clear();
+    transition_attests_.clear();
     plans_committed_ = 0;
     // Observations expire at the boundary: the new epoch's members are the new
     // observers, and continuity has to be re-established under them.

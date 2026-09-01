@@ -116,6 +116,7 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/driver.cpp
     security/lifecycle/eligibility_path.cpp
     security/lifecycle/tier2_path.cpp
+    security/lifecycle/adoption_path.cpp
     security/lifecycle/adversarial.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)

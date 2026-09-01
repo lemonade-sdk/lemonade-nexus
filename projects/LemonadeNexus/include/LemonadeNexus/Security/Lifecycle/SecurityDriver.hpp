@@ -161,6 +161,8 @@ private:
     [[nodiscard]] std::optional<EpochHandoff> derive_handoff() const;
     void on_plan_committed(const ConsensusCommit& commit);
     void on_readiness_committed(const ConsensusCommit& commit);
+    void broadcast_transcript_attest(EpochId target);
+    void maybe_adopt_attested_transcript();
     void abandon_boundary(const char* reason);
     void broadcast_proof(SecurityMessageKind kind, SecurityBody body, EpochId epoch);
     [[nodiscard]] bool candidate_verify_proof(const Digest& transitions_digest,
@@ -244,6 +246,8 @@ private:
     std::set<NodeId> state_ready_;
     std::optional<CandidateReadiness> readiness_;
     CommitProof readiness_proof_;
+    /// Ceremony participants' signed outcomes, for members outside it.
+    std::map<NodeId, DkgTranscriptAttest> transition_attests_;
 
     // Candidate-side adoption state: everything this node verified for the
     // plan that names it. Grants nothing; it is what preparation runs on.

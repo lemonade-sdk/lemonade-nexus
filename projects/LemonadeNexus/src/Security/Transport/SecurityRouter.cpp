@@ -165,7 +165,6 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
         message.kind == SecurityMessageKind::SyncRequest ||
         message.kind == SecurityMessageKind::SyncResponse;
     const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
-                                message.kind == SecurityMessageKind::DkgTranscriptAttest ||
                                 message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
                                 message.kind == SecurityMessageKind::BootstrapCertificate;
     if (epochs == nullptr) {
@@ -187,6 +186,7 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
                              message.kind == SecurityMessageKind::DkgPairwise ||
                              message.kind == SecurityMessageKind::AttestationChallenge ||
                              message.kind == SecurityMessageKind::AttestationEvidence ||
+                             message.kind == SecurityMessageKind::DkgTranscriptAttest ||
                              message.kind == SecurityMessageKind::EpochAnnouncement;
     return preparation && message.epoch == current + 1;
 }
