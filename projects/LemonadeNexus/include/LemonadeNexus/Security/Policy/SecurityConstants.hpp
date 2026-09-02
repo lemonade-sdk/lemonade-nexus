@@ -113,6 +113,16 @@ inline constexpr uint64_t kDkgStallSeconds = 300;
 // item.
 inline constexpr uint32_t kMaxTier1AttestAttemptsPerEpoch = 4;
 
+// Final-readiness challenges are accounted separately from the eligibility
+// cadence: both purposes name the same target epoch, and one shared bucket
+// would let a long boundary starve the next epoch's re-attestation — or let
+// legitimate renewal wedge an honest boundary. The bound is derived, not
+// tuned: one renewal per freshness window across a whole target-epoch-length
+// boundary.
+inline constexpr uint32_t kMaxFinalAttestAttemptsPerEpoch =
+    static_cast<uint32_t>(kTargetEpochSeconds / kFinalAttestMaxAgeSeconds);
+static_assert(kMaxFinalAttestAttemptsPerEpoch == 12);
+
 // --- Mesh eligibility observations ------------------------------------------
 
 // Distinct attestations one observer must have verified before it counts

@@ -331,6 +331,8 @@ private:
     std::string                      expected_network_id_;
     bool                             has_root_pubkey_{false};
     std::vector<std::string>         revoked_pubkeys_;
+    /// Tier 1 membership per finalized state; unset denies tier1 labels.
+    std::function<bool(const std::string&)> tier1_membership_;
 
     // Equivocation detection: last signed tree-delta we've seen per conflict identity
     // (signer ‖ target_node_id ‖ sequence) → the delta's JSON. A second, differing
@@ -381,6 +383,13 @@ public:
 
     /// Set the DNS service for distributed DNS record sync.
     void set_dns(network::DnsService* dns);
+
+    /// Answers whether a server pubkey (base64) is a CURRENT Tier 1 member
+    /// per finalized mesh state. Gates tier1-labelled DNS records: the label
+    /// asserts finalized membership, not enrollment. Unset denies.
+    void set_tier1_membership_source(std::function<bool(const std::string&)> source) {
+        tier1_membership_ = std::move(source);
+    }
 
     /// Broadcast a DNS record delta to all known peers.
     void broadcast_dns_record_delta(const DnsRecordDelta& delta);

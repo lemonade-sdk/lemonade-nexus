@@ -47,6 +47,49 @@ MeshRekeyPlan plan_mesh_rekey(std::string_view prev_ip, std::string_view new_ip,
     return plan;
 }
 
+std::string identity_mesh_pubkey(std::string_view identity_pubkey) {
+    constexpr std::string_view ed_prefix = "ed25519:";
+    std::string prefixed = identity_pubkey.starts_with(ed_prefix)
+                               ? std::string(identity_pubkey)
+                               : std::string(ed_prefix) + std::string(identity_pubkey);
+    const std::string converted = normalize_mesh_pubkey(prefixed);
+    // normalize returns its input unchanged when conversion failed.
+    return converted == prefixed ? std::string{} : converted;
+}
+
+std::optional<std::string> wg_claim_refusal(const tree::PermissionTreeService& tree,
+                                            std::string_view claimed,
+                                            const std::string& node_id,
+                                            const std::string& identity_pubkey) {
+    if (claimed.empty()) {
+        return std::nullopt;
+    }
+    const auto owner = wg_pubkey_owner(tree, claimed);
+    if (owner.has_value() && *owner != node_id) {
+        return "wireguard key is bound to another node";
+    }
+    const std::string normalized = normalize_mesh_pubkey(claimed);
+    if (!normalized.empty() && normalized == identity_mesh_pubkey(identity_pubkey)) {
+        return std::nullopt;  // The claimant's own identity-bound static.
+    }
+    // A static that IS the identity-bound form of some other enrolled
+    // identity can only ever be proved by that identity; first-come
+    // registration of it is a squat and is refused outright.
+    for (const auto type : {tree::NodeType::Endpoint, tree::NodeType::Relay,
+                            tree::NodeType::Root, tree::NodeType::Customer}) {
+        for (const auto& node : tree.get_nodes_by_type(type)) {
+            if (node.id == node_id || node.mgmt_pubkey.empty()) {
+                continue;
+            }
+            const std::string bound = identity_mesh_pubkey(node.mgmt_pubkey);
+            if (!bound.empty() && bound == normalized) {
+                return "wireguard key is the identity-bound static of another node";
+            }
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<std::string> wg_pubkey_owner(const tree::PermissionTreeService& tree,
                                            std::string_view wg_pubkey) {
     if (wg_pubkey.empty()) {

@@ -26,8 +26,11 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     if (purpose == AttestationPurpose::Eligibility && context != Digest{}) {
         return std::nullopt;
     }
-    auto& used = attempts_[{epoch, node}];
-    if (used >= constants::kMaxTier1AttestAttemptsPerEpoch) {
+    auto& used = attempts_[{epoch, node, purpose}];
+    const uint32_t limit = purpose == AttestationPurpose::FinalEpochReadiness
+                               ? constants::kMaxFinalAttestAttemptsPerEpoch
+                               : constants::kMaxTier1AttestAttemptsPerEpoch;
+    if (used >= limit) {
         return std::nullopt;
     }
     ++used;
@@ -95,8 +98,9 @@ std::optional<AttestationVerdict> AttestationService::verdict(const NodeId& node
     return it->second;
 }
 
-uint32_t AttestationService::attempts(const NodeId& node, EpochId epoch) const {
-    const auto it = attempts_.find({epoch, node});
+uint32_t AttestationService::attempts(const NodeId& node, EpochId epoch,
+                                      AttestationPurpose purpose) const {
+    const auto it = attempts_.find({epoch, node, purpose});
     return it == attempts_.end() ? 0 : it->second;
 }
 

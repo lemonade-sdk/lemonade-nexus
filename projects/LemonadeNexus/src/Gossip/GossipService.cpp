@@ -1956,6 +1956,20 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
             return;
         }
 
+        // A tier1 label asserts finalized membership, not enrollment. Only a
+        // CURRENT Tier 1 member may author one, judged against finalized mesh
+        // state; with no membership source configured, nothing qualifies.
+        std::string fqdn_lower = delta.fqdn;
+        std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (fqdn_lower.find(".tier1.") != std::string::npos &&
+            (!tier1_membership_ || !tier1_membership_(delta.signer_pubkey))) {
+            spdlog::warn("[{}] DENIED tier1-labelled DNS record from {}:{} — author is "
+                          "not a current Tier 1 member", name(),
+                          sender.address().to_string(), sender.port());
+            return;
+        }
+
         // Convert to DnsZoneRecord for DnsService
         network::DnsZoneRecord zone_rec;
         zone_rec.fqdn        = delta.fqdn;

@@ -467,8 +467,10 @@ std::optional<PeerPlatformBinding> ServerAdmissionService::verify_admission_evid
     PeerPlatformBinding binding;
 
     if (a.platform_class.empty() && a.evidence.empty()) {
-        binding.ak_pubkey = a.tpm_ak_pubkey;   // legacy tpm2 enrollment, admin-validated
-        if (!binding.ak_pubkey.empty()) binding.platform_class = "tpm2";
+        // A plain Tier 2 enrollment: nothing platform-related was claimed, so
+        // nothing platform-related is minted. Admin say-so never converts a
+        // candidate-supplied key into a verified platform fact — a Tier 1
+        // claim exists only behind verified evidence.
         return binding;
     }
 

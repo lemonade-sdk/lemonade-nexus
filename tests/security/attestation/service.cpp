@@ -158,3 +158,46 @@ TEST(AttestationService, EvidenceDoesNotCrossNetworks) {
 }
 
 }  // namespace
+
+// Eligibility and final readiness are budgeted separately: they name the same
+// target epoch, and one shared bucket would let a long boundary starve the
+// next epoch's re-attestation cadence — or let legitimate renewal wedge an
+// honest boundary.
+TEST(AttestationService, PurposeBudgetsAreIndependent) {
+    AttestationService service(network(0xA0), LinuxAttestationProfile{});
+    nexus::security::Digest context{};
+    context.fill(0x77);
+
+    // Spend the whole eligibility budget for (node, epoch 9)...
+    for (uint32_t i = 0; i < constants::kMaxTier1AttestAttemptsPerEpoch; ++i) {
+        EXPECT_TRUE(service
+                        .create_challenge(node(0x01), key(0x11), 1, 9,
+                                          nexus::security::AttestationPurpose::Eligibility)
+                        .has_value());
+    }
+    EXPECT_FALSE(service
+                     .create_challenge(node(0x01), key(0x11), 1, 9,
+                                       nexus::security::AttestationPurpose::Eligibility)
+                     .has_value());
+
+    // ...and every final-readiness challenge for the same node and epoch is
+    // still available, under its own derived bound.
+    for (uint32_t i = 0; i < constants::kMaxFinalAttestAttemptsPerEpoch; ++i) {
+        EXPECT_TRUE(service
+                        .create_challenge(node(0x01), key(0x11), 1, 9,
+                                          nexus::security::AttestationPurpose::FinalEpochReadiness,
+                                          context)
+                        .has_value())
+            << "final challenge " << i;
+    }
+    EXPECT_FALSE(service
+                     .create_challenge(node(0x01), key(0x11), 1, 9,
+                                       nexus::security::AttestationPurpose::FinalEpochReadiness,
+                                       context)
+                     .has_value());
+
+    EXPECT_EQ(service.attempts(node(0x01), 9), constants::kMaxTier1AttestAttemptsPerEpoch);
+    EXPECT_EQ(service.attempts(node(0x01), 9,
+                               nexus::security::AttestationPurpose::FinalEpochReadiness),
+              constants::kMaxFinalAttestAttemptsPerEpoch);
+}

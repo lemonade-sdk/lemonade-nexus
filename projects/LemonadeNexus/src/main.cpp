@@ -268,6 +268,17 @@ int main(int argc, char* argv[]) {
     });
     ddns.start();
 
+    // Tier1-labelled DNS records assert finalized membership; the same source
+    // that gates DDNS credentials gates them, and unset denies.
+    gossip.set_tier1_membership_source([&security_mesh](const std::string& pk_b64) {
+        if (!security_mesh) return false;
+        const auto bytes = nexus::crypto::from_base64(pk_b64);
+        if (bytes.size() != nexus::crypto::kEd25519PublicKeySize) return false;
+        nexus::security::NodeId node;
+        std::memcpy(node.bytes.data(), bytes.data(), bytes.size());
+        return security_mesh->is_current_member(node);
+    });
+
     // ========================================================================
     // STUN + Relay
     // ========================================================================

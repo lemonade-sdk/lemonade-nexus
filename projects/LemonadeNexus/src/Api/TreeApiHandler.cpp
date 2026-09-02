@@ -106,14 +106,16 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         // A WireGuard static binds to one node identity. The Ed25519 challenge
         // authenticated WHO is joining; this guard decides what that identity
-        // may claim: its own static, or a fresh one — never a key another node
-        // already registered. Checked before any tree write or dataplane
-        // change, so a hostile claim moves no route.
+        // may claim: its own identity-bound static (possession proved
+        // transitively through the challenge), its previously registered key,
+        // or a fresh opaque one — never a key another node registered, and
+        // never another enrolled identity's bound form. Checked before any
+        // tree write or dataplane change, so a hostile claim moves no route.
         if (const auto advertised = body.value("wg_pubkey", std::string{});
             !advertised.empty()) {
-            const auto owner = api::wg_pubkey_owner(ctx_.tree, advertised);
-            if (owner.has_value() && *owner != node_id) {
-                error_response(res, "wireguard key is bound to another node", 409);
+            if (const auto refusal =
+                    api::wg_claim_refusal(ctx_.tree, advertised, node_id, norm_pubkey)) {
+                error_response(res, *refusal, 409);
                 return;
             }
         }
@@ -595,11 +597,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
         if (body.contains("wg_pubkey")) {
             // Same ownership rule as the join path: edit permission on this
-            // node never extends to claiming a static another node holds.
+            // node never extends to claiming a static another node holds or
+            // another identity's bound form.
             const auto claimed = body["wg_pubkey"].get<std::string>();
-            const auto owner = api::wg_pubkey_owner(ctx_.tree, claimed);
-            if (owner.has_value() && *owner != node_id) {
-                error_response(res, "wireguard key is bound to another node", 409);
+            if (const auto refusal = api::wg_claim_refusal(ctx_.tree, claimed, node_id,
+                                                           normalize_pubkey(claims.pubkey))) {
+                error_response(res, *refusal, 409);
                 return;
             }
             updated.wg_pubkey = claimed;

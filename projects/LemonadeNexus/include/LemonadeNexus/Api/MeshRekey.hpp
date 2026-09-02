@@ -42,4 +42,22 @@ struct MeshRekeyPlan {
 [[nodiscard]] std::optional<std::string> wg_pubkey_owner(
     const tree::PermissionTreeService& tree, std::string_view wg_pubkey);
 
+/// The identity-bound mesh static for an "ed25519:..." identity pubkey: the
+/// birational X25519 form of the identity key. A client whose static is this
+/// value has proved possession transitively — the Ed25519 challenge proved
+/// the identity secret, and the static's secret is its conversion. Empty when
+/// the identity does not convert.
+[[nodiscard]] std::string identity_mesh_pubkey(std::string_view identity_pubkey);
+
+/// Why a wg_pubkey claim by `node_id` — authenticated as `identity_pubkey`
+/// ("ed25519:..." form) — must be refused, or nullopt when it may proceed.
+/// Refusals: the static is bound to another node; or it is the
+/// identity-bound form of a DIFFERENT enrolled identity, which only that
+/// identity could ever prove. An unrecognized opaque static is still
+/// accepted for legacy clients until the derivation cutover; the
+/// registering identity then owns it under the one-key-one-node rule.
+[[nodiscard]] std::optional<std::string> wg_claim_refusal(
+    const tree::PermissionTreeService& tree, std::string_view claimed,
+    const std::string& node_id, const std::string& identity_pubkey);
+
 } // namespace nexus::api

@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <tuple>
 #include <utility>
 
 namespace nexus::security {
@@ -50,7 +51,12 @@ public:
     [[nodiscard]] const LinuxAttestationProfile& profile() const { return profile_; }
     [[nodiscard]] const Digest& policy_digest() const { return policy_digest_; }
 
-    [[nodiscard]] uint32_t attempts(const NodeId& node, EpochId epoch) const;
+    /// Challenges issued for one node, one epoch, one purpose. Eligibility
+    /// and final readiness are accounted separately: they share a target
+    /// epoch, and one bucket would let either starve the other.
+    [[nodiscard]] uint32_t attempts(
+        const NodeId& node, EpochId epoch,
+        AttestationPurpose purpose = AttestationPurpose::Eligibility) const;
 
 private:
     NetworkId network_id_;
@@ -60,7 +66,7 @@ private:
 
     std::map<NodeId, AttestationChallenge> pending_;
     std::map<NodeId, AttestationVerdict> verdicts_;
-    std::map<std::pair<EpochId, NodeId>, uint32_t> attempts_;
+    std::map<std::tuple<EpochId, NodeId, AttestationPurpose>, uint32_t> attempts_;
 };
 
 }  // namespace nexus::security

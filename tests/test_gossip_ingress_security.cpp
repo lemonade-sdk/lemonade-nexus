@@ -1037,3 +1037,57 @@ TEST_F(GossipIngressSecurityTest, PeerExchangeAdoptsOnlyVerifiedRelayedCertifica
     ASSERT_TRUE(pump_until([&] { return a.dns->resolve(fqdn).has_value(); }));
     EXPECT_EQ(a.dns->resolve(fqdn)->ipv4_address, "10.4.4.4");
 }
+
+// A tier1 DNS label asserts finalized membership, not enrollment: a certified
+// author that is not a current Tier 1 member cannot publish one, and with no
+// membership source configured nothing qualifies. Membership makes the same
+// record land.
+TEST_F(GossipIngressSecurityTest, Tier1DnsLabelRequiresFinalizedMembership) {
+    auto root_kp   = kc->ed25519_keygen();
+    auto certified = kc->ed25519_keygen();
+    const auto certified_b64 = crypto::to_base64(certified.public_key);
+    const auto cert_json = issue_cert(certified_b64, "peer-certified", root_kp);
+
+    bool is_member = false;
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(certified_b64, "127.0.0.1:9", cert_json)}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    const std::string tier1_fqdn = "srv9.tier1.us-east.seip.lemonade-nexus.io";
+
+    // No membership source configured: the label is unprovable, so it fails
+    // closed even for a certified author.
+    const auto first = dns_delta_payload(certified, "delta-t1-1", tier1_fqdn, "10.1.1.1");
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, first), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(tier1_fqdn).has_value());
+
+    // A source that answers "not a member": still refused.
+    a.gossip->set_tier1_membership_source([&](const std::string&) { return is_member; });
+    const auto second = dns_delta_payload(certified, "delta-t1-2", tier1_fqdn, "10.1.1.1");
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, second), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(tier1_fqdn).has_value());
+
+    // Finalized membership is what makes the label true.
+    is_member = true;
+    const auto third = dns_delta_payload(certified, "delta-t1-3", tier1_fqdn, "10.1.1.1");
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, third), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(tier1_fqdn).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(tier1_fqdn)->ipv4_address, "10.1.1.1");
+
+    // Ordinary records never consult the membership source.
+    is_member = false;
+    const std::string plain_fqdn = "srv9.us-east.seip.lemonade-nexus.io";
+    const auto plain = dns_delta_payload(certified, "delta-t1-4", plain_fqdn, "10.2.2.2");
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, plain), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(plain_fqdn).has_value(); }));
+}

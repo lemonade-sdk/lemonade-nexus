@@ -257,6 +257,12 @@ TEST_F(MultiEpochMesh, AReadyCandidateThatRefusesTheDkgIsReplaced) {
             EXPECT_EQ(node->driver->current_epoch(), from_epoch + 1);
         }
         EXPECT_NE(refuser->driver->current_epoch(), from_epoch + 1);
+        // Silence cost the refuser this boundary and nothing more: it is not
+        // objectively provable, so no member records it as a permanent fault.
+        for (Node* member : replacement_selected) {
+            EXPECT_FALSE(member->driver->eligibility().ledger().faults().contains(refuser->id))
+                << "observed silence must never become a permanent objective fault";
+        }
         return replacement_selected;
     };
 
@@ -307,9 +313,26 @@ TEST_F(MultiEpochMesh, AStalledBoundaryRenewsItsFinalAttestation) {
     const auto selected = selected_nodes(*members.front());
     wait_for_keys(members, selected, 2);
 
-    // Whatever attestations the plan commit produced are now older than the
-    // freshness window. Without renewal no readiness set could ever form.
-    mesh.now_ms += (constants::kFinalAttestMaxAgeSeconds + 10) * 1000;
+    // The boundary outlives the freshness window twice over: each jump
+    // stales every attestation answered so far, and each recovery runs the
+    // renewal exchange again. The per-purpose budget must carry all of it —
+    // one initial round plus one renewal per window is exactly the load the
+    // derived final-attest bound is sized for.
+    for (int window = 0; window < 2; ++window) {
+        mesh.now_ms += (constants::kFinalAttestMaxAgeSeconds + 10) * 1000;
+        for (int i = 0; i < 40; ++i) {
+            step(1, members);
+            answer_final_challenges();
+        }
+    }
+    for (Node* member : members) {
+        for (Node* subject : selected) {
+            EXPECT_LT(member->runtime->attestation().attempts(
+                          subject->id, 2, AttestationPurpose::FinalEpochReadiness),
+                      constants::kMaxFinalAttestAttemptsPerEpoch)
+                << "legitimate renewal must never exhaust the budget";
+        }
+    }
 
     run_to_activation(members, selected, 2);
     for (Node* node : selected) {

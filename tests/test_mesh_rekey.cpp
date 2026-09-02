@@ -160,3 +160,65 @@ TEST(WgPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
     crypto.stop();
     fs::remove_all(dir);
 }
+
+// The identity-bound static: the birational X25519 form of the authenticated
+// Ed25519 identity. Claiming your own bound form is possession proved
+// transitively through the challenge; claiming ANOTHER enrolled identity's
+// bound form is a squat and is refused before any registration.
+TEST(WgClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / ("nexus_wg_claim_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    nexus::crypto::SodiumCryptoService crypto;
+    crypto.start();
+    nexus::storage::FileStorageService storage(dir);
+    storage.start();
+    nexus::tree::PermissionTreeService tree(storage, crypto);
+    tree.start();
+
+    const auto victim = crypto.ed25519_keygen();
+    const auto attacker = crypto.ed25519_keygen();
+    const std::string victim_id = "ed25519:" + nexus::crypto::to_base64(victim.public_key);
+    const std::string attacker_id = "ed25519:" + nexus::crypto::to_base64(attacker.public_key);
+
+    nexus::tree::TreeNode root;
+    root.id = "root";
+    root.type = nexus::tree::NodeType::Root;
+    ASSERT_TRUE(tree.insert_join_node(root));
+    // The victim is enrolled (its identity is on its node) but has not yet
+    // registered any wg static.
+    nexus::tree::TreeNode victim_node;
+    victim_node.id = "victim";
+    victim_node.parent_id = "root";
+    victim_node.type = nexus::tree::NodeType::Endpoint;
+    victim_node.mgmt_pubkey = victim_id;
+    ASSERT_TRUE(tree.insert_join_node(victim_node));
+
+    const std::string victim_bound = nexus::api::identity_mesh_pubkey(victim_id);
+    ASSERT_FALSE(victim_bound.empty());
+
+    // The attacker cannot first-register the victim's identity-bound static.
+    const auto squat =
+        nexus::api::wg_claim_refusal(tree, victim_bound, "attacker", attacker_id);
+    ASSERT_TRUE(squat.has_value());
+
+    // The victim's own bound claim proceeds, and so does the attacker's own.
+    EXPECT_FALSE(nexus::api::wg_claim_refusal(tree, victim_bound, "victim", victim_id)
+                     .has_value());
+    const std::string attacker_bound = nexus::api::identity_mesh_pubkey(attacker_id);
+    EXPECT_FALSE(
+        nexus::api::wg_claim_refusal(tree, attacker_bound, "attacker", attacker_id)
+            .has_value());
+
+    // A legacy opaque static is still accepted — and once registered, owned.
+    EXPECT_FALSE(nexus::api::wg_claim_refusal(
+                     tree, "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=", "attacker",
+                     attacker_id)
+                     .has_value());
+
+    tree.stop();
+    storage.stop();
+    crypto.stop();
+    fs::remove_all(dir);
+}
