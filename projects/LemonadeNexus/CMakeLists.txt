@@ -55,6 +55,12 @@ install(TARGETS LemonadeNexusApp
         RUNTIME DESTINATION bin
         COMPONENT Runtime)
 
+# License and third-party attribution notices ship with every package
+install(FILES "${CMAKE_SOURCE_DIR}/LICENSE"
+              "${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md"
+        DESTINATION share/doc/lemonade-nexus
+        COMPONENT Runtime)
+
 # Platform-specific service files
 if(UNIX AND NOT APPLE)
     # Linux: systemd unit

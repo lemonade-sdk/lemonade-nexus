@@ -1,5 +1,7 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -10,6 +12,13 @@ import 'theme/app_theme.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Native SDK dependencies (OpenSSL, libsodium, boringtun, ...) are not Dart
+  // packages, so Flutter does not collect their notices automatically. Surface
+  // the repository's notices file on the standard Licenses page instead.
+  LicenseRegistry.addLicense(() async* {
+    final text = await rootBundle.loadString('assets/THIRD_PARTY_NOTICES.md');
+    yield LicenseEntryWithLineBreaks(const ['Lemonade Nexus SDK'], text);
+  });
   if (Platform.isWindows || Platform.isMacOS || Platform.isLinux) {
     await windowManager.ensureInitialized();
     const options = WindowOptions(
