@@ -322,37 +322,47 @@ protected:
         return msgpack_of(wire);
     }
 
+    // A DNS delta signed exactly the way handle_dns_record_sync rebuilds the
+    // origin preimage: data fields only, sorted keys.
     std::vector<uint8_t> dns_delta_payload(const crypto::Ed25519Keypair& signer,
                                            const std::string& delta_id,
                                            const std::string& fqdn,
                                            const std::string& value) {
-        nlohmann::json j;
-        j["delta_id"]      = delta_id;
-        j["operation"]     = "set";
-        j["fqdn"]          = fqdn;
-        j["record_type"]   = "A";
-        j["value"]         = value;
-        j["ttl"]           = uint32_t{60};
-        j["timestamp"]     = uint64_t{1000};
-        j["signer_pubkey"] = crypto::to_base64(signer.public_key);
-        j["signature"]     = sign_b64(signer, delta_id + fqdn + value);
-        return msgpack_of(j);
+        nlohmann::json canonical;
+        canonical["delta_id"]    = delta_id;
+        canonical["fqdn"]        = fqdn;
+        canonical["operation"]   = "set";
+        canonical["record_type"] = "A";
+        canonical["timestamp"]   = uint64_t{1000};
+        canonical["ttl"]         = uint32_t{60};
+        canonical["value"]       = value;
+
+        nlohmann::json wire = canonical;
+        wire["signer_pubkey"] = crypto::to_base64(signer.public_key);
+        wire["signature"]     = sign_b64(signer, canonical.dump());
+        return msgpack_of(wire);
     }
 
+    // A backbone claim signed by its author. `named_pubkey_b64` is the server
+    // the claim NAMES; splitting it from the signer makes the self-claim rule
+    // testable.
     std::vector<uint8_t> ipam_delta_payload(const crypto::Ed25519Keypair& signer,
+                                            const std::string& named_pubkey_b64,
                                             const std::string& delta_id,
                                             const std::string& server_node_id,
                                             const std::string& backbone_ip) {
-        nlohmann::json j;
-        j["delta_id"]       = delta_id;
-        j["operation"]      = "allocate";
-        j["server_node_id"] = server_node_id;
-        j["server_pubkey"]  = crypto::to_base64(signer.public_key);
-        j["backbone_ip"]    = backbone_ip;
-        j["timestamp"]      = uint64_t{1000};
-        j["signer_pubkey"]  = crypto::to_base64(signer.public_key);
-        j["signature"]      = sign_b64(signer, delta_id + backbone_ip);
-        return msgpack_of(j);
+        nlohmann::json canonical;
+        canonical["backbone_ip"]    = backbone_ip;
+        canonical["delta_id"]       = delta_id;
+        canonical["operation"]      = "allocate";
+        canonical["server_node_id"] = server_node_id;
+        canonical["server_pubkey"]  = named_pubkey_b64;
+        canonical["timestamp"]      = uint64_t{1000};
+
+        nlohmann::json wire = canonical;
+        wire["signer_pubkey"] = crypto::to_base64(signer.public_key);
+        wire["signature"]     = sign_b64(signer, canonical.dump());
+        return msgpack_of(wire);
     }
 
     // An NS slot claim exactly as try_claim_ns_slot signs one. `named` is the
@@ -430,7 +440,7 @@ protected:
 // database. Control: the IDENTICAL payload bytes from a cert-verified peer are
 // applied, so neither the delta signature, the delta id, nor the wire encoding
 // can explain the refusal — only the sender's certificate does.
-TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertVerifiedSender) {
+TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertifiedAuthorAndSender) {
     auto root_kp   = kc->ed25519_keygen();
     auto certified = kc->ed25519_keygen();
     auto outsider  = kc->ed25519_keygen();
@@ -452,18 +462,33 @@ TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertVerifiedSender) {
     // A known peer WITHOUT a certificate: peer-list membership is not trust.
     a.gossip->add_peer("127.0.0.1:9", crypto::to_base64(outsider.public_key));
 
-    const auto payload = acl_delta_payload(
-        outsider, "delta-acl-1", "user-1", "res-1",
-        static_cast<uint32_t>(acl::Permission::Read | acl::Permission::Write));
-
     ASSERT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
 
-    inject(build_packet(outsider, gossip::GossipMsgType::AclDelta, payload), a);
+    // Authored by an uncertified key, forwarded by an uncertified peer.
+    const auto outsider_authored = acl_delta_payload(
+        outsider, "delta-acl-1", "user-1", "res-1",
+        static_cast<uint32_t>(acl::Permission::Read | acl::Permission::Write));
+    inject(build_packet(outsider, gossip::GossipMsgType::AclDelta, outsider_authored), a);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
 
-    // Control: the same bytes from the cert-verified peer are applied.
-    inject(build_packet(certified, gossip::GossipMsgType::AclDelta, payload), a);
+    // Laundering: the SAME uncertified-author bytes relayed by the certified
+    // peer. The forwarder's certificate must not stand in for the author's.
+    inject(build_packet(certified, gossip::GossipMsgType::AclDelta, outsider_authored), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
+
+    // Certified author behind an uncertified forwarder: still refused at the
+    // transport gate.
+    const auto certified_authored = acl_delta_payload(
+        certified, "delta-acl-2", "user-1", "res-1",
+        static_cast<uint32_t>(acl::Permission::Read | acl::Permission::Write));
+    inject(build_packet(outsider, gossip::GossipMsgType::AclDelta, certified_authored), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
+
+    // Control: certified author, certified forwarder — applied.
+    inject(build_packet(certified, gossip::GossipMsgType::AclDelta, certified_authored), a);
     ASSERT_TRUE(pump_until([&] {
         return a.acl->get_permissions("user-1", "res-1") != acl::Permission::None;
     }));
@@ -479,7 +504,7 @@ TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertVerifiedSender) {
 // Control: the identical bytes from a cert-verified peer set the record, which
 // then resolves. The SOA serial pins that the zone did not change at all under
 // the hostile packet — a record set and instantly shadowed would still bump it.
-TEST_F(GossipIngressSecurityTest, DnsRecordSyncRequiresCertVerifiedSender) {
+TEST_F(GossipIngressSecurityTest, DnsRecordSyncRequiresCertifiedAuthorAndSender) {
     auto root_kp   = kc->ed25519_keygen();
     auto certified = kc->ed25519_keygen();
     auto outsider  = kc->ed25519_keygen();
@@ -501,18 +526,34 @@ TEST_F(GossipIngressSecurityTest, DnsRecordSyncRequiresCertVerifiedSender) {
     a.gossip->add_peer("127.0.0.1:9", crypto::to_base64(outsider.public_key));
 
     const std::string fqdn = "srv1.us-east.seip.lemonade-nexus.io";
-    const auto payload = dns_delta_payload(outsider, "delta-dns-1", fqdn, "10.9.8.7");
-
     const auto serial_before = a.dns->soa_serial();
     ASSERT_FALSE(a.dns->resolve(fqdn).has_value());
 
-    inject(build_packet(outsider, gossip::GossipMsgType::DnsRecordSync, payload), a);
+    // Authored by an uncertified key: refused whoever forwards it.
+    const auto outsider_authored =
+        dns_delta_payload(outsider, "delta-dns-1", fqdn, "10.9.8.7");
+    inject(build_packet(outsider, gossip::GossipMsgType::DnsRecordSync, outsider_authored), a);
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, outsider_authored), a);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(a.dns->resolve(fqdn).has_value());
     EXPECT_EQ(a.dns->soa_serial(), serial_before);
 
-    // Control: the same bytes from the cert-verified peer are applied.
-    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, payload), a);
+    // A certified author whose payload was tampered after signing writes
+    // nothing either: the signature covers every data field.
+    auto tampered = dns_delta_payload(certified, "delta-dns-2", fqdn, "10.9.8.7");
+    {
+        auto j = nlohmann::json::from_msgpack(tampered);
+        j["value"] = "10.66.66.66";
+        auto packed = nlohmann::json::to_msgpack(j);
+        tampered.assign(packed.begin(), packed.end());
+    }
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, tampered), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(fqdn).has_value());
+
+    // Control: certified author, certified forwarder — the record lands.
+    const auto genuine = dns_delta_payload(certified, "delta-dns-3", fqdn, "10.9.8.7");
+    inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, genuine), a);
     ASSERT_TRUE(pump_until([&] { return a.dns->resolve(fqdn).has_value(); }));
     EXPECT_EQ(a.dns->resolve(fqdn)->ipv4_address, "10.9.8.7");
     EXPECT_NE(a.dns->soa_serial(), serial_before);
@@ -526,11 +567,12 @@ TEST_F(GossipIngressSecurityTest, DnsRecordSyncRequiresCertVerifiedSender) {
 // certificate is the ONLY gate on this path — apply_remote_backbone_allocation
 // verifies no signature of its own — so the refusal has to happen in gossip.
 // Control: the identical bytes from a cert-verified peer allocate.
-TEST_F(GossipIngressSecurityTest, BackboneIpamSyncRequiresCertVerifiedSender) {
+TEST_F(GossipIngressSecurityTest, BackboneIpamSyncRequiresCertifiedSelfClaim) {
     auto root_kp   = kc->ed25519_keygen();
     auto certified = kc->ed25519_keygen();
     auto outsider  = kc->ed25519_keygen();
     const auto certified_b64 = crypto::to_base64(certified.public_key);
+    const auto outsider_b64  = crypto::to_base64(outsider.public_key);
     const auto cert_json = issue_cert(certified_b64, "peer-certified", root_kp);
 
     auto& a = make_node(
@@ -545,24 +587,32 @@ TEST_F(GossipIngressSecurityTest, BackboneIpamSyncRequiresCertVerifiedSender) {
             n.gossip->set_ipam(n.ipam.get());
         });
 
-    a.gossip->add_peer("127.0.0.1:9", crypto::to_base64(outsider.public_key));
-
-    const auto payload = ipam_delta_payload(outsider, "delta-ipam-1", "srv-hostile",
-                                            "172.16.0.42/32");
+    a.gossip->add_peer("127.0.0.1:9", outsider_b64);
 
     ASSERT_TRUE(a.ipam->get_backbone_allocations().empty());
 
-    inject(build_packet(outsider, gossip::GossipMsgType::BackboneIpamSync, payload), a);
+    // An uncertified author claims an address: refused however it arrives.
+    const auto outsider_claim = ipam_delta_payload(outsider, outsider_b64, "delta-ipam-1",
+                                                   "srv-hostile", "172.16.0.42/32");
+    inject(build_packet(outsider, gossip::GossipMsgType::BackboneIpamSync, outsider_claim), a);
+    inject(build_packet(certified, gossip::GossipMsgType::BackboneIpamSync, outsider_claim), a);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_TRUE(a.ipam->get_backbone_allocations().empty());
 
-    // Control: the same bytes from the cert-verified peer are applied.
-    inject(build_packet(certified, gossip::GossipMsgType::BackboneIpamSync, payload), a);
+    // A certified author claiming SOMEONE ELSE's allocation: a backbone claim
+    // is a statement about one's own address, so a third-party claim writes
+    // nothing — the eviction lever is gone.
+    const auto third_party = ipam_delta_payload(certified, outsider_b64, "delta-ipam-2",
+                                                "srv-victim", "172.16.0.42/32");
+    inject(build_packet(certified, gossip::GossipMsgType::BackboneIpamSync, third_party), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(a.ipam->get_backbone_allocations().empty());
+
+    // Control: the certified author's claim about ITSELF is applied.
+    const auto self_claim = ipam_delta_payload(certified, certified_b64, "delta-ipam-3",
+                                               "srv-certified", "172.16.0.42/32");
+    inject(build_packet(certified, gossip::GossipMsgType::BackboneIpamSync, self_claim), a);
     ASSERT_TRUE(pump_until([&] { return !a.ipam->get_backbone_allocations().empty(); }));
-    const auto allocs = a.ipam->get_backbone_allocations();
-    ASSERT_EQ(allocs.size(), 1u);
-    EXPECT_EQ(allocs[0].customer_node_id, "srv-hostile");
-    EXPECT_EQ(allocs[0].base_network, "172.16.0.42/32");
 }
 
 // ---------------------------------------------------------------------------

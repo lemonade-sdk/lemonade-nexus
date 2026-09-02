@@ -268,7 +268,19 @@ TEST_F(MultiEpochMesh, AReadyCandidateThatRefusesTheDkgIsReplaced) {
     EXPECT_EQ(members.front()->driver->current_epoch(), 2u);
 
     // Transition two: the same attack from a different candidate pair, one
-    // epoch later. History does not soften the rule.
+    // epoch later. History does not soften the rule. One incumbent founder
+    // drops out first, so the pool holds fewer incumbents than seats and
+    // selection MUST promote — the guarantee is structural, not a draw.
+    Node* dropped = nullptr;
+    for (Node* member : members) {
+        if (std::find(founders.begin(), founders.end(), member) != founders.end() &&
+            !mesh.offline.contains(member->id)) {
+            dropped = member;
+            break;
+        }
+    }
+    ASSERT_NE(dropped, nullptr);
+    mesh.offline.insert(dropped->id);
     std::vector<Node*> online;
     for (Node* member : members) {
         if (!mesh.offline.contains(member->id)) online.push_back(member);

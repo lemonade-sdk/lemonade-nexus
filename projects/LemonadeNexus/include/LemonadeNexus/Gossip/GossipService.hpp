@@ -288,6 +288,20 @@ private:
     /// root via verify_cert_core (real issuer==root check + Ed25519 verify).
     [[nodiscard]] bool peer_certificate_is_root_signed(const std::string& pubkey) const;
 
+    /// The origin-signed half of a gossiped delta: the named author signed
+    /// exactly `canonical`, and the root enrolled that author. The packet
+    /// signature only ever names the forwarder.
+    [[nodiscard]] bool delta_origin_verified(const std::string& canonical,
+                                             const std::string& signer_pubkey_b64,
+                                             const std::string& signature_b64) const;
+
+    /// Stores a certificate relayed through peer exchange, but only after the
+    /// same full verification a direct hello gets, and never over one already
+    /// held. This is how a delta's author can be certified without being a
+    /// direct peer.
+    void adopt_relayed_certificate(const std::string& pubkey_b64,
+                                   const std::string& certificate_json);
+
     /// Same check for callers that already hold peers_mutex_.
     [[nodiscard]] bool peer_certificate_is_root_signed_locked(const std::string& pubkey) const;
 

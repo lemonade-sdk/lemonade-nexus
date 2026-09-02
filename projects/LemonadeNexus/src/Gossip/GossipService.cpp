@@ -763,6 +763,12 @@ void GossipService::handle_peer_exchange(const asio::ip::udp::endpoint& sender,
                 do_add_peer(ep, pk);
                 ++added;
             }
+
+            // A relayed certificate is candidate data: it counts only after
+            // the same full verification a direct hello gets. Adopting it
+            // here is what lets a delta's AUTHOR be certified even when the
+            // author is not a direct peer of this node.
+            adopt_relayed_certificate(pk, p.value("certificate_json", ""));
         }
 
         if (added > 0) {
@@ -1560,16 +1566,121 @@ void GossipService::try_add_backbone_wg_peer(const GossipPeer& peer) {
     }
 }
 
-void GossipService::broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta) {
+namespace {
+
+// The origin-signed preimage of each delta family: data fields only, sorted
+// keys, signer and signature excluded — the shape ACL and the NS claims
+// already use.
+std::string dns_delta_canonical(const DnsRecordDelta& d) {
     json j;
-    j["delta_id"]        = delta.delta_id;
-    j["operation"]       = delta.operation;
-    j["server_node_id"]  = delta.server_node_id;
-    j["server_pubkey"]   = delta.server_pubkey;
-    j["backbone_ip"]     = delta.backbone_ip;
-    j["timestamp"]       = delta.timestamp;
-    j["signer_pubkey"]   = delta.signer_pubkey;
-    j["signature"]       = delta.signature;
+    j["delta_id"]    = d.delta_id;
+    j["fqdn"]        = d.fqdn;
+    j["operation"]   = d.operation;
+    j["record_type"] = d.record_type;
+    j["timestamp"]   = d.timestamp;
+    j["ttl"]         = d.ttl;
+    j["value"]       = d.value;
+    return j.dump();
+}
+
+std::string ipam_delta_canonical(const ipam::BackboneAllocationDelta& d) {
+    json j;
+    j["backbone_ip"]    = d.backbone_ip;
+    j["delta_id"]       = d.delta_id;
+    j["operation"]      = d.operation;
+    j["server_node_id"] = d.server_node_id;
+    j["server_pubkey"]  = d.server_pubkey;
+    j["timestamp"]      = d.timestamp;
+    return j.dump();
+}
+
+}  // namespace
+
+void GossipService::adopt_relayed_certificate(const std::string& pubkey_b64,
+                                              const std::string& certificate_json) {
+    if (pubkey_b64.empty() || certificate_json.empty()) {
+        return;
+    }
+    {
+        std::lock_guard lock(peers_mutex_);
+        const auto it = std::find_if(peers_.begin(), peers_.end(),
+                                     [&](const GossipPeer& p) { return p.pubkey == pubkey_b64; });
+        if (it == peers_.end() || !it->certificate_json.empty()) {
+            return;  // Unknown peer, or a certificate is already held.
+        }
+    }
+    try {
+        const ServerCertificate cert = json::parse(certificate_json).get<ServerCertificate>();
+        if (cert.server_pubkey != pubkey_b64 || !verify_cert_core(cert)) {
+            return;
+        }
+    } catch (...) {
+        return;
+    }
+    std::lock_guard lock(peers_mutex_);
+    const auto it = std::find_if(peers_.begin(), peers_.end(),
+                                 [&](const GossipPeer& p) { return p.pubkey == pubkey_b64; });
+    if (it != peers_.end() && it->certificate_json.empty()) {
+        it->certificate_json = certificate_json;
+        save_peers();
+    }
+}
+
+bool GossipService::delta_origin_verified(const std::string& canonical,
+                                          const std::string& signer_pubkey_b64,
+                                          const std::string& signature_b64) const {
+    // The packet signature named the FORWARDER; this names the AUTHOR. A
+    // delta applies only when the author signed exactly these fields AND the
+    // root enrolled the author — a self-minted key authors nothing the mesh
+    // accepts, no matter who relays it.
+    if (signer_pubkey_b64.empty() || signature_b64.empty()) {
+        return false;
+    }
+    try {
+        const auto pk  = crypto::from_base64(signer_pubkey_b64);
+        const auto sig = crypto::from_base64(signature_b64);
+        if (pk.size() != crypto::kEd25519PublicKeySize ||
+            sig.size() != crypto::kEd25519SignatureSize) {
+            return false;
+        }
+        crypto::Ed25519PublicKey pubkey{};
+        crypto::Ed25519Signature signature{};
+        std::memcpy(pubkey.data(), pk.data(), pk.size());
+        std::memcpy(signature.data(), sig.data(), sig.size());
+        if (!crypto_.ed25519_verify(
+                pubkey,
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                         canonical.size()),
+                signature)) {
+            return false;
+        }
+    } catch (...) {
+        return false;
+    }
+    return peer_certificate_is_root_signed(signer_pubkey_b64);
+}
+
+void GossipService::broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta) {
+    // The origin signs what it asserts; forwarding never re-signs. A server
+    // may only assert its own allocation, so the signer IS the subject.
+    ipam::BackboneAllocationDelta signed_delta = delta;
+    signed_delta.signer_pubkey = crypto::to_base64(keypair_.public_key);
+    const std::string canonical = ipam_delta_canonical(signed_delta);
+    const auto sig = crypto_.ed25519_sign(
+        keypair_.private_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                 canonical.size()));
+    signed_delta.signature = crypto::to_base64(sig);
+
+    json j;
+    j["delta_id"]        = signed_delta.delta_id;
+    j["operation"]       = signed_delta.operation;
+    j["server_node_id"]  = signed_delta.server_node_id;
+    j["server_pubkey"]   = signed_delta.server_pubkey;
+    j["backbone_ip"]     = signed_delta.backbone_ip;
+    j["timestamp"]       = signed_delta.timestamp;
+    j["signer_pubkey"]   = signed_delta.signer_pubkey;
+    j["signature"]       = signed_delta.signature;
 
     auto packed = json::to_msgpack(j);
     std::vector<uint8_t> payload(packed.begin(), packed.end());
@@ -1611,6 +1722,18 @@ void GossipService::handle_backbone_ipam_sync(
         delta.signature      = j.value("signature", "");
 
         if (delta.delta_id.empty() || delta.server_node_id.empty()) {
+            return;
+        }
+
+        // A backbone claim is a statement about the claimant's OWN address:
+        // the author must be the named server, must have signed these exact
+        // fields, and must be root-enrolled. Third parties evict nobody.
+        if (delta.signer_pubkey != delta.server_pubkey ||
+            !delta_origin_verified(ipam_delta_canonical(delta), delta.signer_pubkey,
+                                   delta.signature)) {
+            spdlog::warn("[{}] DENIED backbone IPAM delta from {}:{} — origin is not "
+                          "the certified subject of its own claim", name(),
+                          sender.address().to_string(), sender.port());
             return;
         }
 
@@ -1711,6 +1834,16 @@ void GossipService::handle_acl_delta(const asio::ip::udp::endpoint& sender,
             return;
         }
 
+        // The service verifies the signature against the named author below;
+        // the author itself must also be a root-enrolled server. A key minted
+        // for the occasion self-signs a valid delta and still writes nothing.
+        if (!peer_certificate_is_root_signed(delta.signer_pubkey)) {
+            spdlog::warn("[{}] DENIED ACL delta from {}:{} — the delta's author is "
+                          "not a cert-verified enrolled peer", name(),
+                          sender.address().to_string(), sender.port());
+            return;
+        }
+
         // apply_remote_delta verifies signature and deduplicates
         if (acl_->apply_remote_delta(delta)) {
             // New delta — forward to all peers except sender (epidemic spread)
@@ -1738,16 +1871,26 @@ void GossipService::set_dns(network::DnsService* dns) {
 }
 
 void GossipService::broadcast_dns_record_delta(const DnsRecordDelta& delta) {
+    // The origin signs what it asserts; forwarding never re-signs.
+    DnsRecordDelta signed_delta = delta;
+    signed_delta.signer_pubkey = crypto::to_base64(keypair_.public_key);
+    const std::string canonical = dns_delta_canonical(signed_delta);
+    const auto sig = crypto_.ed25519_sign(
+        keypair_.private_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                 canonical.size()));
+    signed_delta.signature = crypto::to_base64(sig);
+
     json j;
-    j["delta_id"]      = delta.delta_id;
-    j["operation"]     = delta.operation;
-    j["fqdn"]          = delta.fqdn;
-    j["record_type"]   = delta.record_type;
-    j["value"]         = delta.value;
-    j["ttl"]           = delta.ttl;
-    j["timestamp"]     = delta.timestamp;
-    j["signer_pubkey"] = delta.signer_pubkey;
-    j["signature"]     = delta.signature;
+    j["delta_id"]      = signed_delta.delta_id;
+    j["operation"]     = signed_delta.operation;
+    j["fqdn"]          = signed_delta.fqdn;
+    j["record_type"]   = signed_delta.record_type;
+    j["value"]         = signed_delta.value;
+    j["ttl"]           = signed_delta.ttl;
+    j["timestamp"]     = signed_delta.timestamp;
+    j["signer_pubkey"] = signed_delta.signer_pubkey;
+    j["signature"]     = signed_delta.signature;
 
     auto packed = json::to_msgpack(j);
     std::vector<uint8_t> payload(packed.begin(), packed.end());
@@ -1791,6 +1934,17 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
         if (delta.delta_id.empty() || delta.fqdn.empty()) {
             spdlog::warn("[{}] received invalid DNS record delta from {}:{}",
                           name(), sender.address().to_string(), sender.port());
+            return;
+        }
+
+        // Zone writes are authored, not relayed into existence: the origin
+        // signed exactly these fields and is a root-enrolled server, or the
+        // record does not change.
+        if (!delta_origin_verified(dns_delta_canonical(delta), delta.signer_pubkey,
+                                   delta.signature)) {
+            spdlog::warn("[{}] DENIED DNS record delta from {}:{} — origin signature "
+                          "or enrollment failed", name(),
+                          sender.address().to_string(), sender.port());
             return;
         }
 
