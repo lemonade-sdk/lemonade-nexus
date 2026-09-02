@@ -21,9 +21,8 @@ Summary (not a substitute for the terms below):
     publish those modifications in a public fork of the original
     repository, under this same License.
   * Commercial use of any kind requires a separate written Commercial
-    License Agreement with the Licensor. The Licensor grants these only as
-    partnerships in which it shares in the economic benefit the Software
-    creates, never as one-off transactional licenses. Agreements that have
+    License Agreement with the Licensor. These are structured as
+    partnerships rather than one-off transactions. Agreements that have
     been reached are recorded in Schedule A of this file.
   * The Designated Partners listed in Schedule B (currently Advanced Micro
     Devices, Inc. and the Lemonade SDK project) may use and modify the
@@ -220,17 +219,15 @@ Summary (not a substitute for the terms below):
 3.5 To request a Commercial License Agreement, contact the Licensor through
     the repository listed in Section 1.2.
 
-3.6 Partnership principle. The Licensor enters into Commercial License
-    Agreements only as partnerships between equals in which the Licensor
-    participates in the economic benefit that the Software creates. The
-    terms of each partnership are private to the parties and are not
-    recorded in this License. The Licensor does not grant flat-fee, one-time, or
-    otherwise transactional commercial licenses, and no party may use the
-    Software to generate revenue or to conduct or facilitate transactions
-    unless the Licensor benefits financially under a Commercial License
-    Agreement. This Section states the basis on which the Licensor
-    exercises its discretion under Section 3.2; it does not oblige the
-    Licensor to accept any particular proposal.
+3.6 Partnership principle. The Licensor's approach to commercial use is
+    partnership. Commercial License Agreements are structured as
+    partnerships between equals, in which the Licensor takes part in the
+    value the Software helps create, rather than as one-time or flat-fee
+    transactions. The terms of each partnership are private to the parties
+    and are not recorded in this License. This Section describes how the
+    Licensor exercises its discretion under Section 3.2; it does not
+    oblige the Licensor to accept any proposal, nor prevent it from agreeing
+    different terms in a particular case.
 
 3.7 The same principle applies to any consent the Licensor gives a
     Designated Partner under Section 4.2 to make Commercial Use of the

@@ -880,7 +880,7 @@ Lemonade-Nexus is source-available under the [Lemonade-Nexus Source-Available Li
 
 - **Individuals**: free to download, build, self-host, and modify for personal, educational, research, and other non-commercial use.
 - **Modifications must be public**: anyone without a commercial license who modifies the code must publish the changes in a public fork of this repository, under the same license.
-- **Commercial use**: requires a separate written agreement with the licensors, granted only as a partnership in which the licensors share in the economic benefit. No flat-fee or transactional licenses. Agreements are recorded in Schedule A of the [LICENSE](LICENSE) file.
+- **Commercial use**: requires a separate written agreement with the licensors, structured as a partnership rather than a one-off transaction. Agreements are recorded in Schedule A of the [LICENSE](LICENSE) file.
 - **AMD and the Lemonade SDK project**: designated partners with internal-use and commit rights, no commercialization without written consent. Each has its own file under [licenses/partners](licenses/partners/). Lemonade may additionally bundle the software inside Lemonade Server and the Lemonade UI.
 - **Not permitted**: copying code into other projects, redistributing binaries, or publishing modified versions anywhere other than a public fork of this repository.
 
