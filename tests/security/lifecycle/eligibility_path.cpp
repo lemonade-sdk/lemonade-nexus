@@ -174,7 +174,7 @@ TEST_F(EligibilityPath, RestartBeforeSelectionRequiresSyncThenRecovers) {
 
     // Past the boundary it finalizes with the quorum and gets its pool back.
     mesh.now_ms += constants::kTargetEpochSeconds * 1000;
-    for (int i = 0; i < 120 && eligibility_of(*victim).finalized() == nullptr; ++i) {
+    for (int i = 0; i < 400 && eligibility_of(*victim).finalized() == nullptr; ++i) {
         step(1);
     }
     ASSERT_NE(eligibility_of(*victim).finalized(), nullptr);

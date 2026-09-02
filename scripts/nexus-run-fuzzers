@@ -37,6 +37,7 @@ readonly TARGETS=(
     eligibility_observation
     participation_response
     adoption_proof
+    authority_chain
 )
 
 if ! [[ "${SECONDS_PER_TARGET}" =~ ^[0-9]+$ ]]; then

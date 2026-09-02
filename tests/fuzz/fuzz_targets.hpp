@@ -16,6 +16,7 @@
 #include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/VoteKey.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityLedger.hpp>
+#include <LemonadeNexus/Security/Epoch/AuthorityChain.hpp>
 #include <LemonadeNexus/Security/Epoch/NextEpochPlan.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Eligibility/ParticipationProof.hpp>
@@ -307,6 +308,81 @@ inline void fuzz_adoption_proof(Bytes input) {
     }
 }
 
+/// The pinned trust anchor a chain walk starts from: a genesis keypair, its
+/// signed certificate over the five-node fuzz committee, and the verified
+/// Epoch 1 authority derived from both.
+struct FuzzChainAnchor {
+    nexus::crypto::Ed25519Keypair genesis{};
+    nexus::security::BootstrapCertificate certificate;
+    std::vector<std::pair<nexus::security::NodeId, nexus::crypto::Ed25519PublicKey>> listing;
+    nexus::security::VerifiedEpochAuthority authority;
+};
+
+inline const FuzzChainAnchor& fuzz_chain_anchor() {
+    static const FuzzChainAnchor anchor = [] {
+        FuzzChainAnchor out;
+        crypto_sign_keypair(out.genesis.public_key.data(), out.genesis.private_key.data());
+        std::vector<nexus::security::NodeId> members;
+        std::map<nexus::security::NodeId, nexus::crypto::Ed25519PublicKey> keys;
+        for (const auto& [node, key] : fuzz_vote_pubs()) {
+            members.push_back(node);
+            keys[node] = key;
+            out.listing.emplace_back(node, key);
+        }
+        auto& c = out.certificate;
+        c.network_id = fuzz_network();
+        c.epoch = 1;
+        c.tier1_set_digest = nexus::security::Tier1Set::from_nodes(members)->digest();
+        c.authority_threshold =
+            nexus::security::constants::authority_threshold(members.size());
+        c.authority_public_key.fill(0x91);
+        c.dkg_transcript_digest.fill(0xD1);
+        c.attestation_root.fill(0xA1);
+        c.founding_eligibility_digest.fill(0xE1);
+        c.vote_key_set_digest = nexus::security::vote_key_set_digest(keys);
+        c.security_ruleset = nexus::security::constants::kSecurityRulesetVersion;
+        c.consensus_ruleset = nexus::security::constants::kConsensusRulesetVersion;
+        const auto digest = nexus::security::bootstrap_certificate_signing_digest(c);
+        crypto_sign_detached(c.genesis_signature.data(), nullptr, digest.data(), digest.size(),
+                             out.genesis.private_key.data());
+        out.authority = *nexus::security::verify_epoch_one_authority(
+            c, out.genesis.public_key, out.listing);
+        return out;
+    }();
+    return anchor;
+}
+
+/// The authority-chain walk over hostile pages. A page that proves nothing
+/// advances nothing; the walk must simply return, never crash, and never
+/// step outside the links it verified.
+inline void fuzz_authority_chain(Bytes input) {
+    const auto decoded = nexus::security::decode_security_message(input);
+    if (!std::holds_alternative<nexus::security::SecurityMessage>(decoded)) {
+        return;
+    }
+    const auto& message = std::get<nexus::security::SecurityMessage>(decoded);
+    const auto* page = std::get_if<nexus::security::AuthorityChainPage>(&message.body);
+    if (page == nullptr) {
+        return;
+    }
+    const auto& anchor = fuzz_chain_anchor();
+    if (page->has_base) {
+        (void)nexus::security::verify_epoch_one_authority(
+            page->base_certificate, anchor.genesis.public_key, page->base_vote_keys);
+    }
+    auto authority = anchor.authority;
+    for (const auto& link : page->links) {
+        auto advanced =
+            nexus::security::advance_epoch_authority(authority, link.handoff, link.proof);
+        auto* next = std::get_if<nexus::security::VerifiedEpochAuthority>(&advanced);
+        if (next == nullptr) {
+            break;
+        }
+        authority = std::move(*next);
+    }
+    (void)nexus::security::verified_epoch_authority_digest(authority);
+}
+
 struct Target {
     const char* name;
     void (*run)(Bytes);
@@ -325,6 +401,7 @@ inline constexpr Target kTargets[] = {
     {"eligibility_observation", &fuzz_eligibility_observation},
     {"participation_response", &fuzz_participation_response},
     {"adoption_proof", &fuzz_adoption_proof},
+    {"authority_chain", &fuzz_authority_chain},
 };
 
 }  // namespace nexus_fuzz

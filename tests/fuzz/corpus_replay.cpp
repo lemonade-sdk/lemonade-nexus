@@ -243,6 +243,109 @@ std::vector<std::vector<uint8_t>> adoption_corpus(Rng& rng) {
     return corpus;
 }
 
+/// A genuine chain page — the pinned base plus one properly proved link —
+/// and mutations of it. The walk's deep paths only open past real
+/// verification, so the corpus has to carry real signatures.
+std::vector<std::vector<uint8_t>> chain_corpus(Rng& rng) {
+    std::vector<std::vector<uint8_t>> corpus;
+    const auto& anchor = nexus_fuzz::fuzz_chain_anchor();
+    const auto& keys = nexus_fuzz::fuzz_vote_keys();
+
+    nexus::security::EpochHandoff handoff;
+    handoff.network_id = nexus_fuzz::fuzz_network();
+    handoff.from_epoch = 1;
+    handoff.to_epoch = 2;
+    handoff.plan_digest.fill(0x32);
+    handoff.previous_anchor = anchor.authority.anchor_digest;
+    for (const auto& [node, key] : keys) {
+        handoff.members.push_back(node);
+        handoff.incarnations[node] = 1;
+        handoff.vote_keys[node] = nexus::security::make_epoch_vote_key(2, node).public_key;
+    }
+    handoff.group_public_key.fill(0x92);
+    handoff.dkg_transcript_digest.fill(0xD2);
+    handoff.key_generation = 2;
+    handoff.attestation_root.fill(0xA2);
+    handoff.security_ruleset = constants::kSecurityRulesetVersion;
+    handoff.consensus_ruleset = constants::kConsensusRulesetVersion;
+    const auto handoff_digest = nexus::security::epoch_handoff_digest(handoff);
+
+    // A real three-chain proof under the epoch-1 keys.
+    nexus::security::CommitProof proof;
+    nexus::security::Digest parent{};
+    nexus::security::QuorumCertificate justify{};
+    justify.qc_format_version = constants::kQcFormatVersion;
+    justify.consensus_ruleset = constants::kConsensusRulesetVersion;
+    justify.network_id = handoff.network_id;
+    justify.epoch = 1;
+    for (uint8_t i = 0; i < 3; ++i) {
+        nexus::security::Proposal proposal{};
+        proposal.security_ruleset = constants::kSecurityRulesetVersion;
+        proposal.consensus_ruleset = constants::kConsensusRulesetVersion;
+        proposal.network_id = handoff.network_id;
+        proposal.epoch = 1;
+        proposal.height = 30 + i;
+        proposal.view = 30 + i;
+        proposal.leader = keys.begin()->first;
+        proposal.parent_digest = parent;
+        proposal.transitions_digest = i == 0 ? handoff_digest : nexus::security::Digest{};
+        proof.chain.push_back({proposal, justify});
+        const auto digest = nexus::security::proposal_digest(proposal);
+        nexus::security::QuorumCertificate qc{};
+        qc.qc_format_version = constants::kQcFormatVersion;
+        qc.consensus_ruleset = constants::kConsensusRulesetVersion;
+        qc.network_id = handoff.network_id;
+        qc.epoch = 1;
+        qc.height = proposal.height;
+        qc.view = proposal.view;
+        qc.proposal_digest = digest;
+        for (const auto& [node, key] : keys) {
+            nexus::security::Vote vote{};
+            vote.consensus_ruleset = constants::kConsensusRulesetVersion;
+            vote.network_id = handoff.network_id;
+            vote.epoch = 1;
+            vote.height = proposal.height;
+            vote.view = proposal.view;
+            vote.proposal_digest = digest;
+            vote.voter = node;
+            const auto signing = nexus::security::vote_signing_digest(vote);
+            crypto_sign_detached(vote.signature.data(), nullptr, signing.data(),
+                                 signing.size(), key.private_key.data());
+            qc.signers.push_back({node, vote.signature});
+        }
+        parent = digest;
+        justify = qc;
+    }
+    proof.certifying = justify;
+
+    nexus::security::AuthorityChainPage page;
+    page.has_base = true;
+    page.base_certificate = anchor.certificate;
+    page.base_vote_keys = anchor.listing;
+    page.links.push_back({handoff, proof});
+
+    nexus::security::SecurityMessage envelope;
+    envelope.kind = nexus::security::SecurityMessageKind::AuthorityChainPage;
+    envelope.security_ruleset = constants::kSecurityRulesetVersion;
+    envelope.consensus_ruleset = constants::kConsensusRulesetVersion;
+    envelope.network_id = handoff.network_id;
+    envelope.epoch = 1;
+    envelope.sender = keys.begin()->first;
+    envelope.body = page;
+    mutate_into(corpus, nexus::security::encode_security_message(envelope), rng);
+
+    nexus::security::SecurityMessage ask;
+    ask.kind = nexus::security::SecurityMessageKind::AuthorityChainRequest;
+    ask.security_ruleset = constants::kSecurityRulesetVersion;
+    ask.consensus_ruleset = constants::kConsensusRulesetVersion;
+    ask.network_id = handoff.network_id;
+    ask.epoch = 0;
+    ask.sender = keys.begin()->first;
+    ask.body = nexus::security::AuthorityChainRequest{1};
+    mutate_into(corpus, nexus::security::encode_security_message(ask), rng);
+    return corpus;
+}
+
 /// A valid message with one byte corrupted is the input most likely to reach
 /// deep parser state, so the corpus carries those too.
 std::vector<std::vector<uint8_t>> near_miss_corpus(Rng& rng) {
@@ -287,6 +390,7 @@ TEST(FuzzCorpus, EveryTargetSurvivesTheCorpus) {
     for (auto& input : near_miss_corpus(rng)) corpus.push_back(std::move(input));
     for (auto& input : eligibility_corpus(rng)) corpus.push_back(std::move(input));
     for (auto& input : adoption_corpus(rng)) corpus.push_back(std::move(input));
+    for (auto& input : chain_corpus(rng)) corpus.push_back(std::move(input));
 
     for (const auto& target : nexus_fuzz::kTargets) {
         for (const auto& input : corpus) {
