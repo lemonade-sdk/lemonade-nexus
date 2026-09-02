@@ -119,6 +119,7 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/tier2_path.cpp
     security/lifecycle/adoption_path.cpp
     security/lifecycle/multi_epoch.cpp
+    security/lifecycle/population.cpp
     security/lifecycle/hostile_adoption.cpp
     security/lifecycle/adversarial.cpp)
 add_nexus_test(test_security_genesis

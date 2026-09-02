@@ -104,8 +104,9 @@ inline constexpr uint64_t kFinalAttestMaxAgeSeconds = 300;
 // How long an authorized next-epoch DKG may sit incomplete before the attempt
 // fails and the deterministic replacement runs. Liveness only: a stall never
 // activates anything, and the silent participants are excluded from the next
-// attempt by their own observed silence.
-inline constexpr uint64_t kDkgStallSeconds = 120;
+// attempt by their own observed silence. Wide enough that a run of view
+// timeouts at the pacemaker's maximum backoff can never masquerade as one.
+inline constexpr uint64_t kDkgStallSeconds = 300;
 
 // Tier 1 attestation is expensive; the budget binds to node identity and
 // epoch, never to an IP address (architecture 24). Initial value; a tuning
