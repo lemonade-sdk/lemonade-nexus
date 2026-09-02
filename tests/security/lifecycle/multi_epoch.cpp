@@ -224,6 +224,17 @@ TEST_F(MultiEpochMesh, AReadyCandidateThatRefusesTheDkgIsReplaced) {
         // Readiness can now finalize — and the refuser goes silent. Its
         // round-1 silence is observed identically by every member.
         mesh.offline.insert(refuser->id);
+        const std::size_t ready_before = mesh.captured_readiness.size();
+        for (int i = 0; i < 900 && mesh.captured_readiness.size() == ready_before; ++i) {
+            step(1, members);
+        }
+        if (mesh.captured_readiness.size() == ready_before) {
+            ADD_FAILURE() << "readiness never finalized";
+            return members;
+        }
+
+        // The ceremony now hangs on the refuser. Past the compiled window the
+        // attempt fails and the replacement plan commits.
         const uint32_t plans_before = static_cast<uint32_t>(mesh.captured_plans.size());
         mesh.now_ms += (constants::kDkgStallSeconds + 5) * 1000;
         for (int i = 0; i < 900 && mesh.captured_plans.size() == plans_before; ++i) {
