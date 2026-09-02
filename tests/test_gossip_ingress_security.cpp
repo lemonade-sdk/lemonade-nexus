@@ -509,7 +509,8 @@ TEST_F(GossipIngressSecurityTest, DnsRecordSyncRequiresCertifiedAuthorAndSender)
     auto certified = kc->ed25519_keygen();
     auto outsider  = kc->ed25519_keygen();
     const auto certified_b64 = crypto::to_base64(certified.public_key);
-    const auto cert_json = issue_cert(certified_b64, "peer-certified", root_kp);
+    // The author's certificate carries the server_id that OWNS the SEIP FQDN.
+    const auto cert_json = issue_cert(certified_b64, "srv1", root_kp);
 
     auto& a = make_node(
         "a",
@@ -988,7 +989,7 @@ TEST_F(GossipIngressSecurityTest, PeerExchangeAdoptsOnlyVerifiedRelayedCertifica
     auto origin  = kc->ed25519_keygen();
     auto other   = kc->ed25519_keygen();
     const auto origin_b64 = crypto::to_base64(origin.public_key);
-    const auto origin_cert = issue_cert(origin_b64, "peer-origin", root_kp);
+    const auto origin_cert = issue_cert(origin_b64, "srv2", root_kp);
 
     auto& a = make_node(
         "a",
@@ -1046,7 +1047,7 @@ TEST_F(GossipIngressSecurityTest, Tier1DnsLabelRequiresFinalizedMembership) {
     auto root_kp   = kc->ed25519_keygen();
     auto certified = kc->ed25519_keygen();
     const auto certified_b64 = crypto::to_base64(certified.public_key);
-    const auto cert_json = issue_cert(certified_b64, "peer-certified", root_kp);
+    const auto cert_json = issue_cert(certified_b64, "srv9", root_kp);
 
     bool is_member = false;
     auto& a = make_node(
@@ -1090,4 +1091,56 @@ TEST_F(GossipIngressSecurityTest, Tier1DnsLabelRequiresFinalizedMembership) {
     const auto plain = dns_delta_payload(certified, "delta-t1-4", plain_fqdn, "10.2.2.2");
     inject(build_packet(certified, gossip::GossipMsgType::DnsRecordSync, plain), a);
     ASSERT_TRUE(pump_until([&] { return a.dns->resolve(plain_fqdn).has_value(); }));
+}
+
+// A per-server SEIP DNS record is an ordinary resource: its FQDN embeds the
+// owning server's id, and an enrolled author may write only its own. Another
+// certified server cannot author a record in a foreign server's SEIP name.
+TEST_F(GossipIngressSecurityTest, SeipDnsRecordsAreOwnedByTheirServerId) {
+    auto root_kp = kc->ed25519_keygen();
+    auto owner   = kc->ed25519_keygen();
+    auto other   = kc->ed25519_keygen();
+    const auto owner_b64 = crypto::to_base64(owner.public_key);
+    const auto other_b64 = crypto::to_base64(other.public_key);
+    // owner's certificate owns server_id "srv-owner"; other's owns "srv-other".
+    const auto owner_cert = issue_cert(owner_b64, "srv-owner", root_kp);
+    const auto other_cert = issue_cert(other_b64, "srv-other", root_kp);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(owner_b64, "127.0.0.1:9", owner_cert),
+                 peer_entry(other_b64, "127.0.0.2:9", other_cert)}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    const std::string owned_fqdn = "srv-owner.us-east.seip.lemonade-nexus.io";
+
+    // The other certified server cannot author a record in srv-owner's name.
+    const auto poached = dns_delta_payload(other, "delta-own-1", owned_fqdn, "10.0.0.9");
+    inject(build_packet(other, gossip::GossipMsgType::DnsRecordSync, poached), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(owned_fqdn).has_value());
+
+    // The owner authors its own record, and it lands.
+    const auto genuine = dns_delta_payload(owner, "delta-own-2", owned_fqdn, "10.0.0.1");
+    inject(build_packet(owner, gossip::GossipMsgType::DnsRecordSync, genuine), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(owned_fqdn).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(owned_fqdn)->ipv4_address, "10.0.0.1");
+
+    // The private.<id> qualifier resolves to the same owner.
+    const std::string private_fqdn = "private.srv-owner.us-east.seip.lemonade-nexus.io";
+    const auto priv = dns_delta_payload(owner, "delta-own-3", private_fqdn, "10.64.0.1");
+    inject(build_packet(owner, gossip::GossipMsgType::DnsRecordSync, priv), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(private_fqdn).has_value(); }));
+    const auto poach_priv =
+        dns_delta_payload(other, "delta-own-4", private_fqdn, "10.66.66.66");
+    inject(build_packet(other, gossip::GossipMsgType::DnsRecordSync, poach_priv), a);
+    pump_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(a.dns->resolve(private_fqdn)->ipv4_address, "10.64.0.1");
 }

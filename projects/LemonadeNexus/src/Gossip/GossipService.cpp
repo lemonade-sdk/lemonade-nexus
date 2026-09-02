@@ -1362,6 +1362,21 @@ bool GossipService::peer_certificate_is_root_signed_locked(const std::string& pu
     }
 }
 
+std::string GossipService::certified_server_id(const std::string& pubkey) const {
+    std::lock_guard lock(peers_mutex_);
+    if (!has_root_pubkey_ || pubkey.empty() || is_revoked(pubkey)) return {};
+    const auto it = std::find_if(peers_.begin(), peers_.end(),
+        [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+    if (it == peers_.end() || it->certificate_json.empty()) return {};
+    try {
+        auto cert = json::parse(it->certificate_json).get<ServerCertificate>();
+        if (cert.server_pubkey != pubkey || !verify_cert_core(cert)) return {};
+        return cert.server_id;
+    } catch (...) {
+        return {};
+    }
+}
+
 void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                                           const uint8_t* payload,
                                           std::size_t payload_len,
@@ -1968,6 +1983,28 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
                           "not a current Tier 1 member", name(),
                           sender.address().to_string(), sender.port());
             return;
+        }
+
+        // A per-server SEIP record is an ORDINARY resource owned by exactly
+        // one server: the FQDN embeds that server's id. An enrolled author may
+        // write only its own — never another node's address record. The real
+        // names are "<id>.<region>.seip.<base>", "<id>.tier<N>.<region>.seip"
+        // and "private.<id>.<region>.seip"; the owner id is the FIRST label,
+        // after dropping a leading "private." qualifier.
+        if (fqdn_lower.find(".seip.") != std::string::npos) {
+            std::string_view head(fqdn_lower);
+            if (head.substr(0, 8) == "private.") {
+                head.remove_prefix(8);
+            }
+            const auto dot = head.find('.');
+            const std::string owner_id(dot == std::string_view::npos ? head
+                                                                     : head.substr(0, dot));
+            if (!owner_id.empty() && owner_id != certified_server_id(delta.signer_pubkey)) {
+                spdlog::warn("[{}] DENIED SEIP DNS record from {}:{} — author does not "
+                              "own the server id '{}'", name(),
+                              sender.address().to_string(), sender.port(), owner_id);
+                return;
+            }
         }
 
         // Convert to DnsZoneRecord for DnsService

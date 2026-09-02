@@ -305,6 +305,11 @@ private:
     /// Same check for callers that already hold peers_mutex_.
     [[nodiscard]] bool peer_certificate_is_root_signed_locked(const std::string& pubkey) const;
 
+    /// The server_id in a peer's root-verified certificate, or empty when the
+    /// peer is unknown, uncertified, or revoked. Ordinary per-server resource
+    /// ownership (SEIP DNS records) is keyed on this.
+    [[nodiscard]] std::string certified_server_id(const std::string& pubkey) const;
+
     // Load the server certificate and root pubkey
     void load_server_certificate();
 
