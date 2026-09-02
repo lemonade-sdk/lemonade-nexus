@@ -823,3 +823,74 @@ the root signature; issuance refuses without a network id everywhere.
   the cross-population table exercises the real records and verifiers at
   every N but not the full driver.
 - Real libFuzzer runs still need the Linux container (no local daemon).
+
+## M12 — The authority chain and the closed adoption gaps
+
+Every M11 gap except the container-bound fuzzer run is closed, and the
+architecture document is rewritten as Final Draft 1.2 (in `.idea/`,
+superseding 1.1).
+
+### Final attestation binds its context
+
+An attestation now answers one compiled purpose under one canonical context
+digest — Eligibility (network, epoch, node, incarnation) or
+FinalEpochReadiness (network, next epoch, plan digest, attempt, selected-set
+digest, node, incarnation). Purpose and context sit inside the challenge
+digest (the quote nonce input) and the identity-signed evidence, travel on
+the wire, and are matched by the verifier, the epoch manager and the driver.
+Plan A evidence cannot answer plan B, attempt N cannot answer N+1, and
+eligibility evidence cannot be relabelled as final readiness or the
+reverse. No unbound final challenge exists.
+
+### The verified epoch authority chain
+
+VerifiedEpochAuthority is the walk's output: Epoch 1 from the pinned Genesis
+certificate plus the listing it commits to by digest, every later epoch from
+the previous epoch's verified finalized handoff. The handoff record now
+binds its predecessor's anchor digest. advance_epoch_authority refuses
+gaps, reorders, broken linkage, self-certified proofs, reused keys, foreign
+rulesets and invalid memberships by name. Chain transport is bounded pages
+(base + at most 4 links); requests are idempotent; a page that proves
+nothing changes nothing. The anchor persists crash-atomically bound to its
+own digest: stale = availability, modified = fail closed, superseded stored
+epoch = resume as Tier 2.
+
+### Proven live, repeatedly
+
+One mesh runs four real rotations (three Tier 2 promotions in sequence), a
+fresh node appears during epoch 4 with only the pinned anchor and is a
+member by epoch 5, a rolled-back member recovers as Tier 2, a ready
+candidate that refuses the DKG is replaced across two successive
+transitions, and growth rotations at N = 7 and N = 10 run the full driver
+with multi-newcomer adoption. The DKG stall window plus round-1 silence
+observation (recorded from authenticated broadcasts, with or without a
+session) turned ready-then-silent from a permanent stall into a replaced
+attempt.
+
+### Two live defects found by the multi-epoch run
+
+- Participation witnessing derived from votes, which only the collecting
+  leader saw; the member seated after an offline peer in the rotation could
+  never witness, starving the witness bar and stalling every later
+  boundary. Witnessing now derives from the justify certificate every
+  replica validates identically.
+- The production SecurityMeshService event proxy forwarded only a subset of
+  driver events; eligibility, participation and the whole adoption exchange
+  were dropped on the production wiring (test harnesses had their own
+  complete proxies). It forwards everything now.
+
+### Remaining gaps
+
+- Real libFuzzer executions still need the Linux runner (no local Docker
+  daemon); the deterministic corpus — now including genuinely signed chain
+  pages — runs in every suite, and the `authority_chain` target is wired
+  into `scripts/nexus-run-fuzzers`.
+- In-session DKG culprit attribution (an invalid round-2 package) is only
+  observable by ceremony participants; non-participant members converge
+  through the stall path instead. Liveness only.
+- The admission surface (certificate issuance, enrollment tokens,
+  supersede) and the gossip-replicated application stores (ACL, DNS, IPAM,
+  NS slots) remain identity- or root-gated transitional gates outside the
+  finalized-state derivation; the mutation-path audit enumerates them and
+  the DDNS Tier 1 gate is the reference pattern to migrate toward. None of
+  them can touch epochs, eligibility or authority keys.

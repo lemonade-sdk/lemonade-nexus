@@ -614,9 +614,12 @@ void UserspaceDataplane::drain_followups(const PeerPtr& peer, uint64_t to_packed
                                          std::vector<uint8_t>& scratch_a,
                                          std::vector<uint8_t>& scratch_b) {
     // After a handshake completes boringtun queues the response/keepalive and
-    // any packets buffered while no session existed.
+    // any packets buffered while no session existed. The empty read must pass
+    // a valid pointer: the FFI builds a Rust slice from it, and a null slice
+    // base is undefined behavior there even at length zero.
+    static constexpr uint8_t kEmpty[1] = {0};
     while (true) {
-        auto r = wireguard_read(peer->tunn, nullptr, 0, scratch_a.data(),
+        auto r = wireguard_read(peer->tunn, kEmpty, 0, scratch_a.data(),
                                 static_cast<uint32_t>(scratch_a.size()));
         if (r.op == WRITE_TO_NETWORK && r.size > 0) {
             send_udp(scratch_a.data(), r.size, to_packed);

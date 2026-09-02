@@ -100,10 +100,15 @@ struct NextEpochPlanProof {
     std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>> current_vote_keys;
 };
 
-/// A pending candidate's objective statement that it acquired current
-/// certified state: the quorum certificate it verified, at or above the plan's
-/// checkpoint, signed under its identity. A node that never synced holds no
-/// valid current-epoch certificate to present.
+/// A pending candidate's signed statement of exactly three facts: it
+/// possesses and verified a current certified checkpoint at or above the
+/// plan's, it completed its local verified sync procedure, and this is the
+/// state it adopted. It does NOT prove physical possession of every state
+/// object — a Byzantine candidate can lie about its local storage, and
+/// nothing may depend on that assertion. Safety never does: current HotStuff
+/// selected the candidate, finalizes its readiness, a fresh DKG must
+/// complete, current HotStuff finalizes the handoff, and the new epoch
+/// tolerates at most f Byzantine members like any other.
 struct CandidateStateReadyMsg {
     NetworkId network_id{};
     Digest plan_digest{};

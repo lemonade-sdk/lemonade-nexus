@@ -1849,9 +1849,10 @@ void SecurityDriver::on_candidate_sync_response(const SyncResponse& response,
     adoption_->state_synced = true;
     adoption_->verified_qc = response.high_qc;
 
-    // The objective statement: this node holds a certified current-epoch
-    // object it verified itself. Signed, so nobody can claim it on this
-    // node's behalf.
+    // The statement is narrow and stays narrow: this node verified a current
+    // certified checkpoint and completed its sync procedure. It proves no
+    // byte of local storage, and safety never rests on it — finality and the
+    // fresh DKG do the deciding.
     CandidateStateReadyMsg ready;
     ready.network_id = adoption_->plan.network_id;
     ready.plan_digest = adoption_->plan_digest;
