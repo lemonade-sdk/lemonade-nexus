@@ -102,6 +102,9 @@ struct EventsProxy : ISecurityEvents {
     void on_certificate(const QuorumCertificate& q) override {
         if (target) target->on_certificate(q);
     }
+    void on_justify_quorum(const QuorumCertificate& q) override {
+        if (target) target->on_justify_quorum(q);
+    }
     void on_timeout_certificate(const TimeoutCertificate& t) override {
         if (target) target->on_timeout_certificate(t);
     }
@@ -300,14 +303,19 @@ inline AttestationEvidence evidence_for(const NodeId& id, const nexus::crypto::E
     return evidence;
 }
 
-struct DriverMesh : ::testing::Test {
+struct DriverMeshBase : ::testing::Test {
+    explicit DriverMeshBase(std::size_t reserve_count = kReserves)
+        : reserve_count_(reserve_count) {}
+
     void SetUp() override {
         ASSERT_GE(sodium_init(), 0);
-        root = fs::temp_directory_path() / ("nexus_driver_" + std::to_string(::getpid()));
+        root = fs::temp_directory_path() / ("nexus_driver_" + std::to_string(::getpid()) + "_" +
+                                            std::to_string(reserve_count_));
+        fs::remove_all(root);
         fs::create_directories(root);
 
         // Node 0 is Genesis: its identity IS the pinned genesis key.
-        for (std::size_t i = 0; i < kFounders + kReserves + 1; ++i) {
+        for (std::size_t i = 0; i < kFounders + reserve_count_ + 1; ++i) {
             auto node = std::make_unique<Node>();
             crypto_sign_keypair(node->identity.public_key.data(),
                                 node->identity.private_key.data());
@@ -522,23 +530,33 @@ struct DriverMesh : ::testing::Test {
 
     /// The plan the members most recently committed and broadcast. Final
     /// attestation binds to it, so the injected verdicts must name it too.
+    /// A missing plan is a recorded failure and an empty plan, never UB.
     [[nodiscard]] const NextEpochPlan& latest_plan() const {
-        EXPECT_FALSE(mesh.captured_plans.empty());
+        static const NextEpochPlan kNone{};
+        if (mesh.captured_plans.empty()) {
+            ADD_FAILURE() << "no plan was captured";
+            return kNone;
+        }
         return mesh.captured_plans.back().plan;
     }
 
     /// Injects the fresh final-attestation verdicts for the committed plan
-    /// into each observer, bound to that plan's exact context.
+    /// into each observer, bound to that plan's exact context. Every observer
+    /// also holds a verdict for itself: the production path loops evidence
+    /// back through the local verifier.
     void final_attest_subjects(uint8_t round, const std::vector<Node*>& subjects,
                                const std::vector<Node*>& observers) {
         const NextEpochPlan plan = latest_plan();
         for (Node* observer : observers) {
             for (Node* subject : subjects) {
-                if (subject == observer) continue;
+                const auto vote_key = subject->driver->vote_key_for_epoch(plan.next_epoch);
+                if (!vote_key.has_value()) {
+                    ADD_FAILURE() << "selected node holds no next-epoch key";
+                    continue;
+                }
                 observer->driver->on_attestation_verdict(
                     final_verdict(plan, subject->id, round),
-                    evidence_for(subject->id,
-                                 *subject->driver->vote_key_for_epoch(plan.next_epoch)));
+                    evidence_for(subject->id, *vote_key));
             }
         }
         mesh.pump();
@@ -560,13 +578,13 @@ struct DriverMesh : ::testing::Test {
     /// over the wire; the verdicts are injected because the positive
     /// attestation path needs a confidential VM.
     void run_reattest_cadence(uint8_t round, const std::vector<Node*>& subjects,
-                              const std::vector<Node*>& online = {}) {
+                              const std::vector<Node*>& online = {}, EpochId epoch = 1) {
         const std::vector<Node*>& members = online.empty() ? founders : online;
         mesh.now_ms += constants::kReattestIntervalSeconds * 1000;
         for (Node* node : members) node->driver->tick(mesh.now_ms);
         for (Node* reserve : reserves) reserve->driver->tick(mesh.now_ms);
         mesh.pump();
-        attest_subjects(round, subjects, members);
+        attest_subjects(round, subjects, members, epoch);
         advance_commit(members);
     }
 
@@ -624,6 +642,10 @@ struct DriverMesh : ::testing::Test {
     Node* genesis_node = nullptr;
     std::vector<Node*> founders;
     std::vector<Node*> reserves;
+    std::size_t reserve_count_ = kReserves;
 };
+
+/// The default mesh: five founders, two reserves.
+struct DriverMesh : DriverMeshBase {};
 
 }  // namespace lifecycle_test

@@ -1043,6 +1043,34 @@ void SecurityDriver::on_vote_accepted(const Vote& vote) {
     }
 }
 
+void SecurityDriver::on_justify_quorum(const QuorumCertificate& certificate) {
+    const EpochManager* epochs = runtime_.epochs();
+    const HotStuffService* consensus = runtime_.consensus();
+    if (phase_ != DriverPhase::Active || epochs == nullptr || consensus == nullptr ||
+        !consensus->synced()) {
+        return;
+    }
+    if (certificate.epoch != epochs->current().id) {
+        return;
+    }
+    // Every signer of a validated certificate proved participation at its
+    // height, and every replica holds the same certificate — so the witness
+    // evidence cannot depend on which leader happened to collect the votes.
+    for (const auto& signer : certificate.signers) {
+        ParticipationProof proof;
+        proof.network_id = certificate.network_id;
+        proof.epoch = certificate.epoch;
+        proof.consensus_ruleset = certificate.consensus_ruleset;
+        proof.subject = signer.node_id;
+        proof.incarnation = 1;
+        proof.subject_height = certificate.height;
+        if (auto observation = eligibility_.observe_participation(proof, last_committed_height_,
+                                                                  last_committed_root_)) {
+            publish(*observation, epochs->current().id);
+        }
+    }
+}
+
 void SecurityDriver::on_eligibility_observation(const EligibilityObservation& observation) {
     (void)eligibility_.accept(observation);
     maybe_attest_founding_eligibility();
@@ -1579,15 +1607,24 @@ void SecurityDriver::on_epoch_announcement(const EpochAnnouncement& announcement
 }
 
 void SecurityDriver::maybe_request_chain() {
-    // Only a node with no current epoch state walks; members are at the head
-    // by construction. Genesis is a one-shot authority, not a walker.
-    if (runtime_.epochs() != nullptr || phase_ != DriverPhase::Idle || genesis_node()) {
+    // An idle Tier 2 node walks toward the head; a member stuck in Syncing
+    // asks too, because unanswered sync may mean the mesh moved past its
+    // epoch. Active members are at the head by construction, and Genesis is a
+    // one-shot authority, not a walker.
+    if (genesis_node()) {
+        return;
+    }
+    const bool idle_walker = runtime_.epochs() == nullptr && phase_ == DriverPhase::Idle;
+    const bool stale_member = phase_ == DriverPhase::Syncing;
+    if (!idle_walker && !stale_member) {
         return;
     }
     const EpochId have = authority_.has_value() ? authority_->epoch : 0;
-    // With a verified authority and no hint of anything newer, there is
-    // nothing to ask for. With none at all, the ask itself is the start.
-    if (authority_.has_value() && chain_hint_epoch_ <= have) {
+    // An idle walker with a verified authority and no hint of anything newer
+    // has nothing to ask for. With none at all, the ask itself is the start.
+    // A syncing member keeps asking: silence from its own epoch is the very
+    // signal it is investigating.
+    if (idle_walker && authority_.has_value() && chain_hint_epoch_ <= have) {
         return;
     }
     if (now_ms_ - chain_request_ms_ < config_.sync_window_ms) {
@@ -1647,8 +1684,10 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
 void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) {
     // Candidate data from a peer. Everything is verified from the pinned
     // Genesis key and the advancing anchor; a page that proves nothing
-    // changes nothing.
-    if (runtime_.epochs() != nullptr) {
+    // changes nothing. A stale member in Syncing may advance its ANCHOR here
+    // — a record of verified facts — but its runtime state never moves this
+    // way: on restart the advanced anchor makes it resume as Tier 2.
+    if (runtime_.epochs() != nullptr && phase_ != DriverPhase::Syncing) {
         return;
     }
     const EpochId before = authority_.has_value() ? authority_->epoch : 0;
@@ -1679,12 +1718,13 @@ void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, con
         install_authority(std::move(*next));
     }
     if (authority_->epoch > before) {
-        // Progress: ask the same server for the next page right away.
+        // Progress: ask for the next page right away, and ask everyone — the
+        // server this page came from may itself be mid-walk and hold no more.
+        // A server with nothing newer stays silent, which ends the walk.
         chain_request_ms_ = now_ms_;
-        (void)router_.send(from,
-                           router_.compose(SecurityMessageKind::AuthorityChainRequest,
-                                           AuthorityChainRequest{authority_->epoch},
-                                           authority_->epoch));
+        (void)router_.broadcast(router_.compose(SecurityMessageKind::AuthorityChainRequest,
+                                                AuthorityChainRequest{authority_->epoch},
+                                                authority_->epoch));
     }
 }
 

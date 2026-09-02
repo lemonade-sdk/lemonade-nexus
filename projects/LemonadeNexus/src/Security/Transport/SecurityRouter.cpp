@@ -171,7 +171,11 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
         message.kind == SecurityMessageKind::DkgBroadcast ||
         message.kind == SecurityMessageKind::DkgPairwise ||
         message.kind == SecurityMessageKind::SyncRequest ||
-        message.kind == SecurityMessageKind::SyncResponse;
+        message.kind == SecurityMessageKind::SyncResponse ||
+        // An announcement is a hint that can prompt a chain request; a node
+        // with no epoch state needs to hear it precisely because it cannot
+        // place its epoch number. Believing it is not on the table.
+        message.kind == SecurityMessageKind::EpochAnnouncement;
     const bool bootstrap_kind = message.kind == SecurityMessageKind::GenesisFounding ||
                                 message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
                                 message.kind == SecurityMessageKind::BootstrapCertificate;
@@ -401,6 +405,9 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
     if (result.rejected.has_value()) {
         return drop(DropReason::ServiceRejected, code(*result.rejected));
     }
+    // The service validated the justify with the proposal, so its signers are
+    // a proved fact every replica holds equally.
+    events_.on_justify_quorum(message.justify);
     if (result.vote.has_value()) {
         // Chained HotStuff: the vote goes to the leader of the next view,
         // who forms the certificate and proposes on it.

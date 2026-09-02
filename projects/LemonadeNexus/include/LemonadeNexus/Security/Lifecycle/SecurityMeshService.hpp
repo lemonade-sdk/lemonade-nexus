@@ -89,6 +89,9 @@ private:
         void on_certificate(const QuorumCertificate& q) override {
             if (target) target->on_certificate(q);
         }
+        void on_justify_quorum(const QuorumCertificate& q) override {
+            if (target) target->on_justify_quorum(q);
+        }
         void on_timeout_certificate(const TimeoutCertificate& t) override {
             if (target) target->on_timeout_certificate(t);
         }

@@ -60,6 +60,11 @@ public:
     /// asserted none of it, and nothing about it is a health score.
     virtual void on_vote_accepted(const Vote&) {}
     virtual void on_certificate(const QuorumCertificate&) {}
+    /// The justify certificate of an accepted proposal: a validated quorum of
+    /// signed votes, seen identically by every replica. Participation
+    /// witnessing derives from this, so no member's evidence depends on
+    /// which leader happened to collect the votes.
+    virtual void on_justify_quorum(const QuorumCertificate&) {}
     virtual void on_timeout_certificate(const TimeoutCertificate&) {}
     virtual void on_commits(const std::vector<ConsensusCommit>&) {}
     virtual void on_dkg_round1_complete(EpochId) {}

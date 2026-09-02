@@ -110,6 +110,7 @@ public:
                                   const NodeId& from) override;
     void on_sync_certificate(const QuorumCertificate& certificate, const NodeId& from) override;
     void on_vote_accepted(const Vote& vote) override;
+    void on_justify_quorum(const QuorumCertificate& certificate) override;
     void on_eligibility_observation(const EligibilityObservation& observation) override;
     void on_genesis_eligibility_attest(const GenesisEligibilityAttest& attest) override;
     void on_participation_challenge(const ParticipationChallenge& challenge,
