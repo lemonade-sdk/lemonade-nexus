@@ -21,11 +21,17 @@ Summary (not a substitute for the terms below):
     publish those modifications in a public fork of the original
     repository, under this same License.
   * Commercial use of any kind requires a separate written Commercial
-    License Agreement with the Licensor. Agreements that have been reached
-    are recorded in Schedule A of this file.
+    License Agreement with the Licensor. The Licensor grants these only as
+    partnerships in which it shares in the economic benefit the Software
+    creates, never as one-off transactional licenses. Agreements that have
+    been reached are recorded in Schedule A of this file.
   * The Designated Partners listed in Schedule B (currently Advanced Micro
-    Devices, Inc. and the Lemonade SDK project) hold full usage rights,
-    including commercial use, and commit rights to the canonical repository.
+    Devices, Inc. and the Lemonade SDK project) may use and modify the
+    Software internally without publishing their changes, and have commit
+    rights to the canonical repository. They may not commercialize the
+    Software without the Licensor's written consent. Each partner's exact
+    rights are set out in its own Partner License File under
+    licenses/partners/.
   * Nobody may copy code out of this project into another project or
     redistribute the source code or binaries, except through such a public
     fork or as otherwise expressly permitted below.
@@ -88,9 +94,12 @@ Summary (not a substitute for the terms below):
     (c) use that is intended for, or directed toward, commercial advantage,
         revenue generation, or monetary compensation of any kind;
     (d) use in connection with paid consulting, support, integration, or
-        deployment services; and
+        deployment services;
     (e) bundling, embedding, or distributing the Software with any hardware,
-        firmware, or software product.
+        firmware, or software product; and
+    (f) use to conduct, process, settle, secure, or facilitate transactions,
+        payments, subscriptions, or any other exchange of value between any
+        parties.
 
 1.7 "Commercial License Agreement" means a separate written agreement,
     signed by the Licensor, that grants a named party rights to make
@@ -99,6 +108,18 @@ Summary (not a substitute for the terms below):
     Schedule A.
 
 1.8 "Designated Partner" means each entity listed in Schedule B.
+
+1.8A "Partner License File" means the file named for a Designated Partner
+    in Schedule B, kept under licenses/partners/ in the Canonical
+    Repository, which sets out that partner's specific rights,
+    restrictions, and any written consents the Licensor has given it.
+
+1.8B "Internal Use" means use by a Designated Partner and its employees
+    and contractors, on systems the partner owns or controls, for the
+    partner's own evaluation, development, testing, integration, research,
+    and internal operations, where the Software is not made available to
+    any third party and no product or service incorporating the Software
+    is offered to any third party.
 
 1.9 "Contribution" means any work of authorship, including modifications,
     additions, bug fixes, documentation, or other material, that is
@@ -192,47 +213,80 @@ Summary (not a substitute for the terms below):
     License for the named licensee only; it does not modify this License
     for anyone else.
 
-3.4 Commercial License Agreements are secondary to the rights of the
-    Designated Partners. No Commercial License Agreement may grant rights
-    that restrict, dilute, or conflict with the rights granted to the
-    Designated Partners in Section 4.
+3.4 No Commercial License Agreement may restrict, dilute, or conflict with
+    the rights granted to a Designated Partner in Section 4 or in its
+    Partner License File.
 
 3.5 To request a Commercial License Agreement, contact the Licensor through
     the repository listed in Section 1.2.
 
+3.6 Partnership principle. The Licensor enters into Commercial License
+    Agreements only as partnerships between equals in which the Licensor
+    participates in the economic benefit that the Software creates, for
+    example through revenue sharing, equity, profit participation, or a
+    joint venture. The Licensor does not grant flat-fee, one-time, or
+    otherwise transactional commercial licenses, and no party may use the
+    Software to generate revenue or to conduct or facilitate transactions
+    unless the Licensor benefits financially under a Commercial License
+    Agreement. This Section states the basis on which the Licensor
+    exercises its discretion under Section 3.2; it does not oblige the
+    Licensor to accept any particular proposal.
+
+3.7 The same principle applies to any consent the Licensor gives a
+    Designated Partner under Section 4.2 to make Commercial Use of the
+    Software.
+
 4. DESIGNATED PARTNERS
 
-4.1 The Licensor grants each Designated Partner, and each Designated
-    Partner's affiliates, a worldwide, non-exclusive, perpetual,
-    irrevocable, royalty-free, fully paid-up license to use, reproduce,
-    modify, prepare derivative works of, display, perform, distribute,
-    sublicense, and otherwise exploit the Software and any Modifications,
-    for any purpose, including Commercial Use, in source and object form.
+4.1 Internal Use. The Licensor grants each Designated Partner a worldwide,
+    non-exclusive, royalty-free license to use, reproduce, modify, prepare
+    derivative works of, build, and run the Software and its Modifications,
+    in source and object form, for Internal Use. Section 2.4 does not apply
+    to a Designated Partner's Internal Use, so a Designated Partner may
+    keep its Modifications private.
 
-4.2 The Licensor grants each Designated Partner the right to commit to,
-    and to nominate individuals to commit to, the canonical repository of
-    the Software. Contributions made by a Designated Partner are subject to
-    Section 6, so that the Software remains licensable as a whole under this
-    License and under Commercial License Agreements.
+4.2 No commercialization without consent. Except as stated in Section 4.1
+    or in its Partner License File, a Designated Partner may not distribute,
+    publish, sublicense, sell, rent, offer as a service, bundle with any
+    product, or otherwise make Commercial Use of the Software or any
+    Modification without the Licensor's prior written consent. A consent
+    is effective only when it is signed by the Licensor and recorded in
+    the partner's Partner License File. A consent may be limited to a
+    named product, field, territory, or period, and is construed narrowly.
 
-4.3 The rights of a Designated Partner under this Section 4 are not
-    conditioned on Sections 2, 3, or 5, and do not terminate under Section
-    9. They may be varied only by a written agreement between the Licensor
-    and that Designated Partner. Where such an agreement exists, it governs
-    the relationship between the Licensor and that Designated Partner and
-    controls over this Section 4 in the event of any conflict.
+4.3 Partner License Files. The specific rights of each Designated Partner,
+    any additional permissions beyond Section 4.1, any restrictions beyond
+    Section 4.2, and every written consent given under Section 4.2 are set
+    out in that partner's Partner License File. The Partner License File
+    is part of this License as it applies to that partner and controls
+    over this Section 4 in the event of any conflict. Changes to a Partner
+    License File take effect only when made or countersigned by the
+    Licensor.
 
-4.4 A Designated Partner's rights do not extend to any third party except
-    through a sublicense that the Designated Partner is entitled to grant
-    under Section 4.1 or under its written agreement with the Licensor.
-    Distribution of the Software by a Designated Partner does not grant
-    recipients any rights beyond those in this License unless the
-    Designated Partner's sublicense expressly says otherwise.
+4.4 Commit rights. The Licensor grants each Designated Partner the right
+    to commit to, and to nominate individuals to commit to, the Canonical
+    Repository. Contributions made by a Designated Partner are subject to
+    Section 6, so that the Software remains licensable as a whole under
+    this License and under Commercial License Agreements.
 
-4.5 The Licensor may add Designated Partners by appending them to Schedule
-    B. A Designated Partner may be removed from Schedule B only with that
-    Designated Partner's written consent, and removal does not revoke rights
-    already granted under Section 4.1.
+4.5 No sublicensing. A Designated Partner's rights do not extend to any
+    third party, including the partner's affiliates unless its Partner
+    License File says so. Where a Partner License File permits a Designated
+    Partner to distribute the Software, recipients receive it under this
+    License directly from the Licensor and have no rights beyond those this
+    License grants them.
+
+4.6 Term. A Designated Partner's rights under this Section 4 continue
+    until varied or ended by a written agreement between the Licensor and
+    that partner, or until the Licensor terminates them by written notice
+    for a material breach that the partner has not cured within thirty
+    (30) days of notice. Termination of a Designated Partner's rights does
+    not affect Contributions already made under Section 6.
+
+4.7 Adding and removing partners. The Licensor may add Designated Partners
+    by appending them to Schedule B and adding a Partner License File. A
+    Designated Partner may be removed from Schedule B only under Section
+    4.6.
 
 5. RESTRICTIONS
 
@@ -303,9 +357,8 @@ Summary (not a substitute for the terms below):
     employer has rights in the Contribution, You have received permission
     from Your employer to submit it on these terms.
 
-6.3 Except for the license granted in Section 6.1 and the rights of
-    Designated Partners under Section 4, You retain copyright in Your
-    Contribution. Nothing in this Section 6 obliges the Licensor to accept
+6.3 Except for the license granted in Section 6.1, You retain copyright in
+    Your Contribution. Nothing in this Section 6 obliges the Licensor to accept
     or include any Contribution.
 
 6.4 Every Modification published in a Public Fork under Section 2.4 is a
@@ -428,6 +481,7 @@ Format:
   A.<n>  Licensee:        <legal name of licensee>
          Effective date:  <YYYY-MM-DD>
          Scope:           <short description of the licensed use>
+         Economic terms:  <revenue share, equity, or other participation>
          Term:            <end date, "perpetual", or "until terminated">
          Reference:       <agreement identifier or file name>
          Status:          <active | ended YYYY-MM-DD>
@@ -440,15 +494,18 @@ Entries:
 
 SCHEDULE B - DESIGNATED PARTNERS
 
-Each entity below is a Designated Partner under Section 4 and holds the
-rights described in that Section, including full usage rights (including
-Commercial Use) and commit rights to the canonical repository.
+Each entity below is a Designated Partner under Section 4. Each holds the
+Internal Use and commit rights described in that Section, may not
+commercialize the Software without the Licensor's written consent, and is
+governed in detail by its Partner License File.
 
-  B.1  Advanced Micro Devices, Inc. ("AMD"), together with its affiliates.
+  B.1  Advanced Micro Devices, Inc. ("AMD")
+       Partner License File: licenses/partners/AMD.md
        Effective date: 2026-09-02
 
   B.2  The Lemonade SDK project (https://github.com/lemonade-sdk),
        including its maintainers acting in that capacity ("Lemonade").
+       Partner License File: licenses/partners/Lemonade.md
        Effective date: 2026-09-02
 
 --------------------------------------------------------------------------
