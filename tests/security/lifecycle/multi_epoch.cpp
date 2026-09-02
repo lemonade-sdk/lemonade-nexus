@@ -327,16 +327,86 @@ TEST_F(MultiEpochMesh, AStalledBoundaryRenewsItsFinalAttestation) {
     }
     for (Node* member : members) {
         for (Node* subject : selected) {
-            EXPECT_LT(member->runtime->attestation().attempts(
-                          subject->id, 2, AttestationPurpose::FinalEpochReadiness),
-                      constants::kMaxFinalAttestAttemptsPerEpoch)
-                << "legitimate renewal must never exhaust the budget";
+            EXPECT_LE(member->runtime->attestation().final_attempts(
+                          subject->id,
+                          SecurityDriver::plan_attest_context(latest_plan(), subject->id)),
+                      constants::kMaxFinalAttestAttemptsPerPlan)
+                << "renewal stays inside the attempt's own budget";
         }
     }
 
     run_to_activation(members, selected, 2);
     for (Node* node : selected) {
         EXPECT_EQ(node->driver->current_epoch(), 2u);
+    }
+}
+
+// A boundary that outlives a whole target epoch still recovers: the truant
+// candidate exhausts its attempt's bounded final-attestation budget, the
+// attempt fails deterministically, the old epoch stays authoritative, and
+// the replacement attempt — with its own fresh budget — activates. No
+// wall-clock horizon wedges the mesh, and no constant is raised to fake one.
+TEST_F(MultiEpochMesh, ABoundaryOutlivingTheTargetEpochStillActivates) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+
+    mesh.offline.insert(founders[4]->id);
+    std::vector<Node*> members(founders.begin(), founders.begin() + 4);
+    std::vector<Node*> pool = members;
+    pool.push_back(reserves[0]);
+    pool.push_back(reserves[1]);
+    observe(members, pool, 1);
+    run_to_plan(members);
+    const uint64_t plan_committed_ms = mesh.now_ms;
+
+    // The promoted candidate vanishes before it syncs: this attempt can
+    // never complete, and only budget exhaustion may end it.
+    auto selected = selected_nodes(*members.front());
+    Node* truant = nullptr;
+    for (Node* node : selected) {
+        if (std::find(members.begin(), members.end(), node) == members.end()) {
+            truant = node;
+            break;
+        }
+    }
+    ASSERT_NE(truant, nullptr);
+    mesh.offline.insert(truant->id);
+    const uint32_t attempt_before = latest_plan().attempt;
+
+    // Freshness window after freshness window passes — far beyond one target
+    // epoch in total — with every reachable node renewing honestly.
+    const uint32_t plans_before = static_cast<uint32_t>(mesh.captured_plans.size());
+    for (int window = 0; window < 5 && mesh.captured_plans.size() == plans_before;
+         ++window) {
+        mesh.now_ms += 1000 * 1000;
+        for (int i = 0; i < 60; ++i) {
+            step(1, members);
+            answer_final_challenges();
+            if (mesh.captured_plans.size() != plans_before) break;
+        }
+    }
+    ASSERT_GT(mesh.captured_plans.size(), plans_before)
+        << "budget exhaustion must fail the attempt and commit a replacement";
+    EXPECT_GT(latest_plan().attempt, attempt_before);
+    EXPECT_TRUE(std::find(latest_plan().selected.begin(), latest_plan().selected.end(),
+                          truant->id) == latest_plan().selected.end())
+        << "the never-fulfilled candidate is out of the replacement attempt";
+
+    // The replacement attempt completes on its own fresh budget.
+    selected = selected_nodes(*members.front());
+    wait_for_keys(members, selected, 2);
+    run_to_activation(members, selected, 2);
+    for (Node* node : selected) {
+        EXPECT_EQ(node->driver->current_epoch(), 2u);
+    }
+    EXPECT_GT(mesh.now_ms - plan_committed_ms, constants::kTargetEpochSeconds * 1000)
+        << "the boundary genuinely outlived a full target epoch";
+
+    // Exhaustion was an attempt outcome, never a fault: the truant keeps a
+    // clean ledger everywhere.
+    for (Node* member : members) {
+        EXPECT_FALSE(member->driver->eligibility().ledger().faults().contains(truant->id));
     }
 }
 

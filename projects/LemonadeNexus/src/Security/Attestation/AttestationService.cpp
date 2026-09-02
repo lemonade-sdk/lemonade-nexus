@@ -26,14 +26,22 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     if (purpose == AttestationPurpose::Eligibility && context != Digest{}) {
         return std::nullopt;
     }
-    auto& used = attempts_[{epoch, node, purpose}];
-    const uint32_t limit = purpose == AttestationPurpose::FinalEpochReadiness
-                               ? constants::kMaxFinalAttestAttemptsPerEpoch
-                               : constants::kMaxTier1AttestAttemptsPerEpoch;
-    if (used >= limit) {
-        return std::nullopt;
+    if (purpose == AttestationPurpose::FinalEpochReadiness) {
+        auto& used = final_attempts_[{node, context}];
+        if (used >= constants::kMaxFinalAttestAttemptsPerPlan) {
+            return std::nullopt;
+        }
+        ++used;
+        while (final_attempts_.size() > 4 * constants::kMaxActiveTier1) {
+            final_attempts_.erase(final_attempts_.begin());
+        }
+    } else {
+        auto& used = attempts_[{epoch, node}];
+        if (used >= constants::kMaxTier1AttestAttemptsPerEpoch) {
+            return std::nullopt;
+        }
+        ++used;
     }
-    ++used;
 
     AttestationChallenge challenge;
     challenge.network_id = network_id_;
@@ -98,10 +106,14 @@ std::optional<AttestationVerdict> AttestationService::verdict(const NodeId& node
     return it->second;
 }
 
-uint32_t AttestationService::attempts(const NodeId& node, EpochId epoch,
-                                      AttestationPurpose purpose) const {
-    const auto it = attempts_.find({epoch, node, purpose});
+uint32_t AttestationService::attempts(const NodeId& node, EpochId epoch) const {
+    const auto it = attempts_.find({epoch, node});
     return it == attempts_.end() ? 0 : it->second;
+}
+
+uint32_t AttestationService::final_attempts(const NodeId& node, const Digest& context) const {
+    const auto it = final_attempts_.find({node, context});
+    return it == final_attempts_.end() ? 0 : it->second;
 }
 
 }  // namespace nexus::security

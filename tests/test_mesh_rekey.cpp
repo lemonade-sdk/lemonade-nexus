@@ -222,3 +222,27 @@ TEST(WgClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
     crypto.stop();
     fs::remove_all(dir);
 }
+
+// The cross-component contract of the SDK cutover: the client's
+// identity-bound static (sk -> curve25519, then scalarmult base) is exactly
+// the key the server derives from the authenticated identity's PUBLIC half.
+TEST(WgClaimRefusal, ClientAndServerDeriveTheSameIdentityBoundStatic) {
+    nexus::crypto::SodiumCryptoService crypto;
+    crypto.start();
+    const auto identity = crypto.ed25519_keygen();
+
+    // Client side: secret-key conversion.
+    unsigned char x_priv[32];
+    unsigned char x_pub[32];
+    ASSERT_EQ(crypto_sign_ed25519_sk_to_curve25519(x_priv, identity.private_key.data()), 0);
+    crypto_scalarmult_base(x_pub, x_priv);
+    const std::string client_static =
+        nexus::crypto::to_base64(std::span<const uint8_t>(x_pub, 32));
+
+    // Server side: public-key conversion from the authenticated identity.
+    const std::string server_derived = nexus::api::identity_mesh_pubkey(
+        "ed25519:" + nexus::crypto::to_base64(identity.public_key));
+
+    EXPECT_EQ(client_static, server_derived);
+    crypto.stop();
+}

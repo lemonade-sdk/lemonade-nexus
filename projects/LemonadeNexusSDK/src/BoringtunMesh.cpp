@@ -297,4 +297,24 @@ std::pair<std::string, std::string> BoringtunMesh::derive_keypair(std::span<cons
     return keys;
 }
 
+std::pair<std::string, std::string> BoringtunMesh::identity_bound_keypair(
+    std::span<const uint8_t> ed25519_secret_key) {
+    unsigned char priv[32];
+    unsigned char pub[32];
+    if (ed25519_secret_key.size() != crypto_sign_SECRETKEYBYTES ||
+        crypto_sign_ed25519_sk_to_curve25519(priv, ed25519_secret_key.data()) != 0) {
+        return {};
+    }
+    crypto_scalarmult_base(pub, priv);
+
+    char priv_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    char pub_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    sodium_bin2base64(priv_b64, sizeof priv_b64, priv, 32, sodium_base64_VARIANT_ORIGINAL);
+    sodium_bin2base64(pub_b64, sizeof pub_b64, pub, 32, sodium_base64_VARIANT_ORIGINAL);
+
+    std::pair<std::string, std::string> keys{priv_b64, pub_b64};
+    sodium_memzero(priv, sizeof priv);
+    return keys;
+}
+
 } // namespace lnsdk

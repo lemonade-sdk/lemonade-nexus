@@ -113,15 +113,16 @@ inline constexpr uint64_t kDkgStallSeconds = 300;
 // item.
 inline constexpr uint32_t kMaxTier1AttestAttemptsPerEpoch = 4;
 
-// Final-readiness challenges are accounted separately from the eligibility
-// cadence: both purposes name the same target epoch, and one shared bucket
-// would let a long boundary starve the next epoch's re-attestation — or let
-// legitimate renewal wedge an honest boundary. The bound is derived, not
-// tuned: one renewal per freshness window across a whole target-epoch-length
-// boundary.
-inline constexpr uint32_t kMaxFinalAttestAttemptsPerEpoch =
-    static_cast<uint32_t>(kTargetEpochSeconds / kFinalAttestMaxAgeSeconds);
-static_assert(kMaxFinalAttestAttemptsPerEpoch == 12);
+// Final-readiness challenges are budgeted PER PLAN ATTEMPT, separately from
+// the eligibility cadence: the bucket is keyed by the plan-bound attestation
+// context, so a replacement attempt starts fresh and no wall-clock horizon —
+// an epoch can legally outlive its target — ever wedges an honest boundary.
+// Exhaustion is a protocol signal, not a dead end: the attempt fails, the
+// old epoch stays authoritative, and the next deterministic attempt carries
+// a fresh bucket. Attempts are consensus-committed plans, so the challenge
+// source stays bounded by finality, never by time. The value matches the
+// eligibility budget: one initial exchange plus three renewals.
+inline constexpr uint32_t kMaxFinalAttestAttemptsPerPlan = kMaxTier1AttestAttemptsPerEpoch;
 
 // --- Mesh eligibility observations ------------------------------------------
 

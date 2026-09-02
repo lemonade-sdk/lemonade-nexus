@@ -51,12 +51,13 @@ public:
     [[nodiscard]] const LinuxAttestationProfile& profile() const { return profile_; }
     [[nodiscard]] const Digest& policy_digest() const { return policy_digest_; }
 
-    /// Challenges issued for one node, one epoch, one purpose. Eligibility
-    /// and final readiness are accounted separately: they share a target
-    /// epoch, and one bucket would let either starve the other.
-    [[nodiscard]] uint32_t attempts(
-        const NodeId& node, EpochId epoch,
-        AttestationPurpose purpose = AttestationPurpose::Eligibility) const;
+    /// Eligibility challenges issued for one node and epoch.
+    [[nodiscard]] uint32_t attempts(const NodeId& node, EpochId epoch) const;
+
+    /// Final-readiness challenges issued for one node under one plan-bound
+    /// context. The bucket dies with its attempt: a replacement plan carries
+    /// a fresh one, so exhaustion fails an attempt, never an identity.
+    [[nodiscard]] uint32_t final_attempts(const NodeId& node, const Digest& context) const;
 
 private:
     NetworkId network_id_;
@@ -66,7 +67,11 @@ private:
 
     std::map<NodeId, AttestationChallenge> pending_;
     std::map<NodeId, AttestationVerdict> verdicts_;
-    std::map<std::tuple<EpochId, NodeId, AttestationPurpose>, uint32_t> attempts_;
+    std::map<std::pair<EpochId, NodeId>, uint32_t> attempts_;
+    /// Keyed by the plan-bound context, so each attempt is its own bucket.
+    /// Size-capped: a pruned stale bucket could only re-open a superseded
+    /// attempt's budget, whose challenges no current context accepts.
+    std::map<std::pair<NodeId, Digest>, uint32_t> final_attempts_;
 };
 
 }  // namespace nexus::security

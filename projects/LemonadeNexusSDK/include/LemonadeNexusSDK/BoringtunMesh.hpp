@@ -72,6 +72,15 @@ public:
     /// same seed always yields the same pair, so re-joins present the same key.
     static std::pair<std::string, std::string> derive_keypair(std::span<const uint8_t> seed);
 
+    /// The identity-bound mesh keypair: the birational X25519 form of the
+    /// device's Ed25519 identity (64-byte libsodium secret key). The server
+    /// can derive the public half from the authenticated identity alone, so
+    /// possession is proved transitively by the join challenge — no extra
+    /// handshake exists or is needed. This supersedes derive_keypair, which
+    /// remains only for pre-cutover devices.
+    static std::pair<std::string, std::string> identity_bound_keypair(
+        std::span<const uint8_t> ed25519_secret_key);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

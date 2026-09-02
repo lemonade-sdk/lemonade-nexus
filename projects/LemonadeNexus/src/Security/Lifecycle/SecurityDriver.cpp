@@ -1478,9 +1478,12 @@ void SecurityDriver::issue_final_challenges(bool stale_only) {
     // Readiness rests on FRESH attestations, and a boundary can outlive their
     // freshness — slow candidates, view recovery. The renewal pass re-asks
     // exactly the nodes whose proof aged out, at most once per freshness
-    // window, so a stalled exchange recovers instead of deadlocking the
-    // boundary. The attestation budget still caps the total per epoch.
+    // window each. The budget is scoped to this attempt's context: when it
+    // refuses a node the boundary still needs, the ATTEMPT is over — never
+    // the boundary. The nodes that never fulfilled their part are excluded
+    // for this boundary, and the replacement plan carries a fresh budget.
     const EpochId target = plan_->next_epoch;
+    bool starved = false;
     for (const auto& member : plan_->selected) {
         if (stale_only) {
             const auto seen = final_verdict_ms_.find(member);
@@ -1510,8 +1513,38 @@ void SecurityDriver::issue_final_challenges(bool stale_only) {
             (void)router_.send(member,
                                router_.compose(SecurityMessageKind::AttestationChallenge,
                                                *challenge, target));
+        } else if (stale_only) {
+            starved = true;
         }
     }
+    if (starved) {
+        fail_starved_attempt();
+    }
+}
+
+void SecurityDriver::fail_starved_attempt() {
+    // The attempt's attestation budget ran dry with the readiness set still
+    // incomplete. Exclude exactly the selected nodes that never fulfilled a
+    // requirement this whole attempt — no verdict at all, or no state
+    // possession statement — and let the deterministic replacement run. A
+    // node that answered and merely went stale is selected again with a
+    // fresh budget. Nothing here is a fault: exhaustion proves only that
+    // this attempt is over.
+    const EpochManager* epochs = runtime_.epochs();
+    for (const auto& member : plan_->selected) {
+        if (member == config_.self) {
+            continue;
+        }
+        const bool attested = final_verdict_ms_.contains(member);
+        const bool incumbent = epochs->current().tier1_members.contains(member);
+        const bool possession = incumbent || state_ready_.contains(member);
+        if (!attested || !possession) {
+            boundary_failed_.insert(member);
+        }
+    }
+    runtime_.authority().abandon_dkg();
+    pending_dkg_.reset();
+    abandon_boundary("final-attestation budget exhausted; the attempt is replaced");
 }
 
 void SecurityDriver::maybe_renew_final_attestation() {

@@ -189,6 +189,9 @@ private:
     /// freshness window, at most once per window each.
     void issue_final_challenges(bool stale_only);
     void maybe_renew_final_attestation();
+    /// The attempt's budget ran dry with readiness incomplete: exclude the
+    /// never-fulfilled nodes for this boundary and replace the attempt.
+    void fail_starved_attempt();
     void broadcast_transcript_attest(EpochId target);
     void maybe_adopt_attested_transcript();
     void abandon_boundary(const char* reason);
