@@ -83,7 +83,7 @@ set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
 
 # ── RPM (Fedora/RHEL/CentOS) ────────────────────────────────────────────────
 
-set(CPACK_RPM_PACKAGE_LICENSE "MIT")
+set(CPACK_RPM_PACKAGE_LICENSE "Lemonade-Nexus Source-Available License 1.0")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Internet")
 set(CPACK_RPM_PACKAGE_REQUIRES "")
 set(CPACK_RPM_PACKAGE_ARCHITECTURE "x86_64")

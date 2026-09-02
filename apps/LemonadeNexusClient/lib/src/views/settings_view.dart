@@ -287,6 +287,21 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                   const SizedBox(height: 8),
                   _buildAboutRow('Windows Version', Platform.operatingSystemVersion),
                 ],
+                const SizedBox(height: 12),
+                Align(
+                  alignment: Alignment.centerLeft,
+                  child: TextButton.icon(
+                    onPressed: () => showLicensePage(
+                      context: context,
+                      applicationName: 'Lemonade Nexus',
+                      applicationLegalese:
+                          'Lemonade-Nexus Source-Available License. '
+                          'Third-party components are listed under their own licenses.',
+                    ),
+                    icon: const Icon(Icons.description_outlined, size: 16),
+                    label: const Text('Licenses and third-party notices'),
+                  ),
+                ),
               ],
             ),
           ),
