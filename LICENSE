@@ -222,9 +222,9 @@ Summary (not a substitute for the terms below):
 
 3.6 Partnership principle. The Licensor enters into Commercial License
     Agreements only as partnerships between equals in which the Licensor
-    participates in the economic benefit that the Software creates, for
-    example through revenue sharing, equity, profit participation, or a
-    joint venture. The Licensor does not grant flat-fee, one-time, or
+    participates in the economic benefit that the Software creates. The
+    terms of each partnership are private to the parties and are not
+    recorded in this License. The Licensor does not grant flat-fee, one-time, or
     otherwise transactional commercial licenses, and no party may use the
     Software to generate revenue or to conduct or facilitate transactions
     unless the Licensor benefits financially under a Commercial License
@@ -277,11 +277,11 @@ Summary (not a substitute for the terms below):
     License grants them.
 
 4.6 Term. A Designated Partner's rights under this Section 4 continue
-    until varied or ended by a written agreement between the Licensor and
-    that partner, or until the Licensor terminates them by written notice
-    for a material breach that the partner has not cured within thirty
-    (30) days of notice. Termination of a Designated Partner's rights does
-    not affect Contributions already made under Section 6.
+    until the Licensor amends that partner's Partner License File or
+    Schedule B, or terminates them by written notice for a material breach
+    that the partner has not cured within thirty (30) days of notice.
+    Termination of a Designated Partner's rights does not affect
+    Contributions already made under Section 6.
 
 4.7 Adding and removing partners. The Licensor may add Designated Partners
     by appending them to Schedule B and adding a Partner License File. A
@@ -481,7 +481,6 @@ Format:
   A.<n>  Licensee:        <legal name of licensee>
          Effective date:  <YYYY-MM-DD>
          Scope:           <short description of the licensed use>
-         Economic terms:  <revenue share, equity, or other participation>
          Term:            <end date, "perpetual", or "until terminated">
          Reference:       <agreement identifier or file name>
          Status:          <active | ended YYYY-MM-DD>

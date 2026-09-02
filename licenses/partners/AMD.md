@@ -45,9 +45,9 @@ controls over Section 4 of the License in the event of conflict.
 ## 3. Written consents
 
 Each consent the Licensor gives AMD under Section 4.2 of the License is
-recorded here. A consent is effective only when signed by the Licensor and is given on
-the partnership basis stated in Section 3.6 of the License: the Licensor
-must share in the economic benefit of any commercial use it consents to.
+recorded here. A consent is effective only when signed by the Licensor. The terms on
+which a consent is given are private to the parties and are not recorded
+here.
 Consents are appended in order and never removed; an ended consent is
 annotated with its end date.
 
@@ -56,7 +56,6 @@ Format:
 ```
 C.<n>  Granted:       <YYYY-MM-DD>
        Scope:         <product, field, territory, or activity permitted>
-       Economic terms: <revenue share, equity, or other participation by the Licensor>
        Conditions:    <attribution, notices, or other conditions>
        Term:          <end date, "perpetual", or "until terminated">
        Signed for the Licensor by: <name>
@@ -70,17 +69,4 @@ Consents:
 ## 4. Term
 
 AMD's rights under this file continue as stated in Section 4.6 of the
-License. This file may be amended only by the Licensor, or by a written
-agreement between the Licensor and AMD that is referenced here.
-
-## 5. Acknowledgement
-
-Signature by an authorized AMD representative below records AMD's
-acceptance of this file. Absence of a signature does not enlarge AMD's
-rights beyond Internal Use and commit rights.
-
-    For AMD:            ______________________________   Date: __________
-    Name and title:     ______________________________
-
-    For the Licensor:   ______________________________   Date: __________
-    Name:               ______________________________
+License. This file may be amended only by the Licensor.
