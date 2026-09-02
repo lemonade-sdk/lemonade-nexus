@@ -1617,11 +1617,19 @@ void GossipService::adopt_relayed_certificate(const std::string& pubkey_b64,
     } catch (...) {
         return;
     }
-    std::lock_guard lock(peers_mutex_);
-    const auto it = std::find_if(peers_.begin(), peers_.end(),
-                                 [&](const GossipPeer& p) { return p.pubkey == pubkey_b64; });
-    if (it != peers_.end() && it->certificate_json.empty()) {
-        it->certificate_json = certificate_json;
+    bool stored = false;
+    {
+        std::lock_guard lock(peers_mutex_);
+        const auto it = std::find_if(peers_.begin(), peers_.end(), [&](const GossipPeer& p) {
+            return p.pubkey == pubkey_b64;
+        });
+        if (it != peers_.end() && it->certificate_json.empty()) {
+            it->certificate_json = certificate_json;
+            stored = true;
+        }
+    }
+    // Outside the lock: save_peers takes peers_mutex_ itself.
+    if (stored) {
         save_peers();
     }
 }

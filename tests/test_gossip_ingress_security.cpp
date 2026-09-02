@@ -974,3 +974,66 @@ TEST_F(GossipIngressSecurityTest, NsClaimSignatureMustBindTheNamedClaimant) {
            a);
     ASSERT_TRUE(pump_until([&] { return a.ns_holder(5) == claimant_b64; }));
 }
+
+// ---------------------------------------------------------------------------
+// Relayed certificates through peer exchange
+// ---------------------------------------------------------------------------
+
+// Peer exchange is how a delta's AUTHOR can become certified without a direct
+// hello: a relayed certificate is adopted only after the same full
+// verification a direct hello gets, and a bogus one changes nothing. Once
+// adopted, a delta authored by that origin verifies end to end.
+TEST_F(GossipIngressSecurityTest, PeerExchangeAdoptsOnlyVerifiedRelayedCertificates) {
+    auto root_kp = kc->ed25519_keygen();
+    auto origin  = kc->ed25519_keygen();
+    auto other   = kc->ed25519_keygen();
+    const auto origin_b64 = crypto::to_base64(origin.public_key);
+    const auto origin_cert = issue_cert(origin_b64, "peer-origin", root_kp);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) { attach_dns(n); },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    // The origin is a known peer with NO stored certificate yet, so its
+    // authored delta is refused.
+    a.gossip->add_peer("127.0.0.1:9", origin_b64);
+    const std::string fqdn = "srv2.us-east.seip.lemonade-nexus.io";
+    const auto authored = dns_delta_payload(origin, "delta-relay-1", fqdn, "10.4.4.4");
+    inject(build_packet(origin, gossip::GossipMsgType::DnsRecordSync, authored), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(fqdn).has_value());
+
+    // A relayed certificate for the WRONG subject is not adopted...
+    const auto wrong_subject = issue_cert(crypto::to_base64(other.public_key),
+                                          "peer-other", root_kp);
+    nlohmann::json bogus;
+    bogus["peers"] = nlohmann::json::array(
+        {{{"pubkey", origin_b64}, {"endpoint", "127.0.0.1:9"},
+          {"certificate_json", wrong_subject}}});
+    bogus["is_response"] = true;
+    const auto bogus_str = bogus.dump();
+    inject(build_packet(other, gossip::GossipMsgType::PeerExchange,
+                        std::vector<uint8_t>(bogus_str.begin(), bogus_str.end())), a);
+    pump_for(std::chrono::milliseconds(200));
+    inject(build_packet(origin, gossip::GossipMsgType::DnsRecordSync, authored), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(fqdn).has_value());
+
+    // ...while the origin's real certificate, relayed the same way, is.
+    nlohmann::json genuine;
+    genuine["peers"] = nlohmann::json::array(
+        {{{"pubkey", origin_b64}, {"endpoint", "127.0.0.1:9"},
+          {"certificate_json", origin_cert}}});
+    genuine["is_response"] = true;
+    const auto genuine_str = genuine.dump();
+    inject(build_packet(other, gossip::GossipMsgType::PeerExchange,
+                        std::vector<uint8_t>(genuine_str.begin(), genuine_str.end())), a);
+    pump_for(std::chrono::milliseconds(200));
+    inject(build_packet(origin, gossip::GossipMsgType::DnsRecordSync, authored), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(fqdn).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(fqdn)->ipv4_address, "10.4.4.4");
+}
