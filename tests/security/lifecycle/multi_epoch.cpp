@@ -277,6 +277,34 @@ TEST_F(MultiEpochMesh, AReadyCandidateThatRefusesTheDkgIsReplaced) {
     EXPECT_EQ(members.front()->driver->current_epoch(), 3u);
 }
 
+// A boundary that outlives the final-attestation freshness window renews the
+// exchange instead of deadlocking: the members re-challenge exactly the
+// nodes whose proof aged out, the answers arrive through the ordinary
+// verifier path, and the handoff completes.
+TEST_F(MultiEpochMesh, AStalledBoundaryRenewsItsFinalAttestation) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+
+    mesh.offline.insert(founders[4]->id);
+    std::vector<Node*> members(founders.begin(), founders.begin() + 4);
+    std::vector<Node*> pool = members;
+    pool.push_back(reserves[0]);
+    observe(members, pool, 1);
+    run_to_plan(members);
+    const auto selected = selected_nodes(*members.front());
+    wait_for_keys(members, selected, 2);
+
+    // Whatever attestations the plan commit produced are now older than the
+    // freshness window. Without renewal no readiness set could ever form.
+    mesh.now_ms += (constants::kFinalAttestMaxAgeSeconds + 10) * 1000;
+
+    run_to_activation(members, selected, 2);
+    for (Node* node : selected) {
+        EXPECT_EQ(node->driver->current_epoch(), 2u);
+    }
+}
+
 // A modified anchor record never loads: the driver fails closed rather than
 // resuming from state it cannot bind to its own digest.
 TEST_F(MultiEpochMesh, ATamperedAnchorRecordFailsClosed) {

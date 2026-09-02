@@ -285,6 +285,7 @@ void SecurityDriver::tick(uint64_t now_ms) {
         runtime_.epochs()->current().tier1_members.contains(config_.self)) {
         drain_objective_faults();
         maybe_fail_stalled_dkg(now_ms);
+        maybe_renew_final_attestation();
         run_epoch_cadence(now_ms);
     }
 }
@@ -1467,10 +1468,35 @@ void SecurityDriver::on_plan_committed(const ConsensusCommit& commit) {
     }
 
     // Final-attestation challenges to every selected node, this one included.
+    issue_final_challenges(false);
+}
+
+void SecurityDriver::issue_final_challenges(bool stale_only) {
     // Each challenge binds the plan context, so the answer commits to exactly
     // this plan, attempt and selected set — not merely to the target epoch.
+    //
+    // Readiness rests on FRESH attestations, and a boundary can outlive their
+    // freshness — slow candidates, view recovery. The renewal pass re-asks
+    // exactly the nodes whose proof aged out, at most once per freshness
+    // window, so a stalled exchange recovers instead of deadlocking the
+    // boundary. The attestation budget still caps the total per epoch.
     const EpochId target = plan_->next_epoch;
     for (const auto& member : plan_->selected) {
+        if (stale_only) {
+            const auto seen = final_verdict_ms_.find(member);
+            const bool fresh =
+                seen != final_verdict_ms_.end() &&
+                now_ms_ - seen->second <= constants::kFinalAttestMaxAgeSeconds * 1000;
+            if (fresh) {
+                continue;
+            }
+            const auto asked = final_challenge_ms_.find(member);
+            if (asked != final_challenge_ms_.end() &&
+                now_ms_ - asked->second < constants::kFinalAttestMaxAgeSeconds * 1000) {
+                continue;
+            }
+        }
+        final_challenge_ms_[member] = now_ms_;
         const Digest context = plan_attest_context(*plan_, member);
         if (member == config_.self) {
             attest_self_for(target, context);
@@ -1486,6 +1512,20 @@ void SecurityDriver::on_plan_committed(const ConsensusCommit& commit) {
                                                *challenge, target));
         }
     }
+}
+
+void SecurityDriver::maybe_renew_final_attestation() {
+    // Only while the readiness set is still forming. Once it committed, the
+    // finalized record carries the evidence digests and freshness no longer
+    // gates anything.
+    const EpochManager* epochs = runtime_.epochs();
+    const EpochTransition* transition = epochs->transition();
+    if (transition == nullptr || readiness_.has_value() || !plan_.has_value() ||
+        transition->phase == EpochTransitionPhase::Aborted ||
+        transition->phase == EpochTransitionPhase::Ready) {
+        return;
+    }
+    issue_final_challenges(true);
 }
 
 void SecurityDriver::on_readiness_committed(const ConsensusCommit& commit) {
@@ -1517,6 +1557,7 @@ void SecurityDriver::abandon_boundary(const char* reason) {
     dkg_authorized_ms_ = 0;
     state_ready_.clear();
     final_verdict_ms_.clear();
+    final_challenge_ms_.clear();
     transition_attests_.clear();
     EpochManager* epochs = runtime_.epochs();
     if (epochs != nullptr && epochs->transition() != nullptr) {
@@ -1554,6 +1595,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     state_ready_.clear();
     boundary_failed_.clear();
     final_verdict_ms_.clear();
+    final_challenge_ms_.clear();
     transition_attests_.clear();
     plans_committed_ = 0;
     dkg_authorized_ms_ = 0;

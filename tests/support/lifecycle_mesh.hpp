@@ -56,6 +56,11 @@ struct MemoryMesh {
     std::vector<NextEpochPlanProof> captured_plans;
     std::vector<ReadinessProofMsg> captured_readiness;
     std::vector<EpochHandoffProofMsg> captured_handoffs;
+    /// Final-attestation challenges in flight, with their challenger. The
+    /// fixture answers them the way a real producer and verifier would; a
+    /// challenge to an offline subject is never captured, which is exactly a
+    /// node refusing to attest.
+    std::vector<std::pair<NodeId, AttestationChallenge>> captured_final_challenges;
     // Unreachable nodes: nothing is delivered to or from them. Offline is a
     // transport fact, not a protocol one.
     std::set<NodeId> offline;
@@ -209,7 +214,11 @@ inline void MemoryMesh::capture(std::span<const uint8_t> bytes) {
         return;
     }
     const auto& message = std::get<SecurityMessage>(decoded);
-    if (const auto* plan = std::get_if<NextEpochPlanProof>(&message.body)) {
+    if (const auto* challenge = std::get_if<AttestationChallenge>(&message.body)) {
+        if (challenge->purpose == AttestationPurpose::FinalEpochReadiness) {
+            captured_final_challenges.emplace_back(message.sender, *challenge);
+        }
+    } else if (const auto* plan = std::get_if<NextEpochPlanProof>(&message.body)) {
         captured_plans.push_back(*plan);
     } else if (const auto* readiness = std::get_if<ReadinessProofMsg>(&message.body)) {
         captured_readiness.push_back(*readiness);
@@ -304,8 +313,8 @@ inline AttestationEvidence evidence_for(const NodeId& id, const nexus::crypto::E
 }
 
 struct DriverMeshBase : ::testing::Test {
-    explicit DriverMeshBase(std::size_t reserve_count = kReserves)
-        : reserve_count_(reserve_count) {}
+    explicit DriverMeshBase(std::size_t reserve_count = kReserves, uint8_t seed_salt = 0)
+        : reserve_count_(reserve_count), seed_salt_(seed_salt) {}
 
     void SetUp() override {
         ASSERT_GE(sodium_init(), 0);
@@ -314,11 +323,19 @@ struct DriverMeshBase : ::testing::Test {
         fs::remove_all(root);
         fs::create_directories(root);
 
-        // Node 0 is Genesis: its identity IS the pinned genesis key.
+        // Node 0 is Genesis: its identity IS the pinned genesis key. The
+        // identities are seeded, so the same fixture elects the same nodes on
+        // every run; the entropy that remains is the protocol's own — vote
+        // keys and the DKG group key — and TearDown records it on failure.
         for (std::size_t i = 0; i < kFounders + reserve_count_ + 1; ++i) {
             auto node = std::make_unique<Node>();
-            crypto_sign_keypair(node->identity.public_key.data(),
-                                node->identity.private_key.data());
+            std::array<uint8_t, crypto_sign_SEEDBYTES> seed{};
+            seed[0] = 0x5E;
+            seed[1] = static_cast<uint8_t>(reserve_count_);
+            seed[2] = static_cast<uint8_t>(seed_salt_);
+            seed[3] = static_cast<uint8_t>(i);
+            crypto_sign_seed_keypair(node->identity.public_key.data(),
+                                     node->identity.private_key.data(), seed.data());
             node->id.bytes = node->identity.public_key;
             nodes.push_back(std::move(node));
         }
@@ -399,6 +416,16 @@ struct DriverMeshBase : ::testing::Test {
     }
 
     void TearDown() override {
+        if (::testing::Test::HasFailure() && !founders.empty() &&
+            founders.front()->runtime->epochs() != nullptr) {
+            // The one entropy source left is the DKG: the authority key seeds
+            // the leader order and the selection ranking. Record it so a
+            // failing run's ordering can be reasoned about.
+            const auto& key =
+                founders.front()->runtime->epochs()->current().authority_public_key;
+            std::fprintf(stderr, "[mesh] failing run authority key: %s\n",
+                         nexus::crypto::to_hex(std::span<const uint8_t>(key.data(), 16)).c_str());
+        }
         for (auto& node : nodes) {
             if (node->wrapping) node->wrapping->stop();
             if (node->file_storage) node->file_storage->stop();
@@ -643,6 +670,65 @@ struct DriverMeshBase : ::testing::Test {
     std::vector<Node*> founders;
     std::vector<Node*> reserves;
     std::size_t reserve_count_ = kReserves;
+    uint8_t seed_salt_ = 0;
+
+    /// Answers every captured final-attestation challenge the way the real
+    /// producer and verifier would: a verdict for the challenged context,
+    /// injected into the challenger. Unanswerable challenges (the subject has
+    /// no key yet) stay queued for the next pass. A member that challenged
+    /// anyone also challenged itself through the local loopback the mesh
+    /// cannot see; its self verdict refreshes here too.
+    void answer_final_challenges() {
+        if (mesh.captured_final_challenges.empty()) {
+            return;
+        }
+        auto pending = std::move(mesh.captured_final_challenges);
+        mesh.captured_final_challenges.clear();
+        std::set<NodeId> asked;
+        for (auto& [challenger, challenge] : pending) {
+            const auto subject_it = mesh.nodes.find(challenge.node_id);
+            if (subject_it == mesh.nodes.end() || mesh.offline.contains(challenge.node_id)) {
+                continue;
+            }
+            Node* subject = subject_it->second;
+            const auto vote_key = subject->driver->vote_key_for_epoch(challenge.epoch);
+            if (!vote_key.has_value()) {
+                mesh.captured_final_challenges.emplace_back(challenger, challenge);
+                continue;
+            }
+            AttestationVerdict verdict =
+                passing_verdict(challenge.node_id, challenge.epoch, final_round_,
+                                challenge.incarnation);
+            verdict.purpose = challenge.purpose;
+            verdict.context_digest = challenge.context_digest;
+            mesh.nodes.at(challenger)->driver->on_attestation_verdict(
+                verdict, evidence_for(challenge.node_id, *vote_key));
+            asked.insert(challenger);
+        }
+        for (const auto& challenger : asked) {
+            Node* node = mesh.nodes.at(challenger);
+            if (mesh.captured_plans.empty() || mesh.offline.contains(challenger)) {
+                continue;
+            }
+            const NextEpochPlan& plan = mesh.captured_plans.back().plan;
+            if (std::find(plan.selected.begin(), plan.selected.end(), challenger) ==
+                plan.selected.end()) {
+                continue;
+            }
+            const auto vote_key = node->driver->vote_key_for_epoch(plan.next_epoch);
+            if (!vote_key.has_value()) {
+                continue;
+            }
+            node->driver->on_attestation_verdict(final_verdict(plan, challenger, final_round_),
+                                                 evidence_for(challenger, *vote_key));
+        }
+        ++final_round_;
+        mesh.pump();
+    }
+
+    /// Distinct evidence digests per answering wave; starts above the round
+    /// numbers the explicit injection helpers use.
+    uint8_t final_round_ = 0x40;
 };
 
 /// The default mesh: five founders, two reserves.

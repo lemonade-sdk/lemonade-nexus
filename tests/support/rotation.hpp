@@ -87,6 +87,7 @@ struct RotatingMeshBase : DriverMeshBase {
                        EpochId target, int max_steps = 600) {
         for (int i = 0; i < max_steps; ++i) {
             step(1, members);
+            answer_final_challenges();
             const bool keyed = std::all_of(selected.begin(), selected.end(), [&](Node* node) {
                 return mesh.offline.contains(node->id) ||
                        node->driver->vote_key_for_epoch(target).has_value();
@@ -101,6 +102,7 @@ struct RotatingMeshBase : DriverMeshBase {
                            int max_steps = 2500) {
         for (int i = 0; i < max_steps; ++i) {
             step(1, members);
+            answer_final_challenges();
             const bool active =
                 std::all_of(expect_active.begin(), expect_active.end(), [&](Node* n) {
                     return n->driver->current_epoch() == target;
@@ -125,7 +127,9 @@ struct RotatingMeshBase : DriverMeshBase {
         if (::testing::Test::HasFatalFailure()) {
             return members;
         }
-        final_attest_subjects(9, selected, members);
+        // No injection here: the members' own challenges — initial and
+        // renewal — drive the verdicts through answer_final_challenges, the
+        // same shape production runs.
         run_to_activation(members, selected, from_epoch + 1);
         return selected;
     }

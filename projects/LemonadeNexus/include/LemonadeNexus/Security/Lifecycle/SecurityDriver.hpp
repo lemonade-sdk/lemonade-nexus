@@ -184,6 +184,11 @@ private:
     [[nodiscard]] std::optional<EpochHandoff> derive_handoff() const;
     void on_plan_committed(const ConsensusCommit& commit);
     void on_readiness_committed(const ConsensusCommit& commit);
+    /// Challenges the selected set for the plan-bound final attestation.
+    /// `stale_only` re-asks just the nodes whose proof aged past the
+    /// freshness window, at most once per window each.
+    void issue_final_challenges(bool stale_only);
+    void maybe_renew_final_attestation();
     void broadcast_transcript_attest(EpochId target);
     void maybe_adopt_attested_transcript();
     void abandon_boundary(const char* reason);
@@ -274,6 +279,9 @@ private:
     uint32_t plans_committed_ = 0;
     std::set<NodeId> boundary_failed_;
     std::map<NodeId, uint64_t> final_verdict_ms_;
+    /// When each selected node was last challenged for the final attestation;
+    /// the renewal pass rate-limits itself with this.
+    std::map<NodeId, uint64_t> final_challenge_ms_;
     std::set<NodeId> state_ready_;
     std::optional<CandidateReadiness> readiness_;
     CommitProof readiness_proof_;
