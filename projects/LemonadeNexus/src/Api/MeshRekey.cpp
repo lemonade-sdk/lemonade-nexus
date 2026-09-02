@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
@@ -43,6 +45,26 @@ MeshRekeyPlan plan_mesh_rekey(std::string_view prev_ip, std::string_view new_ip,
         }
     }
     return plan;
+}
+
+std::optional<std::string> wg_pubkey_owner(const tree::PermissionTreeService& tree,
+                                           std::string_view wg_pubkey) {
+    if (wg_pubkey.empty()) {
+        return std::nullopt;
+    }
+    const std::string want = normalize_mesh_pubkey(wg_pubkey);
+    for (const auto type : {tree::NodeType::Endpoint, tree::NodeType::Relay,
+                            tree::NodeType::Root, tree::NodeType::Customer}) {
+        for (const auto& node : tree.get_nodes_by_type(type)) {
+            if (node.wg_pubkey.empty()) {
+                continue;
+            }
+            if (normalize_mesh_pubkey(node.wg_pubkey) == want) {
+                return node.id;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 } // namespace nexus::api

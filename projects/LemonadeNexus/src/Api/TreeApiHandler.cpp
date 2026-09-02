@@ -104,6 +104,20 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Normalize pubkey to "ed25519:base64..." format for tree storage
         auto norm_pubkey = normalize_pubkey(client_pubkey);
 
+        // A WireGuard static binds to one node identity. The Ed25519 challenge
+        // authenticated WHO is joining; this guard decides what that identity
+        // may claim: its own static, or a fresh one — never a key another node
+        // already registered. Checked before any tree write or dataplane
+        // change, so a hostile claim moves no route.
+        if (const auto advertised = body.value("wg_pubkey", std::string{});
+            !advertised.empty()) {
+            const auto owner = api::wg_pubkey_owner(ctx_.tree, advertised);
+            if (owner.has_value() && *owner != node_id) {
+                error_response(res, "wireguard key is bound to another node", 409);
+                return;
+            }
+        }
+
         // Optional device-link token (single use, minted via POST /api/link/token):
         // places the new endpoint under the token owner's Customer group.
         auto link_token = body.value("link_token", std::string{});
@@ -579,7 +593,17 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (body.contains("tunnel_ip"))   updated.tunnel_ip   = body["tunnel_ip"].get<std::string>();
         if (body.contains("private_subnet")) updated.private_subnet = body["private_subnet"].get<std::string>();
         if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
-        if (body.contains("wg_pubkey"))   updated.wg_pubkey   = body["wg_pubkey"].get<std::string>();
+        if (body.contains("wg_pubkey")) {
+            // Same ownership rule as the join path: edit permission on this
+            // node never extends to claiming a static another node holds.
+            const auto claimed = body["wg_pubkey"].get<std::string>();
+            const auto owner = api::wg_pubkey_owner(ctx_.tree, claimed);
+            if (owner.has_value() && *owner != node_id) {
+                error_response(res, "wireguard key is bound to another node", 409);
+                return;
+            }
+            updated.wg_pubkey = claimed;
+        }
         if (body.contains("listen_endpoint")) updated.listen_endpoint = body["listen_endpoint"].get<std::string>();
         if (body.contains("region"))      updated.region      = body["region"].get<std::string>();
         if (body.contains("capacity_mbps")) updated.capacity_mbps = body["capacity_mbps"].get<uint32_t>();

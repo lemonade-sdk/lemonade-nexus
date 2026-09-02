@@ -103,3 +103,60 @@ TEST(MeshRekeyPlan, EquivalentKeysAcrossFormatsDoNotRemovePeer) {
     EXPECT_FALSE(plan.remove_stale_peer);  // same dataplane key -> not stale
     EXPECT_EQ(plan.new_peer_key, new_wg);
 }
+
+// The ownership lookup the join and update handlers gate on: equivalence is
+// judged on the normalized Curve25519 key, so a respelled or
+// "ed25519:"-prefixed claim resolves to the same owner.
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Storage/FileStorageService.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+
+#include <filesystem>
+#include <unistd.h>
+
+TEST(WgPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
+    namespace fs = std::filesystem;
+    const fs::path dir =
+        fs::temp_directory_path() / ("nexus_wg_owner_" + std::to_string(::getpid()));
+    fs::create_directories(dir);
+    nexus::crypto::SodiumCryptoService crypto;
+    crypto.start();
+    nexus::storage::FileStorageService storage(dir);
+    storage.start();
+    nexus::tree::PermissionTreeService tree(storage, crypto);
+    tree.start();
+
+    // An identity key, stored in its ed25519: spelling on one node.
+    const auto identity = crypto.ed25519_keygen();
+    const std::string prefixed =
+        "ed25519:" + nexus::crypto::to_base64(identity.public_key);
+
+    nexus::tree::TreeNode root;
+    root.id = "root";
+    root.type = nexus::tree::NodeType::Root;
+    ASSERT_TRUE(tree.insert_join_node(root));
+    nexus::tree::TreeNode node;
+    node.id = "owner_node";
+    node.parent_id = "root";
+    node.type = nexus::tree::NodeType::Endpoint;
+    node.wg_pubkey = prefixed;
+    ASSERT_TRUE(tree.insert_join_node(node));
+
+    // The raw X25519 spelling of the same key names the same owner.
+    const auto normalized = nexus::api::normalize_mesh_pubkey(prefixed);
+    ASSERT_NE(normalized, prefixed);
+    const auto owner = nexus::api::wg_pubkey_owner(tree, normalized);
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_EQ(*owner, "owner_node");
+    EXPECT_EQ(nexus::api::wg_pubkey_owner(tree, prefixed).value_or(""), "owner_node");
+
+    // An unclaimed key has no owner.
+    EXPECT_FALSE(nexus::api::wg_pubkey_owner(
+                     tree, "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=")
+                     .has_value());
+
+    tree.stop();
+    storage.stop();
+    crypto.stop();
+    fs::remove_all(dir);
+}

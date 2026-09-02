@@ -595,3 +595,44 @@ TEST_F(PermissionTreeTest, CreateEndpointUnderCustomer) {
     auto children = tree_svc->get_children("acme_corp");
     EXPECT_EQ(children.size(), 1u);
 }
+
+// A WireGuard static binds to exactly one node. The service holds the
+// invariant for every caller; the API layer additionally compares normalized
+// spellings before any dataplane change.
+TEST_F(PermissionTreeTest, WgPubkeyBindsToExactlyOneNode) {
+    tree::TreeNode owner;
+    owner.id = "wg_owner";
+    owner.parent_id = "root";
+    owner.type = tree::NodeType::Endpoint;
+    owner.wg_pubkey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    ASSERT_TRUE(tree_svc->insert_join_node(owner));
+
+    // A different node claiming the same static is refused outright.
+    tree::TreeNode squatter;
+    squatter.id = "wg_squatter";
+    squatter.parent_id = "root";
+    squatter.type = tree::NodeType::Endpoint;
+    squatter.wg_pubkey = owner.wg_pubkey;
+    EXPECT_FALSE(tree_svc->insert_join_node(squatter));
+    EXPECT_FALSE(tree_svc->get_node("wg_squatter").has_value());
+
+    // And a different node updating itself onto the static is refused too.
+    tree::TreeNode bystander;
+    bystander.id = "wg_bystander";
+    bystander.parent_id = "root";
+    bystander.type = tree::NodeType::Endpoint;
+    bystander.wg_pubkey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+    ASSERT_TRUE(tree_svc->insert_join_node(bystander));
+    tree::TreeNode stolen = bystander;
+    stolen.wg_pubkey = owner.wg_pubkey;
+    EXPECT_FALSE(tree_svc->update_node_direct("wg_bystander", stolen));
+    EXPECT_EQ(tree_svc->get_node("wg_bystander")->wg_pubkey, bystander.wg_pubkey);
+
+    // The owner itself may rotate and rebind freely.
+    tree::TreeNode rotated = owner;
+    rotated.wg_pubkey = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
+    EXPECT_TRUE(tree_svc->update_node_direct("wg_owner", rotated));
+    tree::TreeNode back = rotated;
+    back.wg_pubkey = owner.wg_pubkey;
+    EXPECT_TRUE(tree_svc->update_node_direct("wg_owner", back));
+}

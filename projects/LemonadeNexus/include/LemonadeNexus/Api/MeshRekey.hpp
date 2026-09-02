@@ -1,7 +1,10 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
+
+namespace nexus::tree { class PermissionTreeService; }
 
 namespace nexus::api {
 
@@ -28,5 +31,15 @@ struct MeshRekeyPlan {
                                             std::string_view new_ip,
                                             std::string_view prev_wg,
                                             std::string_view new_wg);
+
+/// The node that already holds this WireGuard static, compared on the
+/// normalized Curve25519 key so a respelled or "ed25519:"-prefixed claim
+/// cannot slip past. A transport static binds to exactly one node identity:
+/// the identity that first registered it under authentication owns it, and
+/// only that identity may rebind it. Clients derive the static from their own
+/// identity secret, so no two identities can legitimately arrive at one key —
+/// and nobody can compute another node's static before that node revealed it.
+[[nodiscard]] std::optional<std::string> wg_pubkey_owner(
+    const tree::PermissionTreeService& tree, std::string_view wg_pubkey);
 
 } // namespace nexus::api
