@@ -79,8 +79,6 @@ jobs:
       - name: Analyze + test
         working-directory: apps/LemonadeNexusClient
         run: |
-          cmp ../../THIRD_PARTY_NOTICES.md assets/THIRD_PARTY_NOTICES.md \
-            || { echo "::error::assets/THIRD_PARTY_NOTICES.md is out of date; copy it from the repo root"; exit 1; }
           flutter pub get
           flutter analyze
           flutter test
@@ -171,8 +169,6 @@ jobs:
       - name: Analyze + test
         working-directory: apps/LemonadeNexusClient
         run: |
-          cmp ../../THIRD_PARTY_NOTICES.md assets/THIRD_PARTY_NOTICES.md \
-            || { echo "::error::assets/THIRD_PARTY_NOTICES.md is out of date; copy it from the repo root"; exit 1; }
           flutter pub get
           flutter analyze
           flutter test

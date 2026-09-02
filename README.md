@@ -876,12 +876,4 @@ All dependencies are fetched automatically via CMake FetchContent:
 
 ## License
 
-Lemonade-Nexus is source-available under the [Lemonade-Nexus Source-Available License](LICENSE). In short:
-
-- **Individuals**: free to download, build, self-host, and modify for personal, educational, research, and other non-commercial use.
-- **Modifications must be public**: anyone without a commercial license who modifies the code must publish the changes in a public fork of this repository, under the same license.
-- **Commercial use**: requires a separate written agreement with the licensors. Agreements are recorded in Schedule A of the [LICENSE](LICENSE) file.
-- **AMD and the Lemonade SDK project**: designated partners with full usage and commit rights (Schedule B).
-- **Not permitted**: copying code into other projects, redistributing binaries, or publishing modified versions anywhere other than a public fork of this repository.
-
-Third-party dependencies keep their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). This is not an OSI-approved open source license.
+See repository license file for details.
