@@ -20,6 +20,13 @@ namespace nexus::security {
 enum class AuthorityOperation : uint16_t {
     EpochTransition = 1,
     Checkpoint = 2,
+    // Post-Genesis credential authority. A signing session for one of these is
+    // authorized exactly like any other AuthorityObject — bound to a finalized
+    // consensus certificate — so a mesh credential is never signed without the
+    // current epoch first finalizing the decision. The object's
+    // finalized_state_digest carries the mesh_credential_digest.
+    IssueCredential = 3,
+    RevokeCredential = 4,
 };
 
 struct AuthorityObject {

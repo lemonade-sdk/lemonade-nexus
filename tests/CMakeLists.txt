@@ -128,7 +128,8 @@ add_nexus_test(test_security_authority
     security/authority/authority_object.cpp
     security/authority/nonce_commitment.cpp
     security/authority/dkg_session.cpp
-    security/authority/signing.cpp)
+    security/authority/signing.cpp
+    security/authority/mesh_credential.cpp)
 add_nexus_test(test_security_eligibility
     security/eligibility/ledger.cpp
     security/eligibility/store.cpp
