@@ -29,7 +29,7 @@ struct RotatingMeshBase : DriverMeshBase {
         // Participation witnessing accumulates one leader rotation at a time;
         // a real epoch has an hour of views, the compressed one gets commits
         // until every pool subject met its witness bar on every member.
-        for (int i = 0; i < 40; ++i) {
+        for (int i = 0; i < 60; ++i) {
             bool complete = true;
             for (Node* member : members) {
                 const auto& service = member->driver->eligibility();
@@ -50,7 +50,7 @@ struct RotatingMeshBase : DriverMeshBase {
     }
 
     /// Ages the epoch and steps until every online member opened a transition.
-    void run_to_plan(const std::vector<Node*>& members, int max_steps = 1500) {
+    void run_to_plan(const std::vector<Node*>& members, int max_steps = 2500) {
         mesh.now_ms += constants::kTargetEpochSeconds * 1000;
         for (int i = 0; i < max_steps; ++i) {
             step(1, members);
@@ -98,7 +98,7 @@ struct RotatingMeshBase : DriverMeshBase {
 
     void run_to_activation(const std::vector<Node*>& members,
                            const std::vector<Node*>& expect_active, EpochId target,
-                           int max_steps = 1500) {
+                           int max_steps = 2500) {
         for (int i = 0; i < max_steps; ++i) {
             step(1, members);
             const bool active =

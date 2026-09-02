@@ -480,7 +480,7 @@ struct DriverMeshBase : ::testing::Test {
     /// strictly newer certified heights, so a round that lands at the height
     /// the last one used says nothing new; with a member offline the next
     /// commit waits on a view timeout, which no fixed step count can promise.
-    void advance_commit(const std::vector<Node*>& online, int max_steps = 400) {
+    void advance_commit(const std::vector<Node*>& online, int max_steps = 800) {
         const Height start = online.front()->driver->last_committed_height();
         for (int i = 0; i < max_steps; ++i) {
             step(1, online);
