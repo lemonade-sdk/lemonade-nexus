@@ -10,6 +10,7 @@
 #include <openssl/x509v3.h>
 
 #include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <ctime>
 #include <memory>
