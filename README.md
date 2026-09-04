@@ -876,4 +876,4 @@ All dependencies are fetched automatically via CMake FetchContent:
 
 ## License
 
-See repository license file for details.
+Lemonade-Nexus is released under the [MIT License](LICENSE).
