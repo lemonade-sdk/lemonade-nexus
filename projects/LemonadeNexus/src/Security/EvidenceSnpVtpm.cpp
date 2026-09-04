@@ -470,52 +470,77 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
     std::memcpy(qualifying.buffer, binding.data(), kEvidenceBindingSize);
 
     const TPML_PCR_SELECTION sel = evidence_pcr_selection();
-    TPM2B_ATTEST*   quoted = nullptr;
-    TPMT_SIGNATURE* sig = nullptr;
-    const TSS2_RC rc = quote_under_ak(sess.esys, ak, qualifying, sel, &quoted, &sig);
 
-    bool ok = false;
-    if (rc == TSS2_RC_SUCCESS && quoted && sig) {
-        ev.tpms_attest.assign(quoted->attestationData, quoted->attestationData + quoted->size);
-        ok = serialize_signature(*sig, ev.tpm_signature);
-        if (!ok) {
-            set_fail(failure, "the vTPM signed the quote with a scheme we cannot transport "
-                              "(expected RSASSA or RSAPSS under HCLAkPub)");
-        }
-    } else {
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "TPM2_Quote under HCLAkPub failed (0x%x)",
-                      static_cast<unsigned>(rc));
-        set_fail(failure, buf);
-    }
-    if (quoted) Esys_Free(quoted);
-    if (sig) Esys_Free(sig);
-
-    Esys_TR_Close(sess.esys, &ak);
-
-    // 5. PCR values, and the proof that they are the ones the quote signed.
+    // 4b/5. Quote, read the PCR values back, and prove they are the ones the
+    // quote signed.
     //
     // TPM2_Quote returns pcrDigest, not values, so the values come from a
-    // separate PCR_Read — and separate means racy. Recomputing the digest is
-    // both the binding and the race detector: one hash, one comparison, no retry.
-    if (ok && !read_pcr_values(sess.esys, ev.pcr_values)) {
-        set_fail(failure, "could not read back the quoted PCR values");
-        ok = false;
-    }
+    // separate PCR_Read — and separate means racy: anything that extends a
+    // quoted PCR in between hands back values the quote never covered.
+    // Recomputing the digest is both the binding and the race detector.
+    //
+    // A lost race is retried, at most kQuoteAttempts times, because refusing
+    // outright would make a busy host unattestable — measured on a live Genoa
+    // guest under exec churn, the first attempt does lose. The bound is fixed:
+    // this cannot spin, and after the last attempt it refuses deterministically.
+    constexpr int kQuoteAttempts = 3;
     std::optional<TpmQuote> quote;
-    if (ok) {
+    bool ok = false;
+
+    for (int attempt = 1; attempt <= kQuoteAttempts && !ok; ++attempt) {
+        ev.tpms_attest.clear();
+        ev.tpm_signature.clear();
+        ev.pcr_values.clear();
+        quote.reset();
+
+        TPM2B_ATTEST*   quoted = nullptr;
+        TPMT_SIGNATURE* sig = nullptr;
+        const TSS2_RC rc = quote_under_ak(sess.esys, ak, qualifying, sel, &quoted, &sig);
+
+        bool attempt_ok = false;
+        if (rc == TSS2_RC_SUCCESS && quoted && sig) {
+            ev.tpms_attest.assign(quoted->attestationData,
+                                  quoted->attestationData + quoted->size);
+            attempt_ok = serialize_signature(*sig, ev.tpm_signature);
+            if (!attempt_ok) {
+                set_fail(failure, "the vTPM signed the quote with a scheme we cannot transport "
+                                  "(expected RSASSA or RSAPSS under HCLAkPub)");
+            }
+        } else {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "TPM2_Quote under HCLAkPub failed (0x%x)",
+                          static_cast<unsigned>(rc));
+            set_fail(failure, buf);
+        }
+        if (quoted) Esys_Free(quoted);
+        if (sig) Esys_Free(sig);
+        if (!attempt_ok) break;  // a scheme or TPM fault will not fix itself
+
+        if (!read_pcr_values(sess.esys, ev.pcr_values)) {
+            set_fail(failure, "could not read back the quoted PCR values");
+            break;
+        }
+
         quote = parse_tpm_quote(ev.tpms_attest);
         const auto quote_hash = tpmt_signature_hash_alg(ev.tpm_signature);
         if (!quote || !quote_hash) {
             set_fail(failure, "the vTPM returned a quote this build cannot parse");
-            ok = false;
-        } else if (!quote_pcr_digest_matches(*quote, ev.pcr_values, *quote_hash)) {
+            break;
+        }
+        if (quote_pcr_digest_matches(*quote, ev.pcr_values, *quote_hash)) {
+            ok = true;
+        } else if (attempt < kQuoteAttempts) {
+            spdlog::debug("[evidence] a quoted PCR moved between quote and read; "
+                          "attempt {} of {}", attempt, kQuoteAttempts);
+        } else {
             set_fail(failure, "the PCR values read back do not hash to the quote's signed "
-                              "pcrDigest — a quoted PCR was extended between the quote and the "
-                              "read, so these values are not the ones the vTPM attested");
-            ok = false;
+                              "pcrDigest after " + std::to_string(kQuoteAttempts) +
+                              " attempts — a quoted PCR is being extended faster than the pair "
+                              "can be taken, so these values are not the ones the vTPM attested");
         }
     }
+
+    Esys_TR_Close(sess.esys, &ak);
 
     // 6. The measurement log, read AFTER the quote and cut where the quote ends.
     //
