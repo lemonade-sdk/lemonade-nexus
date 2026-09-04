@@ -91,7 +91,9 @@ struct SnpVtpmEvidence {
 
 struct EvidenceProduceConfig {
     std::filesystem::path cache_dir;              ///< where the VCEK + AMD chain are cached
-    std::string           product{"Milan"};
+    /// The AMD silicon generation is discovered from the report, never chosen
+    /// here — see discover_amd_endorsement. A field would only let a caller
+    /// name the wrong one and get no evidence at all.
     bool                  allow_network{true};    ///< may we reach AMD KDS
     std::vector<uint8_t>  identity_pubkey;        ///< raw Ed25519; bound into the quote
     std::filesystem::path hcl_blob_override;      ///< offline testing only, never a bypass

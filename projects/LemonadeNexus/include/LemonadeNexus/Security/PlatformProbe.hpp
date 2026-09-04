@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -66,7 +67,6 @@ struct PlatformProbeResult {
 
 struct PlatformProbeConfig {
     std::filesystem::path cache_dir;             // where a fetched VCEK is cached
-    std::string           product{"Milan"};      // AMD silicon generation
     SnpPolicyRequirements policy;
     bool                  allow_network{true};   // may we reach AMD KDS for a VCEK
     /// Raw Ed25519 identity to bind the self-test quote to. Empty is fine — the
@@ -100,10 +100,41 @@ struct PlatformProbeConfig {
 
 /// The VCEK for this chip and TCB, from the cache or AMD KDS. Not trusted on
 /// arrival: the verifier independently requires the chain root to be the
-/// compiled-in ARK, so a spoofed KDS buys nothing.
+/// compiled-in ARK, so a spoofed KDS buys nothing. Cached per product, so a
+/// certificate fetched for one silicon generation is never served for another.
 [[nodiscard]] std::vector<uint8_t> fetch_vcek(const std::filesystem::path& cache_dir,
                                                const SnpReport& report,
                                                const std::string& product, bool allow_network);
+
+/// One chip's AMD endorsement, and the silicon generation it belongs to.
+struct AmdEndorsement {
+    std::string          product;   ///< empty when no pinned product endorsed the report
+    std::vector<uint8_t> vcek_der;
+
+    [[nodiscard]] bool empty() const { return product.empty() || vcek_der.empty(); }
+};
+
+/// Where a candidate product's VCEK comes from. Defaults to the AMD KDS fetch
+/// above; a test supplies its own so discovery runs without network. This is a
+/// seam for callers inside the binary, not an operator input — there is no
+/// configuration path that reaches it.
+using VcekSource =
+    std::function<std::vector<uint8_t>(const SnpReport&, const std::string& product)>;
+
+/// Which AMD product endorsed this report, and that product's VCEK.
+///
+/// The silicon generation is NOT a caller's choice. A wrong guess silently
+/// fetches from the wrong KDS path and produces no evidence at all, so the
+/// answer is derived instead: every compiled-in product is tried in order, and
+/// a candidate is accepted only when its VCEK verifies THIS report under THAT
+/// product's pinned ASK/ARK and names this report's chip. AMD's own signature
+/// decides, so a hostile or confused KDS cannot steer the result. Fails closed
+/// when no pinned product verifies — including for silicon this release
+/// carries no root material for.
+[[nodiscard]] AmdEndorsement discover_amd_endorsement(const std::filesystem::path& cache_dir,
+                                                       const SnpReport& report,
+                                                       bool allow_network,
+                                                       const VcekSource& source = {});
 
 /// ASK + ARK, from the cache or AMD KDS. Same caveat as above.
 [[nodiscard]] std::string fetch_amd_chain(const std::filesystem::path& cache_dir,

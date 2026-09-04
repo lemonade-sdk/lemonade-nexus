@@ -351,18 +351,21 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
     }
 
     // 2. The AMD certificate material a peer needs to check it.
-    ev.vcek_der = fetch_vcek(cfg.cache_dir, hcl->snp, cfg.product, cfg.allow_network);
-    if (ev.vcek_der.empty()) {
-        set_fail(failure, "no VCEK for this chip and TCB (AMD KDS unreachable and nothing cached)");
+    // Which silicon generation endorsed this report is derived, not assumed —
+    // a hard-coded product fetches from the wrong KDS path and yields nothing.
+    const auto endorsement =
+        discover_amd_endorsement(cfg.cache_dir, hcl->snp, cfg.allow_network);
+    if (endorsement.empty()) {
+        set_fail(failure, "no AMD endorsement for this chip and TCB: no compiled-in product's "
+                          "VCEK verifies this report (AMD KDS unreachable, nothing cached, or "
+                          "this release carries no root material for this silicon)");
         return std::nullopt;
     }
+    ev.vcek_der = endorsement.vcek_der;
     // The ASK and ARK are compiled in, so they are deliberately NOT put in the
     // bundle: 4.6 KB of a 65 KB gossip budget to deliver material the verifier
-    // refuses to trust from the wire anyway.
-    if (pinned_amd_chain(cfg.product).empty()) {
-        set_fail(failure, "no compiled-in AMD certificate chain for product '" + cfg.product + "'");
-        return std::nullopt;
-    }
+    // refuses to trust from the wire anyway. Discovery already proved this
+    // product has pinned material, so there is nothing left to check here.
 
     // 3. The kernel's measurement of the running binary — not our own hash of it.
     //

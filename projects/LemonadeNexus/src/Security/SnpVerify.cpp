@@ -321,6 +321,34 @@ bool serial_is_revoked(X509_CRL* crl, const ASN1_INTEGER* serial) {
     return false;
 }
 
+/// AMD's HWID extension: the chip this VCEK was issued for.
+constexpr const char* kOidVcekHwid = "1.3.6.1.4.1.3704.1.4";
+
+/// The HWID an AMD VCEK names, or empty if the certificate carries none.
+std::vector<uint8_t> vcek_hwid(X509* cert) {
+    ASN1_OBJECT* oid = OBJ_txt2obj(kOidVcekHwid, 1);
+    if (!oid) return {};
+    const int idx = X509_get_ext_by_OBJ(cert, oid, -1);
+    ASN1_OBJECT_free(oid);
+    if (idx < 0) return {};
+
+    X509_EXTENSION* ext = X509_get_ext(cert, idx);
+    if (!ext) return {};
+    const ASN1_OCTET_STRING* value = X509_EXTENSION_get_data(ext);
+    if (!value) return {};
+
+    const uint8_t* p = ASN1_STRING_get0_data(value);
+    int len = ASN1_STRING_length(value);
+    if (!p || len <= 0) return {};
+    // AMD writes the raw HWID as the extension payload. Tolerate a nested
+    // OCTET STRING too, so a re-encoded certificate is read the same way.
+    if (len > 2 && p[0] == 0x04 && p[1] == len - 2) {
+        p += 2;
+        len -= 2;
+    }
+    return {p, p + len};
+}
+
 }  // namespace
 
 std::span<const std::string_view> pinned_amd_products() {
@@ -391,6 +419,19 @@ SnpVerifyResult verify_snp_signature(const SnpReport& report,
         const int err = X509_STORE_CTX_get_error(ctx.get());
         return fail(std::string("VCEK does not chain to the AMD root: ") +
                     X509_verify_cert_error_string(err));
+    }
+
+    // --- the chip this endorsement is for -----------------------------------
+    // A VCEK is issued per chip. Binding it to the report's CHIP_ID states that
+    // relationship explicitly rather than leaving it implied by the signature,
+    // so an endorsement for another chip is refused by name instead of
+    // surfacing as an opaque signature failure. Absent is failed: every AMD
+    // VCEK carries this extension.
+    const auto hwid = vcek_hwid(vcek.get());
+    if (hwid.empty()) return fail("VCEK carries no AMD HWID extension");
+    if (hwid.size() != report.chip_id.size() ||
+        std::memcmp(hwid.data(), report.chip_id.data(), hwid.size()) != 0) {
+        return fail("VCEK was issued for a different chip than the report");
     }
 
     // --- the report signature itself ---------------------------------------

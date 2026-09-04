@@ -52,12 +52,16 @@ PlatformDiagnostics gather_diagnostics() {
 }
 
 /// VCEK is per chip and per TCB, so cache it under both.
-fs::path vcek_cache_path(const fs::path& cache_dir, const SnpReport& r) {
+/// Product is part of the key: the same chip and TCB have a different VCEK URL
+/// per silicon generation, and serving one product's certificate for another
+/// would make discovery depend on whatever was cached first.
+fs::path vcek_cache_path(const fs::path& cache_dir, const SnpReport& r,
+                         const std::string& product) {
     const auto& t = r.reported_tcb;
     return cache_dir / "vcek" /
-           (r.chip_id_hex().substr(0, 32) + "-" + std::to_string(t.bootloader) + "." +
-            std::to_string(t.tee) + "." + std::to_string(t.snp) + "." +
-            std::to_string(t.microcode) + ".der");
+           (product + "-" + r.chip_id_hex().substr(0, 32) + "-" +
+            std::to_string(t.bootloader) + "." + std::to_string(t.tee) + "." +
+            std::to_string(t.snp) + "." + std::to_string(t.microcode) + ".der");
 }
 
 PlatformProbeResult no(PlatformProbeResult r, std::string why) {
@@ -143,7 +147,7 @@ std::vector<uint8_t> read_hcl_nv_blob() {
 
 std::vector<uint8_t> fetch_vcek(const fs::path& cache_dir, const SnpReport& r,
                                  const std::string& product, bool allow_network) {
-    const auto cached = vcek_cache_path(cache_dir, r);
+    const auto cached = vcek_cache_path(cache_dir, r, product);
     if (auto bytes = read_file(cached); !bytes.empty()) {
         spdlog::debug("[probe] using cached VCEK {}", cached.string());
         return bytes;
@@ -174,6 +178,35 @@ std::vector<uint8_t> fetch_vcek(const fs::path& cache_dir, const SnpReport& r,
         spdlog::warn("[probe] VCEK fetch failed: {}", e.what());
         return {};
     }
+}
+
+AmdEndorsement discover_amd_endorsement(const fs::path& cache_dir, const SnpReport& report,
+                                         bool allow_network, const VcekSource& source) {
+    for (const auto product_view : pinned_amd_products()) {
+        const std::string product{product_view};
+        // A product with no compiled-in root is not a candidate: nothing it
+        // returned could be checked against anything.
+        const std::string chain = pinned_amd_chain(product);
+        if (chain.empty()) continue;
+
+        std::vector<uint8_t> der = source ? source(report, product)
+                                          : fetch_vcek(cache_dir, report, product, allow_network);
+        if (der.empty()) continue;
+
+        // The acceptance test is AMD's own signature over THIS report under
+        // THIS product's pinned ASK/ARK, plus the HWID naming this chip. A
+        // certificate from another generation cannot pass, so discovery is
+        // decided by the silicon rather than by whatever KDS answered.
+        if (const auto verified = verify_snp_signature(report, der, chain); !verified.ok) {
+            spdlog::debug("[probe] {} did not endorse this report: {}", product,
+                           verified.failure);
+            continue;
+        }
+        spdlog::info("[probe] AMD endorsement resolved to product '{}'", product);
+        return AmdEndorsement{product, std::move(der)};
+    }
+    spdlog::warn("[probe] no compiled-in AMD product endorses this report");
+    return {};
 }
 
 std::string fetch_amd_chain(const fs::path& cache_dir, const std::string& product,
@@ -225,21 +258,16 @@ PlatformProbeResult probe_platform(const PlatformProbeConfig& cfg) {
         if (!hcl) return no(std::move(out), "the attestation blob is malformed or inconsistent");
         out.profile = EvidenceProfile::SnpVtpm;
 
-        auto vcek = fetch_vcek(cfg.cache_dir, hcl->snp, cfg.product, cfg.allow_network);
-        if (vcek.empty()) {
-            return no(std::move(out), "no VCEK for this chip and TCB (AMD KDS unreachable and "
-                                       "nothing cached), so the report cannot be verified");
+        const auto endorsement =
+            discover_amd_endorsement(cfg.cache_dir, hcl->snp, cfg.allow_network);
+        if (endorsement.empty()) {
+            return no(std::move(out), "no AMD endorsement for this chip and TCB: no compiled-in "
+                                       "product's VCEK verifies this report, so it cannot be "
+                                       "checked");
         }
-        if (pinned_amd_root(cfg.product).empty()) {
-            return no(std::move(out), "no compiled-in AMD root for product '" + cfg.product + "'");
-        }
-        const std::string chain = fetch_amd_chain(cfg.cache_dir, cfg.product, cfg.allow_network);
-        if (chain.empty()) {
-            return no(std::move(out), "no AMD certificate chain available for this product");
-        }
-        if (auto sig = verify_snp_signature(hcl->snp, vcek, chain); !sig.ok) {
-            return no(std::move(out), "AMD signature check failed: " + sig.failure);
-        }
+        // Discovery accepted this VCEK only because the signature verified
+        // under the product's pinned chain, so the report is already proven
+        // AMD-signed by the time we get here.
         if (auto pol = verify_snp_policy(hcl->snp, cfg.policy); !pol.ok) {
             return no(std::move(out), "platform policy check failed: " + pol.failure);
         }
@@ -264,7 +292,6 @@ PlatformProbeResult probe_platform(const PlatformProbeConfig& cfg) {
 
     EvidenceProduceConfig prod;
     prod.cache_dir       = cfg.cache_dir;
-    prod.product         = cfg.product;
     prod.allow_network   = cfg.allow_network;
     prod.identity_pubkey = cfg.identity_pubkey;
 

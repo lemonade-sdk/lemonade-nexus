@@ -69,6 +69,13 @@ target_compile_definitions(test_snp_genoa PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 target_link_libraries(test_snp_genoa PRIVATE OpenSSL::Crypto)
 
+# Which AMD generation endorsed a report is derived from the report, not
+# configured. Uses real Milan and Genoa material so the cross-product
+# substitutions are refused by AMD's own signature.
+add_nexus_test(test_amd_product_discovery test_amd_product_discovery.cpp)
+target_compile_definitions(test_amd_product_discovery PRIVATE
+    NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
 # The links above the AMD signature: the quote under HCLAkPub, the evidence
 # binding, and the IMA replay.
 add_nexus_test(test_evidence_chain    test_evidence_chain.cpp)
