@@ -8,7 +8,9 @@ cmake_minimum_required(VERSION 3.25.1)
 # without starting a daemon or owning a TPM (tests/test_nexus_attestd.cpp).
 add_library(LemonadeNexusAttestdCore
         src/AttestdGate.cpp
+        src/AttestdFraming.cpp
         src/AttestdCodec.cpp
+        src/AttestdClient.cpp
         src/AttestdService.cpp
         src/AttestdSocket.cpp)
 

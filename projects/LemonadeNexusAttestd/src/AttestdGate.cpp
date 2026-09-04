@@ -50,7 +50,7 @@ std::string_view refusal_reason(Refusal r) {
         case Refusal::EvidenceUnavailable:
             return "the platform produced no evidence";
         case Refusal::EvidenceOversized:
-            return "the produced evidence exceeds the security wire bound";
+            return "the produced evidence exceeds what one local operation may stream";
     }
     return "unknown";
 }

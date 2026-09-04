@@ -70,6 +70,22 @@ struct ImaLog {
 [[nodiscard]] std::optional<ImaEntry> ima_entry_for_path(const ImaLog& log,
                                                           std::string_view path);
 
+/// Cut `text` at the entry where its replay into `pcr_index` reaches `target`.
+///
+/// A quote and a log read are two operations, so on a busy host the log grows
+/// between them and replays PAST the quoted PCR. The quoted value names its own
+/// endpoint: fold entries one at a time and stop when the running value equals
+/// it. Extension chains each value into the next, so that position is unique
+/// under collision resistance and everything after it is the next attestation's.
+///
+/// Returns the prefix including the matching line's newline. nullopt when no
+/// prefix reaches `target` — the log did not produce this quote. An all-zero
+/// `target` yields an empty string. One pass, no retry, no quiet host needed.
+[[nodiscard]] std::optional<std::string> ima_truncate_to_pcr(std::string_view text,
+                                                              uint32_t pcr_index,
+                                                              uint16_t bank_hash_alg,
+                                                              std::span<const uint8_t> target);
+
 /// Read /sys/kernel/security/ima/ascii_runtime_measurements. Empty when IMA is
 /// not enabled, the securityfs is not mounted, or we are not on Linux.
 [[nodiscard]] std::string read_ima_ascii_log();

@@ -22,12 +22,15 @@ bool PlatformEvidenceProducer::platform_available() const {
 #endif
 }
 
-SnpVtpmEvidence PlatformEvidenceProducer::platform_bundle(const Digest& nonce) const {
-    // A privileged helper, when one is configured. It is handed the nonce and
-    // the identity PUBLIC key — everything needed to derive the quote binding,
-    // and nothing that could sign on this node's behalf.
+SnpVtpmEvidence PlatformEvidenceProducer::platform_bundle(const AttestationChallenge& challenge,
+                                                           const Digest& nonce) const {
+    // A privileged helper, when configured. It gets the challenge — the identity
+    // PUBLIC key and nothing that could sign on this node's behalf. It derives
+    // the quote nonce itself; `nonce` is what we independently expect, and the
+    // source must refuse evidence bound to anything else.
     if (sources_.platform_source) {
-        return sources_.platform_source(nonce, sources_.identity.public_key);
+        (void)nonce;
+        return sources_.platform_source(challenge);
     }
 
     // The challenge digest is the quote nonce, so one quote binds the node
@@ -91,7 +94,7 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     evidence.purpose = challenge.purpose;
     evidence.context_digest = challenge.context_digest;
     evidence.epoch_vote_key = *vote_key;
-    evidence.platform = platform_bundle(evidence.challenge_digest);
+    evidence.platform = platform_bundle(challenge, evidence.challenge_digest);
 
     // Sign last. The identity binds the vote key and every other field
     // above, the platform bundle included (architecture 18).

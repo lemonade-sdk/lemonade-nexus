@@ -17,11 +17,13 @@
 // can ask for over the wire. It cannot choose what gets quoted, cannot get
 // arbitrary bytes signed, and cannot obtain an eligibility decision.
 //
-// The protocol is one request per connection: a JSON challenge terminated by a
-// newline or by end-of-stream, one JSON response terminated by a newline, then
-// close. Requests are served ONE AT A TIME. A vTPM does one quote at a time
-// anyway, and serialising removes a whole class of concurrency bugs from the one
-// component on the host that must not have them.
+// One request per connection: a JSON challenge terminated by a newline or by
+// end-of-stream, then a framed response (AttestdFraming.hpp), then close. Served
+// ONE AT A TIME — a vTPM does one quote at a time anyway.
+//
+// The request keeps newline framing: it is already bounded at 8 KiB by a closed
+// grammar. The RESPONSE is framed, because it carries a measurement log whose
+// size the daemon does not choose.
 
 #include <atomic>
 #include <cstdint>
@@ -50,9 +52,13 @@ struct AttestdSocketConfig {
     uint32_t mode{0660};
 };
 
-/// Returns the response for one request. Kept as a callback so the socket knows
-/// nothing about attestation and the service knows nothing about sockets.
-using RequestHandler = std::function<std::string(std::string_view)>;
+/// Writes one frame. False once the peer is gone or the deadline has passed,
+/// which stops the handler where it stands.
+using ResponseWriter = std::function<bool(std::string_view bytes)>;
+
+/// Serves one request by writing frames, so the socket knows nothing about
+/// attestation and no whole response is buffered on either side.
+using RequestHandler = std::function<void(std::string_view request, const ResponseWriter& write)>;
 
 class UnixRequestSocket {
 public:

@@ -137,8 +137,11 @@ int main(int argc, char* argv[]) {
     std::signal(SIGPIPE, SIG_IGN);
 #endif
 
-    socket.serve([&service](std::string_view request) { return service.handle_request(request); },
-                 g_stop);
+    socket.serve(
+        [&service](std::string_view request, const nexus::attestd::ResponseWriter& write) {
+            service.handle_request(request, write);
+        },
+        g_stop);
 
     spdlog::info("nexus-attestd stopping");
     return 0;

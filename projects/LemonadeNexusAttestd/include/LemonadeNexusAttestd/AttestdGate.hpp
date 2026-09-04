@@ -77,8 +77,9 @@ enum class Refusal : uint16_t {
     /// string, never a second typed value: the caller's action is the same.
     EvidenceUnavailable,
 
-    /// The produced bundle exceeds kMaxPlatformEvidenceWireBytes, so no peer
-    /// could carry it. Refused here rather than shipped and dropped later.
+    /// The bundle exceeds what one local operation may stream
+    /// (kMaxLocalFrameBytes x kMaxLocalChunks). A LOCAL resource bound, not the
+    /// mesh's kMaxPlatformEvidenceWireBytes — see AttestdFraming.hpp.
     EvidenceOversized,
 };
 

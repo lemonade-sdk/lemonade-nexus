@@ -11,20 +11,26 @@
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/EvidenceBinding.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexusAttestd/AttestdClient.hpp>
 #include <LemonadeNexusAttestd/AttestdCodec.hpp>
+#include <LemonadeNexusAttestd/AttestdFraming.hpp>
 #include <LemonadeNexusAttestd/AttestdGate.hpp>
 #include <LemonadeNexusAttestd/AttestdService.hpp>
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 #include <sodium.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace constants = nexus::security::constants;
@@ -37,7 +43,6 @@ using nexus::attestd::check_challenge;
 using nexus::attestd::decode_challenge;
 using nexus::attestd::derive_quote_binding;
 using nexus::attestd::PlatformEvidenceBundle;
-using nexus::attestd::encode_bundle;
 using nexus::security::AttestationChallenge;
 using nexus::security::AttestationProfileId;
 using nexus::security::AttestationPurpose;
@@ -47,6 +52,41 @@ using nexus::security::evidence_binding;
 namespace {
 
 using json = nlohmann::json;
+using nexus::attestd::FrameKind;
+
+/// Split a framed response into (kind, payload) pairs. The bounds are asserted
+/// here so a malformed stream fails as a test error, not as a hang.
+std::vector<std::pair<FrameKind, std::string>> split_frames(std::string_view bytes) {
+    std::vector<std::pair<FrameKind, std::string>> out;
+    std::size_t at = 0;
+    while (at + nexus::attestd::kFrameHeaderBytes <= bytes.size()) {
+        const auto* p = reinterpret_cast<const uint8_t*>(bytes.data()) + at;
+        const std::size_t len = (std::size_t(p[0]) << 24) | (std::size_t(p[1]) << 16) |
+                                (std::size_t(p[2]) << 8) | std::size_t(p[3]);
+        at += nexus::attestd::kFrameHeaderBytes;
+        if (at + len > bytes.size()) break;
+        out.emplace_back(static_cast<FrameKind>(p[4]), std::string(bytes.substr(at, len)));
+        at += len;
+    }
+    return out;
+}
+
+/// Drive the service and return everything it wrote.
+std::string collect_frames(AttestdService& service, std::string_view request) {
+    std::string wire;
+    service.handle_request(request, [&](std::string_view frame) {
+        wire.append(frame);
+        return true;
+    });
+    return wire;
+}
+
+/// The single frame of a response that should have exactly one.
+std::pair<FrameKind, std::string> one_frame(AttestdService& service, std::string_view request) {
+    const auto frames = split_frames(collect_frames(service, request));
+    EXPECT_EQ(frames.size(), 1u);
+    return frames.empty() ? std::pair{FrameKind::Refusal, std::string{}} : frames.front();
+}
 
 template <std::size_t N>
 std::array<uint8_t, N> patterned(uint8_t seed) {
@@ -413,7 +453,7 @@ TEST_F(AttestdServiceTest, TheWirePathAlwaysAnswersTyped) {
     AttestdService service{config()};
 
     for (const char* garbage : {"", "{", "[]", "null", "{\"type\":\"whatever\"}"}) {
-        const auto document = json::parse(service.handle_request(garbage), nullptr, false);
+        const auto document = json::parse(one_frame(service, garbage).second, nullptr, false);
         ASSERT_FALSE(document.is_discarded()) << garbage;
         EXPECT_EQ(document["type"], std::string(nexus::attestd::kRefusalType)) << garbage;
         EXPECT_EQ(document["refusal"], "malformed_request") << garbage;
@@ -422,7 +462,7 @@ TEST_F(AttestdServiceTest, TheWirePathAlwaysAnswersTyped) {
     // A well-formed request gets a typed answer about the PLATFORM, never
     // about identity: the daemon holds no key and has no opinion on whose
     // challenge this is.
-    const auto document = json::parse(service.handle_request(good_request().dump()));
+    const auto document = json::parse(one_frame(service, good_request().dump()).second);
     EXPECT_EQ(document["type"], std::string(nexus::attestd::kRefusalType));
     EXPECT_EQ(document["refusal"], "platform_unavailable");
 }
@@ -435,26 +475,228 @@ TEST_F(AttestdServiceTest, TheWirePathAlwaysAnswersTyped) {
 // key material, so there is nothing for the privileged process to leak and
 // nothing it could sign a Nexus protocol object with.
 TEST_F(AttestdServiceTest, HoldsNoIdentityAndSignsNothing) {
-    const std::string response = AttestdService{config()}.handle_request(good_request().dump());
+    AttestdService service{config()};
+    const std::string response = collect_frames(service, good_request().dump());
     // Whatever the platform answers, the reply is a bundle or a refusal — never
     // a signed AttestationEvidence.
     EXPECT_EQ(response.find("identity_signature"), std::string::npos);
     EXPECT_EQ(response.find("epoch_vote_key"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// The local framed stream, and the bounds that keep it bounded
+// ---------------------------------------------------------------------------
+
 namespace {
 
-/// Written the way a deployment would: a secret is not world-accessible, and
-/// the loader refuses one that is.
-void write_secret(const fs::path& path, const std::string& text) {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    out << text;
-    out.close();
-    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
-                    fs::perm_options::replace);
+using nexus::attestd::FrameError;
+using nexus::attestd::ResponseAssembler;
+using nexus::attestd::encode_frame;
+using nexus::attestd::kMaxLocalChunks;
+using nexus::attestd::kMaxLocalFrameBytes;
+using nexus::attestd::read_framed_response;
+
+/// A bundle whose evidence is `log_bytes` of measurement log, so the size of
+/// the local response can be steered without a TPM.
+PlatformEvidenceBundle bundle_with_log(std::size_t log_bytes) {
+    PlatformEvidenceBundle b;
+    b.challenge_digest = patterned<32>(0x77);
+    b.platform.ima_log.assign(log_bytes, 'x');
+    b.platform.hcl_blob.assign(64, 0x5A);
+    b.platform.tpms_attest.assign(64, 0x5B);
+    return b;
+}
+
+std::string frames_for(const PlatformEvidenceBundle& b, bool* emitted = nullptr) {
+    std::string wire;
+    const bool ok = nexus::attestd::emit_bundle(b, [&](std::string_view f) {
+        wire.append(f);
+        return true;
+    });
+    if (emitted) *emitted = ok;
+    return wire;
+}
+
+/// Feed raw bytes to the reader over a socketpair. `close_write` models a daemon
+/// that hung up; leaving it open models one that stalled. The write runs on its
+/// own thread because a response larger than the socket buffer would otherwise
+/// block before the reader ever started.
+FrameError read_bytes(std::string_view wire, bool close_write, int deadline_seconds,
+                      PlatformEvidenceBundle* out = nullptr) {
+    int fds[2] = {-1, -1};
+    EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const std::string payload{wire};
+    std::thread writer([fd = fds[1], payload, close_write] {
+        std::size_t sent = 0;
+        while (sent < payload.size()) {
+            const ssize_t n = ::write(fd, payload.data() + sent, payload.size() - sent);
+            if (n <= 0) break;
+            sent += static_cast<std::size_t>(n);
+        }
+        if (close_write) ::close(fd);
+    });
+
+    PlatformEvidenceBundle sink;
+    const auto result = read_framed_response(fds[0], deadline_seconds, out ? *out : sink);
+    ::close(fds[0]);
+    writer.join();
+    if (!close_write) ::close(fds[1]);
+    return result.ok ? FrameError::None : result.transport;
 }
 
 }  // namespace
 
+TEST(AttestdFraming, ALocalResponseMayExceedTheMeshWireBound) {
+    // The layering D3 fixes. 56 KiB is what a PEER will accept; it is not a
+    // limit on what the local daemon may hand its own Nexus process.
+    const auto bundle = bundle_with_log(100 * 1024);
+    const auto encoded = nexus::security::encode_snp_vtpm_evidence(bundle.platform);
+    ASSERT_GT(encoded.size(), constants::kMaxPlatformEvidenceWireBytes);
 
+    bool emitted = false;
+    const std::string wire = frames_for(bundle, &emitted);
+    ASSERT_TRUE(emitted);
 
+    PlatformEvidenceBundle got;
+    EXPECT_EQ(read_bytes(wire, /*close_write=*/true, 5, &got), FrameError::None);
+    EXPECT_EQ(got.challenge_digest, bundle.challenge_digest);
+    EXPECT_EQ(got.platform.ima_log, bundle.platform.ima_log);
+}
+
+TEST(AttestdFraming, AFrameOverTheSizeBoundIsRefusedBeforeItsBodyIsRead) {
+    // Only the 5-byte header is written, and the write side stays OPEN. A reader
+    // that reserved or read the declared body would block to the deadline; the
+    // bound has to be checked first, so this returns immediately.
+    std::string header(5, '\0');
+    const uint32_t huge = static_cast<uint32_t>(kMaxLocalFrameBytes + 1);
+    header[0] = static_cast<char>((huge >> 24) & 0xFF);
+    header[1] = static_cast<char>((huge >> 16) & 0xFF);
+    header[2] = static_cast<char>((huge >> 8) & 0xFF);
+    header[3] = static_cast<char>(huge & 0xFF);
+    header[4] = static_cast<char>(nexus::attestd::FrameKind::Header);
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(read_bytes(header, /*close_write=*/false, 10), FrameError::Oversized);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(5));
+}
+
+TEST(AttestdFraming, MoreChunksThanTheBudgetAreRefused) {
+    ResponseAssembler assembler;
+    json head;
+    head["version"] = nexus::attestd::kAttestdWireVersion;
+    head["type"] = std::string(nexus::attestd::kBundleType);
+    head["challenge_digest"] = nexus::crypto::to_hex(patterned<32>(0x01));
+    head["platform_bytes"] = kMaxLocalFrameBytes * kMaxLocalChunks;
+    ASSERT_TRUE(assembler.offer(nexus::attestd::FrameKind::Header, head.dump()));
+
+    for (std::size_t i = 0; i < kMaxLocalChunks; ++i) {
+        ASSERT_TRUE(assembler.offer(nexus::attestd::FrameKind::EvidenceChunk, "x")) << i;
+    }
+    EXPECT_FALSE(assembler.offer(nexus::attestd::FrameKind::EvidenceChunk, "x"));
+    EXPECT_EQ(assembler.error(), FrameError::TooManyChunks);
+    EXPECT_FALSE(assembler.done());
+}
+
+TEST(AttestdFraming, AStalledStreamExpiresRatherThanWaiting) {
+    // Half a frame, write side left open: the deadline is the only thing that
+    // ends this, and it must.
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(read_bytes(std::string(3, '\0'), /*close_write=*/false, 1), FrameError::Truncated);
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    EXPECT_GE(elapsed, std::chrono::milliseconds(900));
+    EXPECT_LT(elapsed, std::chrono::seconds(10));
+}
+
+TEST(AttestdFraming, MalformedFramesAreRefused) {
+    // An unknown kind.
+    EXPECT_EQ(read_bytes(encode_frame(static_cast<nexus::attestd::FrameKind>(99), "{}"), true, 5),
+              FrameError::Malformed);
+
+    // A chunk before any header: the grammar is a state machine, not a bag.
+    EXPECT_EQ(read_bytes(encode_frame(nexus::attestd::FrameKind::EvidenceChunk, "x"), true, 5),
+              FrameError::Malformed);
+
+    // An End with nothing to end.
+    EXPECT_EQ(read_bytes(encode_frame(nexus::attestd::FrameKind::End, "{\"chunks\":0}"), true, 5),
+              FrameError::Malformed);
+
+    // A header that is not JSON, and one missing its length.
+    EXPECT_EQ(read_bytes(encode_frame(nexus::attestd::FrameKind::Header, "not json"), true, 5),
+              FrameError::Malformed);
+    EXPECT_EQ(read_bytes(encode_frame(nexus::attestd::FrameKind::Header, "{\"version\":1}"), true, 5),
+              FrameError::Malformed);
+}
+
+TEST(AttestdFraming, AHeaderDeclaringMoreThanTheBudgetIsRefused) {
+    json head;
+    head["version"] = nexus::attestd::kAttestdWireVersion;
+    head["type"] = std::string(nexus::attestd::kBundleType);
+    head["challenge_digest"] = nexus::crypto::to_hex(patterned<32>(0x01));
+    head["platform_bytes"] = kMaxLocalFrameBytes * kMaxLocalChunks + 1;
+
+    ResponseAssembler assembler;
+    EXPECT_FALSE(assembler.offer(nexus::attestd::FrameKind::Header, head.dump()));
+    EXPECT_EQ(assembler.error(), FrameError::TooLarge);
+}
+
+TEST(AttestdFraming, ReassembledBytesMustMatchWhatTheEndFrameCommittedTo) {
+    const auto bundle = bundle_with_log(1024);
+    std::string wire = frames_for(bundle);
+
+    // Flip a byte inside the evidence. The length still adds up, so only the
+    // committed digest catches it.
+    const auto at = wire.find("xxxx");
+    ASSERT_NE(at, std::string::npos);
+    wire[at] = 'y';
+
+    EXPECT_EQ(read_bytes(wire, true, 5), FrameError::Malformed);
+}
+
+TEST(AttestdFraming, ATruncatedStreamNeverYieldsABundle) {
+    const auto bundle = bundle_with_log(1024);
+    const std::string wire = frames_for(bundle);
+    // Everything but the End frame, then hang up.
+    EXPECT_EQ(read_bytes(wire.substr(0, wire.size() - 8), true, 5), FrameError::Truncated);
+}
+
+TEST(AttestdFraming, ARefusalTerminatesTheStreamAndCarriesNoBundle) {
+    std::string wire;
+    ASSERT_TRUE(nexus::attestd::emit_refusal(Refusal::PlatformUnavailable,
+                                             [&](std::string_view f) {
+                                                 wire.append(f);
+                                                 return true;
+                                             },
+                                             "no TPM here"));
+    int fds[2] = {-1, -1};
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    ASSERT_EQ(::write(fds[1], wire.data(), wire.size()), static_cast<ssize_t>(wire.size()));
+    ::close(fds[1]);
+
+    PlatformEvidenceBundle out;
+    const auto result = read_framed_response(fds[0], 5, out);
+    ::close(fds[0]);
+
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.refusal, Refusal::PlatformUnavailable);
+    EXPECT_EQ(result.transport, FrameError::None);
+    EXPECT_EQ(result.detail, "no TPM here");
+    EXPECT_TRUE(out.platform.empty());
+}
+
+TEST(AttestdFraming, TheRequestSurfaceIsStillOneChallengeAndNothingElse) {
+    // The client can only ever ask one thing, and the bytes it sends are the
+    // closed grammar the daemon parses — no path, no offset, no nonce, no PCR
+    // selection, no bytes to sign.
+    const auto request = nexus::attestd::encode_challenge_request(good_challenge());
+    const auto parsed = json::parse(request);
+    EXPECT_EQ(parsed.size(), 15u);
+    for (const char* forbidden : {"qualifying_data", "pcr_selection", "path", "offset",
+                                  "sign", "report_data", "length"}) {
+        EXPECT_FALSE(parsed.contains(forbidden)) << forbidden;
+    }
+    // And it round-trips into exactly the challenge that was asked for.
+    auto back = decode_challenge(std::string_view(request).substr(0, request.size() - 1));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(challenge_digest(*back), challenge_digest(good_challenge()));
+}

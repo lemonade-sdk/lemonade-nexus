@@ -154,6 +154,70 @@ TEST_F(TpmQuoteTest, PcrDigestBindsTheSuppliedValues) {
     EXPECT_FALSE(quote_pcr_digest_matches(*q, tampered, kTpmAlgSha256));
 }
 
+// ---------------------------------------------------------------------------
+// D2: PCR values are proven against the quote, not trusted beside it
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The prover's step 5, exactly: parse the quote, take the hash from the
+/// signature, and recompute pcrDigest over what PCR_Read returned.
+bool prover_binds_values(const std::vector<uint8_t>& attest,
+                         const std::vector<uint8_t>& signature,
+                         const std::vector<uint8_t>& values) {
+    auto q = parse_tpm_quote(attest);
+    auto hash = tpmt_signature_hash_alg(signature);
+    return q && hash && quote_pcr_digest_matches(*q, values, *hash);
+}
+
+}  // namespace
+
+TEST_F(TpmQuoteTest, ValuesThatMatchTheQuoteArePcrDigestBound) {
+    auto key = nexus_test::gen_rsa_key();
+    const auto attest = build_quote(extra_, sha256_of(pcr_values_), bitmap_);
+    const auto sig = sign_tpmt_rsa(key->pkey, attest);
+    EXPECT_TRUE(prover_binds_values(attest, sig, pcr_values_));
+}
+
+TEST_F(TpmQuoteTest, APcrExtendedBetweenQuoteAndReadIsRefused) {
+    // The race D2 exists to catch: PCR_Read runs after TPM2_Quote, so a PCR
+    // extended in between returns a value the quote never covered.
+    auto key = nexus_test::gen_rsa_key();
+    const auto attest = build_quote(extra_, sha256_of(pcr_values_), bitmap_);
+    const auto sig = sign_tpmt_rsa(key->pkey, attest);
+
+    auto moved = pcr_values_;
+    moved[4 * 32] ^= 0x01;  // PCR 10's slot: an exec landed mid-flight
+    EXPECT_FALSE(prover_binds_values(attest, sig, moved));
+}
+
+TEST_F(TpmQuoteTest, APcrSelectionMismatchIsRefused) {
+    // Values for four PCRs against a quote that selected five. Nothing here can
+    // be salvaged by offset arithmetic, and it must not be.
+    auto key = nexus_test::gen_rsa_key();
+    const auto attest = build_quote(extra_, sha256_of(pcr_values_), bitmap_);
+    const auto sig = sign_tpmt_rsa(key->pkey, attest);
+
+    std::vector<uint8_t> fewer(pcr_values_.begin(), pcr_values_.begin() + 4 * 32);
+    EXPECT_FALSE(prover_binds_values(attest, sig, fewer));
+
+    std::vector<uint8_t> more = pcr_values_;
+    more.insert(more.end(), 32, 23);
+    EXPECT_FALSE(prover_binds_values(attest, sig, more));
+}
+
+TEST_F(TpmQuoteTest, ATamperedPcrDigestIsRefused) {
+    auto key = nexus_test::gen_rsa_key();
+    auto attest = build_quote(extra_, sha256_of(pcr_values_), bitmap_);
+    const auto sig = sign_tpmt_rsa(key->pkey, attest);
+
+    // The digest is the last TPM2B in the structure.
+    attest.back() ^= 0x01;
+    EXPECT_FALSE(prover_binds_values(attest, sig, pcr_values_));
+    // And the tamper is not free: the signature no longer verifies either.
+    EXPECT_FALSE(verify_quote_signature_rsa(attest, sig, key->modulus, key->exponent));
+}
+
 TEST_F(TpmQuoteTest, ExtractsTheRequestedPcrFromTheConcatenatedValues) {
     const auto attest = build_quote(extra_, sha256_of(pcr_values_), bitmap_);
     auto q = parse_tpm_quote(attest);
@@ -417,6 +481,107 @@ TEST(ImaLogTest, LastMeasurementOfAPathWins) {
     ASSERT_TRUE(e.has_value());
     EXPECT_EQ(e->file_hash_hex, hex_rep(0xBB, 32));
     EXPECT_FALSE(ima_entry_for_path(*parsed, "/bin/absent").has_value());
+}
+
+// ---------------------------------------------------------------------------
+// D1: the quote defines the endpoint, not the log read
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// PCR 10 after the first `count` entries of a SHA-256 log built from `hashes`.
+std::vector<uint8_t> pcr_after(const std::vector<std::string>& hashes, std::size_t count) {
+    std::vector<uint8_t> pcr(32, 0);
+    for (std::size_t i = 0; i < count; ++i) {
+        std::vector<uint8_t> in = pcr;
+        for (std::size_t at = 0; at < hashes[i].size(); at += 2) {
+            in.push_back(static_cast<uint8_t>(std::stoul(hashes[i].substr(at, 2), nullptr, 16)));
+        }
+        pcr = sha256_of(in);
+    }
+    return pcr;
+}
+
+std::string log_of(const std::vector<std::string>& hashes, std::size_t count) {
+    std::string out;
+    for (std::size_t i = 0; i < count; ++i) {
+        out += ima_line(hashes[i], hex_rep(static_cast<uint8_t>(0xA0 + i), 32),
+                        "/bin/p" + std::to_string(i)) +
+               "\n";
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(ImaEndpointTest, ABusyHostGrowsTheLogAfterTheQuoteAndTheEndpointStillVerifies) {
+    // The shipped defect: the prover read the log, then quoted, so anything
+    // exec'd in between made the log replay PAST the quoted PCR and the verifier
+    // refused a correct host. Quote first, read after, cut at the quoted value.
+    std::vector<std::string> hashes;
+    for (uint8_t i = 0; i < 6; ++i) hashes.push_back(hex_rep(static_cast<uint8_t>(0x11 + i), 32));
+
+    const auto quoted = pcr_after(hashes, 4);        // what the quote covers
+    const std::string grown = log_of(hashes, 6);     // two more execs since
+
+    auto cut = ima_truncate_to_pcr(grown, kImaPcr, kTpmAlgSha256, quoted);
+    ASSERT_TRUE(cut.has_value());
+    EXPECT_EQ(*cut, log_of(hashes, 4));
+
+    auto parsed = parse_ima_ascii(*cut);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->entries.size(), 4u);
+    EXPECT_EQ(replay_ima_pcr(*parsed, kImaPcr, kTpmAlgSha256), quoted);
+
+    // The surplus really was surplus: the untruncated log does not replay.
+    auto whole = parse_ima_ascii(grown);
+    ASSERT_TRUE(whole.has_value());
+    EXPECT_NE(replay_ima_pcr(*whole, kImaPcr, kTpmAlgSha256), quoted);
+}
+
+TEST(ImaEndpointTest, ALogThatNeverReachesTheQuotedValueIsRefused) {
+    std::vector<std::string> hashes;
+    for (uint8_t i = 0; i < 4; ++i) hashes.push_back(hex_rep(static_cast<uint8_t>(0x11 + i), 32));
+
+    // A log missing an entry the quote covers: no prefix reproduces the value.
+    std::vector<std::string> holed = {hashes[0], hashes[2], hashes[3]};
+    EXPECT_FALSE(ima_truncate_to_pcr(log_of(holed, 3), kImaPcr, kTpmAlgSha256,
+                                     pcr_after(hashes, 4))
+                     .has_value());
+}
+
+TEST(ImaEndpointTest, AnUnextendedPcrCutsAtTheEmptyPrefix) {
+    std::vector<std::string> hashes{hex_rep(0x11, 32), hex_rep(0x22, 32)};
+    const std::vector<uint8_t> zero(32, 0);
+    auto cut = ima_truncate_to_pcr(log_of(hashes, 2), kImaPcr, kTpmAlgSha256, zero);
+    ASSERT_TRUE(cut.has_value());
+    EXPECT_TRUE(cut->empty());
+}
+
+TEST(ImaEndpointTest, EntriesForOtherPcrsRideAlongWithoutMovingTheEndpoint) {
+    // Only PCR 10 entries advance the value, but a PCR 11 line inside the cut
+    // must survive the cut — the verifier replays the same text.
+    const std::string h1 = hex_rep(0x11, 32), h2 = hex_rep(0x22, 32);
+    std::string log = ima_line(h1, hex_rep(0xAA, 32), "/a") + "\n";
+    log += "11 " + hex_rep(0x99, 32) + " ima-ng sha256:" + hex_rep(0xCC, 32) + " /other\n";
+    log += ima_line(h2, hex_rep(0xBB, 32), "/b") + "\n";
+
+    auto cut = ima_truncate_to_pcr(log, kImaPcr, kTpmAlgSha256, pcr_after({h1, h2}, 2));
+    ASSERT_TRUE(cut.has_value());
+    EXPECT_EQ(*cut, log);
+
+    auto at_one = ima_truncate_to_pcr(log, kImaPcr, kTpmAlgSha256, pcr_after({h1}, 1));
+    ASSERT_TRUE(at_one.has_value());
+    EXPECT_EQ(*at_one, ima_line(h1, hex_rep(0xAA, 32), "/a") + "\n");
+}
+
+TEST(ImaEndpointTest, TruncationIsRefusedInTheWrongBank) {
+    std::vector<std::string> hashes{hex_rep(0x11, 32)};
+    // A SHA-256 log against a SHA-1 target: the width alone disqualifies it, so
+    // no amount of folding can be made to "nearly" match.
+    EXPECT_FALSE(ima_truncate_to_pcr(log_of(hashes, 1), kImaPcr, kTpmAlgSha1,
+                                     std::vector<uint8_t>(20, 0xFF))
+                     .has_value());
 }
 
 // ===========================================================================

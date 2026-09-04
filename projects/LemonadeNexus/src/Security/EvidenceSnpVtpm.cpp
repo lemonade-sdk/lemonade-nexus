@@ -369,13 +369,17 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
 
     // 3. The kernel's measurement of the running binary — not our own hash of it.
     //
+    // This read is ONLY for the quote binding, which must be computed before
+    // TPM2_Quote. The log that ships is read after the quote, in step 6. Our
+    // binary was measured at exec(), so it sits in every prefix both reads share.
+    //
     // A missing measurement does NOT abort here. The two requirements are separate
     // — secure memory (the AMD-anchored quote) and secure binary (IMA) — and
     // collapsing them means an operator with a working platform and an
     // unconfigured IMA policy sees the same opaque failure as one with neither.
     // The evidence goes out carrying no binary hash and the VERIFIER refuses it;
     // ev.ima_unavailable says why, for diagnostics only.
-    ev.ima_log     = read_ima_ascii_log();
+    const std::string binding_log = read_ima_ascii_log();
     ev.binary_path = running_executable_path();
 
     // The IMA policy the kernel is enforcing. Most builds leave
@@ -407,7 +411,7 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
             }
         }
     }
-    if (ev.ima_log.empty()) {
+    if (binding_log.empty()) {
         std::error_code ec;
         const bool present =
             fs::exists("/sys/kernel/security/ima/ascii_runtime_measurements", ec);
@@ -416,7 +420,7 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
               "process must run as root to measure its own binary"
             : "IMA is not enabled: /sys/kernel/security/ima/ascii_runtime_measurements is "
               "absent, so the running binary has no measurement the kernel will vouch for";
-    } else if (auto log = parse_ima_ascii(ev.ima_log); !log) {
+    } else if (auto log = parse_ima_ascii(binding_log); !log) {
         ev.ima_unavailable = "the IMA measurement log did not parse";
     } else if (auto entry = ima_entry_for_path(*log, ev.binary_path); !entry) {
         ev.ima_unavailable = "the IMA log carries no measurement of '" + ev.binary_path +
@@ -487,12 +491,70 @@ std::optional<SnpVtpmEvidence> produce_snp_vtpm_evidence(const EvidenceProduceCo
     if (quoted) Esys_Free(quoted);
     if (sig) Esys_Free(sig);
 
+    Esys_TR_Close(sess.esys, &ak);
+
+    // 5. PCR values, and the proof that they are the ones the quote signed.
+    //
+    // TPM2_Quote returns pcrDigest, not values, so the values come from a
+    // separate PCR_Read — and separate means racy. Recomputing the digest is
+    // both the binding and the race detector: one hash, one comparison, no retry.
     if (ok && !read_pcr_values(sess.esys, ev.pcr_values)) {
         set_fail(failure, "could not read back the quoted PCR values");
         ok = false;
     }
+    std::optional<TpmQuote> quote;
+    if (ok) {
+        quote = parse_tpm_quote(ev.tpms_attest);
+        const auto quote_hash = tpmt_signature_hash_alg(ev.tpm_signature);
+        if (!quote || !quote_hash) {
+            set_fail(failure, "the vTPM returned a quote this build cannot parse");
+            ok = false;
+        } else if (!quote_pcr_digest_matches(*quote, ev.pcr_values, *quote_hash)) {
+            set_fail(failure, "the PCR values read back do not hash to the quote's signed "
+                              "pcrDigest — a quoted PCR was extended between the quote and the "
+                              "read, so these values are not the ones the vTPM attested");
+            ok = false;
+        }
+    }
 
-    Esys_TR_Close(sess.esys, &ak);
+    // 6. The measurement log, read AFTER the quote and cut where the quote ends.
+    //
+    // Reading it first was the bug: on a busy host the log outgrew the PCR the
+    // quote covers and the replay failed on timing alone. Reading it after gives
+    // a superset, and the quoted PCR 10 names its own endpoint inside it.
+    if (ok) {
+        ev.ima_log = read_ima_ascii_log();
+    }
+    if (ok && !ev.ima_log.empty()) {
+        auto log = parse_ima_ascii(ev.ima_log);
+        const uint16_t bank = log ? ima_replay_bank(*log) : 0;
+        auto quoted_pcr10 =
+            bank ? quote_pcr_value(*quote, bank, kImaPcr, ev.pcr_values) : std::nullopt;
+        auto cut = quoted_pcr10 ? ima_truncate_to_pcr(ev.ima_log, kImaPcr, bank, *quoted_pcr10)
+                                : std::nullopt;
+        if (!cut) {
+            set_fail(failure, "no prefix of the IMA log replays to the quoted PCR 10 — the log "
+                              "and the quote do not describe the same measurement sequence");
+            ok = false;
+        } else {
+            ev.ima_log = std::move(*cut);
+        }
+    }
+
+    // The binding covers the pre-quote measurement. If the cut log disagrees,
+    // the binary was re-measured mid-flight; say so here rather than let it fail
+    // at the far end as a replay mismatch.
+    if (ok && !ev.binary_sha256.empty()) {
+        auto log = parse_ima_ascii(ev.ima_log);
+        auto entry = log ? ima_entry_for_path(*log, ev.binary_path) : std::nullopt;
+        if (!entry || entry->file_hash_hex != ev.binary_sha256) {
+            set_fail(failure, "'" + ev.binary_path + "' was re-measured between the binding and "
+                              "the quote, so the quoted log no longer carries the measurement "
+                              "the quote is bound to");
+            ok = false;
+        }
+    }
+
     if (!ok) return std::nullopt;
     return ev;
 }

@@ -45,20 +45,17 @@ NetworkId net(uint8_t b) {
     return n;
 }
 
-/// The daemon, wired in as the producer's platform source. It receives only the
-/// nonce and the identity public key, exactly as the socket path would.
+/// The daemon, wired in as the producer's platform source. It receives the
+/// challenge and nothing else, exactly as the socket path does.
 PlatformEvidenceSource attestd_source(attestd::AttestdService& daemon,
-                                      const AttestationChallenge& challenge,
                                       attestd::Refusal* refusal_out) {
-    return [&daemon, challenge, refusal_out](const Digest& nonce,
-                                             const crypto::Ed25519PublicKey&) {
+    return [&daemon, refusal_out](const AttestationChallenge& challenge) {
         attestd::PlatformEvidenceBundle bundle;
         std::string detail;
         const attestd::Refusal r = daemon.answer(challenge, bundle, &detail);
         if (refusal_out) *refusal_out = r;
-        // The producer's nonce and the daemon's derived digest must agree, or
-        // the bundle answers a different challenge than the one being signed.
-        EXPECT_EQ(bundle.challenge_digest, nonce)
+        // The daemon derives its own digest; it must be the one being signed.
+        EXPECT_EQ(bundle.challenge_digest, challenge_digest(challenge))
             << "the daemon bound its evidence to a different challenge";
         return bundle.platform;
     };
@@ -94,7 +91,7 @@ struct AttestdIntegration : ::testing::Test {
         EvidenceProducerSources sources;
         sources.identity = identity_;
         sources.vote_key_for_epoch = [this](EpochId) { return vote_key_; };
-        sources.platform_source = attestd_source(daemon, challenge, refusal);
+        sources.platform_source = attestd_source(daemon, refusal);
         return PlatformEvidenceProducer(std::move(sources)).produce(challenge);
     }
 };
@@ -115,7 +112,11 @@ TEST_F(AttestdIntegration, TheDaemonReturnsNoSignatureAndNoVoteKey) {
     // The bundle is platform material bound to a digest. Authority is absent by
     // construction: there is no field for either.
     EXPECT_EQ(bundle.challenge_digest, challenge_digest(challenge));
-    const std::string wire = attestd::encode_bundle(bundle);
+    std::string wire;
+    EXPECT_TRUE(attestd::emit_bundle(bundle, [&](std::string_view frame) {
+        wire.append(frame);
+        return true;
+    }));
     EXPECT_EQ(wire.find("identity_signature"), std::string::npos);
     EXPECT_EQ(wire.find("epoch_vote_key"), std::string::npos);
 }
@@ -184,7 +185,7 @@ TEST_F(AttestdIntegration, NoVoteKeyMeansNoEvidence) {
     EvidenceProducerSources sources;
     sources.identity = identity_;
     sources.vote_key_for_epoch = [](EpochId) { return std::nullopt; };
-    sources.platform_source = attestd_source(daemon, challenge, nullptr);
+    sources.platform_source = attestd_source(daemon, nullptr);
     EXPECT_FALSE(PlatformEvidenceProducer(std::move(sources)).produce(challenge).has_value());
 }
 

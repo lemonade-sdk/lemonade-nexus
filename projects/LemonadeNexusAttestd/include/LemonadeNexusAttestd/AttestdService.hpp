@@ -20,6 +20,7 @@
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
+#include <LemonadeNexusAttestd/AttestdCodec.hpp>
 #include <LemonadeNexusAttestd/AttestdGate.hpp>
 
 #include <filesystem>
@@ -57,10 +58,11 @@ public:
     [[nodiscard]] Refusal answer(const security::AttestationChallenge& challenge,
                                  PlatformEvidenceBundle& out, std::string* detail);
 
-    /// The wire path: bytes in, bytes out. Always produces a response — a
-    /// caller that sends garbage gets a typed refusal, never a closed socket
-    /// with no explanation.
-    [[nodiscard]] std::string handle_request(std::string_view request);
+    /// The wire path: bytes in, frames out. Always emits a response — a caller
+    /// that sends garbage gets a typed refusal, never a closed socket with no
+    /// explanation. Streams rather than returning a string, so the evidence is
+    /// never held twice.
+    void handle_request(std::string_view request, const FrameSink& sink);
 
 private:
     AttestdConfig config_;

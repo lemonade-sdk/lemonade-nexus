@@ -1,17 +1,13 @@
 #include <LemonadeNexusAttestd/AttestdService.hpp>
 
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
-#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexusAttestd/AttestdCodec.hpp>
 
-#include <sodium.h>
 #include <spdlog/spdlog.h>
 
 #include <utility>
 
 namespace nexus::attestd {
-
-namespace constants = nexus::security::constants;
 
 AttestdService::AttestdService(AttestdConfig config) : config_(std::move(config)) {}
 
@@ -68,13 +64,15 @@ Refusal AttestdService::answer(const security::AttestationChallenge& challenge,
         return Refusal::EvidenceUnavailable;
     }
 
-    // A bundle no peer can carry is worse than no bundle: it fails late, at the
-    // far end, as an unexplained drop.
+    // Bounded by what this operation can carry LOCALLY, never by the mesh's
+    // kMaxPlatformEvidenceWireBytes — that is a decision for the process that
+    // gossips, and enforcing it here withheld correct answers from local callers.
     if (const auto encoded = security::encode_snp_vtpm_evidence(*bundle);
-        encoded.size() > constants::kMaxPlatformEvidenceWireBytes) {
+        encoded.size() > kMaxLocalFrameBytes * kMaxLocalChunks) {
         if (detail) {
             *detail = "evidence is " + std::to_string(encoded.size()) + " bytes, over the " +
-                      std::to_string(constants::kMaxPlatformEvidenceWireBytes) + " byte bound";
+                      std::to_string(kMaxLocalFrameBytes * kMaxLocalChunks) +
+                      " byte local stream bound";
         }
         return Refusal::EvidenceOversized;
     }
@@ -83,11 +81,12 @@ Refusal AttestdService::answer(const security::AttestationChallenge& challenge,
     return Refusal::None;
 }
 
-std::string AttestdService::handle_request(std::string_view request) {
+void AttestdService::handle_request(std::string_view request, const FrameSink& sink) {
     const auto challenge = decode_challenge(request);
     if (!challenge) {
         spdlog::warn("[attestd] refused: {}", refusal_name(Refusal::MalformedRequest));
-        return encode_refusal(Refusal::MalformedRequest);
+        (void)emit_refusal(Refusal::MalformedRequest, sink);
+        return;
     }
 
     PlatformEvidenceBundle bundle;
@@ -98,7 +97,8 @@ std::string AttestdService::handle_request(std::string_view request) {
                      challenge->epoch, static_cast<uint16_t>(challenge->purpose),
                      challenge->incarnation, refusal_name(refusal),
                      detail.empty() ? "" : " — ", detail);
-        return encode_refusal(refusal, detail);
+        (void)emit_refusal(refusal, sink, detail);
+        return;
     }
 
     spdlog::info("[attestd] answered epoch={} purpose={} incarnation={} challenge={} binary={}",
@@ -106,7 +106,11 @@ std::string AttestdService::handle_request(std::string_view request) {
                  challenge->incarnation, crypto::to_hex(bundle.challenge_digest),
                  bundle.platform.binary_sha256.empty() ? "unmeasured"
                                                        : bundle.platform.binary_sha256);
-    return encode_bundle(bundle);
+    if (!emit_bundle(bundle, sink)) {
+        // Caller gone, or the bundle needs more frames than one operation allows.
+        spdlog::warn("[attestd] response stream ended early for epoch={} incarnation={}",
+                     challenge->epoch, challenge->incarnation);
+    }
 }
 
 }  // namespace nexus::attestd

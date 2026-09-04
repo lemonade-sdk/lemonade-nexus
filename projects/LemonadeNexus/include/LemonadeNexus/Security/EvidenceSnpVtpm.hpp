@@ -56,7 +56,9 @@ struct SnpVtpmEvidence {
     std::vector<uint8_t> tpms_attest;    ///< the signed TPMS_ATTEST
     std::vector<uint8_t> tpm_signature;  ///< TPMT_SIGNATURE wire bytes, under HCLAkPub
     std::vector<uint8_t> pcr_values;     ///< concatenated quoted PCR values
-    std::string          ima_log;        ///< IMA ASCII measurement log
+    /// IMA ASCII log, cut at the entry whose replay reaches the quoted PCR 10.
+    /// Read after the quote, so it is a superset; see ima_truncate_to_pcr.
+    std::string          ima_log;
     std::string          binary_path;    ///< which IMA entry describes the running binary
     std::string          binary_sha256;  ///< hex; bound into the quote, confirmed against the log
     /// Why the prover could not measure its own binary. Diagnostic only — a

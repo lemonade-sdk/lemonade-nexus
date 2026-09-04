@@ -1,10 +1,12 @@
 #include <LemonadeNexusAttestd/AttestdSocket.hpp>
 
 #include <LemonadeNexusAttestd/AttestdCodec.hpp>
+#include <LemonadeNexusAttestd/AttestdFraming.hpp>
 
 #include <spdlog/spdlog.h>
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -24,13 +26,11 @@ namespace {
 
 #ifndef _WIN32
 
-/// How long an accepted connection may take to send its request or read its
-/// reply. Bounded so one wedged local client cannot hold the single-threaded
-/// server forever.
-constexpr int kPeerTimeoutSeconds = 10;
-
 /// Accept wakes at this cadence to notice a shutdown request.
 constexpr int kAcceptPollMs = 250;
+
+/// Per-syscall patience. kLocalStreamDeadlineSeconds bounds the whole exchange.
+constexpr int kPeerTimeoutSeconds = 10;
 
 void set_timeouts(int fd) {
     ::timeval tv{};
@@ -197,11 +197,22 @@ void UnixRequestSocket::serve(const RequestHandler& handler, const std::atomic<b
         if (read_request(peer, request)) {
             spdlog::debug("[attestd] request from {} ({} bytes)", peer_description(peer),
                           request.size());
-            std::string response = handler(request);
-            response.push_back('\n');
-            if (!write_all(peer, response)) {
-                spdlog::warn("[attestd] peer {} closed before reading the response",
-                             peer_description(peer));
+
+            // One deadline for the whole exchange, quote included, so a stalled
+            // stream costs the deadline rather than the thread.
+            const auto expires = std::chrono::steady_clock::now() +
+                                 std::chrono::seconds(kLocalStreamDeadlineSeconds);
+            std::size_t written = 0;
+            const ResponseWriter write = [&](std::string_view bytes) {
+                if (bytes.empty()) return false;  // a frame the emitter could not size
+                if (std::chrono::steady_clock::now() >= expires) return false;
+                if (written + bytes.size() > kMaxLocalResponseBytes) return false;
+                written += bytes.size();
+                return write_all(peer, bytes);
+            };
+            handler(request, write);
+            if (written == 0) {
+                spdlog::warn("[attestd] peer {} got no response bytes", peer_description(peer));
             }
         } else {
             spdlog::debug("[attestd] peer {} sent nothing", peer_description(peer));
