@@ -168,6 +168,40 @@ TEST_F(AmdProductDiscoveryTest, ACertificateFromAnotherChainDoesNotVerifyUnderTh
     EXPECT_NE(crossed.failure.find("AMD root"), std::string::npos) << crossed.failure;
 }
 
+// --- the live Azure Genoa host ---------------------------------------------
+
+// The combination the Milan default actually broke: an Azure paravisor CVM on
+// Genoa silicon. Captured from nexus01 (Standard_DC2as_v6, EPYC 9V74). Before
+// the fix this host asked AMD for a Milan VCEK and got a 404, so it produced no
+// evidence at all while every verifier-side check would have accepted it.
+TEST_F(AmdProductDiscoveryTest, TheLiveAzureGenoaHostResolvesToGenoa) {
+    const auto blob = read_bytes("azure_genoa_hcl.bin");
+    auto hcl = parse_hcl_blob(blob);
+    ASSERT_TRUE(hcl.has_value());
+    // Azure shape: the AK is bound through REPORT_DATA, not asserted.
+    EXPECT_TRUE(hcl->report_data_binds_runtime);
+    EXPECT_EQ(hcl->ak.kid, "HCLAkPub");
+
+    const auto vcek = read_bytes("vcek_azure_genoa.der");
+    const auto endorsement = discover_amd_endorsement({}, hcl->snp, false, always(vcek));
+    ASSERT_FALSE(endorsement.empty());
+    EXPECT_EQ(endorsement.product, "Genoa");
+
+    // And the KDS path it would have used is the Genoa one.
+    EXPECT_NE(vcek_kds_url(hcl->snp, endorsement.product).find("/vcek/v1/Genoa/"),
+              std::string::npos);
+}
+
+// The same host's evidence must NOT resolve under Milan, which is what the old
+// hard-coded default asked for.
+TEST_F(AmdProductDiscoveryTest, TheLiveAzureGenoaHostIsNotEndorsedByMilan) {
+    auto hcl = parse_hcl_blob(read_bytes("azure_genoa_hcl.bin"));
+    ASSERT_TRUE(hcl.has_value());
+    const auto milan = verify_snp_signature(hcl->snp, read_bytes("vcek_milan.der"),
+                                             pinned_amd_chain("Milan"));
+    EXPECT_FALSE(milan.ok);
+}
+
 // --- the chip binding -------------------------------------------------------
 
 // The VCEK is issued per chip. A valid certificate for a DIFFERENT chip of the
