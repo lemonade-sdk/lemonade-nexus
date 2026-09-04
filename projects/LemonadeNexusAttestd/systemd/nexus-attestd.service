@@ -111,13 +111,22 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources @obsolete @debug @mount @swap @reboot @module @clock @cpu-emulation @raw-io @keyring
+# chown lives in @privileged, but the daemon needs exactly one call: setting the
+# socket's group to the one that forms its ACL. Without this the socket cannot be
+# created and the daemon exits at startup. Everything else in @privileged stays
+# blocked, and the daemon cannot chown to a group it is not a member of anyway.
+SystemCallFilter=chown fchown fchownat lchown chown32 fchown32 lchown32
 SystemCallErrorNumber=EPERM
 
 # A core dump would contain live TPM session state and the platform bundle
 # and live TPM session state. Both halves are needed: LimitCORE=0 stops the
-# kernel writing one, CoreDumpFilter=0x00 makes any dump that still happens
+# kernel writing one, # CoreDumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
+# older systemd, so this is belt-and-braces where it is understood.
+CoreDumpFilter=0x00 makes any dump that still happens
 # (a coredump handler with its own limits) carry no mapped pages.
 LimitCORE=0
+# CoreDumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
+# older systemd, so this is belt-and-braces where it is understood.
 CoreDumpFilter=0x00
 
 # Bounded work: one request at a time, a few file descriptors, no forking.
