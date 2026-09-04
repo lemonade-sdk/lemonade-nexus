@@ -160,8 +160,9 @@ struct EvidenceVerdict {
     std::string tcb;
     std::string report_summary;
     /// True when the IMA log could only be replayed in the SHA-1 bank, so log
-    /// integrity rests on SHA-1 collision resistance. Fixed by booting the guest
-    /// with ima_template_hash_algo=sha256.
+    /// integrity rests on SHA-1 collision resistance. This is a property of the
+    /// ASCII log, which carries only the SHA-1 template digest; the kernel's
+    /// SHA-256 bank may well be correct. Replaying it needs the binary log.
     bool ima_replayed_in_sha1_bank{false};
 
     /// Per-link outcomes, so a caller can build a Tier 1 evidence state without

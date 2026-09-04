@@ -56,10 +56,13 @@ struct ImaLog {
 /// matched exactly, the SHA-256 bank did not, and no zero-extension rule bridges
 /// them because the SHA-256 bank holds a genuinely different digest.
 ///
-/// So the bank is chosen by the log's own width rather than fixed. Booting with
-/// `ima_template_hash_algo=sha256` upgrades this to SHA-256 with no code change;
-/// until then log integrity rests on SHA-1 collision resistance, which callers are
-/// expected to surface rather than hide.
+/// So the bank is chosen by the log's own width rather than fixed, and with an
+/// ASCII log that width is always SHA-1. No boot parameter changes this: the
+/// SHA-256 template digests are not in the ASCII format at all. Measured on the
+/// live Azure box, the kernel's SHA-256 bank replays correctly from
+/// binary_runtime_measurements — so reaching it is a format change here, not a
+/// host configuration change. Until then log integrity rests on SHA-1 collision
+/// resistance, which callers are expected to surface rather than hide.
 [[nodiscard]] uint16_t ima_replay_bank(const ImaLog& log);
 
 /// The kernel's measurement of `path`. The LAST entry wins: a file re-measured

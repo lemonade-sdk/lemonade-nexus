@@ -344,7 +344,8 @@ std::string format_probe_report(const PlatformProbeResult& r) {
     }
     if (r.ima_sha1_bank) {
         s += "  WARNING: the IMA log replays only in the SHA-1 PCR bank, so log integrity "
-             "rests on SHA-1.\n           Boot the guest with ima_template_hash_algo=sha256.\n";
+             "rests on SHA-1.\n           The ASCII log carries no SHA-256 template digests; "
+             "no boot parameter changes that.\n";
     }
     if (!r.chip_id_hex.empty())     s += "  chip id:     " + r.chip_id_hex + "\n";
     if (!r.tcb.empty())             s += "  tcb:         " + r.tcb + "\n";
