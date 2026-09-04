@@ -44,9 +44,20 @@ void set_timeouts(int fd) {
 std::string peer_description(int fd) {
     uid_t uid = 0;
     gid_t gid = 0;
+#if defined(__linux__)
+    // Linux spells this SO_PEERCRED; getpeereid is a BSD interface.
+    struct ucred cred {};
+    socklen_t len = sizeof(cred);
+    if (::getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0) {
+        uid = cred.uid;
+        gid = cred.gid;
+        return "uid=" + std::to_string(uid) + " gid=" + std::to_string(gid);
+    }
+#else
     if (::getpeereid(fd, &uid, &gid) == 0) {
         return "uid=" + std::to_string(uid) + " gid=" + std::to_string(gid);
     }
+#endif
     return "uid=? gid=?";
 }
 
