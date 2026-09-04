@@ -20,6 +20,15 @@
 
 namespace nexus::security {
 
+/// Where the platform half of a bundle comes from, given the quote nonce and the
+/// identity the binding must cover. Unset means produce it in this process,
+/// which needs TPM and IMA access here. Set it to reach a privileged helper
+/// (nexus-attestd) instead, so this process stays unprivileged. Either way the
+/// identity key never leaves here: the source is handed a PUBLIC key and returns
+/// evidence, and this class does the signing.
+using PlatformEvidenceSource =
+    std::function<SnpVtpmEvidence(const Digest& nonce, const crypto::Ed25519PublicKey& identity)>;
+
 struct EvidenceProducerSources {
     /// This node's identity. The NodeId is identity.public_key.
     crypto::Ed25519Keypair identity;
@@ -32,6 +41,10 @@ struct EvidenceProducerSources {
     /// never written into a bundle, because a self-declared path is the
     /// self-attestation that architecture 5.1 forbids.
     std::string nexus_binary_path;
+
+    /// Optional out-of-process platform source; see PlatformEvidenceSource.
+    /// Last so existing positional initialisation keeps working.
+    PlatformEvidenceSource platform_source;
 };
 
 class PlatformEvidenceProducer final : public IEvidenceProducer {

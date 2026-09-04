@@ -8,6 +8,48 @@
 # This collector does not decide trust. A remote Nexus verifier must examine
 # the evidence against the approved profile in the verified Nexus binary.
 #
+# --- The evidence binding ---------------------------------------------------
+#
+# There is exactly one evidence-binding algorithm in this system. It is declared
+# in projects/LemonadeNexus/include/LemonadeNexus/Security/EvidenceBinding.hpp
+# and implemented in projects/LemonadeNexus/src/Security/EvidenceBinding.cpp:
+#
+#   evidence_binding(nonce, identity_pubkey, binary_measurement) =
+#       SHA-256( LP("lemonade-nexus/evidence-binding:v1")
+#              | LP(nonce) | LP(identity_pubkey) | LP(binary_measurement) )
+#
+#   LP(x) = the length of x as a 32-bit little-endian integer, then x itself.
+#
+# Those 32 bytes are what the prover hands TPM2_Quote as qualifyingData, and
+# exactly what verify_snp_vtpm_evidence() recomputes and compares against the
+# quote's extraData. The SNP REPORT_DATA form is the same 32 bytes zero-extended
+# to 64 (evidence_report_data).
+#
+# Until 0.2.0 this collector fed the raw --challenge bytes straight to
+# "tpm2_quote -q" and used sha512(challenge) as REPORT_DATA. Neither value can
+# ever equal the binding a verifier computes, so evidence collected the
+# documented way was guaranteed to be rejected — while the flag name invited the
+# operator to believe it was production evidence. The collector now builds the
+# real binding from the real inputs. prepare_binding() below carries a python3
+# reproduction of the C++, kept byte-for-byte equivalent to it; that
+# reproduction is the only place the collector derives qualifyingData, in either
+# mode, so the collector cannot drift into a second binding algorithm.
+#
+# The three inputs, and where an operator gets them:
+#
+#   nonce               challenge_digest(AttestationChallenge) — the 32-byte
+#                       digest the challenging Tier 1 set computed over the whole
+#                       challenge. Pass it with --challenge-digest. It is NOT the
+#                       challenge's own `nonce` field, and not raw challenge
+#                       bytes; see PlatformEvidenceProducer::produce().
+#   identity_pubkey     the node's 32-byte Ed25519 public key, which is also the
+#                       challenge's node_key (--identity-pubkey).
+#   binary_measurement  the raw bytes of the sha256 that IMA recorded for the
+#                       running Nexus executable, or empty when IMA measured
+#                       nothing. --binary-measurement defaults to empty and
+#                       accepts "auto" to read it from this host's IMA log the
+#                       way the prover does.
+#
 # Recommended use:
 #
 #   sudo ./nexus-attest-profile reference \
@@ -15,11 +57,18 @@
 #       --service nexus.service
 #
 #   sudo ./nexus-attest-profile evidence \
-#       --challenge /path/to/challenge.bin \
+#       --challenge-digest 0123...ef \
+#       --identity-pubkey  89ab...cd \
+#       --binary-measurement auto \
 #       --nexus-binary /usr/local/bin/nexus \
 #       --service nexus.service
 #
-# The --challenge value can also be an even-length hexadecimal string.
+# reference mode runs the same binding over a locally generated random nonce, so
+# the quote path is exercised end to end but no verifier issued that nonce: a
+# reference bundle is a known-good host profile, never an answer to a live
+# challenge. Only evidence mode produces a quote a Nexus verifier can accept.
+#
+# python3 is required: it computes the binding.
 #
 # Azure AMD CVM defaults:
 #   Attestation report NV index: 0x01400001
@@ -34,13 +83,20 @@ IFS=$'\n\t'
 umask 077
 
 PROGRAM="nexus-attest-profile"
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 MODE=""
 OUT_DIR=""
 NEXUS_BINARY="${NEXUS_BINARY:-/usr/local/bin/nexus}"
 NEXUS_SERVICE="${NEXUS_SERVICE:-nexus.service}"
+
+# Evidence-binding inputs. CHALLENGE_INPUT is a reference-mode-only override for
+# the locally generated nonce; evidence mode refuses it, because raw challenge
+# bytes are not what a verifier binds to.
 CHALLENGE_INPUT=""
+CHALLENGE_DIGEST_INPUT=""
+IDENTITY_PUBKEY_INPUT=""
+BINARY_MEASUREMENT_INPUT=""
 
 AZURE_ATTESTATION_REPORT_INDEX="${AZURE_ATTESTATION_REPORT_INDEX:-0x01400001}"
 AZURE_AK_CERT_INDEX="${AZURE_AK_CERT_INDEX:-0x01C101D0}"
@@ -56,22 +112,48 @@ usage() {
     cat <<'EOF'
 Usage:
   nexus-attest-profile reference [options]
-  nexus-attest-profile evidence --challenge <hex-or-file> [options]
+  nexus-attest-profile evidence
+      --challenge-digest <64 hex>
+      --identity-pubkey <64 hex | file>
+      [--binary-measurement <64 hex | auto>] [options]
 
 Modes:
   reference
-      Collect a known-good host profile.
-      The collector generates a random local quote challenge.
+      Collect a known-good host profile. The collector generates a random
+      32-byte nonce locally. The quote is bound with the production algorithm,
+      but no verifier issued that nonce, so the bundle answers no live
+      challenge and cannot be submitted as attestation evidence.
 
   evidence
-      Collect live attestation evidence.
-      A caller-supplied challenge is required.
+      Collect live attestation evidence a Nexus verifier can accept. The quote's
+      qualifyingData is evidence_binding(nonce, identity_pubkey,
+      binary_measurement) exactly as the Nexus prover and verifier compute it,
+      and the native SNP REPORT_DATA is that value zero-extended to 64 bytes.
 
-Options:
-  --challenge VALUE
-      A binary challenge file or an even-length hexadecimal string.
+Evidence-binding options:
+  --challenge-digest HEX
+      The 32-byte challenge_digest(AttestationChallenge) issued by the
+      challenging Tier 1 set, as 64 hexadecimal characters. This is the nonce
+      input of the binding. It is not the challenge's own nonce field and not
+      raw challenge bytes. Required in evidence mode.
+
+  --identity-pubkey VALUE
+      This node's 32-byte Ed25519 public key: 64 hexadecimal characters, a file
+      of 32 raw bytes, or a file holding that hex as text.
       Required in evidence mode.
 
+  --binary-measurement VALUE
+      The sha256 IMA recorded for the running Nexus executable, as 64
+      hexadecimal characters, or "auto" to read it from this host's IMA log the
+      way the prover does. Default: empty, which is the binding the prover uses
+      on a host where IMA measured nothing.
+
+  --challenge VALUE
+      Reference mode only: use these bytes as the local nonce instead of 32
+      random ones. A binary file or an even-length hexadecimal string.
+      Rejected in evidence mode — a verifier binds to --challenge-digest.
+
+Options:
   --nexus-binary PATH
       Nexus executable path.
       Default: /usr/local/bin/nexus
@@ -222,6 +304,21 @@ parse_args() {
                 CHALLENGE_INPUT="$2"
                 shift 2
                 ;;
+            --challenge-digest)
+                [[ $# -ge 2 ]] || { log "ERROR: --challenge-digest needs a value."; exit 2; }
+                CHALLENGE_DIGEST_INPUT="$2"
+                shift 2
+                ;;
+            --identity-pubkey)
+                [[ $# -ge 2 ]] || { log "ERROR: --identity-pubkey needs a value."; exit 2; }
+                IDENTITY_PUBKEY_INPUT="$2"
+                shift 2
+                ;;
+            --binary-measurement)
+                [[ $# -ge 2 ]] || { log "ERROR: --binary-measurement needs a value."; exit 2; }
+                BINARY_MEASUREMENT_INPUT="$2"
+                shift 2
+                ;;
             --nexus-binary)
                 [[ $# -ge 2 ]] || { log "ERROR: --nexus-binary needs a value."; exit 2; }
                 NEXUS_BINARY="$2"
@@ -254,9 +351,30 @@ parse_args() {
         esac
     done
 
-    if [[ "$MODE" == "evidence" && -z "$CHALLENGE_INPUT" ]]; then
-        log "ERROR: evidence mode requires --challenge."
-        exit 2
+    if [[ "$MODE" == "evidence" ]]; then
+        # Refuse the old flag loudly. Silently reinterpreting it would recreate
+        # the defect this version exists to fix.
+        if [[ -n "$CHALLENGE_INPUT" ]]; then
+            log "ERROR: --challenge is not a production binding input."
+            log "       A verifier compares the quote's extraData against"
+            log "       evidence_binding(challenge_digest, identity_pubkey, binary_measurement)."
+            log "       Pass the 32-byte challenge digest with --challenge-digest instead."
+            exit 2
+        fi
+        if [[ -z "$CHALLENGE_DIGEST_INPUT" ]]; then
+            log "ERROR: evidence mode requires --challenge-digest."
+            exit 2
+        fi
+        if [[ -z "$IDENTITY_PUBKEY_INPUT" ]]; then
+            log "ERROR: evidence mode requires --identity-pubkey."
+            exit 2
+        fi
+    else
+        if [[ -n "$CHALLENGE_DIGEST_INPUT" || -n "$IDENTITY_PUBKEY_INPUT" ]]; then
+            log "ERROR: --challenge-digest and --identity-pubkey belong to evidence mode."
+            log "       reference mode collects a host profile, not an answer to a challenge."
+            exit 2
+        fi
     fi
 }
 
@@ -267,6 +385,7 @@ make_output_tree() {
 
     mkdir -p \
         "$OUT_DIR" \
+        "$OUT_DIR/binding" \
         "$OUT_DIR/platform" \
         "$OUT_DIR/tpm" \
         "$OUT_DIR/boot" \
@@ -284,50 +403,333 @@ make_output_tree() {
     : > "$STATUS_FILE"
 }
 
-prepare_challenge() {
-    local challenge_file="$OUT_DIR/challenge.bin"
+# --- The evidence binding ---------------------------------------------------
+#
+# The single place this collector derives a qualifyingData / REPORT_DATA value.
+# See the file header for why it exists and what it must agree with.
 
-    if [[ "$MODE" == "reference" && -z "$CHALLENGE_INPUT" ]]; then
-        if dd if=/dev/urandom of="$challenge_file" bs=32 count=1 status=none; then
-            record "challenge" "ok" "generated 32 random bytes"
-        else
-            record "challenge" "error" "could not generate random challenge"
-            return 1
+# The prover measures the executable it is actually running, so "auto" resolves
+# the same way: the service's live exe when there is one, the configured path
+# otherwise.
+resolve_measured_binary_path() {
+    local pid path
+    if have systemctl; then
+        pid="$(systemctl show -p MainPID --value "$NEXUS_SERVICE" 2>/dev/null || true)"
+        if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+            path="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+            if [[ -n "$path" ]]; then
+                printf '%s' "$path"
+                return 0
+            fi
         fi
-    elif [[ -f "$CHALLENGE_INPUT" ]]; then
-        if cp -- "$CHALLENGE_INPUT" "$challenge_file"; then
-            record "challenge" "ok" "copied binary challenge"
-        else
-            record "challenge" "error" "could not copy challenge"
-            return 1
-        fi
-    else
-        local hex="${CHALLENGE_INPUT#0x}"
+    fi
+    readlink -f -- "$NEXUS_BINARY" 2>/dev/null || printf '%s' "$NEXUS_BINARY"
+}
 
-        if [[ ! "$hex" =~ ^[0-9A-Fa-f]+$ ]]; then
-            record "challenge" "error" "challenge is not a file or hex string"
-            return 1
+# Same order read_ima_ascii_log() tries, so "auto" reads the log the prover reads.
+ima_ascii_log_path() {
+    local candidate
+    for candidate in \
+        /sys/kernel/security/ima/ascii_runtime_measurements \
+        /sys/kernel/security/integrity/ima/ascii_runtime_measurements
+    do
+        if [[ -r "$candidate" ]]; then
+            printf '%s' "$candidate"
+            return 0
         fi
+    done
+    return 1
+}
 
-        if (( ${#hex} % 2 != 0 )); then
-            record "challenge" "error" "hex challenge has an odd character count"
-            return 1
-        fi
+summary_value() {
+    local key="$1"
+    awk -F'=' -v k="$key" '$1 == k { sub("^" k "=", ""); print; exit }' \
+        "$OUT_DIR/binding/summary.txt" 2>/dev/null || true
+}
 
-        if (( ${#hex} == 0 || ${#hex} > 128 )); then
-            record "challenge" "error" "challenge must contain 1 to 64 bytes"
-            return 1
-        fi
-
-        if ! printf '%s' "$hex" | xxd -r -p > "$challenge_file"; then
-            record "challenge" "error" "could not decode hex challenge"
-            return 1
-        fi
-
-        record "challenge" "ok" "decoded hexadecimal challenge"
+prepare_binding() {
+    if ! have python3; then
+        record "binding" "missing" "python3 is required to compute the evidence binding"
+        return 1
     fi
 
-    sha256sum "$challenge_file" > "$OUT_DIR/challenge.sha256"
+    local nonce_spec="$CHALLENGE_DIGEST_INPUT"
+    if [[ "$MODE" == "reference" ]]; then
+        nonce_spec="${CHALLENGE_INPUT:-random}"
+    fi
+
+    local ima_log="" measured_path=""
+    if [[ "$BINARY_MEASUREMENT_INPUT" == "auto" ]]; then
+        ima_log="$(ima_ascii_log_path || true)"
+        measured_path="$(resolve_measured_binary_path)"
+    fi
+
+    local rc=0
+    python3 - \
+        "$OUT_DIR/binding" \
+        "$MODE" \
+        "$nonce_spec" \
+        "$IDENTITY_PUBKEY_INPUT" \
+        "$BINARY_MEASUREMENT_INPUT" \
+        "$ima_log" \
+        "$measured_path" \
+        > "$OUT_DIR/binding/summary.txt" \
+        2>"$ERROR_DIR/binding.stderr" <<'PY' || rc=$?
+# A faithful reproduction of nexus::security::evidence_binding, from
+# projects/LemonadeNexus/src/Security/EvidenceBinding.cpp. Verified byte-for-byte
+# against that implementation. Change one of these two and you have shipped a
+# system where the prover and the verifier disagree, so change neither alone.
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+# kDomain in EvidenceBinding.cpp.
+DOMAIN = b"lemonade-nexus/evidence-binding:v1"
+
+# kEvidenceBindingSize / kEvidenceReportDataSize.
+BINDING_SIZE = 32
+REPORT_DATA_SIZE = 64
+
+HEX = "0123456789abcdefABCDEF"
+
+
+def fail(message):
+    sys.stderr.write("binding: " + message + "\n")
+    raise SystemExit(1)
+
+
+def put_lp(field):
+    # put_lp(): a uint32 little-endian length, then the field. The domain string
+    # is length-prefixed too, exactly like the other three fields.
+    return len(field).to_bytes(4, "little") + field
+
+
+def evidence_binding(nonce, identity_pubkey, binary_measurement):
+    buf = (put_lp(DOMAIN) + put_lp(nonce) + put_lp(identity_pubkey) +
+           put_lp(binary_measurement))
+    return hashlib.sha256(buf).digest()[:BINDING_SIZE]
+
+
+def evidence_report_data(nonce, identity_pubkey, binary_measurement):
+    # The 32-byte binding zero-extended to 64: the padding rule from
+    # EvidenceBinding.hpp, which lives in one place on purpose.
+    return evidence_binding(nonce, identity_pubkey, binary_measurement).ljust(
+        REPORT_DATA_SIZE, b"\x00")
+
+
+def decode_hex(text, what):
+    stripped = "".join(text.split())
+    if stripped[:2].lower() == "0x":
+        stripped = stripped[2:]
+    if stripped == "":
+        return b""
+    if len(stripped) % 2 or any(c not in HEX for c in stripped):
+        fail("%s is not an even-length hexadecimal string" % what)
+    return bytes.fromhex(stripped)
+
+
+def looks_like_hex_text(raw):
+    try:
+        text = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    stripped = "".join(text.split())
+    if not stripped or len(stripped) % 2 or any(c not in HEX for c in stripped):
+        return None
+    return bytes.fromhex(stripped)
+
+
+def load_field(spec, what):
+    """A hex argument, a file of raw bytes, or a file of hex text.
+
+    A 32-byte raw key is not valid hex text and 64 hex characters are not 32
+    raw bytes, so the two file forms cannot be confused for each other.
+    """
+    if spec == "":
+        return b"", "empty"
+    path = pathlib.Path(spec)
+    if path.is_file():
+        raw = path.read_bytes()
+        as_hex = looks_like_hex_text(raw)
+        if as_hex is not None:
+            return as_hex, "hexadecimal text in " + spec
+        return raw, "raw bytes from " + spec
+    return decode_hex(spec, what), "hexadecimal argument"
+
+
+def unescape_ima_path(text):
+    """unescape_path() from src/Security/MeasurementIma.cpp.
+
+    The i + 3 < len bound is that function's, quirk included: a \\xHH escape at
+    the very end of the line is left alone there, so it is left alone here.
+    """
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\\" and i + 3 < len(text) and text[i + 1] == "x":
+            pair = text[i + 2:i + 4]
+            if len(pair) == 2 and all(c in HEX for c in pair):
+                out.append(chr(int(pair, 16)))
+                i += 4
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def ima_measurement(log_path, binary_path):
+    """What produce_snp_vtpm_evidence() puts in binary_measurement.
+
+    Returns (bytes, note). An empty measurement is a legitimate outcome: on a
+    host where IMA measured nothing the prover binds an empty field and the
+    verifier expects exactly that.
+    """
+    if not log_path:
+        return b"", "no readable IMA ascii log on this host"
+    if not binary_path:
+        return b"", "no Nexus binary path to look up"
+    try:
+        text = pathlib.Path(log_path).read_text(errors="replace")
+    except OSError as exc:
+        return b"", "could not read %s (%s)" % (log_path, exc)
+
+    found = None
+    for line in text.splitlines():
+        # <pcr> <template-hash> <template-name> <file-hash> <path> [signature]
+        parts = line.split(None, 4)
+        if len(parts) < 5:
+            continue
+        template_name, file_hash, rest = parts[2], parts[3], parts[4]
+        if template_name == "ima-sig":
+            # ima-sig appends a hex signature after the path, and paths may hold
+            # spaces, so only a trailing hex token is stripped.
+            space = rest.rfind(" ")
+            if space != -1:
+                tail = rest[space + 1:]
+                if tail and all(c in HEX for c in tail):
+                    rest = rest[:space]
+        if unescape_ima_path(rest) == binary_path:
+            found = file_hash  # last measurement wins, as in ima_entry_for_path
+
+    if found is None:
+        return b"", "the IMA log carries no measurement of " + binary_path
+    # ima-ng/ima-sig write "<algo>:<hex>"; the original "ima" template writes a
+    # bare digest, which leaves the algorithm empty and so fails the check below.
+    algo, separator, digest_hex = found.partition(":")
+    if not separator:
+        algo, digest_hex = "", found
+    if algo != "sha256" or not digest_hex:
+        return b"", "IMA measured %s with '%s', not sha256" % (binary_path, algo)
+    try:
+        return bytes.fromhex(digest_hex), "sha256 from " + log_path
+    except ValueError:
+        return b"", "the IMA measurement of %s is not hex" % binary_path
+
+
+out_dir = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+nonce_spec = sys.argv[3]
+identity_spec = sys.argv[4]
+measurement_spec = sys.argv[5]
+ima_log_path = sys.argv[6]
+measured_binary_path = sys.argv[7]
+
+if nonce_spec == "random":
+    nonce, nonce_source = os.urandom(BINDING_SIZE), "32 random local bytes"
+else:
+    nonce, nonce_source = load_field(nonce_spec, "the challenge digest")
+
+identity, identity_source = load_field(identity_spec, "the identity public key")
+
+if measurement_spec == "auto":
+    measurement, measurement_source = ima_measurement(
+        ima_log_path, measured_binary_path)
+else:
+    measurement, measurement_source = load_field(
+        measurement_spec, "the binary measurement")
+
+# Evidence mode must produce something a verifier can accept, so the field
+# widths the production types fix are enforced here rather than discovered as a
+# silent rejection later. Reference mode is a host profile and stays permissive.
+if mode == "evidence":
+    if len(nonce) != 32:
+        fail("--challenge-digest must be 32 bytes (64 hex characters); got %d"
+             % len(nonce))
+    if len(identity) != 32:
+        fail("--identity-pubkey must be a 32-byte Ed25519 key; got %d bytes"
+             % len(identity))
+    if measurement and len(measurement) != 32:
+        fail("--binary-measurement must be a 32-byte sha256 or empty; got %d bytes"
+             % len(measurement))
+
+binding = evidence_binding(nonce, identity, measurement)
+report_data = evidence_report_data(nonce, identity, measurement)
+
+out_dir.mkdir(parents=True, exist_ok=True)
+(out_dir / "nonce.bin").write_bytes(nonce)
+(out_dir / "identity-pubkey.bin").write_bytes(identity)
+(out_dir / "binary-measurement.bin").write_bytes(measurement)
+(out_dir / "qualifying-data.bin").write_bytes(binding)
+(out_dir / "qualifying-data.hex").write_text(binding.hex() + "\n", encoding="utf-8")
+(out_dir / "report-data.bin").write_bytes(report_data)
+
+inputs = {
+    "algorithm": "lemonade-nexus/evidence-binding:v1",
+    "encoding": ("sha256(LP(domain) | LP(nonce) | LP(identity_pubkey) | "
+                 "LP(binary_measurement)); LP(x) = uint32le(len(x)) | x"),
+    "mode": mode,
+    "nonce_hex": nonce.hex(),
+    "nonce_source": nonce_source,
+    "identity_pubkey_hex": identity.hex(),
+    "identity_pubkey_source": identity_source,
+    "binary_measurement_hex": measurement.hex(),
+    "binary_measurement_source": measurement_source,
+    "qualifying_data_hex": binding.hex(),
+    "report_data_hex": report_data.hex(),
+    # Reference nonces are self-chosen, so a reference quote proves liveness to
+    # nobody. Only an evidence bundle answers a verifier's challenge.
+    "answers_a_verifier_challenge": mode == "evidence",
+}
+(out_dir / "binding-inputs.json").write_text(
+    json.dumps(inputs, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+for key in ("nonce_source", "identity_pubkey_source", "binary_measurement_source",
+            "qualifying_data_hex", "binary_measurement_hex"):
+    print("%s=%s" % (key, inputs[key]))
+PY
+
+    if (( rc != 0 )); then
+        record "binding" "error" "see $ERROR_DIR/binding.stderr"
+        log "ERROR: $(cat "$ERROR_DIR/binding.stderr" 2>/dev/null)"
+        return 1
+    fi
+    rm -f "$ERROR_DIR/binding.stderr"
+
+    record "binding:algorithm" "ok" "evidence_binding lemonade-nexus/evidence-binding:v1"
+    record "binding:nonce" "ok" "$(summary_value nonce_source)"
+    record "binding:identity-pubkey" "ok" "$(summary_value identity_pubkey_source)"
+
+    local measurement_hex measurement_source
+    measurement_hex="$(summary_value binary_measurement_hex)"
+    measurement_source="$(summary_value binary_measurement_source)"
+    if [[ -n "$measurement_hex" ]]; then
+        record "binding:binary-measurement" "ok" "$measurement_source"
+    else
+        # Legitimate, and matched by a verifier that sees an empty binary_sha256.
+        # Still worth flagging: on a Tier 1 host IMA is expected to be measuring.
+        record "binding:binary-measurement" "warning" "empty binding field: $measurement_source"
+    fi
+
+    record "binding:qualifying-data" "ok" "$(summary_value qualifying_data_hex)"
+
+    if [[ "$MODE" == "reference" ]]; then
+        record "binding:answers-challenge" "warning" \
+            "locally generated nonce; this quote answers no verifier challenge"
+    else
+        record "binding:answers-challenge" "ok" "bound to the supplied challenge digest"
+    fi
 }
 
 collect_tool_versions() {
@@ -570,18 +972,17 @@ collect_snp_native() {
         return
     fi
 
-    # REPORT_DATA is exactly 64 bytes. SHA-512 of the challenge fills it and
-    # binds this report to the caller's challenge.
-    local inblob="$OUT_DIR/snp/report-data.bin"
-    if have openssl; then
-        openssl dgst -sha512 -binary "$OUT_DIR/challenge.bin" > "$inblob" 2>/dev/null
-    fi
+    # REPORT_DATA is exactly 64 bytes, and evidence_report_data() defines what
+    # goes in it: the 32-byte evidence binding, zero-extended. Anything else
+    # (sha512 of the challenge, say) is a value no Nexus verifier recomputes.
+    local inblob="$OUT_DIR/binding/report-data.bin"
     if [[ ! -s "$inblob" ]]; then
-        record "snp:report-data" "error" "could not derive REPORT_DATA"
+        record "snp:report-data" "error" "the evidence binding was not computed"
         rmdir "$entry" 2>/dev/null
         return
     fi
-    record "snp:report-data" "ok" "sha512(challenge)"
+    cp -- "$inblob" "$OUT_DIR/snp/report-data.bin" 2>/dev/null || true
+    record "snp:report-data" "ok" "evidence_report_data (binding, zero-extended to 64 bytes)"
 
     if ! cat "$inblob" > "$entry/inblob" 2>"$ERROR_DIR/snp_inblob.stderr"; then
         record "snp:inblob" "error" "write failed"
@@ -901,10 +1302,18 @@ collect_ak_and_quote() {
 
     local err="$ERROR_DIR/tpm_quote.stderr"
 
+    # qualifyingData is the evidence binding and nothing else: it is the value
+    # verify_snp_vtpm_evidence() recomputes and compares against extraData.
+    # 32 bytes, because the Azure vTPM rejects a 64-byte one with TPM2_RC_SIZE.
+    if [[ ! -s "$OUT_DIR/binding/qualifying-data.bin" ]]; then
+        record "tpm:quote" "error" "the evidence binding was not computed"
+        return
+    fi
+
     if tpm2_quote \
         -c "$ak_context" \
         -l "$PCR_LIST" \
-        -q "$OUT_DIR/challenge.bin" \
+        -q "$OUT_DIR/binding/qualifying-data.bin" \
         -m "$OUT_DIR/tpm/quote.msg" \
         -s "$OUT_DIR/tpm/quote.sig" \
         -o "$OUT_DIR/tpm/quote.pcrs" \
@@ -1036,6 +1445,16 @@ collect_security_runtime() {
 }
 
 write_readme() {
+    local mode_note
+    if [[ "$MODE" == "evidence" ]]; then
+        mode_note="The nonce is the challenge digest supplied with --challenge-digest, so the
+quote in tpm/ answers that challenge and a Nexus verifier can accept it."
+    else
+        mode_note="The nonce was generated locally by this collector. No verifier issued it, so
+the quote in tpm/ answers no live challenge: this bundle is a known-good host
+profile, not attestation evidence. Collect an evidence bundle for that."
+    fi
+
     cat > "$OUT_DIR/README.txt" <<EOF
 Lemonade Nexus attestation evidence
 ===================================
@@ -1049,12 +1468,41 @@ PCR selection:     $PCR_LIST
 
 This directory contains collected evidence only.
 
+Evidence binding
+----------------
+
+binding/ holds the value the hardware signed over and the inputs it came from.
+It is computed with the one canonical algorithm, nexus::security::
+evidence_binding (projects/LemonadeNexus/src/Security/EvidenceBinding.cpp):
+
+  qualifyingData = SHA-256( LP("lemonade-nexus/evidence-binding:v1")
+                          | LP(nonce) | LP(identity_pubkey)
+                          | LP(binary_measurement) )
+  LP(x)          = the length of x as a 32-bit little-endian integer, then x
+  REPORT_DATA    = qualifyingData, zero-extended to 64 bytes
+
+  binding/nonce.bin               $(summary_value nonce_source)
+  binding/identity-pubkey.bin     $(summary_value identity_pubkey_source)
+  binding/binary-measurement.bin  $(summary_value binary_measurement_source)
+  binding/qualifying-data.bin     TPM2_Quote -q, i.e. the quote's extraData
+  binding/report-data.bin         native SEV-SNP REPORT_DATA
+  binding/binding-inputs.json     all of the above as hex
+
+$mode_note
+
+A verifier recomputes the binding from its own copy of the three inputs and
+compares it with the quote's extraData; nothing here needs to be trusted for
+that check, and any mismatch means this bundle does not answer that challenge.
+
+Verification
+------------
+
 The collector does not decide whether this host is Tier 1 eligible.
 A remote Nexus verifier must:
 
 1. Examine the Azure SEV-SNP report and endorsement chain.
 2. Bind the vTPM attestation key to the SEV-SNP report.
-3. Verify the TPM quote with the caller challenge.
+3. Recompute evidence_binding and compare it with the quote's extraData.
 4. Replay the measured-boot event log.
 5. Replay the IMA log and compare it with quoted PCR 10.
 6. Compare boot, runtime, binary, and policy measurements with the approved profile.
@@ -1081,7 +1529,6 @@ finalize_manifest() {
         python3 - "$OUT_DIR" "$MODE" "$VERSION" "$START_UTC" \
             "$NEXUS_BINARY" "$NEXUS_SERVICE" "$PCR_LIST" <<'PY'
 import csv
-import hashlib
 import json
 import pathlib
 import socket
@@ -1110,13 +1557,20 @@ if status_path.exists():
                 "detail": row[2],
             })
 
-challenge_sha256 = None
-challenge_path = root / "challenge.bin"
-if challenge_path.exists():
-    challenge_sha256 = hashlib.sha256(challenge_path.read_bytes()).hexdigest()
+# The binding, verbatim from the one place that computed it. A consumer reads
+# this to learn exactly what the hardware signed over and what it was derived
+# from, and "answers_a_verifier_challenge" tells it whether this bundle is an
+# answer to a challenge at all.
+evidence_binding = None
+binding_path = root / "binding" / "binding-inputs.json"
+if binding_path.exists():
+    try:
+        evidence_binding = json.loads(binding_path.read_text(encoding="utf-8"))
+    except ValueError:
+        evidence_binding = None
 
 manifest = {
-    "schema": "lemonade-nexus-attestation-collector-v1",
+    "schema": "lemonade-nexus-attestation-collector-v2",
     "collector_version": version,
     "mode": mode,
     "started_utc": started,
@@ -1127,7 +1581,7 @@ manifest = {
     "nexus_binary": nexus_binary,
     "nexus_service": nexus_service,
     "pcr_selection": pcr_list,
-    "challenge_sha256": challenge_sha256,
+    "evidence_binding": evidence_binding,
     "status": statuses,
 }
 
@@ -1170,16 +1624,11 @@ main() {
         record "collector:privilege" "ok" "root"
     fi
 
-    if ! have xxd; then
-        record "tool:xxd" "missing" "required only for hexadecimal --challenge input"
-        if [[ "$MODE" == "evidence" && ! -f "$CHALLENGE_INPUT" ]]; then
-            log "ERROR: xxd is required for a hexadecimal challenge."
-            exit 2
-        fi
-    fi
-
-    prepare_challenge || {
-        log "ERROR: Could not prepare the challenge."
+    # Before anything else: without the binding there is no evidence, only a
+    # pile of files, so a failure here stops the run rather than producing a
+    # bundle whose quote is bound to nothing.
+    prepare_binding || {
+        log "ERROR: Could not compute the evidence binding."
         exit 2
     }
 

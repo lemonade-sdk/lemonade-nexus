@@ -1,0 +1,128 @@
+[Unit]
+Description=Nexus attestation evidence daemon
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus
+# No network dependency: the daemon serves a local socket. It may reach AMD KDS
+# for a VCEK it has not cached, which is a best-effort fetch, not a start
+# condition.
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/nexus-attestd \
+    --socket /run/nexus-attestd/nexus-attestd.sock \
+    --group nexus \
+    --cache-dir /var/lib/nexus-attestd/cache
+Restart=on-failure
+RestartSec=5
+
+# ---------------------------------------------------------------------------
+# The privilege boundary
+# ---------------------------------------------------------------------------
+#
+# This unit is the reason the component exists. The Nexus server must NOT have
+# TPM or IMA access; this daemon has exactly that and nothing else, and answers
+# one question over one socket. Everything granted below is listed with why.
+#
+# Dedicated identity. Not root, and not the server's account: a compromise of
+# the mesh server must not inherit TPM access, and a compromise of this daemon
+# must not inherit the server's data.
+User=nexus-attestd
+Group=nexus-attestd
+
+# GRANTED — group memberships (DAC, not capabilities):
+#   tss    read/write /dev/tpmrm0. The resource-manager device is root:tss 0660
+#          on every distribution that ships tpm2-tss, so group membership is the
+#          intended way in. It is a group, not CAP_DAC_OVERRIDE, so it grants
+#          access to that device and to nothing else on the filesystem.
+#   nexus  chgrp the listening socket to the group allowed to use it. A
+#          non-root process may only chgrp to a group it belongs to, so without
+#          this the socket would be created for nobody.
+SupplementaryGroups=tss nexus
+
+# GRANTED — the single capability:
+#   CAP_DAC_READ_SEARCH   read /sys/kernel/security/ima/ascii_runtime_measurements
+#          and traverse /sys/kernel/security to reach it. securityfs is 0700
+#          root and the log itself is 0440 root, so there is no group to join;
+#          the kernel exposes no other interface to the IMA measurement log, and
+#          without it the daemon cannot measure its own binary and produces
+#          evidence a verifier fails on the ABSENT measurement.
+#          It is the read-only half of DAC bypass. CAP_DAC_OVERRIDE would also
+#          bypass WRITE and EXECUTE checks and is deliberately not granted.
+#
+# Everything else is dropped. Notably NOT granted: CAP_SYS_ADMIN,
+# CAP_SYS_RAWIO, CAP_NET_ADMIN, CAP_NET_BIND_SERVICE (no TCP port is ever
+# bound), CAP_SETUID/CAP_SETGID, CAP_DAC_OVERRIDE, CAP_SYS_PTRACE.
+# The only capability. /sys/kernel/security is 0700 root and the IMA log 0440
+# root, so there is no group to join and no other interface to the measurement
+# log. This is the read-only half of DAC bypass; CAP_DAC_OVERRIDE would also
+# bypass write and execute and is not granted. Everything else is dropped.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+
+# GRANTED — the one device. DevicePolicy=closed leaves only the standard pseudo
+# devices; the TPM resource manager is added explicitly and needs write as well
+# as read, because a TPM command is a write followed by a read. /dev/tpm0 is
+# NOT allowed: the raw device serialises no sessions and is not what the FAPI
+# stack should be handed. PrivateDevices= is deliberately not used — it would
+# replace /dev wholesale and take the TPM with it.
+DevicePolicy=closed
+DeviceAllow=/dev/tpmrm0 rw
+
+# The socket lives in a directory this service owns, because ProtectSystem=strict
+# makes /run read-only. 0755 so any local process can traverse to the socket;
+# the socket itself is mode 0660 group nexus, and that is the access decision.
+RuntimeDirectory=nexus-attestd
+RuntimeDirectoryMode=0755
+
+# The VCEK / AMD chain cache. The only writable path in the unit.
+StateDirectory=nexus-attestd
+StateDirectoryMode=0700
+
+
+# Filesystem
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectProc=invisible
+ProcSubset=pid
+UMask=0077
+
+# Kernel and host surface
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RemoveIPC=true
+
+# AF_UNIX for the request socket; AF_INET/AF_INET6 only so an uncached VCEK can
+# be fetched from AMD KDS. A network-isolated deployment pre-seeds the cache,
+# adds --no-network to ExecStart, and may then reduce this to AF_UNIX and set
+# IPAddressDeny=any.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @debug @mount @swap @reboot @module @clock @cpu-emulation @raw-io @keyring
+SystemCallErrorNumber=EPERM
+
+# A core dump would contain live TPM session state and the platform bundle
+# and live TPM session state. Both halves are needed: LimitCORE=0 stops the
+# kernel writing one, CoreDumpFilter=0x00 makes any dump that still happens
+# (a coredump handler with its own limits) carry no mapped pages.
+LimitCORE=0
+CoreDumpFilter=0x00
+
+# Bounded work: one request at a time, a few file descriptors, no forking.
+LimitNOFILE=256
+TasksMax=16
+
+[Install]
+WantedBy=multi-user.target

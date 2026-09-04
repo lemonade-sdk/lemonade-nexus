@@ -92,7 +92,7 @@ LinuxAttestationProfile pinned_profile() {
     profile.snp.expected_measurement_hex = "aa11";
     profile.required_ak_spki_b64 = "QUsx";
     profile.ima_policy_digest = patterned<32>(0x60);
-    profile.enforce_ima_policy = true;
+    profile.require_ima = true;
     profile.approved_binary_sha256 = {"01ab"};
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;

@@ -81,6 +81,11 @@ target_compile_definitions(test_amd_product_discovery PRIVATE
 add_nexus_test(test_evidence_chain    test_evidence_chain.cpp)
 target_compile_definitions(test_evidence_chain PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+# The evidence daemon's refusal gate, derived quote binding and closed request
+# grammar — all of it exercisable without a TPM.
+add_nexus_test(test_nexus_attestd    test_nexus_attestd.cpp)
+target_link_libraries(test_nexus_attestd PRIVATE LemonadeNexusAttestdCore)
+
 add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
 # Hostile packets at the real wire boundary: cert-gated sync, ServerHello
@@ -157,8 +162,10 @@ add_nexus_test(test_security_attestation
     security/attestation/service.cpp
     security/attestation/producer.cpp
     security/attestation/providers.cpp
+    security/attestation/attestd_integration.cpp
     security/attestation/tier1_path.cpp)
 # providers.cpp runs the substitution negatives against the captured SNP blob.
+target_link_libraries(test_security_attestation PRIVATE LemonadeNexusAttestdCore)
 target_compile_definitions(test_security_attestation PRIVATE
     NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 

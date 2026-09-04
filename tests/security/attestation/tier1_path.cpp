@@ -409,8 +409,8 @@ TEST_F(Tier1PathTest, NoProfileRelaxationSurvivesThePolicyDigestCheck) {
         {"vmpl policy relaxed", [](LinuxAttestationProfile& p) {
              p.vmpl_policy = nexus::security::VmplPolicy::Unconstrained; }},
         {"tcb floor lowered", [](LinuxAttestationProfile& p) { p.snp.min_tcb.microcode -= 1; }},
-        {"ima policy not enforced",
-         [](LinuxAttestationProfile& p) { p.enforce_ima_policy = false; }},
+        {"ima log not required",
+         [](LinuxAttestationProfile& p) { p.require_ima = false; }},
         {"seccomp not required", [](LinuxAttestationProfile& p) { p.require_seccomp = false; }},
         {"no_new_privs not required",
          [](LinuxAttestationProfile& p) { p.require_no_new_privs = false; }},

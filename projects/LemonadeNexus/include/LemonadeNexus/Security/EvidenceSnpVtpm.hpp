@@ -40,10 +40,11 @@ namespace nexus::security {
 inline constexpr uint32_t kEvidencePcrs[] = {0, 1, 4, 7, 10};
 inline constexpr uint32_t kImaPcr = 10;
 
-/// PCR 10 is quoted in the SHA-1 bank as well, because which bank the IMA log can
-/// be replayed against is decided by the kernel's ima_template_hash_algo, not by
-/// us. Quoting both means one prover works on either configuration; the verifier
-/// then demands the bank the log actually matches. See ima_replay_bank.
+/// PCR 10 is quoted in both banks. A crypto-agile kernel extends each bank with
+/// its own template digest, but the ASCII log carries only the SHA-1 one, so
+/// ima_replay_bank can currently reconcile only that bank even where the SHA-256
+/// bank is correct. Quoting both keeps the evidence sufficient for a verifier
+/// that replays the binary log instead.
 inline constexpr uint16_t kEvidenceImaBanks[] = {kTpmAlgSha256, kTpmAlgSha1};
 
 /// Everything a peer needs to check the chain above without asking us anything
@@ -135,6 +136,7 @@ struct EvidenceRequirements {
     /// Hex SHA-256 of the IMA policy the prover must be enforcing. Empty pins
     /// none.
     std::string expected_ima_policy_sha256;
+
 
     /// Runtime profile. See the caveat on the evidence fields: these are
     /// self-reported by an approved binary, not attested by hardware.

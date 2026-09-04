@@ -33,7 +33,7 @@ LinuxAttestationProfile base_profile() {
     profile.snp.expected_measurement_hex = "aa11";
     profile.required_ak_spki_b64 = "QUsx";
     profile.ima_policy_digest = patterned_digest(0x60);
-    profile.enforce_ima_policy = true;
+    profile.require_ima = true;
     profile.approved_binary_sha256 = {"01ab", "02cd"};
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
@@ -63,7 +63,7 @@ const ProfileMutation kProfileMutations[] = {
      [](LinuxAttestationProfile& p) { p.snp.expected_measurement_hex = "bb22"; }},
     {"required_ak_spki_b64", [](LinuxAttestationProfile& p) { p.required_ak_spki_b64 = "QUsy"; }},
     {"ima_policy_digest", [](LinuxAttestationProfile& p) { p.ima_policy_digest[0] ^= 1; }},
-    {"enforce_ima_policy", [](LinuxAttestationProfile& p) { p.enforce_ima_policy = false; }},
+    {"require_ima", [](LinuxAttestationProfile& p) { p.require_ima = false; }},
     {"approved list entry", [](LinuxAttestationProfile& p) { p.approved_binary_sha256[0] = "03ef"; }},
     {"approved list extra entry",
      [](LinuxAttestationProfile& p) { p.approved_binary_sha256.push_back("03ef"); }},
@@ -91,7 +91,7 @@ TEST(LinuxAttestationProfile, EveryFieldChangesDigest) {
 
 TEST(LinuxAttestationProfile, EveryBooleanFlipChangesDigest) {
     bool LinuxAttestationProfile::* fields[] = {
-        &LinuxAttestationProfile::enforce_ima_policy,
+        &LinuxAttestationProfile::require_ima,
         &LinuxAttestationProfile::require_no_new_privs,
         &LinuxAttestationProfile::require_seccomp,
     };
@@ -226,14 +226,25 @@ TEST(LinuxAttestationProfileCompleteness, EachUnpinnedPrerequisiteIsItsOwnGap) {
 // The IMA policy digest is required only while IMA enforcement is on. Turning
 // enforcement off removes the gap, and that is a weaker profile — not an
 // incomplete one — so the distinction has to stay visible.
-TEST(LinuxAttestationProfileCompleteness, ImaPolicyDigestTracksEnforcement) {
+TEST(LinuxAttestationProfileCompleteness, TheImaPolicyPinIsUnconditional) {
+    // There is no setting under which the measuring policy goes unproven: the
+    // digest is required whatever proof method the profile names.
     auto p = complete_profile();
     p.ima_policy_digest = Digest{};
-    p.enforce_ima_policy = true;
     EXPECT_TRUE(has_gap(p, ProfileGap::NoImaPolicyDigest));
 
-    p.enforce_ima_policy = false;
-    EXPECT_FALSE(has_gap(p, ProfileGap::NoImaPolicyDigest));
+    p.ima_policy_proof = nexus::security::ImaPolicyProof::KernelReadback;
+    EXPECT_TRUE(has_gap(p, ProfileGap::NoImaPolicyDigest));
+}
+
+TEST(LinuxAttestationProfileCompleteness, DroppingTheImaLogIsItsOwnGap) {
+    // Turning the IMA log off would remove binary measurement entirely, so it
+    // cannot be a way to reach a complete profile.
+    auto p = complete_profile();
+    ASSERT_TRUE(profile_is_complete(p));
+    p.require_ima = false;
+    EXPECT_TRUE(has_gap(p, ProfileGap::ImaNotRequired));
+    EXPECT_FALSE(profile_is_complete(p));
 }
 
 TEST(LinuxAttestationProfileCompleteness, EveryGapNamesItself) {

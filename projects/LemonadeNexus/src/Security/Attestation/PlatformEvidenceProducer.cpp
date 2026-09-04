@@ -23,6 +23,13 @@ bool PlatformEvidenceProducer::platform_available() const {
 }
 
 SnpVtpmEvidence PlatformEvidenceProducer::platform_bundle(const Digest& nonce) const {
+    // A privileged helper, when one is configured. It is handed the nonce and
+    // the identity PUBLIC key — everything needed to derive the quote binding,
+    // and nothing that could sign on this node's behalf.
+    if (sources_.platform_source) {
+        return sources_.platform_source(nonce, sources_.identity.public_key);
+    }
+
     // The challenge digest is the quote nonce, so one quote binds the node
     // identity, the incarnation, the epoch and the policy (architecture 9).
     EvidenceProduceConfig config;

@@ -78,6 +78,7 @@ include(libraries/frost)
 add_subdirectory(projects/LemonadeNexus)
 add_subdirectory(projects/LemonadeNexusSDK)
 add_subdirectory(projects/LemonadeNexusSidecar)
+add_subdirectory(projects/LemonadeNexusAttestd)
 
 #-----------------------------------------------------------------------------
 # Tests (optional, enabled by default)

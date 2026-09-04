@@ -1,14 +1,7 @@
 #pragma once
 
-// The compiled Linux Tier 1 attestation profile.
-//
-// The verified binary carries the first profile; binary attestation is what
-// protects it. There is deliberately no loader from operator configuration —
-// an operator input here would let one host weaken the bar every verifier
-// applies. A new profile requires a new verified release.
-//
-// Architecture reference: Security Architecture Final Draft 1.1, sections 5.4
-// and 31.
+// The compiled Tier 1 attestation profile. Not operator-configurable: a profile
+// change requires an approved release.
 
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Security/SnpVerify.hpp>
@@ -22,55 +15,58 @@
 
 namespace nexus::security {
 
+/// How the verifier learns the approved measurement policy is in force. No
+/// value means "do not check": a kernel satisfying no method is unsupported.
+enum class ImaPolicyProof : uint16_t {
+    /// Prover forwards the kernel's own active-rule digest. Needs
+    /// CONFIG_IMA_READ_POLICY.
+    KernelReadback = 1,
+};
+
+[[nodiscard]] std::string_view ima_policy_proof_name(ImaPolicyProof proof);
+
 struct LinuxAttestationProfile {
     uint32_t profile_version{};
 
     SnpPolicyRequirements snp;
 
-    /// Base64 DER SPKI of the enrolled vTPM attestation key. Empty pins none.
+    /// Per-node enrollment state, not global policy: excluded from profile_gaps.
     std::string required_ak_spki_b64;
 
-    /// Digest of the required IMA policy (architecture 10.2). Bound into the
-    /// profile digest now; enforcement waits on an evidence field the platform
-    /// chain does not carry yet.
-    Digest ima_policy_digest{};
-    bool enforce_ima_policy{true};
+    /// Require IMA log replay and approved binary measurement.
+    bool require_ima{true};
 
-    /// Hex SHA-256 digests from the approved release ledger. The measured
-    /// binary must match one of them; an empty list approves none.
+    /// The approved IMA policy. The digest is mandatory under every method.
+    Digest ima_policy_digest{};
+    ImaPolicyProof ima_policy_proof{ImaPolicyProof::KernelReadback};
+
+    /// Approved release digests (hex SHA-256). Empty approves nothing.
     std::vector<std::string> approved_binary_sha256;
 
-    /// Approved boot state: one pinned hex value per quoted PCR. The TPM quote
-    /// covers these, so they are attested facts rather than claims. An empty
-    /// list pins no boot state and leaves the prerequisite unproven.
+    /// Approved boot state, one pinned hex value per quoted PCR. One of two
+    /// boot-integrity inputs; snp.expected_measurement_hex is the other, and
+    /// completeness requires both.
     std::vector<std::pair<uint32_t, std::string>> expected_pcrs;
 
-    /// The VMPL rule this profile applies, copied into SnpPolicyRequirements
-    /// when evidence is examined.
-    ///
-    /// Unset is not a policy. Unconstrained accepts a report requested at any
-    /// level, which for Tier 1 must be a decision rather than an oversight, so
-    /// a profile that never chose is incomplete and refuses every candidate.
+    /// Explicit VMPL policy. Unset makes the profile incomplete.
     std::optional<VmplPolicy> vmpl_policy;
 
     bool require_no_new_privs{true};
     bool require_seccomp{true};
 
-    /// AMD's signature over an endorsement it has since withdrawn is worth
-    /// nothing. Tier 1 demands a current CRL; absent or expired revocation data
-    /// fails NEW attestation, and never shrinks a live epoch (1.1 section 11).
+    /// Require current endorsement revocation data. Absent or expired data
+    /// fails new attestation and never shrinks a live epoch.
     bool require_endorsement_revocation{true};
 
     SecurityRulesetVersion security_ruleset{};
 };
 
-/// A prerequisite the profile leaves unpinned. A profile carrying any gap
-/// cannot tell a good platform from a bad one, so the verifier refuses every
-/// candidate rather than accepting on silence.
+/// A condition that makes the compiled profile incomplete or invalid.
 enum class ProfileGap : uint16_t {
     ProfileVersionUnset,
     NoPinnedLaunchMeasurement,
     NoTcbFloor,
+    ImaNotRequired,
     NoApprovedBinary,
     NoImaPolicyDigest,
     NoVmplPolicy,
@@ -80,25 +76,17 @@ enum class ProfileGap : uint16_t {
 [[nodiscard]] std::string_view profile_gap_name(ProfileGap gap);
 
 /// Every gap in `profile`, in declaration order. Empty means complete.
-/// `required_ak_spki_b64` is deliberately absent: an attestation key is pinned
-/// per enrolled node, not once for the whole mesh.
 [[nodiscard]] std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile);
 
-/// True when the profile pins everything it needs to decide.
 [[nodiscard]] bool profile_is_complete(const LinuxAttestationProfile& profile);
 
-/// The shape of Linux attestation profile version 1.
-///
-/// The returned profile is deliberately INCOMPLETE: it fixes the rules but pins
-/// no measurement, no TCB floor, no IMA policy digest and no approved binary,
-/// because those values may only be read from a host that already satisfies the
-/// rules. Until such a host exists, every candidate fails with ProfileIncomplete.
-/// That is the intended behavior. Filling these in from an unqualified host
-/// would pin the wrong values and make the profile decide nothing.
+/// Template for profile version 1: fixes the rules, pins no measured values, so
+/// every candidate fails ProfileIncomplete until a release pins them from an
+/// already-qualified host.
 [[nodiscard]] LinuxAttestationProfile linux_attestation_profile_v1();
 
 /// The attestation_policy_digest carried in every challenge. Every field is
-/// encoded, so two profiles that differ in effect differ in digest.
+/// encoded, so two profiles differing in effect differ in digest.
 [[nodiscard]] Digest profile_digest(const LinuxAttestationProfile& profile);
 
 }  // namespace nexus::security

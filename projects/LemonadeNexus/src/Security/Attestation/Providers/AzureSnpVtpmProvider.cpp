@@ -37,7 +37,7 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
     requirements.policy.vmpl_policy =
         profile_.vmpl_policy.value_or(VmplPolicy::Unconstrained);
     requirements.expected_ak_spki_b64 = profile_.required_ak_spki_b64;
-    requirements.require_ima = profile_.enforce_ima_policy;
+    requirements.require_ima = profile_.require_ima;
     requirements.expected_pcrs = profile_.expected_pcrs;
     requirements.require_no_new_privs = profile_.require_no_new_privs;
     requirements.require_seccomp = profile_.require_seccomp;
@@ -45,7 +45,8 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
     if (revocation_) {
         requirements.revocation = revocation_();
     }
-    if (profile_.enforce_ima_policy && profile_.ima_policy_digest != Digest{}) {
+    // Unconditional: readiness() has already refused a profile with no pin.
+    if (profile_.ima_policy_digest != Digest{}) {
         requirements.expected_ima_policy_sha256 = hex_of(profile_.ima_policy_digest);
     }
 

@@ -17,6 +17,13 @@ void add_bool(CanonicalEncoder& encoder, bool value) {
 
 }  // namespace
 
+std::string_view ima_policy_proof_name(ImaPolicyProof proof) {
+    switch (proof) {
+        case ImaPolicyProof::KernelReadback: return "kernel-readback";
+    }
+    return "unknown";
+}
+
 std::string_view profile_gap_name(ProfileGap gap) {
     switch (gap) {
         case ProfileGap::ProfileVersionUnset:      return "profile_version is 0";
@@ -27,7 +34,9 @@ std::string_view profile_gap_name(ProfileGap gap) {
         case ProfileGap::NoApprovedBinary:
             return "no approved binary digest: no release can ever be approved";
         case ProfileGap::NoImaPolicyDigest:
-            return "IMA enforcement is on but no policy digest is pinned";
+            return "no IMA policy digest pinned: the measuring policy is unproven";
+        case ProfileGap::ImaNotRequired:
+            return "the IMA log is not required, so no binary can be measured";
         case ProfileGap::NoVmplPolicy:
             return "no VMPL policy chosen: which level may request a report is undecided";
         case ProfileGap::SecurityRulesetMismatch:
@@ -53,7 +62,13 @@ std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile) {
     if (profile.approved_binary_sha256.empty()) {
         gaps.push_back(ProfileGap::NoApprovedBinary);
     }
-    if (profile.enforce_ima_policy && profile.ima_policy_digest == Digest{}) {
+    // The IMA log is where binary integrity comes from; a profile that does not
+    // demand it cannot prove runtime integrity under any policy proof.
+    if (!profile.require_ima) {
+        gaps.push_back(ProfileGap::ImaNotRequired);
+    }
+    // Unconditional: no proof method may proceed without a pinned digest.
+    if (profile.ima_policy_digest == Digest{}) {
         gaps.push_back(ProfileGap::NoImaPolicyDigest);
     }
     if (!profile.vmpl_policy.has_value()) {
@@ -81,7 +96,8 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     // report. A different provider chooses a different level.
     profile.vmpl_policy = VmplPolicy::RequireVmpl0;
 
-    profile.enforce_ima_policy = true;
+    profile.require_ima = true;
+    profile.ima_policy_proof = ImaPolicyProof::KernelReadback;
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = constants::kSecurityRulesetVersion;
@@ -112,7 +128,8 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
 
     encoder.add_string(profile.required_ak_spki_b64);
     encoder.add_bytes(profile.ima_policy_digest);
-    add_bool(encoder, profile.enforce_ima_policy);
+    encoder.add_u16(static_cast<uint16_t>(profile.ima_policy_proof));
+    add_bool(encoder, profile.require_ima);
 
     encoder.add_u64(profile.approved_binary_sha256.size());
     for (const auto& binary_sha256 : profile.approved_binary_sha256) {
