@@ -34,10 +34,18 @@ inline constexpr std::size_t kMaxPlatformEvidenceBytes = 4 * 1024 * 1024;
 /// Total bytes of the variable-length fields in a platform bundle.
 [[nodiscard]] std::size_t platform_evidence_size(const SnpVtpmEvidence& platform);
 
-/// True when `binary_sha256_hex` appears in the profile's approved list.
-/// An empty list or an empty measurement approves nothing — fail closed.
+/// True when `binary_sha256_hex` is an approved release OF `binary_path`.
+/// Digests do not cross paths: an approved release of one component never
+/// satisfies another component's path. An unknown path, an empty digest list
+/// or an empty measurement approves nothing — fail closed.
 [[nodiscard]] bool binary_approved(const LinuxAttestationProfile& profile,
+                                   std::string_view binary_path,
                                    std::string_view binary_sha256_hex);
+
+/// Just the paths, in profile order — what the platform chain needs to refuse a
+/// prover-chosen path. The digests stay with the profile.
+[[nodiscard]] std::vector<std::string> approved_path_list(
+    const LinuxAttestationProfile& profile);
 
 /// Deterministic mapping from the platform chain's verdict to the typed
 /// failure model. Same verdict, same failure.

@@ -38,6 +38,7 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
         profile_.vmpl_policy.value_or(VmplPolicy::Unconstrained);
     requirements.expected_ak_spki_b64 = profile_.required_ak_spki_b64;
     requirements.require_ima = profile_.require_ima;
+    requirements.approved_paths = approved_path_list(profile_);
     requirements.expected_pcrs = profile_.expected_pcrs;
     requirements.require_no_new_privs = profile_.require_no_new_privs;
     requirements.require_seccomp = profile_.require_seccomp;
@@ -70,9 +71,9 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
         return fail(map_platform_failure(platform));
     }
 
-    // The IMA-anchored binary must be on the approved release list. The
-    // platform chain takes no list input, so the check belongs here.
-    if (!binary_approved(profile_, platform.binary_sha256)) {
+    // The platform chain refused any path outside the profile; this is the
+    // other half — an approved release OF that path.
+    if (!binary_approved(profile_, platform.binary_path, platform.binary_sha256)) {
         return fail(AttestationFailure::BinaryMeasurementInvalid);
     }
     result.claims.binary_approved = true;

@@ -51,3 +51,11 @@ if(UNIX AND NOT APPLE)
             DESTINATION lib/systemd/system
             COMPONENT Runtime)
 endif()
+
+# The server's platform source. The link lives here, not in LemonadeNexus, so
+# there is no cycle: this project already depends on LemonadeNexus, and only the
+# assembled executable depends on this one.
+if(TARGET LemonadeNexusApp)
+    target_link_libraries(LemonadeNexusApp PRIVATE LemonadeNexusAttestdCore)
+    target_compile_definitions(LemonadeNexusApp PRIVATE LEMONADE_HAVE_ATTESTD_CLIENT)
+endif()

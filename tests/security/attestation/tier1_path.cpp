@@ -100,7 +100,7 @@ protected:
         profile_.snp.min_tcb = {2, 0, 6, 55};
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest = patterned<32>(0x60);
-        profile_.approved_binary_sha256 = {kApprovedBinary};
+        profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         ASSERT_TRUE(profile_is_complete(profile_));
 
         challenge_ = issue(profile_);
@@ -193,7 +193,7 @@ TEST_F(Tier1PathTest, IncompleteProfileRejectsAnOtherwiseFlawlessCandidate) {
 }
 
 TEST_F(Tier1PathTest, ProfileCompletenessWinsOverEveryOtherFault) {
-    profile_.approved_binary_sha256.clear();
+    profile_.approved_paths.clear();
     ASSERT_FALSE(profile_is_complete(profile_));
 
     challenge_.policy_digest = patterned<32>(0x66);
@@ -376,7 +376,7 @@ TEST_F(Tier1PathTest, ChallengeOnAnOlderSecurityRulesetIsRejected) {
 
 TEST_F(Tier1PathTest, ChallengeIssuedUnderAnotherProfileIsRejected) {
     LinuxAttestationProfile other = profile_;
-    other.approved_binary_sha256 = {kApprovedBinary, kOtherBinary};
+    other.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary, kOtherBinary}}};
     ASSERT_NE(profile_digest(other), profile_digest(profile_));
 
     // A complete, correctly signed attempt under the other profile.
@@ -415,7 +415,7 @@ TEST_F(Tier1PathTest, NoProfileRelaxationSurvivesThePolicyDigestCheck) {
         {"no_new_privs not required",
          [](LinuxAttestationProfile& p) { p.require_no_new_privs = false; }},
         {"extra approved binary",
-         [](LinuxAttestationProfile& p) { p.approved_binary_sha256.push_back(kOtherBinary); }},
+         [](LinuxAttestationProfile& p) { p.approved_paths[0].sha256.push_back(kOtherBinary); }},
     };
 
     for (const auto& relaxation : relaxations) {

@@ -130,6 +130,12 @@ struct EvidenceRequirements {
     /// measurement non-self-chosen. Off only for the platform-only probe.
     bool require_ima{true};
 
+    /// The only paths whose measurement may be looked up. binary_path is
+    /// prover-supplied, so without this the prover picks which measured file it
+    /// is judged on. Empty accepts any, which is only right for the
+    /// platform-only probe.
+    std::vector<std::string> approved_paths;
+
     /// Boot state. Each entry pins one quoted PCR to a hex value. The quote
     /// covers these PCRs, so unlike the runtime fields below they are hardware
     /// facts. Empty pins none, which is only right for a first enrollment.
@@ -158,6 +164,9 @@ struct EvidenceVerdict {
     std::string measurement_hex;   ///< SNP launch measurement (pin this at enrollment)
     std::string ak_spki_b64;       ///< HCLAkPub as DER SPKI (pin this too)
     std::string binary_sha256;     ///< IMA-confirmed measurement of the running binary
+    /// The path that measurement was recorded against, already checked against
+    /// approved_paths. Callers resolve per-path digest policy with it.
+    std::string binary_path;
     std::string chip_id_hex;
     std::string tcb;
     std::string report_summary;

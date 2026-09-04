@@ -397,7 +397,7 @@ LinuxAttestationProfile complete_profile() {
     profile.snp.min_tcb = {2, 0, 6, 55};
     profile.snp.expected_measurement_hex = std::string(96, 'a');
     profile.ima_policy_digest = filled(0x60);
-    profile.approved_binary_sha256 = {std::string(64, 'b')};
+    profile.approved_paths = {{"/usr/bin/nexus", {std::string(64, 'b')}}};
     return profile;
 }
 

@@ -93,7 +93,7 @@ LinuxAttestationProfile pinned_profile() {
     profile.required_ak_spki_b64 = "QUsx";
     profile.ima_policy_digest = patterned<32>(0x60);
     profile.require_ima = true;
-    profile.approved_binary_sha256 = {"01ab"};
+    profile.approved_paths = {{"/usr/bin/nexus", {"01ab"}}};
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = nexus::security::constants::kSecurityRulesetVersion;

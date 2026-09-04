@@ -66,7 +66,8 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           config.identity,
           [this](EpochId epoch) { return driver_.vote_key_for_epoch(epoch); },
           config.data_root / "security" / "attestation-cache",
-          {}}),
+          {},
+          config.platform_source}),
       driver_(SecurityDriverConfig{
                   .self = self_id(config),
                   .identity = config.identity,

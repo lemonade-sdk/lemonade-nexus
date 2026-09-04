@@ -55,7 +55,7 @@ protected:
         profile_.snp.min_tcb = {2, 0, 6, 55};
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest.fill(0x60);
-        profile_.approved_binary_sha256 = {kApprovedBinary};
+        profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
 
         challenge_.nonce = patterned<32>(0x01);
@@ -204,3 +204,84 @@ TEST_F(PlatformEvidenceProducerTest, TamperedVoteKeyFailsIdentitySignature) {
 }
 
 }  // namespace
+
+// --- The external platform source ---------------------------------------------
+//
+// In production the platform half comes from nexus-attestd over a unix socket,
+// so the server needs no TPM and no root-only IMA log. These pin the two
+// properties that makes safe: the source is actually consulted, and there is no
+// in-process path to fall back to when it fails.
+
+TEST_F(PlatformEvidenceProducerTest, TheExternalSourceIsWhatProducesThePlatformHalf) {
+    int calls = 0;
+    AttestationChallenge seen;
+    auto with_source = sources();
+    with_source.platform_source = [&](const AttestationChallenge& challenge) {
+        ++calls;
+        seen = challenge;
+        nexus::security::SnpVtpmEvidence platform;
+        platform.hcl_blob = {0xDE, 0xAD};
+        platform.tpms_attest = {0xBE, 0xEF};
+        platform.binary_path = "/usr/bin/nexus";
+        return platform;
+    };
+
+    PlatformEvidenceProducer producer{std::move(with_source)};
+    const auto evidence = producer.produce(challenge_);
+    ASSERT_TRUE(evidence.has_value());
+
+    EXPECT_EQ(calls, 1);
+    // The whole challenge crosses, never a bare nonce: the helper derives the
+    // quote binding itself and cannot be handed one.
+    EXPECT_EQ(challenge_digest(seen), challenge_digest(challenge_));
+    EXPECT_EQ(evidence->platform.hcl_blob, (std::vector<uint8_t>{0xDE, 0xAD}));
+    EXPECT_EQ(evidence->platform.tpms_attest, (std::vector<uint8_t>{0xBE, 0xEF}));
+}
+
+TEST_F(PlatformEvidenceProducerTest, AnUnavailableSourceFailsClosedWithNoFallback) {
+    // What happens when nexus-attestd is absent or refuses: the source returns
+    // empty evidence. Nothing may fill it in.
+    int calls = 0;
+    auto with_source = sources();
+    with_source.platform_source = [&](const AttestationChallenge&) {
+        ++calls;
+        return nexus::security::SnpVtpmEvidence{};
+    };
+
+    PlatformEvidenceProducer producer{std::move(with_source)};
+    const auto evidence = producer.produce(challenge_);
+
+    // An envelope is still produced and still signed — the failure is the
+    // verifier's to state, not the producer's to hide.
+    ASSERT_TRUE(evidence.has_value());
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(evidence->platform.empty());
+    EXPECT_TRUE(evidence->platform.hcl_blob.empty());
+    EXPECT_TRUE(evidence->platform.tpms_attest.empty());
+    EXPECT_TRUE(evidence->platform.ima_log.empty());
+    EXPECT_TRUE(evidence->platform.binary_sha256.empty());
+
+    // And the verifier refuses it, rather than any of it being treated as proven.
+    const auto verdict = examine(*evidence);
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_NE(verdict.failure, nexus::security::AttestationFailure::IdentitySignatureInvalid);
+    EXPECT_NE(verdict.failure, nexus::security::AttestationFailure::ChallengeMismatch);
+}
+
+TEST_F(PlatformEvidenceProducerTest, AConfiguredSourceIsNeverBypassed) {
+    // The bypass this forbids: a source that yields nothing must NOT cause the
+    // producer to collect evidence in this process instead. Marked evidence
+    // proves which path ran, on every build.
+    auto with_source = sources();
+    with_source.platform_source = [](const AttestationChallenge&) {
+        nexus::security::SnpVtpmEvidence platform;
+        platform.ima_unavailable = "from the helper";
+        return platform;
+    };
+
+    PlatformEvidenceProducer producer{std::move(with_source)};
+    const auto evidence = producer.produce(challenge_);
+    ASSERT_TRUE(evidence.has_value());
+    EXPECT_EQ(evidence->platform.ima_unavailable, "from the helper");
+    EXPECT_TRUE(evidence->platform.hcl_blob.empty());
+}

@@ -186,6 +186,11 @@ inline constexpr std::size_t kMaxQcSignatures = kMaxActiveTier1;
 inline constexpr uint8_t kSecurityWireVersion = 1;
 inline constexpr std::size_t kMaxSecurityMessageBytes = 60000;
 inline constexpr std::size_t kMaxPlatformEvidenceWireBytes = 56 * 1024;
+
+// Most components one attestation profile may approve. This is what makes a
+// checkpoint summary sizeable from the compiled profile instead of from the
+// measurement log: one entry per approved path, and the list is bounded here.
+inline constexpr std::size_t kMaxSummarisedPaths = 16;
 inline constexpr std::size_t kMaxDkgPayloadBytes = 4096;
 inline constexpr std::size_t kMaxFrostPayloadBytes = 1024;
 inline constexpr std::size_t kMaxCiphersuiteNameBytes = 64;

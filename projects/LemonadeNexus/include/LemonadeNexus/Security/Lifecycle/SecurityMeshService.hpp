@@ -46,6 +46,12 @@ struct SecurityMeshConfig {
     // The gossip identity keypair: the node identity on the security wire.
     crypto::Ed25519Keypair identity{};
     LinuxAttestationProfile profile;
+    /// Where platform evidence comes from. Unset means this process collects
+    /// it itself, which needs TPM and IMA access here; the assembled server
+    /// sets it to the nexus-attestd socket so it needs neither. There is no
+    /// fallback: once set, a helper that fails yields empty evidence and the
+    /// verifier refuses it.
+    PlatformEvidenceSource platform_source;
 };
 
 class SecurityMeshService : public core::IService<SecurityMeshService> {

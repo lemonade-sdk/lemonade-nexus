@@ -48,6 +48,10 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#ifdef LEMONADE_HAVE_ATTESTD_CLIENT
+#  include <LemonadeNexusAttestd/AttestdClient.hpp>
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -227,6 +231,25 @@ int main(int argc, char* argv[]) {
             }
             spdlog::warn("No node can reach Tier 1 until the profile pins these values.");
         }
+#ifdef LEMONADE_HAVE_ATTESTD_CLIENT
+        // Platform evidence comes from nexus-attestd over its unix socket, so
+        // this process needs neither TPM access nor the root-only IMA log.
+        // There is no in-process fallback: if the daemon is absent or refuses,
+        // the source yields empty evidence and the verifier fails it closed.
+        {
+            nexus::attestd::AttestdClientConfig attestd;
+            mesh_config.platform_source = nexus::attestd::attestd_platform_source(attestd);
+            std::error_code sock_ec;
+            if (!std::filesystem::exists(attestd.path, sock_ec)) {
+                spdlog::warn("nexus-attestd socket {} is absent; platform evidence will be "
+                             "empty and every attestation will fail until the daemon runs",
+                             attestd.path.string());
+            } else {
+                spdlog::info("platform evidence source: nexus-attestd at {}",
+                             attestd.path.string());
+            }
+        }
+#endif
         security_mesh.emplace(coordinator.io_context(), mesh_config, gossip, &key_wrapping);
         security_mesh->start();
     }

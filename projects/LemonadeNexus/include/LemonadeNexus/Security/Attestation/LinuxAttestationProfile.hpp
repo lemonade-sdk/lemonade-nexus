@@ -25,6 +25,22 @@ enum class ImaPolicyProof : uint16_t {
 
 [[nodiscard]] std::string_view ima_policy_proof_name(ImaPolicyProof proof);
 
+/// One approved component: where it lives, and which releases of IT are
+/// approved.
+///
+/// The digests belong to the path, not to the profile. A global digest set
+/// would let an approved release of one component satisfy the path reserved
+/// for another — a verifier asked about /usr/bin/nexus would accept the hash of
+/// an approved helper. Binding them here makes that unrepresentable, and makes
+/// a second component a matter of adding an entry.
+struct ApprovedPath {
+    /// Absolute, as the kernel records it in the IMA log.
+    std::string path;
+    /// Hex SHA-256 of each approved release of this component. Empty approves
+    /// nothing, which makes the profile incomplete.
+    std::vector<std::string> sha256;
+};
+
 struct LinuxAttestationProfile {
     uint32_t profile_version{};
 
@@ -40,8 +56,10 @@ struct LinuxAttestationProfile {
     Digest ima_policy_digest{};
     ImaPolicyProof ima_policy_proof{ImaPolicyProof::KernelReadback};
 
-    /// Approved release digests (hex SHA-256). Empty approves nothing.
-    std::vector<std::string> approved_binary_sha256;
+    /// The approved components, and nothing else. Bounded by
+    /// kMaxSummarisedPaths so a checkpoint summary can be sized from the
+    /// profile rather than from the log.
+    std::vector<ApprovedPath> approved_paths;
 
     /// Approved boot state, one pinned hex value per quoted PCR. One of two
     /// boot-integrity inputs; snp.expected_measurement_hex is the other, and
@@ -67,6 +85,10 @@ enum class ProfileGap : uint16_t {
     NoPinnedLaunchMeasurement,
     NoTcbFloor,
     ImaNotRequired,
+    NoApprovedPaths,
+    TooManyApprovedPaths,
+    ApprovedPathNotAbsolute,
+    DuplicateApprovedPath,
     NoApprovedBinary,
     NoImaPolicyDigest,
     NoVmplPolicy,

@@ -7,6 +7,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <utility>
 
 using nexus::security::Digest;
@@ -34,7 +35,7 @@ LinuxAttestationProfile base_profile() {
     profile.required_ak_spki_b64 = "QUsx";
     profile.ima_policy_digest = patterned_digest(0x60);
     profile.require_ima = true;
-    profile.approved_binary_sha256 = {"01ab", "02cd"};
+    profile.approved_paths = {{"/usr/bin/nexus", {"01ab", "02cd"}}};
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = 1;
@@ -64,12 +65,12 @@ const ProfileMutation kProfileMutations[] = {
     {"required_ak_spki_b64", [](LinuxAttestationProfile& p) { p.required_ak_spki_b64 = "QUsy"; }},
     {"ima_policy_digest", [](LinuxAttestationProfile& p) { p.ima_policy_digest[0] ^= 1; }},
     {"require_ima", [](LinuxAttestationProfile& p) { p.require_ima = false; }},
-    {"approved list entry", [](LinuxAttestationProfile& p) { p.approved_binary_sha256[0] = "03ef"; }},
+    {"approved list entry", [](LinuxAttestationProfile& p) { p.approved_paths[0].sha256[0] = "03ef"; }},
     {"approved list extra entry",
-     [](LinuxAttestationProfile& p) { p.approved_binary_sha256.push_back("03ef"); }},
+     [](LinuxAttestationProfile& p) { p.approved_paths[0].sha256.push_back("03ef"); }},
     {"approved list order",
      [](LinuxAttestationProfile& p) {
-         std::swap(p.approved_binary_sha256[0], p.approved_binary_sha256[1]);
+         std::swap(p.approved_paths[0].sha256[0], p.approved_paths[0].sha256[1]);
      }},
     {"require_no_new_privs", [](LinuxAttestationProfile& p) { p.require_no_new_privs = false; }},
     {"require_seccomp", [](LinuxAttestationProfile& p) { p.require_seccomp = false; }},
@@ -105,10 +106,10 @@ TEST(LinuxAttestationProfile, EveryBooleanFlipChangesDigest) {
 
 TEST(LinuxAttestationProfile, EmptyApprovedListIsEncodedNotSkipped) {
     LinuxAttestationProfile empty_list = base_profile();
-    empty_list.approved_binary_sha256 = {};
+    empty_list.approved_paths = {};
 
     LinuxAttestationProfile one_empty_entry = base_profile();
-    one_empty_entry.approved_binary_sha256 = {""};
+    one_empty_entry.approved_paths = {{"/usr/bin/nexus", {""}}};
 
     // The element count is encoded, so zero entries and one empty entry differ.
     EXPECT_NE(profile_digest(empty_list), profile_digest(one_empty_entry));
@@ -116,10 +117,10 @@ TEST(LinuxAttestationProfile, EmptyApprovedListIsEncodedNotSkipped) {
 
 TEST(LinuxAttestationProfile, ListBoundariesCannotShift) {
     LinuxAttestationProfile split = base_profile();
-    split.approved_binary_sha256 = {"ab", "cd"};
+    split.approved_paths = {{"/usr/bin/nexus", {"ab", "cd"}}};
 
     LinuxAttestationProfile joined = base_profile();
-    joined.approved_binary_sha256 = {"abcd"};
+    joined.approved_paths = {{"/usr/bin/nexus", {"abcd"}}};
 
     EXPECT_NE(profile_digest(split), profile_digest(joined));
 }
@@ -178,7 +179,7 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
     EXPECT_FALSE(profile_is_complete(v1));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoPinnedLaunchMeasurement));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoTcbFloor));
-    EXPECT_TRUE(has_gap(v1, ProfileGap::NoApprovedBinary));
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoApprovedPaths));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoImaPolicyDigest));
     // The rules it DOES fix are already right, so these are not gaps.
     EXPECT_FALSE(has_gap(v1, ProfileGap::ProfileVersionUnset));
@@ -205,7 +206,13 @@ TEST(LinuxAttestationProfileCompleteness, EachUnpinnedPrerequisiteIsItsOwnGap) {
     }
     {
         auto p = complete_profile();
-        p.approved_binary_sha256.clear();
+        p.approved_paths.clear();
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::NoApprovedPaths));
+    }
+    {   // A path that lists no release digest can never be satisfied.
+        auto p = complete_profile();
+        p.approved_paths[0].sha256.clear();
         EXPECT_FALSE(profile_is_complete(p));
         EXPECT_TRUE(has_gap(p, ProfileGap::NoApprovedBinary));
     }
@@ -289,4 +296,82 @@ TEST(LinuxAttestationProfileCompleteness, ATierOneProfileMustChooseAVmplPolicy) 
     LinuxAttestationProfile unchosen = profile;
     unchosen.vmpl_policy.reset();
     EXPECT_NE(profile_digest(unchosen), profile_digest(profile));
+}
+
+// --- Approved paths -----------------------------------------------------------
+//
+// binary_path arrives inside the evidence, so without a compiled path list the
+// prover chooses which measured file the verifier looks up. These pin the list
+// and the invariants that keep it summarisable.
+
+TEST(ApprovedPaths, AnEmptyListAndAnOversizedListAreBothGaps) {
+    auto none = complete_profile();
+    none.approved_paths.clear();
+    EXPECT_TRUE(has_gap(none, ProfileGap::NoApprovedPaths));
+
+    auto many = complete_profile();
+    many.approved_paths.clear();
+    for (std::size_t i = 0; i <= nexus::security::constants::kMaxSummarisedPaths; ++i) {
+        many.approved_paths.push_back({"/usr/bin/c" + std::to_string(i), {"aa"}});
+    }
+    EXPECT_TRUE(has_gap(many, ProfileGap::TooManyApprovedPaths));
+
+    // Exactly at the bound is allowed: the bound is what the summary is sized to.
+    auto edge = complete_profile();
+    edge.approved_paths.clear();
+    for (std::size_t i = 0; i < nexus::security::constants::kMaxSummarisedPaths; ++i) {
+        edge.approved_paths.push_back({"/usr/bin/c" + std::to_string(i), {"aa"}});
+    }
+    EXPECT_FALSE(has_gap(edge, ProfileGap::TooManyApprovedPaths));
+}
+
+TEST(ApprovedPaths, RelativeAndEmptyPathsAreRefused) {
+    for (const char* bad : {"", "usr/bin/nexus", "./nexus", "../nexus"}) {
+        auto p = complete_profile();
+        p.approved_paths = {{bad, {"aa"}}};
+        EXPECT_TRUE(has_gap(p, ProfileGap::ApprovedPathNotAbsolute)) << bad;
+        EXPECT_FALSE(profile_is_complete(p)) << bad;
+    }
+}
+
+TEST(ApprovedPaths, DuplicatesAreRefusedEvenWhenSpelledDifferently) {
+    auto exact = complete_profile();
+    exact.approved_paths = {{"/usr/bin/nexus", {"aa"}}, {"/usr/bin/nexus", {"bb"}}};
+    EXPECT_TRUE(has_gap(exact, ProfileGap::DuplicateApprovedPath));
+
+    // Two spellings of one component would otherwise carry two digest sets, and
+    // whichever the prover named would decide which releases are approved.
+    auto spelled = complete_profile();
+    spelled.approved_paths = {{"/usr/bin/nexus", {"aa"}}, {"/usr/bin/./nexus", {"bb"}}};
+    EXPECT_TRUE(has_gap(spelled, ProfileGap::DuplicateApprovedPath));
+
+    auto distinct = complete_profile();
+    distinct.approved_paths = {{"/usr/bin/nexus", {"aa"}}, {"/usr/bin/nexus-attestd", {"bb"}}};
+    EXPECT_FALSE(has_gap(distinct, ProfileGap::DuplicateApprovedPath));
+    EXPECT_TRUE(profile_is_complete(distinct));
+}
+
+TEST(ApprovedPaths, TheDigestChangesWithThePathPolicy) {
+    const Digest base = profile_digest(complete_profile());
+
+    auto renamed = complete_profile();
+    renamed.approved_paths[0].path = "/usr/local/bin/nexus";
+    EXPECT_NE(profile_digest(renamed), base);
+
+    auto added = complete_profile();
+    added.approved_paths.push_back({"/usr/bin/nexus-attestd", {"aa"}});
+    EXPECT_NE(profile_digest(added), base);
+
+    // The same digests attached to different components is a different policy,
+    // so it must be a different profile.
+    auto two_split = complete_profile();
+    two_split.approved_paths = {{"/usr/bin/a", {"aa"}}, {"/usr/bin/b", {"bb"}}};
+    auto two_swapped = complete_profile();
+    two_swapped.approved_paths = {{"/usr/bin/a", {"bb"}}, {"/usr/bin/b", {"aa"}}};
+    EXPECT_NE(profile_digest(two_split), profile_digest(two_swapped));
+
+    // And a path's digests cannot be merged into one pooled list.
+    auto pooled = complete_profile();
+    pooled.approved_paths = {{"/usr/bin/a", {"aa", "bb"}}, {"/usr/bin/b", {}}};
+    EXPECT_NE(profile_digest(pooled), profile_digest(two_split));
 }

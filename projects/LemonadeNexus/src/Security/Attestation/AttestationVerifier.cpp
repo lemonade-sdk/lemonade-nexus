@@ -21,14 +21,29 @@ std::size_t platform_evidence_size(const SnpVtpmEvidence& platform) {
            platform.binary_sha256.size() + platform.ima_unavailable.size();
 }
 
-bool binary_approved(const LinuxAttestationProfile& profile,
+bool binary_approved(const LinuxAttestationProfile& profile, std::string_view binary_path,
                      std::string_view binary_sha256_hex) {
-    if (binary_sha256_hex.empty()) {
+    if (binary_path.empty() || binary_sha256_hex.empty()) {
         return false;
     }
-    return std::find(profile.approved_binary_sha256.begin(),
-                     profile.approved_binary_sha256.end(),
-                     binary_sha256_hex) != profile.approved_binary_sha256.end();
+    const auto entry = std::find_if(profile.approved_paths.begin(), profile.approved_paths.end(),
+                                    [binary_path](const ApprovedPath& approved) {
+                                        return approved.path == binary_path;
+                                    });
+    if (entry == profile.approved_paths.end()) {
+        return false;
+    }
+    return std::find(entry->sha256.begin(), entry->sha256.end(), binary_sha256_hex) !=
+           entry->sha256.end();
+}
+
+std::vector<std::string> approved_path_list(const LinuxAttestationProfile& profile) {
+    std::vector<std::string> paths;
+    paths.reserve(profile.approved_paths.size());
+    for (const auto& approved : profile.approved_paths) {
+        paths.push_back(approved.path);
+    }
+    return paths;
 }
 
 AttestationFailure map_platform_failure(const EvidenceVerdict& verdict) {

@@ -167,7 +167,7 @@ protected:
         profile_.snp.min_tcb = {2, 0, 6, 55};
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest.fill(0x60);
-        profile_.approved_binary_sha256 = {kApprovedBinary};
+        profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         ASSERT_TRUE(profile_is_complete(profile_));
 
         challenge_ = issue(kTier1AttestationProfileId);
@@ -303,7 +303,7 @@ TEST_F(ProviderBoundaryTest, AnIncompleteProfileRefusesBeforeAnyEvidenceIsRead) 
     EXPECT_TRUE(bare.tier1_capable());
 
     LinuxAttestationProfile incomplete = profile_;
-    incomplete.approved_binary_sha256.clear();
+    incomplete.approved_paths.clear();
     ASSERT_FALSE(profile_is_complete(incomplete));
     const auto verdict = AttestationVerifier(incomplete).examine(challenge_, evidence_);
     EXPECT_EQ(verdict.failure, AttestationFailure::ProfileIncomplete);
@@ -518,7 +518,7 @@ LinuxAttestationProfile profile_for_the_captured_host() {
     profile.snp.min_tcb = {4, 0, 28, 222};
     profile.snp.expected_measurement_hex = captured_measurement_hex();
     profile.ima_policy_digest.fill(0x60);
-    profile.approved_binary_sha256 = {kApprovedBinary};
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
     // The captured fixture predates any cached CRL, and revocation is checked
     // right after the AMD signature. Leaving it on here would stop every test
     // below at the same step; the revocation rule has its own tests instead.

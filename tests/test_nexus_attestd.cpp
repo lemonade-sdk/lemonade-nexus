@@ -30,6 +30,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -699,4 +700,66 @@ TEST(AttestdFraming, TheRequestSurfaceIsStillOneChallengeAndNothingElse) {
     auto back = decode_challenge(std::string_view(request).substr(0, request.size() - 1));
     ASSERT_TRUE(back.has_value());
     EXPECT_EQ(challenge_digest(*back), challenge_digest(good_challenge()));
+}
+
+// ---------------------------------------------------------------------------
+// The privilege boundary, restated as a test
+// ---------------------------------------------------------------------------
+
+// AttestdConfig is the daemon's entire configurable surface. If key material
+// could reach the daemon at all, it would reach it through here — so the
+// absence is asserted on the type, not on a code path that might be missed.
+TEST(AttestdBoundary, NothingInTheDaemonConfigCanCarryKeyMaterial) {
+    // Structured binding, so a new field breaks the BUILD rather than slipping
+    // past a runtime check. Both members are named here; neither can hold a key.
+    AttestdConfig config;
+    auto& [cache_dir, allow_network] = config;
+    cache_dir = "/var/lib/nexus-attestd/cache";
+    allow_network = false;
+
+    static_assert(std::is_same_v<decltype(cache_dir), std::filesystem::path>);
+    static_assert(std::is_same_v<decltype(allow_network), bool>);
+    EXPECT_EQ(config.cache_dir, "/var/lib/nexus-attestd/cache");
+}
+
+TEST(AttestdBoundary, NoResponseEverCarriesAuthority) {
+    // Every response the daemon can produce, checked for the field names that
+    // would mean it had signed or voted.
+    AttestdConfig config;
+    config.cache_dir = ::testing::TempDir();
+    AttestdService service{config};
+
+    std::vector<std::string> responses;
+    responses.push_back(collect_frames(service, "{"));                     // malformed
+    responses.push_back(collect_frames(service, good_request().dump()));   // gated
+    {
+        auto other_network = good_request();
+        other_network["network_id"] = std::string(64, '0');
+        responses.push_back(collect_frames(service, other_network.dump()));
+    }
+
+    for (const auto& response : responses) {
+        for (const char* forbidden : {"identity_signature", "epoch_vote_key", "private",
+                                      "frost", "share", "secret", "signature"}) {
+            EXPECT_EQ(response.find(forbidden), std::string::npos)
+                << forbidden << " appeared in a daemon response";
+        }
+    }
+}
+
+TEST(AttestdBoundary, TheRequestGrammarAdmitsNoQuoteSteering) {
+    // A caller may not choose the quoted PCRs, the REPORT_DATA, the nonce, or
+    // any path the daemon reads. Each of these is a well-formed request with
+    // exactly one extra key, and each must be refused outright.
+    AttestdConfig config;
+    config.cache_dir = ::testing::TempDir();
+    AttestdService service{config};
+
+    for (const char* key : {"qualifying_data", "pcr_selection", "report_data", "hcl_blob_override",
+                            "sign", "path", "offset", "ima_log_path"}) {
+        auto request = good_request();
+        request[key] = "whatever";
+        const auto document = json::parse(one_frame(service, request.dump()).second);
+        EXPECT_EQ(document["refusal"], "malformed_request") << key;
+    }
 }

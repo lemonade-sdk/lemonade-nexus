@@ -3,7 +3,11 @@
 #include <LemonadeNexus/Security/CanonicalEncoding.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
+#include <algorithm>
+#include <filesystem>
+#include <string>
 #include <string_view>
+#include <unordered_set>
 
 namespace nexus::security {
 
@@ -13,6 +17,12 @@ inline constexpr std::string_view kProfileDomain = "lemonade-nexus/attestation-p
 
 void add_bool(CanonicalEncoder& encoder, bool value) {
     encoder.add_u16(value ? 1 : 0);
+}
+
+/// The form two approved paths are compared in. "/usr/bin/./nexus" and
+/// "/usr/bin/nexus" name one component, so they are one duplicate.
+std::string canonical_path(const std::string& path) {
+    return std::filesystem::path(path).lexically_normal().generic_string();
 }
 
 }  // namespace
@@ -31,8 +41,16 @@ std::string_view profile_gap_name(ProfileGap gap) {
             return "no launch measurement pinned: any SNP guest image would pass";
         case ProfileGap::NoTcbFloor:
             return "no TCB floor: firmware with known issues would pass";
+        case ProfileGap::NoApprovedPaths:
+            return "no approved paths: no measured component can ever be looked up";
+        case ProfileGap::TooManyApprovedPaths:
+            return "more approved paths than kMaxSummarisedPaths";
+        case ProfileGap::ApprovedPathNotAbsolute:
+            return "an approved path is not absolute, so it names no file the kernel measures";
+        case ProfileGap::DuplicateApprovedPath:
+            return "two approved paths name the same component under different digest sets";
         case ProfileGap::NoApprovedBinary:
-            return "no approved binary digest: no release can ever be approved";
+            return "an approved path lists no release digest, so it can never be satisfied";
         case ProfileGap::NoImaPolicyDigest:
             return "no IMA policy digest pinned: the measuring policy is unproven";
         case ProfileGap::ImaNotRequired:
@@ -59,7 +77,35 @@ std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile) {
         profile.snp.min_tcb.snp == 0 && profile.snp.min_tcb.microcode == 0) {
         gaps.push_back(ProfileGap::NoTcbFloor);
     }
-    if (profile.approved_binary_sha256.empty()) {
+    if (profile.approved_paths.empty()) {
+        gaps.push_back(ProfileGap::NoApprovedPaths);
+    }
+    if (profile.approved_paths.size() > constants::kMaxSummarisedPaths) {
+        gaps.push_back(ProfileGap::TooManyApprovedPaths);
+    }
+    if (std::any_of(profile.approved_paths.begin(), profile.approved_paths.end(),
+                    [](const ApprovedPath& p) {
+                        return p.path.empty() || !std::filesystem::path(p.path).is_absolute();
+                    })) {
+        gaps.push_back(ProfileGap::ApprovedPathNotAbsolute);
+    }
+    {
+        std::unordered_set<std::string> seen;
+        for (const auto& approved : profile.approved_paths) {
+            if (!seen.insert(canonical_path(approved.path)).second) {
+                gaps.push_back(ProfileGap::DuplicateApprovedPath);
+                break;
+            }
+        }
+    }
+    // A path with no digests approves nothing, which is the old NoApprovedBinary
+    // failure moved to where the digests now live.
+    if (std::any_of(profile.approved_paths.begin(), profile.approved_paths.end(),
+                    [](const ApprovedPath& p) {
+                        return p.sha256.empty() ||
+                               std::any_of(p.sha256.begin(), p.sha256.end(),
+                                           [](const std::string& h) { return h.empty(); });
+                    })) {
         gaps.push_back(ProfileGap::NoApprovedBinary);
     }
     // The IMA log is where binary integrity comes from; a profile that does not
@@ -103,7 +149,7 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     profile.security_ruleset = constants::kSecurityRulesetVersion;
 
     // snp.min_tcb, snp.expected_measurement_hex, ima_policy_digest and
-    // approved_binary_sha256 stay unset on purpose. See the header.
+    // approved_paths stay unset on purpose. See the header.
     return profile;
 }
 
@@ -131,9 +177,16 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
     encoder.add_u16(static_cast<uint16_t>(profile.ima_policy_proof));
     add_bool(encoder, profile.require_ima);
 
-    encoder.add_u64(profile.approved_binary_sha256.size());
-    for (const auto& binary_sha256 : profile.approved_binary_sha256) {
-        encoder.add_string(binary_sha256);
+    // Path and digests together, in declaration order. Moving a digest between
+    // paths changes the digest, because which component a release approves is
+    // itself the policy.
+    encoder.add_u64(profile.approved_paths.size());
+    for (const auto& approved : profile.approved_paths) {
+        encoder.add_string(approved.path);
+        encoder.add_u64(approved.sha256.size());
+        for (const auto& binary_sha256 : approved.sha256) {
+            encoder.add_string(binary_sha256);
+        }
     }
 
     encoder.add_u64(profile.expected_pcrs.size());

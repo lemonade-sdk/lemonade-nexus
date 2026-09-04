@@ -9,6 +9,7 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -750,6 +751,16 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
             return deny(std::move(v), "the IMA log does not replay to the quoted PCR 10 — the "
                                        "log has been edited or truncated");
         }
+        // Checked BEFORE the lookup. binary_path is prover-supplied, so a path
+        // outside the profile is refused rather than searched for — otherwise
+        // the prover chooses which measured file the verifier judges.
+        if (!req.approved_paths.empty() &&
+            std::find(req.approved_paths.begin(), req.approved_paths.end(), ev.binary_path) ==
+                req.approved_paths.end()) {
+            return deny(std::move(v), "'" + ev.binary_path + "' is not an approved path");
+        }
+        // Last measurement wins: a component replaced after an approved
+        // measurement appears again, and the newest line is what is running.
         auto entry = ima_entry_for_path(*log, ev.binary_path);
         if (!entry) {
             return deny(std::move(v), "the IMA log carries no measurement of '" +
@@ -760,6 +771,7 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
                                        "recorded for that path");
         }
         v.binary_sha256 = entry->file_hash_hex;
+        v.binary_path = ev.binary_path;
         v.ima_anchored = true;
         v.binary_measured = true;
     } else {

@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <gtest/gtest.h>
@@ -18,6 +19,7 @@ using nexus::security::AttestationVerifier;
 using nexus::security::Digest;
 using nexus::security::EvidenceVerdict;
 using nexus::security::LinuxAttestationProfile;
+using nexus::security::approved_path_list;
 using nexus::security::binary_approved;
 using nexus::security::challenge_digest;
 using nexus::security::evidence_signing_digest;
@@ -52,7 +54,7 @@ protected:
         profile_.snp.min_tcb = {2, 0, 6, 55};
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest.fill(0x60);
-        profile_.approved_binary_sha256 = {kApprovedBinary};
+        profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
 
         challenge_.nonce = patterned<32>(0x01);
@@ -221,25 +223,54 @@ TEST_F(AttestationVerifierTest, VerdictIsDeterministic) {
 
 TEST(BinaryApproved, ListedMeasurementIsApproved) {
     LinuxAttestationProfile profile;
-    profile.approved_binary_sha256 = {"aa", "bb"};
-    EXPECT_TRUE(binary_approved(profile, "aa"));
-    EXPECT_TRUE(binary_approved(profile, "bb"));
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa", "bb"}}};
+    EXPECT_TRUE(binary_approved(profile, "/usr/bin/nexus", "aa"));
+    EXPECT_TRUE(binary_approved(profile, "/usr/bin/nexus", "bb"));
 }
 
 TEST(BinaryApproved, UnlistedMeasurementIsRejected) {
     LinuxAttestationProfile profile;
-    profile.approved_binary_sha256 = {"aa"};
-    EXPECT_FALSE(binary_approved(profile, "cc"));
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}}};
+    EXPECT_FALSE(binary_approved(profile, "/usr/bin/nexus", "cc"));
 }
 
 TEST(BinaryApproved, EmptyListApprovesNothing) {
-    EXPECT_FALSE(binary_approved(LinuxAttestationProfile{}, "aa"));
+    EXPECT_FALSE(binary_approved(LinuxAttestationProfile{}, "/usr/bin/nexus", "aa"));
 }
 
 TEST(BinaryApproved, EmptyMeasurementFailsClosedEvenWhenListed) {
     LinuxAttestationProfile profile;
-    profile.approved_binary_sha256 = {""};
-    EXPECT_FALSE(binary_approved(profile, ""));
+    profile.approved_paths = {{"/usr/bin/nexus", {""}}};
+    EXPECT_FALSE(binary_approved(profile, "/usr/bin/nexus", ""));
+}
+
+TEST(BinaryApproved, APathOutsideTheCompiledListApprovesNothing) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}}};
+    EXPECT_FALSE(binary_approved(profile, "/tmp/nexus", "aa"));
+    EXPECT_FALSE(binary_approved(profile, "", "aa"));
+}
+
+TEST(BinaryApproved, DigestsDoNotCrossPaths) {
+    // The ambiguity this model exists to remove: an approved release of the
+    // helper must not satisfy the path reserved for the server.
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}},
+                              {"/usr/bin/nexus-attestd", {"bb"}}};
+
+    EXPECT_TRUE(binary_approved(profile, "/usr/bin/nexus", "aa"));
+    EXPECT_TRUE(binary_approved(profile, "/usr/bin/nexus-attestd", "bb"));
+    EXPECT_FALSE(binary_approved(profile, "/usr/bin/nexus", "bb"));
+    EXPECT_FALSE(binary_approved(profile, "/usr/bin/nexus-attestd", "aa"));
+}
+
+TEST(BinaryApproved, TheListedPathsAreWhatTheChainIsGiven) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}},
+                              {"/usr/bin/nexus-attestd", {"bb"}}};
+    EXPECT_EQ(approved_path_list(profile),
+              (std::vector<std::string>{"/usr/bin/nexus", "/usr/bin/nexus-attestd"}));
+    EXPECT_TRUE(approved_path_list(LinuxAttestationProfile{}).empty());
 }
 
 // --- Platform failure mapping -------------------------------------------------
@@ -364,3 +395,82 @@ TEST(MapPlatformFailure, MappingIsDeterministic) {
 }
 
 }  // namespace
+
+// --- Last-wins across a replacement -------------------------------------------
+//
+// This composes the two steps the verifier composes: find the LAST measurement
+// the kernel recorded for the approved path, then ask whether that release is
+// approved for it. Written against a real log rather than a mocked lookup,
+// because the ordering rule is the security property.
+//
+// It exists before any checkpoint code on purpose. A checkpoint summary that
+// let an older approved measurement shadow a newer unapproved one would turn
+// this refusal into an acceptance, and this is the test that would catch it.
+
+namespace {
+
+std::string ima_entry(const char* template_hash, const char* file_hash, const char* path) {
+    return std::string("10 ") + template_hash + " ima-ng sha256:" + file_hash + " " + path + "\n";
+}
+
+/// What the verifier does with a log: last measurement of the path, then the
+/// per-path approval decision.
+bool log_satisfies(const LinuxAttestationProfile& profile, const std::string& log,
+                   const char* path) {
+    auto parsed = nexus::security::parse_ima_ascii(log);
+    if (!parsed) return false;
+    auto entry = nexus::security::ima_entry_for_path(*parsed, path);
+    if (!entry) return false;
+    return binary_approved(profile, path, entry->file_hash_hex);
+}
+
+constexpr const char* kUnapprovedBinary =
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+}  // namespace
+
+TEST(ReplacementBinary, ALaterUnapprovedMeasurementOverridesAnEarlierApprovedOne) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+
+    // Approved at boot, replaced afterwards. The kernel measured both.
+    const std::string log = ima_entry(std::string(40, '1').c_str(), kApprovedBinary,
+                                      "/usr/bin/nexus") +
+                            ima_entry(std::string(40, '2').c_str(), kUnapprovedBinary,
+                                      "/usr/bin/nexus");
+    EXPECT_FALSE(log_satisfies(profile, log, "/usr/bin/nexus"));
+
+    // The approved entry alone still passes, so the refusal above is the
+    // ordering rule and not a broken fixture.
+    EXPECT_TRUE(log_satisfies(
+        profile, ima_entry(std::string(40, '1').c_str(), kApprovedBinary, "/usr/bin/nexus"),
+        "/usr/bin/nexus"));
+}
+
+TEST(ReplacementBinary, AnApprovedMeasurementOfAnotherPathDoesNotRescueIt) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}},
+                              {"/usr/bin/nexus-attestd", {kUnapprovedBinary}}};
+
+    // The replacement's hash IS approved — for the other component. Pooling the
+    // digests would accept this.
+    const std::string log = ima_entry(std::string(40, '1').c_str(), kApprovedBinary,
+                                      "/usr/bin/nexus") +
+                            ima_entry(std::string(40, '2').c_str(), kUnapprovedBinary,
+                                      "/usr/bin/nexus");
+    EXPECT_FALSE(log_satisfies(profile, log, "/usr/bin/nexus"));
+}
+
+TEST(ReplacementBinary, AProverNamedPathOutsideTheProfileIsRefused) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+
+    // A perfectly real, correctly measured file that the profile never approved.
+    const std::string log = ima_entry(std::string(40, '3').c_str(), kApprovedBinary, "/tmp/copy");
+    EXPECT_FALSE(log_satisfies(profile, log, "/tmp/copy"));
+
+    // And the path list the platform chain is handed does not contain it, so
+    // the chain refuses before the lookup as well.
+    const auto paths = approved_path_list(profile);
+    EXPECT_EQ(std::find(paths.begin(), paths.end(), "/tmp/copy"), paths.end());
+}
