@@ -163,6 +163,7 @@ add_nexus_test(test_security_attestation
     security/attestation/producer.cpp
     security/attestation/providers.cpp
     security/attestation/attestd_integration.cpp
+    security/attestation/attestd_live.cpp
     security/attestation/tier1_path.cpp)
 # providers.cpp runs the substitution negatives against the captured SNP blob.
 target_link_libraries(test_security_attestation PRIVATE LemonadeNexusAttestdCore)
