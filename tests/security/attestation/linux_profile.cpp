@@ -185,7 +185,7 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
     // designation — but their digest sets are release observations and stay
     // empty, which is its own gap.
     ASSERT_EQ(v1.approved_paths.size(), 2u);
-    EXPECT_EQ(v1.approved_paths[0].path, "/usr/local/bin/nexus");
+    EXPECT_EQ(v1.approved_paths[0].path, "/usr/bin/lemonade-nexus");
     EXPECT_EQ(v1.approved_paths[1].path, "/usr/bin/nexus-attestd");
     EXPECT_EQ(v1.evidence_collector_path, "/usr/bin/nexus-attestd");
     EXPECT_FALSE(has_gap(v1, ProfileGap::NoApprovedPaths));
@@ -366,7 +366,7 @@ TEST(ApprovedPaths, TheDigestChangesWithThePathPolicy) {
     const Digest base = profile_digest(complete_profile());
 
     auto renamed = complete_profile();
-    renamed.approved_paths[0].path = "/usr/local/bin/nexus";
+    renamed.approved_paths[0].path = "/usr/local/bin/nexus";  // an ad-hoc name, not the packaged one
     EXPECT_NE(profile_digest(renamed), base);
 
     auto added = complete_profile();

@@ -53,14 +53,14 @@
 # Recommended use:
 #
 #   sudo ./nexus-attest-profile reference \
-#       --nexus-binary /usr/local/bin/nexus \
+#       --nexus-binary /usr/bin/lemonade-nexus \
 #       --service nexus.service
 #
 #   sudo ./nexus-attest-profile evidence \
 #       --challenge-digest 0123...ef \
 #       --identity-pubkey  89ab...cd \
 #       --binary-measurement auto \
-#       --nexus-binary /usr/local/bin/nexus \
+#       --nexus-binary /usr/bin/lemonade-nexus \
 #       --service nexus.service
 #
 # reference mode runs the same binding over a locally generated random nonce, so
@@ -87,7 +87,7 @@ VERSION="0.2.0"
 
 MODE=""
 OUT_DIR=""
-NEXUS_BINARY="${NEXUS_BINARY:-/usr/local/bin/nexus}"
+NEXUS_BINARY="${NEXUS_BINARY:-/usr/bin/lemonade-nexus}"
 NEXUS_SERVICE="${NEXUS_SERVICE:-nexus.service}"
 
 # Evidence-binding inputs. CHALLENGE_INPUT is a reference-mode-only override for
@@ -156,7 +156,7 @@ Evidence-binding options:
 Options:
   --nexus-binary PATH
       Nexus executable path.
-      Default: /usr/local/bin/nexus
+      Default: /usr/bin/lemonade-nexus
 
   --service NAME
       systemd service name.

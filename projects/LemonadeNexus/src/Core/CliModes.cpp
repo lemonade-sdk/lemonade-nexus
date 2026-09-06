@@ -77,15 +77,33 @@ int run_first_run(const ServerConfig& config) {
     std::printf("Next steps\n");
     std::printf("----------\n");
     std::printf("GENESIS (first server of a new mesh):\n");
-    std::printf("  ./lemonade-nexus --root-pubkey %s\n", init->identity_pubkey_hex.c_str());
-    std::printf("  The identity pubkey above IS the mesh root pubkey; every other\n");
-    std::printf("  server must be started with that same --root-pubkey value.\n");
+    std::printf("  ./lemonade-nexus --data-root %s \\\n", config.data_root.c_str());
+    std::printf("      --root-pubkey %s \\\n", init->identity_pubkey_hex.c_str());
+    std::printf("      --genesis-pubkey %s \\\n", init->gossip_pubkey_b64.c_str());
+    std::printf("      --release-signing-pubkey <RELEASE_SIGNING_PUBKEY>\n");
+    std::printf("\n");
+    std::printf("  Every value above is REQUIRED; the server exits if root-pubkey or\n");
+    std::printf("  release-signing-pubkey is missing.\n");
+    std::printf("    --root-pubkey            the identity pubkey above. It IS the mesh\n");
+    std::printf("                             root pubkey; every other server must be\n");
+    std::printf("                             started with the same value.\n");
+    std::printf("    --genesis-pubkey         the gossip pubkey above. It pins the Genesis\n");
+    std::printf("                             bootstrap anchor, whose authority ends at\n");
+    std::printf("                             Epoch 1 activation. Without it the security\n");
+    std::printf("                             mesh does not start.\n");
+    std::printf("    --release-signing-pubkey the key your release manifests are signed\n");
+    std::printf("                             with. This is NOT the node identity key and\n");
+    std::printf("                             is not generated here — supply the key your\n");
+    std::printf("                             releases are actually signed with, or no\n");
+    std::printf("                             binary can be approved and no node can\n");
+    std::printf("                             reach Tier 1.\n");
     std::printf("\n");
     std::printf("JOIN an existing mesh:\n");
     std::printf("  ./lemonade-nexus --onboard-server [host:port] --data-root %s\n",
                 config.data_root.c_str());
-    std::printf("  (requests admission over the mesh's public API; the mesh admin\n");
-    std::printf("   approves it, no file copying needed)\n");
+    std::printf("  (requests admission over the mesh's public API. Admission is decided\n");
+    std::printf("   by the mesh itself: Tier 1 members vote, and the candidate must pass\n");
+    std::printf("   attestation. No file copying, and no single administrator approval.)\n");
     std::printf("\n");
 
     return 0;

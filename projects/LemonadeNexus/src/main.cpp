@@ -862,14 +862,27 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Run -- blocks until SIGINT/SIGTERM
     // ========================================================================
-    const auto http_proto = http_server.is_tls() ? "HTTPS" : "HTTP";
+    // Report what is actually bound. The control-plane APIs serve HTTPS or
+    // nothing, so naming a port the server never listened on read as a
+    // plaintext fallback that does not exist: with no certificate there is no
+    // TCP listener at all, and a probe of that port is refused.
+    const std::string public_api_status =
+        http_server.is_tls() ? ("HTTPS:" + std::to_string(http_port))
+                             : ("HTTPS:" + std::to_string(http_port) + " (withheld, not listening)");
+    const std::string private_api_status =
+        (private_http_server && private_http_server->is_tls())
+            ? ("PrivateHTTPS:" + tunnel_bind_ip + ":" + std::to_string(config.private_http_port))
+            : ("PrivateHTTPS:" + tunnel_bind_ip + ":" + std::to_string(config.private_http_port) +
+               " (withheld, not listening)");
     if (private_http_server) {
-        spdlog::info("All services started. Listening on {}:{}, PrivateHTTP:{}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
-                     http_proto, http_port, tunnel_bind_ip, config.private_http_port,
-                     udp_port, gossip_port, stun_port, relay_port, dns_port);
+        spdlog::info("All services started. {}, {}, UDP:{}, Gossip/UDP:{}, STUN/UDP:{}, "
+                     "Relay/UDP:{}, DNS/UDP:{}",
+                     public_api_status, private_api_status, udp_port, gossip_port, stun_port, relay_port,
+                     dns_port);
     } else {
-        spdlog::info("All services started. Listening on {}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
-                     http_proto, http_port, udp_port, gossip_port, stun_port, relay_port, dns_port);
+        spdlog::info("All services started. {}, UDP:{}, Gossip/UDP:{}, STUN/UDP:{}, "
+                     "Relay/UDP:{}, DNS/UDP:{}",
+                     public_api_status, udp_port, gossip_port, stun_port, relay_port, dns_port);
     }
     if (http_server.is_tls() && !server_fqdn.empty()) {
         spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());

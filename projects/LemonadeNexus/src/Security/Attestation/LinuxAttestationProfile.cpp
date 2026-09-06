@@ -163,7 +163,12 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     // empty here — hashes are release observations — so the template remains
     // incomplete until a release pins them, along with the audited shared
     // objects these components map (see approved_paths).
-    profile.approved_paths = {{"/usr/local/bin/nexus", {}}, {"/usr/bin/nexus-attestd", {}}};
+    // The INSTALLED paths, matching what the packaging actually writes:
+    // LemonadeNexusApp -> bin/lemonade-nexus, LemonadeNexusAttestd ->
+    // bin/nexus-attestd. Pinning an ad-hoc name such as /usr/local/bin/nexus
+    // would approve whatever was last copied there; the sidecar installs as
+    // lemonade-nexus-sidecar and can never satisfy an entry it is not named by.
+    profile.approved_paths = {{"/usr/bin/lemonade-nexus", {}}, {"/usr/bin/nexus-attestd", {}}};
     profile.evidence_collector_path = "/usr/bin/nexus-attestd";
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <set>
 
@@ -140,7 +141,17 @@ ServerConfig load_config(int argc, char* argv[]) {
     }
 
     // --- Load JSON config file ---
-    if (std::filesystem::exists(config_path)) {
+    // Non-throwing: the default path is relative, so this stats the current
+    // directory. Launched from somewhere the user cannot read, the throwing
+    // overload aborts the process before any configuration is applied; an
+    // unreadable directory means "no config file here", not a fatal error.
+    std::error_code config_ec;
+    const bool config_exists = std::filesystem::exists(config_path, config_ec);
+    if (config_ec) {
+        spdlog::warn("Cannot check for config at {}: {} — continuing without a config file",
+                     config_path, config_ec.message());
+    }
+    if (config_exists) {
         try {
             std::ifstream f(config_path);
             auto j = json::parse(f);
