@@ -203,17 +203,17 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
         // DH shared secret
         auto shared_secret = crypto_.x25519_dh(our_x_priv, root_x_pub);
 
-        // Derive AES-256-GCM key from shared secret
+        // Derive the AEAD key from the shared secret
         const std::string info_str = "lemonade-nexus-ddns-credentials";
         auto aes_key_bytes = crypto_.hkdf_sha256(
             shared_secret,
             std::span<const uint8_t>{}, // no salt
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(info_str.data()), info_str.size()),
-            crypto::kAesGcmKeySize);
+            crypto::kAeadKeySize);
 
-        crypto::AesGcmKey aes_key{};
-        std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAesGcmKeySize);
+        crypto::AeadKey aes_key{};
+        std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAeadKeySize);
 
         // Decrypt the credentials
         auto ciphertext_bytes = crypto::from_base64(
@@ -221,19 +221,17 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
         auto nonce_bytes = crypto::from_base64(
             response.value("nonce", ""));
 
-        // Either AEAD, depending on what the sending host had; see CryptoTypes.
-        if (nonce_bytes.size() != crypto::kAesGcmNonceSize &&
-            nonce_bytes.size() != crypto::kXChaCha20NonceSize) {
+        if (nonce_bytes.size() != crypto::kAeadNonceSize) {
             spdlog::error("[{}] invalid nonce in credential response", name());
             return false;
         }
 
-        crypto::AesGcmCiphertext ct;
+        crypto::EncryptedBlob ct;
         ct.ciphertext = std::move(ciphertext_bytes);
         ct.nonce = std::move(nonce_bytes);
 
         const std::string aad_str = "ddns-credential-transfer";
-        auto plaintext = crypto_.aes_gcm_decrypt(
+        auto plaintext = crypto_.aead_decrypt(
             aes_key, ct,
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
@@ -428,10 +426,10 @@ std::optional<std::string> DdnsService::handle_credential_request(
         std::span<const uint8_t>{}, // no salt
         std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(info_str.data()), info_str.size()),
-        crypto::kAesGcmKeySize);
+        crypto::kAeadKeySize);
 
-    crypto::AesGcmKey aes_key{};
-    std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAesGcmKeySize);
+    crypto::AeadKey aes_key{};
+    std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAeadKeySize);
 
     // Encrypt the DDNS credentials
     json creds_json = config_;
@@ -439,7 +437,7 @@ std::optional<std::string> DdnsService::handle_credential_request(
     auto creds_bytes = std::vector<uint8_t>(creds_str.begin(), creds_str.end());
 
     const std::string aad_str = "ddns-credential-transfer";
-    auto ct = crypto_.aes_gcm_encrypt(
+    auto ct = crypto_.aead_encrypt(
         aes_key, creds_bytes,
         std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
@@ -709,10 +707,10 @@ bool DdnsService::save_encrypted_credentials() {
                 reinterpret_cast<const uint8_t*>(salt_str.data()), salt_str.size()),
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(info_str.data()), info_str.size()),
-            crypto::kAesGcmKeySize);
+            crypto::kAeadKeySize);
 
-        crypto::AesGcmKey aes_key{};
-        std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAesGcmKeySize);
+        crypto::AeadKey aes_key{};
+        std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAeadKeySize);
 
         // Encrypt
         json creds = config_;
@@ -720,13 +718,14 @@ bool DdnsService::save_encrypted_credentials() {
         auto plaintext = std::vector<uint8_t>(plaintext_str.begin(), plaintext_str.end());
 
         const std::string aad_str = "ddns-at-rest";
-        auto ct = crypto_.aes_gcm_encrypt(
+        auto ct = crypto_.aead_encrypt(
             aes_key, plaintext,
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
 
         // Store as signed envelope
         json stored;
+        stored["crypto_version"] = static_cast<unsigned>(ct.version);
         stored["ciphertext"] = crypto::to_base64(ct.ciphertext);
         stored["nonce"] = crypto::to_base64(ct.nonce);
 
@@ -772,26 +771,30 @@ bool DdnsService::load_encrypted_credentials() {
                 reinterpret_cast<const uint8_t*>(salt_str.data()), salt_str.size()),
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(info_str.data()), info_str.size()),
-            crypto::kAesGcmKeySize);
+            crypto::kAeadKeySize);
 
-        crypto::AesGcmKey aes_key{};
-        std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAesGcmKeySize);
+        crypto::AeadKey aes_key{};
+        std::memcpy(aes_key.data(), aes_key_bytes.data(), crypto::kAeadKeySize);
 
         // Parse stored envelope
         auto stored = json::parse(env->data);
         auto ct_bytes = crypto::from_base64(stored.value("ciphertext", ""));
         auto nonce_bytes = crypto::from_base64(stored.value("nonce", ""));
-        if (nonce_bytes.size() != crypto::kAesGcmNonceSize &&
-            nonce_bytes.size() != crypto::kXChaCha20NonceSize) {
+        if (nonce_bytes.size() != crypto::kAeadNonceSize) {
+            return false;
+        }
+        if (!stored.contains("crypto_version") ||
+            !stored["crypto_version"].is_number_unsigned() ||
+            stored["crypto_version"].get<unsigned>() != crypto::kEncryptedBlobVersion) {
             return false;
         }
 
-        crypto::AesGcmCiphertext ct;
+        crypto::EncryptedBlob ct;
         ct.ciphertext = std::move(ct_bytes);
         ct.nonce = std::move(nonce_bytes);
 
         const std::string aad_str = "ddns-at-rest";
-        auto plaintext = crypto_.aes_gcm_decrypt(
+        auto plaintext = crypto_.aead_decrypt(
             aes_key, ct,
             std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));

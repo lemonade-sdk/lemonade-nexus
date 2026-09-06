@@ -38,22 +38,32 @@ struct X25519Keypair {
     X25519PrivateKey private_key{};
 };
 
-// --- AES-256-GCM / XChaCha20-Poly1305 AEAD ---
-static constexpr std::size_t kAesGcmKeySize        = 32;
-static constexpr std::size_t kAesGcmNonceSize       = 12;
-/// XChaCha20-Poly1305 is the fallback when the CPU has no AES acceleration, and
-/// its nonce is wider. Anything that stores or parses a nonce must accept both
-/// sizes: which cipher was used depends on the machine that encrypted.
-static constexpr std::size_t kXChaCha20NonceSize    = 24;
-/// Both AEADs append a 16-byte tag, so ciphertext length does not distinguish
-/// them — only the nonce size does.
-static constexpr std::size_t kAesGcmTagSize         = 16;
-using AesGcmKey   = std::array<uint8_t, kAesGcmKeySize>;
-using AesGcmNonce = std::array<uint8_t, kAesGcmNonceSize>;
+// --- Application AEAD: XChaCha20-Poly1305-IETF, and nothing else -------------
+//
+// One algorithm on every cpu. The cipher is NOT chosen from hardware
+// capability: a ciphertext written anywhere must open anywhere with the same
+// key, so AES-NI, cpu model, VM host and architecture are not inputs to the
+// format. libsodium ships AES-256-GCM only as aesni/armcrypto, so an
+// AES-encrypted object is unreadable on a machine without those instructions —
+// which is exactly the property this rules out.
+static constexpr std::size_t kAeadKeySize   = 32;
+static constexpr std::size_t kAeadNonceSize = 24;
+static constexpr std::size_t kAeadTagSize   = 16;
+using AeadKey = std::array<uint8_t, kAeadKeySize>;
 
-struct AesGcmCiphertext {
-    std::vector<uint8_t> ciphertext; // includes appended tag
-    std::vector<uint8_t> nonce;      // 12 bytes
+/// The one encrypted-object format. `version` names an exact construction, so a
+/// reader never infers the algorithm from field widths.
+///
+///   version 1 = XChaCha20-Poly1305-IETF, 24-byte random nonce, 16-byte tag
+///
+/// Unknown versions fail closed. There is deliberately no algorithm field:
+/// negotiation would put the choice back on the wire.
+static constexpr uint8_t kEncryptedBlobVersion = 1;
+
+struct EncryptedBlob {
+    uint8_t              version{kEncryptedBlobVersion};
+    std::vector<uint8_t> nonce;       // exactly kAeadNonceSize
+    std::vector<uint8_t> ciphertext;  // includes the appended tag
 };
 
 // --- HKDF ---

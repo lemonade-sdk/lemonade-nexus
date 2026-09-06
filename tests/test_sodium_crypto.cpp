@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -114,33 +115,26 @@ TEST_F(SodiumCryptoTest, X25519DHDifferentPeersProduceDifferentSecrets) {
     EXPECT_NE(shared_ab, shared_ac);
 }
 
-// --- AES-256-GCM ---
+// --- Application AEAD ---
 
-TEST_F(SodiumCryptoTest, AesGcmEncryptDecryptRoundTrip) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
-
-    AesGcmKey key{};
+TEST_F(SodiumCryptoTest, AeadEncryptDecryptRoundTrip) {
+    AeadKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 
     std::string plaintext = "Secret data for Lemonade-Nexus";
     auto pt_bytes = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size());
 
-    auto ct = crypto.aes_gcm_encrypt(key, pt_bytes);
-    auto result = crypto.aes_gcm_decrypt(key, ct);
+    auto ct = crypto.aead_encrypt(key, pt_bytes);
+    auto result = crypto.aead_decrypt(key, ct);
 
     ASSERT_TRUE(result.has_value());
     std::string decrypted(result->begin(), result->end());
     EXPECT_EQ(decrypted, plaintext);
 }
 
-TEST_F(SodiumCryptoTest, AesGcmWithAAD) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
-    AesGcmKey key{};
+TEST_F(SodiumCryptoTest, AeadWithAAD) {
+    AeadKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 
     std::string plaintext = "Secret data";
@@ -150,19 +144,16 @@ TEST_F(SodiumCryptoTest, AesGcmWithAAD) {
     auto aad_bytes = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(aad.data()), aad.size());
 
-    auto ct = crypto.aes_gcm_encrypt(key, pt_bytes, aad_bytes);
-    auto result = crypto.aes_gcm_decrypt(key, ct, aad_bytes);
+    auto ct = crypto.aead_encrypt(key, pt_bytes, aad_bytes);
+    auto result = crypto.aead_decrypt(key, ct, aad_bytes);
 
     ASSERT_TRUE(result.has_value());
     std::string decrypted(result->begin(), result->end());
     EXPECT_EQ(decrypted, plaintext);
 }
 
-TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongKey) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
-    AesGcmKey key1{}, key2{};
+TEST_F(SodiumCryptoTest, AeadDecryptFailsWithWrongKey) {
+    AeadKey key1{}, key2{};
     crypto.random_bytes(std::span<uint8_t>(key1));
     crypto.random_bytes(std::span<uint8_t>(key2));
 
@@ -170,16 +161,13 @@ TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongKey) {
     auto pt_bytes = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size());
 
-    auto ct = crypto.aes_gcm_encrypt(key1, pt_bytes);
-    auto result = crypto.aes_gcm_decrypt(key2, ct);
+    auto ct = crypto.aead_encrypt(key1, pt_bytes);
+    auto result = crypto.aead_decrypt(key2, ct);
     EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongAAD) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
-    AesGcmKey key{};
+TEST_F(SodiumCryptoTest, AeadDecryptFailsWithWrongAAD) {
+    AeadKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 
     std::string plaintext = "Secret data";
@@ -192,28 +180,25 @@ TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithWrongAAD) {
     auto aad2_bytes = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(aad2.data()), aad2.size());
 
-    auto ct = crypto.aes_gcm_encrypt(key, pt_bytes, aad1_bytes);
-    auto result = crypto.aes_gcm_decrypt(key, ct, aad2_bytes);
+    auto ct = crypto.aead_encrypt(key, pt_bytes, aad1_bytes);
+    auto result = crypto.aead_decrypt(key, ct, aad2_bytes);
     EXPECT_FALSE(result.has_value());
 }
 
-TEST_F(SodiumCryptoTest, AesGcmDecryptFailsWithTamperedCiphertext) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
-    AesGcmKey key{};
+TEST_F(SodiumCryptoTest, AeadDecryptFailsWithTamperedCiphertext) {
+    AeadKey key{};
     crypto.random_bytes(std::span<uint8_t>(key));
 
     std::string plaintext = "Secret data";
     auto pt_bytes = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(plaintext.data()), plaintext.size());
 
-    auto ct = crypto.aes_gcm_encrypt(key, pt_bytes);
+    auto ct = crypto.aead_encrypt(key, pt_bytes);
     // Tamper with ciphertext
     if (!ct.ciphertext.empty()) {
         ct.ciphertext[0] ^= 0xFF;
     }
-    auto result = crypto.aes_gcm_decrypt(key, ct);
+    auto result = crypto.aead_decrypt(key, ct);
     EXPECT_FALSE(result.has_value());
 }
 
@@ -340,77 +325,110 @@ TEST_F(SodiumCryptoTest, ServiceName) {
     EXPECT_EQ(crypto.service_name(), "SodiumCryptoService");
 }
 
-// --- Nonce width decides the cipher, on every host -----------------------------
+// --- Ciphertext is CPU-independent --------------------------------------------
 //
-// aes_gcm_encrypt uses AES-256-GCM where the CPU accelerates it and
-// XChaCha20-Poly1305 where it does not, and the two nonces are different
-// widths. Anything that stores nonce||ciphertext must therefore recover the
-// width rather than assume 12 — ACLService assumed 12, so every permission
-// written on a host without AES-NI decoded as garbage and read back as None.
+// The cipher is no longer chosen from hardware. These pin the consequence: the
+// format is the same everywhere, so an object written on one machine opens on
+// any other with the same key.
 
-TEST_F(SodiumCryptoTest, EncryptEmitsOneOfTheTwoKnownNonceWidths) {
-    AesGcmKey key{};
+TEST_F(SodiumCryptoTest, EveryCiphertextIsVersionOneWithATwentyFourByteNonce) {
+    AeadKey key{};
     randombytes_buf(key.data(), key.size());
-    const std::vector<uint8_t> plaintext{1, 2, 3, 4};
 
-    const auto ct = crypto.aes_gcm_encrypt(key, plaintext);
-    EXPECT_TRUE(ct.nonce.size() == kAesGcmNonceSize ||
-                ct.nonce.size() == kXChaCha20NonceSize)
-        << "unexpected nonce width " << ct.nonce.size();
-    // Both AEADs append the same tag size, which is what makes the width
-    // recoverable from the total length.
-    EXPECT_EQ(ct.ciphertext.size(), plaintext.size() + kAesGcmTagSize);
-}
+    // Sizes spanning the payloads Nexus actually encrypts.
+    for (const std::size_t size : {std::size_t{0}, std::size_t{4}, std::size_t{64},
+                                   std::size_t{1024}, std::size_t{16384}}) {
+        std::vector<uint8_t> plaintext(size, 0x5A);
+        const auto blob = crypto.aead_encrypt(key, plaintext);
+        EXPECT_EQ(blob.version, kEncryptedBlobVersion) << size;
+        EXPECT_EQ(blob.nonce.size(), kAeadNonceSize) << size;
+        EXPECT_EQ(blob.ciphertext.size(), size + kAeadTagSize) << size;
 
-TEST_F(SodiumCryptoTest, AnXChaCha20CiphertextDecryptsOnAnyHost) {
-    // Built with libsodium directly, so this runs the fallback path even on a
-    // machine whose CPU would have chosen AES-GCM.
-    AesGcmKey key{};
-    randombytes_buf(key.data(), key.size());
-    const std::vector<uint8_t> plaintext{0xDE, 0xAD, 0xBE, 0xEF};
-
-    AesGcmCiphertext ct;
-    ct.nonce.resize(kXChaCha20NonceSize);
-    randombytes_buf(ct.nonce.data(), ct.nonce.size());
-    ct.ciphertext.resize(plaintext.size() + kAesGcmTagSize);
-    unsigned long long written = 0;
-    ASSERT_EQ(crypto_aead_xchacha20poly1305_ietf_encrypt(
-                  ct.ciphertext.data(), &written, plaintext.data(), plaintext.size(),
-                  nullptr, 0, nullptr, ct.nonce.data(), key.data()),
-              0);
-    ct.ciphertext.resize(static_cast<std::size_t>(written));
-
-    const auto back = crypto.aes_gcm_decrypt(key, ct);
-    ASSERT_TRUE(back.has_value());
-    EXPECT_EQ(*back, plaintext);
-}
-
-TEST_F(SodiumCryptoTest, ANonceWidthIsRecoverableFromAStoredBlob) {
-    // The exact arithmetic ACLService::decrypt_perms relies on: permissions are
-    // a fixed four bytes, both tags are 16, so nonce width = blob - 20 and the
-    // two layouts can never collide.
-    constexpr std::size_t kCiphertextSize = sizeof(uint32_t) + kAesGcmTagSize;
-    for (const std::size_t width : {kAesGcmNonceSize, kXChaCha20NonceSize}) {
-        const std::size_t blob = width + kCiphertextSize;
-        EXPECT_EQ(blob - kCiphertextSize, width);
+        const auto back = crypto.aead_decrypt(key, blob);
+        ASSERT_TRUE(back.has_value()) << size;
+        EXPECT_EQ(*back, plaintext) << size;
     }
-    EXPECT_NE(kAesGcmNonceSize + kCiphertextSize, kXChaCha20NonceSize + kCiphertextSize);
 }
 
-TEST_F(SodiumCryptoTest, AShortNonceIsRefusedRatherThanOverRead) {
-    // libsodium reads NPUBBYTES from the nonce with no length argument, so a
-    // truncated nonce off disk or off the wire used to be a heap over-read
-    // inside the AEAD rather than a decrypt failure. Every width that is not
-    // one of the two legal ones must be refused before the call.
-    AesGcmKey key{};
+TEST_F(SodiumCryptoTest, TwoIndependentServicesProduceTheSameFormat) {
+    // Two services on the same host stand in for two machines: whatever either
+    // one writes, the other reads. There is no capability that could differ.
+    AeadKey key{};
+    randombytes_buf(key.data(), key.size());
+    const std::vector<uint8_t> plaintext{1, 2, 3, 4, 5, 6, 7, 8};
+
+    SodiumCryptoService other;
+    other.start();
+
+    const auto mine = crypto.aead_encrypt(key, plaintext);
+    const auto theirs = other.aead_encrypt(key, plaintext);
+    EXPECT_EQ(mine.version, theirs.version);
+    EXPECT_EQ(mine.nonce.size(), theirs.nonce.size());
+    EXPECT_EQ(mine.ciphertext.size(), theirs.ciphertext.size());
+    // Nonces are random, so the bytes differ while the format does not.
+    EXPECT_NE(mine.nonce, theirs.nonce);
+
+    const auto cross_a = other.aead_decrypt(key, mine);
+    const auto cross_b = crypto.aead_decrypt(key, theirs);
+    ASSERT_TRUE(cross_a.has_value());
+    ASSERT_TRUE(cross_b.has_value());
+    EXPECT_EQ(*cross_a, plaintext);
+    EXPECT_EQ(*cross_b, plaintext);
+    other.stop();
+}
+
+TEST_F(SodiumCryptoTest, NoncesAreFreshPerEncryption) {
+    AeadKey key{};
+    randombytes_buf(key.data(), key.size());
+    const std::vector<uint8_t> plaintext{0xAB};
+
+    std::set<std::vector<uint8_t>> seen;
+    for (int i = 0; i < 256; ++i) {
+        const auto blob = crypto.aead_encrypt(key, plaintext);
+        ASSERT_EQ(blob.nonce.size(), kAeadNonceSize);
+        EXPECT_TRUE(seen.insert(blob.nonce).second) << "nonce repeated at " << i;
+    }
+}
+
+TEST_F(SodiumCryptoTest, AnUnknownVersionIsRefused) {
+    AeadKey key{};
+    randombytes_buf(key.data(), key.size());
+    auto blob = crypto.aead_encrypt(key, std::vector<uint8_t>{1, 2, 3, 4});
+
+    for (const uint8_t bad : {uint8_t{0}, uint8_t{2}, uint8_t{255}}) {
+        auto tampered = blob;
+        tampered.version = bad;
+        EXPECT_FALSE(crypto.aead_decrypt(key, tampered).has_value()) << unsigned(bad);
+    }
+}
+
+TEST_F(SodiumCryptoTest, AWrongSizedNonceIsRefusedRatherThanOverRead) {
+    // libsodium reads NPUBBYTES with no length argument, so every width other
+    // than the exact one must be refused before the pointer is handed over.
+    AeadKey key{};
     randombytes_buf(key.data(), key.size());
 
-    for (const std::size_t width : {std::size_t{0}, std::size_t{1}, std::size_t{5},
-                                    std::size_t{11}, std::size_t{13}, std::size_t{23},
-                                    std::size_t{25}, std::size_t{64}}) {
-        AesGcmCiphertext ct;
-        ct.nonce.assign(width, 0xAB);
-        ct.ciphertext.assign(kAesGcmTagSize + 4, 0xCD);
-        EXPECT_FALSE(crypto.aes_gcm_decrypt(key, ct).has_value()) << "width " << width;
+    for (const std::size_t width : {std::size_t{0}, std::size_t{1}, std::size_t{11},
+                                    std::size_t{12}, std::size_t{23}, std::size_t{25},
+                                    std::size_t{64}}) {
+        EncryptedBlob blob;
+        blob.version = kEncryptedBlobVersion;
+        blob.nonce.assign(width, 0xAB);
+        blob.ciphertext.assign(kAeadTagSize + 4, 0xCD);
+        EXPECT_FALSE(crypto.aead_decrypt(key, blob).has_value()) << "width " << width;
     }
+}
+
+TEST_F(SodiumCryptoTest, AssociatedDataIsStillAuthenticated) {
+    AeadKey key{};
+    randombytes_buf(key.data(), key.size());
+    const std::vector<uint8_t> plaintext{9, 9, 9};
+    const std::vector<uint8_t> aad{0x01, 0x02, 0x03};
+
+    const auto blob = crypto.aead_encrypt(key, plaintext, aad);
+    ASSERT_TRUE(crypto.aead_decrypt(key, blob, aad).has_value());
+
+    const std::vector<uint8_t> other_aad{0x01, 0x02, 0x04};
+    EXPECT_FALSE(crypto.aead_decrypt(key, blob, other_aad).has_value());
+    EXPECT_FALSE(crypto.aead_decrypt(key, blob).has_value());
 }

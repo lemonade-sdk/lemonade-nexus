@@ -21,12 +21,36 @@ title: Security
 |-----------|-----------|---------|
 | Identity keys | Ed25519 | Server and client identity, signing |
 | Mesh keys | X25519 (Curve25519) | Tunnel encryption (derived from Ed25519) |
-| Symmetric AEAD | XChaCha20-Poly1305 / AES-256-GCM | Credential encryption, at-rest encryption |
+| Symmetric AEAD | XChaCha20-Poly1305-IETF | Credential encryption, at-rest encryption |
 | Key derivation | HKDF-SHA256 | Derive encryption keys from shared secrets |
 | Password hashing | PBKDF2-SHA256 (100k iterations) | Derive Ed25519 seed from username+password |
 | Hashing | SHA-256 | Binary attestation, deduplication |
 | Fast hashing | xxHash | Gossip deduplication |
 | TLS | OpenSSL 3.3.2 | HTTPS for public and private APIs |
+
+### Encrypted object format
+
+Every Nexus-controlled encrypted object uses one construction. The algorithm is
+never selected from CPU capabilities, so a ciphertext written on any supported
+machine opens on every other with the same key.
+
+```text
+EncryptedBlob {
+    version      // 1
+    nonce        // exactly 24 bytes, cryptographically random per encryption
+    ciphertext   // includes the 16-byte Poly1305 tag
+}
+
+version 1 = XChaCha20-Poly1305-IETF
+```
+
+A reader checks the version first and requires the exact nonce length before any
+bytes reach the AEAD. Unknown versions fail closed. There is no algorithm
+negotiation field: one version means one exact construction.
+
+Objects carrying this format: the wrapped node identity (`identity/keypair.enc`),
+ACL permission values, epoch vote keys, DDNS credentials at rest and in
+transfer, and the issued-certificate bundle sent to SDK clients.
 
 All cryptography via **libsodium** (identity, signing, DH, AEAD) and **OpenSSL** (TLS, ACME).
 
@@ -102,7 +126,7 @@ Sensitive credentials (DDNS passwords) are distributed via encrypted channel:
 
 1. Server sends: certificate + binary hash + X25519 public key + signature
 2. Root verifies: certificate (Ed25519), binary hash (against manifests), signature
-3. Encryption: X25519 DH → HKDF → AES-256-GCM
+3. Encryption: X25519 DH → HKDF → XChaCha20-Poly1305
 4. At-rest: re-encrypted with server's own identity-derived key
 
 ## Rate Limiting and Replay Protection

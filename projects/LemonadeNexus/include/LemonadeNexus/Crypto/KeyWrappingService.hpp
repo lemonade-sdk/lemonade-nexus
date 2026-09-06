@@ -12,9 +12,9 @@
 
 namespace nexus::crypto {
 
-/// A wrapped Ed25519 private key: AES-256-GCM ciphertext + nonce.
+/// A wrapped Ed25519 private key: an EncryptedBlob (XChaCha20-Poly1305).
 struct WrappedKey {
-    AesGcmCiphertext ciphertext;  // encrypted Ed25519PrivateKey (64 bytes)
+    EncryptedBlob ciphertext;  // encrypted Ed25519PrivateKey (64 bytes)
     std::string      label;       // human-readable identifier
 };
 
@@ -22,7 +22,7 @@ struct WrappedKey {
 struct DelegationResult {
     Ed25519Keypair   child_keypair;       // child's new Ed25519 keypair
     WrappedKey       wrapped_child_key;   // child privkey wrapped with a random wrapping key
-    AesGcmCiphertext encrypted_wk;       // wrapping key encrypted to child's X25519 pubkey
+    EncryptedBlob encrypted_wk;       // wrapping key encrypted to child's X25519 pubkey
     X25519PublicKey  ephemeral_pubkey{};  // ephemeral X25519 pubkey needed by child to derive DH
     bool             success{false};
     std::string      error_message;
@@ -32,13 +32,13 @@ struct DelegationResult {
 ///
 /// Key unlock flow:
 ///   1. WebAuthn assertion provides a credential secret
-///   2. HKDF-SHA256(secret, salt="lemonade-nexus-mgmt-key", info=pubkey) → AES-256 key
-///   3. AES-GCM decrypt the wrapped Ed25519 private key
+///   2. HKDF-SHA256(secret, salt="lemonade-nexus-mgmt-key", info=pubkey) → 32-byte AEAD key
+///   3. AEAD-decrypt the wrapped Ed25519 private key
 ///
 /// Delegation flow:
 ///   1. Generate child Ed25519 keypair
 ///   2. Generate random wrapping key (WK)
-///   3. AES-GCM(WK, child privkey) → wrapped child key
+///   3. AEAD(WK, child privkey) → wrapped child key
 ///   4. X25519-encrypt WK to child's public key (derived from Ed25519 via Curve25519)
 class KeyWrappingService : public core::IService<KeyWrappingService> {
     friend class core::IService<KeyWrappingService>;
@@ -100,8 +100,8 @@ private:
     ///             layer — see docs/TEE-Attestation-Hardening-Plan.md §2 / wrap_seal TODO.)
     enum class WrapBinding { Legacy, Machine };
 
-    /// Derive an AES-256 key from a passphrase using HKDF-SHA256, bound per `binding`.
-    [[nodiscard]] AesGcmKey derive_wrapping_key(
+    /// Derive a 32-byte AEAD key from a passphrase using HKDF-SHA256, bound per `binding`.
+    [[nodiscard]] AeadKey derive_wrapping_key(
             std::span<const uint8_t> passphrase,
             const Ed25519PublicKey& pubkey,
             WrapBinding binding) const;

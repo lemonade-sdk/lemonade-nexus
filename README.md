@@ -498,7 +498,7 @@ Clients can request TLS certificates for their hostname (e.g., `my-laptop.capi.l
 
 1. Client calls `request_certificate("my-laptop")`
 2. Server obtains the cert from Let's Encrypt/ZeroSSL via ACME DNS-01
-3. Server encrypts the private key using X25519 DH + HKDF + AES-256-GCM with the client's Ed25519 public key
+3. Server encrypts the private key using X25519 DH + HKDF + XChaCha20-Poly1305 with the client's Ed25519 public key
 4. Client decrypts with `decrypt_certificate()` to get the PEM files
 
 ## Configuration
@@ -719,7 +719,7 @@ The root Ed25519 private key is split using Shamir's Secret Sharing over GF(2^8)
 
 - **N** = all eligible Tier 1 peers (100% distribution)
 - **K** = ceil(75% of N), minimum 2 (reconstruction threshold)
-- Shares are encrypted per-peer using X25519 Diffie-Hellman + HKDF + AES-256-GCM
+- Shares are encrypted per-peer using X25519 Diffie-Hellman + HKDF + XChaCha20-Poly1305
 - If the root server goes offline, any K Tier 1 peers can reconstruct the key
 
 ## Building from Source
@@ -862,7 +862,7 @@ All dependencies are fetched automatically via CMake FetchContent:
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| libsodium | latest | Ed25519, X25519, AES-GCM, Shamir |
+| libsodium | latest | Ed25519, X25519, XChaCha20-Poly1305, Shamir |
 | nlohmann_json | 3.12.0 | JSON serialization |
 | spdlog | 1.16.0 | Logging |
 | asio | 1.34.2 | Async I/O (UDP, timers) |

@@ -456,6 +456,7 @@ ln_error_t ln_cert_request(ln_client_t* client,
     j["domain"]           = result.value.domain;
     j["fullchain_pem"]    = result.value.fullchain_pem;
     j["encrypted_privkey"] = result.value.encrypted_privkey;
+    j["crypto_version"]    = result.value.crypto_version;
     j["nonce"]            = result.value.nonce;
     j["ephemeral_pubkey"] = result.value.ephemeral_pubkey;
     j["expires_at"]       = result.value.expires_at;
@@ -477,6 +478,7 @@ ln_error_t ln_cert_decrypt(ln_client_t* client,
     bundle.domain           = parsed.value("domain", "");
     bundle.fullchain_pem    = parsed.value("fullchain_pem", "");
     bundle.encrypted_privkey = parsed.value("encrypted_privkey", "");
+    bundle.crypto_version    = parsed.value("crypto_version", 0u);
     bundle.nonce            = parsed.value("nonce", "");
     bundle.ephemeral_pubkey = parsed.value("ephemeral_pubkey", "");
     bundle.expires_at       = parsed.value("expires_at", uint64_t{0});

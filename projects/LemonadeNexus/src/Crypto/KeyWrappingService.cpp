@@ -75,7 +75,7 @@ WrappedKey KeyWrappingService::wrap_with_binding(const Ed25519PrivateKey& privke
     auto aes_key = derive_wrapping_key(passphrase, pubkey, binding);
 
     // Encrypt the 64-byte Ed25519 private key
-    auto ct = crypto_.aes_gcm_encrypt(
+    auto ct = crypto_.aead_encrypt(
         aes_key,
         std::span<const uint8_t>(privkey.data(), privkey.size()),
         std::span<const uint8_t>(pubkey.data(), pubkey.size())); // pubkey as AAD
@@ -92,7 +92,7 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unwrap_with_binding(
         WrapBinding binding) {
     auto aes_key = derive_wrapping_key(passphrase, pubkey, binding);
 
-    auto plaintext = crypto_.aes_gcm_decrypt(
+    auto plaintext = crypto_.aead_decrypt(
         aes_key,
         wrapped.ciphertext,
         std::span<const uint8_t>(pubkey.data(), pubkey.size())); // pubkey as AAD
@@ -140,10 +140,13 @@ Ed25519Keypair KeyWrappingService::generate_and_store_identity(
         // The "v2:" prefix marks the machine-bound binding (see WrapBinding::Machine).
         auto enc_path = identity_dir / "keypair.enc";
         std::ofstream ofs(enc_path, std::ios::binary);
+        // "v2:" marks the machine binding; the number after it is the crypto
+        // format version, so the construction is named rather than guessed.
         auto nonce_hex = to_hex(std::span<const uint8_t>(
             wrapped.ciphertext.nonce.data(), wrapped.ciphertext.nonce.size()));
         auto ct_hex = to_hex(std::span<const uint8_t>(wrapped.ciphertext.ciphertext));
-        ofs << kEncV2Prefix << nonce_hex << ":" << ct_hex;
+        ofs << kEncV2Prefix << static_cast<unsigned>(wrapped.ciphertext.version) << ":"
+            << nonce_hex << ":" << ct_hex;
         ofs.close();
         // Owner read/write only — encrypted key material
         std::error_code ec;
@@ -213,33 +216,47 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
         content.erase(0, kEncV2Prefix.size());
     }
 
-    auto colon = content.find(':');
-    if (colon == std::string::npos) {
+    // version : nonce_hex : ciphertext_hex
+    const auto first = content.find(':');
+    if (first == std::string::npos) {
         spdlog::warn("[{}] invalid encrypted key format", name());
         return std::nullopt;
     }
-    if (colon + 1 >= content.size()) {
+    const auto second = content.find(':', first + 1);
+    if (second == std::string::npos || second + 1 >= content.size()) {
         spdlog::warn("[{}] invalid encrypted key format: empty ciphertext", name());
+        return std::nullopt;
+    }
+
+    unsigned version = 0;
+    try {
+        version = static_cast<unsigned>(std::stoul(content.substr(0, first)));
+    } catch (...) {
+        spdlog::warn("[{}] invalid encrypted key version", name());
+        return std::nullopt;
+    }
+    if (version != kEncryptedBlobVersion) {
+        spdlog::warn("[{}] unsupported encrypted key version {}", name(), version);
         return std::nullopt;
     }
 
     std::vector<uint8_t> nonce_bytes;
     std::vector<uint8_t> ct_bytes;
     try {
-        nonce_bytes = from_hex(content.substr(0, colon));
-        ct_bytes = from_hex(content.substr(colon + 1));
+        nonce_bytes = from_hex(content.substr(first + 1, second - first - 1));
+        ct_bytes = from_hex(content.substr(second + 1));
     } catch (...) {
         spdlog::warn("[{}] invalid hex in encrypted key file", name());
         return std::nullopt;
     }
 
-    // Accept both AES-GCM (12-byte) and XChaCha20-Poly1305 (24-byte) nonces
-    if (nonce_bytes.size() != kAesGcmNonceSize && nonce_bytes.size() != kXChaCha20NonceSize) {
+    if (nonce_bytes.size() != kAeadNonceSize) {
         spdlog::warn("[{}] invalid nonce size in encrypted key: {}", name(), nonce_bytes.size());
         return std::nullopt;
     }
 
     WrappedKey wrapped;
+    wrapped.ciphertext.version = static_cast<uint8_t>(version);
     wrapped.ciphertext.nonce = std::move(nonce_bytes);
     wrapped.ciphertext.ciphertext = std::move(ct_bytes);
 
@@ -290,7 +307,8 @@ void KeyWrappingService::migrate_legacy_identity(
             spdlog::warn("[{}] legacy identity migration: cannot open temp file", name());
             return;
         }
-        ofs << kEncV2Prefix << nonce_hex << ":" << ct_hex;
+        ofs << kEncV2Prefix << static_cast<unsigned>(rewrapped.ciphertext.version) << ":"
+            << nonce_hex << ":" << ct_hex;
         ofs.close();
         if (!ofs) {
             spdlog::warn("[{}] legacy identity migration: temp write failed", name());
@@ -322,11 +340,11 @@ DelegationResult KeyWrappingService::delegate_key(
     result.child_keypair = crypto_.ed25519_keygen();
 
     // Generate random wrapping key (WK)
-    AesGcmKey wk{};
+    AeadKey wk{};
     crypto_.random_bytes(std::span<uint8_t>(wk));
 
     // Wrap child private key with WK
-    result.wrapped_child_key.ciphertext = crypto_.aes_gcm_encrypt(
+    result.wrapped_child_key.ciphertext = crypto_.aead_encrypt(
         wk,
         std::span<const uint8_t>(result.child_keypair.private_key.data(),
                                  result.child_keypair.private_key.size()),
@@ -349,13 +367,13 @@ DelegationResult KeyWrappingService::delegate_key(
                                  parent_passphrase.size()),
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>("lemonade-nexus-delegation"),
                                  22),
-        kAesGcmKeySize);
+        kAeadKeySize);
 
-    AesGcmKey delegation_key{};
-    std::memcpy(delegation_key.data(), derived.data(), kAesGcmKeySize);
+    AeadKey delegation_key{};
+    std::memcpy(delegation_key.data(), derived.data(), kAeadKeySize);
 
     // Encrypt WK with the derived key, include ephemeral pubkey as AAD
-    result.encrypted_wk = crypto_.aes_gcm_encrypt(
+    result.encrypted_wk = crypto_.aead_encrypt(
         delegation_key,
         std::span<const uint8_t>(wk.data(), wk.size()),
         std::span<const uint8_t>(ephemeral.public_key.data(),
@@ -377,7 +395,7 @@ DelegationResult KeyWrappingService::delegate_key(
 // Internal
 // ---------------------------------------------------------------------------
 
-AesGcmKey KeyWrappingService::derive_wrapping_key(
+AeadKey KeyWrappingService::derive_wrapping_key(
         std::span<const uint8_t> passphrase,
         const Ed25519PublicKey& pubkey,
         WrapBinding binding) const {
@@ -400,10 +418,10 @@ AesGcmKey KeyWrappingService::derive_wrapping_key(
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kHkdfSalt.data()),
                                  kHkdfSalt.size()),
         std::span<const uint8_t>(info.data(), info.size()),
-        kAesGcmKeySize);
+        kAeadKeySize);
 
-    AesGcmKey key{};
-    std::memcpy(key.data(), derived.data(), kAesGcmKeySize);
+    AeadKey key{};
+    std::memcpy(key.data(), derived.data(), kAeadKeySize);
     sodium_memzero(ikm.data(), ikm.size());
     return key;
 }
@@ -418,7 +436,7 @@ std::vector<uint8_t> KeyWrappingService::machine_binding_secret() const {
         if (ifs && (ifs >> hex_str)) {
             try {
                 auto bytes = from_hex(hex_str);
-                if (bytes.size() == kAesGcmKeySize) {
+                if (bytes.size() == kAeadKeySize) {
                     return bytes;
                 }
             } catch (...) {
@@ -431,7 +449,7 @@ std::vector<uint8_t> KeyWrappingService::machine_binding_secret() const {
     }
 
     // First use (or corrupt): generate a fresh per-install secret, owner-only.
-    std::vector<uint8_t> secret(kAesGcmKeySize);
+    std::vector<uint8_t> secret(kAeadKeySize);
     crypto_.random_bytes(std::span<uint8_t>(secret.data(), secret.size()));
 
     std::error_code ec;

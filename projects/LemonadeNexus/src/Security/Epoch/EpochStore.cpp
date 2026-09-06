@@ -459,6 +459,7 @@ bool EpochStore::store_vote_key(const EpochVoteKey& key) {
     j["epoch"] = key.epoch;
     j["node_id"] = b64(key.node_id.bytes);
     j["public_key"] = b64(key.public_key);
+    j["crypto_version"] = static_cast<unsigned>(wrapped.ciphertext.version);
     j["ciphertext"] = crypto::to_base64(wrapped.ciphertext.ciphertext);
     j["nonce"] = crypto::to_base64(wrapped.ciphertext.nonce);
     return write_atomic(directory_ / vote_key_file(key.epoch), j.dump());
@@ -486,9 +487,16 @@ std::optional<EpochVoteKey> EpochStore::load_vote_key(EpochId epoch, const NodeI
         !from_b64(j["public_key"], pubkey)) {
         return std::nullopt;
     }
+    // Named construction, then exact lengths — nothing is inferred from widths.
+    if (!j.contains("crypto_version") || !j["crypto_version"].is_number_unsigned() ||
+        j["crypto_version"].get<unsigned>() != crypto::kEncryptedBlobVersion) {
+        return std::nullopt;
+    }
     crypto::WrappedKey wrapped;
     wrapped.ciphertext.ciphertext = crypto::from_base64(j["ciphertext"].get<std::string>());
+    wrapped.ciphertext.version = crypto::kEncryptedBlobVersion;
     wrapped.ciphertext.nonce = crypto::from_base64(j["nonce"].get<std::string>());
+    if (wrapped.ciphertext.nonce.size() != crypto::kAeadNonceSize) return std::nullopt;
     auto secret = wrapping_->unwrap_key(wrapped, {}, pubkey);
     if (!secret.has_value()) {
         return std::nullopt;

@@ -12,15 +12,6 @@ void SodiumCryptoService::on_start() {
         throw std::runtime_error("Failed to initialize libsodium");
     }
 
-    // AES-256-GCM requires hardware support (AES-NI on x86, ARM crypto on ARM64)
-    aes_gcm_available_ = (crypto_aead_aes256gcm_is_available() != 0);
-    if (!aes_gcm_available_) {
-        spdlog::warn("[{}] AES-256-GCM not available — using XChaCha20-Poly1305 fallback "
-                     "(equally secure, software-only)", name());
-    } else {
-        spdlog::info("[{}] AES-256-GCM hardware support confirmed", name());
-    }
-
     spdlog::info("[{}] libsodium initialized (version {})", name(), sodium_version_string());
 }
 
@@ -70,109 +61,67 @@ X25519SharedSecret SodiumCryptoService::do_x25519_dh(const X25519PrivateKey& our
     return shared;
 }
 
-// --- AEAD: AES-256-GCM (hardware) or XChaCha20-Poly1305 (software fallback) ---
+// --- Application AEAD: XChaCha20-Poly1305-IETF only ---------------------------
 //
-// Both use 32-byte keys and 16-byte auth tags.  We distinguish them by nonce
-// size: AES-GCM uses 12 bytes, XChaCha20-Poly1305 uses 24 bytes.  This makes
-// the stored format backward-compatible: old ciphertexts with 12-byte nonces
-// decrypt with AES-GCM, new ciphertexts written on non-AES-GCM CPUs have
-// 24-byte nonces and are decrypted with XChaCha20-Poly1305.
+// One construction, chosen at compile time rather than from the cpu, so a
+// ciphertext is portable across every supported machine. See EncryptedBlob.
 
-AesGcmCiphertext SodiumCryptoService::do_aes_gcm_encrypt(const AesGcmKey& key,
-                                                           std::span<const uint8_t> plaintext,
-                                                           std::span<const uint8_t> aad) {
-    AesGcmCiphertext result;
+EncryptedBlob SodiumCryptoService::do_aead_encrypt(const AeadKey& key,
+                                                    std::span<const uint8_t> plaintext,
+                                                    std::span<const uint8_t> aad) {
+    EncryptedBlob result;
+    result.version = kEncryptedBlobVersion;
+    result.nonce.resize(kAeadNonceSize);
+    result.ciphertext.resize(plaintext.size() + kAeadTagSize);
 
-    if (aes_gcm_available_) {
-        // Hardware AES-256-GCM path
-        result.nonce.resize(crypto_aead_aes256gcm_NPUBBYTES); // 12 bytes
-        result.ciphertext.resize(plaintext.size() + crypto_aead_aes256gcm_ABYTES);
-        randombytes_buf(result.nonce.data(), result.nonce.size());
+    // A fresh random nonce per encryption. 24 bytes is wide enough that random
+    // selection needs no counter and no coordination to stay collision-free.
+    randombytes_buf(result.nonce.data(), result.nonce.size());
 
-        unsigned long long ciphertext_len = 0;
-        if (crypto_aead_aes256gcm_encrypt(
-                result.ciphertext.data(), &ciphertext_len,
-                plaintext.data(), plaintext.size(),
-                aad.data(), aad.size(),
-                nullptr, result.nonce.data(), key.data()) != 0) {
-            throw std::runtime_error("AES-256-GCM encryption failed");
-        }
-        result.ciphertext.resize(static_cast<std::size_t>(ciphertext_len));
-    } else {
-        // XChaCha20-Poly1305 software fallback
-        result.nonce.resize(crypto_aead_xchacha20poly1305_ietf_NPUBBYTES); // 24 bytes
-        result.ciphertext.resize(plaintext.size() + crypto_aead_xchacha20poly1305_ietf_ABYTES);
-        randombytes_buf(result.nonce.data(), result.nonce.size());
-
-        unsigned long long ciphertext_len = 0;
-        if (crypto_aead_xchacha20poly1305_ietf_encrypt(
-                result.ciphertext.data(), &ciphertext_len,
-                plaintext.data(), plaintext.size(),
-                aad.data(), aad.size(),
-                nullptr, result.nonce.data(), key.data()) != 0) {
-            throw std::runtime_error("XChaCha20-Poly1305 encryption failed");
-        }
-        result.ciphertext.resize(static_cast<std::size_t>(ciphertext_len));
+    unsigned long long ciphertext_len = 0;
+    if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+            result.ciphertext.data(), &ciphertext_len,
+            plaintext.data(), plaintext.size(),
+            aad.data(), aad.size(),
+            nullptr, result.nonce.data(), key.data()) != 0) {
+        throw std::runtime_error("XChaCha20-Poly1305 encryption failed");
     }
-
+    result.ciphertext.resize(static_cast<std::size_t>(ciphertext_len));
     return result;
 }
 
-std::optional<std::vector<uint8_t>> SodiumCryptoService::do_aes_gcm_decrypt(
-        const AesGcmKey& key,
-        const AesGcmCiphertext& ct,
+std::optional<std::vector<uint8_t>> SodiumCryptoService::do_aead_decrypt(
+        const AeadKey& key,
+        const EncryptedBlob& blob,
         std::span<const uint8_t> aad) {
 
-    // Detect cipher by nonce size: 12 = AES-GCM, 24 = XChaCha20-Poly1305
-    if (ct.nonce.size() == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) {
-        // XChaCha20-Poly1305 path (24-byte nonce)
-        if (ct.ciphertext.size() < crypto_aead_xchacha20poly1305_ietf_ABYTES) {
-            return std::nullopt;
-        }
-        std::vector<uint8_t> plaintext(
-            ct.ciphertext.size() - crypto_aead_xchacha20poly1305_ietf_ABYTES);
-        unsigned long long plaintext_len = 0;
-
-        if (crypto_aead_xchacha20poly1305_ietf_decrypt(
-                plaintext.data(), &plaintext_len,
-                nullptr,
-                ct.ciphertext.data(), ct.ciphertext.size(),
-                aad.data(), aad.size(),
-                ct.nonce.data(), key.data()) != 0) {
-            return std::nullopt;
-        }
-        plaintext.resize(static_cast<std::size_t>(plaintext_len));
-        return plaintext;
-    }
-
-    // AES-256-GCM path. The width must be checked, not assumed: libsodium reads
-    // NPUBBYTES from the nonce with no length parameter, so a short nonce off
-    // disk or off the wire is a heap over-read, not a decrypt failure.
-    if (ct.nonce.size() != crypto_aead_aes256gcm_NPUBBYTES) {
+    // Version first: one version means one exact construction, so nothing here
+    // guesses an algorithm from a field width.
+    if (blob.version != kEncryptedBlobVersion) {
+        spdlog::warn("[{}] refusing encrypted blob of version {}", name(),
+                     static_cast<unsigned>(blob.version));
         return std::nullopt;
     }
-    if (!aes_gcm_available_) {
-        spdlog::error("[{}] Cannot decrypt AES-256-GCM ciphertext: no hardware support. "
-                      "This data was encrypted on a CPU with AES-NI.", name());
+    // libsodium reads NPUBBYTES from the nonce with no length argument, so the
+    // size must be exact BEFORE the pointer is handed over — a short nonce is a
+    // heap over-read, not a decrypt failure.
+    if (blob.nonce.size() != kAeadNonceSize) {
+        return std::nullopt;
+    }
+    if (blob.ciphertext.size() < kAeadTagSize) {
         return std::nullopt;
     }
 
-    if (ct.ciphertext.size() < crypto_aead_aes256gcm_ABYTES) {
-        return std::nullopt;
-    }
-
-    std::vector<uint8_t> plaintext(ct.ciphertext.size() - crypto_aead_aes256gcm_ABYTES);
+    std::vector<uint8_t> plaintext(blob.ciphertext.size() - kAeadTagSize);
     unsigned long long plaintext_len = 0;
-
-    if (crypto_aead_aes256gcm_decrypt(
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
             plaintext.data(), &plaintext_len,
             nullptr,
-            ct.ciphertext.data(), ct.ciphertext.size(),
+            blob.ciphertext.data(), blob.ciphertext.size(),
             aad.data(), aad.size(),
-            ct.nonce.data(), key.data()) != 0) {
+            blob.nonce.data(), key.data()) != 0) {
         return std::nullopt;
     }
-
     plaintext.resize(static_cast<std::size_t>(plaintext_len));
     return plaintext;
 }

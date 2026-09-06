@@ -229,12 +229,13 @@ struct CertStatus {
 
 /// An issued certificate bundle (borrowed license from server).
 /// The private key is encrypted with the client's Ed25519 key via
-/// ephemeral X25519 DH + HKDF + AES-256-GCM.
+/// ephemeral X25519 DH + HKDF + XChaCha20-Poly1305-IETF.
 struct IssuedCertBundle {
     std::string domain;             ///< e.g. "my-laptop.capi.lemonade-nexus.io"
     std::string fullchain_pem;      ///< Full certificate chain (PEM)
-    std::string encrypted_privkey;  ///< AES-GCM encrypted private key (base64)
-    std::string nonce;              ///< AES-GCM nonce (base64)
+    std::string encrypted_privkey;  ///< encrypted private key (base64)
+    unsigned    crypto_version{0};  ///< crypto format version; 1 = XChaCha20-Poly1305-IETF
+    std::string nonce;              ///< 24-byte nonce (base64)
     std::string ephemeral_pubkey;   ///< Server's ephemeral X25519 pubkey (base64)
     uint64_t    expires_at{0};      ///< Certificate expiry (Unix timestamp)
 };

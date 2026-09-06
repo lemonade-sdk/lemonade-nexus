@@ -139,7 +139,7 @@ public:
     [[nodiscard]] Result<IssuedCertBundle> request_certificate(const std::string& hostname);
 
     /// Decrypt an issued certificate bundle using our Ed25519 identity.
-    /// Performs X25519 DH with the server's ephemeral pubkey, derives AES-256-GCM
+    /// Performs X25519 DH with the server's ephemeral pubkey, derives the AEAD
     /// key via HKDF, and decrypts the private key.
     /// @param bundle The encrypted bundle from request_certificate()
     /// @return Decrypted certificate (fullchain PEM + private key PEM)

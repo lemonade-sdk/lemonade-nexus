@@ -27,6 +27,11 @@
 
 namespace lnsdk {
 
+// The one crypto construction this SDK speaks; mirrors
+// nexus::crypto::kEncryptedBlobVersion. Version 1 is
+// XChaCha20-Poly1305-IETF with a 24-byte nonce.
+static constexpr unsigned kEncryptedBlobVersion = 1;
+
 using json = nlohmann::json;
 
 namespace {
@@ -1337,6 +1342,7 @@ Result<IssuedCertBundle> LemonadeNexusClient::request_certificate(const std::str
     result.value.domain           = resp->value("domain", "");
     result.value.fullchain_pem    = resp->value("fullchain_pem", "");
     result.value.encrypted_privkey = resp->value("encrypted_privkey", "");
+    result.value.crypto_version    = resp->value("crypto_version", 0u);
     result.value.nonce            = resp->value("nonce", "");
     result.value.ephemeral_pubkey = resp->value("ephemeral_pubkey", "");
     result.value.expires_at       = resp->value("expires_at", uint64_t{0});
@@ -1383,7 +1389,7 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
         return result;
     }
 
-    // 4. HKDF-SHA256 to derive AES-256 key
+    // 4. HKDF-SHA256 to derive the 32-byte AEAD key
     // Extract: PRK = HMAC-SHA256(salt="", IKM=shared_secret)
     const std::string info_str = "lemonade-nexus-cert-issue";
     uint8_t prk[32];
@@ -1402,49 +1408,38 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
         crypto_auth_hmacsha256_final(&st, aes_key);
     }
 
-    // 5. Decrypt. The server picks AES-256-GCM or XChaCha20-Poly1305 by what
-    //    ITS cpu accelerates, and the two nonces are different widths, so the
-    //    width selects the cipher here. Assuming AES-GCM made every bundle from
-    //    a server without AES-NI undecryptable by any client.
+    // 5. Decrypt. One construction, named by the bundle's version — never
+    //    inferred from a field width, and never chosen from this cpu.
     auto nonce_bytes = Identity::from_base64(bundle.nonce);
     auto ct_bytes = Identity::from_base64(bundle.encrypted_privkey);
 
-    const bool is_xchacha =
-        nonce_bytes.size() == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
-    const bool is_aes_gcm = nonce_bytes.size() == crypto_aead_aes256gcm_NPUBBYTES;
-    if (!is_xchacha && !is_aes_gcm) {
-        result.error = "invalid nonce size";
+    const auto fail = [&](const char* why) {
+        result.error = why;
         sodium_memzero(our_x25519_sk, 32);
         sodium_memzero(shared_secret, 32);
         sodium_memzero(aes_key, 32);
         return result;
+    };
+
+    if (bundle.crypto_version != kEncryptedBlobVersion) {
+        return fail("unsupported certificate bundle crypto version");
     }
-    if (is_aes_gcm && crypto_aead_aes256gcm_is_available() == 0) {
-        result.error = "certificate bundle needs AES-NI, which this cpu lacks";
-        sodium_memzero(our_x25519_sk, 32);
-        sodium_memzero(shared_secret, 32);
-        sodium_memzero(aes_key, 32);
-        return result;
+    // Exact size before the pointer reaches libsodium.
+    if (nonce_bytes.size() != crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) {
+        return fail("invalid nonce size");
+    }
+    if (ct_bytes.size() < crypto_aead_xchacha20poly1305_ietf_ABYTES) {
+        return fail("invalid ciphertext size");
     }
 
     std::vector<uint8_t> plaintext(ct_bytes.size());
     unsigned long long plaintext_len = 0;
 
-    const int decrypted =
-        is_xchacha ? crypto_aead_xchacha20poly1305_ietf_decrypt(
-                         plaintext.data(), &plaintext_len, nullptr,
-                         ct_bytes.data(), ct_bytes.size(), nullptr, 0,
-                         nonce_bytes.data(), aes_key)
-                   : crypto_aead_aes256gcm_decrypt(
-                         plaintext.data(), &plaintext_len, nullptr,
-                         ct_bytes.data(), ct_bytes.size(), nullptr, 0,
-                         nonce_bytes.data(), aes_key);
-    if (decrypted != 0) {
-        result.error = "decryption failed (wrong key or corrupted data)";
-        sodium_memzero(our_x25519_sk, 32);
-        sodium_memzero(shared_secret, 32);
-        sodium_memzero(aes_key, 32);
-        return result;
+    if (crypto_aead_xchacha20poly1305_ietf_decrypt(
+            plaintext.data(), &plaintext_len, nullptr,
+            ct_bytes.data(), ct_bytes.size(), nullptr, 0,
+            nonce_bytes.data(), aes_key) != 0) {
+        return fail("decryption failed (wrong key or corrupted data)");
     }
 
     // Clean up sensitive material

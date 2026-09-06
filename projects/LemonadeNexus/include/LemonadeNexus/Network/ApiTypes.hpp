@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+
 namespace nexus::network {
 
 // ============================================================================
@@ -388,6 +390,8 @@ struct CertIssueResponse {
     std::string domain;
     std::string fullchain_pem;
     std::string encrypted_privkey;
+    /// Crypto format version of encrypted_privkey; see EncryptedBlob.
+    unsigned    crypto_version{nexus::crypto::kEncryptedBlobVersion};
     std::string nonce;
     std::string ephemeral_pubkey;
     uint64_t    expires_at{0};
@@ -398,6 +402,7 @@ inline void to_json(nlohmann::json& j, const CertIssueResponse& r) {
         {"domain",            r.domain},
         {"fullchain_pem",     r.fullchain_pem},
         {"encrypted_privkey", r.encrypted_privkey},
+        {"crypto_version",    r.crypto_version},
         {"nonce",             r.nonce},
         {"ephemeral_pubkey",  r.ephemeral_pubkey},
         {"expires_at",        r.expires_at},
@@ -408,6 +413,7 @@ inline void from_json(const nlohmann::json& j, CertIssueResponse& r) {
     r.domain            = j.value("domain", "");
     r.fullchain_pem     = j.value("fullchain_pem", "");
     r.encrypted_privkey = j.value("encrypted_privkey", "");
+    r.crypto_version    = j.value("crypto_version", 0u);
     r.nonce             = j.value("nonce", "");
     r.ephemeral_pubkey  = j.value("ephemeral_pubkey", "");
     r.expires_at        = j.value("expires_at", uint64_t{0});

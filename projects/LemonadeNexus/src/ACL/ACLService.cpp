@@ -402,10 +402,10 @@ void ACLService::derive_encryption_key() {
         std::span<const uint8_t>{ikm},
         std::span<const uint8_t>{salt_bytes},
         std::span<const uint8_t>{info},
-        crypto::kAesGcmKeySize);
+        crypto::kAeadKeySize);
 
-    if (derived.size() == crypto::kAesGcmKeySize) {
-        std::memcpy(encryption_key_.data(), derived.data(), crypto::kAesGcmKeySize);
+    if (derived.size() == crypto::kAeadKeySize) {
+        std::memcpy(encryption_key_.data(), derived.data(), crypto::kAeadKeySize);
         has_key_ = true;
     }
 }
@@ -419,11 +419,13 @@ std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
     plaintext[2] = static_cast<uint8_t>((perms >> 16) & 0xFF);
     plaintext[3] = static_cast<uint8_t>((perms >> 24) & 0xFF);
 
-    auto ct = crypto_.aes_gcm_encrypt(encryption_key_,
-                                       std::span<const uint8_t>{plaintext});
+    const auto ct = crypto_.aead_encrypt(encryption_key_, std::span<const uint8_t>{plaintext});
 
+    // version || nonce || ciphertext. The version leads so a reader names the
+    // construction outright instead of inferring it from a field width.
     std::vector<uint8_t> blob;
-    blob.reserve(ct.nonce.size() + ct.ciphertext.size());
+    blob.reserve(1 + ct.nonce.size() + ct.ciphertext.size());
+    blob.push_back(ct.version);
     blob.insert(blob.end(), ct.nonce.begin(), ct.nonce.end());
     blob.insert(blob.end(), ct.ciphertext.begin(), ct.ciphertext.end());
     return blob;
@@ -432,24 +434,20 @@ std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
 std::optional<uint32_t> ACLService::decrypt_perms(const std::vector<uint8_t>& blob) const {
     if (!has_key_) return std::nullopt;
 
-    // The blob is nonce || ciphertext, and the nonce width depends on which
-    // AEAD the ENCRYPTING machine had: 12 bytes with AES-NI, 24 without. A
-    // fixed 12-byte split silently mis-parsed every record written on a host
-    // without AES acceleration, so the permissions never decoded there.
-    // Permissions are a fixed 4 bytes and both AEADs use a 16-byte tag, so the
-    // ciphertext length is constant and the nonce width follows from the rest.
-    constexpr std::size_t kCiphertextSize = sizeof(uint32_t) + crypto::kAesGcmTagSize;
-    if (blob.size() <= kCiphertextSize) return std::nullopt;
-    const std::size_t nonce_size = blob.size() - kCiphertextSize;
-    if (nonce_size != crypto::kAesGcmNonceSize && nonce_size != crypto::kXChaCha20NonceSize) {
-        return std::nullopt;
-    }
+    // version || nonce || ciphertext, with every length checked before any of
+    // it reaches the AEAD.
+    constexpr std::size_t kMinimum = 1 + crypto::kAeadNonceSize + crypto::kAeadTagSize;
+    if (blob.size() < kMinimum) return std::nullopt;
+    if (blob[0] != crypto::kEncryptedBlobVersion) return std::nullopt;
 
-    crypto::AesGcmCiphertext ct;
-    ct.nonce.assign(blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(nonce_size));
-    ct.ciphertext.assign(blob.begin() + static_cast<std::ptrdiff_t>(nonce_size), blob.end());
+    crypto::EncryptedBlob ct;
+    ct.version = blob[0];
+    const auto nonce_begin = blob.begin() + 1;
+    const auto nonce_end = nonce_begin + static_cast<std::ptrdiff_t>(crypto::kAeadNonceSize);
+    ct.nonce.assign(nonce_begin, nonce_end);
+    ct.ciphertext.assign(nonce_end, blob.end());
 
-    auto plaintext = crypto_.aes_gcm_decrypt(encryption_key_, ct);
+    auto plaintext = crypto_.aead_decrypt(encryption_key_, ct);
     if (!plaintext || plaintext->size() != 4) return std::nullopt;
 
     auto& pt = *plaintext;

@@ -29,7 +29,7 @@ struct AclDelta {
 /// Callback type: called when a local ACL mutation needs to be broadcast via gossip.
 using AclDeltaCallback = std::function<void(const AclDelta&)>;
 
-/// SQLite-backed ACL service with AES-256-GCM encrypted permission values
+/// SQLite-backed ACL service with XChaCha20-Poly1305 encrypted permission values
 /// and distributed sync via gossip ACL deltas.
 ///
 /// Database: data/acl.db
@@ -89,7 +89,7 @@ private:
     std::filesystem::path        db_path_;
     crypto::SodiumCryptoService& crypto_;
     crypto::Ed25519Keypair       signing_keypair_{};
-    crypto::AesGcmKey            encryption_key_{};
+    crypto::AeadKey            encryption_key_{};
     bool                         has_key_{false};
 
     sqlite3*                     db_{nullptr};

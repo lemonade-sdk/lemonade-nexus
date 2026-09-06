@@ -35,12 +35,12 @@ public:
     [[nodiscard]] X25519SharedSecret do_x25519_dh(const X25519PrivateKey& our_priv,
                                                     const X25519PublicKey& their_pub);
 
-    [[nodiscard]] AesGcmCiphertext do_aes_gcm_encrypt(const AesGcmKey& key,
-                                                        std::span<const uint8_t> plaintext,
-                                                        std::span<const uint8_t> aad);
-    [[nodiscard]] std::optional<std::vector<uint8_t>> do_aes_gcm_decrypt(
-            const AesGcmKey& key,
-            const AesGcmCiphertext& ciphertext,
+    [[nodiscard]] EncryptedBlob do_aead_encrypt(const AeadKey& key,
+                                                 std::span<const uint8_t> plaintext,
+                                                 std::span<const uint8_t> aad);
+    [[nodiscard]] std::optional<std::vector<uint8_t>> do_aead_decrypt(
+            const AeadKey& key,
+            const EncryptedBlob& blob,
             std::span<const uint8_t> aad);
 
     [[nodiscard]] std::vector<uint8_t> do_hkdf_sha256(std::span<const uint8_t> ikm,
@@ -56,11 +56,7 @@ public:
     [[nodiscard]] static X25519PublicKey ed25519_pk_to_x25519(const Ed25519PublicKey& ed_pk);
     [[nodiscard]] static X25519PrivateKey ed25519_sk_to_x25519(const Ed25519PrivateKey& ed_sk);
 
-    /// Returns true if hardware AES-256-GCM is available on this CPU.
-    [[nodiscard]] bool aes_gcm_available() const { return aes_gcm_available_; }
-
 private:
-    bool aes_gcm_available_{false};
 };
 
 } // namespace nexus::crypto

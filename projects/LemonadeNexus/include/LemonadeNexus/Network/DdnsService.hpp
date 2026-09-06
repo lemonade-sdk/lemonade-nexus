@@ -39,7 +39,7 @@ void from_json(const nlohmann::json& j, DdnsConfig& c);
 /// 1. Root server holds DDNS credentials (encrypted at rest)
 /// 2. Verified server requests credentials via POST /api/credentials/request
 /// 3. Root verifies: server certificate + binary hash in approved manifest
-/// 4. Root encrypts credentials via X25519 key exchange + AES-256-GCM
+/// 4. Root encrypts credentials via X25519 key exchange + XChaCha20-Poly1305
 /// 5. Server decrypts, stores encrypted locally, makes DDNS API calls
 ///
 /// Namecheap DDNS API:
