@@ -763,3 +763,178 @@ TEST(AttestdBoundary, TheRequestGrammarAdmitsNoQuoteSteering) {
         EXPECT_EQ(document["refusal"], "malformed_request") << key;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Hostile framing: the assembler under a peer that lies
+// ---------------------------------------------------------------------------
+
+namespace {
+
+json good_header(std::size_t platform_bytes) {
+    json head;
+    head["version"] = nexus::attestd::kAttestdWireVersion;
+    head["type"] = std::string(nexus::attestd::kBundleType);
+    head["challenge_digest"] = nexus::crypto::to_hex(patterned<32>(0x01));
+    head["platform_bytes"] = platform_bytes;
+    return head;
+}
+
+}  // namespace
+
+TEST(AttestdFramingHostile, ZeroLengthChunksStillCountAgainstTheChunkBudget) {
+    ResponseAssembler assembler;
+    ASSERT_TRUE(assembler.offer(FrameKind::Header, good_header(1).dump()));
+    for (std::size_t i = 0; i < kMaxLocalChunks; ++i) {
+        ASSERT_TRUE(assembler.offer(FrameKind::EvidenceChunk, "")) << i;
+    }
+    EXPECT_FALSE(assembler.offer(FrameKind::EvidenceChunk, ""));
+    EXPECT_EQ(assembler.error(), FrameError::TooManyChunks);
+}
+
+TEST(AttestdFramingHostile, ADuplicateHeaderIsRefused) {
+    ResponseAssembler assembler;
+    ASSERT_TRUE(assembler.offer(FrameKind::Header, good_header(4).dump()));
+    EXPECT_FALSE(assembler.offer(FrameKind::Header, good_header(4).dump()));
+    EXPECT_EQ(assembler.error(), FrameError::Malformed);
+}
+
+TEST(AttestdFramingHostile, NothingIsAcceptedAfterTheStreamEnds) {
+    // End closes the stream; a second End, a late chunk, and a late refusal are
+    // all refused rather than mutating a completed response.
+    const auto ended = [] {
+        ResponseAssembler a;
+        EXPECT_TRUE(a.offer(FrameKind::Header, good_header(0).dump()));
+        json end;
+        end["chunks"] = 0;
+        end["platform_sha256"] = std::string(64, '0');
+        EXPECT_FALSE(a.offer(FrameKind::End, end.dump()));
+        EXPECT_TRUE(a.done());
+        return a;
+    };
+    for (const auto kind : {FrameKind::End, FrameKind::EvidenceChunk, FrameKind::Refusal,
+                            FrameKind::Header}) {
+        auto a = ended();
+        EXPECT_FALSE(a.offer(kind, "{}")) << static_cast<int>(kind);
+    }
+}
+
+TEST(AttestdFramingHostile, ARefusalAfterAHeaderIsRefused) {
+    ResponseAssembler assembler;
+    ASSERT_TRUE(assembler.offer(FrameKind::Header, good_header(4).dump()));
+    EXPECT_FALSE(assembler.offer(FrameKind::Refusal, "{\"code\":8}"));
+    EXPECT_EQ(assembler.error(), FrameError::Malformed);
+    EXPECT_EQ(assembler.refusal(), Refusal::None);  // not mistaken for a real refusal
+}
+
+TEST(AttestdFramingHostile, AMaximumSizedFrameIsStillAccepted) {
+    // The bound is exact: kMaxLocalFrameBytes passes, one more is refused.
+    ResponseAssembler assembler;
+    ASSERT_TRUE(assembler.offer(FrameKind::Header, good_header(kMaxLocalFrameBytes).dump()));
+    EXPECT_TRUE(assembler.offer(FrameKind::EvidenceChunk,
+                                std::string(kMaxLocalFrameBytes, 'x')));
+    ResponseAssembler over;
+    ASSERT_TRUE(over.offer(FrameKind::Header, good_header(kMaxLocalFrameBytes).dump()));
+    EXPECT_FALSE(over.offer(FrameKind::EvidenceChunk,
+                            std::string(kMaxLocalFrameBytes + 1, 'x')));
+    EXPECT_EQ(over.error(), FrameError::Oversized);
+}
+
+TEST(AttestdFramingHostile, AWrappingLengthPrefixIsRefusedBeforeAllocation) {
+    // 0xFFFFFFFF declared: the reader must refuse on the declared value alone.
+    std::string header(5, '\xFF');
+    header[4] = static_cast<char>(FrameKind::Header);
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_EQ(read_bytes(header, /*close_write=*/false, 10), FrameError::Oversized);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(5));
+}
+
+TEST(AttestdFramingHostile, ATruncatedLengthPrefixFailsClosed) {
+    EXPECT_EQ(read_bytes(std::string(3, '\0'), /*close_write=*/true, 5), FrameError::Truncated);
+    EXPECT_EQ(read_bytes("", /*close_write=*/true, 5), FrameError::Truncated);
+}
+
+TEST(AttestdFramingHostile, TrailingBytesAfterEndCannotAlterTheResult) {
+    const auto bundle = bundle_with_log(512);
+    std::string wire = frames_for(bundle);
+    wire += std::string(4096, 'Z');  // never read: the reader stops at End
+
+    PlatformEvidenceBundle got;
+    EXPECT_EQ(read_bytes(wire, /*close_write=*/true, 5, &got), FrameError::None);
+    EXPECT_EQ(got.platform.ima_log, bundle.platform.ima_log);
+}
+
+TEST(AttestdFramingHostile, TheServerRefusesToEmitABundleOverItsOwnBudget) {
+    // The emitter's bound mirrors the reader's: a bundle needing more than
+    // kMaxLocalChunks emits NOTHING, not a stream the reader must abort.
+    const auto oversized = bundle_with_log(kMaxLocalFrameBytes * kMaxLocalChunks + 1);
+    std::string wire;
+    EXPECT_FALSE(nexus::attestd::emit_bundle(oversized, [&](std::string_view f) {
+        wire.append(f);
+        return true;
+    }));
+    EXPECT_TRUE(wire.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Hostile grammar: JSON shapes the closed grammar must refuse
+// ---------------------------------------------------------------------------
+
+namespace {
+AttestdConfig grammar_config() {
+    AttestdConfig cfg;
+    cfg.cache_dir = ::testing::TempDir();
+    cfg.allow_network = false;
+    return cfg;
+}
+}  // namespace
+
+TEST(AttestdGrammarHostile, WrongJsonShapesAreRefusedTyped) {
+    AttestdService service{grammar_config()};
+
+    const auto refuse = [&](const std::string& request, const char* what) {
+        const auto frame = one_frame(service, request);
+        const auto document = json::parse(frame.second, nullptr, false);
+        ASSERT_FALSE(document.is_discarded()) << what;
+        EXPECT_EQ(document["refusal"], "malformed_request") << what;
+    };
+
+    auto with = [&](const char* key, json value) {
+        auto r = good_request();
+        r[key] = std::move(value);
+        return r.dump();
+    };
+
+    refuse(with("nonce", nullptr), "null value");
+    refuse(with("epoch", -1), "negative integer");
+    refuse(with("epoch", 1.5), "fraction");
+    refuse(with("epoch", json::array({1})), "array for scalar");
+    refuse(with("nonce", json::object({{"hex", "00"}})), "nested object");
+    refuse(with("purpose", 65536), "oversized purpose");
+    refuse(with("incarnation", json::parse("18446744073709551616")), "over-u64 integer");
+    refuse("{}", "empty object");
+    refuse(good_request().dump() + good_request().dump(), "second JSON object");
+    refuse(good_request().dump() + " x", "trailing data");
+    refuse(std::string(9 * 1024, ' ') + good_request().dump(), "over the request byte cap");
+
+    // Deep nesting parses or fails, but never crashes and never authorizes.
+    std::string deep(2000, '[');
+    deep += std::string(2000, ']');
+    refuse(deep, "deep nesting");
+}
+
+TEST(AttestdGrammarHostile, ADuplicateKeyCannotSmuggleASecondValue) {
+    // nlohmann keeps the LAST duplicate, before the closed-grammar scan runs.
+    // Whatever survives parsing is what the daemon hashes into the challenge
+    // digest, so a duplicate steers nothing — the quote binds the value the
+    // daemon actually used, and the caller sees which one that was.
+    auto base = good_request();
+    std::string request = base.dump();
+    const std::string honest = "\"epoch\":" + base["epoch"].dump();
+    const auto at = request.find(honest);
+    ASSERT_NE(at, std::string::npos);
+    request.insert(at, "\"epoch\":999,");
+
+    const auto decoded = decode_challenge(request);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->epoch, base["epoch"].get<uint64_t>());
+}

@@ -88,6 +88,16 @@ ProtectProc=invisible
 ProcSubset=pid
 UMask=0077
 
+# CAP_DAC_READ_SEARCH bypasses DAC read/search, so ProtectSystem read-only and
+# 0600 owner-only modes do NOT keep this daemon out of another user's files —
+# it could otherwise read the Nexus node identity key and /etc/shadow, which
+# would make compromising the evidence helper equivalent to stealing the
+# server's signing key. A capability cannot reach what the mount namespace does
+# not show it, so the sensitive trees are masked here. The Nexus data root is
+# the one that matters (node identity, any persisted authority material); the
+# host credential files are defence in depth. '-' tolerates an absent path.
+InaccessiblePaths=-/var/lib/nexus -/etc/shadow -/etc/gshadow -/etc/ssh
+
 # Kernel and host surface
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -118,15 +128,11 @@ SystemCallFilter=~@privileged @resources @obsolete @debug @mount @swap @reboot @
 SystemCallFilter=chown fchown fchownat lchown chown32 fchown32 lchown32
 SystemCallErrorNumber=EPERM
 
-# A core dump would contain live TPM session state and the platform bundle
-# and live TPM session state. Both halves are needed: LimitCORE=0 stops the
-# kernel writing one, # CoreDumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
-# older systemd, so this is belt-and-braces where it is understood.
-CoreDumpFilter=0x00 makes any dump that still happens
-# (a coredump handler with its own limits) carry no mapped pages.
+# A core dump would carry live TPM session state and the platform bundle.
+# LimitCORE=0 stops the kernel writing one; CoreDumpFilter=0x00 needs systemd
+# 252, so where it is understood it also strips mapped pages from any dump a
+# handler with its own limits might still take.
 LimitCORE=0
-# CoreDumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
-# older systemd, so this is belt-and-braces where it is understood.
 CoreDumpFilter=0x00
 
 # Bounded work: one request at a time, a few file descriptors, no forking.

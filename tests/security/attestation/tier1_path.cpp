@@ -293,6 +293,19 @@ TEST_F(Tier1PathTest, IncarnationMustMatchExactlyInBothDirections) {
     }
 }
 
+TEST_F(Tier1PathTest, EvidenceForAnotherNetworkIsRejected) {
+    // A node enrolled in one mesh must not answer another mesh's challenge with
+    // the same identity and platform. The signature is re-made, so the refusal
+    // is the network comparison itself, not a stale signature.
+    evidence_ = answer(challenge_);
+    evidence_.network_id[0] ^= 0x01;
+    sign_evidence();
+
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::NetworkMismatch);
+}
+
 // --- 5. The epoch ---------------------------------------------------------------
 
 TEST_F(Tier1PathTest, EvidenceFromAnotherEpochReportsEpochMismatch) {
