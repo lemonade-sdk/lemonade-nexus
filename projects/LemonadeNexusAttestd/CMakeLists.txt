@@ -22,25 +22,24 @@ target_link_libraries(LemonadeNexusAttestdCore PUBLIC
         nlohmann_json::nlohmann_json
         spdlog)
 
-add_executable(LemonadeNexusAttestd src/main.cpp)
-set_target_properties(LemonadeNexusAttestd PROPERTIES OUTPUT_NAME "nexus-attestd")
-target_compile_features(LemonadeNexusAttestd PRIVATE cxx_std_20)
-target_link_libraries(LemonadeNexusAttestd PRIVATE LemonadeNexusAttestdCore)
+# The target IS nexus-attestd: `cmake --build --target nexus-attestd` builds the
+# daemon under every generator, and it is what the unit file and installed path
+# name. A separate OUTPUT_NAME plus a same-named alias target would give Ninja
+# two rules for one output path and abort generation, so there is neither.
+add_executable(nexus-attestd src/main.cpp)
+target_compile_features(nexus-attestd PRIVATE cxx_std_20)
+target_link_libraries(nexus-attestd PRIVATE LemonadeNexusAttestdCore)
 
 # Compiled-in version identity (values from cmake/version.cmake)
-target_compile_definitions(LemonadeNexusAttestd PRIVATE
+target_compile_definitions(nexus-attestd PRIVATE
         NEXUS_VERSION="${NEXUS_VERSION}"
         NEXUS_GIT_COMMIT="${NEXUS_GIT_COMMIT}")
 
-# Build alias, so `cmake --build build --target nexus-attestd` names the same
-# thing the installed binary and the unit file do.
-add_custom_target(nexus-attestd DEPENDS LemonadeNexusAttestd)
-
 if(NOT MSVC AND TARGET all_projects)
-    add_dependencies(all_projects LemonadeNexusAttestd)
+    add_dependencies(all_projects nexus-attestd)
 endif()
 
-install(TARGETS LemonadeNexusAttestd
+install(TARGETS nexus-attestd
         RUNTIME DESTINATION bin
         COMPONENT Runtime)
 
