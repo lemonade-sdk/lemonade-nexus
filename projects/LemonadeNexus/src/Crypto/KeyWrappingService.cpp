@@ -75,10 +75,12 @@ WrappedKey KeyWrappingService::wrap_with_binding(const Ed25519PrivateKey& privke
     auto aes_key = derive_wrapping_key(passphrase, pubkey, binding);
 
     // Encrypt the 64-byte Ed25519 private key
+    const auto aad = aead_aad(aead_purpose::kKeyWrapping,
+                              {std::span<const uint8_t>(pubkey.data(), pubkey.size())});
     auto ct = crypto_.aead_encrypt(
         aes_key,
         std::span<const uint8_t>(privkey.data(), privkey.size()),
-        std::span<const uint8_t>(pubkey.data(), pubkey.size())); // pubkey as AAD
+        std::span<const uint8_t>{aad});
 
     WrappedKey result;
     result.ciphertext = std::move(ct);
@@ -92,10 +94,12 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unwrap_with_binding(
         WrapBinding binding) {
     auto aes_key = derive_wrapping_key(passphrase, pubkey, binding);
 
+    const auto aad = aead_aad(aead_purpose::kKeyWrapping,
+                              {std::span<const uint8_t>(pubkey.data(), pubkey.size())});
     auto plaintext = crypto_.aead_decrypt(
         aes_key,
         wrapped.ciphertext,
-        std::span<const uint8_t>(pubkey.data(), pubkey.size())); // pubkey as AAD
+        std::span<const uint8_t>{aad});
 
     if (!plaintext || plaintext->size() != kEd25519PrivateKeySize) {
         return std::nullopt;
@@ -344,11 +348,18 @@ DelegationResult KeyWrappingService::delegate_key(
     crypto_.random_bytes(std::span<uint8_t>(wk));
 
     // Wrap child private key with WK
+    // Bound to the child it belongs to. The per-delegation random WK already
+    // makes two wrapped child keys non-interchangeable; naming the child as
+    // well means a swap fails on authentication rather than on key mismatch.
+    const auto child_aad =
+        aead_aad(aead_purpose::kChildKey,
+                 {std::span<const uint8_t>(result.child_keypair.public_key.data(),
+                                           result.child_keypair.public_key.size())});
     result.wrapped_child_key.ciphertext = crypto_.aead_encrypt(
         wk,
         std::span<const uint8_t>(result.child_keypair.private_key.data(),
                                  result.child_keypair.private_key.size()),
-        {}); // no AAD for delegation wrapping
+        std::span<const uint8_t>{child_aad});
 
     // Convert child's Ed25519 public key to X25519 for hybrid encryption
     auto child_x25519_pk = SodiumCryptoService::ed25519_pk_to_x25519(
@@ -373,11 +384,14 @@ DelegationResult KeyWrappingService::delegate_key(
     std::memcpy(delegation_key.data(), derived.data(), kAeadKeySize);
 
     // Encrypt WK with the derived key, include ephemeral pubkey as AAD
+    const auto wk_aad =
+        aead_aad(aead_purpose::kDelegationWrappingKey,
+                 {std::span<const uint8_t>(ephemeral.public_key.data(),
+                                           ephemeral.public_key.size())});
     result.encrypted_wk = crypto_.aead_encrypt(
         delegation_key,
         std::span<const uint8_t>(wk.data(), wk.size()),
-        std::span<const uint8_t>(ephemeral.public_key.data(),
-                                 ephemeral.public_key.size()));
+        std::span<const uint8_t>{wk_aad});
 
     // Store ephemeral pubkey so the child can derive the same shared secret
     result.ephemeral_pubkey = ephemeral.public_key;

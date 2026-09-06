@@ -68,8 +68,13 @@ public:
 
 private:
     void derive_encryption_key();
-    [[nodiscard]] std::vector<uint8_t> encrypt_perms(uint32_t perms) const;
-    [[nodiscard]] std::optional<uint32_t> decrypt_perms(const std::vector<uint8_t>& blob) const;
+    /// The row identity is authenticated, so a permission blob cannot be moved
+    /// to another (user, resource) pair.
+    [[nodiscard]] std::vector<uint8_t> encrypt_perms(uint32_t perms, std::string_view user_id,
+                                                     std::string_view resource) const;
+    [[nodiscard]] std::optional<uint32_t> decrypt_perms(const std::vector<uint8_t>& blob,
+                                                        std::string_view user_id,
+                                                        std::string_view resource) const;
 
     /// Read current permissions. Caller must hold mutex_.
     [[nodiscard]] uint32_t read_perms_locked(std::string_view user_id, std::string_view resource) const;

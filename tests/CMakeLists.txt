@@ -41,6 +41,7 @@ add_nexus_test(test_ipam              test_ipam.cpp)
 add_nexus_test(test_auth              test_auth.cpp)
 add_nexus_test(test_acme              test_acme.cpp)
 add_nexus_test(test_dns               test_dns.cpp)
+add_nexus_test(test_ddns_credentials_format test_ddns_credentials_format.cpp)
 add_nexus_test(test_geo_region        test_geo_region.cpp)
 add_nexus_test(test_seed_discovery    test_seed_discovery.cpp)
 

@@ -1210,3 +1210,55 @@ TEST_F(GossipIngressSecurityTest, APreChangeAesPermissionRowIsRefused) {
     EXPECT_EQ(a.acl->get_permissions("user-legacy", "res-legacy"), acl::Permission::None)
         << "a pre-change AES row must not decode";
 }
+
+// A permission blob is bound to the row it belongs to. Lifting a valid, freshly
+// written ciphertext out of one (user, resource) row and dropping it into
+// another must fail authentication — otherwise anyone with database access
+// could grant themselves a permission by copying a row they are allowed to have.
+TEST_F(GossipIngressSecurityTest, APermissionBlobCannotBeTransplantedToAnotherRow) {
+    const auto acl_kp = kc->ed25519_keygen();
+    auto& a = make_node("a", [&](Node& n) { attach_acl(n, acl_kp); }, [](Node&) {});
+
+    // Row A is privileged; row B is not.
+    ASSERT_TRUE(a.acl->grant("alice", "secret-resource", acl::Permission::Admin));
+    ASSERT_TRUE(a.acl->grant("mallory", "secret-resource", acl::Permission::Read));
+    ASSERT_NE(a.acl->get_permissions("alice", "secret-resource"), acl::Permission::None);
+
+    a.acl->stop();
+    std::vector<uint8_t> alices_blob;
+    {
+        sqlite3* db = nullptr;
+        ASSERT_EQ(sqlite3_open((a.dir / "acl.db").string().c_str(), &db), SQLITE_OK);
+        sqlite3_stmt* q = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      db, "SELECT perms_enc FROM acl WHERE user_id = ? AND resource = ?",
+                      -1, &q, nullptr),
+                  SQLITE_OK);
+        sqlite3_bind_text(q, 1, "alice", -1, SQLITE_STATIC);
+        sqlite3_bind_text(q, 2, "secret-resource", -1, SQLITE_STATIC);
+        ASSERT_EQ(sqlite3_step(q), SQLITE_ROW);
+        const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(q, 0));
+        alices_blob.assign(p, p + sqlite3_column_bytes(q, 0));
+        sqlite3_finalize(q);
+
+        // Transplant it verbatim onto mallory's row.
+        sqlite3_stmt* u = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      db, "UPDATE acl SET perms_enc = ? WHERE user_id = ? AND resource = ?",
+                      -1, &u, nullptr),
+                  SQLITE_OK);
+        sqlite3_bind_blob(u, 1, alices_blob.data(), static_cast<int>(alices_blob.size()),
+                          SQLITE_STATIC);
+        sqlite3_bind_text(u, 2, "mallory", -1, SQLITE_STATIC);
+        sqlite3_bind_text(u, 3, "secret-resource", -1, SQLITE_STATIC);
+        ASSERT_EQ(sqlite3_step(u), SQLITE_DONE);
+        sqlite3_finalize(u);
+        sqlite3_close(db);
+    }
+    a.acl->start();
+
+    EXPECT_EQ(a.acl->get_permissions("mallory", "secret-resource"), acl::Permission::None)
+        << "a transplanted permission blob must not authenticate";
+    // The row it legitimately belongs to still opens.
+    EXPECT_NE(a.acl->get_permissions("alice", "secret-resource"), acl::Permission::None);
+}

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <string_view>
+#include <initializer_list>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -65,6 +67,54 @@ struct EncryptedBlob {
     std::vector<uint8_t> nonce;       // exactly kAeadNonceSize
     std::vector<uint8_t> ciphertext;  // includes the appended tag
 };
+
+/// Canonical authenticated associated data for one encrypted object:
+///
+///     version || LP(purpose) || LP(context[0]) || LP(context[1]) ...
+///
+/// where LP(x) is a u32 little-endian length followed by the bytes. Every field
+/// is length-prefixed, so no two (purpose, context) pairs can produce the same
+/// AAD by moving a boundary.
+///
+/// The version is the COMPILED constant, not the value read off a blob. A
+/// tampered version field is already refused before decryption, and binding the
+/// constant is what stops a future version-2 ciphertext from being replayed as
+/// version 1: its AAD was computed with a different leading byte, so the tag
+/// fails. This is domain separation, not algorithm negotiation.
+///
+/// `purpose` is a fixed tag per construction; `context` carries the immutable
+/// identity the ciphertext belongs to, so a valid blob cannot be transplanted
+/// into another row, record or recipient.
+[[nodiscard]] inline std::vector<uint8_t> aead_aad(
+        std::string_view purpose,
+        std::initializer_list<std::span<const uint8_t>> context = {}) {
+    std::vector<uint8_t> aad;
+    const auto put = [&aad](const uint8_t* data, std::size_t size) {
+        const auto n = static_cast<uint32_t>(size);
+        aad.push_back(static_cast<uint8_t>(n & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 16) & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 24) & 0xFF));
+        aad.insert(aad.end(), data, data + size);
+    };
+    aad.push_back(kEncryptedBlobVersion);
+    put(reinterpret_cast<const uint8_t*>(purpose.data()), purpose.size());
+    for (const auto& piece : context) {
+        put(piece.data(), piece.size());
+    }
+    return aad;
+}
+
+/// The fixed purpose tags. One per construction; never reused across objects.
+namespace aead_purpose {
+inline constexpr std::string_view kAclPermissions = "acl-permissions";
+inline constexpr std::string_view kDdnsAtRest = "ddns-at-rest";
+inline constexpr std::string_view kDdnsCredentialTransfer = "ddns-credential-transfer";
+inline constexpr std::string_view kCertBundle = "cert-bundle";
+inline constexpr std::string_view kKeyWrapping = "key-wrapping";
+inline constexpr std::string_view kChildKey = "child-key";
+inline constexpr std::string_view kDelegationWrappingKey = "delegation-wrapping-key";
+}  // namespace aead_purpose
 
 // --- HKDF ---
 static constexpr std::size_t kHkdfSaltSize = 32;

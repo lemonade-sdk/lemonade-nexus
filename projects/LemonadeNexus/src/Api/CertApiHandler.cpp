@@ -193,7 +193,15 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         auto privkey_bytes = std::vector<uint8_t>(
             existing->privkey_pem.begin(), existing->privkey_pem.end());
-        auto encrypted = ctx_.crypto.aead_encrypt(aes_key, privkey_bytes, {});
+        // Bound to the request it answers: this client and this domain. A
+        // bundle cannot be replayed at another client or another name.
+        const auto aad = crypto::aead_aad(
+            crypto::aead_purpose::kCertBundle,
+            {std::span<const uint8_t>(client_ed_pk.data(), client_ed_pk.size()),
+             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fqdn.data()),
+                                      fqdn.size())});
+        auto encrypted =
+            ctx_.crypto.aead_encrypt(aes_key, privkey_bytes, std::span<const uint8_t>{aad});
 
         network::CertIssueResponse resp{
             .domain            = fqdn,

@@ -230,11 +230,10 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
         ct.ciphertext = std::move(ciphertext_bytes);
         ct.nonce = std::move(nonce_bytes);
 
-        const std::string aad_str = "ddns-credential-transfer";
+        const auto aad_bytes = crypto::aead_aad(crypto::aead_purpose::kDdnsCredentialTransfer);
         auto plaintext = crypto_.aead_decrypt(
             aes_key, ct,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
+            std::span<const uint8_t>{aad_bytes});
 
         if (!plaintext) {
             spdlog::error("[{}] failed to decrypt DDNS credentials", name());
@@ -436,11 +435,10 @@ std::optional<std::string> DdnsService::handle_credential_request(
     auto creds_str = creds_json.dump();
     auto creds_bytes = std::vector<uint8_t>(creds_str.begin(), creds_str.end());
 
-    const std::string aad_str = "ddns-credential-transfer";
+    const auto aad_bytes = crypto::aead_aad(crypto::aead_purpose::kDdnsCredentialTransfer);
     auto ct = crypto_.aead_encrypt(
         aes_key, creds_bytes,
-        std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
+        std::span<const uint8_t>{aad_bytes});
 
     // Build response
     json response;
@@ -717,11 +715,10 @@ bool DdnsService::save_encrypted_credentials() {
         auto plaintext_str = creds.dump();
         auto plaintext = std::vector<uint8_t>(plaintext_str.begin(), plaintext_str.end());
 
-        const std::string aad_str = "ddns-at-rest";
+        const auto aad_bytes = crypto::aead_aad(crypto::aead_purpose::kDdnsAtRest);
         auto ct = crypto_.aead_encrypt(
             aes_key, plaintext,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
+            std::span<const uint8_t>{aad_bytes});
 
         // Store as signed envelope
         json stored;
@@ -793,11 +790,10 @@ bool DdnsService::load_encrypted_credentials() {
         ct.ciphertext = std::move(ct_bytes);
         ct.nonce = std::move(nonce_bytes);
 
-        const std::string aad_str = "ddns-at-rest";
+        const auto aad_bytes = crypto::aead_aad(crypto::aead_purpose::kDdnsAtRest);
         auto plaintext = crypto_.aead_decrypt(
             aes_key, ct,
-            std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(aad_str.data()), aad_str.size()));
+            std::span<const uint8_t>{aad_bytes});
 
         if (!plaintext) {
             spdlog::warn("[{}] failed to decrypt stored DDNS credentials", name());

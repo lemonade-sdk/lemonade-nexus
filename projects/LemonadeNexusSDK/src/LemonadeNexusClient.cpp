@@ -32,6 +32,28 @@ namespace lnsdk {
 // XChaCha20-Poly1305-IETF with a 24-byte nonce.
 static constexpr unsigned kEncryptedBlobVersion = 1;
 
+// Byte-identical mirror of nexus::crypto::aead_aad:
+//   version || LP(purpose) || LP(context[0]) ...   (LP = u32 LE length + bytes)
+// The server builds the same bytes; if these ever diverge the tag fails, which
+// is the intended failure mode rather than a silent mismatch.
+static std::vector<uint8_t> aead_aad(
+        std::string_view purpose,
+        std::initializer_list<std::span<const uint8_t>> context) {
+    std::vector<uint8_t> aad;
+    const auto put = [&aad](const uint8_t* data, std::size_t size) {
+        const auto n = static_cast<uint32_t>(size);
+        aad.push_back(static_cast<uint8_t>(n & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 16) & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 24) & 0xFF));
+        aad.insert(aad.end(), data, data + size);
+    };
+    aad.push_back(static_cast<uint8_t>(kEncryptedBlobVersion));
+    put(reinterpret_cast<const uint8_t*>(purpose.data()), purpose.size());
+    for (const auto& piece : context) put(piece.data(), piece.size());
+    return aad;
+}
+
 using json = nlohmann::json;
 
 namespace {
@@ -1435,9 +1457,17 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
     std::vector<uint8_t> plaintext(ct_bytes.size());
     unsigned long long plaintext_len = 0;
 
+    // Same binding the server used: this client's identity and this domain.
+    const auto our_pk = local_identity.public_key();
+    const auto aad = aead_aad(
+        "cert-bundle",
+        {std::span<const uint8_t>(our_pk.data(), our_pk.size()),
+         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bundle.domain.data()),
+                                  bundle.domain.size())});
+
     if (crypto_aead_xchacha20poly1305_ietf_decrypt(
             plaintext.data(), &plaintext_len, nullptr,
-            ct_bytes.data(), ct_bytes.size(), nullptr, 0,
+            ct_bytes.data(), ct_bytes.size(), aad.data(), aad.size(),
             nonce_bytes.data(), aes_key) != 0) {
         return fail("decryption failed (wrong key or corrupted data)");
     }

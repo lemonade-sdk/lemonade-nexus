@@ -191,10 +191,13 @@ TEST_F(KeyWrappingTest, LegacyBlobMigratesToV2OnUnlock) {
     AeadKey legacy_key{};
     std::memcpy(legacy_key.data(), derived.data(), kAeadKeySize);
 
+    const auto aad = aead_aad(aead_purpose::kKeyWrapping,
+                              {std::span<const uint8_t>(keypair.public_key.data(),
+                                                        keypair.public_key.size())});
     auto ct = crypto->aead_encrypt(
         legacy_key,
         std::span<const uint8_t>(keypair.private_key.data(), keypair.private_key.size()),
-        std::span<const uint8_t>(keypair.public_key.data(), keypair.public_key.size()));
+        std::span<const uint8_t>{aad});
 
     auto id_dir = temp_dir / "identity";
     fs::create_directories(id_dir);
@@ -275,4 +278,61 @@ TEST_F(KeyWrappingTest, APreChangeAesIdentityFileIsRefused) {
     }
 
     EXPECT_FALSE(kw->unlock_identity({}).has_value());
+}
+
+// Two delegations, each with its own random wrapping key and its own child.
+//
+// Two independent things stop a wrapped child key being substituted between
+// them. The wrapping key is random per delegation, so the ciphertexts are not
+// interchangeable even before authentication. On top of that the child's own
+// identity is authenticated, which is what this asserts directly: holding the
+// CORRECT key, the wrong child's AAD still fails.
+TEST_F(KeyWrappingTest, AWrappedChildKeyIsBoundToItsChild) {
+    std::string passphrase = "delegate-pass";
+    auto pp = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
+    kw->generate_and_store_identity(pp);
+
+    auto first = kw->delegate_key(pp);
+    auto second = kw->delegate_key(pp);
+    ASSERT_TRUE(first.success);
+    ASSERT_TRUE(second.success);
+    ASSERT_NE(first.child_keypair.public_key, second.child_keypair.public_key);
+
+    // Each delegation carries its own random wrapping key, so neither ciphertext
+    // is reusable as the other in the first place.
+    EXPECT_NE(first.wrapped_child_key.ciphertext.ciphertext,
+              second.wrapped_child_key.ciphertext.ciphertext);
+    EXPECT_NE(first.encrypted_wk.ciphertext, second.encrypted_wk.ciphertext);
+
+    // The binding itself, with the key held: re-wrap a child key under a known
+    // WK and prove only that child's AAD opens it.
+    AeadKey wk{};
+    crypto->random_bytes(std::span<uint8_t>(wk));
+    const auto aad_first =
+        aead_aad(aead_purpose::kChildKey,
+                 {std::span<const uint8_t>(first.child_keypair.public_key.data(),
+                                           first.child_keypair.public_key.size())});
+    const auto aad_second =
+        aead_aad(aead_purpose::kChildKey,
+                 {std::span<const uint8_t>(second.child_keypair.public_key.data(),
+                                           second.child_keypair.public_key.size())});
+
+    const auto blob = crypto->aead_encrypt(
+        wk,
+        std::span<const uint8_t>(first.child_keypair.private_key.data(),
+                                 first.child_keypair.private_key.size()),
+        std::span<const uint8_t>{aad_first});
+
+    // Correct key, correct child.
+    ASSERT_TRUE(crypto->aead_decrypt(wk, blob, std::span<const uint8_t>{aad_first}).has_value());
+    // Correct key, WRONG child: refused on authentication.
+    EXPECT_FALSE(crypto->aead_decrypt(wk, blob, std::span<const uint8_t>{aad_second}).has_value());
+    // And a different purpose tag does not open it either.
+    const auto wrong_purpose =
+        aead_aad(aead_purpose::kKeyWrapping,
+                 {std::span<const uint8_t>(first.child_keypair.public_key.data(),
+                                           first.child_keypair.public_key.size())});
+    EXPECT_FALSE(
+        crypto->aead_decrypt(wk, blob, std::span<const uint8_t>{wrong_purpose}).has_value());
 }
