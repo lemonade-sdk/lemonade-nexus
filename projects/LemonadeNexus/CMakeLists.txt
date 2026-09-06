@@ -62,6 +62,11 @@ if(UNIX AND NOT APPLE)
     install(FILES "${CMAKE_SOURCE_DIR}/packaging/systemd/lemonade-nexus.service"
             DESTINATION lib/systemd/system
             COMPONENT Runtime)
+    # The bootstrap step between installing and starting: it writes the config
+    # the unit runs on, so it ships with the unit rather than beside it.
+    install(PROGRAMS "${CMAKE_SOURCE_DIR}/scripts/nexus-bootstrap"
+            DESTINATION bin
+            COMPONENT Runtime)
 elseif(APPLE)
     # macOS: launchd plist
     install(FILES "${CMAKE_SOURCE_DIR}/packaging/macos/io.lemonade-nexus.plist"
