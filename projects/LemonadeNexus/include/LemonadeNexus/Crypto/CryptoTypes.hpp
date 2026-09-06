@@ -41,6 +41,12 @@ struct X25519Keypair {
 // --- AES-256-GCM / XChaCha20-Poly1305 AEAD ---
 static constexpr std::size_t kAesGcmKeySize        = 32;
 static constexpr std::size_t kAesGcmNonceSize       = 12;
+/// XChaCha20-Poly1305 is the fallback when the CPU has no AES acceleration, and
+/// its nonce is wider. Anything that stores or parses a nonce must accept both
+/// sizes: which cipher was used depends on the machine that encrypted.
+static constexpr std::size_t kXChaCha20NonceSize    = 24;
+/// Both AEADs append a 16-byte tag, so ciphertext length does not distinguish
+/// them — only the nonce size does.
 static constexpr std::size_t kAesGcmTagSize         = 16;
 using AesGcmKey   = std::array<uint8_t, kAesGcmKeySize>;
 using AesGcmNonce = std::array<uint8_t, kAesGcmNonceSize>;

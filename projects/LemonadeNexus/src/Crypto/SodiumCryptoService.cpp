@@ -145,7 +145,12 @@ std::optional<std::vector<uint8_t>> SodiumCryptoService::do_aes_gcm_decrypt(
         return plaintext;
     }
 
-    // AES-256-GCM path (12-byte nonce)
+    // AES-256-GCM path. The width must be checked, not assumed: libsodium reads
+    // NPUBBYTES from the nonce with no length parameter, so a short nonce off
+    // disk or off the wire is a heap over-read, not a decrypt failure.
+    if (ct.nonce.size() != crypto_aead_aes256gcm_NPUBBYTES) {
+        return std::nullopt;
+    }
     if (!aes_gcm_available_) {
         spdlog::error("[{}] Cannot decrypt AES-256-GCM ciphertext: no hardware support. "
                       "This data was encrypted on a CPU with AES-NI.", name());

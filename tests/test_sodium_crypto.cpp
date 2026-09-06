@@ -339,3 +339,78 @@ TEST_F(SodiumCryptoTest, Ed25519ToX25519DHWorks) {
 TEST_F(SodiumCryptoTest, ServiceName) {
     EXPECT_EQ(crypto.service_name(), "SodiumCryptoService");
 }
+
+// --- Nonce width decides the cipher, on every host -----------------------------
+//
+// aes_gcm_encrypt uses AES-256-GCM where the CPU accelerates it and
+// XChaCha20-Poly1305 where it does not, and the two nonces are different
+// widths. Anything that stores nonce||ciphertext must therefore recover the
+// width rather than assume 12 — ACLService assumed 12, so every permission
+// written on a host without AES-NI decoded as garbage and read back as None.
+
+TEST_F(SodiumCryptoTest, EncryptEmitsOneOfTheTwoKnownNonceWidths) {
+    AesGcmKey key{};
+    randombytes_buf(key.data(), key.size());
+    const std::vector<uint8_t> plaintext{1, 2, 3, 4};
+
+    const auto ct = crypto.aes_gcm_encrypt(key, plaintext);
+    EXPECT_TRUE(ct.nonce.size() == kAesGcmNonceSize ||
+                ct.nonce.size() == kXChaCha20NonceSize)
+        << "unexpected nonce width " << ct.nonce.size();
+    // Both AEADs append the same tag size, which is what makes the width
+    // recoverable from the total length.
+    EXPECT_EQ(ct.ciphertext.size(), plaintext.size() + kAesGcmTagSize);
+}
+
+TEST_F(SodiumCryptoTest, AnXChaCha20CiphertextDecryptsOnAnyHost) {
+    // Built with libsodium directly, so this runs the fallback path even on a
+    // machine whose CPU would have chosen AES-GCM.
+    AesGcmKey key{};
+    randombytes_buf(key.data(), key.size());
+    const std::vector<uint8_t> plaintext{0xDE, 0xAD, 0xBE, 0xEF};
+
+    AesGcmCiphertext ct;
+    ct.nonce.resize(kXChaCha20NonceSize);
+    randombytes_buf(ct.nonce.data(), ct.nonce.size());
+    ct.ciphertext.resize(plaintext.size() + kAesGcmTagSize);
+    unsigned long long written = 0;
+    ASSERT_EQ(crypto_aead_xchacha20poly1305_ietf_encrypt(
+                  ct.ciphertext.data(), &written, plaintext.data(), plaintext.size(),
+                  nullptr, 0, nullptr, ct.nonce.data(), key.data()),
+              0);
+    ct.ciphertext.resize(static_cast<std::size_t>(written));
+
+    const auto back = crypto.aes_gcm_decrypt(key, ct);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(*back, plaintext);
+}
+
+TEST_F(SodiumCryptoTest, ANonceWidthIsRecoverableFromAStoredBlob) {
+    // The exact arithmetic ACLService::decrypt_perms relies on: permissions are
+    // a fixed four bytes, both tags are 16, so nonce width = blob - 20 and the
+    // two layouts can never collide.
+    constexpr std::size_t kCiphertextSize = sizeof(uint32_t) + kAesGcmTagSize;
+    for (const std::size_t width : {kAesGcmNonceSize, kXChaCha20NonceSize}) {
+        const std::size_t blob = width + kCiphertextSize;
+        EXPECT_EQ(blob - kCiphertextSize, width);
+    }
+    EXPECT_NE(kAesGcmNonceSize + kCiphertextSize, kXChaCha20NonceSize + kCiphertextSize);
+}
+
+TEST_F(SodiumCryptoTest, AShortNonceIsRefusedRatherThanOverRead) {
+    // libsodium reads NPUBBYTES from the nonce with no length argument, so a
+    // truncated nonce off disk or off the wire used to be a heap over-read
+    // inside the AEAD rather than a decrypt failure. Every width that is not
+    // one of the two legal ones must be refused before the call.
+    AesGcmKey key{};
+    randombytes_buf(key.data(), key.size());
+
+    for (const std::size_t width : {std::size_t{0}, std::size_t{1}, std::size_t{5},
+                                    std::size_t{11}, std::size_t{13}, std::size_t{23},
+                                    std::size_t{25}, std::size_t{64}}) {
+        AesGcmCiphertext ct;
+        ct.nonce.assign(width, 0xAB);
+        ct.ciphertext.assign(kAesGcmTagSize + 4, 0xCD);
+        EXPECT_FALSE(crypto.aes_gcm_decrypt(key, ct).has_value()) << "width " << width;
+    }
+}

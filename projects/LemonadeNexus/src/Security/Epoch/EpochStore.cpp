@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
+#include <LemonadeNexus/Security/DurableWrite.hpp>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
@@ -6,8 +7,6 @@
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <fstream>
 #include <sstream>
@@ -72,40 +71,11 @@ EpochStore::EpochStore(std::filesystem::path directory, crypto::KeyWrappingServi
     std::filesystem::create_directories(directory_, ec);
 }
 
-// Temp file, fsync, rename, directory fsync: the state a node acts on after
-// a restart must be exactly one complete version.
+// The state a node acts on after a restart must be exactly one complete
+// version; the shared helper also makes the rename itself durable, which this
+// store previously left best-effort.
 bool EpochStore::write_atomic(const std::filesystem::path& path, const std::string& content) const {
-    const std::filesystem::path temp = path.string() + ".tmp";
-    const int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) {
-        return false;
-    }
-    std::size_t written = 0;
-    while (written < content.size()) {
-        const ssize_t n = ::write(fd, content.data() + written, content.size() - written);
-        if (n <= 0) {
-            ::close(fd);
-            return false;
-        }
-        written += static_cast<std::size_t>(n);
-    }
-    if (::fsync(fd) != 0) {
-        ::close(fd);
-        return false;
-    }
-    ::close(fd);
-
-    std::error_code ec;
-    std::filesystem::rename(temp, path, ec);
-    if (ec) {
-        return false;
-    }
-    const int dir = ::open(directory_.c_str(), O_RDONLY);
-    if (dir >= 0) {
-        ::fsync(dir);
-        ::close(dir);
-    }
-    return true;
+    return write_durable(path, content);
 }
 
 std::optional<std::string> EpochStore::read_all(const std::filesystem::path& path) const {

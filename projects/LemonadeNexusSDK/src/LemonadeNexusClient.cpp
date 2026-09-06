@@ -1402,12 +1402,25 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
         crypto_auth_hmacsha256_final(&st, aes_key);
     }
 
-    // 5. Decrypt with AES-256-GCM
+    // 5. Decrypt. The server picks AES-256-GCM or XChaCha20-Poly1305 by what
+    //    ITS cpu accelerates, and the two nonces are different widths, so the
+    //    width selects the cipher here. Assuming AES-GCM made every bundle from
+    //    a server without AES-NI undecryptable by any client.
     auto nonce_bytes = Identity::from_base64(bundle.nonce);
     auto ct_bytes = Identity::from_base64(bundle.encrypted_privkey);
 
-    if (nonce_bytes.size() != crypto_aead_aes256gcm_NPUBBYTES) {
+    const bool is_xchacha =
+        nonce_bytes.size() == crypto_aead_xchacha20poly1305_ietf_NPUBBYTES;
+    const bool is_aes_gcm = nonce_bytes.size() == crypto_aead_aes256gcm_NPUBBYTES;
+    if (!is_xchacha && !is_aes_gcm) {
         result.error = "invalid nonce size";
+        sodium_memzero(our_x25519_sk, 32);
+        sodium_memzero(shared_secret, 32);
+        sodium_memzero(aes_key, 32);
+        return result;
+    }
+    if (is_aes_gcm && crypto_aead_aes256gcm_is_available() == 0) {
+        result.error = "certificate bundle needs AES-NI, which this cpu lacks";
         sodium_memzero(our_x25519_sk, 32);
         sodium_memzero(shared_secret, 32);
         sodium_memzero(aes_key, 32);
@@ -1417,14 +1430,17 @@ Result<DecryptedCert> LemonadeNexusClient::decrypt_certificate(const IssuedCertB
     std::vector<uint8_t> plaintext(ct_bytes.size());
     unsigned long long plaintext_len = 0;
 
-    if (crypto_aead_aes256gcm_decrypt(
-            plaintext.data(), &plaintext_len,
-            nullptr, // nsec
-            ct_bytes.data(), ct_bytes.size(),
-            nullptr, 0, // no AAD
-            nonce_bytes.data(),
-            aes_key) != 0) {
-        result.error = "AES-GCM decryption failed (wrong key or corrupted data)";
+    const int decrypted =
+        is_xchacha ? crypto_aead_xchacha20poly1305_ietf_decrypt(
+                         plaintext.data(), &plaintext_len, nullptr,
+                         ct_bytes.data(), ct_bytes.size(), nullptr, 0,
+                         nonce_bytes.data(), aes_key)
+                   : crypto_aead_aes256gcm_decrypt(
+                         plaintext.data(), &plaintext_len, nullptr,
+                         ct_bytes.data(), ct_bytes.size(), nullptr, 0,
+                         nonce_bytes.data(), aes_key);
+    if (decrypted != 0) {
+        result.error = "decryption failed (wrong key or corrupted data)";
         sodium_memzero(our_x25519_sk, 32);
         sodium_memzero(shared_secret, 32);
         sodium_memzero(aes_key, 32);

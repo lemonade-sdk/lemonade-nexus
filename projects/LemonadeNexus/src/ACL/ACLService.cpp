@@ -430,11 +430,24 @@ std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
 }
 
 std::optional<uint32_t> ACLService::decrypt_perms(const std::vector<uint8_t>& blob) const {
-    if (!has_key_ || blob.size() <= crypto::kAesGcmNonceSize) return std::nullopt;
+    if (!has_key_) return std::nullopt;
+
+    // The blob is nonce || ciphertext, and the nonce width depends on which
+    // AEAD the ENCRYPTING machine had: 12 bytes with AES-NI, 24 without. A
+    // fixed 12-byte split silently mis-parsed every record written on a host
+    // without AES acceleration, so the permissions never decoded there.
+    // Permissions are a fixed 4 bytes and both AEADs use a 16-byte tag, so the
+    // ciphertext length is constant and the nonce width follows from the rest.
+    constexpr std::size_t kCiphertextSize = sizeof(uint32_t) + crypto::kAesGcmTagSize;
+    if (blob.size() <= kCiphertextSize) return std::nullopt;
+    const std::size_t nonce_size = blob.size() - kCiphertextSize;
+    if (nonce_size != crypto::kAesGcmNonceSize && nonce_size != crypto::kXChaCha20NonceSize) {
+        return std::nullopt;
+    }
 
     crypto::AesGcmCiphertext ct;
-    ct.nonce.assign(blob.begin(), blob.begin() + crypto::kAesGcmNonceSize);
-    ct.ciphertext.assign(blob.begin() + crypto::kAesGcmNonceSize, blob.end());
+    ct.nonce.assign(blob.begin(), blob.begin() + static_cast<std::ptrdiff_t>(nonce_size));
+    ct.ciphertext.assign(blob.begin() + static_cast<std::ptrdiff_t>(nonce_size), blob.end());
 
     auto plaintext = crypto_.aes_gcm_decrypt(encryption_key_, ct);
     if (!plaintext || plaintext->size() != 4) return std::nullopt;

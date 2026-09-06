@@ -221,7 +221,9 @@ bool DdnsService::request_credentials(const std::string& root_http_endpoint,
         auto nonce_bytes = crypto::from_base64(
             response.value("nonce", ""));
 
-        if (nonce_bytes.size() != crypto::kAesGcmNonceSize) {
+        // Either AEAD, depending on what the sending host had; see CryptoTypes.
+        if (nonce_bytes.size() != crypto::kAesGcmNonceSize &&
+            nonce_bytes.size() != crypto::kXChaCha20NonceSize) {
             spdlog::error("[{}] invalid nonce in credential response", name());
             return false;
         }
@@ -779,7 +781,8 @@ bool DdnsService::load_encrypted_credentials() {
         auto stored = json::parse(env->data);
         auto ct_bytes = crypto::from_base64(stored.value("ciphertext", ""));
         auto nonce_bytes = crypto::from_base64(stored.value("nonce", ""));
-        if (nonce_bytes.size() != crypto::kAesGcmNonceSize) {
+        if (nonce_bytes.size() != crypto::kAesGcmNonceSize &&
+            nonce_bytes.size() != crypto::kXChaCha20NonceSize) {
             return false;
         }
 

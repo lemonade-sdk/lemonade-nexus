@@ -1,11 +1,9 @@
 #include <LemonadeNexus/Security/Consensus/ConsensusStore.hpp>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/DurableWrite.hpp>
 
 #include <nlohmann/json.hpp>
-
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -25,47 +23,6 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 namespace {
-
-// Crash-atomic durable write, in this exact order: write "<final>.tmp" in the
-// same directory, fsync the file descriptor, rename onto the final name, then
-// fsync the DIRECTORY so the rename itself is durable. The write path is
-// POSIX because ofstream cannot fsync.
-//
-// A vote may only leave this node after its safety state is on disk. A torn
-// write that survives a crash would let the node vote twice.
-[[nodiscard]] bool write_durable(const fs::path& final_path, std::string_view payload) {
-    fs::path temp_path = final_path;
-    temp_path += ".tmp";
-
-    const int fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return false;
-
-    std::size_t written = 0;
-    while (written < payload.size()) {
-        const ssize_t count =
-            ::write(fd, payload.data() + written, payload.size() - written);
-        if (count <= 0) {
-            ::close(fd);
-            return false;
-        }
-        written += static_cast<std::size_t>(count);
-    }
-    if (::fsync(fd) != 0) {
-        ::close(fd);
-        return false;
-    }
-    if (::close(fd) != 0) return false;
-
-    std::error_code ec;
-    fs::rename(temp_path, final_path, ec);
-    if (ec) return false;
-
-    const int dir_fd = ::open(final_path.parent_path().c_str(), O_RDONLY);
-    if (dir_fd < 0) return false;
-    const bool directory_synced = ::fsync(dir_fd) == 0;
-    ::close(dir_fd);
-    return directory_synced;
-}
 
 [[nodiscard]] std::optional<std::string> read_file(const fs::path& path) {
     std::ifstream stream(path, std::ios::binary);
