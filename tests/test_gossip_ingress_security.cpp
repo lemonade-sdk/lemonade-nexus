@@ -30,6 +30,8 @@
 
 #include <asio.hpp>
 #include <gtest/gtest.h>
+#include <sodium.h>
+#include <sqlite3.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -1143,4 +1145,68 @@ TEST_F(GossipIngressSecurityTest, SeipDnsRecordsAreOwnedByTheirServerId) {
     inject(build_packet(other, gossip::GossipMsgType::DnsRecordSync, poach_priv), a);
     pump_for(std::chrono::milliseconds(200));
     EXPECT_EQ(a.dns->resolve(private_fqdn)->ipv4_address, "10.64.0.1");
+}
+
+// A permissions row exactly as the pre-change code stored it: nonce||ciphertext
+// with a 12-byte AES-GCM nonce and no version byte. The reader must refuse it
+// and report no permission, rather than mis-split it or reach a cipher that no
+// longer exists.
+TEST_F(GossipIngressSecurityTest, APreChangeAesPermissionRowIsRefused) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "cannot build a genuine AES ciphertext on this cpu";
+    }
+    const auto acl_kp = kc->ed25519_keygen();
+    auto& a = make_node("a", [&](Node& n) { attach_acl(n, acl_kp); }, [](Node&) {});
+
+    ASSERT_TRUE(a.acl->grant("user-legacy", "res-legacy", acl::Permission::Read));
+    ASSERT_NE(a.acl->get_permissions("user-legacy", "res-legacy"), acl::Permission::None);
+
+    // The exact key ACLService derives, so the row is genuinely decryptable
+    // under the old scheme and refused only because that format is gone.
+    static constexpr std::string_view kSalt = "lemonade-nexus-acl-db-key";
+    const std::vector<uint8_t> info{'a', 'c', 'l'};
+    auto derived = a.crypto->hkdf_sha256(
+        std::span<const uint8_t>(acl_kp.private_key.data(), acl_kp.private_key.size()),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kSalt.data()), kSalt.size()),
+        std::span<const uint8_t>{info},
+        nexus::crypto::kAeadKeySize);
+    ASSERT_EQ(derived.size(), nexus::crypto::kAeadKeySize);
+    std::array<uint8_t, nexus::crypto::kAeadKeySize> key{};
+    std::memcpy(key.data(), derived.data(), key.size());
+
+    std::array<uint8_t, 4> perms{static_cast<uint8_t>(acl::Permission::Read), 0, 0, 0};
+    std::vector<uint8_t> nonce(crypto_aead_aes256gcm_NPUBBYTES);
+    randombytes_buf(nonce.data(), nonce.size());
+    std::vector<uint8_t> ct(perms.size() + crypto_aead_aes256gcm_ABYTES);
+    unsigned long long ct_len = 0;
+    ASSERT_EQ(crypto_aead_aes256gcm_encrypt(ct.data(), &ct_len, perms.data(), perms.size(),
+                                            nullptr, 0, nullptr, nonce.data(), key.data()),
+              0);
+    ct.resize(static_cast<std::size_t>(ct_len));
+
+    // Old layout: nonce || ciphertext, no leading version byte.
+    std::vector<uint8_t> legacy;
+    legacy.insert(legacy.end(), nonce.begin(), nonce.end());
+    legacy.insert(legacy.end(), ct.begin(), ct.end());
+
+    a.acl->stop();
+    {
+        sqlite3* db = nullptr;
+        ASSERT_EQ(sqlite3_open((a.dir / "acl.db").string().c_str(), &db), SQLITE_OK);
+        sqlite3_stmt* stmt = nullptr;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      db, "UPDATE acl SET perms_enc = ? WHERE user_id = ? AND resource = ?",
+                      -1, &stmt, nullptr),
+                  SQLITE_OK);
+        sqlite3_bind_blob(stmt, 1, legacy.data(), static_cast<int>(legacy.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 2, "user-legacy", -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 3, "res-legacy", -1, SQLITE_STATIC);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+    }
+    a.acl->start();
+
+    EXPECT_EQ(a.acl->get_permissions("user-legacy", "res-legacy"), acl::Permission::None)
+        << "a pre-change AES row must not decode";
 }

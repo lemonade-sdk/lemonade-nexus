@@ -231,3 +231,48 @@ TEST_F(KeyWrappingTest, LegacyBlobMigratesToV2OnUnlock) {
 TEST_F(KeyWrappingTest, ServiceName) {
     EXPECT_EQ(kw->service_name(), "KeyWrappingService");
 }
+
+// A keypair.enc exactly as the pre-change code wrote it on an accelerated host:
+// "v2:" + 12-byte AES-GCM nonce + ciphertext, and no crypto version. The reader
+// must refuse it cleanly — there is no AES decryption left to attempt.
+TEST_F(KeyWrappingTest, APreChangeAesIdentityFileIsRefused) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "cannot build a genuine AES ciphertext on this cpu";
+    }
+    auto keypair = crypto->ed25519_keygen();
+
+    static constexpr std::string_view kSalt = "lemonade-nexus-mgmt-key";
+    auto derived = crypto->hkdf_sha256(
+        std::span<const uint8_t>{},
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kSalt.data()), kSalt.size()),
+        std::span<const uint8_t>(keypair.public_key.data(), keypair.public_key.size()),
+        kAeadKeySize);
+    AeadKey key{};
+    std::memcpy(key.data(), derived.data(), kAeadKeySize);
+
+    std::vector<uint8_t> nonce(crypto_aead_aes256gcm_NPUBBYTES);
+    randombytes_buf(nonce.data(), nonce.size());
+    std::vector<uint8_t> ct(keypair.private_key.size() + crypto_aead_aes256gcm_ABYTES);
+    unsigned long long ct_len = 0;
+    ASSERT_EQ(crypto_aead_aes256gcm_encrypt(
+                  ct.data(), &ct_len, keypair.private_key.data(), keypair.private_key.size(),
+                  keypair.public_key.data(), keypair.public_key.size(), nullptr,
+                  nonce.data(), key.data()),
+              0);
+    ct.resize(static_cast<std::size_t>(ct_len));
+
+    auto id_dir = temp_dir / "identity";
+    fs::create_directories(id_dir);
+    {
+        std::ofstream ofs(id_dir / "keypair.pub", std::ios::binary);
+        ofs << to_hex(std::span<const uint8_t>(keypair.public_key));
+    }
+    {
+        // The exact pre-change encoding: no crypto version field.
+        std::ofstream ofs(id_dir / "keypair.enc", std::ios::binary);
+        ofs << "v2:" << to_hex(std::span<const uint8_t>(nonce.data(), nonce.size()))
+            << ":" << to_hex(std::span<const uint8_t>(ct));
+    }
+
+    EXPECT_FALSE(kw->unlock_identity({}).has_value());
+}

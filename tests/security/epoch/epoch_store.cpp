@@ -4,6 +4,7 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -176,3 +177,31 @@ TEST(EpochStoreWithoutWrapping, VoteKeyIsNotPersisted) {
 }
 
 }  // namespace
+
+// A vote-key record exactly as the pre-change code wrote it: no crypto version
+// and a 12-byte AES-GCM nonce. The reader refuses it rather than attempting an
+// algorithm that no longer exists.
+TEST_F(EpochStoreFixture, APreChangeAesVoteKeyRecordIsRefused) {
+    const NodeId self = node(0x07);
+    EpochVoteKey original = make_epoch_vote_key(3, self);
+    ASSERT_TRUE(store->store_vote_key(original));
+
+    const auto path = store->directory() / "vote-key-3.json";
+    nlohmann::json j;
+    {
+        std::ifstream in(path);
+        in >> j;
+    }
+    ASSERT_TRUE(j.contains("crypto_version"));
+
+    // Rewrite it in the old shape: version field gone, 12-byte nonce.
+    j.erase("crypto_version");
+    std::vector<uint8_t> narrow_nonce(12, 0xAB);
+    j["nonce"] = nexus::crypto::to_base64(narrow_nonce);
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << j.dump();
+    }
+
+    EXPECT_FALSE(store->load_vote_key(3, self).has_value());
+}

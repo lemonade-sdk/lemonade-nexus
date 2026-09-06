@@ -432,3 +432,43 @@ TEST_F(SodiumCryptoTest, AssociatedDataIsStillAuthenticated) {
     EXPECT_FALSE(crypto.aead_decrypt(key, blob, other_aad).has_value());
     EXPECT_FALSE(crypto.aead_decrypt(key, blob).has_value());
 }
+
+// --- Pre-change AES blobs are rejected, never decrypted ------------------------
+//
+// A genuine AES-256-GCM ciphertext with a 12-byte nonce — exactly what the old
+// polymorphic path produced on an accelerated host. No decoder may open it, and
+// none may fault on it. There is no AES decryption left to reach.
+
+TEST_F(SodiumCryptoTest, AGenuineAesFormatBlobIsRefusedByTheCoreDecoder) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "cannot build a genuine AES ciphertext on this cpu";
+    }
+    AeadKey key{};
+    randombytes_buf(key.data(), key.size());
+    const std::vector<uint8_t> plaintext{1, 2, 3, 4};
+
+    // Build it the way the removed code did.
+    std::vector<uint8_t> nonce(crypto_aead_aes256gcm_NPUBBYTES);
+    randombytes_buf(nonce.data(), nonce.size());
+    std::vector<uint8_t> ct(plaintext.size() + crypto_aead_aes256gcm_ABYTES);
+    unsigned long long ct_len = 0;
+    ASSERT_EQ(crypto_aead_aes256gcm_encrypt(ct.data(), &ct_len, plaintext.data(),
+                                            plaintext.size(), nullptr, 0, nullptr,
+                                            nonce.data(), key.data()),
+              0);
+    ct.resize(static_cast<std::size_t>(ct_len));
+
+    // Presented as version 1 (the most optimistic reading a migration could
+    // make) it is still refused, on the nonce width.
+    EncryptedBlob as_v1;
+    as_v1.version = kEncryptedBlobVersion;
+    as_v1.nonce = nonce;
+    as_v1.ciphertext = ct;
+    EXPECT_FALSE(crypto.aead_decrypt(key, as_v1).has_value());
+
+    // Presented with no version at all (an old record carried none) it is
+    // refused on the version.
+    EncryptedBlob unversioned = as_v1;
+    unversioned.version = 0;
+    EXPECT_FALSE(crypto.aead_decrypt(key, unversioned).has_value());
+}
