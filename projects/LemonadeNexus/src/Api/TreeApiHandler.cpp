@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <algorithm>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>

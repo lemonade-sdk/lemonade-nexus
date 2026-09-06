@@ -6,6 +6,8 @@
 
 #include "support/lifecycle_mesh.hpp"
 
+#include <algorithm>
+
 namespace lifecycle_test {
 
 struct RotatingMeshBase : DriverMeshBase {

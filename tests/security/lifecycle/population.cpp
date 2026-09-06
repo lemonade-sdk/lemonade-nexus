@@ -8,6 +8,8 @@
 
 #include "support/rotation.hpp"
 
+#include <algorithm>
+
 namespace lifecycle_test {
 namespace {
 

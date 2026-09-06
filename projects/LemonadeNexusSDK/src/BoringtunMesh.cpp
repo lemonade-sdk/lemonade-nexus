@@ -1,4 +1,5 @@
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
+#include <algorithm>
 
 #include <LemonadeNexus/Boringtun/IpRouter.hpp>
 #include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>

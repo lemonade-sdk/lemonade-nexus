@@ -8,6 +8,7 @@
 
 #include <LemonadeNexus/Security/Eligibility/EligibilityService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <algorithm>
 
 #include <gtest/gtest.h>
 #include <sodium.h>

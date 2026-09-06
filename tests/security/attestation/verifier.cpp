@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/MeasurementIma.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <algorithm>
 
 #include <gtest/gtest.h>
 #include <sodium.h>
