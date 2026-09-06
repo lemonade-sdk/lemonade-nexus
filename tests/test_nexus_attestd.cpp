@@ -460,12 +460,14 @@ TEST_F(AttestdServiceTest, TheWirePathAlwaysAnswersTyped) {
         EXPECT_EQ(document["refusal"], "malformed_request") << garbage;
     }
 
-    // A well-formed request gets a typed answer about the PLATFORM, never
-    // about identity: the daemon holds no key and has no opinion on whose
-    // challenge this is.
+    // A well-formed request gets a platform refusal, never an identity one.
+    // No TPM stack -> platform_unavailable; stack but no device (CI) -> the
+    // prover runs and fails with evidence_unavailable. Both are platform-class.
     const auto document = json::parse(one_frame(service, good_request().dump()).second);
     EXPECT_EQ(document["type"], std::string(nexus::attestd::kRefusalType));
-    EXPECT_EQ(document["refusal"], "platform_unavailable");
+    const std::string refusal = document["refusal"];
+    EXPECT_TRUE(refusal == "platform_unavailable" || refusal == "evidence_unavailable")
+        << "unexpected refusal: " << refusal;
 }
 
 // ---------------------------------------------------------------------------
