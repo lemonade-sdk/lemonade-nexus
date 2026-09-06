@@ -101,6 +101,7 @@ protected:
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest = patterned<32>(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+        profile_.evidence_collector_path = "/usr/bin/nexus";
         ASSERT_TRUE(profile_is_complete(profile_));
 
         challenge_ = issue(profile_);
@@ -377,6 +378,7 @@ TEST_F(Tier1PathTest, ChallengeOnAnOlderSecurityRulesetIsRejected) {
 TEST_F(Tier1PathTest, ChallengeIssuedUnderAnotherProfileIsRejected) {
     LinuxAttestationProfile other = profile_;
     other.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary, kOtherBinary}}};
+    other.evidence_collector_path = "/usr/bin/nexus";
     ASSERT_NE(profile_digest(other), profile_digest(profile_));
 
     // A complete, correctly signed attempt under the other profile.

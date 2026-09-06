@@ -754,6 +754,11 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
         // Checked BEFORE the lookup. binary_path is prover-supplied, so a path
         // outside the profile is refused rather than searched for — otherwise
         // the prover chooses which measured file the verifier judges.
+        if (!req.evidence_collector_path.empty() &&
+            ev.binary_path != req.evidence_collector_path) {
+            return deny(std::move(v), "the evidence names '" + ev.binary_path +
+                                          "' as its collector, not the compiled one");
+        }
         if (!req.approved_paths.empty() &&
             std::find(req.approved_paths.begin(), req.approved_paths.end(), ev.binary_path) ==
                 req.approved_paths.end()) {

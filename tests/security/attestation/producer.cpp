@@ -56,6 +56,7 @@ protected:
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+        profile_.evidence_collector_path = "/usr/bin/nexus";
         ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
 
         challenge_.nonce = patterned<32>(0x01);

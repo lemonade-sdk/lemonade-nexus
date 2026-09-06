@@ -59,7 +59,7 @@ struct SnpVtpmEvidence {
     /// IMA ASCII log, cut at the entry whose replay reaches the quoted PCR 10.
     /// Read after the quote, so it is a superset; see ima_truncate_to_pcr.
     std::string          ima_log;
-    std::string          binary_path;    ///< which IMA entry describes the running binary
+    std::string          binary_path;    ///< the collector's own path; a verifier pins it, never picks by it
     std::string          binary_sha256;  ///< hex; bound into the quote, confirmed against the log
     /// Why the prover could not measure its own binary. Diagnostic only — a
     /// verifier rejects on the ABSENT measurement, never on this string.
@@ -135,6 +135,11 @@ struct EvidenceRequirements {
     /// is judged on. Empty accepts any, which is only right for the
     /// platform-only probe.
     std::vector<std::string> approved_paths;
+
+    /// The one component allowed to supply the quote binding. Non-empty demands
+    /// binary_path equal it exactly — an approved path with a valid hash is
+    /// still refused if it is not THE collector.
+    std::string evidence_collector_path;
 
     /// Boot state. Each entry pins one quoted PCR to a hex value. The quote
     /// covers these PCRs, so unlike the runtime fields below they are hardware

@@ -398,6 +398,7 @@ LinuxAttestationProfile complete_profile() {
     profile.snp.expected_measurement_hex = std::string(96, 'a');
     profile.ima_policy_digest = filled(0x60);
     profile.approved_paths = {{"/usr/bin/nexus", {std::string(64, 'b')}}};
+    profile.evidence_collector_path = "/usr/bin/nexus";
     return profile;
 }
 

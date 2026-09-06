@@ -21,8 +21,8 @@ std::size_t platform_evidence_size(const SnpVtpmEvidence& platform) {
            platform.binary_sha256.size() + platform.ima_unavailable.size();
 }
 
-bool binary_approved(const LinuxAttestationProfile& profile, std::string_view binary_path,
-                     std::string_view binary_sha256_hex) {
+bool path_approved(const LinuxAttestationProfile& profile, std::string_view binary_path,
+                   std::string_view binary_sha256_hex) {
     if (binary_path.empty() || binary_sha256_hex.empty()) {
         return false;
     }
@@ -35,6 +35,20 @@ bool binary_approved(const LinuxAttestationProfile& profile, std::string_view bi
     }
     return std::find(entry->sha256.begin(), entry->sha256.end(), binary_sha256_hex) !=
            entry->sha256.end();
+}
+
+bool binary_approved(const LinuxAttestationProfile& profile, const ImaLog& log) {
+    if (profile.approved_paths.empty()) {
+        return false;
+    }
+    for (const auto& required : profile.approved_paths) {
+        const auto entry = ima_entry_for_path(log, required.path);
+        if (!entry || entry->file_hash_algo != "sha256" ||
+            !path_approved(profile, required.path, entry->file_hash_hex)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::vector<std::string> approved_path_list(const LinuxAttestationProfile& profile) {

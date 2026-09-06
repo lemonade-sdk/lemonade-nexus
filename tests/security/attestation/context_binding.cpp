@@ -94,6 +94,7 @@ LinuxAttestationProfile pinned_profile() {
     profile.ima_policy_digest = patterned<32>(0x60);
     profile.require_ima = true;
     profile.approved_paths = {{"/usr/bin/nexus", {"01ab"}}};
+    profile.evidence_collector_path = "/usr/bin/nexus";
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = nexus::security::constants::kSecurityRulesetVersion;

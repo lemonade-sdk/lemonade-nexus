@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Security/Attestation/Providers/AzureSnpVtpmProvider.hpp>
 
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
 
 #include <utility>
 
@@ -39,6 +40,7 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
     requirements.expected_ak_spki_b64 = profile_.required_ak_spki_b64;
     requirements.require_ima = profile_.require_ima;
     requirements.approved_paths = approved_path_list(profile_);
+    requirements.evidence_collector_path = profile_.evidence_collector_path;
     requirements.expected_pcrs = profile_.expected_pcrs;
     requirements.require_no_new_privs = profile_.require_no_new_privs;
     requirements.require_seccomp = profile_.require_seccomp;
@@ -71,9 +73,11 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
         return fail(map_platform_failure(platform));
     }
 
-    // The platform chain refused any path outside the profile; this is the
-    // other half — an approved release OF that path.
-    if (!binary_approved(profile_, platform.binary_path, platform.binary_sha256)) {
+    // The chain proved the log is the quoted one and that the binding came
+    // from the collector. This is the conjunction on top: EVERY required
+    // component measured, last measurement in its own approved set.
+    const auto log = parse_ima_ascii(evidence.platform.ima_log);
+    if (!log || !binary_approved(profile_, *log)) {
         return fail(AttestationFailure::BinaryMeasurementInvalid);
     }
     result.claims.binary_approved = true;

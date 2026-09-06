@@ -36,6 +36,7 @@ LinuxAttestationProfile base_profile() {
     profile.ima_policy_digest = patterned_digest(0x60);
     profile.require_ima = true;
     profile.approved_paths = {{"/usr/bin/nexus", {"01ab", "02cd"}}};
+    profile.evidence_collector_path = "/usr/bin/nexus";
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = 1;
@@ -179,8 +180,18 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
     EXPECT_FALSE(profile_is_complete(v1));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoPinnedLaunchMeasurement));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoTcbFloor));
-    EXPECT_TRUE(has_gap(v1, ProfileGap::NoApprovedPaths));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoImaPolicyDigest));
+    // The required paths ARE compiled — server, collector, and the collector
+    // designation — but their digest sets are release observations and stay
+    // empty, which is its own gap.
+    ASSERT_EQ(v1.approved_paths.size(), 2u);
+    EXPECT_EQ(v1.approved_paths[0].path, "/usr/local/bin/nexus");
+    EXPECT_EQ(v1.approved_paths[1].path, "/usr/bin/nexus-attestd");
+    EXPECT_EQ(v1.evidence_collector_path, "/usr/bin/nexus-attestd");
+    EXPECT_FALSE(has_gap(v1, ProfileGap::NoApprovedPaths));
+    EXPECT_FALSE(has_gap(v1, ProfileGap::NoEvidenceCollector));
+    EXPECT_FALSE(has_gap(v1, ProfileGap::CollectorNotApproved));
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoApprovedBinary));
     // The rules it DOES fix are already right, so these are not gaps.
     EXPECT_FALSE(has_gap(v1, ProfileGap::ProfileVersionUnset));
     EXPECT_FALSE(has_gap(v1, ProfileGap::SecurityRulesetMismatch));
@@ -374,4 +385,35 @@ TEST(ApprovedPaths, TheDigestChangesWithThePathPolicy) {
     auto pooled = complete_profile();
     pooled.approved_paths = {{"/usr/bin/a", {"aa", "bb"}}, {"/usr/bin/b", {}}};
     EXPECT_NE(profile_digest(pooled), profile_digest(two_split));
+}
+
+// --- Evidence collector -------------------------------------------------------
+
+TEST(EvidenceCollector, MustBeNamedAndMustBeARequiredPath) {
+    auto unnamed = complete_profile();
+    unnamed.evidence_collector_path.clear();
+    EXPECT_TRUE(has_gap(unnamed, ProfileGap::NoEvidenceCollector));
+    EXPECT_FALSE(profile_is_complete(unnamed));
+
+    auto outsider = complete_profile();
+    outsider.evidence_collector_path = "/usr/bin/somewhere-else";
+    EXPECT_TRUE(has_gap(outsider, ProfileGap::CollectorNotApproved));
+    EXPECT_FALSE(profile_is_complete(outsider));
+
+    // Exact match, not canonical: a differently spelled collector is an
+    // authoring error to fix, not to repair.
+    auto spelled = complete_profile();
+    spelled.evidence_collector_path = "/usr/bin/./nexus";
+    EXPECT_TRUE(has_gap(spelled, ProfileGap::CollectorNotApproved));
+}
+
+TEST(EvidenceCollector, ChangingTheCollectorChangesTheProfileDigest) {
+    auto base = complete_profile();
+    base.approved_paths.push_back({"/usr/bin/nexus-attestd", {"aa"}});
+
+    auto other = base;
+    other.evidence_collector_path = "/usr/bin/nexus-attestd";
+    EXPECT_TRUE(profile_is_complete(base));
+    EXPECT_TRUE(profile_is_complete(other));
+    EXPECT_NE(profile_digest(base), profile_digest(other));
 }

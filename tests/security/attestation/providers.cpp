@@ -168,6 +168,7 @@ protected:
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+        profile_.evidence_collector_path = "/usr/bin/nexus";
         ASSERT_TRUE(profile_is_complete(profile_));
 
         challenge_ = issue(kTier1AttestationProfileId);
@@ -519,6 +520,7 @@ LinuxAttestationProfile profile_for_the_captured_host() {
     profile.snp.expected_measurement_hex = captured_measurement_hex();
     profile.ima_policy_digest.fill(0x60);
     profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+    profile.evidence_collector_path = "/usr/bin/nexus";
     // The captured fixture predates any cached CRL, and revocation is checked
     // right after the AMD signature. Leaving it on here would stop every test
     // below at the same step; the revocation rule has its own tests instead.

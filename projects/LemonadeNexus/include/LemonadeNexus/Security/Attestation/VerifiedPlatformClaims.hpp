@@ -70,6 +70,8 @@ struct VerifiedPlatformClaims {
     // self-report only narrows what an already-approved binary is doing
     // (1.1 section 10.2).
     bool ima_anchored{false};
+    /// EVERY required component's last measurement is in its approved set —
+    /// the conjunction over approved_paths, never one binary.
     bool binary_approved{false};
     bool runtime_profile_enforced{false};
 };

@@ -25,14 +25,17 @@ enum class ImaPolicyProof : uint16_t {
 
 [[nodiscard]] std::string_view ima_policy_proof_name(ImaPolicyProof proof);
 
-/// One approved component: where it lives, and which releases of IT are
+/// One REQUIRED component: where it lives, and which releases of IT are
 /// approved.
+///
+/// Every entry is mandatory, not selectable: a passing attestation proves, for
+/// EVERY entry, that the path was measured and its LAST measurement is in the
+/// entry's own digest set. A prover cannot satisfy the profile with a subset,
+/// and an absent required component fails closed. See binary_approved.
 ///
 /// The digests belong to the path, not to the profile. A global digest set
 /// would let an approved release of one component satisfy the path reserved
-/// for another — a verifier asked about /usr/bin/nexus would accept the hash of
-/// an approved helper. Binding them here makes that unrepresentable, and makes
-/// a second component a matter of adding an entry.
+/// for another. Binding them here makes that unrepresentable.
 struct ApprovedPath {
     /// Absolute, as the kernel records it in the IMA log.
     std::string path;
@@ -56,10 +59,19 @@ struct LinuxAttestationProfile {
     Digest ima_policy_digest{};
     ImaPolicyProof ima_policy_proof{ImaPolicyProof::KernelReadback};
 
-    /// The approved components, and nothing else. Bounded by
-    /// kMaxSummarisedPaths so a checkpoint summary can be sized from the
-    /// profile rather than from the log.
+    /// The required runtime components — every entry mandatory, see
+    /// ApprovedPath. Bounded by kMaxSummarisedPaths so a checkpoint summary can
+    /// be sized from the profile rather than from the log. A release pinning
+    /// this list must include the audited executable dependencies (the shared
+    /// objects the components map), not just the two Nexus executables.
     std::vector<ApprovedPath> approved_paths;
+
+    /// The one component that obtains platform evidence — the quote binding
+    /// covers ITS measurement. Must name an approved_paths entry exactly, and
+    /// the evidence must identify itself with this path: the prover never
+    /// chooses which approved component supplies the binding. Compiled, never
+    /// configured.
+    std::string evidence_collector_path;
 
     /// Approved boot state, one pinned hex value per quoted PCR. One of two
     /// boot-integrity inputs; snp.expected_measurement_hex is the other, and
@@ -90,6 +102,8 @@ enum class ProfileGap : uint16_t {
     ApprovedPathNotAbsolute,
     DuplicateApprovedPath,
     NoApprovedBinary,
+    NoEvidenceCollector,
+    CollectorNotApproved,
     NoImaPolicyDigest,
     NoVmplPolicy,
     SecurityRulesetMismatch,

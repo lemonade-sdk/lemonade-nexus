@@ -16,6 +16,7 @@
 
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProvider.hpp>
 #include <LemonadeNexus/Security/Attestation/Providers/AzureSnpVtpmProvider.hpp>
 
@@ -38,9 +39,16 @@ inline constexpr std::size_t kMaxPlatformEvidenceBytes = 4 * 1024 * 1024;
 /// Digests do not cross paths: an approved release of one component never
 /// satisfies another component's path. An unknown path, an empty digest list
 /// or an empty measurement approves nothing — fail closed.
-[[nodiscard]] bool binary_approved(const LinuxAttestationProfile& profile,
-                                   std::string_view binary_path,
-                                   std::string_view binary_sha256_hex);
+[[nodiscard]] bool path_approved(const LinuxAttestationProfile& profile,
+                                 std::string_view binary_path,
+                                 std::string_view binary_sha256_hex);
+
+/// The conjunction over the COMPLETE required set: for every approved_paths
+/// entry, the log carries a measurement of that path, the LAST one wins, and
+/// that hash is in the entry's own digest set. Any absent, superseded or
+/// unapproved required component fails the whole set — there is no
+/// prover-selected subset. An empty required set approves nothing.
+[[nodiscard]] bool binary_approved(const LinuxAttestationProfile& profile, const ImaLog& log);
 
 /// Just the paths, in profile order — what the platform chain needs to refuse a
 /// prover-chosen path. The digests stay with the profile.

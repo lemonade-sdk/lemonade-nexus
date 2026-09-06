@@ -50,7 +50,11 @@ std::string_view profile_gap_name(ProfileGap gap) {
         case ProfileGap::DuplicateApprovedPath:
             return "two approved paths name the same component under different digest sets";
         case ProfileGap::NoApprovedBinary:
-            return "an approved path lists no release digest, so it can never be satisfied";
+            return "a required path lists no release digest, so it can never be satisfied";
+        case ProfileGap::NoEvidenceCollector:
+            return "no evidence collector named: the quote binding has no defined component";
+        case ProfileGap::CollectorNotApproved:
+            return "the evidence collector is not itself a required approved path";
         case ProfileGap::NoImaPolicyDigest:
             return "no IMA policy digest pinned: the measuring policy is unproven";
         case ProfileGap::ImaNotRequired:
@@ -108,6 +112,16 @@ std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile) {
                     })) {
         gaps.push_back(ProfileGap::NoApprovedBinary);
     }
+    if (profile.evidence_collector_path.empty()) {
+        gaps.push_back(ProfileGap::NoEvidenceCollector);
+    } else if (std::none_of(profile.approved_paths.begin(), profile.approved_paths.end(),
+                            [&profile](const ApprovedPath& p) {
+                                return p.path == profile.evidence_collector_path;
+                            })) {
+        // Exact match, deliberately: a collector spelled differently from its
+        // approved entry is a profile-authoring error, not something to repair.
+        gaps.push_back(ProfileGap::CollectorNotApproved);
+    }
     // The IMA log is where binary integrity comes from; a profile that does not
     // demand it cannot prove runtime integrity under any policy proof.
     if (!profile.require_ima) {
@@ -144,12 +158,19 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
 
     profile.require_ima = true;
     profile.ima_policy_proof = ImaPolicyProof::KernelReadback;
+
+    // The required Nexus components at their installed paths. Digest sets stay
+    // empty here — hashes are release observations — so the template remains
+    // incomplete until a release pins them, along with the audited shared
+    // objects these components map (see approved_paths).
+    profile.approved_paths = {{"/usr/local/bin/nexus", {}}, {"/usr/bin/nexus-attestd", {}}};
+    profile.evidence_collector_path = "/usr/bin/nexus-attestd";
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = constants::kSecurityRulesetVersion;
 
-    // snp.min_tcb, snp.expected_measurement_hex, ima_policy_digest and
-    // approved_paths stay unset on purpose. See the header.
+    // snp.min_tcb, snp.expected_measurement_hex, ima_policy_digest and every
+    // approved digest set stay unset on purpose. See the header.
     return profile;
 }
 
@@ -188,6 +209,7 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
             encoder.add_string(binary_sha256);
         }
     }
+    encoder.add_string(profile.evidence_collector_path);
 
     encoder.add_u64(profile.expected_pcrs.size());
     for (const auto& [index, value_hex] : profile.expected_pcrs) {

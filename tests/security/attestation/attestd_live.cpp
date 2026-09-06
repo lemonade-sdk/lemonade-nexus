@@ -12,15 +12,19 @@
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexusAttestd/AttestdClient.hpp>
 
 #include <gtest/gtest.h>
 #include <sodium.h>
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace nexus::security;
 namespace attestd = nexus::attestd;
@@ -58,6 +62,54 @@ struct AttestdLive : ::testing::Test {
         sources.cache_directory = ::testing::TempDir();
         sources.platform_source = attestd::attestd_platform_source(config_);
         return sources;
+    }
+
+    /// The required runtime set, pinned from the host's own post-quote log:
+    /// the two Nexus components at their compiled paths, plus every audited
+    /// shared object either process maps. nullopt when a required component is
+    /// not in the log at all.
+    std::optional<LinuxAttestationProfile> pinned_profile_from(
+        const AttestationEvidence& evidence, const EvidenceVerdict& seen) {
+        auto log = parse_ima_ascii(evidence.platform.ima_log);
+        if (!log) return std::nullopt;
+
+        auto profile = linux_attestation_profile_v1();
+        profile.snp.min_tcb = {1, 0, 1, 1};
+        profile.snp.expected_measurement_hex = seen.measurement_hex;
+        profile.required_ak_spki_b64 = seen.ak_spki_b64;
+        profile.require_endorsement_revocation = false;
+        profile.require_no_new_privs = false;
+        profile.require_seccomp = false;
+        profile.ima_policy_digest.fill(0x60);
+
+        // The audited dependency set: what /proc/<pid>/maps shows both
+        // processes execute, by exact measured path. libstdc++ is matched by
+        // prefix because its real path is version-suffixed.
+        static constexpr const char* kLibs[] = {
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libm.so.6",
+            "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+            "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+        };
+        std::vector<std::string> required(std::begin(kLibs), std::end(kLibs));
+        for (const auto& entry : log->entries) {
+            if (entry.path.starts_with("/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.") &&
+                std::find(required.begin(), required.end(), entry.path) == required.end()) {
+                required.push_back(entry.path);
+            }
+        }
+        // The two components keep their compiled template entries; libs append.
+        for (const auto& path : required) profile.approved_paths.push_back({path, {}});
+
+        for (auto& approved : profile.approved_paths) {
+            const auto entry = ima_entry_for_path(*log, approved.path);
+            if (!entry || entry->file_hash_algo != "sha256") return std::nullopt;
+            approved.sha256 = {entry->file_hash_hex};
+        }
+        if (!profile_is_complete(profile)) return std::nullopt;
+        return profile;
     }
 
     AttestationChallenge challenge_for(AttestationPurpose purpose) {
@@ -142,32 +194,18 @@ TEST_F(AttestdLive, TheVerifierReachesTheImaPolicyAndRefusesThere) {
     probe.require_revocation_check = false;
     const auto seen = verify_snp_vtpm_evidence(evidence->platform, evidence->challenge_digest,
                                                identity_.public_key, probe);
-    RecordProperty("platform_failure", seen.failure);
     ASSERT_TRUE(seen.quote_verified) << "the platform chain failed before the quote: "
                                      << seen.failure;
 
-    auto profile = linux_attestation_profile_v1();
-    profile.snp.min_tcb = {1, 0, 1, 1};
-    profile.snp.expected_measurement_hex = seen.measurement_hex;
-    profile.required_ak_spki_b64 = seen.ak_spki_b64;
-    profile.require_endorsement_revocation = false;
-    profile.require_no_new_privs = false;
-    profile.require_seccomp = false;
-    profile.approved_paths = {{evidence->platform.binary_path,
-                               {evidence->platform.binary_sha256}}};
-    // The one pin the host cannot satisfy: KernelReadback needs
-    // CONFIG_IMA_READ_POLICY, and a stock kernel does not publish its policy.
-    profile.ima_policy_digest.fill(0x60);
-    ASSERT_TRUE(profile_is_complete(profile)) << "the pinned profile is still incomplete";
+    const auto profile = pinned_profile_from(*evidence, seen);
+    ASSERT_TRUE(profile.has_value());
 
     auto pinned = challenge;
-    pinned.policy_digest = profile_digest(profile);
-    const auto refreshed =
-        PlatformEvidenceProducer(production_sources()).produce(pinned);
+    pinned.policy_digest = profile_digest(*profile);
+    const auto refreshed = PlatformEvidenceProducer(production_sources()).produce(pinned);
     ASSERT_TRUE(refreshed.has_value());
 
-    const auto verdict = AttestationVerifier(profile).examine(pinned, *refreshed);
-    RecordProperty("verdict_failure", static_cast<int>(verdict.failure));
+    const auto verdict = AttestationVerifier(*profile).examine(pinned, *refreshed);
     EXPECT_FALSE(verdict.passed);
 
     // Everything the host CAN prove must have been proved. These are the
@@ -185,4 +223,47 @@ TEST_F(AttestdLive, TheVerifierReachesTheImaPolicyAndRefusesThere) {
     EXPECT_EQ(verdict.failure, AttestationFailure::ImaMeasurementInvalid);
     EXPECT_TRUE(refreshed->platform.ima_policy_sha256.empty())
         << "the kernel published a policy digest; KernelReadback may now be satisfiable";
+}
+
+TEST_F(AttestdLive, TheWholeRequiredRuntimeSetIsMeasuredAndApproved) {
+    const auto challenge = challenge_for(AttestationPurpose::Eligibility);
+    const auto evidence = PlatformEvidenceProducer(production_sources()).produce(challenge);
+    ASSERT_TRUE(evidence.has_value());
+    ASSERT_FALSE(evidence->platform.empty());
+
+    // The deployed collector is the compiled one — policy matches reality.
+    EXPECT_EQ(evidence->platform.binary_path,
+              linux_attestation_profile_v1().evidence_collector_path);
+
+    EvidenceRequirements probe;
+    probe.require_ima = false;
+    probe.require_revocation_check = false;
+    const auto seen = verify_snp_vtpm_evidence(evidence->platform, evidence->challenge_digest,
+                                               identity_.public_key, probe);
+    ASSERT_TRUE(seen.quote_verified);
+
+    const auto profile = pinned_profile_from(*evidence, seen);
+    ASSERT_TRUE(profile.has_value()) << "a required component is missing from the live log";
+    // Two executables plus their audited shared objects, with headroom left.
+    EXPECT_GE(profile->approved_paths.size(), 9u);
+    EXPECT_LE(profile->approved_paths.size(), constants::kMaxSummarisedPaths);
+
+    // The conjunction holds against the real post-quote history: every
+    // required component measured, every last measurement in its own set.
+    auto log = parse_ima_ascii(evidence->platform.ima_log);
+    ASSERT_TRUE(log.has_value());
+    ASSERT_TRUE(binary_approved(*profile, *log));
+
+    // And each required component is refused INDEPENDENTLY: corrupting or
+    // removing any single entry fails the whole set.
+    for (std::size_t i = 0; i < profile->approved_paths.size(); ++i) {
+        auto corrupted = *profile;
+        corrupted.approved_paths[i].sha256 = {std::string(64, 'f')};
+        EXPECT_FALSE(binary_approved(corrupted, *log))
+            << "an unapproved " << profile->approved_paths[i].path << " was accepted";
+    }
+    auto extra = *profile;
+    extra.approved_paths.push_back({"/usr/local/bin/never-measured", {std::string(64, 'e')}});
+    EXPECT_FALSE(binary_approved(extra, *log))
+        << "an absent required component did not fail the set";
 }
