@@ -67,6 +67,16 @@ if(UNIX AND NOT APPLE)
     install(PROGRAMS "${CMAKE_SOURCE_DIR}/scripts/nexus-bootstrap"
             DESTINATION bin
             COMPONENT Runtime)
+    # Public DNS port -> unprivileged dns_port. Both files are inert on install:
+    # the unit has ConditionPathExists on a conf that only
+    # `nexus-bootstrap --install-dns-nat` writes, so installing the package
+    # never changes the host's firewall state.
+    install(FILES "${CMAKE_SOURCE_DIR}/packaging/systemd/nexus-dns-nat.service"
+            DESTINATION lib/systemd/system
+            COMPONENT Runtime)
+    install(FILES "${CMAKE_SOURCE_DIR}/packaging/nftables/nexus-dns-nat.nft"
+            DESTINATION lib/lemonade-nexus
+            COMPONENT Runtime)
 elseif(APPLE)
     # macOS: launchd plist
     install(FILES "${CMAKE_SOURCE_DIR}/packaging/macos/io.lemonade-nexus.plist"

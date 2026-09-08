@@ -862,10 +862,6 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Run -- blocks until SIGINT/SIGTERM
     // ========================================================================
-    // Report what is actually bound. The control-plane APIs serve HTTPS or
-    // nothing, so naming a port the server never listened on read as a
-    // plaintext fallback that does not exist: with no certificate there is no
-    // TCP listener at all, and a probe of that port is refused.
     const std::string public_api_status =
         http_server.is_tls() ? ("HTTPS:" + std::to_string(http_port))
                              : ("HTTPS:" + std::to_string(http_port) + " (withheld, not listening)");
@@ -874,15 +870,16 @@ int main(int argc, char* argv[]) {
             ? ("PrivateHTTPS:" + tunnel_bind_ip + ":" + std::to_string(config.private_http_port))
             : ("PrivateHTTPS:" + tunnel_bind_ip + ":" + std::to_string(config.private_http_port) +
                " (withheld, not listening)");
+    const auto dns_transport = dns.tcp_listening() ? "UDP+TCP" : "UDP";
     if (private_http_server) {
         spdlog::info("All services started. {}, {}, UDP:{}, Gossip/UDP:{}, STUN/UDP:{}, "
-                     "Relay/UDP:{}, DNS/UDP:{}",
+                     "Relay/UDP:{}, DNS/{}:{}",
                      public_api_status, private_api_status, udp_port, gossip_port, stun_port, relay_port,
-                     dns_port);
+                     dns_transport, dns_port);
     } else {
         spdlog::info("All services started. {}, UDP:{}, Gossip/UDP:{}, STUN/UDP:{}, "
-                     "Relay/UDP:{}, DNS/UDP:{}",
-                     public_api_status, udp_port, gossip_port, stun_port, relay_port, dns_port);
+                     "Relay/UDP:{}, DNS/{}:{}",
+                     public_api_status, udp_port, gossip_port, stun_port, relay_port, dns_transport, dns_port);
     }
     if (http_server.is_tls() && !server_fqdn.empty()) {
         spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());

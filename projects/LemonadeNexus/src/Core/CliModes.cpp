@@ -56,6 +56,10 @@ int run_verify_platform(const ServerConfig& config) {
 }
 
 int run_first_run(const ServerConfig& config) {
+    if (!config.region.empty() && !gossip::valid_server_id_label(config.region)) {
+        spdlog::error("Region is not a valid DNS label: {}", config.region);
+        return 1;
+    }
     auto init = ensure_initialized(config);
     if (!init) return 1;
 

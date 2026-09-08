@@ -41,6 +41,7 @@ add_nexus_test(test_ipam              test_ipam.cpp)
 add_nexus_test(test_auth              test_auth.cpp)
 add_nexus_test(test_acme              test_acme.cpp)
 add_nexus_test(test_dns               test_dns.cpp)
+add_nexus_test(test_dns_tcp           test_dns_tcp.cpp)
 add_nexus_test(test_jwt_secret_bootstrap test_jwt_secret_bootstrap.cpp)
 add_nexus_test(test_server_config_discovery test_server_config_discovery.cpp)
 add_nexus_test(test_ddns_credentials_format test_ddns_credentials_format.cpp)
@@ -241,3 +242,10 @@ add_sdk_test(test_group_key_envelope   test_group_key_envelope.cpp)
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
 add_nexus_test(test_virtual_e2e        test_virtual_e2e.cpp)
+
+if(UNIX)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME BootstrapPackaging
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_bootstrap.py
+                $<TARGET_FILE:LemonadeNexusApp>)
+endif()

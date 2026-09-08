@@ -1,172 +1,231 @@
-#!/usr/bin/env bash
-#
-# nexus-bootstrap — prepare a packaged Lemonade Nexus server for first start.
-#
-# Turns a fresh install into a node that can pass config validation:
-#
-#     package install  ->  nexus-bootstrap  ->  systemctl start lemonade-nexus
-#
-# It initializes the identity if there is none, reads back the keys the server
-# generated, and writes /var/lib/lemonade-nexus/lemonade-nexus.json — the
-# packaged source of truth. The service itself takes no arguments; everything it
-# needs comes from that file.
-#
-# The release-signing public key is REQUIRED input. This script never generates
-# one and never invents a stand-in: that key belongs to whoever signs releases,
-# and a node that trusts a key nobody signs with can approve no binary at all.
-# --test-release-key exists only so a throwaway mesh can pass validation, and it
-# says so in the file it writes.
-#
-set -euo pipefail
+#!/usr/bin/python3
+"""Prepare a packaged Genesis server; trust configuration stays operator-owned."""
 
-BIN="${NEXUS_BIN:-/usr/bin/lemonade-nexus}"
-STATE_DIR="${NEXUS_STATE_DIR:-/var/lib/lemonade-nexus}"
-DATA_ROOT="${NEXUS_DATA_ROOT:-$STATE_DIR/data}"
-CONFIG="$STATE_DIR/lemonade-nexus.json"
-SERVICE_USER="${NEXUS_USER:-lemonade-nexus}"
+import argparse
+import base64
+from dataclasses import asdict, dataclass
+import ipaddress
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
 
-RELEASE_KEY=""
-TEST_RELEASE_KEY=0
-PUBLIC_IP=""
-LOG_LEVEL="info"
-ACME_PROVIDER="letsencrypt"
-DNS_PORT=5335
-PUBLIC_DNS_PORT=53
-REGION=""
-DDNS_ENABLED="false"
-FORCE=0
 
-die() { printf 'nexus-bootstrap: %s\n' "$*" >&2; exit 1; }
-say() { printf 'nexus-bootstrap: %s\n' "$*"; }
+@dataclass
+class BootstrapConfig:
+    data_root: str
+    dns_port: int = 5335
+    public_dns_port: int = 53
+    log_level: str = "info"
+    acme_provider: str = "letsencrypt"
+    public_ip: str = ""
+    region: str = ""
+    ddns_enabled: bool = False
+    root_pubkey: str = ""
+    genesis_pubkey: str = ""
+    release_signing_pubkey: str = ""
 
-usage() {
-    cat <<'USAGE'
-Usage: nexus-bootstrap --release-signing-pubkey <hex|base64> [options]
-       nexus-bootstrap --test-release-key [options]
 
-Required (one of):
-  --release-signing-pubkey KEY  Ed25519 public key your release manifests are
-                                signed with. Not generated here.
-  --test-release-key            Throwaway meshes only. Reuses the node identity
-                                as the release-signing key so validation passes.
-                                No manifest is signed by it, so no binary is ever
-                                approved through it. The written config is marked.
+def port(value):
+    if not re.fullmatch(r"[0-9]{1,5}", value) or not 1 <= int(value) <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 1..65535")
+    return int(value)
 
-Options:
-  --public-ip ADDR              Public IP to advertise. Default: auto-detect at runtime.
-  --log-level LEVEL             trace|debug|info|warn|error. Default: info.
-  --acme-provider NAME          letsencrypt | letsencrypt_staging | zerossl.
-                                Default: letsencrypt.
-  --dns-port PORT               Local DNS bind port. Default: 5335.
-  --public-dns-port PORT        DNS port advertised to clients. Default: 53.
-                                Requires a 53 -> dns-port mapping; see below.
-  --region CODE                 Cloud region (e.g. us-east). Default: auto-detect.
-  --ddns-enabled                Enable dynamic DNS updates. Default: disabled.
-  --force                       Rewrite an existing config.
-  -h, --help                    This message.
 
-Note: --public-dns-port 53 only advertises 53. Nexus binds --dns-port
-unprivileged; a firewall/NAT rule must map public UDP/53 to it. Without that
-rule clients are told to use a port nothing answers on.
-USAGE
-}
+def public_key(value):
+    try:
+        decoded = (bytes.fromhex(value) if re.fullmatch(r"[0-9a-fA-F]{64}", value)
+                   else base64.b64decode(value, validate=True))
+        if len(decoded) == 32:
+            return value
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("expected a 32-byte Ed25519 public key in hex or base64")
 
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --release-signing-pubkey) RELEASE_KEY="${2:?--release-signing-pubkey needs a value}"; shift 2 ;;
-        --test-release-key)       TEST_RELEASE_KEY=1; shift ;;
-        --public-ip)              PUBLIC_IP="${2:?--public-ip needs a value}"; shift 2 ;;
-        --log-level)              LOG_LEVEL="${2:?--log-level needs a value}"; shift 2 ;;
-        --acme-provider)          ACME_PROVIDER="${2:?--acme-provider needs a value}"; shift 2 ;;
-        --dns-port)               DNS_PORT="${2:?--dns-port needs a value}"; shift 2 ;;
-        --public-dns-port)        PUBLIC_DNS_PORT="${2:?--public-dns-port needs a value}"; shift 2 ;;
-        --region)                 REGION="${2:?--region needs a value}"; shift 2 ;;
-        --ddns-enabled)           DDNS_ENABLED="true"; shift ;;
-        --force)                  FORCE=1; shift ;;
-        -h|--help)                usage; exit 0 ;;
-        *)                        usage >&2; die "unknown argument '$1'" ;;
-    esac
-done
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (writes $STATE_DIR and installs config)"
-[ -x "$BIN" ] || die "server binary not found at $BIN"
-id -u "$SERVICE_USER" >/dev/null 2>&1 || die "service user '$SERVICE_USER' does not exist; install the package first"
+def ip_address(value):
+    try:
+        if "%" not in value:
+            return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("expected an IPv4 or IPv6 address")
 
-if [ "$TEST_RELEASE_KEY" -eq 1 ] && [ -n "$RELEASE_KEY" ]; then
-    die "--test-release-key and --release-signing-pubkey are mutually exclusive"
-fi
-if [ "$TEST_RELEASE_KEY" -eq 0 ] && [ -z "$RELEASE_KEY" ]; then
-    usage >&2
-    die "a release-signing public key is required; pass --release-signing-pubkey, or --test-release-key for a throwaway mesh"
-fi
 
-if [ -e "$CONFIG" ] && [ "$FORCE" -eq 0 ]; then
-    die "$CONFIG already exists; pass --force to rewrite it"
-fi
+def region(value):
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+        raise argparse.ArgumentTypeError("region must be a lowercase DNS label")
+    return value
 
-# --- state tree -------------------------------------------------------------
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0750 "$STATE_DIR"
-install -d -o "$SERVICE_USER" -g "$SERVICE_USER" -m 0700 "$DATA_ROOT"
 
-# --- identity ---------------------------------------------------------------
-# --first-run is idempotent: it reports the existing keys rather than replacing
-# them, so re-running this script never rotates an identity.
-INIT_LOG="$(mktemp)"
-trap 'rm -f "$INIT_LOG"' EXIT
-say "initializing identity in $DATA_ROOT"
-if ! runuser -u "$SERVICE_USER" -- sh -c "cd '$STATE_DIR' && '$BIN' --data-root '$DATA_ROOT' --first-run" >"$INIT_LOG" 2>&1; then
-    sed 's/^/  /' "$INIT_LOG" >&2
-    die "--first-run failed"
-fi
+def interface(value):
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", value) or value in (".", "..", "lo"):
+        raise argparse.ArgumentTypeError("expected an external interface name (1..15 safe characters)")
+    return value
 
-# "Identity pubkey:  <hex>[  (existing)]"
-IDENTITY_PUBKEY="$(sed -n 's/^Identity pubkey: *\([0-9a-fA-F]\{64\}\).*$/\1/p' "$INIT_LOG" | head -1)"
-GOSSIP_PUBKEY="$(sed -n 's/^Gossip pubkey: *\([A-Za-z0-9+/=]\{40,\}\).*$/\1/p' "$INIT_LOG" | head -1)"
-[ -n "$IDENTITY_PUBKEY" ] || { sed 's/^/  /' "$INIT_LOG" >&2; die "could not read the identity pubkey from --first-run output"; }
-[ -n "$GOSSIP_PUBKEY" ]   || { sed 's/^/  /' "$INIT_LOG" >&2; die "could not read the gossip pubkey from --first-run output"; }
 
-# The node identity is the mesh root; the gossip key is the Genesis anchor.
-ROOT_PUBKEY="$IDENTITY_PUBKEY"
-GENESIS_PUBKEY="$GOSSIP_PUBKEY"
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    key = parser.add_mutually_exclusive_group(required=True)
+    key.add_argument("--release-signing-pubkey", type=public_key)
+    key.add_argument("--test-release-key", action="store_true", help="throwaway meshes only: use the node identity key")
+    parser.add_argument("--public-ip", type=ip_address)
+    parser.add_argument("--log-level", choices=("trace", "debug", "info", "warn", "error"), default="info")
+    parser.add_argument("--acme-provider", choices=("letsencrypt", "letsencrypt_staging", "zerossl"), default="letsencrypt")
+    parser.add_argument("--dns-port", type=port, default=5335)
+    parser.add_argument("--public-dns-port", type=port, default=53)
+    parser.add_argument("--region", type=region)
+    parser.add_argument("--ddns-enabled", action="store_true")
+    parser.add_argument("--install-dns-nat", action="store_true", help="map public DNS to the local port over UDP and TCP using nftables")
+    parser.add_argument("--wan-interface", type=interface)
+    parser.add_argument("--force", action="store_true", help="replace an existing config")
+    args = parser.parse_args(argv)
+    args.public_ip = args.public_ip or ""
+    args.region = args.region or ""
+    args.wan_interface = args.wan_interface or ""
+    if args.dns_port < 1024:
+        parser.error("--dns-port must be unprivileged (1024..65535)")
+    return args
 
-TEST_KEY_NOTE=""
-if [ "$TEST_RELEASE_KEY" -eq 1 ]; then
-    RELEASE_KEY="$IDENTITY_PUBKEY"
-    TEST_KEY_NOTE='  "_release_signing_pubkey_is_a_test_fixture": "Reuses the node identity so config validation passes on a throwaway mesh. No release manifest is signed by this key, so no binary is ever approved through it. Never use this on a real deployment.",'
-    say "WARNING: --test-release-key in use; the release-signing key is the node identity"
-fi
 
-# --- config -----------------------------------------------------------------
-# Written to a temp file in the same directory and renamed, so a reader never
-# observes a partial config.
-TMP="$(mktemp "$STATE_DIR/.lemonade-nexus.json.XXXXXX")"
-{
-    printf '{\n'
-    [ -n "$TEST_KEY_NOTE" ] && printf '%s\n' "$TEST_KEY_NOTE"
-    printf '  "data_root": "%s",\n'              "$DATA_ROOT"
-    printf '  "dns_port": %s,\n'                 "$DNS_PORT"
-    printf '  "public_dns_port": %s,\n'          "$PUBLIC_DNS_PORT"
-    printf '  "log_level": "%s",\n'              "$LOG_LEVEL"
-    [ -n "$PUBLIC_IP" ] && printf '  "public_ip": "%s",\n' "$PUBLIC_IP"
-    [ -n "$REGION" ]    && printf '  "region": "%s",\n'    "$REGION"
-    printf '  "root_pubkey": "%s",\n'            "$ROOT_PUBKEY"
-    printf '  "genesis_pubkey": "%s",\n'         "$GENESIS_PUBKEY"
-    printf '  "release_signing_pubkey": "%s",\n' "$RELEASE_KEY"
-    printf '  "acme_provider": "%s",\n'          "$ACME_PROVIDER"
-    printf '  "ddns_enabled": %s\n'              "$DDNS_ENABLED"
-    printf '}\n'
-} >"$TMP"
+def trusted_directory(path, gid):
+    # A protected file is replaceable if any ancestor is writable by the daemon.
+    for ancestor in reversed((path, *path.parents)):
+        if not ancestor.exists() and not ancestor.is_symlink():
+            continue
+        mode = ancestor.lstat()
+        if not stat.S_ISDIR(mode.st_mode):
+            raise ValueError(f"not a real directory: {ancestor}")
+        if ancestor != path and (mode.st_uid != 0 or
+                                 (mode.st_mode & 0o022 and not mode.st_mode & stat.S_ISVTX)):
+            raise ValueError(f"untrusted config ancestor: {ancestor}")
+    path.mkdir(mode=0o750, parents=True, exist_ok=True)
+    os.chown(path, 0, gid)
+    path.chmod(0o750)
 
-chown "$SERVICE_USER:$SERVICE_USER" "$TMP"
-chmod 0640 "$TMP"
-mv -f "$TMP" "$CONFIG"
 
-say "wrote $CONFIG"
-say "  root_pubkey    $ROOT_PUBKEY"
-say "  genesis_pubkey $GENESIS_PUBKEY"
-say "  dns_port       $DNS_PORT (advertised as $PUBLIC_DNS_PORT)"
-if [ "$PUBLIC_DNS_PORT" != "$DNS_PORT" ]; then
-    say "  NOTE: clients are told port $PUBLIC_DNS_PORT. Map public UDP/$PUBLIC_DNS_PORT"
-    say "        to UDP/$DNS_PORT in the firewall, or set --public-dns-port $DNS_PORT."
-fi
-say "now run: systemctl start lemonade-nexus"
+def write_config(path, config, gid, test_key=False):
+    document = asdict(config)
+    if test_key:
+        document["_release_signing_pubkey_is_a_test_fixture"] = True
+    fd, temporary = tempfile.mkstemp(prefix=".lemonade-nexus.json.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            os.fchown(out.fileno(), 0, gid)
+            os.fchmod(out.fileno(), 0o640)
+            json.dump(document, out, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def run(arguments, **kwargs):
+    return subprocess.run(arguments, check=True, text=True, **kwargs)
+
+
+def dns_nat(args, gid):
+    if args.public_dns_port == args.dns_port:
+        return
+    if not args.install_dns_nat:
+        print(f"Map public {args.public_dns_port}/udp+tcp to local {args.dns_port}, or use --install-dns-nat.")
+        return
+    wan = args.wan_interface
+    if not wan:
+        routes = json.loads(run(["ip", "-j", "route", "show", "default"], capture_output=True).stdout)
+        wan = interface(next((route["dev"] for route in routes if "dev" in route), ""))
+    run(["ip", "link", "show", "dev", wan], capture_output=True)
+    rules = "/usr/lib/lemonade-nexus/nexus-dns-nat.nft"
+    conf = Path("/etc/lemonade-nexus/nexus-dns-nat.conf")
+    trusted_directory(conf.parent, gid)
+    fd, temporary = tempfile.mkstemp(prefix=".nexus-dns-nat.", dir=conf.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(f'define nexus_wan_if = "{wan}"\n'
+                      f'define nexus_public_dns_port = {args.public_dns_port}\n'
+                      f'define nexus_dns_port = {args.dns_port}\n')
+            os.fchmod(out.fileno(), 0o644)
+        previous = conf.read_bytes() if conf.exists() else None
+        os.replace(temporary, conf)
+        try:
+            run(["nft", "-c", "-f", rules])
+        except (OSError, subprocess.CalledProcessError):
+            if previous is None:
+                conf.unlink()
+            else:
+                conf.write_bytes(previous)
+            raise
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", "--now", "nexus-dns-nat.service"])
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def bootstrap(args):
+    if os.geteuid() != 0:
+        raise ValueError("must run as root")
+    binary = str(Path(os.environ.get("NEXUS_BIN", "/usr/bin/lemonade-nexus")).absolute())
+    state = Path(os.environ.get("NEXUS_STATE_DIR", "/var/lib/lemonade-nexus")).absolute()
+    data = Path(os.environ.get("NEXUS_DATA_ROOT", str(state / "data"))).absolute()
+    user = os.environ.get("NEXUS_USER", "lemonade-nexus")
+    account = pwd.getpwnam(user)
+    if account.pw_uid == 0:
+        raise ValueError("the runtime user must be unprivileged")
+    target = state / "lemonade-nexus.json"
+    if target.is_symlink() or (target.exists() and not args.force):
+        raise ValueError(f"{target} exists; use --force for a regular config file")
+    if data.parent != state:
+        raise ValueError("data root must be a direct child of the protected state directory")
+    trusted_directory(state, account.pw_gid)
+    if data.is_symlink():
+        raise ValueError("data root must not be a symlink")
+    data.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chown(data, account.pw_uid, account.pw_gid)
+    data.chmod(0o700)
+    config = BootstrapConfig(str(data), args.dns_port, args.public_dns_port,
+                             args.log_level, args.acme_provider, args.public_ip,
+                             args.region, args.ddns_enabled,
+                             release_signing_pubkey=args.release_signing_pubkey or "")
+    # Run native config validation and identity initialization without loading an old config or SP_* overrides.
+    with tempfile.TemporaryDirectory(prefix=".bootstrap-", dir=state) as staging:
+        staging = Path(staging)
+        os.chown(staging, 0, account.pw_gid)
+        staging.chmod(0o750)
+        candidate = staging / "lemonade-nexus.json"
+        write_config(candidate, config, account.pw_gid)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("SP_")}
+        result = run(["runuser", "-u", user, "--", binary, "--config", str(candidate),
+                      "--data-root", str(data), "--first-run"], cwd=state, env=env, capture_output=True)
+        identity = re.search(r"^Identity pubkey: *([0-9a-fA-F]{64})(?:\s|$)", result.stdout, re.MULTILINE)
+        gossip = re.search(r"^Gossip pubkey: *(\S+)", result.stdout, re.MULTILINE)
+        if not identity or not gossip:
+            raise ValueError("could not read public keys from --first-run output")
+        config.root_pubkey = public_key(identity[1])
+        config.genesis_pubkey = public_key(gossip[1])
+        if args.test_release_key:
+            config.release_signing_pubkey = config.root_pubkey
+            print("WARNING: using the node identity as a test release key")
+        write_config(target, config, account.pw_gid, args.test_release_key)
+    dns_nat(args, account.pw_gid)
+    print(f"Wrote {target}; runtime state: {data}")
+    print("Now run: systemctl start lemonade-nexus")
+
+
+def main():
+    try:
+        bootstrap(parse_args())
+    except (OSError, ValueError, KeyError, argparse.ArgumentTypeError, subprocess.CalledProcessError) as error:
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(error.stderr, file=sys.stderr)
+        raise SystemExit(f"nexus-bootstrap: {error}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,13 +1,14 @@
-// The packaged install shipped SP_JWT_SECRET=CHANGE_ME. These pin what the
-// binary actually does with a configured secret, so the packaging decision
-// rests on observed behaviour rather than assumption.
-
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
 #include <gtest/gtest.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <process.h>
+#  define getpid _getpid
+#else
+#  include <unistd.h>
+#endif
 
 #include <filesystem>
 #include <string>
@@ -36,10 +37,6 @@ struct JwtSecretBootstrap : ::testing::Test {
 
 }  // namespace
 
-// The finding: a configured secret is used verbatim. Nothing rejects a
-// placeholder, so shipping one in the package means every install signs with a
-// publicly known value. The fix is to stop shipping one, not to special-case
-// this string.
 TEST_F(JwtSecretBootstrap, AConfiguredSecretIsUsedVerbatimAndNothingIsGenerated) {
     nexus::core::ServerConfig config;
     config.jwt_secret = "CHANGE_ME";
@@ -50,8 +47,6 @@ TEST_F(JwtSecretBootstrap, AConfiguredSecretIsUsedVerbatimAndNothingIsGenerated)
         << "no secret is generated while one is configured";
 }
 
-// With no secret configured — which is what the package must ship — first run
-// generates a strong one and persists it.
 TEST_F(JwtSecretBootstrap, AnUnsetSecretIsGeneratedAndPersisted) {
     nexus::core::ServerConfig config;
     ASSERT_TRUE(config.jwt_secret.empty()) << "the default must be empty";
@@ -61,12 +56,10 @@ TEST_F(JwtSecretBootstrap, AnUnsetSecretIsGeneratedAndPersisted) {
     EXPECT_NE(first, "CHANGE_ME");
     EXPECT_TRUE(fs::exists(dir / "identity" / "jwt_secret.hex"));
 
-    // Stable across restarts.
     const auto second = nexus::core::resolve_jwt_secret(config, dir, crypto);
     EXPECT_EQ(second, first);
 }
 
-// Two independent first runs must not share a secret.
 TEST_F(JwtSecretBootstrap, GeneratedSecretsDifferBetweenInstalls) {
     nexus::core::ServerConfig config;
     const auto a = nexus::core::resolve_jwt_secret(config, dir / "a", crypto);

@@ -26,8 +26,9 @@ WorkingDirectory=/var/lib/lemonade-nexus
 # one socket. postinst creates the group so this never blocks startup.
 SupplementaryGroups=nexus
 EnvironmentFile=-/etc/lemonade-nexus/lemonade-nexus.env
-# on-failure, not always: a node that cannot pass config validation exits, and
-# restarting it forever only fills the journal. Bootstrap, then start.
+# Restart after an unexpected failure, but leave a clean exit stopped.
+# The package enables this unit without starting it; bootstrap must write a
+# valid configuration before the operator starts the service.
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
@@ -37,7 +38,7 @@ LimitNOFILE=65536
 # bounding set drops every capability.
 #
 # CAP_NET_BIND_SERVICE is deliberately NOT granted. Every port this server binds
-# is unprivileged: HTTP 9100, private HTTP 9101, WireGuard 51940, gossip 9102,
+# is unprivileged: HTTPS 9100, private HTTPS 9101, mesh UDP 51940, gossip 9102,
 # STUN 3478, relay 9103, DNS 5335. Public 53 and 443 are reached by a
 # firewall/NAT mapping, not by binding them here.
 NoNewPrivileges=yes
@@ -61,7 +62,7 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-# Other processes are invisible, so nothing here can inspect or trace them.
+# Hide processes owned by other users from the service's /proc view.
 ProtectProc=invisible
 ProcSubset=pid
 RestrictNamespaces=yes
@@ -70,14 +71,19 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 
 # --- filesystem -----------------------------------------------------------
-# Read-only everywhere, with exactly one writable directory.
+# Protect the trust config and its parent from daemon writes. Only the data
+# subdirectory is writable; it holds runtime identity, certificates, and state.
+# The nested ReadWritePaths exception leaves that data writable beneath the
+# read-only parent. Root ownership also protects the config outside this unit.
+# One-shot onboarding uses a staging config under data for its seed-peer
+# write-back; the operator keeps the installed trust anchors in the parent.
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateMounts=yes
 PrivateDevices=yes
-ReadWritePaths=/var/lib/lemonade-nexus
-ReadOnlyPaths=/etc/lemonade-nexus
+ReadWritePaths=/var/lib/lemonade-nexus/data
+ReadOnlyPaths=/etc/lemonade-nexus /var/lib/lemonade-nexus
 UMask=0077
 
 # --- network --------------------------------------------------------------

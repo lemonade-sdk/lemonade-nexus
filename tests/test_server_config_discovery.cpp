@@ -1,17 +1,12 @@
-// Config discovery must not abort the process.
-//
-// The default config path is relative, so load_config() stats the CURRENT
-// directory. Started from a directory the user cannot read, the throwing
-// filesystem overload terminated the process before any configuration was
-// applied — observed on the Azure host as:
-//   terminate called after throwing an instance of 'std::filesystem_error'
-//     what(): filesystem error: status: Permission denied [lemonade-nexus.json]
-// An unreadable directory means "no config file here", not a fatal error.
-
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 
 #include <gtest/gtest.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <process.h>
+#  define getpid _getpid
+#else
+#  include <unistd.h>
+#endif
 
 #include <filesystem>
 #include <string>
@@ -42,8 +37,6 @@ struct ConfigDiscovery : ::testing::Test {
     fs::path dir;
 };
 
-/// load_config with the minimum required values, so it returns rather than
-/// exiting on a missing key.
 nexus::core::ServerConfig load_from_cwd() {
     std::string a0 = "lemonade-nexus";
     std::string a1 = "--root-pubkey";
@@ -56,23 +49,24 @@ nexus::core::ServerConfig load_from_cwd() {
 
 }  // namespace
 
+#ifndef _WIN32
 TEST_F(ConfigDiscovery, AnUnreadableWorkingDirectoryDoesNotTerminate) {
     if (::geteuid() == 0) {
         GTEST_SKIP() << "root bypasses directory permissions, so this cannot be exercised";
     }
     fs::current_path(dir);
 
-    // Strip every permission: statting a relative path now fails with EACCES.
     std::error_code ec;
     fs::permissions(dir, fs::perms::none, fs::perm_options::replace, ec);
     ASSERT_FALSE(ec) << ec.message();
 
-    // The throwing overload would abort here. This must simply return.
     EXPECT_NO_THROW({
         const auto config = load_from_cwd();
         EXPECT_FALSE(config.data_root.empty());
     });
 }
+
+#endif
 
 TEST_F(ConfigDiscovery, AReadableDirectoryWithNoConfigStillLoadsDefaults) {
     fs::current_path(dir);

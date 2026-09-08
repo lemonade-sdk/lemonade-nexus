@@ -366,7 +366,7 @@ TEST(ApprovedPaths, TheDigestChangesWithThePathPolicy) {
     const Digest base = profile_digest(complete_profile());
 
     auto renamed = complete_profile();
-    renamed.approved_paths[0].path = "/usr/local/bin/nexus";  // an ad-hoc name, not the packaged one
+    renamed.approved_paths[0].path = "/usr/local/bin/nexus";
     EXPECT_NE(profile_digest(renamed), base);
 
     auto added = complete_profile();
