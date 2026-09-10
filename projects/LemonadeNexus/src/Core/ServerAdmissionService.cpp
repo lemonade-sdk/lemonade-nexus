@@ -14,10 +14,9 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <stdexcept>
 
 namespace nexus::core {
-
-using json = nlohmann::json;
 
 namespace {
 
@@ -27,24 +26,7 @@ uint64_t now_unix() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-void put_lp(std::vector<uint8_t>& buf, const std::string& s) {
-    uint32_t n = static_cast<uint32_t>(s.size());
-    for (int i = 0; i < 4; ++i) buf.push_back((n >> (i * 8)) & 0xFF);
-    buf.insert(buf.end(), s.begin(), s.end());
-}
-
 } // namespace
-
-const char* ServerAdmissionService::state_name(State s) {
-    switch (s) {
-        case State::Pending:   return "pending";
-        case State::Approved:  return "approved";
-        case State::Denied:    return "denied";
-        case State::Expired:   return "expired";
-        case State::Completed: return "completed";
-    }
-    return "unknown";
-}
 
 ServerAdmissionService::ServerAdmissionService(
         const ServerConfig& config,
@@ -58,64 +40,6 @@ ServerAdmissionService::ServerAdmissionService(
     cfg_.enabled         = config.onboard_enabled;
     cfg_.request_ttl_sec = config.onboard_request_ttl_sec;
     cfg_.max_pending     = config.onboard_max_pending;
-}
-
-std::vector<uint8_t> ServerAdmissionService::canonical_request(const RequestInput& in) {
-    // The tag is versioned so a v1 client fails loudly on signature verification
-    // instead of quietly signing a different set of fields.
-    std::vector<uint8_t> buf;
-    put_lp(buf, "ln-onboard:v2");
-    put_lp(buf, in.nonce);
-    put_lp(buf, in.candidate_pubkey);
-    put_lp(buf, in.server_id);
-    put_lp(buf, in.region);
-    put_lp(buf, in.tpm_ak_pubkey);
-    put_lp(buf, in.platform_class);
-    put_lp(buf, in.measurement);
-    put_lp(buf, in.binary_hash);
-    put_lp(buf, in.evidence_sha256);
-    put_lp(buf, std::to_string(in.timestamp));
-    return buf;
-}
-
-nlohmann::json ServerAdmissionService::claim_from_request(const RequestInput& in) {
-    return {{"candidate_pubkey", in.candidate_pubkey},
-            {"server_id",        in.server_id},
-            {"region",           in.region},
-            {"tpm_ak_pubkey",    in.tpm_ak_pubkey},
-            {"platform_class",   in.platform_class},
-            {"measurement",      in.measurement},
-            {"binary_hash",      in.binary_hash},
-            {"evidence_sha256",  in.evidence_sha256},
-            {"nonce",            in.nonce},
-            {"timestamp",        in.timestamp},
-            {"signature",        in.signature}};
-}
-
-ServerAdmissionService::RequestInput ServerAdmissionService::request_from_claim(
-        const nlohmann::json& claim) {
-    RequestInput in;
-    in.candidate_pubkey = claim.value("candidate_pubkey", std::string{});
-    in.server_id        = claim.value("server_id", std::string{});
-    in.region           = claim.value("region", std::string{});
-    in.tpm_ak_pubkey    = claim.value("tpm_ak_pubkey", std::string{});
-    in.platform_class   = claim.value("platform_class", std::string{});
-    in.measurement      = claim.value("measurement", std::string{});
-    in.binary_hash      = claim.value("binary_hash", std::string{});
-    in.evidence_sha256  = claim.value("evidence_sha256", std::string{});
-    in.nonce            = claim.value("nonce", std::string{});
-    in.timestamp        = claim.value("timestamp", uint64_t{0});
-    in.signature        = claim.value("signature", std::string{});
-    return in;
-}
-
-std::vector<uint8_t> ServerAdmissionService::canonical_poll(
-        const std::string& tag, const std::string& request_id, uint64_t timestamp) {
-    std::vector<uint8_t> buf;
-    put_lp(buf, tag);
-    put_lp(buf, request_id);
-    put_lp(buf, std::to_string(timestamp));
-    return buf;
 }
 
 void ServerAdmissionService::on_start() {
@@ -189,7 +113,8 @@ ServerAdmissionService::mint_admission_token(const std::string& candidate_pubkey
     return tokens_.mint(candidate_pubkey, ttl, server_id);
 }
 
-ServerAdmissionService::Result ServerAdmissionService::create_request(const RequestInput& in) {
+ServerAdmissionService::Result ServerAdmissionService::create_request(
+        const AdmissionRequest& in, const std::string& source_ip) {
     if (!accepts_onboarding())
         return {false, 403, "this server is not accepting onboarding requests", ""};
     if (!gossip::valid_server_id_label(in.server_id))
@@ -208,7 +133,7 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     auto nv = nonce_values_.find(in.candidate_pubkey);
     if (nv == nonce_values_.end() || nv->second != in.nonce)
         return {false, 401, "missing or invalid challenge nonce", ""};
-    if (!verify_sig(in.candidate_pubkey, canonical_request(in), in.signature))
+    if (!verify_sig(in.candidate_pubkey, canonical_admission_request(in), in.signature))
         return {false, 401, "signature verification failed", ""};
     // Consume the nonce regardless of downstream outcome.
     nonces_.erase(in.candidate_pubkey);
@@ -231,8 +156,8 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
 
     // Enrollment token: a valid, candidate-bound token admits immediately.
     bool token_admit = false;
-    if (!in.enrollment_token.empty()) {
-        auto rec = tokens_.verify(in.enrollment_token, in.candidate_pubkey);
+    if (in.enrollment_token) {
+        auto rec = tokens_.verify(*in.enrollment_token, in.candidate_pubkey);
         if (!rec)
             return {false, 403, "invalid, expired, or already-used enrollment token", ""};
         // The onboarding transport is not authenticated (cert verification
@@ -258,9 +183,10 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     for (const auto& p : gossip_.get_peers()) {
         if (p.certificate_json.empty()) continue;
         try {
-            auto cj = json::parse(p.certificate_json);
-            if (cj.value("server_id", "") == in.server_id &&
-                cj.value("server_pubkey", "") != in.candidate_pubkey)
+            auto certificate = nlohmann::json::parse(p.certificate_json)
+                                   .get<gossip::ServerCertificate>();
+            if (certificate.server_id == in.server_id &&
+                certificate.server_pubkey != in.candidate_pubkey)
                 return {false, 409, "server_id already in use by another server", ""};
         } catch (...) {}
     }
@@ -269,7 +195,8 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     // get_peers() only lists peers past ServerHello, so two candidates could race
     // for one server_id before either cert appears there.
     for (const auto& [rid, other] : admissions_) {
-        if ((other.state == State::Pending || other.state == State::Approved) &&
+        if ((other.state == AdmissionState::Pending ||
+             other.state == AdmissionState::Approved) &&
             other.server_id == in.server_id && other.candidate_pubkey != in.candidate_pubkey)
             return {false, 409, "server_id already claimed by another admission", ""};
     }
@@ -279,7 +206,8 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     std::string request_id;
     bool is_existing = false;
     for (const auto& [rid, a] : admissions_) {
-        if (a.candidate_pubkey == in.candidate_pubkey && a.state == State::Pending) {
+        if (a.candidate_pubkey == in.candidate_pubkey &&
+            a.state == AdmissionState::Pending) {
             request_id = rid; is_existing = true; break;
         }
     }
@@ -297,7 +225,8 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
         diff("region",          cur.region,          in.region);
         diff("tpm_ak_pubkey",   cur.tpm_ak_pubkey,   in.tpm_ak_pubkey);
         diff("tpm_ek_cert",     cur.tpm_ek_cert,     in.tpm_ek_cert);
-        diff("platform_class",  cur.platform_class,  in.platform_class);
+        diff("platform_class",  std::string(admission_platform_name(cur.platform_class)),
+             std::string(admission_platform_name(in.platform_class)));
         diff("measurement",     cur.measurement,     in.measurement);
         diff("binary_hash",     cur.binary_hash,     in.binary_hash);
         diff("evidence_sha256", cur.evidence_sha256, in.evidence_sha256);
@@ -315,7 +244,7 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     if (!is_existing && !token_admit) {
         uint32_t pending_count = 0;
         for (const auto& [rid, a] : admissions_)
-            if (a.state == State::Pending) ++pending_count;
+            if (a.state == AdmissionState::Pending) ++pending_count;
         if (pending_count >= cfg_.max_pending)
             return {false, 429, "too many pending admissions; try again later", ""};
     }
@@ -329,7 +258,7 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     // Build/refresh the record from the CURRENT signed request — never from a
     // stale earlier one, so the issued cert always binds the fields this
     // request proved possession of.
-    Admission& a = admissions_[request_id];
+    AdmissionRecord& a = admissions_[request_id];
     a.request_id       = request_id;
     a.candidate_pubkey = in.candidate_pubkey;
     a.server_id        = in.server_id;
@@ -342,10 +271,10 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     a.evidence_sha256  = in.evidence_sha256;
     a.evidence         = in.evidence;
     a.challenge_nonce  = in.nonce;
-    a.source_ip        = in.source_ip;
+    a.source_ip        = source_ip;
     a.expires_at       = now + cfg_.request_ttl_sec;
     if (!is_existing) {
-        a.state = State::Pending;
+        a.state = AdmissionState::Pending;
         a.created_at = now;
         // Every admission is sole-discretion: the gossip admission ballot is
         // gone. Tier-1 authority lives in the mesh security system; this grants
@@ -359,7 +288,7 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
     // checked above, so the common failure can't burn a token; a rarer
     // issuance failure requires a fresh token.
     if (token_admit) {
-        if (!tokens_.consume(in.enrollment_token, in.candidate_pubkey)) {
+        if (!tokens_.consume(*in.enrollment_token, in.candidate_pubkey)) {
             if (!is_existing) admissions_.erase(request_id);  // no phantom record
             return {false, 403, "enrollment token already used", ""};
         }
@@ -388,7 +317,7 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(const Requ
 }
 
 ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
-        Admission& a, const std::string& decided_by, bool supersede) {
+        AdmissionRecord& a, const std::string& decided_by, bool supersede) {
     // Re-check at issuance: never sign a server certificate unless this server's
     // identity is the configured root anchor. The local identity below would
     // otherwise self-sign a cert peers reject, from a server that shouldn't issue.
@@ -406,13 +335,14 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
     for (const auto& p : gossip_.get_peers()) {
         if (p.certificate_json.empty()) continue;
         try {
-            auto cj = json::parse(p.certificate_json);
-            if (cj.value("server_id", "") == a.server_id &&
-                cj.value("server_pubkey", "") != a.candidate_pubkey) {
+            auto certificate = nlohmann::json::parse(p.certificate_json)
+                                   .get<gossip::ServerCertificate>();
+            if (certificate.server_id == a.server_id &&
+                certificate.server_pubkey != a.candidate_pubkey) {
                 if (!supersede)
                     return {false, 409, "server_id bound to a different pubkey; pass supersede=true",
                             a.request_id};
-                auto old_pk = cj.value("server_pubkey", "");
+                const auto& old_pk = certificate.server_pubkey;
                 // Route the revocation through GossipService so its in-memory
                 // revoked set stays authoritative — a direct file write here is
                 // silently clobbered the next time GossipService persists from
@@ -450,9 +380,8 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
     params.expires_at        = 0;  // no expiry (renewal machinery is a follow-up)
 
     auto cert = gossip::issue_server_certificate(params, crypto_, *root_sk, *root_pk);
-    json cert_json = cert;
-    a.issued_cert_json = cert_json.dump();
-    a.state            = State::Approved;
+    a.issued_cert_json = nlohmann::json(cert).dump();
+    a.state            = AdmissionState::Approved;
     a.decided_by       = decided_by;
     ever_approved_     = true;
 
@@ -463,10 +392,10 @@ ServerAdmissionService::Result ServerAdmissionService::do_approve_locked(
 }
 
 std::optional<PeerPlatformBinding> ServerAdmissionService::verify_admission_evidence(
-        Admission& a) const {
+        AdmissionRecord& a) const {
     PeerPlatformBinding binding;
 
-    if (a.platform_class.empty() && a.evidence.empty()) {
+    if (a.platform_class == AdmissionPlatform::None && a.evidence.empty()) {
         // A plain Tier 2 enrollment: nothing platform-related was claimed, so
         // nothing platform-related is minted. Admin say-so never converts a
         // candidate-supplied key into a verified platform fact — a Tier 1
@@ -474,8 +403,9 @@ std::optional<PeerPlatformBinding> ServerAdmissionService::verify_admission_evid
         return binding;
     }
 
-    if (a.platform_class != "snp-vtpm") {
-        a.decision_reason = "unknown platform_class '" + a.platform_class + "'";
+    if (a.platform_class != AdmissionPlatform::SnpVtpm) {
+        a.decision_reason = "unsupported platform_class '" +
+                            std::string(admission_platform_name(a.platform_class)) + "'";
         return std::nullopt;
     }
 
@@ -509,14 +439,14 @@ std::optional<PeerPlatformBinding> ServerAdmissionService::verify_admission_evid
         return std::nullopt;
     }
 
-    binding.platform_class       = "snp-vtpm";
+    binding.platform_class       = admission_platform_name(a.platform_class);
     binding.ak_pubkey            = verdict.ak_spki_b64;
     binding.expected_measurement = verdict.measurement_hex;
     binding.approved_binary_hash = verdict.binary_sha256;
     return binding;
 }
 
-std::optional<ServerAdmissionService::Admission> ServerAdmissionService::status(
+std::optional<AdmissionRecord> ServerAdmissionService::status(
         const std::string& request_id, const std::string& candidate_pubkey) {
     std::lock_guard lock(mu_);
     sweep_expired();
@@ -532,17 +462,17 @@ bool ServerAdmissionService::acknowledge(const std::string& request_id,
     auto it = admissions_.find(request_id);
     if (it == admissions_.end() || it->second.candidate_pubkey != candidate_pubkey)
         return false;
-    if (it->second.state != State::Approved) return false;
-    it->second.state = State::Completed;
+    if (it->second.state != AdmissionState::Approved) return false;
+    it->second.state = AdmissionState::Completed;
     persist();
     return true;
 }
 
-std::vector<ServerAdmissionService::Admission> ServerAdmissionService::pending() const {
+std::vector<AdmissionRecord> ServerAdmissionService::pending() const {
     std::lock_guard lock(mu_);
-    std::vector<Admission> out;
+    std::vector<AdmissionRecord> out;
     for (const auto& [rid, a] : admissions_)
-        if (a.state == State::Pending) out.push_back(a);
+        if (a.state == AdmissionState::Pending) out.push_back(a);
     return out;
 }
 
@@ -552,7 +482,8 @@ ServerAdmissionService::Result ServerAdmissionService::approve(
     auto it = admissions_.find(request_id);
     if (it == admissions_.end()) return {false, 404, "no such admission", request_id};
     auto& a = it->second;
-    if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
+    if (a.state != AdmissionState::Pending)
+        return {false, 409, "admission is not pending", request_id};
 
     // Out-of-band verification duty: admin must echo the candidate's pubkey or
     // its first-16-hex fingerprint.
@@ -572,9 +503,10 @@ ServerAdmissionService::Result ServerAdmissionService::deny(
     auto it = admissions_.find(request_id);
     if (it == admissions_.end()) return {false, 404, "no such admission", request_id};
     auto& a = it->second;
-    if (a.state != State::Pending) return {false, 409, "admission is not pending", request_id};
+    if (a.state != AdmissionState::Pending)
+        return {false, 409, "admission is not pending", request_id};
 
-    a.state = State::Denied;
+    a.state = AdmissionState::Denied;
     a.decision_reason = reason;
     a.decided_by = "admin";
     denied_until_[a.candidate_pubkey] = now_unix() + cfg_.denied_cooldown_sec;
@@ -587,8 +519,8 @@ void ServerAdmissionService::sweep_expired() {
     // caller holds mu_
     const auto now = now_unix();
     for (auto& [rid, a] : admissions_) {
-        if (a.state == State::Pending && a.expires_at < now) {
-            a.state = State::Expired;
+        if (a.state == AdmissionState::Pending && a.expires_at < now) {
+            a.state = AdmissionState::Expired;
             a.decision_reason = "request timed out";
         }
     }
@@ -602,29 +534,16 @@ void ServerAdmissionService::sweep_expired() {
 
 void ServerAdmissionService::persist() {
     // caller holds mu_
-    json arr = json::array();
-    for (const auto& [rid, a] : admissions_) {
-        arr.push_back({
-            {"request_id", a.request_id}, {"candidate_pubkey", a.candidate_pubkey},
-            {"server_id", a.server_id}, {"region", a.region},
-            {"tpm_ak_pubkey", a.tpm_ak_pubkey}, {"tpm_ek_cert", a.tpm_ek_cert},
-            {"platform_class", a.platform_class}, {"measurement", a.measurement},
-            {"binary_hash", a.binary_hash}, {"evidence_sha256", a.evidence_sha256},
-            {"evidence", a.evidence}, {"challenge_nonce", a.challenge_nonce},
-            {"source_ip", a.source_ip}, {"state", static_cast<int>(a.state)},
-            {"created_at", a.created_at}, {"expires_at", a.expires_at},
-            {"issued_cert_json", a.issued_cert_json},
-            {"decision_reason", a.decision_reason}, {"decided_by", a.decided_by},
-            {"decision_mode", a.decision_mode},
-        });
+    AdmissionStoreDocument document;
+    document.ever_approved = ever_approved_;
+    document.denied_until.insert(denied_until_.begin(), denied_until_.end());
+    document.admissions.reserve(admissions_.size());
+    for (const auto& entry : admissions_) {
+        document.admissions.push_back(entry.second);
     }
-    json denied = json::object();
-    for (const auto& [pk, until] : denied_until_) denied[pk] = until;
-    json root{{"ever_approved", ever_approved_}, {"admissions", arr},
-              {"denied_until", denied}};
     storage::SignedEnvelope env;
     env.type = "admissions";
-    env.data = root.dump();
+    env.data = document.toJson().dump();
     env.timestamp = now_unix();
     (void)storage_.write_file("onboarding", "admissions.json", env);
 }
@@ -633,49 +552,16 @@ void ServerAdmissionService::load() {
     auto env = storage_.read_file("onboarding", "admissions.json");
     if (!env) return;
     try {
-        auto root = json::parse(env->data);
-        ever_approved_ = root.value("ever_approved", false);
-        // Materialized locals, not `root.value(...)` inline in the range-for:
-        // value() returns a temporary that dies at the end of the range-init
-        // expression under C++20 (P2718 extends it only in C++23), so
-        // iterating it directly is use-after-destroy.
-        const json arr = root.value("admissions", json::array());
-        for (const auto& j : arr) {
-            Admission a;
-            a.request_id       = j.value("request_id", "");
-            a.candidate_pubkey = j.value("candidate_pubkey", "");
-            a.server_id        = j.value("server_id", "");
-            a.region           = j.value("region", "");
-            a.tpm_ak_pubkey    = j.value("tpm_ak_pubkey", "");
-            a.tpm_ek_cert      = j.value("tpm_ek_cert", "");
-            a.platform_class   = j.value("platform_class", "");
-            a.measurement      = j.value("measurement", "");
-            a.binary_hash      = j.value("binary_hash", "");
-            a.evidence_sha256  = j.value("evidence_sha256", "");
-            a.evidence         = j.value("evidence", "");
-            a.challenge_nonce  = j.value("challenge_nonce", "");
-            a.source_ip        = j.value("source_ip", "");
-            a.state            = static_cast<State>(j.value("state", 0));
-            a.created_at       = j.value("created_at", 0ULL);
-            a.expires_at       = j.value("expires_at", 0ULL);
-            a.issued_cert_json = j.value("issued_cert_json", "");
-            a.decision_reason  = j.value("decision_reason", "");
-            a.decided_by       = j.value("decided_by", "");
-            a.decision_mode    = j.value("decision_mode", "");
-            // Historical records: "ballot" decisions load as the facts they are
-            // (new records only ever write "sole"). Pre-decision_mode records
-            // that carried a ballot claim keep their ballot labeling.
-            if (a.decision_mode.empty() && !j.value("ballot_claim_json", std::string{}).empty())
-                a.decision_mode = "ballot";
-            if (!a.request_id.empty()) admissions_[a.request_id] = std::move(a);
+        const auto json = nlohmann::json::parse(env->data);
+        auto decoded = admission_store_from_json(json);
+        if (!decoded) throw std::runtime_error(decoded.error);
+        ever_approved_ = decoded.value->ever_approved;
+        for (auto& admission : decoded.value->admissions) {
+            admissions_[admission.request_id] = std::move(admission);
         }
-        // Restore denied-pubkey cooldowns; a restart must not clear an active
-        // denial. Entries whose cooldown already elapsed are dropped.
         const auto now = now_unix();
-        const json denied = root.value("denied_until", json::object());
-        for (const auto& [pk, until] : denied.items()) {
-            if (until.is_number_unsigned() && until.get<uint64_t>() > now)
-                denied_until_[pk] = until.get<uint64_t>();
+        for (const auto& [pubkey, until] : decoded.value->denied_until) {
+            if (until > now) denied_until_[pubkey] = until;
         }
     } catch (const std::exception& e) {
         spdlog::warn("[ServerAdmissionService] failed to load admissions.json: {}", e.what());

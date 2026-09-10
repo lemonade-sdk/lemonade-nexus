@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
+#include <LemonadeNexus/Core/OnboardingTypes.hpp>
 
 namespace nexus::api {
 
@@ -16,8 +17,8 @@ public:
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
 
-    /// Assemble the certificate, root key, seed peers, and mesh transport fields.
-    [[nodiscard]] nlohmann::json approved_bundle(const std::string& cert_json) const;
+    [[nodiscard]] std::optional<core::ApprovedOnboardingBundle> approved_bundle(
+        const std::string& cert_json) const;
 
     ApiContext& ctx_;
 };

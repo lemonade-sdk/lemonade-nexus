@@ -227,21 +227,21 @@ TEST(Onboarding, RequestSignatureRoundTrip) {
     c.start();
     auto cand = make_key(c);
 
-    core::ServerAdmissionService::RequestInput in;
+    core::AdmissionRequest in;
     in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
     in.server_id = "berlin-2";
     in.region = "eu-west";
     in.nonce = "bm9uY2U=";
     in.timestamp = 1751328000;
 
-    auto msg = core::ServerAdmissionService::canonical_request(in);
+    auto msg = core::canonical_admission_request(in);
     auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
     EXPECT_TRUE(c.ed25519_verify(cand.public_key, std::span<const uint8_t>(msg), sig));
 
     // Tampering with any signed field breaks verification.
     auto tampered = in;
     tampered.server_id = "berlin-3";
-    auto msg2 = core::ServerAdmissionService::canonical_request(tampered);
+    auto msg2 = core::canonical_admission_request(tampered);
     EXPECT_FALSE(c.ed25519_verify(cand.public_key, std::span<const uint8_t>(msg2), sig));
     c.stop();
 }
@@ -253,26 +253,30 @@ TEST(Onboarding, EveryPlatformEvidenceFieldIsSigned) {
     c.start();
     auto cand = make_key(c);
 
-    core::ServerAdmissionService::RequestInput in;
+    core::AdmissionRequest in;
     in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
     in.server_id      = "berlin-2";
     in.region         = "eu-west";
     in.tpm_ak_pubkey  = "QUs=";
-    in.platform_class = "snp-vtpm";
+    in.platform_class = core::AdmissionPlatform::SnpVtpm;
     in.measurement    = std::string(96, 'a');
     in.binary_hash    = std::string(64, 'b');
     in.evidence_sha256 = std::string(64, 'c');
     in.nonce          = "bm9uY2U=";
     in.timestamp      = 1751328000;
 
-    const auto msg = core::ServerAdmissionService::canonical_request(in);
+    const auto msg = core::canonical_admission_request(in);
     const auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
 
-    auto breaks = [&](core::ServerAdmissionService::RequestInput edited) {
-        auto m = core::ServerAdmissionService::canonical_request(edited);
+    auto breaks = [&](core::AdmissionRequest edited) {
+        auto m = core::canonical_admission_request(edited);
         return !c.ed25519_verify(cand.public_key, std::span<const uint8_t>(m), sig);
     };
-    { auto e = in; e.platform_class  = "tpm2";              EXPECT_TRUE(breaks(e)); }
+    {
+        auto e = in;
+        e.platform_class = core::AdmissionPlatform::Tpm2;
+        EXPECT_TRUE(breaks(e));
+    }
     { auto e = in; e.measurement     = std::string(96, 'f'); EXPECT_TRUE(breaks(e)); }
     { auto e = in; e.binary_hash     = std::string(64, 'f'); EXPECT_TRUE(breaks(e)); }
     { auto e = in; e.evidence_sha256 = std::string(64, 'f'); EXPECT_TRUE(breaks(e)); }
@@ -283,39 +287,40 @@ TEST(Onboarding, EveryPlatformEvidenceFieldIsSigned) {
 TEST(Onboarding, RequestCanonicalIsTaggedV2) {
     // A v1 client signs different bytes; the tag makes that a signature failure
     // rather than a silently narrower set of fields.
-    core::ServerAdmissionService::RequestInput in;
+    core::AdmissionRequest in;
     in.nonce = "n";
-    const auto msg = core::ServerAdmissionService::canonical_request(in);
+    const auto msg = core::canonical_admission_request(in);
     const std::string text(msg.begin(), msg.end());
     EXPECT_NE(text.find("ln-onboard:v2"), std::string::npos);
     EXPECT_EQ(text.find("ln-onboard:v1"), std::string::npos);
 }
 
-TEST(Onboarding, ClaimReproducesTheSignedBytesExactly) {
+TEST(Onboarding, AdmissionRequestSerializationPreservesCanonicalBytes) {
     // The receiver re-derives the canonical form from the request body. A lost
     // field means the server verifies different bytes than the candidate signed.
-    core::ServerAdmissionService::RequestInput in;
-    in.candidate_pubkey = "Y2FuZA==";
+    core::AdmissionRequest in;
+    in.candidate_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
     in.server_id       = "tokyo-1";
     in.region          = "ap-northeast";
     in.tpm_ak_pubkey   = "QUs=";
-    in.platform_class  = "snp-vtpm";
+    in.platform_class  = core::AdmissionPlatform::SnpVtpm;
     in.measurement     = std::string(96, 'a');
     in.binary_hash     = std::string(64, 'b');
     in.evidence_sha256 = std::string(64, 'c');
-    in.nonce           = "bm9uY2U=";
+    in.evidence        = "bundle";
+    in.nonce           = b64(std::vector<uint8_t>(32, 2));
     in.timestamp       = 1751328000;
-    in.signature       = "c2ln";
+    in.signature       = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
 
-    const auto claim = core::ServerAdmissionService::claim_from_request(in);
-    const auto back  = core::ServerAdmissionService::request_from_claim(claim);
+    const auto claim = in.toJson();
+    const auto decoded = core::AdmissionRequest::fromJson(claim);
+    ASSERT_TRUE(decoded) << decoded.error;
+    const auto& back = *decoded.value;
 
-    EXPECT_EQ(core::ServerAdmissionService::canonical_request(in),
-              core::ServerAdmissionService::canonical_request(back));
+    EXPECT_EQ(core::canonical_admission_request(in),
+              core::canonical_admission_request(back));
     EXPECT_EQ(back.signature, in.signature);
-    // The bundle stays out (bound by evidence_sha256 instead), and the bearer
-    // token is never part of any signed or replicated body.
-    EXPECT_FALSE(claim.contains("evidence"));
+    // The bearer token remains outside the signed canonical projection.
     EXPECT_FALSE(claim.contains("enrollment_token"));
 }
 
@@ -324,10 +329,174 @@ TEST(Onboarding, PollSignatureIsDomainSeparated) {
     // production constants both endpoints verify with (OnboardApiHandler uses
     // kOnboardPollTag / kOnboardAckTag) — not on re-typed literals, which
     // would keep passing if the endpoints drifted to one shared tag.
-    ASSERT_STRNE(core::kOnboardPollTag, core::kOnboardAckTag);
-    auto poll = core::ServerAdmissionService::canonical_poll(core::kOnboardPollTag, "rid", 42);
-    auto ack  = core::ServerAdmissionService::canonical_poll(core::kOnboardAckTag, "rid", 42);
+    ASSERT_NE(core::kOnboardPollTag, core::kOnboardAckTag);
+    auto poll = core::canonical_onboarding_status(core::kOnboardPollTag, "rid", 42);
+    auto ack  = core::canonical_onboarding_status(core::kOnboardAckTag, "rid", 42);
     EXPECT_NE(poll, ack);
+}
+
+TEST(OnboardingJson, StrictAdmissionRequestDecoding) {
+    core::AdmissionRequest request;
+    request.candidate_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
+    request.server_id = "berlin-2";
+    request.region = "eu-west";
+    request.nonce = b64(std::vector<uint8_t>(32, 2));
+    request.timestamp = 1751328000;
+    request.signature = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+
+    const auto valid = request.toJson();
+    ASSERT_TRUE(core::AdmissionRequest::fromJson(valid));
+
+    auto missing = valid;
+    missing.erase("region");
+    EXPECT_EQ(missing.value("region", std::string{}), "");
+    auto missing_result = core::AdmissionRequest::fromJson(missing);
+    ASSERT_FALSE(missing_result);
+    EXPECT_NE(missing_result.error.find("/region"), std::string::npos);
+
+    auto wrong_type = valid;
+    wrong_type["timestamp"] = "1751328000";
+    auto type_result = core::AdmissionRequest::fromJson(wrong_type);
+    ASSERT_FALSE(type_result);
+    EXPECT_NE(type_result.error.find("/timestamp"), std::string::npos);
+
+    auto unknown = valid;
+    unknown["candidate_role"] = "root";
+    auto unknown_result = core::AdmissionRequest::fromJson(unknown);
+    ASSERT_FALSE(unknown_result);
+    EXPECT_NE(unknown_result.error.find("/candidate_role"), std::string::npos);
+
+    auto bad_key = valid;
+    bad_key["candidate_pubkey"] = "c2hvcnQ=";
+    auto key_result = core::AdmissionRequest::fromJson(bad_key);
+    ASSERT_FALSE(key_result);
+    EXPECT_NE(key_result.error.find("/candidate_pubkey"), std::string::npos);
+
+    auto bad_digest = valid;
+    bad_digest["evidence"] = "bundle";
+    bad_digest["evidence_sha256"] = "abcd";
+    auto digest_result = core::AdmissionRequest::fromJson(bad_digest);
+    ASSERT_FALSE(digest_result);
+    EXPECT_NE(digest_result.error.find("/evidence_sha256"), std::string::npos);
+
+    auto null_token = valid;
+    null_token["enrollment_token"] = nullptr;
+    auto null_result = core::AdmissionRequest::fromJson(null_token);
+    ASSERT_FALSE(null_result);
+    EXPECT_NE(null_result.error.find("/enrollment_token"), std::string::npos);
+}
+
+TEST(OnboardingJson, EnumAndIntegerRangesAreStrict) {
+    auto status = core::AdmissionStatusResponse{ };
+    auto invalid_state = status.toJson();
+    invalid_state["state"] = "waiting";
+    auto state_result = core::AdmissionStatusResponse::fromJson(invalid_state);
+    ASSERT_FALSE(state_result);
+    EXPECT_NE(state_result.error.find("/state"), std::string::npos);
+
+    core::AdmissionRequest request;
+    request.candidate_pubkey = b64(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
+    request.server_id = "berlin-2";
+    request.region = "eu-west";
+    request.nonce = b64(std::vector<uint8_t>(32, 2));
+    request.timestamp = 1751328000;
+    request.signature = b64(
+        std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+    auto invalid_platform = request.toJson();
+    invalid_platform["platform_class"] = "fake-tee";
+    auto platform_result = core::AdmissionRequest::fromJson(invalid_platform);
+    ASSERT_FALSE(platform_result);
+    EXPECT_NE(platform_result.error.find("/platform_class"), std::string::npos);
+
+    auto negative_timestamp = request.toJson();
+    negative_timestamp["timestamp"] = -1;
+    auto timestamp_result = core::AdmissionRequest::fromJson(negative_timestamp);
+    ASSERT_FALSE(timestamp_result);
+    EXPECT_NE(timestamp_result.error.find("/timestamp"), std::string::npos);
+
+    core::ChallengeRequest challenge;
+    challenge.candidate_pubkey = b64(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 4));
+    auto challenge_json = challenge.toJson();
+    challenge_json["extra"] = true;
+    EXPECT_FALSE(core::ChallengeRequest::fromJson(challenge_json));
+
+    nlohmann::json port = 70000;
+    uint16_t decoded_port = 0;
+    std::string error;
+    EXPECT_FALSE(core::onboarding_json::decode_value(port, decoded_port,
+                                                     "/gossip_port", error));
+    EXPECT_NE(error.find("out of range"), std::string::npos);
+}
+
+TEST(OnboardingJson, ApprovedBundleRoundTripsForClientAndServer) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = c.ed25519_keygen();
+    auto candidate = c.ed25519_keygen();
+
+    gossip::CertIssueParams params;
+    params.network_id = kTestNetworkHex;
+    params.server_pubkey_b64 = b64(
+        {candidate.public_key.begin(), candidate.public_key.end()});
+    params.server_id = "berlin-2";
+
+    core::ApprovedOnboardingBundle bundle;
+    bundle.certificate = gossip::issue_server_certificate(
+        params, c, root.private_key, root.public_key);
+    bundle.root_pubkey = crypto::to_hex(root.public_key);
+    bundle.mesh_server_pubkey = b64(std::vector<uint8_t>(crypto::kX25519PublicKeySize, 5));
+    bundle.seed_peers = {"berlin-1.example:9102"};
+    bundle.mesh_endpoint = "203.0.113.10:51940";
+    bundle.gossip_port = 9102;
+
+    const core::PollResponse server_response{bundle};
+    const auto wire = core::poll_response_to_json(server_response);
+    auto client_response = core::poll_response_from_json(wire);
+    ASSERT_TRUE(client_response) << client_response.error;
+    const auto* decoded = std::get_if<core::ApprovedOnboardingBundle>(
+        &*client_response.value);
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_EQ(decoded->certificate.server_pubkey, bundle.certificate.server_pubkey);
+    EXPECT_EQ(decoded->root_pubkey, bundle.root_pubkey);
+    EXPECT_EQ(decoded->seed_peers, bundle.seed_peers);
+    c.stop();
+}
+
+TEST(OnboardingJson, AdmissionStoreRoundTripAndLegacyMigration) {
+    core::AdmissionRecord record;
+    record.request_id = std::string(32, 'a');
+    record.candidate_pubkey = b64(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 6));
+    record.server_id = "berlin-2";
+    record.region = "eu-west";
+    record.state = core::AdmissionState::Pending;
+    record.decision_mode = "sole";
+
+    core::AdmissionStoreDocument document;
+    document.admissions.push_back(record);
+    document.denied_until.emplace(record.candidate_pubkey, 1751328600);
+
+    const auto encoded = document.toJson();
+    EXPECT_EQ(encoded.at("version"), core::AdmissionStoreDocument::kVersion);
+    EXPECT_EQ(encoded.at("admissions").at(0).at("state"), "pending");
+    auto decoded = core::admission_store_from_json(encoded);
+    ASSERT_TRUE(decoded) << decoded.error;
+    ASSERT_EQ(decoded.value->admissions.size(), 1u);
+    EXPECT_EQ(decoded.value->admissions.front().request_id, record.request_id);
+
+    auto legacy = encoded;
+    legacy.erase("version");
+    legacy["admissions"][0]["state"] = 0;
+    auto migrated = core::admission_store_from_json(legacy);
+    ASSERT_TRUE(migrated) << migrated.error;
+    EXPECT_EQ(migrated.value->admissions.front().state, core::AdmissionState::Pending);
+
+    legacy["admissions"][0]["state"] = 9;
+    auto invalid = core::admission_store_from_json(legacy);
+    ASSERT_FALSE(invalid);
+    EXPECT_NE(invalid.error.find("state"), std::string::npos);
 }
 
 // ===========================================================================
@@ -518,9 +687,9 @@ protected:
     }
 
     /// A fresh candidate's fully-signed onboarding request (challenge → sign).
-    core::ServerAdmissionService::RequestInput
+    core::AdmissionRequest
     signed_request(const crypto::Ed25519Keypair& cand, const std::string& server_id) {
-        core::ServerAdmissionService::RequestInput in;
+        core::AdmissionRequest in;
         in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
         in.server_id        = server_id;
         in.region           = "eu-west";
@@ -532,9 +701,9 @@ protected:
         return in;
     }
 
-    void sign(core::ServerAdmissionService::RequestInput& in,
+    void sign(core::AdmissionRequest& in,
               const crypto::Ed25519Keypair& key) {
-        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto msg = core::canonical_admission_request(in);
         auto sig = crypto_svc->ed25519_sign(key.private_key, std::span<const uint8_t>(msg));
         in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
     }
@@ -572,7 +741,7 @@ TEST_F(AdmissionServiceTest, ValidPopRequestLandsPending) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_EQ(a->state, core::AdmissionState::Pending);
     EXPECT_TRUE(a->decided_by.empty());
     EXPECT_TRUE(a->issued_cert_json.empty());
     EXPECT_EQ(a->decision_mode, "sole");
@@ -618,7 +787,7 @@ TEST_F(AdmissionServiceTest, WrongOrReplayedNonceRefused) {
     make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
-    core::ServerAdmissionService::RequestInput in;
+    core::AdmissionRequest in;
     in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
     in.server_id = "berlin-2";
     in.region    = "eu-west";
@@ -676,7 +845,7 @@ TEST_F(AdmissionServiceTest, TokenAdmitsImmediatelyAndBurns) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     EXPECT_EQ(a->decided_by, "token");
     ASSERT_FALSE(a->issued_cert_json.empty());
 
@@ -750,7 +919,7 @@ TEST_F(AdmissionServiceTest, BoundTokenEnforced) {
     ASSERT_TRUE(r_a.ok) << r_a.error;
     auto a = admission->status(r_a.request_id, in_a.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
 }
 
 TEST_F(AdmissionServiceTest, ServerIdBoundTokenEnforced) {
@@ -777,7 +946,7 @@ TEST_F(AdmissionServiceTest, ServerIdBoundTokenEnforced) {
     ASSERT_TRUE(r2.ok) << r2.error;
     auto a = admission->status(r2.request_id, in2.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     EXPECT_EQ(a->server_id, "berlin-2");
 }
 
@@ -803,7 +972,7 @@ TEST_F(AdmissionServiceTest, TokenRetryApprovesExistingPending) {
 
     auto a = admission->status(r1.request_id, in1.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     EXPECT_EQ(a->decided_by, "token");
 }
 
@@ -827,7 +996,7 @@ TEST_F(AdmissionServiceTest, AdminApproveMintsRootSignedCert) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     EXPECT_EQ(a->decided_by, "admin");
     ASSERT_FALSE(a->issued_cert_json.empty());
     // The mint is real: the certificate verifies against the root anchor key.
@@ -848,7 +1017,7 @@ TEST_F(AdmissionServiceTest, AdminDenySetsCooldown) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Denied);
+    EXPECT_EQ(a->state, core::AdmissionState::Denied);
 
     // The denied identity cannot immediately re-request: a denial without a
     // cooldown is just a retry prompt for an attacker.
@@ -859,13 +1028,13 @@ TEST_F(AdmissionServiceTest, AdminDenySetsCooldown) {
 
 TEST_F(AdmissionServiceTest, ApproveRefusesUnverifiedPlatformClaim) {
     // The approve-time evidence gate: a Tier-1-class claim that does not
-    // verify must never mint. An unknown platform_class is refused and the
+    // verify must never mint. An unsupported platform_class is refused and the
     // record stays pending with no certificate.
     make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
     auto in   = signed_request(cand, "berlin-2");
-    in.platform_class  = "fake-tee";
+    in.platform_class  = core::AdmissionPlatform::Tpm2;
     in.evidence        = "bundle-bytes";
     in.evidence_sha256 = crypto::to_hex(crypto_svc->sha256(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(in.evidence.data()), in.evidence.size())));
@@ -880,7 +1049,7 @@ TEST_F(AdmissionServiceTest, ApproveRefusesUnverifiedPlatformClaim) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_EQ(a->state, core::AdmissionState::Pending);
     EXPECT_TRUE(a->issued_cert_json.empty());
 }
 
@@ -900,7 +1069,7 @@ TEST_F(AdmissionServiceTest, AcknowledgeCompletesApprovedOnly) {
     EXPECT_TRUE(admission->acknowledge(r.request_id, in.candidate_pubkey));
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Completed);
+    EXPECT_EQ(a->state, core::AdmissionState::Completed);
     EXPECT_FALSE(admission->acknowledge(r.request_id, in.candidate_pubkey));  // final
 }
 
@@ -978,7 +1147,7 @@ TEST_F(AdmissionServiceTest, PendingAdmissionSurvivesRestart) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_EQ(a->state, core::AdmissionState::Pending);
     EXPECT_EQ(a->server_id, "berlin-2");
     EXPECT_EQ(a->candidate_pubkey, in.candidate_pubkey);
     EXPECT_EQ(a->decision_mode, "sole");
@@ -1011,7 +1180,7 @@ TEST_F(AdmissionServiceTest, PersistedExpiryEnforcedAfterRestart) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Expired);
+    EXPECT_EQ(a->state, core::AdmissionState::Expired);
 }
 
 TEST_F(AdmissionServiceTest, DenialCooldownSurvivesRestart) {
@@ -1067,18 +1236,24 @@ TEST_F(AdmissionServiceTest, HistoricalBallotRecordLoadsAsFact) {
 
     auto legacy_key = crypto_svc->ed25519_keygen();
     auto legacy_b64 = b64({legacy_key.public_key.begin(), legacy_key.public_key.end()});
+    const std::string legacy_id_1(32, '1');
+    const std::string legacy_id_2(32, '2');
 
     nlohmann::json rec_ballot = {
-        {"request_id", "legacy-1"}, {"candidate_pubkey", legacy_b64},
+        {"request_id", legacy_id_1}, {"candidate_pubkey", legacy_b64},
         {"server_id", "old-node"}, {"region", "eu-west"},
+        {"tpm_ak_pubkey", ""}, {"tpm_ek_cert", ""}, {"source_ip", "192.0.2.1"},
         {"state", 1 /* Approved */}, {"created_at", 1}, {"expires_at", 2},
         {"issued_cert_json", "{}"}, {"decision_reason", "quorum approved"},
         {"decided_by", "ballot"}, {"decision_mode", "ballot"},
     };
     // Pre-decision_mode record: a stored ballot claim keeps its ballot labeling.
     nlohmann::json rec_pre = {
-        {"request_id", "legacy-2"}, {"candidate_pubkey", legacy_b64},
-        {"server_id", "old-node-2"}, {"state", 1 /* Approved */},
+        {"request_id", legacy_id_2}, {"candidate_pubkey", legacy_b64},
+        {"server_id", "old-node-2"}, {"region", ""},
+        {"tpm_ak_pubkey", ""}, {"tpm_ek_cert", ""}, {"source_ip", ""},
+        {"state", 1 /* Approved */}, {"created_at", 0}, {"expires_at", 0},
+        {"issued_cert_json", ""}, {"decision_reason", ""},
         {"decided_by", "ballot"}, {"ballot_claim_json", "{\"nonce\":\"n\"}"},
     };
     nlohmann::json root_j{{"ever_approved", true},
@@ -1093,13 +1268,13 @@ TEST_F(AdmissionServiceTest, HistoricalBallotRecordLoadsAsFact) {
         config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
     admission->start();
 
-    auto a1 = admission->status("legacy-1", legacy_b64);
+    auto a1 = admission->status(legacy_id_1, legacy_b64);
     ASSERT_TRUE(a1.has_value());
-    EXPECT_EQ(a1->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a1->state, core::AdmissionState::Approved);
     EXPECT_EQ(a1->decision_mode, "ballot");
     EXPECT_EQ(a1->decided_by, "ballot");
 
-    auto a2 = admission->status("legacy-2", legacy_b64);
+    auto a2 = admission->status(legacy_id_2, legacy_b64);
     ASSERT_TRUE(a2.has_value());
     EXPECT_EQ(a2->decision_mode, "ballot");
 
@@ -1164,7 +1339,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     ASSERT_TRUE(token.has_value());
 
     auto sign_req = [&](const std::string& server_id) {
-        core::ServerAdmissionService::RequestInput in;
+        core::AdmissionRequest in;
         in.candidate_pubkey = cand_b64;
         in.server_id = server_id;
         in.region = "eu-west";
@@ -1172,7 +1347,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
         in.timestamp = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto msg = core::canonical_admission_request(in);
         auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
         in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
         in.enrollment_token = token->first;
@@ -1192,7 +1367,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     ASSERT_TRUE(r2.ok) << r2.error;
     auto a = admission.status(r2.request_id, free_req.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
 
     admission.stop();
     gossip.stop();
@@ -1252,7 +1427,7 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
     auto cand     = c.ed25519_keygen();
     auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     auto sign_req = [&](const std::string& server_id) {
-        core::ServerAdmissionService::RequestInput in;
+        core::AdmissionRequest in;
         in.candidate_pubkey = cand_b64;
         in.server_id = server_id;
         in.region = "eu-west";
@@ -1260,7 +1435,7 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
         in.timestamp = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto msg = core::canonical_admission_request(in);
         auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
         in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
         return in;
@@ -1313,7 +1488,7 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
 
     auto cand     = c.ed25519_keygen();
     auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-    core::ServerAdmissionService::RequestInput in;
+    core::AdmissionRequest in;
     in.candidate_pubkey = cand_b64;
     in.server_id = "berlin-2";
     in.region = "eu-west";
@@ -1322,7 +1497,7 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
     {
-        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto msg = core::canonical_admission_request(in);
         auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
         in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
     }
@@ -1362,7 +1537,7 @@ TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
 
     auto a = admission.status(r.request_id, cand_b64);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     ASSERT_FALSE(a->issued_cert_json.empty());
     EXPECT_TRUE(cert_verifies_against(a->issued_cert_json, root.public_key, c));
 
