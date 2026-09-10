@@ -77,13 +77,13 @@ TEST_F(RoutingCoordinationTest, FullLifecycle) {
     routing::EndpointRegistration reg;
     reg.node_id = "ep-1";
     reg.endpoint_identifier = "infer-ep-1";
-    reg.wg_pubkey = "WGEP";
+    reg.mesh_pubkey = "MESH_EP";
     reg.mgmt_pubkey = "ed25519:ep-1";
     routing->register_endpoint(reg);
 
     auto in = req("client-1", "ep-1");
     in.conn_nonce = {{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16}};
-    in.client_wg_pub = "WGCLIENT";
+    in.client_mesh_pubkey = "MESH_CLIENT";
     auto r = routing->create_request(in);
     ASSERT_TRUE(r.ok);
     EXPECT_EQ(r.status, 202);
@@ -105,7 +105,7 @@ TEST_F(RoutingCoordinationTest, FullLifecycle) {
     routing::EndpointReadyInput ready;
     ready.connection_id = cid;
     ready.endpoint_node_id = "ep-1";
-    ready.endpoint_wg_pub = "WGEP";
+    ready.endpoint_mesh_pubkey = "MESH_EP";
     std::string err;
     ASSERT_TRUE(routing->endpoint_ready(ready, err)) << err;
 
@@ -114,7 +114,7 @@ TEST_F(RoutingCoordinationTest, FullLifecycle) {
     auto d = routing->build_client_directive(cid, "client-1");
     ASSERT_TRUE(d.has_value());
     EXPECT_EQ(d->endpoint_identifier, "infer-ep-1");
-    EXPECT_EQ(d->endpoint_wg_pub, "WGEP");
+    EXPECT_EQ(d->endpoint_mesh_pubkey, "MESH_EP");
     EXPECT_EQ(d->conn_nonce, in.conn_nonce);
 }
 

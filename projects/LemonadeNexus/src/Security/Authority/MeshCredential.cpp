@@ -12,7 +12,7 @@ Digest mesh_credential_digest(const MeshCredentialGrant& grant) {
     encoder.add_u16(static_cast<uint16_t>(grant.operation));
     encoder.add_string(grant.subject_pubkey);
     encoder.add_string(grant.subject_server_id);
-    encoder.add_string(grant.subject_wg_pubkey);
+    encoder.add_string(grant.subject_mesh_pubkey);
     encoder.add_string(grant.platform_class);
     encoder.add_string(grant.expected_measurement);
     encoder.add_string(grant.approved_binary_hash);

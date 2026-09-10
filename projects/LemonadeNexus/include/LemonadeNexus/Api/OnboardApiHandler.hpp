@@ -16,7 +16,7 @@ public:
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
 
-    /// Assemble {certificate, root_pubkey, seed_peers, wg_*} for an approved poll.
+    /// Assemble the certificate, root key, seed peers, and mesh transport fields.
     [[nodiscard]] nlohmann::json approved_bundle(const std::string& cert_json) const;
 
     ApiContext& ctx_;

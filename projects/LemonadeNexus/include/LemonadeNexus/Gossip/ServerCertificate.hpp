@@ -18,7 +18,7 @@ struct ServerCertificate {
     /// is no acceptance path for a certificate without one.
     std::string network_id;
     std::string server_pubkey;   // base64 Ed25519 public key of the server
-    std::string wg_pubkey;       // base64 X25519 mesh public key (derived from Ed25519)
+    std::string mesh_pubkey;     // base64 X25519 mesh public key (derived from Ed25519)
     std::string server_id;       // human-readable identifier (e.g. "us-east-1")
     std::string endpoint_hint;   // initial "host:port" (may change)
     uint64_t    issued_at{0};    // Unix timestamp

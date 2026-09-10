@@ -343,7 +343,7 @@ struct LemonadeNexusClient::Impl {
         return std::nullopt;
     }
 
-    // --- Private API (verified HTTPS over the WG tunnel, by private FQDN) ---
+    // --- Private API (verified HTTPS over the mesh, by private FQDN) ---
 
     // Send a private-API request over the userspace mesh dataplane — the only
     // path to the server's private routes (the server terminates the tunnel in
@@ -1528,7 +1528,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     // legacy hash-derived static simply rotates on this join; the server's
     // rekey path handles that. Fall back to a random key only when there is
     // no identity (e.g. password-only join).
-    auto [wg_privkey, wg_pubkey] = local_identity.is_valid()
+    auto [mesh_private_key, mesh_pubkey] = local_identity.is_valid()
         ? BoringtunMesh::identity_bound_keypair(
               std::span<const uint8_t>(local_identity.private_key()))
         : BoringtunMesh::generate_keypair();
@@ -1540,7 +1540,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     if (local_identity.is_valid()) {
         join_body["public_key"] = local_identity.pubkey_string(); // "ed25519:base64..."
     }
-    join_body["wg_pubkey"] = wg_pubkey;
+    join_body["mesh_pubkey"] = mesh_pubkey;
 
     // Single-use device link token (see set_link_token / create_link_token)
     {
@@ -1614,13 +1614,13 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     result.value.success        = true;
     result.value.node_id        = node_id;
     result.value.tunnel_ip      = tunnel_ip;
-    result.value.wg_pubkey      = wg_pubkey;
+    result.value.mesh_pubkey    = mesh_pubkey;
 
     {
         std::lock_guard lock(impl_->mutex);
         impl_->node_id = node_id;
         impl_->link_token.clear();  // consumed server-side on successful join
-        // Store server private FQDN for HTTPS over WG tunnel
+        // Store server private FQDN for HTTPS over the mesh
         // Store server tunnel IP for HTTP fallback
         auto srv_tunnel = resp->value("server_tunnel_ip", std::string{});
         if (!srv_tunnel.empty()) {
@@ -1671,11 +1671,13 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
     // Step 4: bring up the userspace mesh dataplane with the assigned config.
     if (!tunnel_ip.empty()) {
         BoringtunConfig bt;
-        bt.private_key       = wg_privkey;
-        bt.public_key        = wg_pubkey;
+        bt.private_key       = mesh_private_key;
+        bt.public_key        = mesh_pubkey;
         bt.tunnel_ip         = tunnel_ip;
-        bt.server_public_key = resp->value("wg_server_pubkey", std::string{});
-        bt.server_endpoint   = resp->value("wg_endpoint", std::string{});
+        bt.server_public_key = resp->value(
+            "mesh_server_pubkey", resp->value("wg_server_pubkey", std::string{}));
+        bt.server_endpoint   = resp->value(
+            "mesh_endpoint", resp->value("wg_endpoint", std::string{}));
         bt.allowed_ips       = {resp->value("tunnel_subnet", std::string{"10.64.0.0/10"})};
 
         {
@@ -1707,8 +1709,8 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         }
     }
 
-    spdlog::info("[LemonadeNexusClient] joined network: node_id={}, tunnel_ip={}, wg_pubkey={}",
-                  node_id, tunnel_ip, wg_pubkey);
+    spdlog::info("[LemonadeNexusClient] joined network: node_id={}, tunnel_ip={}, mesh_pubkey={}",
+                  node_id, tunnel_ip, mesh_pubkey);
     return result;
 }
 
@@ -1908,7 +1910,7 @@ Result<std::vector<ServerEntry>> LemonadeNexusClient::get_servers() {
 Result<TrustStatus> LemonadeNexusClient::get_trust_status() {
     std::lock_guard lock(impl_->mutex);
     int status = 0;
-    // /api/trust/status is a private-API route (served over the WG tunnel),
+    // /api/trust/status is a private-API route (served over the mesh),
     // like /api/relay/list — route it through the private base URL.
     auto resp = impl_->private_http_get("/api/trust/status", status);
     if (!resp) return {false, {}, status, "Connection failed"};
@@ -2136,7 +2138,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                 MeshPeer mp;
                 mp.node_id        = p.value("node_id", "");
                 mp.hostname       = p.value("hostname", "");
-                mp.wg_pubkey      = p.value("wg_pubkey", "");
+                mp.mesh_pubkey    = p.value("mesh_pubkey", p.value("wg_pubkey", ""));
                 mp.tunnel_ip      = p.value("tunnel_ip", "");
                 mp.private_subnet = p.value("private_subnet", "");
                 mp.endpoint       = p.value("endpoint", "");
@@ -2157,7 +2159,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                     }
                     return false;
                 };
-                if (has_unsafe_chars(mp.wg_pubkey) || has_unsafe_chars(mp.endpoint) ||
+                if (has_unsafe_chars(mp.mesh_pubkey) || has_unsafe_chars(mp.endpoint) ||
                     has_unsafe_chars(mp.tunnel_ip) || has_unsafe_chars(mp.private_subnet) ||
                     has_unsafe_chars(mp.relay_endpoint) || has_unsafe_chars(mp.hostname)) {
                     spdlog::warn("[MeshPeers] Rejected peer '{}' with shell-unsafe characters",
@@ -2165,8 +2167,8 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                     continue;  // skip this peer entirely
                 }
                 // Reject peers with empty pubkey (unusable for the mesh)
-                if (mp.wg_pubkey.empty()) {
-                    spdlog::debug("[MeshPeers] Skipping peer '{}' with empty wg_pubkey", mp.node_id);
+                if (mp.mesh_pubkey.empty()) {
+                    spdlog::debug("[MeshPeers] Skipping peer '{}' with empty mesh_pubkey", mp.node_id);
                     continue;
                 }
 
@@ -2219,12 +2221,12 @@ Result<RoutingProfile> LemonadeNexusClient::get_routing_profile(int page, int pa
 
 Result<ConnectionRequestResult> LemonadeNexusClient::request_endpoint(
     const std::string& identifier, const std::string& conn_nonce_b64,
-    const std::string& client_wg_pub, const std::vector<std::string>& candidates) {
+    const std::string& client_mesh_pubkey, const std::vector<std::string>& candidates) {
     Result<ConnectionRequestResult> result;
     nlohmann::json body = {
         {"identifier", identifier},
         {"conn_nonce", conn_nonce_b64},
-        {"client_wg_pub", client_wg_pub},
+        {"client_mesh_pubkey", client_mesh_pubkey},
         {"client_candidates", candidates},
     };
     int status = 0;
@@ -2285,11 +2287,11 @@ Result<ConnectionStatus> LemonadeNexusClient::connection_status(
 
 Result<nlohmann::json> LemonadeNexusClient::routing_register_endpoint(
     const std::string& cpu_id, const std::string& net_mac,
-    const std::string& wg_pubkey, const std::string& stun_endpoint) {
+    const std::string& mesh_pubkey, const std::string& stun_endpoint) {
     Result<nlohmann::json> result;
     nlohmann::json body = {
         {"cpu_id", cpu_id}, {"net_mac", net_mac},
-        {"wg_pubkey", wg_pubkey}, {"stun_endpoint", stun_endpoint},
+        {"mesh_pubkey", mesh_pubkey}, {"stun_endpoint", stun_endpoint},
     };
     int status = 0;
     auto resp = impl_->private_http_post("/api/routing/endpoint/register", body, status);
@@ -2302,12 +2304,12 @@ Result<nlohmann::json> LemonadeNexusClient::routing_register_endpoint(
 
 Result<nlohmann::json> LemonadeNexusClient::routing_endpoint_ready(
     const std::string& connection_id, const std::string& cpu_id,
-    const std::string& net_mac, const std::string& endpoint_wg_pub,
+    const std::string& net_mac, const std::string& endpoint_mesh_pubkey,
     const std::vector<std::string>& candidates) {
     Result<nlohmann::json> result;
     nlohmann::json body = {
         {"connection_id", connection_id}, {"cpu_id", cpu_id}, {"net_mac", net_mac},
-        {"endpoint_wg_pub", endpoint_wg_pub}, {"endpoint_candidates", candidates},
+        {"endpoint_mesh_pubkey", endpoint_mesh_pubkey}, {"endpoint_candidates", candidates},
     };
     int status = 0;
     auto resp = impl_->private_http_post("/api/routing/endpoint/ready", body, status);

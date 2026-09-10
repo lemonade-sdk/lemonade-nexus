@@ -20,9 +20,7 @@ struct ServerConfig {
     std::string bind_address{"0.0.0.0"};
     std::string public_ip;              // public-facing IP for DNS glue records (auto-detected if empty)
     std::string region;                 // cloud region code (e.g. "us-east", auto-detected if empty)
-    std::string wg_interface{"nexus0"}; // boringtun interface name. MUST NOT be "wg0" or any
-                                        // interface you are connected through -- the server flushes
-                                        // and re-keys this device on startup, which would drop that tunnel.
+    std::string mesh_interface{"nexus0"}; // BoringTun dataplane instance name
 
     // Storage
     std::string data_root{"data"};

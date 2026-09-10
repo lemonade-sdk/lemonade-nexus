@@ -42,7 +42,7 @@ struct ConnectionRequestResult {
 struct ConnectionDirective {
     std::string connection_id;
     std::string endpoint_identifier;
-    std::string endpoint_wg_pub;       ///< E2E Noise static (from peer_binding)
+    std::string endpoint_mesh_pubkey;  ///< E2E Noise static (from peer_binding)
     std::string data_path;             ///< "direct" | "relay"
     std::string relay_endpoint;
     std::string conn_nonce_b64;
@@ -98,7 +98,7 @@ inline void from_json(const nlohmann::json& j, ConnectionDirective& d) {
     d.punch_at            = j.value("punch_at", uint64_t{0});
     if (auto it = j.find("peer_binding"); it != j.end()) {
         d.endpoint_identifier = it->value("identifier", "");
-        d.endpoint_wg_pub     = it->value("wg_pubkey", "");
+        d.endpoint_mesh_pubkey = it->value("mesh_pubkey", it->value("wg_pubkey", ""));
     }
     if (auto it = j.find("ticket"); it != j.end())
         d.ticket_signed = it->value("signed", false);

@@ -41,7 +41,7 @@ void MeshOrchestrator::stop() {
     {
         std::lock_guard lock(mutex_);
         for (const auto& peer : known_peers_) {
-            mesh_.remove_peer(peer.wg_pubkey);
+            mesh_.remove_peer(peer.mesh_pubkey);
         }
         known_peers_.clear();
         last_status_ = {};
@@ -185,7 +185,7 @@ void MeshOrchestrator::do_monitor() {
                 }
             }
 
-            // Online = best signal (WG handshake or server last_seen) is fresh
+            // Online = best signal (Noise handshake or server last_seen) is fresh
             int64_t best_ts = std::max(peer.last_handshake,
                                         static_cast<int64_t>(peer.last_seen));
             if (best_ts > 0) {

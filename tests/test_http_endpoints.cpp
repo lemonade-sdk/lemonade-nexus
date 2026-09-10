@@ -268,7 +268,7 @@ protected:
                     json p;
                     p["node_id"] = s.id;
                     p["hostname"] = s.hostname;
-                    p["wg_pubkey"] = s.wg_pubkey;
+                    p["mesh_pubkey"] = s.mesh_pubkey;
                     p["tunnel_ip"] = s.tunnel_ip;
                     p["endpoint"] = s.listen_endpoint;
                     peers.push_back(std::move(p));
@@ -575,7 +575,7 @@ TEST_F(HttpEndpointTest, CreateCustomerThenEndpoint) {
     endpoint.type = tree::NodeType::Endpoint;
     endpoint.mgmt_pubkey = root_pubkey_str;
     endpoint.tunnel_ip = tunnel_ip;
-    endpoint.wg_pubkey = "wg_test_key";
+    endpoint.mesh_pubkey = "mesh_test_key";
 
     auto delta2 = make_signed_delta("create_node", "acme_ep1", endpoint);
     auto res2 = cli.Post("/api/tree/delta", json(delta2).dump(), "application/json");
@@ -701,7 +701,7 @@ TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
     ep1.type = tree::NodeType::Endpoint;
     ep1.mgmt_pubkey = root_pubkey_str;
     ep1.assignments = {{root_pubkey_str, {"admin"}}};
-    ep1.wg_pubkey = "wg_pubkey_ep1";
+    ep1.mesh_pubkey = "mesh_pubkey_ep1";
     ep1.tunnel_ip = "10.0.0.2";
     ep1.hostname = "peer-alpha";
     auto d2 = make_signed_delta("create_node", "mesh_ep1", ep1);
@@ -713,7 +713,7 @@ TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
     ep2.type = tree::NodeType::Endpoint;
     ep2.mgmt_pubkey = root_pubkey_str;
     ep2.assignments = {{root_pubkey_str, {"admin"}}};
-    ep2.wg_pubkey = "wg_pubkey_ep2";
+    ep2.mesh_pubkey = "mesh_pubkey_ep2";
     ep2.tunnel_ip = "10.0.0.3";
     ep2.hostname = "peer-beta";
     auto d3 = make_signed_delta("create_node", "mesh_ep2", ep2);
@@ -732,7 +732,7 @@ TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
     EXPECT_EQ(peers.size(), 1u);
     EXPECT_EQ(peers[0]["node_id"], "mesh_ep2");
     EXPECT_EQ(peers[0]["hostname"], "peer-beta");
-    EXPECT_EQ(peers[0]["wg_pubkey"], "wg_pubkey_ep2");
+    EXPECT_EQ(peers[0]["mesh_pubkey"], "mesh_pubkey_ep2");
     EXPECT_EQ(peers[0]["tunnel_ip"], "10.0.0.3");
 }
 
@@ -765,7 +765,7 @@ TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
     epA.type = tree::NodeType::Endpoint;
     epA.mgmt_pubkey = root_pubkey_str;
     epA.assignments = {{root_pubkey_str, {"admin"}}};
-    epA.wg_pubkey = "wg_A";
+    epA.mesh_pubkey = "mesh_A";
     auto dEpA = make_signed_delta("create_node", "idor_epA", epA);
     cli.Post("/api/tree/delta", json(dEpA).dump(), "application/json");
 
@@ -775,7 +775,7 @@ TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
     epB.type = tree::NodeType::Endpoint;
     epB.mgmt_pubkey = root_pubkey_str;
     epB.assignments = {{root_pubkey_str, {"admin"}}};
-    epB.wg_pubkey = "wg_B";
+    epB.mesh_pubkey = "mesh_B";
     auto dEpB = make_signed_delta("create_node", "idor_epB", epB);
     cli.Post("/api/tree/delta", json(dEpB).dump(), "application/json");
 

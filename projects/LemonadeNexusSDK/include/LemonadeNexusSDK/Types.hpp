@@ -120,7 +120,7 @@ struct TreeNode {
     // Crypto
     std::string              mgmt_pubkey;
     std::string              wrapped_mgmt_privkey;
-    std::string              wg_pubkey;
+    std::string              mesh_pubkey;
 
     // Assignments
     std::vector<Assignment>  assignments;
@@ -257,7 +257,7 @@ struct JoinResult {
     std::string node_id;
     std::string tunnel_ip;
     std::string private_subnet;
-    std::string wg_pubkey;          ///< mesh public key (base64)
+    std::string mesh_pubkey;        ///< mesh public key (base64)
     std::string error;
 };
 
@@ -310,7 +310,7 @@ struct TunnelStatus {
     bool        is_up{false};
     std::string tunnel_ip;
     std::string server_endpoint;
-    int64_t     last_handshake{0};          ///< Unix timestamp of last WG handshake
+    int64_t     last_handshake{0};          ///< Unix timestamp of last Noise handshake
     uint64_t    rx_bytes{0};
     uint64_t    tx_bytes{0};
     int32_t     latency_ms{-1};             ///< -1 = unknown
@@ -324,7 +324,7 @@ struct TunnelStatus {
 struct MeshPeer {
     std::string node_id;
     std::string hostname;
-    std::string wg_pubkey;              ///< Curve25519 base64
+    std::string mesh_pubkey;            ///< Curve25519 base64
     std::string tunnel_ip;              ///< e.g. "10.64.0.5/32"
     std::string private_subnet;         ///< e.g. "10.128.17.4/30"
     std::string endpoint;               ///< Direct "ip:port" (from STUN/hole-punch)

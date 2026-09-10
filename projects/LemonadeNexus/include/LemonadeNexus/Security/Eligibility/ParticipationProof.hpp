@@ -11,7 +11,7 @@
 // No existing exchange proves enough. Attestation evidence binds identity,
 // incarnation, epoch and ruleset but nothing about finalized state, and it is
 // already what continuity counts, so reusing it would collapse the two facts
-// into one. A sync request is unsigned. Gossip and WireGuard authenticate a
+// into one. A sync request is unsigned. Gossip and the mesh transport authenticate a
 // transport, which is not an authorization result. So this is the smallest
 // dedicated challenge-response that binds everything required, and nothing
 // else: it is not a health protocol and carries no load, latency or score.

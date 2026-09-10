@@ -93,7 +93,7 @@ protected:
         cert.network_id = kTestNetworkHex;
         cert.server_id = "infer-x";
         cert.server_pubkey = crypto::to_base64(c->ed25519_keygen().public_key);
-        cert.wg_pubkey = crypto::to_base64(c->x25519_keygen().public_key);
+        cert.mesh_pubkey = crypto::to_base64(c->x25519_keygen().public_key);
         cert.issuer_pubkey = crypto::to_base64(root.public_key);
         cert.expires_at = 0;
         auto canon = gossip::canonical_cert_json(cert);

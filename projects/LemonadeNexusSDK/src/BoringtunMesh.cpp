@@ -201,12 +201,12 @@ StatusResult BoringtunMesh::sync_peers(const std::vector<MeshPeer>& desired) {
 
     std::unordered_set<std::string> want;
     for (const auto& p : desired) {
-        if (p.wg_pubkey.empty()) continue;
+        if (p.mesh_pubkey.empty()) continue;
         const std::string endpoint = p.endpoint.empty() ? p.relay_endpoint : p.endpoint;
         const std::string allowed = allowed_for(p.tunnel_ip, p.private_subnet);
         if (allowed.empty()) continue;
-        want.insert(p.wg_pubkey);
-        (void)impl_->dp.add_peer(p.wg_pubkey, allowed, endpoint,
+        want.insert(p.mesh_pubkey);
+        (void)impl_->dp.add_peer(p.mesh_pubkey, allowed, endpoint,
                                  static_cast<uint16_t>(p.keepalive ? p.keepalive : 25));
     }
 
@@ -239,7 +239,7 @@ MeshTunnelStatus BoringtunMesh::mesh_status() const {
     for (const auto& peer : impl_->dp.snapshot_peers()) {
         if (peer.public_key == impl_->server_pubkey) continue;
         MeshPeer mp;
-        mp.wg_pubkey     = peer.public_key;
+        mp.mesh_pubkey   = peer.public_key;
         mp.tunnel_ip     = addr_part(peer.allowed_ips);  // first cidr's address
         mp.endpoint      = peer.endpoint;
         mp.last_handshake = static_cast<int64_t>(peer.last_handshake);

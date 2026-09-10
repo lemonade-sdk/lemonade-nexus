@@ -533,6 +533,36 @@ TEST_F(PermissionTreeTest, CanonicalDeltaJsonWithHostnameSet) {
     EXPECT_NE(canonical.find("\"hostname\":\"my-laptop\""), std::string::npos);
 }
 
+TEST_F(PermissionTreeTest, MeshKeyJsonMigratesWithoutChangingCanonicalSignatures) {
+    tree::TreeNode node;
+    node.id = "ep-mesh-key";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mesh_pubkey = "mesh-key";
+
+    nlohmann::json current = node;
+    EXPECT_EQ(current.at("mesh_pubkey"), "mesh-key");
+    EXPECT_FALSE(current.contains("wg_pubkey"));
+
+    auto legacy = current;
+    legacy["wg_pubkey"] = legacy["mesh_pubkey"];
+    legacy.erase("mesh_pubkey");
+    const auto loaded = legacy.get<tree::TreeNode>();
+    EXPECT_EQ(loaded.mesh_pubkey, "mesh-key");
+
+    const auto canonical_node = tree::canonical_node_json(loaded);
+    EXPECT_NE(canonical_node.find("\"wg_pubkey\":\"mesh-key\""), std::string::npos);
+    EXPECT_EQ(canonical_node.find("\"mesh_pubkey\""), std::string::npos);
+
+    tree::TreeDelta delta;
+    delta.operation = "create_node";
+    delta.target_node_id = loaded.id;
+    delta.node_data = loaded;
+    const auto canonical_delta = tree::canonical_delta_json(delta);
+    EXPECT_NE(canonical_delta.find("\"wg_pubkey\":\"mesh-key\""), std::string::npos);
+    EXPECT_EQ(canonical_delta.find("\"mesh_pubkey\""), std::string::npos);
+}
+
 TEST_F(PermissionTreeTest, CreateEndpointWithHostname) {
     // Create customer first
     tree::TreeNode customer;
@@ -581,7 +611,7 @@ TEST_F(PermissionTreeTest, CreateEndpointUnderCustomer) {
     endpoint.type = tree::NodeType::Endpoint;
     endpoint.mgmt_pubkey = root_pubkey_str;
     endpoint.tunnel_ip = "10.64.0.1/32";
-    endpoint.wg_pubkey = "wg_test_pubkey";
+    endpoint.mesh_pubkey = "mesh_test_pubkey";
 
     auto delta = make_signed_delta("create_node", "acme_ep1", endpoint, root_keypair);
     EXPECT_TRUE(tree_svc->apply_delta(delta));
@@ -596,43 +626,43 @@ TEST_F(PermissionTreeTest, CreateEndpointUnderCustomer) {
     EXPECT_EQ(children.size(), 1u);
 }
 
-// A WireGuard static binds to exactly one node. The service holds the
+// A mesh transport static binds to exactly one node. The service holds the
 // invariant for every caller; the API layer additionally compares normalized
 // spellings before any dataplane change.
-TEST_F(PermissionTreeTest, WgPubkeyBindsToExactlyOneNode) {
+TEST_F(PermissionTreeTest, MeshPubkeyBindsToExactlyOneNode) {
     tree::TreeNode owner;
-    owner.id = "wg_owner";
+    owner.id = "mesh_owner";
     owner.parent_id = "root";
     owner.type = tree::NodeType::Endpoint;
-    owner.wg_pubkey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    owner.mesh_pubkey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     ASSERT_TRUE(tree_svc->insert_join_node(owner));
 
     // A different node claiming the same static is refused outright.
     tree::TreeNode squatter;
-    squatter.id = "wg_squatter";
+    squatter.id = "mesh_squatter";
     squatter.parent_id = "root";
     squatter.type = tree::NodeType::Endpoint;
-    squatter.wg_pubkey = owner.wg_pubkey;
+    squatter.mesh_pubkey = owner.mesh_pubkey;
     EXPECT_FALSE(tree_svc->insert_join_node(squatter));
-    EXPECT_FALSE(tree_svc->get_node("wg_squatter").has_value());
+    EXPECT_FALSE(tree_svc->get_node("mesh_squatter").has_value());
 
     // And a different node updating itself onto the static is refused too.
     tree::TreeNode bystander;
-    bystander.id = "wg_bystander";
+    bystander.id = "mesh_bystander";
     bystander.parent_id = "root";
     bystander.type = tree::NodeType::Endpoint;
-    bystander.wg_pubkey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+    bystander.mesh_pubkey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
     ASSERT_TRUE(tree_svc->insert_join_node(bystander));
     tree::TreeNode stolen = bystander;
-    stolen.wg_pubkey = owner.wg_pubkey;
-    EXPECT_FALSE(tree_svc->update_node_direct("wg_bystander", stolen));
-    EXPECT_EQ(tree_svc->get_node("wg_bystander")->wg_pubkey, bystander.wg_pubkey);
+    stolen.mesh_pubkey = owner.mesh_pubkey;
+    EXPECT_FALSE(tree_svc->update_node_direct("mesh_bystander", stolen));
+    EXPECT_EQ(tree_svc->get_node("mesh_bystander")->mesh_pubkey, bystander.mesh_pubkey);
 
     // The owner itself may rotate and rebind freely.
     tree::TreeNode rotated = owner;
-    rotated.wg_pubkey = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
-    EXPECT_TRUE(tree_svc->update_node_direct("wg_owner", rotated));
+    rotated.mesh_pubkey = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
+    EXPECT_TRUE(tree_svc->update_node_direct("mesh_owner", rotated));
     tree::TreeNode back = rotated;
-    back.wg_pubkey = owner.wg_pubkey;
-    EXPECT_TRUE(tree_svc->update_node_direct("wg_owner", back));
+    back.mesh_pubkey = owner.mesh_pubkey;
+    EXPECT_TRUE(tree_svc->update_node_direct("mesh_owner", back));
 }

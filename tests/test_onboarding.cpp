@@ -203,6 +203,21 @@ TEST(Onboarding, CertificateJsonCarriesThePlatformPolicy) {
     EXPECT_EQ(back.approved_binary_hash, cert.approved_binary_hash);
 }
 
+TEST(Onboarding, CertificateMeshKeyJsonAcceptsLegacyField) {
+    gossip::ServerCertificate cert;
+    cert.server_pubkey = "cGs=";
+    cert.mesh_pubkey = "mesh-key";
+
+    nlohmann::json current = cert;
+    EXPECT_EQ(current.at("mesh_pubkey"), "mesh-key");
+    EXPECT_FALSE(current.contains("wg_pubkey"));
+
+    auto legacy = current;
+    legacy["wg_pubkey"] = legacy["mesh_pubkey"];
+    legacy.erase("mesh_pubkey");
+    EXPECT_EQ(legacy.get<gossip::ServerCertificate>().mesh_pubkey, "mesh-key");
+}
+
 // ===========================================================================
 // Candidate proof-of-possession signing (the /api/onboard/request path)
 // ===========================================================================

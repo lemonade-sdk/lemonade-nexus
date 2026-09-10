@@ -52,7 +52,7 @@ struct MeshCredentialGrant {
 
     /// The mesh static the subject is bound to. Empty for a Tier 2 credential
     /// with no advertised static, or for Revoke.
-    std::string subject_wg_pubkey;
+    std::string subject_mesh_pubkey;
 
     /// Platform policy the subject must satisfy for Tier 1. Empty class = a
     /// plain Tier 2 credential, which claims no platform facts (the mesh does

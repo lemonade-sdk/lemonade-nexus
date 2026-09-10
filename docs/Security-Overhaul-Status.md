@@ -672,7 +672,7 @@ observer
 
 No existing exchange proved enough. Attestation evidence binds identity,
 incarnation, epoch and ruleset but says nothing about finalized state, and it is
-already what continuity counts. A sync request is unsigned. Gossip and WireGuard
+already what continuity counts. A sync request is unsigned. Gossip and the mesh transport
 authenticate a transport, which is not an authorization result.
 
 Candidates enter the eligibility state through the observations themselves

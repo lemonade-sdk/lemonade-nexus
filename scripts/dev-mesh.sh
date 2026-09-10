@@ -82,7 +82,7 @@ provision() {
   "relay_port": $((9610 + i)),
   "dns_port": $((9710 + i)),
   "public_dns_port": $((9710 + i)),
-  "wg_interface": "nexusdev$i",
+  "mesh_interface": "nexusdev$i",
   "log_level": "debug",
   "root_pubkey": "$ROOT_HEX",
   "genesis_pubkey": "${GOSSIP[0]}",

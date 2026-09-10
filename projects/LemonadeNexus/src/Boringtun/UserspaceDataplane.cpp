@@ -446,17 +446,17 @@ std::vector<BoringtunPeer> UserspaceDataplane::snapshot_peers() const {
     out.reserve(peers.size());
     const auto now = static_cast<uint64_t>(std::time(nullptr));
     for (const auto& peer : peers) {
-        BoringtunPeer wg;
-        wg.public_key           = peer->pubkey_b64;
-        wg.allowed_ips          = peer->allowed_ips;
-        wg.endpoint             = endpoint_to_string(peer->endpoint.load(std::memory_order_relaxed));
-        wg.persistent_keepalive = peer->keepalive;
+        BoringtunPeer snapshot;
+        snapshot.public_key           = peer->pubkey_b64;
+        snapshot.allowed_ips          = peer->allowed_ips;
+        snapshot.endpoint             = endpoint_to_string(peer->endpoint.load(std::memory_order_relaxed));
+        snapshot.persistent_keepalive = peer->keepalive;
         auto st = wireguard_stats(peer->tunn);
         if (st.time_since_last_handshake >= 0)
-            wg.last_handshake = now - static_cast<uint64_t>(st.time_since_last_handshake);
-        wg.rx_bytes = st.rx_bytes;
-        wg.tx_bytes = st.tx_bytes;
-        out.push_back(std::move(wg));
+            snapshot.last_handshake = now - static_cast<uint64_t>(st.time_since_last_handshake);
+        snapshot.rx_bytes = st.rx_bytes;
+        snapshot.tx_bytes = st.tx_bytes;
+        out.push_back(std::move(snapshot));
     }
     return out;
 }
@@ -647,7 +647,7 @@ void UserspaceDataplane::route_decrypted(std::span<const uint8_t> ip_pkt,
     auto dst_ip = wire::ipv4::dst_addr(ip_pkt);
     if (!src_ip || !dst_ip) return;
 
-    // Cryptokey routing source check (kernel-WG parity): the inner source
+    // Cryptokey routing source check: the inner source
     // address must be inside the sending peer's allowed IPs, or a peer could
     // spoof traffic from addresses it does not own.
     bool src_allowed = false;

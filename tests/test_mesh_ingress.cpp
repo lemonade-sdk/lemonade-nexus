@@ -2,7 +2,7 @@
 // service into the mesh via BoringtunMesh::tcp_ingress (the sidecar pattern —
 // "expose lemond's port to my other devices"), and node B reaches it through
 // tcp_egress. Both ends are fully userspace; the only real sockets are
-// loopback TCP and the two WG/UDP sockets.
+// loopback TCP and the two encrypted mesh UDP sockets.
 
 #include <gtest/gtest.h>
 
@@ -61,7 +61,7 @@ TEST(MeshIngress, ExposedServiceReachableFromPeer) {
 
     // A needs B as a peer for the return path
     lnsdk::MeshPeer bp;
-    bp.wg_pubkey = b_keys.second;
+    bp.mesh_pubkey = b_keys.second;
     bp.tunnel_ip = "10.64.0.3/32";
     bp.endpoint  = "127.0.0.1:" + std::to_string(b.bound_port());
     ASSERT_TRUE(a.sync_peers({bp}).ok);

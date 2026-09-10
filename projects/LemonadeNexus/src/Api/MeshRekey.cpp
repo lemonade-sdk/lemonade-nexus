@@ -10,11 +10,11 @@
 
 namespace nexus::api {
 
-std::string normalize_mesh_pubkey(std::string_view wg_pubkey) {
+std::string normalize_mesh_pubkey(std::string_view mesh_pubkey) {
     constexpr std::string_view ed_prefix = "ed25519:";
-    if (!wg_pubkey.starts_with(ed_prefix)) return std::string(wg_pubkey);
+    if (!mesh_pubkey.starts_with(ed_prefix)) return std::string(mesh_pubkey);
     try {
-        auto ed_bytes = crypto::from_base64(wg_pubkey.substr(ed_prefix.size()));
+        auto ed_bytes = crypto::from_base64(mesh_pubkey.substr(ed_prefix.size()));
         if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
             crypto::Ed25519PublicKey ed_pk{};
             std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
@@ -22,23 +22,24 @@ std::string normalize_mesh_pubkey(std::string_view wg_pubkey) {
             return crypto::to_base64(std::span<const uint8_t>(x_pk.data(), x_pk.size()));
         }
     } catch (...) {}
-    return std::string(wg_pubkey);
+    return std::string(mesh_pubkey);
 }
 
 MeshRekeyPlan plan_mesh_rekey(std::string_view prev_ip, std::string_view new_ip,
-                              std::string_view prev_wg, std::string_view new_wg) {
+                              std::string_view prev_mesh_pubkey,
+                              std::string_view new_mesh_pubkey) {
     MeshRekeyPlan plan;
-    plan.new_peer_key = normalize_mesh_pubkey(new_wg);
+    plan.new_peer_key = normalize_mesh_pubkey(new_mesh_pubkey);
 
     // Rewrite the stored node when the IP OR the key changed. The old code
     // updated only on an IP change, so a re-join (same IP) with a rotated key
-    // left a stale wg_pubkey on the node.
-    plan.update_node = (prev_ip != new_ip) || (prev_wg != new_wg);
+    // left a stale mesh public key on the node.
+    plan.update_node = (prev_ip != new_ip) || (prev_mesh_pubkey != new_mesh_pubkey);
 
     // Drop the previous dataplane peer when the key actually rotated — compared
     // on the normalized (Curve25519) key, since that is what the dataplane uses.
-    if (!prev_wg.empty()) {
-        auto prev_key = normalize_mesh_pubkey(prev_wg);
+    if (!prev_mesh_pubkey.empty()) {
+        auto prev_key = normalize_mesh_pubkey(prev_mesh_pubkey);
         if (prev_key != plan.new_peer_key) {
             plan.remove_stale_peer = true;
             plan.stale_peer_key = prev_key;
@@ -57,16 +58,15 @@ std::string identity_mesh_pubkey(std::string_view identity_pubkey) {
     return converted == prefixed ? std::string{} : converted;
 }
 
-std::optional<std::string> wg_claim_refusal(const tree::PermissionTreeService& tree,
-                                            std::string_view claimed,
-                                            const std::string& node_id,
-                                            const std::string& identity_pubkey) {
+std::optional<std::string> mesh_key_claim_refusal(
+    const tree::PermissionTreeService& tree, std::string_view claimed,
+    const std::string& node_id, const std::string& identity_pubkey) {
     if (claimed.empty()) {
         return std::nullopt;
     }
-    const auto owner = wg_pubkey_owner(tree, claimed);
+    const auto owner = mesh_pubkey_owner(tree, claimed);
     if (owner.has_value() && *owner != node_id) {
-        return "wireguard key is bound to another node";
+        return "mesh key is bound to another node";
     }
     const std::string normalized = normalize_mesh_pubkey(claimed);
     if (!normalized.empty() && normalized == identity_mesh_pubkey(identity_pubkey)) {
@@ -83,26 +83,26 @@ std::optional<std::string> wg_claim_refusal(const tree::PermissionTreeService& t
             }
             const std::string bound = identity_mesh_pubkey(node.mgmt_pubkey);
             if (!bound.empty() && bound == normalized) {
-                return "wireguard key is the identity-bound static of another node";
+                return "mesh key is the identity-bound key of another node";
             }
         }
     }
     return std::nullopt;
 }
 
-std::optional<std::string> wg_pubkey_owner(const tree::PermissionTreeService& tree,
-                                           std::string_view wg_pubkey) {
-    if (wg_pubkey.empty()) {
+std::optional<std::string> mesh_pubkey_owner(const tree::PermissionTreeService& tree,
+                                             std::string_view mesh_pubkey) {
+    if (mesh_pubkey.empty()) {
         return std::nullopt;
     }
-    const std::string want = normalize_mesh_pubkey(wg_pubkey);
+    const std::string want = normalize_mesh_pubkey(mesh_pubkey);
     for (const auto type : {tree::NodeType::Endpoint, tree::NodeType::Relay,
                             tree::NodeType::Root, tree::NodeType::Customer}) {
         for (const auto& node : tree.get_nodes_by_type(type)) {
-            if (node.wg_pubkey.empty()) {
+            if (node.mesh_pubkey.empty()) {
                 continue;
             }
-            if (normalize_mesh_pubkey(node.wg_pubkey) == want) {
+            if (normalize_mesh_pubkey(node.mesh_pubkey) == want) {
                 return node.id;
             }
         }

@@ -53,10 +53,10 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
     // persists as --root-pubkey. (Issuance is gated on being the root holder, so
     // these coincide, but the anchor is the authoritative source.)
     bundle["root_pubkey"] = ctx_.config.root_pubkey;
-    // Server mesh WG pubkey (X25519), for the candidate's optional handshake probe.
+    // Server mesh public key (X25519), for the candidate's optional handshake probe.
     if (auto pk = ctx_.key_wrapping.load_identity_pubkey()) {
         auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*pk);
-        bundle["wg_server_pubkey"] = crypto::to_base64(
+        bundle["mesh_server_pubkey"] = crypto::to_base64(
             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
     }
 
@@ -78,7 +78,7 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
     bundle["seed_peers"] = seeds;
 
     if (!ctx_.server_public_ip.empty())
-        bundle["wg_endpoint"] =
+        bundle["mesh_endpoint"] =
             ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
     // Lets the candidate seed the address it actually reached us on, which may
     // differ from our self-detected public IP (multihomed/NAT'd genesis).

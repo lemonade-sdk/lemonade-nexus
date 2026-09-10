@@ -69,7 +69,7 @@ ln_free(auth_json);
 // Join network
 char* join_json = NULL;
 ln_join_network(client, &join_json);
-// join_json contains: tunnel_ip, node_id, wg_endpoint, etc.
+// join_json contains: tunnel_ip, node_id, mesh_endpoint, etc.
 // The mesh dataplane is brought up automatically during join.
 ln_free(join_json);
 
@@ -142,8 +142,8 @@ The join flow is composite — one call does everything:
 | `tunnel_ip` | `10.64.0.10/32` | Your mesh tunnel IP |
 | `server_tunnel_ip` | `10.64.0.1` | Server's tunnel IP |
 | `server_private_fqdn` | `private.<id>.<region>.seip.<domain>` | Server's private HTTPS hostname |
-| `wg_server_pubkey` | `base64...` | Server's mesh X25519 key |
-| `wg_endpoint` | `67.x.x.x:51940` | Server's mesh endpoint |
+| `mesh_server_pubkey` | `base64...` | Server's mesh X25519 key |
+| `mesh_endpoint` | `67.x.x.x:51940` | Server's mesh endpoint |
 
 After joining, private API calls (tree, IPAM, mesh) route through HTTPS over the mesh tunnel via the `server_private_fqdn`.
 

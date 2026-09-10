@@ -2,7 +2,7 @@
 // (nexus::api::plan_mesh_rekey / normalize_mesh_pubkey).
 //
 // A client that rotates its boringtun key on re-join must (a) have its stored
-// wg_pubkey rewritten even though the tunnel IP is unchanged, and (b) have its
+// mesh_pubkey rewritten even though the tunnel IP is unchanged, and (b) have its
 // previous dataplane peer dropped before the new one is added — otherwise the
 // stale peer's allowed_ips route shadows the new key and the tunnel dies after
 // the first session. The buggy prior behavior updated the node only on an IP
@@ -96,12 +96,13 @@ TEST(MeshRekeyPlan, EquivalentKeysAcrossFormatsDoNotRemovePeer) {
     crypto.start();
     auto kp = crypto.ed25519_keygen();
 
-    auto prev_wg = "ed25519:" + b64(kp.public_key);  // stored in prefixed form
-    auto new_wg = b64(nexus::crypto::SodiumCryptoService::ed25519_pk_to_x25519(kp.public_key));
+    auto previous_mesh_key = "ed25519:" + b64(kp.public_key);  // stored in prefixed form
+    auto new_mesh_key = b64(nexus::crypto::SodiumCryptoService::ed25519_pk_to_x25519(kp.public_key));
 
-    auto plan = plan_mesh_rekey("10.64.0.11", "10.64.0.11", prev_wg, new_wg);
+    auto plan = plan_mesh_rekey(
+        "10.64.0.11", "10.64.0.11", previous_mesh_key, new_mesh_key);
     EXPECT_FALSE(plan.remove_stale_peer);  // same dataplane key -> not stale
-    EXPECT_EQ(plan.new_peer_key, new_wg);
+    EXPECT_EQ(plan.new_peer_key, new_mesh_key);
 }
 
 // The ownership lookup the join and update handlers gate on: equivalence is
@@ -114,10 +115,10 @@ TEST(MeshRekeyPlan, EquivalentKeysAcrossFormatsDoNotRemovePeer) {
 #include <filesystem>
 #include <unistd.h>
 
-TEST(WgPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
+TEST(MeshPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
     namespace fs = std::filesystem;
     const fs::path dir =
-        fs::temp_directory_path() / ("nexus_wg_owner_" + std::to_string(::getpid()));
+        fs::temp_directory_path() / ("nexus_mesh_owner_" + std::to_string(::getpid()));
     fs::create_directories(dir);
     nexus::crypto::SodiumCryptoService crypto;
     crypto.start();
@@ -139,19 +140,19 @@ TEST(WgPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
     node.id = "owner_node";
     node.parent_id = "root";
     node.type = nexus::tree::NodeType::Endpoint;
-    node.wg_pubkey = prefixed;
+    node.mesh_pubkey = prefixed;
     ASSERT_TRUE(tree.insert_join_node(node));
 
     // The raw X25519 spelling of the same key names the same owner.
     const auto normalized = nexus::api::normalize_mesh_pubkey(prefixed);
     ASSERT_NE(normalized, prefixed);
-    const auto owner = nexus::api::wg_pubkey_owner(tree, normalized);
+    const auto owner = nexus::api::mesh_pubkey_owner(tree, normalized);
     ASSERT_TRUE(owner.has_value());
     EXPECT_EQ(*owner, "owner_node");
-    EXPECT_EQ(nexus::api::wg_pubkey_owner(tree, prefixed).value_or(""), "owner_node");
+    EXPECT_EQ(nexus::api::mesh_pubkey_owner(tree, prefixed).value_or(""), "owner_node");
 
     // An unclaimed key has no owner.
-    EXPECT_FALSE(nexus::api::wg_pubkey_owner(
+    EXPECT_FALSE(nexus::api::mesh_pubkey_owner(
                      tree, "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD=")
                      .has_value());
 
@@ -165,10 +166,10 @@ TEST(WgPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
 // Ed25519 identity. Claiming your own bound form is possession proved
 // transitively through the challenge; claiming ANOTHER enrolled identity's
 // bound form is a squat and is refused before any registration.
-TEST(WgClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
+TEST(MeshKeyClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
     namespace fs = std::filesystem;
     const fs::path dir =
-        fs::temp_directory_path() / ("nexus_wg_claim_" + std::to_string(::getpid()));
+        fs::temp_directory_path() / ("nexus_mesh_claim_" + std::to_string(::getpid()));
     fs::create_directories(dir);
     nexus::crypto::SodiumCryptoService crypto;
     crypto.start();
@@ -187,7 +188,7 @@ TEST(WgClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
     root.type = nexus::tree::NodeType::Root;
     ASSERT_TRUE(tree.insert_join_node(root));
     // The victim is enrolled (its identity is on its node) but has not yet
-    // registered any wg static.
+    // registered any mesh transport static.
     nexus::tree::TreeNode victim_node;
     victim_node.id = "victim";
     victim_node.parent_id = "root";
@@ -200,19 +201,19 @@ TEST(WgClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
 
     // The attacker cannot first-register the victim's identity-bound static.
     const auto squat =
-        nexus::api::wg_claim_refusal(tree, victim_bound, "attacker", attacker_id);
+        nexus::api::mesh_key_claim_refusal(tree, victim_bound, "attacker", attacker_id);
     ASSERT_TRUE(squat.has_value());
 
     // The victim's own bound claim proceeds, and so does the attacker's own.
-    EXPECT_FALSE(nexus::api::wg_claim_refusal(tree, victim_bound, "victim", victim_id)
+    EXPECT_FALSE(nexus::api::mesh_key_claim_refusal(tree, victim_bound, "victim", victim_id)
                      .has_value());
     const std::string attacker_bound = nexus::api::identity_mesh_pubkey(attacker_id);
     EXPECT_FALSE(
-        nexus::api::wg_claim_refusal(tree, attacker_bound, "attacker", attacker_id)
+        nexus::api::mesh_key_claim_refusal(tree, attacker_bound, "attacker", attacker_id)
             .has_value());
 
     // A legacy opaque static is still accepted — and once registered, owned.
-    EXPECT_FALSE(nexus::api::wg_claim_refusal(
+    EXPECT_FALSE(nexus::api::mesh_key_claim_refusal(
                      tree, "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE=", "attacker",
                      attacker_id)
                      .has_value());
@@ -226,7 +227,7 @@ TEST(WgClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
 // The cross-component contract of the SDK cutover: the client's
 // identity-bound static (sk -> curve25519, then scalarmult base) is exactly
 // the key the server derives from the authenticated identity's PUBLIC half.
-TEST(WgClaimRefusal, ClientAndServerDeriveTheSameIdentityBoundStatic) {
+TEST(MeshKeyClaimRefusal, ClientAndServerDeriveTheSameIdentityBoundStatic) {
     nexus::crypto::SodiumCryptoService crypto;
     crypto.start();
     const auto identity = crypto.ed25519_keygen();

@@ -75,3 +75,15 @@ TEST_F(ConfigDiscovery, AReadableDirectoryWithNoConfigStillLoadsDefaults) {
         EXPECT_FALSE(config.data_root.empty());
     });
 }
+
+TEST(ServerConfigJson, MeshInterfaceAcceptsLegacyNameAndPrefersCurrentName) {
+    nexus::core::ServerConfig legacy;
+    nexus::core::from_json(nlohmann::json{{"wg_interface", "legacy0"}}, legacy);
+    EXPECT_EQ(legacy.mesh_interface, "legacy0");
+
+    nexus::core::ServerConfig current;
+    nexus::core::from_json(
+        nlohmann::json{{"mesh_interface", "mesh0"}, {"wg_interface", "legacy0"}},
+        current);
+    EXPECT_EQ(current.mesh_interface, "mesh0");
+}

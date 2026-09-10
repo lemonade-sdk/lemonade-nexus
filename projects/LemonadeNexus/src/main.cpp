@@ -536,7 +536,7 @@ int main(int argc, char* argv[]) {
     // boringtun interface — server-side tunnel endpoint
     // ========================================================================
     nexus::boringtun::BoringtunService boringtun_service{
-        config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
+        config.mesh_interface, std::filesystem::path{config.data_root} / "wireguard"};
     boringtun_service.start();
 
     // In-process traffic termination: the userspace netstack answers on our
@@ -551,21 +551,21 @@ int main(int argc, char* argv[]) {
     });
 
     // Derive Curve25519 keypair from Ed25519 identity for the mesh
-    std::string wg_server_privkey_b64;
+    std::string mesh_server_private_key_b64;
     if (root_privkey) {
         auto x_sk = nexus::crypto::SodiumCryptoService::ed25519_sk_to_x25519(*root_privkey);
-        wg_server_privkey_b64 = nexus::crypto::to_base64(
+        mesh_server_private_key_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(x_sk.data(), x_sk.size()));
     }
 
     // Set up the boringtun interface with the server's tunnel IP
-    if (!wg_server_privkey_b64.empty() && !tunnel_bind_ip.empty()) {
-        nexus::boringtun::BoringtunInterfaceConfig wg_iface;
-        wg_iface.private_key = wg_server_privkey_b64;
-        wg_iface.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
-        wg_iface.listen_port = config.udp_port;
+    if (!mesh_server_private_key_b64.empty() && !tunnel_bind_ip.empty()) {
+        nexus::boringtun::BoringtunInterfaceConfig mesh_interface_config;
+        mesh_interface_config.private_key = mesh_server_private_key_b64;
+        mesh_interface_config.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
+        mesh_interface_config.listen_port = config.udp_port;
 
-        if (boringtun_service.setup_interface(wg_iface, {})) {
+        if (boringtun_service.setup_interface(mesh_interface_config, {})) {
             // The netstack answers on our tunnel IP across the whole client plane.
             vnet.add_local_ip(tunnel_bind_ip + "/10");
             spdlog::info("boringtun: userspace dataplane up on :{} with tunnel IP {}/10",
@@ -575,21 +575,22 @@ int main(int argc, char* argv[]) {
                           "clients will not be able to connect.", config.udp_port);
         }
     } else {
-        spdlog::warn("boringtun: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
+        spdlog::warn("boringtun: skipping {} setup (no identity key or tunnel IP)",
+                     config.mesh_interface);
     }
 
     // ========================================================================
     // Backbone: server-to-server boringtun mesh (172.16.0.0/22)
     // ========================================================================
     std::string backbone_ip;
-    std::string wg_server_pubkey_b64;
+    std::string mesh_server_public_key_b64;
     if (root_pubkey) {
         auto x_pk = nexus::crypto::SodiumCryptoService::ed25519_pk_to_x25519(*root_pubkey);
-        wg_server_pubkey_b64 = nexus::crypto::to_base64(
+        mesh_server_public_key_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
     }
 
-    if (!server_node_id.empty() && !wg_server_pubkey_b64.empty()) {
+    if (!server_node_id.empty() && !mesh_server_public_key_b64.empty()) {
         auto ed25519_pubkey_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
 
@@ -606,10 +607,10 @@ int main(int argc, char* argv[]) {
             spdlog::info("Backbone: registered virtual {}/22", backbone_ip_bare);
         }
 
-        // Wire gossip with WG service and backbone info
+        // Give gossip the mesh dataplane and backbone identity.
         gossip.set_boringtun(&boringtun_service);
         gossip.set_our_backbone_ip(backbone_ip_bare);
-        gossip.set_our_wg_pubkey(wg_server_pubkey_b64);
+        gossip.set_our_mesh_pubkey(mesh_server_public_key_b64);
 
         // Set up IPAM callback to broadcast backbone allocations via gossip
         ipam.set_backbone_callback(
@@ -617,10 +618,10 @@ int main(int argc, char* argv[]) {
                 gossip.broadcast_backbone_ipam_delta(delta);
             });
 
-        spdlog::info("Backbone: server mesh on 172.16.0.0/22, our IP: {}, WG pubkey: {}",
-                      backbone_ip_bare, wg_server_pubkey_b64.substr(0, 12) + "...");
+        spdlog::info("Backbone: server mesh on 172.16.0.0/22, our IP: {}, mesh public key: {}",
+                      backbone_ip_bare, mesh_server_public_key_b64.substr(0, 12) + "...");
     } else {
-        spdlog::warn("Backbone: skipping (no server node ID or WG key)");
+        spdlog::warn("Backbone: skipping (no server node ID or mesh key)");
     }
 
     // ========================================================================

@@ -1555,8 +1555,8 @@ void GossipService::set_ipam(ipam::IPAMService* ipam) {
     ipam_ = ipam;
 }
 
-void GossipService::set_boringtun(boringtun::BoringtunService* wg) {
-    boringtun_ = wg;
+void GossipService::set_boringtun(boringtun::BoringtunService* dataplane) {
+    boringtun_ = dataplane;
 }
 
 std::string GossipService::our_tunnel_ip() const {
@@ -1564,20 +1564,20 @@ std::string GossipService::our_tunnel_ip() const {
     return our_tunnel_ip_;
 }
 
-void GossipService::try_add_backbone_wg_peer(const GossipPeer& peer) {
-    if (!boringtun_ || peer.wg_pubkey.empty() || peer.backbone_ip.empty()) return;
+void GossipService::try_add_backbone_mesh_peer(const GossipPeer& peer) {
+    if (!boringtun_ || peer.mesh_pubkey.empty() || peer.backbone_ip.empty()) return;
 
-    // Build the backbone endpoint: use the peer's public endpoint IP + WG port (51940)
-    std::string wg_endpoint;
+    // Build the backbone endpoint from the peer's public address and mesh UDP port.
+    std::string mesh_endpoint;
     auto colon = peer.endpoint.rfind(':');
     if (colon != std::string::npos) {
         // Extract the IP from the gossip endpoint "ip:9102" and use port 51940
-        wg_endpoint = peer.endpoint.substr(0, colon) + ":51940";
+        mesh_endpoint = peer.endpoint.substr(0, colon) + ":51940";
     }
 
-    if (boringtun_->add_peer(peer.wg_pubkey, peer.backbone_ip + "/32", wg_endpoint)) {
-        spdlog::info("[{}] added backbone WG peer {} ({}) endpoint={}",
-                      name(), peer.backbone_ip, peer.pubkey.substr(0, 12), wg_endpoint);
+    if (boringtun_->add_peer(peer.mesh_pubkey, peer.backbone_ip + "/32", mesh_endpoint)) {
+        spdlog::info("[{}] added backbone mesh peer {} ({}) endpoint={}",
+                      name(), peer.backbone_ip, peer.pubkey.substr(0, 12), mesh_endpoint);
     }
 }
 
@@ -1771,7 +1771,7 @@ void GossipService::handle_backbone_ipam_sync(
                 }
             }
 
-            // If allocate operation, try to add as WG peer
+            // If allocate operation, try to add it as a mesh peer.
             if (delta.operation == "allocate") {
                 // Find the peer in our list and update backbone_ip
                 for (auto& peer : peers_) {
@@ -1782,7 +1782,7 @@ void GossipService::handle_backbone_ipam_sync(
                         if (slash != std::string::npos) {
                             peer.backbone_ip = peer.backbone_ip.substr(0, slash);
                         }
-                        try_add_backbone_wg_peer(peer);
+                        try_add_backbone_mesh_peer(peer);
                         break;
                     }
                 }

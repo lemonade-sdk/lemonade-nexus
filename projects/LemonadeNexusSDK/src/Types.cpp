@@ -56,7 +56,7 @@ void to_json(json& j, const TreeNode& n) {
         {"shared_domain",            n.shared_domain},
         {"mgmt_pubkey",              n.mgmt_pubkey},
         {"wrapped_mgmt_privkey",     n.wrapped_mgmt_privkey},
-        {"wg_pubkey",                n.wg_pubkey},
+        {"mesh_pubkey",              n.mesh_pubkey},
         {"assignments",              n.assignments},
         {"signature",                n.signature},
         {"listen_endpoint",          n.listen_endpoint},
@@ -80,7 +80,7 @@ void from_json(const json& j, TreeNode& n) {
     n.shared_domain            = j.value("shared_domain", "");
     n.mgmt_pubkey              = j.value("mgmt_pubkey", "");
     n.wrapped_mgmt_privkey     = j.value("wrapped_mgmt_privkey", "");
-    n.wg_pubkey                = j.value("wg_pubkey", "");
+    n.mesh_pubkey              = j.value("mesh_pubkey", j.value("wg_pubkey", ""));
     if (j.contains("assignments") && j["assignments"].is_array()) {
         j["assignments"].get_to(n.assignments);
     }
@@ -120,7 +120,11 @@ void from_json(const json& j, TreeDelta& d) {
 
 std::string canonical_delta_json(const TreeDelta& delta) {
     json j;
-    j["node_data"]      = delta.node_data;
+    json node_data = delta.node_data;
+    // Existing delta signatures cover this historical field label.
+    node_data["wg_pubkey"] = node_data["mesh_pubkey"];
+    node_data.erase("mesh_pubkey");
+    j["node_data"]      = std::move(node_data);
     j["operation"]      = delta.operation;
     j["signer_pubkey"]  = delta.signer_pubkey;
     j["target_node_id"] = delta.target_node_id;
@@ -262,7 +266,7 @@ void to_json(json& j, const MeshPeer& p) {
     j = json{
         {"node_id",        p.node_id},
         {"hostname",       p.hostname},
-        {"wg_pubkey",      p.wg_pubkey},
+        {"mesh_pubkey",    p.mesh_pubkey},
         {"tunnel_ip",      p.tunnel_ip},
         {"private_subnet", p.private_subnet},
         {"endpoint",       p.endpoint},
@@ -280,7 +284,7 @@ void to_json(json& j, const MeshPeer& p) {
 void from_json(const json& j, MeshPeer& p) {
     p.node_id        = j.value("node_id", "");
     p.hostname       = j.value("hostname", "");
-    p.wg_pubkey      = j.value("wg_pubkey", "");
+    p.mesh_pubkey    = j.value("mesh_pubkey", j.value("wg_pubkey", ""));
     p.tunnel_ip      = j.value("tunnel_ip", "");
     p.private_subnet = j.value("private_subnet", "");
     p.endpoint       = j.value("endpoint", "");

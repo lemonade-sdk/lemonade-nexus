@@ -72,7 +72,7 @@ class TreeNode {
   final String? tunnelIp;
   final String? privateSubnet;
   final String? mgmtPubkey;
-  final String? wgPubkey;
+  final String? meshPubkey;
   final List<NodeAssignment>? assignments;
   final String? region;
   final String? listenEndpoint;
@@ -90,7 +90,7 @@ class TreeNode {
     this.tunnelIp,
     this.privateSubnet,
     this.mgmtPubkey,
-    this.wgPubkey,
+    this.meshPubkey,
     this.assignments,
     this.region,
     this.listenEndpoint,
@@ -428,7 +428,7 @@ class TunnelStatus {
 class MeshPeer {
   final String nodeId;
   final String? hostname;
-  final String wgPubkey;
+  final String meshPubkey;
   final String? tunnelIp;
   final String? privateSubnet;
   final String? endpoint;
@@ -443,7 +443,7 @@ class MeshPeer {
   MeshPeer({
     required this.nodeId,
     this.hostname,
-    required this.wgPubkey,
+    required this.meshPubkey,
     this.tunnelIp,
     this.privateSubnet,
     this.endpoint,
@@ -465,7 +465,7 @@ class MeshPeer {
   factory MeshPeer.fromJson(Map<String, dynamic> json) => MeshPeer(
         nodeId: (json['node_id'] ?? '').toString(),
         hostname: json['hostname']?.toString(),
-        wgPubkey: (json['wg_pubkey'] ?? '').toString(),
+        meshPubkey: (json['mesh_pubkey'] ?? json['wg_pubkey'] ?? '').toString(),
         tunnelIp: json['tunnel_ip']?.toString(),
         privateSubnet: json['private_subnet']?.toString(),
         endpoint: json['endpoint']?.toString(),

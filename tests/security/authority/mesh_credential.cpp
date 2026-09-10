@@ -54,7 +54,7 @@ MeshCredentialGrant base_grant(const NetworkId& network) {
     g.operation = CredentialOperation::Issue;
     g.subject_pubkey = "c3ViamVjdA==";
     g.subject_server_id = "srv-east-1";
-    g.subject_wg_pubkey = "d2dwdWJrZXk=";
+    g.subject_mesh_pubkey = "d2dwdWJrZXk=";
     g.platform_class = "";  // plain Tier 2
     g.issued_at = 1000;
     g.expires_at = 0;
@@ -98,7 +98,7 @@ TEST_F(MeshCredentialTest, EveryBoundFieldIsSigned) {
     const Digest base = mesh_credential_digest(base_grant(network));
     EXPECT_NE(mutate([](auto& x) { x.subject_pubkey = "b3RoZXI="; }), base);
     EXPECT_NE(mutate([](auto& x) { x.subject_server_id = "srv-west-9"; }), base);
-    EXPECT_NE(mutate([](auto& x) { x.subject_wg_pubkey = "b3RoZXJ3Zw=="; }), base);
+    EXPECT_NE(mutate([](auto& x) { x.subject_mesh_pubkey = "b3RoZXJ3Zw=="; }), base);
     EXPECT_NE(mutate([](auto& x) { x.platform_class = "snp-vtpm"; }), base);
     EXPECT_NE(mutate([](auto& x) { x.expected_measurement = "aa"; }), base);
     EXPECT_NE(mutate([](auto& x) { x.approved_binary_hash = "bb"; }), base);
@@ -168,7 +168,7 @@ TEST_F(MeshCredentialTest, RevocationIsAMeshAuthorizedGrant) {
 
     auto revoke = base_grant(network);
     revoke.operation = CredentialOperation::Revoke;
-    revoke.subject_wg_pubkey.clear();
+    revoke.subject_mesh_pubkey.clear();
     const auto cred = sign_credential(revoke, g);
     EXPECT_EQ(verify_mesh_credential(cred, authority, 2000), MeshCredentialFailure::None);
     EXPECT_EQ(cred.grant.operation, CredentialOperation::Revoke);

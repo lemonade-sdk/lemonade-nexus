@@ -203,9 +203,9 @@ class _NodeDetailViewState extends ConsumerState<NodeDetailView> {
         children: [
           if (node.mgmtPubkey != null)
             _buildKeyRow('Management Key', value: node.mgmtPubkey!),
-          if (node.wgPubkey != null)
-            _buildKeyRow('Mesh Key', value: node.wgPubkey!),
-          if (node.mgmtPubkey == null && node.wgPubkey == null)
+          if (node.meshPubkey != null)
+            _buildKeyRow('Mesh Key', value: node.meshPubkey!),
+          if (node.mgmtPubkey == null && node.meshPubkey == null)
             Text(
               'No keys available.',
               style: TextStyle(

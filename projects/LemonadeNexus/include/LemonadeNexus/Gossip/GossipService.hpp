@@ -75,7 +75,7 @@ public:
     void set_ipam(ipam::IPAMService* ipam);
 
     /// Set the boringtun service for backbone peer provisioning.
-    void set_boringtun(boringtun::BoringtunService* wg);
+    void set_boringtun(boringtun::BoringtunService* dataplane);
 
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
     [[nodiscard]] std::string our_tunnel_ip() const;
@@ -93,8 +93,8 @@ public:
     /// Get our backbone IP.
     [[nodiscard]] std::string our_backbone_ip() const { return our_backbone_ip_; }
 
-    /// Set our WG pubkey for inclusion in ServerHello messages.
-    void set_our_wg_pubkey(const std::string& pubkey) { our_wg_pubkey_ = pubkey; }
+    /// Set our mesh public key for inclusion in ServerHello messages.
+    void set_our_mesh_pubkey(const std::string& pubkey) { our_mesh_pubkey_ = pubkey; }
 
     /// Set the "ip:port" this server is reachable at, carried in ServerHello so
     /// peers share it instead of the UDP source they happen to observe. Call
@@ -120,7 +120,7 @@ public:
     [[nodiscard]] std::vector<NsSlotClaimData> get_ns_slots() const;
 
     /// Try to add a gossip peer as a mesh backbone peer.
-    void try_add_backbone_wg_peer(const GossipPeer& peer);
+    void try_add_backbone_mesh_peer(const GossipPeer& peer);
 
     /// Access this server's Ed25519 identity keypair.
     [[nodiscard]] const crypto::Ed25519Keypair& keypair() const { return keypair_; }
@@ -356,7 +356,7 @@ private:
     boringtun::BoringtunService*     boringtun_{nullptr};
     std::string                      our_tunnel_ip_;     // assigned by peer or self
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
-    std::string                      our_wg_pubkey_;     // base64 X25519
+    std::string                      our_mesh_pubkey_;   // base64 X25519
     std::string                      our_advertised_endpoint_;  // "ip:port" we are reachable at
 
     // Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
