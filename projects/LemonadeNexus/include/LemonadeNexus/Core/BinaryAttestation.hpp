@@ -75,7 +75,7 @@ public:
     /// Empty on any host that cannot measure us (no IMA, no Linux). That is a
     /// refusal, not a fallback: an absent measurement is a failed measurement, and
     /// every gate downstream rejects it.
-    [[nodiscard]] const std::string& measured_hash() const { return measured_hash_; }
+    const std::string& measured_hash() const { return measured_hash_; }
 
     /// Check if a binary hash matches any signed release manifest.
     /// Respects minimum_version — manifests below the floor are rejected.

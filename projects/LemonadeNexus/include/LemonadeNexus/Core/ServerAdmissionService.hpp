@@ -153,12 +153,12 @@ public:
 
     /// Rebuild the signed input from a request body, so the receiver recomputes
     /// exactly the bytes the candidate signed.
-    [[nodiscard]] static RequestInput request_from_claim(const nlohmann::json& claim);
+    static RequestInput request_from_claim(const nlohmann::json& claim);
 
     /// The self-signed claim an onboarding request body carries. Excludes the
     /// evidence bundle (bound by digest, sent alongside) and the enrollment
     /// token (a bearer credential, never part of the signed canonical).
-    [[nodiscard]] static nlohmann::json claim_from_request(const RequestInput& in);
+    static nlohmann::json claim_from_request(const RequestInput& in);
     /// Canonical bytes a candidate signs for status/ack (tag "ln-onboard-poll:v1").
     [[nodiscard]] static std::vector<uint8_t> canonical_poll(const std::string& tag,
                                                              const std::string& request_id,
