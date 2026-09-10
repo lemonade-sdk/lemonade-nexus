@@ -446,17 +446,17 @@ std::vector<BoringtunPeer> UserspaceDataplane::snapshot_peers() const {
     out.reserve(peers.size());
     const auto now = static_cast<uint64_t>(std::time(nullptr));
     for (const auto& peer : peers) {
-        BoringtunPeer wg;
-        wg.public_key           = peer->pubkey_b64;
-        wg.allowed_ips          = peer->allowed_ips;
-        wg.endpoint             = endpoint_to_string(peer->endpoint.load(std::memory_order_relaxed));
-        wg.persistent_keepalive = peer->keepalive;
+        BoringtunPeer snapshot;
+        snapshot.public_key           = peer->pubkey_b64;
+        snapshot.allowed_ips          = peer->allowed_ips;
+        snapshot.endpoint             = endpoint_to_string(peer->endpoint.load(std::memory_order_relaxed));
+        snapshot.persistent_keepalive = peer->keepalive;
         auto st = wireguard_stats(peer->tunn);
         if (st.time_since_last_handshake >= 0)
-            wg.last_handshake = now - static_cast<uint64_t>(st.time_since_last_handshake);
-        wg.rx_bytes = st.rx_bytes;
-        wg.tx_bytes = st.tx_bytes;
-        out.push_back(std::move(wg));
+            snapshot.last_handshake = now - static_cast<uint64_t>(st.time_since_last_handshake);
+        snapshot.rx_bytes = st.rx_bytes;
+        snapshot.tx_bytes = st.tx_bytes;
+        out.push_back(std::move(snapshot));
     }
     return out;
 }
@@ -614,9 +614,12 @@ void UserspaceDataplane::drain_followups(const PeerPtr& peer, uint64_t to_packed
                                          std::vector<uint8_t>& scratch_a,
                                          std::vector<uint8_t>& scratch_b) {
     // After a handshake completes boringtun queues the response/keepalive and
-    // any packets buffered while no session existed.
+    // any packets buffered while no session existed. The empty read must pass
+    // a valid pointer: the FFI builds a Rust slice from it, and a null slice
+    // base is undefined behavior there even at length zero.
+    static constexpr uint8_t kEmpty[1] = {0};
     while (true) {
-        auto r = wireguard_read(peer->tunn, nullptr, 0, scratch_a.data(),
+        auto r = wireguard_read(peer->tunn, kEmpty, 0, scratch_a.data(),
                                 static_cast<uint32_t>(scratch_a.size()));
         if (r.op == WRITE_TO_NETWORK && r.size > 0) {
             send_udp(scratch_a.data(), r.size, to_packed);
@@ -644,7 +647,7 @@ void UserspaceDataplane::route_decrypted(std::span<const uint8_t> ip_pkt,
     auto dst_ip = wire::ipv4::dst_addr(ip_pkt);
     if (!src_ip || !dst_ip) return;
 
-    // Cryptokey routing source check (kernel-WG parity): the inner source
+    // Cryptokey routing source check: the inner source
     // address must be inside the sending peer's allowed IPs, or a peer could
     // spoof traffic from addresses it does not own.
     bool src_allowed = false;

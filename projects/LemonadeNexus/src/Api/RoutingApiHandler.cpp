@@ -151,7 +151,8 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         routing::ConnectionRequestInput in;
         in.client_node_id   = caller_node_id;
         in.client_pubkey    = caller_pubkey;
-        in.client_wg_pub    = body.value("client_wg_pub", std::string{});
+        in.client_mesh_pubkey = body.value(
+            "client_mesh_pubkey", body.value("client_wg_pub", std::string{}));
         in.target_node_id   = target->id;
         in.target_identifier= identifier;
         in.source_ip        = req.remote_addr;
@@ -199,7 +200,8 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         routing::EndpointRegistration reg;
         reg.node_id             = node_id;
         reg.endpoint_identifier = node->endpoint_identifier;
-        reg.wg_pubkey           = body.value("wg_pubkey", node->wg_pubkey);
+        reg.mesh_pubkey = body.value(
+            "mesh_pubkey", body.value("wg_pubkey", node->mesh_pubkey));
         reg.mgmt_pubkey         = node->mgmt_pubkey;
         reg.stun_endpoint       = body.value("stun_endpoint", std::string{});
         reg.source_ip           = req.remote_addr;
@@ -237,7 +239,8 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         routing::EndpointReadyInput in;
         in.connection_id   = body.value("connection_id", std::string{});
         in.endpoint_node_id= node_id;
-        in.endpoint_wg_pub = body.value("endpoint_wg_pub", node->wg_pubkey);
+        in.endpoint_mesh_pubkey = body.value(
+            "endpoint_mesh_pubkey", body.value("endpoint_wg_pub", node->mesh_pubkey));
         in.source_ip       = req.remote_addr;
         if (body.contains("endpoint_candidates") && body["endpoint_candidates"].is_array()) {
             for (auto& c : body["endpoint_candidates"]) {
@@ -289,7 +292,7 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
             {"peer_binding", {                       // M4: root-signed IdentityBinding
                 {"identifier",  d->endpoint_identifier},
                 {"mgmt_pubkey", d->endpoint_mgmt_pubkey},
-                {"wg_pubkey",   d->endpoint_wg_pub},  // the E2E Noise static
+                {"mesh_pubkey", d->endpoint_mesh_pubkey},
                 {"signed",      false},
             }},
             {"endpoint_candidates", candidates_json(d->endpoint_candidates)},
@@ -347,7 +350,8 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         const auto client_node_id = body.value("client_node_id", std::string{});
         const auto identifier     = body.value("identifier", std::string{});
         const auto conn_nonce_b64 = body.value("conn_nonce", std::string{});
-        const auto client_wg_pub  = body.value("client_wg_pub", std::string{});
+        const auto client_mesh_pubkey = body.value(
+            "client_mesh_pubkey", body.value("client_wg_pub", std::string{}));
 
         // (1a) caller must be a known enrolled peer.
         bool known = false;
@@ -389,7 +393,7 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         routing::ConnectionRequestInput in;
         in.client_node_id    = client_node_id;
         in.client_pubkey     = client_pubkey;
-        in.client_wg_pub     = client_wg_pub;
+        in.client_mesh_pubkey = client_mesh_pubkey;
         in.target_node_id    = target->id;
         in.target_identifier = identifier;
         in.source_ip         = req.remote_addr;

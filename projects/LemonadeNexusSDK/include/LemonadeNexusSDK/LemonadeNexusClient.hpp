@@ -139,7 +139,7 @@ public:
     [[nodiscard]] Result<IssuedCertBundle> request_certificate(const std::string& hostname);
 
     /// Decrypt an issued certificate bundle using our Ed25519 identity.
-    /// Performs X25519 DH with the server's ephemeral pubkey, derives AES-256-GCM
+    /// Performs X25519 DH with the server's ephemeral pubkey, derives the AEAD
     /// key via HKDF, and decrypts the private key.
     /// @param bundle The encrypted bundle from request_certificate()
     /// @return Decrypted certificate (fullchain PEM + private key PEM)
@@ -186,7 +186,7 @@ public:
     /// conn_nonce_b64 is a client-chosen 16-byte nonce (base64).
     [[nodiscard]] Result<ConnectionRequestResult> request_endpoint(
         const std::string& identifier, const std::string& conn_nonce_b64,
-        const std::string& client_wg_pub = "",
+        const std::string& client_mesh_pubkey = "",
         const std::vector<std::string>& candidates = {});
 
     /// POST /api/routing/connect — fetch the directive once the endpoint is ready.
@@ -202,12 +202,12 @@ public:
     /// POST /api/routing/endpoint/register — returns any pending connection ids.
     [[nodiscard]] Result<nlohmann::json> routing_register_endpoint(
         const std::string& cpu_id, const std::string& net_mac,
-        const std::string& wg_pubkey, const std::string& stun_endpoint = "");
+        const std::string& mesh_pubkey, const std::string& stun_endpoint = "");
 
     /// POST /api/routing/endpoint/ready — signal readiness for a connection.
     [[nodiscard]] Result<nlohmann::json> routing_endpoint_ready(
         const std::string& connection_id, const std::string& cpu_id,
-        const std::string& net_mac, const std::string& endpoint_wg_pub = "",
+        const std::string& net_mac, const std::string& endpoint_mesh_pubkey = "",
         const std::vector<std::string>& candidates = {});
 
     // -----------------------------------------------------------------

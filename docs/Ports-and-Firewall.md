@@ -21,7 +21,8 @@ title: Ports and Firewall
 | **9102** | UDP | Inbound | Mesh servers | Gossip protocol (state sync, IPAM, NS slots) |
 | **3478** | UDP | Inbound | Mesh servers | STUN (NAT traversal, external IP discovery) |
 | **9103** | UDP | Inbound | Mesh servers | Relay (forwarded mesh traffic) |
-| **53** | UDP | Inbound | Any | Authoritative DNS (NAT to 5353 on server) |
+| **53** | UDP | Inbound | Any | Authoritative DNS (NAT to 5335 on server) |
+| **53** | TCP | Inbound | Any | Authoritative DNS (NAT to 5335 on server) — required, not optional |
 | **9101** | TCP | N/A | Mesh tunnel only | Private HTTPS API (not externally exposed) |
 
 > **9100/tcp**, **51940/udp**, and **51941/udp** must allow ANY source — clients connect from unknown IPs. Gossip and STUN can be restricted to known mesh server IPs.
@@ -40,8 +41,22 @@ iptables -A INPUT -p udp --dport 3478 -j ACCEPT   # STUN
 
 # Optional
 iptables -A INPUT -p udp --dport 9103 -j ACCEPT   # Relay
+
+# Required for Genesis/bootstrap and authoritative DNS
 iptables -A INPUT -p udp --dport 53 -j ACCEPT     # DNS
+iptables -A INPUT -p tcp --dport 53 -j ACCEPT     # DNS over TCP
+
+# Public 53 -> the unprivileged port the server actually binds. Both transports.
+# -i pins this to the external interface so the loopback stub resolver on
+# 127.0.0.53:53 is not captured.
+iptables -t nat -A PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-port 5335
+iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 53 -j REDIRECT --to-port 5335
 ```
+
+On a packaged install, `nexus-bootstrap --install-dns-nat` does the same in its
+own nftables table (`inet nexus-dns`) behind `nexus-dns-nat.service`, so it can
+be inspected with `nft list table inet nexus-dns` and removed with
+`systemctl disable --now nexus-dns-nat.service` without disturbing other rules.
 
 ## MikroTik Rules
 
@@ -53,7 +68,8 @@ iptables -A INPUT -p udp --dport 53 -j ACCEPT     # DNS
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9102 comment="FRS-LMND-NXS-GOSSIP"
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=3478 comment="FRS-LMND-NXS-STUN"
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9103 comment="FRS-LMND-NXS-RELAY"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=5353 comment="FRS-LMND-NXS-DNS"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=5335 comment="FRS-LMND-NXS-DNS"
+/ip firewall filter add chain=forward action=accept protocol=tcp dst-address=10.10.12.16 dst-port=5335 comment="FRS-LMND-NXS-DNS-TCP"
 ```
 
 **NAT rules** (public IP: 67.204.56.242 → internal: 10.10.12.16):
@@ -64,7 +80,8 @@ iptables -A INPUT -p udp --dport 53 -j ACCEPT     # DNS
 /ip firewall nat add chain=dstnat action=dst-nat protocol=udp dst-address=67.204.56.242 dst-port=9102 to-addresses=10.10.12.16 to-ports=9102 comment="FRS-LMND-NXS-GOSSIP"
 /ip firewall nat add chain=dstnat action=dst-nat protocol=udp dst-address=67.204.56.242 dst-port=3478 to-addresses=10.10.12.16 to-ports=3478 comment="FRS-LMND-NXS-STUN"
 /ip firewall nat add chain=dstnat action=dst-nat protocol=udp dst-address=67.204.56.242 dst-port=9103 to-addresses=10.10.12.16 to-ports=9103 comment="FRS-LMND-NXS-RELAY"
-/ip firewall nat add chain=dstnat action=dst-nat protocol=udp dst-address=67.204.56.242 dst-port=53 to-addresses=10.10.12.16 to-ports=5353 comment="FRS-LMND-NXS-DNS-NAT"
+/ip firewall nat add chain=dstnat action=dst-nat protocol=udp dst-address=67.204.56.242 dst-port=53 to-addresses=10.10.12.16 to-ports=5335 comment="FRS-LMND-NXS-DNS-NAT"
+/ip firewall nat add chain=dstnat action=dst-nat protocol=tcp dst-address=67.204.56.242 dst-port=53 to-addresses=10.10.12.16 to-ports=5335 comment="FRS-LMND-NXS-DNS-NAT-TCP"
 ```
 
 ## UFW Rules
@@ -76,5 +93,6 @@ ufw allow 51941/udp  # Hole punch
 ufw allow 9102/udp   # Gossip
 ufw allow 3478/udp   # STUN
 ufw allow 9103/udp   # Relay (optional)
-ufw allow 53/udp     # DNS (optional)
+ufw allow 53/udp     # DNS
+ufw allow 53/tcp     # DNS over TCP (required for an authoritative server)
 ```

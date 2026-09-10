@@ -1,0 +1,231 @@
+#!/usr/bin/python3
+"""Prepare a packaged Genesis server; trust configuration stays operator-owned."""
+
+import argparse
+import base64
+from dataclasses import asdict, dataclass
+import ipaddress
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+@dataclass
+class BootstrapConfig:
+    data_root: str
+    dns_port: int = 5335
+    public_dns_port: int = 53
+    log_level: str = "info"
+    acme_provider: str = "letsencrypt"
+    public_ip: str = ""
+    region: str = ""
+    ddns_enabled: bool = False
+    root_pubkey: str = ""
+    genesis_pubkey: str = ""
+    release_signing_pubkey: str = ""
+
+
+def port(value):
+    if not re.fullmatch(r"[0-9]{1,5}", value) or not 1 <= int(value) <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer in 1..65535")
+    return int(value)
+
+
+def public_key(value):
+    try:
+        decoded = (bytes.fromhex(value) if re.fullmatch(r"[0-9a-fA-F]{64}", value)
+                   else base64.b64decode(value, validate=True))
+        if len(decoded) == 32:
+            return value
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("expected a 32-byte Ed25519 public key in hex or base64")
+
+
+def ip_address(value):
+    try:
+        if "%" not in value:
+            return str(ipaddress.ip_address(value))
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError("expected an IPv4 or IPv6 address")
+
+
+def region(value):
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", value):
+        raise argparse.ArgumentTypeError("region must be a lowercase DNS label")
+    return value
+
+
+def interface(value):
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", value) or value in (".", "..", "lo"):
+        raise argparse.ArgumentTypeError("expected an external interface name (1..15 safe characters)")
+    return value
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    key = parser.add_mutually_exclusive_group(required=True)
+    key.add_argument("--release-signing-pubkey", type=public_key)
+    key.add_argument("--test-release-key", action="store_true", help="throwaway meshes only: use the node identity key")
+    parser.add_argument("--public-ip", type=ip_address)
+    parser.add_argument("--log-level", choices=("trace", "debug", "info", "warn", "error"), default="info")
+    parser.add_argument("--acme-provider", choices=("letsencrypt", "letsencrypt_staging", "zerossl"), default="letsencrypt")
+    parser.add_argument("--dns-port", type=port, default=5335)
+    parser.add_argument("--public-dns-port", type=port, default=53)
+    parser.add_argument("--region", type=region)
+    parser.add_argument("--ddns-enabled", action="store_true")
+    parser.add_argument("--install-dns-nat", action="store_true", help="map public DNS to the local port over UDP and TCP using nftables")
+    parser.add_argument("--wan-interface", type=interface)
+    parser.add_argument("--force", action="store_true", help="replace an existing config")
+    args = parser.parse_args(argv)
+    args.public_ip = args.public_ip or ""
+    args.region = args.region or ""
+    args.wan_interface = args.wan_interface or ""
+    if args.dns_port < 1024:
+        parser.error("--dns-port must be unprivileged (1024..65535)")
+    return args
+
+
+def trusted_directory(path, gid):
+    # A protected file is replaceable if any ancestor is writable by the daemon.
+    for ancestor in reversed((path, *path.parents)):
+        if not ancestor.exists() and not ancestor.is_symlink():
+            continue
+        mode = ancestor.lstat()
+        if not stat.S_ISDIR(mode.st_mode):
+            raise ValueError(f"not a real directory: {ancestor}")
+        if ancestor != path and (mode.st_uid != 0 or
+                                 (mode.st_mode & 0o022 and not mode.st_mode & stat.S_ISVTX)):
+            raise ValueError(f"untrusted config ancestor: {ancestor}")
+    path.mkdir(mode=0o750, parents=True, exist_ok=True)
+    os.chown(path, 0, gid)
+    path.chmod(0o750)
+
+
+def write_config(path, config, gid, test_key=False):
+    document = asdict(config)
+    if test_key:
+        document["_release_signing_pubkey_is_a_test_fixture"] = True
+    fd, temporary = tempfile.mkstemp(prefix=".lemonade-nexus.json.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            os.fchown(out.fileno(), 0, gid)
+            os.fchmod(out.fileno(), 0o640)
+            json.dump(document, out, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def run(arguments, **kwargs):
+    return subprocess.run(arguments, check=True, text=True, **kwargs)
+
+
+def dns_nat(args, gid):
+    if args.public_dns_port == args.dns_port:
+        return
+    if not args.install_dns_nat:
+        print(f"Map public {args.public_dns_port}/udp+tcp to local {args.dns_port}, or use --install-dns-nat.")
+        return
+    wan = args.wan_interface
+    if not wan:
+        routes = json.loads(run(["ip", "-j", "route", "show", "default"], capture_output=True).stdout)
+        wan = interface(next((route["dev"] for route in routes if "dev" in route), ""))
+    run(["ip", "link", "show", "dev", wan], capture_output=True)
+    rules = "/usr/lib/lemonade-nexus/nexus-dns-nat.nft"
+    conf = Path("/etc/lemonade-nexus/nexus-dns-nat.conf")
+    trusted_directory(conf.parent, gid)
+    fd, temporary = tempfile.mkstemp(prefix=".nexus-dns-nat.", dir=conf.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(f'define nexus_wan_if = "{wan}"\n'
+                      f'define nexus_public_dns_port = {args.public_dns_port}\n'
+                      f'define nexus_dns_port = {args.dns_port}\n')
+            os.fchmod(out.fileno(), 0o644)
+        previous = conf.read_bytes() if conf.exists() else None
+        os.replace(temporary, conf)
+        try:
+            run(["nft", "-c", "-f", rules])
+        except (OSError, subprocess.CalledProcessError):
+            if previous is None:
+                conf.unlink()
+            else:
+                conf.write_bytes(previous)
+            raise
+        run(["systemctl", "daemon-reload"])
+        run(["systemctl", "enable", "--now", "nexus-dns-nat.service"])
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def bootstrap(args):
+    if os.geteuid() != 0:
+        raise ValueError("must run as root")
+    binary = str(Path(os.environ.get("NEXUS_BIN", "/usr/bin/lemonade-nexus")).absolute())
+    state = Path(os.environ.get("NEXUS_STATE_DIR", "/var/lib/lemonade-nexus")).absolute()
+    data = Path(os.environ.get("NEXUS_DATA_ROOT", str(state / "data"))).absolute()
+    user = os.environ.get("NEXUS_USER", "lemonade-nexus")
+    account = pwd.getpwnam(user)
+    if account.pw_uid == 0:
+        raise ValueError("the runtime user must be unprivileged")
+    target = state / "lemonade-nexus.json"
+    if target.is_symlink() or (target.exists() and not args.force):
+        raise ValueError(f"{target} exists; use --force for a regular config file")
+    if data.parent != state:
+        raise ValueError("data root must be a direct child of the protected state directory")
+    trusted_directory(state, account.pw_gid)
+    if data.is_symlink():
+        raise ValueError("data root must not be a symlink")
+    data.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chown(data, account.pw_uid, account.pw_gid)
+    data.chmod(0o700)
+    config = BootstrapConfig(str(data), args.dns_port, args.public_dns_port,
+                             args.log_level, args.acme_provider, args.public_ip,
+                             args.region, args.ddns_enabled,
+                             release_signing_pubkey=args.release_signing_pubkey or "")
+    # Run native config validation and identity initialization without loading an old config or SP_* overrides.
+    with tempfile.TemporaryDirectory(prefix=".bootstrap-", dir=state) as staging:
+        staging = Path(staging)
+        os.chown(staging, 0, account.pw_gid)
+        staging.chmod(0o750)
+        candidate = staging / "lemonade-nexus.json"
+        write_config(candidate, config, account.pw_gid)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("SP_")}
+        result = run(["runuser", "-u", user, "--", binary, "--config", str(candidate),
+                      "--data-root", str(data), "--first-run"], cwd=state, env=env, capture_output=True)
+        identity = re.search(r"^Identity pubkey: *([0-9a-fA-F]{64})(?:\s|$)", result.stdout, re.MULTILINE)
+        gossip = re.search(r"^Gossip pubkey: *(\S+)", result.stdout, re.MULTILINE)
+        if not identity or not gossip:
+            raise ValueError("could not read public keys from --first-run output")
+        config.root_pubkey = public_key(identity[1])
+        config.genesis_pubkey = public_key(gossip[1])
+        if args.test_release_key:
+            config.release_signing_pubkey = config.root_pubkey
+            print("WARNING: using the node identity as a test release key")
+        write_config(target, config, account.pw_gid, args.test_release_key)
+    dns_nat(args, account.pw_gid)
+    print(f"Wrote {target}; runtime state: {data}")
+    print("Now run: systemctl start lemonade-nexus")
+
+
+def main():
+    try:
+        bootstrap(parse_args())
+    except (OSError, ValueError, KeyError, argparse.ArgumentTypeError, subprocess.CalledProcessError) as error:
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            print(error.stderr, file=sys.stderr)
+        raise SystemExit(f"nexus-bootstrap: {error}")
+
+
+if __name__ == "__main__":
+    main()

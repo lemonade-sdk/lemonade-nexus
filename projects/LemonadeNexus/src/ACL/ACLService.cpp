@@ -129,7 +129,7 @@ uint32_t ACLService::read_perms_locked(std::string_view user_id, std::string_vie
         auto blob_len = sqlite3_column_bytes(stmt, 0);
         if (blob_ptr && blob_len > 0) {
             std::vector<uint8_t> blob(blob_ptr, blob_ptr + blob_len);
-            auto dec = decrypt_perms(blob);
+            auto dec = decrypt_perms(blob, user_id, resource);
             if (dec) result = *dec;
         }
     }
@@ -152,7 +152,7 @@ bool ACLService::write_perms_locked(std::string_view user_id, std::string_view r
         return rc == SQLITE_DONE;
     }
 
-    auto enc = encrypt_perms(perms);
+    auto enc = encrypt_perms(perms, user_id, resource);
     if (enc.empty()) return false;
 
     const char* sql =
@@ -402,15 +402,16 @@ void ACLService::derive_encryption_key() {
         std::span<const uint8_t>{ikm},
         std::span<const uint8_t>{salt_bytes},
         std::span<const uint8_t>{info},
-        crypto::kAesGcmKeySize);
+        crypto::kAeadKeySize);
 
-    if (derived.size() == crypto::kAesGcmKeySize) {
-        std::memcpy(encryption_key_.data(), derived.data(), crypto::kAesGcmKeySize);
+    if (derived.size() == crypto::kAeadKeySize) {
+        std::memcpy(encryption_key_.data(), derived.data(), crypto::kAeadKeySize);
         has_key_ = true;
     }
 }
 
-std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
+std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms, std::string_view user_id,
+                                               std::string_view resource) const {
     if (!has_key_) return {};
 
     std::array<uint8_t, 4> plaintext{};
@@ -419,24 +420,50 @@ std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
     plaintext[2] = static_cast<uint8_t>((perms >> 16) & 0xFF);
     plaintext[3] = static_cast<uint8_t>((perms >> 24) & 0xFF);
 
-    auto ct = crypto_.aes_gcm_encrypt(encryption_key_,
-                                       std::span<const uint8_t>{plaintext});
+    // The row this permission belongs to is authenticated, so a valid blob
+    // lifted out of one row fails in any other.
+    const auto aad = crypto::aead_aad(
+        crypto::aead_purpose::kAclPermissions,
+        {std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(user_id.data()), user_id.size()),
+         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(resource.data()),
+                                  resource.size())});
+    const auto ct = crypto_.aead_encrypt(encryption_key_, std::span<const uint8_t>{plaintext},
+                                         std::span<const uint8_t>{aad});
 
+    // version || nonce || ciphertext. The version leads so a reader names the
+    // construction outright instead of inferring it from a field width.
     std::vector<uint8_t> blob;
-    blob.reserve(ct.nonce.size() + ct.ciphertext.size());
+    blob.reserve(1 + ct.nonce.size() + ct.ciphertext.size());
+    blob.push_back(ct.version);
     blob.insert(blob.end(), ct.nonce.begin(), ct.nonce.end());
     blob.insert(blob.end(), ct.ciphertext.begin(), ct.ciphertext.end());
     return blob;
 }
 
-std::optional<uint32_t> ACLService::decrypt_perms(const std::vector<uint8_t>& blob) const {
-    if (!has_key_ || blob.size() <= crypto::kAesGcmNonceSize) return std::nullopt;
+std::optional<uint32_t> ACLService::decrypt_perms(const std::vector<uint8_t>& blob,
+                                                  std::string_view user_id,
+                                                  std::string_view resource) const {
+    if (!has_key_) return std::nullopt;
 
-    crypto::AesGcmCiphertext ct;
-    ct.nonce.assign(blob.begin(), blob.begin() + crypto::kAesGcmNonceSize);
-    ct.ciphertext.assign(blob.begin() + crypto::kAesGcmNonceSize, blob.end());
+    // version || nonce || ciphertext, with every length checked before any of
+    // it reaches the AEAD.
+    constexpr std::size_t kMinimum = 1 + crypto::kAeadNonceSize + crypto::kAeadTagSize;
+    if (blob.size() < kMinimum) return std::nullopt;
+    if (blob[0] != crypto::kEncryptedBlobVersion) return std::nullopt;
 
-    auto plaintext = crypto_.aes_gcm_decrypt(encryption_key_, ct);
+    crypto::EncryptedBlob ct;
+    ct.version = blob[0];
+    const auto nonce_begin = blob.begin() + 1;
+    const auto nonce_end = nonce_begin + static_cast<std::ptrdiff_t>(crypto::kAeadNonceSize);
+    ct.nonce.assign(nonce_begin, nonce_end);
+    ct.ciphertext.assign(nonce_end, blob.end());
+
+    const auto aad = crypto::aead_aad(
+        crypto::aead_purpose::kAclPermissions,
+        {std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(user_id.data()), user_id.size()),
+         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(resource.data()),
+                                  resource.size())});
+    auto plaintext = crypto_.aead_decrypt(encryption_key_, ct, std::span<const uint8_t>{aad});
     if (!plaintext || plaintext->size() != 4) return std::nullopt;
 
     auto& pt = *plaintext;

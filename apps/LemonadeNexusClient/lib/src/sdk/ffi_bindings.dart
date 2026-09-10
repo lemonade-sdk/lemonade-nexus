@@ -695,14 +695,14 @@ typedef _LnRoutingRequest = ffi.Int32 Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Char> identifier,
   ffi.Pointer<ffi.Char> connNonceB64,
-  ffi.Pointer<ffi.Char> clientWgPub,
+  ffi.Pointer<ffi.Char> clientMeshPubkey,
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 typedef _LnRoutingRequestDart = int Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Char> identifier,
   ffi.Pointer<ffi.Char> connNonceB64,
-  ffi.Pointer<ffi.Char> clientWgPub,
+  ffi.Pointer<ffi.Char> clientMeshPubkey,
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
@@ -1927,21 +1927,21 @@ class LemonadeNexusFfi {
   }
 
   /// POST /api/routing/request — request a connection to [identifier].
-  /// [connNonceB64] is a client-chosen 16-byte nonce (base64). [clientWgPub]
+  /// [connNonceB64] is a client-chosen 16-byte nonce (base64). [clientMeshPubkey]
   /// may be empty. Returns {connection_id,state} JSON, or null on error.
   String? routingRequest(
     LnClientHandle client,
     String identifier,
     String connNonceB64, {
-    String clientWgPub = '',
+    String clientMeshPubkey = '',
   }) {
     final identifierPtr = identifier.toNativeUtf8().cast<ffi.Char>();
     final noncePtr = connNonceB64.toNativeUtf8().cast<ffi.Char>();
-    final wgPubPtr = clientWgPub.toNativeUtf8().cast<ffi.Char>();
+    final meshPubkeyPtr = clientMeshPubkey.toNativeUtf8().cast<ffi.Char>();
     final outJson = calloc<ffi.Pointer<ffi.Char>>();
     try {
-      final result =
-          _lnRoutingRequest(client, identifierPtr, noncePtr, wgPubPtr, outJson);
+      final result = _lnRoutingRequest(
+          client, identifierPtr, noncePtr, meshPubkeyPtr, outJson);
       if (result == 0) {
         return toStringAndFree(outJson.value);
       }
@@ -1950,7 +1950,7 @@ class LemonadeNexusFfi {
     } finally {
       malloc.free(identifierPtr);
       malloc.free(noncePtr);
-      malloc.free(wgPubPtr);
+      malloc.free(meshPubkeyPtr);
       calloc.free(outJson);
     }
   }

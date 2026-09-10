@@ -110,6 +110,12 @@ public:
     [[nodiscard]] std::vector<TreeNode> do_get_nodes_by_type(NodeType type) const;
 
 private:
+    /// True when another node already stores exactly this mesh public key. Caller
+    /// holds mutex_. The API layer additionally compares normalized keys; this
+    /// backstop keeps the one-key-one-node invariant for every caller.
+    [[nodiscard]] bool mesh_pubkey_taken_locked(const std::string& mesh_pubkey,
+                                                const std::string& own_id) const;
+
     /// Persist a tree node to storage wrapped in a SignedEnvelope.
     bool persist_node(const TreeNode& node);
 

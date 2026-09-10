@@ -16,7 +16,7 @@ title: DNS Discovery
 
 ## Subdomain Hierarchy
 
-All DNS records are served by our authoritative DNS (port 5353, NAT from 53) and gossip-synced across all servers.
+All DNS records are served by our authoritative DNS (port 5335, NAT from 53 on both UDP and TCP) and gossip-synced across all servers.
 
 ### SEIP — Server Endpoint IP
 
@@ -101,7 +101,7 @@ These NS records are set at the registrar (Namecheap) and cached globally by rec
 ## Config TXT Format
 
 ```
-v=sp1 http=9100 udp=51940 gossip=9102 stun=3478 relay=9103 dns=5353 private_http=9101 region=us-west load=5 host=ns1.srv.lemonade-nexus.io
+v=sp1 http=9100 udp=51940 gossip=9102 stun=3478 relay=9103 dns=53 private_http=9101 region=us-west load=5 host=ns1.srv.lemonade-nexus.io
 ```
 
 | Field | Description |

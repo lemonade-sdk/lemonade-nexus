@@ -1,0 +1,107 @@
+#include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
+
+#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+
+#include <sodium.h>
+#include <spdlog/spdlog.h>
+
+#include <string>
+#include <utility>
+
+namespace nexus::security {
+
+PlatformEvidenceProducer::PlatformEvidenceProducer(EvidenceProducerSources sources)
+    : sources_(std::move(sources)) {}
+
+bool PlatformEvidenceProducer::platform_available() const {
+#if defined(__linux__) && defined(LEMONADE_HAVE_TPM_FAPI)
+    return true;
+#else
+    return false;
+#endif
+}
+
+SnpVtpmEvidence PlatformEvidenceProducer::platform_bundle(const AttestationChallenge& challenge,
+                                                           const Digest& nonce) const {
+    // A privileged helper, when configured. It gets the challenge — the identity
+    // PUBLIC key and nothing that could sign on this node's behalf. It derives
+    // the quote nonce itself; `nonce` is what we independently expect, and the
+    // source must refuse evidence bound to anything else.
+    if (sources_.platform_source) {
+        (void)nonce;
+        return sources_.platform_source(challenge);
+    }
+
+    // The challenge digest is the quote nonce, so one quote binds the node
+    // identity, the incarnation, the epoch and the policy (architecture 9).
+    EvidenceProduceConfig config;
+    config.cache_dir = sources_.cache_directory;
+    config.identity_pubkey.assign(sources_.identity.public_key.begin(),
+                                  sources_.identity.public_key.end());
+
+    // A build without the TPM stack has a stub that refuses with a reason.
+    std::string why;
+    if (auto bundle = produce_snp_vtpm_evidence(config, nonce, &why)) {
+        return std::move(*bundle);
+    }
+
+    // An empty bundle claims nothing. The verifier fails it, which is the
+    // correct outcome for a host that cannot prove its platform.
+    spdlog::debug("[producer] no platform evidence: {}", why);
+    return {};
+}
+
+std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
+    const AttestationChallenge& challenge) {
+    // A challenge for another identity is never answered.
+    if (challenge.node_id.bytes != sources_.identity.public_key ||
+        challenge.node_key != sources_.identity.public_key) {
+        spdlog::debug("[producer] challenge addresses another identity; not answered");
+        return std::nullopt;
+    }
+
+    // This producer builds one evidence format. A challenge naming any other
+    // profile goes unanswered rather than being answered with the wrong shape.
+    if (challenge.profile_id != kTier1AttestationProfileId ||
+        challenge.profile_ruleset != kAttestationProfileRulesetVersion) {
+        spdlog::debug("[producer] challenge names profile {} ruleset {}; not answered",
+                      attestation_profile_id_name(challenge.profile_id),
+                      challenge.profile_ruleset);
+        return std::nullopt;
+    }
+
+    // No vote key, no attestation. Nothing is fabricated.
+    std::optional<crypto::Ed25519PublicKey> vote_key;
+    if (sources_.vote_key_for_epoch) {
+        vote_key = sources_.vote_key_for_epoch(challenge.epoch);
+    }
+    if (!vote_key) {
+        spdlog::debug("[producer] no vote key for epoch {}; not answered", challenge.epoch);
+        return std::nullopt;
+    }
+
+    AttestationEvidence evidence;
+    evidence.network_id = challenge.network_id;
+    evidence.challenge_digest = challenge_digest(challenge);
+    evidence.node_id.bytes = sources_.identity.public_key;
+    evidence.incarnation = challenge.incarnation;
+    evidence.epoch = challenge.epoch;
+    evidence.security_ruleset = constants::kSecurityRulesetVersion;
+    evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
+    evidence.profile_id = challenge.profile_id;
+    evidence.profile_ruleset = challenge.profile_ruleset;
+    evidence.purpose = challenge.purpose;
+    evidence.context_digest = challenge.context_digest;
+    evidence.epoch_vote_key = *vote_key;
+    evidence.platform = platform_bundle(challenge, evidence.challenge_digest);
+
+    // Sign last. The identity binds the vote key and every other field
+    // above, the platform bundle included (architecture 18).
+    const Digest digest = evidence_signing_digest(evidence);
+    crypto_sign_detached(evidence.identity_signature.data(), nullptr, digest.data(),
+                         digest.size(), sources_.identity.private_key.data());
+    return evidence;
+}
+
+}  // namespace nexus::security

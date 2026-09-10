@@ -7,6 +7,7 @@
 #include <ares_dns_record.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <set>
 #ifdef _WIN32
@@ -16,6 +17,7 @@
 #endif
 #include <chrono>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <random>
 #include <sstream>
@@ -23,10 +25,6 @@
 namespace nexus::network {
 
 using asio::ip::udp;
-
-// ---------------------------------------------------------------------------
-// Construction
-// ---------------------------------------------------------------------------
 
 DnsService::DnsService(asio::io_context& io,
                          uint16_t port,
@@ -42,32 +40,74 @@ DnsService::DnsService(asio::io_context& io,
     soa_email_ = "admin." + base_domain_;
 }
 
-// ---------------------------------------------------------------------------
-// IService lifecycle
-// ---------------------------------------------------------------------------
+DnsService::~DnsService() { on_stop(); }
 
 void DnsService::on_start() {
-    spdlog::info("[{}] listening on UDP port {} (zone: {})",
-                  name(), socket_.local_endpoint().port(), base_domain_);
+    const uint16_t port = socket_.local_endpoint().port();
     start_receive();
+
+    tcp_handler_ = std::make_shared<TcpQueryHandler>(
+        [this, state = async_state_](const uint8_t* data, std::size_t bytes, const ResponseSink& reply) {
+            std::lock_guard lock(state->mutex);
+            if (state->stopped) return;
+            handle_query(data, bytes, reply);
+        });
+
+    try {
+        acceptor_.emplace(static_cast<asio::io_context&>(socket_.get_executor().context()),
+                          asio::ip::tcp::endpoint{asio::ip::tcp::v4(), port});
+        acceptor_->listen();
+        start_accept();
+        spdlog::info("[{}] listening on UDP and TCP port {} (zone: {})", name(), port,
+                     base_domain_);
+    } catch (const std::exception& e) {
+        acceptor_.reset();
+        spdlog::error("[{}] TCP listener on port {} failed: {} — UDP only, which is not "
+                      "sufficient for an authoritative server", name(), port, e.what());
+    }
+}
+
+uint16_t DnsService::local_port() const {
+    asio::error_code ec;
+    const auto ep = socket_.local_endpoint(ec);
+    return ec ? 0 : ep.port();
 }
 
 void DnsService::on_stop() {
+    // Wait for callbacks using the authority before destruction.
+    std::lock_guard lock(async_state_->mutex);
+    if (async_state_->stopped) return;
+    async_state_->stopped = true;
+    tcp_handler_.reset();
+    for (const auto& session : async_state_->sessions) session.stop();
+    async_state_->sessions.clear();
+
     asio::error_code ec;
+    if (acceptor_) {
+        acceptor_->close(ec);
+        acceptor_.reset();
+    }
     socket_.close(ec);
     spdlog::info("[{}] stopped", name());
 }
 
-// ---------------------------------------------------------------------------
-// Async receive loop
-// ---------------------------------------------------------------------------
-
 void DnsService::start_receive() {
     socket_.async_receive_from(
-        asio::buffer(recv_buffer_), remote_endpoint_,
-        [this](const asio::error_code& ec, std::size_t bytes) {
+        asio::buffer(async_state_->recv_buffer), async_state_->remote_endpoint,
+        [this, state = async_state_](const asio::error_code& ec, std::size_t bytes) {
+            std::lock_guard lock(state->mutex);
+            if (state->stopped) return;
             if (!ec) {
-                handle_query(bytes);
+                // The next receive overwrites the shared endpoint before send completion.
+                const udp::endpoint peer = state->remote_endpoint;
+                handle_query(state->recv_buffer.data(), bytes,
+                             [this, peer](std::vector<uint8_t> resp) {
+                                 auto buf =
+                                     std::make_shared<std::vector<uint8_t>>(std::move(resp));
+                                 socket_.async_send_to(
+                                     asio::buffer(*buf), peer,
+                                     [buf](const asio::error_code&, std::size_t) {});
+                             });
                 start_receive();
             } else if (ec != asio::error::operation_aborted) {
                 spdlog::error("[{}] UDP receive error: {}", name(), ec.message());
@@ -75,10 +115,197 @@ void DnsService::start_receive() {
         });
 }
 
-void DnsService::handle_query(std::size_t bytes) {
-    if (bytes < 12) return; // Too short for DNS header
+namespace {
 
-    const auto* data = recv_buffer_.data();
+class DnsTcpSession : public std::enable_shared_from_this<DnsTcpSession> {
+public:
+    using Handler = std::function<void(const uint8_t*, std::size_t,
+                                       const std::function<void(std::vector<uint8_t>)>&)>;
+
+    DnsTcpSession(asio::ip::tcp::socket socket, std::weak_ptr<Handler> handler,
+                  std::shared_ptr<std::atomic<int>> sessions)
+        : strand_(socket.get_executor())
+        , socket_(std::move(socket))
+        , timer_(strand_)
+        , handler_(std::move(handler))
+        , sessions_(std::move(sessions)) {}
+
+    ~DnsTcpSession() { sessions_->fetch_sub(1); }
+
+    void start() {
+        asio::dispatch(strand_, [self = shared_from_this()] {
+            self->arm_idle_timer();
+            self->read_length();
+        });
+    }
+
+    void stop() {
+        asio::dispatch(strand_, [self = shared_from_this()] { self->close(); });
+    }
+
+private:
+    void close() {
+        if (closed_) return;
+        closed_ = true;
+        asio::error_code ec;
+        socket_.close(ec);
+        timer_.cancel();
+    }
+
+    void arm_idle_timer() {
+        if (closed_) return;
+        timer_.expires_after(std::chrono::seconds(kDnsTcpIdleTimeoutSeconds));
+        auto self = shared_from_this();
+        timer_.async_wait(asio::bind_executor(strand_, [self](const asio::error_code& ec) {
+            if (!ec && self->timer_.expiry() <= std::chrono::steady_clock::now()) self->close();
+        }));
+    }
+
+    // Asio skips the condition on a full buffer; final handlers refresh too.
+    auto refresh_on_progress() {
+        return [self = shared_from_this()](const asio::error_code& ec, std::size_t bytes) {
+            if (!ec && bytes != 0) self->arm_idle_timer();
+            return asio::transfer_all()(ec, bytes);
+        };
+    }
+
+    void read_length() {
+        if (closed_) return;
+        auto self = shared_from_this();
+        asio::async_read(
+            socket_, asio::buffer(length_prefix_), refresh_on_progress(),
+            asio::bind_executor(strand_, [self](const asio::error_code& ec, std::size_t) {
+                if (ec || self->closed_) { self->close(); return; }
+                self->arm_idle_timer();
+                const std::size_t declared =
+                    (static_cast<std::size_t>(self->length_prefix_[0]) << 8) |
+                    static_cast<std::size_t>(self->length_prefix_[1]);
+                if (declared < kDnsMinMessageBytes || declared > kDnsTcpMaxMessageBytes) {
+                    self->close();
+                    return;
+                }
+                self->read_message(declared);
+            }));
+    }
+
+    void read_message(std::size_t declared) {
+        message_.assign(declared, 0);
+        auto self = shared_from_this();
+        asio::async_read(
+            socket_, asio::buffer(message_), refresh_on_progress(),
+            asio::bind_executor(strand_,
+                                [self, declared](const asio::error_code& ec, std::size_t got) {
+                                    if (ec || self->closed_ || got != declared) { self->close(); return; }
+                                    self->arm_idle_timer();
+                                    self->answer();
+                                }));
+    }
+
+    void answer() {
+        const auto handler = handler_.lock();
+        if (!handler) { close(); return; }
+
+        auto self = shared_from_this();
+        bool replied = false;
+        (*handler)(message_.data(), message_.size(),
+                   [self, &replied](std::vector<uint8_t> resp) {
+                       if (replied || resp.empty()) return;
+                       replied = true;
+                       self->enqueue_reply(std::move(resp));
+                   });
+        if (!replied) { close(); return; }
+
+        if (write_queue_.size() >= kDnsTcpMaxQueuedResponses) {
+            reads_paused_ = true;
+            return;
+        }
+        read_length();
+    }
+
+    void enqueue_reply(std::vector<uint8_t> resp) {
+        if (resp.size() > kDnsTcpMaxMessageBytes) { close(); return; }
+        auto out = std::make_shared<std::vector<uint8_t>>();
+        out->reserve(2 + resp.size());
+        out->push_back(static_cast<uint8_t>((resp.size() >> 8) & 0xFF));
+        out->push_back(static_cast<uint8_t>(resp.size() & 0xFF));
+        out->insert(out->end(), resp.begin(), resp.end());
+        write_queue_.push_back(std::move(out));
+        if (!write_in_flight_) write_next();
+    }
+
+    // One write in flight preserves DNS frame boundaries (RFC 7766).
+    void write_next() {
+        if (closed_) return;
+        if (write_queue_.empty()) { write_in_flight_ = false; return; }
+        write_in_flight_ = true;
+        auto out = write_queue_.front();
+        auto self = shared_from_this();
+        asio::async_write(
+            socket_, asio::buffer(*out), refresh_on_progress(),
+            asio::bind_executor(strand_, [self, out](const asio::error_code& ec, std::size_t) {
+                self->write_queue_.pop_front();
+                self->write_in_flight_ = false;
+                if (ec || self->closed_) { self->close(); return; }
+                self->arm_idle_timer();
+                self->write_next();
+                if (self->reads_paused_ &&
+                    self->write_queue_.size() < kDnsTcpMaxQueuedResponses) {
+                    self->reads_paused_ = false;
+                    self->read_length();
+                }
+            }));
+    }
+
+    asio::strand<asio::any_io_executor> strand_;
+    asio::ip::tcp::socket    socket_;
+    asio::steady_timer       timer_;
+    std::weak_ptr<Handler>   handler_;
+    std::shared_ptr<std::atomic<int>> sessions_;
+    std::array<uint8_t, 2>   length_prefix_{};
+    std::vector<uint8_t>     message_;
+    std::deque<std::shared_ptr<std::vector<uint8_t>>> write_queue_;
+    bool                     write_in_flight_{false};
+    bool                     reads_paused_{false};
+    bool                     closed_{false};
+};
+
+}  // namespace
+
+void DnsService::start_accept() {
+    if (!acceptor_ || !tcp_handler_) return;
+    acceptor_->async_accept([this, state = async_state_](const asio::error_code& ec, asio::ip::tcp::socket socket) {
+        std::lock_guard lock(state->mutex);
+        if (state->stopped) return;
+        if (ec) {
+            if (ec != asio::error::operation_aborted) {
+                spdlog::error("[{}] TCP accept error: {}", name(), ec.message());
+                start_accept();
+            }
+            return;
+        }
+        if (tcp_sessions_->load() >= kDnsTcpMaxSessions) {
+            asio::error_code ignored;
+            socket.close(ignored);
+            spdlog::warn("[{}] TCP session limit ({}) reached; dropping connection", name(),
+                         kDnsTcpMaxSessions);
+        } else {
+            tcp_sessions_->fetch_add(1);
+            auto session = std::make_shared<DnsTcpSession>(std::move(socket),
+                                            std::weak_ptr<TcpQueryHandler>(tcp_handler_),
+                                            tcp_sessions_);
+            std::erase_if(state->sessions, [](const auto& entry) { return entry.lifetime.expired(); });
+            state->sessions.push_back({session, [weak = std::weak_ptr(session)] {
+                if (auto live = weak.lock()) live->stop();
+            }});
+            session->start();
+        }
+        start_accept();
+    });
+}
+
+void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
+                              const ResponseSink& send_response) {
+    if (bytes < kDnsMinMessageBytes) return; // Too short for DNS header
 
     // Parse the query using c-ares
     ares_dns_record_t* dnsrec = nullptr;
@@ -124,12 +351,6 @@ void DnsService::handle_query(std::size_t bytes) {
     std::string base_lower = base_domain_;
     std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
         [](unsigned char c) { return std::tolower(c); });
-
-    auto send_response = [&](std::vector<uint8_t> resp) {
-        auto buf = std::make_shared<std::vector<uint8_t>>(std::move(resp));
-        socket_.async_send_to(asio::buffer(*buf), remote_endpoint_,
-            [buf](const asio::error_code&, std::size_t) {});
-    };
 
     // --- SOA queries ---
     if (qtype == ARES_REC_TYPE_SOA && qclass == ARES_CLASS_IN) {

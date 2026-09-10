@@ -7,42 +7,96 @@ if ! id -u lemonade-nexus >/dev/null 2>&1; then
         --home-dir /var/lib/lemonade-nexus lemonade-nexus
 fi
 
-# Create directories
-mkdir -p /var/lib/lemonade-nexus
-mkdir -p /etc/lemonade-nexus
+# The nexus-attestd socket's ACL is membership of group 'nexus'. Create it here
+# so the unit's SupplementaryGroups= always resolves, whether or not the
+# attestd package is installed yet.
+if ! getent group nexus >/dev/null 2>&1; then
+    groupadd --system nexus
+fi
+if ! id -nG lemonade-nexus 2>/dev/null | tr ' ' '\n' | grep -qx nexus; then
+    usermod -a -G nexus lemonade-nexus
+fi
 
-# Install default env file if not present
+# The config file contains the root, Genesis, and release-signing trust anchors.
+# Its parent must be root-owned as well: protecting the file alone would still
+# let the daemon replace it by renaming another file into the directory.
+# Runtime identity, wrapped keys, certificates, and other mutable state live
+# under data, which remains owned by the service user with mode 0700.
+# The daemon must not replace trust anchors directly or through their parent.
+[ ! -L /var/lib/lemonade-nexus ] || exit 1
+install -d -o root -g lemonade-nexus -m 0750 /var/lib/lemonade-nexus
+[ ! -L /var/lib/lemonade-nexus/data ] || exit 1
+[ ! -L /var/lib/lemonade-nexus/lemonade-nexus.json ] || exit 1
+if [ -f /var/lib/lemonade-nexus/lemonade-nexus.json ]; then
+    # Changing ownership does not revoke a writable descriptor already open
+    # against the old file. Install a new inode and rename it into place so
+    # existing descriptors and hard links cannot alter the installed config.
+    config_tmp=$(mktemp /var/lib/lemonade-nexus/.lemonade-nexus.json.XXXXXX)
+    trap 'rm -f "$config_tmp"' EXIT
+    install -o root -g lemonade-nexus -m 0640 /var/lib/lemonade-nexus/lemonade-nexus.json "$config_tmp"
+    mv -f "$config_tmp" /var/lib/lemonade-nexus/lemonade-nexus.json
+    trap - EXIT
+fi
+install -d -o lemonade-nexus -g lemonade-nexus -m 0700 /var/lib/lemonade-nexus/data
+install -d -o root           -g lemonade-nexus -m 0750 /etc/lemonade-nexus
+
+# The server is configured by /var/lib/lemonade-nexus/lemonade-nexus.json, which
+# nexus-bootstrap writes. The env file exists only for deliberate operator
+# overrides and ships EMPTY: a value here wins over the config file, so shipping
+# defaults meant an install silently ran on them.
+#
+# In particular there is no SP_JWT_SECRET. A configured secret is used verbatim,
+# so shipping a placeholder meant every install signed tokens with a value
+# published in this file. Left unset, the server generates one on first run and
+# persists it to <data_root>/identity/jwt_secret.hex.
 if [ ! -f /etc/lemonade-nexus/lemonade-nexus.env ]; then
     cat > /etc/lemonade-nexus/lemonade-nexus.env <<'ENVEOF'
-# Lemonade-Nexus configuration — see .env.example for all options
-SP_HTTP_PORT=9100
-SP_DATA_ROOT=/var/lib/lemonade-nexus/data
-SP_LOG_LEVEL=info
-SP_JWT_SECRET=CHANGE_ME
-#SP_ROOT_PUBKEY=
-#SP_SEED_PEERS=
+# Lemonade-Nexus operator overrides.
+#
+# Normal configuration lives in /var/lib/lemonade-nexus/lemonade-nexus.json,
+# written by nexus-bootstrap. Anything set here OVERRIDES that file, so leave it
+# empty unless you are deliberately overriding a single value.
+#
+# Do NOT put the bootstrap trust anchors here (root_pubkey, genesis_pubkey,
+# release_signing_pubkey). They belong in the config file, in one place.
+#
+# See .env.example for the full list of SP_* variables.
 ENVEOF
 fi
 
-# Set ownership
-chown -R lemonade-nexus:lemonade-nexus /var/lib/lemonade-nexus
-chown -R lemonade-nexus:lemonade-nexus /etc/lemonade-nexus
-chmod 600 /etc/lemonade-nexus/lemonade-nexus.env
+chown root:lemonade-nexus /etc/lemonade-nexus/lemonade-nexus.env
+chmod 0640 /etc/lemonade-nexus/lemonade-nexus.env
 
-# Enable and start service
+# Enable the unit without starting it. A fresh install has no config until
+# nexus-bootstrap runs; starting now would fail validation and trigger the
+# unit's failure-restart policy before bootstrap has had a chance to finish.
+#
+# nexus-dns-nat.service is deliberately left alone. Installing a package must not
+# change the host's firewall; its rules only appear once nexus-bootstrap
+# --install-dns-nat has written the conf its ConditionPathExists tests for.
 systemctl daemon-reload
 systemctl enable lemonade-nexus.service
 
 echo ""
 echo "========================================"
-echo " Lemonade-Nexus installed successfully"
+echo " Lemonade-Nexus installed"
 echo "========================================"
 echo ""
-echo " Config:  /etc/lemonade-nexus/lemonade-nexus.env"
+echo " Config:  /var/lib/lemonade-nexus/lemonade-nexus.json  (written by bootstrap)"
 echo " Data:    /var/lib/lemonade-nexus/data"
 echo " Logs:    journalctl -u lemonade-nexus"
 echo ""
-echo " Edit /etc/lemonade-nexus/lemonade-nexus.env, then:"
+echo " The service is enabled but not started: it has no configuration yet."
+echo " Bootstrap it, then start:"
+echo ""
+echo "   sudo nexus-bootstrap --release-signing-pubkey <YOUR_RELEASE_KEY> \\"
+echo "                        --install-dns-nat"
 echo "   sudo systemctl start lemonade-nexus"
+echo ""
+echo " --install-dns-nat maps public 53/udp+tcp to the unprivileged DNS port."
+echo " Without it the advertised DNS port answers nothing. No firewall rule has"
+echo " been installed by this package."
+echo ""
+echo " nexus-bootstrap --help explains the remaining options."
 echo ""
 echo "========================================"

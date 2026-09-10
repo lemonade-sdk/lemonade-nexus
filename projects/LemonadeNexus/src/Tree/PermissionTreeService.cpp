@@ -120,6 +120,16 @@ bool PermissionTreeService::insert_join_node(const TreeNode& node) {
         }
     }
 
+    // Same rule for the transport static: one key, one node. The API layer
+    // refuses equivalence-aware claims first; this exact-match backstop holds
+    // the invariant against any other caller.
+    if (mesh_pubkey_taken_locked(node.mesh_pubkey, node.id)) {
+        spdlog::error("[{}] insert_join_node: mesh public key already bound to another "
+                      "node — rejecting node '{}'",
+                      name(), node.id);
+        return false;
+    }
+
     nodes_[node.id] = node;
     if (!persist_node(node)) {
         spdlog::error("[{}] failed to persist join node '{}'", name(), node.id);
@@ -144,6 +154,13 @@ bool PermissionTreeService::update_node_direct(const std::string& node_id,
     auto it = nodes_.find(node_id);
     if (it == nodes_.end()) {
         spdlog::error("[{}] update_node_direct: node '{}' not found", name(), node_id);
+        return false;
+    }
+
+    if (mesh_pubkey_taken_locked(updated.mesh_pubkey, node_id)) {
+        spdlog::error("[{}] update_node_direct: mesh public key already bound to another "
+                      "node — rejecting update of '{}'",
+                      name(), node_id);
         return false;
     }
 
@@ -232,6 +249,15 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
 
     spdlog::info("[{}] deleted node '{}' directly", name(), node_id);
     return true;
+}
+
+bool PermissionTreeService::mesh_pubkey_taken_locked(const std::string& mesh_pubkey,
+                                                     const std::string& own_id) const {
+    if (mesh_pubkey.empty()) return false;
+    for (const auto& [id, node] : nodes_) {
+        if (id != own_id && node.mesh_pubkey == mesh_pubkey) return true;
+    }
+    return false;
 }
 
 bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {

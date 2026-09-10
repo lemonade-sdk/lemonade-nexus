@@ -1008,17 +1008,17 @@ class LemonadeNexusSdk {
 
   /// Requests a connection to an endpoint by [identifier].
   ///
-  /// [connNonceB64] is a client-chosen 16-byte nonce (base64). [clientWgPub]
+  /// [connNonceB64] is a client-chosen 16-byte nonce (base64). [clientMeshPubkey]
   /// is optional. Returns the raw {connection_id, state} JSON.
   Future<Map<String, dynamic>> routingRequest(
     String identifier,
     String connNonceB64, {
-    String clientWgPub = '',
+    String clientMeshPubkey = '',
   }) async {
     _checkDisposed();
     _checkConnected();
     final json = _ffi.routingRequest(_client!, identifier, connNonceB64,
-        clientWgPub: clientWgPub);
+        clientMeshPubkey: clientMeshPubkey);
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Routing request failed');
     }

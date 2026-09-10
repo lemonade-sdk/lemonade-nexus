@@ -1,20 +1,18 @@
 #pragma once
 
 #include <LemonadeNexus/ACL/ACLService.hpp>
-#include <LemonadeNexus/Core/GovernanceService.hpp>
 #include <LemonadeNexus/Core/IService.hpp>
-#include <LemonadeNexus/Core/RootKeyChain.hpp>
-#include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Gossip/IGossipProvider.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
+#include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
 #include <asio.hpp>
 
 #include <array>
-#include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -39,12 +37,13 @@ struct MisbehaviorProof;  // Gossip/MisbehaviorDetector.hpp
 ///
 /// Peers are loaded from and saved to identity/peers.json via FileStorageService.
 class GossipService : public core::IService<GossipService>,
-                       public IGossipProvider<GossipService> {
+                       public IGossipProvider<GossipService>,
+                       public security::ISecurityTransport {
     friend class core::IService<GossipService>;
     friend class IGossipProvider<GossipService>;
-    // Test seam: the ballot handlers sit behind packet-signature verification and
-    // a bound socket, neither of which a unit test can drive. Reaching them via a
-    // friend keeps the production surface unchanged (tests/test_onboarding.cpp).
+    // Test seam: private state sits behind packet-signature verification and a
+    // bound socket, neither of which a unit test can drive. Reaching it via a
+    // friend keeps the production surface unchanged.
     friend struct GossipBallotTestAccess;
 
 public:
@@ -54,6 +53,11 @@ public:
 
     /// Set the root management pubkey for certificate verification.
     void set_root_pubkey(const crypto::Ed25519PublicKey& pk);
+
+    /// The Nexus network this node belongs to, as hex. Certificate validation
+    /// requires it and rejects a certificate for any other network — the gate
+    /// never fails open, so with no network configured no certificate is valid.
+    void set_network_id(const std::string& network_hex);
 
     /// True once a root-of-trust pubkey has been configured.
     [[nodiscard]] bool has_root_pubkey() const { return has_root_pubkey_; }
@@ -67,21 +71,11 @@ public:
     /// cannot accept any binding.
     [[nodiscard]] bool verify_identity_binding(const ServerCertificate& cert) const;
 
-    /// Set the TrustPolicyService for zero-trust enforcement.
-    /// Must be called before start() for trust features to be active.
-    void set_trust_policy(core::TrustPolicyService* policy);
-
-    /// Set the RootKeyChainService for key rotation and Shamir share distribution.
-    void set_root_key_chain(core::RootKeyChainService* chain);
-
-    /// Set the GovernanceService for democratic parameter changes.
-    void set_governance(core::GovernanceService* governance);
-
     /// Set the IPAM service for tunnel IP allocation during ServerHello exchange.
     void set_ipam(ipam::IPAMService* ipam);
 
     /// Set the boringtun service for backbone peer provisioning.
-    void set_boringtun(boringtun::BoringtunService* wg);
+    void set_boringtun(boringtun::BoringtunService* dataplane);
 
     /// Get the tunnel IP assigned to this server (empty if not yet assigned).
     [[nodiscard]] std::string our_tunnel_ip() const;
@@ -99,8 +93,8 @@ public:
     /// Get our backbone IP.
     [[nodiscard]] std::string our_backbone_ip() const { return our_backbone_ip_; }
 
-    /// Set our WG pubkey for inclusion in ServerHello messages.
-    void set_our_wg_pubkey(const std::string& pubkey) { our_wg_pubkey_ = pubkey; }
+    /// Set our mesh public key for inclusion in ServerHello messages.
+    void set_our_mesh_pubkey(const std::string& pubkey) { our_mesh_pubkey_ = pubkey; }
 
     /// Set the "ip:port" this server is reachable at, carried in ServerHello so
     /// peers share it instead of the UDP source they happen to observe. Call
@@ -126,10 +120,33 @@ public:
     [[nodiscard]] std::vector<NsSlotClaimData> get_ns_slots() const;
 
     /// Try to add a gossip peer as a mesh backbone peer.
-    void try_add_backbone_wg_peer(const GossipPeer& peer);
+    void try_add_backbone_mesh_peer(const GossipPeer& peer);
 
-    /// Access the Ed25519 keypair (needed by TrustPolicy for token generation).
+    /// Access this server's Ed25519 identity keypair.
     [[nodiscard]] const crypto::Ed25519Keypair& keypair() const { return keypair_; }
+
+    // ISecurityTransport. Gossip is transport only for the security protocol:
+    // the packet signature authenticates the sender, the byte bound applies,
+    // and the bytes go to the sink unparsed. Nothing here decides security
+    // truth and nothing here relays an envelope.
+
+    /// Receiver for inbound security envelopes. Runs on the io thread during
+    /// packet dispatch; the span is valid only for the call. Call before start().
+    void set_security_sink(security::SecuritySink sink);
+
+    /// Reports the peer whose certificate just verified in handle_server_hello
+    /// (the peer's raw Ed25519 identity key). Transport reports contact; it
+    /// decides nothing. Runs on the io thread, outside peers_mutex_.
+    void set_peer_certified_callback(std::function<void(const security::NodeId&)> cb);
+
+    [[nodiscard]] bool send_to(const security::NodeId& peer,
+                               std::span<const uint8_t> envelope) override;
+    std::size_t broadcast(std::span<const uint8_t> envelope) override;
+
+    /// Whether this peer holds a root-signed transport certificate. One of the
+    /// Tier 1 prerequisites, and the transport is where the root signature was
+    /// already verified. Reports an answer; it grants nothing.
+    [[nodiscard]] bool peer_is_root_certified(const security::NodeId& peer) const;
 
     // IService
     void on_start();
@@ -170,6 +187,7 @@ private:
     void handle_delta_request(const asio::ip::udp::endpoint& sender,
                                const uint8_t* payload, std::size_t payload_len);
     void handle_delta_response(const asio::ip::udp::endpoint& sender,
+                                const std::string& sender_pubkey,
                                 const uint8_t* payload, std::size_t payload_len);
     void handle_anti_entropy(const asio::ip::udp::endpoint& sender,
                               const uint8_t* payload, std::size_t payload_len);
@@ -187,6 +205,15 @@ private:
     // Verify an incoming packet's Ed25519 signature
     [[nodiscard]] bool verify_packet_signature(const uint8_t* data, std::size_t total_len) const;
 
+    // Security envelope: sender_pubkey is the signature-verified packet signer.
+    void handle_security_envelope(const uint8_t* sender_pubkey,
+                                  const uint8_t* payload, std::size_t len);
+
+    // Endpoint of the peer whose canonical base64 key equals `b64`. Takes
+    // peers_mutex_ internally.
+    [[nodiscard]] bool find_peer_endpoint_by_pubkey(std::string_view b64,
+                                                    asio::ip::udp::endpoint& out) const;
+
     // Pick up to N random peers for PeerExchange
     [[nodiscard]] std::vector<GossipPeer> random_peers(std::size_t count) const;
 
@@ -197,85 +224,19 @@ private:
                               const uint8_t* payload, std::size_t payload_len,
                               const std::string& signer_pubkey);
 
-    // TEE challenge/response handlers (mutual verification)
-    void handle_tee_challenge(const asio::ip::udp::endpoint& sender,
-                               const uint8_t* payload, std::size_t payload_len);
-    void handle_tee_response(const asio::ip::udp::endpoint& sender,
-                              const uint8_t* payload, std::size_t payload_len);
-
-    /// Send a TEE challenge to a peer to verify their Tier 1 status.
-    void send_tee_challenge(const asio::ip::udp::endpoint& target,
-                             const std::string& peer_pubkey);
-
-    // Enrollment quorum handlers
-    void handle_enrollment_vote_request(const asio::ip::udp::endpoint& sender,
-                                         const std::string& sender_pubkey,
-                                         const uint8_t* payload, std::size_t payload_len);
-    void handle_enrollment_vote(const asio::ip::udp::endpoint& sender,
-                                 const std::string& sender_pubkey,
-                                 const uint8_t* payload, std::size_t payload_len);
-
-    /// Broadcast an enrollment vote request to all known Tier1 peers.
-    void broadcast_enrollment_vote_request(const EnrollmentBallot& ballot);
-
-    /// Cast our vote for an enrollment and broadcast it.
-    void cast_enrollment_vote(const std::string& request_id,
-                               const std::string& candidate_pubkey,
-                               bool approve, const std::string& reason);
-
-    /// Check if quorum is met for a pending enrollment.
-    void check_enrollment_quorum(const std::string& request_id);
-
-    /// Expire timed-out enrollment ballots.
-    void expire_enrollment_ballots();
-
-    /// Zero-trust gate: verify an incoming message's attestation token.
-    /// Returns the sender's pubkey if authorized, empty string if denied.
-    [[nodiscard]] std::string verify_message_trust(
-        const uint8_t* payload, std::size_t payload_len,
-        core::TrustOperation required_op);
-
-    // Root key rotation handlers
-    void handle_root_key_rotation(const asio::ip::udp::endpoint& sender,
-                                   const uint8_t* payload, std::size_t payload_len);
-    void handle_shamir_share_offer(const asio::ip::udp::endpoint& sender,
-                                    const uint8_t* payload, std::size_t payload_len);
-    void handle_shamir_share_submit(const asio::ip::udp::endpoint& sender,
-                                     const uint8_t* payload, std::size_t payload_len);
-    void handle_peer_health_report(const asio::ip::udp::endpoint& sender,
-                                    const uint8_t* payload, std::size_t payload_len);
-
-    /// Broadcast root key rotation to all peers.
-    void broadcast_root_key_rotation(const core::RootKeyEntry& entry);
-
-    /// Distribute Shamir shares to all eligible Tier1 peers (encrypted per-peer).
-    void distribute_shamir_shares();
-
-    /// Broadcast our peer health observations to peers.
-    void broadcast_peer_health();
-
-    /// Record gossip tick for peer health tracking.
-    void record_peer_health_tick();
-
-    // Governance handlers
-    void handle_governance_proposal(const asio::ip::udp::endpoint& sender,
-                                     const uint8_t* payload, std::size_t payload_len);
-    void handle_governance_vote(const asio::ip::udp::endpoint& sender,
-                                 const uint8_t* payload, std::size_t payload_len);
-
-    /// Broadcast a governance message to all known peers.
-    void broadcast_governance_message(GossipMsgType type, const std::vector<uint8_t>& payload);
-
     // ACL delta handler
     void handle_acl_delta(const asio::ip::udp::endpoint& sender,
+                           const std::string& sender_pubkey,
                            const uint8_t* payload, std::size_t payload_len);
 
     // DNS record sync handler
     void handle_dns_record_sync(const asio::ip::udp::endpoint& sender,
+                                 const std::string& sender_pubkey,
                                  const uint8_t* payload, std::size_t payload_len);
 
     // Backbone IPAM sync handler
     void handle_backbone_ipam_sync(const asio::ip::udp::endpoint& sender,
+                                    const std::string& sender_pubkey,
                                     const uint8_t* payload, std::size_t payload_len);
 
     // NS slot claim handler
@@ -313,36 +274,41 @@ private:
                                      const std::string& exclude_endpoint = {});
 
     /// Durably ban a convicted pubkey: add to the revocation list (persisted), drop
-    /// its trust state and peer entry, exclude it from Tier1/Shamir eligibility, and
-    /// persist the proof as evidence. Idempotent. `pubkey` may carry an "ed25519:"
+    /// its peer entry, and persist the proof as evidence. Idempotent. `pubkey`
+    /// may carry an "ed25519:"
     /// prefix; it is normalized to the certificate/revocation form.
     void apply_ban(const std::string& pubkey, const MisbehaviorProof& proof);
 
     /// Persist the current revocation list to identity/revoked_servers.json.
     void save_revoked_servers() const;
 
-    /// Zero-trust identity binding: true only if `pubkey` belongs to a known peer
-    /// that presented a valid, non-revoked, root-CA-signed certificate. Used to
-    /// reject attestation tokens/reports whose self-asserted pubkey is not an
-    /// enrolled identity (see docs/TEE-Attestation-Hardening-Plan.md).
-    [[nodiscard]] bool peer_has_verified_certificate(const std::string& pubkey) const;
-
-    /// Governance-grade electorate test. UNLIKE peer_has_verified_certificate,
-    /// this NEVER fails open: it returns false when no root pubkey is configured,
-    /// so an admission ballot with no attested electorate fails closed. True only
-    /// if `pubkey` is a known, non-revoked peer whose stored certificate belongs
-    /// to it and verifies against the configured root via verify_cert_core (real
-    /// issuer==root check + Ed25519 verify, not the advisory fail-open path).
+    /// Tier-2 transport membership gate — NEVER fails open: false when no root
+    /// pubkey is configured. True only if `pubkey` is a known, non-revoked peer
+    /// whose stored certificate belongs to it and verifies against the configured
+    /// root via verify_cert_core (real issuer==root check + Ed25519 verify).
     [[nodiscard]] bool peer_certificate_is_root_signed(const std::string& pubkey) const;
 
-    /// Same voter predicate as remote peers, applied to our own identity.
-    /// Gates the local vote AND our slot in the denominator (one electorate).
-    [[nodiscard]] bool self_is_eligible_voter(bool is_admission) const;
+    /// The origin-signed half of a gossiped delta: the named author signed
+    /// exactly `canonical`, and the root enrolled that author. The packet
+    /// signature only ever names the forwarder.
+    [[nodiscard]] bool delta_origin_verified(const std::string& canonical,
+                                             const std::string& signer_pubkey_b64,
+                                             const std::string& signature_b64) const;
 
-    /// The TPM Attestation Key pinned in `pubkey`'s enrolled certificate (base64
-    /// DER SPKI), or "" if the peer has no verified certificate or no AK enrolled.
-    /// This is the trust anchor a TPM quote signature is verified against.
-    [[nodiscard]] std::string certificate_ak_pubkey(const std::string& pubkey) const;
+    /// Stores a certificate relayed through peer exchange, but only after the
+    /// same full verification a direct hello gets, and never over one already
+    /// held. This is how a delta's author can be certified without being a
+    /// direct peer.
+    void adopt_relayed_certificate(const std::string& pubkey_b64,
+                                   const std::string& certificate_json);
+
+    /// Same check for callers that already hold peers_mutex_.
+    [[nodiscard]] bool peer_certificate_is_root_signed_locked(const std::string& pubkey) const;
+
+    /// The server_id in a peer's root-verified certificate, or empty when the
+    /// peer is unknown, uncertified, or revoked. Ordinary per-server resource
+    /// ownership (SEIP DNS records) is keyed on this.
+    [[nodiscard]] std::string certified_server_id(const std::string& pubkey) const;
 
     // Load the server certificate and root pubkey
     void load_server_certificate();
@@ -367,8 +333,11 @@ private:
     // Server enrollment
     std::optional<ServerCertificate> our_certificate_;
     crypto::Ed25519PublicKey         root_pubkey_{};
+    std::string                      expected_network_id_;
     bool                             has_root_pubkey_{false};
     std::vector<std::string>         revoked_pubkeys_;
+    /// Tier 1 membership per finalized state; unset denies tier1 labels.
+    std::function<bool(const std::string&)> tier1_membership_;
 
     // Equivocation detection: last signed tree-delta we've seen per conflict identity
     // (signer ‖ target_node_id ‖ sequence) → the delta's JSON. A second, differing
@@ -382,28 +351,13 @@ private:
     // Misbehavior proofs we've already processed (proof_id) — dedupe re-broadcasts.
     std::unordered_map<std::string, uint64_t> known_proofs_;
 
-    // Zero-trust enforcement (nullptr = trust checks disabled)
-    core::TrustPolicyService*        trust_policy_{nullptr};
-
-    // Root key chain (nullptr = rotation disabled)
-    core::RootKeyChainService*       root_key_chain_{nullptr};
-
-    // Democratic governance (nullptr = governance disabled)
-    core::GovernanceService*         governance_{nullptr};
-    std::atomic<uint64_t>            last_known_generation_{0};
-
     // IPAM for tunnel IP allocation during ServerHello exchange
     ipam::IPAMService*               ipam_{nullptr};
     boringtun::BoringtunService*     boringtun_{nullptr};
     std::string                      our_tunnel_ip_;     // assigned by peer or self
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
-    std::string                      our_wg_pubkey_;     // base64 X25519
+    std::string                      our_mesh_pubkey_;   // base64 X25519
     std::string                      our_advertised_endpoint_;  // "ip:port" we are reachable at
-
-    // Shamir reconstruction: collect submitted shares from peers
-    std::mutex                              reconstruction_mutex_;
-    std::vector<std::string>                reconstruction_shares_;
-    uint8_t                                 reconstruction_threshold_{0};
 
     // Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
     std::string                      our_region_;
@@ -418,18 +372,12 @@ private:
     // Distributed DNS record sync (nullptr = DNS sync disabled)
     network::DnsService*             dns_{nullptr};
 
-    // Quorum-based enrollment
-    bool     enrollment_quorum_enabled_{false};
-    float    enrollment_quorum_ratio_{0.5f};
-    float    admission_quorum_ratio_{0.75f};   // mirrors ServerConfig default
-    uint32_t enrollment_vote_timeout_sec_{60};
-    uint32_t enrollment_max_retries_{3};
-    std::unordered_map<std::string, EnrollmentBallot> pending_enrollments_;
-    std::function<void(const EnrollmentBallot&)> enrollment_decision_cb_;
-
-    // Throttle for proactive Tier-1 re-challenge (pubkey → last challenge unix sec).
-    // Only touched from on_gossip_tick (the single gossip-timer thread).
-    std::unordered_map<std::string, uint64_t> last_rechallenge_;
+    // Security transport: inbound sink and the oversize-drop log throttle
+    // (both touched only from handle_receive on the io thread).
+    security::SecuritySink                security_sink_;
+    std::function<void(const security::NodeId&)> peer_certified_cb_;
+    std::chrono::steady_clock::time_point security_drop_warn_at_{};
+    uint64_t                              security_drops_since_warn_{0};
 
 public:
     /// Set the ACL service for distributed permission sync.
@@ -441,41 +389,19 @@ public:
     /// Set the DNS service for distributed DNS record sync.
     void set_dns(network::DnsService* dns);
 
+    /// Answers whether a server pubkey (base64) is a CURRENT Tier 1 member
+    /// per finalized mesh state. Gates tier1-labelled DNS records: the label
+    /// asserts finalized membership, not enrollment. Unset denies.
+    void set_tier1_membership_source(std::function<bool(const std::string&)> source) {
+        tier1_membership_ = std::move(source);
+    }
+
     /// Broadcast a DNS record delta to all known peers.
     void broadcast_dns_record_delta(const DnsRecordDelta& delta);
-
-    /// Configure enrollment quorum parameters.
-    void set_enrollment_config(bool enabled, float ratio,
-                                uint32_t timeout_sec, uint32_t max_retries);
-
-    /// Local floor for ADMISSION ballots. Separate from the enrollment ratio: a
-    /// remote sponsor supplies its own, and we must never accept a lower bar.
-    void set_admission_quorum_ratio(float ratio);
 
     /// Pin the NS slot this server claims (1-9); 0 = auto (lowest free). Set
     /// when the operator's ns<N> identity matches registrar glue for that name.
     void set_preferred_ns_slot(uint8_t slot);
-
-    /// Get pending enrollment ballots (for status API).
-    [[nodiscard]] std::vector<EnrollmentBallot> pending_enrollments() const;
-
-    /// Fired when a ballot leaves Collecting (Approved/Rejected/TimedOut). The
-    /// callback runs outside peers_mutex_ with a snapshot of the ballot.
-    void set_enrollment_decision_callback(
-        std::function<void(const EnrollmentBallot&)> cb) {
-        enrollment_decision_cb_ = std::move(cb);
-    }
-
-    /// Open a governed ADMISSION ballot for a certless candidate (75% Tier1).
-    /// `claim_json` is the candidate's self-signed onboarding claim.
-    /// `claim_hash` binds votes to this claim. Re-entry with our own live
-    /// ballot is a no-op, so callers may re-arm with it after a restart.
-    void start_admission_ballot(const std::string& request_id,
-                                const std::string& candidate_pubkey,
-                                const std::string& server_id,
-                                const std::string& claim_json,
-                                const std::string& claim_hash,
-                                float required_ratio);
 
     /// Add a server pubkey to the revocation set and persist it. Idempotent.
     /// The single runtime writer of revoked_servers.json — callers such as the

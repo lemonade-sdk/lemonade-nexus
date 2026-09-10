@@ -29,7 +29,7 @@ struct AclDelta {
 /// Callback type: called when a local ACL mutation needs to be broadcast via gossip.
 using AclDeltaCallback = std::function<void(const AclDelta&)>;
 
-/// SQLite-backed ACL service with AES-256-GCM encrypted permission values
+/// SQLite-backed ACL service with XChaCha20-Poly1305 encrypted permission values
 /// and distributed sync via gossip ACL deltas.
 ///
 /// Database: data/acl.db
@@ -68,11 +68,16 @@ public:
 
 private:
     void derive_encryption_key();
-    [[nodiscard]] std::vector<uint8_t> encrypt_perms(uint32_t perms) const;
-    [[nodiscard]] std::optional<uint32_t> decrypt_perms(const std::vector<uint8_t>& blob) const;
+    /// The row identity is authenticated, so a permission blob cannot be moved
+    /// to another (user, resource) pair.
+    std::vector<uint8_t> encrypt_perms(uint32_t perms, std::string_view user_id,
+                                       std::string_view resource) const;
+    [[nodiscard]] std::optional<uint32_t> decrypt_perms(const std::vector<uint8_t>& blob,
+                                                        std::string_view user_id,
+                                                        std::string_view resource) const;
 
     /// Read current permissions. Caller must hold mutex_.
-    [[nodiscard]] uint32_t read_perms_locked(std::string_view user_id, std::string_view resource) const;
+    uint32_t read_perms_locked(std::string_view user_id, std::string_view resource) const;
 
     /// Write permissions. Caller must hold mutex_.
     bool write_perms_locked(std::string_view user_id, std::string_view resource,
@@ -89,7 +94,7 @@ private:
     std::filesystem::path        db_path_;
     crypto::SodiumCryptoService& crypto_;
     crypto::Ed25519Keypair       signing_keypair_{};
-    crypto::AesGcmKey            encryption_key_{};
+    crypto::AeadKey            encryption_key_{};
     bool                         has_key_{false};
 
     sqlite3*                     db_{nullptr};

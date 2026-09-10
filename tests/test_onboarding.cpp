@@ -1,10 +1,12 @@
+// Server onboarding under the surviving admission model: proof-of-possession,
+// evidence-digest binding, single-use bound tokens, and root-holder sole
+// discretion. The old gossip admission ballot is gone; Tier-1 authority lives
+// in the mesh security system. Historical "ballot" records must still load.
+
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
-#include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
-#include <LemonadeNexus/Core/TeeAttestation.hpp>
-#include <LemonadeNexus/Core/TrustPolicy.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -17,6 +19,7 @@
 
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -31,7 +34,20 @@
 using namespace nexus;
 namespace fs = std::filesystem;
 
+// Observation-only friend seam: reads the private revoked set so the
+// supersede test can see the revocation land. No test writes through it.
+namespace nexus::gossip {
+struct GossipBallotTestAccess {
+    static bool revoked(const GossipService& g, const std::string& pubkey_b64) {
+        return g.is_revoked(pubkey_b64);
+    }
+};
+}  // namespace nexus::gossip
+
 namespace {
+
+// Certificates bind to a network id; one value serves every fixture.
+inline const std::string kTestNetworkHex(64, 'a');
 
 crypto::Ed25519Keypair make_key(crypto::SodiumCryptoService& c) {
     return c.ed25519_keygen();
@@ -39,6 +55,22 @@ crypto::Ed25519Keypair make_key(crypto::SodiumCryptoService& c) {
 
 std::string b64(const std::vector<uint8_t>& v) {
     return crypto::to_base64(std::span<const uint8_t>(v.data(), v.size()));
+}
+
+// True when `cert_json` carries a certificate whose signature verifies against
+// `root_pk` over the canonical form. Approval paths must never mint anything
+// weaker.
+bool cert_verifies_against(const std::string& cert_json,
+                           const crypto::Ed25519PublicKey& root_pk,
+                           crypto::SodiumCryptoService& c) {
+    auto cert = nlohmann::json::parse(cert_json).get<gossip::ServerCertificate>();
+    auto canonical = gossip::canonical_cert_json(cert);
+    auto sig = crypto::from_base64(cert.signature);
+    if (sig.size() != crypto::kEd25519SignatureSize) return false;
+    crypto::Ed25519Signature s{};
+    std::memcpy(s.data(), sig.data(), s.size());
+    std::vector<uint8_t> msg(canonical.begin(), canonical.end());
+    return c.ed25519_verify(root_pk, std::span<const uint8_t>(msg), s);
 }
 
 } // namespace
@@ -73,6 +105,7 @@ TEST(Onboarding, CertificateIssueAndVerify) {
     auto cand = make_key(c);
 
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     p.server_id = "berlin-2";
 
@@ -81,9 +114,7 @@ TEST(Onboarding, CertificateIssueAndVerify) {
     // Bound to the candidate, issued by the root.
     EXPECT_EQ(cert.server_pubkey, p.server_pubkey_b64);
     EXPECT_EQ(cert.server_id, "berlin-2");
-    EXPECT_EQ(cert.issuer_pubkey,
-              crypto::to_base64(std::span<const uint8_t>(root.public_key.data(),
-                                                         root.public_key.size())));
+    EXPECT_EQ(cert.issuer_pubkey, crypto::to_base64(root.public_key));
     EXPECT_EQ(cert.expires_at, 0u);
 
     // Signature verifies against the root pubkey over the canonical form.
@@ -107,6 +138,7 @@ TEST(Onboarding, CertificateTierCapability) {
     auto root = make_key(c);
     auto cand = make_key(c);
     gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
     p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
     p.server_id = "tpm-node";
     p.tpm_ak_pubkey = "QUstUElOTkVE";  // non-empty → Tier1-capable
@@ -118,6 +150,74 @@ TEST(Onboarding, CertificateTierCapability) {
     c.stop();
 }
 
+TEST(Onboarding, CertificatePlatformPolicyIsSigned) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = make_key(c);
+    auto cand = make_key(c);
+
+    gossip::CertIssueParams p;
+    p.network_id = kTestNetworkHex;
+    p.server_pubkey_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    p.server_id            = "snp-node";
+    p.tpm_ak_pubkey        = "QUstUElOTkVE";
+    p.platform_class       = "snp-vtpm";
+    p.expected_measurement = std::string(96, 'a');
+    p.approved_binary_hash = std::string(64, 'b');
+
+    auto cert = gossip::issue_server_certificate(p, c, root.private_key, root.public_key);
+    const auto canonical = gossip::canonical_cert_json(cert);
+    EXPECT_NE(canonical.find("snp-vtpm"), std::string::npos);
+    EXPECT_NE(canonical.find(p.expected_measurement), std::string::npos);
+    EXPECT_NE(canonical.find(p.approved_binary_hash), std::string::npos);
+
+    // Downgrading the policy must invalidate the root signature, or a peer could
+    // strip the measurement pin and present any Azure CVM.
+    auto sig = crypto::from_base64(cert.signature);
+    crypto::Ed25519Signature sigv{};
+    ASSERT_EQ(sig.size(), sigv.size());
+    std::memcpy(sigv.data(), sig.data(), sig.size());
+
+    auto downgraded = cert;
+    downgraded.expected_measurement.clear();
+    const auto tampered = gossip::canonical_cert_json(downgraded);
+    EXPECT_FALSE(c.ed25519_verify(
+        root.public_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(tampered.data()),
+                                 tampered.size()),
+        sigv));
+    c.stop();
+}
+
+TEST(Onboarding, CertificateJsonCarriesThePlatformPolicy) {
+    gossip::ServerCertificate cert;
+    cert.server_pubkey        = "cGs=";
+    cert.platform_class       = "snp-vtpm";
+    cert.expected_measurement = std::string(96, 'a');
+    cert.approved_binary_hash = std::string(64, 'b');
+
+    nlohmann::json j = cert;
+    auto back = j.get<gossip::ServerCertificate>();
+    EXPECT_EQ(back.platform_class, cert.platform_class);
+    EXPECT_EQ(back.expected_measurement, cert.expected_measurement);
+    EXPECT_EQ(back.approved_binary_hash, cert.approved_binary_hash);
+}
+
+TEST(Onboarding, CertificateMeshKeyJsonAcceptsLegacyField) {
+    gossip::ServerCertificate cert;
+    cert.server_pubkey = "cGs=";
+    cert.mesh_pubkey = "mesh-key";
+
+    nlohmann::json current = cert;
+    EXPECT_EQ(current.at("mesh_pubkey"), "mesh-key");
+    EXPECT_FALSE(current.contains("wg_pubkey"));
+
+    auto legacy = current;
+    legacy["wg_pubkey"] = legacy["mesh_pubkey"];
+    legacy.erase("mesh_pubkey");
+    EXPECT_EQ(legacy.get<gossip::ServerCertificate>().mesh_pubkey, "mesh-key");
+}
+
 // ===========================================================================
 // Candidate proof-of-possession signing (the /api/onboard/request path)
 // ===========================================================================
@@ -127,30 +227,276 @@ TEST(Onboarding, RequestSignatureRoundTrip) {
     c.start();
     auto cand = make_key(c);
 
-    core::ServerAdmissionService::RequestInput in;
+    core::AdmissionRequest in;
     in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
     in.server_id = "berlin-2";
     in.region = "eu-west";
     in.nonce = "bm9uY2U=";
     in.timestamp = 1751328000;
 
-    auto msg = core::ServerAdmissionService::canonical_request(in);
+    auto msg = core::canonical_admission_request(in);
     auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
     EXPECT_TRUE(c.ed25519_verify(cand.public_key, std::span<const uint8_t>(msg), sig));
 
     // Tampering with any signed field breaks verification.
     auto tampered = in;
     tampered.server_id = "berlin-3";
-    auto msg2 = core::ServerAdmissionService::canonical_request(tampered);
+    auto msg2 = core::canonical_admission_request(tampered);
     EXPECT_FALSE(c.ed25519_verify(cand.public_key, std::span<const uint8_t>(msg2), sig));
     c.stop();
 }
 
+TEST(Onboarding, EveryPlatformEvidenceFieldIsSigned) {
+    // A peer that could edit any of these after signing would be choosing its own
+    // platform policy. Each must break the signature on its own.
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto cand = make_key(c);
+
+    core::AdmissionRequest in;
+    in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
+    in.server_id      = "berlin-2";
+    in.region         = "eu-west";
+    in.tpm_ak_pubkey  = "QUs=";
+    in.platform_class = core::AdmissionPlatform::SnpVtpm;
+    in.measurement    = std::string(96, 'a');
+    in.binary_hash    = std::string(64, 'b');
+    in.evidence_sha256 = std::string(64, 'c');
+    in.nonce          = "bm9uY2U=";
+    in.timestamp      = 1751328000;
+
+    const auto msg = core::canonical_admission_request(in);
+    const auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
+
+    auto breaks = [&](core::AdmissionRequest edited) {
+        auto m = core::canonical_admission_request(edited);
+        return !c.ed25519_verify(cand.public_key, std::span<const uint8_t>(m), sig);
+    };
+    {
+        auto e = in;
+        e.platform_class = core::AdmissionPlatform::Tpm2;
+        EXPECT_TRUE(breaks(e));
+    }
+    { auto e = in; e.measurement     = std::string(96, 'f'); EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.binary_hash     = std::string(64, 'f'); EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.evidence_sha256 = std::string(64, 'f'); EXPECT_TRUE(breaks(e)); }
+    { auto e = in; e.tpm_ak_pubkey   = "b3RoZXI=";           EXPECT_TRUE(breaks(e)); }
+    c.stop();
+}
+
+TEST(Onboarding, RequestCanonicalIsTaggedV2) {
+    // A v1 client signs different bytes; the tag makes that a signature failure
+    // rather than a silently narrower set of fields.
+    core::AdmissionRequest in;
+    in.nonce = "n";
+    const auto msg = core::canonical_admission_request(in);
+    const std::string text(msg.begin(), msg.end());
+    EXPECT_NE(text.find("ln-onboard:v2"), std::string::npos);
+    EXPECT_EQ(text.find("ln-onboard:v1"), std::string::npos);
+}
+
+TEST(Onboarding, AdmissionRequestSerializationPreservesCanonicalBytes) {
+    // The receiver re-derives the canonical form from the request body. A lost
+    // field means the server verifies different bytes than the candidate signed.
+    core::AdmissionRequest in;
+    in.candidate_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
+    in.server_id       = "tokyo-1";
+    in.region          = "ap-northeast";
+    in.tpm_ak_pubkey   = "QUs=";
+    in.platform_class  = core::AdmissionPlatform::SnpVtpm;
+    in.measurement     = std::string(96, 'a');
+    in.binary_hash     = std::string(64, 'b');
+    in.evidence_sha256 = std::string(64, 'c');
+    in.evidence        = "bundle";
+    in.nonce           = b64(std::vector<uint8_t>(32, 2));
+    in.timestamp       = 1751328000;
+    in.signature       = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+
+    const auto claim = in.toJson();
+    const auto decoded = core::AdmissionRequest::fromJson(claim);
+    ASSERT_TRUE(decoded) << decoded.error;
+    const auto& back = *decoded.value;
+
+    EXPECT_EQ(core::canonical_admission_request(in),
+              core::canonical_admission_request(back));
+    EXPECT_EQ(back.signature, in.signature);
+    // The bearer token remains outside the signed canonical projection.
+    EXPECT_FALSE(claim.contains("enrollment_token"));
+}
+
 TEST(Onboarding, PollSignatureIsDomainSeparated) {
-    // poll and ack share a shape but must not be cross-usable (distinct tags).
-    auto poll = core::ServerAdmissionService::canonical_poll("ln-onboard-poll:v1", "rid", 42);
-    auto ack  = core::ServerAdmissionService::canonical_poll("ln-onboard-ack:v1", "rid", 42);
+    // poll and ack share a shape but must not be cross-usable. Assert on the
+    // production constants both endpoints verify with (OnboardApiHandler uses
+    // kOnboardPollTag / kOnboardAckTag) — not on re-typed literals, which
+    // would keep passing if the endpoints drifted to one shared tag.
+    ASSERT_NE(core::kOnboardPollTag, core::kOnboardAckTag);
+    auto poll = core::canonical_onboarding_status(core::kOnboardPollTag, "rid", 42);
+    auto ack  = core::canonical_onboarding_status(core::kOnboardAckTag, "rid", 42);
     EXPECT_NE(poll, ack);
+}
+
+TEST(OnboardingJson, StrictAdmissionRequestDecoding) {
+    core::AdmissionRequest request;
+    request.candidate_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
+    request.server_id = "berlin-2";
+    request.region = "eu-west";
+    request.nonce = b64(std::vector<uint8_t>(32, 2));
+    request.timestamp = 1751328000;
+    request.signature = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+
+    const auto valid = request.toJson();
+    ASSERT_TRUE(core::AdmissionRequest::fromJson(valid));
+
+    auto missing = valid;
+    missing.erase("region");
+    EXPECT_EQ(missing.value("region", std::string{}), "");
+    auto missing_result = core::AdmissionRequest::fromJson(missing);
+    ASSERT_FALSE(missing_result);
+    EXPECT_NE(missing_result.error.find("/region"), std::string::npos);
+
+    auto wrong_type = valid;
+    wrong_type["timestamp"] = "1751328000";
+    auto type_result = core::AdmissionRequest::fromJson(wrong_type);
+    ASSERT_FALSE(type_result);
+    EXPECT_NE(type_result.error.find("/timestamp"), std::string::npos);
+
+    auto unknown = valid;
+    unknown["candidate_role"] = "root";
+    auto unknown_result = core::AdmissionRequest::fromJson(unknown);
+    ASSERT_FALSE(unknown_result);
+    EXPECT_NE(unknown_result.error.find("/candidate_role"), std::string::npos);
+
+    auto bad_key = valid;
+    bad_key["candidate_pubkey"] = "c2hvcnQ=";
+    auto key_result = core::AdmissionRequest::fromJson(bad_key);
+    ASSERT_FALSE(key_result);
+    EXPECT_NE(key_result.error.find("/candidate_pubkey"), std::string::npos);
+
+    auto bad_digest = valid;
+    bad_digest["evidence"] = "bundle";
+    bad_digest["evidence_sha256"] = "abcd";
+    auto digest_result = core::AdmissionRequest::fromJson(bad_digest);
+    ASSERT_FALSE(digest_result);
+    EXPECT_NE(digest_result.error.find("/evidence_sha256"), std::string::npos);
+
+    auto null_token = valid;
+    null_token["enrollment_token"] = nullptr;
+    auto null_result = core::AdmissionRequest::fromJson(null_token);
+    ASSERT_FALSE(null_result);
+    EXPECT_NE(null_result.error.find("/enrollment_token"), std::string::npos);
+}
+
+TEST(OnboardingJson, EnumAndIntegerRangesAreStrict) {
+    auto status = core::AdmissionStatusResponse{ };
+    auto invalid_state = status.toJson();
+    invalid_state["state"] = "waiting";
+    auto state_result = core::AdmissionStatusResponse::fromJson(invalid_state);
+    ASSERT_FALSE(state_result);
+    EXPECT_NE(state_result.error.find("/state"), std::string::npos);
+
+    core::AdmissionRequest request;
+    request.candidate_pubkey = b64(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
+    request.server_id = "berlin-2";
+    request.region = "eu-west";
+    request.nonce = b64(std::vector<uint8_t>(32, 2));
+    request.timestamp = 1751328000;
+    request.signature = b64(
+        std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+    auto invalid_platform = request.toJson();
+    invalid_platform["platform_class"] = "fake-tee";
+    auto platform_result = core::AdmissionRequest::fromJson(invalid_platform);
+    ASSERT_FALSE(platform_result);
+    EXPECT_NE(platform_result.error.find("/platform_class"), std::string::npos);
+
+    auto negative_timestamp = request.toJson();
+    negative_timestamp["timestamp"] = -1;
+    auto timestamp_result = core::AdmissionRequest::fromJson(negative_timestamp);
+    ASSERT_FALSE(timestamp_result);
+    EXPECT_NE(timestamp_result.error.find("/timestamp"), std::string::npos);
+
+    core::ChallengeRequest challenge;
+    challenge.candidate_pubkey = b64(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 4));
+    auto challenge_json = challenge.toJson();
+    challenge_json["extra"] = true;
+    EXPECT_FALSE(core::ChallengeRequest::fromJson(challenge_json));
+
+    nlohmann::json port = 70000;
+    uint16_t decoded_port = 0;
+    std::string error;
+    EXPECT_FALSE(core::onboarding_json::decode_value(port, decoded_port,
+                                                     "/gossip_port", error));
+    EXPECT_NE(error.find("out of range"), std::string::npos);
+}
+
+TEST(OnboardingJson, ApprovedBundleRoundTripsForClientAndServer) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = c.ed25519_keygen();
+    auto candidate = c.ed25519_keygen();
+
+    gossip::CertIssueParams params;
+    params.network_id = kTestNetworkHex;
+    params.server_pubkey_b64 = b64(
+        {candidate.public_key.begin(), candidate.public_key.end()});
+    params.server_id = "berlin-2";
+
+    core::ApprovedOnboardingBundle bundle;
+    bundle.certificate = gossip::issue_server_certificate(
+        params, c, root.private_key, root.public_key);
+    bundle.root_pubkey = crypto::to_hex(root.public_key);
+    bundle.mesh_server_pubkey = b64(std::vector<uint8_t>(crypto::kX25519PublicKeySize, 5));
+    bundle.seed_peers = {"berlin-1.example:9102"};
+    bundle.mesh_endpoint = "203.0.113.10:51940";
+    bundle.gossip_port = 9102;
+
+    const core::PollResponse server_response{bundle};
+    const auto wire = core::poll_response_to_json(server_response);
+    auto client_response = core::poll_response_from_json(wire);
+    ASSERT_TRUE(client_response) << client_response.error;
+    const auto* decoded = std::get_if<core::ApprovedOnboardingBundle>(
+        &*client_response.value);
+    ASSERT_NE(decoded, nullptr);
+    EXPECT_EQ(decoded->certificate.server_pubkey, bundle.certificate.server_pubkey);
+    EXPECT_EQ(decoded->root_pubkey, bundle.root_pubkey);
+    EXPECT_EQ(decoded->seed_peers, bundle.seed_peers);
+    c.stop();
+}
+
+TEST(OnboardingJson, AdmissionStoreRoundTripAndLegacyMigration) {
+    core::AdmissionRecord record;
+    record.request_id = std::string(32, 'a');
+    record.candidate_pubkey = b64(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 6));
+    record.server_id = "berlin-2";
+    record.region = "eu-west";
+    record.state = core::AdmissionState::Pending;
+    record.decision_mode = "sole";
+
+    core::AdmissionStoreDocument document;
+    document.admissions.push_back(record);
+    document.denied_until.emplace(record.candidate_pubkey, 1751328600);
+
+    const auto encoded = document.toJson();
+    EXPECT_EQ(encoded.at("version"), core::AdmissionStoreDocument::kVersion);
+    EXPECT_EQ(encoded.at("admissions").at(0).at("state"), "pending");
+    auto decoded = core::admission_store_from_json(encoded);
+    ASSERT_TRUE(decoded) << decoded.error;
+    ASSERT_EQ(decoded.value->admissions.size(), 1u);
+    EXPECT_EQ(decoded.value->admissions.front().request_id, record.request_id);
+
+    auto legacy = encoded;
+    legacy.erase("version");
+    legacy["admissions"][0]["state"] = 0;
+    auto migrated = core::admission_store_from_json(legacy);
+    ASSERT_TRUE(migrated) << migrated.error;
+    EXPECT_EQ(migrated.value->admissions.front().state, core::AdmissionState::Pending);
+
+    legacy["admissions"][0]["state"] = 9;
+    auto invalid = core::admission_store_from_json(legacy);
+    ASSERT_FALSE(invalid);
+    EXPECT_NE(invalid.error.find("state"), std::string::npos);
 }
 
 // ===========================================================================
@@ -198,6 +544,7 @@ protected:
     void SetUp() override {
         temp_dir = fs::temp_directory_path() /
                    ("nexus_test_admtoken_" + std::to_string(getpid()));
+        fs::remove_all(temp_dir);
         fs::create_directories(temp_dir);
         crypto_svc = std::make_unique<crypto::SodiumCryptoService>();
         crypto_svc->start();
@@ -266,9 +613,10 @@ TEST_F(AdmissionTokenTest, MintValidatesCandidateKey) {
 }
 
 // ===========================================================================
-// Live ServerAdmissionService — root-holder issuance gate and the
-// enrollment-token admission flow. Stands up the full dependency set so
-// on_start() computes is_root_key_holder_ against a real loaded identity.
+// Live ServerAdmissionService — root-holder gate, PoP, evidence binding,
+// tokens, admin sole discretion, cooldown, and persistence. Stands up the full
+// dependency set so on_start() computes is_root_key_holder_ against a real
+// loaded identity.
 // ===========================================================================
 
 class AdmissionServiceTest : public ::testing::Test {
@@ -281,16 +629,16 @@ protected:
     std::unique_ptr<gossip::GossipService>        gossip_svc;
     std::unique_ptr<core::ServerAdmissionService> admission;
 
-    core::ServerConfig       config;
-    crypto::Ed25519Keypair   local_identity;  // this server's own gossip/root identity
+    core::ServerConfig     config;
+    crypto::Ed25519Keypair local_identity;  // this server's own gossip/root identity
 
     /// Build the stack. `root_is_local` points the trust anchor at this server's
     /// own identity (it IS the root holder) or an unrelated key (a non-root
-    /// enrolled server). `min_tier1 = 0` puts a peerless service into the vote
-    /// regime (eligible_voter_count() >= 0) without needing live gossip peers.
-    void make(bool root_is_local, uint32_t min_tier1 = 6) {
+    /// enrolled server).
+    void make(bool root_is_local) {
         temp_dir = fs::temp_directory_path() /
                    ("nexus_test_admission_" + std::to_string(getpid()));
+        fs::remove_all(temp_dir);
         fs::create_directories(temp_dir);
 
         crypto_svc = std::make_unique<crypto::SodiumCryptoService>();
@@ -303,20 +651,29 @@ protected:
         // Persist this server's local identity (empty passphrase, as the daemon does).
         local_identity = kw->generate_and_store_identity({});
 
-        // Value (not reference): the non-root branch's keypair is a temporary,
-        // and a ternary binding would not extend its lifetime.
+        // Value (not reference): the non-root branch's keypair is a temporary.
         crypto::Ed25519PublicKey anchor = root_is_local
             ? local_identity.public_key
             : crypto_svc->ed25519_keygen().public_key;
         config.root_pubkey = crypto::to_hex(
             std::span<const uint8_t>(anchor.data(), anchor.size()));
-        config.onboard_enabled            = true;
-        config.onboard_min_tier1_for_vote = min_tier1;
+        config.onboard_enabled = true;
 
         gossip_svc = std::make_unique<gossip::GossipService>(io, 0, *storage_svc, *crypto_svc);
+        gossip_svc->set_network_id(kTestNetworkHex);
         admission  = std::make_unique<core::ServerAdmissionService>(
-            config, *crypto_svc, *kw, *storage_svc, *gossip_svc, nullptr);
+            config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
+        admission->set_network_id(kTestNetworkHex);
         admission->start();  // on_start() computes is_root_key_holder_
+    }
+
+    /// Simulate a service restart over the same storage root.
+    void restart_admission() {
+        admission->stop();
+        admission = std::make_unique<core::ServerAdmissionService>(
+            config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
+        admission->set_network_id(kTestNetworkHex);
+        admission->start();
     }
 
     void TearDown() override {
@@ -325,13 +682,14 @@ protected:
         if (kw)          kw->stop();
         if (storage_svc) storage_svc->stop();
         if (crypto_svc)  crypto_svc->stop();
-        if (!temp_dir.empty()) fs::remove_all(temp_dir);
+        // A failing test keeps its data directory for inspection.
+        if (!temp_dir.empty() && !HasFailure()) fs::remove_all(temp_dir);
     }
 
     /// A fresh candidate's fully-signed onboarding request (challenge → sign).
-    core::ServerAdmissionService::RequestInput
+    core::AdmissionRequest
     signed_request(const crypto::Ed25519Keypair& cand, const std::string& server_id) {
-        core::ServerAdmissionService::RequestInput in;
+        core::AdmissionRequest in;
         in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
         in.server_id        = server_id;
         in.region           = "eu-west";
@@ -339,59 +697,140 @@ protected:
         in.timestamp        = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-        auto msg = core::ServerAdmissionService::canonical_request(in);
-        auto sig = crypto_svc->ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
-        in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
+        sign(in, cand);
         return in;
+    }
+
+    void sign(core::AdmissionRequest& in,
+              const crypto::Ed25519Keypair& key) {
+        auto msg = core::canonical_admission_request(in);
+        auto sig = crypto_svc->ed25519_sign(key.private_key, std::span<const uint8_t>(msg));
+        in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
     }
 };
 
-// --- Only the root-key holder may accept/issue ---
+// --- Root-holder gate ---
 
-TEST_F(AdmissionServiceTest, NonRootServerCannotIssue) {
+TEST_F(AdmissionServiceTest, NonRootHolderRefusesOnboardingEntirely) {
     make(/*root_is_local=*/false);
     // Merely having root_pubkey configured (every enrolled server does) must not
-    // let a non-root server advertise onboarding or issue a certificate.
+    // let a non-root server advertise onboarding, take requests, or mint tokens.
     EXPECT_FALSE(admission->accepts_onboarding());
 
     auto cand = crypto_svc->ed25519_keygen();
     auto r = admission->create_request(signed_request(cand, "berlin-2"));
     EXPECT_FALSE(r.ok);
     EXPECT_EQ(r.status, 403);
+
+    EXPECT_FALSE(admission->mint_admission_token("", std::chrono::seconds{600}).has_value());
 }
 
-TEST_F(AdmissionServiceTest, RootHolderCanIssue) {
+// --- Proof of possession and evidence binding ---
+
+TEST_F(AdmissionServiceTest, ValidPopRequestLandsPending) {
+    // Default state is closed: a valid request waits for the admin (or a token),
+    // never self-admits. Every new record is sole-discretion.
     make(/*root_is_local=*/true);
     EXPECT_TRUE(admission->accepts_onboarding());
-
-    auto cand = crypto_svc->ed25519_keygen();
-    auto r = admission->create_request(signed_request(cand, "berlin-2"));
-    EXPECT_TRUE(r.ok) << r.error;
-    EXPECT_EQ(r.status, 200);
-}
-
-// --- No unattended admission; the enrollment token is the only bypass ---
-
-TEST_F(AdmissionServiceTest, FirstRequestParksInPending) {
-    // Default state is closed: the first request on a fresh genesis must wait
-    // for an admin (or carry a token), never self-admit.
-    make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
     auto in   = signed_request(cand, "berlin-2");
     auto r    = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(r.status, 200);
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Pending);
+    EXPECT_EQ(a->state, core::AdmissionState::Pending);
     EXPECT_TRUE(a->decided_by.empty());
     EXPECT_TRUE(a->issued_cert_json.empty());
+    EXPECT_EQ(a->decision_mode, "sole");
 }
 
-TEST_F(AdmissionServiceTest, RequestWithValidTokenApproved) {
+TEST_F(AdmissionServiceTest, BadPopSignatureRefused) {
+    // A signature by any key other than the claimed candidate key is not proof
+    // of possession, whatever else the request carries.
+    make(/*root_is_local=*/true);
+
+    auto cand  = crypto_svc->ed25519_keygen();
+    auto other = crypto_svc->ed25519_keygen();
+    auto in    = signed_request(cand, "berlin-2");
+    sign(in, other);  // wrong signer over the same canonical bytes
+
+    auto r = admission->create_request(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 401);
+    EXPECT_TRUE(admission->pending().empty());
+}
+
+TEST_F(AdmissionServiceTest, EvidenceDigestMismatchRefused) {
+    // The signature covers evidence_sha256, not the bundle. A bundle that does
+    // not hash to the signed digest is a swapped bundle and must be refused.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    in.evidence        = "not-the-signed-bundle";
+    in.evidence_sha256 = std::string(64, 'c');  // digest of something else
+    sign(in, cand);  // correctly signed — only the binding is broken
+
+    auto r = admission->create_request(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 400);
+    EXPECT_TRUE(admission->pending().empty());
+}
+
+TEST_F(AdmissionServiceTest, WrongOrReplayedNonceRefused) {
+    // The nonce is single-use proof-of-possession state: a nonce the service
+    // never issued fails, and a captured request cannot be replayed once its
+    // nonce is consumed — the signature is still valid both times.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    core::AdmissionRequest in;
+    in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
+    in.server_id = "berlin-2";
+    in.region    = "eu-west";
+    in.nonce     = "bm90LWlzc3VlZA==";  // never issued
+    in.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    sign(in, cand);
+    auto r = admission->create_request(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 401);
+    EXPECT_TRUE(admission->pending().empty());
+
+    // Replay: the first submission consumes the real nonce; the identical
+    // signed bytes must fail on the second pass.
+    auto in2 = signed_request(cand, "berlin-2");
+    ASSERT_TRUE(admission->create_request(in2).ok);
+    auto replay = admission->create_request(in2);
+    EXPECT_FALSE(replay.ok);
+    EXPECT_EQ(replay.status, 401);
+}
+
+TEST_F(AdmissionServiceTest, StaleTimestampRefused) {
+    // Freshness window: a request outside the ±nonce-TTL window is refused
+    // before any other processing, so a captured request has a short life
+    // independent of its nonce.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    in.timestamp -= 100000;  // far outside the window
+    sign(in, cand);          // correctly signed — only the freshness is broken
+    auto r = admission->create_request(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 400);
+    EXPECT_TRUE(admission->pending().empty());
+}
+
+// --- Single-use bound token admission ---
+
+TEST_F(AdmissionServiceTest, TokenAdmitsImmediatelyAndBurns) {
     // A candidate-bound token admits immediately, is single-use, and the issued
-    // cert is signed by the root anchor (proves the issuance path uses it).
+    // cert is root-signed (proves the issuance path uses the anchor key).
     make(/*root_is_local=*/true);
 
     auto cand     = crypto_svc->ed25519_keygen();
@@ -406,16 +845,16 @@ TEST_F(AdmissionServiceTest, RequestWithValidTokenApproved) {
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     EXPECT_EQ(a->decided_by, "token");
     ASSERT_FALSE(a->issued_cert_json.empty());
 
     auto cert = nlohmann::json::parse(a->issued_cert_json);
-    EXPECT_EQ(cert.value("issuer_pubkey", ""),
-              crypto::to_base64(std::span<const uint8_t>(
-                  local_identity.public_key.data(), local_identity.public_key.size())));
+    EXPECT_EQ(cert.value("issuer_pubkey", ""), crypto::to_base64(local_identity.public_key));
+    EXPECT_TRUE(cert_verifies_against(a->issued_cert_json,
+                                      local_identity.public_key, *crypto_svc));
 
-    // Spent: the same token cannot be redeemed again (single-use).
+    // Spent: the same token cannot be redeemed again (single use).
     auto in2 = signed_request(cand, "berlin-3");
     in2.enrollment_token = minted->first;
     auto r2 = admission->create_request(in2);
@@ -423,7 +862,7 @@ TEST_F(AdmissionServiceTest, RequestWithValidTokenApproved) {
     EXPECT_EQ(r2.status, 403);
 }
 
-TEST_F(AdmissionServiceTest, RequestWithInvalidTokenRejected) {
+TEST_F(AdmissionServiceTest, InvalidTokenRejected) {
     make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
@@ -480,7 +919,35 @@ TEST_F(AdmissionServiceTest, BoundTokenEnforced) {
     ASSERT_TRUE(r_a.ok) << r_a.error;
     auto a = admission->status(r_a.request_id, in_a.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
+}
+
+TEST_F(AdmissionServiceTest, ServerIdBoundTokenEnforced) {
+    // A token minted for one server_id must not admit another name — the
+    // candidate does not get to choose its DNS label. The mismatch is
+    // refused WITHOUT burning the token, and the bound name still admits.
+    make(/*root_is_local=*/true);
+
+    auto cand     = crypto_svc->ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+    auto minted   = admission->mint_admission_token(cand_b64, std::chrono::seconds{600},
+                                                    "berlin-2");
+    ASSERT_TRUE(minted.has_value());
+
+    auto in = signed_request(cand, "berlin-9");
+    in.enrollment_token = minted->first;
+    auto r = admission->create_request(in);
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 403);
+
+    auto in2 = signed_request(cand, "berlin-2");
+    in2.enrollment_token = minted->first;
+    auto r2 = admission->create_request(in2);
+    ASSERT_TRUE(r2.ok) << r2.error;
+    auto a = admission->status(r2.request_id, in2.candidate_pubkey);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
+    EXPECT_EQ(a->server_id, "berlin-2");
 }
 
 TEST_F(AdmissionServiceTest, TokenRetryApprovesExistingPending) {
@@ -505,167 +972,149 @@ TEST_F(AdmissionServiceTest, TokenRetryApprovesExistingPending) {
 
     auto a = admission->status(r1.request_id, in1.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
     EXPECT_EQ(a->decided_by, "token");
 }
 
-TEST_F(AdmissionServiceTest, VoteRegimeBallotGoverns) {
-    // At/above the vote threshold the quorum ballot decides. A presented token
-    // cannot admit — and it IS consumed (burned) at first submission so it can
-    // never be re-spent to bypass the ballot if churn later drops the mesh below
-    // the vote threshold (the H1 restart/regime bypass).
-    make(/*root_is_local=*/true, /*min_tier1=*/0);
+// --- Admin sole discretion ---
 
-    auto minted = admission->mint_admission_token("", std::chrono::seconds{600});
-    ASSERT_TRUE(minted.has_value());
+TEST_F(AdmissionServiceTest, AdminApproveMintsRootSignedCert) {
+    make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
     auto in   = signed_request(cand, "berlin-2");
-    in.enrollment_token = minted->first;
-    auto r = admission->create_request(in);
+    auto r    = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
-    EXPECT_TRUE(r.needs_ballot);
+
+    // Approval requires echoing the candidate identity (out-of-band check duty).
+    auto wrong = admission->approve(r.request_id, "not-the-candidate", /*supersede=*/false);
+    EXPECT_FALSE(wrong.ok);
+    EXPECT_EQ(wrong.status, 400);
+
+    auto ap = admission->approve(r.request_id, in.candidate_pubkey, /*supersede=*/false);
+    ASSERT_TRUE(ap.ok) << ap.error;
 
     auto a = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Pending);
-
-    // The gossip-replicated ballot claim must never carry token material.
-    EXPECT_EQ(a->ballot_claim_json.find(minted->first), std::string::npos);
-
-    // Consumed: the token is burned at first submission and cannot be re-spent
-    // after a later regime drop below the vote threshold (H1).
-    core::AdmissionTokenStore store{*storage_svc, *crypto_svc};
-    EXPECT_FALSE(store.verify(minted->first, in.candidate_pubkey).has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
+    EXPECT_EQ(a->decided_by, "admin");
+    ASSERT_FALSE(a->issued_cert_json.empty());
+    // The mint is real: the certificate verifies against the root anchor key.
+    EXPECT_TRUE(cert_verifies_against(a->issued_cert_json,
+                                      local_identity.public_key, *crypto_svc));
 }
 
-TEST_F(AdmissionServiceTest, VoteRegimeAdminCannotBypassBallot) {
-    // In the vote regime neither approve() nor deny() may resolve a
-    // ballot-governed admission — only the Tier-1 quorum callback can. Otherwise
-    // a root admin could admit (or reject) ahead of the vote and the quorum
-    // would be advisory.
-    make(/*root_is_local=*/true, /*min_tier1=*/0);
+TEST_F(AdmissionServiceTest, AdminDenySetsCooldown) {
+    make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
     auto in   = signed_request(cand, "berlin-2");
     auto r    = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
-    ASSERT_TRUE(r.needs_ballot);
 
-    // Direct admin approve/deny are both rejected with 409 while the ballot governs.
-    auto ap = admission->approve(r.request_id, in.candidate_pubkey, /*supersede=*/false);
-    EXPECT_FALSE(ap.ok);
-    EXPECT_EQ(ap.status, 409);
-    auto dn = admission->deny(r.request_id, "nope");
-    EXPECT_FALSE(dn.ok);
-    EXPECT_EQ(dn.status, 409);
+    auto dn = admission->deny(r.request_id, "unverified operator");
+    ASSERT_TRUE(dn.ok) << dn.error;
 
-    // Still pending and unissued after both attempts.
-    auto mid = admission->status(r.request_id, in.candidate_pubkey);
-    ASSERT_TRUE(mid.has_value());
-    EXPECT_EQ(mid->state, core::ServerAdmissionService::State::Pending);
-    EXPECT_TRUE(mid->issued_cert_json.empty());
+    auto a = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Denied);
 
-    // Only the quorum callback resolves it.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "", "");
-    auto after = admission->status(r.request_id, in.candidate_pubkey);
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
-    EXPECT_EQ(after->decided_by, "ballot");
+    // The denied identity cannot immediately re-request: a denial without a
+    // cooldown is just a retry prompt for an attacker.
+    auto again = admission->create_request(signed_request(cand, "berlin-2"));
+    EXPECT_FALSE(again.ok);
+    EXPECT_EQ(again.status, 429);
 }
 
-TEST_F(AdmissionServiceTest, BallotDecisionModeSurvivesRestart) {
-    // The ballot gate must be persisted: after a restart, a ballot-governed
-    // admission must still reject direct approve()/deny(), or the quorum bypass
-    // reopens.
-    make(/*root_is_local=*/true, /*min_tier1=*/0);
+TEST_F(AdmissionServiceTest, ApproveRefusesUnverifiedPlatformClaim) {
+    // The approve-time evidence gate: a Tier-1-class claim that does not
+    // verify must never mint. An unsupported platform_class is refused and the
+    // record stays pending with no certificate.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    in.platform_class  = core::AdmissionPlatform::Tpm2;
+    in.evidence        = "bundle-bytes";
+    in.evidence_sha256 = crypto::to_hex(crypto_svc->sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(in.evidence.data()), in.evidence.size())));
+    sign(in, cand);  // the digest binding holds — only the platform claim is bogus
+
+    auto r = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+
+    auto ap = admission->approve(r.request_id, in.candidate_pubkey, /*supersede=*/false);
+    EXPECT_FALSE(ap.ok);
+    EXPECT_EQ(ap.status, 403);
+
+    auto a = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Pending);
+    EXPECT_TRUE(a->issued_cert_json.empty());
+}
+
+TEST_F(AdmissionServiceTest, AcknowledgeCompletesApprovedOnly) {
+    // Approved → Completed, gated on the owner key; anything else refuses.
+    make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
     auto in   = signed_request(cand, "berlin-2");
     auto r    = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
-    ASSERT_TRUE(r.needs_ballot);
 
-    // Simulate a restart: tear down the service and rebuild it from the SAME
-    // data root, so on_start()->load() restores the persisted admission.
-    admission->stop();
-    admission = std::make_unique<core::ServerAdmissionService>(
-        config, *crypto_svc, *kw, *storage_svc, *gossip_svc, nullptr);
-    admission->start();
+    EXPECT_FALSE(admission->acknowledge(r.request_id, in.candidate_pubkey));  // not approved
+    ASSERT_TRUE(admission->approve(r.request_id, in.candidate_pubkey, false).ok);
+    EXPECT_FALSE(admission->acknowledge(r.request_id, "not-the-candidate"));
 
-    // Reloaded as ballot-governed: direct approve/deny still 409.
-    auto ap = admission->approve(r.request_id, in.candidate_pubkey, /*supersede=*/false);
-    EXPECT_FALSE(ap.ok);
-    EXPECT_EQ(ap.status, 409);
-    auto dn = admission->deny(r.request_id, "nope");
-    EXPECT_FALSE(dn.ok);
-    EXPECT_EQ(dn.status, 409);
-
-    auto mid = admission->status(r.request_id, in.candidate_pubkey);
-    ASSERT_TRUE(mid.has_value());
-    EXPECT_EQ(mid->state, core::ServerAdmissionService::State::Pending);
-    EXPECT_TRUE(mid->issued_cert_json.empty());
-
-    // Only the quorum callback resolves it, even after the restart.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "", "");
-    auto after = admission->status(r.request_id, in.candidate_pubkey);
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
-    EXPECT_EQ(after->decided_by, "ballot");
+    EXPECT_TRUE(admission->acknowledge(r.request_id, in.candidate_pubkey));
+    auto a = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Completed);
+    EXPECT_FALSE(admission->acknowledge(r.request_id, in.candidate_pubkey));  // final
 }
 
-// A record awaiting admin discretion must not be resolvable by a ballot: the
-// request_id is public, so a candidate could otherwise open its own ballot and
-// have honest voters approve away the admin gate.
-TEST_F(AdmissionServiceTest, SoleDiscretionRecordIgnoresBallotDecision) {
-    make(/*root_is_local=*/true, /*min_tier1=*/6);   // above the mesh size -> "sole"
+TEST_F(AdmissionServiceTest, StatusRequiresTheOwnerKey) {
+    // request_id is not a capability: status is disclosed only to the key
+    // that owns the admission.
+    make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
-    auto in   = signed_request(cand, "berlin-3");
+    auto in   = signed_request(cand, "berlin-2");
     auto r    = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
-    ASSERT_FALSE(r.needs_ballot);   // admin must decide this one
 
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey, "", "");
-
-    auto after = admission->status(r.request_id, in.candidate_pubkey);
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Pending);
-    EXPECT_TRUE(after->issued_cert_json.empty());
+    EXPECT_FALSE(admission->status(r.request_id, "someone-else").has_value());
+    EXPECT_TRUE(admission->status(r.request_id, in.candidate_pubkey).has_value());
 }
 
-// A ballot may only resolve the record it is actually about.
-TEST_F(AdmissionServiceTest, BallotForOtherCandidateIgnored) {
-    make(/*root_is_local=*/true, /*min_tier1=*/0);
+// --- server_id uniqueness and record immutability ---
 
-    auto cand = crypto_svc->ed25519_keygen();
-    auto in   = signed_request(cand, "berlin-4");
-    auto r    = admission->create_request(in);
-    ASSERT_TRUE(r.ok) << r.error;
-    ASSERT_TRUE(r.needs_ballot);
+TEST_F(AdmissionServiceTest, DuplicateServerIdRefused) {
+    // Two candidates racing for one server_id: the second is refused before any
+    // approval can bind the same DNS label to two keys.
+    make(/*root_is_local=*/true);
 
-    auto other = crypto_svc->ed25519_keygen();
-    auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, other_b64, "", "");
+    auto cand_a = crypto_svc->ed25519_keygen();
+    auto r_a = admission->create_request(signed_request(cand_a, "berlin-2"));
+    ASSERT_TRUE(r_a.ok) << r_a.error;
 
-    auto after = admission->status(r.request_id, in.candidate_pubkey);
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Pending);
+    auto cand_b = crypto_svc->ed25519_keygen();
+    auto r_b = admission->create_request(signed_request(cand_b, "berlin-2"));
+    EXPECT_FALSE(r_b.ok);
+    EXPECT_EQ(r_b.status, 409);
 }
 
-// The pending record is what gets minted: peers vote on claim A, the candidate
-// re-submits claim B on the same key, and the old votes would issue B.
 TEST_F(AdmissionServiceTest, PendingAdmissionCannotBeMutated) {
-    make(/*root_is_local=*/true, /*min_tier1=*/0);
+    // The pending record is what gets minted: the admin verifies claim A, so a
+    // re-submission must not swap in claim B under the same request_id.
+    make(/*root_is_local=*/true);
 
     auto cand = crypto_svc->ed25519_keygen();
     auto in   = signed_request(cand, "berlin-5");
     auto r    = admission->create_request(in);
     ASSERT_TRUE(r.ok) << r.error;
-    const auto first_hash = admission->status(r.request_id, in.candidate_pubkey)->claim_hash;
-    ASSERT_FALSE(first_hash.empty());
 
-    // Same key, same pending request, different server_id -> 409, record intact.
+    // Same key, same pending request, different server_id → 409, record intact.
     auto swap = signed_request(cand, "berlin-6");
     auto r2   = admission->create_request(swap);
     EXPECT_FALSE(r2.ok);
@@ -674,54 +1123,177 @@ TEST_F(AdmissionServiceTest, PendingAdmissionCannotBeMutated) {
     auto mid = admission->status(r.request_id, in.candidate_pubkey);
     ASSERT_TRUE(mid.has_value());
     EXPECT_EQ(mid->server_id, "berlin-5");
-    EXPECT_EQ(mid->claim_hash, first_hash);
 
-    // Region is material too.
-    auto region_swap   = signed_request(cand, "berlin-5");
-    region_swap.region = "ap-south";
-    {
-        auto msg = core::ServerAdmissionService::canonical_request(region_swap);
-        auto sig = crypto_svc->ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
-        region_swap.signature = crypto::to_base64(
-            std::span<const uint8_t>(sig.data(), sig.size()));
-    }
-    EXPECT_EQ(admission->create_request(region_swap).status, 409);
-
-    // An identical re-submission stays an idempotent retry and keeps the hash
-    // voters signed rather than rebinding to the new nonce.
+    // An identical re-submission stays an idempotent retry.
     auto same = signed_request(cand, "berlin-5");
     auto r3   = admission->create_request(same);
     EXPECT_TRUE(r3.ok) << r3.error;
     EXPECT_EQ(r3.request_id, r.request_id);
-    EXPECT_TRUE(r3.needs_ballot);   // re-arms the ballot
-    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->claim_hash, first_hash);
-
-    // And a ballot that approves some other claim cannot mint this record.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey,
-                                  "0000000000000000000000000000000000000000000000000000000000000000",
-                                  "");
-    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->state,
-              core::ServerAdmissionService::State::Pending);
-
-    // The claim the quorum actually voted on issues normally.
-    admission->on_ballot_decision(r.request_id, /*approved=*/true, in.candidate_pubkey,
-                                  first_hash, "");
-    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->state,
-              core::ServerAdmissionService::State::Approved);
 }
 
-TEST_F(AdmissionServiceTest, MintRefusedOnNonRootHolder) {
-    make(/*root_is_local=*/false);
-    EXPECT_FALSE(admission->mint_admission_token("", std::chrono::seconds{600}).has_value());
+// --- Persistence ---
+
+TEST_F(AdmissionServiceTest, PendingAdmissionSurvivesRestart) {
+    // A restart must not silently drop a request an operator is mid-way through
+    // verifying, and must not change its content.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+
+    restart_admission();
+
+    auto a = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Pending);
+    EXPECT_EQ(a->server_id, "berlin-2");
+    EXPECT_EQ(a->candidate_pubkey, in.candidate_pubkey);
+    EXPECT_EQ(a->decision_mode, "sole");
+}
+
+TEST_F(AdmissionServiceTest, PersistedExpiryEnforcedAfterRestart) {
+    // Expiry is a property of the stored record, not of the process: a restart
+    // must not resurrect a request past its TTL.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+
+    admission->stop();  // persists the record
+
+    // Backdate the persisted expiry.
+    auto env = storage_svc->read_file("onboarding", "admissions.json");
+    ASSERT_TRUE(env.has_value());
+    auto j = nlohmann::json::parse(env->data);
+    ASSERT_FALSE(j["admissions"].empty());
+    j["admissions"][0]["expires_at"] = 1;
+    env->data = j.dump();
+    ASSERT_TRUE(storage_svc->write_file("onboarding", "admissions.json", *env));
+
+    admission = std::make_unique<core::ServerAdmissionService>(
+        config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
+    admission->start();
+
+    auto a = admission->status(r.request_id, in.candidate_pubkey);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Expired);
+}
+
+TEST_F(AdmissionServiceTest, DenialCooldownSurvivesRestart) {
+    // A restart must not clear an active denial — the cooldown is persisted
+    // state, or a denied identity could retry by crashing the server.
+    make(/*root_is_local=*/true);
+
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    ASSERT_TRUE(admission->deny(r.request_id, "unverified operator").ok);
+
+    restart_admission();
+
+    auto again = admission->create_request(signed_request(cand, "berlin-2"));
+    EXPECT_FALSE(again.ok);
+    EXPECT_EQ(again.status, 429);
+}
+
+TEST_F(AdmissionServiceTest, PendingCapacityRefusalSparesTokens) {
+    // Pending spam cannot lock out a valid token: the request past the cap is
+    // refused 429, while a bound-token admission still lands because tokens
+    // do not count against the pending capacity.
+    make(/*root_is_local=*/true);
+
+    for (int i = 0; i < 8; ++i) {  // cfg default max_pending
+        auto k = crypto_svc->ed25519_keygen();
+        ASSERT_TRUE(admission->create_request(
+            signed_request(k, "node-" + std::to_string(i))).ok);
+    }
+    auto k9 = crypto_svc->ed25519_keygen();
+    auto r9 = admission->create_request(signed_request(k9, "node-full"));
+    EXPECT_FALSE(r9.ok);
+    EXPECT_EQ(r9.status, 429);
+
+    auto tok_cand = crypto_svc->ed25519_keygen();
+    auto tok_b64  = b64({tok_cand.public_key.begin(), tok_cand.public_key.end()});
+    auto minted   = admission->mint_admission_token(tok_b64, std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    auto in = signed_request(tok_cand, "node-token");
+    in.enrollment_token = minted->first;
+    auto r = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+}
+
+TEST_F(AdmissionServiceTest, HistoricalBallotRecordLoadsAsFact) {
+    // Records decided by the removed ballot machinery are history, not errors:
+    // they must load unchanged, and the service must keep working around them.
+    // New records only ever write decision_mode "sole".
+    make(/*root_is_local=*/true);
+    admission->stop();  // release the (empty) persisted state
+
+    auto legacy_key = crypto_svc->ed25519_keygen();
+    auto legacy_b64 = b64({legacy_key.public_key.begin(), legacy_key.public_key.end()});
+    const std::string legacy_id_1(32, '1');
+    const std::string legacy_id_2(32, '2');
+
+    nlohmann::json rec_ballot = {
+        {"request_id", legacy_id_1}, {"candidate_pubkey", legacy_b64},
+        {"server_id", "old-node"}, {"region", "eu-west"},
+        {"tpm_ak_pubkey", ""}, {"tpm_ek_cert", ""}, {"source_ip", "192.0.2.1"},
+        {"state", 1 /* Approved */}, {"created_at", 1}, {"expires_at", 2},
+        {"issued_cert_json", "{}"}, {"decision_reason", "quorum approved"},
+        {"decided_by", "ballot"}, {"decision_mode", "ballot"},
+    };
+    // Pre-decision_mode record: a stored ballot claim keeps its ballot labeling.
+    nlohmann::json rec_pre = {
+        {"request_id", legacy_id_2}, {"candidate_pubkey", legacy_b64},
+        {"server_id", "old-node-2"}, {"region", ""},
+        {"tpm_ak_pubkey", ""}, {"tpm_ek_cert", ""}, {"source_ip", ""},
+        {"state", 1 /* Approved */}, {"created_at", 0}, {"expires_at", 0},
+        {"issued_cert_json", ""}, {"decision_reason", ""},
+        {"decided_by", "ballot"}, {"ballot_claim_json", "{\"nonce\":\"n\"}"},
+    };
+    nlohmann::json root_j{{"ever_approved", true},
+                          {"admissions", nlohmann::json::array({rec_ballot, rec_pre})},
+                          {"denied_until", nlohmann::json::object()}};
+    storage::SignedEnvelope env;
+    env.type = "admissions";
+    env.data = root_j.dump();
+    ASSERT_TRUE(storage_svc->write_file("onboarding", "admissions.json", env));
+
+    admission = std::make_unique<core::ServerAdmissionService>(
+        config, *crypto_svc, *kw, *storage_svc, *gossip_svc);
+    admission->start();
+
+    auto a1 = admission->status(legacy_id_1, legacy_b64);
+    ASSERT_TRUE(a1.has_value());
+    EXPECT_EQ(a1->state, core::AdmissionState::Approved);
+    EXPECT_EQ(a1->decision_mode, "ballot");
+    EXPECT_EQ(a1->decided_by, "ballot");
+
+    auto a2 = admission->status(legacy_id_2, legacy_b64);
+    ASSERT_TRUE(a2.has_value());
+    EXPECT_EQ(a2->decision_mode, "ballot");
+
+    // The service still functions: a fresh request lands pending as "sole".
+    auto cand = crypto_svc->ed25519_keygen();
+    auto in   = signed_request(cand, "berlin-2");
+    auto r    = admission->create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
+    EXPECT_EQ(admission->status(r.request_id, in.candidate_pubkey)->decision_mode, "sole");
 }
 
 // A server_id already claimed by an enrolled peer must 409 the request, and a
 // token presented alongside it must NOT be burned — the operator can retry
-// under a free name with the same token. Needs a live gossip peer, so this
-// stands its own stack up rather than reusing the fixture.
+// under a free name with the same token. Needs a certified gossip peer, so
+// this stands its own stack up rather than reusing the fixture.
 TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     auto tmp = fs::temp_directory_path() /
                ("nexus_test_conflict_" + std::to_string(getpid()));
+    fs::remove_all(tmp);
     fs::create_directories(tmp);
 
     asio::io_context io;
@@ -730,10 +1302,17 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     crypto::KeyWrappingService  kw{c, s};  kw.start();
     auto root = kw.generate_and_store_identity({});
 
-    // Seed a certified peer holding server_id "berlin-2" under a different key.
+    // Seed a certified peer holding server_id "berlin-2" under a different
+    // key. The certificate is real — issued by the root key — because this
+    // is the only state the production ServerHello path can deposit.
     auto other = c.ed25519_keygen();
     auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
-    nlohmann::json cert{{"server_id", "berlin-2"}, {"server_pubkey", other_b64}};
+    gossip::CertIssueParams cp;
+    cp.network_id = kTestNetworkHex;
+    cp.server_pubkey_b64 = other_b64;
+    cp.server_id         = "berlin-2";
+    nlohmann::json cert  = gossip::issue_server_certificate(cp, c, root.private_key,
+                                                            root.public_key);
     nlohmann::json peers{{"peers", nlohmann::json::array({
         {{"pubkey", other_b64}, {"endpoint", "10.9.9.9:9102"},
          {"certificate_json", cert.dump()}}})}};
@@ -743,13 +1322,15 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     ASSERT_TRUE(s.write_file("identity", "peers.json", env));
 
     gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key); gossip.set_network_id(kTestNetworkHex);
     gossip.start();  // load_peers() pulls in the seeded certified peer
 
     core::ServerConfig config;
     config.root_pubkey = crypto::to_hex(
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
     config.onboard_enabled = true;
-    core::ServerAdmissionService admission{config, c, kw, s, gossip, nullptr};
+    core::ServerAdmissionService admission{config, c, kw, s, gossip};
+    admission.set_network_id(kTestNetworkHex);
     admission.start();
 
     auto cand     = c.ed25519_keygen();
@@ -758,15 +1339,15 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     ASSERT_TRUE(token.has_value());
 
     auto sign_req = [&](const std::string& server_id) {
-        core::ServerAdmissionService::RequestInput in;
-        in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
+        core::AdmissionRequest in;
+        in.candidate_pubkey = cand_b64;
         in.server_id = server_id;
         in.region = "eu-west";
         in.nonce = admission.issue_challenge(in.candidate_pubkey);
         in.timestamp = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto msg = core::canonical_admission_request(in);
         auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
         in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
         in.enrollment_token = token->first;
@@ -786,7 +1367,7 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     ASSERT_TRUE(r2.ok) << r2.error;
     auto a = admission.status(r2.request_id, free_req.candidate_pubkey);
     ASSERT_TRUE(a.has_value());
-    EXPECT_EQ(a->state, core::ServerAdmissionService::State::Approved);
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
 
     admission.stop();
     gossip.stop();
@@ -796,59 +1377,79 @@ TEST(OnboardingAdmission, ServerIdConflictDoesNotBurnToken) {
     fs::remove_all(tmp);
 }
 
-// ---------------------------------------------------------------------------
-// Real admission-quorum electorate — regression tests for the forgeable-quorum
-// CRITICAL. The quorum electorate is the ROOT-SIGNED peer set
-// (peer_certificate_is_root_signed), NEVER peers_.size(), and it fails closed
-// when no root anchor is configured. start_admission_ballot() casts the
-// sponsor's self-vote and tallies synchronously, so these need no live UDP.
-// ---------------------------------------------------------------------------
-
-TEST(AdmissionQuorum, NoRootAnchorAdmissionFailsClosed) {
+// The root server's own server_id never appears in get_peers(), so it has its
+// own refusal: a candidate must not be able to claim the root's identity.
+TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
     auto tmp = fs::temp_directory_path() /
-               ("nexus_quorum_noroot_" + std::to_string(getpid()));
+               ("nexus_test_reserved_" + std::to_string(getpid()));
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
     asio::io_context io;
     crypto::SodiumCryptoService c;  c.start();
     storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    kw.generate_and_store_identity({});   // the gossip node's own keypair
+    crypto::KeyWrappingService  kw{c, s};  kw.start();
+    auto root = kw.generate_and_store_identity({});
 
-    // Seed a peer that carries a (self-consistent) certificate. Pre-fix, a null
-    // trust policy made the quorum denominator peers_.size(), so this single
-    // seeded peer plus the sponsor's self-vote could resolve a 75% ballot.
-    // Post-fix, with NO root anchor the attested electorate is empty and
-    // admission MUST fail closed.
-    auto fake = c.ed25519_keygen();
-    auto fake_b64 = b64({fake.public_key.begin(), fake.public_key.end()});
-    nlohmann::json fake_cert{{"server_id", "fake-1"}, {"server_pubkey", fake_b64}};
-    nlohmann::json peers{{"peers", nlohmann::json::array({
-        {{"pubkey", fake_b64}, {"endpoint", "10.0.0.9:9102"},
-         {"certificate_json", fake_cert.dump()}}})}};
-    storage::SignedEnvelope env;
-    env.type = "peer_list";
-    env.data = peers.dump();
-    ASSERT_TRUE(s.write_file("identity", "peers.json", env));
+    // First start creates the gossip identity; then install this server's own
+    // root-signed certificate and start again so our_server_id() is live.
+    std::string self_b64;
+    {
+        gossip::GossipService boot{io, 0, s, c};
+        boot.start();
+        self_b64 = crypto::to_base64(boot.keypair().public_key);
+        boot.stop();
+    }
+    gossip::CertIssueParams cp;
+    cp.network_id = kTestNetworkHex;
+    cp.server_pubkey_b64 = self_b64;
+    cp.server_id         = "rootsrv";
+    auto self_cert = gossip::issue_server_certificate(cp, c, root.private_key,
+                                                      root.public_key);
+    storage::SignedEnvelope cert_env;
+    cert_env.type = "server_cert";
+    cert_env.data = nlohmann::json(self_cert).dump();
+    ASSERT_TRUE(s.write_file("identity", "server_cert.json", cert_env));
 
     gossip::GossipService gossip{io, 0, s, c};
-    // Deliberately NO set_root_pubkey() — the genuine shipped default.
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
+    gossip.set_root_pubkey(root.public_key); gossip.set_network_id(kTestNetworkHex);
     gossip.start();
+    ASSERT_TRUE(gossip.our_server_id().has_value());
 
-    bool approved = false;
-    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
-        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
-    });
+    core::ServerConfig config;
+    config.root_pubkey = crypto::to_hex(
+        std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
+    config.onboard_enabled = true;
+    core::ServerAdmissionService admission{config, c, kw, s, gossip};
+    admission.set_network_id(kTestNetworkHex);
+    admission.start();
 
-    auto cand = c.ed25519_keygen();
+    auto cand     = c.ed25519_keygen();
     auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-    gossip.start_admission_ballot("req-noroot", cand_b64, "worker-1", "", "", 0.75f);
+    auto sign_req = [&](const std::string& server_id) {
+        core::AdmissionRequest in;
+        in.candidate_pubkey = cand_b64;
+        in.server_id = server_id;
+        in.region = "eu-west";
+        in.nonce = admission.issue_challenge(in.candidate_pubkey);
+        in.timestamp = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto msg = core::canonical_admission_request(in);
+        auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
+        in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
+        return in;
+    };
 
-    // Empty attested electorate (tier1_count == 0) -> Admission fails closed.
-    EXPECT_FALSE(approved);
+    auto r = admission.create_request(sign_req("rootsrv"));
+    EXPECT_FALSE(r.ok);
+    EXPECT_EQ(r.status, 409);
 
+    // A free label from the same candidate still parks pending.
+    auto r2 = admission.create_request(sign_req("fresh-node"));
+    EXPECT_TRUE(r2.ok) << r2.error;
+
+    admission.stop();
     gossip.stop();
     kw.stop();
     s.stop();
@@ -856,741 +1457,94 @@ TEST(AdmissionQuorum, NoRootAnchorAdmissionFailsClosed) {
     fs::remove_all(tmp);
 }
 
-namespace {
-
-void seed_peers(storage::FileStorageService& s, const nlohmann::json& arr) {
-    storage::SignedEnvelope env;
-    env.type = "peer_list";
-    env.data = nlohmann::json{{"peers", arr}}.dump();
-    (void)s.write_file("identity", "peers.json", env);
-}
-
-// Install a certificate as THIS server's own identity cert.
-void seed_own_cert(storage::FileStorageService& s, const gossip::ServerCertificate& cert) {
-    storage::SignedEnvelope env;
-    env.type = "server_cert";
-    env.data = nlohmann::json(cert).dump();
-    (void)s.write_file("identity", "server_cert.json", env);
-}
-
-nlohmann::json peer_entry(const std::string& pk, const std::string& ep,
-                          const nlohmann::json& cert) {
-    return {{"pubkey", pk}, {"endpoint", ep}, {"certificate_json", cert.dump()}};
-}
-
-gossip::ServerCertificate sign_cert(crypto::SodiumCryptoService& c,
-                                    const crypto::Ed25519Keypair& root,
-                                    const std::string& pk_b64,
-                                    const std::string& server_id) {
-    gossip::CertIssueParams p;
-    p.server_pubkey_b64 = pk_b64;
-    p.server_id         = server_id;
-    return gossip::issue_server_certificate(p, c, root.private_key, root.public_key);
-}
-
-}  // namespace
-
-// An eligible sponsor also occupies a denominator slot, so its own vote can
-// never clear the threshold alone.
-TEST(AdmissionQuorum, SponsorAloneCannotSatisfyQuorum) {
+// Approve-time supersede: an enrolled peer certified under the requested
+// server_id with a DIFFERENT key blocks approval by default; supersede=true
+// revokes the old key and mints for the new one. The conflicting certificate
+// must land AFTER the request parks — create_request scans get_peers() too
+// and would refuse the request outright.
+TEST(OnboardingAdmission, SupersedeRevokesTheOldCertificate) {
     auto tmp = fs::temp_directory_path() /
-               ("nexus_quorum_sponsor_" + std::to_string(getpid()));
+               ("nexus_test_supersede_" + std::to_string(getpid()));
     fs::remove_all(tmp);
     fs::create_directories(tmp);
 
     asio::io_context io;
     crypto::SodiumCryptoService c;  c.start();
     storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    auto self = kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    // This server is itself a fully eligible voter.
-    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
-    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-1"));
-
-    // ...and exactly one other eligible peer exists.
-    auto p1 = c.ed25519_keygen();
-    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
-    nlohmann::json p1_cj = sign_cert(c, root, p1_b64, "voter-1");
-    seed_peers(s, nlohmann::json::array({peer_entry(p1_b64, "10.0.0.1:9102", p1_cj)}));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
-    gossip.start();
-
-    bool approved = false;
-    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
-        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
-    });
-
-    auto cand = c.ed25519_keygen();
-    gossip.start_admission_ballot(
-        "req-sponsor", b64({cand.public_key.begin(), cand.public_key.end()}),
-        "worker-1", "", "", 0.75f);
-
-    // Electorate = {peer, sponsor} -> needed 2, sponsor supplies only 1.
-    EXPECT_FALSE(approved);
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// A sponsor that does not satisfy the voter predicate casts no vote at all.
-TEST(AdmissionQuorum, IneligibleSponsorCastsNoVote) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_quorum_inelig_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-    // NOTE: no seed_own_cert() -> this server holds no root-signed certificate.
-
-    auto p1 = c.ed25519_keygen();
-    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
-    nlohmann::json p1_cj = sign_cert(c, root, p1_b64, "voter-1");
-    seed_peers(s, nlohmann::json::array({peer_entry(p1_b64, "10.0.0.1:9102", p1_cj)}));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
-    gossip.start();
-
-    bool approved = false;
-    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
-        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
-    });
-
-    auto cand = c.ed25519_keygen();
-    gossip.start_admission_ballot(
-        "req-inelig", b64({cand.public_key.begin(), cand.public_key.end()}),
-        "worker-2", "", "", 0.75f);
-
-    bool found = false;
-    for (const auto& bal : gossip.pending_enrollments()) {
-        if (bal.request_id == "req-inelig") { found = true; EXPECT_TRUE(bal.votes.empty()); }
-    }
-    EXPECT_TRUE(found);
-    EXPECT_FALSE(approved);
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// A peer whose cert is not root-signed forms no electorate: at a 10% ratio the
-// sponsor's vote would clear the bar if that peer were counted.
-TEST(AdmissionQuorum, FabricatedPeerCannotFormElectorate) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_quorum_fab_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    auto self = kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
-    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-3"));
-
-    auto p2 = c.ed25519_keygen();
-    auto p2_b64 = b64({p2.public_key.begin(), p2.public_key.end()});
-    nlohmann::json fake{{"server_id", "voter-x"}, {"server_pubkey", p2_b64},
-                        {"issuer_pubkey", p2_b64}, {"signature", "AAAA"}};
-    seed_peers(s, nlohmann::json::array({peer_entry(p2_b64, "10.0.0.2:9102", fake)}));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.10f, 60, 3);
-    gossip.start();
-
-    bool approved = false;
-    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
-        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
-    });
-
-    auto cand = c.ed25519_keygen();
-    gossip.start_admission_ballot(
-        "req-fab", b64({cand.public_key.begin(), cand.public_key.end()}),
-        "worker-3", "", "", 0.10f);
-
-    EXPECT_FALSE(approved);
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// ---------------------------------------------------------------------------
-// Ballot trust-boundary regressions.
-//
-// The vote handlers sit behind packet-signature verification on a bound socket,
-// which a unit test cannot drive, so reach them through the friend seam. The
-// dispatcher only ever hands these a signature-verified sender key, so supplying
-// `signer` directly provides the same guarantee the wire path does.
-// ---------------------------------------------------------------------------
-
-// Defined inside its namespace: a qualified-name definition at global scope
-// (`struct nexus::gossip::GossipBallotTestAccess {...}`) is an MSVC extension
-// that GCC rejects — the friend declaration is not a prior declaration.
-namespace nexus::gossip {
-struct GossipBallotTestAccess {
-    static void vote_request(gossip::GossipService& g, const std::string& signer,
-                             const nlohmann::json& body) {
-        auto s = body.dump();
-        g.handle_enrollment_vote_request(asio::ip::udp::endpoint{}, signer,
-            reinterpret_cast<const uint8_t*>(s.data()), s.size());
-    }
-    static void vote(gossip::GossipService& g, const std::string& signer,
-                     const nlohmann::json& body) {
-        auto s = body.dump();
-        g.handle_enrollment_vote(asio::ip::udp::endpoint{}, signer,
-            reinterpret_cast<const uint8_t*>(s.data()), s.size());
-    }
-    static void retally(gossip::GossipService& g, const std::string& rid) {
-        g.check_enrollment_quorum(rid);
-    }
-    static bool has_ballot(gossip::GossipService& g, const std::string& rid) {
-        std::lock_guard lock(g.peers_mutex_);
-        return g.pending_enrollments_.contains(rid);
-    }
-    static std::size_t vote_count(gossip::GossipService& g, const std::string& rid) {
-        std::lock_guard lock(g.peers_mutex_);
-        auto it = g.pending_enrollments_.find(rid);
-        return it == g.pending_enrollments_.end() ? 0 : it->second.votes.size();
-    }
-    static float ratio(gossip::GossipService& g, const std::string& rid) {
-        std::lock_guard lock(g.peers_mutex_);
-        auto it = g.pending_enrollments_.find(rid);
-        return it == g.pending_enrollments_.end() ? -1.0f : it->second.required_ratio;
-    }
-    static void occupy_ns_slot(gossip::GossipService& g, uint8_t slot,
-                               const std::string& holder_pubkey) {
-        std::lock_guard lock(g.peers_mutex_);
-        g.ns_slots_[slot - 1].slot          = slot;
-        g.ns_slots_[slot - 1].server_pubkey = holder_pubkey;
-    }
-};
-}  // namespace nexus::gossip
-
-namespace {
-
-using Access = nexus::gossip::GossipBallotTestAccess;
-
-// A vote signed exactly the way cast_enrollment_vote signs one.
-nlohmann::json signed_vote(crypto::SodiumCryptoService& c,
-                           const crypto::Ed25519Keypair& voter,
-                           const std::string& rid, const std::string& cand,
-                           bool approve, const std::string& claim_hash = "") {
-    auto voter_b64 = b64({voter.public_key.begin(), voter.public_key.end()});
-    const uint64_t ts = 1;
-    const std::string reason = "test";
-    nlohmann::json canonical = {
-        {"approve",          approve},
-        {"candidate_pubkey", cand},
-        {"claim_hash",       claim_hash},
-        {"reason",           reason},
-        {"request_id",       rid},
-        {"timestamp",        ts},
-        {"voter_pubkey",     voter_b64},
-    };
-    auto str = canonical.dump();
-    auto sig = c.ed25519_sign(voter.private_key,
-                              std::vector<uint8_t>(str.begin(), str.end()));
-    return {
-        {"request_id",       rid},
-        {"candidate_pubkey", cand},
-        {"voter_pubkey",     voter_b64},
-        {"approve",          approve},
-        {"reason",           reason},
-        {"timestamp",        ts},
-        {"claim_hash",       claim_hash},
-        {"signature",        crypto::to_base64(sig)},
-    };
-}
-
-// A well-formed admission vote-request body. The claim signature is deliberately
-// junk: these tests assert on ballot ADMISSION, not on candidate verification.
-nlohmann::json vote_request_body(const std::string& rid, const std::string& cand,
-                                 const std::string& sponsor, float ratio) {
-    std::vector<uint8_t> zeros(crypto::kEd25519SignatureSize, 0);
-    return {
-        {"request_id",       rid},
-        {"candidate_pubkey", cand},
-        {"sponsor_pubkey",   sponsor},
-        {"required_ratio",   ratio},
-        {"admission_claim", {
-            {"candidate_pubkey", cand},
-            {"nonce",            "n"},
-            {"region",           "eu-west"},
-            {"tpm_ak_pubkey",    ""},
-            {"server_id",        "worker-x"},
-            {"timestamp",        uint64_t{1}},
-            {"signature",        crypto::to_base64(zeros)},
-        }},
-    };
-}
-
-}  // namespace
-
-// A vote request only ever travels sponsor->voter, so a signer that is not the
-// claimed sponsor must not be able to open a ballot in the sponsor's name.
-TEST(BallotBinding, VoteRequestFromNonSponsorRejected) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_ballot_sponsor_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    (void)kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    // A genuine enrolled sponsor, and an attacker that is also enrolled.
-    auto sponsor = c.ed25519_keygen();
-    auto sponsor_b64 = b64({sponsor.public_key.begin(), sponsor.public_key.end()});
-    auto attacker = c.ed25519_keygen();
-    auto attacker_b64 = b64({attacker.public_key.begin(), attacker.public_key.end()});
-    seed_peers(s, nlohmann::json::array({
-        peer_entry(sponsor_b64, "10.0.0.1:9102", sign_cert(c, root, sponsor_b64, "sponsor")),
-        peer_entry(attacker_b64, "10.0.0.2:9102", sign_cert(c, root, attacker_b64, "attacker")),
-    }));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
-    gossip.start();
-
-    auto cand = c.ed25519_keygen();
-    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-
-    // Signed by the attacker but claiming the sponsor -> dropped.
-    Access::vote_request(gossip, attacker_b64,
-                         vote_request_body("req-spoof", cand_b64, sponsor_b64, 0.75f));
-    EXPECT_FALSE(Access::has_ballot(gossip, "req-spoof"));
-
-    // Positive control: the real sponsor opens the same ballot.
-    Access::vote_request(gossip, sponsor_b64,
-                         vote_request_body("req-real", cand_b64, sponsor_b64, 0.75f));
-    EXPECT_TRUE(Access::has_ballot(gossip, "req-real"));
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// Under a trust policy the sponsor attestation is REQUIRED: omitting the field
-// used to skip the check entirely, and a token owned by another key must not
-// vouch for the claimed sponsor.
-TEST(BallotBinding, MissingSponsorAttestationRejectedUnderTrustPolicy) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_ballot_attest_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    (void)kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    auto sponsor = c.ed25519_keygen();
-    auto sponsor_b64 = b64({sponsor.public_key.begin(), sponsor.public_key.end()});
-    seed_peers(s, nlohmann::json::array({
-        peer_entry(sponsor_b64, "10.0.0.1:9102", sign_cert(c, root, sponsor_b64, "sponsor")),
-    }));
-
-    core::BinaryAttestationService att{c, s};  att.start();
-    core::TeeAttestationService tee{c, s, att};  tee.start();
-    core::TrustPolicyService policy{tee, att, c};  policy.start();
-    // Pre-promote the sponsor: on a machine with no TEE a generated token fails
-    // verification, and verify_and_update then falls back to the peer's standing
-    // tier — which must be above Untrusted for the positive control to pass.
-    policy.set_peer_tier2(sponsor_b64);
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
-    gossip.set_trust_policy(&policy);
-    gossip.start();
-
-    auto cand = c.ed25519_keygen();
-    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-
-    // No attestation_token at all -> dropped.
-    Access::vote_request(gossip, sponsor_b64,
-                         vote_request_body("req-noattest", cand_b64, sponsor_b64, 0.75f));
-    EXPECT_FALSE(Access::has_ballot(gossip, "req-noattest"));
-
-    // Token owned by a DIFFERENT key, claiming the sponsor -> dropped.
-    auto attacker = c.ed25519_keygen();
-    auto body = vote_request_body("req-wrongtok", cand_b64, sponsor_b64, 0.75f);
-    body["attestation_token"] = policy.generate_attestation_token(attacker);
-    Access::vote_request(gossip, sponsor_b64, body);
-    EXPECT_FALSE(Access::has_ballot(gossip, "req-wrongtok"));
-
-    // Positive control: the sponsor's own token is accepted.
-    auto good = vote_request_body("req-attest", cand_b64, sponsor_b64, 0.75f);
-    good["attestation_token"] = policy.generate_attestation_token(sponsor);
-    Access::vote_request(gossip, sponsor_b64, good);
-    EXPECT_TRUE(Access::has_ballot(gossip, "req-attest"));
-
-    gossip.stop(); policy.stop(); tee.stop(); att.stop();
-    kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// required_ratio arrives from the wire: it may raise our bar, never lower it.
-TEST(BallotBinding, RemoteRequestCannotLowerQuorumRatio) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_ballot_ratio_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    (void)kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    auto sponsor = c.ed25519_keygen();
-    auto sponsor_b64 = b64({sponsor.public_key.begin(), sponsor.public_key.end()});
-    seed_peers(s, nlohmann::json::array({
-        peer_entry(sponsor_b64, "10.0.0.1:9102", sign_cert(c, root, sponsor_b64, "sponsor")),
-    }));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    // Deliberately DIFFERENT ratios: an admission ballot must floor against the
-    // admission bar, not the lower enrollment one.
-    gossip.set_enrollment_config(true, 0.5f, 60, 3);
-    gossip.set_admission_quorum_ratio(0.75f);
-    gossip.start();
-
-    auto cand = c.ed25519_keygen();
-    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-
-    // A 1% bar would let a single vote decide; it must clamp up to the admission 75%.
-    Access::vote_request(gossip, sponsor_b64,
-                         vote_request_body("req-low", cand_b64, sponsor_b64, 0.01f));
-    ASSERT_TRUE(Access::has_ballot(gossip, "req-low"));
-    EXPECT_FLOAT_EQ(Access::ratio(gossip, "req-low"), 0.75f);
-
-    // Omitting the field entirely must not downgrade to the enrollment ratio either.
-    auto no_ratio = vote_request_body("req-none", cand_b64, sponsor_b64, 0.0f);
-    no_ratio.erase("required_ratio");
-    Access::vote_request(gossip, sponsor_b64, no_ratio);
-    ASSERT_TRUE(Access::has_ballot(gossip, "req-none"));
-    EXPECT_FLOAT_EQ(Access::ratio(gossip, "req-none"), 0.75f);
-
-    // A stricter remote bar is honoured as-is.
-    Access::vote_request(gossip, sponsor_b64,
-                         vote_request_body("req-high", cand_b64, sponsor_b64, 0.9f));
-    ASSERT_TRUE(Access::has_ballot(gossip, "req-high"));
-    EXPECT_FLOAT_EQ(Access::ratio(gossip, "req-high"), 0.9f);
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// The vote signature covers candidate_pubkey, but the ballot was matched on
-// request_id alone -- so a genuine vote for one candidate could be counted
-// toward a ballot about a different candidate.
-TEST(BallotBinding, VoteForOtherCandidateNotCounted) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_ballot_cand_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    auto self = kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
-    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-c"));
-
-    auto p1 = c.ed25519_keygen();
-    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
-    seed_peers(s, nlohmann::json::array({
-        peer_entry(p1_b64, "10.0.0.1:9102", sign_cert(c, root, p1_b64, "voter-1")),
-    }));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
-    gossip.start();
-
-    auto cand = c.ed25519_keygen();
-    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-    auto other = c.ed25519_keygen();
-    auto other_b64 = b64({other.public_key.begin(), other.public_key.end()});
-
-    gossip.start_admission_ballot("req-cand", cand_b64, "worker-1", "", "", 0.75f);
-    ASSERT_TRUE(Access::has_ballot(gossip, "req-cand"));
-    const auto before = Access::vote_count(gossip, "req-cand");
-
-    // Genuine, correctly signed vote -- for the WRONG candidate.
-    Access::vote(gossip, p1_b64, signed_vote(c, p1, "req-cand", other_b64, true));
-    EXPECT_EQ(Access::vote_count(gossip, "req-cand"), before);
-
-    // The same voter's vote for the ballot's actual candidate is accepted.
-    Access::vote(gossip, p1_b64, signed_vote(c, p1, "req-cand", cand_b64, true));
-    EXPECT_EQ(Access::vote_count(gossip, "req-cand"), before + 1);
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-// A voter that leaves the electorate must leave the numerator at the same
-// instant: otherwise revoking a voter SHRINKS the denominator while its stale
-// approve survives, and a ballot that was short of quorum suddenly passes.
-TEST(BallotBinding, RevokedVoterStaleVoteStopsCounting) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_ballot_stale_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-    auto self = kw.generate_and_store_identity({});
-    auto root = c.ed25519_keygen();
-
-    auto self_b64 = b64({self.public_key.begin(), self.public_key.end()});
-    seed_own_cert(s, sign_cert(c, root, self_b64, "sponsor-s"));
-
-    auto p1 = c.ed25519_keygen();
-    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
-    auto p2 = c.ed25519_keygen();
-    auto p2_b64 = b64({p2.public_key.begin(), p2.public_key.end()});
-    seed_peers(s, nlohmann::json::array({
-        peer_entry(p1_b64, "10.0.0.1:9102", sign_cert(c, root, p1_b64, "voter-1")),
-        peer_entry(p2_b64, "10.0.0.2:9102", sign_cert(c, root, p2_b64, "voter-2")),
-    }));
-
-    gossip::GossipService gossip{io, 0, s, c};
-    gossip.set_root_pubkey(root.public_key);
-    gossip.set_enrollment_config(true, 0.75f, 60, 3);
-    gossip.start();
-
-    bool approved = false;
-    gossip.set_enrollment_decision_callback([&](const gossip::EnrollmentBallot& bal) {
-        if (bal.state == gossip::EnrollmentBallot::State::Approved) approved = true;
-    });
-
-    auto cand = c.ed25519_keygen();
-    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-
-    // Electorate {self, p1, p2} -> needed ceil(3*0.75) = 3. Sponsor supplies 1.
-    gossip.start_admission_ballot("req-stale", cand_b64, "worker-1", "", "", 0.75f);
-    ASSERT_FALSE(approved);
-
-    // p1 approves -> 2 of 3. Still short.
-    Access::vote(gossip, p1_b64, signed_vote(c, p1, "req-stale", cand_b64, true));
-    ASSERT_FALSE(approved);
-
-    // Revoking p1 drops the electorate to {self, p2}: needed 2. Counting p1's
-    // stale approve would give 2 and pass the ballot.
-    gossip.add_revoked_server(p1_b64);
-    Access::retally(gossip, "req-stale");
-    EXPECT_FALSE(approved);
-
-    gossip.stop(); kw.stop(); s.stop(); c.stop();
-    fs::remove_all(tmp);
-}
-
-
-// ===========================================================================
-// NS slot pinning
-// ===========================================================================
-
-namespace {
-
-// Minimal service stack for slot-claim tests; returns started services.
-struct NsSlotRig {
-    asio::io_context io;
-    crypto::SodiumCryptoService c;
-    std::unique_ptr<storage::FileStorageService> s;
-    std::unique_ptr<crypto::KeyWrappingService> kw;
-    std::unique_ptr<gossip::GossipService> gossip;
-    fs::path tmp;
-
-    explicit NsSlotRig(const std::string& tag) {
-        tmp = fs::temp_directory_path() / (tag + std::to_string(getpid()));
-        fs::remove_all(tmp);
-        fs::create_directories(tmp);
-        c.start();
-        s = std::make_unique<storage::FileStorageService>(tmp);
-        s->start();
-        kw = std::make_unique<crypto::KeyWrappingService>(c, *s);
-        kw->start();
-        (void)kw->generate_and_store_identity({});
-        gossip = std::make_unique<gossip::GossipService>(io, 0, *s, c);
-        gossip->start();
-    }
-    ~NsSlotRig() {
-        gossip->stop(); kw->stop(); s->stop(); c.stop();
-        fs::remove_all(tmp);
-    }
-};
-
-}  // namespace
-
-TEST(NsSlot, AutoClaimsLowestFree) {
-    NsSlotRig rig{"nexus_nsslot_auto_"};
-    rig.gossip->try_claim_ns_slot("203.0.113.10");
-    ASSERT_TRUE(rig.gossip->our_ns_slot().has_value());
-    EXPECT_EQ(*rig.gossip->our_ns_slot(), 1);
-}
-
-TEST(NsSlot, PreferredSlotClaimed) {
-    NsSlotRig rig{"nexus_nsslot_pin_"};
-    rig.gossip->set_preferred_ns_slot(3);
-    rig.gossip->try_claim_ns_slot("203.0.113.10");
-    ASSERT_TRUE(rig.gossip->our_ns_slot().has_value());
-    EXPECT_EQ(*rig.gossip->our_ns_slot(), 3);
-}
-
-// A pinned server must claim its slot or none: the registrar glue points the
-// pinned name at this IP, so falling back to another slot advertises a
-// nameserver record the registry contradicts.
-TEST(NsSlot, OccupiedPreferredSlotNotClaimed) {
-    NsSlotRig rig{"nexus_nsslot_busy_"};
-    rig.gossip->set_preferred_ns_slot(3);
-    Access::occupy_ns_slot(*rig.gossip, 3, "someone-else");
-    rig.gossip->try_claim_ns_slot("203.0.113.10");
-    EXPECT_FALSE(rig.gossip->our_ns_slot().has_value());
-}
-
-// ===========================================================================
-// Ballot lifecycle across a restart
-// ===========================================================================
-
-// Ballots are in-memory but the record persists as ballot-governed, so after a
-// restart approve()/deny() refuse it while no ballot exists to resolve it.
-// Driven end to end: real votes, real quorum, no manual decision callback.
-TEST(BallotLifecycle, RestartReopensBallotAndReachesQuorum) {
-    auto tmp = fs::temp_directory_path() /
-               ("nexus_ballot_restart_" + std::to_string(getpid()));
-    fs::remove_all(tmp);
-    fs::create_directories(tmp);
-
-    asio::io_context io;
-    crypto::SodiumCryptoService c;  c.start();
-    storage::FileStorageService s{tmp};  s.start();
-    crypto::KeyWrappingService kw{c, s};  kw.start();
-
-    // Root anchor with its own root-signed cert (an eligible voter); one
-    // enrolled peer makes an electorate of 2.
+    crypto::KeyWrappingService  kw{c, s};  kw.start();
     auto root = kw.generate_and_store_identity({});
-    auto root_b64 = b64({root.public_key.begin(), root.public_key.end()});
-    seed_own_cert(s, sign_cert(c, root, root_b64, "genesis"));
 
-    auto p1 = c.ed25519_keygen();
-    auto p1_b64 = b64({p1.public_key.begin(), p1.public_key.end()});
-    seed_peers(s, nlohmann::json::array({
-        peer_entry(p1_b64, "10.0.0.1:9102", sign_cert(c, root, p1_b64, "voter-1")),
-    }));
+    gossip::GossipService gossip{io, 0, s, c};
+    gossip.set_root_pubkey(root.public_key); gossip.set_network_id(kTestNetworkHex);
+    gossip.start();
 
     core::ServerConfig config;
     config.root_pubkey = crypto::to_hex(
         std::span<const uint8_t>(root.public_key.data(), root.public_key.size()));
-    config.onboard_enabled            = true;
-    config.onboard_min_tier1_for_vote = 0;   // always the vote regime
+    config.onboard_enabled = true;
+    core::ServerAdmissionService admission{config, c, kw, s, gossip};
+    admission.set_network_id(kTestNetworkHex);
+    admission.start();
 
-    // Mirrors main.cpp: the callback is the ONLY path from ballot to issuance.
-    auto wire = [&](gossip::GossipService& g, core::ServerAdmissionService& adm) {
-        g.set_enrollment_decision_callback([&adm, &g](const gossip::EnrollmentBallot& b) {
-            if (b.kind != gossip::EnrollmentBallot::Kind::Admission) return;
-            if (b.sponsor_pubkey != crypto::to_base64(g.keypair().public_key)) return;
-            adm.on_ballot_decision(b.request_id,
-                                   b.state == gossip::EnrollmentBallot::State::Approved,
-                                   b.candidate_pubkey, b.claim_hash, "");
-        });
-    };
-
-    auto make_gossip = [&] {
-        auto g = std::make_unique<gossip::GossipService>(io, 0, s, c);
-        g->set_root_pubkey(root.public_key);
-        g->set_enrollment_config(true, 0.75f, 60, 3);
-        g->set_admission_quorum_ratio(0.75f);
-        g->start();
-        return g;
-    };
-
-    auto cand = c.ed25519_keygen();
+    auto cand     = c.ed25519_keygen();
     auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
-    std::string request_id, claim_hash;
-
-    // --- First boot: open a ballot-governed admission ------------------------
+    core::AdmissionRequest in;
+    in.candidate_pubkey = cand_b64;
+    in.server_id = "berlin-2";
+    in.region = "eu-west";
+    in.nonce = admission.issue_challenge(in.candidate_pubkey);
+    in.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
     {
-        auto gossip = make_gossip();
-        core::ServerAdmissionService adm{config, c, kw, s, *gossip, nullptr};
-        wire(*gossip, adm);
-        adm.start();
-
-        core::ServerAdmissionService::RequestInput in;
-        in.candidate_pubkey = cand_b64;
-        in.server_id        = "worker-restart";
-        in.region           = "eu-west";
-        in.nonce            = adm.issue_challenge(cand_b64);
-        in.timestamp        = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
-        auto msg = core::ServerAdmissionService::canonical_request(in);
+        auto msg = core::canonical_admission_request(in);
         auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
         in.signature = crypto::to_base64(std::span<const uint8_t>(sig.data(), sig.size()));
-
-        auto r = adm.create_request(in);
-        ASSERT_TRUE(r.ok) << r.error;
-        ASSERT_TRUE(r.needs_ballot);
-        adm.start_pending_ballot(r.request_id);
-        request_id = r.request_id;
-        claim_hash = adm.status(request_id, cand_b64)->claim_hash;
-        ASSERT_TRUE(Access::has_ballot(*gossip, request_id));
-
-        adm.stop();
-        gossip->stop();
     }
+    auto r = admission.create_request(in);
+    ASSERT_TRUE(r.ok) << r.error;
 
-    // --- Restart: fresh gossip (empty ballots) + service from the same root ---
-    auto gossip = make_gossip();
-    ASSERT_FALSE(Access::has_ballot(*gossip, request_id));   // in-memory state is gone
+    // The old holder's real root-signed certificate now lands in the peer set
+    // (as a ServerHello would deposit it): restart gossip over a seeded list.
+    auto old_holder = c.ed25519_keygen();
+    auto old_b64 = b64({old_holder.public_key.begin(), old_holder.public_key.end()});
+    gossip::CertIssueParams cp;
+    cp.network_id = kTestNetworkHex;
+    cp.server_pubkey_b64 = old_b64;
+    cp.server_id         = "berlin-2";
+    nlohmann::json old_cert = gossip::issue_server_certificate(cp, c, root.private_key,
+                                                               root.public_key);
+    gossip.stop();
+    nlohmann::json peers{{"peers", nlohmann::json::array({
+        {{"pubkey", old_b64}, {"endpoint", "10.9.9.9:9102"},
+         {"certificate_json", old_cert.dump()}}})}};
+    storage::SignedEnvelope env;
+    env.type = "peer_list";
+    env.data = peers.dump();
+    ASSERT_TRUE(s.write_file("identity", "peers.json", env));
+    gossip.start();
 
-    core::ServerAdmissionService adm{config, c, kw, s, *gossip, nullptr};
-    wire(*gossip, adm);
-    adm.start();
+    // Default refuses: one server_id, two keys is an identity swap.
+    auto blocked = admission.approve(r.request_id, cand_b64, /*supersede=*/false);
+    EXPECT_FALSE(blocked.ok);
+    EXPECT_EQ(blocked.status, 409);
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::revoked(gossip, old_b64));
 
-    // The ballot is re-opened by start(), bound to the same claim.
-    ASSERT_TRUE(Access::has_ballot(*gossip, request_id));
-    EXPECT_EQ(adm.status(request_id, cand_b64)->claim_hash, claim_hash);
-    EXPECT_EQ(adm.status(request_id, cand_b64)->state,
-              core::ServerAdmissionService::State::Pending);
+    // Supersede: the old key is revoked, the new certificate is root-signed.
+    auto ap = admission.approve(r.request_id, cand_b64, /*supersede=*/true);
+    ASSERT_TRUE(ap.ok) << ap.error;
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::revoked(gossip, old_b64));
 
-    // Electorate {self, peer} = 2 at 0.75 -> needs both. The sponsor voted when
-    // the ballot re-opened; the peer's vote closes the quorum.
-    Access::vote(*gossip, p1_b64, signed_vote(c, p1, request_id, cand_b64, true, claim_hash));
+    auto a = admission.status(r.request_id, cand_b64);
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->state, core::AdmissionState::Approved);
+    ASSERT_FALSE(a->issued_cert_json.empty());
+    EXPECT_TRUE(cert_verifies_against(a->issued_cert_json, root.public_key, c));
 
-    auto after = adm.status(request_id, cand_b64);
-    ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->state, core::ServerAdmissionService::State::Approved);
-    EXPECT_EQ(after->decided_by, "ballot");
-    EXPECT_FALSE(after->issued_cert_json.empty());
-
-    adm.stop(); gossip->stop(); kw.stop(); s.stop(); c.stop();
+    admission.stop();
+    gossip.stop();
+    kw.stop();
+    s.stop();
+    c.stop();
     fs::remove_all(tmp);
 }

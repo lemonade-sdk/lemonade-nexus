@@ -456,6 +456,7 @@ ln_error_t ln_cert_request(ln_client_t* client,
     j["domain"]           = result.value.domain;
     j["fullchain_pem"]    = result.value.fullchain_pem;
     j["encrypted_privkey"] = result.value.encrypted_privkey;
+    j["crypto_version"]    = result.value.crypto_version;
     j["nonce"]            = result.value.nonce;
     j["ephemeral_pubkey"] = result.value.ephemeral_pubkey;
     j["expires_at"]       = result.value.expires_at;
@@ -477,6 +478,7 @@ ln_error_t ln_cert_decrypt(ln_client_t* client,
     bundle.domain           = parsed.value("domain", "");
     bundle.fullchain_pem    = parsed.value("fullchain_pem", "");
     bundle.encrypted_privkey = parsed.value("encrypted_privkey", "");
+    bundle.crypto_version    = parsed.value("crypto_version", 0u);
     bundle.nonce            = parsed.value("nonce", "");
     bundle.ephemeral_pubkey = parsed.value("ephemeral_pubkey", "");
     bundle.expires_at       = parsed.value("expires_at", uint64_t{0});
@@ -638,7 +640,7 @@ ln_error_t ln_join_network(ln_client_t* client,
     j["node_id"]        = result.value.node_id;
     j["tunnel_ip"]      = result.value.tunnel_ip;
     j["private_subnet"] = result.value.private_subnet;
-    j["wg_pubkey"]      = result.value.wg_pubkey;
+    j["mesh_pubkey"]    = result.value.mesh_pubkey;
     if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);
@@ -1148,7 +1150,7 @@ ln_error_t ln_mesh_status(ln_client_t* client, char** out_json) {
         json pj;
         pj["node_id"]        = p.node_id;
         pj["hostname"]       = p.hostname;
-        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["mesh_pubkey"]    = p.mesh_pubkey;
         pj["tunnel_ip"]      = p.tunnel_ip;
         pj["private_subnet"] = p.private_subnet;
         pj["endpoint"]       = p.endpoint;
@@ -1176,7 +1178,7 @@ ln_error_t ln_mesh_peers(ln_client_t* client, char** out_json) {
         json pj;
         pj["node_id"]        = p.node_id;
         pj["hostname"]       = p.hostname;
-        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["mesh_pubkey"]    = p.mesh_pubkey;
         pj["tunnel_ip"]      = p.tunnel_ip;
         pj["private_subnet"] = p.private_subnet;
         pj["endpoint"]       = p.endpoint;
@@ -1225,11 +1227,11 @@ ln_error_t ln_routing_profile(ln_client_t* client, int page, int page_size,
 }
 
 ln_error_t ln_routing_request(ln_client_t* client, const char* identifier,
-                              const char* conn_nonce_b64, const char* client_wg_pub,
+                              const char* conn_nonce_b64, const char* client_mesh_pubkey,
                               char** out_json) {
     if (!client || !identifier || !conn_nonce_b64 || !out_json) return LN_ERR_NULL_ARG;
     auto r = client->client.request_endpoint(identifier, conn_nonce_b64,
-                                             client_wg_pub ? client_wg_pub : "");
+                                             client_mesh_pubkey ? client_mesh_pubkey : "");
     if (!r.ok) return r.http_status == 403 ? LN_ERR_REJECTED : LN_ERR_CONNECT;
     json j = {{"connection_id", r.value.connection_id}, {"state", r.value.state}};
     *out_json = strdup_json(j);

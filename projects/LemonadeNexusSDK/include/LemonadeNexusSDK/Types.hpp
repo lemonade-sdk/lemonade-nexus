@@ -120,7 +120,7 @@ struct TreeNode {
     // Crypto
     std::string              mgmt_pubkey;
     std::string              wrapped_mgmt_privkey;
-    std::string              wg_pubkey;
+    std::string              mesh_pubkey;
 
     // Assignments
     std::vector<Assignment>  assignments;
@@ -229,12 +229,13 @@ struct CertStatus {
 
 /// An issued certificate bundle (borrowed license from server).
 /// The private key is encrypted with the client's Ed25519 key via
-/// ephemeral X25519 DH + HKDF + AES-256-GCM.
+/// ephemeral X25519 DH + HKDF + XChaCha20-Poly1305-IETF.
 struct IssuedCertBundle {
     std::string domain;             ///< e.g. "my-laptop.capi.lemonade-nexus.io"
     std::string fullchain_pem;      ///< Full certificate chain (PEM)
-    std::string encrypted_privkey;  ///< AES-GCM encrypted private key (base64)
-    std::string nonce;              ///< AES-GCM nonce (base64)
+    std::string encrypted_privkey;  ///< encrypted private key (base64)
+    unsigned    crypto_version{0};  ///< crypto format version; 1 = XChaCha20-Poly1305-IETF
+    std::string nonce;              ///< 24-byte nonce (base64)
     std::string ephemeral_pubkey;   ///< Server's ephemeral X25519 pubkey (base64)
     uint64_t    expires_at{0};      ///< Certificate expiry (Unix timestamp)
 };
@@ -256,7 +257,7 @@ struct JoinResult {
     std::string node_id;
     std::string tunnel_ip;
     std::string private_subnet;
-    std::string wg_pubkey;          ///< mesh public key (base64)
+    std::string mesh_pubkey;        ///< mesh public key (base64)
     std::string error;
 };
 
@@ -309,7 +310,7 @@ struct TunnelStatus {
     bool        is_up{false};
     std::string tunnel_ip;
     std::string server_endpoint;
-    int64_t     last_handshake{0};          ///< Unix timestamp of last WG handshake
+    int64_t     last_handshake{0};          ///< Unix timestamp of last Noise handshake
     uint64_t    rx_bytes{0};
     uint64_t    tx_bytes{0};
     int32_t     latency_ms{-1};             ///< -1 = unknown
@@ -323,7 +324,7 @@ struct TunnelStatus {
 struct MeshPeer {
     std::string node_id;
     std::string hostname;
-    std::string wg_pubkey;              ///< Curve25519 base64
+    std::string mesh_pubkey;            ///< Curve25519 base64
     std::string tunnel_ip;              ///< e.g. "10.64.0.5/32"
     std::string private_subnet;         ///< e.g. "10.128.17.4/30"
     std::string endpoint;               ///< Direct "ip:port" (from STUN/hole-punch)

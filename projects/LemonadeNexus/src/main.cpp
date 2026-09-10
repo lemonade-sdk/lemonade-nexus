@@ -23,12 +23,10 @@
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
-#include <LemonadeNexus/Core/GovernanceService.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
-#include <LemonadeNexus/Core/RootKeyChain.hpp>
-#include <LemonadeNexus/Core/TeeAttestation.hpp>
-#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
-#include <LemonadeNexus/Core/TrustPolicy.hpp>
+#include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
+#include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
+#include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
@@ -50,6 +48,10 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#ifdef LEMONADE_HAVE_ATTESTD_CLIENT
+#  include <LemonadeNexusAttestd/AttestdClient.hpp>
+#endif
+
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -59,6 +61,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <unordered_set>
 
@@ -117,28 +120,8 @@ int main(int argc, char* argv[]) {
     }
     attestation.start();
 
-    nexus::core::TeeAttestationService tee{crypto, storage, attestation};
-    if (!config.tee_platform_override.empty()) {
-        // set_platform_override is now hardware-gated: it can only select a platform
-        // whose device is actually present, or downgrade to None. It can no longer
-        // fabricate TEE capability on a box with no root of trust (hardening plan,
-        // issue 7) — so this is safe to drive from config.
-        tee.set_platform_override(config.tee_platform_override);
-    }
-
-    tee.start();
-
-    if (config.require_tee_attestation &&
-        tee.detected_platform() != nexus::core::TeePlatform::Tpm2) {
-        spdlog::warn("require_tee_attestation is set but no TPM 2.0 was detected on this host. "
-                     "This server will operate as Tier 2 (it can VERIFY Tier-1 peers but cannot "
-                     "self-attest). Provision a TPM (/dev/tpmrm0) to become Tier-1 capable.");
-    }
-
-    nexus::core::TrustPolicyService trust_policy{tee, attestation, crypto};
-    // Strict TPM-only Tier 1 is enforced whenever attestation is required.
-    trust_policy.set_require_tpm(config.require_tee_attestation);
-    trust_policy.start();
+    // The old TEE/trust services are gone: attestation, eligibility, and
+    // Tier 1 authority live in the mesh security system.
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
     tree.start();
@@ -146,9 +129,6 @@ int main(int argc, char* argv[]) {
     nexus::ipam::IPAMService ipam{storage};
     ipam.start();
 
-    nexus::core::RootKeyChainService root_key_chain{crypto, storage};
-    root_key_chain.set_io_context(coordinator.io_context());
-    root_key_chain.start();
 
     // Load or auto-generate server identity keypair
     auto root_privkey = key_wrapping.unlock_identity({});
@@ -159,32 +139,7 @@ int main(int argc, char* argv[]) {
         root_privkey = generated.private_key;
         root_pubkey  = generated.public_key;
     }
-    if (root_privkey && root_pubkey) {
-        nexus::crypto::Ed25519Keypair root_kp;
-        root_kp.private_key = *root_privkey;
-        root_kp.public_key = *root_pubkey;
-        root_key_chain.initialize_genesis(root_kp);
 
-        // If the tree has a root node with a different pubkey (e.g. identity was
-        // regenerated after keypair files were lost), update it automatically.
-        auto identity_pk = "ed25519:" + nexus::crypto::to_base64(
-            std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
-        auto root_node = tree.get_node("root");
-        if (root_node && root_node->mgmt_pubkey != identity_pk) {
-            spdlog::warn("Root node pubkey mismatch — updating to match new server identity");
-            spdlog::info("  old: {}", root_node->mgmt_pubkey);
-            spdlog::info("  new: {}", identity_pk);
-            auto updated = *root_node;
-            updated.mgmt_pubkey = identity_pk;
-            for (auto& a : updated.assignments) {
-                a.management_pubkey = identity_pk;
-            }
-            tree.update_node_direct("root", updated);
-        }
-    }
-
-    nexus::core::GovernanceService governance{crypto, storage, root_key_chain};
-    governance.start();
 
     // ========================================================================
     // Gossip (depends on storage + crypto, uses io_context)
@@ -198,16 +153,6 @@ int main(int argc, char* argv[]) {
             gossip.set_root_pubkey(root_pk);
         }
     }
-    if (config.require_tee_attestation) {
-        gossip.set_trust_policy(&trust_policy);
-    }
-    gossip.set_root_key_chain(&root_key_chain);
-    gossip.set_governance(&governance);
-    gossip.set_enrollment_config(config.require_peer_confirmation,
-                                  config.enrollment_quorum_ratio,
-                                  config.enrollment_vote_timeout_sec,
-                                  config.enrollment_max_retries);
-    gossip.set_admission_quorum_ratio(config.admission_quorum_ratio);
     gossip.set_ipam(&ipam);
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
@@ -246,12 +191,68 @@ int main(int argc, char* argv[]) {
         }).detach();
     }
 
-    // Bind our identity into the TPM quote's qualifyingData. Use the very keypair
-    // gossip signs TEE reports with, so report.server_pubkey matches what the prover
-    // hashes into the quote (and what a verifier recomputes).
-    tee.set_identity_pubkey(nexus::crypto::to_base64(
-        std::span<const uint8_t>(gossip.keypair().public_key.data(),
-                                 gossip.keypair().public_key.size())));
+
+    // ========================================================================
+    // New security lifecycle (gossip is its transport; the old trust system
+    // stays constructed and is not consulted by it)
+    // ========================================================================
+    // Runs only with a pinned Genesis anchor: no assumed authority, no local
+    // override, no fallback. Constructed after gossip.start() because the
+    // gossip identity keypair exists only then; declared after gossip so it is
+    // destroyed first.
+    std::optional<nexus::security::SecurityMeshService> security_mesh;
+    if (!config.genesis_pubkey.empty()) {
+        const auto genesis_bytes = nexus::crypto::from_base64(
+            nexus::crypto::canonical_key_b64(config.genesis_pubkey));
+        if (genesis_bytes.size() != nexus::crypto::kEd25519PublicKeySize) {
+            spdlog::error("Config: genesis_pubkey is not a base64 Ed25519 public key");
+            return 1;
+        }
+        nexus::security::SecurityMeshConfig mesh_config;
+        mesh_config.data_root = data_root;
+        std::memcpy(mesh_config.genesis_public_key.data(), genesis_bytes.data(),
+                    genesis_bytes.size());
+        // Certificates bind to the derived network id. The gossip gate never
+        // fails open, so without this no certificate validates.
+        gossip.set_network_id(nexus::crypto::to_hex(nexus::security::derive_network_id(
+            mesh_config.genesis_public_key,
+            nexus::security::constants::kSecurityRulesetVersion,
+            nexus::security::constants::kConsensusRulesetVersion)));
+        mesh_config.identity = gossip.keypair();
+        // The named profile, not a default-constructed one. It is currently
+        // incomplete by design, so every attestation fails with
+        // ProfileIncomplete until a qualifying host supplies the pinned values.
+        mesh_config.profile = nexus::security::linux_attestation_profile_v1();
+        if (!nexus::security::profile_is_complete(mesh_config.profile)) {
+            for (const auto gap : nexus::security::profile_gaps(mesh_config.profile)) {
+                spdlog::warn("Attestation profile v{} is incomplete: {}",
+                             mesh_config.profile.profile_version,
+                             nexus::security::profile_gap_name(gap));
+            }
+            spdlog::warn("No node can reach Tier 1 until the profile pins these values.");
+        }
+#ifdef LEMONADE_HAVE_ATTESTD_CLIENT
+        // Platform evidence comes from nexus-attestd over its unix socket, so
+        // this process needs neither TPM access nor the root-only IMA log.
+        // There is no in-process fallback: if the daemon is absent or refuses,
+        // the source yields empty evidence and the verifier fails it closed.
+        {
+            nexus::attestd::AttestdClientConfig attestd;
+            mesh_config.platform_source = nexus::attestd::attestd_platform_source(attestd);
+            std::error_code sock_ec;
+            if (!std::filesystem::exists(attestd.path, sock_ec)) {
+                spdlog::warn("nexus-attestd socket {} is absent; platform evidence will be "
+                             "empty and every attestation will fail until the daemon runs",
+                             attestd.path.string());
+            } else {
+                spdlog::info("platform evidence source: nexus-attestd at {}",
+                             attestd.path.string());
+            }
+        }
+#endif
+        security_mesh.emplace(coordinator.io_context(), mesh_config, gossip, &key_wrapping);
+        security_mesh->start();
+    }
 
     // ========================================================================
     // Dynamic DNS
@@ -277,10 +278,29 @@ int main(int argc, char* argv[]) {
             } catch (...) {}
         }
     }
-    if (config.require_tee_attestation) {
-        ddns.set_trust_policy(&trust_policy);
-    }
+    // The mesh security system answers Tier 1 membership; an unset gate
+    // denies inside DdnsService.
+    ddns.set_tier1_gate([&security_mesh](std::string_view server_pk_b64) {
+        if (!security_mesh) return false;
+        const auto bytes = nexus::crypto::from_base64(
+            nexus::crypto::canonical_key_b64(server_pk_b64));
+        if (bytes.size() != nexus::crypto::kEd25519PublicKeySize) return false;
+        nexus::security::NodeId node;
+        std::memcpy(node.bytes.data(), bytes.data(), bytes.size());
+        return security_mesh->is_current_member(node);
+    });
     ddns.start();
+
+    // Tier1-labelled DNS records assert finalized membership; the same source
+    // that gates DDNS credentials gates them, and unset denies.
+    gossip.set_tier1_membership_source([&security_mesh](const std::string& pk_b64) {
+        if (!security_mesh) return false;
+        const auto bytes = nexus::crypto::from_base64(pk_b64);
+        if (bytes.size() != nexus::crypto::kEd25519PublicKeySize) return false;
+        nexus::security::NodeId node;
+        std::memcpy(node.bytes.data(), bytes.data(), bytes.size());
+        return security_mesh->is_current_member(node);
+    });
 
     // ========================================================================
     // STUN + Relay
@@ -387,14 +407,14 @@ int main(int argc, char* argv[]) {
             dns.publish_seip_records(seip_id, config.region, server_public_ip);
             spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
 
-            // Publish our tier record so other nodes can discover us by tier+region
-            // (tier<N>.<region>.seip.<domain>). Tier1 = TEE-attested, Tier2 = cert-only.
-            const auto our_tier = trust_policy.our_tier();
-            const int tier_num = (our_tier == nexus::core::TrustTier::Tier1) ? 1
-                               : (our_tier == nexus::core::TrustTier::Tier2) ? 2 : 0;
-            if (tier_num > 0) {
-                dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
-            }
+            // Tier 1 = current epoch membership in the mesh security system.
+            // Every enrolled server is at least Tier 2 transport.
+            const int tier_num =
+                (security_mesh &&
+                 security_mesh->is_current_member(
+                     nexus::security::NodeId{gossip.keypair().public_key}))
+                    ? 1 : 2;
+            dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
 
             // The public API cert (for the SEIP FQDN) is resolved below via
             // public_cert_fqdn — no per-FQDN handling needed here.
@@ -516,7 +536,7 @@ int main(int argc, char* argv[]) {
     // boringtun interface — server-side tunnel endpoint
     // ========================================================================
     nexus::boringtun::BoringtunService boringtun_service{
-        config.wg_interface, std::filesystem::path{config.data_root} / "wireguard"};
+        config.mesh_interface, std::filesystem::path{config.data_root} / "wireguard"};
     boringtun_service.start();
 
     // In-process traffic termination: the userspace netstack answers on our
@@ -531,21 +551,21 @@ int main(int argc, char* argv[]) {
     });
 
     // Derive Curve25519 keypair from Ed25519 identity for the mesh
-    std::string wg_server_privkey_b64;
+    std::string mesh_server_private_key_b64;
     if (root_privkey) {
         auto x_sk = nexus::crypto::SodiumCryptoService::ed25519_sk_to_x25519(*root_privkey);
-        wg_server_privkey_b64 = nexus::crypto::to_base64(
+        mesh_server_private_key_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(x_sk.data(), x_sk.size()));
     }
 
     // Set up the boringtun interface with the server's tunnel IP
-    if (!wg_server_privkey_b64.empty() && !tunnel_bind_ip.empty()) {
-        nexus::boringtun::BoringtunInterfaceConfig wg_iface;
-        wg_iface.private_key = wg_server_privkey_b64;
-        wg_iface.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
-        wg_iface.listen_port = config.udp_port;
+    if (!mesh_server_private_key_b64.empty() && !tunnel_bind_ip.empty()) {
+        nexus::boringtun::BoringtunInterfaceConfig mesh_interface_config;
+        mesh_interface_config.private_key = mesh_server_private_key_b64;
+        mesh_interface_config.address     = tunnel_bind_ip + "/10";  // 10.64.0.0/10 mesh subnet
+        mesh_interface_config.listen_port = config.udp_port;
 
-        if (boringtun_service.setup_interface(wg_iface, {})) {
+        if (boringtun_service.setup_interface(mesh_interface_config, {})) {
             // The netstack answers on our tunnel IP across the whole client plane.
             vnet.add_local_ip(tunnel_bind_ip + "/10");
             spdlog::info("boringtun: userspace dataplane up on :{} with tunnel IP {}/10",
@@ -555,21 +575,22 @@ int main(int argc, char* argv[]) {
                           "clients will not be able to connect.", config.udp_port);
         }
     } else {
-        spdlog::warn("boringtun: skipping {} setup (no identity key or tunnel IP)", config.wg_interface);
+        spdlog::warn("boringtun: skipping {} setup (no identity key or tunnel IP)",
+                     config.mesh_interface);
     }
 
     // ========================================================================
     // Backbone: server-to-server boringtun mesh (172.16.0.0/22)
     // ========================================================================
     std::string backbone_ip;
-    std::string wg_server_pubkey_b64;
+    std::string mesh_server_public_key_b64;
     if (root_pubkey) {
         auto x_pk = nexus::crypto::SodiumCryptoService::ed25519_pk_to_x25519(*root_pubkey);
-        wg_server_pubkey_b64 = nexus::crypto::to_base64(
+        mesh_server_public_key_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
     }
 
-    if (!server_node_id.empty() && !wg_server_pubkey_b64.empty()) {
+    if (!server_node_id.empty() && !mesh_server_public_key_b64.empty()) {
         auto ed25519_pubkey_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
 
@@ -586,10 +607,10 @@ int main(int argc, char* argv[]) {
             spdlog::info("Backbone: registered virtual {}/22", backbone_ip_bare);
         }
 
-        // Wire gossip with WG service and backbone info
+        // Give gossip the mesh dataplane and backbone identity.
         gossip.set_boringtun(&boringtun_service);
         gossip.set_our_backbone_ip(backbone_ip_bare);
-        gossip.set_our_wg_pubkey(wg_server_pubkey_b64);
+        gossip.set_our_mesh_pubkey(mesh_server_public_key_b64);
 
         // Set up IPAM callback to broadcast backbone allocations via gossip
         ipam.set_backbone_callback(
@@ -597,10 +618,10 @@ int main(int argc, char* argv[]) {
                 gossip.broadcast_backbone_ipam_delta(delta);
             });
 
-        spdlog::info("Backbone: server mesh on 172.16.0.0/22, our IP: {}, WG pubkey: {}",
-                      backbone_ip_bare, wg_server_pubkey_b64.substr(0, 12) + "...");
+        spdlog::info("Backbone: server mesh on 172.16.0.0/22, our IP: {}, mesh public key: {}",
+                      backbone_ip_bare, mesh_server_public_key_b64.substr(0, 12) + "...");
     } else {
-        spdlog::warn("Backbone: skipping (no server node ID or WG key)");
+        spdlog::warn("Backbone: skipping (no server node ID or mesh key)");
     }
 
     // ========================================================================
@@ -713,26 +734,19 @@ int main(int argc, char* argv[]) {
     // Server onboarding (admission of new servers over the public API)
     // ========================================================================
     nexus::core::ServerAdmissionService admission{
-        config, crypto, key_wrapping, storage, gossip,
-        config.require_tee_attestation ? &trust_policy : nullptr};
-
-    // Governed-admission ballots (>= onboard_min_tier1_for_vote Tier1 peers)
-    // resolve through the gossip enrollment machinery; map the outcome back to
-    // certificate issuance / denial. Registered before start() so a ballot
-    // re-opened on startup can't resolve into a missing callback.
-    gossip.set_enrollment_decision_callback(
-        [&admission, &gossip](const nexus::gossip::EnrollmentBallot& b) {
-            if (b.kind != nexus::gossip::EnrollmentBallot::Kind::Admission) return;
-            // Only the sponsor holds the matching admission record, so a ballot we
-            // did not open must never resolve one of ours.
-            if (b.sponsor_pubkey !=
-                nexus::crypto::to_base64(gossip.keypair().public_key)) return;
-            const bool approved = b.state == nexus::gossip::EnrollmentBallot::State::Approved;
-            admission.on_ballot_decision(
-                b.request_id, approved, b.candidate_pubkey, b.claim_hash,
-                approved ? "" : "admission ballot did not reach quorum");
-        });
-
+        config, crypto, key_wrapping, storage, gossip};
+    if (!config.genesis_pubkey.empty()) {
+        const auto genesis_bytes = nexus::crypto::from_base64(
+            nexus::crypto::canonical_key_b64(config.genesis_pubkey));
+        if (genesis_bytes.size() == nexus::crypto::kEd25519PublicKeySize) {
+            nexus::crypto::Ed25519PublicKey genesis_pk{};
+            std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
+            admission.set_network_id(nexus::crypto::to_hex(
+                nexus::security::derive_network_id(
+                    genesis_pk, nexus::security::constants::kSecurityRulesetVersion,
+                    nexus::security::constants::kConsensusRulesetVersion)));
+        }
+    }
     admission.start();
 
     // ========================================================================
@@ -754,9 +768,6 @@ int main(int argc, char* argv[]) {
         .relay_discovery  = relay_discovery,
         .routing          = routing,
         .attestation      = attestation,
-        .tee              = tee,
-        .trust_policy     = trust_policy,
-        .governance       = governance,
         .admission        = admission,
         .boringtun        = &boringtun_service,
         .dns              = &dns,
@@ -852,14 +863,24 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Run -- blocks until SIGINT/SIGTERM
     // ========================================================================
-    const auto http_proto = http_server.is_tls() ? "HTTPS" : "HTTP";
+    const std::string public_api_status =
+        http_server.is_tls() ? ("HTTPS:" + std::to_string(http_port))
+                             : ("HTTPS:" + std::to_string(http_port) + " (withheld, not listening)");
+    const std::string private_api_status =
+        (private_http_server && private_http_server->is_tls())
+            ? ("PrivateHTTPS:" + tunnel_bind_ip + ":" + std::to_string(config.private_http_port))
+            : ("PrivateHTTPS:" + tunnel_bind_ip + ":" + std::to_string(config.private_http_port) +
+               " (withheld, not listening)");
+    const auto dns_transport = dns.tcp_listening() ? "UDP+TCP" : "UDP";
     if (private_http_server) {
-        spdlog::info("All services started. Listening on {}:{}, PrivateHTTP:{}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
-                     http_proto, http_port, tunnel_bind_ip, config.private_http_port,
-                     udp_port, gossip_port, stun_port, relay_port, dns_port);
+        spdlog::info("All services started. {}, {}, UDP:{}, Gossip/UDP:{}, STUN/UDP:{}, "
+                     "Relay/UDP:{}, DNS/{}:{}",
+                     public_api_status, private_api_status, udp_port, gossip_port, stun_port, relay_port,
+                     dns_transport, dns_port);
     } else {
-        spdlog::info("All services started. Listening on {}:{}, UDP:{}, Gossip:{}, STUN:{}, Relay:{}, DNS:{}",
-                     http_proto, http_port, udp_port, gossip_port, stun_port, relay_port, dns_port);
+        spdlog::info("All services started. {}, UDP:{}, Gossip/UDP:{}, STUN/UDP:{}, "
+                     "Relay/UDP:{}, DNS/{}:{}",
+                     public_api_status, udp_port, gossip_port, stun_port, relay_port, dns_transport, dns_port);
     }
     if (http_server.is_tls() && !server_fqdn.empty()) {
         spdlog::info("TLS enabled for {} (cert={})", server_fqdn, http_server.tls_cert_path());
@@ -1047,13 +1068,12 @@ int main(int argc, char* argv[]) {
     relay_discovery.stop();
     relay.stop();
     stun.stop();
+    if (security_mesh) {
+        security_mesh->stop();  // uses gossip as transport: stop it first
+    }
     gossip.stop();
-    governance.stop();
-    root_key_chain.stop();
     ipam.stop();
     tree.stop();
-    trust_policy.stop();
-    tee.stop();
     attestation.stop();
     key_wrapping.stop();
     acl_service.stop();

@@ -1,38 +1,101 @@
 [Unit]
 Description=Lemonade-Nexus Mesh VPN Server
-Documentation=https://github.com/OWNER/lemonade-nexus
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus
 After=network-online.target
 Wants=network-online.target
+
+# The measurement policy must be loaded before this binary ever executes,
+# otherwise its first execution is not measured and it can never be anchored.
+# Both are optional so a Tier 2 node without the attestation stack still starts:
+# a missing nexus-attestd costs Tier 1, it does not stop the mesh node.
+Wants=nexus-ima-policy.service nexus-attestd.service
+After=nexus-ima-policy.service nexus-attestd.service
 
 [Service]
 Type=simple
 User=lemonade-nexus
 Group=lemonade-nexus
+# No arguments. Configuration comes from
+# /var/lib/lemonade-nexus/lemonade-nexus.json, discovered via WorkingDirectory
+# and written by nexus-bootstrap. The env file is operator overrides only.
 ExecStart=/usr/bin/lemonade-nexus
 WorkingDirectory=/var/lib/lemonade-nexus
+# The nexus-attestd socket is mode 0660 group 'nexus', and that group membership
+# IS its access control list. Without this the server cannot ask for platform
+# evidence and can never reach Tier 1. It grants nothing else: the group owns
+# one socket. postinst creates the group so this never blocks startup.
+SupplementaryGroups=nexus
 EnvironmentFile=-/etc/lemonade-nexus/lemonade-nexus.env
-Restart=always
+# Restart after an unexpected failure, but leave a clean exit stopped.
+# The package enables this unit without starting it; bootstrap must write a
+# valid configuration before the operator starts the service.
+Restart=on-failure
 RestartSec=5
 LimitNOFILE=65536
 
-# Hardening
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ReadWritePaths=/var/lib/lemonade-nexus
-ReadOnlyPaths=/etc/lemonade-nexus
+# --- privilege ------------------------------------------------------------
+# No path from this unit to more privilege than it starts with. The empty
+# bounding set drops every capability.
+#
+# CAP_NET_BIND_SERVICE is deliberately NOT granted. Every port this server binds
+# is unprivileged: HTTPS 9100, private HTTPS 9101, mesh UDP 51940, gossip 9102,
+# STUN 3478, relay 9103, DNS 5335. Public 53 and 443 are reached by a
+# firewall/NAT mapping, not by binding them here.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+SecureBits=noroot noroot-locked
 
-# Allow binding to privileged ports (HTTP 80/443, DNS 53) without running as
-# root. CAP_NET_ADMIN is intentionally NOT granted: the boringtun dataplane runs
-# fully in userspace (no kernel interface / TUN device), so the daemon needs no
-# network-administration privileges.
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# --- system call surface --------------------------------------------------
+# @debug covers ptrace and friends, so the process cannot attach a debugger to
+# anything, including itself.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @debug @mount @swap @reboot @raw-io @module @cpu-emulation @clock
+SystemCallErrorNumber=EPERM
+
+# --- kernel and process surface -------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Hide processes owned by other users from the service's /proc view.
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# --- filesystem -----------------------------------------------------------
+# Protect the trust config and its parent from daemon writes. Only the data
+# subdirectory is writable; it holds runtime identity, certificates, and state.
+# The nested ReadWritePaths exception leaves that data writable beneath the
+# read-only parent. Root ownership also protects the config outside this unit.
+# One-shot onboarding uses a staging config under data for its seed-peer
+# write-back; the operator keeps the installed trust anchors in the parent.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateMounts=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/lemonade-nexus/data
+ReadOnlyPaths=/etc/lemonade-nexus /var/lib/lemonade-nexus
+UMask=0077
+
+# --- network --------------------------------------------------------------
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# --- core dumps -----------------------------------------------------------
+# A core file would spill mesh key material to disk. Refused twice: no size
+# budget, and no segments selected even if something raised the limit.
+# CoreDumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
+# older systemd, which warns about the unknown key and ignores it.
+LimitCORE=0
+CoreDumpFilter=0x00
 
 [Install]
 WantedBy=multi-user.target

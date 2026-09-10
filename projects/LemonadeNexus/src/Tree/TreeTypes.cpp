@@ -55,7 +55,7 @@ void to_json(json& j, const TreeNode& n) {
         {"shared_domain",            n.shared_domain},
         {"mgmt_pubkey",              n.mgmt_pubkey},
         {"wrapped_mgmt_privkey",     n.wrapped_mgmt_privkey},
-        {"wg_pubkey",                n.wg_pubkey},
+        {"mesh_pubkey",              n.mesh_pubkey},
         {"endpoint_identifier",      n.endpoint_identifier},
         {"cpu_id",                   n.cpu_id},
         {"net_mac",                  n.net_mac},
@@ -81,7 +81,11 @@ void from_json(const json& j, TreeNode& n) {
     j.at("shared_domain").get_to(n.shared_domain);
     j.at("mgmt_pubkey").get_to(n.mgmt_pubkey);
     j.at("wrapped_mgmt_privkey").get_to(n.wrapped_mgmt_privkey);
-    j.at("wg_pubkey").get_to(n.wg_pubkey);
+    if (j.contains("mesh_pubkey")) {
+        j.at("mesh_pubkey").get_to(n.mesh_pubkey);
+    } else if (j.contains("wg_pubkey")) {
+        j.at("wg_pubkey").get_to(n.mesh_pubkey);
+    }
     // Optional: nodes persisted before the routing layer lack these.
     if (j.contains("endpoint_identifier")) j.at("endpoint_identifier").get_to(n.endpoint_identifier);
     if (j.contains("cpu_id"))              j.at("cpu_id").get_to(n.cpu_id);
@@ -135,7 +139,8 @@ std::string canonical_node_json(const TreeNode& node) {
     j["shared_domain"]            = node.shared_domain;
     j["mgmt_pubkey"]              = node.mgmt_pubkey;
     j["wrapped_mgmt_privkey"]     = node.wrapped_mgmt_privkey;
-    j["wg_pubkey"]                = node.wg_pubkey;
+    // Existing node signatures cover this historical field label.
+    j["wg_pubkey"]                = node.mesh_pubkey;
     j["endpoint_identifier"]      = node.endpoint_identifier;
     j["cpu_id"]                   = node.cpu_id;
     j["net_mac"]                  = node.net_mac;
@@ -153,7 +158,11 @@ std::string canonical_node_json(const TreeNode& node) {
 std::string canonical_delta_json(const TreeDelta& delta) {
     // Build a sorted JSON object excluding the "signature" field.
     json j;
-    j["node_data"]      = delta.node_data;
+    json node_data = delta.node_data;
+    // Existing delta signatures cover this historical field label.
+    node_data["wg_pubkey"] = node_data["mesh_pubkey"];
+    node_data.erase("mesh_pubkey");
+    j["node_data"]      = std::move(node_data);
     j["operation"]      = delta.operation;
     j["signer_pubkey"]  = delta.signer_pubkey;
     j["target_node_id"] = delta.target_node_id;

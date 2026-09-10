@@ -1,0 +1,37 @@
+#!/usr/sbin/nft -f
+#
+# Public DNS -> unprivileged Nexus DNS.
+#
+# Nexus binds its DNS port as an unprivileged user and is never granted
+# CAP_NET_BIND_SERVICE. This mapping is what makes the public port reachable;
+# both UDP and TCP must reach the same unprivileged DNS listener.
+#
+# Everything lives in one dedicated table, so `nft delete table inet nexus-dns`
+# removes exactly this and no other policy on the host. nft applies a -f file as
+# a single transaction, so a load either installs both rules or changes nothing:
+# there is no half-configured state to inherit.
+#
+# Ports and interface come from the conf file, which nexus-bootstrap writes.
+
+include "/etc/lemonade-nexus/nexus-dns-nat.conf"
+
+# Create-then-delete is what makes a reload idempotent. Without the create the
+# delete fails on a first load; without the delete a reload stacks a second copy
+# of the rules in the same chain.
+table inet nexus-dns {}
+delete table inet nexus-dns
+
+table inet nexus-dns {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+
+        # systemd-resolved's stub listens on 127.0.0.53:53. Matching only the
+        # external interface leaves the host's own resolver untouched.
+        #
+        # Locally generated queries do not traverse this prerouting redirect.
+        # Test public port 53 from another host; on this server, query the local
+        # DNS port directly. Other firewall rules can still affect either path.
+        iifname $nexus_wan_if udp dport $nexus_public_dns_port redirect to :$nexus_dns_port
+        iifname $nexus_wan_if tcp dport $nexus_public_dns_port redirect to :$nexus_dns_port
+    }
+}
