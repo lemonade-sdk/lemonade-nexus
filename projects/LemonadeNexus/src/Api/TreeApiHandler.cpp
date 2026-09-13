@@ -461,7 +461,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     priv.Post("/api/tree/delta", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto body_opt = parse_body(req, res);
         if (!body_opt) return;
         auto& body = *body_opt;
@@ -479,6 +479,20 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
             delta.signer_pubkey = body.value("signer_pubkey", "");
             delta.signature     = body.value("signature", "");
+        }
+
+        // Two-plane agreement: the authenticated session identity must be the
+        // delta signer. apply_delta authorizes on delta.signer_pubkey's tree
+        // assignments plus a signature the caller claims to possess, so without
+        // this check any session holder could submit deltas signed with another
+        // principal's key (e.g. a captured management key). Compare by key bytes
+        // (canonical_principal), same as do_apply_delta.
+        if (delta.signer_pubkey.empty() ||
+            tree::canonical_principal(normalize_pubkey(claims.pubkey)) !=
+                tree::canonical_principal(delta.signer_pubkey)) {
+            spdlog::warn("[TreeApi] delta signer does not match authenticated session");
+            error_response(res, "delta signer does not match session", 403);
+            return;
         }
 
         bool ok = ctx_.tree.apply_delta(delta);
