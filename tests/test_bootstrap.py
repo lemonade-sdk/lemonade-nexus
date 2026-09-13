@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import re
 import os
 from pathlib import Path
 import stat
@@ -159,6 +160,49 @@ class BootstrapTest(unittest.TestCase):
         nat = (REPO / "packaging/nftables/nexus-dns-nat.nft").read_text()
         for transport in ("udp", "tcp"):
             self.assertIn(f"iifname $nexus_wan_if {transport} dport $nexus_public_dns_port redirect to :$nexus_dns_port", nat)
+
+
+class WorkflowMatrixConsistencyTest(unittest.TestCase):
+    # release.yml ships binaries for whatever it builds, so it must never be
+    # active on a platform that ci.yml does not gate (the Windows entries in
+    # both files are disabled together — see their TODO(windows) comments).
+
+    @staticmethod
+    def _active_matrix_platforms(workflow_path):
+        # Collects the `platform:` value of every ACTIVE (uncommented) matrix
+        # entry in the file: a list item under an `include:` key counts, and
+        # the list ends at the first line (comment or not) indented at or
+        # below the `include:` line. Commented-out entries are skipped.
+        platforms = []
+        include_indent = None
+        for line in workflow_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip())
+            stripped = line.strip()
+            if include_indent is not None and indent <= include_indent:
+                include_indent = None
+            if stripped.startswith("include:"):
+                include_indent = indent
+            elif include_indent is not None and not stripped.startswith("#"):
+                match = re.search(r"platform:\s*(\S+)", stripped)
+                if match:
+                    platforms.append(match.group(1))
+        return platforms
+
+    def test_release_does_not_ship_platforms_ci_does_not_gate(self):
+        ci_platforms = self._active_matrix_platforms(REPO / ".github/workflows/ci.yml")
+        release_platforms = self._active_matrix_platforms(REPO / ".github/workflows/release.yml")
+        self.assertIn("linux-x86_64", ci_platforms)
+        self.assertIn("darwin-arm64", ci_platforms)
+        for platform in release_platforms:
+            with self.subTest(platform=platform):
+                self.assertIn(platform, ci_platforms,
+                              f"release.yml ships {platform} but ci.yml does not gate it")
+        # Windows is currently disabled in both files; a re-enable must be done
+        # in both together (see the TODO(windows) comments in each workflow).
+        self.assertEqual([p for p in release_platforms if p.startswith("windows-")], [])
+        self.assertEqual([p for p in ci_platforms if p.startswith("windows-")], [])
 
 
 if __name__ == "__main__":
