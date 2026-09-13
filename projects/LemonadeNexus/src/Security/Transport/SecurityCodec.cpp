@@ -217,7 +217,7 @@ bool encode_timeout(Writer& w, const TimeoutVote& t) {
 bool encode_dkg(Writer& w, const DkgMessage& d) {
     w.fixed(d.network_id);
     w.u64(d.target_epoch);
-    w.fixed(d.participant_set_digest);
+    w.fixed(d.session_digest);
     put_node(w, d.sender);
     w.u64(d.sender_incarnation);
     w.u16(static_cast<uint16_t>(d.round));
@@ -644,7 +644,7 @@ bool decode_timeout(Reader& r, TimeoutVote& t) {
 
 bool decode_dkg(Reader& r, DkgMessage& d, SecurityMessageKind kind) {
     uint16_t round = 0;
-    if (!(r.fixed(d.network_id) && r.u64(d.target_epoch) && r.fixed(d.participant_set_digest) &&
+    if (!(r.fixed(d.network_id) && r.u64(d.target_epoch) && r.fixed(d.session_digest) &&
           get_node(r, d.sender) && r.u64(d.sender_incarnation) && r.u16(round))) {
         return false;
     }

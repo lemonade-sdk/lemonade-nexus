@@ -80,7 +80,7 @@ DkgMessage dkg_message(DkgRound round) {
     DkgMessage d;
     d.network_id = digest(0xAA);
     d.target_epoch = 8;
-    d.participant_set_digest = digest(0x41);
+    d.session_digest = digest(0x41);
     d.sender = node(0x01);
     d.sender_incarnation = 9;
     d.round = round;
