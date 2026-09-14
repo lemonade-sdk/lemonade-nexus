@@ -8,18 +8,22 @@
 
 #include <unistd.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <variant>
 
 namespace constants = nexus::security::constants;
 namespace fs = std::filesystem;
+using json = nlohmann::json;
 using nexus::security::ConsensusCommit;
 using nexus::security::Digest;
 using nexus::security::EpochId;
 using nexus::security::FileConsensusStore;
+using nexus::security::Height;
 using nexus::security::HotStuffState;
 using nexus::security::IConsensusStore;
 using nexus::security::NodeId;
@@ -118,6 +122,28 @@ protected:
     void write_raw(const fs::path& path, const std::string& content) const {
         std::ofstream stream(path, std::ios::binary | std::ios::trunc);
         stream << content;
+    }
+
+    [[nodiscard]] std::string read_raw(const fs::path& path) const {
+        std::ifstream stream(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(stream)),
+                           std::istreambuf_iterator<char>());
+    }
+
+    [[nodiscard]] fs::path commit_file(EpochId epoch) const {
+        return directory_ / ("hotstuff-commit-" + std::to_string(epoch) + ".json");
+    }
+
+    [[nodiscard]] ConsensusCommit make_commit(EpochId epoch, Height height, View view) const {
+        ConsensusCommit commit{};
+        commit.epoch = epoch;
+        commit.height = height;
+        commit.view = view;
+        commit.proposal_digest = filled_digest(0x51);
+        commit.proposed_state_root = filled_digest(0x52);
+        commit.transitions_digest = filled_digest(0x54);
+        commit.qc_digest = filled_digest(0x53);
+        return commit;
     }
 
     fs::path directory_;
@@ -293,6 +319,173 @@ TEST_F(ConsensusStoreTest, TwoEpochsStoreSideBySide) {
     // The epoch-8 view floor is lower; it never guards epoch 7.
     EXPECT_FALSE(store.store_before_vote(make_state(7, 4, 4, 3)));
     EXPECT_TRUE(store.store_before_vote(make_state(8, 3, 2, 1)));
+}
+
+// --- Integrity: version + record_digest (strict, no legacy layout) ---------
+
+TEST_F(ConsensusStoreTest, StoredRecordsCarryVersionAndDigest) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
+    const auto safety = json::parse(read_raw(safety_file(7)));
+    EXPECT_EQ(safety["version"].get<uint32_t>(), constants::kConsensusStoreFormatVersion);
+    EXPECT_TRUE(safety.contains("record_digest"));
+
+    ASSERT_TRUE(store.store_commit(make_commit(7, 3, 5)));
+    const auto commit = json::parse(read_raw(commit_file(7)));
+    EXPECT_EQ(commit["version"].get<uint32_t>(), constants::kConsensusStoreFormatVersion);
+    EXPECT_TRUE(commit.contains("record_digest"));
+}
+
+TEST_F(ConsensusStoreTest, FlippedByteInSafetyRecordIsCorrupt) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_before_vote(make_state(7, 5, 4, 3)));
+
+    auto content = read_raw(safety_file(7));
+    content[content.size() / 2] ^= 0x01;
+    write_raw(safety_file(7), content);
+
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+
+    // Corrupt safety state is never re-storable as if it were fresh.
+    EXPECT_FALSE(store.store_before_vote(make_state(7, 9, 8, 7)));
+}
+
+TEST_F(ConsensusStoreTest, FlippedByteInCommitRecordIsRejected) {
+    FileConsensusStore store(directory_);
+    const auto commit = make_commit(7, 3, 5);
+    ASSERT_TRUE(store.store_commit(commit));
+
+    auto content = read_raw(commit_file(7));
+    content[content.size() / 2] ^= 0x01;
+    write_raw(commit_file(7), content);
+
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
+}
+
+TEST_F(ConsensusStoreTest, WrongVersionSafetyRecordIsCorrupt) {
+    FileConsensusStore store(directory_);
+    const auto state = make_state(7, 5, 4, 3);
+    auto document = nexus::security::hotstuff_state_to_json(state);
+    document["version"] = 2;
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, VersionlessSafetyRecordIsCorrupt) {
+    // No node ever wrote the pre-version layout: it is simply corrupt.
+    FileConsensusStore store(directory_);
+    auto document = nexus::security::hotstuff_state_to_json(make_state(7, 5, 4, 3));
+    document.erase("version");
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, UnknownTopLevelKeyInSafetyRecordIsCorrupt) {
+    FileConsensusStore store(directory_);
+    auto document = nexus::security::hotstuff_state_to_json(make_state(7, 5, 4, 3));
+    document["extra"] = 1;
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, UnknownKeyInsideQcIsCorrupt) {
+    FileConsensusStore store(directory_);
+    auto document = nexus::security::hotstuff_state_to_json(make_state(7, 5, 4, 3));
+    document["high_qc"]["padding"] = "x";
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, WrongRecordDigestSafetyIsCorrupt) {
+    FileConsensusStore store(directory_);
+    auto document = nexus::security::hotstuff_state_to_json(make_state(7, 5, 4, 3));
+    document["record_digest"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, PayloadEditWithoutDigestUpdateIsCorrupt) {
+    FileConsensusStore store(directory_);
+    auto document = nexus::security::hotstuff_state_to_json(make_state(7, 5, 4, 3));
+    // A replayed/rolled-back floor: the stored value must not move backwards.
+    document["last_voted_view"] = 4;
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, MissingRecordDigestSafetyIsCorrupt) {
+    FileConsensusStore store(directory_);
+    auto document = nexus::security::hotstuff_state_to_json(make_state(7, 5, 4, 3));
+    document.erase("record_digest");
+    write_raw(safety_file(7), document.dump());
+    const auto result = store.load(7);
+    ASSERT_TRUE(std::holds_alternative<LoadResult>(result));
+    EXPECT_EQ(std::get<LoadResult>(result), LoadResult::Corrupt);
+}
+
+TEST_F(ConsensusStoreTest, WrongVersionCommitRecordIsRejected) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_commit(make_commit(7, 3, 5)));
+    auto document = json::parse(read_raw(commit_file(7)));
+    document["version"] = 2;
+    write_raw(commit_file(7), document.dump());
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
+}
+
+TEST_F(ConsensusStoreTest, VersionlessCommitRecordIsRejected) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_commit(make_commit(7, 3, 5)));
+    auto document = json::parse(read_raw(commit_file(7)));
+    document.erase("version");
+    write_raw(commit_file(7), document.dump());
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
+}
+
+TEST_F(ConsensusStoreTest, UnknownKeyInCommitRecordIsRejected) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_commit(make_commit(7, 3, 5)));
+    auto document = json::parse(read_raw(commit_file(7)));
+    document["extra"] = 1;
+    write_raw(commit_file(7), document.dump());
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
+}
+
+TEST_F(ConsensusStoreTest, WrongRecordDigestCommitIsRejected) {
+    FileConsensusStore store(directory_);
+    ASSERT_TRUE(store.store_commit(make_commit(7, 3, 5)));
+    auto document = json::parse(read_raw(commit_file(7)));
+    document["record_digest"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    write_raw(commit_file(7), document.dump());
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
+}
+
+TEST_F(ConsensusStoreTest, CommitRoundTripCoversTransitionsDigest) {
+    FileConsensusStore store(directory_);
+    const auto commit = make_commit(7, 3, 5);
+    ASSERT_TRUE(store.store_commit(commit));
+    const auto latest = store.latest_commit(7);
+    ASSERT_TRUE(latest.has_value());
+    EXPECT_EQ(latest->transitions_digest, commit.transitions_digest);
+
+    // A file without transitions_digest is corrupt, not an "old" record.
+    auto document = json::parse(read_raw(commit_file(7)));
+    document.erase("transitions_digest");
+    write_raw(commit_file(7), document.dump());
+    EXPECT_EQ(store.latest_commit(7), std::nullopt);
 }
 
 }  // namespace

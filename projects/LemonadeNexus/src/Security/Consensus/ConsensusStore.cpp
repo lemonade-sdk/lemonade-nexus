@@ -24,6 +24,23 @@ using json = nlohmann::json;
 
 namespace {
 
+// The store record is closed: an unexpected key means the file is not what
+// this binary writes and must not be acted on.
+[[nodiscard]] bool has_unknown_key(const json& object, std::initializer_list<const char*> expected) {
+    for (const auto& [key, value] : object.items()) {
+        (void)value;
+        bool known = false;
+        for (const auto* name : expected) {
+            if (key == name) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return true;
+    }
+    return false;
+}
+
 [[nodiscard]] std::optional<std::string> read_file(const fs::path& path) {
     std::ifstream stream(path, std::ios::binary);
     if (!stream) return std::nullopt;
@@ -64,28 +81,53 @@ namespace {
 }
 
 [[nodiscard]] json commit_to_json(const ConsensusCommit& commit) {
-    return json{{"epoch", commit.epoch},
+    // Same record_digest convention as the safety record and the epoch
+    // store's anchor: the digest covers the payload (version included,
+    // digest excluded) through the shared canonical encoder.
+    return json{{"version", constants::kConsensusStoreFormatVersion},
+                {"epoch", commit.epoch},
                 {"height", commit.height},
                 {"view", commit.view},
                 {"proposal_digest", crypto::to_base64(commit.proposal_digest)},
                 {"proposed_state_root", crypto::to_base64(commit.proposed_state_root)},
                 {"transitions_digest", crypto::to_base64(commit.transitions_digest)},
-                {"qc_digest", crypto::to_base64(commit.qc_digest)}};
+                {"qc_digest", crypto::to_base64(commit.qc_digest)},
+                {"record_digest", crypto::to_base64(consensus_commit_record_digest(commit))}};
 }
 
 [[nodiscard]] std::optional<ConsensusCommit> commit_from_json(const json& document) {
     if (!document.is_object()) return std::nullopt;
+    if (has_unknown_key(document, {"version", "epoch", "height", "view", "proposal_digest",
+                                   "proposed_state_root", "transitions_digest", "qc_digest",
+                                   "record_digest"})) {
+        return std::nullopt;
+    }
+    // The format is new; every file must be exactly this version.
+    const auto version_it = document.find("version");
+    if (version_it == document.end() || !version_it->is_number_unsigned() ||
+        version_it->get<uint64_t>() > 0xFFFFFFFFu ||
+        version_it->get<uint64_t>() != constants::kConsensusStoreFormatVersion) {
+        return std::nullopt;
+    }
+
     ConsensusCommit commit{};
     if (!read_u64(document, "epoch", commit.epoch)) return std::nullopt;
     if (!read_u64(document, "height", commit.height)) return std::nullopt;
     if (!read_u64(document, "view", commit.view)) return std::nullopt;
     if (!read_digest(document, "proposal_digest", commit.proposal_digest)) return std::nullopt;
-    // Informational field; an older record without it loads as zero.
-    (void)read_digest(document, "transitions_digest", commit.transitions_digest);
     if (!read_digest(document, "proposed_state_root", commit.proposed_state_root)) {
         return std::nullopt;
     }
+    // Every field of the record is load-bearing: transitions_digest feeds the
+    // record digest, so a file without it is corrupt, not "old".
+    if (!read_digest(document, "transitions_digest", commit.transitions_digest)) return std::nullopt;
     if (!read_digest(document, "qc_digest", commit.qc_digest)) return std::nullopt;
+
+    Digest recorded{};
+    if (!read_digest(document, "record_digest", recorded) ||
+        recorded != consensus_commit_record_digest(commit)) {
+        return std::nullopt;
+    }
     return commit;
 }
 

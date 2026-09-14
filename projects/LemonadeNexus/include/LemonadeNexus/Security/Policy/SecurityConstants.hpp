@@ -30,6 +30,11 @@ inline constexpr uint16_t kConsensusRulesetVersion = 1;
 inline constexpr uint16_t kBftProtocolVersion = 1;
 inline constexpr uint16_t kQcFormatVersion = 1;
 
+// On-disk format of the durable consensus store records
+// (hotstuff-safety-<epoch>.json and hotstuff-commit-<epoch>.json). The format
+// is new; every write carries this version and every read requires it.
+inline constexpr uint32_t kConsensusStoreFormatVersion = 1;
+
 // --- Domain-separation strings ----------------------------------------------
 
 inline constexpr std::string_view kBftProtocolDomain = "LEMONADE-NEXUS-HOTSTUFF-V1";

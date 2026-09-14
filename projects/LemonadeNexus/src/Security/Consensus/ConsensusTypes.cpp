@@ -130,4 +130,31 @@ Digest timeout_certificate_digest(const TimeoutCertificate& certificate) {
     return encoder.digest();
 }
 
+Digest consensus_state_record_digest(const QuorumCertificate& high_qc,
+                                     const QuorumCertificate& locked_qc,
+                                     ConsensusRulesetVersion consensus_ruleset, EpochId epoch,
+                                     View last_voted_view) {
+    auto encoder = make_encoder("safety-record");
+    encoder.add_u32(constants::kConsensusStoreFormatVersion);
+    encoder.add_u64(epoch);
+    encoder.add_u16(consensus_ruleset);
+    encoder.add_u64(last_voted_view);
+    encoder.add_bytes(qc_digest(high_qc));
+    encoder.add_bytes(qc_digest(locked_qc));
+    return encoder.digest();
+}
+
+Digest consensus_commit_record_digest(const ConsensusCommit& commit) {
+    auto encoder = make_encoder("commit-record");
+    encoder.add_u32(constants::kConsensusStoreFormatVersion);
+    encoder.add_u64(commit.epoch);
+    encoder.add_u64(commit.height);
+    encoder.add_u64(commit.view);
+    encoder.add_bytes(commit.proposal_digest);
+    encoder.add_bytes(commit.proposed_state_root);
+    encoder.add_bytes(commit.transitions_digest);
+    encoder.add_bytes(commit.qc_digest);
+    return encoder.digest();
+}
+
 }  // namespace nexus::security

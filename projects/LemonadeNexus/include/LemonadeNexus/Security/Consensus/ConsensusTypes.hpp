@@ -104,6 +104,22 @@ struct ConsensusCommit {
     Digest qc_digest;
 };
 
+// Digests of the durable store records. They are what a restarted node
+// re-checks against its own file before acting on it: the epoch store binds
+// its anchor the same way (record_digest), so a consensus safety or commit
+// file flipped at rest loads as Corrupt, never as different state.
+//
+// The encoder is the same one every other consensus digest uses
+// (CanonicalEncoder under kBftProtocolDomain, kind string second); the
+// records bind the exact field set of their on-disk form, including the
+// format version.
+[[nodiscard]] Digest consensus_state_record_digest(const QuorumCertificate& high_qc,
+                                                  const QuorumCertificate& locked_qc,
+                                                  ConsensusRulesetVersion consensus_ruleset,
+                                                  EpochId epoch,
+                                                  View last_voted_view);
+[[nodiscard]] Digest consensus_commit_record_digest(const ConsensusCommit& commit);
+
 enum class ConsensusFailure : uint16_t {
     FormatVersion,
     RulesetMismatch,
