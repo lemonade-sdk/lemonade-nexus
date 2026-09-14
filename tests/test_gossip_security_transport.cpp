@@ -11,6 +11,8 @@
 #include <nlohmann/json.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
+#include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <asio.hpp>
@@ -390,6 +392,62 @@ TEST_F(GossipSecurityTransportTest, InboundEnvelopeFromUnknownPeerIsDropped) {
     EXPECT_EQ(b.received[0].sender.bytes, a.pubkey());
     // Delivery is not a drop: only the two hostile packets were recorded.
     EXPECT_EQ(b.envelope_drops(), drops_before + 2);
+}
+
+// The membership gate is scoped to state-mutating kinds: an attestation-kind
+// envelope from an unknown signer is EXEMPT (it is the enrolment mechanism —
+// Genesis challenges a node precisely because it has no root-signed
+// certificate yet), so it reaches the sink and is NOT recorded as a drop.
+// The same bytes as a HotStuffProposal from the same stranger ARE dropped.
+TEST_F(GossipSecurityTransportTest, InboundAttestationFromUnknownPeerIsExempt) {
+    const auto root_kp  = root_crypto->ed25519_keygen();
+    const auto stranger = root_crypto->ed25519_keygen();
+
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    peer_all();
+    a.gossip->set_root_pubkey(root_kp.public_key);
+    a.gossip->set_network_id(kTestNetworkHex);
+    b.gossip->set_root_pubkey(root_kp.public_key);
+    b.gossip->set_network_id(kTestNetworkHex);
+    const auto a_cert = issue_cert(crypto::to_base64(a.pubkey()), "peer-a", root_kp);
+    gossip::GossipBallotTestAccess::attach_cert(*b.gossip, crypto::to_base64(a.pubkey()),
+                                                a_cert);
+    ASSERT_TRUE(b.gossip->peer_is_root_certified(a.id()));
+    ASSERT_FALSE(b.gossip->peer_is_root_certified(node_id_of(stranger)));
+
+    // AttestationChallenge body, signed by the stranger: exempt from the
+    // membership gate, reaches the sink, no drop recorded.
+    const security::AttestationChallenge att{};
+    const auto att_bytes = security::encode_security_message(
+        security::SecurityMessage{
+            .kind = security::SecurityMessageKind::AttestationChallenge,
+            .epoch = 1,
+            .sender = b.id(),
+            .body = att});
+    ASSERT_FALSE(att_bytes.empty());
+    const auto drops_before = b.envelope_drops();
+    inject(build_packet(*root_crypto, stranger, att_bytes), b);
+    ASSERT_TRUE(pump_until([&] { return !b.received.empty(); }));
+    EXPECT_EQ(b.received[0].bytes, att_bytes);
+    EXPECT_EQ(b.envelope_drops(), drops_before);
+
+    // Same stranger, same signature path, but a HotStuffProposal body:
+    // state-mutating, gated, dropped.
+    const auto drops_after_att = b.envelope_drops();
+    b.received.clear();
+    const security::ProposalMessage proposal{};
+    const auto prop_bytes = security::encode_security_message(
+        security::SecurityMessage{
+            .kind = security::SecurityMessageKind::HotStuffProposal,
+            .epoch = 1,
+            .sender = b.id(),
+            .body = proposal});
+    ASSERT_FALSE(prop_bytes.empty());
+    inject(build_packet(*root_crypto, stranger, prop_bytes), b);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(b.received.empty());
+    EXPECT_EQ(b.envelope_drops(), drops_after_att + 1);
 }
 
 // (e) No sink: the envelope is dropped and the service keeps running.
