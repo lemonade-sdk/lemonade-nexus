@@ -185,7 +185,7 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
     }
 
     // 7. Leader of the view.
-    if (proposal.leader != config_.leader_order[proposal.view % config_.leader_order.size()]) {
+    if (proposal.leader != config_.leader_order[proposal.view.underlying() % config_.leader_order.size()]) {
         result.rejected = ConsensusFailure::WrongLeader;
         return result;
     }
@@ -467,7 +467,7 @@ std::variant<Proposal, ConsensusFailure> HotStuffService::make_proposal(
     const Digest& proposed_state_root,
     const Digest& transitions_digest) {
     if (failed_ || !synced_) return ConsensusFailure::NotSynced;
-    if (config_.self != config_.leader_order[current_view_ % config_.leader_order.size()]) {
+    if (config_.self != config_.leader_order[current_view_.underlying() % config_.leader_order.size()]) {
         return ConsensusFailure::NotLeader;
     }
 

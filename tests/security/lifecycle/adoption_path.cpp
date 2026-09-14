@@ -87,7 +87,7 @@ struct AdoptionPath : DriverMesh {
                 });
             if (active) return;
         }
-        FAIL() << "epoch " << target << " did not activate within " << max_steps << " steps";
+        FAIL() << "epoch " << target.underlying() << " did not activate within " << max_steps << " steps";
     }
 };
 

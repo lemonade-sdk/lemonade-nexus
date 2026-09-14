@@ -47,7 +47,7 @@ struct GenesisEligibilityAttest {
 [[nodiscard]] inline Digest genesis_eligibility_attest_digest(
     const GenesisEligibilityAttest& attest) {
     CanonicalEncoder encoder("lemonade-nexus/genesis-eligibility-attest:v1");
-    encoder.add_u64(attest.epoch);
+    encoder.add_u64(attest.epoch.underlying());
     encoder.add_bytes(attest.founding_state_digest);
     encoder.add_bytes(attest.node.bytes);
     return encoder.digest();
@@ -55,7 +55,7 @@ struct GenesisEligibilityAttest {
 
 [[nodiscard]] inline Digest dkg_transcript_attest_digest(const DkgTranscriptAttest& attest) {
     CanonicalEncoder encoder("lemonade-nexus/dkg-transcript-attest:v1");
-    encoder.add_u64(attest.epoch);
+    encoder.add_u64(attest.epoch.underlying());
     encoder.add_bytes(attest.participant_set_digest);
     encoder.add_bytes(attest.transcript_digest);
     encoder.add_bytes(attest.group_public_key);

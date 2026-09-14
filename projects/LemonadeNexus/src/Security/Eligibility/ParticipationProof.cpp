@@ -18,13 +18,13 @@ inline constexpr std::string_view kResponseDomain =
 Digest participation_challenge_digest(const ParticipationChallenge& challenge) {
     CanonicalEncoder encoder(kChallengeDomain);
     encoder.add_bytes(challenge.network_id);
-    encoder.add_u64(challenge.epoch);
+    encoder.add_u64(challenge.epoch.underlying());
     encoder.add_u16(challenge.security_ruleset);
     encoder.add_u16(challenge.consensus_ruleset);
     encoder.add_bytes(challenge.node_id.bytes);
-    encoder.add_u64(challenge.incarnation);
+    encoder.add_u64(challenge.incarnation.underlying());
     encoder.add_bytes(challenge.nonce);
-    encoder.add_u64(challenge.anchor_height);
+    encoder.add_u64(challenge.anchor_height.underlying());
     encoder.add_bytes(challenge.anchor_state);
     encoder.add_bytes(challenge.observer.bytes);
     return encoder.digest();
@@ -37,12 +37,12 @@ Digest participation_response_signing_digest(const ParticipationResponse& respon
     CanonicalEncoder encoder(kResponseDomain);
     encoder.add_bytes(response.challenge_digest);
     encoder.add_bytes(response.network_id);
-    encoder.add_u64(response.epoch);
+    encoder.add_u64(response.epoch.underlying());
     encoder.add_u16(response.security_ruleset);
     encoder.add_u16(response.consensus_ruleset);
     encoder.add_bytes(response.node_id.bytes);
-    encoder.add_u64(response.incarnation);
-    encoder.add_u64(response.anchor_height);
+    encoder.add_u64(response.incarnation.underlying());
+    encoder.add_u64(response.anchor_height.underlying());
     encoder.add_bytes(response.anchor_state);
     return encoder.digest();
 }

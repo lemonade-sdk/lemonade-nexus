@@ -77,7 +77,7 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
         vote_key = sources_.vote_key_for_epoch(challenge.epoch);
     }
     if (!vote_key) {
-        spdlog::debug("[producer] no vote key for epoch {}; not answered", challenge.epoch);
+        spdlog::debug("[producer] no vote key for epoch {}; not answered", challenge.epoch.underlying());
         return std::nullopt;
     }
 

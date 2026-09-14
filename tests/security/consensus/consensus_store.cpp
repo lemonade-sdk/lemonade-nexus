@@ -52,7 +52,7 @@ namespace {
     certificate.consensus_ruleset = constants::kConsensusRulesetVersion;
     certificate.network_id = filled_digest(0xAA);
     certificate.epoch = epoch;
-    certificate.height = view;
+    certificate.height = Height(view.underlying());
     certificate.view = view;
     certificate.proposal_digest = filled_digest(seed);
     for (uint8_t i = 0; i < 3; ++i) {
@@ -116,7 +116,7 @@ protected:
     void TearDown() override { fs::remove_all(directory_); }
 
     [[nodiscard]] fs::path safety_file(EpochId epoch) const {
-        return directory_ / ("hotstuff-safety-" + std::to_string(epoch) + ".json");
+        return directory_ / ("hotstuff-safety-" + std::to_string(epoch.underlying()) + ".json");
     }
 
     void write_raw(const fs::path& path, const std::string& content) const {
@@ -131,7 +131,7 @@ protected:
     }
 
     [[nodiscard]] fs::path commit_file(EpochId epoch) const {
-        return directory_ / ("hotstuff-commit-" + std::to_string(epoch) + ".json");
+        return directory_ / ("hotstuff-commit-" + std::to_string(epoch.underlying()) + ".json");
     }
 
     [[nodiscard]] ConsensusCommit make_commit(EpochId epoch, Height height, View view) const {

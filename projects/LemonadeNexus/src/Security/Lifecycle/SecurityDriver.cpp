@@ -1280,7 +1280,7 @@ std::optional<EpochHandoff> SecurityDriver::derive_handoff() const {
     handoff.vote_keys = epochs->next_vote_keys();
     handoff.group_public_key = transition.next_authority_key;
     handoff.dkg_transcript_digest = transition.dkg_transcript_digest;
-    handoff.key_generation = transition.to_epoch;
+    handoff.key_generation = KeyGeneration(transition.to_epoch.underlying());
     handoff.attestation_root = transition.attestation_root;
     handoff.security_ruleset = constants::kSecurityRulesetVersion;
     handoff.consensus_ruleset = constants::kConsensusRulesetVersion;
@@ -1657,7 +1657,7 @@ void SecurityDriver::announce_epoch(const Digest& checkpoint, const Digest& dkg_
     EpochAnnouncement announcement;
     announcement.authority.network_id = current.network_id;
     announcement.authority.epoch = current.id;
-    announcement.authority.key_generation = current.id;
+    announcement.authority.key_generation = KeyGeneration(current.id.underlying());
     announcement.authority.security_ruleset = current.security_ruleset;
     announcement.authority.consensus_ruleset = current.consensus_ruleset;
     announcement.authority.tier1_set_digest = current.participant_set_digest;

@@ -194,7 +194,7 @@ TEST(AuthoritySigning, ThresholdSetSignsFinalizedObject) {
     const Digest object_digest = authority_object_digest(mesh.object);
     for (const auto& signature : signatures) {
         EXPECT_EQ(signature.epoch, kEpoch);
-        EXPECT_EQ(signature.key_generation, kEpoch);
+        EXPECT_EQ(signature.key_generation, KeyGeneration(kEpoch.underlying()));
         EXPECT_EQ(signature.object_digest, object_digest);
         EXPECT_EQ(signature.signature, signatures[0].signature);
         EXPECT_TRUE(nexus::crypto::FrostProvider::verify(mesh.group_key, object_digest,
@@ -220,7 +220,7 @@ TEST(AuthoritySigning, ObjectMustBindThisEpochAndNetwork) {
               SigningFailure::WrongEpoch);
 
     object = mesh.object;
-    object.key_generation = kEpoch + 1;
+    object.key_generation = KeyGeneration(kEpoch.underlying() + 1);
     EXPECT_EQ(mesh.services[0]->start_signing(object, mesh.certificate, mesh.nodes).failure,
               SigningFailure::WrongKeyGeneration);
 

@@ -46,8 +46,8 @@ inline constexpr std::string_view kEpochAuthorityDomain = "lemonade-nexus/epoch-
 [[nodiscard]] inline Digest epoch_authority_digest(const EpochAuthority& authority) {
     CanonicalEncoder encoder(kEpochAuthorityDomain);
     encoder.add_bytes(authority.network_id);
-    encoder.add_u64(authority.epoch);
-    encoder.add_u64(authority.key_generation);
+    encoder.add_u64(authority.epoch.underlying());
+    encoder.add_u64(authority.key_generation.underlying());
     encoder.add_u16(authority.security_ruleset);
     encoder.add_u16(authority.consensus_ruleset);
     encoder.add_bytes(authority.tier1_set_digest);

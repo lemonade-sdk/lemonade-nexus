@@ -32,6 +32,15 @@ using json = nlohmann::json;
     return true;
 }
 
+// StrongId overload: same validation, typed store.
+template <typename Tag>
+[[nodiscard]] bool read_u64(const json& object, const char* key, StrongId<Tag>& out) {
+    uint64_t raw = 0;
+    if (!read_u64(object, key, raw)) return false;
+    out = raw;
+    return true;
+}
+
 [[nodiscard]] bool read_u16(const json& object, const char* key, uint16_t& out) {
     uint64_t value = 0;
     if (!read_u64(object, key, value) || value > 0xFFFF) return false;
@@ -70,9 +79,9 @@ template <std::size_t N>
     return json{{"qc_format_version", certificate.qc_format_version},
                 {"consensus_ruleset", certificate.consensus_ruleset},
                 {"network_id", b64(certificate.network_id)},
-                {"epoch", certificate.epoch},
-                {"height", certificate.height},
-                {"view", certificate.view},
+                {"epoch", certificate.epoch.underlying()},
+                {"height", certificate.height.underlying()},
+                {"view", certificate.view.underlying()},
                 {"proposal_digest", b64(certificate.proposal_digest)},
                 {"signers", std::move(signers)}};
 }
@@ -136,9 +145,9 @@ json hotstuff_state_to_json(const HotStuffState& state) {
     // payload digest; version is still re-checked on read so a wrong-version
     // record never acts as state.
     return json{{"version", constants::kConsensusStoreFormatVersion},
-                {"epoch", state.epoch},
+                {"epoch", state.epoch.underlying()},
                 {"consensus_ruleset", state.consensus_ruleset},
-                {"last_voted_view", state.last_voted_view},
+                {"last_voted_view", state.last_voted_view.underlying()},
                 {"high_qc", qc_to_json(state.high_qc)},
                 {"locked_qc", qc_to_json(state.locked_qc)},
                 {"record_digest",

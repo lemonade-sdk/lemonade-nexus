@@ -7,8 +7,8 @@ namespace nexus::security {
 Digest mesh_credential_digest(const MeshCredentialGrant& grant) {
     CanonicalEncoder encoder(kMeshCredentialDomain);
     encoder.add_bytes(grant.network_id);
-    encoder.add_u64(grant.epoch);
-    encoder.add_u64(grant.key_generation);
+    encoder.add_u64(grant.epoch.underlying());
+    encoder.add_u64(grant.key_generation.underlying());
     encoder.add_u16(static_cast<uint16_t>(grant.operation));
     encoder.add_string(grant.subject_pubkey);
     encoder.add_string(grant.subject_server_id);
@@ -35,7 +35,7 @@ MeshCredentialFailure verify_mesh_credential(const MeshCredential& credential,
     if (grant.epoch != issuing_authority.epoch) {
         return MeshCredentialFailure::EpochUnavailable;
     }
-    if (grant.key_generation != grant.epoch) {
+    if (grant.key_generation != KeyGeneration(grant.epoch.underlying())) {
         return MeshCredentialFailure::KeyGenerationInvalid;
     }
     // The one cryptographic check: the epoch authority group key signed this

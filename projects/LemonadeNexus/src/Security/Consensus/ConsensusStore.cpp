@@ -66,6 +66,15 @@ namespace {
     return true;
 }
 
+// StrongId overload: same validation, typed store.
+template <typename Tag>
+[[nodiscard]] bool read_u64(const json& object, const char* key, StrongId<Tag>& out) {
+    uint64_t raw = 0;
+    if (!read_u64(object, key, raw)) return false;
+    out = raw;
+    return true;
+}
+
 [[nodiscard]] bool read_digest(const json& object, const char* key, Digest& out) {
     const auto it = object.find(key);
     if (it == object.end() || !it->is_string()) return false;
@@ -85,9 +94,9 @@ namespace {
     // store's anchor: the digest covers the payload (version included,
     // digest excluded) through the shared canonical encoder.
     return json{{"version", constants::kConsensusStoreFormatVersion},
-                {"epoch", commit.epoch},
-                {"height", commit.height},
-                {"view", commit.view},
+                {"epoch", commit.epoch.underlying()},
+                {"height", commit.height.underlying()},
+                {"view", commit.view.underlying()},
                 {"proposal_digest", crypto::to_base64(commit.proposal_digest)},
                 {"proposed_state_root", crypto::to_base64(commit.proposed_state_root)},
                 {"transitions_digest", crypto::to_base64(commit.transitions_digest)},
@@ -138,11 +147,11 @@ FileConsensusStore::FileConsensusStore(fs::path directory) : directory_(std::mov
 }
 
 fs::path FileConsensusStore::safety_path(EpochId epoch) const {
-    return directory_ / ("hotstuff-safety-" + std::to_string(epoch) + ".json");
+    return directory_ / ("hotstuff-safety-" + std::to_string(epoch.underlying()) + ".json");
 }
 
 fs::path FileConsensusStore::commit_path(EpochId epoch) const {
-    return directory_ / ("hotstuff-commit-" + std::to_string(epoch) + ".json");
+    return directory_ / ("hotstuff-commit-" + std::to_string(epoch.underlying()) + ".json");
 }
 
 bool FileConsensusStore::store_before_vote(const HotStuffState& state) {

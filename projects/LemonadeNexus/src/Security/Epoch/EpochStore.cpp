@@ -50,6 +50,15 @@ bool get_u64(const json& value, uint64_t& out) {
     return true;
 }
 
+// StrongId overload: same validation, typed store.
+template <typename Tag>
+bool get_u64(const json& value, StrongId<Tag>& out) {
+    uint64_t raw = 0;
+    if (!get_u64(value, raw)) return false;
+    out = raw;
+    return true;
+}
+
 bool get_u16(const json& value, uint16_t& out) {
     uint64_t wide = 0;
     if (!get_u64(value, wide) || wide > 0xFFFF) {
@@ -60,7 +69,7 @@ bool get_u16(const json& value, uint16_t& out) {
 }
 
 std::string vote_key_file(EpochId epoch) {
-    return "vote-key-" + std::to_string(epoch) + ".json";
+    return "vote-key-" + std::to_string(epoch.underlying()) + ".json";
 }
 
 }  // namespace
@@ -93,7 +102,7 @@ std::optional<std::string> EpochStore::read_all(const std::filesystem::path& pat
 bool EpochStore::store_bootstrap(const BootstrapCertificate& c) {
     json j;
     j["network_id"] = b64(c.network_id);
-    j["epoch"] = c.epoch;
+    j["epoch"] = c.epoch.underlying();
     j["tier1_set_digest"] = b64(c.tier1_set_digest);
     j["authority_threshold"] = static_cast<uint64_t>(c.authority_threshold);
     j["authority_public_key"] = b64(c.authority_public_key);
@@ -144,7 +153,7 @@ std::variant<BootstrapCertificate, EpochLoadResult> EpochStore::load_bootstrap()
 
 bool EpochStore::store_epoch(const StoredEpoch& epoch) {
     json j;
-    j["id"] = epoch.state.id;
+    j["id"] = epoch.state.id.underlying();
     j["network_id"] = b64(epoch.state.network_id);
     json members = json::array();
     for (const auto& node : epoch.state.tier1_members.members()) {
@@ -239,7 +248,7 @@ bool EpochStore::append_authority(const EpochAuthorityRecord& record) {
     json j = json::array();
     for (const auto& r : records) {
         json entry;
-        entry["epoch"] = r.epoch;
+        entry["epoch"] = r.epoch.underlying();
         entry["group_public_key"] = b64(r.group_public_key);
         entry["tier1_set_digest"] = b64(r.tier1_set_digest);
         entry["dkg_transcript_digest"] = b64(r.dkg_transcript_digest);
@@ -280,14 +289,14 @@ EpochStore::load_authority_history() const {
 bool EpochStore::store_authority_anchor(const VerifiedEpochAuthority& anchor) {
     json j;
     j["network_id"] = b64(anchor.network_id);
-    j["epoch"] = anchor.epoch;
+    j["epoch"] = anchor.epoch.underlying();
     json members = json::array();
     for (const auto& node : anchor.members) {
         json entry;
         entry["node"] = b64(node.bytes);
         const auto incarnation = anchor.incarnations.find(node);
         entry["incarnation"] =
-            incarnation != anchor.incarnations.end() ? incarnation->second : 0;
+            incarnation != anchor.incarnations.end() ? incarnation->second.underlying() : 0u;
         const auto key = anchor.vote_keys.find(node);
         if (key == anchor.vote_keys.end()) {
             return false;
@@ -301,7 +310,7 @@ bool EpochStore::store_authority_anchor(const VerifiedEpochAuthority& anchor) {
     j["security_ruleset"] = anchor.security_ruleset;
     j["consensus_ruleset"] = anchor.consensus_ruleset;
     j["group_public_key"] = b64(anchor.group_public_key);
-    j["key_generation"] = anchor.key_generation;
+    j["key_generation"] = anchor.key_generation.underlying();
     j["attestation_root"] = b64(anchor.attestation_root);
     j["checkpoint"] = b64(anchor.checkpoint);
     j["previous_anchor"] = b64(anchor.previous_anchor);
@@ -456,7 +465,7 @@ bool EpochStore::store_vote_key(const EpochVoteKey& key) {
     sodium_memzero(secret.data(), secret.size());
 
     json j;
-    j["epoch"] = key.epoch;
+    j["epoch"] = key.epoch.underlying();
     j["node_id"] = b64(key.node_id.bytes);
     j["public_key"] = b64(key.public_key);
     j["crypto_version"] = static_cast<unsigned>(wrapped.ciphertext.version);

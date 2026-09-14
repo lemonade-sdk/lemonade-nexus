@@ -19,13 +19,13 @@ inline constexpr std::string_view kObservationDomain =
 Digest observation_signing_digest(const EligibilityObservation& observation) {
     CanonicalEncoder encoder(kObservationDomain);
     encoder.add_bytes(observation.network_id);
-    encoder.add_u64(observation.epoch);
+    encoder.add_u64(observation.epoch.underlying());
     encoder.add_bytes(observation.subject.bytes);
-    encoder.add_u64(observation.subject_incarnation);
+    encoder.add_u64(observation.subject_incarnation.underlying());
     encoder.add_u16(static_cast<uint16_t>(observation.kind));
     encoder.add_bytes(observation.attestation_digest);
     encode_platform_claims(encoder, observation.claims);
-    encoder.add_u64(observation.height);
+    encoder.add_u64(observation.height.underlying());
     encoder.add_bytes(observation.state_reference);
     encoder.add_bytes(observation.observer.bytes);
     return encoder.digest();

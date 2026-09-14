@@ -156,7 +156,7 @@ TEST_F(StoreTest, DamagedStateIsReportedAsCorrupt) {
     EligibilityStore store{root_};
     ASSERT_TRUE(store.store(kEpoch, full_ledger().snapshot()));
 
-    const fs::path file = root_ / ("observations-" + std::to_string(kEpoch) + ".json");
+    const fs::path file = root_ / ("observations-" + std::to_string(kEpoch.underlying()) + ".json");
     ASSERT_TRUE(fs::exists(file));
     { std::ofstream out(file, std::ios::trunc); out << "{ this is not json"; }
 
@@ -173,7 +173,7 @@ TEST_F(StoreTest, AnEditedRecordMakesTheWholeFileCorrupt) {
     EligibilityStore store{root_};
     ASSERT_TRUE(store.store(kEpoch, full_ledger().snapshot()));
 
-    const fs::path file = root_ / ("observations-" + std::to_string(kEpoch) + ".json");
+    const fs::path file = root_ / ("observations-" + std::to_string(kEpoch.underlying()) + ".json");
     std::string text;
     { std::ifstream in(file); text.assign(std::istreambuf_iterator<char>(in),
                                           std::istreambuf_iterator<char>()); }
@@ -219,8 +219,8 @@ TEST_F(StoreTest, RollbackDoesNotExtendContinuity) {
 TEST_F(StoreTest, ARenamedFileIsCorruptRatherThanAccepted) {
     EligibilityStore store{root_};
     ASSERT_TRUE(store.store(kEpoch, full_ledger().snapshot()));
-    fs::rename(root_ / ("observations-" + std::to_string(kEpoch) + ".json"),
-               root_ / ("observations-" + std::to_string(kEpoch + 1) + ".json"));
+    fs::rename(root_ / ("observations-" + std::to_string(kEpoch.underlying()) + ".json"),
+               root_ / ("observations-" + std::to_string((kEpoch + 1).underlying()) + ".json"));
 
     const MeshFactContext next =
         established_fact_context(network(), kEpoch + 1, context_.observers);
@@ -236,8 +236,8 @@ TEST_F(StoreTest, ExpiredEpochsAreDiscarded) {
     ASSERT_TRUE(store.store(kEpoch + 1, full_ledger().snapshot()));
 
     store.discard_before(kEpoch + 1);
-    EXPECT_FALSE(fs::exists(root_ / ("observations-" + std::to_string(kEpoch) + ".json")));
-    EXPECT_TRUE(fs::exists(root_ / ("observations-" + std::to_string(kEpoch + 1) + ".json")));
+    EXPECT_FALSE(fs::exists(root_ / ("observations-" + std::to_string(kEpoch.underlying()) + ".json")));
+    EXPECT_TRUE(fs::exists(root_ / ("observations-" + std::to_string((kEpoch + 1).underlying()) + ".json")));
 }
 
 // An observer that left the Tier 1 set cannot keep contributing through a file

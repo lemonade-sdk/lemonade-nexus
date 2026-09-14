@@ -48,6 +48,15 @@ template <std::size_t N>
     return true;
 }
 
+// StrongId overload: same validation, typed store.
+template <typename Tag>
+[[nodiscard]] bool read_u64(const json& value, StrongId<Tag>& out) {
+    uint64_t raw = 0;
+    if (!read_u64(value, raw)) return false;
+    out = raw;
+    return true;
+}
+
 [[nodiscard]] json encode(const EligibilityLedger::PersistedRecord& record) {
     const EligibilityObservation& o = record.latest;
     json attestations = json::array();
@@ -56,19 +65,19 @@ template <std::size_t N>
     }
     return json{
         {"network_id", hex_of(o.network_id)},
-        {"epoch", o.epoch},
+        {"epoch", o.epoch.underlying()},
         {"subject", hex_of(o.subject.bytes)},
-        {"subject_incarnation", o.subject_incarnation},
+        {"subject_incarnation", o.subject_incarnation.underlying()},
         {"kind", static_cast<uint16_t>(o.kind)},
         {"attestation_digest", hex_of(o.attestation_digest)},
         {"profile_id", static_cast<uint16_t>(o.claims.profile_id)},
         {"profile_ruleset", o.claims.profile_ruleset},
         {"claim_bits", platform_claim_bits(o.claims)},
-        {"height", o.height},
+        {"height", o.height.underlying()},
         {"state_reference", hex_of(o.state_reference)},
         {"observer", hex_of(o.observer.bytes)},
         {"signature", hex_of(o.signature)},
-        {"incarnation", record.incarnation},
+        {"incarnation", record.incarnation.underlying()},
         {"attestations", attestations},
     };
 }
@@ -139,7 +148,7 @@ EligibilityStore::EligibilityStore(std::filesystem::path directory)
     : directory_(std::move(directory)) {}
 
 std::filesystem::path EligibilityStore::path_for(EpochId epoch) const {
-    return directory_ / ("observations-" + std::to_string(epoch) + ".json");
+    return directory_ / ("observations-" + std::to_string(epoch.underlying()) + ".json");
 }
 
 bool EligibilityStore::store(EpochId epoch,
@@ -158,7 +167,7 @@ bool EligibilityStore::store(EpochId epoch,
     }
     const json document{
         {"format", kFormatVersion},
-        {"epoch", epoch},
+        {"epoch", epoch.underlying()},
         {"records", std::move(entries)},
     };
     return write_atomic(path_for(epoch), document.dump());

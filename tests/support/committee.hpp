@@ -68,7 +68,7 @@ struct Committee {
     }
 
     /// A real three-chain proof over a block carrying `transitions`.
-    [[nodiscard]] CommitProof prove(const Digest& transitions, Height base = 20) const {
+    [[nodiscard]] CommitProof prove(const Digest& transitions, uint64_t base = 20) const {
         CommitProof proof;
         Digest parent{};
         QuorumCertificate justify{};
@@ -82,8 +82,8 @@ struct Committee {
             proposal.consensus_ruleset = constants::kConsensusRulesetVersion;
             proposal.network_id = network;
             proposal.epoch = epoch;
-            proposal.height = base + i;
-            proposal.view = base + i;
+            proposal.height = Height{base + i};
+            proposal.view = View{base + i};
             proposal.leader = members.front();
             proposal.parent_digest = parent;
             proposal.transitions_digest = i == 0 ? transitions : Digest{};

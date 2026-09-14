@@ -19,12 +19,12 @@ inline constexpr std::string_view kVerifiedAuthorityDomain =
 Digest verified_epoch_authority_digest(const VerifiedEpochAuthority& authority) {
     CanonicalEncoder encoder(kVerifiedAuthorityDomain);
     encoder.add_bytes(authority.network_id);
-    encoder.add_u64(authority.epoch);
+    encoder.add_u64(authority.epoch.underlying());
     encoder.add_u64(authority.members.size());
     for (const auto& node : authority.members) {
         encoder.add_bytes(node.bytes);
         const auto incarnation = authority.incarnations.find(node);
-        encoder.add_u64(incarnation != authority.incarnations.end() ? incarnation->second : 0);
+        encoder.add_u64(incarnation != authority.incarnations.end() ? incarnation->second.underlying() : 0u);
     }
     encoder.add_bytes(vote_key_set_digest(authority.vote_keys));
     encoder.add_u64(static_cast<uint64_t>(authority.consensus_quorum));
@@ -32,7 +32,7 @@ Digest verified_epoch_authority_digest(const VerifiedEpochAuthority& authority) 
     encoder.add_u16(authority.security_ruleset);
     encoder.add_u16(authority.consensus_ruleset);
     encoder.add_bytes(authority.group_public_key);
-    encoder.add_u64(authority.key_generation);
+    encoder.add_u64(authority.key_generation.underlying());
     encoder.add_bytes(authority.attestation_root);
     encoder.add_bytes(authority.checkpoint);
     encoder.add_bytes(authority.previous_anchor);
@@ -139,7 +139,7 @@ std::variant<VerifiedEpochAuthority, HandoffChainFailure> advance_epoch_authorit
             }
         }
     }
-    if (handoff.key_generation != handoff.to_epoch) {
+    if (handoff.key_generation != KeyGeneration(handoff.to_epoch.underlying())) {
         return HandoffChainFailure::KeyGenerationInvalid;
     }
 

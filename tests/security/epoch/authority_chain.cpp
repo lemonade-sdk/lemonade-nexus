@@ -73,17 +73,17 @@ EpochHandoff handoff_between(const Committee& next, const Digest& previous_ancho
     handoff.network_id = next.network;
     handoff.from_epoch = next.epoch - 1;
     handoff.to_epoch = next.epoch;
-    handoff.plan_digest.fill(static_cast<uint8_t>(0x30 + next.epoch));
+    handoff.plan_digest.fill(static_cast<uint8_t>(0x30 + next.epoch.underlying()));
     handoff.previous_anchor = previous_anchor;
     handoff.members = next.members;
     for (const auto& node : next.members) {
         handoff.incarnations[node] = 1;
         handoff.vote_keys[node] = next.pubs.at(node);
     }
-    handoff.group_public_key.fill(static_cast<uint8_t>(0x90 + next.epoch));
-    handoff.dkg_transcript_digest.fill(static_cast<uint8_t>(0xD0 + next.epoch));
-    handoff.key_generation = next.epoch;
-    handoff.attestation_root.fill(static_cast<uint8_t>(0xA0 + next.epoch));
+    handoff.group_public_key.fill(static_cast<uint8_t>(0x90 + next.epoch.underlying()));
+    handoff.dkg_transcript_digest.fill(static_cast<uint8_t>(0xD0 + next.epoch.underlying()));
+    handoff.key_generation = KeyGeneration(next.epoch.underlying());
+    handoff.attestation_root.fill(static_cast<uint8_t>(0xA0 + next.epoch.underlying()));
     handoff.security_ruleset = constants::kSecurityRulesetVersion;
     handoff.consensus_ruleset = constants::kConsensusRulesetVersion;
     return handoff;

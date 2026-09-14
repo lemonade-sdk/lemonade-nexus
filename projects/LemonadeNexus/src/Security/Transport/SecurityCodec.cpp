@@ -18,6 +18,8 @@ public:
     void u16(uint16_t value) { put_le(value, 2); }
     void u32(uint32_t value) { put_le(value, 4); }
     void u64(uint64_t value) { put_le(value, 8); }
+    template <typename Tag>
+    void u64(StrongId<Tag> value) { put_le(value.underlying(), 8); }
     void fixed(std::span<const uint8_t> bytes) { out_.insert(out_.end(), bytes.begin(), bytes.end()); }
 
     /// Length-prefixed field. Returns false when the field exceeds its bound,
@@ -51,6 +53,13 @@ public:
     [[nodiscard]] bool u16(uint16_t& value) { return read_le(value, 2); }
     [[nodiscard]] bool u32(uint32_t& value) { return read_le(value, 4); }
     [[nodiscard]] bool u64(uint64_t& value) { return read_le(value, 8); }
+    template <typename Tag>
+    [[nodiscard]] bool u64(StrongId<Tag>& value) {
+        uint64_t raw = 0;
+        if (!read_le(raw, 8)) return false;
+        value = raw;
+        return true;
+    }
 
     template <std::size_t N>
     [[nodiscard]] bool fixed(std::array<uint8_t, N>& value) {
@@ -1138,7 +1147,7 @@ Digest candidate_state_ready_digest(const CandidateStateReadyMsg& message) {
     encoder.add_bytes(message.network_id);
     encoder.add_bytes(message.plan_digest);
     encoder.add_bytes(message.node.bytes);
-    encoder.add_u64(message.incarnation);
+    encoder.add_u64(message.incarnation.underlying());
     encoder.add_bytes(qc_digest(message.verified_qc));
     return encoder.digest();
 }

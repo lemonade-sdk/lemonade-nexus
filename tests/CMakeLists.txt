@@ -105,6 +105,9 @@ add_nexus_test(test_security_policy
     security/policy/tier1_eligibility.cpp
     security/policy/tier1_evidence.cpp
     security/policy/canonical_encoding.cpp)
+
+# Pins the StrongId wrapper semantics and the typed-ID separation.
+add_nexus_test(test_security_strong_id security/test_strong_id.cpp)
 add_nexus_test(test_secure_buffer      test_secure_buffer.cpp)
 add_nexus_test(test_frost_provider     test_frost_provider.cpp)
 add_nexus_test(test_security_consensus
