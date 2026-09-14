@@ -10,6 +10,17 @@
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Relay/RelayService.hpp>
+#include <LemonadeNexus/Relay/RelayDiscoveryService.hpp>
+#include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
+#include <LemonadeNexus/Core/BinaryAttestation.hpp>
+#include <LemonadeNexus/Core/ServerAdmissionService.hpp>
+#include <LemonadeNexus/Network/DdnsService.hpp>
+#include <LemonadeNexus/Acme/AcmeService.hpp>
+#include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Api/IRequestHandler.hpp>
+#include <LemonadeNexus/Api/TreeApiHandler.hpp>
 
 #include <gtest/gtest.h>
 #include <httplib.h>
@@ -20,6 +31,7 @@
 #include <filesystem>
 #include <string>
 #include <thread>
+#include <asio.hpp>
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -31,6 +43,89 @@ using namespace nexus;
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+// ---------------------------------------------------------------------------
+// Test-only process-lifetime ApiContext + TreeApiHandler storage.
+//
+// ApiContext is non-default-constructible (reference members), so we heap-
+// allocate it once and keep it for the process lifetime. This is safe because
+// the test fixture runs sequentially in a single gtest process.
+// ---------------------------------------------------------------------------
+namespace test_api {
+
+struct Storage {
+    core::ServerConfig* config = nullptr;
+    api::ApiContext*    ctx    = nullptr;
+    api::TreeApiHandler* handler = nullptr;
+
+    void release() {
+        delete handler;
+        delete ctx;
+        delete config;
+        handler = nullptr;
+        ctx = nullptr;
+        config = nullptr;
+    }
+};
+
+// Per-fixture storage — reset each test.
+inline Storage& current() {
+    static Storage s;
+    return s;
+}
+
+inline void reset() { current().release(); }
+
+inline void install(core::ServerConfig& cfg,
+                    auth::AuthService& auth,
+                    tree::PermissionTreeService& tree,
+                    ipam::IPAMService& ipam,
+                    gossip::GossipService& gossip,
+                    crypto::SodiumCryptoService& crypto,
+                    crypto::KeyWrappingService& kw,
+                    storage::FileStorageService& store,
+                    acme::AcmeService& acme,
+                    network::HttpServer& http,
+                    network::DdnsService& ddns,
+                    relay::RelayService& relay,
+                    relay::RelayDiscoveryService& rd,
+                    routing::RoutingCoordinationService& routing,
+                    core::BinaryAttestationService& att,
+                    core::ServerAdmissionService& adm) {
+    auto& s = current();
+    if (s.ctx) return; // already installed this test
+    s.config = new core::ServerConfig(cfg);
+    s.ctx = new api::ApiContext{
+        .config           = *s.config,
+        .auth             = auth,
+        .tree             = tree,
+        .ipam             = ipam,
+        .gossip           = gossip,
+        .crypto           = crypto,
+        .key_wrapping     = kw,
+        .storage          = store,
+        .acme             = acme,
+        .http_server      = http,
+        .ddns             = ddns,
+        .relay            = relay,
+        .relay_discovery  = rd,
+        .routing          = routing,
+        .attestation      = att,
+        .admission        = adm,
+        .boringtun        = nullptr,
+        .dns              = nullptr,
+        .server_fqdn      = "test.local",
+        .server_seip_fqdn = "",
+        .server_private_fqdn = "",
+        .server_public_ip = "",
+        .tunnel_bind_ip   = "",
+    };
+    s.handler = new api::TreeApiHandler(*s.ctx);
+}
+
+inline api::TreeApiHandler& handler() { return *current().handler; }
+
+} // namespace test_api
+
 /// Integration test that spins up the HTTP server with real services
 /// and tests endpoints via httplib::Client.
 class HttpEndpointTest : public ::testing::Test {
@@ -38,6 +133,7 @@ protected:
     uint16_t test_port_{0};
 
     fs::path temp_dir;
+    asio::io_context io;
     std::unique_ptr<crypto::SodiumCryptoService> crypto;
     std::unique_ptr<storage::FileStorageService> storage;
     std::unique_ptr<crypto::KeyWrappingService> key_wrapping;
@@ -46,6 +142,17 @@ protected:
     std::unique_ptr<ipam::IPAMService> ipam;
     std::unique_ptr<network::HttpServer> http;
     std::unique_ptr<network::RateLimiter> rate_limiter;
+
+    // Services required by the real TreeApiHandler (ApiContext stand-ins)
+    std::unique_ptr<relay::RelayService> relay;
+    std::unique_ptr<relay::RelayDiscoveryService> relay_discovery;
+    std::unique_ptr<gossip::GossipService> gossip;
+    std::unique_ptr<routing::RoutingCoordinationService> routing;
+    std::unique_ptr<core::BinaryAttestationService> attestation;
+    std::unique_ptr<core::ServerAdmissionService> admission;
+    std::unique_ptr<network::DdnsService> ddns;
+    std::unique_ptr<acme::AcmeService> acme;
+    core::ServerConfig config;
 
     crypto::Ed25519Keypair root_keypair;
     std::string root_pubkey_str;
@@ -91,7 +198,25 @@ protected:
         rate_limiter = std::make_unique<network::RateLimiter>(
             network::RateLimitConfig{.requests_per_minute = 1000, .burst_size = 100});
 
+        // Dummy services referenced by ApiContext. The delta route only touches
+        // auth + tree, so unstarted stand-ins are never used.
+        relay = std::make_unique<relay::RelayService>(io, 0, *crypto, root_keypair.public_key);
+        relay_discovery = std::make_unique<relay::RelayDiscoveryService>(*storage);
+        gossip = std::make_unique<gossip::GossipService>(io, 0, *storage, *crypto);
+        routing = std::make_unique<routing::RoutingCoordinationService>(*crypto, *gossip);
+        attestation = std::make_unique<core::BinaryAttestationService>(*crypto, *storage);
+        admission = std::make_unique<core::ServerAdmissionService>(
+            config, *crypto, *key_wrapping, *storage, *gossip);
+        ddns = std::make_unique<network::DdnsService>(
+            io, *crypto, *storage, *attestation, *gossip);
+        acme = std::make_unique<acme::AcmeService>(*storage);
+
+        test_api::install(config, *auth, *tree, *ipam, *gossip, *crypto,
+                          *key_wrapping, *storage, *acme, *http, *ddns,
+                          *relay, *relay_discovery, *routing, *attestation,
+                          *admission);
         register_routes();
+        test_api::handler().register_routes(http->server(), http->server());
         http->start();
 
         // Brief pause to let the server thread bind
@@ -99,6 +224,7 @@ protected:
     }
 
     void TearDown() override {
+        test_api::reset();
         http->stop();
         ipam->stop();
         auth->stop();
@@ -188,29 +314,6 @@ protected:
                 return;
             }
             json resp = *node;
-            res.set_content(resp.dump(), "application/json");
-        });
-
-        // Tree: submit delta
-        srv.Post("/api/tree/delta", [this](const httplib::Request& req, httplib::Response& res) {
-            auto body = json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
-                res.status = 400;
-                res.set_content(R"({"error":"invalid json"})", "application/json");
-                return;
-            }
-            tree::TreeDelta delta;
-            try {
-                delta = body.get<tree::TreeDelta>();
-            } catch (...) {
-                res.status = 400;
-                res.set_content(R"({"error":"invalid delta"})", "application/json");
-                return;
-            }
-            bool ok = tree->apply_delta(delta);
-            res.status = ok ? 200 : 403;
-            json resp = {{"success", ok}};
-            if (!ok) resp["error"] = "delta rejected";
             res.set_content(resp.dump(), "application/json");
         });
 
@@ -382,6 +485,7 @@ protected:
     }
 
     /// Generate a valid JWT for testing auth-protected endpoints.
+    /// Sets the `pubkey` claim (the session identity used by tree authorization).
     std::string make_jwt(const std::string& user_id) {
         auto now = std::chrono::system_clock::now();
         return jwt::create()
@@ -389,7 +493,16 @@ protected:
             .set_subject(user_id)
             .set_issued_at(now)
             .set_expires_at(now + std::chrono::hours{1})
+            .set_payload_claim("pubkey", jwt::claim(user_id))
             .sign(jwt::algorithm::hs256{jwt_secret});
+    }
+
+    /// POST a delta with an auth header matching the root key identity.
+    httplib::Result post_auth_delta(
+        httplib::Client& cli, const std::string& body) {
+        httplib::Headers h = {{"Authorization",
+                               "Bearer " + make_jwt(root_pubkey_str)}};
+        return cli.Post("/api/tree/delta", h, body, "application/json");
     }
 
     httplib::Client make_client() {
@@ -485,7 +598,7 @@ TEST_F(HttpEndpointTest, CreateNodeViaDelta) {
     auto delta = make_signed_delta("create_node", "http_child1", child);
     json delta_json = delta;
 
-    auto res = cli.Post("/api/tree/delta", delta_json.dump(), "application/json");
+    auto res = post_auth_delta(cli, delta_json.dump());
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 200);
 
@@ -510,7 +623,7 @@ TEST_F(HttpEndpointTest, GetChildren) {
         child.mgmt_pubkey = root_pubkey_str;
 
         auto delta = make_signed_delta("create_node", name, child);
-        cli.Post("/api/tree/delta", json(delta).dump(), "application/json");
+        post_auth_delta(cli, json(delta).dump());
     }
 
     auto res = cli.Get("/api/tree/children/root");
@@ -557,7 +670,7 @@ TEST_F(HttpEndpointTest, CreateCustomerThenEndpoint) {
     customer.assignments = {{root_pubkey_str, {"admin"}}};
 
     auto delta1 = make_signed_delta("create_node", "acme_corp", customer);
-    auto res1 = cli.Post("/api/tree/delta", json(delta1).dump(), "application/json");
+    auto res1 = post_auth_delta(cli, json(delta1).dump());
     ASSERT_NE(res1, nullptr);
     EXPECT_EQ(res1->status, 200);
 
@@ -578,7 +691,7 @@ TEST_F(HttpEndpointTest, CreateCustomerThenEndpoint) {
     endpoint.mesh_pubkey = "mesh_test_key";
 
     auto delta2 = make_signed_delta("create_node", "acme_ep1", endpoint);
-    auto res2 = cli.Post("/api/tree/delta", json(delta2).dump(), "application/json");
+    auto res2 = post_auth_delta(cli, json(delta2).dump());
     ASSERT_NE(res2, nullptr);
     EXPECT_EQ(res2->status, 200);
 
@@ -604,7 +717,7 @@ TEST_F(HttpEndpointTest, CreateCustomerThenEndpoint) {
 
 TEST_F(HttpEndpointTest, DeltaInvalidJson) {
     auto cli = make_client();
-    auto res = cli.Post("/api/tree/delta", "not json", "application/json");
+    auto res = post_auth_delta(cli, "not json");
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 400);
 }
@@ -693,7 +806,7 @@ TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
     group.mgmt_pubkey = root_pubkey_str;
     group.assignments = {{root_pubkey_str, {"admin"}}};
     auto d1 = make_signed_delta("create_node", "mesh_group", group);
-    cli.Post("/api/tree/delta", json(d1).dump(), "application/json");
+    post_auth_delta(cli, json(d1).dump());
 
     tree::TreeNode ep1;
     ep1.id = "mesh_ep1";
@@ -705,7 +818,7 @@ TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
     ep1.tunnel_ip = "10.0.0.2";
     ep1.hostname = "peer-alpha";
     auto d2 = make_signed_delta("create_node", "mesh_ep1", ep1);
-    cli.Post("/api/tree/delta", json(d2).dump(), "application/json");
+    post_auth_delta(cli, json(d2).dump());
 
     tree::TreeNode ep2;
     ep2.id = "mesh_ep2";
@@ -717,7 +830,7 @@ TEST_F(HttpEndpointTest, MeshPeersSiblingDiscovery) {
     ep2.tunnel_ip = "10.0.0.3";
     ep2.hostname = "peer-beta";
     auto d3 = make_signed_delta("create_node", "mesh_ep2", ep2);
-    cli.Post("/api/tree/delta", json(d3).dump(), "application/json");
+    post_auth_delta(cli, json(d3).dump());
 
     // Request peers for ep1 — should see ep2 but not itself
     auto token = make_jwt(root_pubkey_str);
@@ -748,7 +861,7 @@ TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
     groupA.mgmt_pubkey = root_pubkey_str;
     groupA.assignments = {{root_pubkey_str, {"admin"}}};
     auto dA = make_signed_delta("create_node", "idor_groupA", groupA);
-    cli.Post("/api/tree/delta", json(dA).dump(), "application/json");
+    post_auth_delta(cli, json(dA).dump());
 
     tree::TreeNode groupB;
     groupB.id = "idor_groupB";
@@ -757,7 +870,7 @@ TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
     groupB.mgmt_pubkey = root_pubkey_str;
     groupB.assignments = {{root_pubkey_str, {"admin"}}};
     auto dB = make_signed_delta("create_node", "idor_groupB", groupB);
-    cli.Post("/api/tree/delta", json(dB).dump(), "application/json");
+    post_auth_delta(cli, json(dB).dump());
 
     tree::TreeNode epA;
     epA.id = "idor_epA";
@@ -767,7 +880,7 @@ TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
     epA.assignments = {{root_pubkey_str, {"admin"}}};
     epA.mesh_pubkey = "mesh_A";
     auto dEpA = make_signed_delta("create_node", "idor_epA", epA);
-    cli.Post("/api/tree/delta", json(dEpA).dump(), "application/json");
+    post_auth_delta(cli, json(dEpA).dump());
 
     tree::TreeNode epB;
     epB.id = "idor_epB";
@@ -777,7 +890,7 @@ TEST_F(HttpEndpointTest, MeshPeersIDORPrevention) {
     epB.assignments = {{root_pubkey_str, {"admin"}}};
     epB.mesh_pubkey = "mesh_B";
     auto dEpB = make_signed_delta("create_node", "idor_epB", epB);
-    cli.Post("/api/tree/delta", json(dEpB).dump(), "application/json");
+    post_auth_delta(cli, json(dEpB).dump());
 
     // Querying peers for epA should NOT include epB (different group)
     auto token = make_jwt(root_pubkey_str);
@@ -807,7 +920,7 @@ TEST_F(HttpEndpointTest, MeshHeartbeatUnauthorizedNode) {
     node.type = tree::NodeType::Endpoint;
     node.mgmt_pubkey = root_pubkey_str;
     auto d = make_signed_delta("create_node", "hb_node", node);
-    cli.Post("/api/tree/delta", json(d).dump(), "application/json");
+    post_auth_delta(cli, json(d).dump());
 
     // Try heartbeat with a different user (no EditNode permission)
     auto other_kp = crypto->ed25519_keygen();
@@ -851,7 +964,7 @@ TEST_F(HttpEndpointTest, MeshHeartbeatInvalidEndpointFormat) {
     node.mgmt_pubkey = root_pubkey_str;
     node.assignments = {{root_pubkey_str, {"admin"}}};
     auto d = make_signed_delta("create_node", "hb_validate_node", node);
-    cli.Post("/api/tree/delta", json(d).dump(), "application/json");
+    post_auth_delta(cli, json(d).dump());
 
     auto token = make_jwt(root_pubkey_str);
     httplib::Headers h = {{"Authorization", "Bearer " + token}};
@@ -879,4 +992,79 @@ TEST_F(HttpEndpointTest, MeshHeartbeatInvalidEndpointFormat) {
     auto res4 = cli.Post("/api/mesh/heartbeat", h, body4.dump(), "application/json");
     ASSERT_NE(res4, nullptr);
     EXPECT_EQ(res4->status, 200) << "Empty endpoint (clear) should be accepted";
+}
+
+// --- Two-plane agreement on POST /api/tree/delta ---
+//
+// The delta handler is auth-gated, but apply_delta authorizes purely on
+// delta.signer_pubkey's tree assignments plus a signature the caller claims to
+// possess. The handler must additionally require the authenticated session
+// identity (claims.pubkey) to BE the delta signer, or any session holder could
+// submit deltas signed with another principal's captured management key.
+
+TEST_F(HttpEndpointTest, DeltaSignerMatchesSessionIsApplied) {
+    auto cli = make_client();
+
+    // Session for the root key (same key that signs the delta below)
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+
+    tree::TreeNode child;
+    child.id = "p14_match_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = root_pubkey_str;
+
+    // Signed by root_keypair — the same identity the session authenticates
+    auto delta = make_signed_delta("create_node", "p14_match_child", child);
+    auto res = cli.Post("/api/tree/delta", h, json(delta).dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 200) << res->body;
+    auto body = json::parse(res->body);
+    EXPECT_TRUE(body.value("success", false));
+    EXPECT_TRUE(tree->get_node("p14_match_child").has_value());
+}
+
+TEST_F(HttpEndpointTest, DeltaSignerMismatchWithSessionIsRejected) {
+    auto cli = make_client();
+
+    // A second principal with full permission on root (so apply_delta alone
+    // WOULD authorize it) but whose key differs from the session identity.
+    auto other_kp = crypto->ed25519_keygen();
+    auto other_pubkey = "ed25519:" + crypto::to_base64(other_kp.public_key);
+    tree->grant_assignment("root", {.management_pubkey = other_pubkey,
+                                    .permissions = {"read", "write",
+                                                    "add_child", "delete_node",
+                                                    "edit_node", "admin"}});
+
+    // Session authenticates as a DIFFERENT key (root), delta signs as other
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+
+    tree::TreeNode child;
+    child.id = "p14_mismatch_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = other_pubkey;
+
+    // Build the delta with the other principal as signer
+    tree::TreeDelta delta;
+    delta.operation      = "create_node";
+    delta.target_node_id = "p14_mismatch_child";
+    delta.node_data      = child;
+    delta.signer_pubkey  = other_pubkey;
+    delta.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    auto canonical = tree::canonical_delta_json(delta);
+    auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    delta.signature = crypto::to_base64(
+        crypto->ed25519_sign(other_kp.private_key, msg));
+
+    auto res = cli.Post("/api/tree/delta", h, json(delta).dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403) << res->body;
+    // The tree must be unmutated
+    EXPECT_FALSE(tree->get_node("p14_mismatch_child").has_value());
 }
