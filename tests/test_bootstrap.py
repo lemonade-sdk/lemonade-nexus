@@ -221,6 +221,13 @@ class BootstrapTest(unittest.TestCase):
                     temporary = out.name
                 try:
                     result = subprocess.run([nft, "-c", "-f", temporary], capture_output=True)
+                    if result.returncode != 0:
+                        stderr = result.stderr.decode().lower()
+                        if "netlink" in stderr and "operation not permitted" in stderr:
+                            # Unprivileged hosts (e.g. CI runners) cannot open
+                            # the netlink cache the dry-run needs. Same as a
+                            # missing nft: skip rather than fail.
+                            self.skipTest("nft cannot open netlink cache (unprivileged host)")
                     self.assertEqual(result.returncode, 0, result.stderr.decode())
                 finally:
                     Path(temporary).unlink()

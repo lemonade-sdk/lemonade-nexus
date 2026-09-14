@@ -159,7 +159,7 @@ jobs:
             install_cmd: >-
               apt-get update &&
               apt-get install -y cmake ninja-build make g++ libssl-dev pkg-config
-              libjson-c-dev libcurl4-openssl-dev uuid-dev git ca-certificates curl
+              libjson-c-dev libcurl4-openssl-dev uuid-dev git ca-certificates curl python3
           - container: fedora:40
             platform: linux-x86_64-rpm
             install_cmd: >-
@@ -168,7 +168,7 @@ jobs:
           - container: archlinux:latest
             platform: linux-x86_64-arch
             install_cmd: >-
-              pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git
+              pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git python
           - container: amazonlinux:2023
             platform: linux-x86_64-amzn2023
             # AL2023's defaults are too old for this codebase: GCC 11.5 lacks the

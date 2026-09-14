@@ -238,7 +238,10 @@ DecodeResult<T> decode(const nlohmann::json& json) {
     if (!json.is_object()) return {std::nullopt, "/: expected object"};
 
     std::string error;
-    for (const auto& [key, unused] : json.items()) {
+    for (const auto& item : json.items()) {
+        // Plain local, not a structured binding: AppleClang rejects lambdas
+        // capturing structured bindings from the enclosing function.
+        const std::string key = item.key();
         bool known = false;
         std::apply([&](const auto&... descriptor) {
             ((known = known || key == descriptor.name), ...);
