@@ -158,8 +158,20 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(
     bool token_admit = false;
     if (in.enrollment_token) {
         auto rec = tokens_.verify(*in.enrollment_token, in.candidate_pubkey);
-        if (!rec)
+        if (!rec) {
+            // The token is dead (bad/spent/expired). It cannot admit, so a
+            // pending record for this candidate must not stay live waiting
+            // for a token that will never work — invalidate it.
+            for (auto it = admissions_.begin(); it != admissions_.end(); ) {
+                if (it->second.candidate_pubkey == in.candidate_pubkey &&
+                    it->second.state == AdmissionState::Pending)
+                    it = admissions_.erase(it);
+                else
+                    ++it;
+            }
+            persist();
             return {false, 403, "invalid, expired, or already-used enrollment token", ""};
+        }
         // The onboarding transport is not authenticated (cert verification
         // is disabled and plain HTTP is permitted), so a bearer token must
         // be bound to the candidate key — an intermediary must not be able
@@ -288,14 +300,32 @@ ServerAdmissionService::Result ServerAdmissionService::create_request(
     // checked above, so the common failure can't burn a token; a rarer
     // issuance failure requires a fresh token.
     if (token_admit) {
+        // A dead or burned token must not keep a pending record alive: on ANY
+        // token-failure path the pending admission is invalidated (Pending is
+        // immutable — it cannot be decided or modified — so removing it is the
+        // only honest outcome; a re-submission mints a fresh record).
+        auto invalidate = [&]() {
+            if (auto it = admissions_.find(request_id);
+                it != admissions_.end() &&
+                it->second.state == AdmissionState::Pending)
+                admissions_.erase(it);
+            persist();
+        };
+        // Re-verify right before spending: the token is a file on disk, and
+        // it may have been spent by another process since the check above.
+        // If it is gone now, the burn has already happened — the token is
+        // dead, and the pending record must not survive it.
+        if (!tokens_.verify(*in.enrollment_token, in.candidate_pubkey)) {
+            invalidate();  // already spent/expired: no stale record
+            return {false, 403, "enrollment token already used", ""};
+        }
         if (!tokens_.consume(*in.enrollment_token, in.candidate_pubkey)) {
-            if (!is_existing) admissions_.erase(request_id);  // no phantom record
+            invalidate();  // concurrent spend (burn race): no stale record
             return {false, 403, "enrollment token already used", ""};
         }
         auto r = do_approve_locked(a, "token", /*supersede=*/false);
         if (!r.ok) {
-            if (!is_existing) admissions_.erase(request_id);
-            persist();
+            invalidate();  // token burned but issuance failed
             return r;
         }
         spdlog::info("[ServerAdmissionService] admitted '{}' via enrollment token",

@@ -1131,6 +1131,57 @@ TEST_F(AdmissionServiceTest, PendingAdmissionCannotBeMutated) {
     EXPECT_EQ(r3.request_id, r.request_id);
 }
 
+TEST_F(AdmissionServiceTest, FailedTokenApprovalLeavesNoLivePending) {
+    // A candidate that was parked pending retries with a token. When the
+    // token turns out to be unusable, the failed-approval path may spend the
+    // token (consume fail-closed) — but a burned/failed token must not leave
+    // a LIVE Pending record behind: the stale pending admission would linger,
+    // claim the server_id, and keep counting until it expires.
+    make(/*root_is_local=*/true);
+
+    auto cand     = crypto_svc->ed25519_keygen();
+    auto cand_b64 = b64({cand.public_key.begin(), cand.public_key.end()});
+
+    // First submission parks a live Pending record (no token).
+    auto in1 = signed_request(cand, "berlin-2");
+    auto r1  = admission->create_request(in1);
+    ASSERT_TRUE(r1.ok) << r1.error;
+    ASSERT_TRUE(admission->status(r1.request_id, in1.candidate_pubkey).has_value());
+    ASSERT_EQ(admission->status(r1.request_id, in1.candidate_pubkey)->state,
+              core::AdmissionState::Pending);
+    ASSERT_EQ(admission->pending().size(), 1u);
+
+    // A burned token is dead — the store rejects it at verify() the moment
+    // its file is gone, so the admission path must invalidate the pending
+    // record on that refusal too (the burn already happened; the only
+    // remaining question is what the stale record does).
+    auto minted = admission->mint_admission_token(cand_b64, std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    core::AdmissionTokenStore store{*storage_svc, *crypto_svc};
+    ASSERT_TRUE(store.consume(minted->first, cand_b64).has_value());  // spent
+    ASSERT_FALSE(store.verify(minted->first, cand_b64).has_value()); // dead
+
+    auto in2 = signed_request(cand, "berlin-2");
+    in2.enrollment_token = minted->first;
+    auto r2 = admission->create_request(in2);
+    EXPECT_FALSE(r2.ok);
+    EXPECT_EQ(r2.status, 403);
+
+    // The pending record is gone (not merely expired): the pending map no
+    // longer contains the candidate's entry at all.
+    ASSERT_TRUE(admission->pending().empty());
+    EXPECT_FALSE(admission->status(r1.request_id, in1.candidate_pubkey).has_value());
+
+    // The candidate can start over with a fresh (tokenless) request — the
+    // old record is not a zombie blocking the server_id.
+    auto in3 = signed_request(cand, "berlin-2");
+    auto r3  = admission->create_request(in3);
+    EXPECT_TRUE(r3.ok) << r3.error;
+    EXPECT_NE(r3.request_id, r1.request_id);
+    EXPECT_EQ(admission->status(r3.request_id, in3.candidate_pubkey)->state,
+              core::AdmissionState::Pending);
+}
+
 // --- Persistence ---
 
 TEST_F(AdmissionServiceTest, PendingAdmissionSurvivesRestart) {
