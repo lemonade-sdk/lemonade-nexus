@@ -111,7 +111,7 @@ struct RotatingMeshBase : DriverMeshBase {
                 });
             if (active) return;
         }
-        FAIL() << "epoch " << target << " did not activate within " << max_steps << " steps";
+        FAIL() << "epoch " << target.underlying() << " did not activate within " << max_steps << " steps";
     }
 
     /// One full rotation on the production path. `pool` is who the mesh

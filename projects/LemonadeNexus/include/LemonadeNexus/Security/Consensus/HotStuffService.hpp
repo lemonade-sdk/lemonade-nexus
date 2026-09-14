@@ -137,7 +137,7 @@ public:
     [[nodiscard]] std::optional<CommitProof> commit_proof(const Digest& proposal_digest) const;
 
     [[nodiscard]] NodeId leader_of(View view) const {
-        return config_.leader_order[view % config_.leader_order.size()];
+        return config_.leader_order[view.underlying() % config_.leader_order.size()];
     }
     [[nodiscard]] bool synced() const { return synced_; }
     [[nodiscard]] bool usable() const { return !failed_; }

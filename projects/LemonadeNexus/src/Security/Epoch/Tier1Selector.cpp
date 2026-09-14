@@ -14,7 +14,7 @@ namespace {
     CanonicalEncoder encoder(constants::kTier1SelectDomain);
     encoder.add_string("seed");
     encoder.add_bytes(group_key);
-    encoder.add_u64(next_epoch);
+    encoder.add_u64(next_epoch.underlying());
     return encoder.digest();
 }
 

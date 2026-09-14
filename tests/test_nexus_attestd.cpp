@@ -132,8 +132,8 @@ json good_request() {
     j["nonce"] = nexus::crypto::to_hex(c.nonce);
     j["node_id"] = nexus::crypto::to_hex(c.node_id.bytes);
     j["node_key"] = nexus::crypto::to_hex(c.node_key);
-    j["incarnation"] = c.incarnation;
-    j["epoch"] = c.epoch;
+    j["incarnation"] = c.incarnation.underlying();
+    j["epoch"] = c.epoch.underlying();
     j["security_ruleset"] = c.security_ruleset;
     j["consensus_ruleset"] = c.consensus_ruleset;
     j["profile_id"] = static_cast<uint16_t>(c.profile_id);
@@ -247,8 +247,8 @@ TEST(AttestdBinding, ChangesWithEveryChallengeField) {
         {"network_id", [](AttestationChallenge& c) { c.network_id[0] ^= 1; }},
         {"nonce", [](AttestationChallenge& c) { c.nonce[0] ^= 1; }},
         {"node_key", [](AttestationChallenge& c) { c.node_key[0] ^= 1; }},
-        {"incarnation", [](AttestationChallenge& c) { c.incarnation ^= 1; }},
-        {"epoch", [](AttestationChallenge& c) { c.epoch ^= 1; }},
+        {"incarnation", [](AttestationChallenge& c) { c.incarnation.value ^= 1; }},
+        {"epoch", [](AttestationChallenge& c) { c.epoch.value ^= 1; }},
         {"policy_digest", [](AttestationChallenge& c) { c.policy_digest[0] ^= 1; }},
         {"context_digest", [](AttestationChallenge& c) { c.context_digest[0] ^= 1; }},
         {"purpose",

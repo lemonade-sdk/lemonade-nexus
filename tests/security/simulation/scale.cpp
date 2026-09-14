@@ -78,14 +78,14 @@ Measurement measure(std::size_t members, std::size_t views, std::size_t failed_l
     Block last = harness.make_block(1, 1, parent, justify, 0x20);
 
     for (Height height = 1; height <= views; ++height) {
-        if (skipped < failed_leaders && height % 4 == 2) {
+        if (skipped < failed_leaders && height.underlying() % 4 == 2) {
             ++skipped;
             ++view;
             ++m.view_changes;
             ++m.liveness_failures;
         }
         const Block block = harness.make_block(height, view, parent,
-                                               justify, static_cast<uint8_t>(0x20 + height * 4));
+                                               justify, static_cast<uint8_t>(0x20 + height.underlying() * 4));
         const auto result = replica.receive_proposal(block.proposal, block.justify);
         ++m.proposals;
         if (result.vote.has_value()) {

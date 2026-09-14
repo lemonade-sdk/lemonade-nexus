@@ -32,7 +32,7 @@ protected:
     void TearDown() override { fs::remove_all(directory_); }
 
     [[nodiscard]] fs::path safety_file() const {
-        return directory_ / ("hotstuff-safety-" + std::to_string(kEpoch) + ".json");
+        return directory_ / ("hotstuff-safety-" + std::to_string(kEpoch.underlying()) + ".json");
     }
 
     // Votes at views 1 and 2, then goes away.

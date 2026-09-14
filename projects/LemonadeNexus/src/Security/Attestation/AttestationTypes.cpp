@@ -17,9 +17,9 @@ Digest eligibility_attestation_context(const NetworkId& network_id, EpochId epoc
     CanonicalEncoder encoder(kAttestationContextDomain);
     encoder.add_u16(static_cast<uint16_t>(AttestationPurpose::Eligibility));
     encoder.add_bytes(network_id);
-    encoder.add_u64(epoch);
+    encoder.add_u64(epoch.underlying());
     encoder.add_bytes(node.bytes);
-    encoder.add_u64(incarnation);
+    encoder.add_u64(incarnation.underlying());
     return encoder.digest();
 }
 
@@ -30,12 +30,12 @@ Digest final_readiness_attestation_context(const NetworkId& network_id, EpochId 
     CanonicalEncoder encoder(kAttestationContextDomain);
     encoder.add_u16(static_cast<uint16_t>(AttestationPurpose::FinalEpochReadiness));
     encoder.add_bytes(network_id);
-    encoder.add_u64(next_epoch);
+    encoder.add_u64(next_epoch.underlying());
     encoder.add_bytes(plan_digest);
     encoder.add_u32(attempt);
     encoder.add_bytes(selected_set_digest);
     encoder.add_bytes(node.bytes);
-    encoder.add_u64(incarnation);
+    encoder.add_u64(incarnation.underlying());
     return encoder.digest();
 }
 
@@ -46,8 +46,8 @@ Digest challenge_digest(const AttestationChallenge& challenge) {
     encoder.add_bytes(challenge.nonce);
     encoder.add_bytes(challenge.node_id.bytes);
     encoder.add_bytes(challenge.node_key);
-    encoder.add_u64(challenge.incarnation);
-    encoder.add_u64(challenge.epoch);
+    encoder.add_u64(challenge.incarnation.underlying());
+    encoder.add_u64(challenge.epoch.underlying());
     encoder.add_u16(challenge.security_ruleset);
     encoder.add_u16(challenge.consensus_ruleset);
     // The profile identity is inside the challenge digest, so the TPM quote
@@ -84,8 +84,8 @@ Digest evidence_signing_digest(const AttestationEvidence& evidence) {
     encoder.add_bytes(evidence.network_id);
     encoder.add_bytes(evidence.challenge_digest);
     encoder.add_bytes(evidence.node_id.bytes);
-    encoder.add_u64(evidence.incarnation);
-    encoder.add_u64(evidence.epoch);
+    encoder.add_u64(evidence.incarnation.underlying());
+    encoder.add_u64(evidence.epoch.underlying());
     encoder.add_u16(evidence.security_ruleset);
     encoder.add_u16(evidence.consensus_ruleset);
     encoder.add_u16(static_cast<uint16_t>(evidence.profile_id));

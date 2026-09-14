@@ -168,7 +168,7 @@ public:
         proposal.epoch = kEpoch;
         proposal.height = height;
         proposal.view = view;
-        proposal.leader = members[view % members.size()];
+        proposal.leader = members[view.underlying() % members.size()];
         proposal.parent_digest = parent_digest;
         proposal.justify_qc_digest = nexus::security::qc_digest(justify);
         proposal.previous_state_root = filled_digest(payload_seed);

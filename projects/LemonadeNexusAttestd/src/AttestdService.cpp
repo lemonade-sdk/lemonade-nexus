@@ -94,22 +94,22 @@ void AttestdService::handle_request(std::string_view request, const FrameSink& s
     const Refusal refusal = answer(*challenge, bundle, &detail);
     if (refusal != Refusal::None) {
         spdlog::warn("[attestd] refused epoch={} purpose={} incarnation={}: {}{}{}",
-                     challenge->epoch, static_cast<uint16_t>(challenge->purpose),
-                     challenge->incarnation, refusal_name(refusal),
+                     challenge->epoch.underlying(), static_cast<uint16_t>(challenge->purpose),
+                     challenge->incarnation.underlying(), refusal_name(refusal),
                      detail.empty() ? "" : " — ", detail);
         (void)emit_refusal(refusal, sink, detail);
         return;
     }
 
     spdlog::info("[attestd] answered epoch={} purpose={} incarnation={} challenge={} binary={}",
-                 challenge->epoch, static_cast<uint16_t>(challenge->purpose),
-                 challenge->incarnation, crypto::to_hex(bundle.challenge_digest),
+                 challenge->epoch.underlying(), static_cast<uint16_t>(challenge->purpose),
+                 challenge->incarnation.underlying(), crypto::to_hex(bundle.challenge_digest),
                  bundle.platform.binary_sha256.empty() ? "unmeasured"
                                                        : bundle.platform.binary_sha256);
     if (!emit_bundle(bundle, sink)) {
         // Caller gone, or the bundle needs more frames than one operation allows.
         spdlog::warn("[attestd] response stream ended early for epoch={} incarnation={}",
-                     challenge->epoch, challenge->incarnation);
+                     challenge->epoch.underlying(), challenge->incarnation.underlying());
     }
 }
 

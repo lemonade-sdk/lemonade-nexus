@@ -22,6 +22,7 @@
 namespace constants = nexus::security::constants;
 
 using nexus::security::AttestationChallenge;
+using nexus::security::IncarnationId;
 using nexus::security::AttestationEvidence;
 using nexus::security::AttestationFailure;
 using nexus::security::AttestationVerdict;
@@ -279,17 +280,17 @@ TEST_F(Tier1PathTest, EvidenceCarryingAnotherNodeIdIsRejected) {
 TEST_F(Tier1PathTest, IncarnationMustMatchExactlyInBothDirections) {
     // The check is equality, not a floor. A restarted node that claims a newer
     // incarnation than the challenge names is rejected exactly like a stale one.
-    const uint64_t incarnations[] = {challenge_.incarnation - 1, challenge_.incarnation + 1};
-    for (const uint64_t incarnation : incarnations) {
+    const IncarnationId incarnations[] = {challenge_.incarnation - 1, challenge_.incarnation + 1};
+    for (const IncarnationId incarnation : incarnations) {
         evidence_ = answer(challenge_);
         evidence_.incarnation = incarnation;
         sign_evidence();
 
         const auto verdict = examine();
-        EXPECT_FALSE(verdict.passed) << incarnation;
-        EXPECT_EQ(verdict.failure, AttestationFailure::IncarnationStale) << incarnation;
-        EXPECT_EQ(verdict.incarnation, challenge_.incarnation) << incarnation;
-        EXPECT_EQ(verdict.evidence_digest, Digest{}) << incarnation;
+        EXPECT_FALSE(verdict.passed) << incarnation.underlying();
+        EXPECT_EQ(verdict.failure, AttestationFailure::IncarnationStale) << incarnation.underlying();
+        EXPECT_EQ(verdict.incarnation, challenge_.incarnation) << incarnation.underlying();
+        EXPECT_EQ(verdict.evidence_digest, Digest{}) << incarnation.underlying();
     }
 }
 

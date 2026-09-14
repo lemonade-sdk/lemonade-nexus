@@ -17,7 +17,7 @@ std::vector<NodeId> LeaderSelection::order(std::span<const NodeId> members,
     CanonicalEncoder seed_encoder(constants::kLeaderOrderDomain);
     seed_encoder.add_string("seed");
     seed_encoder.add_bytes(previous_checkpoint);
-    seed_encoder.add_u64(epoch);
+    seed_encoder.add_u64(epoch.underlying());
     const Digest seed = seed_encoder.digest();
 
     std::vector<std::pair<Digest, NodeId>> scored;
@@ -46,7 +46,7 @@ NodeId LeaderSelection::leader(const std::vector<NodeId>& order, View view) {
     if (order.empty()) {
         throw std::invalid_argument("leader order is empty");
     }
-    return order[view % order.size()];
+    return order[view.underlying() % order.size()];
 }
 
 }  // namespace nexus::security

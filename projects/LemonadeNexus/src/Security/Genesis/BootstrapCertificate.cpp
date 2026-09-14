@@ -17,7 +17,7 @@ NetworkId derive_network_id(const crypto::Ed25519PublicKey& genesis_public_key,
 Digest bootstrap_certificate_signing_digest(const BootstrapCertificate& certificate) {
     CanonicalEncoder encoder("lemonade-nexus/bootstrap-certificate:v1");
     encoder.add_bytes(certificate.network_id);
-    encoder.add_u64(certificate.epoch);
+    encoder.add_u64(certificate.epoch.underlying());
     encoder.add_bytes(certificate.tier1_set_digest);
     encoder.add_u64(certificate.authority_threshold);
     encoder.add_bytes(certificate.authority_public_key);

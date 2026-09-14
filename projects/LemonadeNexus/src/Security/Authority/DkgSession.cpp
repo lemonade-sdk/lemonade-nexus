@@ -23,10 +23,10 @@ Digest dkg_message_digest(const DkgMessage& message) {
     CanonicalEncoder encoder(kMessageDomain);
     encoder.add_string("message");
     encoder.add_bytes(message.network_id);
-    encoder.add_u64(message.target_epoch);
+    encoder.add_u64(message.target_epoch.underlying());
     encoder.add_bytes(message.session_digest);
     encoder.add_bytes(message.sender.bytes);
-    encoder.add_u64(message.sender_incarnation);
+    encoder.add_u64(message.sender_incarnation.underlying());
     encoder.add_u16(static_cast<uint16_t>(message.round));
     encoder.add_bytes(message.recipient.bytes);
     encoder.add_bytes(payload_digest(message.payload));
@@ -169,7 +169,7 @@ std::optional<Digest> DkgSession::transcript_digest() const {
     }
     CanonicalEncoder encoder(kTranscriptDomain);
     encoder.add_bytes(config_.network_id);
-    encoder.add_u64(config_.target_epoch);
+    encoder.add_u64(config_.target_epoch.underlying());
     encoder.add_bytes(config_.participants.digest());
     encoder.add_u64(config_.participants.size());
     for (const auto& [sender, payload] : round1_payloads_) {

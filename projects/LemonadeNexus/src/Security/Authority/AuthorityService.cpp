@@ -135,7 +135,7 @@ SigningStart AuthorityService::open_session(SigningSessionId session_id,
     if (object.epoch != context_->epoch) {
         return fail(SigningFailure::WrongEpoch);
     }
-    if (object.key_generation != context_->epoch) {
+    if (object.key_generation != KeyGeneration(context_->epoch.underlying())) {
         return fail(SigningFailure::WrongKeyGeneration);
     }
 
@@ -181,7 +181,7 @@ SigningStart AuthorityService::open_session(SigningSessionId session_id,
     OpenSession open;
     open.session.id = session_id;
     open.session.epoch = context_->epoch;
-    open.session.key_generation = context_->epoch;
+    open.session.key_generation = KeyGeneration(context_->epoch.underlying());
     open.session.object = object;
     open.session.signer_set = std::move(signer_set);
     open.session.phase = SigningPhase::CollectingCommitments;
@@ -190,7 +190,7 @@ SigningStart AuthorityService::open_session(SigningSessionId session_id,
 
     NonceCommitment record;
     record.epoch = context_->epoch;
-    record.key_generation = context_->epoch;
+    record.key_generation = KeyGeneration(context_->epoch.underlying());
     record.session_id = session_id;
     record.participant = self_;
     record.commitment = commit.value->commitments;

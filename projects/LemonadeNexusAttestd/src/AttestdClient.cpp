@@ -89,8 +89,8 @@ std::string encode_challenge_request(const security::AttestationChallenge& chall
     j["nonce"] = crypto::to_hex(challenge.nonce);
     j["node_id"] = crypto::to_hex(challenge.node_id.bytes);
     j["node_key"] = crypto::to_hex(challenge.node_key);
-    j["incarnation"] = challenge.incarnation;
-    j["epoch"] = challenge.epoch;
+    j["incarnation"] = challenge.incarnation.underlying();
+    j["epoch"] = challenge.epoch.underlying();
     j["security_ruleset"] = challenge.security_ruleset;
     j["consensus_ruleset"] = challenge.consensus_ruleset;
     j["profile_id"] = static_cast<uint16_t>(challenge.profile_id);

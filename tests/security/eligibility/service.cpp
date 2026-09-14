@@ -98,7 +98,7 @@ struct ServiceMesh : ::testing::Test {
         verdict.claims = complete_claims();
         verdict.evidence_digest.fill(subject.bytes[0]);
         verdict.evidence_digest[0] = static_cast<uint8_t>(0xA0 + round);
-        verdict.evidence_digest[1] = static_cast<uint8_t>(incarnation);
+        verdict.evidence_digest[1] = static_cast<uint8_t>(incarnation.underlying());
         return verdict;
     }
 
@@ -148,7 +148,7 @@ struct ServiceMesh : ::testing::Test {
             for (const std::size_t j : subjects) {
                 if (i == j) continue;
                 auto observation = services[i]->observe_participation(
-                    proof_for(ids[j], height), height, reference(static_cast<uint8_t>(height)));
+                    proof_for(ids[j], height), height, reference(static_cast<uint8_t>(height.underlying())));
                 ASSERT_TRUE(observation.has_value());
                 publish(*observation);
             }

@@ -91,7 +91,7 @@ struct ChainFixture {
             }
             handoff.group_public_key.fill(static_cast<uint8_t>(0x90 + i));
             handoff.dkg_transcript_digest.fill(static_cast<uint8_t>(0xD0 + i));
-            handoff.key_generation = to.epoch;
+            handoff.key_generation = KeyGeneration(to.epoch.underlying());
             handoff.attestation_root.fill(static_cast<uint8_t>(0xA0 + i));
             handoff.security_ruleset = constants::kSecurityRulesetVersion;
             handoff.consensus_ruleset = constants::kConsensusRulesetVersion;
@@ -147,9 +147,9 @@ TEST(ChainScale, TheChainClimbsTheWholeTableInBoundedPages) {
         for (const auto& link : page.links) {
             const auto advanced = advance_epoch_authority(authority, link.handoff, link.proof);
             const auto* next = std::get_if<VerifiedEpochAuthority>(&advanced);
-            ASSERT_NE(next, nullptr) << "genuine link refused at epoch " << authority.epoch;
+            ASSERT_NE(next, nullptr) << "genuine link refused at epoch " << authority.epoch.underlying();
             std::printf("  %5llu %4zu -> %-4zu %9zu\n",
-                        (unsigned long long)link.handoff.from_epoch,
+                        (unsigned long long)link.handoff.from_epoch.underlying(),
                         authority.members.size(), next->members.size(), bytes);
             authority = *next;
             ++walked;

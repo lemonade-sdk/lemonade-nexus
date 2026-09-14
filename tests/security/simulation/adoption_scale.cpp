@@ -71,7 +71,7 @@ EpochHandoff handoff_for(const Committee& committee, const Digest& plan_digest) 
     }
     handoff.group_public_key.fill(0x99);
     handoff.dkg_transcript_digest.fill(0xD1);
-    handoff.key_generation = kEpoch + 1;
+    handoff.key_generation = KeyGeneration(kEpoch.underlying() + 1);
     handoff.attestation_root.fill(0xA7);
     handoff.security_ruleset = constants::kSecurityRulesetVersion;
     handoff.consensus_ruleset = constants::kConsensusRulesetVersion;

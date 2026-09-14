@@ -372,7 +372,7 @@ AttestationVerdict passing_verdict(const NetworkId& network, const NodeId& id, E
     // evidence digest proves no attestation ran and is refused as such.
     verdict.evidence_digest.fill(id.bytes[0]);
     verdict.evidence_digest[0] = static_cast<uint8_t>(0xA0 + round);
-    verdict.evidence_digest[1] = static_cast<uint8_t>(epoch + 1);
+    verdict.evidence_digest[1] = static_cast<uint8_t>(epoch.underlying() + 1);
     return verdict;
 }
 
@@ -560,7 +560,7 @@ struct AdversarialMesh : ::testing::Test {
             });
             if (done) return;
         }
-        FAIL() << "no commit at height " << height << " within " << max_steps << " steps";
+        FAIL() << "no commit at height " << height.underlying() << " within " << max_steps << " steps";
     }
 
     // One re-attestation round: every member verifies every other one and
@@ -654,7 +654,7 @@ struct AdversarialMesh : ::testing::Test {
                     seen.emplace(key, entry.second);
                 } else {
                     EXPECT_EQ(it->second, entry.second)
-                        << "conflicting commit at epoch " << epoch << " height " << entry.first;
+                        << "conflicting commit at epoch " << epoch.underlying() << " height " << entry.first.underlying();
                 }
             }
         }

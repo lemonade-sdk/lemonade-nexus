@@ -22,9 +22,9 @@ Digest proposal_digest(const Proposal& proposal) {
     encoder.add_u16(proposal.security_ruleset);
     encoder.add_u16(proposal.consensus_ruleset);
     encoder.add_bytes(proposal.network_id);
-    encoder.add_u64(proposal.epoch);
-    encoder.add_u64(proposal.height);
-    encoder.add_u64(proposal.view);
+    encoder.add_u64(proposal.epoch.underlying());
+    encoder.add_u64(proposal.height.underlying());
+    encoder.add_u64(proposal.view.underlying());
     encoder.add_bytes(proposal.leader.span());
     encoder.add_bytes(proposal.parent_digest);
     encoder.add_bytes(proposal.justify_qc_digest);
@@ -45,9 +45,9 @@ Digest vote_signing_digest(ConsensusRulesetVersion consensus_ruleset,
     auto encoder = make_encoder("vote");
     encoder.add_u16(consensus_ruleset);
     encoder.add_bytes(network_id);
-    encoder.add_u64(epoch);
-    encoder.add_u64(height);
-    encoder.add_u64(view);
+    encoder.add_u64(epoch.underlying());
+    encoder.add_u64(height.underlying());
+    encoder.add_u64(view.underlying());
     encoder.add_bytes(proposal_digest);
     encoder.add_bytes(voter.span());
     return encoder.digest();
@@ -67,8 +67,8 @@ Digest timeout_vote_signing_digest(ConsensusRulesetVersion consensus_ruleset,
     auto encoder = make_encoder("timeout-vote");
     encoder.add_u16(consensus_ruleset);
     encoder.add_bytes(network_id);
-    encoder.add_u64(epoch);
-    encoder.add_u64(view);
+    encoder.add_u64(epoch.underlying());
+    encoder.add_u64(view.underlying());
     encoder.add_bytes(high_qc_digest);
     encoder.add_bytes(voter.span());
     return encoder.digest();
@@ -85,9 +85,9 @@ Digest qc_digest(const QuorumCertificate& certificate) {
     encoder.add_u16(certificate.qc_format_version);
     encoder.add_u16(certificate.consensus_ruleset);
     encoder.add_bytes(certificate.network_id);
-    encoder.add_u64(certificate.epoch);
-    encoder.add_u64(certificate.height);
-    encoder.add_u64(certificate.view);
+    encoder.add_u64(certificate.epoch.underlying());
+    encoder.add_u64(certificate.height.underlying());
+    encoder.add_u64(certificate.view.underlying());
     encoder.add_bytes(certificate.proposal_digest);
 
     auto signers = certificate.signers;
@@ -108,8 +108,8 @@ Digest timeout_certificate_digest(const TimeoutCertificate& certificate) {
     auto encoder = make_encoder("tc");
     encoder.add_u16(certificate.consensus_ruleset);
     encoder.add_bytes(certificate.network_id);
-    encoder.add_u64(certificate.epoch);
-    encoder.add_u64(certificate.view);
+    encoder.add_u64(certificate.epoch.underlying());
+    encoder.add_u64(certificate.view.underlying());
 
     auto signers = certificate.signers;
     std::sort(signers.begin(), signers.end(),
@@ -136,9 +136,9 @@ Digest consensus_state_record_digest(const QuorumCertificate& high_qc,
                                      View last_voted_view) {
     auto encoder = make_encoder("safety-record");
     encoder.add_u32(constants::kConsensusStoreFormatVersion);
-    encoder.add_u64(epoch);
+    encoder.add_u64(epoch.underlying());
     encoder.add_u16(consensus_ruleset);
-    encoder.add_u64(last_voted_view);
+    encoder.add_u64(last_voted_view.underlying());
     encoder.add_bytes(qc_digest(high_qc));
     encoder.add_bytes(qc_digest(locked_qc));
     return encoder.digest();
@@ -147,9 +147,9 @@ Digest consensus_state_record_digest(const QuorumCertificate& high_qc,
 Digest consensus_commit_record_digest(const ConsensusCommit& commit) {
     auto encoder = make_encoder("commit-record");
     encoder.add_u32(constants::kConsensusStoreFormatVersion);
-    encoder.add_u64(commit.epoch);
-    encoder.add_u64(commit.height);
-    encoder.add_u64(commit.view);
+    encoder.add_u64(commit.epoch.underlying());
+    encoder.add_u64(commit.height.underlying());
+    encoder.add_u64(commit.view.underlying());
     encoder.add_bytes(commit.proposal_digest);
     encoder.add_bytes(commit.proposed_state_root);
     encoder.add_bytes(commit.transitions_digest);

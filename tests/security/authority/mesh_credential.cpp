@@ -32,7 +32,7 @@ VerifiedEpochAuthority authority_with(const crypto::Ed25519PublicKey& group, Epo
     a.network_id = network;
     a.epoch = epoch;
     a.group_public_key = group;
-    a.key_generation = epoch;
+    a.key_generation = KeyGeneration(epoch.underlying());
     return a;
 }
 

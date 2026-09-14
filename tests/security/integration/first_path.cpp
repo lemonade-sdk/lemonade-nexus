@@ -191,8 +191,8 @@ void run_round(std::vector<Node*>& members, const std::vector<NodeId>& order,
     Node* leader = nullptr;
     Node* next_leader = nullptr;
     for (Node* node : members) {
-        if (node->id == order[view % order.size()]) leader = node;
-        if (node->id == order[(view + 1) % order.size()]) next_leader = node;
+        if (node->id == order[view.underlying() % order.size()]) leader = node;
+        if (node->id == order[(view + 1).underlying() % order.size()]) next_leader = node;
     }
     ASSERT_NE(leader, nullptr);
     ASSERT_NE(next_leader, nullptr);
@@ -206,8 +206,8 @@ void run_round(std::vector<Node*>& members, const std::vector<NodeId>& order,
     auto made = leader->runtime->consensus()->make_proposal(previous, proposed, transitions);
     if (!std::holds_alternative<Proposal>(made)) {
         ADD_FAILURE() << "make_proposal failed with code "
-                      << static_cast<int>(std::get<ConsensusFailure>(made)) << " at view " << view
-                      << " leader current_view " << leader->runtime->consensus()->current_view();
+                      << static_cast<int>(std::get<ConsensusFailure>(made)) << " at view " << view.underlying()
+                      << " leader current_view " << leader->runtime->consensus()->current_view().underlying();
         return;
     }
     round.proposal = std::get<Proposal>(made);

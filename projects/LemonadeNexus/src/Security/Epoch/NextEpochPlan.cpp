@@ -16,10 +16,10 @@ inline constexpr std::string_view kVoteKeySetDomain = "lemonade-nexus/vote-key-s
 Digest next_epoch_plan_digest(const NextEpochPlan& plan) {
     CanonicalEncoder encoder(kPlanDomain);
     encoder.add_bytes(plan.network_id);
-    encoder.add_u64(plan.current_epoch);
-    encoder.add_u64(plan.next_epoch);
+    encoder.add_u64(plan.current_epoch.underlying());
+    encoder.add_u64(plan.next_epoch.underlying());
     encoder.add_u32(plan.attempt);
-    encoder.add_u64(plan.checkpoint_height);
+    encoder.add_u64(plan.checkpoint_height.underlying());
     encoder.add_bytes(plan.checkpoint_state_root);
     encoder.add_bytes(plan.eligibility_commitment);
     encoder.add_bytes(plan.selection_seed);
@@ -27,7 +27,7 @@ Digest next_epoch_plan_digest(const NextEpochPlan& plan) {
     for (const auto& node : plan.selected) {
         encoder.add_bytes(node.bytes);
         const auto incarnation = plan.incarnations.find(node);
-        encoder.add_u64(incarnation != plan.incarnations.end() ? incarnation->second : 0);
+        encoder.add_u64(incarnation != plan.incarnations.end() ? incarnation->second.underlying() : 0u);
     }
     encoder.add_u16(plan.security_ruleset);
     encoder.add_u16(plan.consensus_ruleset);
@@ -40,11 +40,11 @@ Digest candidate_readiness_digest(const CandidateReadiness& readiness) {
     CanonicalEncoder encoder(kReadinessDomain);
     encoder.add_bytes(readiness.network_id);
     encoder.add_bytes(readiness.plan_digest);
-    encoder.add_u64(readiness.next_epoch);
+    encoder.add_u64(readiness.next_epoch.underlying());
     encoder.add_u64(readiness.entries.size());
     for (const auto& entry : readiness.entries) {
         encoder.add_bytes(entry.node.bytes);
-        encoder.add_u64(entry.incarnation);
+        encoder.add_u64(entry.incarnation.underlying());
         encoder.add_bytes(entry.evidence_digest);
         encoder.add_bytes(entry.vote_key);
     }
@@ -54,20 +54,20 @@ Digest candidate_readiness_digest(const CandidateReadiness& readiness) {
 Digest epoch_handoff_digest(const EpochHandoff& handoff) {
     CanonicalEncoder encoder(kHandoffDomain);
     encoder.add_bytes(handoff.network_id);
-    encoder.add_u64(handoff.from_epoch);
-    encoder.add_u64(handoff.to_epoch);
+    encoder.add_u64(handoff.from_epoch.underlying());
+    encoder.add_u64(handoff.to_epoch.underlying());
     encoder.add_bytes(handoff.plan_digest);
     encoder.add_bytes(handoff.previous_anchor);
     encoder.add_u64(handoff.members.size());
     for (const auto& node : handoff.members) {
         encoder.add_bytes(node.bytes);
         const auto incarnation = handoff.incarnations.find(node);
-        encoder.add_u64(incarnation != handoff.incarnations.end() ? incarnation->second : 0);
+        encoder.add_u64(incarnation != handoff.incarnations.end() ? incarnation->second.underlying() : 0u);
     }
     encoder.add_bytes(vote_key_set_digest(handoff.vote_keys));
     encoder.add_bytes(handoff.group_public_key);
     encoder.add_bytes(handoff.dkg_transcript_digest);
-    encoder.add_u64(handoff.key_generation);
+    encoder.add_u64(handoff.key_generation.underlying());
     encoder.add_bytes(handoff.attestation_root);
     encoder.add_u16(handoff.security_ruleset);
     encoder.add_u16(handoff.consensus_ruleset);

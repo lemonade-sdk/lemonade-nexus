@@ -56,6 +56,14 @@ template <typename T>
     return true;
 }
 
+template <typename Tag>
+[[nodiscard]] bool read_uint(const json& value, security::StrongId<Tag>& out) {
+    uint64_t raw = 0;
+    if (!read_uint(value, raw)) return false;
+    out = raw;
+    return true;
+}
+
 /// Only the two purposes the protocol defines. An unknown value is refused
 /// rather than defaulting into Eligibility, which is the weaker context.
 [[nodiscard]] bool read_purpose(const json& value, security::AttestationPurpose& out) {

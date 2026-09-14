@@ -38,8 +38,8 @@ Digest platform_claims_digest(const VerifiedPlatformClaims& claims) {
 Digest eligibility_state_digest(const EligibilityState& state) {
     CanonicalEncoder encoder(kStateDomain);
     encoder.add_bytes(state.network_id);
-    encoder.add_u64(state.epoch);
-    encoder.add_u64(state.next_epoch);
+    encoder.add_u64(state.epoch.underlying());
+    encoder.add_u64(state.next_epoch.underlying());
     encoder.add_u16(state.security_ruleset);
     encoder.add_u16(state.consensus_ruleset);
     encoder.add_bytes(state.observer_set);
@@ -49,7 +49,7 @@ Digest eligibility_state_digest(const EligibilityState& state) {
     // produce a different digest and simply fail to agree with anyone.
     for (const auto& record : state.records) {
         encoder.add_bytes(record.subject.bytes);
-        encoder.add_u64(record.incarnation);
+        encoder.add_u64(record.incarnation.underlying());
         add_flag(encoder, record.uptime_valid);
         add_flag(encoder, record.mesh_health_valid);
         add_flag(encoder, record.certificate_valid);
@@ -63,8 +63,8 @@ Digest eligibility_state_digest(const EligibilityState& state) {
 Digest eligibility_commitment_digest(const EligibilityState& state) {
     CanonicalEncoder encoder(kCommitmentDomain);
     encoder.add_bytes(state.network_id);
-    encoder.add_u64(state.epoch);
-    encoder.add_u64(state.next_epoch);
+    encoder.add_u64(state.epoch.underlying());
+    encoder.add_u64(state.next_epoch.underlying());
     encoder.add_bytes(eligibility_state_digest(state));
     return encoder.digest();
 }

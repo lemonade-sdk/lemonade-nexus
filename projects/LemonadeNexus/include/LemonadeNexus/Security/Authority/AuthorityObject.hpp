@@ -54,7 +54,7 @@ struct AuthorityObject {
     AuthorityObject object;
     object.network_id = network_id;
     object.epoch = commit.epoch;
-    object.key_generation = commit.epoch;
+    object.key_generation = KeyGeneration(commit.epoch.underlying());
     object.operation = operation;
     object.operation_id = operation_id;
     object.previous_state_digest = previous_state_digest;
@@ -66,10 +66,10 @@ struct AuthorityObject {
 [[nodiscard]] inline Digest authority_object_digest(const AuthorityObject& object) {
     CanonicalEncoder encoder("lemonade-nexus/authority-object:v1");
     encoder.add_bytes(object.network_id);
-    encoder.add_u64(object.epoch);
-    encoder.add_u64(object.key_generation);
+    encoder.add_u64(object.epoch.underlying());
+    encoder.add_u64(object.key_generation.underlying());
     encoder.add_u16(static_cast<uint16_t>(object.operation));
-    encoder.add_u64(object.operation_id);
+    encoder.add_u64(object.operation_id.underlying());
     encoder.add_bytes(object.previous_state_digest);
     encoder.add_bytes(object.finalized_state_digest);
     encoder.add_bytes(object.consensus_certificate_digest);
