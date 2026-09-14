@@ -12,6 +12,16 @@
 // The honest limit: this proves a modified binary cannot ATTEST, not that it
 // cannot RUN. "Cannot run" needs dm-verity, and on an Azure CVM that has to ride
 // the boot PCRs too, because the SNP launch MEASUREMENT does not cover the guest.
+//
+// The kernel sources of truth for the ABI parsed here:
+//   * IMA ABI reference (ascii_runtime_measurements line format, template names,
+//     template digests): https://docs.kernel.org/security/IMA-ABI.html
+//     (source: Documentation/security/IMA-ABI.rst)
+//   * the securityfs ascii_runtime_measurements interface specifically:
+//     https://docs.kernel.org/security/IMA-ABI.html#ascii-runtime-measurements
+//   * the template definitions ("ima", "ima-ng", "ima-sig", ...) and the
+//     per-bank template digest widths (20 = SHA-1, 32 = SHA-256, ...):
+//     https://docs.kernel.org/security/IMA-ABI.html#template-digest-format
 
 #include <cstdint>
 #include <optional>
@@ -35,6 +45,8 @@ struct ImaEntry {
 struct ImaLog {
     std::vector<ImaEntry> entries;
     /// Digest width seen in the log: 20 for SHA-1 template hashes, 32 for SHA-256.
+    /// Widths follow the kernel's template digest format:
+    /// https://docs.kernel.org/security/IMA-ABI.html#template-digest-format
     [[nodiscard]] std::size_t template_hash_size() const;
 };
 
@@ -56,8 +68,14 @@ struct ImaLog {
 /// matched exactly, the SHA-256 bank did not, and no zero-extension rule bridges
 /// them because the SHA-256 bank holds a genuinely different digest.
 ///
-/// So the bank is chosen by the log's own width rather than fixed, and with an
-/// ASCII log that width is always SHA-1. No boot parameter changes this: the
+/// Kernel reference for the per-bank template digests, the
+/// ascii_runtime_measurements line format, and the width-to-bank mapping:
+/// https://docs.kernel.org/security/IMA-ABI.html#ascii-runtime-measurements and
+/// https://docs.kernel.org/security/IMA-ABI.html#template-digest-format
+///
+/// So the bank is chosen by the log's own width rather than fixed — mapping the
+/// width (20/32/48/64) to the PCR bank hash algorithm — and with an ASCII log
+/// that width is always SHA-1. No boot parameter changes this: the
 /// SHA-256 template digests are not in the ASCII format at all. Measured on the
 /// live Azure box, the kernel's SHA-256 bank replays correctly from
 /// binary_runtime_measurements — so reaching it is a format change here, not a

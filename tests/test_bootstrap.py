@@ -197,6 +197,21 @@ class BootstrapTest(unittest.TestCase):
         self.assertNotIn("-/var/lib/nexus", " ".join(lines).replace("-/var/lib/lemonade-nexus", ""))
 
 
+class ImaKernelReferenceTest(unittest.TestCase):
+    # MeasurementIma.hpp parses the kernel's ascii runtime measurements ABI;
+    # the header must carry the authoritative kernel documentation reference so
+    # a future reader (or reviewer) can verify the format, template names, and
+    # per-bank digest widths against the source of truth.
+
+    URL = "docs.kernel.org/security/IMA-ABI"
+
+    def test_measurement_ima_header_cites_kernel_ima_abi_reference(self):
+        header = (REPO / "projects/LemonadeNexus/include/LemonadeNexus/Security/MeasurementIma.hpp").read_text()
+        self.assertIn(f"https://{self.URL}.html", header)
+        self.assertIn(f"https://{self.URL}.html#ascii-runtime-measurements", header)
+        self.assertIn(f"https://{self.URL}.html#template-digest-format", header)
+
+
 class WorkflowMatrixConsistencyTest(unittest.TestCase):
     # release.yml ships binaries for whatever it builds, so it must never be
     # active on a platform that ci.yml does not gate (the Windows entries in
