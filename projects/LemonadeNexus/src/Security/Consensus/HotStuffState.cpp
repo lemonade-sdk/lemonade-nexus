@@ -39,6 +39,13 @@ using json = nlohmann::json;
     return true;
 }
 
+[[nodiscard]] bool read_u32(const json& object, const char* key, uint32_t& out) {
+    uint64_t value = 0;
+    if (!read_u64(object, key, value) || value > 0xFFFFFFFFu) return false;
+    out = static_cast<uint32_t>(value);
+    return true;
+}
+
 template <std::size_t N>
 [[nodiscard]] bool read_b64(const json& object, const char* key, std::array<uint8_t, N>& out) {
     const auto it = object.find(key);
@@ -70,8 +77,29 @@ template <std::size_t N>
                 {"signers", std::move(signers)}};
 }
 
+// The store record is closed: an unexpected key means the file is not what
+// this binary writes and must not be acted on.
+[[nodiscard]] bool has_unknown_key(const json& object, std::initializer_list<const char*> expected) {
+    for (const auto& [key, value] : object.items()) {
+        (void)value;
+        bool known = false;
+        for (const auto* name : expected) {
+            if (key == name) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) return true;
+    }
+    return false;
+}
+
 [[nodiscard]] bool qc_from_json(const json& object, QuorumCertificate& out) {
     if (!object.is_object()) return false;
+    if (has_unknown_key(object, {"qc_format_version", "consensus_ruleset", "network_id", "epoch",
+                                 "height", "view", "proposal_digest", "signers"})) {
+        return false;
+    }
 
     QuorumCertificate certificate{};
     if (!read_u16(object, "qc_format_version", certificate.qc_format_version)) return false;
@@ -88,6 +116,7 @@ template <std::size_t N>
     if (signers->size() > constants::kMaxQcSignatures) return false;
     for (const auto& entry : *signers) {
         if (!entry.is_object()) return false;
+        if (has_unknown_key(entry, {"node_id", "signature"})) return false;
         QcSigner signer{};
         if (!read_b64(entry, "node_id", signer.node_id.bytes)) return false;
         if (!read_b64(entry, "signature", signer.signature)) return false;
@@ -101,15 +130,37 @@ template <std::size_t N>
 }  // namespace
 
 json hotstuff_state_to_json(const HotStuffState& state) {
-    return json{{"epoch", state.epoch},
+    // The record binds its own payload: a byte changed at rest loads as
+    // Corrupt, the same convention the epoch store uses for its anchor's
+    // record_digest. version/record_digest are envelope fields, outside the
+    // payload digest; version is still re-checked on read so a wrong-version
+    // record never acts as state.
+    return json{{"version", constants::kConsensusStoreFormatVersion},
+                {"epoch", state.epoch},
                 {"consensus_ruleset", state.consensus_ruleset},
                 {"last_voted_view", state.last_voted_view},
                 {"high_qc", qc_to_json(state.high_qc)},
-                {"locked_qc", qc_to_json(state.locked_qc)}};
+                {"locked_qc", qc_to_json(state.locked_qc)},
+                {"record_digest",
+                 b64(consensus_state_record_digest(state.high_qc, state.locked_qc,
+                                                   state.consensus_ruleset, state.epoch,
+                                                   state.last_voted_view))}};
 }
 
 std::optional<HotStuffState> hotstuff_state_from_json(const json& document) {
     if (!document.is_object()) return std::nullopt;
+    if (has_unknown_key(document, {"version", "epoch", "consensus_ruleset", "last_voted_view",
+                                   "high_qc", "locked_qc", "record_digest"})) {
+        return std::nullopt;
+    }
+
+    // The format is new; every file must be exactly this version. There is no
+    // legacy layout to accept.
+    uint32_t version = 0;
+    if (!read_u32(document, "version", version) ||
+        version != constants::kConsensusStoreFormatVersion) {
+        return std::nullopt;
+    }
 
     HotStuffState state;
     if (!read_u64(document, "epoch", state.epoch)) return std::nullopt;
@@ -120,6 +171,13 @@ std::optional<HotStuffState> hotstuff_state_from_json(const json& document) {
     if (high == document.end() || !qc_from_json(*high, state.high_qc)) return std::nullopt;
     const auto locked = document.find("locked_qc");
     if (locked == document.end() || !qc_from_json(*locked, state.locked_qc)) {
+        return std::nullopt;
+    }
+    Digest recorded{};
+    if (!read_b64(document, "record_digest", recorded) ||
+        recorded != consensus_state_record_digest(state.high_qc, state.locked_qc,
+                                                  state.consensus_ruleset, state.epoch,
+                                                  state.last_voted_view)) {
         return std::nullopt;
     }
     return state;
