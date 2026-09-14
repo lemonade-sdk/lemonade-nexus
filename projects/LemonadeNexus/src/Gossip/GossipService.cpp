@@ -2391,6 +2391,48 @@ bool GossipService::find_peer_endpoint_by_pubkey(std::string_view b64,
 
 void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
                                              const uint8_t* payload, std::size_t len) {
+    // Fail-closed membership gate, mirroring every other state-mutating gossip
+    // ingress path: the packet signer must hold a root-signed certificate.
+    // With no root pubkey anchored the gate refuses everything (there is no
+    // anchor to trust), and a peer-table entry without a certificate proves
+    // nothing — only enrolment counts. A stranger can otherwise reach the
+    // Tier 1 security plane (SecurityRouter) line rate with bytes it signed
+    // itself, and the outbound refusal is hollow if the inbound one is not.
+    //
+    // Bootstrap exemption: while no peer holds a root-signed certificate the
+    // mesh is not yet formed — nothing is registered yet for the security
+    // plane to decide about, and ServerHello/PeerExchange is still the only
+    // way certificates enter the network. Once any peer is certified the gate
+    // is live for everyone. This is a window in the formation phase, not an
+    // acceptance path: an unknown sender can gain nothing before the mesh
+    // exists (the router drops every message from a non-member), and from the
+    // moment it does exist the gate holds.
+    const auto sender_b64 =
+        crypto::to_base64(std::span<const uint8_t>{sender_pubkey, 32});
+    bool any_certified = false;
+    {
+        std::lock_guard lock(peers_mutex_);
+        any_certified = has_root_pubkey_ &&
+                        std::any_of(peers_.begin(), peers_.end(),
+                                    [&](const GossipPeer& p) {
+                                        return !p.certificate_json.empty();
+                                    });
+        if (any_certified && !peer_certificate_is_root_signed_locked(sender_b64)) {
+            ++security_envelope_drops_;
+            ++security_drops_since_warn_;
+            const auto now = chrono::steady_clock::now();
+            if (now - security_drop_warn_at_ >= chrono::seconds(10)) {
+                spdlog::warn(
+                    "[{}] dropped {} security envelope(s) from uncertified sender "
+                    "{}:{}, latest {} bytes", name(), security_drops_since_warn_,
+                    remote_endpoint_.address().to_string(), remote_endpoint_.port(), len);
+                security_drop_warn_at_ = now;
+                security_drops_since_warn_ = 0;
+            }
+            return;
+        }
+    }
+
     if (len > security::constants::kMaxSecurityMessageBytes) {
         // A peer can repeat this at line rate; keep the log from becoming the
         // amplifier.
