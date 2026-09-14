@@ -66,3 +66,24 @@ TEST_F(JwtSecretBootstrap, GeneratedSecretsDifferBetweenInstalls) {
     const auto b = nexus::core::resolve_jwt_secret(config, dir / "b", crypto);
     EXPECT_NE(a, b);
 }
+
+TEST_F(JwtSecretBootstrap, GeneratedSecretFileIsNotGroupOrWorldReadable) {
+    // The bootstrap path (scripts/nexus-bootstrap) generates the file from a
+    // root shell with umask 022; the mode must not inherit the umask.
+    const auto old_umask = umask(022);
+    nexus::core::ServerConfig config;
+    ASSERT_TRUE(config.jwt_secret.empty());
+
+    const auto secret = nexus::core::resolve_jwt_secret(config, dir, crypto);
+    EXPECT_EQ(secret.size(), 64u);
+
+    const auto jwt_path = dir / "identity" / "jwt_secret.hex";
+    ASSERT_TRUE(fs::exists(jwt_path));
+    const auto perms = fs::status(jwt_path).permissions();
+    EXPECT_EQ(perms,
+              fs::perms::owner_read | fs::perms::owner_write)
+        << "jwt_secret.hex must be created 0600, got mode "
+        << std::oct << static_cast<int>(
+               static_cast<int>(perms & fs::perms::all) >> 3);
+    umask(old_umask);
+}
