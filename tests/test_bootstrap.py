@@ -160,6 +160,13 @@ class BootstrapTest(unittest.TestCase):
         for transport in ("udp", "tcp"):
             self.assertIn(f"iifname $nexus_wan_if {transport} dport $nexus_public_dns_port redirect to :$nexus_dns_port", nat)
 
+    def test_attestd_unit_masks_lemonade_nexus_data_root(self):
+        unit = (REPO / "projects/LemonadeNexusAttestd/systemd/nexus-attestd.service").read_text()
+        lines = [line for line in unit.splitlines() if line.startswith("InaccessiblePaths=")]
+        self.assertTrue(lines)
+        self.assertIn("-/var/lib/lemonade-nexus", " ".join(lines))
+        self.assertNotIn("-/var/lib/nexus", " ".join(lines).replace("-/var/lib/lemonade-nexus", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
