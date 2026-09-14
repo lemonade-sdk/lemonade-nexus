@@ -93,10 +93,11 @@ UMask=0077
 # it could otherwise read the Nexus node identity key and /etc/shadow, which
 # would make compromising the evidence helper equivalent to stealing the
 # server's signing key. A capability cannot reach what the mount namespace does
-# not show it, so the sensitive trees are masked here. The Nexus data root is
-# the one that matters (node identity, any persisted authority material); the
+# not show it, so the sensitive trees are masked here. The Nexus data root,
+# /var/lib/lemonade-nexus, is the one that matters: it holds the node identity
+# keypair (identity/keypair.json) and any persisted authority material; the
 # host credential files are defence in depth. '-' tolerates an absent path.
-InaccessiblePaths=-/var/lib/nexus -/etc/shadow -/etc/gshadow -/etc/ssh
+InaccessiblePaths=-/var/lib/lemonade-nexus -/etc/shadow -/etc/gshadow -/etc/ssh
 
 # Kernel and host surface
 ProtectKernelTunables=true
