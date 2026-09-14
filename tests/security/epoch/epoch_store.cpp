@@ -62,6 +62,29 @@ struct EpochStoreFixture : ::testing::Test {
         return epoch;
     }
 
+    VerifiedEpochAuthority sample_anchor() const {
+        VerifiedEpochAuthority anchor;
+        anchor.network_id.fill(0x0F);
+        anchor.epoch = 1;
+        std::vector<NodeId> members;
+        for (uint8_t i = 1; i <= 5; ++i) members.push_back(node(i));
+        anchor.members = members;
+        anchor.group_public_key = key(0xA0);
+        for (const auto& member : members) {
+            anchor.incarnations[member] = 1;
+            anchor.vote_keys[member] = key(member.bytes[0]);
+        }
+        anchor.consensus_quorum = 4;
+        anchor.authority_threshold = 5;
+        anchor.security_ruleset = 1;
+        anchor.consensus_ruleset = 1;
+        anchor.key_generation = 1;
+        anchor.attestation_root.fill(0x33);
+        anchor.checkpoint.fill(0x11);
+        anchor.anchor_digest.fill(0x22);
+        return anchor;
+    }
+
     fs::path root;
     nexus::crypto::SodiumCryptoService crypto;
     std::optional<nexus::storage::FileStorageService> storage;
@@ -119,6 +142,62 @@ TEST_F(EpochStoreFixture, BootstrapCertificateRoundTrip) {
               bootstrap_certificate_signing_digest(certificate));
     EXPECT_EQ(std::get<BootstrapCertificate>(loaded).genesis_signature,
               certificate.genesis_signature);
+}
+
+TEST_F(EpochStoreFixture, AuthorityAnchorRecomputesOnLoad) {
+    const auto anchor = sample_anchor();
+    ASSERT_TRUE(store->store_authority_anchor(anchor));
+    const auto loaded = store->load_authority_anchor();
+    ASSERT_TRUE(std::holds_alternative<VerifiedEpochAuthority>(loaded));
+    const auto& back = std::get<VerifiedEpochAuthority>(loaded);
+    EXPECT_EQ(back.epoch, 1u);
+    EXPECT_EQ(back.group_public_key, anchor.group_public_key);
+    EXPECT_EQ(back.vote_keys, anchor.vote_keys);
+    EXPECT_EQ(back.anchor_digest, anchor.anchor_digest);
+    EXPECT_EQ(verified_epoch_authority_digest(back), verified_epoch_authority_digest(anchor));
+}
+
+// The anchor record binds its own digest: a single byte flipped at rest must
+// load as Corrupt, never as a silently different anchor.
+TEST_F(EpochStoreFixture, AuthorityAnchorTamperIsRejected) {
+    const auto anchor = sample_anchor();
+    ASSERT_TRUE(store->store_authority_anchor(anchor));
+    ASSERT_TRUE(std::holds_alternative<VerifiedEpochAuthority>(store->load_authority_anchor()));
+
+    const auto path = store->directory() / "authority-anchor.json";
+    nlohmann::json j;
+    {
+        std::ifstream in(path);
+        in >> j;
+    }
+
+    // A well-formed change: swap one member's persisted vote key for a
+    // different valid 32-byte key. The record still parses, but the digest
+    // the store recomputes no longer matches the bound record_digest.
+    const auto other = key(0xEE);
+    const auto member_b64 = nexus::crypto::to_base64(anchor.members[0].bytes);
+    j["members"][0]["vote_key"] = nexus::crypto::to_base64(other);
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << j.dump();
+    }
+    EXPECT_EQ(std::get<EpochLoadResult>(store->load_authority_anchor()), EpochLoadResult::Corrupt);
+
+    // Also a raw in-place byte flip in the persisted payload, leaving the JSON
+    // structure intact: still rejected, not re-accepted as a new anchor.
+    ASSERT_TRUE(store->store_authority_anchor(anchor));
+    std::ifstream in(path, std::ios::binary);
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // Find the stored vote-key payload and flip one byte inside it.
+    const auto victim = nexus::crypto::to_base64(anchor.vote_keys.at(anchor.members[0]));
+    const auto pos = text.find(victim);
+    ASSERT_NE(pos, std::string::npos);
+    text[pos + 1] = char(text[pos + 1] ^ 0x01);
+    {
+        std::ofstream out(path, std::ios::trunc);
+        out << text;
+    }
+    EXPECT_EQ(std::get<EpochLoadResult>(store->load_authority_anchor()), EpochLoadResult::Corrupt);
 }
 
 TEST_F(EpochStoreFixture, AuthorityHistoryAppendsOncePerEpoch) {
