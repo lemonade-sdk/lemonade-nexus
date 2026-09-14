@@ -21,6 +21,9 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <LemonadeNexus/Api/RoutingApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshRekey.hpp>
+#include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 
 #include <gtest/gtest.h>
 #include <httplib.h>
@@ -56,11 +59,14 @@ struct Storage {
     core::ServerConfig* config = nullptr;
     api::ApiContext*    ctx    = nullptr;
     api::TreeApiHandler* handler = nullptr;
+    api::RoutingApiHandler* routing_handler = nullptr;
 
     void release() {
+        delete routing_handler;
         delete handler;
         delete ctx;
         delete config;
+        routing_handler = nullptr;
         handler = nullptr;
         ctx = nullptr;
         config = nullptr;
@@ -120,9 +126,11 @@ inline void install(core::ServerConfig& cfg,
         .tunnel_bind_ip   = "",
     };
     s.handler = new api::TreeApiHandler(*s.ctx);
+    s.routing_handler = new api::RoutingApiHandler(*s.ctx);
 }
 
 inline api::TreeApiHandler& handler() { return *current().handler; }
+inline api::RoutingApiHandler& routing_handler() { return *current().routing_handler; }
 
 } // namespace test_api
 
@@ -217,6 +225,7 @@ protected:
                           *admission);
         register_routes();
         test_api::handler().register_routes(http->server(), http->server());
+        test_api::routing_handler().register_routes(http->server(), http->server());
         http->start();
 
         // Brief pause to let the server thread bind
@@ -1067,4 +1076,116 @@ TEST_F(HttpEndpointTest, DeltaSignerMismatchWithSessionIsRejected) {
     EXPECT_EQ(res->status, 403) << res->body;
     // The tree must be unmutated
     EXPECT_FALSE(tree->get_node("p14_mismatch_child").has_value());
+}
+
+// --- P2-17: POST /api/routing/endpoint/register must not accept a
+// caller-supplied mesh key as authoritative. The node's mesh public key is
+// established at join/onboarding (tree->mesh_pubkey); a body override with a
+// different key must be rejected and must NOT overwrite the trusted key,
+// or an authenticated principal could MITM another node's mesh routing.
+
+TEST_F(HttpEndpointTest, RoutingRegisterUsesTrustedMeshKey) {
+    // Endpoint node whose mesh key is the identity-bound (X25519) form of the
+    // session's Ed25519 key — the normal onboarding shape.
+    auto ep_kp = crypto->ed25519_keygen();
+    const std::string ep_pubkey = "ed25519:" + crypto::to_base64(ep_kp.public_key);
+    const std::string trusted =
+        api::identity_mesh_pubkey(ep_pubkey);
+    ASSERT_FALSE(trusted.empty());
+
+    tree::TreeNode node;
+    node.id = "p17_ep1";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = root_pubkey_str;
+    node.region = "us-east";
+    node.cpu_id = "cpu-p17-1";
+    node.net_mac = "aa:bb:cc:dd:ee:01";
+    node.is_inference = true;
+    node.mesh_pubkey = trusted;
+    node.endpoint_identifier = routing::derive_endpoint_identifier(
+        node.id, node.region, node.cpu_id, node.net_mac, node.is_inference);
+
+    tree::TreeDelta delta;
+    delta.operation = "create_node";
+    delta.target_node_id = node.id;
+    delta.node_data = node;
+    delta.signer_pubkey = root_pubkey_str;
+    delta.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    auto canonical = tree::canonical_delta_json(delta);
+    auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    delta.signature = crypto::to_base64(
+        crypto->ed25519_sign(root_keypair.private_key, msg));
+    ASSERT_TRUE(tree->apply_delta(delta));
+
+    auto cli = make_client();
+    httplib::Headers h = {{"Authorization", "Bearer " + make_jwt("p17_ep1")}};
+    json body = {{"cpu_id", node.cpu_id}, {"net_mac", node.net_mac},
+                 {"mesh_pubkey", trusted}};  // matches the trusted key
+    auto res = cli.Post("/api/routing/endpoint/register", h, body.dump(),
+                        "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 200) << res->body;
+    auto resp = json::parse(res->body);
+    EXPECT_TRUE(resp.value("success", false));
+    EXPECT_EQ(resp["endpoint_identifier"].get<std::string>(),
+              node.endpoint_identifier);
+
+    // The node's registered mesh key must be the trusted one.
+    const auto stored = tree->get_node("p17_ep1");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->mesh_pubkey, trusted);
+}
+
+TEST_F(HttpEndpointTest, RoutingRegisterRejectsForeignMeshKey) {
+    auto ep_kp = crypto->ed25519_keygen();
+    const std::string ep_pubkey = "ed25519:" + crypto::to_base64(ep_kp.public_key);
+    const std::string trusted = api::identity_mesh_pubkey(ep_pubkey);
+    ASSERT_FALSE(trusted.empty());
+
+    tree::TreeNode node;
+    node.id = "p17_ep2";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = root_pubkey_str;
+    node.region = "us-east";
+    node.cpu_id = "cpu-p17-2";
+    node.net_mac = "aa:bb:cc:dd:ee:02";
+    node.is_inference = true;
+    node.mesh_pubkey = trusted;
+    node.endpoint_identifier = routing::derive_endpoint_identifier(
+        node.id, node.region, node.cpu_id, node.net_mac, node.is_inference);
+
+    tree::TreeDelta delta;
+    delta.operation = "create_node";
+    delta.target_node_id = node.id;
+    delta.node_data = node;
+    delta.signer_pubkey = root_pubkey_str;
+    delta.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    auto canonical = tree::canonical_delta_json(delta);
+    auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    delta.signature = crypto::to_base64(
+        crypto->ed25519_sign(root_keypair.private_key, msg));
+    ASSERT_TRUE(tree->apply_delta(delta));
+
+    auto cli = make_client();
+    httplib::Headers h = {{"Authorization", "Bearer " + make_jwt("p17_ep2")}};
+    // Attacker-controlled mesh key in the body — must be refused.
+    json body = {{"cpu_id", node.cpu_id}, {"net_mac", node.net_mac},
+                 {"mesh_pubkey", "attacker-controlled-mesh-key"}};
+    auto res = cli.Post("/api/routing/endpoint/register", h, body.dump(),
+                        "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 409) << res->body;
+
+    // The node's registered mesh key must remain the trusted one.
+    const auto stored = tree->get_node("p17_ep2");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->mesh_pubkey, trusted);
 }

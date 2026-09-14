@@ -9,6 +9,7 @@
 #include <LemonadeNexus/Routing/ConnectionTicket.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
@@ -197,11 +198,34 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
             return;
         }
 
+        // The mesh public key is established at join/onboarding and is the
+        // node's trusted identity in the routing layer — never a body field.
+        // Accept the caller-supplied key only when it is the node's trusted
+        // key (normalized: raw Curve25519 or "ed25519:"-prefixed) or the
+        // identity-bound X25519 form of the session's Ed25519 pubkey; any
+        // other key is a routing MITM attempt and is refused outright.
+        const std::string trusted = api::normalize_mesh_pubkey(node->mesh_pubkey);
+        const std::string claimed = body.value(
+            "mesh_pubkey", body.value("wg_pubkey", std::string{}));
+        if (!claimed.empty()) {
+            const std::string claimed_norm = api::normalize_mesh_pubkey(claimed);
+            const std::string identity_bound =
+                api::identity_mesh_pubkey(claims.pubkey);
+            if (claimed_norm != trusted && claimed_norm != identity_bound) {
+                spdlog::warn(
+                    "[RoutingApiHandler] refusing mesh key override on "
+                    "endpoint register for node '{}' (authenticated as '{}')",
+                    node_id, claims.pubkey.substr(0, 16));
+                error_response(res, "mesh_pubkey does not match the node's "
+                                    "trusted mesh key", 409);
+                return;
+            }
+        }
+
         routing::EndpointRegistration reg;
         reg.node_id             = node_id;
         reg.endpoint_identifier = node->endpoint_identifier;
-        reg.mesh_pubkey = body.value(
-            "mesh_pubkey", body.value("wg_pubkey", node->mesh_pubkey));
+        reg.mesh_pubkey         = node->mesh_pubkey;
         reg.mgmt_pubkey         = node->mgmt_pubkey;
         reg.stun_endpoint       = body.value("stun_endpoint", std::string{});
         reg.source_ip           = req.remote_addr;
