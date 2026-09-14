@@ -84,12 +84,23 @@ bool SecurityRouter::within_budget(const NodeId& sender, uint64_t now_ms) {
 bool SecurityRouter::challenger_is_member(const NodeId& from) const {
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
-        // Before Epoch 1 only the founding set exists, and it does not ask
-        // over the wire; it injects its own verdicts. A remote challenger has
-        // no legitimate reason to force production at all.
-        return false;
+        // No EpochManager yet: the genesis window. The founding anchor
+        // challenges peers over the wire precisely during this phase
+        // (issue_genesis_challenge) to collect eligibility verdicts, so a
+        // remote challenger is legitimate here. There is nothing a stranger
+        // can corrupt before an epoch is frozen — the router has no member
+        // state to act on, and evidence it cannot bind to an epoch is inert.
+        return true;
     }
-    return epochs->current().tier1_members.contains(from);
+    const EpochState& cur = epochs->current();
+    if (cur.id == 0) {
+        // EpochManager exists but no epoch is activated yet (GenesisCollecting
+        // / selection): the receiver is still choosing its founding set and
+        // must answer the anchor's eligibility challenges. Same window as
+        // above.
+        return true;
+    }
+    return cur.tier1_members.contains(from);
 }
 
 bool SecurityRouter::within_challenge_budget(const NodeId& from, uint64_t now_ms) {
