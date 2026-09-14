@@ -10,6 +10,7 @@
 #include <nlohmann/json.hpp>
 
 #include <mutex>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -38,7 +39,7 @@ void from_json(const nlohmann::json& j, DdnsConfig& c);
 /// 1. Root server holds DDNS credentials (encrypted at rest)
 /// 2. Verified server requests credentials via POST /api/credentials/request
 /// 3. Root verifies: server certificate + binary hash in approved manifest
-/// 4. Root encrypts credentials via X25519 key exchange + AES-256-GCM
+/// 4. Root encrypts credentials via X25519 key exchange + XChaCha20-Poly1305
 /// 5. Server decrypts, stores encrypted locally, makes DDNS API calls
 ///
 /// Namecheap DDNS API:
@@ -54,8 +55,10 @@ public:
                 core::BinaryAttestationService& attestation,
                 gossip::GossipService& gossip);
 
-    /// Set TrustPolicy for tier enforcement on credential distribution.
-    void set_trust_policy(core::TrustPolicyService* policy);
+    /// The Tier 1 gate for credential distribution. The mesh security system
+    /// answers membership; this service only asks. Unset means DENY: an
+    /// unconfigured gate never becomes an open door.
+    void set_tier1_gate(std::function<bool(std::string_view server_pk_b64)> gate);
 
     /// Set DDNS credentials directly (root server config, or after decryption).
     void set_credentials(const DdnsConfig& config);
@@ -134,8 +137,7 @@ private:
     bool        timer_running_{false};
     mutable std::mutex mutex_;
 
-    // Zero-trust enforcement (nullptr = trust checks disabled)
-    core::TrustPolicyService* trust_policy_{nullptr};
+    std::function<bool(std::string_view)> tier1_gate_;
 };
 
 } // namespace nexus::network

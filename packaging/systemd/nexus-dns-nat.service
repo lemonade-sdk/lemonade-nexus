@@ -1,0 +1,25 @@
+[Unit]
+Description=Public DNS port -> Lemonade-Nexus DNS (nftables redirect)
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus
+# iifname matches by name at packet time, so the rules load safely before the
+# interface exists. Ordering after nftables.service only avoids a race with a
+# host ruleset being flushed on top of ours.
+After=network-pre.target nftables.service
+Wants=network-pre.target
+Before=lemonade-nexus.service
+# No conf, no rules. The unit is installed by the package but does nothing until
+# nexus-bootstrap --install-dns-nat has written the ports and interface.
+ConditionPathExists=/etc/lemonade-nexus/nexus-dns-nat.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# One transaction: both rules or neither.
+ExecStart=/usr/sbin/nft -f /usr/lib/lemonade-nexus/nexus-dns-nat.nft
+ExecReload=/usr/sbin/nft -f /usr/lib/lemonade-nexus/nexus-dns-nat.nft
+# Removes only this table. '-' so stopping a unit whose table is already gone is
+# not itself a failure.
+ExecStop=-/usr/sbin/nft delete table inet nexus-dns
+
+[Install]
+WantedBy=multi-user.target

@@ -17,7 +17,7 @@ All dependencies are fetched automatically via CMake `FetchContent`. No system p
 
 | Library | Version | Purpose | Why |
 |---------|---------|---------|-----|
-| **libsodium** | 1.0.20 | Ed25519, X25519, XChaCha20-Poly1305, AES-256-GCM, HKDF, random | Battle-tested, misuse-resistant API, constant-time operations |
+| **libsodium** | 1.0.20 | Ed25519, X25519, XChaCha20-Poly1305, HKDF, random | Battle-tested, misuse-resistant API, constant-time operations |
 | **OpenSSL** | 3.3.2 | TLS for HTTPS, ACME client, X.509 certificates | Industry standard TLS, built from source (no Homebrew dependency) |
 
 ## Networking

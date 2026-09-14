@@ -228,7 +228,12 @@ class _PeersViewState extends ConsumerState<PeersView> {
           _buildDetailRow('Node ID', peer.nodeId, showCopy: true),
           _buildDetailRow('Tunnel IP', peer.tunnelIp ?? 'Not assigned'),
           _buildDetailRow('Private Subnet', peer.privateSubnet ?? 'Not assigned'),
-          _buildDetailRow('WG Public Key', peer.wgPubkey.isNotEmpty ? '${peer.wgPubkey.substring(0, peer.wgPubkey.length.clamp(0, 20))}...' : 'Not available', showCopy: true),
+          _buildDetailRow(
+              'Mesh Public Key',
+              peer.meshPubkey.isNotEmpty
+                  ? '${peer.meshPubkey.substring(0, peer.meshPubkey.length.clamp(0, 20))}...'
+                  : 'Not available',
+              showCopy: true),
           _buildDetailRow('Endpoint', peer.endpoint?.isNotEmpty == true ? peer.endpoint! : 'Unknown'),
           if (peer.relayEndpoint?.isNotEmpty == true) _buildDetailRow('Relay Endpoint', peer.relayEndpoint!),
           _buildDetailRow('Latency', peer.latencyMs != null && peer.latencyMs! >= 0 ? '${peer.latencyMs!.round()} ms' : 'Unknown'),

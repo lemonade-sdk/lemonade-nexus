@@ -2,11 +2,14 @@
 
 #include <LemonadeNexus/Core/CliModes.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
-#include <LemonadeNexus/Core/ServerAdmissionService.hpp>
+#include <LemonadeNexus/Core/OnboardingTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
+#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+#include <LemonadeNexus/Security/HclReport.hpp>
+#include <LemonadeNexus/Security/TpmQuote.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <httplib.h>
@@ -55,16 +58,6 @@ HttpResult http_call(const std::string& host, int port, const std::string& metho
     return {true, r->status, r->body};
 }
 
-std::vector<uint8_t> lp_join(const std::vector<std::string>& parts) {
-    std::vector<uint8_t> buf;
-    for (const auto& s : parts) {
-        uint32_t n = static_cast<uint32_t>(s.size());
-        for (int i = 0; i < 4; ++i) buf.push_back((n >> (i * 8)) & 0xFF);
-        buf.insert(buf.end(), s.begin(), s.end());
-    }
-    return buf;
-}
-
 /// host:port -> {host, port(default 9100)}.
 std::pair<std::string, int> split_hostport(const std::string& hp, int default_port) {
     auto colon = hp.rfind(':');
@@ -103,10 +96,10 @@ std::string sign_b64(crypto::SodiumCryptoService& crypto,
 }
 
 /// Verify the issued cert is bound to our pubkey and signed by the root anchor.
-bool verify_issued_cert(crypto::SodiumCryptoService& crypto, const json& cert_j,
+bool verify_issued_cert(crypto::SodiumCryptoService& crypto,
+                        const gossip::ServerCertificate& cert,
                         const std::string& our_pubkey_b64, const std::string& root_hex,
                         std::string& err) {
-    gossip::ServerCertificate cert = cert_j.get<gossip::ServerCertificate>();
     if (cert.server_pubkey != our_pubkey_b64) {
         err = "certificate is bound to a different pubkey"; return false;
     }
@@ -153,6 +146,31 @@ void merge_config(const std::string& config_path, const std::string& root_hex,
     out << j.dump(2) << "\n";
 }
 
+/// Produce platform evidence bound to the admission challenge nonce, so the bundle
+/// the root server verifies cannot be one captured from another node's join.
+std::optional<security::SnpVtpmEvidence> collect_onboarding_evidence(
+        const ServerConfig& config, const std::string& our_pubkey_b64,
+        const std::string& nonce_b64) {
+    security::EvidenceProduceConfig cfg;
+    cfg.cache_dir = std::filesystem::path(config.data_root) / "attestation";
+    try {
+        cfg.identity_pubkey = crypto::from_base64(our_pubkey_b64);
+    } catch (...) {
+        return std::nullopt;
+    }
+    std::vector<uint8_t> nonce;
+    try {
+        nonce = crypto::from_base64(nonce_b64);
+    } catch (...) {
+        return std::nullopt;
+    }
+
+    std::string why;
+    auto ev = security::produce_snp_vtpm_evidence(cfg, nonce, &why);
+    if (!ev) spdlog::debug("Onboard: no platform evidence ({})", why);
+    return ev;
+}
+
 /// Probe candidate targets; return the first "host:port" that accepts onboarding.
 std::string pick_target(const std::vector<std::string>& targets,
                         const std::string& connect_ip) {
@@ -160,9 +178,10 @@ std::string pick_target(const std::vector<std::string>& targets,
         auto [host, port] = split_hostport(t, 9100);
         auto r = http_call(host, port, "GET", "/api/onboard/info", "", connect_ip);
         if (!r.connected || r.status != 200) continue;
-        try {
-            if (json::parse(r.body).value("accepts_onboarding", false)) return t;
-        } catch (...) {}
+        auto body = json::parse(r.body, nullptr, false);
+        if (body.is_discarded()) continue;
+        auto info = OnboardingInfoResponse::fromJson(body);
+        if (info && info.value->accepts_onboarding) return t;
     }
     return {};
 }
@@ -254,35 +273,70 @@ int run_onboard_server(ServerConfig& config) {
     auto [host, port] = split_hostport(target, 9100);
     spdlog::info("Onboard: requesting admission from {} as '{}'", target, server_id);
 
-    // Optional Tier1 evidence.
-    std::string tpm_ak;
-    // (AK export is a follow-up hookup; Tier2 cert by default.)
-
     // 1. Challenge.
+    ChallengeRequest challenge_request;
+    challenge_request.candidate_pubkey = keys.pub_b64;
     auto ch = http_call(host, port, "POST", "/api/onboard/challenge",
-                        json{{"candidate_pubkey", keys.pub_b64}}.dump(), connect_ip);
+                        challenge_request.toJson().dump(), connect_ip);
     if (!ch.connected || ch.status != 200) {
         spdlog::error("Onboard: challenge failed ({})", ch.body); return 1;
     }
-    std::string nonce = json::parse(ch.body).value("nonce", "");
+    auto challenge_json = json::parse(ch.body, nullptr, false);
+    auto challenge = challenge_json.is_discarded()
+        ? onboarding_json::DecodeResult<ChallengeResponse>{
+              std::nullopt, "/: invalid json"}
+        : ChallengeResponse::fromJson(challenge_json);
+    if (!challenge) {
+        spdlog::error("Onboard: invalid challenge response ({})", challenge.error);
+        return 1;
+    }
+    const std::string& nonce = challenge.value->nonce;
 
-    // 2. Signed request.
-    uint64_t ts = now_unix();
-    auto req_sig = sign_b64(crypto, keys.priv,
-        lp_join({"ln-onboard:v1", nonce, keys.pub_b64, server_id, region, tpm_ak,
-                 std::to_string(ts)}));
-    json reqbody{{"candidate_pubkey", keys.pub_b64}, {"server_id", server_id},
-                 {"region", region}, {"tpm_ak_pubkey", tpm_ak}, {"nonce", nonce},
-                 {"timestamp", ts}, {"signature", req_sig}};
-    // Deliberately outside the signed canonical: nonce+PoP already bind the
-    // request to our key; mint-time binding ties the token to it.
+    // 2. Platform evidence, bound to the challenge nonce so this bundle admits only
+    //    this join. Absent evidence is a Tier-2 certificate, not a failure.
+    AdmissionRequest in;
+    in.candidate_pubkey = keys.pub_b64;
+    in.server_id        = server_id;
+    in.region           = region;
+    in.nonce            = nonce;
+    in.timestamp        = now_unix();
+
+    if (auto ev = collect_onboarding_evidence(config, keys.pub_b64, nonce)) {
+        in.platform_class  = AdmissionPlatform::SnpVtpm;
+        in.evidence        = security::encode_snp_vtpm_evidence(*ev);
+        in.binary_hash     = ev->binary_sha256;
+        in.evidence_sha256 = crypto::to_hex(crypto.sha256(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(in.evidence.data()), in.evidence.size())));
+        if (auto blob = security::parse_hcl_blob(ev->hcl_blob)) {
+            in.measurement   = blob->snp.measurement_hex();
+            in.tpm_ak_pubkey = security::rsa_spki_b64(blob->ak.modulus, blob->ak.exponent);
+        }
+        spdlog::info("Onboard: attaching snp-vtpm evidence (measurement {}...)",
+                     in.measurement.substr(0, 16));
+    } else {
+        spdlog::warn("Onboard: no platform evidence on this host — requesting a Tier-2 "
+                     "certificate");
+    }
+
+    // 3. Signed request.
+    in.signature = sign_b64(crypto, keys.priv, canonical_admission_request(in));
     if (!config.onboard_token.empty())
-        reqbody["enrollment_token"] = config.onboard_token;
-    auto rq = http_call(host, port, "POST", "/api/onboard/request", reqbody.dump(), connect_ip);
+        in.enrollment_token = config.onboard_token;
+    auto rq = http_call(host, port, "POST", "/api/onboard/request",
+                        in.toJson().dump(), connect_ip);
     if (!rq.connected || rq.status != 200) {
         spdlog::error("Onboard: admission request rejected ({})", rq.body); return 1;
     }
-    std::string request_id = json::parse(rq.body).value("request_id", "");
+    auto response_json = json::parse(rq.body, nullptr, false);
+    auto response = response_json.is_discarded()
+        ? onboarding_json::DecodeResult<AdmissionResponse>{
+              std::nullopt, "/: invalid json"}
+        : AdmissionResponse::fromJson(response_json);
+    if (!response) {
+        spdlog::error("Onboard: invalid admission response ({})", response.error);
+        return 1;
+    }
+    const std::string request_id = response.value->request_id;
 
     // Print our fingerprint for the admin's out-of-band comparison.
     std::printf("\nOnboarding request submitted.\n");
@@ -299,40 +353,55 @@ int run_onboard_server(ServerConfig& config) {
 
     // 3. Poll until decided or timeout.
     const uint64_t deadline = now_unix() + config.onboard_timeout_sec;
-    json approved;
+    std::optional<ApprovedOnboardingBundle> approved;
     while (now_unix() < deadline) {
         uint64_t pts = now_unix();
-        auto psig = sign_b64(crypto, keys.priv,
-            lp_join({"ln-onboard-poll:v1", request_id, std::to_string(pts)}));
+        PollRequest poll;
+        poll.request_id = request_id;
+        poll.candidate_pubkey = keys.pub_b64;
+        poll.timestamp = pts;
+        poll.signature = sign_b64(crypto, keys.priv,
+            canonical_onboarding_status(kOnboardPollTag, request_id, pts));
         auto pl = http_call(host, port, "POST", "/api/onboard/poll",
-            json{{"request_id", request_id}, {"candidate_pubkey", keys.pub_b64},
-                 {"timestamp", pts}, {"signature", psig}}.dump(), connect_ip);
+                            poll.toJson().dump(), connect_ip);
         if (pl.connected && pl.status == 200) {
-            auto pj = json::parse(pl.body);
-            auto state = pj.value("state", "");
-            if (state == "approved") { approved = pj; break; }
-            if (state == "denied" || state == "expired") {
-                spdlog::error("Onboard: admission {} ({})", state, pj.value("reason", ""));
+            auto poll_json = json::parse(pl.body, nullptr, false);
+            auto decoded = poll_json.is_discarded()
+                ? onboarding_json::DecodeResult<PollResponse>{
+                      std::nullopt, "/: invalid json"}
+                : poll_response_from_json(poll_json);
+            if (!decoded) {
+                spdlog::error("Onboard: invalid poll response ({})", decoded.error);
+                return 1;
+            }
+            if (auto* bundle = std::get_if<ApprovedOnboardingBundle>(&*decoded.value)) {
+                approved = std::move(*bundle);
+                break;
+            }
+            const auto& status = std::get<AdmissionStatusResponse>(*decoded.value);
+            if (status.state == AdmissionState::Denied ||
+                status.state == AdmissionState::Expired) {
+                spdlog::error("Onboard: admission {} ({})",
+                              admission_state_name(status.state), status.reason);
                 return 1;
             }
         }
         std::this_thread::sleep_for(std::chrono::seconds(5));
     }
-    if (approved.is_null()) {
+    if (!approved) {
         spdlog::error("Onboard: timed out waiting for admission after {}s",
                       config.onboard_timeout_sec);
         return 1;
     }
 
     // 4. Verify + install the certificate — strictly against the pinned root.
-    if (auto err = check_root_confirmation(config.root_pubkey,
-                                           approved.value("root_pubkey", ""));
+    if (auto err = check_root_confirmation(config.root_pubkey, approved->root_pubkey);
         !err.empty()) {
         spdlog::error("Onboard: {}", err);
         return 1;
     }
     std::string err;
-    if (!verify_issued_cert(crypto, approved["certificate"], keys.pub_b64,
+    if (!verify_issued_cert(crypto, approved->certificate, keys.pub_b64,
                             config.root_pubkey, err)) {
         spdlog::error("Onboard: refusing certificate — {}", err);
         return 1;
@@ -342,19 +411,17 @@ int run_onboard_server(ServerConfig& config) {
     storage.start();
     storage::SignedEnvelope env;
     env.type = "server_certificate";
-    env.data = approved["certificate"].dump();
+    env.data = nlohmann::json(approved->certificate).dump();
     env.timestamp = now_unix();
     if (!storage.write_file("identity", "server_cert.json", env)) {
         spdlog::error("Onboard: failed to write server_cert.json"); return 1;
     }
 
-    std::vector<std::string> seeds;
-    if (approved.contains("seed_peers"))
-        seeds = approved["seed_peers"].get<std::vector<std::string>>();
+    std::vector<std::string> seeds = approved->seed_peers;
     // The server-reported seeds use its self-detected public IP, which can be
     // wrong (multihomed/NAT). The address we just onboarded through is proven
     // reachable — seed it first.
-    auto proven = host + ":" + std::to_string(approved.value("gossip_port", 9102));
+    auto proven = host + ":" + std::to_string(approved->gossip_port);
     if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
         seeds.insert(seeds.begin(), proven);
     merge_config(config.config_path, config.root_pubkey, seeds);
@@ -367,11 +434,14 @@ int run_onboard_server(ServerConfig& config) {
 
     // 5. Acknowledge (releases the server-side pending record).
     uint64_t ats = now_unix();
-    auto asig = sign_b64(crypto, keys.priv,
-        lp_join({"ln-onboard-ack:v1", request_id, std::to_string(ats)}));
+    AckRequest ack;
+    ack.request_id = request_id;
+    ack.candidate_pubkey = keys.pub_b64;
+    ack.timestamp = ats;
+    ack.signature = sign_b64(crypto, keys.priv,
+        canonical_onboarding_status(kOnboardAckTag, request_id, ats));
     (void)http_call(host, port, "POST", "/api/onboard/ack",
-        json{{"request_id", request_id}, {"candidate_pubkey", keys.pub_b64},
-             {"timestamp", ats}, {"signature", asig}}.dump(), connect_ip);
+                    ack.toJson().dump(), connect_ip);
 
     std::printf("\n====================================================================\n");
     std::printf("  Onboarded as '%s'\n", server_id.c_str());

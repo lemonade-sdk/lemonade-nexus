@@ -7,7 +7,7 @@
 // Topology, all over loopback UDP:
 //
 //   httplib::Client --(loopback TCP)--> client VirtualNetService (egress)
-//     -> client UserspaceDataplane (encrypt) ==WG/UDP==> server UserspaceDataplane
+//     -> client UserspaceDataplane (encrypt) ==mesh/UDP==> server UserspaceDataplane
 //     (decrypt, dst == our virtual IP) -> server VirtualNetService (ingress)
 //     -> httplib::Server on loopback -> "pong"
 //   ... and the response retraces the path.

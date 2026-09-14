@@ -20,9 +20,7 @@ struct ServerConfig {
     std::string bind_address{"0.0.0.0"};
     std::string public_ip;              // public-facing IP for DNS glue records (auto-detected if empty)
     std::string region;                 // cloud region code (e.g. "us-east", auto-detected if empty)
-    std::string wg_interface{"nexus0"}; // boringtun interface name. MUST NOT be "wg0" or any
-                                        // interface you are connected through -- the server flushes
-                                        // and re-keys this device on startup, which would drop that tunnel.
+    std::string mesh_interface{"nexus0"}; // BoringTun dataplane instance name
 
     // Storage
     std::string data_root{"data"};
@@ -34,9 +32,14 @@ struct ServerConfig {
     // Server identity
     std::string root_pubkey; // hex Ed25519 pubkey of the root management key
 
+    // Pinned Genesis bootstrap anchor (base64 Ed25519) for the new security
+    // lifecycle. A verification anchor only: its authority ends at Epoch 1
+    // activation (architecture 14). Empty = the new security system is not
+    // configured on this node.
+    std::string genesis_pubkey;
+
     // Gossip
     std::vector<std::string> seed_peers; // ["host:port", ...]
-    uint32_t gossip_interval_sec{5};
 
     // Rate limiting
     uint32_t rate_limit_rpm{120};
@@ -61,7 +64,6 @@ struct ServerConfig {
 
     // Binary attestation
     std::string release_signing_pubkey;       // base64 Ed25519 pubkey for release manifest verification
-    bool require_binary_attestation{false};   // require matching manifest for credential distribution
 
     // GitHub release manifest fetching (auto-fetch signed manifests for older versions)
     std::string github_releases_url;              // e.g. "https://api.github.com/repos/owner/repo/releases"
@@ -81,10 +83,11 @@ struct ServerConfig {
     // Enrollment CLI mode (non-empty = run enrollment and exit)
     std::string enroll_server_pubkey;
     std::string enroll_server_id;
-    std::string enroll_tpm_ak_pubkey;  // base64 DER SPKI AK to pin in the cert (Model A)
+    std::string enroll_tpm_ak_pubkey;  // base64 DER SPKI platform binding key to pin in the cert
     std::string enroll_tpm_ek_cert_path; // optional path to the joining TPM's EK cert (PEM)
     std::string revoke_server_pubkey;
-    bool        print_tpm_ak{false};   // print this host's TPM AK pubkey (base64 DER SPKI) and exit
+    bool        verify_platform{false};    // run the platform evidence probe and exit
+    std::string verify_platform_blob;      // optional: verify a captured HCL blob instead of this host's
 
     // Manifest CLI mode
     std::string add_manifest_path;  // path to a release manifest JSON to import
@@ -105,8 +108,6 @@ struct ServerConfig {
     bool        mint_admission_token{false};       // CLI mode: mint an enrollment token and exit (runtime-only)
     std::string mint_token_candidate;              // optional base64 candidate key to bind (runtime-only)
     uint32_t    mint_token_ttl_sec{600};           // minted-token TTL (runtime-only)
-    float       admission_quorum_ratio{0.75f};     // Tier1 vote fraction for admission ballots
-    uint32_t    onboard_min_tier1_for_vote{6};     // switch from sole-discretion to voting at this many Tier1s
     uint32_t    onboard_request_ttl_sec{3600};     // pending admission lifetime
     uint32_t    onboard_max_pending{8};            // cap on concurrent pending admissions
 
@@ -117,15 +118,11 @@ struct ServerConfig {
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
 
     // Quorum-based enrollment
-    bool     require_peer_confirmation{false};    // require Tier1 peer votes before full admission
-    float    enrollment_quorum_ratio{0.5f};       // fraction of Tier1 peers needed (default 50%)
-    uint32_t enrollment_vote_timeout_sec{60};     // vote collection window (seconds)
-    uint32_t enrollment_max_retries{3};           // retries before permanent rejection
 
-    // TEE Attestation / Trust
-    bool require_tee_attestation{false};      // require Tier 1 TEE for full mesh participation
-    uint32_t tee_attestation_validity_sec{3600};  // how long a TEE report is valid (default 1h)
-    std::string tee_platform_override;        // force TEE platform detection ("sgx", "tdx", "sev-snp", "secure-enclave")
+    // TEE attestation is not configurable: Tier 1 is granted only by a verified
+    // evidence chain produced at startup, and enforcement is always on. The retired
+    // knobs (require_tee_attestation, tee_platform_override, require_binary_attestation,
+    // tee_attestation_validity_sec) were variously unreachable, inert, or dead.
 };
 
 /// Load config: CLI args > env vars > config file > defaults.
@@ -137,7 +134,8 @@ struct ServerConfig {
 /// Print usage/help text.
 void print_usage(const char* prog);
 
-void to_json(nlohmann::json& j, const ServerConfig& c);
+/// Read-only: nothing writes a whole ServerConfig back. The one config write-back
+/// is the two-key merge in OnboardingClient.
 void from_json(const nlohmann::json& j, ServerConfig& c);
 
 } // namespace nexus::core

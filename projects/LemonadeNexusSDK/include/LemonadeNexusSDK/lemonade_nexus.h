@@ -35,6 +35,11 @@ typedef enum {
     LN_ERR_NOT_FOUND  = -4,
     LN_ERR_REJECTED   = -5,
     LN_ERR_NO_IDENTITY = -6,
+    LN_ERR_PARSE      = -7, ///< Malformed response: HTTP 2xx with a body that did not
+                            ///< deserialize (e.g. a node endpoint returned 200 with a
+                            ///< body that is not a valid TreeNode). Distinct from
+                            ///< LN_ERR_NOT_FOUND (404), LN_ERR_AUTH (401/403) and
+                            ///< LN_ERR_CONNECT (no transport / network error).
     LN_ERR_INTERNAL   = -99
 } ln_error_t;
 
@@ -316,7 +321,7 @@ ln_error_t ln_mesh_disable(ln_client_t* client);
 ln_error_t ln_mesh_status(ln_client_t* client, char** out_json);
 
 /** Get current mesh peers as JSON array.
- *  Each peer: {node_id, hostname, wg_pubkey, tunnel_ip, private_subnet,
+ *  Each peer: {node_id, hostname, mesh_pubkey, tunnel_ip, private_subnet,
  *  endpoint, relay_endpoint, is_online, last_handshake, rx_bytes, tx_bytes,
  *  latency_ms, keepalive}.
  *  Caller must ln_free(*out_json). */
@@ -440,7 +445,7 @@ ln_error_t ln_routing_profile(ln_client_t* client, int page, int page_size,
 /** POST /api/routing/request. conn_nonce_b64 is a client-chosen 16-byte nonce
  *  (base64). Returns {connection_id,state} JSON. Caller must ln_free(*out_json). */
 ln_error_t ln_routing_request(ln_client_t* client, const char* identifier,
-                              const char* conn_nonce_b64, const char* client_wg_pub,
+                              const char* conn_nonce_b64, const char* client_mesh_pubkey,
                               char** out_json);
 
 /** GET /api/routing/session/{id}. Returns session-state JSON. ln_free(*out_json). */

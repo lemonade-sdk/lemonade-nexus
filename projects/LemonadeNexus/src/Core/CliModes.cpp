@@ -3,7 +3,9 @@
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
-#include <LemonadeNexus/Core/TeeAttestationTpm.hpp>
+#include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
+#include <LemonadeNexus/Security/PlatformProbe.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -30,20 +32,34 @@ uint64_t now_unix() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-int run_print_tpm_ak() {
-    auto ak = tpm::export_ak_pubkey_b64();
-    if (!ak) {
-        spdlog::error("No TPM available — cannot export an Attestation Key. "
-                      "(Need /dev/tpmrm0 or a TCTI such as swtpm, on a Linux TPM build.)");
-        return 1;
+/// Is the pubkey being enrolled this host's own gossip key?
+bool enrolling_self(storage::FileStorageService& storage, const std::string& pubkey_b64) {
+    auto kp_env = storage.read_file("identity", "keypair.json");
+    if (!kp_env) return false;
+    try {
+        return nlohmann::json::parse(kp_env->data).value("public_key", "") == pubkey_b64;
+    } catch (...) {
+        return false;
     }
-    // Print the raw value to stdout so it can be piped into --enroll-tpm-ak.
-    spdlog::info("TPM AK pubkey (base64 DER SPKI):");
-    std::printf("%s\n", ak->c_str());
-    return 0;
+}
+
+
+int run_verify_platform(const ServerConfig& config) {
+    security::PlatformProbeConfig cfg;
+    cfg.cache_dir = std::filesystem::path(config.data_root) / "attestation";
+    if (!config.verify_platform_blob.empty()) {
+        cfg.hcl_blob_override = config.verify_platform_blob;
+    }
+    const auto result = security::probe_platform(cfg);
+    std::printf("%s", security::format_probe_report(result).c_str());
+    return result.tier1_capable ? 0 : 1;
 }
 
 int run_first_run(const ServerConfig& config) {
+    if (!config.region.empty() && !gossip::valid_server_id_label(config.region)) {
+        spdlog::error("Region is not a valid DNS label: {}", config.region);
+        return 1;
+    }
     auto init = ensure_initialized(config);
     if (!init) return 1;
 
@@ -65,15 +81,33 @@ int run_first_run(const ServerConfig& config) {
     std::printf("Next steps\n");
     std::printf("----------\n");
     std::printf("GENESIS (first server of a new mesh):\n");
-    std::printf("  ./lemonade-nexus --root-pubkey %s\n", init->identity_pubkey_hex.c_str());
-    std::printf("  The identity pubkey above IS the mesh root pubkey; every other\n");
-    std::printf("  server must be started with that same --root-pubkey value.\n");
+    std::printf("  ./lemonade-nexus --data-root %s \\\n", config.data_root.c_str());
+    std::printf("      --root-pubkey %s \\\n", init->identity_pubkey_hex.c_str());
+    std::printf("      --genesis-pubkey %s \\\n", init->gossip_pubkey_b64.c_str());
+    std::printf("      --release-signing-pubkey <RELEASE_SIGNING_PUBKEY>\n");
+    std::printf("\n");
+    std::printf("  Every value above is REQUIRED; the server exits if root-pubkey or\n");
+    std::printf("  release-signing-pubkey is missing.\n");
+    std::printf("    --root-pubkey            the identity pubkey above. It IS the mesh\n");
+    std::printf("                             root pubkey; every other server must be\n");
+    std::printf("                             started with the same value.\n");
+    std::printf("    --genesis-pubkey         the gossip pubkey above. It pins the Genesis\n");
+    std::printf("                             bootstrap anchor, whose authority ends at\n");
+    std::printf("                             Epoch 1 activation. Without it the security\n");
+    std::printf("                             mesh does not start.\n");
+    std::printf("    --release-signing-pubkey the key your release manifests are signed\n");
+    std::printf("                             with. This is NOT the node identity key and\n");
+    std::printf("                             is not generated here — supply the key your\n");
+    std::printf("                             releases are actually signed with, or no\n");
+    std::printf("                             binary can be approved and no node can\n");
+    std::printf("                             reach Tier 1.\n");
     std::printf("\n");
     std::printf("JOIN an existing mesh:\n");
     std::printf("  ./lemonade-nexus --onboard-server [host:port] --data-root %s\n",
                 config.data_root.c_str());
-    std::printf("  (requests admission over the mesh's public API; the mesh admin\n");
-    std::printf("   approves it, no file copying needed)\n");
+    std::printf("  (requests admission over the mesh's public API. Admission is decided\n");
+    std::printf("   by the mesh itself: Tier 1 members vote, and the candidate must pass\n");
+    std::printf("   attestation. No file copying, and no single administrator approval.)\n");
     std::printf("\n");
 
     return 0;
@@ -130,11 +164,50 @@ int run_enroll(const ServerConfig& config) {
         }
     }
 
+    if (config.genesis_pubkey.empty()) {
+        spdlog::error("Cannot enroll: certificates bind to the network id, which derives "
+                      "from genesis_pubkey; configure it first.");
+        return 1;
+    }
+    const auto genesis_bytes =
+        crypto::from_base64(crypto::canonical_key_b64(config.genesis_pubkey));
+    if (genesis_bytes.size() != crypto::kEd25519PublicKeySize) {
+        spdlog::error("Cannot enroll: genesis_pubkey is not a base64 Ed25519 public key");
+        return 1;
+    }
+    crypto::Ed25519PublicKey genesis_pk{};
+    std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
+
     gossip::CertIssueParams params;
+    params.network_id = crypto::to_hex(security::derive_network_id(
+        genesis_pk, security::constants::kSecurityRulesetVersion,
+        security::constants::kConsensusRulesetVersion));
     params.server_pubkey_b64 = config.enroll_server_pubkey;
     params.server_id         = config.enroll_server_id;
     params.tpm_ak_pubkey     = config.enroll_tpm_ak_pubkey;
     params.expires_at        = 0;
+
+    // Self-enrollment is the only manual path that can prove anything: we are the
+    // host being enrolled, so run the probe and take the policy from what actually
+    // verified. Nothing is typed in — an operator cannot pin a measurement this
+    // host does not produce, and cannot forget to pin one it does.
+    const bool self_enroll = enrolling_self(enroll_storage, config.enroll_server_pubkey);
+    if (self_enroll) {
+        security::PlatformProbeConfig probe_cfg;
+        probe_cfg.cache_dir = std::filesystem::path(config.data_root) / "attestation";
+        const auto probe = security::probe_platform(probe_cfg);
+        if (probe.tier1_capable) {
+            params.platform_class       = std::string(evidence_profile_name(probe.profile));
+            params.tpm_ak_pubkey        = probe.ak_pub_b64;
+            params.expected_measurement = probe.measurement_hex;
+            params.approved_binary_hash = probe.binary_sha256;
+            spdlog::info("Enroll: platform evidence verified — issuing a '{}' certificate",
+                         params.platform_class);
+        } else {
+            spdlog::warn("Enroll: no verified platform evidence on this host ({}) — issuing a "
+                         "Tier-2 certificate", probe.failure);
+        }
+    }
 
     if (!config.enroll_tpm_ek_cert_path.empty()) {
         std::ifstream ek_f(config.enroll_tpm_ek_cert_path);
@@ -150,13 +223,11 @@ int run_enroll(const ServerConfig& config) {
                          config.enroll_tpm_ek_cert_path);
         }
     }
-    if (params.tpm_ak_pubkey.empty()) {
-        spdlog::warn("Enroll: no TPM AK pinned (--enroll-tpm-ak) — '{}' will be a Tier-2 "
-                     "certificate and cannot reach Tier 1 under require_tee_attestation.",
+    if (params.platform_class.empty()) {
+        spdlog::warn("Enroll: '{}' gets a Tier-2 certificate. Only a host that proves its own "
+                     "platform can hold a Tier-1 one — self-enroll there, or let it join "
+                     "through --onboard-server, which verifies evidence at admission.",
                      config.enroll_server_id);
-    } else {
-        spdlog::info("Enroll: pinned TPM AK ({}...) for '{}'",
-                     params.tpm_ak_pubkey.substr(0, 16), config.enroll_server_id);
     }
 
     auto cert = gossip::issue_server_certificate(params, enroll_crypto, *privkey, *pubkey);
@@ -171,15 +242,9 @@ int run_enroll(const ServerConfig& config) {
     // (gossip, DDNS, and node-id resolution all read it), so only install
     // there when enrolling our own gossip pubkey. Certs issued for other
     // servers go to a sibling file the admin copies to the joining server.
-    std::string cert_file = "server_cert_" + config.enroll_server_id + ".json";
-    if (auto kp_env = enroll_storage.read_file("identity", "keypair.json")) {
-        try {
-            auto kp_j = nlohmann::json::parse(kp_env->data);
-            if (kp_j.value("public_key", "") == config.enroll_server_pubkey) {
-                cert_file = "server_cert.json";
-            }
-        } catch (...) {}
-    }
+    const std::string cert_file = self_enroll
+        ? "server_cert.json"
+        : "server_cert_" + config.enroll_server_id + ".json";
 
     if (!enroll_storage.write_file("identity", cert_file, env)) {
         spdlog::error("Failed to write certificate to {}/identity/{}",
@@ -188,7 +253,7 @@ int run_enroll(const ServerConfig& config) {
     }
 
     spdlog::info("Enrolled server '{}' (pubkey: {})", cert.server_id, cert.server_pubkey);
-    if (cert_file == "server_cert.json") {
+    if (self_enroll) {
         spdlog::info("Enrolled our own gossip pubkey — installed as this server's "
                      "certificate: {}/identity/server_cert.json", config.data_root);
     } else {
@@ -381,7 +446,7 @@ std::optional<InitResult> ensure_initialized(const ServerConfig& config) {
 }
 
 std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0) {
-    if (config.print_tpm_ak)                      return run_print_tpm_ak();
+    if (config.verify_platform)                   return run_verify_platform(config);
     if (config.first_run)                         return run_first_run(config);
     if (config.onboard_server)                    return run_onboard_server(config);
     if (config.mint_admission_token)              return run_mint_admission_token(config);

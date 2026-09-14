@@ -18,7 +18,7 @@ Every gossip message carries cryptographic proof. TEE hardware attestation (Inte
 - **Encrypted mesh tunnel** for all data (Curve25519 + ChaCha20-Poly1305)
 - **Ed25519** identity for all signing and authentication
 - **HTTPS** with auto-provisioned ACME certificates (even the private API over the tunnel)
-- **AES-256-GCM** for credential encryption at rest
+- **XChaCha20-Poly1305** for credential encryption at rest
 
 ## Auto-Discovery
 Clients find the best server automatically via DNS. No manual IP configuration. Region-aware selection picks the lowest-latency, lowest-load server. If your region has no servers, it falls back to the next closest.

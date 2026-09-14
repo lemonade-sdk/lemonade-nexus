@@ -36,29 +36,17 @@ The server binary is at `build/projects/LemonadeNexus/lemonade-nexus`.
 
 ### Install
 
+On Debian/Ubuntu, build and install the package so the service user, bootstrap
+command, and systemd units are installed together:
+
 ```bash
-sudo cp build/projects/LemonadeNexus/lemonade-nexus /usr/local/bin/
-sudo mkdir -p /var/lib/lemonade-nexus
+cpack --config build/CPackConfig.cmake -G DEB -B build/packages
+sudo dpkg -i build/packages/lemonade-nexus-*.deb
 ```
 
-### systemd Service
-
-```ini
-[Unit]
-Description=Lemonade-Nexus Mesh VPN Server
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/var/lib/lemonade-nexus
-ExecStart=/usr/local/bin/lemonade-nexus --dns-port 5353
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+The packaged executable is `/usr/bin/lemonade-nexus`. The package enables the
+service without starting it. Follow [Getting Started](Getting-Started.md) to
+bootstrap the protected configuration and configure public DNS before starting.
 
 ## macOS Build
 

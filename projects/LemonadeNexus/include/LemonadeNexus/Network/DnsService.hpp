@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -59,6 +60,12 @@ using DnsRecordCallback = std::function<void(const std::string& delta_id,
 ///   _config.<id>.<region>.seip.<base_domain>     -> Server config TXT (SEIP)
 ///   _config.<hostname>.<base_domain>             -> TXT record with port config
 ///   _acme-challenge.<domain>                     -> ACME DNS-01 TXT challenge
+inline constexpr std::size_t kDnsTcpMaxMessageBytes = 65535;
+inline constexpr std::size_t kDnsMinMessageBytes = 12;
+inline constexpr int kDnsTcpMaxSessions = 64;
+inline constexpr int kDnsTcpIdleTimeoutSeconds = 10;
+inline constexpr std::size_t kDnsTcpMaxQueuedResponses = 16;
+
 class DnsService : public core::IService<DnsService>,
                     public IDnsProvider<DnsService> {
     friend class core::IService<DnsService>;
@@ -75,6 +82,8 @@ public:
                std::string base_domain = "lemonade-nexus.io");
 
     // IService
+    ~DnsService();
+
     void on_start();
     void on_stop();
     [[nodiscard]] static constexpr std::string_view name() { return "DnsService"; }
@@ -132,6 +141,13 @@ public:
     // -----------------------------------------------------------------
     // Utilities (public for testing)
     // -----------------------------------------------------------------
+
+    /// The one port both transports answer on; with port 0 the OS chooses it.
+    uint16_t local_port() const;
+
+    /// False means this node answers UDP only, which is not a complete
+    /// authoritative server.
+    bool tcp_listening() const { return acceptor_.has_value(); }
 
     /// Strip CIDR prefix length if present (e.g. "10.64.0.1/32" -> "10.64.0.1").
     [[nodiscard]] static std::string strip_cidr(const std::string& addr);
@@ -196,7 +212,28 @@ public:
 
 private:
     void start_receive();
-    void handle_query(std::size_t bytes);
+
+    using ResponseSink = std::function<void(std::vector<uint8_t>)>;
+    void handle_query(const uint8_t* data, std::size_t bytes, const ResponseSink& reply);
+
+    void start_accept();
+
+    using TcpQueryHandler =
+        std::function<void(const uint8_t*, std::size_t, const ResponseSink&)>;
+    std::shared_ptr<TcpQueryHandler> tcp_handler_;
+
+    struct AsyncState {
+        std::mutex mutex;
+        bool stopped{false};
+        std::array<uint8_t, 512> recv_buffer{};
+        asio::ip::udp::endpoint remote_endpoint;
+        struct Session {
+            std::weak_ptr<void> lifetime;
+            std::function<void()> stop;
+        };
+        std::vector<Session> sessions;
+    };
+    std::shared_ptr<AsyncState> async_state_ = std::make_shared<AsyncState>();
 
     // --- Response builders ---
     [[nodiscard]] std::vector<uint8_t> build_response(
@@ -237,8 +274,9 @@ private:
     void bump_serial();
 
     asio::ip::udp::socket   socket_;
-    asio::ip::udp::endpoint remote_endpoint_;
-    std::array<uint8_t, 512> recv_buffer_{};
+    std::optional<asio::ip::tcp::acceptor> acceptor_;
+    std::shared_ptr<std::atomic<int>> tcp_sessions_ =
+        std::make_shared<std::atomic<int>>(0);
 
     tree::PermissionTreeService& tree_;
     std::string                  base_domain_;

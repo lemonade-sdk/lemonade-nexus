@@ -16,9 +16,6 @@
 namespace nexus::core {
     struct ServerConfig;
     class BinaryAttestationService;
-    class TeeAttestationService;
-    class TrustPolicyService;
-    class GovernanceService;
     class ServerAdmissionService;
 }
 namespace nexus::auth { class AuthService; }
@@ -67,9 +64,6 @@ struct ApiContext {
     relay::RelayDiscoveryService&     relay_discovery;
     routing::RoutingCoordinationService& routing;
     core::BinaryAttestationService&   attestation;
-    core::TeeAttestationService&      tee;
-    core::TrustPolicyService&         trust_policy;
-    core::GovernanceService&          governance;
     core::ServerAdmissionService&     admission;
     boringtun::BoringtunService*      boringtun{nullptr};
     network::DnsService*              dns{nullptr};

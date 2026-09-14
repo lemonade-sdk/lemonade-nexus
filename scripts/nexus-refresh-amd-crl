@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+#
+# nexus-refresh-amd-crl
+#
+# Fetch the AMD KDS certificate revocation list for one silicon generation and
+# place it in the Nexus revocation cache.
+#
+# This tool moves bytes. It does not decide trust and it cannot grant any.
+# The verified Nexus binary checks the CRL signature against its compiled-in
+# AMD chain, checks the validity window, and checks the serials. A CRL this
+# script writes is a candidate, not an accepted one.
+#
+# What this tool must never do, and does not:
+#   - mark a CRL trusted
+#   - change Tier 1 eligibility
+#   - bypass or pre-empt signature validation
+#   - choose which AMD product the verifier applies to a given peer
+#   - delete a valid cached entry before a replacement is in place
+#
+# Usage:
+#   nexus-refresh-amd-crl --cache-dir DIR [--product Milan|Genoa] [--all]
+#                         [--url URL] [--timeout SECONDS]
+#
+# Exit status:
+#   0  a new CRL was installed, or the existing one was kept and is unexpired
+#   1  usage error
+#   2  fetch failed and no usable cached entry exists
+#   3  the fetched bytes are not a CRL, so the previous entry was kept
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly KDS_BASE="https://kdsintf.amd.com/vcek/v1"
+
+# The products the verified binary carries root material for. A CRL for
+# anything else has no chain to verify against, so fetching one is pointless.
+readonly SUPPORTED_PRODUCTS=(Milan Genoa)
+
+cache_dir=""
+products=()
+url_override=""
+timeout_seconds=30
+
+die() { printf 'nexus-refresh-amd-crl: %s\n' "$*" >&2; exit 1; }
+note() { printf '%s\n' "$*" >&2; }
+
+usage() {
+    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --cache-dir) [ $# -ge 2 ] || usage; cache_dir="$2"; shift 2 ;;
+        --product)   [ $# -ge 2 ] || usage; products+=("$2"); shift 2 ;;
+        --all)       products=("${SUPPORTED_PRODUCTS[@]}"); shift ;;
+        --url)       [ $# -ge 2 ] || usage; url_override="$2"; shift 2 ;;
+        --timeout)   [ $# -ge 2 ] || usage; timeout_seconds="$2"; shift 2 ;;
+        -h|--help)   usage ;;
+        *)           die "unknown argument: $1" ;;
+    esac
+done
+
+[ -n "$cache_dir" ] || usage
+[ "${#products[@]}" -gt 0 ] || products=("${SUPPORTED_PRODUCTS[@]}")
+
+supported() {
+    local candidate="$1" known
+    for known in "${SUPPORTED_PRODUCTS[@]}"; do
+        [ "$candidate" = "$known" ] && return 0
+    done
+    return 1
+}
+
+have_openssl() { command -v openssl >/dev/null 2>&1; }
+
+# Is `file` a parsable CRL? This is a shape check so the tool does not install
+# a captive-portal page over a good cache entry. It is NOT a trust decision:
+# the signature and the validity window are the verifier's business.
+parsable_crl() {
+    local file="$1"
+    have_openssl || return 0
+    openssl crl -inform DER -in "$file" -noout >/dev/null 2>&1 && return 0
+    openssl crl -inform PEM -in "$file" -noout >/dev/null 2>&1 && return 0
+    return 1
+}
+
+crl_next_update() {
+    local file="$1" form
+    have_openssl || return 1
+    for form in DER PEM; do
+        if openssl crl -inform "$form" -in "$file" -noout -nextupdate 2>/dev/null |
+               sed 's/^nextUpdate=//'; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+overall=0
+
+for product in "${products[@]}"; do
+    if ! supported "$product"; then
+        note "skipping $product: the verified binary carries no root for it"
+        overall=1
+        continue
+    fi
+
+    target="${cache_dir}/${product}.crl"
+    url="${url_override:-${KDS_BASE}/${product}/crl}"
+    staged="${target}.candidate.$$"
+
+    mkdir -p "$cache_dir"
+
+    if ! curl --silent --show-error --fail --location \
+              --max-time "$timeout_seconds" --output "$staged" "$url"; then
+        rm -f "$staged"
+        # An outage must not remove working revocation data. The cached entry
+        # stays until its own nextUpdate passes; the verifier fails new
+        # attestation closed after that, and never touches a frozen epoch.
+        if [ -s "$target" ]; then
+            note "$product: fetch failed, keeping the existing cache entry"
+            if next_update="$(crl_next_update "$target")"; then
+                note "$product: cached list is valid until $next_update"
+            fi
+        else
+            note "$product: fetch failed and nothing is cached"
+            overall=2
+        fi
+        continue
+    fi
+
+    if ! [ -s "$staged" ] || ! parsable_crl "$staged"; then
+        rm -f "$staged"
+        note "$product: fetched bytes are not a CRL, keeping the existing entry"
+        overall=3
+        continue
+    fi
+
+    # Atomic replacement: the cache never holds a half-written list, and the
+    # previous entry survives until the new one is complete on disk.
+    chmod 0600 "$staged"
+    mv -f "$staged" "$target"
+    date +%s > "${target}.stored"
+
+    if next_update="$(crl_next_update "$target")"; then
+        note "$product: installed, valid until $next_update"
+    else
+        note "$product: installed"
+    fi
+done
+
+exit "$overall"

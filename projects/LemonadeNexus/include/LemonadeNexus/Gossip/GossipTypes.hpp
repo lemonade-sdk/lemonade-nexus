@@ -1,16 +1,21 @@
 #pragma once
 
-#include <LemonadeNexus/Core/TrustTypes.hpp>
-
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace nexus::gossip {
 
 static constexpr uint16_t kGossipMagic   = 0x4C47; // "LG"
 static constexpr uint8_t  kGossipVersion = 0x01;
 static constexpr uint16_t kDefaultGossipPort = 9102;
+
+/// Cap on peers this node will track. Peer exchange takes entries from
+/// unauthenticated senders, so without a cap a stranger can grow the table
+/// until the process runs out of memory. A peer holding a root-signed
+/// certificate is mesh membership and is never refused by this cap.
+static constexpr std::size_t kMaxTrackedPeers = 512;
 
 enum class GossipMsgType : uint8_t {
     Digest        = 0x01,  // "here's my latest state"
@@ -19,22 +24,39 @@ enum class GossipMsgType : uint8_t {
     AntiEntropy   = 0x04,  // "let's compare full state"
     PeerExchange  = 0x05,  // "here are peers I know"
     ServerHello   = 0x06,  // "here's my server certificate"
-    TeeChallenge  = 0x07,  // "prove you have TEE hardware" (nonce challenge)
-    TeeResponse   = 0x08,  // "here's my TEE attestation report" (challenge response)
-    EnrollmentVoteRequest = 0x09, // "new server presented cert, cast your vote"
-    EnrollmentVote        = 0x0A, // "I approve/reject server X"
-    RootKeyRotation       = 0x0B, // "root key rotated, here's the new chain entry"
-    ShamirShareOffer      = 0x0C, // "here's your encrypted Shamir share of the root key"
-    ShamirShareSubmit     = 0x0D, // "submitting my share for root key reconstruction"
-    PeerHealthReport      = 0x0E, // "here's my view of peer uptime/health"
-    GovernanceProposal    = 0x0F, // "I propose changing protocol parameter X to Y"
-    GovernanceVote        = 0x10, // "I approve/reject governance proposal P"
+    // 0x07-0x10 retired (old network-authority protocol: TEE challenge/response,
+    // enrollment votes, root-key rotation, Shamir shares, peer health,
+    // governance). Reserved forever — never reuse these values.
     AclDelta              = 0x11, // "ACL grant/revoke — distributed permission sync"
     DnsRecordSync         = 0x12, // "DNS record add/remove — distributed authoritative DNS"
     BackboneIpamSync      = 0x13, // "backbone IP allocate/release — server mesh IPAM sync"
     NsSlotClaim           = 0x14, // "democratic NS slot claim — ns1-ns9 bootstrap nameservers"
     MisbehaviorProofBroadcast = 0x15, // "proof a peer equivocated — verify and ban the accused"
+    SecurityEnvelope      = 0x16,  // opaque security-protocol envelope; routed to SecurityRuntime, never relayed
 };
+
+// Compile-time pin on the retired range: a new enumerator inside [0x07, 0x10]
+// would revive wire values the removed authority protocol used, and old peers
+// would misparse it. Every live enumerator must stay outside the range.
+namespace detail {
+constexpr bool outside_retired_range(GossipMsgType t) {
+    const auto v = static_cast<uint8_t>(t);
+    return v < 0x07 || v > 0x10;
+}
+}  // namespace detail
+static_assert(detail::outside_retired_range(GossipMsgType::Digest) &&
+              detail::outside_retired_range(GossipMsgType::DeltaRequest) &&
+              detail::outside_retired_range(GossipMsgType::DeltaResponse) &&
+              detail::outside_retired_range(GossipMsgType::AntiEntropy) &&
+              detail::outside_retired_range(GossipMsgType::PeerExchange) &&
+              detail::outside_retired_range(GossipMsgType::ServerHello) &&
+              detail::outside_retired_range(GossipMsgType::AclDelta) &&
+              detail::outside_retired_range(GossipMsgType::DnsRecordSync) &&
+              detail::outside_retired_range(GossipMsgType::BackboneIpamSync) &&
+              detail::outside_retired_range(GossipMsgType::NsSlotClaim) &&
+              detail::outside_retired_range(GossipMsgType::MisbehaviorProofBroadcast) &&
+              detail::outside_retired_range(GossipMsgType::SecurityEnvelope),
+              "gossip wire values 0x07-0x10 are retired and reserved forever");
 
 #pragma pack(push, 1)
 struct GossipPacketHeader {
@@ -55,15 +77,14 @@ struct GossipPeer {
     std::string endpoint;            // "ip:port" as observed (UDP source) — used for direct replies
     std::string advertised_endpoint; // "ip:port" the peer says it's reachable at — shared with third parties (the observed source can be a NAT/VPN artifact valid only from our vantage point)
     bool        advertised_confirmed{false}; // advertised_endpoint matched the observed UDP source at hello time — only then is it safe to relay/seed to third parties
-    std::string backbone_endpoint;   // "ip:port" (gossip port, over WG backbone — preferred when available)
-    std::string wg_pubkey;           // base64 X25519 mesh public key
+    std::string backbone_endpoint;   // "ip:port" (gossip port over the mesh backbone)
+    std::string mesh_pubkey;         // base64 X25519 mesh public key
     std::string backbone_ip;         // "172.16.0.X" (empty until allocated)
     std::string region;              // cloud region code (e.g. "us-east-1")
     uint16_t    http_port{9100};     // HTTP control plane port
     uint64_t    last_seen{0};        // Unix timestamp
     float       reputation{1.0f};
     std::string certificate_json;    // serialized ServerCertificate (may be empty)
-    core::TrustTier trust_tier{core::TrustTier::Untrusted};  // zero-trust tier
 };
 
 struct GossipDigest {
@@ -74,7 +95,9 @@ struct GossipDigest {
 };
 
 // ---------------------------------------------------------------------------
-// Quorum-based enrollment
+// Quorum-based enrollment — NO wire use any more (the vote message types are
+// retired). Kept only because ServerAdmissionService still compiles against
+// these; their reduction is a later stage.
 // ---------------------------------------------------------------------------
 
 /// A single signed vote for/against a server enrollment.
@@ -118,54 +141,6 @@ struct EnrollmentBallot {
     float          required_ratio{0.0f}; // 0 = use configured enrollment ratio
     uint32_t       retries{0};
     std::vector<EnrollmentVoteData> votes;
-};
-
-// ---------------------------------------------------------------------------
-// Democratic governance — Tier1 parameter changes
-// ---------------------------------------------------------------------------
-
-/// Goverable protocol parameters (the only ones that can change via vote).
-enum class GovernableParam : uint8_t {
-    RotationIntervalSec = 0x01,  // root key rotation interval
-    ShamirQuorumRatio   = 0x02,  // Shamir K = ceil(N * ratio)
-    MinTier1Uptime      = 0x03,  // minimum uptime for Tier1 authority
-};
-
-/// A governance proposal to change a protocol parameter.
-struct GovernanceProposalData {
-    std::string       proposal_id;       // unique ID (UUID or hash)
-    std::string       proposer_pubkey;   // Tier1 peer that proposed the change
-    GovernableParam   parameter;         // which parameter to change
-    std::string       new_value;         // proposed new value (serialized)
-    std::string       old_value;         // current value at proposal time (safety check)
-    std::string       rationale;         // human-readable reason for the change
-    uint64_t          created_at{0};     // Unix timestamp
-    uint64_t          expires_at{0};     // vote window end
-    std::string       signature;         // Ed25519 over canonical JSON (excludes this field)
-};
-
-/// A single signed vote on a governance proposal.
-struct GovernanceVoteData {
-    std::string proposal_id;      // matches the proposal
-    std::string voter_pubkey;     // Tier1 peer casting the vote
-    bool        approve{false};
-    std::string reason;           // optional reason
-    uint64_t    timestamp{0};
-    std::string signature;        // Ed25519 over canonical vote JSON
-};
-
-/// Tracks a governance proposal with collected votes.
-struct GovernanceBallot {
-    enum class State : uint8_t {
-        Collecting = 0,
-        Approved   = 1,
-        Rejected   = 2,
-        TimedOut   = 3,
-    };
-
-    GovernanceProposalData          proposal;
-    State                           state{State::Collecting};
-    std::vector<GovernanceVoteData> votes;
 };
 
 // ---------------------------------------------------------------------------

@@ -18,7 +18,7 @@ namespace nexus::boringtun {
 /// (UserspaceDataplane): one UDP socket, per-peer boringtun Noise sessions, and
 /// a userspace cryptokey router. There is no kernel network interface and no
 /// TUN device, so the server needs no root / CAP_NET_ADMIN and host-level tools
-/// (`wg`, `tcpdump`) cannot observe tunnel keys or plaintext.
+/// cannot observe tunnel keys or plaintext through kernel networking tools.
 ///
 /// The interface name is retained only for config-file naming and log lines —
 /// it does not correspond to any kernel device. Callers (GossipService,

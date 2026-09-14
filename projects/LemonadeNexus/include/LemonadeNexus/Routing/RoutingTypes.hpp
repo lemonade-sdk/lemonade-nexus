@@ -23,7 +23,7 @@ struct Candidate {
 struct EndpointControlSession {
     std::string node_id;
     std::string endpoint_identifier;
-    std::string wg_pubkey;     // Noise static (X25519, base64)
+    std::string mesh_pubkey;   // Noise static (X25519, base64)
     std::string mgmt_pubkey;   // Ed25519 identity (for the M3.5 IdentityBinding)
     Candidate   reflexive;     // server-witnessed reflexive address
     uint64_t    last_seen{0};
@@ -57,12 +57,12 @@ struct PendingSession {
 
     std::string client_node_id;
     std::string client_pubkey;
-    std::string client_wg_pub;
+    std::string client_mesh_pubkey;
     std::vector<Candidate> client_candidates;
 
     std::string endpoint_node_id;
     std::string endpoint_identifier;
-    std::string endpoint_wg_pub;
+    std::string endpoint_mesh_pubkey;
     std::string endpoint_mgmt_pubkey;
     std::vector<Candidate> endpoint_candidates;
 

@@ -22,9 +22,21 @@ namespace {
 
 using core::ServerAdmissionService;
 
+template <typename T>
+std::optional<T> parse_typed_body(const httplib::Request& req, httplib::Response& res) {
+    auto json = parse_body(req, res);
+    if (!json) return std::nullopt;
+    auto decoded = T::fromJson(*json);
+    if (!decoded) {
+        error_response(res, "invalid request " + decoded.error);
+        return std::nullopt;
+    }
+    return std::move(*decoded.value);
+}
+
 /// Verify a candidate's signature over the poll/ack canonical bytes.
 bool verify_poll_sig(crypto::SodiumCryptoService& crypto,
-                     const std::string& tag,
+                     std::string_view tag,
                      const std::string& candidate_pubkey,
                      const std::string& request_id,
                      uint64_t timestamp,
@@ -37,35 +49,43 @@ bool verify_poll_sig(crypto::SodiumCryptoService& crypto,
     crypto::Ed25519Signature signature{};
     std::memcpy(pubkey.data(), pk.data(), pk.size());
     std::memcpy(signature.data(), sig.data(), sig.size());
-    auto msg = ServerAdmissionService::canonical_poll(tag, request_id, timestamp);
+    auto msg = core::canonical_onboarding_status(tag, request_id, timestamp);
     return crypto.ed25519_verify(pubkey, std::span<const uint8_t>(msg), signature);
 }
 
 } // namespace
 
-nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) const {
-    nlohmann::json bundle;
-    bundle["state"] = "approved";
-    bundle["certificate"] = nlohmann::json::parse(cert_json, nullptr, false);
+std::optional<core::ApprovedOnboardingBundle> OnboardApiHandler::approved_bundle(
+        const std::string& cert_json) const {
+    const auto certificate_json = nlohmann::json::parse(cert_json, nullptr, false);
+    if (certificate_json.is_discarded()) return std::nullopt;
+
+    core::ApprovedOnboardingBundle bundle;
+    bundle.state = core::AdmissionState::Approved;
+    try {
+        bundle.certificate = certificate_json.get<gossip::ServerCertificate>();
+    } catch (...) {
+        return std::nullopt;
+    }
 
     // Root anchor as hex, sourced from the configured trust anchor — NOT from
     // whichever local identity handled the request. This is what the candidate
     // persists as --root-pubkey. (Issuance is gated on being the root holder, so
     // these coincide, but the anchor is the authoritative source.)
-    bundle["root_pubkey"] = ctx_.config.root_pubkey;
-    // Server mesh WG pubkey (X25519), for the candidate's optional handshake probe.
+    bundle.root_pubkey = ctx_.config.root_pubkey;
+    // Server mesh public key (X25519), for the candidate's optional handshake probe.
     if (auto pk = ctx_.key_wrapping.load_identity_pubkey()) {
         auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*pk);
-        bundle["wg_server_pubkey"] = crypto::to_base64(
+        bundle.mesh_server_pubkey = crypto::to_base64(
             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
     }
 
     // Seed peers: our own gossip endpoint plus every known peer's endpoint —
     // preferring what each peer advertises over the UDP source we observed,
     // which can be a NAT/VPN artifact only reachable from our vantage point.
-    nlohmann::json seeds = nlohmann::json::array();
     if (!ctx_.server_public_ip.empty())
-        seeds.push_back(ctx_.server_public_ip + ":" + std::to_string(ctx_.config.gossip_port));
+        bundle.seed_peers.push_back(ctx_.server_public_ip + ":" +
+                                    std::to_string(ctx_.config.gossip_port));
     for (const auto& p : ctx_.gossip.get_peers()) {
         // Only seed an advertised endpoint that gossip confirmed against the
         // peer's real UDP source; an unconfirmed advertisement is attacker-
@@ -73,16 +93,15 @@ nlohmann::json OnboardApiHandler::approved_bundle(const std::string& cert_json) 
         // back to the observed source otherwise.
         const auto& ep = (p.advertised_confirmed && !p.advertised_endpoint.empty())
                              ? p.advertised_endpoint : p.endpoint;
-        if (!ep.empty()) seeds.push_back(ep);
+        if (!ep.empty()) bundle.seed_peers.push_back(ep);
     }
-    bundle["seed_peers"] = seeds;
 
     if (!ctx_.server_public_ip.empty())
-        bundle["wg_endpoint"] =
+        bundle.mesh_endpoint =
             ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
     // Lets the candidate seed the address it actually reached us on, which may
     // differ from our self-detected public IP (multihomed/NAT'd genesis).
-    bundle["gossip_port"] = ctx_.config.gossip_port;
+    bundle.gossip_port = ctx_.config.gossip_port;
     return bundle;
 }
 
@@ -104,92 +123,79 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
     // ── GET /api/onboard/info (public) ──────────────────────────────────────
     pub.Get("/api/onboard/info", [this, &admission](const httplib::Request&,
                                                      httplib::Response& res) {
-        json_response(res, {
-            {"accepts_onboarding", admission.accepts_onboarding()},
-            {"regime",             admission.regime()},
-            {"eligible_voters",    admission.eligible_voter_count()},
-            {"dns_base_domain",    ctx_.config.dns_base_domain},
-            {"server_fqdn",        ctx_.server_fqdn},
-        });
+        core::OnboardingInfoResponse response;
+        response.accepts_onboarding = admission.accepts_onboarding();
+        response.dns_base_domain = ctx_.config.dns_base_domain;
+        response.server_fqdn = ctx_.server_fqdn;
+        json_response(res, response.toJson());
     });
 
     // ── POST /api/onboard/challenge (public) ────────────────────────────────
     pub.Post("/api/onboard/challenge", [this, &admission](const httplib::Request& req,
                                                           httplib::Response& res) {
-        auto body = parse_body(req, res);
-        if (!body) return;
-        auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
-        if (crypto::from_base64(candidate_pubkey).size() != crypto::kEd25519PublicKeySize) {
-            error_response(res, "candidate_pubkey must be a base64 Ed25519 key"); return;
-        }
+        auto request = parse_typed_body<core::ChallengeRequest>(req, res);
+        if (!request) return;
         if (!admission.accepts_onboarding()) {
             error_response(res, "this server is not accepting onboarding requests", 403); return;
         }
-        json_response(res, {{"nonce", admission.issue_challenge(candidate_pubkey)},
-                            {"server_id_required", true}});
+        core::ChallengeResponse response;
+        response.nonce = admission.issue_challenge(request->candidate_pubkey);
+        json_response(res, response.toJson());
     });
 
     // ── POST /api/onboard/request (public) ──────────────────────────────────
     pub.Post("/api/onboard/request", [this, &admission](const httplib::Request& req,
                                                         httplib::Response& res) {
-        auto body = parse_body(req, res);
-        if (!body) return;
-        ServerAdmissionService::RequestInput in;
-        in.candidate_pubkey = body->value("candidate_pubkey", std::string{});
-        in.server_id        = body->value("server_id", std::string{});
-        in.region           = body->value("region", std::string{});
-        in.tpm_ak_pubkey    = body->value("tpm_ak_pubkey", std::string{});
-        in.tpm_ek_cert      = body->value("tpm_ek_cert", std::string{});
-        in.nonce            = body->value("nonce", std::string{});
-        in.timestamp        = body->value("timestamp", uint64_t{0});
-        in.signature        = body->value("signature", std::string{});
-        in.source_ip        = req.remote_addr;
-        in.enrollment_token = body->value("enrollment_token", std::string{});
-        auto r = admission.create_request(in);
+        auto request = parse_typed_body<core::AdmissionRequest>(req, res);
+        if (!request) return;
+        auto r = admission.create_request(*request, req.remote_addr);
         if (!r.ok) { error_response(res, r.error, r.status); return; }
-        if (r.needs_ballot) admission.start_pending_ballot(r.request_id);
-        json_response(res, {{"request_id", r.request_id}, {"state", "pending"}});
+        core::AdmissionResponse response;
+        response.request_id = r.request_id;
+        json_response(res, response.toJson());
     });
 
     // ── POST /api/onboard/poll (public, candidate-signed) ───────────────────
     pub.Post("/api/onboard/poll", [this, &admission](const httplib::Request& req,
                                                      httplib::Response& res) {
-        auto body = parse_body(req, res);
-        if (!body) return;
-        auto request_id       = body->value("request_id", std::string{});
-        auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
-        auto timestamp        = body->value("timestamp", uint64_t{0});
-        auto signature        = body->value("signature", std::string{});
-        if (!verify_poll_sig(ctx_.crypto, "ln-onboard-poll:v1", candidate_pubkey,
-                             request_id, timestamp, signature)) {
+        auto request = parse_typed_body<core::PollRequest>(req, res);
+        if (!request) return;
+        if (!verify_poll_sig(ctx_.crypto, core::kOnboardPollTag,
+                             request->candidate_pubkey, request->request_id,
+                             request->timestamp, request->signature)) {
             error_response(res, "invalid signature", 401); return;
         }
-        auto a = admission.status(request_id, candidate_pubkey);
+        auto a = admission.status(request->request_id, request->candidate_pubkey);
         if (!a) { error_response(res, "no such admission", 404); return; }
-        if (a->state == ServerAdmissionService::State::Approved) {
-            json_response(res, approved_bundle(a->issued_cert_json)); return;
+        if (a->state == core::AdmissionState::Approved) {
+            auto response = approved_bundle(a->issued_cert_json);
+            if (!response) {
+                error_response(res, "stored certificate is invalid", 500);
+                return;
+            }
+            json_response(res, response->toJson());
+            return;
         }
-        json_response(res, {{"state", ServerAdmissionService::state_name(a->state)},
-                            {"reason", a->decision_reason}});
+        core::AdmissionStatusResponse response;
+        response.state = a->state;
+        response.reason = a->decision_reason;
+        json_response(res, response.toJson());
     });
 
     // ── POST /api/onboard/ack (public, candidate-signed) ────────────────────
     pub.Post("/api/onboard/ack", [this, &admission](const httplib::Request& req,
                                                     httplib::Response& res) {
-        auto body = parse_body(req, res);
-        if (!body) return;
-        auto request_id       = body->value("request_id", std::string{});
-        auto candidate_pubkey = body->value("candidate_pubkey", std::string{});
-        auto timestamp        = body->value("timestamp", uint64_t{0});
-        auto signature        = body->value("signature", std::string{});
-        if (!verify_poll_sig(ctx_.crypto, "ln-onboard-ack:v1", candidate_pubkey,
-                             request_id, timestamp, signature)) {
+        auto request = parse_typed_body<core::AckRequest>(req, res);
+        if (!request) return;
+        if (!verify_poll_sig(ctx_.crypto, core::kOnboardAckTag,
+                             request->candidate_pubkey, request->request_id,
+                             request->timestamp, request->signature)) {
             error_response(res, "invalid signature", 401); return;
         }
-        if (!admission.acknowledge(request_id, candidate_pubkey)) {
+        if (!admission.acknowledge(request->request_id, request->candidate_pubkey)) {
             error_response(res, "cannot acknowledge (not approved or unknown)", 409); return;
         }
-        json_response(res, {{"state", "completed"}});
+        json_response(res, core::AckResponse{}.toJson());
     });
 
     // ── GET /api/onboard/pending (private, JWT) ─────────────────────────────
@@ -197,20 +203,20 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         [this, &admission, require_admin](const httplib::Request&, httplib::Response& res,
                            const auth::SessionClaims& claims) {
         if (!require_admin(claims, res)) return;
-        nlohmann::json arr = nlohmann::json::array();
+        core::PendingAdmissionsResponse response;
         for (const auto& a : admission.pending()) {
-            arr.push_back({
-                {"request_id", a.request_id},
-                {"server_id", a.server_id},
-                {"region", a.region},
-                {"candidate_pubkey", a.candidate_pubkey},
-                {"fingerprint", a.candidate_pubkey.substr(0, 16)},
-                {"tier1_capable", !a.tpm_ak_pubkey.empty()},
-                {"source_ip", a.source_ip},
-                {"created_at", a.created_at},
-            });
+            core::PendingAdmissionSummary summary;
+            summary.request_id = a.request_id;
+            summary.server_id = a.server_id;
+            summary.region = a.region;
+            summary.candidate_pubkey = a.candidate_pubkey;
+            summary.fingerprint = a.candidate_pubkey.substr(0, 16);
+            summary.tier1_capable = !a.tpm_ak_pubkey.empty();
+            summary.source_ip = a.source_ip;
+            summary.created_at = a.created_at;
+            response.pending.push_back(std::move(summary));
         }
-        json_response(res, {{"regime", admission.regime()}, {"pending", arr}});
+        json_response(res, response.toJson());
     }));
 
     // ── POST /api/onboard/approve/<id> (private, JWT) ───────────────────────
@@ -218,14 +224,17 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
                            const auth::SessionClaims& claims) {
         if (!require_admin(claims, res)) return;
-        auto body = parse_body(req, res);
-        if (!body) return;
+        auto request = parse_typed_body<core::ApprovalRequest>(req, res);
+        if (!request) return;
         auto request_id = req.matches[1];
-        auto fp = body->value("pubkey", body->value("fingerprint", std::string{}));
-        bool supersede = body->value("supersede", false);
+        auto fp = request->pubkey.value_or(request->fingerprint.value_or(""));
+        bool supersede = request->supersede.value_or(false);
         auto r = admission.approve(request_id, fp, supersede);
         if (!r.ok) { error_response(res, r.error, r.status); return; }
-        json_response(res, {{"state", "approved"}, {"request_id", r.request_id}});
+        core::AdmissionDecisionResponse response;
+        response.state = core::AdmissionState::Approved;
+        response.request_id = r.request_id;
+        json_response(res, response.toJson());
     }));
 
     // ── POST /api/onboard/deny/<id> (private, JWT) ──────────────────────────
@@ -233,13 +242,16 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
                            const auth::SessionClaims& claims) {
         if (!require_admin(claims, res)) return;
-        auto body = parse_body(req, res);
-        if (!body) return;
+        auto request = parse_typed_body<core::DenialRequest>(req, res);
+        if (!request) return;
         auto request_id = req.matches[1];
-        auto reason = body->value("reason", std::string{"denied by admin"});
+        auto reason = request->reason.value_or("denied by admin");
         auto r = admission.deny(request_id, reason);
         if (!r.ok) { error_response(res, r.error, r.status); return; }
-        json_response(res, {{"state", "denied"}, {"request_id", r.request_id}});
+        core::AdmissionDecisionResponse response;
+        response.state = core::AdmissionState::Denied;
+        response.request_id = r.request_id;
+        json_response(res, response.toJson());
     }));
 
     // ── POST /api/onboard/token (private, JWT + root admin) ─────────────────
@@ -249,36 +261,23 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         [this, &admission, require_admin](const httplib::Request& req, httplib::Response& res,
                            const auth::SessionClaims& claims) {
         if (!require_admin(claims, res)) return;
-        auto body = parse_body(req, res);
-        if (!body) return;
-        // Candidate binding is mandatory: the token travels the unauthenticated
-        // onboarding transport as a bearer credential, so it must be spendable
-        // only by the intended candidate key.
-        auto candidate = body->value("candidate_pubkey", std::string{});
-        bool valid = false;
-        try {   // from_base64 throws on malformed input
-            valid = crypto::from_base64(candidate).size() ==
-                    crypto::kEd25519PublicKeySize;
-        } catch (...) {}
-        if (!valid) {
-            error_response(res, "candidate_pubkey (base64 Ed25519 gossip key of the "
-                                "joining server) is required"); return;
-        }
-        auto ttl = std::chrono::seconds{body->value(
-            "ttl_sec", static_cast<uint64_t>(core::AdmissionTokenStore::kDefaultTtl.count()))};
-        // Optional: bind the token to a specific server_id so it can admit only
-        // that identity (a candidate otherwise picks server_id freely).
-        auto token_server_id = body->value("server_id", std::string{});
-        auto minted = admission.mint_admission_token(candidate, ttl, token_server_id);
+        auto request = parse_typed_body<core::AdmissionTokenRequest>(req, res);
+        if (!request) return;
+        auto ttl = std::chrono::seconds{request->ttl_sec.value_or(
+            static_cast<uint64_t>(core::AdmissionTokenStore::kDefaultTtl.count()))};
+        auto minted = admission.mint_admission_token(
+            request->candidate_pubkey, ttl, request->server_id.value_or(""));
         if (!minted) {
             error_response(res, "this server does not hold the root key or "
                                 "onboarding is disabled", 503); return;
         }
-        json_response(res, {{"enrollment_token", minted->first},
-                            {"expires_at", minted->second.expires_at},
-                            {"candidate_pubkey", minted->second.candidate_pubkey},
-                            {"server_id", minted->second.server_id},
-                            {"root_pubkey", ctx_.config.root_pubkey}});
+        core::AdmissionInvitation response;
+        response.enrollment_token = minted->first;
+        response.expires_at = minted->second.expires_at;
+        response.candidate_pubkey = minted->second.candidate_pubkey;
+        response.server_id = minted->second.server_id;
+        response.root_pubkey = ctx_.config.root_pubkey;
+        json_response(res, response.toJson());
     }));
 }
 

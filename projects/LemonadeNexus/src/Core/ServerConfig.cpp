@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <set>
 
@@ -16,62 +17,6 @@ using json = nlohmann::json;
 // JSON serialization
 // ---------------------------------------------------------------------------
 
-void to_json(json& j, const ServerConfig& c) {
-    j = json{
-        {"http_port",           c.http_port},
-        {"udp_port",            c.udp_port},
-        {"gossip_port",         c.gossip_port},
-        {"stun_port",           c.stun_port},
-        {"relay_port",          c.relay_port},
-        {"dns_port",            c.dns_port},
-        {"public_dns_port",     c.public_dns_port},
-        {"bind_address",        c.bind_address},
-        {"wg_interface",        c.wg_interface},
-        {"data_root",           c.data_root},
-        {"rp_id",               c.rp_id},
-        {"jwt_secret",          c.jwt_secret},
-        {"root_pubkey",         c.root_pubkey},
-        {"seed_peers",          c.seed_peers},
-        {"gossip_interval_sec", c.gossip_interval_sec},
-        {"rate_limit_rpm",      c.rate_limit_rpm},
-        {"rate_limit_burst",    c.rate_limit_burst},
-        {"log_level",           c.log_level},
-        {"acme_provider",       c.acme_provider},
-        {"acme_eab_kid",        c.acme_eab_kid},
-        {"acme_eab_hmac_key",   c.acme_eab_hmac_key},
-        {"dns_provider",        c.dns_provider},
-        {"public_ip",           c.public_ip},
-        {"region",              c.region},
-        {"server_hostname",     c.server_hostname},
-        {"dns_base_domain",     c.dns_base_domain},
-        {"dns_seed_discovery",  c.dns_seed_discovery},
-        {"dns_ns_hostname",     c.dns_ns_hostname},
-        {"release_signing_pubkey",     c.release_signing_pubkey},
-        {"require_binary_attestation", c.require_binary_attestation},
-        {"github_releases_url",        c.github_releases_url},
-        {"manifest_fetch_interval_sec", c.manifest_fetch_interval_sec},
-        {"minimum_version",            c.minimum_version},
-        {"ddns_domain",                c.ddns_domain},
-        {"ddns_password",              c.ddns_password},
-        {"ddns_update_interval_sec",   c.ddns_update_interval_sec},
-        {"ddns_enabled",               c.ddns_enabled},
-        {"open_registration",          c.open_registration},
-        {"private_http_port",          c.private_http_port},
-        {"require_peer_confirmation",  c.require_peer_confirmation},
-        {"enrollment_quorum_ratio",    c.enrollment_quorum_ratio},
-        {"enrollment_vote_timeout_sec", c.enrollment_vote_timeout_sec},
-        {"enrollment_max_retries",     c.enrollment_max_retries},
-        {"require_tee_attestation",    c.require_tee_attestation},
-        {"tee_attestation_validity_sec", c.tee_attestation_validity_sec},
-        {"tee_platform_override",      c.tee_platform_override},
-        {"onboard_enabled",            c.onboard_enabled},
-        {"admission_quorum_ratio",     c.admission_quorum_ratio},
-        {"onboard_min_tier1_for_vote", c.onboard_min_tier1_for_vote},
-        {"onboard_request_ttl_sec",    c.onboard_request_ttl_sec},
-        {"onboard_max_pending",        c.onboard_max_pending},
-    };
-}
-
 void from_json(const json& j, ServerConfig& c) {
     if (j.contains("http_port"))           j.at("http_port").get_to(c.http_port);
     if (j.contains("udp_port"))            j.at("udp_port").get_to(c.udp_port);
@@ -81,13 +26,17 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("dns_port"))            j.at("dns_port").get_to(c.dns_port);
     if (j.contains("public_dns_port"))     j.at("public_dns_port").get_to(c.public_dns_port);
     if (j.contains("bind_address"))        j.at("bind_address").get_to(c.bind_address);
-    if (j.contains("wg_interface"))        j.at("wg_interface").get_to(c.wg_interface);
+    if (j.contains("mesh_interface")) {
+        j.at("mesh_interface").get_to(c.mesh_interface);
+    } else if (j.contains("wg_interface")) {
+        j.at("wg_interface").get_to(c.mesh_interface);
+    }
     if (j.contains("data_root"))           j.at("data_root").get_to(c.data_root);
     if (j.contains("rp_id"))               j.at("rp_id").get_to(c.rp_id);
     if (j.contains("jwt_secret"))          j.at("jwt_secret").get_to(c.jwt_secret);
     if (j.contains("root_pubkey"))         j.at("root_pubkey").get_to(c.root_pubkey);
+    if (j.contains("genesis_pubkey"))      j.at("genesis_pubkey").get_to(c.genesis_pubkey);
     if (j.contains("seed_peers"))          j.at("seed_peers").get_to(c.seed_peers);
-    if (j.contains("gossip_interval_sec")) j.at("gossip_interval_sec").get_to(c.gossip_interval_sec);
     if (j.contains("rate_limit_rpm"))      j.at("rate_limit_rpm").get_to(c.rate_limit_rpm);
     if (j.contains("rate_limit_burst"))    j.at("rate_limit_burst").get_to(c.rate_limit_burst);
     if (j.contains("log_level"))           j.at("log_level").get_to(c.log_level);
@@ -102,7 +51,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("dns_seed_discovery"))  j.at("dns_seed_discovery").get_to(c.dns_seed_discovery);
     if (j.contains("dns_ns_hostname"))     j.at("dns_ns_hostname").get_to(c.dns_ns_hostname);
     if (j.contains("release_signing_pubkey"))     j.at("release_signing_pubkey").get_to(c.release_signing_pubkey);
-    if (j.contains("require_binary_attestation")) j.at("require_binary_attestation").get_to(c.require_binary_attestation);
     if (j.contains("github_releases_url"))        j.at("github_releases_url").get_to(c.github_releases_url);
     if (j.contains("manifest_fetch_interval_sec")) j.at("manifest_fetch_interval_sec").get_to(c.manifest_fetch_interval_sec);
     if (j.contains("minimum_version"))            j.at("minimum_version").get_to(c.minimum_version);
@@ -112,16 +60,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
     if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
-    if (j.contains("require_peer_confirmation"))  j.at("require_peer_confirmation").get_to(c.require_peer_confirmation);
-    if (j.contains("enrollment_quorum_ratio"))  j.at("enrollment_quorum_ratio").get_to(c.enrollment_quorum_ratio);
-    if (j.contains("enrollment_vote_timeout_sec")) j.at("enrollment_vote_timeout_sec").get_to(c.enrollment_vote_timeout_sec);
-    if (j.contains("enrollment_max_retries"))   j.at("enrollment_max_retries").get_to(c.enrollment_max_retries);
-    if (j.contains("require_tee_attestation"))   j.at("require_tee_attestation").get_to(c.require_tee_attestation);
-    if (j.contains("tee_attestation_validity_sec")) j.at("tee_attestation_validity_sec").get_to(c.tee_attestation_validity_sec);
-    if (j.contains("tee_platform_override"))     j.at("tee_platform_override").get_to(c.tee_platform_override);
     if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
-    if (j.contains("admission_quorum_ratio"))    j.at("admission_quorum_ratio").get_to(c.admission_quorum_ratio);
-    if (j.contains("onboard_min_tier1_for_vote")) j.at("onboard_min_tier1_for_vote").get_to(c.onboard_min_tier1_for_vote);
     if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
     if (j.contains("onboard_max_pending"))       j.at("onboard_max_pending").get_to(c.onboard_max_pending);
 }
@@ -142,11 +81,12 @@ void print_usage(const char* prog) {
     spdlog::info("  --relay-port <N>           Relay UDP port (default: 9103)");
     spdlog::info("  --bind-address <addr>      Bind address for all services (default: 0.0.0.0)");
     spdlog::info("  --public-ip <addr>         Public IP to advertise in DNS (default: auto-detect)");
-    spdlog::info("  --wg-interface <name>      boringtun interface (default: nexus0). NEVER use 'wg0' or anything in use.");
+    spdlog::info("  --mesh-interface <name>    BoringTun dataplane instance (default: nexus0)");
     spdlog::info("  --data-root <path>         Data directory (default: data)");
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
+    spdlog::info("  --genesis-pubkey <b64>     Pinned Genesis bootstrap anchor (base64 Ed25519); its authority ends at Epoch 1 activation");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
     spdlog::info("  --onboard-server [fqdn:port] Join an existing mesh: request admission over its public API (verified HTTPS by FQDN), then exit (requires --root-pubkey)");
@@ -158,22 +98,22 @@ void print_usage(const char* prog) {
     spdlog::info("  --token-ttl <sec>          Minted-token lifetime, 60-3600s (default: 600)");
     spdlog::info("  --no-onboard               Refuse to accept onboarding requests from new servers");
     spdlog::info("  --enroll-server <b64> <id> Enroll a server: sign cert for its base64 gossip pubkey; <id> is a unique DNS label");
-    spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's TPM AK pubkey (base64 DER SPKI) in the cert");
+    spdlog::info("  --enroll-tpm-ak <b64>      Pin the server's platform binding key (base64 DER SPKI) in the cert");
     spdlog::info("  --enroll-tpm-ek-cert <path> Attach the server's TPM EK cert (PEM) for audit/validation");
-    spdlog::info("  --print-tpm-ak             Print this host's TPM AK pubkey (base64 DER SPKI) and exit");
+    spdlog::info("  --verify-platform [blob]   Verify this host's platform evidence (AMD signature chain,");
+    spdlog::info("                             guest policy, memory-encryption guarantees) and exit.");
+    spdlog::info("                             Optionally verify a captured HCL blob file instead.");
     spdlog::info("  --revoke-server <b64>      Revoke a server by its base64 gossip pubkey");
     spdlog::info("  --add-manifest <path>      Import a signed release manifest JSON");
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
     spdlog::info("  --ddns-password <pass>     Namecheap DDNS password");
     spdlog::info("  --ddns-enabled             Enable dynamic DNS updates");
     spdlog::info("  --release-signing-pubkey <b64>  Release signing pubkey (base64 Ed25519)");
-    spdlog::info("  --require-attestation      Require binary attestation for credential distribution");
     spdlog::info("  --github-releases-url <url>  GitHub API URL for fetching release manifests");
     spdlog::info("  --manifest-fetch-interval <sec>  How often to fetch manifests (default 3600)");
     spdlog::info("  --minimum-version <semver>   Minimum binary version allowed (e.g. 1.2.0)");
     spdlog::info("  --private-http-port <N>      Private API port (default: 9101)");
     spdlog::info("  --require-peer-confirmation  Require peer quorum before full enrollment");
-    spdlog::info("  --enrollment-quorum <ratio>  Fraction of Tier1 peers needed (default 0.5)");
     spdlog::info("  --dns-port <N>             Internal DNS listen port (default: 5335, NAT-mapped from public)");
     spdlog::info("  --public-dns-port <N>      DNS port advertised to clients (default: 53)");
     spdlog::info("  --dns-base-domain <dom>    DNS zone suffix (default: lemonade-nexus.io)");
@@ -186,8 +126,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
-    spdlog::info("  --require-tee              Require TEE hardware attestation for Tier 1");
-    spdlog::info("  --tee-platform <name>      Override TEE platform detection (sgx/tdx/sev-snp/secure-enclave)");
     spdlog::info("  --help, -h                 Show this help");
 }
 
@@ -207,7 +145,13 @@ ServerConfig load_config(int argc, char* argv[]) {
     }
 
     // --- Load JSON config file ---
-    if (std::filesystem::exists(config_path)) {
+    std::error_code config_ec;
+    const bool config_exists = std::filesystem::exists(config_path, config_ec);
+    if (config_ec) {
+        spdlog::warn("Cannot check for config at {}: {} — continuing without a config file",
+                     config_path, config_ec.message());
+    }
+    if (config_exists) {
         try {
             std::ifstream f(config_path);
             auto j = json::parse(f);
@@ -220,6 +164,10 @@ ServerConfig load_config(int argc, char* argv[]) {
     config.config_path = config_path;  // remembered for onboarding write-back
 
     // --- Pass 2: CLI overrides ---
+    // Whether the operator pinned a trust anchor on the command line. Pass 3
+    // leaves those alone when they did.
+    bool root_pubkey_from_cli = false;
+    bool genesis_pubkey_from_cli = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]);
@@ -240,8 +188,9 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.bind_address = argv[++i];
         } else if (std::strcmp(argv[i], "--public-ip") == 0 && i + 1 < argc) {
             config.public_ip = argv[++i];
-        } else if (std::strcmp(argv[i], "--wg-interface") == 0 && i + 1 < argc) {
-            config.wg_interface = argv[++i];
+        } else if ((std::strcmp(argv[i], "--mesh-interface") == 0 ||
+                    std::strcmp(argv[i], "--wg-interface") == 0) && i + 1 < argc) {
+            config.mesh_interface = argv[++i];
         } else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) {
             config.data_root = argv[++i];
         } else if (std::strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
@@ -250,6 +199,10 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.seed_peers.push_back(argv[++i]);
         } else if (std::strcmp(argv[i], "--root-pubkey") == 0 && i + 1 < argc) {
             config.root_pubkey = argv[++i];
+            root_pubkey_from_cli = true;
+        } else if (std::strcmp(argv[i], "--genesis-pubkey") == 0 && i + 1 < argc) {
+            config.genesis_pubkey = argv[++i];
+            genesis_pubkey_from_cli = true;
         } else if (std::strcmp(argv[i], "--rp-id") == 0 && i + 1 < argc) {
             config.rp_id = argv[++i];
         } else if (std::strcmp(argv[i], "--enroll-server") == 0 && i + 2 < argc) {
@@ -261,8 +214,9 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.enroll_tpm_ek_cert_path = argv[++i];
         } else if (std::strcmp(argv[i], "--first-run") == 0) {
             config.first_run = true;
-        } else if (std::strcmp(argv[i], "--print-tpm-ak") == 0) {
-            config.print_tpm_ak = true;
+        } else if (std::strcmp(argv[i], "--verify-platform") == 0) {
+            config.verify_platform = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') config.verify_platform_blob = argv[++i];
         } else if (std::strcmp(argv[i], "--revoke-server") == 0 && i + 1 < argc) {
             config.revoke_server_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--add-manifest") == 0 && i + 1 < argc) {
@@ -275,8 +229,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.ddns_enabled = true;
         } else if (std::strcmp(argv[i], "--release-signing-pubkey") == 0 && i + 1 < argc) {
             config.release_signing_pubkey = argv[++i];
-        } else if (std::strcmp(argv[i], "--require-attestation") == 0) {
-            config.require_binary_attestation = true;
         } else if (std::strcmp(argv[i], "--github-releases-url") == 0 && i + 1 < argc) {
             config.github_releases_url = argv[++i];
         } else if (std::strcmp(argv[i], "--manifest-fetch-interval") == 0 && i + 1 < argc) {
@@ -285,10 +237,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.minimum_version = argv[++i];
         } else if (std::strcmp(argv[i], "--private-http-port") == 0 && i + 1 < argc) {
             config.private_http_port = static_cast<uint16_t>(std::atoi(argv[++i]));
-        } else if (std::strcmp(argv[i], "--require-peer-confirmation") == 0) {
-            config.require_peer_confirmation = true;
-        } else if (std::strcmp(argv[i], "--enrollment-quorum") == 0 && i + 1 < argc) {
-            config.enrollment_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--onboard-server") == 0) {
             config.onboard_server = true;
             // Optional positional target ("<fqdn>[:port]"); anything starting with '-' is a flag.
@@ -309,8 +257,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.mint_token_ttl_sec = static_cast<uint32_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--no-onboard") == 0) {
             config.onboard_enabled = false;
-        } else if (std::strcmp(argv[i], "--admission-quorum") == 0 && i + 1 < argc) {
-            config.admission_quorum_ratio = std::atof(argv[++i]);
         } else if (std::strcmp(argv[i], "--dns-port") == 0 && i + 1 < argc) {
             config.dns_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--public-dns-port") == 0 && i + 1 < argc) {
@@ -333,16 +279,18 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_hmac_key = argv[++i];
         } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
             config.open_registration = false;
-        } else if (std::strcmp(argv[i], "--require-tee") == 0) {
-            config.require_tee_attestation = true;
-        } else if (std::strcmp(argv[i], "--tee-platform") == 0 && i + 1 < argc) {
-            config.tee_platform_override = argv[++i];
         } else if (std::strcmp(argv[i], "--region") == 0 && i + 1 < argc) {
             config.region = argv[++i];
         }
     }
 
     // --- Pass 3: environment variable overrides ---
+    //
+    // The trust anchors are exempt from this pass when the operator named them
+    // on the command line. Everything else may be overridden by the
+    // environment, but letting an environment variable silently replace an
+    // explicitly pinned root or genesis key would redirect who this server
+    // trusts without the command that started it saying so.
     if (const char* v = std::getenv("SP_LOG_LEVEL"))   config.log_level   = v;
     if (const char* v = std::getenv("SP_HTTP_PORT"))    config.http_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_UDP_PORT"))     config.udp_port    = static_cast<uint16_t>(std::atoi(v));
@@ -350,10 +298,28 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_STUN_PORT"))    config.stun_port   = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_BIND_ADDRESS")) config.bind_address = v;
-    if (const char* v = std::getenv("SP_WG_INTERFACE")) config.wg_interface = v;
+    if (const char* v = std::getenv("SP_MESH_INTERFACE")) {
+        config.mesh_interface = v;
+    } else if (const char* v = std::getenv("SP_WG_INTERFACE")) {
+        config.mesh_interface = v;
+    }
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
     if (const char* v = std::getenv("SP_DATA_ROOT"))    config.data_root   = v;
-    if (const char* v = std::getenv("SP_ROOT_PUBKEY"))  config.root_pubkey = v;
+    if (const char* v = std::getenv("SP_ROOT_PUBKEY")) {
+        if (root_pubkey_from_cli) {
+            spdlog::warn("Config: ignoring SP_ROOT_PUBKEY — --root-pubkey was given explicitly");
+        } else {
+            config.root_pubkey = v;
+        }
+    }
+    if (const char* v = std::getenv("SP_GENESIS_PUBKEY")) {
+        if (genesis_pubkey_from_cli) {
+            spdlog::warn("Config: ignoring SP_GENESIS_PUBKEY — --genesis-pubkey was given "
+                         "explicitly");
+        } else {
+            config.genesis_pubkey = v;
+        }
+    }
     if (const char* v = std::getenv("SP_ONBOARD_TOKEN")) config.onboard_token = v;
     if (const char* v = std::getenv("SP_JWT_SECRET"))   config.jwt_secret  = v;
     if (const char* v = std::getenv("SP_RP_ID"))          config.rp_id       = v;
@@ -371,15 +337,10 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;
     if (const char* v = std::getenv("SP_DDNS_PASSWORD"))  config.ddns_password = v;
     if (std::getenv("SP_DDNS_ENABLED"))                   config.ddns_enabled  = true;
-    if (std::getenv("SP_REQUIRE_ATTESTATION"))            config.require_binary_attestation = true;
     if (const char* v = std::getenv("SP_GITHUB_RELEASES_URL"))  config.github_releases_url       = v;
     if (const char* v = std::getenv("SP_MANIFEST_FETCH_INTERVAL")) config.manifest_fetch_interval_sec = static_cast<uint32_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_MINIMUM_VERSION"))      config.minimum_version           = v;
     if (const char* v = std::getenv("SP_PRIVATE_HTTP_PORT")) config.private_http_port = static_cast<uint16_t>(std::atoi(v));
-    if (std::getenv("SP_REQUIRE_PEER_CONFIRMATION"))      config.require_peer_confirmation = true;
-    if (const char* v = std::getenv("SP_ENROLLMENT_QUORUM")) config.enrollment_quorum_ratio = std::atof(v);
-    if (std::getenv("SP_REQUIRE_TEE"))                   config.require_tee_attestation   = true;
-    if (const char* v = std::getenv("SP_TEE_PLATFORM"))  config.tee_platform_override     = v;
     if (const char* v = std::getenv("SP_REGION"))        config.region                    = v;
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
@@ -450,18 +411,33 @@ bool validate_config(const ServerConfig& config) {
         valid = false;
     }
 
-    // Tier 1 (require_tee_attestation) gates sensitive operations on a verified
-    // binary measurement. Without a release signing pubkey, is_approved_binary()
-    // cannot be evaluated and the binary check is silently skipped — so require it.
-    if (config.require_tee_attestation && config.release_signing_pubkey.empty()) {
-        spdlog::error("Config: require_tee_attestation is set but release_signing_pubkey "
-                       "is empty — Tier1 binary attestation cannot be enforced");
-        valid = false;
-    }
 
-    // Warnings (non-fatal)
-    if (config.root_pubkey.empty()) {
-        spdlog::warn("Config: root_pubkey not set — server enrollment will not be available");
+    // Trust anchors are mandatory for a normal server start. Both used to be
+    // warnings, and both are now load-bearing: without root_pubkey no certificate
+    // can be verified (verify_server_certificate fails closed), and without
+    // release_signing_pubkey no release manifest can be authenticated, so no binary
+    // can ever be approved. A server missing either can never reach Tier 1 — say so
+    // at startup instead of running in a permanently degraded state.
+    //
+    // CLI modes are exempt: --first-run generates the identity these anchor to, and
+    // the enroll/onboard/manifest modes exit before any of it is used.
+    const bool cli_mode = config.first_run || config.verify_platform ||
+                          config.onboard_server ||
+                          config.mint_admission_token || !config.enroll_server_pubkey.empty() ||
+                          !config.revoke_server_pubkey.empty() || !config.add_manifest_path.empty();
+
+    if (!cli_mode) {
+        if (config.root_pubkey.empty()) {
+            spdlog::error("Config: root_pubkey is required — without it no server certificate "
+                           "can be verified and no peer can be trusted");
+            valid = false;
+        }
+        if (config.release_signing_pubkey.empty()) {
+            spdlog::error("Config: release_signing_pubkey is required — without it no release "
+                           "manifest can be authenticated, so no binary can be approved and "
+                           "this server can never reach Tier 1");
+            valid = false;
+        }
     }
 
     if (config.seed_peers.empty()) {
@@ -472,7 +448,7 @@ bool validate_config(const ServerConfig& config) {
         spdlog::warn("Config: rp_id is empty — WebAuthn passkeys will not validate");
     }
 
-    spdlog::info("Config: HTTP:{} UDP/WG:{} Gossip:{} STUN:{} Relay:{} DNS:{} data={}",
+    spdlog::info("Config: HTTP:{} mesh UDP:{} Gossip:{} STUN:{} Relay:{} DNS:{} data={}",
                   config.http_port, config.udp_port, config.gossip_port,
                   config.stun_port, config.relay_port, config.dns_port,
                   config.data_root);

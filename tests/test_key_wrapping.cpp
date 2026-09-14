@@ -52,9 +52,6 @@ protected:
 };
 
 TEST_F(KeyWrappingTest, WrapUnwrapRoundTrip) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
     auto keypair = crypto->ed25519_keygen();
     std::string passphrase = "test-passphrase-123";
     auto pp_bytes = std::span<const uint8_t>(
@@ -68,9 +65,6 @@ TEST_F(KeyWrappingTest, WrapUnwrapRoundTrip) {
 }
 
 TEST_F(KeyWrappingTest, UnwrapFailsWithWrongPassphrase) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
     auto keypair = crypto->ed25519_keygen();
     std::string pass1 = "correct-passphrase";
     std::string pass2 = "wrong-passphrase";
@@ -85,9 +79,6 @@ TEST_F(KeyWrappingTest, UnwrapFailsWithWrongPassphrase) {
 }
 
 TEST_F(KeyWrappingTest, GenerateAndStoreIdentity) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
     std::string passphrase = "identity-pass";
     auto pp = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
@@ -106,9 +97,6 @@ TEST_F(KeyWrappingTest, GenerateAndStoreIdentity) {
 }
 
 TEST_F(KeyWrappingTest, UnlockIdentityFailsWithWrongPassphrase) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
     std::string pass1 = "correct";
     std::string pass2 = "wrong";
     auto pp1 = std::span<const uint8_t>(
@@ -127,9 +115,6 @@ TEST_F(KeyWrappingTest, LoadIdentityPubkeyReturnsNulloptWhenNoneStored) {
 }
 
 TEST_F(KeyWrappingTest, DelegateKeyProducesValidResult) {
-    if (!crypto_aead_aes256gcm_is_available()) {
-        GTEST_SKIP() << "AES-256-GCM not available on this CPU (requires AES-NI)";
-    }
     std::string passphrase = "delegate-pass";
     auto pp = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
@@ -202,14 +187,17 @@ TEST_F(KeyWrappingTest, LegacyBlobMigratesToV2OnUnlock) {
         std::span<const uint8_t>{},
         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kSalt.data()), kSalt.size()),
         std::span<const uint8_t>(keypair.public_key.data(), keypair.public_key.size()),
-        kAesGcmKeySize);
-    AesGcmKey legacy_key{};
-    std::memcpy(legacy_key.data(), derived.data(), kAesGcmKeySize);
+        kAeadKeySize);
+    AeadKey legacy_key{};
+    std::memcpy(legacy_key.data(), derived.data(), kAeadKeySize);
 
-    auto ct = crypto->aes_gcm_encrypt(
+    const auto aad = aead_aad(aead_purpose::kKeyWrapping,
+                              {std::span<const uint8_t>(keypair.public_key.data(),
+                                                        keypair.public_key.size())});
+    auto ct = crypto->aead_encrypt(
         legacy_key,
         std::span<const uint8_t>(keypair.private_key.data(), keypair.private_key.size()),
-        std::span<const uint8_t>(keypair.public_key.data(), keypair.public_key.size()));
+        std::span<const uint8_t>{aad});
 
     auto id_dir = temp_dir / "identity";
     fs::create_directories(id_dir);
@@ -218,9 +206,12 @@ TEST_F(KeyWrappingTest, LegacyBlobMigratesToV2OnUnlock) {
         ofs << to_hex(std::span<const uint8_t>(keypair.public_key));
     }
     {
-        // Legacy on-disk format: nonce_hex:ct_hex with NO "v2:" prefix.
+        // Legacy BINDING (no "v2:" prefix), current crypto encoding:
+        // version:nonce_hex:ct_hex. The binding axis and the crypto format
+        // version are independent.
         std::ofstream ofs(id_dir / "keypair.enc", std::ios::binary);
-        ofs << to_hex(std::span<const uint8_t>(ct.nonce.data(), ct.nonce.size()))
+        ofs << static_cast<unsigned>(ct.version) << ":"
+            << to_hex(std::span<const uint8_t>(ct.nonce.data(), ct.nonce.size()))
             << ":" << to_hex(std::span<const uint8_t>(ct.ciphertext));
     }
 
@@ -242,4 +233,106 @@ TEST_F(KeyWrappingTest, LegacyBlobMigratesToV2OnUnlock) {
 
 TEST_F(KeyWrappingTest, ServiceName) {
     EXPECT_EQ(kw->service_name(), "KeyWrappingService");
+}
+
+// A keypair.enc exactly as the pre-change code wrote it on an accelerated host:
+// "v2:" + 12-byte AES-GCM nonce + ciphertext, and no crypto version. The reader
+// must refuse it cleanly — there is no AES decryption left to attempt.
+TEST_F(KeyWrappingTest, APreChangeAesIdentityFileIsRefused) {
+    if (!crypto_aead_aes256gcm_is_available()) {
+        GTEST_SKIP() << "cannot build a genuine AES ciphertext on this cpu";
+    }
+    auto keypair = crypto->ed25519_keygen();
+
+    static constexpr std::string_view kSalt = "lemonade-nexus-mgmt-key";
+    auto derived = crypto->hkdf_sha256(
+        std::span<const uint8_t>{},
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(kSalt.data()), kSalt.size()),
+        std::span<const uint8_t>(keypair.public_key.data(), keypair.public_key.size()),
+        kAeadKeySize);
+    AeadKey key{};
+    std::memcpy(key.data(), derived.data(), kAeadKeySize);
+
+    std::vector<uint8_t> nonce(crypto_aead_aes256gcm_NPUBBYTES);
+    randombytes_buf(nonce.data(), nonce.size());
+    std::vector<uint8_t> ct(keypair.private_key.size() + crypto_aead_aes256gcm_ABYTES);
+    unsigned long long ct_len = 0;
+    ASSERT_EQ(crypto_aead_aes256gcm_encrypt(
+                  ct.data(), &ct_len, keypair.private_key.data(), keypair.private_key.size(),
+                  keypair.public_key.data(), keypair.public_key.size(), nullptr,
+                  nonce.data(), key.data()),
+              0);
+    ct.resize(static_cast<std::size_t>(ct_len));
+
+    auto id_dir = temp_dir / "identity";
+    fs::create_directories(id_dir);
+    {
+        std::ofstream ofs(id_dir / "keypair.pub", std::ios::binary);
+        ofs << to_hex(std::span<const uint8_t>(keypair.public_key));
+    }
+    {
+        // The exact pre-change encoding: no crypto version field.
+        std::ofstream ofs(id_dir / "keypair.enc", std::ios::binary);
+        ofs << "v2:" << to_hex(std::span<const uint8_t>(nonce.data(), nonce.size()))
+            << ":" << to_hex(std::span<const uint8_t>(ct));
+    }
+
+    EXPECT_FALSE(kw->unlock_identity({}).has_value());
+}
+
+// Two delegations, each with its own random wrapping key and its own child.
+//
+// Two independent things stop a wrapped child key being substituted between
+// them. The wrapping key is random per delegation, so the ciphertexts are not
+// interchangeable even before authentication. On top of that the child's own
+// identity is authenticated, which is what this asserts directly: holding the
+// CORRECT key, the wrong child's AAD still fails.
+TEST_F(KeyWrappingTest, AWrappedChildKeyIsBoundToItsChild) {
+    std::string passphrase = "delegate-pass";
+    auto pp = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(passphrase.data()), passphrase.size());
+    kw->generate_and_store_identity(pp);
+
+    auto first = kw->delegate_key(pp);
+    auto second = kw->delegate_key(pp);
+    ASSERT_TRUE(first.success);
+    ASSERT_TRUE(second.success);
+    ASSERT_NE(first.child_keypair.public_key, second.child_keypair.public_key);
+
+    // Each delegation carries its own random wrapping key, so neither ciphertext
+    // is reusable as the other in the first place.
+    EXPECT_NE(first.wrapped_child_key.ciphertext.ciphertext,
+              second.wrapped_child_key.ciphertext.ciphertext);
+    EXPECT_NE(first.encrypted_wk.ciphertext, second.encrypted_wk.ciphertext);
+
+    // The binding itself, with the key held: re-wrap a child key under a known
+    // WK and prove only that child's AAD opens it.
+    AeadKey wk{};
+    crypto->random_bytes(std::span<uint8_t>(wk));
+    const auto aad_first =
+        aead_aad(aead_purpose::kChildKey,
+                 {std::span<const uint8_t>(first.child_keypair.public_key.data(),
+                                           first.child_keypair.public_key.size())});
+    const auto aad_second =
+        aead_aad(aead_purpose::kChildKey,
+                 {std::span<const uint8_t>(second.child_keypair.public_key.data(),
+                                           second.child_keypair.public_key.size())});
+
+    const auto blob = crypto->aead_encrypt(
+        wk,
+        std::span<const uint8_t>(first.child_keypair.private_key.data(),
+                                 first.child_keypair.private_key.size()),
+        std::span<const uint8_t>{aad_first});
+
+    // Correct key, correct child.
+    ASSERT_TRUE(crypto->aead_decrypt(wk, blob, std::span<const uint8_t>{aad_first}).has_value());
+    // Correct key, WRONG child: refused on authentication.
+    EXPECT_FALSE(crypto->aead_decrypt(wk, blob, std::span<const uint8_t>{aad_second}).has_value());
+    // And a different purpose tag does not open it either.
+    const auto wrong_purpose =
+        aead_aad(aead_purpose::kKeyWrapping,
+                 {std::span<const uint8_t>(first.child_keypair.public_key.data(),
+                                           first.child_keypair.public_key.size())});
+    EXPECT_FALSE(
+        crypto->aead_decrypt(wk, blob, std::span<const uint8_t>{wrong_purpose}).has_value());
 }

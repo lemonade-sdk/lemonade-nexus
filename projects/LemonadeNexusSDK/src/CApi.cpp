@@ -16,6 +16,20 @@ using json = nlohmann::json;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// Map an lnsdk::Result failure to a distinct ln_error_t. The SDK client
+// reports the transport failure (no HTTP status), the HTTP status it did
+// receive, and a text message. Without this split, e.g. ln_tree_get_node
+// collapsed auth / network / parse failures into one code and a C caller
+// could not tell "not authenticated" from "server unreachable" from a
+// malformed response.
+static ln_error_t ln_map_error(int http_status) {
+    if (http_status == 401 || http_status == 403) return LN_ERR_AUTH;
+    if (http_status == 404) return LN_ERR_NOT_FOUND;
+    if (http_status == 0)   return LN_ERR_CONNECT;
+    if (http_status >= 500) return LN_ERR_CONNECT;
+    return LN_ERR_REJECTED;
+}
+
 struct ln_client_s {
     lnsdk::LemonadeNexusClient client;
     explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {}
@@ -221,7 +235,12 @@ ln_error_t ln_tree_get_node(ln_client_t* client,
     json err;
     err["error"] = result.error;
     *out_json = strdup_json(err);
-    return LN_ERR_NOT_FOUND;
+    // A 2xx response whose body failed to deserialize is a malformed-response
+    // failure (LN_ERR_PARSE), distinct from auth (401/403), not-found (404)
+    // and network (no transport / 5xx) failures.
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_tree_submit_delta(ln_client_t* client,
@@ -456,6 +475,7 @@ ln_error_t ln_cert_request(ln_client_t* client,
     j["domain"]           = result.value.domain;
     j["fullchain_pem"]    = result.value.fullchain_pem;
     j["encrypted_privkey"] = result.value.encrypted_privkey;
+    j["crypto_version"]    = result.value.crypto_version;
     j["nonce"]            = result.value.nonce;
     j["ephemeral_pubkey"] = result.value.ephemeral_pubkey;
     j["expires_at"]       = result.value.expires_at;
@@ -477,6 +497,7 @@ ln_error_t ln_cert_decrypt(ln_client_t* client,
     bundle.domain           = parsed.value("domain", "");
     bundle.fullchain_pem    = parsed.value("fullchain_pem", "");
     bundle.encrypted_privkey = parsed.value("encrypted_privkey", "");
+    bundle.crypto_version    = parsed.value("crypto_version", 0u);
     bundle.nonce            = parsed.value("nonce", "");
     bundle.ephemeral_pubkey = parsed.value("ephemeral_pubkey", "");
     bundle.expires_at       = parsed.value("expires_at", uint64_t{0});
@@ -509,7 +530,13 @@ ln_error_t ln_tree_get_children(ln_client_t* client,
         arr.push_back(j);
     }
     *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    // Symmetric with ln_tree_get_node: a 2xx response whose body did not
+    // parse is a malformed-response failure (LN_ERR_PARSE), not a network or
+    // auth failure.
+    if (result.ok) return LN_OK;
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +629,13 @@ ln_error_t ln_get_group_members(ln_client_t* client,
         });
     }
     *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_NOT_FOUND;
+    // Symmetric with ln_tree_get_node: a 2xx response whose body did not
+    // parse is a malformed-response failure (LN_ERR_PARSE), not a network or
+    // auth failure.
+    if (result.ok) return LN_OK;
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_join_group(ln_client_t* client,
@@ -638,7 +671,7 @@ ln_error_t ln_join_network(ln_client_t* client,
     j["node_id"]        = result.value.node_id;
     j["tunnel_ip"]      = result.value.tunnel_ip;
     j["private_subnet"] = result.value.private_subnet;
-    j["wg_pubkey"]      = result.value.wg_pubkey;
+    j["mesh_pubkey"]    = result.value.mesh_pubkey;
     if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);
@@ -1148,7 +1181,7 @@ ln_error_t ln_mesh_status(ln_client_t* client, char** out_json) {
         json pj;
         pj["node_id"]        = p.node_id;
         pj["hostname"]       = p.hostname;
-        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["mesh_pubkey"]    = p.mesh_pubkey;
         pj["tunnel_ip"]      = p.tunnel_ip;
         pj["private_subnet"] = p.private_subnet;
         pj["endpoint"]       = p.endpoint;
@@ -1176,7 +1209,7 @@ ln_error_t ln_mesh_peers(ln_client_t* client, char** out_json) {
         json pj;
         pj["node_id"]        = p.node_id;
         pj["hostname"]       = p.hostname;
-        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["mesh_pubkey"]    = p.mesh_pubkey;
         pj["tunnel_ip"]      = p.tunnel_ip;
         pj["private_subnet"] = p.private_subnet;
         pj["endpoint"]       = p.endpoint;
@@ -1225,11 +1258,11 @@ ln_error_t ln_routing_profile(ln_client_t* client, int page, int page_size,
 }
 
 ln_error_t ln_routing_request(ln_client_t* client, const char* identifier,
-                              const char* conn_nonce_b64, const char* client_wg_pub,
+                              const char* conn_nonce_b64, const char* client_mesh_pubkey,
                               char** out_json) {
     if (!client || !identifier || !conn_nonce_b64 || !out_json) return LN_ERR_NULL_ARG;
     auto r = client->client.request_endpoint(identifier, conn_nonce_b64,
-                                             client_wg_pub ? client_wg_pub : "");
+                                             client_mesh_pubkey ? client_mesh_pubkey : "");
     if (!r.ok) return r.http_status == 403 ? LN_ERR_REJECTED : LN_ERR_CONNECT;
     json j = {{"connection_id", r.value.connection_id}, {"state", r.value.state}};
     *out_json = strdup_json(j);

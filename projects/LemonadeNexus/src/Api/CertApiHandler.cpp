@@ -188,17 +188,26 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         const std::string info_str = "lemonade-nexus-cert-issue";
         auto enc_key = ctx_.crypto.hkdf_sha256(shared_secret, {},
             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(info_str.data()), info_str.size()), 32);
-        crypto::AesGcmKey aes_key{};
+        crypto::AeadKey aes_key{};
         std::memcpy(aes_key.data(), enc_key.data(), std::min(enc_key.size(), aes_key.size()));
 
         auto privkey_bytes = std::vector<uint8_t>(
             existing->privkey_pem.begin(), existing->privkey_pem.end());
-        auto encrypted = ctx_.crypto.aes_gcm_encrypt(aes_key, privkey_bytes, {});
+        // Bound to the request it answers: this client and this domain. A
+        // bundle cannot be replayed at another client or another name.
+        const auto aad = crypto::aead_aad(
+            crypto::aead_purpose::kCertBundle,
+            {std::span<const uint8_t>(client_ed_pk.data(), client_ed_pk.size()),
+             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fqdn.data()),
+                                      fqdn.size())});
+        auto encrypted =
+            ctx_.crypto.aead_encrypt(aes_key, privkey_bytes, std::span<const uint8_t>{aad});
 
         network::CertIssueResponse resp{
             .domain            = fqdn,
             .fullchain_pem     = existing->fullchain_pem,
             .encrypted_privkey = crypto::to_base64(encrypted.ciphertext),
+            .crypto_version    = encrypted.version,
             .nonce             = crypto::to_base64(encrypted.nonce),
             .ephemeral_pubkey  = crypto::to_base64(ephemeral.public_key),
             .expires_at        = existing->expires_at,

@@ -19,7 +19,7 @@ A self-hosted, cryptographically secure userspace mesh VPN with zero-trust archi
 - **Federated relay servers** — community relays see only ciphertext; geo-aware selection
 - **IPAM** — automatic /10 tunnel IP allocation, private subnets, shared blocks
 - **ACME certificates** — automatic TLS via Let's Encrypt or ZeroSSL; server issues certs for clients
-- **Distributed authoritative DNS** — every Tier 1 peer serves the same DNS zone via gossip-synced records; ACME DNS-01 challenges served locally
+- **Authoritative DNS** — public UDP+TCP 53 maps to local 5335, including Genesis bootstrap records and local ACME DNS-01 challenges
 - **Dynamic DNS** — automatic Namecheap DDNS updates for enrolled servers
 - **Permission tree** — hierarchical ACL with signed deltas and gossip propagation
 - **WebAuthn passkeys** — passwordless authentication for management
@@ -73,7 +73,8 @@ Open the following ports on each server's firewall/security group/ACL:
 | 9102 | **UDP** | Inbound | Mesh servers only | Gossip protocol (peer sync, state replication) | Yes |
 | 3478 | **UDP** | Inbound | Mesh servers only | STUN (NAT traversal, external IP discovery) | Yes |
 | 9103 | **UDP** | Inbound | Mesh servers | Relay (forwarded mesh traffic) | Only if relay |
-| 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (NAT to 5353 on server) | Optional |
+| 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (NAT to 5335 on server) | Genesis/bootstrap and DNS-serving nodes |
+| 53 | **TCP** | Inbound | Internet / mesh | Authoritative DNS (NAT to 5335 on server) | Genesis/bootstrap and DNS-serving nodes |
 
 > **Note on port 9101**: The Private HTTPS API (TCP :9101) binds to the **mesh tunnel IP** (10.64.x.x), not the external interface. It does **not** need a firewall rule — it is only reachable over the encrypted mesh tunnel. The server requests an ACME certificate for `private.<id>.<region>.seip.<domain>` to serve HTTPS on the tunnel.
 
@@ -88,7 +89,18 @@ ALLOW UDP  3478  IN   FROM <mesh-servers>   # STUN NAT traversal
 
 # Optional
 ALLOW UDP  9103  IN   FROM <mesh-servers>   # Relay (only if acting as relay)
-ALLOW UDP    53  IN   FROM any             # DNS (only Tier 1 servers)
+
+# Genesis/bootstrap and authoritative DNS: map public UDP+TCP 53 to local 5335.
+ALLOW UDP    53  IN   FROM any             # DNS
+ALLOW TCP    53  IN   FROM any             # DNS over TCP
+```
+
+On a packaged install the mapping is one flag, and it lives in its own nftables
+table so no other firewall policy is touched:
+```bash
+sudo nexus-bootstrap --release-signing-pubkey <KEY> --install-dns-nat
+nft list table inet nexus-dns          # inspect
+systemctl disable --now nexus-dns-nat.service   # remove
 ```
 
 **MikroTik example** (dst-nat to internal server at 10.10.12.16):
@@ -99,7 +111,8 @@ ALLOW UDP    53  IN   FROM any             # DNS (only Tier 1 servers)
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9102 comment="FRS-LMND-NXS-GOSSIP"
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=3478 comment="FRS-LMND-NXS-STUN"
 /ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9103 comment="FRS-LMND-NXS-RELAY"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=5353 comment="FRS-LMND-NXS-DNS"
+/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=5335 comment="FRS-LMND-NXS-DNS"
+/ip firewall filter add chain=forward action=accept protocol=tcp dst-address=10.10.12.16 dst-port=5335 comment="FRS-LMND-NXS-DNS-TCP"
 ```
 
 > Port **9100/tcp**, **51940/udp**, and **51941/udp** should allow `any` source since clients may connect from unknown IPs. Gossip (**9102/udp**) and STUN (**3478/udp**) can be restricted to known mesh server IPs if desired.
@@ -498,7 +511,7 @@ Clients can request TLS certificates for their hostname (e.g., `my-laptop.capi.l
 
 1. Client calls `request_certificate("my-laptop")`
 2. Server obtains the cert from Let's Encrypt/ZeroSSL via ACME DNS-01
-3. Server encrypts the private key using X25519 DH + HKDF + AES-256-GCM with the client's Ed25519 public key
+3. Server encrypts the private key using X25519 DH + HKDF + XChaCha20-Poly1305 with the client's Ed25519 public key
 4. Client decrypts with `decrypt_certificate()` to get the PEM files
 
 ## Configuration
@@ -520,7 +533,8 @@ All ports are fully configurable at runtime — no recompilation needed.
 | `--gossip-port <N>` | `SP_GOSSIP_PORT` | `gossip_port` | `9102` | Gossip protocol (UDP) |
 | `--stun-port <N>` | `SP_STUN_PORT` | `stun_port` | `3478` | STUN NAT traversal (UDP) |
 | `--relay-port <N>` | `SP_RELAY_PORT` | `relay_port` | `9103` | Relay forwarding (UDP) |
-| `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `53` | Authoritative DNS (UDP) |
+| `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `5335` | Local authoritative DNS, UDP+TCP |
+| `--public-dns-port <N>` | `SP_PUBLIC_DNS_PORT` | `public_dns_port` | `53` | Public DNS, UDP+TCP mapped to local 5335 |
 | `--private-http-port <N>` | `SP_PRIVATE_HTTP_PORT` | `private_http_port` | `9101` | Private HTTPS API, binds to tunnel IP (TCP) |
 | `--bind-address <addr>` | `SP_BIND_ADDRESS` | `bind_address` | `0.0.0.0` | Listen address for all services |
 | `--region <code>` | `SP_REGION` | `region` | (auto-detect) | Cloud region code (e.g. `us-west`, `eu-central`) |
@@ -545,7 +559,7 @@ SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
   "gossip_port": 8102,
   "stun_port": 3478,
   "relay_port": 8103,
-  "dns_port": 5353,
+  "dns_port": 5335,
   "private_http_port": 9101
 }
 ```
@@ -719,7 +733,7 @@ The root Ed25519 private key is split using Shamir's Secret Sharing over GF(2^8)
 
 - **N** = all eligible Tier 1 peers (100% distribution)
 - **K** = ceil(75% of N), minimum 2 (reconstruction threshold)
-- Shares are encrypted per-peer using X25519 Diffie-Hellman + HKDF + AES-256-GCM
+- Shares are encrypted per-peer using X25519 Diffie-Hellman + HKDF + XChaCha20-Poly1305
 - If the root server goes offline, any K Tier 1 peers can reconstruct the key
 
 ## Building from Source
@@ -862,7 +876,7 @@ All dependencies are fetched automatically via CMake FetchContent:
 
 | Library | Version | Purpose |
 |---------|---------|---------|
-| libsodium | latest | Ed25519, X25519, AES-GCM, Shamir |
+| libsodium | latest | Ed25519, X25519, XChaCha20-Poly1305, Shamir |
 | nlohmann_json | 3.12.0 | JSON serialization |
 | spdlog | 1.16.0 | Logging |
 | asio | 1.34.2 | Async I/O (UDP, timers) |

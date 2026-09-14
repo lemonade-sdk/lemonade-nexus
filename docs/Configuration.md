@@ -31,7 +31,8 @@ Priority (highest to lowest):
 | `--gossip-port <N>` | `SP_GOSSIP_PORT` | `gossip_port` | `9102` | Gossip protocol |
 | `--stun-port <N>` | `SP_STUN_PORT` | `stun_port` | `3478` | STUN NAT traversal |
 | `--relay-port <N>` | `SP_RELAY_PORT` | `relay_port` | `9103` | Relay forwarding |
-| `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `53` | Authoritative DNS |
+| `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `5335` | Local authoritative DNS, UDP+TCP |
+| `--public-dns-port <N>` | `SP_PUBLIC_DNS_PORT` | `public_dns_port` | `53` | Public DNS, UDP+TCP mapped to local 5335 |
 | `--private-http-port <N>` | `SP_PRIVATE_HTTP_PORT` | `private_http_port` | `9101` | Private HTTPS API |
 | `--bind-address <addr>` | `SP_BIND_ADDRESS` | `bind_address` | `0.0.0.0` | Listen address |
 | `--region <code>` | `SP_REGION` | `region` | (auto) | Cloud region code |
@@ -92,7 +93,7 @@ Priority (highest to lowest):
   "gossip_port": 9102,
   "stun_port": 3478,
   "relay_port": 9103,
-  "dns_port": 5353,
+  "dns_port": 5335,
   "private_http_port": 9101,
   "region": "us-west",
   "dns_base_domain": "lemonade-nexus.io",

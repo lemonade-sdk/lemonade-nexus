@@ -1,0 +1,525 @@
+#include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <algorithm>
+
+#include <gtest/gtest.h>
+#include <sodium.h>
+
+#include <array>
+#include <cstdint>
+#include <string>
+
+namespace constants = nexus::security::constants;
+
+using nexus::security::AttestationChallenge;
+using nexus::security::AttestationEvidence;
+using nexus::security::AttestationFailure;
+using nexus::security::AttestationVerdict;
+using nexus::security::AttestationVerifier;
+using nexus::security::Digest;
+using nexus::security::EvidenceVerdict;
+using nexus::security::LinuxAttestationProfile;
+using nexus::security::approved_path_list;
+using nexus::security::binary_approved;
+using nexus::security::path_approved;
+using nexus::security::challenge_digest;
+using nexus::security::evidence_signing_digest;
+using nexus::security::kMaxPlatformEvidenceBytes;
+using nexus::security::map_platform_failure;
+using nexus::security::platform_evidence_size;
+using nexus::security::profile_digest;
+
+namespace {
+
+template <std::size_t N>
+std::array<uint8_t, N> patterned(uint8_t seed) {
+    std::array<uint8_t, N> out{};
+    for (std::size_t i = 0; i < N; ++i) {
+        out[i] = static_cast<uint8_t>(seed + i);
+    }
+    return out;
+}
+
+constexpr const char* kApprovedBinary =
+    "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+class AttestationVerifierTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ASSERT_GE(sodium_init(), 0);
+        ASSERT_EQ(crypto_sign_keypair(node_pk_.data(), node_sk_.data()), 0);
+
+        // A COMPLETE profile: examine() refuses everything under an incomplete
+        // one, so every check below would otherwise be unreachable.
+        profile_ = nexus::security::linux_attestation_profile_v1();
+        profile_.snp.min_tcb = {2, 0, 6, 55};
+        profile_.snp.expected_measurement_hex = std::string(96, 'a');
+        profile_.ima_policy_digest.fill(0x60);
+        profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+        profile_.evidence_collector_path = "/usr/bin/nexus";
+        ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
+
+        challenge_.nonce = patterned<32>(0x01);
+        challenge_.node_id.bytes = patterned<32>(0x02);
+        challenge_.node_key = node_pk_;
+        challenge_.incarnation = 3;
+        challenge_.epoch = 9;
+        challenge_.security_ruleset = constants::kSecurityRulesetVersion;
+        challenge_.consensus_ruleset = constants::kConsensusRulesetVersion;
+        challenge_.profile_id = nexus::security::kTier1AttestationProfileId;
+        challenge_.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
+        challenge_.policy_digest = profile_digest(profile_);
+
+        evidence_.challenge_digest = challenge_digest(challenge_);
+        evidence_.node_id = challenge_.node_id;
+        evidence_.incarnation = challenge_.incarnation;
+        evidence_.epoch = challenge_.epoch;
+        evidence_.security_ruleset = constants::kSecurityRulesetVersion;
+        evidence_.consensus_ruleset = constants::kConsensusRulesetVersion;
+        evidence_.profile_id = challenge_.profile_id;
+        evidence_.profile_ruleset = challenge_.profile_ruleset;
+        evidence_.epoch_vote_key = patterned<32>(0x07);
+        // The platform bundle stays empty: garbage the platform chain rejects.
+        sign_evidence();
+    }
+
+    void sign_evidence() {
+        const Digest digest = evidence_signing_digest(evidence_);
+        ASSERT_EQ(crypto_sign_detached(evidence_.identity_signature.data(), nullptr,
+                                       digest.data(), digest.size(), node_sk_.data()),
+                  0);
+    }
+
+    // Built per call: a test may retune profile_ first, and the compiled
+    // provider set is derived from it.
+    [[nodiscard]] AttestationVerdict examine() const {
+        return AttestationVerifier(profile_).examine(challenge_, evidence_);
+    }
+
+    nexus::crypto::Ed25519PublicKey node_pk_{};
+    nexus::crypto::Ed25519PrivateKey node_sk_{};
+    LinuxAttestationProfile profile_;
+    AttestationChallenge challenge_;
+    AttestationEvidence evidence_;
+};
+
+// --- Rejection order: break one link at a time -------------------------------
+
+TEST_F(AttestationVerifierTest, RejectsChallengeForAnotherPolicy) {
+    challenge_.policy_digest[0] ^= 1;
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::RulesetMismatch);
+}
+
+TEST_F(AttestationVerifierTest, RejectsStaleChallengeRuleset) {
+    challenge_.security_ruleset = constants::kSecurityRulesetVersion + 1;
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::RulesetMismatch);
+}
+
+TEST_F(AttestationVerifierTest, RejectsStaleEvidenceSecurityRuleset) {
+    evidence_.security_ruleset = constants::kSecurityRulesetVersion + 1;
+    EXPECT_EQ(examine().failure, AttestationFailure::RulesetMismatch);
+}
+
+TEST_F(AttestationVerifierTest, RejectsStaleEvidenceConsensusRuleset) {
+    evidence_.consensus_ruleset = constants::kConsensusRulesetVersion + 1;
+    EXPECT_EQ(examine().failure, AttestationFailure::RulesetMismatch);
+}
+
+TEST_F(AttestationVerifierTest, RejectsMismatchedChallengeDigest) {
+    evidence_.challenge_digest[0] ^= 1;
+    EXPECT_EQ(examine().failure, AttestationFailure::ChallengeMismatch);
+}
+
+TEST_F(AttestationVerifierTest, RejectsEvidenceForAnotherNode) {
+    evidence_.node_id.bytes[0] ^= 1;
+    EXPECT_EQ(examine().failure, AttestationFailure::IdentityMismatch);
+}
+
+TEST_F(AttestationVerifierTest, RejectsStaleIncarnation) {
+    evidence_.incarnation += 1;
+    EXPECT_EQ(examine().failure, AttestationFailure::IncarnationStale);
+}
+
+TEST_F(AttestationVerifierTest, RejectsSignatureFromAnotherKey) {
+    nexus::crypto::Ed25519PublicKey other_pk{};
+    nexus::crypto::Ed25519PrivateKey other_sk{};
+    ASSERT_EQ(crypto_sign_keypair(other_pk.data(), other_sk.data()), 0);
+
+    const Digest digest = evidence_signing_digest(evidence_);
+    ASSERT_EQ(crypto_sign_detached(evidence_.identity_signature.data(), nullptr,
+                                   digest.data(), digest.size(), other_sk.data()),
+              0);
+    EXPECT_EQ(examine().failure, AttestationFailure::IdentitySignatureInvalid);
+}
+
+TEST_F(AttestationVerifierTest, RejectsUnsignedEvidence) {
+    evidence_.identity_signature.fill(0);
+    EXPECT_EQ(examine().failure, AttestationFailure::IdentitySignatureInvalid);
+}
+
+TEST_F(AttestationVerifierTest, RejectsGarbagePlatformBundle) {
+    // Every protocol link holds; the empty platform bundle must fail closed
+    // through the mapped platform failure.
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::SnpInvalid);
+    EXPECT_EQ(verdict.node_id, challenge_.node_id);
+    EXPECT_EQ(verdict.epoch, challenge_.epoch);
+    EXPECT_EQ(verdict.incarnation, challenge_.incarnation);
+    EXPECT_EQ(verdict.policy_digest, profile_digest(profile_));
+    EXPECT_EQ(verdict.evidence_digest, evidence_signing_digest(evidence_));
+}
+
+TEST_F(AttestationVerifierTest, PolicyCheckWinsWhenEveryLinkIsBroken) {
+    challenge_.policy_digest[0] ^= 1;
+    evidence_.challenge_digest[0] ^= 1;
+    evidence_.node_id.bytes[0] ^= 1;
+    evidence_.incarnation += 1;
+    evidence_.identity_signature.fill(0);
+    EXPECT_EQ(examine().failure, AttestationFailure::RulesetMismatch);
+}
+
+// --- Evidence size bound ------------------------------------------------------
+
+TEST_F(AttestationVerifierTest, RejectsOversizedPlatformBundle) {
+    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'a');
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::EvidenceOversized);
+    // An oversized bundle is never hashed, so the verdict carries no
+    // evidence digest.
+    EXPECT_EQ(verdict.evidence_digest, Digest{});
+}
+
+TEST_F(AttestationVerifierTest, ExactSizeLimitPassesTheGate) {
+    const std::size_t current = platform_evidence_size(evidence_.platform);
+    ASSERT_LT(current, kMaxPlatformEvidenceBytes);
+    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes - current, 'a');
+    ASSERT_EQ(platform_evidence_size(evidence_.platform), kMaxPlatformEvidenceBytes);
+    sign_evidence();
+
+    const auto verdict = examine();
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::SnpInvalid);
+}
+
+// --- Determinism --------------------------------------------------------------
+
+TEST_F(AttestationVerifierTest, VerdictIsDeterministic) {
+    const auto first = examine();
+    const auto second = examine();
+    EXPECT_EQ(first.node_id, second.node_id);
+    EXPECT_EQ(first.epoch, second.epoch);
+    EXPECT_EQ(first.incarnation, second.incarnation);
+    EXPECT_EQ(first.policy_digest, second.policy_digest);
+    EXPECT_EQ(first.evidence_digest, second.evidence_digest);
+    EXPECT_EQ(first.passed, second.passed);
+    EXPECT_EQ(first.failure, second.failure);
+}
+
+// --- Approved binary list -----------------------------------------------------
+
+TEST(PathApproved, ListedMeasurementIsApproved) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa", "bb"}}};
+    EXPECT_TRUE(path_approved(profile, "/usr/bin/nexus", "aa"));
+    EXPECT_TRUE(path_approved(profile, "/usr/bin/nexus", "bb"));
+}
+
+TEST(PathApproved, UnlistedMeasurementIsRejected) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}}};
+    EXPECT_FALSE(path_approved(profile, "/usr/bin/nexus", "cc"));
+}
+
+TEST(PathApproved, EmptyListApprovesNothing) {
+    EXPECT_FALSE(path_approved(LinuxAttestationProfile{}, "/usr/bin/nexus", "aa"));
+}
+
+TEST(PathApproved, EmptyMeasurementFailsClosedEvenWhenListed) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {""}}};
+    EXPECT_FALSE(path_approved(profile, "/usr/bin/nexus", ""));
+}
+
+TEST(PathApproved, APathOutsideTheCompiledListApprovesNothing) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}}};
+    EXPECT_FALSE(path_approved(profile, "/tmp/nexus", "aa"));
+    EXPECT_FALSE(path_approved(profile, "", "aa"));
+}
+
+TEST(PathApproved, DigestsDoNotCrossPaths) {
+    // The ambiguity this model exists to remove: an approved release of the
+    // helper must not satisfy the path reserved for the server.
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}},
+                              {"/usr/bin/nexus-attestd", {"bb"}}};
+
+    EXPECT_TRUE(path_approved(profile, "/usr/bin/nexus", "aa"));
+    EXPECT_TRUE(path_approved(profile, "/usr/bin/nexus-attestd", "bb"));
+    EXPECT_FALSE(path_approved(profile, "/usr/bin/nexus", "bb"));
+    EXPECT_FALSE(path_approved(profile, "/usr/bin/nexus-attestd", "aa"));
+}
+
+TEST(PathApproved, TheListedPathsAreWhatTheChainIsGiven) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {"aa"}},
+                              {"/usr/bin/nexus-attestd", {"bb"}}};
+    EXPECT_EQ(approved_path_list(profile),
+              (std::vector<std::string>{"/usr/bin/nexus", "/usr/bin/nexus-attestd"}));
+    EXPECT_TRUE(approved_path_list(LinuxAttestationProfile{}).empty());
+}
+
+// --- Platform failure mapping -------------------------------------------------
+
+EvidenceVerdict platform_failure(std::string why, bool quote_verified) {
+    EvidenceVerdict verdict;
+    verdict.ok = false;
+    verdict.quote_verified = quote_verified;
+    verdict.failure = std::move(why);
+    return verdict;
+}
+
+struct MappingCase {
+    const char* why;
+    bool quote_verified;
+    AttestationFailure expected;
+};
+
+// Every failure string verify_snp_vtpm_evidence can produce, with the half of
+// the chain it belongs to.
+const MappingCase kMappingCases[] = {
+    // Before the quote held: SNP parse, AMD chain, guest policy.
+    {"the attestation blob is malformed or inconsistent", false,
+     AttestationFailure::SnpInvalid},
+    {"AMD signature check failed: attestation report signature is not valid under the VCEK",
+     false, AttestationFailure::SnpInvalid},
+    {"platform policy check failed: guest policy allows DEBUG — the hypervisor can read "
+     "guest memory",
+     false, AttestationFailure::SnpInvalid},
+    {"platform policy check failed: guest policy allows a migration agent — the guest can "
+     "be moved out of its encryption boundary",
+     false, AttestationFailure::SnpInvalid},
+    {"platform policy check failed: report was requested at VMPL 2, expected VMPL 0", false,
+     AttestationFailure::SnpInvalid},
+    {"platform policy check failed: platform TCB [2.0.6.55] is below the required floor "
+     "[3.0.8.100]",
+     false, AttestationFailure::TcbTooOld},
+    {"platform policy check failed: launch measurement 0011223344556677... does not match "
+     "the pinned value",
+     false, AttestationFailure::SnpInvalid},
+    // The enrolled vTPM pin.
+    {"the platform binding key does not match the one pinned at enrollment (different "
+     "vTPM, or the AK was rotated)",
+     false, AttestationFailure::VtpmBindingInvalid},
+    // The quote itself.
+    {"the quote is not a well-formed TPM2 attestation", false,
+     AttestationFailure::TpmQuoteInvalid},
+    {"the quote is not signed by HCLAkPub: bad signature", false,
+     AttestationFailure::TpmQuoteInvalid},
+    {"the quote signature has no readable hash algorithm", false,
+     AttestationFailure::TpmQuoteInvalid},
+    {"the supplied PCR values are not the ones the quote signed", false,
+     AttestationFailure::TpmQuoteInvalid},
+    // The quote does not answer the current challenge.
+    {"the quote is not bound to this challenge, identity and binary measurement", false,
+     AttestationFailure::ChallengeMismatch},
+    // A malformed self-claimed measurement, rejected before the quote check.
+    {"the claimed binary measurement is not hex", false,
+     AttestationFailure::BinaryMeasurementInvalid},
+    // After the quote held: IMA replay and the binary measurement.
+    {"the platform is verified but its binary is not measured: IMA is not enabled", true,
+     AttestationFailure::BinaryMeasurementInvalid},
+    {"the IMA measurement log did not parse", true, AttestationFailure::ImaMeasurementInvalid},
+    {"the IMA measurement log is empty", true, AttestationFailure::ImaMeasurementInvalid},
+    {"the IMA log's template digest width matches no PCR bank", true,
+     AttestationFailure::ImaMeasurementInvalid},
+    {"the quote does not cover PCR 10 in the bank this IMA log replays into, so the log "
+     "is unanchored",
+     true, AttestationFailure::ImaMeasurementInvalid},
+    {"the IMA log does not replay to the quoted PCR 10 — the log has been edited or "
+     "truncated",
+     true, AttestationFailure::ImaMeasurementInvalid},
+    {"the IMA log carries no measurement of '/opt/nexus'", true,
+     AttestationFailure::BinaryMeasurementInvalid},
+    {"the claimed binary measurement is not what the kernel recorded for that path", true,
+     AttestationFailure::BinaryMeasurementInvalid},
+    // Boot state: the quote covers these PCRs, so a mismatch is an attested
+    // fact about the wrong boot chain.
+    {"the boot measurement does not match the approved value for PCR 4", true,
+     AttestationFailure::BootMeasurementInvalid},
+    {"the boot measurement is incomplete: the quote does not cover PCR 7", true,
+     AttestationFailure::BootMeasurementInvalid},
+    // Runtime profile.
+    {"the runtime profile is wrong: no_new_privs is not set", true,
+     AttestationFailure::RuntimeProfileInvalid},
+    {"the runtime profile is wrong: seccomp is not active", true,
+     AttestationFailure::RuntimeProfileInvalid},
+    // The IMA policy behind the log.
+    {"the IMA policy digest is not the approved one", true,
+     AttestationFailure::ImaMeasurementInvalid},
+    {"the IMA policy digest is absent, so the measuring policy cannot be checked against "
+     "the approved one",
+     true, AttestationFailure::ImaMeasurementInvalid},
+};
+
+TEST(MapPlatformFailure, CoversEveryFailureClassTheChainProduces) {
+    for (const auto& mapping_case : kMappingCases) {
+        const auto verdict = platform_failure(mapping_case.why, mapping_case.quote_verified);
+        EXPECT_EQ(map_platform_failure(verdict), mapping_case.expected) << mapping_case.why;
+    }
+}
+
+TEST(MapPlatformFailure, PassingVerdictMapsToNone) {
+    EvidenceVerdict verdict;
+    verdict.ok = true;
+    verdict.quote_verified = true;
+    EXPECT_EQ(map_platform_failure(verdict), AttestationFailure::None);
+}
+
+TEST(MapPlatformFailure, UnknownStringsMapToTheMostSevereOfTheirHalf) {
+    EXPECT_EQ(map_platform_failure(platform_failure("some future failure", false)),
+              AttestationFailure::SnpInvalid);
+    EXPECT_EQ(map_platform_failure(platform_failure("some future failure", true)),
+              AttestationFailure::ImaMeasurementInvalid);
+}
+
+TEST(MapPlatformFailure, MappingIsDeterministic) {
+    const auto verdict = platform_failure(kMappingCases[0].why, kMappingCases[0].quote_verified);
+    for (int i = 0; i < 10; ++i) {
+        EXPECT_EQ(map_platform_failure(verdict), kMappingCases[0].expected);
+    }
+}
+
+}  // namespace
+
+// --- Last-wins across a replacement -------------------------------------------
+//
+// This composes the two steps the verifier composes: find the LAST measurement
+// the kernel recorded for the approved path, then ask whether that release is
+// approved for it. Written against a real log rather than a mocked lookup,
+// because the ordering rule is the security property.
+//
+// It exists before any checkpoint code on purpose. A checkpoint summary that
+// let an older approved measurement shadow a newer unapproved one would turn
+// this refusal into an acceptance, and this is the test that would catch it.
+
+namespace {
+
+std::string ima_entry(const char* template_hash, const char* file_hash, const char* path) {
+    return std::string("10 ") + template_hash + " ima-ng sha256:" + file_hash + " " + path + "\n";
+}
+
+/// The verifier's whole decision: the conjunction over every required path.
+bool log_satisfies(const LinuxAttestationProfile& profile, const std::string& log) {
+    auto parsed = nexus::security::parse_ima_ascii(log);
+    return parsed && binary_approved(profile, *parsed);
+}
+
+constexpr const char* kUnapprovedBinary =
+    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+}  // namespace
+
+TEST(ReplacementBinary, ALaterUnapprovedMeasurementOverridesAnEarlierApprovedOne) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+
+    // Approved at boot, replaced afterwards. The kernel measured both.
+    const std::string log = ima_entry(std::string(40, '1').c_str(), kApprovedBinary,
+                                      "/usr/bin/nexus") +
+                            ima_entry(std::string(40, '2').c_str(), kUnapprovedBinary,
+                                      "/usr/bin/nexus");
+    EXPECT_FALSE(log_satisfies(profile, log));
+
+    // The approved entry alone still passes, so the refusal above is the
+    // ordering rule and not a broken fixture.
+    EXPECT_TRUE(log_satisfies(
+        profile, ima_entry(std::string(40, '1').c_str(), kApprovedBinary, "/usr/bin/nexus")));
+}
+
+TEST(ReplacementBinary, AnApprovedMeasurementOfAnotherPathDoesNotRescueIt) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}},
+                              {"/usr/bin/nexus-attestd", {kUnapprovedBinary}}};
+
+    // Both required components measured; the server's replacement hash IS
+    // approved — for the other component. Pooling the digests would accept it.
+    const std::string log = ima_entry(std::string(40, '1').c_str(), kApprovedBinary,
+                                      "/usr/bin/nexus") +
+                            ima_entry(std::string(40, '3').c_str(), kUnapprovedBinary,
+                                      "/usr/bin/nexus-attestd") +
+                            ima_entry(std::string(40, '2').c_str(), kUnapprovedBinary,
+                                      "/usr/bin/nexus");
+    EXPECT_FALSE(log_satisfies(profile, log));
+}
+
+TEST(ReplacementBinary, AProverNamedPathOutsideTheProfileIsRefused) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+
+    // A perfectly real, correctly measured file that the profile never approved
+    // — and the required component absent, so the conjunction fails too.
+    const std::string log = ima_entry(std::string(40, '3').c_str(), kApprovedBinary, "/tmp/copy");
+    EXPECT_FALSE(path_approved(profile, "/tmp/copy", kApprovedBinary));
+    EXPECT_FALSE(log_satisfies(profile, log));
+
+    // And the path list the platform chain is handed does not contain it, so
+    // the chain refuses before the lookup as well.
+    const auto paths = approved_path_list(profile);
+    EXPECT_EQ(std::find(paths.begin(), paths.end(), "/tmp/copy"), paths.end());
+}
+
+// --- The required set is a conjunction ----------------------------------------
+
+TEST(RequiredSet, EveryRequiredComponentMustBeMeasured) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}},
+                              {"/usr/bin/nexus-attestd", {kUnapprovedBinary}}};
+
+    const auto nexus_line = ima_entry(std::string(40, '1').c_str(), kApprovedBinary,
+                                      "/usr/bin/nexus");
+    const auto attestd_line = ima_entry(std::string(40, '2').c_str(), kUnapprovedBinary,
+                                        "/usr/bin/nexus-attestd");
+
+    // A subset is not a pass: an absent required component fails the whole set.
+    EXPECT_FALSE(log_satisfies(profile, nexus_line));
+    EXPECT_FALSE(log_satisfies(profile, attestd_line));
+    EXPECT_TRUE(log_satisfies(profile, nexus_line + attestd_line));
+    EXPECT_FALSE(log_satisfies(profile, ""));
+}
+
+TEST(RequiredSet, ANonSha256MeasurementOfARequiredPathFailsClosed) {
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+
+    const std::string log = std::string("10 ") + std::string(40, '1') +
+                            " ima-ng sha1:" + std::string(40, 'a') + " /usr/bin/nexus\n";
+    EXPECT_FALSE(log_satisfies(profile, log));
+}
+
+TEST(RequiredSet, AnEmptyRequiredSetApprovesNothing) {
+    auto parsed = nexus::security::parse_ima_ascii(
+        ima_entry(std::string(40, '1').c_str(), kApprovedBinary, "/usr/bin/nexus"));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_FALSE(binary_approved(LinuxAttestationProfile{}, *parsed));
+}
+
+TEST(RequiredSet, ExtraMeasuredFilesDoNotFailTheConjunction) {
+    // The model's stated limit: the conjunction proves the required components,
+    // not the absence of other measured code. Other files in the log are noise
+    // to this check, not violations of it.
+    LinuxAttestationProfile profile;
+    profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
+    const std::string log = ima_entry(std::string(40, '1').c_str(), kApprovedBinary,
+                                      "/usr/bin/nexus") +
+                            ima_entry(std::string(40, '2').c_str(), kUnapprovedBinary,
+                                      "/usr/bin/other-tool");
+    EXPECT_TRUE(log_satisfies(profile, log));
+}

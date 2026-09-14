@@ -24,13 +24,13 @@ std::string strip_cidr(const std::string& ip) {
     return (slash != std::string::npos) ? ip.substr(0, slash) : ip;
 }
 
-/// Build a map from tunnel_ip (without /prefix) to last WG handshake epoch.
+/// Build a map from tunnel address to the last Noise handshake epoch.
 /// Used to determine peer liveness from the boringtun layer.
-std::unordered_map<std::string, uint64_t> build_wg_handshake_map(
-    nexus::boringtun::BoringtunService* wg) {
+std::unordered_map<std::string, uint64_t> build_mesh_handshake_map(
+    nexus::boringtun::BoringtunService* dataplane) {
     std::unordered_map<std::string, uint64_t> m;
-    if (!wg) return m;
-    for (const auto& peer : wg->get_peers()) {
+    if (!dataplane) return m;
+    for (const auto& peer : dataplane->get_peers()) {
         auto ip = strip_cidr(peer.allowed_ips);
         if (!ip.empty() && peer.last_handshake > 0) {
             m[ip] = peer.last_handshake;
@@ -126,8 +126,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         // Descendants of the caller's parent group; ACL-filtered per node below.
         auto reachable = ctx_.tree.collect_subtree(node.parent_id);
 
-        // Build WG handshake map to determine peer liveness from the tunnel layer
-        auto wg_map = build_wg_handshake_map(ctx_.boringtun);
+        // Use Noise handshake activity to determine peer liveness.
+        auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
         auto now = epoch_seconds();
 
         // Build peer list: all Endpoint-type nodes in scope except the caller
@@ -142,12 +142,12 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 continue;  // skip nodes we can't see
             }
 
-            // Determine online status from WG handshake timestamp
+            // Determine online status from the last Noise handshake.
             auto sip = strip_cidr(sibling.tunnel_ip);
             uint64_t last_seen = 0;
             bool online = false;
-            auto it = wg_map.find(sip);
-            if (it != wg_map.end()) {
+            auto it = mesh_handshakes.find(sip);
+            if (it != mesh_handshakes.end()) {
                 last_seen = it->second;
                 online = (now - last_seen) < kStaleThresholdSec;
             }
@@ -155,7 +155,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             nlohmann::json peer;
             peer["node_id"]        = sibling.id;
             peer["hostname"]       = sibling.hostname;
-            peer["wg_pubkey"]      = sibling.wg_pubkey;
+            peer["mesh_pubkey"]    = sibling.mesh_pubkey;
             peer["tunnel_ip"]      = sibling.tunnel_ip;
             peer["private_subnet"] = sibling.private_subnet;
             peer["endpoint"]       = sibling.listen_endpoint;
@@ -176,7 +176,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             nlohmann::json peer;
             peer["node_id"]        = sibling.id;
             peer["hostname"]       = sibling.hostname;
-            peer["wg_pubkey"]      = sibling.wg_pubkey;
+            peer["mesh_pubkey"]    = sibling.mesh_pubkey;
             peer["tunnel_ip"]      = sibling.tunnel_ip;
             peer["private_subnet"] = sibling.private_subnet;
             peer["endpoint"]       = sibling.listen_endpoint;
@@ -296,7 +296,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         if (!node.parent_id.empty()) {
             auto reachable = ctx_.tree.collect_subtree(node.parent_id);
-            auto wg_map = build_wg_handshake_map(ctx_.boringtun);
+            auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
             auto now = epoch_seconds();
             for (const auto& s : reachable) {
                 if (s.id == node_id) continue;
@@ -310,8 +310,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                     ++online_count;  // relays always considered online
                 } else {
                     auto sip = strip_cidr(s.tunnel_ip);
-                    auto it = wg_map.find(sip);
-                    if (it != wg_map.end() && (now - it->second) < kStaleThresholdSec) {
+                    auto it = mesh_handshakes.find(sip);
+                    if (it != mesh_handshakes.end() &&
+                        (now - it->second) < kStaleThresholdSec) {
                         ++online_count;
                     }
                 }
@@ -338,12 +339,12 @@ nlohmann::json MeshApiHandler::build_server_peer() const {
     sp["is_server"] = true;
 
     // Derive mesh public key from server identity for the peer entry
-    sp["wg_pubkey"] = "";  // filled by caller if needed; server's WG pubkey
+    sp["mesh_pubkey"] = "";
     if (ctx_.boringtun) {
-        // The server's WG pubkey is stored in the root node or derived from identity
+        // The server mesh key is stored in the root node.
         auto root_nodes = ctx_.tree.get_nodes_by_type(tree::NodeType::Root);
         if (!root_nodes.empty()) {
-            sp["wg_pubkey"] = root_nodes[0].wg_pubkey;
+            sp["mesh_pubkey"] = root_nodes[0].mesh_pubkey;
         }
     }
 

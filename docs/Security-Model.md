@@ -31,7 +31,7 @@ title: Security Model
 Every server and client has an Ed25519 keypair. Keys are:
 - **Derived** from username+password via PBKDF2 (100k rounds, SHA256) — deterministic, same creds = same key
 - **Generated** randomly for servers on first boot
-- **Stored** encrypted at rest (AES-256-GCM with HKDF-derived key)
+- **Stored** encrypted at rest (XChaCha20-Poly1305 with HKDF-derived key)
 
 The Ed25519 key is the root of all trust. From it, we derive:
 - **X25519** keys for the mesh tunnel (Curve25519 Noise key exchange)
@@ -108,7 +108,7 @@ Sensitive secrets (DDNS passwords) are distributed via encrypted channel:
 ```
 Server → Root:  certificate + binary_hash + X25519_pubkey + signature
 Root verifies:  cert ✓, binary_hash in manifests ✓, signature ✓
-Root encrypts:  X25519 DH → HKDF → AES-256-GCM(credentials)
+Root encrypts:  X25519 DH → HKDF → XChaCha20-Poly1305(credentials)
 Server stores:  re-encrypt at rest with own identity key
 ```
 
