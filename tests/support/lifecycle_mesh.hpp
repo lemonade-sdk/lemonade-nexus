@@ -56,6 +56,7 @@ struct MemoryMesh {
     std::vector<NextEpochPlanProof> captured_plans;
     std::vector<ReadinessProofMsg> captured_readiness;
     std::vector<EpochHandoffProofMsg> captured_handoffs;
+    std::vector<EpochAnnouncement> captured_announcements;
     /// Final-attestation challenges in flight, with their challenger. The
     /// fixture answers them the way a real producer and verifier would; a
     /// challenge to an offline subject is never captured, which is exactly a
@@ -224,6 +225,8 @@ inline void MemoryMesh::capture(std::span<const uint8_t> bytes) {
         captured_readiness.push_back(*readiness);
     } else if (const auto* handoff = std::get_if<EpochHandoffProofMsg>(&message.body)) {
         captured_handoffs.push_back(*handoff);
+    } else if (const auto* announcement = std::get_if<EpochAnnouncement>(&message.body)) {
+        captured_announcements.push_back(*announcement);
     }
 }
 

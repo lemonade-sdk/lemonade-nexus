@@ -208,7 +208,7 @@ private:
                                               const CommitProof& proof) const;
     void do_activate(const Digest& checkpoint);
     void persist_current_epoch(const Digest& checkpoint);
-    void announce_epoch(const Digest& checkpoint);
+    void announce_epoch(const Digest& checkpoint, const Digest& dkg_transcript_digest);
 
     [[nodiscard]] Digest genesis_attestation_root(const Tier1Set& founders) const;
 

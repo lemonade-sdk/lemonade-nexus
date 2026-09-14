@@ -108,6 +108,76 @@ TEST_F(DriverMesh, TimedHandoffRotatesToEpochTwo) {
     run_until_committed(before + 1);
 }
 
+// The announcement is a hint, not authority — but the hint must not be wrong:
+// its authority record carries the announced epoch's real DKG transcript digest,
+// not an all-zero placeholder, so a verifier comparing canonical digests over
+// the announcement sees the transcript the epoch was actually built on.
+TEST_F(DriverMesh, EpochAnnouncementCarriesTheRealDkgTranscriptDigest) {
+    bootstrap();
+    run_until_committed(1);
+    prepare_handoff();
+
+    // Injected final verdicts for the target epoch, binding epoch-2 vote keys
+    // and the committed plan's exact attestation context.
+    for (Node* member : founders) {
+        const auto vote_key = member->driver->vote_key_for_epoch(2);
+        ASSERT_TRUE(vote_key.has_value());
+        for (Node* founder : founders) {
+            founder->driver->on_attestation_verdict(final_verdict(latest_plan(), member->id),
+                                                    evidence_for(member->id, *vote_key));
+        }
+    }
+    mesh.pump();
+    for (int i = 0; i < 200; ++i) {
+        step(1);
+        const bool ready = std::all_of(founders.begin(), founders.end(), [](Node* f) {
+            return f->runtime->epochs() != nullptr &&
+                   f->runtime->epochs()->transition() != nullptr &&
+                   f->runtime->epochs()->transition()->phase == EpochTransitionPhase::Ready;
+        });
+        if (ready) break;
+    }
+    for (Node* founder : founders) {
+        ASSERT_NE(founder->runtime->epochs()->transition(), nullptr);
+        EXPECT_EQ(founder->runtime->epochs()->transition()->phase, EpochTransitionPhase::Ready);
+    }
+
+    // The next committed block carries the handoff and activates Epoch 2.
+    for (int step = 0; step < 200; ++step) {
+        mesh.now_ms += 200;
+        for (Node* founder : founders) founder->driver->tick(mesh.now_ms);
+        mesh.pump();
+        const bool rotated = std::all_of(founders.begin(), founders.end(), [](Node* f) {
+            return f->driver->current_epoch() == 2u;
+        });
+        if (rotated) break;
+    }
+    for (Node* founder : founders) {
+        ASSERT_EQ(founder->driver->current_epoch(), 2u);
+    }
+
+    // What every honest node derived for the announced epoch: the digest the
+    // driver persisted with the epoch's authority record, straight from the
+    // store the activation path writes through.
+    const auto history = founders.front()->store->load_authority_history();
+    ASSERT_TRUE(std::holds_alternative<std::vector<EpochAuthorityRecord>>(history));
+    const auto& records = std::get<std::vector<EpochAuthorityRecord>>(history);
+    ASSERT_EQ(records.size(), 2u);
+    ASSERT_EQ(records.back().epoch, 2u);
+    const Digest transcript = records.back().dkg_transcript_digest;
+    ASSERT_NE(transcript, Digest{});
+
+    // And what left the mesh for it: the announcement the driver broadcast
+    // when the epoch activated.
+    ASSERT_FALSE(mesh.captured_announcements.empty());
+    const auto found =
+        std::find_if(mesh.captured_announcements.begin(), mesh.captured_announcements.end(),
+                     [](const EpochAnnouncement& a) { return a.authority.epoch == 2u; });
+    ASSERT_NE(found, mesh.captured_announcements.end());
+    const EpochAnnouncement& announcement = *found;
+    EXPECT_EQ(announcement.authority.dkg_transcript_digest, transcript);
+}
+
 TEST_F(DriverMesh, RestartSyncsToACertifiedFloorBeforeVoting) {
     bootstrap();
     run_until_committed(2);
