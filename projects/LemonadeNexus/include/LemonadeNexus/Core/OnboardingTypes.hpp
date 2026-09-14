@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <limits>
@@ -325,6 +326,8 @@ using OnboardingDto = onboarding_json::Serializable<Derived>;
     ::nexus::core::onboarding_json::field(#Name, &Type::Name)
 
 struct OnboardingInfoResponse : OnboardingDto<OnboardingInfoResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 3;
     bool accepts_onboarding{false};
     std::string dns_base_domain;
     std::string server_fqdn;
@@ -337,6 +340,8 @@ struct OnboardingInfoResponse : OnboardingDto<OnboardingInfoResponse> {
 };
 
 struct ChallengeRequest : OnboardingDto<ChallengeRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 1;
     std::string candidate_pubkey;
 
     static constexpr auto jsonFields() {
@@ -346,6 +351,8 @@ struct ChallengeRequest : OnboardingDto<ChallengeRequest> {
 };
 
 struct ChallengeResponse : OnboardingDto<ChallengeResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 2;
     std::string nonce;
     bool server_id_required{true};
 
@@ -357,6 +364,8 @@ struct ChallengeResponse : OnboardingDto<ChallengeResponse> {
 };
 
 struct AdmissionRequest : OnboardingDto<AdmissionRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 14;
     std::string candidate_pubkey;
     std::string server_id;
     std::string region;
@@ -393,6 +402,8 @@ struct AdmissionRequest : OnboardingDto<AdmissionRequest> {
 };
 
 struct AdmissionResponse : OnboardingDto<AdmissionResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 2;
     std::string request_id;
     AdmissionState state{AdmissionState::Pending};
 
@@ -404,6 +415,8 @@ struct AdmissionResponse : OnboardingDto<AdmissionResponse> {
 };
 
 struct PollRequest : OnboardingDto<PollRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 4;
     std::string request_id;
     std::string candidate_pubkey;
     uint64_t timestamp{0};
@@ -419,6 +432,8 @@ struct PollRequest : OnboardingDto<PollRequest> {
 };
 
 struct AdmissionStatusResponse : OnboardingDto<AdmissionStatusResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 2;
     AdmissionState state{AdmissionState::Pending};
     std::string reason;
 
@@ -430,6 +445,8 @@ struct AdmissionStatusResponse : OnboardingDto<AdmissionStatusResponse> {
 };
 
 struct ApprovedOnboardingBundle : OnboardingDto<ApprovedOnboardingBundle> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 7;
     AdmissionState state{AdmissionState::Approved};
     gossip::ServerCertificate certificate;
     std::string root_pubkey;
@@ -457,6 +474,8 @@ using PollResponse = std::variant<AdmissionStatusResponse, ApprovedOnboardingBun
 [[nodiscard]] nlohmann::json poll_response_to_json(const PollResponse& response);
 
 struct AckRequest : OnboardingDto<AckRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 4;
     std::string request_id;
     std::string candidate_pubkey;
     uint64_t timestamp{0};
@@ -472,6 +491,8 @@ struct AckRequest : OnboardingDto<AckRequest> {
 };
 
 struct AckResponse : OnboardingDto<AckResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 1;
     AdmissionState state{AdmissionState::Completed};
 
     static constexpr auto jsonFields() {
@@ -481,6 +502,8 @@ struct AckResponse : OnboardingDto<AckResponse> {
 };
 
 struct PendingAdmissionSummary : OnboardingDto<PendingAdmissionSummary> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 8;
     std::string request_id;
     std::string server_id;
     std::string region;
@@ -503,6 +526,8 @@ struct PendingAdmissionSummary : OnboardingDto<PendingAdmissionSummary> {
 };
 
 struct PendingAdmissionsResponse : OnboardingDto<PendingAdmissionsResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 1;
     std::vector<PendingAdmissionSummary> pending;
 
     static constexpr auto jsonFields() {
@@ -511,6 +536,8 @@ struct PendingAdmissionsResponse : OnboardingDto<PendingAdmissionsResponse> {
 };
 
 struct ApprovalRequest : OnboardingDto<ApprovalRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 3;
     std::optional<std::string> pubkey;
     std::optional<std::string> fingerprint;
     std::optional<bool> supersede;
@@ -523,6 +550,8 @@ struct ApprovalRequest : OnboardingDto<ApprovalRequest> {
 };
 
 struct DenialRequest : OnboardingDto<DenialRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 1;
     std::optional<std::string> reason;
 
     static constexpr auto jsonFields() {
@@ -531,6 +560,8 @@ struct DenialRequest : OnboardingDto<DenialRequest> {
 };
 
 struct AdmissionDecisionResponse : OnboardingDto<AdmissionDecisionResponse> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 2;
     AdmissionState state{AdmissionState::Pending};
     std::string request_id;
 
@@ -541,6 +572,8 @@ struct AdmissionDecisionResponse : OnboardingDto<AdmissionDecisionResponse> {
 };
 
 struct AdmissionTokenRequest : OnboardingDto<AdmissionTokenRequest> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 3;
     std::string candidate_pubkey;
     std::optional<uint64_t> ttl_sec;
     std::optional<std::string> server_id;
@@ -554,6 +587,8 @@ struct AdmissionTokenRequest : OnboardingDto<AdmissionTokenRequest> {
 };
 
 struct AdmissionInvitation : OnboardingDto<AdmissionInvitation> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 5;
     std::string enrollment_token;
     uint64_t expires_at{0};
     std::string candidate_pubkey;
@@ -571,6 +606,8 @@ struct AdmissionInvitation : OnboardingDto<AdmissionInvitation> {
 };
 
 struct AdmissionRecord : OnboardingDto<AdmissionRecord> {
+    // Drift guard: number of data members.
+    static constexpr std::size_t kFieldCount = 20;
     std::string request_id;
     std::string candidate_pubkey;
     std::string server_id;
@@ -620,6 +657,8 @@ struct AdmissionRecord : OnboardingDto<AdmissionRecord> {
 };
 
 struct AdmissionStoreDocument : OnboardingDto<AdmissionStoreDocument> {
+    // Drift guard: number of data members. (kVersion is not a data member.)
+    static constexpr std::size_t kFieldCount = 4;
     static constexpr uint32_t kVersion = 1;
 
     uint32_t version{kVersion};
@@ -643,6 +682,45 @@ admission_store_from_json(const nlohmann::json& json);
 [[nodiscard]] std::vector<uint8_t> canonical_admission_request(const AdmissionRequest& request);
 [[nodiscard]] std::vector<uint8_t> canonical_onboarding_status(
     std::string_view tag, std::string_view request_id, uint64_t timestamp);
+
+static_assert(std::tuple_size_v<decltype(OnboardingInfoResponse::jsonFields())> == OnboardingInfoResponse::kFieldCount,
+              "OnboardingInfoResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(ChallengeRequest::jsonFields())> == ChallengeRequest::kFieldCount,
+              "ChallengeRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(ChallengeResponse::jsonFields())> == ChallengeResponse::kFieldCount,
+              "ChallengeResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionRequest::jsonFields())> == AdmissionRequest::kFieldCount,
+              "AdmissionRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionResponse::jsonFields())> == AdmissionResponse::kFieldCount,
+              "AdmissionResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(PollRequest::jsonFields())> == PollRequest::kFieldCount,
+              "PollRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionStatusResponse::jsonFields())> == AdmissionStatusResponse::kFieldCount,
+              "AdmissionStatusResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(ApprovedOnboardingBundle::jsonFields())> == ApprovedOnboardingBundle::kFieldCount,
+              "ApprovedOnboardingBundle::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AckRequest::jsonFields())> == AckRequest::kFieldCount,
+              "AckRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AckResponse::jsonFields())> == AckResponse::kFieldCount,
+              "AckResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(PendingAdmissionSummary::jsonFields())> == PendingAdmissionSummary::kFieldCount,
+              "PendingAdmissionSummary::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(PendingAdmissionsResponse::jsonFields())> == PendingAdmissionsResponse::kFieldCount,
+              "PendingAdmissionsResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(ApprovalRequest::jsonFields())> == ApprovalRequest::kFieldCount,
+              "ApprovalRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(DenialRequest::jsonFields())> == DenialRequest::kFieldCount,
+              "DenialRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionDecisionResponse::jsonFields())> == AdmissionDecisionResponse::kFieldCount,
+              "AdmissionDecisionResponse::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionTokenRequest::jsonFields())> == AdmissionTokenRequest::kFieldCount,
+              "AdmissionTokenRequest::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionInvitation::jsonFields())> == AdmissionInvitation::kFieldCount,
+              "AdmissionInvitation::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionRecord::jsonFields())> == AdmissionRecord::kFieldCount,
+              "AdmissionRecord::jsonFields() field count drifted from kFieldCount");
+static_assert(std::tuple_size_v<decltype(AdmissionStoreDocument::jsonFields())> == AdmissionStoreDocument::kFieldCount,
+              "AdmissionStoreDocument::jsonFields() field count drifted from kFieldCount");
 
 #undef NEXUS_ONBOARDING_FIELD
 

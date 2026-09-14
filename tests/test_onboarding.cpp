@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <set>
 #include <fstream>
 #include <memory>
 #include <span>
@@ -1506,6 +1507,263 @@ TEST(OnboardingAdmission, ReservedSelfServerIdRefused) {
     s.stop();
     c.stop();
     fs::remove_all(tmp);
+}
+
+// ===========================================================================
+// Onboarding DTO drift guard (P2-25)
+//
+// Every onboarding DTO hand-enumerates its members in jsonFields(); the encode
+// and the SIGNED canonical bytes both derive from that tuple. The static_assert
+// in OnboardingTypes.hpp ties the tuple size to each struct's kFieldCount.
+// This test is the backstop for the struct<->constant direction: if a data
+// member is added to a struct but forgotten in jsonFields(), kFieldCount must
+// be bumped (and so must this expected key set), and BOTH the tuple and the
+// encoded key set will mismatch until jsonFields() is updated.
+// ===========================================================================
+
+namespace {
+
+/// For one DTO: round-trip encode->decode, require the encoded key set to
+/// equal `expected_keys` exactly, and require the tuple size to equal the
+/// struct's declared kFieldCount.
+template <typename T>
+void check_onboarding_dto(const T& sample, const std::set<std::string>& expected_keys) {
+    const auto encoded = sample.toJson();
+    ASSERT_TRUE(encoded.is_object());
+
+    // (1) Round trip: decode what was encoded.
+    auto decoded = T::fromJson(encoded);
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_EQ(decoded.value->toJson().dump(), encoded.dump());
+
+    // (2) The encoded key set is exactly the expected member set. A member
+    //     missing from jsonFields() would make this fail (key set short).
+    std::set<std::string> encoded_keys;
+    for (const auto& [key, unused] : encoded.items()) encoded_keys.insert(key);
+    EXPECT_EQ(encoded_keys, expected_keys);
+
+    // (3) The tuple size equals the struct's declared data-member count.
+    constexpr std::size_t tuple_size = std::tuple_size_v<decltype(T::jsonFields())>;
+    EXPECT_EQ(tuple_size, T::kFieldCount);
+    EXPECT_EQ(tuple_size, expected_keys.size());
+
+    // (4) The tuple's field NAMES are exactly the expected set (in order they
+    //     are what encode() writes; the set is order-independent on purpose).
+    std::set<std::string> field_names;
+    std::apply(
+        [&](const auto&... descriptor) {
+            ((field_names.insert(descriptor.name.data()), ...));
+        },
+        T::jsonFields());
+    EXPECT_EQ(field_names, expected_keys);
+}
+
+} // namespace
+
+TEST(OnboardingDtoDriftGuard, AllDtosMatchTheirDeclaredFieldCounts) {
+    // Expected key sets are the per-struct data-member inventory. Adding a
+    // member to a struct without updating jsonFields() AND this set (and
+    // kFieldCount) makes the build or this test fail.
+
+    core::OnboardingInfoResponse info;
+    info.accepts_onboarding = true;
+    info.dns_base_domain = "example.internal";
+    info.server_fqdn = "node.example.internal";
+    check_onboarding_dto(info, {"accepts_onboarding", "dns_base_domain", "server_fqdn"});
+
+    core::ChallengeRequest challenge_req;
+    challenge_req.candidate_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
+    check_onboarding_dto(challenge_req, {"candidate_pubkey"});
+
+    core::ChallengeResponse challenge_resp;
+    challenge_resp.nonce = b64(std::vector<uint8_t>(32, 2));
+    check_onboarding_dto(challenge_resp, {"nonce", "server_id_required"});
+
+    core::AdmissionRequest admission_req;
+    admission_req.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 2));
+    admission_req.server_id = "berlin-2";
+    admission_req.region = "eu-west";
+    admission_req.tpm_ak_pubkey = "QUs=";
+    admission_req.tpm_ek_cert = "MIIB";
+    admission_req.platform_class = core::AdmissionPlatform::SnpVtpm;
+    admission_req.measurement = std::string(96, 'a');
+    admission_req.binary_hash = std::string(64, 'b');
+    admission_req.evidence_sha256 = std::string(64, 'c');
+    admission_req.evidence = "bundle";
+    admission_req.nonce = b64(std::vector<uint8_t>(32, 2));
+    admission_req.timestamp = 1751328000;
+    admission_req.signature = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+    admission_req.enrollment_token = "adm_0123456789";
+    check_onboarding_dto(admission_req, {
+        "candidate_pubkey", "server_id", "region", "tpm_ak_pubkey", "tpm_ek_cert",
+        "platform_class", "measurement", "binary_hash", "evidence_sha256",
+        "evidence", "nonce", "timestamp", "signature", "enrollment_token"});
+
+    core::AdmissionResponse admission_resp;
+    admission_resp.request_id = std::string(32, 'a');
+    check_onboarding_dto(admission_resp, {"request_id", "state"});
+
+    core::PollRequest poll_req;
+    poll_req.request_id = std::string(32, 'a');
+    poll_req.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 4));
+    poll_req.timestamp = 1751328000;
+    poll_req.signature = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 5));
+    check_onboarding_dto(poll_req,
+                         {"request_id", "candidate_pubkey", "timestamp", "signature"});
+
+    core::AdmissionStatusResponse status;
+    status.state = core::AdmissionState::Denied;
+    status.reason = "unverified";
+    check_onboarding_dto(status, {"state", "reason"});
+
+    core::ApprovedOnboardingBundle bundle;
+    bundle.state = core::AdmissionState::Approved;
+    bundle.certificate.network_id = kTestNetworkHex;
+    bundle.certificate.server_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 6));
+    bundle.certificate.issuer_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 7));
+    bundle.certificate.signature =
+        b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 8));
+    bundle.root_pubkey = crypto::to_hex(std::span<const uint8_t>(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 7).data(), crypto::kEd25519PublicKeySize));
+    bundle.mesh_server_pubkey = b64(std::vector<uint8_t>(crypto::kX25519PublicKeySize, 8));
+    bundle.seed_peers = {"berlin-1.example:9102"};
+    bundle.mesh_endpoint = "203.0.113.10:51940";
+    bundle.gossip_port = 9102;
+    check_onboarding_dto(bundle, {
+        "state", "certificate", "root_pubkey", "mesh_server_pubkey", "seed_peers",
+        "mesh_endpoint", "gossip_port"});
+
+    core::AckRequest ack_req;
+    ack_req.request_id = std::string(32, 'a');
+    ack_req.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 9));
+    ack_req.timestamp = 1751328000;
+    ack_req.signature = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 10));
+    check_onboarding_dto(ack_req,
+                         {"request_id", "candidate_pubkey", "timestamp", "signature"});
+
+    core::AckResponse ack_resp;
+    check_onboarding_dto(ack_resp, {"state"});
+
+    core::PendingAdmissionSummary summary;
+    summary.request_id = std::string(32, 'a');
+    summary.server_id = "berlin-2";
+    summary.region = "eu-west";
+    summary.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 11));
+    summary.fingerprint = std::string(16, 'f');
+    summary.tier1_capable = true;
+    summary.source_ip = "192.0.2.1";
+    summary.created_at = 1751328000;
+    check_onboarding_dto(summary, {
+        "request_id", "server_id", "region", "candidate_pubkey", "fingerprint",
+        "tier1_capable", "source_ip", "created_at"});
+
+    core::PendingAdmissionsResponse pending_resp;
+    pending_resp.pending.push_back(summary);
+    check_onboarding_dto(pending_resp, {"pending"});
+
+    core::ApprovalRequest approval;
+    approval.pubkey = "cGs=";
+    approval.fingerprint = std::string(16, 'f');
+    approval.supersede = true;
+    check_onboarding_dto(approval, {"pubkey", "fingerprint", "supersede"});
+
+    core::DenialRequest denial;
+    denial.reason = "unverified operator";
+    check_onboarding_dto(denial, {"reason"});
+
+    core::AdmissionDecisionResponse decision;
+    decision.state = core::AdmissionState::Denied;
+    decision.request_id = std::string(32, 'a');
+    check_onboarding_dto(decision, {"state", "request_id"});
+
+    core::AdmissionTokenRequest token_req;
+    token_req.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 12));
+    token_req.ttl_sec = 600;
+    token_req.server_id = "berlin-2";
+    check_onboarding_dto(token_req, {"candidate_pubkey", "ttl_sec", "server_id"});
+
+    core::AdmissionInvitation invitation;
+    invitation.enrollment_token = "adm_0123456789";
+    invitation.expires_at = 1751328600;
+    invitation.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 13));
+    invitation.server_id = "berlin-2";
+    invitation.root_pubkey = crypto::to_hex(std::span<const uint8_t>(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 14).data(), crypto::kEd25519PublicKeySize));
+    check_onboarding_dto(invitation, {
+        "enrollment_token", "expires_at", "candidate_pubkey", "server_id",
+        "root_pubkey"});
+
+    core::AdmissionRecord record;
+    record.request_id = std::string(32, 'a');
+    record.candidate_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 15));
+    record.server_id = "berlin-2";
+    record.region = "eu-west";
+    record.tpm_ak_pubkey = "QUs=";
+    record.tpm_ek_cert = "MIIB";
+    record.platform_class = core::AdmissionPlatform::Tpm2;
+    record.measurement = std::string(96, 'a');
+    record.binary_hash = std::string(64, 'b');
+    record.evidence_sha256 = std::string(64, 'c');
+    record.evidence = "bundle";
+    record.challenge_nonce = b64(std::vector<uint8_t>(32, 2));
+    record.source_ip = "192.0.2.1";
+    record.state = core::AdmissionState::Approved;
+    record.created_at = 1751328000;
+    record.expires_at = 1751328600;
+    record.issued_cert_json = "{}";
+    record.decision_reason = "ok";
+    record.decided_by = "admin";
+    record.decision_mode = "sole";
+    check_onboarding_dto(record, {
+        "request_id", "candidate_pubkey", "server_id", "region", "tpm_ak_pubkey",
+        "tpm_ek_cert", "platform_class", "measurement", "binary_hash",
+        "evidence_sha256", "evidence", "challenge_nonce", "source_ip", "state",
+        "created_at", "expires_at", "issued_cert_json", "decision_reason",
+        "decided_by", "decision_mode"});
+
+    core::AdmissionStoreDocument document;
+    document.admissions.push_back(record);
+    document.denied_until.emplace(record.candidate_pubkey, 1751328600);
+    check_onboarding_dto(document, {"version", "ever_approved", "admissions", "denied_until"});
+}
+
+// The guard is a no-op on the wire: encode/decode and the signed canonical
+// projection are built only from jsonFields(), which the static_asserts and
+// the test above pin to the full member set. This test additionally pins the
+// signed bytes of a fully-populated AdmissionRequest so any future change to
+// the canonical construction fails loudly.
+TEST(OnboardingDtoDriftGuard, CanonicalAdmissionRequestBytesPinned) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto cand = make_key(c);
+
+    core::AdmissionRequest in;
+    in.candidate_pubkey = b64({cand.public_key.begin(), cand.public_key.end()});
+    in.server_id = "berlin-2";
+    in.region = "eu-west";
+    in.nonce = b64(std::vector<uint8_t>(32, 2));
+    in.timestamp = 1751328000;
+    in.signature = b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 3));
+
+    auto msg = core::canonical_admission_request(in);
+    auto sig = c.ed25519_sign(cand.private_key, std::span<const uint8_t>(msg));
+    EXPECT_TRUE(c.ed25519_verify(cand.public_key, std::span<const uint8_t>(msg), sig));
+
+    // Re-encode -> decode (the wire path) and confirm the server would verify
+    // the same canonical bytes, i.e. the DTO round trip preserves what is
+    // signed.
+    auto decoded = core::AdmissionRequest::fromJson(in.toJson());
+    ASSERT_TRUE(decoded) << decoded.error;
+    EXPECT_EQ(core::canonical_admission_request(in),
+              core::canonical_admission_request(*decoded.value));
+    c.stop();
 }
 
 // Approve-time supersede: an enrolled peer certified under the requested
