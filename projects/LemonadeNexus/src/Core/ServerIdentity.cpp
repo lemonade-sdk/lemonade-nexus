@@ -52,8 +52,19 @@ std::string resolve_jwt_secret(
         jwt_secret_hex = crypto::to_hex(
             std::span<const uint8_t>(jwt_secret_bytes));
         std::filesystem::create_directories(jwt_path.parent_path());
-        std::ofstream f(jwt_path);
+        std::ofstream f(jwt_path, std::ios::trunc | std::ios::binary);
         f << jwt_secret_hex;
+        // The secret is written with the process umask by default; the
+        // bootstrap path (scripts/nexus-bootstrap) runs as root with umask 022,
+        // which would leave the signing secret world-readable. Force 0600.
+        std::error_code perm_ec;
+        std::filesystem::permissions(
+            jwt_path,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace, perm_ec);
+        if (perm_ec) {
+            spdlog::warn("Could not tighten permissions on {} ({})", jwt_path.string(), perm_ec.message());
+        }
         spdlog::info("Generated and persisted JWT secret to {}", jwt_path.string());
     }
     return jwt_secret_hex;
