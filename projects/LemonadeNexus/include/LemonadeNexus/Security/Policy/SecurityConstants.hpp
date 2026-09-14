@@ -201,6 +201,13 @@ inline constexpr uint64_t kSecurityFloodWindowMs = 1000;
 inline constexpr std::size_t kSecurityTrackedPeers = 512;
 inline constexpr std::size_t kSecurityDedupeWindow = 4096;
 
+// A single attestation answers one challenge, and one challenger at a time
+// has no legitimate reason to force more than a handful of productions.
+// Bounded well below the flood budget so a member at 256 msg/s still cannot
+// extract one full TPM quote per message.
+inline constexpr uint32_t kChallengeProductionsPerWindow = 4;
+inline constexpr uint64_t kChallengeProductionWindowMs = 1000;
+
 // The uncommitted chain is at most a few blocks in chained HotStuff; the
 // sync reply is bounded well above that and well below the envelope limit.
 inline constexpr std::size_t kMaxSyncChainBlocks = 8;

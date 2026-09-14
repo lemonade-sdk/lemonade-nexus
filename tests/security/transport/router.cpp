@@ -93,6 +93,16 @@ struct MemoryTransport : ISecurityTransport {
     NodeId self;
 };
 
+struct RecordingProducer : IEvidenceProducer {
+    int calls = 0;
+    std::optional<AttestationEvidence> answer = std::nullopt;
+
+    std::optional<AttestationEvidence> produce(const AttestationChallenge&) override {
+        ++calls;
+        return answer;
+    }
+};
+
 struct Node {
     nexus::crypto::Ed25519PublicKey identity_pub{};
     nexus::crypto::Ed25519PrivateKey identity_priv{};
@@ -102,6 +112,7 @@ struct Node {
     std::unique_ptr<PairwiseSealer> sealer;
     std::unique_ptr<MemoryTransport> transport;
     RecordingEvents events;
+    RecordingProducer producer;
     std::unique_ptr<SecurityRouter> router;
     std::vector<RouteResult> results;
 
@@ -190,7 +201,7 @@ struct RouterMesh : ::testing::Test {
             node->transport = std::make_unique<MemoryTransport>(mesh, node->id);
             node->router = std::make_unique<SecurityRouter>(
                 SecurityRouterConfig{network}, *node->runtime, *node->transport, node->events,
-                *node->sealer, nullptr);
+                *node->sealer, &node->producer);
             mesh.nodes[node->id] = node.get();
             nodes.push_back(std::move(node));
         }
@@ -497,25 +508,134 @@ TEST_F(RouterMesh, PairwisePackageOpensOnlyForItsRecipient) {
     EXPECT_NE(result.dropped, DropReason::SealFailure);
 }
 
+AttestationChallenge gate_passing_challenge(const NetworkId& network, const NodeId& target) {
+    // A hand-built challenge with the mesh's rulesets and a fresh nonce: it
+    // clears every router gate that does not concern the producer, and the
+    // fresh nonce keeps the dedupe window from firing across repeats.
+    AttestationChallenge challenge;
+    challenge.network_id = network;
+    randombytes_buf(challenge.nonce.data(), challenge.nonce.size());
+    challenge.node_id = target;
+    challenge.incarnation = 1;
+    challenge.epoch = 1;
+    challenge.security_ruleset = constants::kSecurityRulesetVersion;
+    challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
+    return challenge;
+}
+
 TEST_F(RouterMesh, ChallengeWithoutProducerYieldsNoEvidence) {
     bootstrap_epoch_one();
     Node* a = founders[0];
     Node* b = founders[1];
 
-    auto challenge = a->runtime->attestation().create_challenge(b->id, b->identity_pub, 1, 1, AttestationPurpose::Eligibility);
-    ASSERT_TRUE(challenge.has_value());
-    const auto envelope = a->router->compose(SecurityMessageKind::AttestationChallenge, *challenge, 1);
-    // No producer is wired: B cannot answer, and nothing is fabricated.
+    auto challenge = gate_passing_challenge(network, b->id);
+    const auto envelope = a->router->compose(SecurityMessageKind::AttestationChallenge, challenge, 1);
+    // The producer is wired but answers nothing: B cannot answer, and nothing
+    // is fabricated.
     EXPECT_EQ(b->deliver(a->id, encode_security_message(envelope), mesh.now_ms).dropped,
               DropReason::NoService);
+    EXPECT_EQ(b->producer.calls, 1);
     EXPECT_TRUE(mesh.queue.empty());
 
-    // A challenge addressed to another node is refused outright.
-    auto misaddressed = *challenge;
-    misaddressed.node_id = founders[2]->id;
-    const auto wrong = a->router->compose(SecurityMessageKind::AttestationChallenge, misaddressed, 1);
+    // A challenge addressed to another node is refused outright, before any
+    // production.
+    const auto wrong = a->router->compose(SecurityMessageKind::AttestationChallenge,
+                                          gate_passing_challenge(network, founders[2]->id), 1);
     EXPECT_EQ(b->deliver(a->id, encode_security_message(wrong), mesh.now_ms).dropped,
               DropReason::SenderMismatch);
+    EXPECT_EQ(b->producer.calls, 1);
+}
+
+TEST_F(RouterMesh, RemoteNonMemberChallengeIsDroppedBeforeProduction) {
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+
+    // The mesh's only non-member is the outsider; it is not in Epoch 1's
+    // frozen Tier 1 set.
+    const auto challenge = gate_passing_challenge(network, a->id);
+    const auto envelope = outsider->router->compose(SecurityMessageKind::AttestationChallenge,
+                                                    challenge, 1);
+    const auto result = a->deliver(outsider->id, encode_security_message(envelope), mesh.now_ms);
+    EXPECT_EQ(result.dropped, DropReason::NotMember);
+    // The expensive platform work never ran.
+    EXPECT_EQ(a->producer.calls, 0);
+
+    // A member's challenge to the same node is answered: the drop above was
+    // membership, not a refusal of the request itself.
+    const auto member_envelope =
+        founders[1]->router->compose(SecurityMessageKind::AttestationChallenge,
+                                     gate_passing_challenge(network, a->id), 1);
+    // The fake producer answers nothing, so the drop is NoService — but the
+    // production attempt itself happened, which is the point: the member was
+    // let through the gate.
+    const auto member_result =
+        a->deliver(founders[1]->id, encode_security_message(member_envelope), mesh.now_ms);
+    EXPECT_EQ(member_result.dropped, DropReason::NoService);
+    EXPECT_EQ(a->producer.calls, 1);
+}
+
+TEST_F(RouterMesh, ChallengeProductionIsBoundedPerChallenger) {
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+    Node* b = founders[1];
+    Node* c = founders[2];
+
+    // A member's challenge is answered: the fake producer returns a bundle
+    // named for B, so the sender-bound check on the evidence passes.
+    a->producer.answer = AttestationEvidence{};
+    a->producer.answer->node_id = a->id;
+
+    for (uint32_t i = 0; i < constants::kChallengeProductionsPerWindow; ++i) {
+        const auto envelope = b->router->compose(
+            SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
+        a->deliver(b->id, encode_security_message(envelope), mesh.now_ms);
+    }
+    EXPECT_EQ(a->producer.calls, constants::kChallengeProductionsPerWindow);
+
+    // One more from the same challenger in the same window is dropped before
+    // production.
+    const auto excess = b->router->compose(
+        SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
+    EXPECT_EQ(a->deliver(b->id, encode_security_message(excess), mesh.now_ms).dropped,
+              DropReason::BudgetExceeded);
+    EXPECT_EQ(a->producer.calls, constants::kChallengeProductionsPerWindow);
+
+    // A different challenger has its own budget and is still answered.
+    const auto other = c->router->compose(
+        SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
+    const auto other_result = a->deliver(c->id, encode_security_message(other), mesh.now_ms);
+    EXPECT_NE(other_result.dropped, DropReason::BudgetExceeded);
+    EXPECT_EQ(a->producer.calls, constants::kChallengeProductionsPerWindow + 1);
+
+    // The window rolls and B's budget resets.
+    const auto rolled = b->router->compose(
+        SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
+    const auto rolled_result =
+        a->deliver(b->id, encode_security_message(rolled),
+                   mesh.now_ms + constants::kChallengeProductionWindowMs);
+    EXPECT_NE(rolled_result.dropped, DropReason::BudgetExceeded);
+    EXPECT_EQ(a->producer.calls, constants::kChallengeProductionsPerWindow + 2);
+}
+
+TEST_F(RouterMesh, LoopbackAttestationStillAnswersItself) {
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+    a->producer.answer = AttestationEvidence{};
+    a->producer.answer->node_id = a->id;
+
+    // Loopback: the node examines its own evidence. No membership check and
+    // no per-challenger budget may block it.
+    const auto envelope = a->router->compose(
+        SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
+    EXPECT_TRUE(a->apply_local(envelope, mesh.now_ms).delivered);
+    EXPECT_EQ(a->producer.calls, 1);
+
+    // And it is not one-shot: repeated loopback challenges keep answering
+    // within the flood budget.
+    const auto second = a->router->compose(
+        SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
+    EXPECT_TRUE(a->apply_local(second, mesh.now_ms).delivered);
+    EXPECT_EQ(a->producer.calls, 2);
 }
 
 TEST_F(RouterMesh, SyncResponseCarriesAValidatedCertificate) {

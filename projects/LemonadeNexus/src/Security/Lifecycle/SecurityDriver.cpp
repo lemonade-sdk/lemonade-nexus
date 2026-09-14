@@ -274,7 +274,7 @@ void SecurityDriver::tick(uint64_t now_ms) {
             const EpochId epoch = current_epoch().value_or(0);
             auto message = router_.compose(SecurityMessageKind::HotStuffTimeout, timeout, epoch);
             (void)router_.broadcast(message);
-            (void)router_.deliver_local(std::move(message));
+            (void)router_.deliver_local(std::move(message), now_ms);
             pacemaker_.on_timeout();
             last_progress_ms_ = now_ms;
         }
@@ -970,7 +970,7 @@ void SecurityDriver::attest_self_for(EpochId epoch, const Digest& context) {
         AttestationPurpose::FinalEpochReadiness, context);
     if (challenge.has_value()) {
         (void)router_.deliver_local(
-            router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, epoch));
+            router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, epoch), now_ms_);
     }
 }
 
@@ -1370,7 +1370,7 @@ void SecurityDriver::maybe_propose(View view) {
     ProposalMessage message{std::get<Proposal>(made), consensus->state().high_qc};
     auto envelope = router_.compose(SecurityMessageKind::HotStuffProposal, message, epoch);
     (void)router_.broadcast(envelope);
-    (void)router_.deliver_local(std::move(envelope));
+    (void)router_.deliver_local(std::move(envelope), now_ms_);
 }
 
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {

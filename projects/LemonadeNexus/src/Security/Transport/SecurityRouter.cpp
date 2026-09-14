@@ -81,6 +81,44 @@ bool SecurityRouter::within_budget(const NodeId& sender, uint64_t now_ms) {
     return true;
 }
 
+bool SecurityRouter::challenger_is_member(const NodeId& from) const {
+    const EpochManager* epochs = runtime_.epochs();
+    if (epochs == nullptr) {
+        // Before Epoch 1 only the founding set exists, and it does not ask
+        // over the wire; it injects its own verdicts. A remote challenger has
+        // no legitimate reason to force production at all.
+        return false;
+    }
+    return epochs->current().tier1_members.contains(from);
+}
+
+bool SecurityRouter::within_challenge_budget(const NodeId& from, uint64_t now_ms) {
+    auto it = challenge_budgets_.find(from);
+    if (it == challenge_budgets_.end()) {
+        if (challenge_budgets_.size() >= constants::kSecurityTrackedPeers) {
+            // Evict the stalest window so a stream of new identities cannot
+            // grow the table without limit.
+            auto oldest = std::min_element(
+                challenge_budgets_.begin(), challenge_budgets_.end(),
+                [](const auto& a, const auto& b) {
+                    return a.second.window_start_ms < b.second.window_start_ms;
+                });
+            challenge_budgets_.erase(oldest);
+        }
+        it = challenge_budgets_.emplace(from, ChallengeBudget{now_ms, 0}).first;
+    }
+    ChallengeBudget& budget = it->second;
+    if (now_ms - budget.window_start_ms >= constants::kChallengeProductionWindowMs) {
+        budget.window_start_ms = now_ms;
+        budget.count = 0;
+    }
+    if (budget.count >= constants::kChallengeProductionsPerWindow) {
+        return false;
+    }
+    ++budget.count;
+    return true;
+}
+
 bool SecurityRouter::remember(std::span<const uint8_t> envelope) {
     Digest digest{};
     crypto_hash_sha256(digest.data(), envelope.data(), envelope.size());
@@ -242,20 +280,23 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
     if (!idempotent_ask && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
-    return dispatch(message);
+    return dispatch(message, now_ms);
 }
 
-RouteResult SecurityRouter::deliver_local(SecurityMessage message) {
+RouteResult SecurityRouter::deliver_local(SecurityMessage message, uint64_t now_ms) {
     if (message.sender != runtime_.self()) {
         return drop(DropReason::SenderMismatch);
     }
-    return dispatch(message);
+    // No wall clock has advanced for a local message; the flood-window
+    // reference is the current steady value the transport would have stamped.
+    return dispatch(message, 0);
 }
 
-RouteResult SecurityRouter::dispatch(SecurityMessage& message) {
+RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) {
     switch (message.kind) {
         case SecurityMessageKind::AttestationChallenge:
-            return route_challenge(std::get<AttestationChallenge>(message.body), message.sender);
+            return route_challenge(std::get<AttestationChallenge>(message.body), message.sender,
+                                   now_ms);
         case SecurityMessageKind::AttestationEvidence:
             return route_evidence(std::get<AttestationEvidence>(message.body));
         case SecurityMessageKind::HotStuffProposal:
@@ -548,12 +589,23 @@ RouteResult SecurityRouter::route_share(const FrostShareMessage& message) {
 }
 
 RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challenge,
-                                            const NodeId& from) {
+                                            const NodeId& from, uint64_t now_ms) {
     if (challenge.node_id != runtime_.self()) {
         return drop(DropReason::SenderMismatch);
     }
     if (evidence_producer_ == nullptr) {
         return drop(DropReason::NoService);
+    }
+    if (from != runtime_.self() && !challenger_is_member(from)) {
+        // A remote challenger outside the mesh can never act on evidence, and
+        // answering one is expensive local platform work; refuse before any
+        // production.
+        return drop(DropReason::NotMember);
+    }
+    if (!within_challenge_budget(from, now_ms)) {
+        // A member may ask as often as the flood budget allows; this caps how
+        // many times one challenger can force evidence production per window.
+        return drop(DropReason::BudgetExceeded);
     }
     auto evidence = evidence_producer_->produce(challenge);
     if (!evidence.has_value()) {
@@ -563,7 +615,7 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
         compose(SecurityMessageKind::AttestationEvidence, *evidence, challenge.epoch);
     if (from == runtime_.self()) {
         // Loopback attestation: this node examines its own evidence.
-        (void)deliver_local(std::move(out));
+        (void)deliver_local(std::move(out), now_ms);
     } else {
         (void)send(from, out);
     }
