@@ -144,6 +144,34 @@ class BootstrapTest(unittest.TestCase):
                     self.assertEqual(calls[1][:2], ["nft", "-c"])
                     self.assertEqual(calls[-1], ["systemctl", "enable", "--now", "nexus-dns-nat.service"])
 
+    def test_shipped_units_only_reference_units_that_exist_or_are_system_wide(self):
+        shipped = set()
+        unit_directories = [REPO / "packaging/systemd",
+                            REPO / "projects/LemonadeNexusAttestd/systemd"]
+        for directory in unit_directories:
+            shipped.update(path.name for path in directory.glob("*.service"))
+        self.assertTrue(shipped)
+        allowlist = {
+            "network-online.target",
+            "network-pre.target",
+            "local-fs.target",
+            "multi-user.target",
+            "nftables.service",
+        }
+        for directory in unit_directories:
+            for unit in sorted(directory.glob("*.service")):
+                for line in unit.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    key, sep, value = line.partition("=")
+                    if not sep or key not in ("Wants", "Requires", "After", "BindsTo"):
+                        continue
+                    for name in value.split():
+                        self.assertIn(name, shipped | allowlist,
+                                      f"{unit.name} references {name} but it is "
+                                      f"neither shipped by this tree nor a system unit")
+
     def test_packaging_protects_config_and_allows_runtime_data_only(self):
         unit = (REPO / "packaging/systemd/lemonade-nexus.service").read_text()
         self.assertIn("ReadWritePaths=/var/lib/lemonade-nexus/data\n", unit)

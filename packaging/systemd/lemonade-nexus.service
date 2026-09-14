@@ -8,8 +8,12 @@ Wants=network-online.target
 # otherwise its first execution is not measured and it can never be anchored.
 # Both are optional so a Tier 2 node without the attestation stack still starts:
 # a missing nexus-attestd costs Tier 1, it does not stop the mesh node.
-Wants=nexus-ima-policy.service nexus-attestd.service
-After=nexus-ima-policy.service nexus-attestd.service
+# NOTE: the nexus-ima-policy.service unit ships with the IMA measurement
+# component, which is not part of this repository yet. Once it lands, add it
+# back to the Wants=/After= lines below so the policy is loaded before first
+# execution; until then the server's first execution is simply not measured.
+Wants=nexus-attestd.service
+After=nexus-attestd.service
 
 [Service]
 Type=simple
