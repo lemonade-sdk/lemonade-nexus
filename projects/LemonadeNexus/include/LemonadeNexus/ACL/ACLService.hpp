@@ -2,15 +2,14 @@
 
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/ACL/IACLProvider.hpp>
+#include <LemonadeNexus/ACL/AclStore.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
-#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string_view>
-
-struct sqlite3;  // forward-declare (C handle)
+#include <vector>
 
 namespace nexus::acl {
 
@@ -41,9 +40,7 @@ class ACLService : public core::IService<ACLService>,
     friend class core::IService<ACLService>;
     friend class IACLProvider<ACLService>;
 public:
-    explicit ACLService(std::filesystem::path db_path,
-                        crypto::SodiumCryptoService& crypto);
-    ~ACLService();
+    explicit ACLService(AclStore& store, crypto::SodiumCryptoService& crypto);
 
     ACLService(const ACLService&) = delete;
     ACLService& operator=(const ACLService&) = delete;
@@ -76,28 +73,16 @@ private:
                                                         std::string_view user_id,
                                                         std::string_view resource) const;
 
-    /// Read current permissions. Caller must hold mutex_.
-    uint32_t read_perms_locked(std::string_view user_id, std::string_view resource) const;
-
-    /// Write permissions. Caller must hold mutex_.
-    bool write_perms_locked(std::string_view user_id, std::string_view resource,
-                             uint32_t perms, uint64_t timestamp);
-
-    /// Delta deduplication. Caller must hold mutex_.
-    [[nodiscard]] bool is_delta_seen_locked(const std::string& delta_id) const;
-    void mark_delta_seen_locked(const std::string& delta_id);
-
     [[nodiscard]] std::string generate_delta_id() const;
     void sign_delta(AclDelta& delta) const;
     [[nodiscard]] bool verify_delta_signature(const AclDelta& delta) const;
 
-    std::filesystem::path        db_path_;
+    AclStore&                    store_;
     crypto::SodiumCryptoService& crypto_;
     crypto::Ed25519Keypair       signing_keypair_{};
     crypto::AeadKey            encryption_key_{};
     bool                         has_key_{false};
 
-    sqlite3*                     db_{nullptr};
     mutable std::mutex           mutex_;
     AclDeltaCallback             delta_callback_;
 };
