@@ -11,6 +11,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <cstdlib>
 
 namespace fs = std::filesystem;
 using nexus::acl::AclStore;
@@ -20,9 +21,16 @@ namespace {
 class AclStoreTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        dir_ = fs::temp_directory_path() /
-               ("acl-store-test-" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()));
-        fs::create_directories(dir_);
+        // Unique per test case AND per process: the random seed is shared by
+        // every test in a run, and under parallel ctest a fixed seed path would
+        // collide across processes. mkdtemp gives an exclusive directory.
+        auto tmpl = fs::temp_directory_path() / "acl-store-test-XXXXXX";
+        auto tmp = tmpl.string();
+        if (const char* created = ::mkdtemp(tmp.data())) {
+            dir_ = created;
+        } else {
+            GTEST_FAIL() << "mkdtemp failed for the AclStore test directory";
+        }
     }
 
     void TearDown() override {
