@@ -140,7 +140,10 @@ def dns_nat(args, gid):
     wan = args.wan_interface
     if not wan:
         routes = json.loads(run(["ip", "-j", "route", "show", "default"], capture_output=True).stdout)
-        wan = interface(next((route["dev"] for route in routes if "dev" in route), ""))
+        if not (wan := next((route["dev"] for route in routes if "dev" in route), "")):
+            raise SystemExit("no default route; cannot determine WAN interface for DNS NAT, "
+                             "pass --wan-interface")
+        wan = interface(wan)
     run(["ip", "link", "show", "dev", wan], capture_output=True)
     rules = "/usr/lib/lemonade-nexus/nexus-dns-nat.nft"
     conf = Path("/etc/lemonade-nexus/nexus-dns-nat.conf")

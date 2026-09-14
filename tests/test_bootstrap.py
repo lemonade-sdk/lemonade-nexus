@@ -7,6 +7,7 @@ import io
 import json
 import re
 import os
+import shutil
 from pathlib import Path
 import stat
 import subprocess
@@ -188,6 +189,41 @@ class BootstrapTest(unittest.TestCase):
         nat = (REPO / "packaging/nftables/nexus-dns-nat.nft").read_text()
         for transport in ("udp", "tcp"):
             self.assertIn(f"iifname $nexus_wan_if {transport} dport $nexus_public_dns_port redirect to :$nexus_dns_port", nat)
+
+    def test_dns_nat_ruleset_is_denial_by_default_and_uses_a_real_wan(self):
+        nat = (REPO / "packaging/nftables/nexus-dns-nat.nft").read_text()
+        # Unmatched traffic in the NAT base chain must be dropped, not
+        # silently passed on. This chain only holds the two redirects, so a
+        # drop policy leaves every other packet's fate to the rest of the
+        # system's chains; it cannot intercept host traffic.
+        self.assertRegex(nat, r"policy drop;\s*\n")
+        # The WAN interface must be guaranteed non-empty before the ruleset
+        # is applied: an empty iifname makes both redirects no-ops.
+        # parse_args keeps the default empty string, so the guard has to be
+        # in dns_nat(), not in argument parsing.
+        script = (REPO / "scripts/nexus-bootstrap").read_text()
+        self.assertRegex(script, r"no default route; cannot determine WAN interface")
+        self.assertIn("wan = interface(wan)", script)
+        # Dry-run syntax check if nft is available; the conf include is
+        # satisfied from a temp file. Skipped on hosts without nft.
+        if (nft := shutil.which("nft")):
+            rules = REPO / "packaging/nftables/nexus-dns-nat.nft"
+            with tempfile.TemporaryDirectory() as directory:
+                conf = Path(directory) / "nexus-dns-nat.conf"
+                conf.write_text('define nexus_wan_if = "eth0"\n'
+                                "define nexus_public_dns_port = 53\n"
+                                "define nexus_dns_port = 5335\n")
+                source = rules.read_text().replace(
+                    "include \"/etc/lemonade-nexus/nexus-dns-nat.conf\"",
+                    f'include "{conf}"')
+                with tempfile.NamedTemporaryFile("w", suffix=".nft", delete=False) as out:
+                    out.write(source)
+                    temporary = out.name
+                try:
+                    result = subprocess.run([nft, "-c", "-f", temporary], capture_output=True)
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                finally:
+                    Path(temporary).unlink()
 
     def test_attestd_unit_masks_lemonade_nexus_data_root(self):
         unit = (REPO / "projects/LemonadeNexusAttestd/systemd/nexus-attestd.service").read_text()
