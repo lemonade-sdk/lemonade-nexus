@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -2392,44 +2393,65 @@ bool GossipService::find_peer_endpoint_by_pubkey(std::string_view b64,
 void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
                                              const uint8_t* payload, std::size_t len) {
     // Fail-closed membership gate, mirroring every other state-mutating gossip
-    // ingress path: the packet signer must hold a root-signed certificate.
-    // With no root pubkey anchored the gate refuses everything (there is no
-    // anchor to trust), and a peer-table entry without a certificate proves
-    // nothing — only enrolment counts. A stranger can otherwise reach the
-    // Tier 1 security plane (SecurityRouter) line rate with bytes it signed
-    // itself, and the outbound refusal is hollow if the inbound one is not.
+    // ingress path: once the mesh is formed (some peer holds a root-signed
+    // certificate), a packet that reaches the Tier 1 security plane must have
+    // been signed by one of them. A stranger can otherwise reach the router
+    // line rate with bytes it signed itself, and the outbound refusal is hollow
+    // if the inbound one is not.
     //
-    // Bootstrap exemption: while no peer holds a root-signed certificate the
-    // mesh is not yet formed — nothing is registered yet for the security
-    // plane to decide about, and ServerHello/PeerExchange is still the only
-    // way certificates enter the network. Once any peer is certified the gate
-    // is live for everyone. This is a window in the formation phase, not an
-    // acceptance path: an unknown sender can gain nothing before the mesh
-    // exists (the router drops every message from a non-member), and from the
-    // moment it does exist the gate holds.
+    // The gate is scoped to the kinds that mutate security/consensus state.
+    // The attestation-carrying kinds are EXEMPT on purpose: they are the
+    // mechanism by which an uncertified peer becomes certified (Genesis
+    // challenges a new node precisely because it has no root-signed
+    // certificate yet), so gating them would break enrolment. Those kinds are
+    // already bounded upstream by the per-challenger production budget and the
+    // challenge nonce binding; the router additionally drops evidence from a
+    // non-member. While no peer is certified (mesh not yet formed) the gate is
+    // inert for everyone, and ServerHello/PeerExchange is still the only way
+    // certificates enter.
     const auto sender_b64 =
         crypto::to_base64(std::span<const uint8_t>{sender_pubkey, 32});
-    bool any_certified = false;
-    {
-        std::lock_guard lock(peers_mutex_);
-        any_certified = has_root_pubkey_ &&
-                        std::any_of(peers_.begin(), peers_.end(),
-                                    [&](const GossipPeer& p) {
-                                        return !p.certificate_json.empty();
-                                    });
-        if (any_certified && !peer_certificate_is_root_signed_locked(sender_b64)) {
-            ++security_envelope_drops_;
-            ++security_drops_since_warn_;
-            const auto now = chrono::steady_clock::now();
-            if (now - security_drop_warn_at_ >= chrono::seconds(10)) {
-                spdlog::warn(
-                    "[{}] dropped {} security envelope(s) from uncertified sender "
-                    "{}:{}, latest {} bytes", name(), security_drops_since_warn_,
-                    remote_endpoint_.address().to_string(), remote_endpoint_.port(), len);
-                security_drop_warn_at_ = now;
-                security_drops_since_warn_ = 0;
+
+    // Decode just enough to learn the kind. A malformed envelope falls
+    // through to the size check and the sink's own decode, which rejects it;
+    // we do not gate on a kind we cannot read.
+    const auto decoded =
+        security::decode_security_message(std::span<const uint8_t>{payload, len});
+    const bool is_attestation_kind = std::holds_alternative<security::SecurityMessage>(decoded) &&
+        (std::get<security::SecurityMessage>(decoded).kind ==
+             security::SecurityMessageKind::AttestationChallenge ||
+         std::get<security::SecurityMessage>(decoded).kind ==
+             security::SecurityMessageKind::AttestationEvidence ||
+         std::get<security::SecurityMessage>(decoded).kind ==
+             security::SecurityMessageKind::DkgTranscriptAttest ||
+         std::get<security::SecurityMessage>(decoded).kind ==
+             security::SecurityMessageKind::GenesisEligibilityAttest ||
+         std::get<security::SecurityMessage>(decoded).kind ==
+             security::SecurityMessageKind::ParticipationChallenge);
+
+    if (!is_attestation_kind) {
+        bool any_certified = false;
+        {
+            std::lock_guard lock(peers_mutex_);
+            any_certified = has_root_pubkey_ &&
+                            std::any_of(peers_.begin(), peers_.end(),
+                                        [&](const GossipPeer& p) {
+                                            return !p.certificate_json.empty();
+                                        });
+            if (any_certified && !peer_certificate_is_root_signed_locked(sender_b64)) {
+                ++security_envelope_drops_;
+                ++security_drops_since_warn_;
+                const auto now = chrono::steady_clock::now();
+                if (now - security_drop_warn_at_ >= chrono::seconds(10)) {
+                    spdlog::warn(
+                        "[{}] dropped {} security envelope(s) from uncertified sender "
+                        "{}:{}, latest {} bytes", name(), security_drops_since_warn_,
+                        remote_endpoint_.address().to_string(), remote_endpoint_.port(), len);
+                    security_drop_warn_at_ = now;
+                    security_drops_since_warn_ = 0;
+                }
+                return;
             }
-            return;
         }
     }
 
