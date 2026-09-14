@@ -16,6 +16,20 @@ using json = nlohmann::json;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// Map an lnsdk::Result failure to a distinct ln_error_t. The SDK client
+// reports the transport failure (no HTTP status), the HTTP status it did
+// receive, and a text message. Without this split, e.g. ln_tree_get_node
+// collapsed auth / network / parse failures into one code and a C caller
+// could not tell "not authenticated" from "server unreachable" from a
+// malformed response.
+static ln_error_t ln_map_error(int http_status) {
+    if (http_status == 401 || http_status == 403) return LN_ERR_AUTH;
+    if (http_status == 404) return LN_ERR_NOT_FOUND;
+    if (http_status == 0)   return LN_ERR_CONNECT;
+    if (http_status >= 500) return LN_ERR_CONNECT;
+    return LN_ERR_REJECTED;
+}
+
 struct ln_client_s {
     lnsdk::LemonadeNexusClient client;
     explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {}
@@ -221,7 +235,12 @@ ln_error_t ln_tree_get_node(ln_client_t* client,
     json err;
     err["error"] = result.error;
     *out_json = strdup_json(err);
-    return LN_ERR_NOT_FOUND;
+    // A 2xx response whose body failed to deserialize is a malformed-response
+    // failure (LN_ERR_PARSE), distinct from auth (401/403), not-found (404)
+    // and network (no transport / 5xx) failures.
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_tree_submit_delta(ln_client_t* client,
@@ -511,7 +530,13 @@ ln_error_t ln_tree_get_children(ln_client_t* client,
         arr.push_back(j);
     }
     *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    // Symmetric with ln_tree_get_node: a 2xx response whose body did not
+    // parse is a malformed-response failure (LN_ERR_PARSE), not a network or
+    // auth failure.
+    if (result.ok) return LN_OK;
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 // ---------------------------------------------------------------------------
@@ -604,7 +629,13 @@ ln_error_t ln_get_group_members(ln_client_t* client,
         });
     }
     *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_NOT_FOUND;
+    // Symmetric with ln_tree_get_node: a 2xx response whose body did not
+    // parse is a malformed-response failure (LN_ERR_PARSE), not a network or
+    // auth failure.
+    if (result.ok) return LN_OK;
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_join_group(ln_client_t* client,

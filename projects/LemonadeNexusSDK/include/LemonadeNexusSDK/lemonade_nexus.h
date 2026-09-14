@@ -35,6 +35,11 @@ typedef enum {
     LN_ERR_NOT_FOUND  = -4,
     LN_ERR_REJECTED   = -5,
     LN_ERR_NO_IDENTITY = -6,
+    LN_ERR_PARSE      = -7, ///< Malformed response: HTTP 2xx with a body that did not
+                            ///< deserialize (e.g. a node endpoint returned 200 with a
+                            ///< body that is not a valid TreeNode). Distinct from
+                            ///< LN_ERR_NOT_FOUND (404), LN_ERR_AUTH (401/403) and
+                            ///< LN_ERR_CONNECT (no transport / network error).
     LN_ERR_INTERNAL   = -99
 } ln_error_t;
 
