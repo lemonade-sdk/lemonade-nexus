@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
@@ -939,4 +940,161 @@ TEST(AttestdGrammarHostile, ADuplicateKeyCannotSmuggleASecondValue) {
     const auto decoded = decode_challenge(request);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(decoded->epoch, base["epoch"].get<uint64_t>());
+}
+
+// ---------------------------------------------------------------------------
+// The client's anti-replay half: challenge binding on the production path
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using nexus::attestd::AttestdClientConfig;
+using nexus::attestd::attestd_platform_source;
+
+/// A stand-in for the daemon's wire side: whatever request the client sends,
+/// it answers with one pre-arranged framed stream — a bundle bound to some
+/// digest, or a refusal — then hangs up. The request is captured so a test can
+/// confirm WHICH challenge actually left the client.
+class FakeAttestdSocket : public ::testing::Test {
+protected:
+    void SetUp() override {
+        ASSERT_GE(sodium_init(), 0);
+        const auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        const fs::path dir = fs::temp_directory_path() / "nexus_attestd_client" / "t";
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+        fs::create_directories(dir, ec);
+        socket_path_ = dir / "nexus-attestd.sock";
+        if (socket_path_.string().size() >= sizeof(((::sockaddr_un*)nullptr)->sun_path)) {
+            FAIL() << "temp socket path too long for sun_path";
+        }
+
+        const int listen_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        ASSERT_GE(listen_fd, 0);
+        ::sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::memcpy(addr.sun_path, socket_path_.c_str(),
+                    socket_path_.string().size() + 1);
+        ASSERT_EQ(::bind(listen_fd, reinterpret_cast<const ::sockaddr*>(&addr), sizeof(addr)),
+                  0);
+        ASSERT_EQ(::listen(listen_fd, 1), 0);
+        listen_fd_ = listen_fd;
+    }
+
+    void TearDown() override {
+        if (accept_fd_ >= 0) ::close(accept_fd_);
+        if (listen_fd_ >= 0) ::close(listen_fd_);
+        std::error_code ec;
+        if (socket_path_.has_parent_path()) {
+            fs::remove_all(socket_path_.parent_path(), ec);
+        }
+    }
+
+    /// Start a server thread for one connection: read the request (newline
+    /// terminated) into `request_out`, then write `response_wire` and close.
+    void start_server_thread(std::string* request_out, std::string response_wire) {
+        server_thread_ = std::thread([this, request_out, response_wire = std::move(response_wire)] {
+            accept_fd_ = ::accept(listen_fd_, nullptr, nullptr);
+            if (accept_fd_ < 0) return;
+            std::string request;
+            char one = 0;
+            while (::read(accept_fd_, &one, 1) == 1) {
+                request.push_back(one);
+                if (one == '\n') break;
+            }
+            *request_out = std::move(request);
+            std::string_view out = response_wire;
+            while (!out.empty()) {
+                const ssize_t n = ::write(accept_fd_, out.data(), out.size());
+                if (n <= 0) break;
+                out.remove_prefix(static_cast<std::size_t>(n));
+            }
+            ::close(accept_fd_);
+            accept_fd_ = -1;
+        });
+    }
+
+    void join_server() {
+        if (server_thread_.joinable()) server_thread_.join();
+    }
+
+    fs::path socket_path_;
+    int listen_fd_ = -1;
+    int accept_fd_ = -1;
+    std::thread server_thread_;
+};
+
+}  // namespace
+
+TEST_F(FakeAttestdSocket, TheClientDiscardsEvidenceBoundToAnotherChallenge) {
+    // The replay this exists to stop: a daemon (or a proxy of one) hands back
+    // evidence whose challenge_digest is the digest of a DIFFERENT challenge
+    // than the one the client asked about. The production source must refuse
+    // to let that bundle through, rather than hand it to the signer.
+    const auto asked = good_challenge();
+    auto other = good_challenge();
+    other.epoch = asked.epoch + 1;  // a stale/sibling challenge, nothing else
+    ASSERT_NE(challenge_digest(other), challenge_digest(asked));
+
+    const auto bundle = bundle_with_log(64);
+    const std::string wire = frames_for(bundle);
+
+    std::string request;
+    start_server_thread(&request, wire);
+    const auto source = attestd_platform_source(AttestdClientConfig{socket_path_});
+    const auto evidence = source(asked);
+    join_server();
+
+    // The client asked about the challenge it was handed, and it received
+    // nothing usable: the mismatched bundle was dropped, not returned.
+    ASSERT_FALSE(request.empty());
+    const auto decoded = decode_challenge(std::string_view(request).substr(0, request.size() - 1));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(challenge_digest(*decoded), challenge_digest(asked));
+    EXPECT_TRUE(evidence.empty());
+}
+
+TEST_F(FakeAttestdSocket, TheClientAcceptsEvidenceBoundToItsOwnChallenge) {
+    // The positive half: the daemon's own derivation of the digest of the
+    // challenge as sent — the anti-replay invariant satisfied.
+    const auto asked = good_challenge();
+    auto bundle = bundle_with_log(64);
+    bundle.challenge_digest = challenge_digest(asked);
+    const auto encoded = nexus::security::encode_snp_vtpm_evidence(bundle.platform);
+    ASSERT_FALSE(encoded.empty());
+    const std::string wire = frames_for(bundle);
+
+    std::string request;
+    start_server_thread(&request, wire);
+    const auto source = attestd_platform_source(AttestdClientConfig{socket_path_});
+    const auto evidence = source(asked);
+    join_server();
+
+    const auto decoded = decode_challenge(std::string_view(request).substr(0, request.size() - 1));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(challenge_digest(*decoded), challenge_digest(asked));
+    // SnpVtpmEvidence has no operator==; compare the canonical form.
+    EXPECT_EQ(nexus::security::encode_snp_vtpm_evidence(evidence), encoded);
+}
+
+TEST_F(FakeAttestdSocket, TheClientReturnsNothingOnAFramedRefusal) {
+    // A daemon that declines still terminates the stream typed, and the client
+    // maps that to empty evidence — never to whatever a bundle might have been.
+    const auto asked = good_challenge();
+    std::string wire;
+    ASSERT_TRUE(nexus::attestd::emit_refusal(Refusal::PlatformUnavailable,
+                                             [&](std::string_view f) {
+                                                 wire.append(f);
+                                                 return true;
+                                             },
+                                             "no TPM here"));
+
+    std::string request;
+    start_server_thread(&request, wire);
+    const auto source = attestd_platform_source(AttestdClientConfig{socket_path_});
+    const auto evidence = source(asked);
+    join_server();
+
+    EXPECT_FALSE(request.empty());
+    EXPECT_TRUE(evidence.empty());
 }
