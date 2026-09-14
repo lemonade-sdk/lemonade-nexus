@@ -789,7 +789,7 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     set_phase(DriverPhase::Active, "epoch 1 adopted and active");
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
-    announce_epoch(checkpoint);
+    announce_epoch(checkpoint, certificate.dkg_transcript_digest);
 }
 
 // --- Vote keys ---------------------------------------------------------------
@@ -1643,7 +1643,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     last_proposed_view_ = 0;
     last_committed_root_ = Digest{};
     last_committed_height_ = 0;
-    announce_epoch(checkpoint);
+    announce_epoch(checkpoint, dkg_digest);
 }
 
 void SecurityDriver::persist_current_epoch(const Digest& checkpoint) {
@@ -1652,7 +1652,7 @@ void SecurityDriver::persist_current_epoch(const Digest& checkpoint) {
     (void)store_.store_epoch(stored);
 }
 
-void SecurityDriver::announce_epoch(const Digest& checkpoint) {
+void SecurityDriver::announce_epoch(const Digest& checkpoint, const Digest& dkg_transcript_digest) {
     const EpochState& current = runtime_.epochs()->current();
     EpochAnnouncement announcement;
     announcement.authority.network_id = current.network_id;
@@ -1665,7 +1665,7 @@ void SecurityDriver::announce_epoch(const Digest& checkpoint) {
     announcement.authority.authority_threshold = current.authority_threshold;
     announcement.authority.frost_ciphersuite = std::string(constants::kFrostCiphersuite);
     announcement.authority.group_public_key = current.authority_public_key;
-    announcement.authority.dkg_transcript_digest = Digest{};
+    announcement.authority.dkg_transcript_digest = dkg_transcript_digest;
     announcement.authority.attestation_root = current.attestation_root;
     announcement.authority.previous_checkpoint = checkpoint;
     announcement.handoff_certificate_digest = checkpoint;
