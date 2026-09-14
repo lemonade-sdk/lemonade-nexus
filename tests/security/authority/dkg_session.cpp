@@ -149,6 +149,48 @@ TEST(DkgSession, FiveParticipantsAgreeOnOneGroupKeyAndTranscript) {
                                                      *signature.value));
 }
 
+TEST(DkgSession, EpochTransitionMessageCarriesSessionBindingNotSetDigest) {
+    // At an epoch transition the session binding is a digest from a different
+    // domain (the candidate readiness digest), not the participant-set digest.
+    // Every message of the session must carry the binding, while the result
+    // keeps the real participant-set digest.
+    Mesh mesh(5);
+    Digest binding;
+    binding.fill(0x77);
+    ASSERT_NE(binding, mesh.participants.digest());
+
+    // Bind the session to an epoch-transition-style readiness digest and run
+    // the whole mesh under that binding.
+    for (std::size_t i = 0; i < mesh.sessions.size(); ++i) {
+        DkgConfiguration config = mesh.config_for(node(static_cast<uint8_t>(i + 1)));
+        config.session_binding = binding;
+        mesh.sessions[i] = std::make_unique<DkgSession>(std::move(config));
+    }
+
+    auto broadcasts = mesh.run_round1();
+    for (const auto& broadcast : broadcasts) {
+        EXPECT_EQ(broadcast.session_digest, binding) << "message carries the binding";
+        EXPECT_NE(broadcast.session_digest, mesh.participants.digest())
+            << "the binding is a different digest from the participant-set digest";
+    }
+    EXPECT_EQ(mesh.sessions[0]->session_digest(), binding);
+
+    // The Genesis form, with no binding configured, falls back to the bare
+    // participant-set digest.
+    DkgConfiguration unbound_config = mesh.config_for(node(2));
+    DkgSession unbound(unbound_config);
+    EXPECT_EQ(unbound.session_digest(), mesh.participants.digest());
+
+    deliver_round2(mesh);
+    for (auto& session : mesh.sessions) {
+        ASSERT_TRUE(session->finish());
+        auto result = session->take_result();
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result->participant_set_digest, mesh.participants.digest())
+            << "the result keeps the real participant-set digest";
+    }
+}
+
 TEST(DkgSession, CompiledThresholdCannotBeLowered) {
     Mesh mesh(5, 4);
     EXPECT_FALSE(mesh.sessions[0]->start().has_value());
@@ -184,7 +226,7 @@ TEST(DkgSession, BroadcastBindingIsEnforcedBeforeAnyFrostWork) {
     EXPECT_EQ(receiver.receive_broadcast(broken), DkgFailure::WrongEpoch);
 
     broken = valid;
-    broken.participant_set_digest.fill(0xEE);
+    broken.session_digest.fill(0xEE);
     EXPECT_EQ(receiver.receive_broadcast(broken), DkgFailure::WrongParticipantSet);
 
     broken = valid;

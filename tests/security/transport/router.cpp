@@ -472,7 +472,7 @@ TEST_F(RouterMesh, PairwisePackageOpensOnlyForItsRecipient) {
     DkgMessage package;
     package.network_id = network;
     package.target_epoch = 2;
-    package.participant_set_digest = founding_set->digest();
+    package.session_digest = founding_set->digest();
     package.sender = a->id;
     package.sender_incarnation = 1;
     package.round = DkgRound::Round2Pairwise;

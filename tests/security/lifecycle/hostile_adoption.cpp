@@ -338,19 +338,18 @@ TEST_F(HostileAdoption, DkgMessagesMustCarryTheSessionBinding) {
     DkgSession session{bound};
     const auto own = session.start();
     ASSERT_TRUE(own.has_value());
-    EXPECT_EQ(own->participant_set_digest, binding) << "messages carry the binding";
+    EXPECT_EQ(own->session_digest, binding) << "messages carry the binding";
 
     // A message from the same set without the binding — the shape of a replay
     // from an earlier attempt — is refused as the wrong session.
     DkgMessage unbound = *own;
     unbound.sender = ids[1];
-    unbound.participant_set_digest = bound.participants.digest();
-    EXPECT_EQ(session.receive_broadcast(unbound), DkgFailure::WrongParticipantSet);
+    unbound.session_digest = bound.participants.digest();    EXPECT_EQ(session.receive_broadcast(unbound), DkgFailure::WrongParticipantSet);
 
     // The right binding from another participant is the positive control shape
     // (payload validity is FROST's business, judged later).
     DkgMessage rebound = unbound;
-    rebound.participant_set_digest = binding;
+    rebound.session_digest = binding;
     EXPECT_NE(session.receive_broadcast(rebound), DkgFailure::WrongParticipantSet);
 }
 

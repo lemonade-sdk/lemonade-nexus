@@ -32,7 +32,11 @@ enum class DkgRound : uint16_t {
 struct DkgMessage {
     NetworkId network_id{};
     EpochId target_epoch = 0;
-    Digest participant_set_digest{};
+    /// The session binding every message of this session must carry: the
+    /// configured binding (for an epoch transition, the candidate readiness
+    /// digest), or the bare participant-set digest when no binding is set —
+    /// the Genesis form. See DkgConfiguration::session_binding.
+    Digest session_digest{};
 
     NodeId sender;
     IncarnationId sender_incarnation = 0;

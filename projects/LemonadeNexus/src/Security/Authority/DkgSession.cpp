@@ -24,7 +24,7 @@ Digest dkg_message_digest(const DkgMessage& message) {
     encoder.add_string("message");
     encoder.add_bytes(message.network_id);
     encoder.add_u64(message.target_epoch);
-    encoder.add_bytes(message.participant_set_digest);
+    encoder.add_bytes(message.session_digest);
     encoder.add_bytes(message.sender.bytes);
     encoder.add_u64(message.sender_incarnation);
     encoder.add_u16(static_cast<uint16_t>(message.round));
@@ -59,7 +59,7 @@ DkgMessage DkgSession::make_message(DkgRound round, const NodeId& recipient,
     DkgMessage message;
     message.network_id = config_.network_id;
     message.target_epoch = config_.target_epoch;
-    message.participant_set_digest = session_digest();
+    message.session_digest = session_digest();
     message.sender = config_.self;
     message.sender_incarnation = config_.incarnations.at(config_.self);
     message.round = round;
@@ -112,7 +112,7 @@ DkgFailure DkgSession::check_binding(const DkgMessage& message, DkgRound expecte
     if (message.target_epoch != config_.target_epoch) {
         return DkgFailure::WrongEpoch;
     }
-    if (message.participant_set_digest != session_digest()) {
+    if (message.session_digest != session_digest()) {
         return DkgFailure::WrongParticipantSet;
     }
     if (!index_of_.contains(message.sender)) {
