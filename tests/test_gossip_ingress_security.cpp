@@ -85,6 +85,7 @@ struct Node {
     fs::path dir;
     std::unique_ptr<crypto::SodiumCryptoService>   crypto;
     std::unique_ptr<storage::FileStorageService>   storage;
+    std::unique_ptr<acl::AclStore>                 acl_store;
     std::unique_ptr<acl::ACLService>               acl;
     std::unique_ptr<ipam::IPAMService>             ipam;
     std::unique_ptr<tree::PermissionTreeService>   tree;
@@ -194,7 +195,8 @@ protected:
     // A real SQLite-backed ACL service. The signing keypair is what derives the
     // at-rest key, so it must be set before any permission is written or read.
     static void attach_acl(Node& n, const crypto::Ed25519Keypair& kp) {
-        n.acl = std::make_unique<acl::ACLService>(n.dir / "acl.db", *n.crypto);
+        n.acl_store = std::make_unique<acl::AclStore>(n.dir / "acl.db");
+        n.acl = std::make_unique<acl::ACLService>(*n.acl_store, *n.crypto);
         n.acl->set_signing_keypair(kp);
         n.acl->start();
     }

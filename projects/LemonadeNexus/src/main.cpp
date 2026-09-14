@@ -488,7 +488,8 @@ int main(int argc, char* argv[]) {
     auth_service.start();
 
     auto acl_db_path = std::filesystem::path{config.data_root} / "acl.db";
-    nexus::acl::ACLService acl_service{acl_db_path, crypto};
+    nexus::acl::AclStore acl_store{acl_db_path};
+    nexus::acl::ACLService acl_service{acl_store, crypto};
     acl_service.set_signing_keypair(gossip.keypair());
 
     gossip.set_acl(&acl_service);

@@ -26,6 +26,7 @@ endfunction()
 
 # --- Unit tests ---
 add_nexus_test(test_version            test_version.cpp)
+add_nexus_test(test_acl_store          test_acl_store.cpp)
 add_nexus_test(test_crypto_types       test_crypto_types.cpp)
 add_nexus_test(test_sodium_crypto      test_sodium_crypto.cpp)
 add_nexus_test(test_key_wrapping       test_key_wrapping.cpp)
