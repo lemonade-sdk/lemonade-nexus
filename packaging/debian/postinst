@@ -17,6 +17,29 @@ if ! id -nG lemonade-nexus 2>/dev/null | tr ' ' '\n' | grep -qx nexus; then
     usermod -a -G nexus lemonade-nexus
 fi
 
+# The nexus-attestd unit runs as its own user (User=Group=nexus-attestd) so a
+# compromise of the mesh server does not inherit TPM access and vice versa.
+# Create the system account if it is absent, mirroring the lemonade-nexus
+# user above.
+if ! id -u nexus-attestd >/dev/null 2>&1; then
+    groupadd --system nexus-attestd
+    useradd --system --no-create-home --shell /usr/sbin/nologin \
+        --home-dir /nonexistent --gid nexus-attestd nexus-attestd
+fi
+# The unit's SupplementaryGroups= lists tss and nexus. tss is provided by
+# tpm2-tss and may not exist yet on a fresh install; only add the user to a
+# group that is present. Membership is checked the same way as above.
+if getent group tss >/dev/null 2>&1; then
+    if ! id -nG nexus-attestd 2>/dev/null | tr ' ' '\n' | grep -qx tss; then
+        usermod -a -G tss nexus-attestd
+    fi
+fi
+if getent group nexus >/dev/null 2>&1; then
+    if ! id -nG nexus-attestd 2>/dev/null | tr ' ' '\n' | grep -qx nexus; then
+        usermod -a -G nexus nexus-attestd
+    fi
+fi
+
 # The config file contains the root, Genesis, and release-signing trust anchors.
 # Its parent must be root-owned as well: protecting the file alone would still
 # let the daemon replace it by renaming another file into the directory.
@@ -76,6 +99,11 @@ chmod 0640 /etc/lemonade-nexus/lemonade-nexus.env
 # --install-dns-nat has written the conf its ConditionPathExists tests for.
 systemctl daemon-reload
 systemctl enable lemonade-nexus.service
+
+# The Nexus server wants the attestation daemon but does not require it. If the
+# unit shipped by the attestd package is present, enable it the same way: for
+# boot, without starting it.
+systemctl enable nexus-attestd.service
 
 echo ""
 echo "========================================"

@@ -225,6 +225,30 @@ class BootstrapTest(unittest.TestCase):
                 finally:
                     Path(temporary).unlink()
 
+    def test_postinst_creates_attestd_user_groups_and_enables_unit(self):
+        postinst = (REPO / "packaging/debian/postinst").read_text()
+        # (a) the unit's User=/Group= must resolve: a dedicated system account,
+        # created only when absent, mirroring the lemonade-nexus user.
+        self.assertIn("id -u nexus-attestd", postinst)
+        self.assertIn("groupadd --system nexus-attestd", postinst)
+        self.assertIn("useradd --system --no-create-home --shell /usr/sbin/nologin", postinst)
+        self.assertRegex(postinst,
+                         r"useradd --system[^\n]*\\\n"
+                         r"\s*--home-dir /nonexistent --gid nexus-attestd nexus-attestd")
+        # (b) SupplementaryGroups=tss nexus: membership added for every group
+        # that exists, each checked before usermod, idempotent like the
+        # lemonade-nexus membership above.
+        for group in ("tss", "nexus"):
+            with self.subTest(group=group):
+                self.assertRegex(postinst, rf'grep -qx {group}; then')
+                self.assertIn(f'usermod -a -G {group} nexus-attestd', postinst)
+        # (c) the unit is enabled, under the same guard as the server unit:
+        # a plain systemctl enable, no --now and no start.
+        self.assertIn("systemctl enable lemonade-nexus.service", postinst)
+        self.assertIn("systemctl enable nexus-attestd.service", postinst)
+        self.assertNotIn("enable --now nexus-attestd", postinst)
+        self.assertNotIn("start nexus-attestd", postinst)
+
     def test_attestd_unit_masks_lemonade_nexus_data_root(self):
         unit = (REPO / "projects/LemonadeNexusAttestd/systemd/nexus-attestd.service").read_text()
         lines = [line for line in unit.splitlines() if line.startswith("InaccessiblePaths=")]
