@@ -37,6 +37,12 @@ enum class DropReason : uint16_t {
     EpochOutOfWindow,
     Duplicate,
     NoService,
+    /// A remote challenger that is not a Tier 1 member of the current epoch:
+    /// its evidence could never reach a verifier that counts it.
+    NotMember,
+    /// A challenger answered more challenges than the per-challenger budget
+    /// allows inside one window.
+    BudgetExceeded,
     SealFailure,
     ServiceRejected,
 };
@@ -126,8 +132,9 @@ public:
                                           EpochId epoch) const;
 
     /// Applies an own message through the same dispatch as inbound traffic.
-    /// The gates do not run: the message never crossed the wire.
-    RouteResult deliver_local(SecurityMessage message);
+    /// The gates do not run: the message never crossed the wire. Pass
+    /// `now_ms` for the flood and challenge-production windows.
+    RouteResult deliver_local(SecurityMessage message, uint64_t now_ms);
 
     [[nodiscard]] bool send(const NodeId& to, const SecurityMessage& message);
     std::size_t broadcast(const SecurityMessage& message);
@@ -137,25 +144,33 @@ public:
 
 private:
     [[nodiscard]] bool within_budget(const NodeId& sender, uint64_t now_ms);
+    [[nodiscard]] bool challenger_is_member(const NodeId& from) const;
+    [[nodiscard]] bool within_challenge_budget(const NodeId& from, uint64_t now_ms);
     [[nodiscard]] bool remember(std::span<const uint8_t> envelope);
     [[nodiscard]] bool sender_bound(const SecurityMessage& message,
                                     const NodeId& authenticated_sender) const;
     [[nodiscard]] bool epoch_in_window(const SecurityMessage& message) const;
 
-    RouteResult dispatch(SecurityMessage& message);
+    RouteResult dispatch(SecurityMessage& message, uint64_t now_ms);
     RouteResult route_proposal(const ProposalMessage& message);
     RouteResult route_vote(const Vote& vote);
     RouteResult route_timeout(const TimeoutVote& vote);
     RouteResult route_dkg(DkgMessage& message);
     RouteResult route_commitment(const FrostCommitmentMessage& message);
     RouteResult route_share(const FrostShareMessage& message);
-    RouteResult route_challenge(const AttestationChallenge& challenge, const NodeId& from);
+    RouteResult route_challenge(const AttestationChallenge& challenge, const NodeId& from,
+                                uint64_t now_ms);
     RouteResult route_evidence(const AttestationEvidence& evidence);
     RouteResult route_announcement(const EpochAnnouncement& announcement, const NodeId& from);
     RouteResult route_sync_request(const SyncRequest& request, const NodeId& from);
     RouteResult route_sync_response(const SyncResponse& response, const NodeId& from);
 
     struct PeerBudget {
+        uint64_t window_start_ms = 0;
+        uint32_t count = 0;
+    };
+
+    struct ChallengeBudget {
         uint64_t window_start_ms = 0;
         uint32_t count = 0;
     };
@@ -168,6 +183,7 @@ private:
     IEvidenceProducer* evidence_producer_;
 
     std::map<NodeId, PeerBudget> budgets_;
+    std::map<NodeId, ChallengeBudget> challenge_budgets_;
     std::vector<Digest> seen_ring_;
     std::set<Digest> seen_;
     std::size_t seen_next_ = 0;
