@@ -5,7 +5,10 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
+#include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+
+#include <nlohmann/json.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
@@ -40,6 +43,20 @@ using asio::ip::udp;
 namespace nexus::gossip {
 struct GossipBallotTestAccess {
     static uint16_t port(GossipService& g) { return g.socket_.local_endpoint().port(); }
+    // The inbound drop counter is private state behind packet dispatch.
+    static uint64_t security_envelope_drops(GossipService& g) {
+        return g.security_envelope_drops_;
+    }
+    // Binds a root-signed certificate to a tracked peer. No public API carries
+    // a certificate into the peer table except ServerHello/PeerExchange, both
+    // of which need a second live node with a matching cert; this seam is the
+    // minimal stand-in the wire-level suites' storage pre-seed plays.
+    static void attach_cert(GossipService& g, const std::string& pubkey_b64,
+                            const std::string& cert_json) {
+        std::lock_guard lock(g.peers_mutex_);
+        for (auto& p : g.peers_)
+            if (p.pubkey == pubkey_b64) p.certificate_json = cert_json;
+    }
 };
 }  // namespace nexus::gossip
 
@@ -72,10 +89,23 @@ struct Node {
     [[nodiscard]] udp::endpoint udp_endpoint() {
         return udp::endpoint{asio::ip::make_address("127.0.0.1"), port()};
     }
+    [[nodiscard]] uint64_t envelope_drops() {
+        return gossip::GossipBallotTestAccess::security_envelope_drops(*gossip);
+    }
 };
+
+// Certificates bind to a network id; one value serves every fixture.
+inline const std::string kTestNetworkHex(64, 'a');
 
 std::vector<uint8_t> bytes_of(std::string_view s) {
     return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+// The NodeId of a raw keypair (the shape gossip attributes envelopes to).
+security::NodeId node_id_of(const crypto::Ed25519Keypair& kp) {
+    security::NodeId id{};
+    id.bytes = kp.public_key;
+    return id;
 }
 
 class GossipSecurityTransportTest : public ::testing::Test {
@@ -84,12 +114,18 @@ protected:
     asio::io_context io;
     fs::path root;
     std::vector<std::unique_ptr<Node>> nodes;
+    // Separate crypto service for the hostile side: it exists before any node
+    // does, so keypairs for non-members and a root key can be generated up
+    // front and signed into certificates before the receiver is built.
+    std::unique_ptr<crypto::SodiumCryptoService> root_crypto;
 
     void SetUp() override {
         root = fs::temp_directory_path() /
                ("nexus_test_sec_transport_" + std::to_string(getpid()));
         fs::remove_all(root);
         fs::create_directories(root);
+        root_crypto = std::make_unique<crypto::SodiumCryptoService>();
+        root_crypto->start();
     }
 
     void TearDown() override {
@@ -99,7 +135,25 @@ protected:
             (*it)->crypto->stop();
         }
         nodes.clear();
+        root_crypto->stop();
+        root_crypto.reset();
         fs::remove_all(root);
+    }
+
+    // A root-signed certificate for a peer, issued through the real path
+    // (gossip::issue_server_certificate) so the admission gate sees exactly
+    // what production sees.
+    std::string issue_cert(const std::string& server_pubkey_b64,
+                           const std::string& server_id,
+                           const crypto::Ed25519Keypair& root_kp) {
+        gossip::CertIssueParams p;
+        p.network_id        = kTestNetworkHex;
+        p.server_pubkey_b64 = server_pubkey_b64;
+        p.server_id         = server_id;
+        return nlohmann::json(
+            gossip::issue_server_certificate(p, *root_crypto,
+                                             root_kp.private_key, root_kp.public_key))
+            .dump();
     }
 
     // Every node shares one io_context that the test thread pumps, so sinks
@@ -268,6 +322,74 @@ TEST_F(GossipSecurityTransportTest, UnknownPeerAndSelfAreRefused) {
     pump_for(std::chrono::milliseconds(100));
     EXPECT_TRUE(a.received.empty());
     EXPECT_TRUE(b.received.empty());
+}
+
+// (d') Inbound half of (d): a correctly signed envelope FROM a peer this node
+// has not enrolled is refused at the transport before it reaches the sink —
+// the outbound refusal has no effect unless the inbound direction holds too.
+// Unknown means the signer holds no root-signed certificate here (a
+// peer-table entry without one proves nothing); the gate fails closed on the
+// absence of trust, never on the absence of a check.
+//
+// Control: the IDENTICAL bytes (same keypair, same socket, same payload) from
+// a signer that IS cert-verified are delivered to the sink. Only the
+// certificate differs between the two packets, so the refusal cannot be
+// explained by the wire path, the signature, or the payload.
+TEST_F(GossipSecurityTransportTest, InboundEnvelopeFromUnknownPeerIsDropped) {
+    const auto root_kp  = root_crypto->ed25519_keygen();
+    const auto stranger = root_crypto->ed25519_keygen();
+    const auto outsider = root_crypto->ed25519_keygen();
+    const auto outsider_b64 = crypto::to_base64(outsider.public_key);
+
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    // B anchors the test root, knows A as a peer, and A holds a real
+    // root-signed certificate there — but NOT `stranger`, the keypair that
+    // signs the hostile envelope below.
+    peer_all();
+    a.gossip->set_root_pubkey(root_kp.public_key);
+    a.gossip->set_network_id(kTestNetworkHex);
+    b.gossip->set_root_pubkey(root_kp.public_key);
+    b.gossip->set_network_id(kTestNetworkHex);
+    // Attach the real certificate to the peer table entry. The public API
+    // only carries a certificate in via ServerHello/PeerExchange (both of
+    // which need a second live node with a matching cert); this is the same
+    // pre-seed the wire-level ingress suites do with seed_peers.
+    const auto a_cert = issue_cert(crypto::to_base64(a.pubkey()), "peer-a", root_kp);
+    gossip::GossipBallotTestAccess::attach_cert(*b.gossip, crypto::to_base64(a.pubkey()),
+                                                a_cert);
+
+    EXPECT_TRUE(b.gossip->peer_is_root_certified(a.id()));
+    EXPECT_FALSE(b.gossip->peer_is_root_certified(node_id_of(stranger)));
+
+    // Unknown signer: correctly signed, in-bounds, yet it must not reach the
+    // sink and the drop must be recorded.
+    const auto env = bytes_of("from-a-stranger");
+    const auto drops_before = b.envelope_drops();
+    inject(build_packet(*root_crypto, stranger, env), b);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(b.received.empty());
+    EXPECT_EQ(b.envelope_drops(), drops_before + 1);
+
+    // Known peer without a certificate: peer-table membership is not trust.
+    b.gossip->add_peer("127.0.0.1:9", outsider_b64);
+    EXPECT_TRUE(b.gossip->peer_is_root_certified(a.id()));
+    inject(build_packet(*root_crypto, outsider, bytes_of("peer-without-a-cert")), b);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(b.received.empty());
+    EXPECT_EQ(b.envelope_drops(), drops_before + 2);
+
+    // Control: the same raw path, same socket, same payload — signed by the
+    // cert-verified peer A — is delivered. Only the signer's certificate
+    // differs between the hostile packets and this one, so the refusal cannot
+    // be explained by the wire path, the signature check, or the payload.
+    inject(build_packet(*a.crypto, a.gossip->keypair(), env), b);
+    ASSERT_TRUE(pump_until([&] { return !b.received.empty(); }));
+    ASSERT_EQ(b.received.size(), 1u);
+    EXPECT_EQ(b.received[0].bytes, env);
+    EXPECT_EQ(b.received[0].sender.bytes, a.pubkey());
+    // Delivery is not a drop: only the two hostile packets were recorded.
+    EXPECT_EQ(b.envelope_drops(), drops_before + 2);
 }
 
 // (e) No sink: the envelope is dropped and the service keeps running.

@@ -378,6 +378,9 @@ private:
     std::function<void(const security::NodeId&)> peer_certified_cb_;
     std::chrono::steady_clock::time_point security_drop_warn_at_{};
     uint64_t                              security_drops_since_warn_{0};
+    // Inbound security envelopes refused because the packet signer is not a
+    // root-certified peer. Touched only from handle_receive on the io thread.
+    uint64_t                              security_envelope_drops_{0};
 
 public:
     /// Set the ACL service for distributed permission sync.
