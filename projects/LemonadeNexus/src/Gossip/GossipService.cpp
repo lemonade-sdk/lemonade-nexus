@@ -2392,22 +2392,33 @@ bool GossipService::find_peer_endpoint_by_pubkey(std::string_view b64,
 
 void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
                                              const uint8_t* payload, std::size_t len) {
-    // Fail-closed membership gate, mirroring every other state-mutating gossip
-    // ingress path: once the mesh is formed (some peer holds a root-signed
-    // certificate), a packet that reaches the Tier 1 security plane must have
-    // been signed by one of them. A stranger can otherwise reach the router
-    // line rate with bytes it signed itself, and the outbound refusal is hollow
-    // if the inbound one is not.
+    // Fail-closed membership gate, mirroring every other state-mutating
+    // gossip ingress path: once the mesh is formed (some peer holds a
+    // root-signed certificate), a packet that reaches the Tier 1 security
+    // plane must have been signed by one of them. A stranger can otherwise
+    // reach the router line rate with bytes it signed itself, and the
+    // outbound refusal is hollow if the inbound one is not.
     //
-    // The gate is scoped to the kinds that mutate security/consensus state.
-    // The attestation-carrying kinds are EXEMPT on purpose: they are the
-    // mechanism by which an uncertified peer becomes certified (Genesis
-    // challenges a new node precisely because it has no root-signed
-    // certificate yet), so gating them would break enrolment. Those kinds are
-    // already bounded upstream by the per-challenger production budget and the
-    // challenge nonce binding; the router additionally drops evidence from a
-    // non-member. While no peer is certified (mesh not yet formed) the gate is
-    // inert for everyone, and ServerHello/PeerExchange is still the only way
+    // The exemption is per-kind, not a category. Each exempt kind names a
+    // sender this node's certificate table may not hold yet, and each is
+    // authorized somewhere that protocol state decides: transport enrollment
+    // authorizes the peer; attestation evaluates Tier 1 eligibility. It is
+    // the reverse of the old assumption that attestation certifies anyone.
+    //   AttestationChallenge — the pinned anchor issues the founding
+    //     challenges before its certificate has converged into a peer's
+    //     table; the router admits the anchor pre-quorum and current members
+    //     once an epoch is active, then applies the production budget.
+    //   AttestationEvidence — the subject was certified before it was ever
+    //     challenged; an envelope that names no live challenge this node
+    //     issued is refused before any verification work.
+    //   DkgTranscriptAttest / GenesisEligibilityAttest — sent by the founding
+    //     set, anchor included; GenesisService accepts only a signature as a
+    //     founder over the founding transcript, and a stranger holds none of
+    //     those keys.
+    // A ParticipationChallenge is NOT exempt: only current members, all of
+    // them certified, ever issue one, and never before an epoch is active.
+    // While no peer is certified (mesh not yet formed) the gate is inert for
+    // everyone, and ServerHello/PeerExchange is still the only way
     // certificates enter.
     const auto sender_b64 =
         crypto::to_base64(std::span<const uint8_t>{sender_pubkey, 32});
@@ -2417,7 +2428,7 @@ void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
     // we do not gate on a kind we cannot read.
     const auto decoded =
         security::decode_security_message(std::span<const uint8_t>{payload, len});
-    const bool is_attestation_kind = std::holds_alternative<security::SecurityMessage>(decoded) &&
+    const bool is_exempt_kind = std::holds_alternative<security::SecurityMessage>(decoded) &&
         (std::get<security::SecurityMessage>(decoded).kind ==
              security::SecurityMessageKind::AttestationChallenge ||
          std::get<security::SecurityMessage>(decoded).kind ==
@@ -2425,11 +2436,9 @@ void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
          std::get<security::SecurityMessage>(decoded).kind ==
              security::SecurityMessageKind::DkgTranscriptAttest ||
          std::get<security::SecurityMessage>(decoded).kind ==
-             security::SecurityMessageKind::GenesisEligibilityAttest ||
-         std::get<security::SecurityMessage>(decoded).kind ==
-             security::SecurityMessageKind::ParticipationChallenge);
+             security::SecurityMessageKind::GenesisEligibilityAttest);
 
-    if (!is_attestation_kind) {
+    if (!is_exempt_kind) {
         bool any_certified = false;
         {
             std::lock_guard lock(peers_mutex_);

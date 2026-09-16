@@ -115,6 +115,11 @@ public:
 
 struct SecurityRouterConfig {
     NetworkId network_id{};
+    /// The pinned bootstrap anchor. During the genesis window it is the only
+    /// identity authorized to issue a remote challenge; after an epoch is
+    /// active, current members are. It is network state — the network id
+    /// derives from it — not a certificate this node has seen.
+    NodeId genesis_anchor_id{};
 };
 
 class SecurityRouter {
@@ -144,8 +149,12 @@ public:
 
 private:
     [[nodiscard]] bool within_budget(const NodeId& sender, uint64_t now_ms);
+    /// True when `from` is authorized to issue a challenge to this node in
+    /// the current lifecycle phase: the pinned anchor while no epoch is
+    /// active, a current Tier 1 member once one is.
     [[nodiscard]] bool challenger_is_member(const NodeId& from) const;
     [[nodiscard]] bool within_challenge_budget(const NodeId& from, uint64_t now_ms);
+
     [[nodiscard]] bool remember(std::span<const uint8_t> envelope);
     [[nodiscard]] bool sender_bound(const SecurityMessage& message,
                                     const NodeId& authenticated_sender) const;

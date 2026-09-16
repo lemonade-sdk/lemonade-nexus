@@ -24,6 +24,14 @@ namespace {
                              constants::kConsensusRulesetVersion);
 }
 
+// The anchor's identity is network state: every node of this network can name
+// it, and during the genesis window only it may issue a remote challenge.
+[[nodiscard]] NodeId genesis_anchor_id(const SecurityMeshConfig& config) {
+    NodeId id{};
+    id.bytes = config.genesis_public_key;
+    return id;
+}
+
 }  // namespace
 
 SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMeshConfig& config,
@@ -60,8 +68,10 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
       events_(),
       // The producer is constructed after the router; only its address is
       // taken here, never its state.
-      router_(SecurityRouterConfig{mesh_network_id(config)}, runtime_, transport_, events_,
-              sealer_, &producer_),
+      router_(SecurityRouterConfig{
+                  .network_id = mesh_network_id(config),
+                  .genesis_anchor_id = genesis_anchor_id(config)},
+              runtime_, transport_, events_, sealer_, &producer_),
       producer_(EvidenceProducerSources{
           config.identity,
           [this](EpochId epoch) { return driver_.vote_key_for_epoch(epoch); },

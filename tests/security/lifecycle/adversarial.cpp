@@ -464,9 +464,11 @@ struct AdversarialMesh : ::testing::Test {
         node.runtime = std::make_unique<SecurityRuntime>(runtime_config);
         node.sealer = std::make_unique<PairwiseSealer>(node.identity.private_key);
         node.transport = std::make_unique<MemoryTransport>(mesh, node.id);
-        node.router = std::make_unique<SecurityRouter>(SecurityRouterConfig{network},
-                                                       *node.runtime, *node.transport,
-                                                       node.events, *node.sealer, nullptr);
+        node.router = std::make_unique<SecurityRouter>(
+            SecurityRouterConfig{
+                .network_id = network,
+                .genesis_anchor_id = genesis_node->id},
+            *node.runtime, *node.transport, node.events, *node.sealer, nullptr);
         if (&node == genesis_node) {
             node.genesis = std::make_unique<GenesisService>(network);
         }

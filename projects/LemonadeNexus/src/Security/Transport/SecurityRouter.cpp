@@ -84,21 +84,20 @@ bool SecurityRouter::within_budget(const NodeId& sender, uint64_t now_ms) {
 bool SecurityRouter::challenger_is_member(const NodeId& from) const {
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
-        // No EpochManager yet: the genesis window. The founding anchor
-        // challenges peers over the wire precisely during this phase
-        // (issue_genesis_challenge) to collect eligibility verdicts, so a
-        // remote challenger is legitimate here. There is nothing a stranger
-        // can corrupt before an epoch is frozen — the router has no member
-        // state to act on, and evidence it cannot bind to an epoch is inert.
-        return true;
+        // Genesis window. Only the pinned anchor issues founding challenges,
+        // and its identity is network state: the network id derives from it,
+        // so every node of this network knows it without any certificate.
+        // Transport enrollment happens before attestation; attestation never
+        // certifies, which is exactly why a stranger's self-signature must
+        // not open this gate.
+        return from == config_.genesis_anchor_id;
     }
     const EpochState& cur = epochs->current();
     if (cur.id == 0) {
         // EpochManager exists but no epoch is activated yet (GenesisCollecting
-        // / selection): the receiver is still choosing its founding set and
-        // must answer the anchor's eligibility challenges. Same window as
-        // above.
-        return true;
+        // / selection): the anchor is still running the founding round, and
+        // only it may challenge. Same rule as above.
+        return from == config_.genesis_anchor_id;
     }
     return cur.tier1_members.contains(from);
 }
@@ -608,9 +607,9 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
         return drop(DropReason::NoService);
     }
     if (from != runtime_.self() && !challenger_is_member(from)) {
-        // A remote challenger outside the mesh can never act on evidence, and
-        // answering one is expensive local platform work; refuse before any
-        // production.
+        // Answering a challenge is expensive platform work. The requester is
+        // authorized by phase — the pinned anchor pre-quorum, a current
+        // member once an epoch is active — never by its own signature.
         return drop(DropReason::NotMember);
     }
     if (!within_challenge_budget(from, now_ms)) {

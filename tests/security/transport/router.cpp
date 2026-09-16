@@ -183,10 +183,12 @@ struct RouterMesh : ::testing::Test {
         root = fs::temp_directory_path() / ("nexus_router_" + std::to_string(::getpid()));
         fs::create_directories(root);
 
+        NodeId anchor_id{};
         for (std::size_t i = 0; i < kFounders + 1; ++i) {
             auto node = std::make_unique<Node>();
             crypto_sign_keypair(node->identity_pub.data(), node->identity_priv.data());
             node->id.bytes = node->identity_pub;
+            if (i == 0) anchor_id = node->id;  // node 0 is the pinned anchor
             node->dir = root / ("node" + std::to_string(i));
             SecurityRuntimeConfig config;
             config.self = node->id;
@@ -199,8 +201,13 @@ struct RouterMesh : ::testing::Test {
             node->runtime = std::make_unique<SecurityRuntime>(config);
             node->sealer = std::make_unique<PairwiseSealer>(node->identity_priv);
             node->transport = std::make_unique<MemoryTransport>(mesh, node->id);
+            // Node 0 is this fixture's pinned anchor, the same network state
+            // the production config carries.
+            SecurityRouterConfig router_config;
+            router_config.network_id = network;
+            router_config.genesis_anchor_id = anchor_id;
             node->router = std::make_unique<SecurityRouter>(
-                SecurityRouterConfig{network}, *node->runtime, *node->transport, node->events,
+                router_config, *node->runtime, *node->transport, node->events,
                 *node->sealer, &node->producer);
             mesh.nodes[node->id] = node.get();
             nodes.push_back(std::move(node));
@@ -636,6 +643,97 @@ TEST_F(RouterMesh, LoopbackAttestationStillAnswersItself) {
         SecurityMessageKind::AttestationChallenge, gate_passing_challenge(network, a->id), 1);
     EXPECT_TRUE(a->apply_local(second, mesh.now_ms).delivered);
     EXPECT_EQ(a->producer.calls, 2);
+}
+
+// --- Pre-quorum (Genesis window) challenge authorization ----------------
+//
+// No epoch is active in these tests: epochs() is null on every node, so the
+// router is in the bootstrap window. The only identity authorized to issue a
+// remote challenge there is the pinned genesis anchor; every other identity
+// is a stranger, however well-formed and freshly signed its envelope is.
+
+NodeId fresh_stranger_id() {
+    NodeId id{};
+    randombytes_buf(id.bytes.data(), id.bytes.size());
+    return id;
+}
+
+TEST_F(RouterMesh, PreQuorumStrangerChallengeIsDroppedBeforeProduction) {
+    Node* a = founders[0];
+
+    // A correctly formed, correctly signed (at the transport seam) challenge
+    // from an identity that is neither the anchor nor any member, naming A as
+    // the subject, with a fresh nonce: it must die before the expensive
+    // platform work runs.
+    const auto challenge = gate_passing_challenge(network, a->id);
+    const SecurityMessage message = outsider->router->compose(
+        SecurityMessageKind::AttestationChallenge, challenge, 1);
+    const auto result = a->deliver(outsider->id, encode_security_message(message), mesh.now_ms);
+    EXPECT_EQ(result.dropped, DropReason::NotMember);
+    EXPECT_EQ(a->producer.calls, 0);
+}
+
+TEST_F(RouterMesh, PreQuorumIdentityRotationCannotProduceEvidence) {
+    Node* a = founders[0];
+
+    // A stream of freshly generated identities, each inside its own (reset)
+    // per-challenger budget. If authorization were "no epoch yet, anyone",
+    // rotating NodeIds would keep the production rate at the per-identity
+    // budget forever. Count actual producer invocations, not drop codes.
+    constexpr std::size_t kStrangers = 12;
+    for (std::size_t i = 0; i < kStrangers; ++i) {
+        const NodeId stranger = fresh_stranger_id();
+        for (uint32_t c = 0; c < constants::kChallengeProductionsPerWindow; ++c) {
+            const auto challenge = gate_passing_challenge(network, a->id);
+            SecurityMessage message =
+                a->router->compose(SecurityMessageKind::AttestationChallenge, challenge, 1);
+            message.sender = stranger;
+            (void)a->deliver(stranger, encode_security_message(message), mesh.now_ms);
+        }
+    }
+    EXPECT_EQ(a->producer.calls, 0);
+}
+
+TEST_F(RouterMesh, PreQuorumAnchorChallengeIsAnswered) {
+    // founders[0] is this fixture's pinned anchor. Its challenge to a second
+    // node is the founding flow itself and must reach the producer even with
+    // no epoch active.
+    Node* anchor = founders[0];
+    Node* b = founders[1];
+    b->producer.answer = AttestationEvidence{};
+    b->producer.answer->node_id = b->id;
+
+    const auto challenge = gate_passing_challenge(network, b->id);
+    const auto envelope = anchor->router->compose(SecurityMessageKind::AttestationChallenge,
+                                                  challenge, 1);
+    const auto result = b->deliver(anchor->id, encode_security_message(envelope), mesh.now_ms);
+    EXPECT_TRUE(result.delivered);
+    EXPECT_EQ(b->producer.calls, 1);
+}
+
+TEST_F(RouterMesh, PreQuorumAnchorChallengeIsBoundedPerWindow) {
+    Node* anchor = founders[0];
+    Node* b = founders[1];
+    b->producer.answer = AttestationEvidence{};
+    b->producer.answer->node_id = b->id;
+
+    for (uint32_t i = 0; i < constants::kChallengeProductionsPerWindow; ++i) {
+        const auto challenge = gate_passing_challenge(network, b->id);
+        const auto envelope = anchor->router->compose(SecurityMessageKind::AttestationChallenge,
+                                                      challenge, 1);
+        (void)b->deliver(anchor->id, encode_security_message(envelope), mesh.now_ms);
+    }
+    EXPECT_EQ(b->producer.calls, constants::kChallengeProductionsPerWindow);
+
+    // The anchor is authorized, not unbounded: the next one in the same
+    // window is dropped before production.
+    const auto excess = gate_passing_challenge(network, b->id);
+    const auto excess_envelope = anchor->router->compose(
+        SecurityMessageKind::AttestationChallenge, excess, 1);
+    EXPECT_EQ(b->deliver(anchor->id, encode_security_message(excess_envelope), mesh.now_ms)
+                  .dropped,
+              DropReason::BudgetExceeded);
+    EXPECT_EQ(b->producer.calls, constants::kChallengeProductionsPerWindow);
 }
 
 TEST_F(RouterMesh, SyncResponseCarriesAValidatedCertificate) {

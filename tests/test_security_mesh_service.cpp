@@ -15,6 +15,7 @@
 
 #include <asio.hpp>
 #include <gtest/gtest.h>
+#include <sodium.h>
 
 #include <chrono>
 #include <cstdint>
@@ -274,6 +275,78 @@ TEST_F(SecurityMeshServiceTest, GarbageAndForgedEnvelopesAreContained) {
         return a.mesh->runtime().attestation().verdict(b.id()).has_value();
     }));
     EXPECT_FALSE(a.mesh->runtime().attestation().verdict(b.id())->passed);
+}
+
+// (e) The full boundary before the quorum: a well-formed, correctly signed
+// challenge from an identity that is not the pinned anchor and holds no
+// certificate. Evidence production is the only work this path can trigger, and
+// its only observable product is the evidence it sends back — so three
+// rotated stranger identities challenging B must leave no verdict anywhere.
+// The positive control re-runs (b): the anchor's challenge over the same wire
+// does produce.
+TEST_F(SecurityMeshServiceTest, PreQuorumStrangerChallengeProducesNoEvidence) {
+    ASSERT_GE(sodium_init(), 0);
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    auto& s1 = make_node("s1");
+    auto& s2 = make_node("s2");
+    auto& s3 = make_node("s3");
+    peer_all();
+    make_mesh(a, a.pubkey());  // A's identity is the pinned anchor.
+    make_mesh(b, a.pubkey());
+    make_mesh(s1, a.pubkey());
+    make_mesh(s2, a.pubkey());
+    make_mesh(s3, a.pubkey());
+
+    const auto network = security::derive_network_id(
+        a.pubkey(), security::constants::kSecurityRulesetVersion,
+        security::constants::kConsensusRulesetVersion);
+    const auto challenge_for = [&](const Node& s) {
+        security::AttestationChallenge c{};
+        c.network_id = network;
+        randombytes_buf(c.nonce.data(), c.nonce.size());
+        c.node_id = b.id();
+        c.node_key = b.pubkey();
+        c.incarnation = 1;
+        c.epoch = 1;
+        c.security_ruleset = security::constants::kSecurityRulesetVersion;
+        c.consensus_ruleset = security::constants::kConsensusRulesetVersion;
+        // The profile is compiled protocol state, not a secret: a stranger
+        // names the same one the anchor would, so the producer treats the
+        // challenge as answerable.
+        c.profile_id = security::kTier1AttestationProfileId;
+        c.profile_ruleset = security::kAttestationProfileRulesetVersion;
+        const auto bytes = security::encode_security_message(security::SecurityMessage{
+            .kind = security::SecurityMessageKind::AttestationChallenge,
+            .security_ruleset = security::constants::kSecurityRulesetVersion,
+            .consensus_ruleset = security::constants::kConsensusRulesetVersion,
+            .network_id = network,
+            .epoch = 1,
+            .sender = s.id(),
+            .body = c});
+        return bytes;
+    };
+
+    // Three freshly rotated identities, each a full node on the same wire.
+    for (Node* s : {&s1, &s2, &s3}) {
+        ASSERT_TRUE(s->gossip->send_to(b.id(), challenge_for(*s)));
+    }
+    pump_for(std::chrono::milliseconds(600));  // several driver ticks
+
+    // The producer's first act in an answerable production is creating and
+    // persisting the epoch vote key the evidence must bind. No file means no
+    // production ran for any of the strangers.
+    EXPECT_FALSE(fs::exists(b.dir / "mesh" / "security" / "vote-key-1.json"));
+
+    // Positive control: the anchor's own challenge over the identical wire
+    // does reach production — the vote key appears — and returns a (failing,
+    // host-ineligible) verdict to the anchor.
+    gossip::GossipBallotTestAccess::certify(*a.gossip, b.id());
+    ASSERT_TRUE(pump_until([&] {
+        return a.mesh->runtime().attestation().verdict(b.id()).has_value();
+    }));
+    EXPECT_FALSE(a.mesh->runtime().attestation().verdict(b.id())->passed);
+    EXPECT_TRUE(fs::exists(b.dir / "mesh" / "security" / "vote-key-1.json"));
 }
 
 // (d) ServerConfig carries genesis_pubkey from every source; empty stays

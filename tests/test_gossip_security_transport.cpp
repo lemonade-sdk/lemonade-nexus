@@ -394,11 +394,12 @@ TEST_F(GossipSecurityTransportTest, InboundEnvelopeFromUnknownPeerIsDropped) {
     EXPECT_EQ(b.envelope_drops(), drops_before + 2);
 }
 
-// The membership gate is scoped to state-mutating kinds: an attestation-kind
-// envelope from an unknown signer is EXEMPT (it is the enrolment mechanism —
-// Genesis challenges a node precisely because it has no root-signed
-// certificate yet), so it reaches the sink and is NOT recorded as a drop.
-// The same bytes as a HotStuffProposal from the same stranger ARE dropped.
+// The membership gate is per-kind: the anchor's founding kinds from an
+// identity this table has no certificate for are EXEMPT (the anchor may not
+// yet be cert-converged in a peer's table), and each is authorized by
+// protocol state downstream — the router binds the challenger to the anchor
+// pre-quorum and to a current member once an epoch is active. The same bytes
+// as a HotStuffProposal from the same stranger ARE dropped.
 TEST_F(GossipSecurityTransportTest, InboundAttestationFromUnknownPeerIsExempt) {
     const auto root_kp  = root_crypto->ed25519_keygen();
     const auto stranger = root_crypto->ed25519_keygen();
@@ -417,7 +418,8 @@ TEST_F(GossipSecurityTransportTest, InboundAttestationFromUnknownPeerIsExempt) {
     ASSERT_FALSE(b.gossip->peer_is_root_certified(node_id_of(stranger)));
 
     // AttestationChallenge body, signed by the stranger: exempt from the
-    // membership gate, reaches the sink, no drop recorded.
+    // membership gate (the router, not the table, authorizes the challenger),
+    // reaches the sink, no drop recorded.
     const security::AttestationChallenge att{};
     const auto att_bytes = security::encode_security_message(
         security::SecurityMessage{
@@ -448,6 +450,89 @@ TEST_F(GossipSecurityTransportTest, InboundAttestationFromUnknownPeerIsExempt) {
     pump_for(std::chrono::milliseconds(300));
     EXPECT_TRUE(b.received.empty());
     EXPECT_EQ(b.envelope_drops(), drops_after_att + 1);
+}
+
+// The gate is per-kind, not a single "attestation" category. The kinds the
+// pinned anchor itself sends before its certificate has converged into a
+// peer's table (challenge, evidence, the two founding attestations) stay
+// exempt, and each is authorized elsewhere: the router binds the challenger
+// to the anchor (pre-quorum) or to a current member (epoch active) before
+// any production, the evidence must bind to a challenge this node issued,
+// and the attestations must sign as a member of the founding set. A
+// ParticipationChallenge has no phase in which an uncertified sender is
+// legitimate — only current members, all certified, ever issue one — so it is
+// gated like any other state-mutating kind.
+TEST_F(GossipSecurityTransportTest, KindGateIsPerKindNotPerCategory) {
+    const auto root_kp  = root_crypto->ed25519_keygen();
+    const auto stranger = root_crypto->ed25519_keygen();
+
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    peer_all();
+    a.gossip->set_root_pubkey(root_kp.public_key);
+    a.gossip->set_network_id(kTestNetworkHex);
+    b.gossip->set_root_pubkey(root_kp.public_key);
+    b.gossip->set_network_id(kTestNetworkHex);
+    const auto a_cert = issue_cert(crypto::to_base64(a.pubkey()), "peer-a", root_kp);
+    gossip::GossipBallotTestAccess::attach_cert(*b.gossip, crypto::to_base64(a.pubkey()),
+                                                a_cert);
+    ASSERT_TRUE(b.gossip->peer_is_root_certified(a.id()));
+    ASSERT_FALSE(b.gossip->peer_is_root_certified(node_id_of(stranger)));
+
+    const auto send_as = [&](const crypto::Ed25519Keypair& signer,
+                             security::SecurityMessageKind kind, auto&& body) {
+        b.received.clear();
+        const auto bytes = security::encode_security_message(security::SecurityMessage{
+            .kind = kind, .epoch = 1, .sender = b.id(), .body = body});
+        const auto drops_before = b.envelope_drops();
+        inject(build_packet(*root_crypto, signer, bytes), b);
+        pump_for(std::chrono::milliseconds(300));
+        return std::pair{b.received.empty(), b.envelope_drops() - drops_before};
+    };
+
+    // Gated: a stranger's participation challenge is dropped at the
+    // transport; the certified control below proves the wire path is not.
+    const auto gated = send_as(stranger, security::SecurityMessageKind::ParticipationChallenge,
+                               security::ParticipationChallenge{});
+    EXPECT_TRUE(gated.first);
+    EXPECT_EQ(gated.second, 1u);
+
+    // Exempt by construction: the anchor's kinds reach the sink even from an
+    // identity this table has no certificate for; the router, GenesisService,
+    // and the challenge binding decide what counts.
+    {
+        const auto r = send_as(stranger, security::SecurityMessageKind::AttestationChallenge,
+                               security::AttestationChallenge{});
+        EXPECT_FALSE(r.first);
+        EXPECT_EQ(r.second, 0u);
+    }
+    {
+        const auto r = send_as(stranger, security::SecurityMessageKind::AttestationEvidence,
+                               security::AttestationEvidence{});
+        EXPECT_FALSE(r.first);
+        EXPECT_EQ(r.second, 0u);
+    }
+    {
+        const auto r = send_as(stranger, security::SecurityMessageKind::DkgTranscriptAttest,
+                               security::DkgTranscriptAttest{});
+        EXPECT_FALSE(r.first);
+        EXPECT_EQ(r.second, 0u);
+    }
+    {
+        const auto r = send_as(stranger, security::SecurityMessageKind::GenesisEligibilityAttest,
+                               security::GenesisEligibilityAttest{});
+        EXPECT_FALSE(r.first);
+        EXPECT_EQ(r.second, 0u);
+    }
+
+    // Control: the same gated kind from the certified peer A is delivered.
+    const auto ok = send_as(a.gossip->keypair(),
+                            security::SecurityMessageKind::ParticipationChallenge,
+                            security::ParticipationChallenge{});
+    EXPECT_FALSE(ok.first);
+    EXPECT_EQ(ok.second, 0u);
+    ASSERT_EQ(b.received.size(), 1u);
+    EXPECT_EQ(b.received[0].sender.bytes, a.pubkey());
 }
 
 // (e) No sink: the envelope is dropped and the service keeps running.
