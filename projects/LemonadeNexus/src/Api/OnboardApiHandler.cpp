@@ -8,6 +8,8 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <spdlog/spdlog.h>
@@ -67,6 +69,30 @@ std::optional<core::ApprovedOnboardingBundle> OnboardApiHandler::approved_bundle
     } catch (...) {
         return std::nullopt;
     }
+
+    // The configured Genesis anchor must derive exactly the network id the
+    // stored certificate names: a locally inconsistent config or admission
+    // store must not be served to the candidate as a valid join.
+    const auto genesis_bytes =
+        crypto::from_base64(crypto::canonical_key_b64(ctx_.config.genesis_pubkey));
+    if (genesis_bytes.size() != crypto::kEd25519PublicKeySize) return std::nullopt;
+    crypto::Ed25519PublicKey genesis_pk{};
+    std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
+    const auto derived = security::derive_network_id(
+        genesis_pk, security::constants::kSecurityRulesetVersion,
+        security::constants::kConsensusRulesetVersion);
+    std::vector<uint8_t> cert_network;
+    try {
+        cert_network = crypto::from_hex(bundle.certificate.network_id);
+    } catch (...) {
+        return std::nullopt;
+    }
+    if (cert_network.size() != derived.size() ||
+        std::memcmp(cert_network.data(), derived.data(), derived.size()) != 0) {
+        return std::nullopt;
+    }
+    bundle.genesis_pubkey = crypto::to_base64(
+        std::span<const uint8_t>(genesis_bytes.data(), genesis_bytes.size()));
 
     // Root anchor as hex, sourced from the configured trust anchor — NOT from
     // whichever local identity handled the request. This is what the candidate
@@ -170,7 +196,7 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         if (a->state == core::AdmissionState::Approved) {
             auto response = approved_bundle(a->issued_cert_json);
             if (!response) {
-                error_response(res, "stored certificate is invalid", 500);
+                error_response(res, "cannot construct approved onboarding bundle", 500);
                 return;
             }
             json_response(res, response->toJson());

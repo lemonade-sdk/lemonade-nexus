@@ -55,6 +55,11 @@ add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
 add_nexus_test(test_onboarding        test_onboarding.cpp)
+# Internal onboarding validation lives in the library's src tree, not the
+# public include tree; only the onboarding unit tests get a path to it.
+target_include_directories(test_onboarding PRIVATE
+    ${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/Core)
+add_nexus_test(test_onboarding_genesis test_onboarding_genesis.cpp)
 
 # Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
 add_nexus_test(test_tls_transport     test_tls_transport.cpp)

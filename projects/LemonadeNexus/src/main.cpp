@@ -24,6 +24,7 @@
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
+#include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
@@ -193,65 +194,38 @@ int main(int argc, char* argv[]) {
 
 
     // ========================================================================
-    // New security lifecycle (gossip is its transport; the old trust system
-    // stays constructed and is not consulted by it)
-    // ========================================================================
-    // Runs only with a pinned Genesis anchor: no assumed authority, no local
-    // override, no fallback. Constructed after gossip.start() because the
-    // gossip identity keypair exists only then; declared after gossip so it is
+    // Security mesh — unconditional in normal operation; start_security_mesh
+    // is the only wiring. Constructed after gossip.start() because the gossip
+    // identity keypair exists only then; declared after gossip so it is
     // destroyed first.
-    std::optional<nexus::security::SecurityMeshService> security_mesh;
-    if (!config.genesis_pubkey.empty()) {
-        const auto genesis_bytes = nexus::crypto::from_base64(
-            nexus::crypto::canonical_key_b64(config.genesis_pubkey));
-        if (genesis_bytes.size() != nexus::crypto::kEd25519PublicKeySize) {
-            spdlog::error("Config: genesis_pubkey is not a base64 Ed25519 public key");
-            return 1;
-        }
-        nexus::security::SecurityMeshConfig mesh_config;
-        mesh_config.data_root = data_root;
-        std::memcpy(mesh_config.genesis_public_key.data(), genesis_bytes.data(),
-                    genesis_bytes.size());
-        // Certificates bind to the derived network id. The gossip gate never
-        // fails open, so without this no certificate validates.
-        gossip.set_network_id(nexus::crypto::to_hex(nexus::security::derive_network_id(
-            mesh_config.genesis_public_key,
-            nexus::security::constants::kSecurityRulesetVersion,
-            nexus::security::constants::kConsensusRulesetVersion)));
-        mesh_config.identity = gossip.keypair();
-        // The named profile, not a default-constructed one. It is currently
-        // incomplete by design, so every attestation fails with
-        // ProfileIncomplete until a qualifying host supplies the pinned values.
-        mesh_config.profile = nexus::security::linux_attestation_profile_v1();
-        if (!nexus::security::profile_is_complete(mesh_config.profile)) {
-            for (const auto gap : nexus::security::profile_gaps(mesh_config.profile)) {
-                spdlog::warn("Attestation profile v{} is incomplete: {}",
-                             mesh_config.profile.profile_version,
-                             nexus::security::profile_gap_name(gap));
-            }
-            spdlog::warn("No node can reach Tier 1 until the profile pins these values.");
-        }
+    // ========================================================================
+    nexus::security::PlatformEvidenceSource platform_source;
 #ifdef LEMONADE_HAVE_ATTESTD_CLIENT
-        // Platform evidence comes from nexus-attestd over its unix socket, so
-        // this process needs neither TPM access nor the root-only IMA log.
-        // There is no in-process fallback: if the daemon is absent or refuses,
-        // the source yields empty evidence and the verifier fails it closed.
-        {
-            nexus::attestd::AttestdClientConfig attestd;
-            mesh_config.platform_source = nexus::attestd::attestd_platform_source(attestd);
-            std::error_code sock_ec;
-            if (!std::filesystem::exists(attestd.path, sock_ec)) {
-                spdlog::warn("nexus-attestd socket {} is absent; platform evidence will be "
-                             "empty and every attestation will fail until the daemon runs",
-                             attestd.path.string());
-            } else {
-                spdlog::info("platform evidence source: nexus-attestd at {}",
-                             attestd.path.string());
-            }
+    // Platform evidence comes from nexus-attestd over its unix socket, so
+    // this process needs neither TPM access nor the root-only IMA log.
+    // There is no in-process fallback: if the daemon is absent or refuses,
+    // the source yields empty evidence and the verifier fails it closed.
+    {
+        nexus::attestd::AttestdClientConfig attestd;
+        platform_source = nexus::attestd::attestd_platform_source(attestd);
+        std::error_code sock_ec;
+        if (!std::filesystem::exists(attestd.path, sock_ec)) {
+            spdlog::warn("nexus-attestd socket {} is absent; platform evidence will be "
+                         "empty and every attestation will fail until the daemon runs",
+                         attestd.path.string());
+        } else {
+            spdlog::info("platform evidence source: nexus-attestd at {}",
+                         attestd.path.string());
         }
+    }
 #endif
-        security_mesh.emplace(coordinator.io_context(), mesh_config, gossip, &key_wrapping);
-        security_mesh->start();
+    std::string mesh_error;
+    auto security_mesh = nexus::core::start_security_mesh(
+        coordinator.io_context(), config, gossip, key_wrapping,
+        std::move(platform_source), mesh_error);
+    if (!security_mesh) {
+        spdlog::error("Config: {}", mesh_error);
+        return 1;
     }
 
     // ========================================================================
@@ -287,7 +261,7 @@ int main(int argc, char* argv[]) {
         if (bytes.size() != nexus::crypto::kEd25519PublicKeySize) return false;
         nexus::security::NodeId node;
         std::memcpy(node.bytes.data(), bytes.data(), bytes.size());
-        return security_mesh->is_current_member(node);
+        return security_mesh->service->is_current_member(node);
     });
     ddns.start();
 
@@ -299,7 +273,7 @@ int main(int argc, char* argv[]) {
         if (bytes.size() != nexus::crypto::kEd25519PublicKeySize) return false;
         nexus::security::NodeId node;
         std::memcpy(node.bytes.data(), bytes.data(), bytes.size());
-        return security_mesh->is_current_member(node);
+        return security_mesh->service->is_current_member(node);
     });
 
     // ========================================================================
@@ -411,7 +385,7 @@ int main(int argc, char* argv[]) {
             // Every enrolled server is at least Tier 2 transport.
             const int tier_num =
                 (security_mesh &&
-                 security_mesh->is_current_member(
+                 security_mesh->service->is_current_member(
                      nexus::security::NodeId{gossip.keypair().public_key}))
                     ? 1 : 2;
             dns.publish_tier_record(seip_id, config.region, tier_num, server_public_ip);
@@ -736,18 +710,7 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     nexus::core::ServerAdmissionService admission{
         config, crypto, key_wrapping, storage, gossip};
-    if (!config.genesis_pubkey.empty()) {
-        const auto genesis_bytes = nexus::crypto::from_base64(
-            nexus::crypto::canonical_key_b64(config.genesis_pubkey));
-        if (genesis_bytes.size() == nexus::crypto::kEd25519PublicKeySize) {
-            nexus::crypto::Ed25519PublicKey genesis_pk{};
-            std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
-            admission.set_network_id(nexus::crypto::to_hex(
-                nexus::security::derive_network_id(
-                    genesis_pk, nexus::security::constants::kSecurityRulesetVersion,
-                    nexus::security::constants::kConsensusRulesetVersion)));
-        }
-    }
+    admission.set_network_id(security_mesh->network_id_hex);
     admission.start();
 
     // ========================================================================
@@ -1070,7 +1033,7 @@ int main(int argc, char* argv[]) {
     relay.stop();
     stun.stop();
     if (security_mesh) {
-        security_mesh->stop();  // uses gossip as transport: stop it first
+        security_mesh->service->stop();  // uses gossip as transport: stop it first
     }
     gossip.stop();
     ipam.stop();

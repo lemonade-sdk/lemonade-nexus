@@ -7,10 +7,13 @@
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
+#include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Security/HclReport.hpp>
 #include <LemonadeNexus/Security/TpmQuote.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+
+#include "OnboardingValidation.hpp"
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>
@@ -126,24 +129,37 @@ bool verify_issued_cert(crypto::SodiumCryptoService& crypto,
     return true;
 }
 
-/// Key-merge root_pubkey + seed_peers into the JSON config, preserving unknown keys.
-void merge_config(const std::string& config_path, const std::string& root_hex,
-                  const std::vector<std::string>& seeds) {
+// One atomic replacement: the root key, Genesis anchor, and seed peers land
+// together, so no state carries the root without the anchor. A config that
+// is not a JSON object, or that cannot be replaced with its ownership and
+// mode preserved, is refused.
+std::string install_onboarded_config(const std::string& config_path, const std::string& root_hex,
+                                     const std::string& genesis_b64,
+                                     const std::vector<std::string>& seeds) {
     json j = json::object();
     if (std::filesystem::exists(config_path)) {
         std::ifstream f(config_path);
-        try { j = json::parse(f); } catch (...) { j = json::object(); }
-        if (!j.is_object()) j = json::object();
+        if (!f) return "cannot read existing config " + config_path;
+        auto parsed = json::parse(f, nullptr, false);
+        if (parsed.is_discarded() || !parsed.is_object())
+            return "existing config " + config_path +
+                   " does not parse as a JSON object; refusing to overwrite it";
+        j = std::move(parsed);
     }
     j["root_pubkey"] = root_hex;
+    j["genesis_pubkey"] = genesis_b64;
     std::vector<std::string> merged;
-    if (j.contains("seed_peers") && j["seed_peers"].is_array())
+    if (j.contains("seed_peers")) {
+        if (!j["seed_peers"].is_array())
+            return "existing config " + config_path + " has a non-array seed_peers";
         merged = j["seed_peers"].get<std::vector<std::string>>();
+    }
     for (const auto& s : seeds)
         if (std::find(merged.begin(), merged.end(), s) == merged.end()) merged.push_back(s);
     j["seed_peers"] = merged;
-    std::ofstream out(config_path);
-    out << j.dump(2) << "\n";
+    if (!security::write_durable_preserving(config_path, j.dump(2) + "\n"))
+        return "failed to write the onboarded config to " + config_path;
+    return {};
 }
 
 /// Produce platform evidence bound to the admission challenge nonce, so the bundle
@@ -406,6 +422,13 @@ int run_onboard_server(ServerConfig& config) {
         spdlog::error("Onboard: refusing certificate — {}", err);
         return 1;
     }
+    // Verify the Genesis binding before persisting any onboarding state.
+    if (auto binding_err = onboarding_validation::check_bundle_genesis_binding(crypto,
+                                                                              *approved);
+        !binding_err.empty()) {
+        spdlog::error("Onboard: refusing bundle — {}", binding_err);
+        return 1;
+    }
 
     storage::FileStorageService storage{std::filesystem::path(config.data_root)};
     storage.start();
@@ -424,7 +447,12 @@ int run_onboard_server(ServerConfig& config) {
     auto proven = host + ":" + std::to_string(approved->gossip_port);
     if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
         seeds.insert(seeds.begin(), proven);
-    merge_config(config.config_path, config.root_pubkey, seeds);
+    if (auto err = install_onboarded_config(config.config_path, config.root_pubkey,
+                                            approved->genesis_pubkey, seeds);
+        !err.empty()) {
+        spdlog::error("Onboard: {}", err);
+        return 1;
+    }
 
     // Align our hostname with the admitted server_id so DNS/NS records carry
     // one name instead of an auto-generated <region>-N.
@@ -447,7 +475,7 @@ int run_onboard_server(ServerConfig& config) {
     std::printf("  Onboarded as '%s'\n", server_id.c_str());
     std::printf("====================================================================\n");
     std::printf("Certificate installed: %s/identity/server_cert.json\n", config.data_root.c_str());
-    std::printf("Config updated:        %s (root_pubkey + %zu seed peer(s))\n",
+    std::printf("Config updated:        %s (root_pubkey, genesis_pubkey + %zu seed peer(s))\n",
                 config.config_path.c_str(), seeds.size());
     std::printf("\nStart the server normally:\n");
     std::printf("  ./lemonade-nexus --data-root %s\n\n", config.data_root.c_str());

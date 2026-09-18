@@ -11,6 +11,7 @@
 #  include <windows.h>
 #else
 #  include <fcntl.h>
+#  include <sys/stat.h>
 #  include <unistd.h>
 #endif
 
@@ -18,7 +19,10 @@ namespace nexus::security {
 
 namespace fs = std::filesystem;
 
-bool write_durable(const fs::path& final_path, std::string_view payload) {
+namespace {
+
+bool write_durable_impl(const fs::path& final_path, std::string_view payload,
+                        bool preserve_metadata) {
     fs::path temp_path = final_path;
     temp_path += ".tmp";
 
@@ -82,6 +86,25 @@ bool write_durable(const fs::path& final_path, std::string_view payload) {
     const int fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return false;
 
+    if (preserve_metadata) {
+        struct stat existing{};
+        if (::stat(final_path.c_str(), &existing) == 0) {
+            // The write may only replace the file with one the operator still
+            // recognizes. A uid/gid this process cannot set means the
+            // replacement would carry different ownership — refuse it.
+            if (::fchown(fd, existing.st_uid, existing.st_gid) != 0) {
+                ::close(fd);
+                fs::remove(temp_path);
+                return false;
+            }
+            if (::fchmod(fd, existing.st_mode & 07777) != 0) {
+                ::close(fd);
+                fs::remove(temp_path);
+                return false;
+            }
+        }
+    }
+
     std::size_t written = 0;
     while (written < payload.size()) {
         const ssize_t count = ::write(fd, payload.data() + written, payload.size() - written);
@@ -108,6 +131,16 @@ bool write_durable(const fs::path& final_path, std::string_view payload) {
     ::close(dir_fd);
     return directory_synced;
 #endif
+}
+
+}  // namespace
+
+bool write_durable(const fs::path& final_path, std::string_view payload) {
+    return write_durable_impl(final_path, payload, /*preserve_metadata=*/false);
+}
+
+bool write_durable_preserving(const fs::path& final_path, std::string_view payload) {
+    return write_durable_impl(final_path, payload, /*preserve_metadata=*/true);
 }
 
 }  // namespace nexus::security

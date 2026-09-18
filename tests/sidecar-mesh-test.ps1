@@ -93,9 +93,11 @@ Start-Sleep 2
 $pubhex   = (Get-Content "$root\server\identity\keypair.pub" -Raw).Trim()
 $nodeId   = "server-" + $pubhex.Substring(0, 16)
 
-# A normal start now requires both trust anchors. root_pubkey is this genesis's own
-# identity; the release key is a throwaway — the harness never exercises Tier 1, so
-# the server stays Tier 2 with an unapproved binary, which is the correct outcome.
+# A normal start requires all three trust anchors. root_pubkey is this
+# genesis's own identity; the genesis anchor is its own gossip key; the release
+# key is a throwaway (the harness never exercises Tier 1).
+$kpEnv   = Get-Content "$root\server\identity\keypair.json" -Raw | ConvertFrom-Json
+$GENESIS = ($kpEnv.data | ConvertFrom-Json).public_key
 & $ossl genpkey -algorithm ED25519 -out "$root\relsign.pem" 2>"$root\ossl-rel.log" | Out-Null
 & $ossl pkey -in "$root\relsign.pem" -pubout -outform DER -out "$root\relsign.der" 2>>"$root\ossl-rel.log" | Out-Null
 $RELPUB = [Convert]::ToBase64String(([IO.File]::ReadAllBytes("$root\relsign.der"))[12..43])
@@ -133,7 +135,8 @@ Add-Content $HOSTS "127.0.0.1 $PRIVFQDN # nexus-mesh-test" -Encoding ascii
 $procs += Start-Process $srv -PassThru -WindowStyle Hidden `
     -ArgumentList @("--data-root","$root\server","--public-ip","127.0.0.1","--region",$REGION,
                     "--closed-registration","--private-http-port",$PRIV,
-                    "--root-pubkey",$pubhex,"--release-signing-pubkey",$RELPUB) `
+                    "--root-pubkey",$pubhex,"--genesis-pubkey",$GENESIS,
+                    "--release-signing-pubkey",$RELPUB) `
     -RedirectStandardOutput "$root\server.log" -RedirectStandardError "$root\server.err"
 $h = Wait-Url "https://${SEIP}:9100/api/health" $ca "ok|healthy|status" 60
 $m = (Select-String -Path "$root\server.log" -Pattern "SEIP: published (\S+) ->" -EA SilentlyContinue | Select-Object -First 1)

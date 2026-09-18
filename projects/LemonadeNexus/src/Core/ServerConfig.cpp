@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -431,6 +432,25 @@ bool validate_config(const ServerConfig& config) {
             spdlog::error("Config: root_pubkey is required — without it no server certificate "
                            "can be verified and no peer can be trusted");
             valid = false;
+        }
+        // The security mesh is unconditional in normal operation, so a start
+        // without a valid Genesis anchor is refused, not degraded.
+        if (config.genesis_pubkey.empty()) {
+            spdlog::error("Config: genesis_pubkey is required — it pins the Genesis "
+                           "bootstrap anchor the network identity derives from, and the "
+                           "security mesh does not start without it");
+            valid = false;
+        } else {
+            std::vector<uint8_t> anchor;
+            try {
+                anchor = crypto::from_base64(crypto::canonical_key_b64(config.genesis_pubkey));
+            } catch (...) {
+                anchor.clear();
+            }
+            if (anchor.size() != crypto::kEd25519PublicKeySize) {
+                spdlog::error("Config: genesis_pubkey is not a base64 Ed25519 public key");
+                valid = false;
+            }
         }
         if (config.release_signing_pubkey.empty()) {
             spdlog::error("Config: release_signing_pubkey is required — without it no release "

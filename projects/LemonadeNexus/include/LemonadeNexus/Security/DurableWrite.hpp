@@ -25,4 +25,10 @@ namespace nexus::security {
 [[nodiscard]] bool write_durable(const std::filesystem::path& final_path,
                                  std::string_view payload);
 
+/// Like write_durable, but a replacement for an existing file keeps that
+/// file's ownership and mode; a failure to reproduce the metadata aborts
+/// the write. On Windows (no uid/gid) this is write_durable's behavior.
+[[nodiscard]] bool write_durable_preserving(const std::filesystem::path& final_path,
+                                            std::string_view payload);
+
 }  // namespace nexus::security

@@ -449,10 +449,12 @@ struct AdmissionStatusResponse : OnboardingDto<AdmissionStatusResponse> {
 
 struct ApprovedOnboardingBundle : OnboardingDto<ApprovedOnboardingBundle> {
     // Drift guard: number of data members.
-    static constexpr std::size_t kFieldCount = 7;
+    static constexpr std::size_t kFieldCount = 8;
     AdmissionState state{AdmissionState::Approved};
     gossip::ServerCertificate certificate;
     std::string root_pubkey;
+    // Genesis identity must derive the network_id in the root-signed certificate.
+    std::string genesis_pubkey;
     std::optional<std::string> mesh_server_pubkey;
     std::vector<std::string> seed_peers;
     std::optional<std::string> mesh_endpoint;
@@ -462,6 +464,7 @@ struct ApprovedOnboardingBundle : OnboardingDto<ApprovedOnboardingBundle> {
         return std::tuple{NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, state),
                           NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, certificate),
                           NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, root_pubkey),
+                          NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, genesis_pubkey),
                           NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, mesh_server_pubkey),
                           NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, seed_peers),
                           NEXUS_ONBOARDING_FIELD(ApprovedOnboardingBundle, mesh_endpoint),

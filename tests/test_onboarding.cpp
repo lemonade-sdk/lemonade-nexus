@@ -11,7 +11,11 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
+#include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+
+#include <OnboardingValidation.hpp>
 
 #include <asio.hpp>
 #include <gtest/gtest.h>
@@ -447,6 +451,7 @@ TEST(OnboardingJson, ApprovedBundleRoundTripsForClientAndServer) {
     bundle.certificate = gossip::issue_server_certificate(
         params, c, root.private_key, root.public_key);
     bundle.root_pubkey = crypto::to_hex(root.public_key);
+    bundle.genesis_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 6));
     bundle.mesh_server_pubkey = b64(std::vector<uint8_t>(crypto::kX25519PublicKeySize, 5));
     bundle.seed_peers = {"berlin-1.example:9102"};
     bundle.mesh_endpoint = "203.0.113.10:51940";
@@ -461,8 +466,65 @@ TEST(OnboardingJson, ApprovedBundleRoundTripsForClientAndServer) {
     ASSERT_NE(decoded, nullptr);
     EXPECT_EQ(decoded->certificate.server_pubkey, bundle.certificate.server_pubkey);
     EXPECT_EQ(decoded->root_pubkey, bundle.root_pubkey);
+    EXPECT_EQ(decoded->genesis_pubkey, bundle.genesis_pubkey);
     EXPECT_EQ(decoded->seed_peers, bundle.seed_peers);
     c.stop();
+}
+
+TEST(OnboardingJson, ApprovedBundleMissingGenesisIdentityIsRejected) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = c.ed25519_keygen();
+
+    core::ApprovedOnboardingBundle bundle;
+    bundle.certificate.network_id = kTestNetworkHex;
+    bundle.certificate.server_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 6));
+    bundle.certificate.issuer_pubkey =
+        b64(std::vector<uint8_t>(root.public_key.begin(), root.public_key.end()));
+    bundle.certificate.signature =
+        b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 8));
+    bundle.root_pubkey = crypto::to_hex(root.public_key);
+    bundle.genesis_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 9));
+    bundle.seed_peers = {"berlin-1.example:9102"};
+    bundle.gossip_port = 9102;
+
+    const auto wire = core::poll_response_to_json(
+        core::PollResponse{bundle});
+    ASSERT_TRUE(core::poll_response_from_json(wire));
+
+    // A bundle without the Genesis anchor is refused, not defaulted.
+    auto missing = wire;
+    missing.erase("genesis_pubkey");
+    auto result = core::poll_response_from_json(missing);
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.error.find("/genesis_pubkey"), std::string::npos);
+    c.stop();
+}
+
+TEST(OnboardingJson, ApprovedBundleMalformedGenesisIdentityIsRejected) {
+    core::ApprovedOnboardingBundle bundle;
+    bundle.certificate.network_id = kTestNetworkHex;
+    bundle.certificate.server_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 6));
+    bundle.certificate.issuer_pubkey =
+        b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 7));
+    bundle.certificate.signature =
+        b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 8));
+    bundle.root_pubkey = crypto::to_hex(std::span<const uint8_t>(
+        std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 7).data(),
+        crypto::kEd25519PublicKeySize));
+    bundle.seed_peers = {"berlin-1.example:9102"};
+    bundle.gossip_port = 9102;
+
+    for (const auto& malformed :
+         {std::string{""}, std::string{"c2hvcnQ="}, std::string{"!"}}) {
+        auto wire = core::poll_response_to_json(core::PollResponse{bundle});
+        wire["genesis_pubkey"] = malformed;
+        auto result = core::poll_response_from_json(wire);
+        ASSERT_FALSE(result) << malformed;
+        EXPECT_NE(result.error.find("/genesis_pubkey"), std::string::npos);
+    }
 }
 
 TEST(OnboardingJson, AdmissionStoreRoundTripAndLegacyMigration) {
@@ -503,6 +565,103 @@ TEST(OnboardingJson, AdmissionStoreRoundTripAndLegacyMigration) {
 // ===========================================================================
 // Candidate-side pinned-root guards (pure functions)
 // ===========================================================================
+
+namespace {
+
+// The bundle shape the root holder emits: the certificate names the network
+// derived from `genesis`, signed by `root`.
+core::ApprovedOnboardingBundle make_deriving_bundle(
+        crypto::SodiumCryptoService& c,
+        const crypto::Ed25519Keypair& root,
+        const crypto::Ed25519Keypair& candidate,
+        const crypto::Ed25519Keypair& genesis) {
+    gossip::CertIssueParams params;
+    params.network_id = crypto::to_hex(security::derive_network_id(
+        genesis.public_key, security::constants::kSecurityRulesetVersion,
+        security::constants::kConsensusRulesetVersion));
+    params.server_pubkey_b64 = b64({candidate.public_key.begin(),
+                                    candidate.public_key.end()});
+    params.server_id = "berlin-2";
+
+    core::ApprovedOnboardingBundle bundle;
+    bundle.certificate = gossip::issue_server_certificate(
+        params, c, root.private_key, root.public_key);
+    bundle.root_pubkey = crypto::to_hex(root.public_key);
+    bundle.genesis_pubkey = b64({genesis.public_key.begin(),
+                                 genesis.public_key.end()});
+    bundle.gossip_port = 9102;
+    return bundle;
+}
+
+} // namespace
+
+TEST(Onboarding, BundleGenesisBindingAcceptsTheDerivingAnchor) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = make_key(c);
+    auto cand = make_key(c);
+    auto genesis = make_key(c);
+
+    auto bundle = make_deriving_bundle(c, root, cand, genesis);
+    EXPECT_TRUE(core::onboarding_validation::check_bundle_genesis_binding(c, bundle).empty());
+
+    // The anchor is identity: the "ed25519:" prefix form must bind the same way.
+    auto prefixed = bundle;
+    prefixed.genesis_pubkey = "ed25519:" + prefixed.genesis_pubkey;
+    EXPECT_TRUE(core::onboarding_validation::check_bundle_genesis_binding(c, prefixed).empty());
+    c.stop();
+}
+
+TEST(Onboarding, BundleGenesisBindingRejectsMalformedKey) {
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = make_key(c);
+    auto cand = make_key(c);
+    auto genesis = make_key(c);
+
+    auto bundle = make_deriving_bundle(c, root, cand, genesis);
+    for (const auto& malformed :
+         {std::string{""}, std::string{"c2hvcnQ="}, std::string{"!!!"},
+          b64(std::vector<uint8_t>(31, 1))}) {
+        auto bad = bundle;
+        bad.genesis_pubkey = malformed;
+        EXPECT_FALSE(core::onboarding_validation::check_bundle_genesis_binding(c, bad).empty());
+    }
+    c.stop();
+}
+
+TEST(Onboarding, BundleGenesisBindingRejectsWrongNetworkDerivation) {
+    // A different, equally valid Genesis identity derives a different network.
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = make_key(c);
+    auto cand = make_key(c);
+    auto genesis = make_key(c);
+    auto other_genesis = make_key(c);
+
+    auto bundle = make_deriving_bundle(c, root, cand, genesis);
+    auto tampered = bundle;
+    tampered.genesis_pubkey = b64({other_genesis.public_key.begin(),
+                                   other_genesis.public_key.end()});
+    EXPECT_FALSE(core::onboarding_validation::check_bundle_genesis_binding(c, tampered).empty());
+    c.stop();
+}
+
+TEST(Onboarding, BundleGenesisBindingRejectsAlteredCertificateNetwork) {
+    // A bundle with an altered network field must still be refused.
+    crypto::SodiumCryptoService c;
+    c.start();
+    auto root = make_key(c);
+    auto cand = make_key(c);
+    auto genesis = make_key(c);
+
+    auto bundle = make_deriving_bundle(c, root, cand, genesis);
+    auto tampered = bundle;
+    tampered.certificate.network_id[0] = (tampered.certificate.network_id[0] == 'a')
+        ? 'b' : 'a';
+    EXPECT_FALSE(core::onboarding_validation::check_bundle_genesis_binding(c, tampered).empty());
+    c.stop();
+}
 
 TEST(Onboarding, PinnedRootGuards) {
     crypto::SodiumCryptoService c;
@@ -1628,13 +1787,14 @@ TEST(OnboardingDtoDriftGuard, AllDtosMatchTheirDeclaredFieldCounts) {
     bundle.certificate.signature =
         b64(std::vector<uint8_t>(crypto::kEd25519SignatureSize, 8));
     bundle.root_pubkey = crypto::to_hex(std::span<const uint8_t>(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 7).data(), crypto::kEd25519PublicKeySize));
+    bundle.genesis_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 16));
     bundle.mesh_server_pubkey = b64(std::vector<uint8_t>(crypto::kX25519PublicKeySize, 8));
     bundle.seed_peers = {"berlin-1.example:9102"};
     bundle.mesh_endpoint = "203.0.113.10:51940";
     bundle.gossip_port = 9102;
     check_onboarding_dto(bundle, {
-        "state", "certificate", "root_pubkey", "mesh_server_pubkey", "seed_peers",
-        "mesh_endpoint", "gossip_port"});
+        "state", "certificate", "root_pubkey", "genesis_pubkey", "mesh_server_pubkey",
+        "seed_peers", "mesh_endpoint", "gossip_port"});
 
     core::AckRequest ack_req;
     ack_req.request_id = std::string(32, 'a');

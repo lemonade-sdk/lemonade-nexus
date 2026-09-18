@@ -272,6 +272,10 @@ std::optional<std::string> ApprovedOnboardingBundle::validate() const {
                                       crypto::kEd25519PublicKeySize)) {
         return error;
     }
+    if (auto error = require_base64_size("/genesis_pubkey", genesis_pubkey,
+                                         crypto::kEd25519PublicKeySize)) {
+        return error;
+    }
     if (mesh_server_pubkey) {
         if (auto error = require_base64_size("/mesh_server_pubkey", *mesh_server_pubkey,
                                              crypto::kX25519PublicKeySize)) {
