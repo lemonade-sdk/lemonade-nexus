@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Api/AuthApiHandler.hpp>
 
 #include <LemonadeNexus/ACL/Permission.hpp>
+#include <LemonadeNexus/Api/RootBootstrap.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/TokenLinkAuthProvider.hpp>
@@ -17,30 +18,12 @@ namespace nexus::api {
 void AuthApiHandler::ensure_root_node(const std::string& pubkey) {
     if (pubkey.empty()) return;
 
-    auto prefixed = normalize_pubkey(pubkey);
-
-    if (!ctx_.tree.get_node("root")) {
-        // First authenticated Ed25519 key becomes the root owner.
-        tree::TreeNode root_node;
-        root_node.id          = "root";
-        root_node.parent_id   = "";
-        root_node.type        = tree::NodeType::Root;
-        root_node.hostname    = "root";
-        root_node.mgmt_pubkey = prefixed;
-        root_node.assignments = {{
-            .management_pubkey = prefixed,
-            .permissions = {"read", "write", "add_child", "delete_node",
-                            "edit_node", "admin"},
-        }};
-        ctx_.tree.bootstrap_root(root_node);
-    } else if (ctx_.config.open_registration) {
-        // Root already exists — grant basic access. With closed registration,
-        // new keys get no root grants; devices join via link tokens instead.
-        ctx_.tree.grant_assignment("root", {
-            .management_pubkey = prefixed,
-            .permissions       = {"read", "add_child"},
-        });
-    }
+    // Application-root ownership is bound to the locally configured owner
+    // key (ServerConfig::root_pubkey); the Ed25519 challenge-response above
+    // already proved possession. Non-owner keys receive no root claim or
+    // grant regardless of open_registration, and missing or conflicting
+    // owner configuration never transfers or alters an established root.
+    bootstrap_root_for_owner(ctx_.tree, ctx_.config, normalize_pubkey(pubkey));
 }
 
 // ---------------------------------------------------------------------------

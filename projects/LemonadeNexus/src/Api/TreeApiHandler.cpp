@@ -2,6 +2,7 @@
 #include <algorithm>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
+#include <LemonadeNexus/Api/RootBootstrap.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
@@ -150,25 +151,29 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             n.is_inference        = is_inference;
         };
 
-        auto existing_root = ctx_.tree.get_node("root");
-        if (!existing_root) {
-            // First user bootstraps root and gets a Customer group
-            tree::TreeNode root_node;
-            root_node.id        = "root";
-            root_node.parent_id = "";
-            root_node.type      = tree::NodeType::Root;
-            root_node.hostname  = ctx_.config.server_hostname.empty()
-                                      ? "root"
-                                      : ctx_.config.server_hostname;
-            root_node.mgmt_pubkey = norm_pubkey;
-            root_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node", "admin"},
-            }};
-            ctx_.tree.bootstrap_root(root_node);
+        // The application root is bound to the locally configured owner key
+        // (ServerConfig::root_pubkey); the challenge above proved possession.
+        // A non-owner caller can never create or claim the root.
+        const auto root_outcome =
+            bootstrap_root_for_owner(ctx_.tree, ctx_.config, norm_pubkey);
+        const bool is_root_owner =
+            root_outcome == RootBootstrapOutcome::OwnerRootCreated ||
+            root_outcome == RootBootstrapOutcome::OwnerRootExisting;
 
-            // Create a Customer group for the root owner
+        if (!ctx_.tree.get_node("root")) {
+            // The root was not established: the caller is not the configured
+            // owner, or the owner is not configured on this server. No one
+            // but the configured owner may create it.
+            error_response(res,
+                root_outcome == RootBootstrapOutcome::OwnerNotConfigured
+                    ? "server has no root owner configured"
+                    : "application root not established",
+                409);
+            return;
+        }
+
+        if (root_outcome == RootBootstrapOutcome::OwnerRootCreated) {
+            // First join by the configured owner: Customer group for the owner
             std::string customer_id = "customer-" + node_id;
             tree::TreeNode customer_node;
             customer_node.id          = customer_id;
@@ -228,11 +233,6 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 // Under closed registration a brand-new identity needs a link
                 // token — except the root owner, who bootstraps their own
                 // account (their key already owns root via /api/auth).
-                bool is_root_owner = false;
-                if (auto root = ctx_.tree.get_node("root")) {
-                    is_root_owner = (tree::canonical_principal(root->mgmt_pubkey) ==
-                                     tree::canonical_principal(norm_pubkey));
-                }
                 if (!ctx_.config.open_registration && !is_root_owner &&
                     !ctx_.tree.get_node("customer-" + node_id)) {
                     error_response(res, "registration closed — link token required", 403);
