@@ -18,11 +18,12 @@ namespace nexus::api {
 void AuthApiHandler::ensure_root_node(const std::string& pubkey) {
     if (pubkey.empty()) return;
 
-    // Application-root ownership is bound to the locally configured owner
-    // key (ServerConfig::root_pubkey); the Ed25519 challenge-response above
-    // already proved possession. Non-owner keys receive no root claim or
-    // grant regardless of open_registration, and missing or conflicting
-    // owner configuration never transfers or alters an established root.
+    // Application-root ownership is bound to the locally configured
+    // application-owner key (ServerConfig::application_owner_pubkey); the
+    // Ed25519 challenge-response above already proved possession. Non-owner
+    // keys receive no root claim or grant regardless of open_registration,
+    // and missing or conflicting owner configuration never transfers or
+    // alters an established root.
     bootstrap_root_for_owner(ctx_.tree, ctx_.config, normalize_pubkey(pubkey));
 }
 

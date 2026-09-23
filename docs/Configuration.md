@@ -43,7 +43,8 @@ Priority (highest to lowest):
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--root-pubkey <hex>` | `SP_ROOT_PUBKEY` | `root_pubkey` | | Root Ed25519 key (hex) |
+| `--root-pubkey <hex>` | `SP_ROOT_PUBKEY` | `root_pubkey` | | Root Ed25519 key (hex) — mesh trust anchor (server certificates, admission) |
+| `--application-owner-pubkey <hex>` | `SP_APPLICATION_OWNER_PUBKEY` | `application_owner_pubkey` | | Application-owner Ed25519 key (hex). The only key that may create the application root node. Separate from the mesh trust anchor; never derived from it. Unset: the application root cannot be created |
 | `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | WebAuthn relying party ID |
 | `--seed-peer <host:port>` | `SP_SEED_PEERS` | `seed_peers` | | Gossip seed peers (repeatable) |
 | `--server-hostname <name>` | `SP_SERVER_HOSTNAME` | `server_hostname` | (auto) | Server hostname |

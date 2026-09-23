@@ -18,11 +18,12 @@ constexpr const char* kRootId = "root";
 const std::vector<std::string> kRootOwnerPermissions{
     "read", "write", "add_child", "delete_node", "edit_node", "admin"};
 
-/// Canonical "ed25519:base64" form of the configured owner, empty when the
-/// configuration is missing or invalid.
+/// Canonical "ed25519:base64" form of the configured application owner, empty
+/// when the configuration is missing or invalid. Deliberately distinct from
+/// root_pubkey (the mesh trust anchor): the two must never be conflated.
 std::string configured_owner(const core::ServerConfig& config) {
     try {
-        auto bytes = crypto::from_hex(config.root_pubkey);
+        auto bytes = crypto::from_hex(config.application_owner_pubkey);
         if (bytes.size() != crypto::kEd25519PublicKeySize) return {};
         return std::string("ed25519:") + crypto::to_base64(bytes);
     } catch (const std::exception&) {
@@ -57,11 +58,12 @@ RootBootstrapOutcome bootstrap_root_for_owner(tree::PermissionTreeService& tree,
         if (tree::canonical_principal(existing->mgmt_pubkey) != owner) {
             // Established ownership by another key: report, never transfer.
             spdlog::error("[root-bootstrap] ownership conflict: existing root is owned "
-                          "by a key other than the configured root_pubkey; no changes made");
+                          "by a key other than the configured application owner; "
+                          "no changes made");
             return RootBootstrapOutcome::OwnershipConflict;
         }
-        tree.grant_assignment(kRootId, {.management_pubkey = owner,
-                                        .permissions = kRootOwnerPermissions});
+        // One-time bootstrap: the owner assignment was created with the root.
+        // Login verification must not modify an existing root in any way.
         return RootBootstrapOutcome::OwnerRootExisting;
     }
 
@@ -79,7 +81,8 @@ RootBootstrapOutcome bootstrap_root_for_owner(tree::PermissionTreeService& tree,
     }
 
     // Lost a concurrent bootstrap race (or persistence failed): re-verify
-    // instead of assuming, and top up the owner assignment idempotently.
+    // instead of assuming. Whoever won created the owner assignment; a loser
+    // never modifies the root.
     existing = tree.get_node(kRootId);
     if (!existing) {
         spdlog::error("[root-bootstrap] bootstrap failed and no root node exists");
@@ -87,11 +90,10 @@ RootBootstrapOutcome bootstrap_root_for_owner(tree::PermissionTreeService& tree,
     }
     if (tree::canonical_principal(existing->mgmt_pubkey) != owner) {
         spdlog::error("[root-bootstrap] ownership conflict: existing root is owned "
-                      "by a key other than the configured root_pubkey; no changes made");
+                      "by a key other than the configured application owner; "
+                      "no changes made");
         return RootBootstrapOutcome::OwnershipConflict;
     }
-    tree.grant_assignment(kRootId, {.management_pubkey = owner,
-                                    .permissions = kRootOwnerPermissions});
     return RootBootstrapOutcome::OwnerRootExisting;
 }
 

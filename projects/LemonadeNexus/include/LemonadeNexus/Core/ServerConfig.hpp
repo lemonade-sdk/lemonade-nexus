@@ -32,6 +32,13 @@ struct ServerConfig {
     // Server identity
     std::string root_pubkey; // hex Ed25519 pubkey of the root management key
 
+    // Application owner: the one Ed25519 key (hex) allowed to create the
+    // application root node through public authentication. Explicit operator
+    // configuration, independent of the mesh trust anchor above: it must not
+    // be derived from root_pubkey, the Genesis anchor, the node identity, or
+    // the release keys. Empty = the application root cannot be created.
+    std::string application_owner_pubkey;
+
     // Pinned Genesis bootstrap anchor (base64 Ed25519). Verification anchor
     // only: its authority ends at Epoch 1 activation (architecture 14).
     // Mandatory for a normal daemon start; empty is valid only in the CLI

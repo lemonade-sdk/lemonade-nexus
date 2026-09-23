@@ -151,9 +151,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             n.is_inference        = is_inference;
         };
 
-        // The application root is bound to the locally configured owner key
-        // (ServerConfig::root_pubkey); the challenge above proved possession.
-        // A non-owner caller can never create or claim the root.
+        // The application root is bound to the locally configured
+        // application-owner key (ServerConfig::application_owner_pubkey);
+        // the challenge above proved possession. A non-owner caller can
+        // never create or claim the root.
         const auto root_outcome =
             bootstrap_root_for_owner(ctx_.tree, ctx_.config, norm_pubkey);
         const bool is_root_owner =

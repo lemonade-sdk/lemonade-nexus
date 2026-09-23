@@ -22,6 +22,7 @@
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/Api/AuthApiHandler.hpp>
 #include <LemonadeNexus/Api/RootBootstrap.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
@@ -31,6 +32,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <filesystem>
@@ -62,6 +64,9 @@ protected:
 
     core::ServerConfig config;
 
+    // Deliberately three distinct keys: the mesh trust anchor (server
+    // certificates), the application owner, and an unrelated stranger.
+    crypto::Ed25519Keypair mesh_kp;
     crypto::Ed25519Keypair owner_kp;
     crypto::Ed25519Keypair stranger_kp;
 
@@ -95,9 +100,11 @@ protected:
         tree = std::make_unique<tree::PermissionTreeService>(*storage, *crypto);
         tree->start();
 
+        mesh_kp = crypto->ed25519_keygen();
         owner_kp = crypto->ed25519_keygen();
         stranger_kp = crypto->ed25519_keygen();
-        config.root_pubkey = hex_of(owner_kp);
+        config.root_pubkey = hex_of(mesh_kp);
+        config.application_owner_pubkey = hex_of(owner_kp);
     }
 
     void TearDown() override {
@@ -197,23 +204,95 @@ TEST_F(RootBootstrapTest, UnrelatedKeyGetsNoGrantWhenRootExists) {
 }
 
 TEST_F(RootBootstrapTest, MissingOwnerConfigRefusesCreation) {
-    config.root_pubkey = "";
+    config.application_owner_pubkey = "";
     EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(owner_kp)),
               Outcome::OwnerNotConfigured);
     EXPECT_FALSE(tree->get_node("root").has_value());
 }
 
 TEST_F(RootBootstrapTest, InvalidOwnerConfigRefusesCreation) {
-    config.root_pubkey = "zz-not-hex";
+    config.application_owner_pubkey = "zz-not-hex";
     EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(owner_kp)),
               Outcome::OwnerNotConfigured);
     EXPECT_FALSE(tree->get_node("root").has_value());
 
     // Valid hex, wrong length (16 bytes, not an Ed25519 key)
-    config.root_pubkey = std::string(32, '0');
+    config.application_owner_pubkey = std::string(32, '0');
     EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(owner_kp)),
               Outcome::OwnerNotConfigured);
     EXPECT_FALSE(tree->get_node("root").has_value());
+}
+
+// The mesh trust anchor (root_pubkey, used for server-certificate
+// verification) is not an application-owner credential: holding it cannot
+// create or claim the application root.
+TEST_F(RootBootstrapTest, MeshTrustKeyAloneCannotClaimApplicationRoot) {
+    EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(mesh_kp)),
+              Outcome::NotOwner);
+    EXPECT_FALSE(tree->get_node("root").has_value());
+
+    // Even with the application owner unconfigured, the mesh key alone does
+    // not bootstrap.
+    config.application_owner_pubkey = "";
+    EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(mesh_kp)),
+              Outcome::OwnerNotConfigured);
+    EXPECT_FALSE(tree->get_node("root").has_value());
+}
+
+// Setting the application-owner key must not move the mesh trust anchor:
+// a certificate signed by the mesh root key verifies against that key and
+// fails against the application-owner key; the owner setting plays no part
+// in the verification.
+TEST_F(RootBootstrapTest, CertificateVerificationIgnoresApplicationOwnerConfig) {
+    gossip::CertIssueParams p;
+    p.network_id = std::string(64, 'a');
+    p.server_pubkey_b64 = canon_b64_of(stranger_kp);
+    p.server_id = "peer-b";
+    auto cert = gossip::issue_server_certificate(p, *crypto, mesh_kp.private_key,
+                                                 mesh_kp.public_key);
+    auto canonical = gossip::canonical_cert_json(cert);
+    crypto::Ed25519Signature sig{};
+    auto sig_bytes = crypto::from_base64(cert.signature);
+    std::copy_n(sig_bytes.begin(), sig_bytes.size(), sig.begin());
+
+    auto canon_span = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    EXPECT_TRUE(crypto->do_ed25519_verify(mesh_kp.public_key, canon_span, sig));
+    EXPECT_FALSE(crypto->do_ed25519_verify(owner_kp.public_key, canon_span, sig));
+}
+
+// One-time bootstrap: once the root exists, owner logins verify ownership
+// only. Reduced grants are not topped up and removed grants are not
+// restored.
+TEST_F(RootBootstrapTest, ExistingRootGrantsAreNeverModified) {
+    EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(owner_kp)),
+              Outcome::OwnerRootCreated);
+
+    // Reduce the owner assignment (drop admin/write).
+    auto node = tree->get_node("root");
+    ASSERT_TRUE(node.has_value());
+    tree::TreeNode reduced = *node;
+    reduced.assignments[0].permissions = {"read", "add_child", "delete_node",
+                                          "edit_node"};
+    EXPECT_TRUE(tree->update_node_direct("root", reduced));
+
+    EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(owner_kp)),
+              Outcome::OwnerRootExisting);
+    auto after = tree->get_node("root");
+    ASSERT_TRUE(after.has_value());
+    ASSERT_EQ(after->assignments.size(), 1u);
+    EXPECT_EQ(after->assignments[0].permissions, reduced.assignments[0].permissions);
+
+    // Remove the owner assignment entirely: still no re-grant.
+    tree::TreeNode stripped = *after;
+    stripped.assignments.clear();
+    EXPECT_TRUE(tree->update_node_direct("root", stripped));
+    EXPECT_EQ(api::bootstrap_root_for_owner(*tree, config, canon_b64_of(owner_kp)),
+              Outcome::OwnerRootExisting);
+    auto still = tree->get_node("root");
+    ASSERT_TRUE(still.has_value());
+    EXPECT_EQ(still->assignments.size(), 0u);
+    EXPECT_EQ(still->mgmt_pubkey, reduced.mgmt_pubkey);
 }
 
 // A root established by another key is a configuration conflict: it is
@@ -295,6 +374,7 @@ protected:
 
     core::ServerConfig config;
     std::string jwt_secret;
+    crypto::Ed25519Keypair mesh_kp;
     crypto::Ed25519Keypair owner_kp;
     crypto::Ed25519Keypair stranger_kp;
 
@@ -336,9 +416,12 @@ protected:
         ipam->start();
         http = std::make_unique<network::HttpServer>(test_port_);
 
+        mesh_kp = crypto->ed25519_keygen();
         owner_kp = crypto->ed25519_keygen();
         stranger_kp = crypto->ed25519_keygen();
-        config.root_pubkey = hex_of(owner_kp);
+        // Distinct mesh trust anchor and application-owner key.
+        config.root_pubkey = hex_of(mesh_kp);
+        config.application_owner_pubkey = hex_of(owner_kp);
         config.open_registration = true;
 
         crypto::Ed25519Keypair server_kp = crypto->ed25519_keygen();
@@ -528,18 +611,52 @@ TEST_F(RootBootstrapHttpTest, JoinRefusedBeforeOwnerEstablishesRoot) {
 }
 
 TEST_F(RootBootstrapHttpTest, JoinRefusedWhenOwnerNotConfigured) {
-    config.root_pubkey = "";
+    config.application_owner_pubkey = "";
     auto res = join(stranger_kp);
     ASSERT_TRUE(static_cast<bool>(res));
     ASSERT_EQ(res->status, 409);
     EXPECT_NE(res->body.find("no root owner configured"), std::string::npos);
     EXPECT_FALSE(tree->get_node("root").has_value());
 
-    // The owner key cannot help either: the configuration is the binding.
-    config.root_pubkey = hex_of(stranger_kp);
+    // The configured key cannot help either: the configuration is the binding.
+    config.application_owner_pubkey = hex_of(stranger_kp);
     auto owner_res = join(owner_kp);
     ASSERT_TRUE(owner_res && owner_res->status == 409);
     EXPECT_FALSE(tree->get_node("root").has_value());
+}
+
+// The mesh trust anchor (holder of root_pubkey) can authenticate but cannot
+// create or claim the application root.
+TEST_F(RootBootstrapHttpTest, MeshAnchorKeyLoginCreatesNoRoot) {
+    auto res = login(mesh_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_TRUE(json::parse(res->body).value("authenticated", false));
+    EXPECT_FALSE(tree->get_node("root").has_value());
+}
+
+// Repeated owner logins against an existing root with reduced grants change
+// nothing: the tree and assignments remain exactly as stored.
+TEST_F(RootBootstrapHttpTest, ReducedGrantsPreservedAcrossOwnerLogins) {
+    auto res = login(owner_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 200) << res->body;
+    ASSERT_TRUE(tree->get_node("root").has_value());
+
+    // Operator reduces the owner's root grants.
+    auto node = tree->get_node("root");
+    tree::TreeNode reduced = *node;
+    reduced.assignments[0].permissions = {"read"};
+    EXPECT_TRUE(tree->update_node_direct("root", reduced));
+
+    res = login(owner_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 200) << res->body;
+
+    auto after = tree->get_node("root");
+    ASSERT_TRUE(after.has_value());
+    ASSERT_EQ(after->assignments.size(), 1u);
+    EXPECT_EQ(after->assignments[0].permissions, (std::vector<std::string>{"read"}));
 }
 
 TEST_F(RootBootstrapHttpTest, OwnerJoinCreatesRootAndCustomerGroup) {

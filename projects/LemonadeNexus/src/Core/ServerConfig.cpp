@@ -36,6 +36,8 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("rp_id"))               j.at("rp_id").get_to(c.rp_id);
     if (j.contains("jwt_secret"))          j.at("jwt_secret").get_to(c.jwt_secret);
     if (j.contains("root_pubkey"))         j.at("root_pubkey").get_to(c.root_pubkey);
+    if (j.contains("application_owner_pubkey"))
+        j.at("application_owner_pubkey").get_to(c.application_owner_pubkey);
     if (j.contains("genesis_pubkey"))      j.at("genesis_pubkey").get_to(c.genesis_pubkey);
     if (j.contains("seed_peers"))          j.at("seed_peers").get_to(c.seed_peers);
     if (j.contains("rate_limit_rpm"))      j.at("rate_limit_rpm").get_to(c.rate_limit_rpm);
@@ -87,6 +89,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --log-level <level>        Log level: trace/debug/info/warn/error");
     spdlog::info("  --seed-peer <host:port>    Add a gossip seed peer (repeatable)");
     spdlog::info("  --root-pubkey <hex>        Root management Ed25519 public key (hex)");
+    spdlog::info("  --application-owner-pubkey <hex>  Application-owner Ed25519 public key (hex); only this key may create the application root");
     spdlog::info("  --genesis-pubkey <b64>     Pinned Genesis bootstrap anchor (base64 Ed25519); its authority ends at Epoch 1 activation");
     spdlog::info("  --rp-id <domain>           Relying party ID for WebAuthn (default: lemonade-nexus.local)");
     spdlog::info("  --first-run                Initialize the data directory (identity + gossip keys), print onboarding info, exit");
@@ -168,6 +171,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     // Whether the operator pinned a trust anchor on the command line. Pass 3
     // leaves those alone when they did.
     bool root_pubkey_from_cli = false;
+    bool app_owner_pubkey_from_cli = false;
     bool genesis_pubkey_from_cli = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
@@ -201,6 +205,9 @@ ServerConfig load_config(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--root-pubkey") == 0 && i + 1 < argc) {
             config.root_pubkey = argv[++i];
             root_pubkey_from_cli = true;
+        } else if (std::strcmp(argv[i], "--application-owner-pubkey") == 0 && i + 1 < argc) {
+            config.application_owner_pubkey = argv[++i];
+            app_owner_pubkey_from_cli = true;
         } else if (std::strcmp(argv[i], "--genesis-pubkey") == 0 && i + 1 < argc) {
             config.genesis_pubkey = argv[++i];
             genesis_pubkey_from_cli = true;
@@ -311,6 +318,14 @@ ServerConfig load_config(int argc, char* argv[]) {
             spdlog::warn("Config: ignoring SP_ROOT_PUBKEY — --root-pubkey was given explicitly");
         } else {
             config.root_pubkey = v;
+        }
+    }
+    if (const char* v = std::getenv("SP_APPLICATION_OWNER_PUBKEY")) {
+        if (app_owner_pubkey_from_cli) {
+            spdlog::warn("Config: ignoring SP_APPLICATION_OWNER_PUBKEY — "
+                         "--application-owner-pubkey was given explicitly");
+        } else {
+            config.application_owner_pubkey = v;
         }
     }
     if (const char* v = std::getenv("SP_GENESIS_PUBKEY")) {
