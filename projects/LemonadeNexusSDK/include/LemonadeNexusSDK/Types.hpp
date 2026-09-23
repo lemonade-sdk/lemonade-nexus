@@ -24,7 +24,7 @@ struct ServerEndpoint {
 
 struct ServerConfig {
     /// Seed list of servers (at least one). Each host must be a cert FQDN.
-    std::vector<ServerEndpoint> servers{{{"127.0.0.1", 9100, true}}};
+    std::vector<ServerEndpoint> servers{{"127.0.0.1", 9100, true}};
 
     int  connect_timeout_sec{5};
     int  read_timeout_sec{10};

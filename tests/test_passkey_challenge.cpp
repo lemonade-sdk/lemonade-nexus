@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -330,6 +331,8 @@ TEST_F(PasskeyChallengeTest, ExpiredChallengeRejected) {
     EVP_PKEY_free(pkey);
 }
 
+// Single-use semantics with nonzero counters (the sign-count tests below
+// cover counter behavior; these use counters 1 and 2 deliberately).
 TEST_F(PasskeyChallengeTest, ChallengeIsSingleUse) {
     auto* pkey = register_credential("alice", "cred_alice");
     const auto challenge = issue("alice");
@@ -343,16 +346,78 @@ TEST_F(PasskeyChallengeTest, ChallengeIsSingleUse) {
         make_assertion_request(*crypto, pkey, rp_id, "cred_alice", challenge, 2));
     EXPECT_FALSE(replay.authenticated);
     EXPECT_NE(replay.error_message.find("challenge"), std::string::npos);
+    EVP_PKEY_free(pkey);
+}
 
-    // Zero-counter assertion: a FRESH challenge with the original counter
-    // must die on the sign-count check, not the challenge check — proof the
-    // counter advanced to 1 independently and cannot mask a broken
-    // challenge gate.
+// Counter 1 was just stored, so a fresh challenge presented with the OLD
+// counter 1 must fail the sign-count check, not the challenge check: proof
+// the counter advanced independently of the challenge gate.
+TEST_F(PasskeyChallengeTest, StaleNonZeroCounterRejectedOnFreshChallenge) {
+    auto* pkey = register_credential("alice", "cred_alice");
+    const auto c1 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(
+        make_assertion_request(*crypto, pkey, rp_id, "cred_alice", c1, 1)).authenticated);
+
+    const auto c2 = issue("alice");
+    auto stale = passkey->do_authenticate(
+        make_assertion_request(*crypto, pkey, rp_id, "cred_alice", c2, /*sign_count=*/1));
+    EXPECT_FALSE(stale.authenticated);
+    EXPECT_NE(stale.error_message.find("sign count"), std::string::npos);
+    EVP_PKEY_free(pkey);
+}
+
+// sign_count 0 is allowed by the monotonicity rule (0 is non-informative),
+// so a counter-0 assertion's replay protection comes from the single-use
+// challenge. Sequential: first login succeeds, an exact replay fails on the
+// spent challenge, and a fresh challenge with counter 0 succeeds again.
+TEST_F(PasskeyChallengeTest, ZeroCounterSequentialReplay) {
+    auto* pkey = register_credential("alice", "cred_alice");
+
+    const auto c1 = issue("alice");
+    auto first = passkey->do_authenticate(make_assertion_request(
+        *crypto, pkey, rp_id, "cred_alice", c1, /*sign_count=*/0));
+    EXPECT_TRUE(first.authenticated);
+
+    auto replay = passkey->do_authenticate(make_assertion_request(
+        *crypto, pkey, rp_id, "cred_alice", c1, /*sign_count=*/0));
+    EXPECT_FALSE(replay.authenticated);
+    EXPECT_NE(replay.error_message.find("challenge"), std::string::npos);
+
+    const auto c2 = issue("alice");
+    auto fresh = passkey->do_authenticate(make_assertion_request(
+        *crypto, pkey, rp_id, "cred_alice", c2, /*sign_count=*/0));
+    EXPECT_TRUE(fresh.authenticated);
+    EVP_PKEY_free(pkey);
+}
+
+// Concurrent submission of one identical counter-0 assertion, with
+// synchronized thread starts: exactly one submission may win the single-use
+// challenge. A fresh challenge with counter 0 must then authenticate.
+TEST_F(PasskeyChallengeTest, ZeroCounterConcurrentSubmissionSucceedsExactlyOnce) {
+    auto* pkey = register_credential("alice", "cred_alice");
+    const auto challenge = issue("alice");
+    auto request = make_assertion_request(
+        *crypto, pkey, rp_id, "cred_alice", challenge, /*sign_count=*/0);
+
+    constexpr int kThreads = 8;
+    std::atomic<int> successes{0};
+    std::barrier sync_point{kThreads};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i) {
+        workers.emplace_back([&] {
+            sync_point.arrive_and_wait();  // start together
+            if (passkey->do_authenticate(request).authenticated) successes++;
+        });
+    }
+    for (auto& w : workers) w.join();
+
+    EXPECT_EQ(successes.load(), 1);
+
     const auto fresh = issue("alice");
-    auto stale_counter = passkey->do_authenticate(make_assertion_request(
-        *crypto, pkey, rp_id, "cred_alice", fresh, /*sign_count=*/1));
-    EXPECT_FALSE(stale_counter.authenticated);
-    EXPECT_NE(stale_counter.error_message.find("sign count"), std::string::npos);
+    auto after = passkey->do_authenticate(make_assertion_request(
+        *crypto, pkey, rp_id, "cred_alice", fresh, /*sign_count=*/0));
+    EXPECT_TRUE(after.authenticated);
     EVP_PKEY_free(pkey);
 }
 
@@ -394,8 +459,8 @@ TEST_F(PasskeyChallengeTest, ConcurrentReplaySucceedsExactlyOnce) {
 
     EXPECT_EQ(successes.load(), 1);
 
-    // Zero-counter assertion: the winner's counter (1) must now be stored, so
-    // the original counter is refused on a fresh challenge.
+    // The winner's counter (1) must now be stored, so the original counter
+    // is refused on a fresh challenge (sign-count gate, not challenge gate).
     const auto fresh = issue("alice");
     auto stale = passkey->do_authenticate(
         make_assertion_request(*crypto, pkey, rp_id, "cred_alice", fresh, /*sign_count=*/1));

@@ -105,6 +105,12 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
                 error_response(res, "user_id required");
                 return;
             }
+            // Same bound the provider enforces; checked here so callers get a
+            // 400 (bad request) instead of a 503 (capacity) for bad input.
+            if (user_id.size() > 128) {
+                error_response(res, "user_id too long (max 128)");
+                return;
+            }
 
             auto challenge = ctx_.auth.issue_passkey_challenge(user_id);
             if (!challenge) {

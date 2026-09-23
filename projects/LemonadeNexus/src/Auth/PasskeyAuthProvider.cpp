@@ -723,6 +723,13 @@ bool PasskeyAuthProvider::verify_client_data_json(const std::vector<uint8_t>& cl
 
 void PasskeyAuthProvider::persist_sign_count(const std::string& credential_id,
                                               uint32_t sign_count) {
+    // Known concurrency gap (tracked separately, not fixed here): cache_mutex_
+    // is released before the file access below, so the read-modify-rewrite of
+    // credentials/<user>.json is unlocked even in-process. Two concurrent
+    // mutations of the same file (registration plus a sign-count update, or
+    // two credentials of one user) can interleave and silently drop an update;
+    // the rewrite is also not atomic (no temp-file + rename). cache_mutex_ does
+    // NOT serialize file I/O.
     // Find the user_id for this credential
     std::string user_id;
     {
