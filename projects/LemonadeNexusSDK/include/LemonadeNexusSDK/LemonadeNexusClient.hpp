@@ -67,6 +67,11 @@ public:
     /// POST /api/auth — passkey/FIDO2 authentication (backup method).
     [[nodiscard]] Result<AuthResponse> authenticate_passkey(const nlohmann::json& passkey_data);
 
+    /// POST /api/auth/challenge — issue the WebAuthn assertion challenge bound
+    /// to `user_id`. The assertion's clientDataJSON must carry the returned
+    /// challenge; it expires server-side and is single-use.
+    [[nodiscard]] Result<std::string> issue_passkey_challenge(const std::string& user_id);
+
     /// POST /api/auth — token-link authentication.
     [[nodiscard]] Result<AuthResponse> authenticate_token(const std::string& token);
 

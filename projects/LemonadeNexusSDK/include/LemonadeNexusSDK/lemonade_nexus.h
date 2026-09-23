@@ -114,6 +114,13 @@ ln_error_t ln_auth_passkey(ln_client_t* client,
                             const char* passkey_json,
                             char** out_json);
 
+/** Issue the WebAuthn assertion challenge bound to user_id (POST /api/auth/challenge).
+ *  The assertion's clientDataJSON must carry the returned challenge. Returns
+ *  {"challenge":"base64url"} via out_json. */
+ln_error_t ln_auth_passkey_challenge(ln_client_t* client,
+                                     const char* user_id,
+                                     char** out_json);
+
 /** Authenticate with a token-link token. Returns JSON via out_json. */
 ln_error_t ln_auth_token(ln_client_t* client,
                           const char* token,

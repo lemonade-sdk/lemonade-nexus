@@ -786,6 +786,8 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnAuthPassword, _LnAuthPasswordDart>('ln_auth_password');
   late final _lnAuthPasskey =
       _lib.lookupFunction<_LnAuthPasskey, _LnAuthPasskeyDart>('ln_auth_passkey');
+  late final _lnAuthPasskeyChallenge =
+      _lib.lookupFunction<_LnAuthPasskey, _LnAuthPasskeyDart>('ln_auth_passkey_challenge');
   late final _lnAuthToken =
       _lib.lookupFunction<_LnAuthToken, _LnAuthTokenDart>('ln_auth_token');
   late final _lnAuthEd25519 =
@@ -1154,6 +1156,22 @@ class LemonadeNexusFfi {
     try {
       final result = _lnAuthPasskey(client, jsonPtr, outJson);
       malloc.free(jsonPtr);
+      if (result == 0) {
+        return toStringAndFree(outJson.value);
+      }
+      freeString(outJson.value);
+      return null;
+    } finally {
+      calloc.free(outJson);
+    }
+  }
+
+  String? authPasskeyChallenge(LnClientHandle client, String userId) {
+    final userPtr = userId.toNativeUtf8().cast<ffi.Char>();
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnAuthPasskeyChallenge(client, userPtr, outJson);
+      malloc.free(userPtr);
       if (result == 0) {
         return toStringAndFree(outJson.value);
       }

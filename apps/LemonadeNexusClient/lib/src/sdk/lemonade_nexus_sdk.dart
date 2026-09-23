@@ -398,6 +398,24 @@ class LemonadeNexusSdk {
     return _parseJson(result, AuthResponse.fromJson);
   }
 
+  /// Fetches the server-issued WebAuthn assertion challenge bound to [userId].
+  /// The assertion's clientDataJSON must carry it; it expires server-side and
+  /// is single-use.
+  Future<String> getPasskeyChallenge(String userId) async {
+    _checkDisposed();
+    _checkConnected();
+    final json = _ffi.authPasskeyChallenge(_client!, userId);
+    if (json == null) {
+      throw SdkException(LnError.connect,
+          message: 'Passkey challenge request failed');
+    }
+    final challenge = _parseJson(json, (m) => m)['challenge'] as String?;
+    if (challenge == null || challenge.isEmpty) {
+      throw SdkException(LnError.connect, message: 'Empty passkey challenge');
+    }
+    return challenge;
+  }
+
   /// Authenticates with a token.
   Future<AuthResponse> authToken(String token) async {
     _checkDisposed();

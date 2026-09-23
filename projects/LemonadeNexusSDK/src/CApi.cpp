@@ -200,6 +200,22 @@ ln_error_t ln_auth_passkey(ln_client_t* client,
     return result.ok ? LN_OK : LN_ERR_AUTH;
 }
 
+ln_error_t ln_auth_passkey_challenge(ln_client_t* client,
+                                     const char* user_id,
+                                     char** out_json) {
+    if (!client || !user_id || !out_json) return LN_ERR_NULL_ARG;
+
+    auto result = client->client.issue_passkey_challenge(user_id);
+    json j;
+    if (result.ok) {
+        j["challenge"] = result.value;
+    } else {
+        j["error"] = result.error;
+    }
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : ln_map_error(result.http_status);
+}
+
 ln_error_t ln_auth_token(ln_client_t* client,
                           const char* token,
                           char** out_json) {

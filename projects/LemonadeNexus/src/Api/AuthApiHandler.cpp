@@ -91,10 +91,29 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
         json_response(res, j, result.authenticated ? 200 : 400);
     });
 
-    // POST /api/auth/challenge — issue an Ed25519 challenge nonce
+    // POST /api/auth/challenge — issue an Ed25519 challenge nonce, or a
+    // WebAuthn assertion challenge ({"type":"passkey","user_id":"..."}) bound
+    // to that user. The passkey assertion's clientDataJSON must carry the
+    // returned challenge; it expires and is single-use.
     pub.Post("/api/auth/challenge", [this](const httplib::Request& req, httplib::Response& res) {
         auto body = parse_body(req, res);
         if (!body) return;
+
+        if (body->value("type", std::string{}) == "passkey") {
+            auto user_id = body->value("user_id", std::string{});
+            if (user_id.empty()) {
+                error_response(res, "user_id required");
+                return;
+            }
+
+            auto challenge = ctx_.auth.issue_passkey_challenge(user_id);
+            if (!challenge) {
+                error_response(res, "too many pending passkey challenges", 503);
+                return;
+            }
+            json_response(res, *challenge);
+            return;
+        }
 
         auto pubkey = body->value("pubkey", std::string{});
         if (pubkey.empty()) {

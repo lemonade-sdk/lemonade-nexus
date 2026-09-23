@@ -13,7 +13,9 @@
 #include <openssl/param_build.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -124,6 +126,97 @@ AuthResult PasskeyAuthProvider::do_register(const json& registration) {
 }
 
 // ============================================================================
+// Challenge issuance and consumption
+// ============================================================================
+
+std::optional<json> PasskeyAuthProvider::issue_challenge(const std::string& user_id) {
+    // Bound the stored identifier: challenges are attacker-issuable, so an
+    // unbounded user_id would be an unbounded per-entry allocation.
+    if (user_id.empty() || user_id.size() > kMaxChallengeUserIdLen) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, kChallengeSize> nonce{};
+    crypto_.random_bytes(std::span<uint8_t>(nonce));
+
+    // Key the store on the canonical standard-base64 of the nonce bytes;
+    // the wire form is the unpadded base64url spelling of the same bytes.
+    const auto store_key = crypto::to_base64(std::span<const uint8_t>(nonce));
+    auto challenge_encoded = store_key;
+    for (auto& ch : challenge_encoded) {
+        if (ch == '+') ch = '-';
+        else if (ch == '/') ch = '_';
+    }
+    // Padding only ever occurs at the end of a base64 string.
+    challenge_encoded.erase(std::remove(challenge_encoded.begin(), challenge_encoded.end(), '='),
+                            challenge_encoded.end());
+
+    const auto steady_now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lock(challenge_mutex_);
+        // Evict expired entries, then enforce the cap for real: while every
+        // remaining entry is live and the table is full, issuance is refused
+        // instead of growing without bound.
+        std::erase_if(pending_challenges_,
+                      [steady_now](const auto& kv) { return kv.second.deadline <= steady_now; });
+        if (pending_challenges_.size() >= kMaxPendingChallenges) {
+            spdlog::warn("[passkey] refusing challenge issuance: pending table exhausted");
+            return std::nullopt;
+        }
+        pending_challenges_[store_key] =
+            PendingChallenge{user_id, steady_now + std::chrono::seconds{kChallengeTtlSec}};
+    }
+
+    const auto expires_at = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count())
+        + kChallengeTtlSec;
+    spdlog::debug("[passkey] Issued challenge for user '{}'", user_id);
+    return json{{"challenge", challenge_encoded}, {"expires_at", expires_at}};
+}
+
+bool PasskeyAuthProvider::consume_challenge(const std::vector<uint8_t>& challenge,
+                                            const std::string& credential_user_id) {
+    // Only issued challenges are 32 bytes; anything else cannot match and is
+    // refused before it costs a hash or a lookup.
+    if (challenge.size() != kChallengeSize) {
+        spdlog::warn("[passkey] challenge has the wrong length ({} bytes)", challenge.size());
+        return false;
+    }
+
+    // Compare decoded bytes, not encoding: clients may present the same nonce
+    // as standard or url-safe base64, padded or not.
+    const auto key = crypto::to_base64(std::span<const uint8_t>(challenge));
+
+    // Check and consume in one critical section: two threads presenting the
+    // same challenge concurrently must not both pass. Consumption happens
+    // here, before signature verification: a failed assertion still spends
+    // the challenge (explicit behavior, pinned by test).
+    std::lock_guard lock(challenge_mutex_);
+    auto it = pending_challenges_.find(key);
+    if (it == pending_challenges_.end()) {
+        spdlog::warn("[passkey] challenge was not issued by this server (or already used)");
+        return false;
+    }
+
+    if (it->second.deadline <= std::chrono::steady_clock::now()) {
+        pending_challenges_.erase(it);
+        spdlog::warn("[passkey] challenge expired");
+        return false;
+    }
+
+    // A mismatched presentation is refused but does not burn the challenge:
+    // the user it was issued for may still complete the attempt.
+    if (it->second.user_id != credential_user_id) {
+        spdlog::warn("[passkey] challenge was not issued for this credential's user");
+        return false;
+    }
+
+    pending_challenges_.erase(it);
+    return true;
+}
+
+// ============================================================================
 // Authentication (WebAuthn assertion verification)
 // ============================================================================
 
@@ -195,11 +288,12 @@ AuthResult PasskeyAuthProvider::do_authenticate(const json& credentials) {
         };
     }
 
-    // Step (W3C 7.2 steps 8-10): Verify clientDataJSON type and origin
-    if (!verify_client_data_json(client_data_json_bytes)) {
+    // Step (W3C 7.2 steps 8-10): Verify clientDataJSON type, origin, and that
+    // the challenge was issued by this server for this credential's user.
+    if (!verify_client_data_json(client_data_json_bytes, stored->user_id)) {
         return AuthResult{
             .authenticated = false,
-            .error_message = "clientDataJSON verification failed (type/origin mismatch)"
+            .error_message = "clientDataJSON verification failed (type/origin/challenge)"
         };
     }
 
@@ -551,7 +645,8 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
 // clientDataJSON verification (W3C WebAuthn Level 2, Section 7.2)
 // ============================================================================
 
-bool PasskeyAuthProvider::verify_client_data_json(const std::vector<uint8_t>& client_data_json_bytes) {
+bool PasskeyAuthProvider::verify_client_data_json(const std::vector<uint8_t>& client_data_json_bytes,
+                                                  const std::string& credential_user_id) {
     try {
         auto cdj = json::parse(
             std::string(client_data_json_bytes.begin(), client_data_json_bytes.end()),
@@ -592,10 +687,29 @@ bool PasskeyAuthProvider::verify_client_data_json(const std::vector<uint8_t>& cl
             return false;
         }
 
-        // Step 10: challenge verification would require server-side challenge storage
-        // (not yet implemented — would need a challenge nonce map with expiry)
-
-        return true;
+        // Step 10: the challenge must be one this server issued for this
+        // credential's user, still inside its TTL, and not yet presented.
+        // consume_challenge() performs the check and the single-use removal
+        // atomically, so a captured assertion cannot be replayed — not even
+        // twice in quick succession.
+        auto challenge_b64 = cdj.value("challenge", std::string{});
+        if (challenge_b64.empty()) {
+            spdlog::warn("[passkey] clientDataJSON missing challenge");
+            return false;
+        }
+        if (challenge_b64.size() > kMaxChallengeEncodedLen) {
+            spdlog::warn("[passkey] clientDataJSON challenge too long ({} chars)",
+                         challenge_b64.size());
+            return false;
+        }
+        std::vector<uint8_t> challenge;
+        try {
+            challenge = base64url_decode(challenge_b64);
+        } catch (const std::exception& e) {
+            spdlog::warn("[passkey] clientDataJSON challenge is not base64: {}", e.what());
+            return false;
+        }
+        return consume_challenge(challenge, credential_user_id);
 
     } catch (const std::exception& e) {
         spdlog::warn("[passkey] Exception verifying clientDataJSON: {}", e.what());

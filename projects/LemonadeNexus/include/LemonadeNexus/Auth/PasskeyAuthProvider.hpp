@@ -6,6 +6,9 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -16,6 +19,10 @@
 // Forward declarations — avoid pulling full headers into every TU
 namespace nexus::crypto  { class SodiumCryptoService; }
 namespace nexus::storage { class FileStorageService; }
+
+// Unit test (tests/test_passkey_challenge.cpp): rewinds stored deadlines and
+// fills the pending table instead of sleeping or taking a TTL parameter.
+class PasskeyChallengeTest;
 
 namespace nexus::auth {
 
@@ -34,6 +41,16 @@ struct StoredCredential {
 /// and file-based credential storage.
 class PasskeyAuthProvider : public IAuthProvider<PasskeyAuthProvider> {
     friend class IAuthProvider<PasskeyAuthProvider>;
+    friend class ::PasskeyChallengeTest;
+
+private:
+    static constexpr uint32_t kChallengeTtlSec = 60;       // challenge lifetime
+    static constexpr std::size_t kChallengeSize = 32;      // issued nonce bytes
+    static constexpr std::size_t kMaxPendingChallenges = 10000;
+    static constexpr std::size_t kMaxChallengeUserIdLen = 128;
+    // base64url of 32 bytes is 43 chars; anything longer cannot be ours.
+    static constexpr std::size_t kMaxChallengeEncodedLen = 64;
+
 public:
     /// Construct with dependencies.
     /// @param storage   File storage for credential persistence
@@ -62,6 +79,13 @@ public:
     ///       "signature": "base64..."
     ///     } }
     [[nodiscard]] AuthResult do_authenticate(const nlohmann::json& credentials);
+
+    /// Issue a WebAuthn authentication challenge bound to `user_id`.
+    /// The assertion's clientDataJSON must carry this exact challenge; it is
+    /// valid for kChallengeTtlSec and is consumed on first presentation.
+    /// nullopt when the user id is invalid or the pending table is exhausted.
+    /// Returns JSON: {"challenge":"base64url(32 random bytes)","expires_at":unix_timestamp}
+    [[nodiscard]] std::optional<nlohmann::json> issue_challenge(const std::string& user_id);
 
     [[nodiscard]] static constexpr std::string_view auth_provider_name() { return "passkey/fido2"; }
 
@@ -92,7 +116,25 @@ private:
     std::string jwt_secret_;
 
     // --- WebAuthn clientDataJSON verification ---
-    [[nodiscard]] bool verify_client_data_json(const std::vector<uint8_t>& client_data_json_bytes);
+    // `credential_user_id` is the user the presented credential belongs to;
+    // the challenge must have been issued for that user.
+    [[nodiscard]] bool verify_client_data_json(const std::vector<uint8_t>& client_data_json_bytes,
+                                               const std::string& credential_user_id);
+
+    // Validate and atomically consume a challenge. Returns false when the
+    // challenge was never issued, expired, or was not issued for this user.
+    [[nodiscard]] bool consume_challenge(const std::vector<uint8_t>& challenge,
+                                         const std::string& credential_user_id);
+
+    // --- issued challenges: canonical base64(challenge_bytes) -> binding ---
+    // Expiry is monotonic (steady_clock): wall-clock jumps cannot revive or
+    // kill a challenge.
+    struct PendingChallenge {
+        std::string user_id;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::mutex challenge_mutex_;
+    std::unordered_map<std::string, PendingChallenge> pending_challenges_;
 
     // --- credential persistence ---
     void persist_sign_count(const std::string& credential_id, uint32_t sign_count);

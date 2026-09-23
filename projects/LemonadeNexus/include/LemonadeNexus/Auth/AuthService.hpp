@@ -51,6 +51,10 @@ public:
     /// Issue an Ed25519 challenge nonce for the given pubkey.
     [[nodiscard]] nlohmann::json issue_ed25519_challenge(const std::string& pubkey_b64);
 
+    /// Issue a WebAuthn authentication challenge bound to the given user.
+    /// nullopt when the user id is invalid or the pending table is exhausted.
+    [[nodiscard]] std::optional<nlohmann::json> issue_passkey_challenge(const std::string& user_id);
+
     /// Revoke an Ed25519 identity (e.g. on device deletion): future
     /// authentication attempts for this key are rejected. pubkey_b64 is the raw
     /// base64 key (no "ed25519:" prefix). Idempotent.

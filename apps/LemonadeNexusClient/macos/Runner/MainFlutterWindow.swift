@@ -32,7 +32,7 @@ final class PasskeyManager {
     var signCount: UInt32 = 0
   }
 
-  enum PasskeyError: Error { case noCredential, keychain(OSStatus), keygen(String) }
+  enum PasskeyError: Error { case noCredential, challengeMissing, keychain(OSStatus), keygen(String) }
 
   var hasCredential: Bool { loadCredentialInfo() != nil }
   var storedUserId: String? { loadCredentialInfo()?.userId }
@@ -67,9 +67,12 @@ final class PasskeyManager {
   }
 
   /// Sign a WebAuthn assertion (triggers Touch ID for Secure Enclave keys).
-  /// Returns (credentialId, authenticatorData, clientDataJson, signature) — all base64url.
-  func signAssertion(rpId: String) throws -> (String, String, String, String) {
+  /// `challenge` is server-issued (single-use, expiring) and must be carried
+  /// verbatim in clientDataJSON. Returns (credentialId, authenticatorData,
+  /// clientDataJson, signature) — all base64url.
+  func signAssertion(rpId: String, challenge: String) throws -> (String, String, String, String) {
     guard var info = loadCredentialInfo() else { throw PasskeyError.noCredential }
+    guard !challenge.isEmpty else { throw PasskeyError.challengeMissing }
     info.signCount += 1
     try saveCredentialInfo(info)
 
@@ -78,12 +81,10 @@ final class PasskeyManager {
     authData.append(0x05) // UP | UV
     withUnsafeBytes(of: info.signCount.bigEndian) { authData.append(contentsOf: $0) }
 
-    var challengeBytes = [UInt8](repeating: 0, count: 32)
-    _ = SecRandomCopyBytes(kSecRandomDefault, 32, &challengeBytes)
     let clientData = try JSONSerialization.data(
       withJSONObject: [
         "type": "webauthn.get",
-        "challenge": Data(challengeBytes).base64urlEncoded(),
+        "challenge": challenge,
         "origin": rpId,
       ],
       options: [.sortedKeys])
@@ -182,7 +183,8 @@ final class PasskeyManager {
           result(["credentialId": id, "publicKeyX": x, "publicKeyY": y])
         case "signAssertion":
           let (id, ad, cd, sig) = try mgr.signAssertion(
-            rpId: args["rpId"] as? String ?? "lemonade-nexus.io")
+            rpId: args["rpId"] as? String ?? "lemonade-nexus.io",
+            challenge: args["challenge"] as? String ?? "")
           result(["credentialId": id, "authenticatorData": ad,
                   "clientDataJson": cd, "signature": sig])
         default:

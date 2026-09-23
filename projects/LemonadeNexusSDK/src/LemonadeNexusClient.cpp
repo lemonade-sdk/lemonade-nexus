@@ -920,6 +920,33 @@ Result<AuthResponse> LemonadeNexusClient::authenticate_passkey(const nlohmann::j
     return result;
 }
 
+Result<std::string> LemonadeNexusClient::issue_passkey_challenge(const std::string& user_id) {
+    Result<std::string> result;
+
+    json body;
+    body["type"]    = "passkey";
+    body["user_id"] = user_id;
+
+    int status = 0;
+    auto resp = impl_->http_post("/api/auth/challenge", body, status);
+    result.http_status = status;
+
+    if (!resp) {
+        result.error = "challenge request failed";
+        return result;
+    }
+
+    auto challenge = resp->value("challenge", std::string{});
+    if (challenge.empty()) {
+        result.error = resp->value("error", "server returned empty challenge");
+        return result;
+    }
+
+    result.value = std::move(challenge);
+    result.ok    = true;
+    return result;
+}
+
 Result<AuthResponse> LemonadeNexusClient::authenticate_token(const std::string& token) {
     Result<AuthResponse> result;
     json body;

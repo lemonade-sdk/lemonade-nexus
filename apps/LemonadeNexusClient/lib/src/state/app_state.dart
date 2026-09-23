@@ -903,7 +903,17 @@ class AppNotifier extends StateNotifier<AppState> {
     state = state.copyWith(isLoading: true, errorMessage: null);
     _log('signInWithPasskey: start (connStatus=${state.connectionStatus.name})');
     try {
-      final assertion = await _passkey.signAssertion('lemonade-nexus.local');
+      final userId = state.storedPasskeyUserId ?? '';
+      if (userId.isEmpty) {
+        state = state.copyWith(
+            isLoading: false, errorMessage: 'No passkey account stored');
+        return false;
+      }
+      // The assertion must carry a server-issued, single-use, expiring
+      // challenge bound to this account.
+      final challenge = await _sdk.getPasskeyChallenge(userId);
+      final assertion =
+          await _passkey.signAssertion('lemonade-nexus.local', challenge);
       final resp = await _sdk.authPasskey({
         'method': 'passkey',
         'assertion': assertion.toAssertionJson(),

@@ -43,6 +43,10 @@ nlohmann::json AuthService::issue_ed25519_challenge(const std::string& pubkey_b6
     return ed25519_provider_.issue_challenge(pubkey_b64);
 }
 
+std::optional<nlohmann::json> AuthService::issue_passkey_challenge(const std::string& user_id) {
+    return passkey_provider_.issue_challenge(user_id);
+}
+
 std::optional<std::pair<std::string, LinkTokenRecord>>
 AuthService::mint_link_token(const std::string& owner_user_id,
                              const std::string& owner_pubkey,
