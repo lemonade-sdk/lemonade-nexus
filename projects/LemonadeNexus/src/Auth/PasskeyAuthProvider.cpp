@@ -695,6 +695,11 @@ std::optional<StoredCredential> PasskeyAuthProvider::lookup_credential(const std
     }
 
     std::lock_guard lock(cache_mutex_);
+    // Quarantine is authoritative: a quarantined id is never served, even if
+    // a valid entry for it reached the cache.
+    if (conflicted_ids_.count(credential_id)) {
+        return std::nullopt;
+    }
     auto it = credential_cache_.find(credential_id);
     if (it != credential_cache_.end()) {
         return it->second;
@@ -722,6 +727,10 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
     // it may hold ownership claims, so registration must not assume absence
     // of ownership. The identity (or the file stem when the user_id is
     // itself unreadable) is recorded in degraded_identities_.
+    // credential_ids whose ownership is indeterminate (an entry with an
+    // unreadable key) are collected here and merged with the cross-identity
+    // conflicts before the cache is published.
+    std::set<std::string> quarantined_ids;
     bool store_error = false;
     try {
         for (const auto& entry : std::filesystem::directory_iterator(creds_dir)) {
@@ -795,7 +804,7 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
                         spdlog::critical("[passkey] credential '{}' in {} has an invalid "
                                          "key; quarantining the credential_id",
                                          cred.credential_id, entry.path().string());
-                        conflicted_ids_.insert(cred.credential_id);
+                        quarantined_ids.insert(cred.credential_id);
                     }
                     continue;
                 }
@@ -836,6 +845,10 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
         }
     }
 
+    // All quarantine reasons are combined before anything is published: a
+    // valid entry never rescues an id that another reason has quarantined.
+    conflicted.insert(quarantined_ids.begin(), quarantined_ids.end());
+
     for (auto& fc : files) {
         for (auto& cred : fc.credentials) {
             if (conflicted.count(cred.credential_id)) continue;
@@ -843,7 +856,7 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
         }
     }
     // Quarantine survives restart: the set is recomputed from disk on every
-    // load, so conflicted ids stay unregistrable and unauthenticatable.
+    // load, so quarantined ids stay unregistrable and unauthenticatable.
     conflicted_ids_.insert(conflicted.begin(), conflicted.end());
 
     cache_loaded_.store(true, std::memory_order_release);

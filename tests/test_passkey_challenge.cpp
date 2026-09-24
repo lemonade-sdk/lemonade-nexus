@@ -303,6 +303,33 @@ protected:
         ss << ifs.rdbuf();
         return ss.str();
     }
+
+    // Write a prebuilt credential file (for quarantine fixture data).
+    void write_raw_credential_file(const std::string& user_id,
+                                   const nlohmann::json& file) {
+        fs::create_directories(temp_dir / "credentials");
+        std::ofstream ofs(temp_dir / "credentials" / (user_id + ".json"));
+        ofs << file.dump(2);
+    }
+
+    // Build a credential entry; key == nullptr writes an unreadable key.
+    static nlohmann::json cred_entry(const std::string& credential_id,
+                                     EVP_PKEY* key) {
+        nlohmann::json e;
+        e["credential_id"] = credential_id;
+        e["sign_count"] = 0;
+        e["created_at"] = 1;
+        if (key) {
+            std::vector<uint8_t> x, y;
+            p256_coordinates(key, x, y);
+            e["public_key_x"] = nexus::crypto::to_hex(x);
+            e["public_key_y"] = nexus::crypto::to_hex(y);
+        } else {
+            e["public_key_x"] = "zz";
+            e["public_key_y"] = "zz";
+        }
+        return e;
+    }
 };
 
 // --- Credential ownership conflicts and persistence correctness ---
@@ -711,6 +738,146 @@ TEST_F(PasskeyChallengeTest, UnreadableCredentialEntryQuarantined) {
     EXPECT_NE(res.error_message.find("conflict"), std::string::npos);
     auto res2 = register_with_key(*passkey, *crypto, "alice", "cred_badkey", kb);
     EXPECT_FALSE(res2.authenticated);
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kb);
+}
+
+// An invalid-key entry quarantines a credential_id. A VALID entry for the
+// same id persisted under a DIFFERENT identity file must not lift the
+// quarantine: lookup and authentication reject the id, registration stays
+// refused, and unrelated valid credentials keep working.
+TEST_F(PasskeyChallengeTest, QuarantinedIdValidDuplicateAcrossFilesRefused) {
+    auto* ka = generate_p256();  // alice's valid cred_shared key
+    auto* kc = generate_p256();  // carol's unrelated credential
+
+    nlohmann::json carol;
+    carol["user_id"] = "carol";
+    carol["credentials"] = nlohmann::json::array();
+    carol["credentials"].push_back(cred_entry("cred_shared", nullptr));
+    carol["credentials"].push_back(cred_entry("cred_carol_ok", kc));
+    write_raw_credential_file("carol", carol);
+
+    nlohmann::json alice;
+    alice["user_id"] = "alice";
+    alice["credentials"] = nlohmann::json::array();
+    alice["credentials"].push_back(cred_entry("cred_shared", ka));
+    write_raw_credential_file("alice", alice);
+
+    // The valid duplicate does not clear the quarantine.
+    EXPECT_FALSE(lookup(*passkey, "cred_shared").has_value());
+    // An unrelated valid entry in the quarantining file still loads.
+    EXPECT_TRUE(lookup(*passkey, "cred_carol_ok").has_value());
+
+    // Registration of the shared id remains refused.
+    auto res = register_with_key(*passkey, *crypto, "bob", "cred_shared", kc);
+    EXPECT_FALSE(res.authenticated);
+    EXPECT_NE(res.error_message.find("conflict"), std::string::npos);
+
+    // Even a correctly signed assertion cannot authenticate the id.
+    const auto c = issue("alice");
+    EXPECT_FALSE(passkey->do_authenticate(make_assertion_request(
+        *crypto, ka, rp_id, "cred_shared", c, 1)).authenticated);
+
+    // The unrelated valid credential still authenticates.
+    const auto c2 = issue("carol");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, kc, rp_id, "cred_carol_ok", c2, 1)).authenticated);
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kc);
+}
+
+// Same regression within ONE file: a valid entry and an invalid entry share
+// a credential_id; the id must stay quarantined.
+TEST_F(PasskeyChallengeTest, QuarantinedIdValidDuplicateSameFileRefused) {
+    auto* ka = generate_p256();  // valid key for cred_shared
+    auto* kb = generate_p256();  // unrelated credential
+
+    nlohmann::json alice;
+    alice["user_id"] = "alice";
+    alice["credentials"] = nlohmann::json::array();
+    alice["credentials"].push_back(cred_entry("cred_shared", nullptr));
+    alice["credentials"].push_back(cred_entry("cred_shared", ka));
+    alice["credentials"].push_back(cred_entry("cred_alice_ok", kb));
+    write_raw_credential_file("alice", alice);
+
+    EXPECT_FALSE(lookup(*passkey, "cred_shared").has_value());
+    EXPECT_TRUE(lookup(*passkey, "cred_alice_ok").has_value());
+
+    auto res = register_with_key(*passkey, *crypto, "bob", "cred_shared", kb);
+    EXPECT_FALSE(res.authenticated);
+    EXPECT_NE(res.error_message.find("conflict"), std::string::npos);
+
+    const auto c = issue("alice");
+    EXPECT_FALSE(passkey->do_authenticate(make_assertion_request(
+        *crypto, ka, rp_id, "cred_shared", c, 1)).authenticated);
+
+    const auto c2 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, kb, rp_id, "cred_alice_ok", c2, 1)).authenticated);
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kb);
+}
+
+// Both entry orders, each loaded by a FRESH provider over the same
+// directory (a restart). The quarantine must not depend on entry order or
+// on which provider instance happened to see the file first.
+TEST_F(PasskeyChallengeTest, QuarantinedIdBothOrdersAndFreshProviderRestart) {
+    auto* ka = generate_p256();  // valid key for cred_shared
+    auto* kb = generate_p256();  // unrelated credential
+
+    const auto run_case = [&](bool invalid_first) {
+        fs::remove_all(temp_dir / "credentials");
+        nlohmann::json file;
+        file["user_id"] = "alice";
+        file["credentials"] = nlohmann::json::array();
+        if (invalid_first) {
+            file["credentials"].push_back(cred_entry("cred_shared", nullptr));
+            file["credentials"].push_back(cred_entry("cred_shared", ka));
+        } else {
+            file["credentials"].push_back(cred_entry("cred_shared", ka));
+            file["credentials"].push_back(cred_entry("cred_shared", nullptr));
+        }
+        file["credentials"].push_back(cred_entry("cred_alice_ok", kb));
+        write_raw_credential_file("alice", file);
+
+        // A fresh provider over the same directory: a restart.
+        storage::FileStorageService storage2(temp_dir);
+        storage2.start();
+        auto provider2 = std::make_unique<auth::PasskeyAuthProvider>(
+            storage2, *crypto, rp_id, jwt_secret);
+
+        EXPECT_FALSE(lookup(*provider2, "cred_shared").has_value());
+        EXPECT_TRUE(lookup(*provider2, "cred_alice_ok").has_value());
+
+        std::vector<uint8_t> xb, yb;
+        p256_coordinates(kb, xb, yb);
+        auto res = provider2->do_register({
+            {"user_id", "bob"}, {"credential_id", "cred_shared"},
+            {"public_key_x", nexus::crypto::to_hex(xb)},
+            {"public_key_y", nexus::crypto::to_hex(yb)},
+        });
+        EXPECT_FALSE(res.authenticated);
+        EXPECT_NE(res.error_message.find("conflict"), std::string::npos);
+        EXPECT_FALSE(lookup(*provider2, "cred_shared").has_value());
+
+        auto ch = provider2->issue_challenge("alice");
+        ASSERT_TRUE(ch.has_value());
+        EXPECT_FALSE(provider2->do_authenticate(make_assertion_request(
+            *crypto, ka, rp_id, "cred_shared", ch->at("challenge").get<std::string>(), 1))
+            .authenticated);
+
+        auto ch2 = provider2->issue_challenge("alice");
+        ASSERT_TRUE(ch2.has_value());
+        EXPECT_TRUE(provider2->do_authenticate(make_assertion_request(
+            *crypto, kb, rp_id, "cred_alice_ok", ch2->at("challenge").get<std::string>(), 1))
+            .authenticated);
+
+        provider2 = nullptr;
+        storage2.stop();
+    };
+
+    run_case(true);
+    run_case(false);
 
     EVP_PKEY_free(ka); EVP_PKEY_free(kb);
 }
