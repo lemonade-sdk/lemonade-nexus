@@ -68,6 +68,9 @@ void to_json(json& j, const TreeNode& n) {
 }
 
 void from_json(const json& j, TreeNode& n) {
+    if (j.contains("wg_pubkey")) {
+        throw std::invalid_argument("legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'");
+    }
     n.id                       = j.value("id", "");
     n.parent_id                = j.value("parent_id", "");
     if (j.contains("type") && j["type"].is_string()) {
@@ -106,6 +109,10 @@ void to_json(json& j, const TreeDelta& d) {
 }
 
 void from_json(const json& j, TreeDelta& d) {
+    if (j.contains("node_data") && j["node_data"].is_object() &&
+        j["node_data"].contains("wg_pubkey")) {
+        throw std::invalid_argument("legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'");
+    }
     j.at("operation").get_to(d.operation);
     j.at("target_node_id").get_to(d.target_node_id);
     j.at("node_data").get_to(d.node_data);
@@ -120,12 +127,8 @@ void from_json(const json& j, TreeDelta& d) {
 
 std::string canonical_delta_json(const TreeDelta& delta) {
     json j;
-    json node_data = delta.node_data;
-    // Signature-stable field label: existing delta signatures bind
-    // "wg_pubkey" (mirrors the server's canonical_node_json).
-    node_data["wg_pubkey"] = node_data["mesh_pubkey"];
-    node_data.erase("mesh_pubkey");
-    j["node_data"]      = std::move(node_data);
+    // Mirrors the server: node_data is signed as-is under "mesh_pubkey".
+    j["node_data"]      = delta.node_data;
     j["operation"]      = delta.operation;
     j["signer_pubkey"]  = delta.signer_pubkey;
     j["target_node_id"] = delta.target_node_id;

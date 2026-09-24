@@ -204,3 +204,16 @@ rebuild clean (exit 0); Flutter `flutter analyze` 0 errors.
 
 ### TODO next
 - Deferred: contract test harness; `doOperation(sdkOps.X, args)` FFI simplification.
+
+### SUPERSEDED (final): the `wg_pubkey` canonical field label was removed.
+### The earlier "kept deliberately" owner decision is reversed: compatibility is
+### not required. `canonical_node_json` and `canonical_delta_json` (server
+### TreeTypes.cpp + SDK Types.cpp mirror) now sign "mesh_pubkey"; the
+### mesh_pubkey->wg_pubkey translation is deleted. Signatures made under the
+### old label are invalid by design — no alias, no fallback parsing, no
+### legacy-signature translation. `TreeDelta::from_json` / `TreeNode::from_json`
+### (server + SDK) and the POST /api/tree/delta handler reject any JSON still
+### carrying a "wg_pubkey" key (legacy-only or mixed with "mesh_pubkey").
+### Existing persisted signatures/tree hashes from before this change do not
+### verify. Remaining `wireguard_*` identifiers are the third-party BoringTun
+### FFI surface and the WireGuard wire protocol only.

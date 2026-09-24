@@ -1078,6 +1078,35 @@ TEST_F(HttpEndpointTest, DeltaSignerMismatchWithSessionIsRejected) {
     EXPECT_FALSE(tree->get_node("p14_mismatch_child").has_value());
 }
 
+TEST_F(HttpEndpointTest, DeltaWithLegacyWgPubkeyLabelIsRefused) {
+    // The retired "wg_pubkey" label is refused at the HTTP boundary with a
+    // clear 400 — before any signature work — whether it replaces or
+    // duplicates "mesh_pubkey".
+    auto cli = make_client();
+    auto token = make_jwt(root_pubkey_str);
+    httplib::Headers h = {{"Authorization", "Bearer " + token}};
+
+    auto legacy_body = nlohmann::json{
+        {"operation", "create_node"},
+        {"target_node_id", "p14_legacy_child"},
+        {"node_data", {{"id", "p14_legacy_child"}, {"parent_id", "root"},
+                       {"type", "customer"}, {"wg_pubkey", "old-key"}}},
+        {"signer_pubkey", root_pubkey_str},
+        {"signature", "c2ln"},
+        {"timestamp", 1},
+    };
+    auto res = cli.Post("/api/tree/delta", h, legacy_body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 400) << res->body;
+    EXPECT_FALSE(tree->get_node("p14_legacy_child").has_value());
+
+    auto mixed_body = legacy_body;
+    mixed_body["node_data"]["mesh_pubkey"] = "new-key";
+    res = cli.Post("/api/tree/delta", h, mixed_body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 400) << res->body;
+}
+
 // --- P2-17: POST /api/routing/endpoint/register must not accept a
 // caller-supplied mesh key as authoritative. The node's mesh public key is
 // established at join/onboarding (tree->mesh_pubkey); a body override with a

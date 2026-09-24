@@ -413,6 +413,15 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (!body_opt) return;
         auto& body = *body_opt;
 
+        // Legacy "wg_pubkey" is refused here with an explicit 400: the typed
+        // parse also rejects it (TreeDelta::from_json throws), and the manual
+        // fallback below would otherwise swallow that throw.
+        if (body.contains("node_data") && body["node_data"].is_object() &&
+            body["node_data"].contains("wg_pubkey")) {
+            error_response(res, "legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'", 400);
+            return;
+        }
+
         tree::TreeDelta delta;
         try {
             delta = body.get<tree::TreeDelta>();
