@@ -40,10 +40,18 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
         json_response(res, j, result.authenticated ? 200 : 401);
     });
 
-    // POST /api/auth/register — passkey / FIDO2 registration
-    pub.Post("/api/auth/register", [this](const httplib::Request& req, httplib::Response& res) {
+    // POST /api/auth/register — passkey / FIDO2 credential registration.
+    // Requires a valid session: the credential binds to the session's
+    // verified identity. A caller-supplied user_id is never honored, so a
+    // session can never create or replace another identity's credentials.
+    pub.Post("/api/auth/register",
+             require_auth(ctx_.auth,
+                 [this](const httplib::Request& req, httplib::Response& res,
+                        const SessionClaims& claims) {
         auto body = parse_body(req, res);
         if (!body) return;
+
+        (*body)["user_id"] = claims.user_id;
 
         auto result = ctx_.auth.register_passkey(*body);
 
@@ -55,7 +63,7 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
         };
         nlohmann::json j = resp;
         json_response(res, j, result.authenticated ? 200 : 400);
-    });
+    }));
 
     // POST /api/auth/challenge — issue an Ed25519 challenge nonce, or a
     // WebAuthn assertion challenge ({"type":"passkey","user_id":"..."}) bound

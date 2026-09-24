@@ -33,6 +33,8 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <span>
 #include <string>
 #include <vector>
@@ -275,9 +277,39 @@ protected:
 
     httplib::Client make_client() { return httplib::Client("127.0.0.1", test_port_); }
 
-    // Register a passkey credential over the real /api/auth/register route.
+    // Full ed25519 challenge-response login; returns {session_token, user_id}.
+    std::optional<std::pair<std::string, std::string>> login_ed25519(
+            const crypto::Ed25519Keypair& kp) {
+        const auto bare = crypto::to_base64(
+            std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+        auto cli = make_client();
+        auto c_res = cli.Post("/api/auth/challenge",
+                              json{{"pubkey", bare}}.dump(), "application/json");
+        if (!c_res || c_res->status != 200) return std::nullopt;
+        const auto challenge =
+            json::parse(c_res->body).value("challenge", std::string{});
+        auto challenge_bytes = crypto::from_base64(challenge);
+        auto sig = crypto->ed25519_sign(kp.private_key,
+                                        std::span<const uint8_t>(challenge_bytes));
+        json body = {
+            {"method", "ed25519"},
+            {"pubkey", bare},
+            {"challenge", challenge},
+            {"signature", crypto::to_base64(
+                               std::span<const uint8_t>(sig.data(), sig.size()))},
+        };
+        auto res = cli.Post("/api/auth", body.dump(), "application/json");
+        if (!res || res->status != 200) return std::nullopt;
+        auto j = json::parse(res->body);
+        return std::pair{j.value("session_token", std::string{}),
+                         j.value("user_id", std::string{})};
+    }
+
+    // Register a passkey credential over the real /api/auth/register route
+    // with the caller's session: the credential binds to that identity.
     bool register_credential(EVP_PKEY* pkey, const std::string& user_id,
-                             const std::string& credential_id) {
+                             const std::string& credential_id,
+                             const std::string& session_token) {
         std::vector<uint8_t> x, y;
         p256_coordinates(pkey, x, y);
         json body = {
@@ -286,9 +318,23 @@ protected:
             {"public_key_x", crypto::to_hex(x)},
             {"public_key_y", crypto::to_hex(y)},
         };
+        httplib::Headers headers{{"Authorization", "Bearer " + session_token}};
         auto cli = make_client();
-        auto res = cli.Post("/api/auth/register", body.dump(), "application/json");
+        auto res = cli.Post("/api/auth/register", headers, body.dump(),
+                            "application/json");
         return res && res->status == 200;
+    }
+
+    bool credential_file_exists(const std::string& user_id) const {
+        return fs::exists(temp_dir / "credentials" / (user_id + ".json"));
+    }
+
+    // Raw stored credential file contents for mutation comparisons.
+    std::string stored_credentials_file(const std::string& user_id) const {
+        std::ifstream ifs(temp_dir / "credentials" / (user_id + ".json"));
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        return ss.str();
     }
 };
 
@@ -349,12 +395,15 @@ TEST_F(PasskeyChallengeHttpTest, Ed25519ChallengeFlowUnchanged) {
 }
 
 TEST_F(PasskeyChallengeHttpTest, PasskeyAuthenticationWithIssuedChallengeSucceeds) {
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
     auto* pkey = generate_p256();
-    ASSERT_TRUE(register_credential(pkey, "alice", "cred_alice"));
+    ASSERT_TRUE(register_credential(pkey, login->second, "cred_alice",
+                                    login->first));
 
     auto cli = make_client();
     auto res = cli.Post("/api/auth/challenge",
-                        json{{"type", "passkey"}, {"user_id", "alice"}}.dump(),
+                        json{{"type", "passkey"}, {"user_id", login->second}}.dump(),
                         "application/json");
     ASSERT_TRUE(res);
     ASSERT_EQ(res->status, 200);
@@ -368,18 +417,21 @@ TEST_F(PasskeyChallengeHttpTest, PasskeyAuthenticationWithIssuedChallengeSucceed
     ASSERT_EQ(auth_res->status, 200);
     auto body = json::parse(auth_res->body);
     EXPECT_TRUE(body.value("authenticated", false));
-    EXPECT_EQ(body.value("user_id", ""), "alice");
+    EXPECT_EQ(body.value("user_id", ""), login->second);
     EXPECT_FALSE(body.value("session_token", std::string{}).empty());
     EVP_PKEY_free(pkey);
 }
 
 TEST_F(PasskeyChallengeHttpTest, ChallengeReplayRejectedOverHttp) {
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
     auto* pkey = generate_p256();
-    ASSERT_TRUE(register_credential(pkey, "alice", "cred_alice"));
+    ASSERT_TRUE(register_credential(pkey, login->second, "cred_alice",
+                                    login->first));
 
     auto cli = make_client();
     auto res = cli.Post("/api/auth/challenge",
-                        json{{"type", "passkey"}, {"user_id", "alice"}}.dump(),
+                        json{{"type", "passkey"}, {"user_id", login->second}}.dump(),
                         "application/json");
     ASSERT_TRUE(res);
     ASSERT_EQ(res->status, 200);
@@ -399,8 +451,11 @@ TEST_F(PasskeyChallengeHttpTest, ChallengeReplayRejectedOverHttp) {
 }
 
 TEST_F(PasskeyChallengeHttpTest, UnissuedChallengeRejectedOverHttp) {
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
     auto* pkey = generate_p256();
-    ASSERT_TRUE(register_credential(pkey, "alice", "cred_alice"));
+    ASSERT_TRUE(register_credential(pkey, login->second, "cred_alice",
+                                    login->first));
 
     std::array<uint8_t, 32> forged{};
     for (auto& b : forged) b = 0x2A;
@@ -413,4 +468,135 @@ TEST_F(PasskeyChallengeHttpTest, UnissuedChallengeRejectedOverHttp) {
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 401);
     EVP_PKEY_free(pkey);
+}
+
+// ============================================================================
+// Registration authorization (F-34c): /api/auth/register requires a valid
+// session and binds the credential to that session's verified identity.
+// ============================================================================
+
+TEST_F(PasskeyChallengeHttpTest, RegisterWithoutSessionRejectedNoMutation) {
+    auto* pkey = generate_p256();
+    std::vector<uint8_t> x, y;
+    p256_coordinates(pkey, x, y);
+    json body = {
+        {"user_id", "mallory"},
+        {"credential_id", "cred_mallory"},
+        {"public_key_x", crypto::to_hex(x)},
+        {"public_key_y", crypto::to_hex(y)},
+    };
+    auto cli = make_client();
+    auto res = cli.Post("/api/auth/register", body.dump(), "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 401);
+    EXPECT_FALSE(credential_file_exists("mallory"));
+    EVP_PKEY_free(pkey);
+}
+
+TEST_F(PasskeyChallengeHttpTest, RegisterWithForgedSessionRejectedNoMutation) {
+    auto* pkey = generate_p256();
+    std::vector<uint8_t> x, y;
+    p256_coordinates(pkey, x, y);
+    json body = {
+        {"user_id", "mallory"},
+        {"credential_id", "cred_mallory"},
+        {"public_key_x", crypto::to_hex(x)},
+        {"public_key_y", crypto::to_hex(y)},
+    };
+    httplib::Headers headers{{"Authorization", "Bearer not-a-real-jwt"}};
+    auto cli = make_client();
+    auto res = cli.Post("/api/auth/register", headers, body.dump(),
+                        "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 401);
+    EXPECT_FALSE(credential_file_exists("mallory"));
+    EVP_PKEY_free(pkey);
+}
+
+TEST_F(PasskeyChallengeHttpTest, RegisterBindsToSessionIdentityNotBodyUserId) {
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
+    auto* pkey = generate_p256();
+    // Body asks for a foreign identity; the session identity must win.
+    std::vector<uint8_t> x, y;
+    p256_coordinates(pkey, x, y);
+    json body = {
+        {"user_id", "mallory"},
+        {"credential_id", "cred_foreign"},
+        {"public_key_x", crypto::to_hex(x)},
+        {"public_key_y", crypto::to_hex(y)},
+    };
+    httplib::Headers headers{{"Authorization", "Bearer " + login->first}};
+    auto cli = make_client();
+    auto res = cli.Post("/api/auth/register", headers, body.dump(),
+                        "application/json");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200) << res->body;
+    auto j = json::parse(res->body);
+    EXPECT_EQ(j.value("user_id", ""), login->second);
+
+    // Stored under the session identity only, never under the spoofed one.
+    EXPECT_FALSE(credential_file_exists("mallory"));
+    EXPECT_NE(stored_credentials_file(login->second).find("cred_foreign"),
+              std::string::npos);
+    EVP_PKEY_free(pkey);
+}
+
+TEST_F(PasskeyChallengeHttpTest, RegisterCannotReplaceAnotherIdentityCredential) {
+    // Identity B registers a real credential under its own session.
+    auto kp_b = crypto->ed25519_keygen();
+    auto login_b = login_ed25519(kp_b);
+    ASSERT_TRUE(login_b.has_value());
+    auto* pkey_b = generate_p256();
+    ASSERT_TRUE(register_credential(pkey_b, login_b->second, "cred_b",
+                                    login_b->first));
+    const auto before = stored_credentials_file(login_b->second);
+
+    // Identity A tries to replace cred_b by spoofing B's user_id in the body.
+    auto login_a = login_ed25519(root_keypair);
+    ASSERT_TRUE(login_a.has_value());
+    auto* pkey_a = generate_p256();
+    std::vector<uint8_t> x, y;
+    p256_coordinates(pkey_a, x, y);
+    json body = {
+        {"user_id", login_b->second},
+        {"credential_id", "cred_b"},
+        {"public_key_x", crypto::to_hex(x)},
+        {"public_key_y", crypto::to_hex(y)},
+    };
+    httplib::Headers headers{{"Authorization", "Bearer " + login_a->first}};
+    auto cli = make_client();
+    auto res = cli.Post("/api/auth/register", headers, body.dump(),
+                        "application/json");
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_EQ(json::parse(res->body).value("user_id", ""), login_a->second);
+
+    // B's credential file is byte-identical to before; A's file carries the
+    // (attacker-named) credential instead.
+    EXPECT_EQ(stored_credentials_file(login_b->second), before);
+    EXPECT_NE(stored_credentials_file(login_a->second).find("cred_b"),
+              std::string::npos);
+    EVP_PKEY_free(pkey_a);
+    EVP_PKEY_free(pkey_b);
+}
+
+TEST_F(PasskeyChallengeHttpTest, RegisterInvalidBodyWithSessionRejectedNoMutation) {
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
+    // The ed25519 login persists the caller's own identity file; a rejected
+    // registration must leave its contents unchanged.
+    const auto before = stored_credentials_file(login->second);
+    json body = {
+        {"user_id", login->second},
+        {"credential_id", "cred_x"},
+        // missing public_key_x / public_key_y
+    };
+    httplib::Headers headers{{"Authorization", "Bearer " + login->first}};
+    auto cli = make_client();
+    auto res = cli.Post("/api/auth/register", headers, body.dump(),
+                        "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 400);
+    EXPECT_EQ(stored_credentials_file(login->second), before);
 }
