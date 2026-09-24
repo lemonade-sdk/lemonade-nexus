@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // Forward declarations — avoid pulling full headers into every TU
@@ -91,7 +92,9 @@ public:
 
 private:
     // --- credential storage ---
-    [[nodiscard]] bool save_credential(const StoredCredential& cred);
+    // Atomic add-or-update of the credential in the user's file.
+    // Caller must hold cache_mutex_ (serializes all credential file I/O).
+    [[nodiscard]] bool persist_credential_file(const StoredCredential& cred);
     [[nodiscard]] std::optional<StoredCredential> lookup_credential(const std::string& credential_id);
     void load_credentials_from_disk();
 
@@ -137,12 +140,31 @@ private:
     std::unordered_map<std::string, PendingChallenge> pending_challenges_;
 
     // --- credential persistence ---
-    void persist_sign_count(const std::string& credential_id, uint32_t sign_count);
+    // Advances the sign count for an accepted assertion. Rules, checked and
+    // applied under cache_mutex_:
+    //   stored 0, received 0   -> accept, no change (authenticator without counters)
+    //   received > stored      -> persist, then publish
+    //   anything else          -> reject (regression, replay, or 0 after nonzero)
+    // Returns false on rejection or when persistence fails; the cache and the
+    // previous file state are left untouched in both cases.
+    [[nodiscard]] bool update_sign_count(const std::string& credential_id,
+                                         uint32_t sign_count);
 
     // --- credential cache (credential_id -> StoredCredential) ---
+    // cache_mutex_ guards the cache, the conflict set, and ALL credential
+    // file I/O: competing mutations are serialized, so the per-user
+    // read-modify-rename cannot lose an update.
     mutable std::mutex cache_mutex_;
     std::unordered_map<std::string, StoredCredential> credential_cache_;
+    // credential_ids persisted under more than one identity. They stay
+    // unavailable for authentication (absent from the cache) and for
+    // registration (checked in do_register) until the files are repaired.
+    std::unordered_set<std::string> conflicted_ids_;
     std::atomic<bool> cache_loaded_{false};
+
+    // Test fault injection (friend PasskeyChallengeTest): the next credential
+    // file write fails before touching disk.
+    bool test_fail_next_persist_{false};
 };
 
 } // namespace nexus::auth

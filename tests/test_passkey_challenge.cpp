@@ -25,6 +25,7 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #  include <process.h>
@@ -235,7 +236,283 @@ protected:
     lookup(auth::PasskeyAuthProvider& pk, const std::string& credential_id) {
         return pk.lookup_credential(credential_id);
     }
+
+    static std::string issue_for(auth::PasskeyAuthProvider& pk, const std::string& user_id) {
+        auto issued = pk.issue_challenge(user_id);
+        EXPECT_TRUE(issued.has_value());
+        return issued->at("challenge").get<std::string>();
+    }
+
+    // Register with a caller-supplied P-256 key (returns the result, no EXPECT).
+    static auth::AuthResult register_with_key(auth::PasskeyAuthProvider& pk,
+                                              crypto::SodiumCryptoService& c,
+                                              const std::string& user_id,
+                                              const std::string& credential_id,
+                                              EVP_PKEY* pkey) {
+        std::vector<uint8_t> x, y;
+        p256_coordinates(pkey, x, y);
+        return pk.do_register({
+            {"user_id", user_id},
+            {"credential_id", credential_id},
+            {"public_key_x", crypto::to_hex(std::span<const uint8_t>(x))},
+            {"public_key_y", crypto::to_hex(std::span<const uint8_t>(y))},
+        });
+    }
+
+    // Write a user credential file directly (pre-existing on-disk state).
+    void seed_credential_file(const std::string& user_id,
+                               const std::vector<std::pair<std::string, EVP_PKEY*>>& creds) {
+        nlohmann::json file;
+        file["user_id"] = user_id;
+        file["credentials"] = nlohmann::json::array();
+        for (const auto& [cid, pkey] : creds) {
+            std::vector<uint8_t> x, y;
+            p256_coordinates(pkey, x, y);
+            nlohmann::json c;
+            c["credential_id"] = cid;
+            c["public_key_x"] = crypto::to_hex(std::span<const uint8_t>(x));
+            c["public_key_y"] = crypto::to_hex(std::span<const uint8_t>(y));
+            c["sign_count"] = 0;
+            c["created_at"] = 1;
+            file["credentials"].push_back(c);
+        }
+        fs::create_directories(temp_dir / "credentials");
+        std::ofstream ofs(temp_dir / "credentials" / (user_id + ".json"));
+        ofs << file.dump(2);
+    }
+
+    // Arm the injected persistence failure (friend access).
+    void arm_persist_failure() { passkey->test_fail_next_persist_ = true; }
+
+    nlohmann::json read_user_file(const std::string& user_id) {
+        std::ifstream ifs(temp_dir / "credentials" / (user_id + ".json"));
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        return nlohmann::json::parse(ss.str());
+    }
 };
+
+// --- Credential ownership conflicts and persistence correctness ---
+
+// Two identities persisted the same credential_id (a pre-fix registration
+// race). After restart the id must stay unavailable for authentication AND
+// unregistrable by anyone — including both claimants (no silent owner).
+TEST_F(PasskeyChallengeTest, ConflictingPersistedIdsUnavailableAfterRestart) {
+    auto* ka = generate_p256();
+    auto* kb = generate_p256();
+    seed_credential_file("alice", {{"cred_shared", ka}});
+    seed_credential_file("bob",   {{"cred_shared", kb}});
+
+    // The provider loads on first use and must quarantine the shared id.
+    EXPECT_FALSE(lookup(*passkey, "cred_shared").has_value());
+
+    // Re-registration is refused for a third identity...
+    auto* kc = generate_p256();
+    auto third = register_with_key(*passkey, *crypto, "carol", "cred_shared", kc);
+    EXPECT_FALSE(third.authenticated);
+    EXPECT_NE(third.error_message.find("conflict"), std::string::npos);
+
+    // ...and for both claimants.
+    EXPECT_FALSE(register_with_key(*passkey, *crypto, "alice", "cred_shared", ka).authenticated);
+    EXPECT_FALSE(register_with_key(*passkey, *crypto, "bob", "cred_shared", kb).authenticated);
+
+    // Authentication is impossible: the credential is unknown.
+    const auto challenge = issue_for(*passkey, "alice");
+    auto auth = passkey->do_authenticate(make_assertion_request(
+        *crypto, ka, rp_id, "cred_shared", challenge, 1));
+    EXPECT_FALSE(auth.authenticated);
+    EXPECT_NE(auth.error_message.find("Unknown credential"), std::string::npos);
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kb); EVP_PKEY_free(kc);
+}
+
+// A second identity cannot take over a registered credential, and the
+// refusal survives restart.
+TEST_F(PasskeyChallengeTest, SecondIdentityCannotTakeOverCredentialAfterRestart) {
+    auto* ka = register_credential("alice", "cred_a");
+    auto* kb = generate_p256();
+
+    auto reject = register_with_key(*passkey, *crypto, "bob", "cred_a", kb);
+    EXPECT_FALSE(reject.authenticated);
+    ASSERT_TRUE(lookup(*passkey, "cred_a").has_value());
+    EXPECT_EQ(lookup(*passkey, "cred_a")->user_id, "alice");
+
+    // Restart: a fresh provider over the same storage.
+    auto passkey2 = std::make_unique<auth::PasskeyAuthProvider>(*storage, *crypto, rp_id, jwt_secret);
+    ASSERT_TRUE(lookup(*passkey2, "cred_a").has_value());
+    EXPECT_EQ(lookup(*passkey2, "cred_a")->user_id, "alice");
+    EXPECT_FALSE(register_with_key(*passkey2, *crypto, "bob", "cred_a", kb).authenticated);
+
+    // Alice still authenticates after the restart.
+    const auto challenge = issue_for(*passkey2, "alice");
+    auto auth = passkey2->do_authenticate(make_assertion_request(
+        *crypto, ka, rp_id, "cred_a", challenge, 1));
+    EXPECT_TRUE(auth.authenticated);
+    EXPECT_EQ(auth.user_id, "alice");
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kb);
+}
+
+// A failed registration persist must leave no in-memory or on-disk state,
+// and must not block the retry.
+TEST_F(PasskeyChallengeTest, RegistrationPersistenceFailureLeavesNoState) {
+    auto* k = generate_p256();
+    arm_persist_failure();
+    auto result = register_with_key(*passkey, *crypto, "alice", "cred_fail", k);
+    EXPECT_FALSE(result.authenticated);
+    EXPECT_FALSE(lookup(*passkey, "cred_fail").has_value());
+    EXPECT_FALSE(fs::exists(temp_dir / "credentials" / "alice.json"));
+
+    // No fault left armed: the retry succeeds.
+    auto ok = register_with_key(*passkey, *crypto, "alice", "cred_fail", k);
+    EXPECT_TRUE(ok.authenticated);
+    EVP_PKEY_free(k);
+}
+
+// A failed same-owner key rotation must keep the previous key usable: the
+// cache is not published over the un-updated file, and the previous file
+// state survives a restart.
+TEST_F(PasskeyChallengeTest, KeyRotationPersistenceFailureKeepsOldKey) {
+    auto* k1 = register_credential("alice", "cred_rot");
+    auto* k2 = generate_p256();
+
+    arm_persist_failure();
+    auto fail = register_with_key(*passkey, *crypto, "alice", "cred_rot", k2);
+    EXPECT_FALSE(fail.authenticated);
+
+    // Old key still in cache and still authenticates; new key does not.
+    ASSERT_TRUE(lookup(*passkey, "cred_rot").has_value());
+    auto c1 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k1, rp_id, "cred_rot", c1, 1)).authenticated);
+    auto c2 = issue("alice");
+    EXPECT_FALSE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k2, rp_id, "cred_rot", c2, 1)).authenticated);
+
+    // Restart: the file was never overwritten, so the old key still works.
+    auto passkey2 = std::make_unique<auth::PasskeyAuthProvider>(*storage, *crypto, rp_id, jwt_secret);
+    auto c3 = issue_for(*passkey2, "alice");
+    EXPECT_TRUE(passkey2->do_authenticate(make_assertion_request(
+        *crypto, k1, rp_id, "cred_rot", c3, 2)).authenticated);
+
+    EVP_PKEY_free(k1); EVP_PKEY_free(k2);
+}
+
+// A sign-count advance that cannot be persisted must reject the
+// authentication and leave the stored counter unchanged; the same counter
+// still advances on the next attempt.
+TEST_F(PasskeyChallengeTest, SignCountPersistenceFailureRejectsAuthentication) {
+    auto* k = register_credential("alice", "cred_pf");
+
+    auto c1 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k, rp_id, "cred_pf", c1, 1)).authenticated);
+
+    arm_persist_failure();
+    auto c2 = issue("alice");
+    auto fail = passkey->do_authenticate(make_assertion_request(
+        *crypto, k, rp_id, "cred_pf", c2, 2));
+    EXPECT_FALSE(fail.authenticated);
+    EXPECT_NE(fail.error_message.find("sign count"), std::string::npos);
+    ASSERT_TRUE(lookup(*passkey, "cred_pf").has_value());
+    EXPECT_EQ(lookup(*passkey, "cred_pf")->sign_count, 1u);
+
+    auto c3 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k, rp_id, "cred_pf", c3, 2)).authenticated);
+    EXPECT_EQ(lookup(*passkey, "cred_pf")->sign_count, 2u);
+
+    EVP_PKEY_free(k);
+}
+
+// The explicit counter rules: advance accepted and persisted; replay, lower
+// counter, and 0-after-nonzero all rejected; a later higher counter accepted.
+TEST_F(PasskeyChallengeTest, CounterRegressionRules) {
+    auto* k = register_credential("alice", "cred_ctr");
+
+    auto attempt = [&](uint32_t count) {
+        auto c = issue("alice");
+        return passkey->do_authenticate(make_assertion_request(
+            *crypto, k, rp_id, "cred_ctr", c, count));
+    };
+
+    EXPECT_TRUE(attempt(5).authenticated);
+    EXPECT_EQ(lookup(*passkey, "cred_ctr")->sign_count, 5u);
+
+    auto replay = attempt(5);
+    EXPECT_FALSE(replay.authenticated);
+    EXPECT_NE(replay.error_message.find("sign count"), std::string::npos);
+
+    auto lower = attempt(4);
+    EXPECT_FALSE(lower.authenticated);
+    EXPECT_NE(lower.error_message.find("sign count"), std::string::npos);
+
+    // 0 after a nonzero counter is a regression, not a no-counter reset.
+    auto zero = attempt(0);
+    EXPECT_FALSE(zero.authenticated);
+    EXPECT_NE(zero.error_message.find("sign count"), std::string::npos);
+    EXPECT_EQ(lookup(*passkey, "cred_ctr")->sign_count, 5u);
+
+    EXPECT_TRUE(attempt(6).authenticated);
+    EXPECT_EQ(lookup(*passkey, "cred_ctr")->sign_count, 6u);
+
+    // The advanced counter is on disk, not only in the cache.
+    auto file = read_user_file("alice");
+    for (const auto& c : file["credentials"]) {
+        if (c["credential_id"] == "cred_ctr") {
+            EXPECT_EQ(c["sign_count"], 6u);
+        }
+    }
+
+    EVP_PKEY_free(k);
+}
+
+// Competing mutations of the same user file (a registration racing
+// sign-count updates) must not lose an update: both credentials and the
+// advanced counter end up in cache and file.
+TEST_F(PasskeyChallengeTest, ConcurrentRegistrationAndSignCountUpdateNoLostUpdate) {
+    auto* k1 = register_credential("alice", "cred_c1");
+    auto* k2 = generate_p256();
+
+    // Seed counter 1 so the file has one advanced entry before the race.
+    auto c0 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k1, rp_id, "cred_c1", c0, 1)).authenticated);
+
+    std::atomic<bool> reg_done{false};
+    std::thread registrar([&] {
+        register_with_key(*passkey, *crypto, "alice", "cred_c2", k2);
+        reg_done = true;
+    });
+
+    for (uint32_t i = 2; i <= 20; ++i) {
+        if (reg_done.load()) break;
+        auto c = issue("alice");
+        passkey->do_authenticate(make_assertion_request(
+            *crypto, k1, rp_id, "cred_c1", c, i));
+    }
+    registrar.join();
+
+    ASSERT_TRUE(lookup(*passkey, "cred_c1").has_value());
+    ASSERT_TRUE(lookup(*passkey, "cred_c2").has_value());
+    const auto cached_count = lookup(*passkey, "cred_c1")->sign_count;
+    ASSERT_GE(cached_count, 1u);
+
+    // The file must agree with the cache: no lost update from the race.
+    auto file = read_user_file("alice");
+    bool has_c1 = false, has_c2 = false;
+    for (const auto& c : file["credentials"]) {
+        if (c["credential_id"] == "cred_c1") {
+            has_c1 = true;
+            EXPECT_EQ(c["sign_count"], cached_count);
+        }
+        if (c["credential_id"] == "cred_c2") has_c2 = true;
+    }
+    EXPECT_TRUE(has_c1);
+    EXPECT_TRUE(has_c2);
+
+    EVP_PKEY_free(k1); EVP_PKEY_free(k2);
+}
 
 TEST_F(PasskeyChallengeTest, IssuedChallengeIsCanonicalBase64Url) {
     auto encoded = issue("alice");
