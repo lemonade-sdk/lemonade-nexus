@@ -25,27 +25,9 @@ using nexus::auth::SessionClaims;
 
 void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                         httplib::Server& priv) {
-    // POST /api/tls/reload — hot-reload TLS certificates. The certificate
-    // and key come from the server's local configuration only; a session
-    // may never point the reload at arbitrary paths.
-    priv.Post("/api/tls/reload", require_auth(ctx_.auth,
-        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
-        if (!ctx_.http_server.is_tls() ||
-            ctx_.http_server.tls_cert_path().empty() ||
-            ctx_.http_server.tls_key_path().empty()) {
-            error_response(res,
-                "no TLS certificate configured locally — reload unavailable");
-            return;
-        }
-
-        bool ok = ctx_.http_server.reload_tls_certs();
-        nlohmann::json resp = {
-            {"success",   ok},
-            {"cert_path", ctx_.http_server.tls_cert_path()},
-            {"key_path",  ctx_.http_server.tls_key_path()},
-        };
-        json_response(res, resp, ok ? 200 : 500);
-    }));
+    // /api/tls/reload is intentionally not routed: no existing authorization
+    // decision applies to forcing a TLS reload, and a session does not imply
+    // it. Certificate changes happen through local/ACME renewal only.
 
     // POST /api/tls/renew — request ACME cert renewal and hot-reload
     priv.Post("/api/tls/renew", require_auth(ctx_.auth,

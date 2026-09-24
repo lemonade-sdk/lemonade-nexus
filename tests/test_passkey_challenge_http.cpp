@@ -552,7 +552,9 @@ TEST_F(PasskeyChallengeHttpTest, RegisterCannotReplaceAnotherIdentityCredential)
                                     login_b->first));
     const auto before = stored_credentials_file(login_b->second);
 
-    // Identity A tries to replace cred_b by spoofing B's user_id in the body.
+    // Identity A tries to take cred_b by spoofing B's user_id in the body.
+    // The credential_id is already owned by B, so the registration is
+    // rejected before disk or cache changes.
     auto login_a = login_ed25519(root_keypair);
     ASSERT_TRUE(login_a.has_value());
     auto* pkey_a = generate_p256();
@@ -569,14 +571,28 @@ TEST_F(PasskeyChallengeHttpTest, RegisterCannotReplaceAnotherIdentityCredential)
     auto res = cli.Post("/api/auth/register", headers, body.dump(),
                         "application/json");
     ASSERT_TRUE(res);
-    ASSERT_EQ(res->status, 200) << res->body;
-    EXPECT_EQ(json::parse(res->body).value("user_id", ""), login_a->second);
+    EXPECT_EQ(res->status, 400);
 
-    // B's credential file is byte-identical to before; A's file carries the
-    // (attacker-named) credential instead.
+    // B's credential file is byte-identical to before, and A's file never
+    // gains the foreign credential id.
     EXPECT_EQ(stored_credentials_file(login_b->second), before);
-    EXPECT_NE(stored_credentials_file(login_a->second).find("cred_b"),
+    EXPECT_EQ(stored_credentials_file(login_a->second).find("cred_b"),
               std::string::npos);
+
+    // The original credential still authenticates as its original user.
+    auto ch_res = cli.Post("/api/auth/challenge",
+                           json{{"type", "passkey"}, {"user_id", login_b->second}}.dump(),
+                           "application/json");
+    ASSERT_TRUE(ch_res);
+    ASSERT_EQ(ch_res->status, 200);
+    const auto challenge = json::parse(ch_res->body).at("challenge").get<std::string>();
+    auto auth_res = cli.Post("/api/auth",
+                             make_assertion(*crypto, std::string(kRpId), pkey_b,
+                                            "cred_b", challenge, 0).dump(),
+                             "application/json");
+    ASSERT_TRUE(auth_res);
+    ASSERT_EQ(auth_res->status, 200) << auth_res->body;
+    EXPECT_EQ(json::parse(auth_res->body).value("user_id", ""), login_b->second);
     EVP_PKEY_free(pkey_a);
     EVP_PKEY_free(pkey_b);
 }

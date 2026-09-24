@@ -18,6 +18,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <set>
 #include <sstream>
 
 namespace nexus::auth {
@@ -108,7 +110,37 @@ AuthResult PasskeyAuthProvider::do_register(const json& registration) {
     cred.sign_count    = 0;
     cred.created_at    = now;
 
+    // A credential_id belongs to at most one identity. Reject conflicting
+    // ownership before touching disk or cache; the check and the ownership
+    // reservation share one critical section so concurrent registrations
+    // cannot both win.
+    load_credentials_from_disk();
+    bool reserved_new_owner = false;
+    {
+        std::lock_guard lock(cache_mutex_);
+        auto existing = credential_cache_.find(credential_id);
+        if (existing != credential_cache_.end() &&
+            existing->second.user_id != user_id) {
+            spdlog::warn("[passkey] rejecting registration of credential '{}' by '{}': "
+                         "already owned by another identity",
+                         credential_id, user_id);
+            return AuthResult{
+                .authenticated = false,
+                .error_message = "credential_id is already owned by another identity"
+            };
+        }
+        reserved_new_owner = (existing == credential_cache_.end());
+        credential_cache_[credential_id] = cred;
+    }
+
     if (!save_credential(cred)) {
+        if (reserved_new_owner) {
+            std::lock_guard lock(cache_mutex_);
+            auto it = credential_cache_.find(credential_id);
+            if (it != credential_cache_.end() && it->second.user_id == user_id) {
+                credential_cache_.erase(it);
+            }
+        }
         return AuthResult{
             .authenticated = false,
             .error_message = "Failed to store credential"
@@ -587,6 +619,12 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
         return;
     }
 
+    struct FileCredentials {
+        std::string user_id;
+        std::vector<StoredCredential> credentials;
+    };
+    std::vector<FileCredentials> files;
+
     try {
         for (const auto& entry : std::filesystem::directory_iterator(creds_dir)) {
             if (entry.path().extension() != ".json") continue;
@@ -606,10 +644,12 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
                 continue;
             }
 
+            FileCredentials fc;
+            fc.user_id = std::move(user_id);
             for (const auto& cred_json : file_data["credentials"]) {
                 StoredCredential cred;
                 cred.credential_id = cred_json.value("credential_id", std::string{});
-                cred.user_id       = user_id;
+                cred.user_id       = fc.user_id;
                 cred.sign_count    = cred_json.value("sign_count", 0u);
                 cred.created_at    = cred_json.value("created_at", uint64_t{0});
 
@@ -629,12 +669,39 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
                 }
 
                 if (!cred.credential_id.empty()) {
-                    credential_cache_[cred.credential_id] = std::move(cred);
+                    fc.credentials.push_back(std::move(cred));
                 }
             }
+            files.push_back(std::move(fc));
         }
     } catch (const std::exception& e) {
         spdlog::error("[passkey] Error loading credentials from disk: {}", e.what());
+    }
+
+    // A credential_id persisted under more than one identity is a conflict
+    // (left over from a pre-fix registration race). Restart must not pick an
+    // owner from conflicting entries: refuse those credentials instead.
+    std::map<std::string, std::set<std::string>> owners_by_credential;
+    for (const auto& fc : files) {
+        for (const auto& cred : fc.credentials) {
+            owners_by_credential[cred.credential_id].insert(fc.user_id);
+        }
+    }
+    std::set<std::string> conflicted;
+    for (const auto& [credential_id, owners] : owners_by_credential) {
+        if (owners.size() > 1) {
+            conflicted.insert(credential_id);
+            spdlog::critical("[passkey] credential_id '{}' is persisted under {} identities; "
+                             "refusing to load it",
+                             credential_id, owners.size());
+        }
+    }
+
+    for (auto& fc : files) {
+        for (auto& cred : fc.credentials) {
+            if (conflicted.count(cred.credential_id)) continue;
+            credential_cache_[cred.credential_id] = std::move(cred);
+        }
     }
 
     cache_loaded_.store(true, std::memory_order_release);

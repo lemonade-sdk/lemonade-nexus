@@ -1,6 +1,7 @@
 // F-34e API authorization over the real HTTP routes:
-//  - /api/tls/reload must not accept caller-supplied certificate/key paths
-//    and is unavailable when the server has no locally configured TLS.
+//  - /api/tls/reload is not routed at all: no session authorizes a TLS
+//    reload, so the operation is unavailable even on a TLS-configured
+//    server (certificate changes happen via local/ACME renewal only).
 //  - /api/relay/ticket may only be minted for the caller's own identity.
 //  - /api/relay/register requires the existing relay_register permission on
 //    the application root; a valid session alone is insufficient, and with
@@ -33,6 +34,11 @@
 #include <gtest/gtest.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
+
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <array>
 #include <chrono>
@@ -173,7 +179,96 @@ protected:
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    // Secondary HTTPS server carrying only the cert routes, used to prove
+    // the reload operation is unavailable with TLS actually configured.
+    std::unique_ptr<network::HttpServer> tls_http;
+    api::ApiContext* tls_ctx = nullptr;
+    api::CertApiHandler* tls_cert_handler = nullptr;
+    fs::path side_cert, side_key;
+
+    // Write a self-signed cert + key for `cn` (with a matching DNS SAN).
+    static bool make_self_signed(const std::string& cn, const fs::path& cert_p,
+                                 const fs::path& key_p) {
+        EVP_PKEY* pkey = EVP_RSA_gen(2048);
+        if (!pkey) return false;
+        X509* x = X509_new();
+        ASN1_INTEGER_set(X509_get_serialNumber(x), 1);
+        X509_gmtime_adj(X509_getm_notBefore(x), 0);
+        X509_gmtime_adj(X509_getm_notAfter(x), 60 * 60 * 24);
+        X509_set_pubkey(x, pkey);
+        X509_NAME* name = X509_get_subject_name(x);
+        X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                                   reinterpret_cast<const unsigned char*>(cn.c_str()), -1, -1, 0);
+        X509_set_issuer_name(x, name);
+        std::string san = "DNS:" + cn;
+        if (X509_EXTENSION* ext =
+                X509V3_EXT_conf_nid(nullptr, nullptr, NID_subject_alt_name, san.c_str())) {
+            X509_add_ext(x, ext, -1);
+            X509_EXTENSION_free(ext);
+        }
+        bool ok = X509_sign(x, pkey, EVP_sha256()) != 0;
+        if (ok) {
+            if (FILE* cf = std::fopen(cert_p.string().c_str(), "wb")) {
+                ok = ok && PEM_write_X509(cf, x); std::fclose(cf);
+            }
+            if (FILE* kf = std::fopen(key_p.string().c_str(), "wb")) {
+                ok = ok && PEM_write_PrivateKey(kf, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+                std::fclose(kf);
+            }
+        }
+        X509_free(x);
+        EVP_PKEY_free(pkey);
+        return ok;
+    }
+
+    // Returns 0 when TLS could not be configured; tests must ASSERT on it.
+    uint16_t start_tls_side_server() {
+        const uint16_t port = static_cast<uint16_t>(test_port_ + 7);
+        side_cert = temp_dir / "side_cert.pem";
+        side_key  = temp_dir / "side_key.pem";
+        if (!make_self_signed("side.test.local", side_cert, side_key)) return 0;
+        tls_http = std::make_unique<network::HttpServer>(
+            port, "127.0.0.1", side_cert.string(), side_key.string());
+        if (!tls_http->is_tls()) return 0;
+
+        tls_ctx = new api::ApiContext{
+            .config           = config,
+            .auth             = *auth,
+            .tree             = *tree,
+            .ipam             = *ipam,
+            .gossip           = *gossip,
+            .crypto           = *crypto,
+            .key_wrapping     = *key_wrapping,
+            .storage          = *storage,
+            .acme             = *acme,
+            .http_server      = *tls_http,
+            .ddns             = *ddns,
+            .relay            = *relay,
+            .relay_discovery  = *relay_discovery,
+            .routing          = *routing,
+            .attestation      = *attestation,
+            .admission        = *admission,
+            .boringtun        = nullptr,
+            .dns              = nullptr,
+            .server_fqdn      = "test.local",
+            .server_seip_fqdn = "",
+            .server_private_fqdn = "",
+            .server_public_ip = "",
+            .tunnel_bind_ip   = "",
+        };
+        tls_cert_handler = new api::CertApiHandler(*tls_ctx);
+        tls_cert_handler->register_routes(tls_http->server(), tls_http->server());
+        tls_http->start();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        return port;
+    }
+
     void TearDown() override {
+        if (tls_http) tls_http->stop();
+        delete tls_cert_handler;
+        tls_cert_handler = nullptr;
+        delete tls_ctx;
+        tls_ctx = nullptr;
         if (http) http->stop();
         // Route lambdas are dead with the server; drop handlers and context
         // before tearing down the services they reference.
@@ -249,32 +344,37 @@ protected:
 
 // ── /api/tls/reload ─────────────────────────────────────────────────────────
 
-TEST_F(ApiAuthzF34eTest, TlsReloadWithoutSessionRefused) {
-    auto cli = make_client();
+TEST_F(ApiAuthzF34eTest, TlsReloadRouteUnavailableWithoutSession) {
+    const auto port = start_tls_side_server();
+    ASSERT_NE(port, 0);
+    httplib::SSLClient cli("side.test.local", port);
+    cli.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+    cli.set_ca_cert_path(side_cert.string());
     auto res = cli.Post("/api/tls/reload",
                         json{{"cert_path", "/etc/lemonade/evil.crt"},
                              {"key_path", "/etc/lemonade/evil.key"}}.dump(),
                         "application/json");
     ASSERT_TRUE(res);
-    EXPECT_EQ(res->status, 401);
+    EXPECT_EQ(res->status, 404);
 }
 
-// The test server runs plain HTTP with no locally configured certificate:
-// the reload must be unavailable, and caller-supplied paths must never be
-// echoed as an active reload or used at all.
-TEST_F(ApiAuthzF34eTest, TlsReloadIgnoresCallerPathsAndRefusesWithoutLocalTls) {
+// TLS is configured on the side server; an ordinary authenticated caller
+// still has no route and no authorization to trigger a reload.
+TEST_F(ApiAuthzF34eTest, TlsReloadUnavailableForOrdinaryAuthenticatedCaller) {
+    const auto port = start_tls_side_server();
+    ASSERT_NE(port, 0);
     auto login = login_ed25519(root_keypair);
     ASSERT_TRUE(login.has_value());
     httplib::Headers headers{{"Authorization", "Bearer " + login->first}};
-    auto cli = make_client();
+    httplib::SSLClient cli("side.test.local", port);
+    cli.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+    cli.set_ca_cert_path(side_cert.string());
     auto res = cli.Post("/api/tls/reload", headers,
                         json{{"cert_path", "/etc/lemonade/evil.crt"},
                              {"key_path", "/etc/lemonade/evil.key"}}.dump(),
                         "application/json");
     ASSERT_TRUE(res);
-    EXPECT_NE(res->status, 200);
-    // Caller paths are not loaded or echoed as an active reload.
-    EXPECT_EQ(res->body.find("evil"), std::string::npos);
+    EXPECT_EQ(res->status, 404);
     EXPECT_EQ(res->body.find("\"success\":true"), std::string::npos);
 }
 

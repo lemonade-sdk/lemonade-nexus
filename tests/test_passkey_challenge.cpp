@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string>
 #include <thread>
@@ -225,6 +226,14 @@ protected:
         auto key = crypto::to_base64(std::span<const uint8_t>(bytes));
         auto& entry = passkey->pending_challenges_.at(key);
         entry.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    }
+
+    // Private store access via the fixture (friendship is not inherited by
+    // the TEST_F-generated derived class). Works on any provider instance,
+    // including a fresh one standing in for a restart.
+    static std::optional<auth::StoredCredential>
+    lookup(auth::PasskeyAuthProvider& pk, const std::string& credential_id) {
+        return pk.lookup_credential(credential_id);
     }
 };
 
@@ -535,4 +544,163 @@ TEST_F(PasskeyChallengeTest, ChallengeIssuedThroughAuthService) {
     EXPECT_TRUE(result.authenticated);
     EXPECT_EQ(result.user_id, "alice");
     EVP_PKEY_free(pkey);
+}
+
+// ============================================================================
+// Credential ownership: one credential_id belongs to at most one identity.
+// ============================================================================
+
+namespace {
+
+// Write a credential file directly, simulating persisted state.
+void write_credential_file(const fs::path& root, const std::string& user_id,
+                           const std::vector<std::string>& credential_ids,
+                           crypto::SodiumCryptoService& c) {
+    nlohmann::json creds = nlohmann::json::array();
+    for (const auto& id : credential_ids) {
+        std::array<uint8_t, 32> x{};
+        std::array<uint8_t, 32> y{};
+        c.random_bytes(std::span<uint8_t>(x));
+        c.random_bytes(std::span<uint8_t>(y));
+        creds.push_back({
+            {"credential_id", id},
+            {"public_key_x", crypto::to_hex(std::span<const uint8_t>(x))},
+            {"public_key_y", crypto::to_hex(std::span<const uint8_t>(y))},
+            {"sign_count", 0},
+            {"created_at", 1},
+        });
+    }
+    auto dir = root / "credentials";
+    fs::create_directories(dir);
+    std::ofstream ofs(dir / (user_id + ".json"), std::ios::trunc);
+    ofs << nlohmann::json{{"user_id", user_id}, {"credentials", creds}}.dump(2);
+}
+
+}  // namespace
+
+TEST_F(PasskeyChallengeTest, SecondUserCannotTakeExistingCredentialId) {
+    auto* pkey = register_credential("alice", "cred_x");
+
+    auto* pkey_b = generate_p256();
+    std::vector<uint8_t> xb, yb;
+    p256_coordinates(pkey_b, xb, yb);
+    auto rejected = passkey->do_register({
+        {"user_id", "bob"},
+        {"credential_id", "cred_x"},
+        {"public_key_x", crypto::to_hex(xb)},
+        {"public_key_y", crypto::to_hex(yb)},
+    });
+    EXPECT_FALSE(rejected.authenticated);
+    EXPECT_NE(rejected.error_message.find("owned"), std::string::npos);
+
+    // The original owner still authenticates as the original user, and the
+    // rejected registration wrote nothing for the second user.
+    auto issued = auth->issue_passkey_challenge("alice");
+    ASSERT_TRUE(issued.has_value());
+    auto result = auth->authenticate(make_assertion_request(
+        *crypto, pkey, rp_id, "cred_x", issued->at("challenge").get<std::string>(), 1));
+    EXPECT_TRUE(result.authenticated);
+    EXPECT_EQ(result.user_id, "alice");
+    EXPECT_FALSE(fs::exists(temp_dir / "credentials" / "bob.json"));
+    EVP_PKEY_free(pkey_b);
+}
+
+TEST_F(PasskeyChallengeTest, ConflictingOwnershipSurvivesRestart) {
+    auto* pkey = register_credential("alice", "cred_x");
+
+    auto* pkey_b = generate_p256();
+    std::vector<uint8_t> xb, yb;
+    p256_coordinates(pkey_b, xb, yb);
+    auto rejected = passkey->do_register({
+        {"user_id", "bob"},
+        {"credential_id", "cred_x"},
+        {"public_key_x", crypto::to_hex(xb)},
+        {"public_key_y", crypto::to_hex(yb)},
+    });
+    EXPECT_FALSE(rejected.authenticated);
+    EVP_PKEY_free(pkey_b);
+
+    // Restart: fresh provider + service over the same persisted storage.
+    auto auth2 = std::make_unique<auth::AuthService>(*storage, *crypto, rp_id, jwt_secret);
+    auth2->start();
+    auto issued = auth2->issue_passkey_challenge("alice");
+    ASSERT_TRUE(issued.has_value());
+    auto result = auth2->authenticate(make_assertion_request(
+        *crypto, pkey, rp_id, "cred_x", issued->at("challenge").get<std::string>(), 1));
+    EXPECT_TRUE(result.authenticated);
+    EXPECT_EQ(result.user_id, "alice");
+}
+
+TEST_F(PasskeyChallengeTest, ConcurrentConflictingRegistrationsSingleOwner) {
+    auto* pkey_a = generate_p256();
+    auto* pkey_b = generate_p256();
+    std::vector<uint8_t> xa, ya, xb, yb;
+    p256_coordinates(pkey_a, xa, ya);
+    p256_coordinates(pkey_b, xb, yb);
+
+    bool ok_a = false;
+    bool ok_b = false;
+    std::barrier sync(2);
+    std::thread ta([&] {
+        sync.arrive_and_wait();
+        ok_a = passkey->do_register({
+            {"user_id", "alice"},
+            {"credential_id", "cred_race"},
+            {"public_key_x", crypto::to_hex(xa)},
+            {"public_key_y", crypto::to_hex(ya)},
+        }).authenticated;
+    });
+    std::thread tb([&] {
+        sync.arrive_and_wait();
+        ok_b = passkey->do_register({
+            {"user_id", "bob"},
+            {"credential_id", "cred_race"},
+            {"public_key_x", crypto::to_hex(xb)},
+            {"public_key_y", crypto::to_hex(yb)},
+        }).authenticated;
+    });
+    ta.join();
+    tb.join();
+
+    // Exactly one registration may win; both succeeding is the bug.
+    EXPECT_EQ(static_cast<int>(ok_a) + static_cast<int>(ok_b), 1);
+
+    EVP_PKEY* owner_pkey = ok_a ? pkey_a : pkey_b;
+    const char* owner = ok_a ? "alice" : "bob";
+    const char* loser = ok_a ? "bob" : "alice";
+
+    auto loaded = lookup(*passkey, "cred_race");
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->user_id, owner);
+    EXPECT_FALSE(fs::exists(temp_dir / "credentials" / (std::string(loser) + ".json")));
+
+    // The winner authenticates as the winner.
+    auto issued = auth->issue_passkey_challenge(owner);
+    ASSERT_TRUE(issued.has_value());
+    auto result = auth->authenticate(make_assertion_request(
+        *crypto, owner_pkey, rp_id, "cred_race", issued->at("challenge").get<std::string>(), 1));
+    EXPECT_TRUE(result.authenticated);
+    EXPECT_EQ(result.user_id, owner);
+    EVP_PKEY_free(pkey_a);
+    EVP_PKEY_free(pkey_b);
+}
+
+TEST_F(PasskeyChallengeTest, RestartRefusesConflictingPersistedEntries) {
+    // Pre-fix corruption: the same credential_id persisted under two users.
+    write_credential_file(temp_dir, "alice", {"cred_dup", "cred_alice_only"}, *crypto);
+    write_credential_file(temp_dir, "bob", {"cred_dup", "cred_bob_only"}, *crypto);
+
+    // Fresh provider over the same storage must not pick an owner from the
+    // conflicting entries; non-conflicting entries still load.
+    // Fresh provider over the same storage = a restart. It must not pick an
+    // owner from the conflicting entries; non-conflicting entries load.
+    auto passkey2 = std::make_unique<auth::PasskeyAuthProvider>(*storage, *crypto, rp_id, jwt_secret);
+    EXPECT_FALSE(lookup(*passkey2, "cred_dup").has_value());
+
+    auto alice_cred = lookup(*passkey2, "cred_alice_only");
+    ASSERT_TRUE(alice_cred.has_value());
+    EXPECT_EQ(alice_cred->user_id, "alice");
+    auto bob_cred = lookup(*passkey2, "cred_bob_only");
+    ASSERT_TRUE(bob_cred.has_value());
+    EXPECT_EQ(bob_cred->user_id, "bob");
 }
