@@ -25,32 +25,24 @@ using nexus::auth::SessionClaims;
 
 void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                         httplib::Server& priv) {
-    // POST /api/tls/reload — hot-reload TLS certificates
+    // POST /api/tls/reload — hot-reload TLS certificates. The certificate
+    // and key come from the server's local configuration only; a session
+    // may never point the reload at arbitrary paths.
     priv.Post("/api/tls/reload", require_auth(ctx_.auth,
-        [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
-        std::string reload_cert = ctx_.http_server.tls_cert_path();
-        std::string reload_key  = ctx_.http_server.tls_key_path();
-
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (!body.is_discarded()) {
-            if (body.contains("cert_path")) reload_cert = body["cert_path"].get<std::string>();
-            if (body.contains("key_path"))  reload_key  = body["key_path"].get<std::string>();
-        }
-
-        if (!ctx_.http_server.is_tls()) {
-            if (reload_cert.empty() || reload_key.empty()) {
-                error_response(res, "not running TLS and no cert/key paths provided");
-                return;
-            }
-            error_response(res, "server is running plain HTTP — restart with TLS cert to enable HTTPS");
+        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
+        if (!ctx_.http_server.is_tls() ||
+            ctx_.http_server.tls_cert_path().empty() ||
+            ctx_.http_server.tls_key_path().empty()) {
+            error_response(res,
+                "no TLS certificate configured locally — reload unavailable");
             return;
         }
 
-        bool ok = ctx_.http_server.reload_tls_certs(reload_cert, reload_key);
+        bool ok = ctx_.http_server.reload_tls_certs();
         nlohmann::json resp = {
             {"success",   ok},
-            {"cert_path", reload_cert},
-            {"key_path",  reload_key},
+            {"cert_path", ctx_.http_server.tls_cert_path()},
+            {"key_path",  ctx_.http_server.tls_key_path()},
         };
         json_response(res, resp, ok ? 200 : 500);
     }));
