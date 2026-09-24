@@ -122,6 +122,16 @@ AuthResult PasskeyAuthProvider::do_register(const json& registration) {
     // write leaves cache and file exactly as they were.
     load_credentials_from_disk();
     std::lock_guard lock(cache_mutex_);
+    if (!degraded_identities_.empty()) {
+        spdlog::warn("[passkey] refusing registration of credential '{}' by '{}': "
+                     "credential store is degraded (unreadable or invalid file)",
+                     credential_id, user_id);
+        return AuthResult{
+            .authenticated = false,
+            .error_message = "credential store degraded (unreadable or invalid "
+                             "credential file); registration refused"
+        };
+    }
     if (conflicted_ids_.count(credential_id)) {
         spdlog::warn("[passkey] rejecting registration of credential '{}' by '{}': "
                      "credential is in a persisted ownership conflict",
@@ -369,12 +379,19 @@ AuthResult PasskeyAuthProvider::do_authenticate(const json& credentials) {
         (static_cast<uint32_t>(authenticator_data[35]) << 8)  |
         (static_cast<uint32_t>(authenticator_data[36]));
 
-    if (!update_sign_count(credential_id_b64, new_sign_count)) {
+    // Test seam: complete a concurrent key replacement deterministically
+    // between verification and the mutation boundary.
+    if (test_hook_before_sign_count_update_) {
+        test_hook_before_sign_count_update_();
+    }
+
+    if (!update_sign_count(credential_id_b64, new_sign_count, *stored)) {
         spdlog::warn("[passkey] sign count not advanced for credential '{}': "
                      "rejecting assertion", credential_id_b64);
         return AuthResult{
             .authenticated = false,
-            .error_message = "sign count rejected (regression, replay, or persistence failure)"
+            .error_message = "sign count rejected (regression, replay, credential "
+                             "change, or persistence failure)"
         };
     }
 
@@ -549,14 +566,56 @@ bool atomic_write_json(const std::filesystem::path& path, const std::string& tex
     }
 }
 
-std::optional<json> read_user_credential_file(const std::filesystem::path& path) {
+enum class UserCredentialFileState { Absent, Ok, Error };
+
+struct UserCredentialFile {
+    UserCredentialFileState state{UserCredentialFileState::Absent};
+    json data;
+};
+
+// Distinguishes a genuinely ABSENT file from one that exists but cannot be
+// trusted (unreadable, malformed JSON, invalid structure). Error must fail
+// closed at every mutation boundary: an existing file is never replaced by
+// an assumed-empty object.
+UserCredentialFile read_user_credential_file(const std::filesystem::path& path) {
+    UserCredentialFile out;
+    std::error_code ec;
+    if (!std::filesystem::exists(path, ec)) {
+        if (!ec || ec == std::errc::no_such_file_or_directory) {
+            // Plainly absent (a missing parent directory surfaces as ENOENT):
+            // the caller creates a new file.
+            return out;
+        }
+        // exists() failed for a reason other than "not there" — absence is
+        // unconfirmable; fail closed.
+        out.state = UserCredentialFileState::Error;
+        return out;
+    }
+
+    // The file exists: the read must succeed from here on.
     std::ifstream ifs(path);
-    if (!ifs) return std::nullopt;
+    if (!ifs) {
+        out.state = UserCredentialFileState::Error;
+        return out;
+    }
     std::ostringstream ss;
     ss << ifs.rdbuf();
+    if (!ifs) {
+        out.state = UserCredentialFileState::Error;
+        return out;
+    }
     auto file_data = json::parse(ss.str(), nullptr, false);
-    if (file_data.is_discarded()) return std::nullopt;
-    return file_data;
+    if (file_data.is_discarded() || !file_data.is_object()) {
+        out.state = UserCredentialFileState::Error;
+        return out;
+    }
+    if (file_data.contains("credentials") && !file_data["credentials"].is_array()) {
+        out.state = UserCredentialFileState::Error;
+        return out;
+    }
+    out.data = std::move(file_data);
+    out.state = UserCredentialFileState::Ok;
+    return out;
 }
 
 }  // namespace
@@ -574,10 +633,28 @@ bool PasskeyAuthProvider::persist_credential_file(const StoredCredential& cred) 
 
     auto cred_path = storage_.data_root() / "credentials" / (cred.user_id + ".json");
 
-    json file_data = read_user_credential_file(cred_path).value_or(json::object());
+    auto rf = read_user_credential_file(cred_path);
+    if (rf.state == UserCredentialFileState::Error) {
+        spdlog::error("[passkey] refusing to mutate credential file {} — existing "
+                      "file is unreadable or invalid; the file is left untouched",
+                      cred_path.string());
+        return false;
+    }
+    json file_data = (rf.state == UserCredentialFileState::Ok)
+                        ? std::move(rf.data)
+                        : json::object();  // genuinely absent: new file
+
+    if (file_data.contains("user_id") && file_data["user_id"].is_string() &&
+        file_data["user_id"].get<std::string>() != cred.user_id) {
+        spdlog::error("[passkey] refusing to mutate credential file {} — existing "
+                      "file claims a different identity", cred_path.string());
+        return false;
+    }
     file_data["user_id"] = cred.user_id;
 
-    if (!file_data.contains("credentials") || !file_data["credentials"].is_array()) {
+    // A missing array is created; a malformed one is an Error state above and
+    // is never silently reset.
+    if (!file_data.contains("credentials")) {
         file_data["credentials"] = json::array();
     }
 
@@ -641,27 +718,56 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
     };
     std::vector<FileCredentials> files;
 
+    // A file that EXISTS but cannot be read or validated degrades the store:
+    // it may hold ownership claims, so registration must not assume absence
+    // of ownership. The identity (or the file stem when the user_id is
+    // itself unreadable) is recorded in degraded_identities_.
+    bool store_error = false;
     try {
         for (const auto& entry : std::filesystem::directory_iterator(creds_dir)) {
             if (entry.path().extension() != ".json") continue;
+            if (entry.path().filename().string().ends_with(".tmp")) continue;
 
+            const auto identity = entry.path().stem().string();
             std::ifstream ifs(entry.path());
-            if (!ifs) continue;
+            if (!ifs) {
+                spdlog::critical("[passkey] credential file {} exists but is unreadable; "
+                                 "degrading identity '{}'", entry.path().string(), identity);
+                degraded_identities_.insert(identity);
+                continue;
+            }
 
             std::ostringstream ss;
             ss << ifs.rdbuf();
             auto file_data = json::parse(ss.str(), nullptr, false);
-            if (file_data.is_discarded()) continue;
+            if (file_data.is_discarded() || !file_data.is_object()) {
+                spdlog::critical("[passkey] credential file {} is malformed; "
+                                 "degrading identity '{}'", entry.path().string(), identity);
+                degraded_identities_.insert(identity);
+                continue;
+            }
 
-            auto user_id = file_data.value("user_id", std::string{});
-            if (user_id.empty()) continue;
+            std::string user_id;
+            if (!file_data.contains("user_id") || !file_data["user_id"].is_string() ||
+                (user_id = file_data["user_id"].get<std::string>()).empty()) {
+                spdlog::critical("[passkey] credential file {} has no usable user_id; "
+                                 "degrading identity '{}'", entry.path().string(), identity);
+                degraded_identities_.insert(identity);
+                continue;
+            }
 
-            if (!file_data.contains("credentials") || !file_data["credentials"].is_array()) {
+            if (file_data.contains("credentials") &&
+                !file_data["credentials"].is_array()) {
+                spdlog::critical("[passkey] credential file {} has an invalid "
+                                 "credentials field; degrading identity '{}'",
+                                 entry.path().string(), user_id);
+                degraded_identities_.insert(user_id);
                 continue;
             }
 
             FileCredentials fc;
-            fc.user_id = std::move(user_id);
+            fc.user_id = user_id;
+            if (file_data.contains("credentials")) {
             for (const auto& cred_json : file_data["credentials"]) {
                 StoredCredential cred;
                 cred.credential_id = cred_json.value("credential_id", std::string{});
@@ -669,18 +775,28 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
                 cred.sign_count    = cred_json.value("sign_count", 0u);
                 cred.created_at    = cred_json.value("created_at", uint64_t{0});
 
+                bool key_valid = true;
                 try {
                     cred.public_key_x = crypto::from_hex(cred_json.value("public_key_x", ""));
                     cred.public_key_y = crypto::from_hex(cred_json.value("public_key_y", ""));
                 } catch (const std::exception& e) {
-                    spdlog::warn("[passkey] Skipping malformed credential in {}: {}",
-                                 entry.path().string(), e.what());
-                    continue;
+                    key_valid = false;
+                }
+                if (key_valid &&
+                    (cred.public_key_x.size() != 32 || cred.public_key_y.size() != 32)) {
+                    key_valid = false;
                 }
 
-                if (cred.public_key_x.size() != 32 || cred.public_key_y.size() != 32) {
-                    spdlog::warn("[passkey] Skipping credential with wrong key size in {}",
-                                 entry.path().string());
+                if (!key_valid) {
+                    // The entry names a credential_id but its key cannot be
+                    // trusted: ownership of that id is indeterminate, so it is
+                    // quarantined exactly like a cross-identity conflict.
+                    if (!cred.credential_id.empty()) {
+                        spdlog::critical("[passkey] credential '{}' in {} has an invalid "
+                                         "key; quarantining the credential_id",
+                                         cred.credential_id, entry.path().string());
+                        conflicted_ids_.insert(cred.credential_id);
+                    }
                     continue;
                 }
 
@@ -688,10 +804,17 @@ void PasskeyAuthProvider::load_credentials_from_disk() {
                     fc.credentials.push_back(std::move(cred));
                 }
             }
+            }
             files.push_back(std::move(fc));
         }
     } catch (const std::exception& e) {
-        spdlog::error("[passkey] Error loading credentials from disk: {}", e.what());
+        spdlog::critical("[passkey] credential directory scan failed: {} — degrading the "
+                         "whole store", e.what());
+        store_error = true;
+    }
+    if (store_error) {
+        // The load is incomplete: nothing may be assumed about ownership.
+        degraded_identities_.insert(creds_dir.string());
     }
 
     // A credential_id persisted under more than one identity is a conflict
@@ -808,13 +931,26 @@ bool PasskeyAuthProvider::verify_client_data_json(const std::vector<uint8_t>& cl
 // ============================================================================
 
 bool PasskeyAuthProvider::update_sign_count(const std::string& credential_id,
-                                             uint32_t new_count) {
+                                             uint32_t new_count,
+                                             const StoredCredential& verified) {
     std::lock_guard lock(cache_mutex_);
     auto it = credential_cache_.find(credential_id);
     if (it == credential_cache_.end()) {
         return false;
     }
-    const uint32_t stored = it->second.sign_count;
+    // The stored entry must still be the credential the signature was
+    // verified against. A concurrent same-ID key replacement in between must
+    // not be advanced (or read) by an old-key assertion.
+    const auto& cur = it->second;
+    if (cur.user_id != verified.user_id ||
+        cur.public_key_x != verified.public_key_x ||
+        cur.public_key_y != verified.public_key_y) {
+        spdlog::warn("[passkey] credential '{}' changed between verification and "
+                     "sign-count update; rejecting",
+                     credential_id);
+        return false;
+    }
+    const uint32_t stored = cur.sign_count;
 
     if (new_count == 0 && stored == 0) {
         // Authenticator without counters: accept without changing state.
@@ -834,17 +970,17 @@ bool PasskeyAuthProvider::update_sign_count(const std::string& credential_id,
                       "(credential '{}')", credential_id);
         return false;
     }
-    const auto user_id = it->second.user_id;
+    const auto user_id = cur.user_id;
     auto cred_path = storage_.data_root() / "credentials" / (user_id + ".json");
-    auto file_data = read_user_credential_file(cred_path);
-    if (!file_data || !file_data->contains("credentials") ||
-        !file_data->at("credentials").is_array()) {
-        spdlog::error("[passkey] cannot persist sign count: missing credential "
-                      "file {}", cred_path.string());
+    auto rf = read_user_credential_file(cred_path);
+    if (rf.state != UserCredentialFileState::Ok ||
+        !rf.data.contains("credentials")) {
+        spdlog::error("[passkey] cannot persist sign count: credential file {} "
+                      "missing, unreadable, or invalid", cred_path.string());
         return false;
     }
     bool found = false;
-    for (auto& cred_json : file_data->at("credentials")) {
+    for (auto& cred_json : rf.data["credentials"]) {
         if (cred_json.value("credential_id", "") == credential_id) {
             cred_json["sign_count"] = new_count;
             found = true;
@@ -856,7 +992,7 @@ bool PasskeyAuthProvider::update_sign_count(const std::string& credential_id,
                       "not in {}", credential_id, cred_path.string());
         return false;
     }
-    if (!atomic_write_json(cred_path, file_data->dump(2))) {
+    if (!atomic_write_json(cred_path, rf.data.dump(2))) {
         spdlog::error("[passkey] failed to persist sign count for credential "
                       "'{}'", credential_id);
         return false;

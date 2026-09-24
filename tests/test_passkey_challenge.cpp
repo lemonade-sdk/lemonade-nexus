@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <span>
 #include <string>
@@ -284,11 +285,23 @@ protected:
     // Arm the injected persistence failure (friend access).
     void arm_persist_failure() { passkey->test_fail_next_persist_ = true; }
 
+    // Set the pre-mutation test hook (friend access).
+    void set_sign_count_hook(std::function<void()> hook) {
+        passkey->test_hook_before_sign_count_update_ = std::move(hook);
+    }
+
     nlohmann::json read_user_file(const std::string& user_id) {
         std::ifstream ifs(temp_dir / "credentials" / (user_id + ".json"));
         std::ostringstream ss;
         ss << ifs.rdbuf();
         return nlohmann::json::parse(ss.str());
+    }
+
+    static std::string file_bytes(const fs::path& path) {
+        std::ifstream ifs(path, std::ios::binary);
+        std::ostringstream ss;
+        ss << ifs.rdbuf();
+        return ss.str();
     }
 };
 
@@ -467,36 +480,52 @@ TEST_F(PasskeyChallengeTest, CounterRegressionRules) {
     EVP_PKEY_free(k);
 }
 
-// Competing mutations of the same user file (a registration racing
-// sign-count updates) must not lose an update: both credentials and the
-// advanced counter end up in cache and file.
+// Competing mutations of the same user file: a registration racing a
+// controlled burst of sign-count updates. Both operations start together at
+// a barrier, both MUST execute to completion, and both results are asserted —
+// the test cannot pass with zero competing counter updates. No update may be
+// lost: both credentials and the full counter advance end up in cache and
+// file.
 TEST_F(PasskeyChallengeTest, ConcurrentRegistrationAndSignCountUpdateNoLostUpdate) {
     auto* k1 = register_credential("alice", "cred_c1");
     auto* k2 = generate_p256();
 
-    // Seed counter 1 so the file has one advanced entry before the race.
+    // Counter 1 before the race so the file has one advanced entry.
     auto c0 = issue("alice");
     EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
         *crypto, k1, rp_id, "cred_c1", c0, 1)).authenticated);
 
-    std::atomic<bool> reg_done{false};
-    std::thread registrar([&] {
-        register_with_key(*passkey, *crypto, "alice", "cred_c2", k2);
-        reg_done = true;
-    });
+    constexpr uint32_t kUpdates = 8;
+    std::barrier sync{2};
+    std::atomic<bool> reg_ok{false};
+    std::atomic<uint32_t> counter_updates{0};
 
-    for (uint32_t i = 2; i <= 20; ++i) {
-        if (reg_done.load()) break;
-        auto c = issue("alice");
-        passkey->do_authenticate(make_assertion_request(
-            *crypto, k1, rp_id, "cred_c1", c, i));
-    }
+    std::thread registrar([&] {
+        sync.arrive_and_wait();
+        reg_ok = register_with_key(*passkey, *crypto, "alice", "cred_c2", k2)
+                     .authenticated;
+    });
+    std::thread authenticator([&] {
+        sync.arrive_and_wait();
+        for (uint32_t i = 2; i <= 1 + kUpdates; ++i) {
+            auto c = issue("alice");
+            if (passkey->do_authenticate(make_assertion_request(
+                    *crypto, k1, rp_id, "cred_c1", c, i)).authenticated) {
+                counter_updates++;
+            }
+        }
+    });
     registrar.join();
+    authenticator.join();
+
+    // Both operations actually executed.
+    EXPECT_TRUE(reg_ok.load());
+    EXPECT_EQ(counter_updates.load(), kUpdates);
 
     ASSERT_TRUE(lookup(*passkey, "cred_c1").has_value());
     ASSERT_TRUE(lookup(*passkey, "cred_c2").has_value());
     const auto cached_count = lookup(*passkey, "cred_c1")->sign_count;
-    ASSERT_GE(cached_count, 1u);
+    EXPECT_EQ(cached_count, 1u + kUpdates);
 
     // The file must agree with the cache: no lost update from the race.
     auto file = read_user_file("alice");
@@ -504,7 +533,7 @@ TEST_F(PasskeyChallengeTest, ConcurrentRegistrationAndSignCountUpdateNoLostUpdat
     for (const auto& c : file["credentials"]) {
         if (c["credential_id"] == "cred_c1") {
             has_c1 = true;
-            EXPECT_EQ(c["sign_count"], cached_count);
+            EXPECT_EQ(c["sign_count"], 1u + kUpdates);
         }
         if (c["credential_id"] == "cred_c2") has_c2 = true;
     }
@@ -512,6 +541,178 @@ TEST_F(PasskeyChallengeTest, ConcurrentRegistrationAndSignCountUpdateNoLostUpdat
     EXPECT_TRUE(has_c2);
 
     EVP_PKEY_free(k1); EVP_PKEY_free(k2);
+}
+
+// Deterministic mutation-boundary regression: authentication verifies the
+// OLD key, the credential is then replaced (same ID, same owner, new key),
+// and the mutation boundary must see the change and refuse — no session,
+// no counter change to the replacement credential.
+TEST_F(PasskeyChallengeTest, CredentialChangedDuringAuthenticationRejected) {
+    auto* k1 = register_credential("alice", "cred_swap");
+    auto* k2 = generate_p256();
+    const auto challenge = issue("alice");
+    auto request = make_assertion_request(
+        *crypto, k1, rp_id, "cred_swap", challenge, /*sign_count=*/1);
+
+    // Pause between signature verification and the sign-count mutation;
+    // complete the same-ID key replacement while paused.
+    set_sign_count_hook([this, k2] {
+        auto swapped = register_with_key(*passkey, *crypto, "alice", "cred_swap", k2);
+        EXPECT_TRUE(swapped.authenticated);
+    });
+    auto result = passkey->do_authenticate(request);
+    set_sign_count_hook(nullptr);
+
+    EXPECT_FALSE(result.authenticated);
+    EXPECT_TRUE(result.session_token.empty());
+    EXPECT_NE(result.error_message.find("sign count"), std::string::npos);
+
+    // The replacement credential is untouched: new key, counter unchanged.
+    ASSERT_TRUE(lookup(*passkey, "cred_swap").has_value());
+    EXPECT_EQ(lookup(*passkey, "cred_swap")->sign_count, 0u);
+    std::vector<uint8_t> x2, y2;
+    p256_coordinates(k2, x2, y2);
+    EXPECT_EQ(lookup(*passkey, "cred_swap")->public_key_x, x2);
+    EXPECT_EQ(lookup(*passkey, "cred_swap")->public_key_y, y2);
+
+    // The replacement remains healthy, and the old key is dead.
+    auto c2 = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k2, rp_id, "cred_swap", c2, 1)).authenticated);
+    EXPECT_EQ(lookup(*passkey, "cred_swap")->sign_count, 1u);
+    auto c3 = issue("alice");
+    EXPECT_FALSE(passkey->do_authenticate(make_assertion_request(
+        *crypto, k1, rp_id, "cred_swap", c3, 2)).authenticated);
+
+    EVP_PKEY_free(k1); EVP_PKEY_free(k2);
+}
+
+// An existing credential file that cannot be read or parsed must refuse the
+// mutation without being replaced: no loss of the other credentials, no
+// cache change, and the file is byte-identical after the refusal.
+TEST_F(PasskeyChallengeTest, InvalidExistingCredentialFileRefusesMutation) {
+    register_credential("alice", "keep_1");
+    register_credential("alice", "keep_2");
+
+    const auto path = temp_dir / "credentials" / "alice.json";
+    const auto original = file_bytes(path);
+    ASSERT_FALSE(original.empty());
+    {
+        std::ofstream ofs(path, std::ios::trunc | std::ios::binary);
+        ofs << "\x01\x02not json";
+    }
+    const auto corrupted = file_bytes(path);
+    ASSERT_NE(corrupted, original);
+
+    auto* k = generate_p256();
+    // Same-owner update of an existing id: refused...
+    EXPECT_FALSE(register_with_key(*passkey, *crypto, "alice", "keep_1", k).authenticated);
+    // ...as is a brand-new id for the same user.
+    EXPECT_FALSE(register_with_key(*passkey, *crypto, "alice", "keep_3", k).authenticated);
+
+    // The file is byte-identical to the corrupted state: a refused mutation
+    // must not reset it (which would drop keep_2) or "repair" it silently.
+    EXPECT_EQ(file_bytes(path), corrupted);
+    // The cache is unchanged too.
+    EXPECT_TRUE(lookup(*passkey, "keep_1").has_value());
+    EXPECT_TRUE(lookup(*passkey, "keep_2").has_value());
+    EXPECT_FALSE(lookup(*passkey, "keep_3").has_value());
+    EVP_PKEY_free(k);
+}
+
+// An existing file with a structurally invalid "credentials" field must be
+// refused, not silently reset to an array.
+TEST_F(PasskeyChallengeTest, InvalidCredentialsArrayRefusesMutation) {
+    register_credential("alice", "keep_1");
+
+    const auto path = temp_dir / "credentials" / "alice.json";
+    {
+        std::ofstream ofs(path, std::ios::trunc);
+        ofs << R"({"user_id":"alice","credentials":{"bogus":true}})";
+    }
+    const auto before = file_bytes(path);
+
+    auto* k = generate_p256();
+    EXPECT_FALSE(register_with_key(*passkey, *crypto, "alice", "keep_1", k).authenticated);
+    EXPECT_FALSE(register_with_key(*passkey, *crypto, "alice", "keep_9", k).authenticated);
+    EXPECT_EQ(file_bytes(path), before);
+    EVP_PKEY_free(k);
+}
+
+// Startup load with one corrupt file: the store is degraded, so NO
+// registration is authorized (absence of ownership cannot be assumed), even
+// for identities with perfectly readable files. Authentication of readable
+// credentials is unaffected.
+TEST_F(PasskeyChallengeTest, DegradedStoreRefusesRegistrationAtStartup) {
+    auto* ka = generate_p256();
+    seed_credential_file("alice", {{"cred_a_ok", ka}});
+    {
+        std::ofstream ofs(temp_dir / "credentials" / "carol.json",
+                          std::ios::trunc | std::ios::binary);
+        ofs << "\xff\xfe garbage";
+    }
+
+    // First use loads the store: alice's file is fine, carol's is not.
+    EXPECT_TRUE(lookup(*passkey, "cred_a_ok").has_value());
+
+    auto* kb = generate_p256();
+    auto res = register_with_key(*passkey, *crypto, "bob", "cred_b_new", kb);
+    EXPECT_FALSE(res.authenticated);
+    EXPECT_NE(res.error_message.find("degraded"), std::string::npos);
+
+    // Even the healthy identity cannot register on an assumed absence.
+    auto res2 = register_with_key(*passkey, *crypto, "alice", "cred_a2", ka);
+    EXPECT_FALSE(res2.authenticated);
+
+    // Readable credentials still authenticate (no over-refusal).
+    const auto c = issue("alice");
+    EXPECT_TRUE(passkey->do_authenticate(make_assertion_request(
+        *crypto, ka, rp_id, "cred_a_ok", c, 1)).authenticated);
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kb);
+}
+
+// A single credential entry with an unusable key inside an otherwise valid
+// file: that credential_id's ownership is indeterminate, so it is quarantined
+// exactly like a cross-identity conflict; the valid entries still load.
+TEST_F(PasskeyChallengeTest, UnreadableCredentialEntryQuarantined) {
+    auto* ka = generate_p256();
+    nlohmann::json file;
+    file["user_id"] = "alice";
+    file["credentials"] = nlohmann::json::array();
+    {
+        std::vector<uint8_t> x, y;
+        p256_coordinates(ka, x, y);
+        file["credentials"].push_back({
+            {"credential_id", "cred_ok"},
+            {"public_key_x", crypto::to_hex(std::span<const uint8_t>(x))},
+            {"public_key_y", crypto::to_hex(std::span<const uint8_t>(y))},
+            {"sign_count", 0}, {"created_at", 1},
+        });
+    }
+    file["credentials"].push_back({
+        {"credential_id", "cred_badkey"},
+        {"public_key_x", "zz"}, {"public_key_y", "zz"},
+        {"sign_count", 0}, {"created_at", 1},
+    });
+    fs::create_directories(temp_dir / "credentials");
+    {
+        std::ofstream ofs(temp_dir / "credentials" / "alice.json");
+        ofs << file.dump(2);
+    }
+
+    EXPECT_TRUE(lookup(*passkey, "cred_ok").has_value());
+    EXPECT_FALSE(lookup(*passkey, "cred_badkey").has_value());
+
+    // Nobody — including the file's own identity — may register the id.
+    auto* kb = generate_p256();
+    auto res = register_with_key(*passkey, *crypto, "bob", "cred_badkey", kb);
+    EXPECT_FALSE(res.authenticated);
+    EXPECT_NE(res.error_message.find("conflict"), std::string::npos);
+    auto res2 = register_with_key(*passkey, *crypto, "alice", "cred_badkey", kb);
+    EXPECT_FALSE(res2.authenticated);
+
+    EVP_PKEY_free(ka); EVP_PKEY_free(kb);
 }
 
 TEST_F(PasskeyChallengeTest, IssuedChallengeIsCanonicalBase64Url) {

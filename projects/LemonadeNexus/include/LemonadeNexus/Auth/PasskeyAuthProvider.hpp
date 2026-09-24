@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -140,15 +141,20 @@ private:
     std::unordered_map<std::string, PendingChallenge> pending_challenges_;
 
     // --- credential persistence ---
-    // Advances the sign count for an accepted assertion. Rules, checked and
-    // applied under cache_mutex_:
+    // Advances the sign count for an accepted assertion. `verified` is the
+    // credential snapshot the assertion's signature was checked against;
+    // under cache_mutex_ the stored entry must still be that same credential
+    // (same owner and key), or the update is refused — a concurrent same-ID
+    // key replacement must not be advanced by an old-key assertion.
+    // Counter rules, checked and applied under cache_mutex_:
     //   stored 0, received 0   -> accept, no change (authenticator without counters)
     //   received > stored      -> persist, then publish
     //   anything else          -> reject (regression, replay, or 0 after nonzero)
-    // Returns false on rejection or when persistence fails; the cache and the
-    // previous file state are left untouched in both cases.
+    // Returns false on rejection, identity change, or persistence failure;
+    // the cache and the previous file state are left untouched in all cases.
     [[nodiscard]] bool update_sign_count(const std::string& credential_id,
-                                         uint32_t sign_count);
+                                         uint32_t sign_count,
+                                         const StoredCredential& verified);
 
     // --- credential cache (credential_id -> StoredCredential) ---
     // cache_mutex_ guards the cache, the conflict set, and ALL credential
@@ -160,11 +166,21 @@ private:
     // unavailable for authentication (absent from the cache) and for
     // registration (checked in do_register) until the files are repaired.
     std::unordered_set<std::string> conflicted_ids_;
+    // Identities whose credential file exists but could not be read or
+    // validated at load (unreadable, malformed, invalid structure). While any
+    // identity is degraded, registration is refused outright: an unreadable
+    // file may hold ownership claims, so absence of ownership cannot be
+    // assumed. Authentication of readable credentials is unaffected.
+    std::unordered_set<std::string> degraded_identities_;
     std::atomic<bool> cache_loaded_{false};
 
     // Test fault injection (friend PasskeyChallengeTest): the next credential
     // file write fails before touching disk.
     bool test_fail_next_persist_{false};
+    // Test seam (friend PasskeyChallengeTest): invoked after assertion
+    // verification, before the sign-count mutation, to complete a concurrent
+    // key replacement deterministically.
+    std::function<void()> test_hook_before_sign_count_update_;
 };
 
 } // namespace nexus::auth

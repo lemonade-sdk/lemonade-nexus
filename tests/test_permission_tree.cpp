@@ -631,7 +631,8 @@ TEST_F(PermissionTreeTest, SignatureOverLegacyWgCanonicalFormRejected) {
     legacy["signer_pubkey"]  = delta.signer_pubkey;
     legacy["target_node_id"] = delta.target_node_id;
     legacy["timestamp"]      = delta.timestamp;
-    auto legacy_bytes = std::vector<uint8_t>(legacy.dump().begin(), legacy.dump().end());
+    const auto legacy_dump = legacy.dump();
+    auto legacy_bytes = std::vector<uint8_t>(legacy_dump.begin(), legacy_dump.end());
     delta.signature = crypto::to_base64(
         crypto_svc->ed25519_sign(root_keypair.private_key,
                                  std::span<const uint8_t>(legacy_bytes)));
