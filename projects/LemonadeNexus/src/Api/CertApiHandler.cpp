@@ -25,38 +25,12 @@ using nexus::auth::SessionClaims;
 
 void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                         httplib::Server& priv) {
-    // /api/tls/reload is intentionally not routed: no existing authorization
-    // decision applies to forcing a TLS reload, and a session does not imply
-    // it. Certificate changes happen through local/ACME renewal only.
-
-    // POST /api/tls/renew — request ACME cert renewal and hot-reload
-    priv.Post("/api/tls/renew", require_auth(ctx_.auth,
-        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
-        if (ctx_.server_fqdn.empty()) {
-            error_response(res, "no server FQDN configured — set --server-hostname");
-            return;
-        }
-
-        auto result = ctx_.acme.renew_certificate(ctx_.server_fqdn);
-        if (!result.success) {
-            error_response(res, "ACME renewal failed", 502);
-            return;
-        }
-
-        bool reloaded = false;
-        if (ctx_.http_server.is_tls() && !result.cert_path.empty() && !result.key_path.empty()) {
-            reloaded = ctx_.http_server.reload_tls_certs(result.cert_path, result.key_path);
-        }
-
-        nlohmann::json resp = {
-            {"success",      true},
-            {"domain",       ctx_.server_fqdn},
-            {"cert_path",    result.cert_path},
-            {"key_path",     result.key_path},
-            {"hot_reloaded", reloaded},
-        };
-        json_response(res, resp);
-    }));
+    // /api/tls/reload and /api/tls/renew are intentionally not routed: no
+    // accepted authorization rule covers forcing a TLS reload or triggering
+    // certificate renewal (a valid session alone is insufficient, and no
+    // owner/admin/permission model for server TLS operations exists). Renewal
+    // happens only through the local scheduled ACME monitor, which calls
+    // renew_certificate + reload_tls_certs directly.
 
     // GET /api/certs/{domain} — get certificate status for a domain
     priv.Get(R"(/api/certs/(.+))", require_auth(ctx_.auth,

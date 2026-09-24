@@ -1,7 +1,8 @@
 // F-34e API authorization over the real HTTP routes:
-//  - /api/tls/reload is not routed at all: no session authorizes a TLS
-//    reload, so the operation is unavailable even on a TLS-configured
-//    server (certificate changes happen via local/ACME renewal only).
+//  - /api/tls/reload and /api/tls/renew are not routed at all: no session
+//    authorizes a TLS reload or an ACME renewal trigger, so both operations
+//    are unavailable even on a TLS-configured server (certificate changes
+//    happen via the local scheduled ACME monitor only).
 //  - /api/relay/ticket may only be minted for the caller's own identity.
 //  - /api/relay/register requires the existing relay_register permission on
 //    the application root; a valid session alone is insufficient, and with
@@ -356,6 +357,89 @@ TEST_F(ApiAuthzF34eTest, TlsReloadRouteUnavailableWithoutSession) {
                         "application/json");
     ASSERT_TRUE(res);
     EXPECT_EQ(res->status, 404);
+}
+
+// /api/tls/renew: no accepted authorization rule covers triggering an ACME
+// renewal from a session, so the route is removed (same ruling as
+// /api/tls/reload). The control request proves the CertApiHandler is in
+// fact registered on this server: a sibling route answers, renew does not.
+TEST_F(ApiAuthzF34eTest, TlsRenewRouteRemovedWithoutSession) {
+    const auto port = start_tls_side_server();
+    ASSERT_NE(port, 0);
+    httplib::SSLClient cli("side.test.local", port);
+    cli.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+    cli.set_ca_cert_path(side_cert.string());
+
+    auto res = cli.Post("/api/tls/renew", "{}", "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 404);
+
+    // Control: a sibling route of the SAME handler is routable (refused for
+    // lack of a session, not absent), so the 404 is the route removal.
+    auto control = cli.Get("/api/certs/example.test.local");
+    ASSERT_TRUE(control);
+    EXPECT_EQ(control->status, 401);
+}
+
+// A valid session (even the root key, with an FQDN configured on the server)
+// still gets no route and no renewal: the operation is gone, not merely denied.
+TEST_F(ApiAuthzF34eTest, TlsRenewRouteRemovedForAuthenticatedCaller) {
+    const auto port = start_tls_side_server();
+    ASSERT_NE(port, 0);
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
+    httplib::Headers headers{{"Authorization", "Bearer " + login->first}};
+    httplib::SSLClient cli("side.test.local", port);
+    cli.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+    cli.set_ca_cert_path(side_cert.string());
+    auto res = cli.Post("/api/tls/renew", headers, "{}", "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 404);
+    EXPECT_EQ(res->body.find("\"success\":true"), std::string::npos);
+}
+
+// The retained internal renewal mechanism (what the scheduled ACME monitor
+// calls): a hot reload of a NEW cert/key pair on a running TLS server must
+// succeed, and the server must actually serve the new certificate.
+TEST_F(ApiAuthzF34eTest, InternalRenewalReloadMechanismServesNewCertificate) {
+    const auto port = start_tls_side_server();
+    ASSERT_NE(port, 0);
+
+    const auto new_cert = temp_dir / "side_cert_new.pem";
+    const auto new_key  = temp_dir / "side_key_new.pem";
+    ASSERT_TRUE(make_self_signed("side.test.local", new_cert, new_key));
+
+    // Sanity: the server currently serves the ORIGINAL certificate.
+    {
+        httplib::SSLClient trusting_new("side.test.local", port);
+        trusting_new.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+        trusting_new.set_ca_cert_path(new_cert.string());
+        EXPECT_FALSE(trusting_new.Get("/"));  // old cert: untrusted
+    }
+
+    ASSERT_TRUE(tls_http->reload_tls_certs(new_cert.string(), new_key.string()));
+
+    // The server now serves the new certificate: a client trusting it
+    // connects, one trusting only the old certificate does not.
+    {
+        httplib::SSLClient trusting_new("side.test.local", port);
+        trusting_new.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+        trusting_new.set_ca_cert_path(new_cert.string());
+        auto res = trusting_new.Get("/");
+        ASSERT_TRUE(res);
+    }
+    {
+        httplib::SSLClient trusting_old("side.test.local", port);
+        trusting_old.set_hostname_addr_map({{"side.test.local", "127.0.0.1"}});
+        trusting_old.set_ca_cert_path(side_cert.string());
+        EXPECT_FALSE(trusting_old.Get("/"));
+    }
+
+    // Refusal paths of the retained mechanism: no TLS mode, bad paths.
+    network::HttpServer plain(port + 3, "127.0.0.1", "", "");
+    EXPECT_FALSE(plain.reload_tls_certs());
+    EXPECT_FALSE(tls_http->reload_tls_certs("/nonexistent/cert.pem",
+                                            "/nonexistent/key.pem"));
 }
 
 // TLS is configured on the side server; an ordinary authenticated caller

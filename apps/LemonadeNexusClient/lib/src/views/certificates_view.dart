@@ -5,7 +5,7 @@
 /// - Certificate list with status
 /// - Certificate detail panel
 /// - Request certificate action
-/// - Issue/renew certificate
+/// - Issue certificate (server renewal is handled by the scheduled monitor)
 library;
 
 import 'dart:async';
