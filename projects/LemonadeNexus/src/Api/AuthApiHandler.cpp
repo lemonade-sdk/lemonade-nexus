@@ -1,7 +1,6 @@
 #include <LemonadeNexus/Api/AuthApiHandler.hpp>
 
 #include <LemonadeNexus/ACL/Permission.hpp>
-#include <LemonadeNexus/Api/RootBootstrap.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/TokenLinkAuthProvider.hpp>
@@ -10,22 +9,6 @@
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 namespace nexus::api {
-
-// ---------------------------------------------------------------------------
-// Private helper — shared root-bootstrap logic
-// ---------------------------------------------------------------------------
-
-void AuthApiHandler::ensure_root_node(const std::string& pubkey) {
-    if (pubkey.empty()) return;
-
-    // Application-root ownership is bound to the locally configured
-    // application-owner key (ServerConfig::application_owner_pubkey); the
-    // Ed25519 challenge-response above already proved possession. Non-owner
-    // keys receive no root claim or grant regardless of open_registration,
-    // and missing or conflicting owner configuration never transfers or
-    // alters an established root.
-    bootstrap_root_for_owner(ctx_.tree, ctx_.config, normalize_pubkey(pubkey));
-}
 
 // ---------------------------------------------------------------------------
 // Route registration
@@ -43,10 +26,9 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
 
         auto result = ctx_.auth.authenticate(*body);
 
-        // After successful Ed25519 auth, bootstrap or extend root permissions.
-        if (result.authenticated && body->value("method", "") == "ed25519") {
-            ensure_root_node(body->value("pubkey", std::string{}));
-        }
+        // Authentication never creates, claims, or modifies the application
+        // root. Root initialization is deferred to the authority work; an
+        // existing root is left untouched by this endpoint.
 
         network::AuthResponse resp{
             .authenticated = result.authenticated,

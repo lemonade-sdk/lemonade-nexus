@@ -2,7 +2,6 @@
 #include <algorithm>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
-#include <LemonadeNexus/Api/RootBootstrap.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
@@ -151,71 +150,22 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             n.is_inference        = is_inference;
         };
 
-        // The application root is bound to the locally configured
-        // application-owner key (ServerConfig::application_owner_pubkey);
-        // the challenge above proved possession. A non-owner caller can
-        // never create or claim the root.
-        const auto root_outcome =
-            bootstrap_root_for_owner(ctx_.tree, ctx_.config, norm_pubkey);
-        const bool is_root_owner =
-            root_outcome == RootBootstrapOutcome::OwnerRootCreated ||
-            root_outcome == RootBootstrapOutcome::OwnerRootExisting;
-
-        if (!ctx_.tree.get_node("root")) {
-            // The root was not established: the caller is not the configured
-            // owner, or the owner is not configured on this server. No one
-            // but the configured owner may create it.
+        // Root initialization is deferred: no public caller may create the
+        // application root, and this endpoint never modifies an existing
+        // root's data or assignments. Ownership below is pure validation of
+        // the stored root record for the closed-registration exemption.
+        const auto existing_root = ctx_.tree.get_node("root");
+        if (!existing_root) {
             error_response(res,
-                root_outcome == RootBootstrapOutcome::OwnerNotConfigured
-                    ? "server has no root owner configured"
-                    : "application root not established",
+                "application root not established — root initialization is unavailable",
                 409);
             return;
         }
+        const bool is_root_owner = !existing_root->mgmt_pubkey.empty() &&
+            tree::canonical_principal(existing_root->mgmt_pubkey) ==
+            tree::canonical_principal(norm_pubkey);
 
-        if (root_outcome == RootBootstrapOutcome::OwnerRootCreated) {
-            // First join by the configured owner: Customer group for the owner
-            std::string customer_id = "customer-" + node_id;
-            tree::TreeNode customer_node;
-            customer_node.id          = customer_id;
-            customer_node.parent_id   = "root";
-            customer_node.type        = tree::NodeType::Customer;
-            customer_node.hostname    = body.value("hostname",
-                                                   "group-" + node_id.substr(0, 8));
-            customer_node.mgmt_pubkey = norm_pubkey;
-            customer_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node"},
-            }};
-            ctx_.tree.insert_join_node(customer_node);
-
-            // Create the user's Endpoint under their Customer group
-            tree::TreeNode endpoint_node;
-            endpoint_node.id          = node_id;
-            endpoint_node.parent_id   = customer_id;
-            endpoint_node.type        = tree::NodeType::Endpoint;
-            endpoint_node.hostname    = body.value("hostname",
-                                                   "endpoint-" + node_id.substr(0, 8));
-            endpoint_node.mgmt_pubkey = norm_pubkey;
-            // Explicit ACL grant for the endpoint's owner. Heartbeat authorizes
-            // via ownership, but node-scoped reads (GET /api/mesh/peers/<node>,
-            // /api/mesh/status/<node>) require an explicit Read permission on the
-            // node; without this assignment they 403. Mirrors the Customer grant
-            // so the owner has full control of their own endpoint.
-            endpoint_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node"},
-            }};
-            endpoint_node.mesh_pubkey = body.value(
-                "mesh_pubkey", body.value("wg_pubkey", std::string{}));
-            stamp_endpoint_identity(endpoint_node);
-            if (!ctx_.tree.insert_join_node(endpoint_node)) {
-                error_response(res, "endpoint identifier conflict", 409);
-                return;
-            }
-        } else if (node_id != "root") {
+        if (node_id != "root") {
             std::string customer_id;
             auto existing_endpoint = ctx_.tree.get_node(node_id);
 
