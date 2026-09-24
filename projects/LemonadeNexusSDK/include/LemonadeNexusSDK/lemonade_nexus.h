@@ -36,6 +36,8 @@ typedef enum {
     LN_ERR_REJECTED   = -5,
     LN_ERR_NO_IDENTITY = -6,
     LN_ERR_PARSE      = -7, ///< Malformed response: HTTP 2xx with a body that did not
+    LN_ERR_UNSUPPORTED = -8, ///< Retired operation: no server endpoint exists; kept
+                            ///< exported so existing bindings fail explicitly.
                             ///< deserialize (e.g. a node endpoint returned 200 with a
                             ///< body that is not a valid TreeNode). Distinct from
                             ///< LN_ERR_NOT_FOUND (404), LN_ERR_AUTH (401/403) and
@@ -388,10 +390,10 @@ ln_error_t ln_stats(ln_client_t* client, char** out_json);
 ln_error_t ln_servers(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */
-/* Trust & attestation                                                 */
+/* Retired endpoints (kept for ABI stability)                          */
 /* ------------------------------------------------------------------ */
 
-/** GET /api/trust/status. Returns JSON with trust tier, peers, etc. */
+/** Retired: /api/trust/status no longer exists. Returns LN_ERR_UNSUPPORTED. */
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json);
 
 /// Generic authenticated call to a private-API route over the mesh.
@@ -402,7 +404,7 @@ ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
                                const char* path, const char* body_json,
                                char** out_json);
 
-/** GET /api/trust/peer/{pubkey}. Returns JSON with peer trust info. */
+/** Retired: /api/trust/peer/{pubkey} no longer exists. Returns LN_ERR_UNSUPPORTED. */
 ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_json);
 
 /* ------------------------------------------------------------------ */
@@ -413,20 +415,16 @@ ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_jso
 ln_error_t ln_ddns_status(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */
-/* Enrollment                                                          */
+/* Retired endpoints (kept for ABI stability)                          */
 /* ------------------------------------------------------------------ */
 
-/** GET /api/enrollment/status. Returns JSON with enrollment entries. */
+/** Retired: /api/enrollment/status no longer exists. Returns LN_ERR_UNSUPPORTED. */
 ln_error_t ln_enrollment_status(ln_client_t* client, char** out_json);
 
-/* ------------------------------------------------------------------ */
-/* Governance                                                          */
-/* ------------------------------------------------------------------ */
-
-/** GET /api/governance/proposals. Returns JSON array of proposals. */
+/** Retired: /api/governance/proposals no longer exists. Returns LN_ERR_UNSUPPORTED. */
 ln_error_t ln_governance_proposals(ln_client_t* client, char** out_json);
 
-/** POST /api/governance/propose. Returns JSON: {proposal_id, status}. */
+/** Retired: /api/governance/propose no longer exists. Returns LN_ERR_UNSUPPORTED. */
 ln_error_t ln_governance_propose(ln_client_t* client,
                                    uint8_t parameter,
                                    const char* new_value,

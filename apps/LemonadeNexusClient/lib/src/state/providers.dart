@@ -119,11 +119,6 @@ final rootNodeProvider = Provider<TreeNode?>((ref) {
   return ref.watch(appNotifierProvider).rootNode;
 });
 
-/// Selector for trust status only.
-final trustStatusProvider = Provider<TrustStatus?>((ref) {
-  return ref.watch(appNotifierProvider).trustStatus;
-});
-
 /// Selector for selected sidebar item.
 final selectedSidebarItemProvider = Provider<SidebarItem>((ref) {
   return ref.watch(appNotifierProvider).selectedSidebarItem;
@@ -353,10 +348,8 @@ class TreeService {
 
   /// Get all tree nodes.
   List<TreeNode> get treeNodes => _notifier.currentState.treeNodes;
-
-  /// Get trust status.
-  TrustStatus? get trustStatus => _notifier.currentState.trustStatus;
 }
+
 
 // =========================================================================
 // Configuration Provider

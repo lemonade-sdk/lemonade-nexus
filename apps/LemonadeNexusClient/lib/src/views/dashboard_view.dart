@@ -27,12 +27,6 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
     _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
       final notifier = ref.read(appNotifierProvider.notifier);
       await notifier.refreshMeshStatus();
-      // Trust rides the mesh, so it is skipped when the tunnel isn't up yet.
-      // Backfill it once so the tier shows without a manual refresh.
-      final state = ref.read(appNotifierProvider);
-      if (state.isMeshEnabled && state.trustStatus == null) {
-        await notifier.refreshTrustStatus();
-      }
     });
   }
 
@@ -197,28 +191,16 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
 
   Widget _serverHealthCard(AppState appState) {
     final h = appState.healthStatus;
-    final trust = appState.trustStatus;
-    final tier = _tierBadge(trust?.trustTier);
     return _card('Server Health', Icons.favorite_outline, [
       if (h != null) ...[
-        // Row keeps the badges at their intrinsic width; _kv's Expanded would
-        // otherwise stretch them across the card.
         _kv(
           'Status',
-          Row(mainAxisSize: MainAxisSize.min, children: [
-            LemonBadge(
-              text: h.status.toUpperCase(),
-              color: appState.isServerHealthy
-                  ? AppTheme.lemonGreen
-                  : AppTheme.errorColor,
-            ),
-            // Only once trust data has arrived — "not loaded yet" is not the
-            // same as an unknown tier, and shouldn't flash a red badge.
-            if (trust != null) ...[
-              const SizedBox(width: 6),
-              LemonBadge(text: tier.label, color: tier.color),
-            ],
-          ]),
+          LemonBadge(
+            text: h.status.toUpperCase(),
+            color: appState.isServerHealthy
+                ? AppTheme.lemonGreen
+                : AppTheme.errorColor,
+          ),
         ),
         _kv('Service', _mono(h.service.isEmpty ? '—' : h.service)),
         if ((h.dnsBaseDomain ?? '').isNotEmpty)
@@ -261,18 +243,6 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
         '${appState.servers.where((s) => s.available).length}/${appState.servers.length} healthy',
         style: const TextStyle(fontSize: 12))),
     ]);
-  }
-
-  /// The tier arrives either as a number (`our_tier`) or a string ("Tier1"),
-  /// so read the digits out and treat anything else as unknown.
-  ({String label, Color color}) _tierBadge(String? raw) {
-    final tier = int.tryParse(RegExp(r'\d+').firstMatch(raw ?? '')?.group(0) ?? '');
-    return switch (tier) {
-      1 => (label: 'Tier 1', color: AppTheme.lemonGreen),
-      2 => (label: 'Tier 2', color: AppTheme.lemonLime),
-      null || < 1 => (label: 'Tier unknown', color: AppTheme.errorColor),
-      _ => (label: 'Tier $tier', color: AppTheme.lemonYellowDark),
-    };
   }
 
   Widget _activityCard(AppState appState) {

@@ -10,7 +10,7 @@
 ///   1. Carry the mesh: peers fetched from the server are synced in via
 ///      sync_peers(); P2P traffic is cryptokey-routed in userspace.
 ///   2. Carry the private API: the server's private routes (/api/mesh/peers,
-///      /api/trust/status, /api/relay/list) are only reachable over this plane,
+///      /api/relay/list) are only reachable over this plane,
 ///      so tcp_egress() opens a 127.0.0.1 loopback bridged to the server's
 ///      tunnel IP through the netstack, and the client speaks plain HTTP to it.
 

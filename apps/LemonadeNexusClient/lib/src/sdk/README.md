@@ -90,19 +90,13 @@ Dart SDK for the Lemonade Nexus userspace mesh VPN platform.
 - `ln_stats` - GET /api/stats
 - `ln_servers` - GET /api/servers
 
-### Trust & Attestation (2)
-- `ln_trust_status` - Get trust status
-- `ln_trust_peer` - Get peer trust info
-
 ### DDNS (1)
 - `ln_ddns_status` - Get DDNS status
 
-### Enrollment (1)
-- `ln_enrollment_status` - Get enrollment entries
-
-### Governance (2)
-- `ln_governance_proposals` - List proposals
-- `ln_governance_propose` - Submit proposal
+### Retired endpoints (ABI stubs, 5)
+- `ln_trust_status`, `ln_trust_peer`, `ln_enrollment_status`,
+  `ln_governance_proposals`, `ln_governance_propose` — the server routes were
+  retired; the symbols remain exported and return `LN_ERR_UNSUPPORTED`.
 
 ### Attestation Manifests (1)
 - `ln_attestation_manifests` - Get manifests

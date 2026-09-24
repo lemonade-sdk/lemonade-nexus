@@ -85,3 +85,46 @@ TEST_F(SdkPasskeyChallengeTest, CppClientAuthPasskeyFailsCleanlyWhenUnreachable)
     EXPECT_EQ(result.http_status, 0);
     EXPECT_FALSE(result.error.empty());
 }
+
+// F-10: the retired /api/trust, /api/enrollment and /api/governance routes
+// are kept as C ABI stubs. They must fail explicitly with
+// LN_ERR_UNSUPPORTED without touching the network (the client points at a
+// dead port; any network attempt would hang or fail with LN_ERR_CONNECT).
+TEST_F(SdkPasskeyChallengeTest, RetiredCapiStubsReturnUnsupported) {
+    char* out = nullptr;
+
+    EXPECT_EQ(ln_trust_status(c_api_client, &out), LN_ERR_UNSUPPORTED);
+    ASSERT_NE(out, nullptr);
+    EXPECT_NE(std::string(out).find("retired"), std::string::npos);
+    free(out);
+    out = nullptr;
+
+    EXPECT_EQ(ln_trust_peer(c_api_client, "some-pubkey", &out), LN_ERR_UNSUPPORTED);
+    ASSERT_NE(out, nullptr);
+    free(out);
+    out = nullptr;
+
+    EXPECT_EQ(ln_enrollment_status(c_api_client, &out), LN_ERR_UNSUPPORTED);
+    ASSERT_NE(out, nullptr);
+    free(out);
+    out = nullptr;
+
+    EXPECT_EQ(ln_governance_proposals(c_api_client, &out), LN_ERR_UNSUPPORTED);
+    ASSERT_NE(out, nullptr);
+    free(out);
+    out = nullptr;
+
+    EXPECT_EQ(ln_governance_propose(c_api_client, 1, "v", "r", &out),
+              LN_ERR_UNSUPPORTED);
+    ASSERT_NE(out, nullptr);
+    free(out);
+    out = nullptr;
+
+    // Argument validation is preserved on the stubs.
+    EXPECT_EQ(ln_trust_status(nullptr, &out), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_trust_peer(nullptr, "pk", &out), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_enrollment_status(nullptr, &out), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_governance_proposals(nullptr, &out), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_governance_propose(nullptr, 1, "v", "r", &out), LN_ERR_NULL_ARG);
+    EXPECT_EQ(out, nullptr);
+}

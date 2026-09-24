@@ -568,27 +568,6 @@ typedef _LnServersDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
-// Trust & attestation
-typedef _LnTrustStatus = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnTrustStatusDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-typedef _LnTrustPeer = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Char> pubkey,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnTrustPeerDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Char> pubkey,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
 // DDNS status
 typedef _LnDdnsStatus = ffi.Int32 Function(
   LnClientHandle client,
@@ -596,41 +575,6 @@ typedef _LnDdnsStatus = ffi.Int32 Function(
 );
 typedef _LnDdnsStatusDart = int Function(
   LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-// Enrollment
-typedef _LnEnrollmentStatus = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnEnrollmentStatusDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-// Governance
-typedef _LnGovernanceProposals = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnGovernanceProposalsDart = int Function(
-  LnClientHandle client,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-
-typedef _LnGovernancePropose = ffi.Int32 Function(
-  LnClientHandle client,
-  ffi.Uint8 parameter,
-  ffi.Pointer<ffi.Char> newValue,
-  ffi.Pointer<ffi.Char> rationale,
-  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
-);
-typedef _LnGovernanceProposeDart = int Function(
-  LnClientHandle client,
-  int parameter,
-  ffi.Pointer<ffi.Char> newValue,
-  ffi.Pointer<ffi.Char> rationale,
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
@@ -875,25 +819,9 @@ class LemonadeNexusFfi {
   late final _lnServers =
       _lib.lookupFunction<_LnServers, _LnServersDart>('ln_servers');
 
-  // Trust & attestation
-  late final _lnTrustStatus =
-      _lib.lookupFunction<_LnTrustStatus, _LnTrustStatusDart>('ln_trust_status');
-  late final _lnTrustPeer =
-      _lib.lookupFunction<_LnTrustPeer, _LnTrustPeerDart>('ln_trust_peer');
-
   // DDNS status
   late final _lnDdnsStatus =
       _lib.lookupFunction<_LnDdnsStatus, _LnDdnsStatusDart>('ln_ddns_status');
-
-  // Enrollment
-  late final _lnEnrollmentStatus = _lib.lookupFunction<_LnEnrollmentStatus,
-          _LnEnrollmentStatusDart>('ln_enrollment_status');
-
-  // Governance
-  late final _lnGovernanceProposals = _lib.lookupFunction<_LnGovernanceProposals,
-          _LnGovernanceProposalsDart>('ln_governance_proposals');
-  late final _lnGovernancePropose = _lib.lookupFunction<_LnGovernancePropose,
-          _LnGovernanceProposeDart>('ln_governance_propose');
 
   // Attestation manifests
   late final _lnAttestationManifests = _lib.lookupFunction<_LnAttestationManifests,
@@ -1762,40 +1690,6 @@ class LemonadeNexusFfi {
   }
 
   // =========================================================================
-  // Trust & Attestation
-  // =========================================================================
-
-  String? trustStatus(LnClientHandle client) {
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnTrustStatus(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  String? trustPeer(LnClientHandle client, String pubkey) {
-    final pubkeyPtr = pubkey.toNativeUtf8().cast<ffi.Char>();
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnTrustPeer(client, pubkeyPtr, outJson);
-      malloc.free(pubkeyPtr);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  // =========================================================================
   // DDNS Status
   // =========================================================================
 
@@ -1803,71 +1697,6 @@ class LemonadeNexusFfi {
     final outJson = calloc<ffi.Pointer<ffi.Char>>();
     try {
       final result = _lnDdnsStatus(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  // =========================================================================
-  // Enrollment
-  // =========================================================================
-
-  String? enrollmentStatus(LnClientHandle client) {
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnEnrollmentStatus(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  // =========================================================================
-  // Governance
-  // =========================================================================
-
-  String? governanceProposals(LnClientHandle client) {
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnGovernanceProposals(client, outJson);
-      if (result == 0) {
-        return toStringAndFree(outJson.value);
-      }
-      freeString(outJson.value);
-      return null;
-    } finally {
-      calloc.free(outJson);
-    }
-  }
-
-  String? governancePropose(
-    LnClientHandle client,
-    int parameter,
-    String newValue,
-    String rationale,
-  ) {
-    final newValuePtr = newValue.toNativeUtf8().cast<ffi.Char>();
-    final rationalePtr = rationale.toNativeUtf8().cast<ffi.Char>();
-    final outJson = calloc<ffi.Pointer<ffi.Char>>();
-    try {
-      final result = _lnGovernancePropose(
-        client,
-        parameter,
-        newValuePtr,
-        rationalePtr,
-        outJson,
-      );
-      malloc.free(newValuePtr);
-      malloc.free(rationalePtr);
       if (result == 0) {
         return toStringAndFree(outJson.value);
       }

@@ -1931,22 +1931,8 @@ Result<std::vector<ServerEntry>> LemonadeNexusClient::get_servers() {
 }
 
 // ---------------------------------------------------------------------------
-// Trust & attestation queries
+// Private-API transport
 // ---------------------------------------------------------------------------
-
-Result<TrustStatus> LemonadeNexusClient::get_trust_status() {
-    std::lock_guard lock(impl_->mutex);
-    int status = 0;
-    // /api/trust/status is a private-API route (served over the mesh),
-    // like /api/relay/list — route it through the private base URL.
-    auto resp = impl_->private_http_get("/api/trust/status", status);
-    if (!resp) return {false, {}, status, "Connection failed"};
-    try {
-        return {true, resp->get<TrustStatus>(), status, ""};
-    } catch (const std::exception& e) {
-        return {false, {}, status, std::string("Parse error: ") + e.what()};
-    }
-}
 
 Result<std::string> LemonadeNexusClient::call_private_api(const std::string& method,
                                                          const std::string& path,
@@ -1967,18 +1953,6 @@ Result<std::string> LemonadeNexusClient::call_private_api(const std::string& met
     return {true, resp->dump(), status, ""};
 }
 
-Result<TrustPeerInfo> LemonadeNexusClient::get_trust_peer(const std::string& pubkey) {
-    std::lock_guard lock(impl_->mutex);
-    int status = 0;
-    auto resp = impl_->http_get("/api/trust/peer/" + pubkey, status);
-    if (!resp) return {false, {}, status, "Connection failed"};
-    try {
-        return {true, resp->get<TrustPeerInfo>(), status, ""};
-    } catch (const std::exception& e) {
-        return {false, {}, status, std::string("Parse error: ") + e.what()};
-    }
-}
-
 // ---------------------------------------------------------------------------
 // DDNS status
 // ---------------------------------------------------------------------------
@@ -1990,59 +1964,6 @@ Result<DdnsStatus> LemonadeNexusClient::get_ddns_status() {
     if (!resp) return {false, {}, status, "Connection failed"};
     try {
         return {true, resp->get<DdnsStatus>(), status, ""};
-    } catch (const std::exception& e) {
-        return {false, {}, status, std::string("Parse error: ") + e.what()};
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Enrollment
-// ---------------------------------------------------------------------------
-
-Result<EnrollmentStatus> LemonadeNexusClient::get_enrollment_status() {
-    std::lock_guard lock(impl_->mutex);
-    int status = 0;
-    auto resp = impl_->http_get("/api/enrollment/status", status);
-    if (!resp) return {false, {}, status, "Connection failed"};
-    try {
-        return {true, resp->get<EnrollmentStatus>(), status, ""};
-    } catch (const std::exception& e) {
-        return {false, {}, status, std::string("Parse error: ") + e.what()};
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Governance
-// ---------------------------------------------------------------------------
-
-Result<std::vector<GovernanceProposal>> LemonadeNexusClient::get_governance_proposals() {
-    std::lock_guard lock(impl_->mutex);
-    int status = 0;
-    auto resp = impl_->http_get("/api/governance/proposals", status);
-    if (!resp) return {false, {}, status, "Connection failed"};
-    try {
-        if (!resp->is_array()) return {false, {}, status, "Expected array"};
-        return {true, resp->get<std::vector<GovernanceProposal>>(), status, ""};
-    } catch (const std::exception& e) {
-        return {false, {}, status, std::string("Parse error: ") + e.what()};
-    }
-}
-
-Result<ProposalResult> LemonadeNexusClient::submit_governance_proposal(
-    uint8_t parameter, const std::string& new_value, const std::string& rationale) {
-    std::lock_guard lock(impl_->mutex);
-    json body;
-    body["parameter"] = parameter;
-    body["new_value"] = new_value;
-    body["rationale"] = rationale;
-    int status = 0;
-    auto resp = impl_->http_post("/api/governance/propose", body, status);
-    if (!resp) return {false, {}, status, "Connection failed"};
-    try {
-        ProposalResult result;
-        result.proposal_id = resp->value("proposal_id", "");
-        result.status = resp->value("status", "");
-        return {true, std::move(result), status, ""};
     } catch (const std::exception& e) {
         return {false, {}, status, std::string("Parse error: ") + e.what()};
     }

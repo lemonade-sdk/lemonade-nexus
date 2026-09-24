@@ -149,96 +149,12 @@ void from_json(const json& j, ServerEntry& s) {
     s.healthy   = j.value("healthy", false);
 }
 
-// --- TrustPeerInfo ---
-void from_json(const json& j, TrustPeerInfo& p) {
-    p.pubkey               = j.value("pubkey", "");
-    p.tier                 = j.value("tier", uint8_t{0});
-    p.tier_name            = j.value("tier_name", "");
-    p.platform             = j.value("platform", "");
-    p.last_verified        = j.value("last_verified", uint64_t{0});
-    p.attestation_hash     = j.value("attestation_hash", "");
-    p.binary_hash          = j.value("binary_hash", "");
-    p.failed_verifications = j.value("failed_verifications", uint32_t{0});
-}
-
-// --- TrustStatus ---
-void from_json(const json& j, TrustStatus& s) {
-    s.our_tier    = j.value("our_tier", "");
-    s.our_platform = j.value("our_platform", "");
-    s.require_tee = j.value("require_tee", false);
-    s.binary_hash = j.value("binary_hash", "");
-    s.peer_count  = j.value("peer_count", std::size_t{0});
-    if (j.contains("peers") && j["peers"].is_array()) {
-        s.peers = j["peers"].get<std::vector<TrustPeerInfo>>();
-    }
-}
-
 // --- DdnsStatus ---
 void from_json(const json& j, DdnsStatus& s) {
     s.has_credentials = j.value("has_credentials", false);
     s.last_ip         = j.value("last_ip", "");
     s.binary_hash     = j.value("binary_hash", "");
     s.binary_approved = j.value("binary_approved", false);
-}
-
-// --- EnrollmentVote ---
-void from_json(const json& j, EnrollmentVote& v) {
-    v.voter_pubkey = j.value("voter_pubkey", "");
-    v.approve      = j.value("approve", false);
-    v.reason       = j.value("reason", "");
-    v.timestamp    = j.value("timestamp", uint64_t{0});
-}
-
-// --- EnrollmentEntry ---
-void from_json(const json& j, EnrollmentEntry& e) {
-    e.request_id           = j.value("request_id", "");
-    e.candidate_pubkey     = j.value("candidate_pubkey", "");
-    e.candidate_server_id  = j.value("candidate_server_id", "");
-    e.sponsor_pubkey       = j.value("sponsor_pubkey", "");
-    e.state                = j.value("state", uint8_t{0});
-    e.state_name           = j.value("state_name", "");
-    e.created_at           = j.value("created_at", uint64_t{0});
-    e.timeout_at           = j.value("timeout_at", uint64_t{0});
-    e.retries              = j.value("retries", uint32_t{0});
-    if (j.contains("votes") && j["votes"].is_array()) {
-        e.votes = j["votes"].get<std::vector<EnrollmentVote>>();
-    }
-}
-
-// --- EnrollmentStatus ---
-void from_json(const json& j, EnrollmentStatus& s) {
-    s.enabled          = j.value("enabled", false);
-    s.quorum_ratio     = j.value("quorum_ratio", 0.0f);
-    s.vote_timeout_sec = j.value("vote_timeout_sec", uint32_t{0});
-    s.pending_count    = j.value("pending_count", std::size_t{0});
-    if (j.contains("enrollments") && j["enrollments"].is_array()) {
-        s.enrollments = j["enrollments"].get<std::vector<EnrollmentEntry>>();
-    }
-}
-
-// --- GovernanceVote ---
-void from_json(const json& j, GovernanceVote& v) {
-    v.voter_pubkey = j.value("voter_pubkey", "");
-    v.approve      = j.value("approve", false);
-    v.reason       = j.value("reason", "");
-    v.timestamp    = j.value("timestamp", uint64_t{0});
-}
-
-// --- GovernanceProposal ---
-void from_json(const json& j, GovernanceProposal& p) {
-    p.proposal_id    = j.value("proposal_id", "");
-    p.proposer_pubkey = j.value("proposer_pubkey", "");
-    p.parameter      = j.value("parameter", uint8_t{0});
-    p.new_value      = j.value("new_value", "");
-    p.old_value      = j.value("old_value", "");
-    p.rationale      = j.value("rationale", "");
-    p.created_at     = j.value("created_at", uint64_t{0});
-    p.expires_at     = j.value("expires_at", uint64_t{0});
-    p.state          = j.value("state", uint8_t{0});
-    p.state_name     = j.value("state_name", "");
-    if (j.contains("votes") && j["votes"].is_array()) {
-        p.votes = j["votes"].get<std::vector<GovernanceVote>>();
-    }
 }
 
 // --- AttestationManifest ---

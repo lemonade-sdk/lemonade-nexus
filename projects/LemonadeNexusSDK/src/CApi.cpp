@@ -905,47 +905,18 @@ ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
 }
 
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json) {
+    // Retired endpoint: /api/trust/status no longer exists. The symbol is
+    // kept for ABI stability and fails explicitly.
     if (!client || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_trust_status();
-    json j;
-    j["our_tier"]    = result.value.our_tier;
-    j["our_platform"] = result.value.our_platform;
-    j["require_tee"] = result.value.require_tee;
-    j["binary_hash"] = result.value.binary_hash;
-    j["peer_count"]  = result.value.peer_count;
-    json peers = json::array();
-    for (const auto& p : result.value.peers) {
-        peers.push_back({
-            {"pubkey",               p.pubkey},
-            {"tier",                 p.tier},
-            {"tier_name",            p.tier_name},
-            {"platform",             p.platform},
-            {"last_verified",        p.last_verified},
-            {"binary_hash",          p.binary_hash},
-            {"failed_verifications", p.failed_verifications},
-        });
-    }
-    j["peers"] = peers;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_json) {
+    // Retired endpoint: /api/trust/peer/{pubkey} no longer exists.
     if (!client || !pubkey || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_trust_peer(pubkey);
-    json j;
-    j["pubkey"]               = result.value.pubkey;
-    j["tier"]                 = result.value.tier;
-    j["tier_name"]            = result.value.tier_name;
-    j["platform"]             = result.value.platform;
-    j["last_verified"]        = result.value.last_verified;
-    j["attestation_hash"]     = result.value.attestation_hash;
-    j["binary_hash"]          = result.value.binary_hash;
-    j["failed_verifications"] = result.value.failed_verifications;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_NOT_FOUND;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 // ---------------------------------------------------------------------------
@@ -966,81 +937,21 @@ ln_error_t ln_ddns_status(ln_client_t* client, char** out_json) {
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment
+// Retired endpoints (kept for ABI stability)
 // ---------------------------------------------------------------------------
 
 ln_error_t ln_enrollment_status(ln_client_t* client, char** out_json) {
+    // Retired endpoint: /api/enrollment/status no longer exists.
     if (!client || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_enrollment_status();
-    json j;
-    j["enabled"]          = result.value.enabled;
-    j["quorum_ratio"]     = result.value.quorum_ratio;
-    j["vote_timeout_sec"] = result.value.vote_timeout_sec;
-    j["pending_count"]    = result.value.pending_count;
-    json enrollments = json::array();
-    for (const auto& e : result.value.enrollments) {
-        json entry;
-        entry["request_id"]          = e.request_id;
-        entry["candidate_pubkey"]    = e.candidate_pubkey;
-        entry["candidate_server_id"] = e.candidate_server_id;
-        entry["sponsor_pubkey"]      = e.sponsor_pubkey;
-        entry["state"]               = e.state;
-        entry["state_name"]          = e.state_name;
-        entry["created_at"]          = e.created_at;
-        entry["timeout_at"]          = e.timeout_at;
-        entry["retries"]             = e.retries;
-        json votes = json::array();
-        for (const auto& v : e.votes) {
-            votes.push_back({
-                {"voter_pubkey", v.voter_pubkey},
-                {"approve",      v.approve},
-                {"reason",       v.reason},
-                {"timestamp",    v.timestamp},
-            });
-        }
-        entry["votes"] = votes;
-        enrollments.push_back(std::move(entry));
-    }
-    j["enrollments"] = enrollments;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
-// ---------------------------------------------------------------------------
-// Governance
-// ---------------------------------------------------------------------------
-
 ln_error_t ln_governance_proposals(ln_client_t* client, char** out_json) {
+    // Retired endpoint: /api/governance/proposals no longer exists.
     if (!client || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_governance_proposals();
-    json arr = json::array();
-    for (const auto& p : result.value) {
-        json entry;
-        entry["proposal_id"]    = p.proposal_id;
-        entry["proposer_pubkey"] = p.proposer_pubkey;
-        entry["parameter"]      = p.parameter;
-        entry["new_value"]      = p.new_value;
-        entry["old_value"]      = p.old_value;
-        entry["rationale"]      = p.rationale;
-        entry["created_at"]     = p.created_at;
-        entry["expires_at"]     = p.expires_at;
-        entry["state"]          = p.state;
-        entry["state_name"]     = p.state_name;
-        json votes = json::array();
-        for (const auto& v : p.votes) {
-            votes.push_back({
-                {"voter_pubkey", v.voter_pubkey},
-                {"approve",      v.approve},
-                {"reason",       v.reason},
-                {"timestamp",    v.timestamp},
-            });
-        }
-        entry["votes"] = votes;
-        arr.push_back(std::move(entry));
-    }
-    *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 ln_error_t ln_governance_propose(ln_client_t* client,
@@ -1048,14 +959,11 @@ ln_error_t ln_governance_propose(ln_client_t* client,
                                    const char* new_value,
                                    const char* rationale,
                                    char** out_json) {
+    // Retired endpoint: /api/governance/propose no longer exists.
     if (!client || !new_value || !rationale || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.submit_governance_proposal(parameter, new_value, rationale);
-    json j;
-    j["proposal_id"] = result.value.proposal_id;
-    j["status"]      = result.value.status;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_REJECTED;
+    (void)parameter;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 // ---------------------------------------------------------------------------

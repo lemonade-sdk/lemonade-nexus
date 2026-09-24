@@ -236,11 +236,8 @@ public:
     [[nodiscard]] Result<std::vector<ServerEntry>> get_servers();
 
     // -----------------------------------------------------------------
-    // Trust & attestation queries
+    // Private-API transport
     // -----------------------------------------------------------------
-
-    /// GET /api/trust/status
-    [[nodiscard]] Result<TrustStatus> get_trust_status();
 
     /// Generic authenticated call to a private-API route over the mesh. `method`
     /// is "GET" or "POST"; `body` is JSON (ignored for GET). Returns the raw
@@ -250,33 +247,12 @@ public:
                                                        const std::string& path,
                                                        const std::string& body);
 
-    /// GET /api/trust/peer/{pubkey}
-    [[nodiscard]] Result<TrustPeerInfo> get_trust_peer(const std::string& pubkey);
-
     // -----------------------------------------------------------------
     // DDNS status
     // -----------------------------------------------------------------
 
     /// GET /api/ddns/status
     [[nodiscard]] Result<DdnsStatus> get_ddns_status();
-
-    // -----------------------------------------------------------------
-    // Enrollment
-    // -----------------------------------------------------------------
-
-    /// GET /api/enrollment/status
-    [[nodiscard]] Result<EnrollmentStatus> get_enrollment_status();
-
-    // -----------------------------------------------------------------
-    // Governance
-    // -----------------------------------------------------------------
-
-    /// GET /api/governance/proposals
-    [[nodiscard]] Result<std::vector<GovernanceProposal>> get_governance_proposals();
-
-    /// POST /api/governance/propose
-    [[nodiscard]] Result<ProposalResult> submit_governance_proposal(
-        uint8_t parameter, const std::string& new_value, const std::string& rationale);
 
     // -----------------------------------------------------------------
     // Attestation manifests

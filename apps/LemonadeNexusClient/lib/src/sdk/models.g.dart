@@ -357,37 +357,6 @@ Map<String, dynamic> _$ServerInfoToJson(ServerInfo instance) =>
       'latency_ms': instance.latencyMs,
     };
 
-TrustStatus _$TrustStatusFromJson(Map<String, dynamic> json) => TrustStatus(
-      trustTier: json['trust_tier'] as String,
-      peerCount: (json['peer_count'] as num).toInt(),
-      peers: (json['peers'] as List<dynamic>?)
-          ?.map((e) => TrustPeerInfo.fromJson(e as Map<String, dynamic>))
-          .toList(),
-    );
-
-Map<String, dynamic> _$TrustStatusToJson(TrustStatus instance) =>
-    <String, dynamic>{
-      'trust_tier': instance.trustTier,
-      'peer_count': instance.peerCount,
-      'peers': instance.peers,
-    };
-
-TrustPeerInfo _$TrustPeerInfoFromJson(Map<String, dynamic> json) =>
-    TrustPeerInfo(
-      pubkey: json['pubkey'] as String,
-      trustLevel: json['trust_level'] as String,
-      attestations: (json['attestations'] as num).toInt(),
-      lastSeen: json['last_seen'] as String?,
-    );
-
-Map<String, dynamic> _$TrustPeerInfoToJson(TrustPeerInfo instance) =>
-    <String, dynamic>{
-      'pubkey': instance.pubkey,
-      'trust_level': instance.trustLevel,
-      'attestations': instance.attestations,
-      'last_seen': instance.lastSeen,
-    };
-
 DdnsStatus _$DdnsStatusFromJson(Map<String, dynamic> json) => DdnsStatus(
       hasCredentials: json['has_credentials'] as bool? ?? false,
       lastIp: json['last_ip'] as String?,
@@ -402,74 +371,6 @@ Map<String, dynamic> _$DdnsStatusToJson(DdnsStatus instance) =>
       'last_ip': instance.lastIp,
       'binary_hash': instance.binaryHash,
       'binary_approved': instance.binaryApproved,
-      'error': instance.error,
-    };
-
-EnrollmentEntry _$EnrollmentEntryFromJson(Map<String, dynamic> json) =>
-    EnrollmentEntry(
-      requestId: json['request_id'] as String,
-      candidatePubkey: json['candidate_pubkey'] as String?,
-      candidateServerId: json['candidate_server_id'] as String?,
-      sponsorPubkey: json['sponsor_pubkey'] as String?,
-      state: (json['state'] as num?)?.toInt() ?? 0,
-      stateName: json['state_name'] as String?,
-      createdAt: json['created_at'] as String?,
-      timeoutAt: json['timeout_at'] as String?,
-      retries: (json['retries'] as num?)?.toInt() ?? 0,
-    );
-
-Map<String, dynamic> _$EnrollmentEntryToJson(EnrollmentEntry instance) =>
-    <String, dynamic>{
-      'request_id': instance.requestId,
-      'candidate_pubkey': instance.candidatePubkey,
-      'candidate_server_id': instance.candidateServerId,
-      'sponsor_pubkey': instance.sponsorPubkey,
-      'state': instance.state,
-      'state_name': instance.stateName,
-      'created_at': instance.createdAt,
-      'timeout_at': instance.timeoutAt,
-      'retries': instance.retries,
-    };
-
-GovernanceProposal _$GovernanceProposalFromJson(Map<String, dynamic> json) =>
-    GovernanceProposal(
-      proposalId: json['proposal_id'] as String,
-      proposerPubkey: json['proposer_pubkey'] as String?,
-      parameter: (json['parameter'] as num).toInt(),
-      newValue: json['new_value'] as String? ?? '',
-      oldValue: json['old_value'] as String? ?? '',
-      rationale: json['rationale'] as String? ?? '',
-      createdAt: json['created_at'] as String?,
-      expiresAt: json['expires_at'] as String?,
-      state: (json['state'] as num?)?.toInt() ?? 0,
-      stateName: json['state_name'] as String?,
-    );
-
-Map<String, dynamic> _$GovernanceProposalToJson(GovernanceProposal instance) =>
-    <String, dynamic>{
-      'proposal_id': instance.proposalId,
-      'proposer_pubkey': instance.proposerPubkey,
-      'parameter': instance.parameter,
-      'new_value': instance.newValue,
-      'old_value': instance.oldValue,
-      'rationale': instance.rationale,
-      'created_at': instance.createdAt,
-      'expires_at': instance.expiresAt,
-      'state': instance.state,
-      'state_name': instance.stateName,
-    };
-
-ProposeResponse _$ProposeResponseFromJson(Map<String, dynamic> json) =>
-    ProposeResponse(
-      proposalId: json['proposal_id'] as String?,
-      status: json['status'] as String,
-      error: json['error'] as String?,
-    );
-
-Map<String, dynamic> _$ProposeResponseToJson(ProposeResponse instance) =>
-    <String, dynamic>{
-      'proposal_id': instance.proposalId,
-      'status': instance.status,
       'error': instance.error,
     };
 
