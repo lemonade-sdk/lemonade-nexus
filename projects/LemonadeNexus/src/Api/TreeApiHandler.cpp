@@ -112,8 +112,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // or a fresh opaque one — never a key another node registered, and
         // never another enrolled identity's bound form. Checked before any
         // tree write or dataplane change, so a hostile claim moves no route.
-        if (const auto advertised = body.value(
-                "mesh_pubkey", body.value("wg_pubkey", std::string{}));
+        if (const auto advertised = body.value("mesh_pubkey", std::string{});
             !advertised.empty()) {
             if (const auto refusal =
                     api::mesh_key_claim_refusal(ctx_.tree, advertised, node_id, norm_pubkey)) {
@@ -240,8 +239,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         "edit_node"},
                     }};
                 }
-                endpoint_node.mesh_pubkey = body.value(
-                    "mesh_pubkey", body.value("wg_pubkey", std::string{}));
+                endpoint_node.mesh_pubkey = body.value("mesh_pubkey", std::string{});
                 stamp_endpoint_identity(endpoint_node);
                 if (!ctx_.tree.insert_join_node(endpoint_node)) {
                     error_response(res, "endpoint identifier conflict", 409);
@@ -289,8 +287,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (!alloc.base_network.empty()) {
             auto existing_node = ctx_.tree.get_node(node_id);
             if (existing_node) {
-                auto new_mesh_pubkey = body.value(
-                    "mesh_pubkey", body.value("wg_pubkey", existing_node->mesh_pubkey));
+                auto new_mesh_pubkey = body.value("mesh_pubkey", existing_node->mesh_pubkey);
                 rekey = api::plan_mesh_rekey(existing_node->tunnel_ip, alloc.base_network,
                                              existing_node->mesh_pubkey, new_mesh_pubkey);
                 if (rekey.update_node) {
@@ -319,8 +316,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         : ctx_.tunnel_bind_ip;
 
         // Add the client as a mesh peer on the server interface.
-        auto client_mesh_pubkey = body.value(
-            "mesh_pubkey", body.value("wg_pubkey", std::string{}));
+        auto client_mesh_pubkey = body.value("mesh_pubkey", std::string{});
         if (ctx_.boringtun && !client_mesh_pubkey.empty() && !alloc.base_network.empty()) {
             auto peer_mesh_key = api::normalize_mesh_pubkey(client_mesh_pubkey);
 
@@ -566,12 +562,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (body.contains("tunnel_ip"))   updated.tunnel_ip   = body["tunnel_ip"].get<std::string>();
         if (body.contains("private_subnet")) updated.private_subnet = body["private_subnet"].get<std::string>();
         if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
-        if (body.contains("mesh_pubkey") || body.contains("wg_pubkey")) {
+        if (body.contains("mesh_pubkey")) {
             // Same ownership rule as the join path: edit permission on this
             // node never extends to claiming a static another node holds or
             // another identity's bound form.
-            const auto claimed = body.value(
-                "mesh_pubkey", body.value("wg_pubkey", std::string{}));
+            const auto claimed = body.value("mesh_pubkey", std::string{});
             if (const auto refusal = api::mesh_key_claim_refusal(
                     ctx_.tree, claimed, node_id, normalize_pubkey(claims.pubkey))) {
                 error_response(res, *refusal, 409);

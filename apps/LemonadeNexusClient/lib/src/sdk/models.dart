@@ -465,7 +465,7 @@ class MeshPeer {
   factory MeshPeer.fromJson(Map<String, dynamic> json) => MeshPeer(
         nodeId: (json['node_id'] ?? '').toString(),
         hostname: json['hostname']?.toString(),
-        meshPubkey: (json['mesh_pubkey'] ?? json['wg_pubkey'] ?? '').toString(),
+        meshPubkey: (json['mesh_pubkey'] ?? '').toString(),
         tunnelIp: json['tunnel_ip']?.toString(),
         privateSubnet: json['private_subnet']?.toString(),
         endpoint: json['endpoint']?.toString(),

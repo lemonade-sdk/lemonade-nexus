@@ -152,8 +152,7 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         routing::ConnectionRequestInput in;
         in.client_node_id   = caller_node_id;
         in.client_pubkey    = caller_pubkey;
-        in.client_mesh_pubkey = body.value(
-            "client_mesh_pubkey", body.value("client_wg_pub", std::string{}));
+        in.client_mesh_pubkey = body.value("client_mesh_pubkey", std::string{});
         in.target_node_id   = target->id;
         in.target_identifier= identifier;
         in.source_ip        = req.remote_addr;
@@ -205,8 +204,7 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         // identity-bound X25519 form of the session's Ed25519 pubkey; any
         // other key is a routing MITM attempt and is refused outright.
         const std::string trusted = api::normalize_mesh_pubkey(node->mesh_pubkey);
-        const std::string claimed = body.value(
-            "mesh_pubkey", body.value("wg_pubkey", std::string{}));
+        const std::string claimed = body.value("mesh_pubkey", std::string{});
         if (!claimed.empty()) {
             const std::string claimed_norm = api::normalize_mesh_pubkey(claimed);
             const std::string identity_bound =
@@ -263,8 +261,7 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         routing::EndpointReadyInput in;
         in.connection_id   = body.value("connection_id", std::string{});
         in.endpoint_node_id= node_id;
-        in.endpoint_mesh_pubkey = body.value(
-            "endpoint_mesh_pubkey", body.value("endpoint_wg_pub", node->mesh_pubkey));
+        in.endpoint_mesh_pubkey = body.value("endpoint_mesh_pubkey", node->mesh_pubkey);
         in.source_ip       = req.remote_addr;
         if (body.contains("endpoint_candidates") && body["endpoint_candidates"].is_array()) {
             for (auto& c : body["endpoint_candidates"]) {
@@ -374,8 +371,7 @@ void RoutingApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub
         const auto client_node_id = body.value("client_node_id", std::string{});
         const auto identifier     = body.value("identifier", std::string{});
         const auto conn_nonce_b64 = body.value("conn_nonce", std::string{});
-        const auto client_mesh_pubkey = body.value(
-            "client_mesh_pubkey", body.value("client_wg_pub", std::string{}));
+        const auto client_mesh_pubkey = body.value("client_mesh_pubkey", std::string{});
 
         // (1a) caller must be a known enrolled peer.
         bool known = false;

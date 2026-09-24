@@ -24,7 +24,7 @@ void write_le32(std::vector<uint8_t>& pkt, size_t offset, uint32_t v) {
 
 } // namespace
 
-TEST(WgWireProtocol, ParsesAllMessageTypes) {
+TEST(BoringtunWireProtocol, ParsesAllMessageTypes) {
     EXPECT_EQ(parse_type(make_packet(1, kHandshakeInitSize)), MsgType::HandshakeInit);
     EXPECT_EQ(parse_type(make_packet(2, kHandshakeResponseSize)), MsgType::HandshakeResponse);
     EXPECT_EQ(parse_type(make_packet(3, kCookieReplySize)), MsgType::CookieReply);
@@ -32,7 +32,7 @@ TEST(WgWireProtocol, ParsesAllMessageTypes) {
     EXPECT_EQ(parse_type(make_packet(4, 1500)), MsgType::TransportData);
 }
 
-TEST(WgWireProtocol, RejectsMalformedPackets) {
+TEST(BoringtunWireProtocol, RejectsMalformedPackets) {
     // Too short for any type.
     EXPECT_FALSE(parse_type(make_packet(4, 3)).has_value());
     // Wrong size for fixed-size types.
@@ -49,7 +49,7 @@ TEST(WgWireProtocol, RejectsMalformedPackets) {
     EXPECT_FALSE(parse_type(reserved).has_value());
 }
 
-TEST(WgWireProtocol, ExtractsReceiverIndexPerType) {
+TEST(BoringtunWireProtocol, ExtractsReceiverIndexPerType) {
     const uint32_t idx = (1234u << 8) | 7u;
 
     auto resp = make_packet(2, kHandshakeResponseSize);
@@ -71,7 +71,7 @@ TEST(WgWireProtocol, ExtractsReceiverIndexPerType) {
     EXPECT_EQ(peer_index(idx), 1234u);
 }
 
-TEST(WgWireProtocol, Ipv4HeaderParsing) {
+TEST(BoringtunWireProtocol, Ipv4HeaderParsing) {
     std::vector<uint8_t> pkt(20, 0);
     pkt[0] = 0x45;  // IPv4, IHL 5
     // src 10.64.0.2, dst 172.16.0.7

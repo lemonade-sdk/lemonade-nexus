@@ -80,7 +80,7 @@ void from_json(const json& j, TreeNode& n) {
     n.shared_domain            = j.value("shared_domain", "");
     n.mgmt_pubkey              = j.value("mgmt_pubkey", "");
     n.wrapped_mgmt_privkey     = j.value("wrapped_mgmt_privkey", "");
-    n.mesh_pubkey              = j.value("mesh_pubkey", j.value("wg_pubkey", ""));
+    n.mesh_pubkey              = j.value("mesh_pubkey", "");
     if (j.contains("assignments") && j["assignments"].is_array()) {
         j["assignments"].get_to(n.assignments);
     }
@@ -121,7 +121,8 @@ void from_json(const json& j, TreeDelta& d) {
 std::string canonical_delta_json(const TreeDelta& delta) {
     json j;
     json node_data = delta.node_data;
-    // Existing delta signatures cover this historical field label.
+    // Signature-stable field label: existing delta signatures bind
+    // "wg_pubkey" (mirrors the server's canonical_node_json).
     node_data["wg_pubkey"] = node_data["mesh_pubkey"];
     node_data.erase("mesh_pubkey");
     j["node_data"]      = std::move(node_data);
@@ -200,7 +201,7 @@ void to_json(json& j, const MeshPeer& p) {
 void from_json(const json& j, MeshPeer& p) {
     p.node_id        = j.value("node_id", "");
     p.hostname       = j.value("hostname", "");
-    p.mesh_pubkey    = j.value("mesh_pubkey", j.value("wg_pubkey", ""));
+    p.mesh_pubkey    = j.value("mesh_pubkey", "");
     p.tunnel_ip      = j.value("tunnel_ip", "");
     p.private_subnet = j.value("private_subnet", "");
     p.endpoint       = j.value("endpoint", "");

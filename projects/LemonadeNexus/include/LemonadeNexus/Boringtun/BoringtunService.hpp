@@ -36,9 +36,9 @@ class BoringtunService : public core::IService<BoringtunService>,
 public:
     /// @param interface_name  Logical name (e.g. "nexus0"); used only for config
     ///                        file naming and logs — no kernel device is created.
-    /// @param config_dir      Directory for storing config files (e.g. "data/wireguard").
+    /// @param config_dir      Directory for storing config files (e.g. "data/mesh").
     explicit BoringtunService(std::string interface_name = "nexus0",
-                               std::filesystem::path config_dir = "data/wireguard");
+                               std::filesystem::path config_dir = "data/mesh");
     ~BoringtunService();
 
     // IService

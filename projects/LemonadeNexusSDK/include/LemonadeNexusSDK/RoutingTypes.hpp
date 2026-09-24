@@ -98,7 +98,7 @@ inline void from_json(const nlohmann::json& j, ConnectionDirective& d) {
     d.punch_at            = j.value("punch_at", uint64_t{0});
     if (auto it = j.find("peer_binding"); it != j.end()) {
         d.endpoint_identifier = it->value("identifier", "");
-        d.endpoint_mesh_pubkey = it->value("mesh_pubkey", it->value("wg_pubkey", ""));
+        d.endpoint_mesh_pubkey = it->value("mesh_pubkey", "");
     }
     if (auto it = j.find("ticket"); it != j.end())
         d.ticket_signed = it->value("signed", false);

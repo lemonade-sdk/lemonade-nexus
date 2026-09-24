@@ -48,7 +48,7 @@ TreeNode _$TreeNodeFromJson(Map<String, dynamic> json) => TreeNode(
       tunnelIp: json['tunnel_ip'] as String?,
       privateSubnet: json['private_subnet'] as String?,
       mgmtPubkey: json['mgmt_pubkey'] as String?,
-      meshPubkey: (json['mesh_pubkey'] ?? json['wg_pubkey']) as String?,
+      meshPubkey: json['mesh_pubkey'] as String?,
       assignments: (json['assignments'] as List<dynamic>?)
           ?.map((e) => NodeAssignment.fromJson(e as Map<String, dynamic>))
           .toList(),
@@ -273,7 +273,7 @@ Map<String, dynamic> _$TunnelStatusToJson(TunnelStatus instance) =>
 MeshPeer _$MeshPeerFromJson(Map<String, dynamic> json) => MeshPeer(
       nodeId: json['node_id'] as String,
       hostname: json['hostname'] as String?,
-      meshPubkey: (json['mesh_pubkey'] ?? json['wg_pubkey']) as String,
+      meshPubkey: json['mesh_pubkey'] as String,
       tunnelIp: json['tunnel_ip'] as String?,
       privateSubnet: json['private_subnet'] as String?,
       endpoint: json['endpoint'] as String?,

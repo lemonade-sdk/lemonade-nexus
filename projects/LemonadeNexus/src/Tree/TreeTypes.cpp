@@ -83,8 +83,6 @@ void from_json(const json& j, TreeNode& n) {
     j.at("wrapped_mgmt_privkey").get_to(n.wrapped_mgmt_privkey);
     if (j.contains("mesh_pubkey")) {
         j.at("mesh_pubkey").get_to(n.mesh_pubkey);
-    } else if (j.contains("wg_pubkey")) {
-        j.at("wg_pubkey").get_to(n.mesh_pubkey);
     }
     // Optional: nodes persisted before the routing layer lack these.
     if (j.contains("endpoint_identifier")) j.at("endpoint_identifier").get_to(n.endpoint_identifier);
@@ -139,7 +137,9 @@ std::string canonical_node_json(const TreeNode& node) {
     j["shared_domain"]            = node.shared_domain;
     j["mgmt_pubkey"]              = node.mgmt_pubkey;
     j["wrapped_mgmt_privkey"]     = node.wrapped_mgmt_privkey;
-    // Existing node signatures cover this historical field label.
+    // Signature-stable field label: every existing node signature binds
+    // "wg_pubkey", so the canonical form keeps it (renaming would invalidate
+    // all stored signatures).
     j["wg_pubkey"]                = node.mesh_pubkey;
     j["endpoint_identifier"]      = node.endpoint_identifier;
     j["cpu_id"]                   = node.cpu_id;
@@ -159,7 +159,8 @@ std::string canonical_delta_json(const TreeDelta& delta) {
     // Build a sorted JSON object excluding the "signature" field.
     json j;
     json node_data = delta.node_data;
-    // Existing delta signatures cover this historical field label.
+    // Signature-stable field label: existing delta signatures bind
+    // "wg_pubkey" (see canonical_node_json).
     node_data["wg_pubkey"] = node_data["mesh_pubkey"];
     node_data.erase("mesh_pubkey");
     j["node_data"]      = std::move(node_data);

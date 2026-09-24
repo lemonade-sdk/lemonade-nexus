@@ -1701,10 +1701,8 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         bt.private_key       = mesh_private_key;
         bt.public_key        = mesh_pubkey;
         bt.tunnel_ip         = tunnel_ip;
-        bt.server_public_key = resp->value(
-            "mesh_server_pubkey", resp->value("wg_server_pubkey", std::string{}));
-        bt.server_endpoint   = resp->value(
-            "mesh_endpoint", resp->value("wg_endpoint", std::string{}));
+        bt.server_public_key = resp->value("mesh_server_pubkey", std::string{});
+        bt.server_endpoint   = resp->value("mesh_endpoint", std::string{});
         bt.allowed_ips       = {resp->value("tunnel_subnet", std::string{"10.64.0.0/10"})};
 
         {
@@ -2086,7 +2084,7 @@ Result<std::vector<MeshPeer>> LemonadeNexusClient::fetch_mesh_peers(const std::s
                 MeshPeer mp;
                 mp.node_id        = p.value("node_id", "");
                 mp.hostname       = p.value("hostname", "");
-                mp.mesh_pubkey    = p.value("mesh_pubkey", p.value("wg_pubkey", ""));
+                mp.mesh_pubkey    = p.value("mesh_pubkey", "");
                 mp.tunnel_ip      = p.value("tunnel_ip", "");
                 mp.private_subnet = p.value("private_subnet", "");
                 mp.endpoint       = p.value("endpoint", "");

@@ -31,8 +31,6 @@ void from_json(const json& j, ServerCertificate& c) {
     if (j.contains("server_pubkey"))  j.at("server_pubkey").get_to(c.server_pubkey);
     if (j.contains("mesh_pubkey")) {
         j.at("mesh_pubkey").get_to(c.mesh_pubkey);
-    } else if (j.contains("wg_pubkey")) {
-        j.at("wg_pubkey").get_to(c.mesh_pubkey);
     }
     if (j.contains("server_id"))      j.at("server_id").get_to(c.server_id);
     if (j.contains("endpoint_hint"))  j.at("endpoint_hint").get_to(c.endpoint_hint);

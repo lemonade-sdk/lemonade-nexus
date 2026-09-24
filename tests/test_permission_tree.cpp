@@ -533,7 +533,11 @@ TEST_F(PermissionTreeTest, CanonicalDeltaJsonWithHostnameSet) {
     EXPECT_NE(canonical.find("\"hostname\":\"my-laptop\""), std::string::npos);
 }
 
-TEST_F(PermissionTreeTest, MeshKeyJsonMigratesWithoutChangingCanonicalSignatures) {
+TEST_F(PermissionTreeTest, CanonicalJsonRetainsSignedFieldLabel) {
+    // Wire/serialization form uses "mesh_pubkey" only. The canonical (signed)
+    // form binds the historical "wg_pubkey" label: every existing node and
+    // delta signature would be invalidated by renaming it, so the canonical
+    // form is frozen on that label.
     tree::TreeNode node;
     node.id = "ep-mesh-key";
     node.parent_id = "root";
@@ -544,20 +548,14 @@ TEST_F(PermissionTreeTest, MeshKeyJsonMigratesWithoutChangingCanonicalSignatures
     EXPECT_EQ(current.at("mesh_pubkey"), "mesh-key");
     EXPECT_FALSE(current.contains("wg_pubkey"));
 
-    auto legacy = current;
-    legacy["wg_pubkey"] = legacy["mesh_pubkey"];
-    legacy.erase("mesh_pubkey");
-    const auto loaded = legacy.get<tree::TreeNode>();
-    EXPECT_EQ(loaded.mesh_pubkey, "mesh-key");
-
-    const auto canonical_node = tree::canonical_node_json(loaded);
+    const auto canonical_node = tree::canonical_node_json(node);
     EXPECT_NE(canonical_node.find("\"wg_pubkey\":\"mesh-key\""), std::string::npos);
     EXPECT_EQ(canonical_node.find("\"mesh_pubkey\""), std::string::npos);
 
     tree::TreeDelta delta;
     delta.operation = "create_node";
-    delta.target_node_id = loaded.id;
-    delta.node_data = loaded;
+    delta.target_node_id = node.id;
+    delta.node_data = node;
     const auto canonical_delta = tree::canonical_delta_json(delta);
     EXPECT_NE(canonical_delta.find("\"wg_pubkey\":\"mesh-key\""), std::string::npos);
     EXPECT_EQ(canonical_delta.find("\"mesh_pubkey\""), std::string::npos);

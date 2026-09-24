@@ -183,6 +183,12 @@ rebuild clean (exit 0); Flutter `flutter analyze` 0 errors.
   models; regenerated models.g.dart; pruned a dead pump smoke test; cleaned the
   SDK README. `TunnelStatus` model kept (still referenced by live app state).
 
+### SUPERSEDED: the `wg_` wire/JSON fallback readers, CLI/env aliases and the
+### "wireguard" data dir were later removed in favor of the mesh names. The
+### only surviving `wg_pubkey` occurrences are the signature-stable canonical
+### field label (see TreeTypes.cpp canonical_node_json). The kept list below
+### is preserved as history.
+
 ### KEPT DELIBERATELY (owner decision: "don't rename wg_pubkey — remind us where
 ### we came from"): the entire `wg_` wire/JSON contract. Verified untouched by
 ### counting every literal HEAD vs working tree (29/29 `wg_pubkey`, 2/2 each for

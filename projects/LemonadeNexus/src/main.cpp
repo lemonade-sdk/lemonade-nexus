@@ -511,7 +511,7 @@ int main(int argc, char* argv[]) {
     // boringtun interface — server-side tunnel endpoint
     // ========================================================================
     nexus::boringtun::BoringtunService boringtun_service{
-        config.mesh_interface, std::filesystem::path{config.data_root} / "wireguard"};
+        config.mesh_interface, std::filesystem::path{config.data_root} / "mesh"};
     boringtun_service.start();
 
     // In-process traffic termination: the userspace netstack answers on our

@@ -55,7 +55,7 @@ add_nexus_test(test_ddns_credentials_format test_ddns_credentials_format.cpp)
 add_nexus_test(test_geo_region        test_geo_region.cpp)
 add_nexus_test(test_seed_discovery    test_seed_discovery.cpp)
 
-add_nexus_test(test_wg_wire_protocol  test_wg_wire_protocol.cpp)
+add_nexus_test(test_boringtun_wire_protocol  test_boringtun_wire_protocol.cpp)
 add_nexus_test(test_ip_router         test_ip_router.cpp)
 add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 

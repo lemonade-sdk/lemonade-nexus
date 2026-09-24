@@ -44,7 +44,7 @@ All tunnel traffic uses the boringtun mesh:
 - **Key exchange:** Curve25519 (Noise_IK handshake)
 - **Encryption:** ChaCha20-Poly1305
 - **Keepalive:** 5-second persistent keepalive for liveness detection
-- **Offline detection:** No WG handshake for 15 seconds = peer offline
+- **Offline detection:** No mesh handshake for 15 seconds = peer offline
 
 Two tunnel planes:
 1. **Client tunnel** (10.64.0.0/10) — between clients and servers

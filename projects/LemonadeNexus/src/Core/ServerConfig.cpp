@@ -29,8 +29,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("bind_address"))        j.at("bind_address").get_to(c.bind_address);
     if (j.contains("mesh_interface")) {
         j.at("mesh_interface").get_to(c.mesh_interface);
-    } else if (j.contains("wg_interface")) {
-        j.at("wg_interface").get_to(c.mesh_interface);
     }
     if (j.contains("data_root"))           j.at("data_root").get_to(c.data_root);
     if (j.contains("rp_id"))               j.at("rp_id").get_to(c.rp_id);
@@ -189,8 +187,7 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.bind_address = argv[++i];
         } else if (std::strcmp(argv[i], "--public-ip") == 0 && i + 1 < argc) {
             config.public_ip = argv[++i];
-        } else if ((std::strcmp(argv[i], "--mesh-interface") == 0 ||
-                    std::strcmp(argv[i], "--wg-interface") == 0) && i + 1 < argc) {
+        } else if (std::strcmp(argv[i], "--mesh-interface") == 0 && i + 1 < argc) {
             config.mesh_interface = argv[++i];
         } else if (std::strcmp(argv[i], "--data-root") == 0 && i + 1 < argc) {
             config.data_root = argv[++i];
@@ -300,8 +297,6 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_RELAY_PORT"))   config.relay_port  = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_BIND_ADDRESS")) config.bind_address = v;
     if (const char* v = std::getenv("SP_MESH_INTERFACE")) {
-        config.mesh_interface = v;
-    } else if (const char* v = std::getenv("SP_WG_INTERFACE")) {
         config.mesh_interface = v;
     }
     if (const char* v = std::getenv("SP_PUBLIC_IP"))    config.public_ip    = v;
