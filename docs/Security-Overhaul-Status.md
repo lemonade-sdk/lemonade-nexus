@@ -711,6 +711,50 @@ in two consecutive runs on the final candidate (6dcd10d). One flaky
 dependency on loopback scheduling (sampling an ephemeral outstanding
 state) was removed in favor of terminal-state assertions.
 
+### Item 4 correction round (commits 93902e3, af817dc)
+
+Five corrections over the transfer pool:
+
+1. Delta page receipt is hardened: the envelope and every typed field
+   are validated before the outstanding request is consumed; the
+   60,000-byte payload and 100-record bounds are enforced on receipt;
+   the request deadline is checked; JSON, signature, and node_data
+   conversion exceptions are contained so a malformed page cannot
+   escape the receive callback or move a cursor.
+2. Reconstruction fails closed: corruption that prevents complete
+   position reconstruction makes the pool unavailable — files
+   preserved, transfer view cleared, no position reuse, no new
+   retention until a restart reconciles. Serving re-verifies record
+   content against the indexed identifier and author signature.
+3. A post-rename directory-sync failure is reported as an Uncertain
+   write: the position is burned, retention is quarantined, and the
+   outcome is reconciled only by restart reconstruction. Fault
+   injection sits at the actual sync boundary.
+4. Storage bounds are finished: directory enumeration, metadata, and
+   record reads are bounded; absence is distinguished from I/O error;
+   excluded bytes count toward capacity; permission-context denials
+   are retryable (with a successful-retry regression) while unknown
+   operations are final.
+5. Verification coverage: generation and deadline tests capture the
+   exact request nonce and position; the mesh-state concurrency test
+   runs real production writes on the io thread against production
+   getters on a reader thread; the transfer suite passes under
+   ThreadSanitizer with no reports.
+
+A latent socket-lifecycle defect found by the correction tests: a
+stopped service left a receive completion that rearmed itself forever
+on the closed descriptor. `start_receive` no longer arms on a closed
+socket and terminal descriptor errors do not rearm; a regression
+proves a clean stop reaches quiescence with no non-aborted receive
+errors. Same-object stop/start is not supported; tests construct a
+fresh service over the retained storage.
+
+Validation: 34 transfer tests, 33 storage tests, 15 ingress tests,
+5 legacy-removal tests, 30 tree tests, 6 ACL tests; TSan clean on the
+transfer suite; full integrated suite 1358 — 1350 passed, 7 skipped
+(hardware/environment, pre-existing), 1 disabled (pre-existing), 0
+failed.
+
 ## M10 — Tier 2 eligibility and the witness bar
 
 The live eligibility path shipped in M9 had two defects the integration
