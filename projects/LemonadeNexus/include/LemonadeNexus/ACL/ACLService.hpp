@@ -59,8 +59,10 @@ public:
     /// Register a callback invoked when a local ACL mutation needs gossip broadcast.
     void set_delta_callback(AclDeltaCallback cb);
 
-    /// Apply a remote ACL delta received via gossip. Returns true if applied
-    /// (new delta), false if already seen (duplicate).
+    /// A remote ACL delta received via gossip. Always refused: authoritative
+    /// remote ACL mutation is unavailable until finalized mesh authority is
+    /// integrated. Performs no mutation and no seen-marking; existing rows
+    /// are preserved. Returns false in every case.
     bool apply_remote_delta(const AclDelta& delta);
 
 private:

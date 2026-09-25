@@ -158,53 +158,15 @@ bool ACLService::do_revoke(std::string_view user_id, std::string_view resource, 
 // ---------------------------------------------------------------------------
 
 bool ACLService::apply_remote_delta(const AclDelta& delta) {
-    // Verify signature
-    if (!verify_delta_signature(delta)) {
-        spdlog::warn("[{}] rejected ACL delta {} — invalid signature", name(), delta.delta_id);
-        return false;
-    }
-
-    std::lock_guard lock(mutex_);
-    if (!store_.ready() || !has_key_) return false;
-
-    // Deduplication
-    if (store_.is_delta_seen(delta.delta_id)) {
-        return false;  // already applied
-    }
-
-    uint32_t existing = 0;
-    if (auto blob = store_.load_perms(delta.user_id, delta.resource)) {
-        if (auto dec = decrypt_perms(*blob, delta.user_id, delta.resource)) existing = *dec;
-    }
-    uint32_t updated = existing;
-
-    if (delta.operation == "grant") {
-        updated = existing | delta.permissions;
-    } else if (delta.operation == "revoke") {
-        updated = existing & ~delta.permissions;
-    } else {
-        spdlog::warn("[{}] unknown ACL delta operation: {}", name(), delta.operation);
-        return false;
-    }
-
-    bool persisted;
-    if (updated == 0) {
-        persisted = store_.delete_perms(delta.user_id, delta.resource);
-    } else {
-        auto enc = encrypt_perms(updated, delta.user_id, delta.resource);
-        persisted = !enc.empty() &&
-                    store_.store_perms(delta.user_id, delta.resource,
-                                       std::span<const uint8_t>{enc}, delta.timestamp);
-    }
-    if (!persisted) {
-        spdlog::warn("[{}] failed to apply remote ACL delta {}", name(), delta.delta_id);
-        return false;
-    }
-
-    store_.mark_delta_seen(delta.delta_id);
-    spdlog::debug("[{}] applied remote ACL delta {} ({} {} on {})",
-                  name(), delta.delta_id, delta.operation, delta.user_id, delta.resource);
-    return true;
+    // Explicit refusal at the service boundary: a certificate-verified author
+    // is not a permission authority, and authoritative remote ACL mutation is
+    // unavailable until finalized mesh authority is integrated. No mutation,
+    // no seen-marking (a delta id is not retained signed evidence), and no
+    // forwarding signal is produced. Existing rows are preserved untouched.
+    spdlog::warn("[{}] refusing remote ACL delta {} ({} {} on {}) — remote ACL "
+                 "mutation is unavailable pending finalized mesh authority",
+                 name(), delta.delta_id, delta.operation, delta.user_id, delta.resource);
+    return false;
 }
 
 // ---------------------------------------------------------------------------
