@@ -642,6 +642,75 @@ any of them returns.
     (architecture 22, 23.A) and run `nexus-attest-profile reference` there.
 
 
+## 7. PR #47 closeout items
+
+### Item 1 — WG canonical label removed (commit f4fdd2e)
+
+`wg_pubkey` no longer appears as a canonical label; wire and canonical
+forms use `mesh_pubkey` and sign/verify against it.
+
+### Item 2 — Passkey credential state hardened (commits 16901c9, 28c40ed, 4fc0180)
+
+Counters: stored 0 / received 0 accepts without change; received above
+stored persists and then publishes; every other combination is refused.
+One mutex guards the cache, the conflict set, and all credential file
+I/O; writes are atomic (temp + rename). The credential file read is
+three-state (absent, ok, error); any I/O error degrades the store and
+refuses all registrations. Sign-count updates re-check identity and key
+under the lock at the mutation boundary. Quarantined identifiers are
+merged into the conflict set before the cache is published, so a valid
+duplicate cannot bypass a quarantine at load or at lookup.
+
+### Item 3 — TLS renewal route removed (commit f4725f0)
+
+No accepted authorization rule covers TLS renewal; the externally
+callable route is gone.
+
+### Item 4 — Author-signed record transfer (commits da658ff, ad819d5,
+5ce9e3c, 6dcd10d)
+
+Scope, as approved: transfer and retain authenticated author-signed
+tree records. Receipt never authorizes or applies a mutation, and no
+replacement authority, node-sealing protocol, or ownership migration was
+introduced. An authoritative remote tree or ACL mutation remains
+unavailable until finalized mesh authority is integrated; the ACL
+service refuses every remote delta explicitly.
+
+What shipped:
+
+- A bounded on-disk transfer pool in `FileStorageService`: hash-named
+  record files, a generation meta file, atomic synchronized writes,
+  bounded idempotent reconstruction, corrupt files preserved and
+  excluded, capacity bounded by record count and bytes.
+- The pool path fix: `pool_dir_` was derived from a moved-from
+  constructor argument and silently became CWD-relative, so processes
+  sharing a working directory shared one pool. The derivation is pinned
+  by a two-root isolation test.
+- A shared `required_permission_for` / `authorize_delta_statement`
+  rule in `PermissionTreeService`; local apply and received-record
+  admission use the same rules. Local apply retains the applied signed
+  statement through a retention sink wired in `main.cpp`.
+- The gossip wire protocol: generation- and position-bound digests;
+  one outstanding nonce-bound request per peer; bounded pages;
+  contiguous-prefix cursor advance; final versus retryable admission
+  classes; stall budget with backoff; generation change resets the
+  cursor and drops the outstanding request; late and unsolicited
+  responses move nothing. All three data paths require the packet
+  signer to hold a root-signed certificate; identity is the
+  authenticated signer, never the NAT-able endpoint.
+- Retirement of the sequence delta log wire path, the equivocation
+  block, the seen-statement table, and `MisbehaviorDetector`. Wire type
+  0x15 is reserved and its handler is a logged refusal; no received
+  record can ban a peer.
+- Tunnel-IP and NS-slot state under a dedicated `mesh_state_mutex_`; no
+  nesting with the peer lock; external calls outside it.
+
+Validation: 24 new transfer tests plus the storage, tree, ACL, ingress,
+and legacy-removal suites; full integrated suite 1345 passed, 0 failed,
+in two consecutive runs on the final candidate (6dcd10d). One flaky
+dependency on loopback scheduling (sampling an ephemeral outstanding
+state) was removed in favor of terminal-state assertions.
+
 ## M10 — Tier 2 eligibility and the witness bar
 
 The live eligibility path shipped in M9 had two defects the integration
