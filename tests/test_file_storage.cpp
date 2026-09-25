@@ -357,6 +357,50 @@ TEST_F(FileStorageTest, PoolRecordIdentifierRefusesNonHexAndTraversal) {
     EXPECT_FALSE(storage->read_pool_record("../etc", 100, result).has_value());
 }
 
+// The pool directory is derived from the constructor argument. A moved-from
+// or default argument would make it CWD-relative, so two instances with
+// different roots would share one pool. This pins the derivation and proves
+// isolation between two roots.
+TEST_F(FileStorageTest, PoolsOfDifferentRootsAreIsolated) {
+    // The pool dir resolves under THIS instance's root, not the CWD.
+    EXPECT_EQ(storage->pool_dir(), temp_dir / "tree" / "retained_deltas");
+    EXPECT_TRUE(storage->pool_dir().is_absolute());
+
+    const fs::path other_root = temp_dir / "other";
+    FileStorageService other(other_root);
+    other.start();
+    EXPECT_EQ(other.pool_dir(), other_root / "tree" / "retained_deltas");
+    EXPECT_TRUE(other.pool_dir().is_absolute());
+
+    // Each root writes its own generation and record.
+    const std::string hash_a = kHash;
+    const std::string hash_b = kHash.substr(1) + "0";  // distinct 64-hex id
+    ASSERT_TRUE(storage->write_pool_generation("gen-a"));
+    ASSERT_TRUE(storage->write_pool_record(hash_a, "{}"));
+    ASSERT_TRUE(other.write_pool_generation("gen-b"));
+    ASSERT_TRUE(other.write_pool_record(hash_b, "{}"));
+
+    // Neither instance sees the other's pool contents.
+    auto entries_a = storage->list_pool_entries();
+    auto entries_b = other.list_pool_entries();
+    ASSERT_EQ(entries_a.size(), 1u);
+    EXPECT_EQ(entries_a[0].hash, hash_a);
+    ASSERT_EQ(entries_b.size(), 1u);
+    EXPECT_EQ(entries_b[0].hash, hash_b);
+    EXPECT_EQ(*storage->read_pool_generation(), "gen-a");
+    EXPECT_EQ(*other.read_pool_generation(), "gen-b");
+    EXPECT_FALSE(storage->pool_record_exists(hash_b));
+    EXPECT_FALSE(other.pool_record_exists(hash_a));
+
+    // A write through one instance does not appear under the other's root.
+    const std::string hash_c = kHash.substr(2) + "11";
+    ASSERT_TRUE(other.write_pool_record(hash_c, "{}"));
+    EXPECT_EQ(other.list_pool_entries().size(), 2u);
+    EXPECT_EQ(storage->list_pool_entries().size(), 1u);
+
+    other.stop();
+}
+
 TEST_F(FileStorageTest, RetainedDeltaJsonRoundTrip) {
     FileStorageService::RetainedDelta r;
     r.position = 7;

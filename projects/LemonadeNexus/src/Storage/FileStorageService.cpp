@@ -20,8 +20,11 @@ namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 FileStorageService::FileStorageService(fs::path data_root)
-    : data_root_(std::move(data_root))
-    , pool_dir_(std::move(data_root) / "tree" / "retained_deltas") {}
+    // Copy, do not move: members initialize in declaration order, so the
+    // second initializer would otherwise use a moved-from path (unspecified
+    // state — empty on libc++, which silently makes pool_dir_ CWD-relative).
+    : data_root_(data_root)
+    , pool_dir_(data_root / "tree" / "retained_deltas") {}
 
 void FileStorageService::on_start() {
     do_ensure_directories();
