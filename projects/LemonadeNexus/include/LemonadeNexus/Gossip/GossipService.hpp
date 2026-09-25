@@ -194,6 +194,7 @@ public:
 private:
     // UDP async receive loop
     void start_receive();
+    void arm_receive();
     void handle_receive(std::size_t bytes_received);
 
     // Gossip timer: fires every 5 seconds to pick a random peer and send digest
@@ -465,8 +466,11 @@ private:
     std::unordered_map<std::string, uint64_t> pool_hash_to_position_;
     std::unordered_set<std::string>          pool_verified_;
     std::unordered_set<std::string>          pool_excluded_;
+    std::unordered_set<std::string>          pool_temp_hashes_;
     std::uint64_t                            pool_verified_bytes_{0};
     std::uint64_t                            pool_excluded_bytes_{0};
+    std::uint64_t                            pool_temp_bytes_{0};
+    std::size_t                              pool_entry_count_{0};
     std::uint64_t                            pool_next_position_{1};
     std::string                              pool_generation_;
     bool                                    pool_available_{false};
@@ -479,6 +483,11 @@ private:
 
     // Test seam: non-aborted receive errors that reached the error branch.
     std::uint64_t test_receive_error_count_{0};
+    // Test seam: number of async receive operations armed.
+    std::uint64_t test_receive_arm_count_{0};
+    // Test seam: largest serialized delta page emitted (bytes, envelope
+    // included).
+    std::uint64_t test_max_page_bytes_{0};
 
     // Test seams (friend GossipBallotTestAccess): zero selects production.
     std::size_t   test_peer_log_cap_{0};

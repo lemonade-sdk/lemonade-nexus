@@ -755,6 +755,29 @@ transfer suite; full integrated suite 1358 — 1350 passed, 7 skipped
 (hardware/environment, pre-existing), 1 disabled (pre-existing), 0
 failed.
 
+### Item 4 final bounded-pool closeout
+
+The complete serialized delta response, including its envelope, now shares
+the receiver's 60,000-byte limit; production sender-to-receiver pagination is
+covered at that boundary. Pool reads remain bounded while bytes are read, and
+directory scans report I/O failure or truncation instead of publishing a
+partial inventory. Record-path checks are tri-state and do not follow broken
+symlinks. Temp, excluded and verified files share the same startup and runtime
+entry/byte accounting.
+
+Reconstruction publishes a recovered pool only after directory durability is
+successfully reconciled. A continued synchronization failure keeps the pool
+unavailable and preserves its files. Transfer-test service replacement now
+detaches the tree sink, keeps retired services and dependencies alive while
+canceled callbacks drain, and restarts the test `io_context` before reuse.
+Separate regressions cover the closed-socket arm guard and terminal descriptor
+completion path.
+
+Focused validation: 45 transfer, 38 storage, 15 ingress, 30 tree, 6 ACL,
+12 gossip-security-transport and 5 legacy-removal tests passed. AddressSanitizer
+passed the storage suite and callback-lifetime regressions (Apple leak detection
+is unavailable); ThreadSanitizer passed the full transfer suite with no report.
+
 ## M10 — Tier 2 eligibility and the witness bar
 
 The live eligibility path shipped in M9 had two defects the integration

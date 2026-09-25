@@ -394,13 +394,63 @@ FileStorageService::AtomicWrite FileStorageService::atomic_write_synced(
 // hostile or corrupted meta file cannot force an unbounded allocation.
 namespace { constexpr std::uint64_t kPoolMetaMaxBytes = 4096; }
 
+// Read at most max_bytes from path, enforcing the limit DURING the read.
+// A size inspection alone is not sufficient: the file may grow between the
+// inspection and the read, so the reader stops at the limit and reports
+// any further data instead of allocating it. On success, out holds the
+// complete file. On failure, oversize distinguishes "holds more than
+// max_bytes" from an I/O error.
+bool bounded_read_file(const fs::path& path, std::uint64_t max_bytes,
+                       std::string& out, bool& oversize) {
+    oversize = false;
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return false;
+    char buf[8192];
+    std::uint64_t total = 0;
+    for (;;) {
+        const std::uint64_t room = total < max_bytes ? max_bytes - total : 0;
+        const std::size_t want = room >= sizeof(buf)
+                                     ? sizeof(buf)
+                                     : static_cast<std::size_t>(room) + 1;
+        ifs.read(buf, static_cast<std::streamsize>(want));
+        const auto got = static_cast<std::uint64_t>(ifs.gcount());
+        if (got > room) { oversize = true; return false; }
+        total += got;
+        out.append(buf, got);
+        if (got < want) {
+            // A short read ends the read at a clean EOF; anything else is
+            // an I/O error.
+            if (ifs.bad() || (got > 0 && !ifs.eof())) return false;
+            return true;
+        }
+    }
+}
+
+enum class PathEntryKind { Absent, Regular, Other, IoError };
+
+PathEntryKind path_entry_kind(const fs::path& path) {
+    std::error_code ec;
+    const auto status = fs::symlink_status(path, ec);
+    if (ec) {
+        return ec == std::errc::no_such_file_or_directory
+                   ? PathEntryKind::Absent
+                   : PathEntryKind::IoError;
+    }
+    if (status.type() == fs::file_type::not_found) return PathEntryKind::Absent;
+    return fs::is_regular_file(status) ? PathEntryKind::Regular
+                                       : PathEntryKind::Other;
+}
+
 std::optional<std::string> FileStorageService::read_pool_generation(PoolMetaRead& result) const {
     std::lock_guard lock(mutex_);
     const auto path = pool_dir_ / "_meta.json";
-    std::error_code ec;
-    if (!fs::exists(path, ec)) {
-        if (ec) { result = PoolMetaRead::IoError; return std::nullopt; }
+    const auto state = path_entry_kind(path);
+    if (state == PathEntryKind::Absent) {
         result = PoolMetaRead::Absent;
+        return std::nullopt;
+    }
+    if (state != PathEntryKind::Regular) {
+        result = PoolMetaRead::IoError;
         return std::nullopt;
     }
     std::error_code size_ec;
@@ -410,12 +460,15 @@ std::optional<std::string> FileStorageService::read_pool_generation(PoolMetaRead
         result = PoolMetaRead::IoError;
         return std::nullopt;
     }
-    std::ifstream ifs(path);
-    if (!ifs) { result = PoolMetaRead::IoError; return std::nullopt; }
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    if (!ifs) { result = PoolMetaRead::IoError; return std::nullopt; }
-    auto j = json::parse(ss.str(), nullptr, false);
+    // Bounded during the read: growth between the size inspection and the
+    // read is an I/O error, not an unbounded allocation.
+    bool oversize = false;
+    std::string text;
+    if (!bounded_read_file(path, kPoolMetaMaxBytes, text, oversize) || oversize) {
+        result = PoolMetaRead::IoError;
+        return std::nullopt;
+    }
+    auto j = json::parse(text, nullptr, false);
     if (j.is_discarded() || !j.is_object()) { result = PoolMetaRead::IoError; return std::nullopt; }
     if (!j.contains("generation") || !j["generation"].is_string()) {
         result = PoolMetaRead::IoError;
@@ -443,31 +496,51 @@ bool FileStorageService::write_pool_generation(const std::string& generation) {
 // unbounded allocation.
 namespace { constexpr std::size_t kPoolMaxListEntries = 200000; }
 
-std::vector<FileStorageService::PoolEntry> FileStorageService::list_pool_entries() const {
+FileStorageService::PoolList FileStorageService::list_pool_entries() const {
     std::lock_guard lock(mutex_);
-    std::vector<PoolEntry> entries;
+    PoolList list;
     std::error_code ec;
-    if (!fs::exists(pool_dir_, ec) || ec) return entries;
-    const auto cap = test_pool_list_cap_ ? test_pool_list_cap_ : kPoolMaxListEntries;
-    for (const auto& entry : fs::directory_iterator(pool_dir_, ec)) {
-        if (entries.size() >= cap) break;
-        const auto ext = entry.path().extension().string();
-        // Record files are <hash>.json; in-flight writes are <hash>.json.tmp.
-        if (ext != ".json" && ext != ".tmp") continue;
-        if (entry.path().filename() == "_meta.json") continue;
-        PoolEntry pe;
-        auto stem = entry.path().stem().string();
-        pe.temporary = (ext == ".tmp");
-        if (pe.temporary && stem.size() > 5 && stem.ends_with(".json")) {
-            stem.resize(stem.size() - 5);
-        }
-        pe.hash = std::move(stem);
-        std::error_code size_ec;
-        const auto size = entry.file_size(size_ec);
-        pe.size_bytes = size_ec ? 0 : static_cast<uint64_t>(size);
-        entries.push_back(std::move(pe));
+    if (!fs::exists(pool_dir_, ec)) {
+        if (ec) { list.error = true; return list; }
+        return list;  // no pool directory: a complete, empty inventory
     }
-    return entries;
+    const auto cap = test_pool_list_cap_ ? test_pool_list_cap_ : kPoolMaxListEntries;
+    fs::directory_iterator it(pool_dir_, ec);
+    if (ec) { list.error = true; return list; }
+    const fs::directory_iterator end;
+    std::size_t scanned = 0;
+    while (it != end) {
+        if (scanned >= cap) { list.truncated = true; return list; }
+        ++scanned;
+        const auto& entry = *it;
+        const auto filename = entry.path().filename().string();
+        if (filename != "_meta.json") {
+            PoolEntry pe;
+            pe.hash = filename;
+            if (filename.ends_with(".json.tmp")) {
+                pe.hash.resize(pe.hash.size() - 9);
+                pe.temporary = true;
+            } else if (filename.ends_with(".json")) {
+                pe.hash.resize(pe.hash.size() - 5);
+                pe.record = true;
+            }
+            std::error_code status_ec;
+            const auto status = entry.symlink_status(status_ec);
+            if (status_ec || !fs::is_regular_file(status)) {
+                list.error = true;
+                return list;
+            }
+            std::error_code size_ec;
+            const auto size = entry.file_size(size_ec);
+            if (size_ec) { list.error = true; return list; }
+            pe.size_bytes = static_cast<uint64_t>(size);
+            list.entries.push_back(std::move(pe));
+        }
+        std::error_code step_ec;
+        it.increment(step_ec);
+        if (step_ec) { list.error = true; return list; }
+    }
+    return list;
 }
 
 std::optional<std::string> FileStorageService::read_pool_record(const std::string& hash,
@@ -476,8 +549,21 @@ std::optional<std::string> FileStorageService::read_pool_record(const std::strin
     std::lock_guard lock(mutex_);
     const auto path = pool_record_path(hash);
     if (path.empty()) { result = PoolRead::IoError; return std::nullopt; }
-    std::error_code ec;
-    if (!fs::exists(path, ec) || ec) { result = PoolRead::Absent; return std::nullopt; }
+    if (test_remove_record_ == hash) {
+        test_remove_record_.clear();
+        std::error_code remove_ec;
+        fs::remove(path, remove_ec);
+        if (remove_ec) { result = PoolRead::IoError; return std::nullopt; }
+    }
+    const auto state = path_entry_kind(path);
+    if (state == PathEntryKind::Absent) {
+        result = PoolRead::Absent;
+        return std::nullopt;
+    }
+    if (state != PathEntryKind::Regular) {
+        result = PoolRead::IoError;
+        return std::nullopt;
+    }
     std::error_code size_ec;
     const auto size = fs::file_size(path, size_ec);
     if (size_ec) { result = PoolRead::IoError; return std::nullopt; }
@@ -485,13 +571,25 @@ std::optional<std::string> FileStorageService::read_pool_record(const std::strin
         result = PoolRead::Oversized;
         return std::nullopt;  // not read at all
     }
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs) { result = PoolRead::IoError; return std::nullopt; }
-    std::ostringstream ss;
-    ss << ifs.rdbuf();
-    if (!ifs) { result = PoolRead::IoError; return std::nullopt; }
+    if (test_grow_record_ == hash) {
+        // Test seam: a concurrent writer appends between the inspection and
+        // the read. The bounded read must enforce the limit itself.
+        test_grow_record_.clear();
+        std::ofstream ofs(path, std::ios::binary | std::ios::app);
+        ofs << std::string(test_grow_record_bytes_, 'x');
+        test_grow_record_bytes_ = 0;
+        if (!ofs) { result = PoolRead::IoError; return std::nullopt; }
+    }
+    // Bounded during the read: growth past the inspected size is not an
+    // oversize file, the inspected state is no longer the state on disk.
+    bool oversize = false;
+    std::string text;
+    if (!bounded_read_file(path, max_bytes, text, oversize)) {
+        result = PoolRead::IoError;
+        return std::nullopt;
+    }
     result = PoolRead::Ok;
-    return ss.str();
+    return text;
 }
 
 FileStorageService::PoolWrite FileStorageService::write_pool_record(const std::string& hash,
@@ -515,17 +613,60 @@ void FileStorageService::test_arm_pool_dirsync_failure() {
     test_fail_next_pool_dirsync_ = 1;
 }
 
+bool FileStorageService::sync_pool_directory() {
+    std::lock_guard lock(mutex_);
+    std::error_code ec;
+    if (!fs::exists(pool_dir_, ec) || ec) return false;
+    if (test_fail_next_pool_sync_ > 0) {
+        test_fail_next_pool_sync_--;
+        return false;
+    }
+    return synchronize_directory(pool_dir_);
+}
+
+void FileStorageService::test_arm_pool_sync_failure() {
+    std::lock_guard lock(mutex_);
+    test_fail_next_pool_sync_ = 1;
+}
+
+void FileStorageService::test_arm_pool_record_growth(const std::string& hash,
+                                                     std::size_t bytes) {
+    std::lock_guard lock(mutex_);
+    test_grow_record_ = hash;
+    test_grow_record_bytes_ = bytes;
+}
+
+void FileStorageService::test_arm_pool_record_state_failure(const std::string& hash) {
+    std::lock_guard lock(mutex_);
+    test_fail_record_state_ = hash;
+}
+
+void FileStorageService::test_arm_pool_record_disappearance(const std::string& hash) {
+    std::lock_guard lock(mutex_);
+    test_remove_record_ = hash;
+}
+
 void FileStorageService::test_set_pool_list_cap(std::size_t cap) {
     std::lock_guard lock(mutex_);
     test_pool_list_cap_ = cap;
 }
 
-bool FileStorageService::pool_record_exists(const std::string& hash) const {
+FileStorageService::PoolFileState
+FileStorageService::pool_record_state(const std::string& hash) const {
     std::lock_guard lock(mutex_);
     const auto path = pool_record_path(hash);
-    if (path.empty()) return false;
-    std::error_code ec;
-    return fs::exists(path, ec) && !ec;
+    if (path.empty()) return PoolFileState::IoError;
+    if (test_fail_record_state_ == hash) {
+        test_fail_record_state_.clear();
+        return PoolFileState::IoError;
+    }
+    switch (path_entry_kind(path)) {
+        case PathEntryKind::Absent:  return PoolFileState::Absent;
+        case PathEntryKind::IoError: return PoolFileState::IoError;
+        case PathEntryKind::Regular:
+        case PathEntryKind::Other:   return PoolFileState::Present;
+    }
+    return PoolFileState::IoError;
 }
 
 // --- RetainedDelta serialization ---

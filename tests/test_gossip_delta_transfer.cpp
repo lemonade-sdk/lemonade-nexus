@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -137,8 +138,17 @@ struct GossipBallotTestAccess {
     static uint64_t receive_error_count(GossipService& g) {
         return g.test_receive_error_count_;
     }
+    static uint64_t receive_arm_count(GossipService& g) {
+        return g.test_receive_arm_count_;
+    }
+    static void force_receive_on_closed_socket(GossipService& g) {
+        g.arm_receive();
+    }
     static void drop_outstanding(GossipService& g, const std::string& peer) {
         g.test_drop_outstanding(peer);
+    }
+    static uint64_t max_page_bytes(GossipService& g) {
+        return g.test_max_page_bytes_;
     }
 };
 }  // namespace nexus::gossip
@@ -171,7 +181,7 @@ struct Node {
     // The retained pool files on disk (hash -> text), straight from storage.
     [[nodiscard]] std::vector<std::pair<std::string, std::string>> pool_files() const {
         std::vector<std::pair<std::string, std::string>> out;
-        for (const auto& e : storage->list_pool_entries()) {
+        for (const auto& e : storage->list_pool_entries().entries) {
             if (e.temporary) continue;
             storage::FileStorageService::PoolRead result;
             if (auto text = storage->read_pool_record(e.hash,
@@ -189,6 +199,9 @@ protected:
     fs::path root;
     std::unique_ptr<crypto::SodiumCryptoService> kc;
     std::vector<std::unique_ptr<Node>> nodes;
+    // Retired services remain alive until all canceled callbacks have run;
+    // they still reference the storage and crypto owned by nodes.
+    std::vector<std::unique_ptr<gossip::GossipService>> retired_gossip;
     // The author whose signed records move between pools.
     crypto::Ed25519Keypair author_kp{};
     std::string            author_pubkey;  // "ed25519:base64..."
@@ -206,7 +219,20 @@ protected:
 
     void TearDown() override {
         for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
-            (*it)->gossip->stop();
+            if ((*it)->tree) {
+                (*it)->tree->set_delta_retention_sink(
+                    [](const storage::FileStorageService::RetainedDelta&) {
+                        return false;
+                    });
+            }
+            if ((*it)->gossip) {
+                (*it)->gossip->stop();
+                retired_gossip.push_back(std::move((*it)->gossip));
+            }
+        }
+        ASSERT_TRUE(drain_retired_callbacks());
+        retired_gossip.clear();
+        for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
             if ((*it)->tree) (*it)->tree->stop();
             (*it)->storage->stop();
             (*it)->crypto->stop();
@@ -219,14 +245,43 @@ protected:
 
     // A node with a real tree (root bootstrapped so the author holds the
     // required permissions) and the production retention wiring.
-    // Construct a FRESH gossip service over the node's retained storage:
-    // the old instance is stopped (socket closed, timer cancelled, peers
-    // saved) and destroyed; the retention sink is rewired. Same-object
-    // stop/start is not supported.
+    bool drain_retired_callbacks() {
+        if (io.stopped()) io.restart();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        for (int i = 0; i < 500 && std::chrono::steady_clock::now() < deadline; ++i) {
+            if (io.poll_one() == 0) {
+                if (io.stopped()) io.restart();
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (io.stopped()) io.restart();
+        return false;
+    }
+
+    void retire_gossip(std::unique_ptr<gossip::GossipService> g) {
+        if (!g) return;
+        g->stop();
+        retired_gossip.push_back(std::move(g));
+        ASSERT_TRUE(drain_retired_callbacks());
+    }
+
+    // Construct a FRESH gossip service over the node's retained storage.
+    // The old instance remains alive after its callbacks are retired; the
+    // retention sink is rewired to the new instance. Same-object stop/start
+    // is not supported.
     void respawn_gossip(Node& n,
                         const std::function<void(gossip::GossipService&)>& configure =
                             {}) {
-        n.gossip->stop();
+        auto old = std::move(n.gossip);
+        if (n.tree) {
+            // A delta applied during the window must not reach a retiring
+            // object: detach the sink first.
+            n.tree->set_delta_retention_sink(
+                [](const storage::FileStorageService::RetainedDelta&) { return false; });
+        }
+        retire_gossip(std::move(old));
         auto g = std::make_unique<gossip::GossipService>(io, 0, *n.storage, *n.crypto);
         if (n.tree) {
             g->set_tree(n.tree.get());
@@ -237,6 +292,7 @@ protected:
         }
         n.gossip = std::move(g);
         if (configure) configure(*n.gossip);
+        if (io.stopped()) io.restart();
         n.gossip->start();
     }
 
@@ -589,7 +645,7 @@ TEST_F(DeltaTransferTest, CorruptRecordIsExcludedPreservedAndOccupiesItsIdentifi
     EXPECT_FALSE(fresh->retain_local_delta(rec3))
         << "no new retention while the pool is unavailable";
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*fresh), 0u);
-    fresh->stop();
+    retire_gossip(std::move(fresh));
 }
 
 TEST_F(DeltaTransferTest, CorruptBytesCountTowardCapacity) {
@@ -618,7 +674,7 @@ TEST_F(DeltaTransferTest, CorruptBytesCountTowardCapacity) {
     rec.timestamp = d3.timestamp;
     EXPECT_FALSE(fresh->retain_local_delta(rec))
         << "corruption must not create free capacity or retention";
-    fresh->stop();
+    retire_gossip(std::move(fresh));
 
     // Without corruption, the byte budget still bounds retention: a budget
     // that fits the current pool exactly excludes the next record.
@@ -639,6 +695,87 @@ TEST_F(DeltaTransferTest, CorruptBytesCountTowardCapacity) {
     rec2.timestamp = d6.timestamp;
     EXPECT_FALSE(c.gossip->retain_local_delta(rec2))
         << "a byte budget that fits the current pool must exclude the next record";
+}
+
+// An orphan temp file (a crashed write) occupies storage: it counts toward
+// the runtime byte budget, so a record that fits the verified pool does not
+// fit while the temp file is present.
+TEST_F(DeltaTransferTest, RetentionAtByteLimitAccountsForTempFiles) {
+    auto& a = make_node("a");
+    auto d1 = signed_delta("create_node", "t-1", child_node("t-1", "root"));
+    auto d2 = signed_delta("create_node", "t-2", child_node("t-2", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d1));
+    ASSERT_TRUE(a.tree->apply_delta(d2));
+    const auto used = gossip::GossipBallotTestAccess::pool_verified_bytes(*a.gossip);
+
+    // A 1000-byte orphan temp file in the pool directory.
+    const auto tmp = a.storage->pool_dir() / (hash_of(d1) + ".json.tmp");
+    {
+        std::ofstream o(tmp, std::ios::binary);
+        o << std::string(1000, 't');
+    }
+
+    // Recreation counts the temp file into the runtime capacity: a budget
+    // that fits verified + temp exactly admits no new record.
+    respawn_gossip(a, [used](gossip::GossipService& g) {
+        gossip::GossipBallotTestAccess::set_pool_max_bytes(g, used + 1000);
+    });
+    ASSERT_TRUE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
+    ASSERT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 2u);
+    auto d3 = signed_delta("create_node", "t-3", child_node("t-3", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d3));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d3)))
+        << "an orphan temp file must count against the byte budget";
+
+    // With the temp file gone, the same budget admits the same size of
+    // record.
+    fs::remove(tmp);
+    respawn_gossip(a, [used](gossip::GossipService& g) {
+        gossip::GossipBallotTestAccess::set_pool_max_bytes(g, used + 1000);
+    });
+    ASSERT_TRUE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
+    auto d4 = signed_delta("create_node", "t-4", child_node("t-4", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d4));
+    EXPECT_TRUE(a.storage->pool_record_exists(hash_of(d4)))
+        << "without the temp file the same budget must admit a record";
+}
+
+TEST_F(DeltaTransferTest, RetentionAtEntryLimitCountsTempAndExcludedFiles) {
+    auto& a = make_node("a");
+    auto d1 = signed_delta("create_node", "e-1", child_node("e-1", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d1));
+
+    const std::string temp_hash(64, '0');
+    const auto temp = a.storage->pool_dir() / (temp_hash + ".json.tmp");
+    std::ofstream(temp) << "orphan";
+    respawn_gossip(a, [](gossip::GossipService& g) {
+        gossip::GossipBallotTestAccess::set_pool_max_records(g, 2);
+    });
+    ASSERT_TRUE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
+    auto d2 = signed_delta("create_node", "e-2", child_node("e-2", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d2));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d2)))
+        << "a temp file must occupy an entry at runtime";
+
+    fs::remove(temp);
+    const auto excluded = a.storage->pool_dir() / "orphan.bin";
+    std::ofstream(excluded) << "excluded";
+    respawn_gossip(a, [](gossip::GossipService& g) {
+        gossip::GossipBallotTestAccess::set_pool_max_records(g, 2);
+    });
+    ASSERT_TRUE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
+    auto d3 = signed_delta("create_node", "e-3", child_node("e-3", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d3));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d3)))
+        << "an excluded file must occupy an entry at runtime";
+
+    fs::remove(excluded);
+    respawn_gossip(a, [](gossip::GossipService& g) {
+        gossip::GossipBallotTestAccess::set_pool_max_records(g, 2);
+    });
+    auto d4 = signed_delta("create_node", "e-4", child_node("e-4", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d4));
+    EXPECT_TRUE(a.storage->pool_record_exists(hash_of(d4)));
 }
 
 TEST_F(DeltaTransferTest, BoundsExceededAtStartupMakeThePoolUnavailable) {
@@ -692,6 +829,20 @@ TEST_F(DeltaTransferTest, BoundsExceededAtStartupMakeThePoolUnavailable) {
     EXPECT_FALSE(a.gossip->retain_local_delta(rec_for(d4, 0, hash_of(d4))));
     // The three pre-placed files are still on disk.
     EXPECT_EQ(a.pool_files().size(), 3u);
+}
+
+TEST_F(DeltaTransferTest, TruncatedInventoryKeepsPoolUnavailable) {
+    auto& a = make_node("a");
+    auto d = signed_delta("create_node", "truncated",
+                          child_node("truncated", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d));
+
+    a.storage->test_set_pool_list_cap(1);
+    respawn_gossip(a);
+    a.storage->test_set_pool_list_cap(0);
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u);
+    EXPECT_TRUE(a.storage->pool_record_exists(hash_of(d)));
 }
 
 TEST_F(DeltaTransferTest, MissingGenerationWithRecordsMakesThePoolUnavailable) {
@@ -910,6 +1061,108 @@ TEST_F(DeltaTransferTest, PageBoundSplitsTransferIntoContinuedRequests) {
         std::chrono::seconds(10)));
     EXPECT_EQ(gossip::GossipBallotTestAccess::cursor_of(*b.gossip, a_b64),
               static_cast<uint64_t>(kRecords));
+}
+
+// The sender must bound the COMPLETE serialized page, envelope included:
+// the receiver rejects payloads above the same bound, so a page whose
+// records alone fit under the bound would still be dropped once the
+// envelope is added, and the transfer would stall. The wire record size is
+// pinned into the window where the records-only accounting overruns the
+// receiver bound; every emitted page is measured and must satisfy the
+// limit, and the pagination must still complete.
+TEST_F(DeltaTransferTest, PagesNearTheByteLimitCompletePagination) {
+    auto root_kp = kc->ed25519_keygen();
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    make_certified_pair(a, b, root_kp);
+    const auto a_b64 = a.pubkey_b64();
+
+    constexpr std::size_t kWireRecordBytes = 1109;
+    const int kRecords = 110;
+    for (int i = 1; i <= kRecords; ++i) {
+        const auto id = "p-" + std::string(3 - std::to_string(i).size(), '0') +
+                        std::to_string(i);
+        auto d = signed_delta("create_node", id, child_node(id, "root"));
+        auto wire = record_json(d);
+        wire["position"] = static_cast<std::uint64_t>(i);
+        wire["record_hash"] = hash_of(d);
+        ASSERT_LT(wire.dump().size(), kWireRecordBytes);
+        const auto pad = kWireRecordBytes - wire.dump().size();
+        d = signed_delta("create_node", id,
+                         child_node(id, "root", std::string(pad, 'x')));
+        wire = record_json(d);
+        wire["position"] = static_cast<std::uint64_t>(i);
+        wire["record_hash"] = hash_of(d);
+        ASSERT_EQ(wire.dump().size(), kWireRecordBytes)
+            << "fixture must retain its exact serialized wire size";
+        ASSERT_TRUE(a.tree->apply_delta(d));
+    }
+    ASSERT_EQ(gossip::GossipBallotTestAccess::pool_latest(*a.gossip),
+              static_cast<std::uint64_t>(kRecords));
+
+    // Build the exact prefix the old records-only accounting admitted. It is
+    // within 60,000 by that accounting but oversized once the real envelope
+    // is serialized.
+    auto files = a.pool_files();
+    ASSERT_EQ(files.size(), static_cast<std::size_t>(kRecords));
+    std::vector<json> wire_records;
+    for (const auto& [hash, text] : files) {
+        const auto stored = json::parse(text);
+        json r;
+        r["position"]       = stored["position"];
+        r["record_hash"]    = hash;
+        r["operation"]      = stored["operation"];
+        r["target_node_id"] = stored["target_node_id"];
+        r["node_data"]      = stored["node_data"];
+        r["signer_pubkey"]  = stored["signer_pubkey"];
+        r["signature"]      = stored["signature"];
+        r["timestamp"]      = stored["timestamp"];
+        ASSERT_EQ(r.dump().size(), kWireRecordBytes);
+        wire_records.push_back(std::move(r));
+    }
+    std::sort(wire_records.begin(), wire_records.end(), [](const json& lhs, const json& rhs) {
+        return lhs["position"].get<std::uint64_t>() <
+               rhs["position"].get<std::uint64_t>();
+    });
+    json legacy_records = json::array();
+    std::size_t legacy_accounted = 0;
+    for (const auto& r : wire_records) {
+        const auto next = r.dump().size() + 1;
+        if (!legacy_records.empty() &&
+            legacy_accounted + next > gossip::GossipService::kPageMaxPayloadBytes) {
+            break;
+        }
+        legacy_records.push_back(r);
+        legacy_accounted += next;
+    }
+    json legacy_response;
+    legacy_response["nonce"] = 1;
+    legacy_response["from_pos"] = 0;
+    legacy_response["generation"] =
+        gossip::GossipBallotTestAccess::pool_generation(*a.gossip);
+    legacy_response["latest_pos"] = static_cast<std::uint64_t>(kRecords);
+    legacy_response["complete"] = true;
+    legacy_response["records"] = legacy_records;
+    ASSERT_LE(legacy_accounted, gossip::GossipService::kPageMaxPayloadBytes);
+    ASSERT_GT(legacy_response.dump().size(),
+              gossip::GossipService::kPageMaxPayloadBytes)
+        << "the fixture must reproduce the records-only accounting defect";
+
+    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    ASSERT_TRUE(pump_until([&] {
+        return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) ==
+               static_cast<std::size_t>(kRecords);
+    }, std::chrono::seconds(15)))
+        << "a dropped page stalls the transfer; pagination must complete";
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_latest(*b.gossip),
+              static_cast<std::uint64_t>(kRecords));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::cursor_of(*b.gossip, a_b64),
+              static_cast<std::uint64_t>(kRecords));
+    EXPECT_LE(gossip::GossipBallotTestAccess::max_page_bytes(*a.gossip),
+              gossip::GossipService::kPageMaxPayloadBytes)
+        << "every emitted page must satisfy the receiver's payload bound";
+    EXPECT_GT(gossip::GossipBallotTestAccess::max_page_bytes(*a.gossip), 58000u)
+        << "the successful production page must remain close to the boundary";
 }
 
 TEST_F(DeltaTransferTest, DuplicateRecordIsIdempotentAndAdvancesTheCursor) {
@@ -1644,6 +1897,56 @@ TEST_F(DeltaTransferTest, StoppedServiceDoesNotRearmReceive) {
         << "a closed socket must not produce non-aborted receive errors";
 }
 
+// The original defect, reproduced on its exact path: stop() closes the
+// socket, and a same-object start() armed the receive on that closed
+// descriptor. Every completion then failed with a terminal descriptor
+// error and the old error path rearmed, so the chain never reached
+// quiescence. Without the receive-loop correction the handler budget below
+// is exhausted by the endless rearm chain and the error count is nonzero.
+TEST_F(DeltaTransferTest, ClosedDescriptorRestartCannotLoop) {
+    auto& a = make_node("a");
+    const auto armed_before =
+        gossip::GossipBallotTestAccess::receive_arm_count(*a.gossip);
+    a.gossip->stop();
+    a.gossip->start();  // the closed-descriptor path
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    std::uint64_t handlers = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (io.poll_one() > 0) {
+            if (++handlers > 1000) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+            break;  // quiescent
+        }
+    }
+    EXPECT_EQ(gossip::GossipBallotTestAccess::receive_error_count(*a.gossip), 0u)
+        << "a closed descriptor must not produce non-aborted receive errors";
+    EXPECT_EQ(gossip::GossipBallotTestAccess::receive_arm_count(*a.gossip),
+              armed_before)
+        << "same-object start must not arm a receive on the closed socket";
+    EXPECT_LE(handlers, 20u)
+        << "only timer work may run; an endless rearm chain exhausts the budget";
+}
+
+// Exercise the terminal completion branch itself. The test-only force bypasses
+// only the open-socket precondition; the async operation and its completion
+// handler are production code. A bad descriptor is terminal and must not rearm.
+TEST_F(DeltaTransferTest, TerminalDescriptorReceiveErrorDoesNotRearm) {
+    auto& a = make_node("a");
+    a.gossip->stop();
+    ASSERT_TRUE(drain_retired_callbacks());
+
+    const auto arms = gossip::GossipBallotTestAccess::receive_arm_count(*a.gossip);
+    gossip::GossipBallotTestAccess::force_receive_on_closed_socket(*a.gossip);
+    ASSERT_TRUE(drain_retired_callbacks());
+
+    EXPECT_EQ(gossip::GossipBallotTestAccess::receive_arm_count(*a.gossip), arms + 1)
+        << "the terminal completion must not arm another receive";
+    EXPECT_EQ(gossip::GossipBallotTestAccess::receive_error_count(*a.gossip), 0u)
+        << "bad_descriptor/not_socket must take the terminal error branch";
+}
+
 // ---------------------------------------------------------------------------
 // (10) Pool position integrity and serve-time verification
 // ---------------------------------------------------------------------------
@@ -1716,6 +2019,68 @@ TEST_F(DeltaTransferTest, CorruptMiddlePositionAlsoMakesPoolUnavailable) {
 // must not be served, even when the replacement is well-formed and signed.
 // The page fails boundedly; nothing beyond the corruption is served and the
 // index is not silently repaired.
+// An inventory the scan cannot complete (an entry whose size is
+// indeterminate) must not be published as a pool: unavailable, files
+// preserved, no retention.
+TEST_F(DeltaTransferTest, BrokenSymlinkKeepsThePoolUnavailable) {
+    auto& a = make_node("a");
+    auto d1 = signed_delta("create_node", "s-1", child_node("s-1", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d1));
+    ASSERT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 1u);
+
+    // A broken symlink posing as a record file: its size cannot be
+    // determined, so the scan cannot establish a complete inventory.
+    const std::string other = "0123456789abcdef0123456789abcdef"
+                              "0123456789abcdef0123456789abcdef";
+    ::symlink((a.dir / "missing-target").c_str(),
+              (a.storage->pool_dir() / (other + ".json")).c_str());
+    respawn_gossip(a);
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_available(*a.gossip))
+        << "an incomplete inventory must not be published as a pool";
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u);
+    // The symlink and the record are preserved, not repaired or removed.
+    std::error_code sec;
+    const auto st =
+        fs::symlink_status(a.storage->pool_dir() / (other + ".json"), sec);
+    EXPECT_FALSE(sec);
+    EXPECT_TRUE(fs::is_symlink(st));
+    EXPECT_TRUE(a.storage->pool_record_exists(hash_of(d1)));
+    // Retention stays refused.
+    auto d2 = signed_delta("create_node", "s-2", child_node("s-2", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d2));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d2)));
+}
+
+TEST_F(DeltaTransferTest, BrokenRecordSymlinkIsNotOverwrittenAtRuntime) {
+    auto& a = make_node("a");
+    auto d = signed_delta("create_node", "s-runtime",
+                          child_node("s-runtime", "root"));
+    const auto path = a.storage->pool_dir() / (hash_of(d) + ".json");
+    ASSERT_EQ(::symlink((a.dir / "missing-target").c_str(), path.c_str()), 0);
+    ASSERT_EQ(a.storage->pool_record_state(hash_of(d)),
+              storage::FileStorageService::PoolFileState::Present);
+
+    ASSERT_TRUE(a.tree->apply_delta(d));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u);
+    std::error_code ec;
+    EXPECT_TRUE(fs::is_symlink(fs::symlink_status(path, ec)));
+    EXPECT_FALSE(ec);
+}
+
+TEST_F(DeltaTransferTest, RecordStateIoErrorDoesNotAuthorizeAWrite) {
+    auto& a = make_node("a");
+    auto d = signed_delta("create_node", "state-error",
+                          child_node("state-error", "root"));
+    const auto hash = hash_of(d);
+    a.storage->test_arm_pool_record_state_failure(hash);
+
+    ASSERT_TRUE(a.tree->apply_delta(d));
+    EXPECT_EQ(a.storage->pool_record_state(hash),
+              storage::FileStorageService::PoolFileState::Absent);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u)
+        << "an existence-check error must not be treated as proven absence";
+}
+
 TEST_F(DeltaTransferTest, ServingReverifiesContentAgainstTheIndex) {
     auto root_kp = kc->ed25519_keygen();
     auto& a = make_node("a");
@@ -1783,11 +2148,25 @@ TEST_F(DeltaTransferTest, UncertainPoolWriteQuarantinesPoolAndBurnsPosition) {
     EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d2)));
     EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
 
-    // Restart: reconstruction verifies the file and re-indexes it at its
-    // own position (1). The pool is available again; the position was not
-    // lost and the bytes were not ignored.
+    // Recreation while the directory sync STILL fails: reading and
+    // verifying the renamed file is not the failed durability operation.
+    // The reconciliation must complete the sync; while it fails the pool
+    // stays unavailable and the files are preserved.
+    a.storage->test_arm_pool_sync_failure();
     respawn_gossip(a);
     EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_has_uncertain_write(*a.gossip));
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_available(*a.gossip))
+        << "a restart without a completed directory sync is not proof of durability";
+    EXPECT_TRUE(a.storage->pool_record_exists(hash_of(d1)))
+        << "the uncertain write's file must be preserved";
+    auto d2b = signed_delta("create_node", "u-2b", child_node("u-2b", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d2b));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d2b)))
+        << "no retention while the pool is unavailable";
+
+    // Successful reconciliation: the same storage, the sync now succeeds,
+    // and the pool is published with the record at its own position.
+    respawn_gossip(a);
     ASSERT_TRUE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 1u);
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_latest(*a.gossip), 1u);
@@ -1798,6 +2177,54 @@ TEST_F(DeltaTransferTest, UncertainPoolWriteQuarantinesPoolAndBurnsPosition) {
     ASSERT_TRUE(a.tree->apply_delta(d3));
     EXPECT_TRUE(a.storage->pool_record_exists(hash_of(d3)));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_latest(*a.gossip), 2u);
+}
+
+// Growth of a pool record between the size inspection and the read makes
+// the inventory unestablishable: the reconstructed pool stays unavailable
+// and the file is preserved.
+TEST_F(DeltaTransferTest, RecordGrowthDuringReconstructionKeepsPoolUnavailable) {
+    auto& a = make_node("a");
+    auto d1 = signed_delta("create_node", "g-1", child_node("g-1", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d1));
+    ASSERT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 1u);
+
+    std::error_code before_ec;
+    const auto before = fs::file_size(
+        a.storage->pool_dir() / (hash_of(d1) + ".json"), before_ec);
+    ASSERT_FALSE(before_ec);
+    ASSERT_LE(before, gossip::GossipService::kMaxRetainedRecordBytes);
+    const auto growth = static_cast<std::size_t>(
+        gossip::GossipService::kMaxRetainedRecordBytes - before + 1);
+    a.storage->test_arm_pool_record_growth(hash_of(d1), growth);
+    respawn_gossip(a);
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_available(*a.gossip))
+        << "an inventory read over a file that changed cannot be established";
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u);
+    // The file is preserved, grown byte included.
+    std::error_code ec;
+    const auto grown = fs::file_size(
+        a.storage->pool_dir() / (hash_of(d1) + ".json"), ec);
+    ASSERT_FALSE(ec);
+    EXPECT_EQ(grown, gossip::GossipService::kMaxRetainedRecordBytes + 1);
+    // Retention stays refused.
+    auto d2 = signed_delta("create_node", "g-2", child_node("g-2", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d2));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d2)));
+}
+
+TEST_F(DeltaTransferTest, RecordDisappearanceDuringReconstructionIsNotSkipped) {
+    auto& a = make_node("a");
+    auto d1 = signed_delta("create_node", "gone-1", child_node("gone-1", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d1));
+    a.storage->test_arm_pool_record_disappearance(hash_of(d1));
+
+    respawn_gossip(a);
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::pool_available(*a.gossip));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u)
+        << "a changed inventory must not be published as a complete pool";
+    auto d2 = signed_delta("create_node", "gone-2", child_node("gone-2", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d2));
+    EXPECT_FALSE(a.storage->pool_record_exists(hash_of(d2)));
 }
 
 // ---------------------------------------------------------------------------

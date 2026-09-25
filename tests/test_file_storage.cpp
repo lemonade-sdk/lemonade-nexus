@@ -337,20 +337,30 @@ TEST_F(FileStorageTest, PoolListReportsRecordsTempFilesAndExcludesMeta) {
     // A leftover in-flight temp file (e.g. from a crashed write) must be
     // listed so it counts toward storage bounds, and never indexed.
     std::ofstream(storage->pool_dir() / (kHash + ".json.tmp")) << "partial";
+    // Unrecognized physical entries also occupy the bounded directory.
+    std::ofstream(storage->pool_dir() / "orphan.bin") << std::string(17, 'o');
 
-    const auto entries = storage->list_pool_entries();
-    ASSERT_EQ(entries.size(), 2u);
-    bool saw_record = false, saw_tmp = false;
+    const auto listing = storage->list_pool_entries();
+    EXPECT_FALSE(listing.error);
+    EXPECT_FALSE(listing.truncated);
+    const auto& entries = listing.entries;
+    ASSERT_EQ(entries.size(), 3u);
+    bool saw_record = false, saw_tmp = false, saw_excluded = false;
     for (const auto& e : entries) {
-        if (e.hash == kHash && !e.temporary) {
+        if (e.hash == kHash && e.record) {
             saw_record = true;
             EXPECT_EQ(e.size_bytes, 2u);  // "{}"
         }
         if (e.hash == kHash && e.temporary) saw_tmp = true;
+        if (e.hash == "orphan.bin" && !e.record && !e.temporary) {
+            saw_excluded = true;
+            EXPECT_EQ(e.size_bytes, 17u);
+        }
         EXPECT_NE(e.hash, "_meta");
     }
     EXPECT_TRUE(saw_record);
     EXPECT_TRUE(saw_tmp);
+    EXPECT_TRUE(saw_excluded);
 }
 
 TEST_F(FileStorageTest, PoolRecordIdentifierRefusesNonHexAndTraversal) {
@@ -418,13 +428,118 @@ TEST_F(FileStorageTest, PoolListEnumerationIsBoundedWhileCollecting) {
         ASSERT_EQ(storage->write_pool_record(make_hash(i), "{}"),
                   FileStorageService::PoolWrite::Ok);
     }
-    EXPECT_EQ(storage->list_pool_entries().size(), 6u);
+    auto full = storage->list_pool_entries();
+    EXPECT_FALSE(full.error);
+    EXPECT_FALSE(full.truncated);
+    EXPECT_EQ(full.entries.size(), 6u);
 
+    // A scan that stops at the cap is incomplete: it must say so, not
+    // present a partial inventory as complete.
     storage->test_set_pool_list_cap(4);
     const auto capped = storage->list_pool_entries();
-    EXPECT_EQ(capped.size(), 4u);
+    EXPECT_FALSE(capped.error);
+    EXPECT_TRUE(capped.truncated);
+    EXPECT_EQ(capped.entries.size(), 4u);
     storage->test_set_pool_list_cap(0);  // production bound
-    EXPECT_EQ(storage->list_pool_entries().size(), 6u);
+    EXPECT_EQ(storage->list_pool_entries().entries.size(), 6u);
+}
+
+// A file that grows between the size inspection and the read must not be
+// read unbounded: the limit is enforced during the read, and the stale
+// inspection is reported as an I/O error, not absence or oversize.
+TEST_F(FileStorageTest, RecordGrowthBetweenInspectionAndReadIsAnIoError) {
+    // The file is exactly at the read limit, so the size inspection passes.
+    ASSERT_EQ(storage->write_pool_record(kHash, std::string(100, 'r')),
+              FileStorageService::PoolWrite::Ok);
+    storage->test_arm_pool_record_growth(kHash);  // appends one byte in between
+
+    FileStorageService::PoolRead result = FileStorageService::PoolRead::Ok;
+    auto text = storage->read_pool_record(kHash, 100, result);
+    EXPECT_EQ(result, FileStorageService::PoolRead::IoError)
+        << "growth past the inspected size must fail closed, unbounded reads must not happen";
+    EXPECT_FALSE(text.has_value());
+
+    // The file is preserved, not truncated or repaired.
+    std::error_code ec;
+    EXPECT_EQ(fs::file_size(storage->pool_dir() / (kHash + ".json"), ec), 101u);
+    EXPECT_FALSE(ec);
+
+    // The same file reads fine within a limit that fits it.
+    auto text2 = storage->read_pool_record(kHash, 200, result);
+    EXPECT_EQ(result, FileStorageService::PoolRead::Ok);
+    ASSERT_TRUE(text2.has_value());
+    EXPECT_EQ(text2->size(), 101u);
+}
+
+// An existing record file that cannot be read is an I/O error, never
+// absence: the identifier is still occupied by evidence.
+TEST_F(FileStorageTest, UnreadableRecordFileIsIoErrorNotAbsent) {
+    ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
+              FileStorageService::PoolWrite::Ok);
+    const auto path = storage->pool_dir() / (kHash + ".json");
+    ASSERT_EQ(::chmod(path.c_str(), 0), 0);
+
+    FileStorageService::PoolRead result = FileStorageService::PoolRead::Ok;
+    auto text = storage->read_pool_record(kHash, 1000, result);
+    ::chmod(path.c_str(), 0600);
+    EXPECT_EQ(result, FileStorageService::PoolRead::IoError)
+        << "an unreadable existing file must not be reported as absent";
+    EXPECT_FALSE(text.has_value());
+    EXPECT_TRUE(storage->pool_record_exists(kHash));
+}
+
+TEST_F(FileStorageTest, PoolRecordStateDistinguishesIoErrorFromAbsence) {
+    const std::string other = kHash.substr(1) + "0";
+    EXPECT_EQ(storage->pool_record_state(other),
+              FileStorageService::PoolFileState::Absent);
+
+    storage->test_arm_pool_record_state_failure(other);
+    EXPECT_EQ(storage->pool_record_state(other),
+              FileStorageService::PoolFileState::IoError);
+    EXPECT_EQ(storage->pool_record_state(other),
+              FileStorageService::PoolFileState::Absent)
+        << "the injected inspection failure is one-shot, not absence";
+}
+
+// A broken symlink posing as a record file makes the entry size
+// indeterminate: the scan reports the error instead of a zero size or an
+// empty inventory.
+TEST_F(FileStorageTest, BrokenSymlinkMakesTheInventoryIncomplete) {
+    ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
+              FileStorageService::PoolWrite::Ok);
+    const std::string other = kHash.substr(1) + "0";
+    ::symlink((temp_dir / "missing-target").c_str(),
+              (storage->pool_dir() / (other + ".json")).c_str());
+
+    EXPECT_EQ(storage->pool_record_state(other),
+              FileStorageService::PoolFileState::Present)
+        << "a broken symlink is an occupied path, never absence";
+    FileStorageService::PoolRead read_result = FileStorageService::PoolRead::Ok;
+    EXPECT_FALSE(storage->read_pool_record(other, 1000, read_result).has_value());
+    EXPECT_EQ(read_result, FileStorageService::PoolRead::IoError);
+
+    const auto listing = storage->list_pool_entries();
+    EXPECT_TRUE(listing.error)
+        << "an entry whose size cannot be determined must fail the scan";
+    EXPECT_FALSE(listing.truncated);
+
+    ::remove((storage->pool_dir() / (other + ".json")).c_str());
+    const auto clean = storage->list_pool_entries();
+    EXPECT_FALSE(clean.error);
+    EXPECT_EQ(clean.entries.size(), 1u);
+}
+
+// A directory that cannot be opened is a scan error, never a complete
+// empty pool.
+TEST_F(FileStorageTest, UnscannablePoolDirectoryIsAnErrorNotAnEmptyPool) {
+    ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
+              FileStorageService::PoolWrite::Ok);
+    ASSERT_EQ(::chmod(storage->pool_dir().c_str(), 0), 0);
+    const auto blocked = storage->list_pool_entries();
+    ASSERT_EQ(::chmod(storage->pool_dir().c_str(), 0755), 0);
+    EXPECT_TRUE(blocked.error)
+        << "a failed scan must not be presented as an empty pool";
+    EXPECT_EQ(blocked.entries.size(), 0u);
 }
 
 // The pool directory is derived from the constructor argument. A moved-from
@@ -453,8 +568,8 @@ TEST_F(FileStorageTest, PoolsOfDifferentRootsAreIsolated) {
               FileStorageService::PoolWrite::Ok);
 
     // Neither instance sees the other's pool contents.
-    auto entries_a = storage->list_pool_entries();
-    auto entries_b = other.list_pool_entries();
+    auto entries_a = storage->list_pool_entries().entries;
+    auto entries_b = other.list_pool_entries().entries;
     ASSERT_EQ(entries_a.size(), 1u);
     EXPECT_EQ(entries_a[0].hash, hash_a);
     ASSERT_EQ(entries_b.size(), 1u);
@@ -469,8 +584,8 @@ TEST_F(FileStorageTest, PoolsOfDifferentRootsAreIsolated) {
     const std::string hash_c = kHash.substr(2) + "11";
     ASSERT_EQ(other.write_pool_record(hash_c, "{}"),
               FileStorageService::PoolWrite::Ok);
-    EXPECT_EQ(other.list_pool_entries().size(), 2u);
-    EXPECT_EQ(storage->list_pool_entries().size(), 1u);
+    EXPECT_EQ(other.list_pool_entries().entries.size(), 2u);
+    EXPECT_EQ(storage->list_pool_entries().entries.size(), 1u);
 
     other.stop();
 }

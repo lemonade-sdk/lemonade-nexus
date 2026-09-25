@@ -455,8 +455,11 @@ void GossipService::reconstruct_transfer_pool() {
     pool_hash_to_position_.clear();
     pool_verified_.clear();
     pool_excluded_.clear();
+    pool_temp_hashes_.clear();
     pool_verified_bytes_ = 0;
     pool_excluded_bytes_ = 0;
+    pool_temp_bytes_ = 0;
+    pool_entry_count_ = 0;
     pool_next_position_ = 1;
     pool_available_ = false;
     pool_reconstructed_ = false;
@@ -473,6 +476,9 @@ void GossipService::reconstruct_transfer_pool() {
         pool_verified_bytes_ = 0;
         pool_excluded_.clear();
         pool_excluded_bytes_ = 0;
+        pool_temp_hashes_.clear();
+        pool_temp_bytes_ = 0;
+        pool_entry_count_ = 0;
         pool_next_position_ = 1;
         spdlog::critical("[{}] transfer pool unavailable: {} — pool files are "
                          "preserved; transfer and new retention are refused",
@@ -482,8 +488,19 @@ void GossipService::reconstruct_transfer_pool() {
     const auto max_records = effective_pool_max_records();
     const auto max_bytes = effective_pool_max_bytes();
 
-    // Enforce the bounds before reading any record content.
-    const auto entries = storage_.list_pool_entries();
+    // Enforce the bounds before reading any record content. An
+    // interrupted scan is not an inventory: it must not be presented as an
+    // empty or complete pool.
+    const auto listing = storage_.list_pool_entries();
+    if (listing.error) {
+        unavailable("pool directory scan failed");
+        return;
+    }
+    if (listing.truncated) {
+        unavailable("pool directory scan truncated at the entry cap");
+        return;
+    }
+    const auto& entries = listing.entries;
     std::uint64_t total_bytes = 0;
     for (const auto& e : entries) {
         if (e.size_bytes > max_bytes) { total_bytes = max_bytes + 1; break; }
@@ -499,12 +516,13 @@ void GossipService::reconstruct_transfer_pool() {
                     " exceeds the bound " + std::to_string(max_bytes));
         return;
     }
+    pool_entry_count_ = entries.size();
 
     // Generation metadata must be consistent with the records. Unreadable
     // metadata is not absent: it must not be replaced over unreadable state.
     const bool has_record_file =
         std::any_of(entries.begin(), entries.end(),
-                    [](const auto& e) { return !e.temporary; });
+                    [](const auto& e) { return e.record; });
     storage::FileStorageService::PoolMetaRead meta_state{};
     if (auto meta = storage_.read_pool_generation(meta_state)) {
         pool_generation_ = *meta;
@@ -537,10 +555,18 @@ void GossipService::reconstruct_transfer_pool() {
 
     for (const auto& e : entries) {
         if (e.temporary) {
-            // In-flight or orphaned temp files count as storage; they are
-            // never indexed.
-            pool_excluded_bytes_ += e.size_bytes;
+            // In-flight or orphaned temp files count as storage at runtime
+            // capacity; they are never indexed.
+            pool_temp_bytes_ += e.size_bytes;
+            pool_temp_hashes_.insert(e.hash);
             spdlog::warn("[{}] ignoring stale pool temp file {} ({} bytes)",
+                         name(), e.hash, e.size_bytes);
+            continue;
+        }
+        if (!e.record) {
+            pool_excluded_.insert(e.hash);
+            pool_excluded_bytes_ += e.size_bytes;
+            spdlog::warn("[{}] excluding unrecognized pool entry {} ({} bytes)",
                          name(), e.hash, e.size_bytes);
             continue;
         }
@@ -559,7 +585,8 @@ void GossipService::reconstruct_transfer_pool() {
                 unavailable("pool record " + e.hash + " exists but cannot be read");
                 return;
             }
-            continue;  // absent: skipped, the identifier stays free
+            unavailable("pool record " + e.hash + " disappeared during reconstruction");
+            return;
         }
 
         auto rec = storage::FileStorageService::RetainedDelta::from_json(*text);
@@ -605,6 +632,16 @@ void GossipService::reconstruct_transfer_pool() {
         return;
     }
 
+    // Completing the failed durability operation: a write whose post-rename
+    // directory sync failed (or any earlier crash) leaves directory-entry
+    // durability unproven. The recovered pool is published only after the
+    // pool directory itself is synchronized; a restart alone is not proof
+    // of durability.
+    if (!storage_.sync_pool_directory()) {
+        unavailable("pool directory synchronization failed");
+        return;
+    }
+
     pool_available_ = true;
     pool_reconstructed_ = true;
     spdlog::info("[{}] transfer pool reconstructed: {} verified record(s) "
@@ -638,12 +675,21 @@ GossipService::PoolRetain GossipService::retain_verified_record(
         return PoolRetain::Duplicate;
     }
     if (!pool_available_) return PoolRetain::RefusedUnavailable;
-    if (pool_position_index_.size() + 1 > max_records) return PoolRetain::RefusedCapacity;
+    if (pool_entry_count_ + 1 > max_records) return PoolRetain::RefusedCapacity;
 
     // A stored file we could not verify still occupies its identifier:
     // overwriting it would destroy evidence and could resurrect a colliding
     // record. Refuse while it exists.
-    if (storage_.pool_record_exists(*hash)) return PoolRetain::RefusedCollision;
+    if (pool_temp_hashes_.count(*hash)) return PoolRetain::RefusedCollision;
+    const auto file_state = storage_.pool_record_state(*hash);
+    if (file_state == storage::FileStorageService::PoolFileState::Present) {
+        return PoolRetain::RefusedCollision;
+    }
+    if (file_state == storage::FileStorageService::PoolFileState::IoError) {
+        spdlog::error("[{}] cannot establish absence of pool record {}; retention "
+                      "refused", name(), *hash);
+        return PoolRetain::RefusedUnavailable;
+    }
 
     const auto position = pool_next_position_;
     storage::FileStorageService::RetainedDelta stored = rec;
@@ -651,9 +697,11 @@ GossipService::PoolRetain GossipService::retain_verified_record(
     stored.record_hash = *hash;
     const auto text = stored.to_json();
     if (text.size() > kMaxRetainedRecordBytes) return PoolRetain::RefusedOversize;
-    // Capacity accounting includes the excluded evidence bytes: corruption
-    // does not create free capacity.
-    if (pool_verified_bytes_ + pool_excluded_bytes_ + text.size() > max_bytes) {
+    // Capacity accounting includes the excluded evidence bytes and the
+    // temp files: corruption and in-flight writes do not create free
+    // capacity.
+    if (pool_verified_bytes_ + pool_excluded_bytes_ + pool_temp_bytes_ +
+        text.size() > max_bytes) {
         return PoolRetain::RefusedCapacity;
     }
     if (test_fail_next_pool_write_) {
@@ -686,6 +734,7 @@ GossipService::PoolRetain GossipService::retain_verified_record(
     pool_hash_to_position_[*hash] = position;
     pool_verified_.insert(*hash);
     pool_verified_bytes_ += text.size();
+    ++pool_entry_count_;
     pool_next_position_ = position + 1;
     out_position = position;
     return PoolRetain::Retained;
@@ -904,6 +953,11 @@ void GossipService::start_receive() {
     // stops receiving; the same object is not restarted (tests and callers
     // construct a fresh service over the retained storage).
     if (!socket_.is_open()) return;
+    arm_receive();
+}
+
+void GossipService::arm_receive() {
+    ++test_receive_arm_count_;
     socket_.async_receive_from(
         asio::buffer(recv_buffer_), remote_endpoint_,
         [this](const asio::error_code& ec, std::size_t bytes) {
@@ -1117,13 +1171,26 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
     bool page_failed = false;
     std::string generation;
     std::uint64_t latest_pos = 0;
+    // The page is bounded as the COMPLETE serialized response, envelope
+    // included: the receiver rejects payloads above the same bound, so a
+    // page that fits only its records would still be dropped. The envelope
+    // is measured with "complete":false, its longest form.
+    json response;
+    response["nonce"] = nonce;
+    response["from_pos"] = from_pos;
+    response["complete"] = false;
+    response["records"] = json::array();
+    std::size_t envelope_bytes = 0;
+    std::size_t content_bytes = 0;
     {
         std::lock_guard lock(transfer_mutex_);
         generation = pool_generation_;
         latest_pos = pool_latest_position_locked();
+        response["generation"] = generation;
+        response["latest_pos"] = latest_pos;
+        envelope_bytes = response.dump().size();
 
         if (pool_available_) {
-            std::size_t running = 2;  // "records":[] overhead grows as we append
             auto it = pool_position_index_.upper_bound(from_pos);
             for (; it != pool_position_index_.end(); ++it) {
                 if (records.size() >= kPageMaxRecords) break;
@@ -1178,27 +1245,33 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
                 r["signature"]      = stored["signature"];
                 r["timestamp"]      = stored["timestamp"];
                 const auto rsize = r.dump().size();
-                if (!records.empty() && running + rsize + 1 > kPageMaxPayloadBytes) break;
+                // envelope_bytes includes an empty [] records array. Replacing
+                // it with the candidate content adds rsize for the first
+                // record and one comma plus rsize for each later record.
+                if (envelope_bytes + content_bytes + rsize >
+                    kPageMaxPayloadBytes) {
+                    break;
+                }
                 records.push_back(std::move(r));
-                running += rsize + 1;
+                content_bytes += rsize + 1;
             }
         }
     }
 
-    json response;
-    response["nonce"] = nonce;
-    response["from_pos"] = from_pos;
-    response["generation"] = generation;
-    response["latest_pos"] = latest_pos;
     response["complete"] = !page_failed;
     response["records"] = std::move(records);
 
     auto payload_str = response.dump();
-    if (payload_str.size() > 65000) {
-        // Should not happen: the page is bounded to kPageMaxPayloadBytes.
-        spdlog::error("[{}] delta response to {} exceeds the packet cap "
-                      "({} bytes); not sent", name(), signer_pubkey, payload_str.size());
+    if (payload_str.size() > kPageMaxPayloadBytes) {
+        // Unreachable: every page is bounded to the receiver limit,
+        // envelope included. Refuse rather than emit an oversized page.
+        spdlog::error("[{}] delta response to {} exceeds the payload bound "
+                      "({} bytes); not sent", name(), signer_pubkey,
+                      payload_str.size());
         return;
+    }
+    if (payload_str.size() > test_max_page_bytes_) {
+        test_max_page_bytes_ = payload_str.size();
     }
     std::vector<uint8_t> pkt(payload_str.begin(), payload_str.end());
     send_packet(sender, GossipMsgType::DeltaResponse, pkt);
