@@ -471,12 +471,33 @@ private:
     std::string                              pool_generation_;
     bool                                    pool_available_{false};
     bool                                    pool_reconstructed_{false};
+    // Set when a pool write reached the uncertain outcome (rename done,
+    // directory sync failed): further retention is refused and the position
+    // is never handed out again. Only startup reconstruction — which
+    // re-verifies content and identifier — may reconcile the state.
+    bool                                    pool_has_uncertain_write_{false};
+
+    // Test seam: non-aborted receive errors that reached the error branch.
+    std::uint64_t test_receive_error_count_{0};
 
     // Test seams (friend GossipBallotTestAccess): zero selects production.
     std::size_t   test_peer_log_cap_{0};
     std::size_t   test_pool_max_records_{0};
     std::uint64_t test_pool_max_bytes_{0};
     bool          test_fail_next_pool_write_{false};
+
+    // Observation/mutation seams used by the transfer tests. The deadline
+    // seam models the request timeout elapsing while a response is in
+    // flight; the uncertain-write observation reports the quarantine flag.
+    void test_set_outstanding_deadline(std::string_view peer_pubkey,
+                                       std::uint64_t deadline_ms);
+    // Models the request deadline elapsing: frees the peer's outstanding
+    // slot so a new request may be issued.
+    void test_drop_outstanding(std::string_view peer_pubkey) {
+        std::lock_guard lock(transfer_mutex_);
+        outstanding_.erase(std::string(peer_pubkey));
+    }
+    [[nodiscard]] bool test_pool_has_uncertain_write() const;
 
     // IPAM for tunnel IP allocation during ServerHello exchange
     ipam::IPAMService*               ipam_{nullptr};

@@ -43,25 +43,43 @@ nlohmann::json retained_record_node_data(const storage::FileStorageService::Reta
     return nlohmann::json::parse(rec.data, nullptr, false);
 }
 
-bool retained_record_is_malformed(const storage::FileStorageService::RetainedDelta& rec) {
+/// The record as a typed delta. The json-to-TreeNode conversion THROWS on
+/// shape mismatch (missing fields, wrong types, unknown node type); the
+/// conversion is contained here so no caller in the receive path can be
+/// taken down by hostile node_data. nullopt means the content is not a
+/// well-formed node shape and must be treated as malformed.
+std::optional<tree::TreeDelta> retained_record_to_delta(
+    const storage::FileStorageService::RetainedDelta& rec) {
     if (rec.operation.empty() || rec.target_node_id.empty() ||
         rec.signer_pubkey.empty() || rec.signature.empty()) {
-        return true;
+        return std::nullopt;
     }
     const auto nd = retained_record_node_data(rec);
-    return nd.is_discarded() || !nd.is_object();
+    if (nd.is_discarded() || !nd.is_object()) return std::nullopt;
+    tree::TreeDelta td;
+    try {
+        td.operation      = rec.operation;
+        td.target_node_id = rec.target_node_id;
+        td.node_data      = nd;
+        td.signer_pubkey  = rec.signer_pubkey;
+        td.signature      = rec.signature;
+        td.timestamp      = rec.timestamp;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    return td;
 }
 
-std::string retained_record_hash(const storage::FileStorageService::RetainedDelta& rec,
-                                  crypto::SodiumCryptoService& crypto) {
-    tree::TreeDelta td;
-    td.operation      = rec.operation;
-    td.target_node_id = rec.target_node_id;
-    td.node_data      = retained_record_node_data(rec);
-    td.signer_pubkey  = rec.signer_pubkey;
-    td.signature      = rec.signature;
-    td.timestamp      = rec.timestamp;
-    const auto canonical = tree::canonical_delta_json(td);
+bool retained_record_is_malformed(const storage::FileStorageService::RetainedDelta& rec) {
+    return !retained_record_to_delta(rec).has_value();
+}
+
+std::optional<std::string> retained_record_hash(
+    const storage::FileStorageService::RetainedDelta& rec,
+    crypto::SodiumCryptoService& crypto) {
+    auto td = retained_record_to_delta(rec);
+    if (!td) return std::nullopt;
+    const auto canonical = tree::canonical_delta_json(*td);
     const auto msg = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
     return crypto::to_hex(crypto.sha256(msg));
@@ -70,14 +88,9 @@ std::string retained_record_hash(const storage::FileStorageService::RetainedDelt
 bool retained_record_signature_ok(const storage::FileStorageService::RetainedDelta& rec,
                                    crypto::SodiumCryptoService& crypto) {
     if (!rec.signer_pubkey.starts_with("ed25519:")) return false;
-    tree::TreeDelta td;
-    td.operation      = rec.operation;
-    td.target_node_id = rec.target_node_id;
-    td.node_data      = retained_record_node_data(rec);
-    td.signer_pubkey  = rec.signer_pubkey;
-    td.signature      = rec.signature;
-    td.timestamp      = rec.timestamp;
-    const auto canonical = tree::canonical_delta_json(td);
+    auto td = retained_record_to_delta(rec);
+    if (!td) return false;
+    const auto canonical = tree::canonical_delta_json(*td);
     const auto msg = std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
     const auto pk  = crypto::from_base64(rec.signer_pubkey.substr(8));
@@ -91,6 +104,26 @@ bool retained_record_signature_ok(const storage::FileStorageService::RetainedDel
     std::memcpy(pub.data(), pk.data(), pk.size());
     std::memcpy(s.data(), sig.data(), sig.size());
     return crypto.ed25519_verify(pub, msg, s);
+}
+
+// Strict unsigned-integer field read: nlohmann's value() THROWS type_error
+// when the key exists with a different type; reject instead.
+bool u64_field(const nlohmann::json& j, const char* key, std::uint64_t& out) {
+    if (!j.contains(key) || !j[key].is_number_unsigned()) return false;
+    out = j[key].get<std::uint64_t>();
+    return true;
+}
+
+// Record identifiers are 64 lowercase hex characters. Only such identifiers
+// can occupy a pool position; other names are storage but not a position
+// threat.
+bool is_record_identifier(std::string_view name) {
+    if (name.size() != 64) return false;
+    for (char c : name) {
+        const bool hexdigit = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hexdigit) return false;
+    }
+    return true;
 }
 
 }  // namespace
@@ -413,7 +446,11 @@ void GossipService::reconstruct_transfer_pool() {
     std::lock_guard lock(transfer_mutex_);
 
     // Rebuild from scratch: the index is always re-derived from the pool
-    // files, never merged with a previous reconstruction.
+    // files, never merged with a previous reconstruction. This is the only
+    // path that may clear an uncertain-write quarantine — verified content
+    // is re-indexed at its own position; anything else makes the pool
+    // unavailable.
+    pool_has_uncertain_write_ = false;
     pool_position_index_.clear();
     pool_hash_to_position_.clear();
     pool_verified_.clear();
@@ -427,6 +464,16 @@ void GossipService::reconstruct_transfer_pool() {
     const auto unavailable = [this](std::string_view why) {
         pool_available_ = false;
         pool_reconstructed_ = true;
+        // An unavailable pool exposes no transfer view: the index is cleared
+        // (the files are preserved on disk and re-derived by a later
+        // reconstruction). Nothing is served, reported, or retained.
+        pool_position_index_.clear();
+        pool_hash_to_position_.clear();
+        pool_verified_.clear();
+        pool_verified_bytes_ = 0;
+        pool_excluded_.clear();
+        pool_excluded_bytes_ = 0;
+        pool_next_position_ = 1;
         spdlog::critical("[{}] transfer pool unavailable: {} — pool files are "
                          "preserved; transfer and new retention are refused",
                          name(), why);
@@ -453,11 +500,20 @@ void GossipService::reconstruct_transfer_pool() {
         return;
     }
 
-    // Generation metadata must be consistent with the records.
-    if (auto meta = storage_.read_pool_generation()) {
+    // Generation metadata must be consistent with the records. Unreadable
+    // metadata is not absent: it must not be replaced over unreadable state.
+    const bool has_record_file =
+        std::any_of(entries.begin(), entries.end(),
+                    [](const auto& e) { return !e.temporary; });
+    storage::FileStorageService::PoolMetaRead meta_state{};
+    if (auto meta = storage_.read_pool_generation(meta_state)) {
         pool_generation_ = *meta;
     } else {
-        if (!entries.empty()) {
+        if (meta_state == storage::FileStorageService::PoolMetaRead::IoError) {
+            unavailable("generation metadata exists but cannot be read");
+            return;
+        }
+        if (has_record_file) {
             unavailable("records exist without generation metadata");
             return;
         }
@@ -467,6 +523,17 @@ void GossipService::reconstruct_transfer_pool() {
             return;
         }
     }
+
+    // An excluded RECORD identifier means the position it occupied cannot be
+    // reconstructed: the log can no longer be proven complete, and a new
+    // record might be assigned that position. Unavailable, not shortened.
+    bool position_unreconstructable = false;
+    const auto exclude = [this, &position_unreconstructable](
+        const storage::FileStorageService::PoolEntry& e) {
+        pool_excluded_.insert(e.hash);
+        pool_excluded_bytes_ += e.size_bytes;
+        if (is_record_identifier(e.hash)) position_unreconstructable = true;
+    };
 
     for (const auto& e : entries) {
         if (e.temporary) {
@@ -481,8 +548,7 @@ void GossipService::reconstruct_transfer_pool() {
         storage::FileStorageService::PoolRead result;
         auto text = storage_.read_pool_record(e.hash, kMaxRetainedRecordBytes, result);
         if (result == storage::FileStorageService::PoolRead::Oversized) {
-            pool_excluded_.insert(e.hash);
-            pool_excluded_bytes_ += e.size_bytes;
+            exclude(e);
             spdlog::critical("[{}] pool record {} exceeds the per-record bound "
                              "({} bytes); excluded from the index, file preserved",
                              name(), e.hash, e.size_bytes);
@@ -498,8 +564,7 @@ void GossipService::reconstruct_transfer_pool() {
 
         auto rec = storage::FileStorageService::RetainedDelta::from_json(*text);
         if (!rec.has_value()) {
-            pool_excluded_.insert(e.hash);
-            pool_excluded_bytes_ += e.size_bytes;
+            exclude(e);
             spdlog::critical("[{}] pool record {} is not valid retained content; "
                              "excluded from the index, file preserved", name(), e.hash);
             continue;
@@ -509,12 +574,12 @@ void GossipService::reconstruct_transfer_pool() {
         // the canonical content. The stored hash field is never trusted.
         const auto computed = retained_record_hash(*rec, crypto_);
         const bool sig_ok = retained_record_signature_ok(*rec, crypto_);
-        if (computed != e.hash || !sig_ok) {
-            pool_excluded_.insert(e.hash);
-            pool_excluded_bytes_ += e.size_bytes;
+        if (!computed || *computed != e.hash || !sig_ok) {
+            exclude(e);
             spdlog::critical("[{}] pool record {} {} — excluded from the index, "
                              "file preserved", name(), e.hash,
-                             computed != e.hash
+                             !computed ? "content is not a well-formed statement"
+                             : *computed != e.hash
                                  ? "content does not match its identifier"
                                  : "author signature does not verify");
             continue;
@@ -533,6 +598,13 @@ void GossipService::reconstruct_transfer_pool() {
         pool_next_position_ = std::max(pool_next_position_, rec->position + 1);
     }
 
+    if (position_unreconstructable) {
+        unavailable("an excluded record identifier cannot have its position "
+                    "reconstructed; positions beyond the verified prefix cannot "
+                    "be proven free");
+        return;
+    }
+
     pool_available_ = true;
     pool_reconstructed_ = true;
     spdlog::info("[{}] transfer pool reconstructed: {} verified record(s) "
@@ -547,14 +619,20 @@ GossipService::PoolRetain GossipService::retain_verified_record(
     if (!pool_reconstructed_) return PoolRetain::RefusedUnavailable;
     if (retained_record_is_malformed(rec)) return PoolRetain::RefusedMalformed;
 
+    // An uncertain write quarantines the pool: the bytes may be on disk,
+    // so the position must not be handed out again and the storage must not
+    // be ignored. Only the startup reconstruction reconciles the state.
+    if (pool_has_uncertain_write_) return PoolRetain::RefusedUnavailable;
+
     const auto max_records = effective_pool_max_records();
     const auto max_bytes = effective_pool_max_bytes();
 
     // Identity is recomputed from the content; the supplied hash is never
     // trusted.
     const auto hash = retained_record_hash(rec, crypto_);
+    if (!hash) return PoolRetain::RefusedMalformed;
 
-    if (auto it = pool_hash_to_position_.find(hash);
+    if (auto it = pool_hash_to_position_.find(*hash);
         it != pool_hash_to_position_.end()) {
         out_position = it->second;
         return PoolRetain::Duplicate;
@@ -565,12 +643,12 @@ GossipService::PoolRetain GossipService::retain_verified_record(
     // A stored file we could not verify still occupies its identifier:
     // overwriting it would destroy evidence and could resurrect a colliding
     // record. Refuse while it exists.
-    if (storage_.pool_record_exists(hash)) return PoolRetain::RefusedCollision;
+    if (storage_.pool_record_exists(*hash)) return PoolRetain::RefusedCollision;
 
     const auto position = pool_next_position_;
     storage::FileStorageService::RetainedDelta stored = rec;
     stored.position = position;
-    stored.record_hash = hash;
+    stored.record_hash = *hash;
     const auto text = stored.to_json();
     if (text.size() > kMaxRetainedRecordBytes) return PoolRetain::RefusedOversize;
     // Capacity accounting includes the excluded evidence bytes: corruption
@@ -582,12 +660,31 @@ GossipService::PoolRetain GossipService::retain_verified_record(
         test_fail_next_pool_write_ = false;
         return PoolRetain::FailedWrite;
     }
-    if (!storage_.write_pool_record(hash, text)) return PoolRetain::FailedWrite;
+    const auto write_result = storage_.write_pool_record(*hash, text);
+    if (write_result == storage::FileStorageService::PoolWrite::Uncertain) {
+        // The rename may have left the record on disk. The position is
+        // burned — never handed out again — and the pool is quarantined:
+        // no further retention until the startup reconstruction verifies
+        // the content (and re-indexes it) or finds it unreadable (and marks
+        // the pool unavailable). Neither the position nor the bytes are
+        // ignored.
+        pool_next_position_ = position + 1;
+        pool_has_uncertain_write_ = true;
+        pool_available_ = false;
+        spdlog::critical("[{}] pool write at position {} is uncertain (rename "
+                         "done, directory sync failed); position burned and pool "
+                         "quarantined until a restart reconciles the state",
+                         name(), position);
+        return PoolRetain::FailedWrite;
+    }
+    if (write_result != storage::FileStorageService::PoolWrite::Ok) {
+        return PoolRetain::FailedWrite;
+    }
 
     // Acceptance is published only after the durable write succeeded.
-    pool_position_index_[position] = hash;
-    pool_hash_to_position_[hash] = position;
-    pool_verified_.insert(hash);
+    pool_position_index_[position] = *hash;
+    pool_hash_to_position_[*hash] = position;
+    pool_verified_.insert(*hash);
     pool_verified_bytes_ += text.size();
     pool_next_position_ = position + 1;
     out_position = position;
@@ -610,7 +707,20 @@ bool GossipService::retain_local_delta(
     return false;
 }
 
+void GossipService::test_set_outstanding_deadline(std::string_view peer_pubkey,
+                                                  std::uint64_t deadline_ms) {
+    std::lock_guard lock(transfer_mutex_);
+    auto it = outstanding_.find(std::string(peer_pubkey));
+    if (it != outstanding_.end()) it->second.deadline_ms = deadline_ms;
+}
+
+bool GossipService::test_pool_has_uncertain_write() const {
+    std::lock_guard lock(transfer_mutex_);
+    return pool_has_uncertain_write_;
+}
+
 GossipService::Admission GossipService::admit_received_record(const nlohmann::json& r) {
+    try {
     // 1. Statement fields. Transport positions are not part of the statement
     //    and never bind it.
     if (!r.is_object() ||
@@ -641,10 +751,18 @@ GossipService::Admission GossipService::admit_received_record(const nlohmann::js
         return Admission::RefusedFinal;
     }
 
-    // 3. Existing operation-derived permissions. A missing check node or
-    //    assignment context is retryable, not a denial; no author
-    //    certificate is part of the contract.
+    // 3. Existing operation-derived permissions. Only a statement no
+    //    operation could ever name is final: an UNKNOWN operation is
+    //    permanently invalid. A known operation that lacks the required
+    //    permission in the CURRENT tree is not necessarily permanently
+    //    invalid — like a missing context it is retryable, and the same
+    //    signed statement is admitted once the context allows it.
     if (tree_) {
+        if (tree_->required_permission_for(rec.operation) == acl::Permission::None) {
+            spdlog::warn("[{}] received record for unknown operation '{}' — "
+                         "refused (final)", name(), rec.operation);
+            return Admission::RefusedFinal;
+        }
         const auto authz = tree_->authorize_delta_statement(
             rec.operation, rec.target_node_id,
             retained_record_node_data(rec), rec.signer_pubkey);
@@ -655,10 +773,10 @@ GossipService::Admission GossipService::admit_received_record(const nlohmann::js
             return Admission::RefusedRetryable;
         }
         if (authz == tree::PermissionTreeService::DeltaAuthorization::Denied) {
-            spdlog::warn("[{}] received record for {} on '{}' does not hold the "
-                         "required permission — refused (final)",
-                         name(), rec.operation, rec.target_node_id);
-            return Admission::RefusedFinal;
+            spdlog::debug("[{}] received record for {} on '{}' lacks the required "
+                          "permission in the current tree — refused (retryable)",
+                          name(), rec.operation, rec.target_node_id);
+            return Admission::RefusedRetryable;
         }
     } else {
         // No tree wired: no permission context exists to evaluate.
@@ -681,6 +799,14 @@ GossipService::Admission GossipService::admit_received_record(const nlohmann::js
             return Admission::Duplicate;
         default:
             return Admission::RefusedRetryable;
+    }
+    } catch (const std::exception& e) {
+        // Hostile content must not escape the admission boundary: any
+        // conversion or allocation failure is a transfer stall, not a crash
+        // and not a final verdict on the statement.
+        spdlog::error("[{}] received record failed to process: {} — refused "
+                      "(retryable)", name(), e.what());
+        return Admission::RefusedRetryable;
     }
 }
 
@@ -773,13 +899,23 @@ std::vector<GossipPeer> GossipService::do_get_peers() const {
 // ---------------------------------------------------------------------------
 
 void GossipService::start_receive() {
+    // Never arm on a closed socket: the completion would fail instantly and
+    // the error path below would rearm forever. A stopped service simply
+    // stops receiving; the same object is not restarted (tests and callers
+    // construct a fresh service over the retained storage).
+    if (!socket_.is_open()) return;
     socket_.async_receive_from(
         asio::buffer(recv_buffer_), remote_endpoint_,
         [this](const asio::error_code& ec, std::size_t bytes) {
             if (!ec) {
                 handle_receive(bytes);
                 start_receive();
-            } else if (ec != asio::error::operation_aborted) {
+            } else if (ec != asio::error::operation_aborted &&
+                       ec != asio::error::bad_descriptor &&
+                       ec != asio::error::not_socket) {
+                // Terminal descriptor errors must not rearm: the descriptor
+                // will not recover by retrying.
+                ++test_receive_error_count_;
                 spdlog::error("[{}] UDP receive error: {}", name(), ec.message());
                 start_receive();
             }
@@ -1015,6 +1151,23 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
                                   "valid JSON; page incomplete", name(), position, hash);
                     break;
                 }
+                // The file may have changed since reconstruction: the
+                // content must still match the indexed identifier, carry the
+                // indexed position, and verify under the author signature.
+                // Corruption at serve time is a bounded page failure, never
+                // a served record.
+                auto served = storage::FileStorageService::RetainedDelta::from_json(*text);
+                const auto served_hash = served ? retained_record_hash(*served, crypto_)
+                                                : std::nullopt;
+                if (!served || served->position != position ||
+                    !served_hash || *served_hash != hash ||
+                    !retained_record_signature_ok(*served, crypto_)) {
+                    page_failed = true;
+                    spdlog::error("[{}] pool record at position {} (hash {}) no "
+                                  "longer verifies against its identifier; page "
+                                  "incomplete", name(), position, hash);
+                    break;
+                }
                 json r;
                 r["position"]       = stored["position"];
                 r["record_hash"]    = stored["record_hash"];
@@ -1068,64 +1221,120 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
         return;
     }
 
-    json j;
     try {
-        j = json::parse(std::string_view{
-            reinterpret_cast<const char*>(payload), payload_len});
-    } catch (const std::exception& e) {
-        spdlog::warn("[{}] failed to parse delta response from {}: {}",
-                      name(), sender_pubkey, e.what());
-        return;
-    }
-
-    const auto nonce = j.value("nonce", std::uint64_t{0});
-    const auto from_pos = j.value("from_pos", std::uint64_t{0});
-    const auto generation = j.value("generation", std::string{});
-    const auto latest_pos = j.value("latest_pos", std::uint64_t{0});
-    const bool complete = j.value("complete", true);
-    if (!j.contains("records") || !j["records"].is_array()) {
-        spdlog::warn("[{}] delta response from {} has no records array — dropped",
-                      name(), sender_pubkey);
-        return;
-    }
-
-    // Bind the response to the outstanding request: the authenticated peer,
-    // the nonce, the requested generation, and the requested position. A
-    // late response after a generation reset is dropped, not merged.
-    bool bound = false;
-    {
-        std::lock_guard lock(transfer_mutex_);
-        auto it = outstanding_.find(sender_pubkey);
-        if (it == outstanding_.end()) {
-            spdlog::warn("[{}] unsolicited delta response from {} — no outstanding "
-                          "request; dropped", name(), sender_pubkey);
+        // The receive side enforces the page bounds itself: a hostile or
+        // buggy peer must not be able to make us allocate or parse beyond
+        // them.
+        if (payload_len > kPageMaxPayloadBytes) {
+            spdlog::warn("[{}] delta response from {} exceeds the payload bound "
+                          "({} > {} bytes) — dropped",
+                          name(), sender_pubkey, payload_len, kPageMaxPayloadBytes);
             return;
         }
-        const auto& req = it->second;
-        bound = (nonce == req.nonce && from_pos == req.from_pos &&
-                 generation == req.generation);
-        if (!bound) {
-            // A stale answer does not consume the real request: the
-            // in-flight answer can still bind to the outstanding slot.
-            spdlog::warn("[{}] stale delta response from {} (nonce/generation/"
-                          "position mismatch); dropped", name(), sender_pubkey);
-        } else {
-            outstanding_.erase(it);
-        }
-    }
-    if (!bound) return;
 
-    // Admit each record. The cursor advances only over the contiguous
-    // accepted prefix: final refusals and duplicates advance it, retryable
-    // refusals stop it, and a gap is a bounded transfer failure that never
-    // advances past the missing record.
-    bool contiguous = true;
-    std::uint64_t cursor_after = from_pos;
-    std::uint64_t expected = from_pos;
-    for (const auto& r : j["records"]) {
-        if (!r.is_object()) { contiguous = false; break; }
-        const auto pos = r.value("position", std::uint64_t{0});
-        if (pos <= expected) {
+        json j = json::parse(std::string_view{
+            reinterpret_cast<const char*>(payload), payload_len});
+        if (!j.is_object()) {
+            spdlog::warn("[{}] delta response from {} is not an object — dropped",
+                          name(), sender_pubkey);
+            return;
+        }
+
+        // The complete envelope is validated, with strict typed reads, before
+        // any transfer state is touched and before the outstanding request
+        // can be consumed. value() would throw on a mistyped present field;
+        // u64_field refuses instead.
+        std::uint64_t nonce = 0, from_pos = 0, latest_pos = 0;
+        if (!u64_field(j, "nonce", nonce) ||
+            !u64_field(j, "from_pos", from_pos) ||
+            !u64_field(j, "latest_pos", latest_pos)) {
+            spdlog::warn("[{}] delta response from {} has malformed envelope "
+                          "fields — dropped", name(), sender_pubkey);
+            return;
+        }
+        std::string generation;
+        if (j.contains("generation")) {
+            if (!j["generation"].is_string() ||
+                j["generation"].get<std::string>().size() > 128) {
+                spdlog::warn("[{}] delta response from {} has a malformed "
+                              "generation field — dropped", name(), sender_pubkey);
+                return;
+            }
+            generation = j["generation"].get<std::string>();
+        }
+        bool complete = true;
+        if (j.contains("complete")) {
+            if (!j["complete"].is_boolean()) {
+                spdlog::warn("[{}] delta response from {} has a malformed complete "
+                              "field — dropped", name(), sender_pubkey);
+                return;
+            }
+            complete = j["complete"].get<bool>();
+        }
+        if (!j.contains("records") || !j["records"].is_array()) {
+            spdlog::warn("[{}] delta response from {} has no records array — dropped",
+                          name(), sender_pubkey);
+            return;
+        }
+        const auto& records = j["records"];
+        if (records.size() > kPageMaxRecords) {
+            spdlog::warn("[{}] delta response from {} carries more than {} records "
+                          "— dropped", name(), sender_pubkey, kPageMaxRecords);
+            return;
+        }
+
+        // Bind the response to the outstanding request: the authenticated
+        // peer, the nonce, the requested generation, and the requested
+        // position. A late response after a generation reset is dropped, not
+        // merged; an EXPIRED request is dropped with its slot freed and
+        // changes nothing — retained records, cursors, nothing.
+        bool bound = false;
+        {
+            std::lock_guard lock(transfer_mutex_);
+            auto it = outstanding_.find(sender_pubkey);
+            if (it == outstanding_.end()) {
+                spdlog::warn("[{}] unsolicited delta response from {} — no outstanding "
+                              "request; dropped", name(), sender_pubkey);
+                return;
+            }
+            const auto& req = it->second;
+            if (req.deadline_ms < steady_ms()) {
+                outstanding_.erase(it);
+                spdlog::warn("[{}] delta response from {} arrived after the request "
+                              "deadline — dropped", name(), sender_pubkey);
+                return;
+            }
+            bound = (nonce == req.nonce && from_pos == req.from_pos &&
+                     generation == req.generation);
+            if (!bound) {
+                // A stale answer does not consume the real request: the
+                // in-flight answer can still bind to the outstanding slot.
+                spdlog::warn("[{}] stale delta response from {} (nonce/generation/"
+                              "position mismatch); dropped", name(), sender_pubkey);
+            } else {
+                outstanding_.erase(it);
+            }
+        }
+        if (!bound) return;
+
+        // Admit each record. The cursor advances only over the contiguous
+        // accepted prefix: final refusals and duplicates advance it, retryable
+        // refusals stop it, and a gap is a bounded transfer failure that never
+        // advances past the missing record.
+        bool contiguous = true;
+        std::uint64_t cursor_after = from_pos;
+        std::uint64_t expected = from_pos;
+        for (const auto& r : records) {
+            if (!r.is_object()) { contiguous = false; break; }
+            std::uint64_t pos = 0;
+            if (!u64_field(r, "position", pos)) {
+                spdlog::warn("[{}] delta response from {} has a record with a "
+                              "malformed position — page not advanced further",
+                              name(), sender_pubkey);
+                contiguous = false;
+                break;
+            }
+            if (pos <= expected) {
             spdlog::warn("[{}] non-increasing position {} in page from {} — page "
                           "inconsistent; not advancing further",
                           name(), pos, sender_pubkey);
@@ -1139,16 +1348,16 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
             contiguous = false;
             break;
         }
-        expected = pos;
-        const auto admission = admit_received_record(r);
-        if (admission == Admission::Accepted || admission == Admission::Duplicate ||
-            admission == Admission::RefusedFinal) {
-            cursor_after = expected;
-            continue;
+            expected = pos;
+            const auto admission = admit_received_record(r);
+            if (admission == Admission::Accepted || admission == Admission::Duplicate ||
+                admission == Admission::RefusedFinal) {
+                cursor_after = expected;
+                continue;
+            }
+            contiguous = false;  // RefusedRetryable: stall, do not advance
+            break;
         }
-        contiguous = false;  // RefusedRetryable: stall, do not advance
-        break;
-    }
 
     // Publish the cursor under the generation binding.
     bool advanced = false;
@@ -1205,8 +1414,16 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
         if (!in_backoff) maybe_request_from(sender_pubkey, ep, next_cursor);
     }
 
-    spdlog::info("[{}] delta page from {}: {} record(s), cursor now {} (latest {})",
-                   name(), sender_pubkey, j["records"].size(), cursor_now, latest_pos);
+        spdlog::info("[{}] delta page from {}: {} record(s), cursor now {} (latest {})",
+                       name(), sender_pubkey, records.size(), cursor_now, latest_pos);
+    } catch (const std::exception& e) {
+        // Malformed input must not escape the receive callback: a throw out
+        // of an asio completion handler terminates the process. Whatever
+        // was safely retained before the failure stays retained; the rest of
+        // the page is dropped.
+        spdlog::error("[{}] delta response from {} failed to process: {} — the "
+                      "rest of the page is dropped", name(), sender_pubkey, e.what());
+    }
 }
 
 void GossipService::handle_anti_entropy(const asio::ip::udp::endpoint& sender,
