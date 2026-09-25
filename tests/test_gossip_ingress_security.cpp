@@ -19,7 +19,6 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
-#include <LemonadeNexus/Gossip/MisbehaviorDetector.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/IPAM/IPAMTypes.hpp>
@@ -410,28 +409,6 @@ protected:
             {"signature", sign_b64(signer, canonical)},
         };
     }
-
-    // Bundle two statements against `accused` without any dispositiveness
-    // check — this is what a hostile reporter can always build.
-    gossip::MisbehaviorProof forge_proof(const std::string& accused_pubkey_b64,
-                                         const nlohmann::json& a,
-                                         const nlohmann::json& b,
-                                         const std::string& reporter_pubkey_b64) {
-        gossip::MisbehaviorProof proof;
-        proof.kind            = gossip::MisbehaviorKind::TreeDeltaEquivocation;
-        proof.accused_pubkey  = accused_pubkey_b64;
-        proof.statement_a     = a.dump();
-        proof.statement_b     = b.dump();
-        proof.reporter_pubkey = reporter_pubkey_b64;
-        proof.observed_at     = 1000;
-        proof.proof_id        = gossip::misbehavior_proof_id(
-            proof.kind, proof.accused_pubkey, proof.statement_a, proof.statement_b, *kc);
-        return proof;
-    }
-
-    static std::vector<uint8_t> proof_payload(const gossip::MisbehaviorProof& proof) {
-        return bytes_of(nlohmann::json(proof).dump());
-    }
 };
 
 }  // namespace
@@ -444,7 +421,7 @@ protected:
 // database. Control: the IDENTICAL payload bytes from a cert-verified peer are
 // applied, so neither the delta signature, the delta id, nor the wire encoding
 // can explain the refusal — only the sender's certificate does.
-TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertifiedAuthorAndSender) {
+TEST_F(GossipIngressSecurityTest, AclDeltaFromCertifiedPeerIsRefusedAndRowsUntouched) {
     auto root_kp   = kc->ed25519_keygen();
     auto certified = kc->ed25519_keygen();
     auto outsider  = kc->ed25519_keygen();
@@ -468,36 +445,46 @@ TEST_F(GossipIngressSecurityTest, AclDeltaRequiresCertifiedAuthorAndSender) {
 
     ASSERT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
 
-    // Authored by an uncertified key, forwarded by an uncertified peer.
+    // Remote ACL mutation is unavailable pending finalized mesh authority:
+    // every shape below must leave the row untouched — uncertified author
+    // and sender, laundered bytes, uncertified forwarder, and finally the
+    // certified author behind the certified forwarder. A certificate-verified
+    // author is not a permission authority.
     const auto outsider_authored = acl_delta_payload(
         outsider, "delta-acl-1", "user-1", "res-1",
         static_cast<uint32_t>(acl::Permission::Read | acl::Permission::Write));
+    const auto certified_authored = acl_delta_payload(
+        certified, "delta-acl-2", "user-1", "res-1",
+        static_cast<uint32_t>(acl::Permission::Read | acl::Permission::Write));
+
     inject(build_packet(outsider, gossip::GossipMsgType::AclDelta, outsider_authored), a);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
 
-    // Laundering: the SAME uncertified-author bytes relayed by the certified
-    // peer. The forwarder's certificate must not stand in for the author's.
     inject(build_packet(certified, gossip::GossipMsgType::AclDelta, outsider_authored), a);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
 
-    // Certified author behind an uncertified forwarder: still refused at the
-    // transport gate.
-    const auto certified_authored = acl_delta_payload(
-        certified, "delta-acl-2", "user-1", "res-1",
-        static_cast<uint32_t>(acl::Permission::Read | acl::Permission::Write));
     inject(build_packet(outsider, gossip::GossipMsgType::AclDelta, certified_authored), a);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
 
-    // Control: certified author, certified forwarder — applied.
+    // The delta id is not marked seen and no forwarding signal is produced:
+    // a resend is refused again, and a different delta id is refused too.
     inject(build_packet(certified, gossip::GossipMsgType::AclDelta, certified_authored), a);
-    ASSERT_TRUE(pump_until([&] {
-        return a.acl->get_permissions("user-1", "res-1") != acl::Permission::None;
-    }));
-    EXPECT_TRUE(a.acl->check("user-1", "res-1",
-                             acl::Permission::Read | acl::Permission::Write));
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
+    inject(build_packet(certified, gossip::GossipMsgType::AclDelta,
+                        acl_delta_payload(certified, "delta-acl-3", "user-1", "res-1",
+                                           static_cast<uint32_t>(acl::Permission::Read))), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::None);
+
+    // Control: the local service API is alive — the refusal is at the remote
+    // mutation boundary, not in the store.
+    ASSERT_TRUE(a.acl->grant("user-1", "res-1", acl::Permission::Read));
+    EXPECT_EQ(a.acl->get_permissions("user-1", "res-1"), acl::Permission::Read);
+    EXPECT_TRUE(a.acl->check("user-1", "res-1", acl::Permission::Read));
 }
 
 // ---------------------------------------------------------------------------
@@ -635,7 +622,7 @@ TEST_F(GossipIngressSecurityTest, BackboneIpamSyncRequiresCertifiedSelfClaim) {
 // Control: a genuinely dispositive proof — two statements the victim signed at
 // the SAME (target, sequence) with differing content — does ban and does drop
 // the peer, proving the ban path is live and only dispositiveness held it back.
-TEST_F(GossipIngressSecurityTest, HostileMisbehaviorProofDoesNotBanTheAccused) {
+TEST_F(GossipIngressSecurityTest, MisbehaviorProofIsNotProcessedAndCannotBan) {
     auto root_kp  = kc->ed25519_keygen();
     auto victim   = kc->ed25519_keygen();
     auto attacker = kc->ed25519_keygen();
@@ -655,47 +642,31 @@ TEST_F(GossipIngressSecurityTest, HostileMisbehaviorProofDoesNotBanTheAccused) {
     ASSERT_TRUE(a.certified_peer(victim_b64));
     ASSERT_FALSE(a.revoked(victim_b64));
 
-    // (a) Frame-up: the statements really do conflict, but with each other's
-    // signer being the attacker. Naming the victim as accused does not make
-    // the attacker's signatures the victim's.
-    const auto forged_1 = tree_delta(attacker, "node-z", 7, nlohmann::json{{"k", "one"}});
-    const auto forged_2 = tree_delta(attacker, "node-z", 7, nlohmann::json{{"k", "two"}});
-    inject(build_packet(attacker, gossip::GossipMsgType::MisbehaviorProofBroadcast,
-                        proof_payload(forge_proof(victim_b64, forged_1, forged_2,
-                                                  attacker_b64))),
-           a);
+    // The sequence-based tree proof path is retired: transport positions do
+    // not establish equivocation, and no ban is ever issued from a received
+    // record. Even a genuinely dispositive-shaped proof — the victim really
+    // did sign two conflicting statements at the same (target, position) —
+    // must not revoke, drop the peer, or re-broadcast.
+    const auto s1 = tree_delta(victim, "node-z", 9, nlohmann::json{{"k", "one"}});
+    const auto s2 = tree_delta(victim, "node-z", 9, nlohmann::json{{"k", "two"}});
+    nlohmann::json proof;
+    proof["kind"]            = 1;
+    proof["accused_pubkey"]  = victim_b64;
+    proof["statement_a"]     = s1.dump();
+    proof["statement_b"]     = s2.dump();
+    proof["reporter_pubkey"] = attacker_b64;
+    proof["observed_at"]     = 1000;
+    proof["proof_id"]        = "deadbeef";
+    auto proof_bytes = proof.dump();
+    std::vector<uint8_t> proof_payload(proof_bytes.begin(), proof_bytes.end());
 
-    // (b) Non-dispositive: both statements carry the victim's real signature,
-    // but they sit at different sequences — that is honest behaviour, not
-    // equivocation.
-    const auto honest_1 = tree_delta(victim, "node-z", 1, nlohmann::json{{"k", "one"}});
-    const auto honest_2 = tree_delta(victim, "node-z", 2, nlohmann::json{{"k", "two"}});
     inject(build_packet(attacker, gossip::GossipMsgType::MisbehaviorProofBroadcast,
-                        proof_payload(forge_proof(victim_b64, honest_1, honest_2,
-                                                  attacker_b64))),
+                        proof_payload),
            a);
-
     pump_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(a.revoked(victim_b64));
     EXPECT_TRUE(a.has_peer(victim_b64));
     EXPECT_TRUE(a.certified_peer(victim_b64));
-
-    // Control: real equivocation by the victim. Built through the production
-    // constructor, which returns nullopt unless the pair is provably
-    // dispositive — so the control cannot silently degrade into a fabrication.
-    const auto guilty_1 = tree_delta(victim, "node-z", 9, nlohmann::json{{"k", "one"}});
-    const auto guilty_2 = tree_delta(victim, "node-z", 9, nlohmann::json{{"k", "two"}});
-    const auto real_proof = gossip::make_tree_delta_equivocation_proof(
-        guilty_1, guilty_2, attacker_b64, 1000, *kc);
-    ASSERT_TRUE(real_proof.has_value());
-    ASSERT_EQ(real_proof->accused_pubkey, victim_b64);
-
-    inject(build_packet(attacker, gossip::GossipMsgType::MisbehaviorProofBroadcast,
-                        proof_payload(*real_proof)),
-           a);
-    ASSERT_TRUE(pump_until([&] { return a.revoked(victim_b64); }));
-    EXPECT_FALSE(a.has_peer(victim_b64));
-    EXPECT_FALSE(a.certified_peer(victim_b64));
 }
 
 // ---------------------------------------------------------------------------

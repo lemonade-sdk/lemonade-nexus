@@ -56,6 +56,10 @@ struct GossipBallotTestAccess {
     static const NsSlotClaimData& ns_slot(GossipService& g, uint8_t slot) {
         return g.ns_slots_[slot - 1];
     }
+    static bool has_peer_log(GossipService& g, const std::string& pubkey_b64) {
+        std::lock_guard lock(g.transfer_mutex_);
+        return g.peer_logs_.count(pubkey_b64) != 0;
+    }
 };
 }  // namespace nexus::gossip
 
@@ -373,12 +377,16 @@ TEST_F(LegacyRemovalTest, RetiredTypeFromCertifiedPeerIsEquallyDead) {
     EXPECT_EQ(a.storage->latest_delta_seq(), 0u);
 
     // Control: the SAME bytes from the SAME identity under the live
-    // DeltaResponse type are accepted. The retired types died on type alone.
+    // DeltaResponse type also change nothing: the legacy payload shape is
+    // not a bound page of the current transfer protocol (no records array,
+    // no outstanding request). Receipt of a delta has never applied it; the
+    // retired type byte remains the first wall.
     inject(build_packet(*b.crypto, b.gossip->keypair(),
                         gossip::GossipMsgType::DeltaResponse,
                         delta_response_payload(delta)),
            a);
-    ASSERT_TRUE(pump_until([&] { return a.storage->latest_delta_seq() == 1; }));
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.storage->latest_delta_seq(), 0u);
     EXPECT_TRUE(a.received.empty());  // sync is not a security envelope
 }
 
@@ -419,17 +427,32 @@ TEST_F(LegacyRemovalTest, StateMutatingSyncRequiresRootSignedCertificate) {
     pump_for(std::chrono::milliseconds(300));
     EXPECT_EQ(a.storage->latest_delta_seq(), 0u);
 
-    // Cert-verified sender: the same shape applies.
-    const auto honest = make_signed_delta(*b.crypto, b.gossip->keypair(), "node-b", 1);
-    inject(build_packet(*b.crypto, b.gossip->keypair(),
-                        gossip::GossipMsgType::DeltaResponse,
-                        delta_response_payload(honest)),
+    // State-mutating sync ingress under the current protocol: a digest
+    // allocates per-peer transfer session state. The cert gate decides: the
+    // cert-verified sender's digest is admitted; the unenrolled key's
+    // identical digest allocates nothing.
+    auto digest_bytes = []() {
+        nlohmann::json d;
+        d["latest_pos"]     = 1u;
+        d["log_generation"] = "abcdef0123456789abcdef0123456789";
+        d["peer_count"]     = 1u;
+        d["timestamp"]      = 1000u;
+        return bytes_of(d.dump());
+    };
+    const auto unenrolled_b64 = crypto::to_base64(unenrolled.public_key);
+    inject(build_packet(*b.crypto, unenrolled, gossip::GossipMsgType::Digest,
+                        digest_bytes()),
            a);
-    ASSERT_TRUE(pump_until([&] { return a.storage->latest_delta_seq() == 1; }));
-    const auto applied = a.storage->read_delta(1);
-    ASSERT_TRUE(applied.has_value());
-    EXPECT_EQ(applied->target_node_id, "node-b");
-    EXPECT_EQ(applied->signer_pubkey, b.pubkey_b64());
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::has_peer_log(*a.gossip, unenrolled_b64))
+        << "an unenrolled digest must allocate no transfer state";
+    inject(build_packet(*b.crypto, b.gossip->keypair(),
+                        gossip::GossipMsgType::Digest, digest_bytes()),
+           a);
+    ASSERT_TRUE(pump_until([&] {
+        return gossip::GossipBallotTestAccess::has_peer_log(*a.gossip, b.pubkey_b64());
+    }));
+    EXPECT_EQ(a.storage->latest_delta_seq(), 0u);
 }
 
 // (d) With the full security mesh attached, retired-type packets leave the

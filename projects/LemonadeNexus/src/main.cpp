@@ -155,6 +155,17 @@ int main(int argc, char* argv[]) {
         }
     }
     gossip.set_ipam(&ipam);
+
+    // Tree record transfer: the tree retains applied signed statements
+    // through gossip's bounded pool (transfer only, never re-applies them),
+    // and gossip evaluates received records against the tree's existing
+    // operation-derived permissions.
+    tree.set_delta_retention_sink(
+        [&gossip](const nexus::storage::FileStorageService::RetainedDelta& rec) {
+            return gossip.retain_local_delta(rec);
+        });
+    gossip.set_tree(&tree);
+
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
     }

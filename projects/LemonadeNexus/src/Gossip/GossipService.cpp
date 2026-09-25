@@ -1,9 +1,10 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
-#include <LemonadeNexus/Gossip/MisbehaviorDetector.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -20,6 +21,79 @@ namespace nexus::gossip {
 using json = nlohmann::json;
 using asio::ip::udp;
 namespace chrono = std::chrono;
+
+namespace {
+
+std::uint64_t steady_ms() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// Strip an optional "ed25519:" prefix to the bare base64 certificate form
+// used by the revocation list.
+std::string normalize_pubkey(std::string_view pk) {
+    return pk.starts_with("ed25519:") ? std::string(pk.substr(8)) : std::string(pk);
+}
+
+// The retained record's canonical statement (the signed content). The
+// supplied record_hash is never trusted; identity is recomputed from the
+// parsed fields at every boundary.
+nlohmann::json retained_record_node_data(const storage::FileStorageService::RetainedDelta& rec) {
+    return nlohmann::json::parse(rec.data, nullptr, false);
+}
+
+bool retained_record_is_malformed(const storage::FileStorageService::RetainedDelta& rec) {
+    if (rec.operation.empty() || rec.target_node_id.empty() ||
+        rec.signer_pubkey.empty() || rec.signature.empty()) {
+        return true;
+    }
+    const auto nd = retained_record_node_data(rec);
+    return nd.is_discarded() || !nd.is_object();
+}
+
+std::string retained_record_hash(const storage::FileStorageService::RetainedDelta& rec,
+                                  crypto::SodiumCryptoService& crypto) {
+    tree::TreeDelta td;
+    td.operation      = rec.operation;
+    td.target_node_id = rec.target_node_id;
+    td.node_data      = retained_record_node_data(rec);
+    td.signer_pubkey  = rec.signer_pubkey;
+    td.signature      = rec.signature;
+    td.timestamp      = rec.timestamp;
+    const auto canonical = tree::canonical_delta_json(td);
+    const auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    return crypto::to_hex(crypto.sha256(msg));
+}
+
+bool retained_record_signature_ok(const storage::FileStorageService::RetainedDelta& rec,
+                                   crypto::SodiumCryptoService& crypto) {
+    if (!rec.signer_pubkey.starts_with("ed25519:")) return false;
+    tree::TreeDelta td;
+    td.operation      = rec.operation;
+    td.target_node_id = rec.target_node_id;
+    td.node_data      = retained_record_node_data(rec);
+    td.signer_pubkey  = rec.signer_pubkey;
+    td.signature      = rec.signature;
+    td.timestamp      = rec.timestamp;
+    const auto canonical = tree::canonical_delta_json(td);
+    const auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    const auto pk  = crypto::from_base64(rec.signer_pubkey.substr(8));
+    const auto sig = crypto::from_base64(rec.signature);
+    if (pk.size() != crypto::kEd25519PublicKeySize ||
+        sig.size() != crypto::kEd25519SignatureSize) {
+        return false;
+    }
+    crypto::Ed25519PublicKey pub{};
+    crypto::Ed25519Signature s{};
+    std::memcpy(pub.data(), pk.data(), pk.size());
+    std::memcpy(s.data(), sig.data(), sig.size());
+    return crypto.ed25519_verify(pub, msg, s);
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Construction
@@ -103,51 +177,64 @@ void GossipService::on_start() {
     // Load known peers
     load_peers();
 
+    // Reconstruct the transfer pool index before any transfer state can move
+    // (bounded; pool files are preserved on any failure).
+    reconstruct_transfer_pool();
+
     // Send ServerHello to all known peers on startup (before starting async loops).
     // If we need a tunnel IP, include the request flag so a peer allocates one for us.
     {
-        std::lock_guard lock(peers_mutex_);
-
-        spdlog::info("[{}] listening on UDP port {} (pubkey: {}, peers: {})",
-                      name(), port_,
-                      crypto::to_base64(keypair_.public_key),
-                      peers_.size());
-
-        if (our_certificate_ && !peers_.empty()) {
-            bool need_tunnel_ip = ipam_ && our_tunnel_ip_.empty();
-            // Check if IPAM already has our allocation
-            if (need_tunnel_ip && our_certificate_) {
-                auto existing = ipam_->get_allocation(our_certificate_->server_id);
-                if (existing && existing->tunnel) {
-                    auto ip = existing->tunnel->base_network;
-                    if (auto slash = ip.find('/'); slash != std::string::npos)
-                        ip = ip.substr(0, slash);
-                    our_tunnel_ip_ = ip;
-                    need_tunnel_ip = false;
-                }
+        std::vector<std::string> endpoints;
+        bool have_cert = false;
+        {
+            std::lock_guard lock(peers_mutex_);
+            spdlog::info("[{}] listening on UDP port {} (pubkey: {}, peers: {})",
+                          name(), port_,
+                          crypto::to_base64(keypair_.public_key),
+                          peers_.size());
+            if (our_certificate_ && !peers_.empty()) {
+                have_cert = true;
+                for (const auto& p : peers_) endpoints.push_back(p.endpoint);
             }
-
+        }
+        if (have_cert) {
             json hello = *our_certificate_;
-            if (need_tunnel_ip) {
-                hello["request_tunnel_ip"] = true;
-            }
-            if (!our_region_.empty()) {
-                hello["region"] = our_region_;
-            }
-            if (!our_advertised_endpoint_.empty()) {
-                hello["advertised_endpoint"] = our_advertised_endpoint_;
+            bool need_tunnel_ip = false;
+            {
+                std::lock_guard lock(mesh_state_mutex_);
+                need_tunnel_ip = ipam_ && our_tunnel_ip_.empty();
+                // Check if IPAM already has our allocation
+                if (need_tunnel_ip) {
+                    auto existing = ipam_->get_allocation(our_certificate_->server_id);
+                    if (existing && existing->tunnel) {
+                        auto ip = existing->tunnel->base_network;
+                        if (auto slash = ip.find('/'); slash != std::string::npos)
+                            ip = ip.substr(0, slash);
+                        our_tunnel_ip_ = ip;
+                        need_tunnel_ip = false;
+                    }
+                }
+                if (need_tunnel_ip) {
+                    hello["request_tunnel_ip"] = true;
+                }
+                if (!our_region_.empty()) {
+                    hello["region"] = our_region_;
+                }
+                if (!our_advertised_endpoint_.empty()) {
+                    hello["advertised_endpoint"] = our_advertised_endpoint_;
+                }
             }
             auto payload_str = hello.dump();
             std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
 
-            for (const auto& peer : peers_) {
-                auto target = parse_endpoint(peer.endpoint);
+            for (const auto& ep : endpoints) {
+                auto target = parse_endpoint(ep);
                 if (target) {
                     send_packet(*target, GossipMsgType::ServerHello, payload_bytes);
                 }
             }
             spdlog::info("[{}] sent ServerHello to {} peers (request_tunnel_ip: {})",
-                          name(), peers_.size(), need_tunnel_ip);
+                          name(), endpoints.size(), need_tunnel_ip);
         }
     }
 
@@ -234,241 +321,446 @@ void GossipService::do_send_digest(const GossipPeer& peer) {
         return;
     }
 
-    const auto our_seq = storage_.latest_delta_seq();
+    std::string generation;
+    std::uint64_t latest_pos = 0;
+    {
+        std::lock_guard lock(transfer_mutex_);
+        generation = pool_generation_;
+        latest_pos = pool_latest_position_locked();
+    }
 
-    // Build digest JSON payload
+    // Build digest JSON payload. The digest carries this node's transfer-pool
+    // position and log generation — node-local values that never bind any
+    // record.
     json digest;
-    digest["latest_seq"] = our_seq;
-    digest["peer_count"] = static_cast<uint32_t>(peers_.size());
-    digest["timestamp"] = static_cast<uint64_t>(
+    digest["latest_pos"] = latest_pos;
+    digest["log_generation"] = generation;
+    digest["peer_count"] = static_cast<std::uint32_t>(peer_count());
+    digest["timestamp"] = static_cast<std::uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
-
-    // Compute tree hash: SHA-256 of all delta sequences concatenated
-    // For now, hash the latest sequence number as a simple tree hash
-    std::vector<uint8_t> seq_bytes(sizeof(our_seq));
-    std::memcpy(seq_bytes.data(), &our_seq, sizeof(our_seq));
-    auto hash = crypto_.sha256(seq_bytes);
-    digest["tree_hash"] = crypto::to_base64(hash);
 
     auto payload_str = digest.dump();
     std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
 
     send_packet(*target, GossipMsgType::Digest, payload);
-    spdlog::debug("[{}] sent digest to {} (seq={})", name(), peer.endpoint, our_seq);
+    spdlog::debug("[{}] sent digest to {} (pos={}, generation={})",
+                   name(), peer.endpoint, latest_pos, generation.substr(0, 8));
 }
 
-void GossipService::do_handle_digest(const GossipPeer& peer, uint64_t their_seq,
-                                       const std::array<uint8_t, 32>& their_hash) {
-    const auto our_seq = storage_.latest_delta_seq();
+void GossipService::do_handle_digest(const GossipPeer& peer, uint64_t their_pos,
+                                       const std::string& their_generation) {
+    // Identity is the authenticated packet signer (passed through as
+    // peer.pubkey by the handler), not the NAT-able endpoint.
+    if (peer.pubkey.empty()) return;
 
-    spdlog::debug("[{}] received digest from {} (their_seq={}, our_seq={})",
-                   name(), peer.endpoint, their_seq, our_seq);
+    uint64_t from_pos = 0;
+    {
+        std::lock_guard lock(transfer_mutex_);
+        const auto now = steady_ms();
 
-    if (their_seq > our_seq) {
-        // They have deltas we don't — request them
-        auto target = parse_endpoint(peer.endpoint);
-        if (!target) return;
+        // Cap the per-peer log before allocating state for a new identity.
+        if (!peer_logs_.count(peer.pubkey) && peer_logs_.size() >= peer_log_cap()) {
+            evict_idle_peer_logs_locked(now);
+            if (peer_logs_.size() >= peer_log_cap()) {
+                spdlog::debug("[{}] no transfer state for digest from {} — peer log "
+                              "cap reached", name(), peer.pubkey);
+                return;
+            }
+        }
 
-        json request;
-        request["from_seq"] = our_seq;
+        auto& st = peer_logs_[peer.pubkey];
+        st.last_digest_ms = now;
 
-        auto payload_str = request.dump();
-        std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
-        send_packet(*target, GossipMsgType::DeltaRequest, payload);
+        if (!their_generation.empty() && st.generation != their_generation) {
+            // New log generation: positions from the old log mean nothing.
+            // Invalidate the outstanding request and reset the cursor. The
+            // stall budget and backoff persist — a new log is not a retry
+            // reset.
+            st.generation = their_generation;
+            st.cursor = 0;
+            outstanding_.erase(peer.pubkey);
+        }
 
-        spdlog::debug("[{}] requesting deltas from {} since seq {}",
-                       name(), peer.endpoint, our_seq);
+        if (their_generation.empty()) return;  // reports no generation: nothing to request
+        if (st.backoff_until_ms > now) return; // exhausted budget: repeated digests do not reset it
+        if (their_pos <= st.cursor) return;    // caught up
 
-    } else if (our_seq > their_seq) {
-        // We have deltas they don't — send them proactively
-        do_send_deltas(peer, their_seq);
+        from_pos = st.cursor;
+    }
+
+    spdlog::debug("[{}] digest from {} (their_pos={}, generation={})",
+                   name(), peer.endpoint, their_pos, their_generation.substr(0, 8));
+    maybe_request_from(peer.pubkey, peer.endpoint, from_pos);
+}
+
+// ---------------------------------------------------------------------------
+// Delta record transfer: pool index, retention, admission, requests
+// ---------------------------------------------------------------------------
+
+std::uint64_t GossipService::pool_latest_position_locked() const {
+    return pool_position_index_.empty()
+               ? 0
+               : pool_position_index_.rbegin()->first;
+}
+
+std::string GossipService::make_pool_generation_locked() {
+    std::array<uint8_t, 16> buf{};
+    crypto_.random_bytes(std::span<uint8_t>(buf));
+    return crypto::to_hex(std::span<const uint8_t>(buf));
+}
+
+void GossipService::reconstruct_transfer_pool() {
+    std::lock_guard lock(transfer_mutex_);
+
+    // Rebuild from scratch: the index is always re-derived from the pool
+    // files, never merged with a previous reconstruction.
+    pool_position_index_.clear();
+    pool_hash_to_position_.clear();
+    pool_verified_.clear();
+    pool_excluded_.clear();
+    pool_verified_bytes_ = 0;
+    pool_excluded_bytes_ = 0;
+    pool_next_position_ = 1;
+    pool_available_ = false;
+    pool_reconstructed_ = false;
+
+    const auto unavailable = [this](std::string_view why) {
+        pool_available_ = false;
+        pool_reconstructed_ = true;
+        spdlog::critical("[{}] transfer pool unavailable: {} — pool files are "
+                         "preserved; transfer and new retention are refused",
+                         name(), why);
+    };
+
+    const auto max_records = effective_pool_max_records();
+    const auto max_bytes = effective_pool_max_bytes();
+
+    // Enforce the bounds before reading any record content.
+    const auto entries = storage_.list_pool_entries();
+    std::uint64_t total_bytes = 0;
+    for (const auto& e : entries) {
+        if (e.size_bytes > max_bytes) { total_bytes = max_bytes + 1; break; }
+        total_bytes += e.size_bytes;
+    }
+    if (entries.size() > max_records) {
+        unavailable("pool entry count " + std::to_string(entries.size()) +
+                    " exceeds the bound " + std::to_string(max_records));
+        return;
+    }
+    if (total_bytes > max_bytes) {
+        unavailable("pool byte total " + std::to_string(total_bytes) +
+                    " exceeds the bound " + std::to_string(max_bytes));
+        return;
+    }
+
+    // Generation metadata must be consistent with the records.
+    if (auto meta = storage_.read_pool_generation()) {
+        pool_generation_ = *meta;
     } else {
-        // Same sequence — compare tree hashes
-        std::vector<uint8_t> seq_bytes(sizeof(our_seq));
-        std::memcpy(seq_bytes.data(), &our_seq, sizeof(our_seq));
-        auto our_hash = crypto_.sha256(seq_bytes);
-
-        if (our_hash != their_hash) {
-            spdlog::warn("[{}] sequence match but tree hash mismatch with {} — "
-                          "anti-entropy needed", name(), peer.endpoint);
-            // Could trigger AntiEntropy here in a future iteration
+        if (!entries.empty()) {
+            unavailable("records exist without generation metadata");
+            return;
+        }
+        pool_generation_ = make_pool_generation_locked();
+        if (!storage_.write_pool_generation(pool_generation_)) {
+            unavailable("cannot persist pool generation");
+            return;
         }
     }
-}
 
-void GossipService::do_send_deltas(const GossipPeer& peer, uint64_t from_seq) {
-    auto target = parse_endpoint(peer.endpoint);
-    if (!target) return;
-
-    auto deltas = storage_.read_deltas_since(from_seq);
-    if (deltas.empty()) {
-        spdlog::debug("[{}] no deltas to send to {} since seq {}",
-                       name(), peer.endpoint, from_seq);
-        return;
-    }
-
-    json response;
-    json deltas_array = json::array();
-
-    for (const auto& delta : deltas) {
-        json d;
-        d["sequence"]            = delta.sequence;
-        d["operation"]           = delta.operation;
-        d["target_node_id"]      = delta.target_node_id;
-        d["data"]                = json::parse(delta.data, nullptr, false);
-        d["signer_pubkey"]       = delta.signer_pubkey;
-        d["required_permission"] = delta.required_permission;
-        d["signature"]           = delta.signature;
-        d["timestamp"]           = delta.timestamp;
-        deltas_array.push_back(std::move(d));
-    }
-
-    response["deltas"] = std::move(deltas_array);
-    response["from_seq"] = from_seq;
-
-    auto payload_str = response.dump();
-    std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
-    send_packet(*target, GossipMsgType::DeltaResponse, payload);
-
-    spdlog::debug("[{}] sent {} deltas to {} (from_seq={})",
-                   name(), deltas.size(), peer.endpoint, from_seq);
-}
-
-void GossipService::do_handle_deltas(const GossipPeer& peer,
-                                       const nlohmann::json& deltas_json) {
-    if (!deltas_json.contains("deltas") || !deltas_json["deltas"].is_array()) {
-        spdlog::warn("[{}] invalid deltas payload from {}", name(), peer.endpoint);
-        return;
-    }
-
-    std::size_t applied = 0;
-    std::size_t rejected = 0;
-
-    for (const auto& d : deltas_json["deltas"]) {
-        storage::SignedDelta delta;
-        delta.sequence            = d.value("sequence", uint64_t{0});
-        delta.operation           = d.value("operation", "");
-        delta.target_node_id      = d.value("target_node_id", "");
-        delta.signer_pubkey       = d.value("signer_pubkey", "");
-        delta.required_permission = d.value("required_permission", "");
-        delta.signature           = d.value("signature", "");
-        delta.timestamp           = d.value("timestamp", uint64_t{0});
-
-        if (d.contains("data")) {
-            delta.data = d["data"].dump();
-        }
-
-        // Reject unsigned deltas — all deltas MUST be signed
-        if (delta.signer_pubkey.empty() || delta.signature.empty()) {
-            spdlog::warn("[{}] delta seq {} from {} is unsigned, rejecting",
-                          name(), delta.sequence, peer.endpoint);
-            ++rejected;
+    for (const auto& e : entries) {
+        if (e.temporary) {
+            // In-flight or orphaned temp files count as storage; they are
+            // never indexed.
+            pool_excluded_bytes_ += e.size_bytes;
+            spdlog::warn("[{}] ignoring stale pool temp file {} ({} bytes)",
+                         name(), e.hash, e.size_bytes);
             continue;
         }
 
-        // Validate the delta's Ed25519 signature
-        {
-            try {
-                // Extract the raw public key from "ed25519:base64..." format
-                std::string_view pk_str = delta.signer_pubkey;
-                if (pk_str.starts_with("ed25519:")) {
-                    pk_str.remove_prefix(8);
-                }
-                auto pk_bytes = crypto::from_base64(pk_str);
-                auto sig_bytes = crypto::from_base64(delta.signature);
-
-                if (pk_bytes.size() == crypto::kEd25519PublicKeySize &&
-                    sig_bytes.size() == crypto::kEd25519SignatureSize) {
-
-                    crypto::Ed25519PublicKey pub{};
-                    crypto::Ed25519Signature sig{};
-                    std::memcpy(pub.data(), pk_bytes.data(), crypto::kEd25519PublicKeySize);
-                    std::memcpy(sig.data(), sig_bytes.data(), crypto::kEd25519SignatureSize);
-
-                    // Verify signature over the FULL delta (not just data)
-                    // to prevent replay with modified operation/target
-                    std::string canonical =
-                        delta.operation + "\n" +
-                        delta.target_node_id + "\n" +
-                        std::to_string(delta.sequence) + "\n" +
-                        delta.required_permission + "\n" +
-                        std::to_string(delta.timestamp) + "\n" +
-                        delta.data;
-                    auto canonical_bytes = std::vector<uint8_t>(
-                        canonical.begin(), canonical.end());
-                    if (!crypto_.ed25519_verify(pub, canonical_bytes, sig)) {
-                        spdlog::warn("[{}] delta seq {} from {} has invalid signature, skipping",
-                                      name(), delta.sequence, peer.endpoint);
-                        ++rejected;
-                        continue;
-                    }
-                } else {
-                    spdlog::warn("[{}] delta seq {} has malformed key/sig, skipping",
-                                  name(), delta.sequence);
-                    ++rejected;
-                    continue;
-                }
-            } catch (const std::exception& e) {
-                spdlog::warn("[{}] delta sig verification failed: {}", name(), e.what());
-                ++rejected;
-                continue;
+        storage::FileStorageService::PoolRead result;
+        auto text = storage_.read_pool_record(e.hash, kMaxRetainedRecordBytes, result);
+        if (result == storage::FileStorageService::PoolRead::Oversized) {
+            pool_excluded_.insert(e.hash);
+            pool_excluded_bytes_ += e.size_bytes;
+            spdlog::critical("[{}] pool record {} exceeds the per-record bound "
+                             "({} bytes); excluded from the index, file preserved",
+                             name(), e.hash, e.size_bytes);
+            continue;
+        }
+        if (!text.has_value()) {
+            if (result == storage::FileStorageService::PoolRead::IoError) {
+                unavailable("pool record " + e.hash + " exists but cannot be read");
+                return;
             }
+            continue;  // absent: skipped, the identifier stays free
         }
 
-        // Equivocation detection (signature already verified above): if this signer
-        // previously signed a DIFFERENT statement at the same (target_node_id,
-        // sequence), that is non-repudiable proof it equivocated. Mint a proof, ban
-        // the signer, gossip the proof, and refuse to apply the conflicting delta.
-        {
-            std::string id = normalize_pubkey(delta.signer_pubkey) + "\x1f" +
-                             delta.target_node_id + "\x1f" + std::to_string(delta.sequence);
-            std::string current = d.dump();
-            std::string prev;
-            {
-                std::lock_guard lk(seen_statements_mutex_);
-                auto it = seen_statements_.find(id);
-                if (it != seen_statements_.end()) {
-                    prev = it->second;
-                } else if (seen_statements_.size() >= kMaxSeenStatements) {
-                    seen_statements_.clear();  // bounded; only loses detection memory
-                }
-                seen_statements_[id] = current;
-            }
-            if (!prev.empty() && prev != current) {
-                try {
-                    auto prev_json = json::parse(prev);
-                    auto now = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
-                        chrono::system_clock::now().time_since_epoch()).count());
-                    auto proof = make_tree_delta_equivocation_proof(
-                        prev_json, d, crypto::to_base64(keypair_.public_key), now, crypto_);
-                    if (proof) {
-                        spdlog::warn("[{}] EQUIVOCATION: peer {} signed two conflicting deltas "
-                                      "at {}/seq {} — banning", name(), proof->accused_pubkey,
-                                      delta.target_node_id, delta.sequence);
-                        apply_ban(proof->accused_pubkey, *proof);
-                        broadcast_misbehavior_proof(*proof);
-                        ++rejected;
-                        continue;
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::debug("[{}] equivocation check parse error: {}", name(), e.what());
-                }
-            }
+        auto rec = storage::FileStorageService::RetainedDelta::from_json(*text);
+        if (!rec.has_value()) {
+            pool_excluded_.insert(e.hash);
+            pool_excluded_bytes_ += e.size_bytes;
+            spdlog::critical("[{}] pool record {} is not valid retained content; "
+                             "excluded from the index, file preserved", name(), e.hash);
+            continue;
         }
 
-        // Apply the delta via storage
-        auto seq = storage_.append_delta(delta);
-        if (seq > 0) {
-            ++applied;
-        } else {
-            spdlog::warn("[{}] failed to apply delta seq {} from {}",
-                          name(), delta.sequence, peer.endpoint);
-            ++rejected;
+        // Re-verify the author signature and recompute the identifier from
+        // the canonical content. The stored hash field is never trusted.
+        const auto computed = retained_record_hash(*rec, crypto_);
+        const bool sig_ok = retained_record_signature_ok(*rec, crypto_);
+        if (computed != e.hash || !sig_ok) {
+            pool_excluded_.insert(e.hash);
+            pool_excluded_bytes_ += e.size_bytes;
+            spdlog::critical("[{}] pool record {} {} — excluded from the index, "
+                             "file preserved", name(), e.hash,
+                             computed != e.hash
+                                 ? "content does not match its identifier"
+                                 : "author signature does not verify");
+            continue;
         }
+
+        if (rec->position == 0 || rec->position > max_records ||
+            pool_position_index_.count(rec->position)) {
+            unavailable("inconsistent pool position metadata at record " + e.hash);
+            return;
+        }
+
+        pool_position_index_[rec->position] = e.hash;
+        pool_hash_to_position_[e.hash] = rec->position;
+        pool_verified_.insert(e.hash);
+        pool_verified_bytes_ += e.size_bytes;
+        pool_next_position_ = std::max(pool_next_position_, rec->position + 1);
     }
 
-    spdlog::info("[{}] received deltas from {}: {} applied, {} rejected",
-                  name(), peer.endpoint, applied, rejected);
+    pool_available_ = true;
+    pool_reconstructed_ = true;
+    spdlog::info("[{}] transfer pool reconstructed: {} verified record(s) "
+                 "({} bytes), {} excluded identifier(s), latest position {}",
+                 name(), pool_position_index_.size(), pool_verified_bytes_,
+                 pool_excluded_.size(), pool_latest_position_locked());
+}
+
+GossipService::PoolRetain GossipService::retain_verified_record(
+        const storage::FileStorageService::RetainedDelta& rec, uint64_t& out_position) {
+    std::lock_guard lock(transfer_mutex_);
+    if (!pool_reconstructed_) return PoolRetain::RefusedUnavailable;
+    if (retained_record_is_malformed(rec)) return PoolRetain::RefusedMalformed;
+
+    const auto max_records = effective_pool_max_records();
+    const auto max_bytes = effective_pool_max_bytes();
+
+    // Identity is recomputed from the content; the supplied hash is never
+    // trusted.
+    const auto hash = retained_record_hash(rec, crypto_);
+
+    if (auto it = pool_hash_to_position_.find(hash);
+        it != pool_hash_to_position_.end()) {
+        out_position = it->second;
+        return PoolRetain::Duplicate;
+    }
+    if (!pool_available_) return PoolRetain::RefusedUnavailable;
+    if (pool_position_index_.size() + 1 > max_records) return PoolRetain::RefusedCapacity;
+
+    // A stored file we could not verify still occupies its identifier:
+    // overwriting it would destroy evidence and could resurrect a colliding
+    // record. Refuse while it exists.
+    if (storage_.pool_record_exists(hash)) return PoolRetain::RefusedCollision;
+
+    const auto position = pool_next_position_;
+    storage::FileStorageService::RetainedDelta stored = rec;
+    stored.position = position;
+    stored.record_hash = hash;
+    const auto text = stored.to_json();
+    if (text.size() > kMaxRetainedRecordBytes) return PoolRetain::RefusedOversize;
+    // Capacity accounting includes the excluded evidence bytes: corruption
+    // does not create free capacity.
+    if (pool_verified_bytes_ + pool_excluded_bytes_ + text.size() > max_bytes) {
+        return PoolRetain::RefusedCapacity;
+    }
+    if (test_fail_next_pool_write_) {
+        test_fail_next_pool_write_ = false;
+        return PoolRetain::FailedWrite;
+    }
+    if (!storage_.write_pool_record(hash, text)) return PoolRetain::FailedWrite;
+
+    // Acceptance is published only after the durable write succeeded.
+    pool_position_index_[position] = hash;
+    pool_hash_to_position_[hash] = position;
+    pool_verified_.insert(hash);
+    pool_verified_bytes_ += text.size();
+    pool_next_position_ = position + 1;
+    out_position = position;
+    return PoolRetain::Retained;
+}
+
+bool GossipService::retain_local_delta(
+        const storage::FileStorageService::RetainedDelta& rec) {
+    uint64_t position = 0;
+    const auto result = retain_verified_record(rec, position);
+    if (result == PoolRetain::Retained) {
+        spdlog::debug("[{}] retained local delta for {} on '{}' (position {})",
+                      name(), rec.operation, rec.target_node_id, position);
+        return true;
+    }
+    if (result == PoolRetain::Duplicate) return true;
+    spdlog::warn("[{}] local delta retention refused for {} on '{}' (pool full, "
+                 "unavailable, or write failed); the applied mutation is unaffected",
+                 name(), rec.operation, rec.target_node_id);
+    return false;
+}
+
+GossipService::Admission GossipService::admit_received_record(const nlohmann::json& r) {
+    // 1. Statement fields. Transport positions are not part of the statement
+    //    and never bind it.
+    if (!r.is_object() ||
+        !r.contains("operation") || !r["operation"].is_string() ||
+        !r.contains("target_node_id") || !r["target_node_id"].is_string() ||
+        !r.contains("node_data") || !r["node_data"].is_object() ||
+        !r.contains("signer_pubkey") || !r["signer_pubkey"].is_string() ||
+        !r.contains("signature") || !r["signature"].is_string() ||
+        !r.contains("timestamp") || !r["timestamp"].is_number_unsigned()) {
+        spdlog::warn("[{}] received record with malformed statement fields — "
+                     "refused (final)", name());
+        return Admission::RefusedFinal;
+    }
+
+    storage::FileStorageService::RetainedDelta rec;
+    rec.operation      = r["operation"].get<std::string>();
+    rec.target_node_id = r["target_node_id"].get<std::string>();
+    rec.data           = r["node_data"].dump();
+    rec.signer_pubkey  = r["signer_pubkey"].get<std::string>();
+    rec.signature      = r["signature"].get<std::string>();
+    rec.timestamp      = r["timestamp"].get<std::uint64_t>();
+
+    // 2. The original author's signature over the canonical statement.
+    if (!retained_record_signature_ok(rec, crypto_)) {
+        spdlog::warn("[{}] received record for {} on '{}' has an invalid author "
+                     "signature — refused (final)",
+                     name(), rec.operation, rec.target_node_id);
+        return Admission::RefusedFinal;
+    }
+
+    // 3. Existing operation-derived permissions. A missing check node or
+    //    assignment context is retryable, not a denial; no author
+    //    certificate is part of the contract.
+    if (tree_) {
+        const auto authz = tree_->authorize_delta_statement(
+            rec.operation, rec.target_node_id,
+            retained_record_node_data(rec), rec.signer_pubkey);
+        if (authz == tree::PermissionTreeService::DeltaAuthorization::ContextMissing) {
+            spdlog::debug("[{}] received record for {} on '{}': permission context "
+                          "missing — refused (retryable)",
+                          name(), rec.operation, rec.target_node_id);
+            return Admission::RefusedRetryable;
+        }
+        if (authz == tree::PermissionTreeService::DeltaAuthorization::Denied) {
+            spdlog::warn("[{}] received record for {} on '{}' does not hold the "
+                         "required permission — refused (final)",
+                         name(), rec.operation, rec.target_node_id);
+            return Admission::RefusedFinal;
+        }
+    } else {
+        // No tree wired: no permission context exists to evaluate.
+        spdlog::debug("[{}] received record for {} on '{}': no permission context "
+                      "— refused (retryable)", name(), rec.operation, rec.target_node_id);
+        return Admission::RefusedRetryable;
+    }
+
+    // 4. Retain. Every retention refusal is retryable: capacity, collision,
+    //    oversize, unavailability, and write failure are transfer
+    //    conditions, not statement defects.
+    uint64_t position = 0;
+    const auto rr = retain_verified_record(rec, position);
+    switch (rr) {
+        case PoolRetain::Retained:
+            spdlog::debug("[{}] retained received record for {} on '{}' (position {})",
+                          name(), rec.operation, rec.target_node_id, position);
+            return Admission::Accepted;
+        case PoolRetain::Duplicate:
+            return Admission::Duplicate;
+        default:
+            return Admission::RefusedRetryable;
+    }
+}
+
+void GossipService::maybe_request_from(const std::string& peer_pubkey,
+                                        std::string_view endpoint, uint64_t from_pos) {
+    if (peer_pubkey.empty()) return;
+    auto target = parse_endpoint(endpoint);
+    if (!target) return;
+
+    bool will_send = false;
+    std::uint64_t nonce = 0;
+    {
+        std::lock_guard lock(transfer_mutex_);
+        const auto now = steady_ms();
+
+        // Expired requests free their slot.
+        for (auto it = outstanding_.begin(); it != outstanding_.end();) {
+            if (it->second.deadline_ms < now) it = outstanding_.erase(it);
+            else ++it;
+        }
+
+        if (outstanding_.count(peer_pubkey)) return;
+        if (outstanding_.size() >= kOutstandingGlobal) {
+            spdlog::debug("[{}] delta request to {} refused — outstanding cap ({}) "
+                          "reached", name(), peer_pubkey, kOutstandingGlobal);
+            return;
+        }
+        auto st = peer_logs_.find(peer_pubkey);
+        if (st == peer_logs_.end()) return;  // a request binds to a known generation
+
+        std::array<uint8_t, 8> nb{};
+        crypto_.random_bytes(std::span<uint8_t>(nb));
+        std::memcpy(&nonce, nb.data(), 8);
+        if (nonce == 0) nonce = 1;
+        outstanding_[peer_pubkey] = OutstandingRequest{
+            nonce, from_pos, st->second.generation, now + kRequestTimeoutMs};
+        will_send = true;
+    }
+    if (!will_send) return;
+
+    json request;
+    request["nonce"] = nonce;
+    request["from_pos"] = from_pos;
+    auto s = request.dump();
+    std::vector<uint8_t> payload(s.begin(), s.end());
+    send_packet(*target, GossipMsgType::DeltaRequest, payload);
+    spdlog::debug("[{}] delta request to {} (nonce={}, from_pos={})",
+                   name(), peer_pubkey, nonce, from_pos);
+}
+
+void GossipService::evict_idle_peer_logs_locked(std::uint64_t now) {
+    // Only entries with no outstanding request and no active backoff may be
+    // evicted: eviction must not provide a retry bypass.
+    while (peer_logs_.size() >= peer_log_cap()) {
+        std::string stalest;
+        std::uint64_t stalest_seen = ~std::uint64_t{0};
+        for (const auto& [pk, st] : peer_logs_) {
+            if (outstanding_.count(pk)) continue;
+            if (st.backoff_until_ms > now) continue;
+            if (st.last_digest_ms < stalest_seen) {
+                stalest_seen = st.last_digest_ms;
+                stalest = pk;
+            }
+        }
+        if (stalest.empty()) break;  // nothing removable: refuse new state instead
+        peer_logs_.erase(stalest);
+    }
+}
+
+std::size_t GossipService::peer_count() const {
+    std::lock_guard lock(peers_mutex_);
+    return peers_.size();
+}
+
+std::optional<GossipPeer> GossipService::find_peer_by_pubkey(std::string_view b64) const {
+    std::lock_guard lock(peers_mutex_);
+    for (const auto& p : peers_) {
+        if (p.pubkey == b64) return p;
+    }
+    return std::nullopt;
 }
 
 std::vector<GossipPeer> GossipService::do_get_peers() const {
@@ -566,10 +858,12 @@ void GossipService::handle_receive(std::size_t bytes_received) {
     // Dispatch by message type
     switch (header.msg_type) {
         case GossipMsgType::Digest:
-            handle_digest_message(remote_endpoint_, payload, payload_len);
+            handle_digest_message(remote_endpoint_, payload, payload_len,
+                                  sender_pubkey_b64);
             break;
         case GossipMsgType::DeltaRequest:
-            handle_delta_request(remote_endpoint_, payload, payload_len);
+            handle_delta_request(remote_endpoint_, payload, payload_len,
+                                 sender_pubkey_b64);
             break;
         case GossipMsgType::DeltaResponse:
             handle_delta_response(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
@@ -617,83 +911,12 @@ void GossipService::handle_receive(std::size_t bytes_received) {
 
 void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
                                             const uint8_t* payload,
-                                            std::size_t payload_len) {
-    try {
-        auto j = json::parse(std::string_view{
-            reinterpret_cast<const char*>(payload), payload_len});
-
-        const auto their_seq = j.value("latest_seq", uint64_t{0});
-        std::array<uint8_t, 32> their_hash{};
-
-        if (j.contains("tree_hash")) {
-            auto hash_bytes = crypto::from_base64(j["tree_hash"].get<std::string>());
-            if (hash_bytes.size() == 32) {
-                std::memcpy(their_hash.data(), hash_bytes.data(), 32);
-            }
-        }
-
-        // Find or create peer entry
-        const auto endpoint_str = sender.address().to_string() + ":"
-                                   + std::to_string(sender.port());
-        auto peer_opt = find_peer_by_endpoint(sender);
-        GossipPeer peer;
-        if (peer_opt) {
-            peer = *peer_opt;
-        } else {
-            peer.endpoint = endpoint_str;
-            peer.last_seen = static_cast<uint64_t>(
-                chrono::system_clock::to_time_t(chrono::system_clock::now()));
-        }
-
-        do_handle_digest(peer, their_seq, their_hash);
-
-    } catch (const std::exception& e) {
-        spdlog::warn("[{}] failed to parse digest from {}:{}: {}",
-                      name(), sender.address().to_string(), sender.port(), e.what());
-    }
-}
-
-void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
-                                           const uint8_t* payload,
-                                           std::size_t payload_len) {
-    try {
-        auto j = json::parse(std::string_view{
-            reinterpret_cast<const char*>(payload), payload_len});
-
-        const auto from_seq = j.value("from_seq", uint64_t{0});
-
-        const auto endpoint_str = sender.address().to_string() + ":"
-                                   + std::to_string(sender.port());
-        auto peer_opt = find_peer_by_endpoint(sender);
-        GossipPeer peer;
-        if (peer_opt) {
-            peer = *peer_opt;
-        } else {
-            peer.endpoint = endpoint_str;
-        }
-
-        spdlog::debug("[{}] delta request from {} (from_seq={})",
-                       name(), endpoint_str, from_seq);
-
-        do_send_deltas(peer, from_seq);
-
-    } catch (const std::exception& e) {
-        spdlog::warn("[{}] failed to parse delta request from {}:{}: {}",
-                      name(), sender.address().to_string(), sender.port(), e.what());
-    }
-}
-
-void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
-                                            const std::string& sender_pubkey,
-                                            const uint8_t* payload,
-                                            std::size_t payload_len) {
-    // Fail-closed gate, no tokens: state-mutating gossip ingress (delta apply,
-    // ACL/DNS/IPAM sync) requires the packet signer to be an enrolled peer with
-    // a root-signed certificate. Gossip is Tier-2 transport and never decides
-    // Tier 1 — that authority lives in the security plane (SecurityEnvelope →
-    // SecurityRouter).
-    if (!peer_certificate_is_root_signed(sender_pubkey)) {
-        spdlog::warn("[{}] DENIED delta response from {}:{} — sender is not a "
+                                            std::size_t payload_len,
+                                            const std::string& signer_pubkey) {
+    // Transport authorization before any transfer state is allocated: an
+    // uncertified digest allocates nothing and triggers no request.
+    if (!peer_certificate_is_root_signed(signer_pubkey)) {
+        spdlog::warn("[{}] DENIED digest from {}:{} — sender is not a "
                       "cert-verified enrolled peer", name(),
                       sender.address().to_string(), sender.port());
         return;
@@ -703,22 +926,287 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
         auto j = json::parse(std::string_view{
             reinterpret_cast<const char*>(payload), payload_len});
 
-        const auto endpoint_str = sender.address().to_string() + ":"
-                                   + std::to_string(sender.port());
-        auto peer_opt = find_peer_by_endpoint(sender);
+        const auto their_pos = j.value("latest_pos", std::uint64_t{0});
+        const auto their_generation = j.value("log_generation", std::string{});
+
+        // Identity is the authenticated packet signer, not the NAT-able
+        // endpoint.
         GossipPeer peer;
-        if (peer_opt) {
+        if (auto peer_opt = find_peer_by_pubkey(signer_pubkey)) {
             peer = *peer_opt;
         } else {
-            peer.endpoint = endpoint_str;
+            peer.pubkey = signer_pubkey;
+            peer.endpoint = sender.address().to_string() + ":"
+                                + std::to_string(sender.port());
+            peer.last_seen = static_cast<std::uint64_t>(
+                chrono::system_clock::to_time_t(chrono::system_clock::now()));
         }
 
-        do_handle_deltas(peer, j);
+        do_handle_digest(peer, their_pos, their_generation);
 
     } catch (const std::exception& e) {
-        spdlog::warn("[{}] failed to parse delta response from {}:{}: {}",
+        spdlog::warn("[{}] failed to parse digest from {}:{}: {}",
                       name(), sender.address().to_string(), sender.port(), e.what());
     }
+}
+
+void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
+                                           const uint8_t* payload,
+                                           std::size_t payload_len,
+                                           const std::string& signer_pubkey) {
+    // Data-returning path: same transport gate as digest and response.
+    if (!peer_certificate_is_root_signed(signer_pubkey)) {
+        spdlog::warn("[{}] DENIED delta request from {}:{} — sender is not a "
+                      "cert-verified enrolled peer", name(),
+                      sender.address().to_string(), sender.port());
+        return;
+    }
+
+    std::uint64_t nonce = 0, from_pos = 0;
+    try {
+        auto j = json::parse(std::string_view{
+            reinterpret_cast<const char*>(payload), payload_len});
+        nonce = j.value("nonce", std::uint64_t{0});
+        from_pos = j.value("from_pos", std::uint64_t{0});
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse delta request from {}:{}: {}",
+                      name(), sender.address().to_string(), sender.port(), e.what());
+        return;
+    }
+
+    spdlog::debug("[{}] delta request from {} (nonce={}, from_pos={})",
+                   name(), signer_pubkey, nonce, from_pos);
+
+    json records = json::array();
+    bool page_failed = false;
+    std::string generation;
+    std::uint64_t latest_pos = 0;
+    {
+        std::lock_guard lock(transfer_mutex_);
+        generation = pool_generation_;
+        latest_pos = pool_latest_position_locked();
+
+        if (pool_available_) {
+            std::size_t running = 2;  // "records":[] overhead grows as we append
+            auto it = pool_position_index_.upper_bound(from_pos);
+            for (; it != pool_position_index_.end(); ++it) {
+                if (records.size() >= kPageMaxRecords) break;
+                const auto position = it->first;
+                const auto& hash = it->second;
+
+                // The per-record bound is checked before any read; the page
+                // byte bound before appending.
+                storage::FileStorageService::PoolRead result;
+                auto text = storage_.read_pool_record(hash, kMaxRetainedRecordBytes, result);
+                if (!text.has_value() ||
+                    result == storage::FileStorageService::PoolRead::Oversized) {
+                    // A retained record we cannot serve is a bounded transfer
+                    // failure: the page stops here and positions beyond it are
+                    // not served over it.
+                    page_failed = true;
+                    spdlog::error("[{}] pool record at position {} (hash {}) cannot "
+                                  "be served; page incomplete", name(), position, hash);
+                    break;
+                }
+                auto stored = json::parse(*text, nullptr, false);
+                if (stored.is_discarded()) {
+                    page_failed = true;
+                    spdlog::error("[{}] pool record at position {} (hash {}) is not "
+                                  "valid JSON; page incomplete", name(), position, hash);
+                    break;
+                }
+                json r;
+                r["position"]       = stored["position"];
+                r["record_hash"]    = stored["record_hash"];
+                r["operation"]      = stored["operation"];
+                r["target_node_id"] = stored["target_node_id"];
+                r["node_data"]      = stored["node_data"];
+                r["signer_pubkey"]  = stored["signer_pubkey"];
+                r["signature"]      = stored["signature"];
+                r["timestamp"]      = stored["timestamp"];
+                const auto rsize = r.dump().size();
+                if (!records.empty() && running + rsize + 1 > kPageMaxPayloadBytes) break;
+                records.push_back(std::move(r));
+                running += rsize + 1;
+            }
+        }
+    }
+
+    json response;
+    response["nonce"] = nonce;
+    response["from_pos"] = from_pos;
+    response["generation"] = generation;
+    response["latest_pos"] = latest_pos;
+    response["complete"] = !page_failed;
+    response["records"] = std::move(records);
+
+    auto payload_str = response.dump();
+    if (payload_str.size() > 65000) {
+        // Should not happen: the page is bounded to kPageMaxPayloadBytes.
+        spdlog::error("[{}] delta response to {} exceeds the packet cap "
+                      "({} bytes); not sent", name(), signer_pubkey, payload_str.size());
+        return;
+    }
+    std::vector<uint8_t> pkt(payload_str.begin(), payload_str.end());
+    send_packet(sender, GossipMsgType::DeltaResponse, pkt);
+    spdlog::debug("[{}] delta page served to {} (from_pos={}, latest_pos={}, failed={})",
+                   name(), signer_pubkey, from_pos, latest_pos, page_failed);
+}
+
+void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
+                                            const std::string& sender_pubkey,
+                                            const uint8_t* payload,
+                                            std::size_t payload_len) {
+    // Fail-closed gate, no tokens: state-mutating gossip ingress requires the
+    // packet signer to be an enrolled peer with a root-signed certificate.
+    // Gossip is Tier-2 transport and never decides Tier 1 — that authority
+    // lives in the security plane (SecurityEnvelope → SecurityRouter).
+    if (!peer_certificate_is_root_signed(sender_pubkey)) {
+        spdlog::warn("[{}] DENIED delta response from {}:{} — sender is not a "
+                      "cert-verified enrolled peer", name(),
+                      sender.address().to_string(), sender.port());
+        return;
+    }
+
+    json j;
+    try {
+        j = json::parse(std::string_view{
+            reinterpret_cast<const char*>(payload), payload_len});
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse delta response from {}: {}",
+                      name(), sender_pubkey, e.what());
+        return;
+    }
+
+    const auto nonce = j.value("nonce", std::uint64_t{0});
+    const auto from_pos = j.value("from_pos", std::uint64_t{0});
+    const auto generation = j.value("generation", std::string{});
+    const auto latest_pos = j.value("latest_pos", std::uint64_t{0});
+    const bool complete = j.value("complete", true);
+    if (!j.contains("records") || !j["records"].is_array()) {
+        spdlog::warn("[{}] delta response from {} has no records array — dropped",
+                      name(), sender_pubkey);
+        return;
+    }
+
+    // Bind the response to the outstanding request: the authenticated peer,
+    // the nonce, the requested generation, and the requested position. A
+    // late response after a generation reset is dropped, not merged.
+    bool bound = false;
+    {
+        std::lock_guard lock(transfer_mutex_);
+        auto it = outstanding_.find(sender_pubkey);
+        if (it == outstanding_.end()) {
+            spdlog::warn("[{}] unsolicited delta response from {} — no outstanding "
+                          "request; dropped", name(), sender_pubkey);
+            return;
+        }
+        const auto& req = it->second;
+        bound = (nonce == req.nonce && from_pos == req.from_pos &&
+                 generation == req.generation);
+        if (!bound) {
+            // A stale answer does not consume the real request: the
+            // in-flight answer can still bind to the outstanding slot.
+            spdlog::warn("[{}] stale delta response from {} (nonce/generation/"
+                          "position mismatch); dropped", name(), sender_pubkey);
+        } else {
+            outstanding_.erase(it);
+        }
+    }
+    if (!bound) return;
+
+    // Admit each record. The cursor advances only over the contiguous
+    // accepted prefix: final refusals and duplicates advance it, retryable
+    // refusals stop it, and a gap is a bounded transfer failure that never
+    // advances past the missing record.
+    bool contiguous = true;
+    std::uint64_t cursor_after = from_pos;
+    std::uint64_t expected = from_pos;
+    for (const auto& r : j["records"]) {
+        if (!r.is_object()) { contiguous = false; break; }
+        const auto pos = r.value("position", std::uint64_t{0});
+        if (pos <= expected) {
+            spdlog::warn("[{}] non-increasing position {} in page from {} — page "
+                          "inconsistent; not advancing further",
+                          name(), pos, sender_pubkey);
+            contiguous = false;
+            break;
+        }
+        if (pos != expected + 1) {
+            spdlog::warn("[{}] gap in page from {} at position {} (expected {}) — "
+                          "transfer failure; not advancing past it",
+                          name(), sender_pubkey, pos, expected + 1);
+            contiguous = false;
+            break;
+        }
+        expected = pos;
+        const auto admission = admit_received_record(r);
+        if (admission == Admission::Accepted || admission == Admission::Duplicate ||
+            admission == Admission::RefusedFinal) {
+            cursor_after = expected;
+            continue;
+        }
+        contiguous = false;  // RefusedRetryable: stall, do not advance
+        break;
+    }
+
+    // Publish the cursor under the generation binding.
+    bool advanced = false;
+    bool caught_up = false;
+    std::uint64_t cursor_now = from_pos;
+    {
+        std::lock_guard lock(transfer_mutex_);
+        auto it = peer_logs_.find(sender_pubkey);
+        if (it == peer_logs_.end() || it->second.generation != generation) {
+            // Late response after a generation reset (or unknown peer): no
+            // cursor may move.
+            return;
+        }
+        auto& st = it->second;
+        if (contiguous && cursor_after > st.cursor) {
+            st.cursor = cursor_after;
+            advanced = true;
+        }
+        cursor_now = st.cursor;
+        if (advanced) {
+            st.stall = 0;
+        } else {
+            st.stall += 1;
+            if (st.stall >= kStallBudget) {
+                st.stall = 0;
+                st.backoff_until_ms = steady_ms() + kBackoffMs;
+                spdlog::warn("[{}] delta transfer from {} stalled ({} consecutive "
+                              "pages without progress); backing off {} ms",
+                              name(), sender_pubkey, kStallBudget, kBackoffMs);
+            }
+        }
+        caught_up = st.cursor >= latest_pos;
+    }
+
+    // Continue the session: only when we advanced, the page was clean, and
+    // the sender has more to give.
+    if (advanced && complete && contiguous && !caught_up) {
+        std::string ep;
+        std::uint64_t next_cursor = 0;
+        bool in_backoff = false;
+        {
+            std::lock_guard lock(transfer_mutex_);
+            auto it = peer_logs_.find(sender_pubkey);
+            if (it != peer_logs_.end()) {
+                in_backoff = it->second.backoff_until_ms > steady_ms();
+                next_cursor = it->second.cursor;
+            }
+        }
+        if (auto peer_opt = find_peer_by_pubkey(sender_pubkey)) {
+            ep = peer_opt->endpoint;
+        } else {
+            ep = sender.address().to_string() + ":" + std::to_string(sender.port());
+        }
+        if (!in_backoff) maybe_request_from(sender_pubkey, ep, next_cursor);
+    }
+
+    spdlog::info("[{}] delta page from {}: {} record(s), cursor now {} (latest {})",
+                   name(), sender_pubkey, j["records"].size(), cursor_now, latest_pos);
 }
 
 void GossipService::handle_anti_entropy(const asio::ip::udp::endpoint& sender,
@@ -843,10 +1331,13 @@ void GossipService::on_gossip_tick() {
         }
         if (!pending.empty()) {
             json hello = *our_certificate_;
-            if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
-            if (!our_region_.empty()) hello["region"] = our_region_;
-            if (!our_advertised_endpoint_.empty())
-                hello["advertised_endpoint"] = our_advertised_endpoint_;
+            {
+                std::lock_guard lock(mesh_state_mutex_);
+                if (ipam_ && our_tunnel_ip_.empty()) hello["request_tunnel_ip"] = true;
+                if (!our_region_.empty()) hello["region"] = our_region_;
+                if (!our_advertised_endpoint_.empty())
+                    hello["advertised_endpoint"] = our_advertised_endpoint_;
+            }
             auto hello_str = hello.dump();
             std::vector<uint8_t> hello_bytes(hello_str.begin(), hello_str.end());
             for (const auto& ep : pending) {
@@ -1231,9 +1722,6 @@ bool GossipService::is_revoked(const std::string& server_pubkey) const {
 }
 
 // ---------------------------------------------------------------------------
-// Misbehavior detection — equivocation proofs (dispositive auto-ban)
-// ---------------------------------------------------------------------------
-
 void GossipService::save_revoked_servers() const {
     json arr = json::array();
     for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
@@ -1254,81 +1742,15 @@ void GossipService::add_revoked_server(const std::string& server_pubkey) {
     spdlog::warn("[{}] revoked superseded server pubkey {}", name(), pk);
 }
 
-void GossipService::apply_ban(const std::string& pubkey, const MisbehaviorProof& proof) {
-    const std::string pk = normalize_pubkey(pubkey);
-    if (pk.empty() || is_revoked(pk)) return;  // idempotent
-
-    // 1. Durable revocation — is_revoked now rejects all of this peer's certs, tokens
-    //    and messages, across restarts (revoked_servers.json is reloaded on start).
-    revoked_pubkeys_.push_back(pk);
-    save_revoked_servers();
-
-    // 2. Persist the proof as durable, independently-verifiable evidence.
-    {
-        storage::SignedEnvelope env;
-        env.type = "misbehavior_proof";
-        json pj = proof;
-        env.data = pj.dump();
-        env.timestamp = proof.observed_at;
-        (void)storage_.write_file("misbehavior_proofs", proof.proof_id + ".json", env);
-    }
-
-    // 3. Drop the peer entry.
-    do_remove_peer(pk);
-
-    spdlog::warn("[{}] BANNED peer {} (proof {})", name(), pk, proof.proof_id);
-}
-
-void GossipService::broadcast_misbehavior_proof(const MisbehaviorProof& proof,
-                                                const std::string& exclude_endpoint) {
-    json j = proof;
-    auto s = j.dump();
-    std::vector<uint8_t> payload(s.begin(), s.end());
-
-    std::lock_guard lock(peers_mutex_);
-    for (const auto& peer : peers_) {
-        if (!exclude_endpoint.empty() && peer.endpoint == exclude_endpoint) continue;
-        if (auto ep = parse_endpoint(peer.endpoint)) {
-            send_packet(*ep, GossipMsgType::MisbehaviorProofBroadcast, payload);
-        }
-    }
-}
-
 void GossipService::handle_misbehavior_proof(const asio::ip::udp::endpoint& sender,
-                                             const uint8_t* payload, std::size_t payload_len) {
-    MisbehaviorProof proof;
-    try {
-        proof = json::parse(std::string_view(reinterpret_cast<const char*>(payload), payload_len))
-                    .get<MisbehaviorProof>();
-    } catch (const std::exception& e) {
-        spdlog::debug("[{}] malformed misbehavior proof from {}: {}",
-                      name(), sender.address().to_string(), e.what());
-        return;
-    }
-
-    // Dedupe: we may receive the same proof from many peers (epidemic spread).
-    if (known_proofs_.count(proof.proof_id)) return;
-
-    // DISPOSITIVE verification — trust ONLY the accused's own signatures, never the
-    // reporter. A malicious relayer cannot forge this; an invalid proof dies here and
-    // is never forwarded (verify-before-forward), so bad proofs cannot spread.
-    if (!verify_misbehavior_proof(proof, crypto_)) {
-        spdlog::warn("[{}] rejecting INVALID misbehavior proof {} from {}",
-                      name(), proof.proof_id, sender.address().to_string());
-        return;
-    }
-
-    known_proofs_[proof.proof_id] = static_cast<uint64_t>(chrono::duration_cast<chrono::seconds>(
-        chrono::system_clock::now().time_since_epoch()).count());
-
-    spdlog::warn("[{}] verified misbehavior proof {} against {} — banning and re-gossiping",
-                  name(), proof.proof_id, proof.accused_pubkey);
-    apply_ban(proof.accused_pubkey, proof);
-
-    // Re-broadcast to everyone except the peer we received it from (epidemic spread;
-    // every honest node independently verifies, so convergence is guaranteed).
-    std::string from = sender.address().to_string() + ":" + std::to_string(sender.port());
-    broadcast_misbehavior_proof(proof, from);
+                                             const uint8_t* /*payload*/,
+                                             std::size_t /*payload_len*/) {
+    // The sequence-based tree equivocation path is retired: transport
+    // positions do not establish equivocation, and no ban is ever issued
+    // from a received record. Wire value 0x15 remains reserved.
+    spdlog::debug("[{}] misbehavior proof from {}:{} — the sequence-based tree "
+                  "proof path is retired; not processed", name(),
+                  sender.address().to_string(), sender.port());
 }
 
 bool GossipService::peer_certificate_is_root_signed(const std::string& pubkey) const {
@@ -1521,9 +1943,16 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
 
         // If this is a response containing our assigned tunnel IP, store it
         if (j.value("is_response", false) && j.contains("assigned_tunnel_ip")) {
-            std::lock_guard lock(peers_mutex_);
-            our_tunnel_ip_ = j["assigned_tunnel_ip"].get<std::string>();
-            spdlog::info("[{}] received tunnel IP assignment: {}", name(), our_tunnel_ip_);
+            {
+                std::lock_guard lock(mesh_state_mutex_);
+                our_tunnel_ip_ = j["assigned_tunnel_ip"].get<std::string>();
+            }
+            std::string ip;
+            {
+                std::lock_guard lock(mesh_state_mutex_);
+                ip = our_tunnel_ip_;
+            }
+            spdlog::info("[{}] received tunnel IP assignment: {}", name(), ip);
         }
 
         // The certificate verified and the packet signer proved possession of
@@ -1548,7 +1977,7 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
 // ---------------------------------------------------------------------------
 
 void GossipService::set_preferred_ns_slot(uint8_t slot) {
-    std::lock_guard lock(peers_mutex_);
+    std::lock_guard lock(mesh_state_mutex_);
     preferred_ns_slot_ = slot > 9 ? 0 : slot;
 }
 
@@ -1561,7 +1990,7 @@ void GossipService::set_boringtun(boringtun::BoringtunService* dataplane) {
 }
 
 std::string GossipService::our_tunnel_ip() const {
-    std::lock_guard lock(peers_mutex_);
+    std::lock_guard lock(mesh_state_mutex_);
     return our_tunnel_ip_;
 }
 
@@ -2051,11 +2480,12 @@ void GossipService::set_dns_base_domain(const std::string& domain) {
 }
 
 std::optional<uint8_t> GossipService::our_ns_slot() const {
+    std::lock_guard lock(mesh_state_mutex_);
     return our_ns_slot_;
 }
 
 std::vector<NsSlotClaimData> GossipService::get_ns_slots() const {
-    std::lock_guard lock(peers_mutex_);
+    std::lock_guard lock(mesh_state_mutex_);
     std::vector<NsSlotClaimData> result;
     for (const auto& s : ns_slots_) {
         if (s.slot > 0) result.push_back(s);
@@ -2064,78 +2494,81 @@ std::vector<NsSlotClaimData> GossipService::get_ns_slots() const {
 }
 
 void GossipService::try_claim_ns_slot(const std::string& our_public_ip) {
-    std::lock_guard lock(peers_mutex_);
+    NsSlotClaimData claim;
+    bool claimed = false;
+    {
+        std::lock_guard lock(mesh_state_mutex_);
 
-    // Don't claim if we already hold a slot
-    if (our_ns_slot_.has_value()) {
-        spdlog::debug("[{}] already hold NS slot ns{}, skipping claim",
-                       name(), *our_ns_slot_);
-        return;
-    }
-
-    // Pinned: claim exactly that slot or none — the registrar's glue points
-    // ns<pin> at us, so holding any other slot advertises a nameserver the
-    // registry contradicts. Otherwise take the lowest available slot (1-9).
-    uint8_t chosen_slot = 0;
-    if (preferred_ns_slot_ != 0) {
-        const auto& s = ns_slots_[preferred_ns_slot_ - 1];
-        if (s.slot == 0 || s.server_pubkey.empty()) {
-            chosen_slot = preferred_ns_slot_;
-        } else {
-            spdlog::warn("[{}] pinned NS slot ns{} is held by {}; not claiming a slot",
-                          name(), preferred_ns_slot_, s.server_pubkey.substr(0, 12));
+        // Don't claim if we already hold a slot
+        if (our_ns_slot_.has_value()) {
+            spdlog::debug("[{}] already hold NS slot ns{}, skipping claim",
+                           name(), *our_ns_slot_);
             return;
         }
-    } else {
-        for (uint8_t i = 0; i < 9; ++i) {
-            if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-                chosen_slot = i + 1; // slots are 1-based
-                break;
+
+        // Pinned: claim exactly that slot or none — the registrar's glue points
+        // ns<pin> at us, so holding any other slot advertises a nameserver the
+        // registry contradicts. Otherwise take the lowest available slot (1-9).
+        uint8_t chosen_slot = 0;
+        if (preferred_ns_slot_ != 0) {
+            const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+            if (s.slot == 0 || s.server_pubkey.empty()) {
+                chosen_slot = preferred_ns_slot_;
+            } else {
+                spdlog::warn("[{}] pinned NS slot ns{} is held by {}; not claiming a slot",
+                              name(), preferred_ns_slot_, s.server_pubkey.substr(0, 12));
+                return;
+            }
+        } else {
+            for (uint8_t i = 0; i < 9; ++i) {
+                if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                    chosen_slot = i + 1; // slots are 1-based
+                    break;
+                }
             }
         }
+
+        if (chosen_slot == 0) {
+            spdlog::warn("[{}] all 9 NS slots are claimed, cannot claim a slot", name());
+            return;
+        }
+
+        auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+        auto now = static_cast<uint64_t>(
+            chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+        claim.slot          = chosen_slot;
+        claim.server_pubkey = our_pubkey_b64;
+        claim.server_ip     = our_public_ip;
+        claim.region        = our_region_;
+        claim.timestamp     = now;
+
+        // Sign: canonical JSON of the claim fields (excluding signature)
+        json sign_payload;
+        sign_payload["slot"]          = claim.slot;
+        sign_payload["server_pubkey"] = claim.server_pubkey;
+        sign_payload["server_ip"]     = claim.server_ip;
+        sign_payload["region"]        = claim.region;
+        sign_payload["timestamp"]     = claim.timestamp;
+
+        auto sign_data = sign_payload.dump();
+        std::span<const uint8_t> sign_bytes(
+            reinterpret_cast<const uint8_t*>(sign_data.data()), sign_data.size());
+        auto sig = crypto_.ed25519_sign(keypair_.private_key, sign_bytes);
+        claim.signature = crypto::to_base64(sig);
+
+        // Store locally
+        ns_slots_[chosen_slot - 1] = claim;
+        our_ns_slot_ = chosen_slot;
+        claimed = true;
+
+        spdlog::info("[{}] claimed NS slot ns{} (ip={}, region={})",
+                      name(), chosen_slot, our_public_ip, our_region_);
     }
+    if (!claimed) return;
 
-    if (chosen_slot == 0) {
-        spdlog::warn("[{}] all 9 NS slots are claimed, cannot claim a slot", name());
-        return;
-    }
-
-    auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
-    auto now = static_cast<uint64_t>(
-        chrono::system_clock::to_time_t(chrono::system_clock::now()));
-
-    NsSlotClaimData claim;
-    claim.slot          = chosen_slot;
-    claim.server_pubkey = our_pubkey_b64;
-    claim.server_ip     = our_public_ip;
-    claim.region        = our_region_;
-    claim.timestamp     = now;
-
-    // Sign: canonical JSON of the claim fields (excluding signature)
-    json sign_payload;
-    sign_payload["slot"]          = claim.slot;
-    sign_payload["server_pubkey"] = claim.server_pubkey;
-    sign_payload["server_ip"]     = claim.server_ip;
-    sign_payload["region"]        = claim.region;
-    sign_payload["timestamp"]     = claim.timestamp;
-
-    auto sign_data = sign_payload.dump();
-    std::span<const uint8_t> sign_bytes(
-        reinterpret_cast<const uint8_t*>(sign_data.data()), sign_data.size());
-    auto sig = crypto_.ed25519_sign(keypair_.private_key, sign_bytes);
-    claim.signature = crypto::to_base64(sig);
-
-    // Store locally
-    ns_slots_[chosen_slot - 1] = claim;
-    our_ns_slot_ = chosen_slot;
-
-    spdlog::info("[{}] claimed NS slot ns{} (ip={}, region={})",
-                  name(), chosen_slot, our_public_ip, our_region_);
-
-    // Register in DNS
+    // Register in DNS and broadcast outside the mesh lock (external calls)
     register_ns_slot_in_dns(claim);
-
-    // Broadcast to all peers
     broadcast_ns_slot_claim(claim);
 }
 
@@ -2151,14 +2584,15 @@ void GossipService::broadcast_ns_slot_claim(const NsSlotClaimData& claim) {
     auto packed = json::to_msgpack(j);
     std::vector<uint8_t> payload(packed.begin(), packed.end());
 
-    // peers_mutex_ must already be held by callers, or we acquire it here
-    // For broadcast from handle_ns_slot_claim we already hold the lock,
-    // but for try_claim_ns_slot we also hold it. Use the peers_ directly.
-    for (const auto& peer : peers_) {
-        auto ep = parse_endpoint(peer.endpoint);
-        if (ep) {
-            send_packet(*ep, GossipMsgType::NsSlotClaim, payload);
+    std::vector<asio::ip::udp::endpoint> targets;
+    {
+        std::lock_guard lock(peers_mutex_);
+        for (const auto& peer : peers_) {
+            if (auto ep = parse_endpoint(peer.endpoint)) targets.push_back(*ep);
         }
+    }
+    for (const auto& ep : targets) {
+        send_packet(ep, GossipMsgType::NsSlotClaim, payload);
     }
 }
 
@@ -2235,114 +2669,131 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             return;
         }
 
-        std::lock_guard lock(peers_mutex_);
+        NsSlotClaimData accepted_claim;
+        NsSlotClaimData reclaim_claim;
+        bool reclaimed = false;
+        bool accepted = false;
+        {
+            std::lock_guard lock(mesh_state_mutex_);
 
-        auto& existing = ns_slots_[claim.slot - 1];
-        bool is_new = false;
+            auto& existing = ns_slots_[claim.slot - 1];
+            bool is_new = false;
 
-        if (existing.slot == 0 || existing.server_pubkey.empty()) {
-            // Slot is unclaimed — accept
-            is_new = true;
-        } else if (claim.timestamp > existing.timestamp) {
-            // LWW: newer timestamp wins
-            is_new = true;
-        } else if (claim.timestamp == existing.timestamp &&
-                   claim.server_pubkey > existing.server_pubkey) {
-            // Tiebreak: higher pubkey wins (lexicographic)
-            is_new = true;
-        }
-
-        if (!is_new) {
-            spdlog::debug("[{}] rejected NS slot claim for ns{} from {} (existing claim is newer or wins tiebreak)",
-                           name(), claim.slot, claim.server_pubkey);
-            return;
-        }
-
-        // Check if our own slot is being overwritten
-        bool our_slot_stolen = false;
-        std::string our_old_ip;
-        auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
-        if (existing.server_pubkey == our_pubkey_b64 &&
-            claim.server_pubkey != our_pubkey_b64 &&
-            our_ns_slot_.has_value() && *our_ns_slot_ == claim.slot) {
-            our_slot_stolen = true;
-            our_old_ip = existing.server_ip; // save before overwrite
-        }
-
-        // Accept the claim
-        existing = claim;
-
-        spdlog::info("[{}] accepted NS slot claim: ns{} -> {} (ip={}, region={})",
-                      name(), claim.slot, claim.server_pubkey, claim.server_ip, claim.region);
-
-        // Register in DNS
-        register_ns_slot_in_dns(claim);
-
-        // Forward to all peers except sender (epidemic gossip)
-        std::vector<uint8_t> fwd_payload(payload, payload + payload_len);
-        for (const auto& peer : peers_) {
-            auto ep = parse_endpoint(peer.endpoint);
-            if (ep && *ep != sender) {
-                send_packet(*ep, GossipMsgType::NsSlotClaim, fwd_payload);
+            if (existing.slot == 0 || existing.server_pubkey.empty()) {
+                // Slot is unclaimed — accept
+                is_new = true;
+            } else if (claim.timestamp > existing.timestamp) {
+                // LWW: newer timestamp wins
+                is_new = true;
+            } else if (claim.timestamp == existing.timestamp &&
+                       claim.server_pubkey > existing.server_pubkey) {
+                // Tiebreak: higher pubkey wins (lexicographic)
+                is_new = true;
             }
-        }
 
-        // If our slot was stolen, try to re-claim a different one
-        if (our_slot_stolen) {
-            our_ns_slot_.reset();
-            spdlog::warn("[{}] our NS slot ns{} was overwritten by {}, will try to re-claim",
-                          name(), claim.slot, claim.server_pubkey);
-            // Find a new free slot. Pinned: only the pinned slot is ever ours —
-            // if someone else now holds it, stand down instead of advertising a
-            // slot whose registry glue does not point at us.
-            uint8_t new_slot = 0;
-            if (preferred_ns_slot_ != 0) {
-                const auto& s = ns_slots_[preferred_ns_slot_ - 1];
-                if (s.slot == 0 || s.server_pubkey.empty()) new_slot = preferred_ns_slot_;
-            } else {
-                for (uint8_t i = 0; i < 9; ++i) {
-                    if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-                        new_slot = i + 1;
-                        break;
+            if (!is_new) {
+                spdlog::debug("[{}] rejected NS slot claim for ns{} from {} (existing claim is newer or wins tiebreak)",
+                               name(), claim.slot, claim.server_pubkey);
+                return;
+            }
+
+            // Check if our own slot is being overwritten
+            bool our_slot_stolen = false;
+            std::string our_old_ip;
+            auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+            if (existing.server_pubkey == our_pubkey_b64 &&
+                claim.server_pubkey != our_pubkey_b64 &&
+                our_ns_slot_.has_value() && *our_ns_slot_ == claim.slot) {
+                our_slot_stolen = true;
+                our_old_ip = existing.server_ip; // save before overwrite
+            }
+
+            // Accept the claim
+            existing = claim;
+            accepted_claim = claim;
+            accepted = true;
+
+            spdlog::info("[{}] accepted NS slot claim: ns{} -> {} (ip={}, region={})",
+                          name(), claim.slot, claim.server_pubkey, claim.server_ip, claim.region);
+
+            // If our slot was stolen, try to re-claim a different one
+            if (our_slot_stolen) {
+                our_ns_slot_.reset();
+                spdlog::warn("[{}] our NS slot ns{} was overwritten by {}, will try to re-claim",
+                              name(), claim.slot, claim.server_pubkey);
+                // Find a new free slot. Pinned: only the pinned slot is ever ours —
+                // if someone else now holds it, stand down instead of advertising a
+                // slot whose registry glue does not point at us.
+                uint8_t new_slot = 0;
+                if (preferred_ns_slot_ != 0) {
+                    const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+                    if (s.slot == 0 || s.server_pubkey.empty()) new_slot = preferred_ns_slot_;
+                } else {
+                    for (uint8_t i = 0; i < 9; ++i) {
+                        if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                            new_slot = i + 1;
+                            break;
+                        }
                     }
                 }
+                if (new_slot > 0) {
+                    auto now = static_cast<uint64_t>(
+                        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+                    NsSlotClaimData reclaim;
+                    reclaim.slot          = new_slot;
+                    reclaim.server_pubkey = our_pubkey_b64;
+                    reclaim.server_ip     = our_old_ip; // recovered before overwrite
+                    reclaim.region        = our_region_;
+                    reclaim.timestamp = now;
+
+                    json sign_payload;
+                    sign_payload["slot"]          = reclaim.slot;
+                    sign_payload["server_pubkey"] = reclaim.server_pubkey;
+                    sign_payload["server_ip"]     = reclaim.server_ip;
+                    sign_payload["region"]        = reclaim.region;
+                    sign_payload["timestamp"]     = reclaim.timestamp;
+
+                    auto sign_data = sign_payload.dump();
+                    std::span<const uint8_t> sign_bytes(
+                        reinterpret_cast<const uint8_t*>(sign_data.data()), sign_data.size());
+                    auto sig = crypto_.ed25519_sign(keypair_.private_key, sign_bytes);
+                    reclaim.signature = crypto::to_base64(sig);
+
+                    ns_slots_[new_slot - 1] = reclaim;
+                    our_ns_slot_ = new_slot;
+                    reclaim_claim = reclaim;
+                    reclaimed = true;
+
+                    spdlog::info("[{}] re-claimed NS slot ns{} after losing ns{}",
+                                  name(), new_slot, claim.slot);
+                } else {
+                    spdlog::warn("[{}] all NS slots taken after losing ns{}, no slot available",
+                                  name(), claim.slot);
+                }
             }
-            if (new_slot > 0) {
-                auto now = static_cast<uint64_t>(
-                    chrono::system_clock::to_time_t(chrono::system_clock::now()));
+        }
+        if (!accepted) return;
 
-                NsSlotClaimData reclaim;
-                reclaim.slot          = new_slot;
-                reclaim.server_pubkey = our_pubkey_b64;
-                reclaim.server_ip     = our_old_ip; // recovered before overwrite
-                reclaim.region        = our_region_;
-                reclaim.timestamp = now;
+        // Register in DNS and forward outside the mesh lock (external calls)
+        register_ns_slot_in_dns(accepted_claim);
 
-                json sign_payload;
-                sign_payload["slot"]          = reclaim.slot;
-                sign_payload["server_pubkey"] = reclaim.server_pubkey;
-                sign_payload["server_ip"]     = reclaim.server_ip;
-                sign_payload["region"]        = reclaim.region;
-                sign_payload["timestamp"]     = reclaim.timestamp;
-
-                auto sign_data = sign_payload.dump();
-                std::span<const uint8_t> sign_bytes(
-                    reinterpret_cast<const uint8_t*>(sign_data.data()), sign_data.size());
-                auto sig = crypto_.ed25519_sign(keypair_.private_key, sign_bytes);
-                reclaim.signature = crypto::to_base64(sig);
-
-                ns_slots_[new_slot - 1] = reclaim;
-                our_ns_slot_ = new_slot;
-
-                spdlog::info("[{}] re-claimed NS slot ns{} after losing ns{}",
-                              name(), new_slot, claim.slot);
-
-                register_ns_slot_in_dns(reclaim);
-                broadcast_ns_slot_claim(reclaim);
-            } else {
-                spdlog::warn("[{}] all NS slots taken after losing ns{}, no slot available",
-                              name(), claim.slot);
+        {
+            std::vector<asio::ip::udp::endpoint> targets;
+            std::lock_guard lock(peers_mutex_);
+            for (const auto& peer : peers_) {
+                auto ep = parse_endpoint(peer.endpoint);
+                if (ep && *ep != sender) targets.push_back(*ep);
             }
+            std::vector<uint8_t> fwd_payload(payload, payload + payload_len);
+            for (const auto& ep : targets) {
+                send_packet(ep, GossipMsgType::NsSlotClaim, fwd_payload);
+            }
+        }
+
+        if (reclaimed) {
+            register_ns_slot_in_dns(reclaim_claim);
+            broadcast_ns_slot_claim(reclaim_claim);
         }
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse NS slot claim from {}:{}: {}",

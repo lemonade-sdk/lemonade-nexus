@@ -102,11 +102,13 @@ target_compile_definitions(test_evidence_chain PRIVATE
 add_nexus_test(test_nexus_attestd    test_nexus_attestd.cpp)
 target_link_libraries(test_nexus_attestd PRIVATE LemonadeNexusAttestdCore)
 
-add_nexus_test(test_misbehavior_detector test_misbehavior_detector.cpp)
 add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
 # Hostile packets at the real wire boundary: cert-gated sync, ServerHello
-# proof-of-possession, misbehavior proofs, and NS slot claim laundering.
+# proof-of-possession, retired misbehavior proofs, and NS slot claim laundering.
 add_nexus_test(test_gossip_ingress_security test_gossip_ingress_security.cpp)
+# Delta record transfer: generation-bound pagination, request binding, pool
+# retention and refusal, backoff survival, and the mesh-state race.
+add_nexus_test(test_gossip_delta_transfer test_gossip_delta_transfer.cpp)
 add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp)
 add_nexus_test(test_security_mesh_service test_security_mesh_service.cpp)
 
