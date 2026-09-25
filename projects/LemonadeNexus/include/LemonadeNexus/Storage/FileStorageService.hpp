@@ -48,8 +48,21 @@ public:
     /// Result of a bounded pool record read.
     enum class PoolRead { Ok, Absent, Oversized, IoError };
 
-    /// The pool's log generation, or nullopt when no generation is stored.
-    [[nodiscard]] std::optional<std::string> read_pool_generation() const;
+    /// State of the generation metadata file. Absent means no metadata has
+    /// ever been written; IoError means it exists but could not be read —
+    /// the caller must not treat unreadable metadata as absent.
+    enum class PoolMetaRead { Ok, Absent, IoError };
+
+    /// Outcome of a pool record write. Uncertain means the rename succeeded
+    /// but the directory sync failed: the destination file may exist and
+    /// its durability is not confirmed. The caller must neither treat the
+    /// write as failed (the bytes may be there) nor as confirmed (they may
+    /// not be).
+    enum class PoolWrite { Ok, Failed, Uncertain };
+
+    /// The pool's log generation, or nullopt when absent or unreadable.
+    /// `result` distinguishes the three states.
+    [[nodiscard]] std::optional<std::string> read_pool_generation(PoolMetaRead& result) const;
     /// Persist the log generation (atomic). Refuses malformed values.
     [[nodiscard]] bool write_pool_generation(const std::string& generation);
     /// Every pool entry (record and temp files); the generation meta file is
@@ -63,7 +76,16 @@ public:
                                                               PoolRead& result) const;
     /// Write one record file (atomic + synchronized). The hash must be a
     /// 64-character lowercase hex identifier.
-    [[nodiscard]] bool write_pool_record(const std::string& hash, const std::string& text);
+    [[nodiscard]] PoolWrite write_pool_record(const std::string& hash, const std::string& text);
+
+    /// Test seam: the next pool record write succeeds through the rename
+    /// but fails the post-rename directory sync, producing an uncertain
+    /// write outcome at the real durability boundary.
+    void test_arm_pool_dirsync_failure();
+
+    /// Test seam: cap for the pool directory enumeration (0 = production
+    /// bound).
+    void test_set_pool_list_cap(std::size_t cap);
     /// Whether a record file exists for this identifier.
     [[nodiscard]] bool pool_record_exists(const std::string& hash) const;
     [[nodiscard]] const std::filesystem::path& pool_dir() const { return pool_dir_; }
@@ -130,8 +152,11 @@ private:
     static bool synchronize_directory(const std::filesystem::path& path);
 
     /// Write text to path atomically: temp sibling, sync, rename, dir sync.
-    static bool atomic_write_synced(const std::filesystem::path& path,
-                                    const std::string& text);
+    /// Uncertain when the rename succeeded but the directory sync failed.
+    enum class AtomicWrite { Ok, Failed, Uncertain };
+    static AtomicWrite atomic_write_synced(const std::filesystem::path& path,
+                                           const std::string& text,
+                                           bool force_dirsync_fail = false);
 
     /// Validate that a user-supplied path component contains no traversal sequences.
     [[nodiscard]] static bool is_safe_path_component(std::string_view component);
@@ -145,6 +170,10 @@ private:
     std::filesystem::path pool_dir_;
     mutable std::mutex    mutex_;
     uint64_t              next_delta_seq_{1};
+
+    // Test seams.
+    std::size_t test_fail_next_pool_dirsync_{0};
+    std::size_t test_pool_list_cap_{0};
 };
 
 } // namespace nexus::storage

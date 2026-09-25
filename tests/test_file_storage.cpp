@@ -291,18 +291,22 @@ const std::string kHash =
 }
 
 TEST_F(FileStorageTest, PoolGenerationRoundTripAndRefusal) {
-    EXPECT_FALSE(storage->read_pool_generation().has_value());
+    FileStorageService::PoolMetaRead meta = FileStorageService::PoolMetaRead::Ok;
+    EXPECT_FALSE(storage->read_pool_generation(meta).has_value());
+    EXPECT_EQ(meta, FileStorageService::PoolMetaRead::Absent);
     ASSERT_TRUE(storage->write_pool_generation("gen-1"));
-    ASSERT_TRUE(storage->read_pool_generation().has_value());
-    EXPECT_EQ(*storage->read_pool_generation(), "gen-1");
+    ASSERT_TRUE(storage->read_pool_generation(meta).has_value());
+    EXPECT_EQ(meta, FileStorageService::PoolMetaRead::Ok);
+    EXPECT_EQ(*storage->read_pool_generation(meta), "gen-1");
     EXPECT_FALSE(storage->write_pool_generation(""));
-    ASSERT_TRUE(storage->read_pool_generation().has_value());
-    EXPECT_EQ(*storage->read_pool_generation(), "gen-1");  // unchanged
+    ASSERT_TRUE(storage->read_pool_generation(meta).has_value());
+    EXPECT_EQ(*storage->read_pool_generation(meta), "gen-1");  // unchanged
 }
 
 TEST_F(FileStorageTest, PoolRecordWriteReadRoundTripAndBoundedRead) {
     const auto text = R"({"position":1,"operation":"create_node"})";
-    ASSERT_TRUE(storage->write_pool_record(kHash, text));
+    ASSERT_EQ(storage->write_pool_record(kHash, text),
+              FileStorageService::PoolWrite::Ok);
     EXPECT_TRUE(storage->pool_record_exists(kHash));
 
     FileStorageService::PoolRead result = FileStorageService::PoolRead::Ok;
@@ -327,7 +331,8 @@ TEST_F(FileStorageTest, PoolRecordWriteReadRoundTripAndBoundedRead) {
 
 TEST_F(FileStorageTest, PoolListReportsRecordsTempFilesAndExcludesMeta) {
     ASSERT_TRUE(storage->write_pool_generation("gen-x"));
-    ASSERT_TRUE(storage->write_pool_record(kHash, "{}"));
+    ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
+              FileStorageService::PoolWrite::Ok);
 
     // A leftover in-flight temp file (e.g. from a crashed write) must be
     // listed so it counts toward storage bounds, and never indexed.
@@ -349,12 +354,77 @@ TEST_F(FileStorageTest, PoolListReportsRecordsTempFilesAndExcludesMeta) {
 }
 
 TEST_F(FileStorageTest, PoolRecordIdentifierRefusesNonHexAndTraversal) {
-    EXPECT_FALSE(storage->write_pool_record("not-hex", "{}"));
-    EXPECT_FALSE(storage->write_pool_record(kHash.substr(0, 10), "{}"));
+    EXPECT_EQ(storage->write_pool_record("not-hex", "{}"),
+              FileStorageService::PoolWrite::Failed);
+    EXPECT_EQ(storage->write_pool_record(kHash.substr(0, 10), "{}"),
+              FileStorageService::PoolWrite::Failed);
     EXPECT_FALSE(storage->pool_record_exists("not-hex"));
 
     FileStorageService::PoolRead result = FileStorageService::PoolRead::Ok;
     EXPECT_FALSE(storage->read_pool_record("../etc", 100, result).has_value());
+}
+
+// The uncertain outcome is produced at the real boundary: the rename
+// succeeds, the post-rename directory sync fails. The destination exists,
+// and the caller is told the durability is unconfirmed — not Ok, not a
+// clean Failed.
+TEST_F(FileStorageTest, PoolWriteUncertainLeavesDestinationAndReportsUncertain) {
+    storage->test_arm_pool_dirsync_failure();
+    const auto result = storage->write_pool_record(kHash, "{}");
+    EXPECT_EQ(result, FileStorageService::PoolWrite::Uncertain);
+    // The renamed destination exists even though the outcome is uncertain.
+    EXPECT_TRUE(storage->pool_record_exists(kHash));
+    // The seam is one-shot: the next write is a normal durable write.
+    EXPECT_EQ(storage->write_pool_record(kHash, "{}"),
+              FileStorageService::PoolWrite::Ok);
+}
+
+// Generation metadata: absence and filesystem error are distinct states,
+// and the read is bounded before any allocation.
+TEST_F(FileStorageTest, PoolMetaReadBoundedAndDistinguishesAbsentFromError) {
+    FileStorageService::PoolMetaRead meta = FileStorageService::PoolMetaRead::Ok;
+    EXPECT_FALSE(storage->read_pool_generation(meta).has_value());
+    EXPECT_EQ(meta, FileStorageService::PoolMetaRead::Absent);
+
+    // A well-formed meta file reads back.
+    ASSERT_TRUE(storage->write_pool_generation("gen-1"));
+    EXPECT_EQ(*storage->read_pool_generation(meta), "gen-1");
+    EXPECT_EQ(meta, FileStorageService::PoolMetaRead::Ok);
+
+    // Malformed content is an error, not an absence.
+    std::ofstream(storage->pool_dir() / "_meta.json", std::ios::trunc) << "not json";
+    EXPECT_FALSE(storage->read_pool_generation(meta).has_value());
+    EXPECT_EQ(meta, FileStorageService::PoolMetaRead::IoError);
+
+    // An oversized meta file is refused before its content is read.
+    std::ofstream big(storage->pool_dir() / "_meta.json", std::ios::trunc);
+    big << std::string(8192, 'x');
+    big.close();
+    EXPECT_FALSE(storage->read_pool_generation(meta).has_value());
+    EXPECT_EQ(meta, FileStorageService::PoolMetaRead::IoError);
+}
+
+// The directory enumeration is bounded while collecting, not after the
+// vector is built: with a cap below the file count, collection stops at
+// the cap.
+TEST_F(FileStorageTest, PoolListEnumerationIsBoundedWhileCollecting) {
+    auto make_hash = [](int i) {
+        return kHash.substr(0, 60) + std::to_string(i % 10) +
+               std::to_string((i * 7) % 10) + std::to_string((i * 13) % 10) +
+               std::to_string((i * 29) % 10);
+    };
+    // Six distinct record files.
+    for (int i = 0; i < 6; ++i) {
+        ASSERT_EQ(storage->write_pool_record(make_hash(i), "{}"),
+                  FileStorageService::PoolWrite::Ok);
+    }
+    EXPECT_EQ(storage->list_pool_entries().size(), 6u);
+
+    storage->test_set_pool_list_cap(4);
+    const auto capped = storage->list_pool_entries();
+    EXPECT_EQ(capped.size(), 4u);
+    storage->test_set_pool_list_cap(0);  // production bound
+    EXPECT_EQ(storage->list_pool_entries().size(), 6u);
 }
 
 // The pool directory is derived from the constructor argument. A moved-from
@@ -376,9 +446,11 @@ TEST_F(FileStorageTest, PoolsOfDifferentRootsAreIsolated) {
     const std::string hash_a = kHash;
     const std::string hash_b = kHash.substr(1) + "0";  // distinct 64-hex id
     ASSERT_TRUE(storage->write_pool_generation("gen-a"));
-    ASSERT_TRUE(storage->write_pool_record(hash_a, "{}"));
+    ASSERT_EQ(storage->write_pool_record(hash_a, "{}"),
+              FileStorageService::PoolWrite::Ok);
     ASSERT_TRUE(other.write_pool_generation("gen-b"));
-    ASSERT_TRUE(other.write_pool_record(hash_b, "{}"));
+    ASSERT_EQ(other.write_pool_record(hash_b, "{}"),
+              FileStorageService::PoolWrite::Ok);
 
     // Neither instance sees the other's pool contents.
     auto entries_a = storage->list_pool_entries();
@@ -387,14 +459,16 @@ TEST_F(FileStorageTest, PoolsOfDifferentRootsAreIsolated) {
     EXPECT_EQ(entries_a[0].hash, hash_a);
     ASSERT_EQ(entries_b.size(), 1u);
     EXPECT_EQ(entries_b[0].hash, hash_b);
-    EXPECT_EQ(*storage->read_pool_generation(), "gen-a");
-    EXPECT_EQ(*other.read_pool_generation(), "gen-b");
+    FileStorageService::PoolMetaRead meta = FileStorageService::PoolMetaRead::Ok;
+    EXPECT_EQ(*storage->read_pool_generation(meta), "gen-a");
+    EXPECT_EQ(*other.read_pool_generation(meta), "gen-b");
     EXPECT_FALSE(storage->pool_record_exists(hash_b));
     EXPECT_FALSE(other.pool_record_exists(hash_a));
 
     // A write through one instance does not appear under the other's root.
     const std::string hash_c = kHash.substr(2) + "11";
-    ASSERT_TRUE(other.write_pool_record(hash_c, "{}"));
+    ASSERT_EQ(other.write_pool_record(hash_c, "{}"),
+              FileStorageService::PoolWrite::Ok);
     EXPECT_EQ(other.list_pool_entries().size(), 2u);
     EXPECT_EQ(storage->list_pool_entries().size(), 1u);
 

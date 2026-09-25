@@ -343,12 +343,13 @@ bool FileStorageService::synchronize_directory(const fs::path& path) {
 #endif
 }
 
-bool FileStorageService::atomic_write_synced(const fs::path& path, const std::string& text) {
+FileStorageService::AtomicWrite FileStorageService::atomic_write_synced(
+        const fs::path& path, const std::string& text, bool force_dirsync_fail) {
     fs::create_directories(path.parent_path());
     fs::path tmp = path;
     tmp += ".tmp";
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return false;
+    if (fd < 0) return AtomicWrite::Failed;
     bool ok = false;
     {
         const auto* p = text.data();
@@ -373,32 +374,56 @@ bool FileStorageService::atomic_write_synced(const fs::path& path, const std::st
     if (!ok) {
         std::error_code ec;
         fs::remove(tmp, ec);
-        return false;
+        return AtomicWrite::Failed;
     }
     std::error_code ec;
     fs::rename(tmp, path, ec);
     if (ec) {
         fs::remove(tmp, ec);
-        return false;
+        return AtomicWrite::Failed;
     }
-    // The rename itself must be durable, not just the file content.
-    return synchronize_directory(path.parent_path());
+    // The rename itself must be durable, not just the file content. A
+    // failed directory sync after a successful rename is an UNCERTAIN
+    // outcome: the destination exists, but its durability is not confirmed.
+    if (force_dirsync_fail) return AtomicWrite::Uncertain;
+    return synchronize_directory(path.parent_path()) ? AtomicWrite::Ok
+                                                     : AtomicWrite::Uncertain;
 }
 
-std::optional<std::string> FileStorageService::read_pool_generation() const {
+// The generation metadata is small by construction; bound the read so a
+// hostile or corrupted meta file cannot force an unbounded allocation.
+namespace { constexpr std::uint64_t kPoolMetaMaxBytes = 4096; }
+
+std::optional<std::string> FileStorageService::read_pool_generation(PoolMetaRead& result) const {
     std::lock_guard lock(mutex_);
     const auto path = pool_dir_ / "_meta.json";
     std::error_code ec;
-    if (!fs::exists(path, ec) || ec) return std::nullopt;
+    if (!fs::exists(path, ec)) {
+        if (ec) { result = PoolMetaRead::IoError; return std::nullopt; }
+        result = PoolMetaRead::Absent;
+        return std::nullopt;
+    }
+    std::error_code size_ec;
+    const auto size = fs::file_size(path, size_ec);
+    if (size_ec) { result = PoolMetaRead::IoError; return std::nullopt; }
+    if (static_cast<std::uint64_t>(size) > kPoolMetaMaxBytes) {
+        result = PoolMetaRead::IoError;
+        return std::nullopt;
+    }
     std::ifstream ifs(path);
-    if (!ifs) return std::nullopt;
+    if (!ifs) { result = PoolMetaRead::IoError; return std::nullopt; }
     std::ostringstream ss;
     ss << ifs.rdbuf();
+    if (!ifs) { result = PoolMetaRead::IoError; return std::nullopt; }
     auto j = json::parse(ss.str(), nullptr, false);
-    if (j.is_discarded() || !j.is_object()) return std::nullopt;
-    if (!j.contains("generation") || !j["generation"].is_string()) return std::nullopt;
+    if (j.is_discarded() || !j.is_object()) { result = PoolMetaRead::IoError; return std::nullopt; }
+    if (!j.contains("generation") || !j["generation"].is_string()) {
+        result = PoolMetaRead::IoError;
+        return std::nullopt;
+    }
     const auto gen = j["generation"].get<std::string>();
-    if (gen.empty() || gen.size() > 128) return std::nullopt;
+    if (gen.empty() || gen.size() > 128) { result = PoolMetaRead::IoError; return std::nullopt; }
+    result = PoolMetaRead::Ok;
     return gen;
 }
 
@@ -407,15 +432,25 @@ bool FileStorageService::write_pool_generation(const std::string& generation) {
     std::lock_guard lock(mutex_);
     json meta;
     meta["generation"] = generation;
-    return atomic_write_synced(pool_dir_ / "_meta.json", meta.dump());
+    // An uncertain meta write is not a confirmed persist: refuse rather
+    // than claim a generation the pool may not actually carry.
+    return atomic_write_synced(pool_dir_ / "_meta.json", meta.dump()) == AtomicWrite::Ok;
 }
+
+// The pool holds at most kPoolMaxRecords record files plus their temp
+// siblings; the enumeration is bounded WHILE collecting, not after the
+// vector is built, so a hostile or corrupted directory cannot force an
+// unbounded allocation.
+namespace { constexpr std::size_t kPoolMaxListEntries = 200000; }
 
 std::vector<FileStorageService::PoolEntry> FileStorageService::list_pool_entries() const {
     std::lock_guard lock(mutex_);
     std::vector<PoolEntry> entries;
     std::error_code ec;
     if (!fs::exists(pool_dir_, ec) || ec) return entries;
+    const auto cap = test_pool_list_cap_ ? test_pool_list_cap_ : kPoolMaxListEntries;
     for (const auto& entry : fs::directory_iterator(pool_dir_, ec)) {
+        if (entries.size() >= cap) break;
         const auto ext = entry.path().extension().string();
         // Record files are <hash>.json; in-flight writes are <hash>.json.tmp.
         if (ext != ".json" && ext != ".tmp") continue;
@@ -459,11 +494,30 @@ std::optional<std::string> FileStorageService::read_pool_record(const std::strin
     return ss.str();
 }
 
-bool FileStorageService::write_pool_record(const std::string& hash, const std::string& text) {
+FileStorageService::PoolWrite FileStorageService::write_pool_record(const std::string& hash,
+                                                                    const std::string& text) {
     std::lock_guard lock(mutex_);
     const auto path = pool_record_path(hash);
-    if (path.empty()) return false;
-    return atomic_write_synced(path, text);
+    if (path.empty()) return PoolWrite::Failed;
+    bool force_dirsync_fail = false;
+    if (test_fail_next_pool_dirsync_ > 0) {
+        test_fail_next_pool_dirsync_--;
+        force_dirsync_fail = true;
+    }
+    const auto result = atomic_write_synced(path, text, force_dirsync_fail);
+    return result == AtomicWrite::Ok     ? PoolWrite::Ok
+         : result == AtomicWrite::Uncertain ? PoolWrite::Uncertain
+                                            : PoolWrite::Failed;
+}
+
+void FileStorageService::test_arm_pool_dirsync_failure() {
+    std::lock_guard lock(mutex_);
+    test_fail_next_pool_dirsync_ = 1;
+}
+
+void FileStorageService::test_set_pool_list_cap(std::size_t cap) {
+    std::lock_guard lock(mutex_);
+    test_pool_list_cap_ = cap;
 }
 
 bool FileStorageService::pool_record_exists(const std::string& hash) const {
