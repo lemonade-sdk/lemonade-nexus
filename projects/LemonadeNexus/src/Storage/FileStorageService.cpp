@@ -7,13 +7,21 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef _WIN32
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
+
 namespace nexus::storage {
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
 FileStorageService::FileStorageService(fs::path data_root)
-    : data_root_(std::move(data_root)) {}
+    : data_root_(std::move(data_root))
+    , pool_dir_(std::move(data_root) / "tree" / "retained_deltas") {}
 
 void FileStorageService::on_start() {
     do_ensure_directories();
@@ -243,9 +251,10 @@ std::vector<std::string> FileStorageService::do_list_files(std::string_view cate
 }
 
 void FileStorageService::do_ensure_directories() {
-    const std::array<fs::path, 6> dirs = {
+    const std::array<fs::path, 7> dirs = {
         data_root_ / "tree" / "nodes",
         data_root_ / "tree" / "deltas",
+        pool_dir_,
         data_root_ / "identity",
         data_root_ / "credentials",
         data_root_ / "ipam",
@@ -291,6 +300,217 @@ fs::path FileStorageService::file_path(std::string_view category, std::string_vi
         throw std::runtime_error("invalid file_name: path traversal rejected");
     }
     return data_root_ / std::string(category) / std::string(file_name);
+}
+
+fs::path FileStorageService::pool_record_path(std::string_view hash) const {
+    // Record identifiers are hex SHA-256 digests. Anything else is refused:
+    // the caller computes the identifier, but a path-shaped value must not
+    // reach the filesystem through it.
+    if (hash.size() != 64) return {};
+    for (char c : hash) {
+        const bool hexdigit = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        if (!hexdigit) return {};
+    }
+    return pool_dir_ / (std::string(hash) + ".json");
+}
+
+// --- Delta transfer pool primitives ---
+
+bool FileStorageService::synchronize_file(int fd) {
+#ifdef _WIN32
+    HANDLE handle = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    return FlushFileBuffers(handle) != FALSE;
+#else
+    return ::fsync(fd) == 0;
+#endif
+}
+
+bool FileStorageService::synchronize_directory(const fs::path& path) {
+#ifdef _WIN32
+    // No directory sync primitive; the rename is the visibility boundary.
+    (void)path;
+    return true;
+#else
+    int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) return false;
+    const int rc = ::fsync(dfd);
+    ::close(dfd);
+    return rc == 0;
+#endif
+}
+
+bool FileStorageService::atomic_write_synced(const fs::path& path, const std::string& text) {
+    fs::create_directories(path.parent_path());
+    fs::path tmp = path;
+    tmp += ".tmp";
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    bool ok = false;
+    {
+        const auto* p = text.data();
+        std::size_t remaining = text.size();
+        while (remaining > 0) {
+#ifdef _WIN32
+            const auto n = static_cast<std::size_t>(::WriteFile(
+                reinterpret_cast<HANDLE>(_get_osfhandle(fd)), p, static_cast<DWORD>(remaining),
+                nullptr, nullptr));
+            if (n == 0) break;
+            p += n; remaining -= n;
+#else
+            const auto n = ::write(fd, p, remaining);
+            if (n <= 0) break;
+            p += n; remaining -= static_cast<std::size_t>(n);
+#endif
+        }
+        ok = remaining == 0;
+    }
+    if (ok) ok = synchronize_file(fd);
+    ::close(fd);
+    if (!ok) {
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
+    }
+    std::error_code ec;
+    fs::rename(tmp, path, ec);
+    if (ec) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    // The rename itself must be durable, not just the file content.
+    return synchronize_directory(path.parent_path());
+}
+
+std::optional<std::string> FileStorageService::read_pool_generation() const {
+    std::lock_guard lock(mutex_);
+    const auto path = pool_dir_ / "_meta.json";
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) return std::nullopt;
+    std::ifstream ifs(path);
+    if (!ifs) return std::nullopt;
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    auto j = json::parse(ss.str(), nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+    if (!j.contains("generation") || !j["generation"].is_string()) return std::nullopt;
+    const auto gen = j["generation"].get<std::string>();
+    if (gen.empty() || gen.size() > 128) return std::nullopt;
+    return gen;
+}
+
+bool FileStorageService::write_pool_generation(const std::string& generation) {
+    if (generation.empty() || generation.size() > 128) return false;
+    std::lock_guard lock(mutex_);
+    json meta;
+    meta["generation"] = generation;
+    return atomic_write_synced(pool_dir_ / "_meta.json", meta.dump());
+}
+
+std::vector<FileStorageService::PoolEntry> FileStorageService::list_pool_entries() const {
+    std::lock_guard lock(mutex_);
+    std::vector<PoolEntry> entries;
+    std::error_code ec;
+    if (!fs::exists(pool_dir_, ec) || ec) return entries;
+    for (const auto& entry : fs::directory_iterator(pool_dir_, ec)) {
+        const auto ext = entry.path().extension().string();
+        // Record files are <hash>.json; in-flight writes are <hash>.json.tmp.
+        if (ext != ".json" && ext != ".tmp") continue;
+        if (entry.path().filename() == "_meta.json") continue;
+        PoolEntry pe;
+        auto stem = entry.path().stem().string();
+        pe.temporary = (ext == ".tmp");
+        if (pe.temporary && stem.size() > 5 && stem.ends_with(".json")) {
+            stem.resize(stem.size() - 5);
+        }
+        pe.hash = std::move(stem);
+        std::error_code size_ec;
+        const auto size = entry.file_size(size_ec);
+        pe.size_bytes = size_ec ? 0 : static_cast<uint64_t>(size);
+        entries.push_back(std::move(pe));
+    }
+    return entries;
+}
+
+std::optional<std::string> FileStorageService::read_pool_record(const std::string& hash,
+                                                                uint64_t max_bytes,
+                                                                PoolRead& result) const {
+    std::lock_guard lock(mutex_);
+    const auto path = pool_record_path(hash);
+    if (path.empty()) { result = PoolRead::IoError; return std::nullopt; }
+    std::error_code ec;
+    if (!fs::exists(path, ec) || ec) { result = PoolRead::Absent; return std::nullopt; }
+    std::error_code size_ec;
+    const auto size = fs::file_size(path, size_ec);
+    if (size_ec) { result = PoolRead::IoError; return std::nullopt; }
+    if (static_cast<uint64_t>(size) > max_bytes) {
+        result = PoolRead::Oversized;
+        return std::nullopt;  // not read at all
+    }
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) { result = PoolRead::IoError; return std::nullopt; }
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    if (!ifs) { result = PoolRead::IoError; return std::nullopt; }
+    result = PoolRead::Ok;
+    return ss.str();
+}
+
+bool FileStorageService::write_pool_record(const std::string& hash, const std::string& text) {
+    std::lock_guard lock(mutex_);
+    const auto path = pool_record_path(hash);
+    if (path.empty()) return false;
+    return atomic_write_synced(path, text);
+}
+
+bool FileStorageService::pool_record_exists(const std::string& hash) const {
+    std::lock_guard lock(mutex_);
+    const auto path = pool_record_path(hash);
+    if (path.empty()) return false;
+    std::error_code ec;
+    return fs::exists(path, ec) && !ec;
+}
+
+// --- RetainedDelta serialization ---
+
+std::string FileStorageService::RetainedDelta::to_json() const {
+    json j;
+    j["version"]        = 1;
+    j["position"]       = position;
+    j["record_hash"]    = record_hash;
+    j["operation"]      = operation;
+    j["target_node_id"] = target_node_id;
+    j["node_data"]      = json::parse(data, nullptr, false);
+    j["signer_pubkey"]  = signer_pubkey;
+    j["signature"]      = signature;
+    j["timestamp"]      = timestamp;
+    return j.dump();
+}
+
+std::optional<FileStorageService::RetainedDelta> FileStorageService::RetainedDelta::from_json(
+    std::string_view text) {
+    auto j = json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+    if (!j.contains("operation") || !j["operation"].is_string() ||
+        !j.contains("target_node_id") || !j["target_node_id"].is_string() ||
+        !j.contains("node_data") || !j["node_data"].is_object() ||
+        !j.contains("signer_pubkey") || !j["signer_pubkey"].is_string() ||
+        !j.contains("signature") || !j["signature"].is_string() ||
+        !j.contains("timestamp") || !j["timestamp"].is_number_unsigned() ||
+        !j.contains("position") || !j["position"].is_number_unsigned() ||
+        !j.contains("record_hash") || !j["record_hash"].is_string()) {
+        return std::nullopt;
+    }
+    RetainedDelta r;
+    r.position       = j["position"].get<uint64_t>();
+    r.record_hash    = j["record_hash"].get<std::string>();
+    r.operation      = j["operation"].get<std::string>();
+    r.target_node_id = j["target_node_id"].get<std::string>();
+    r.data           = j["node_data"].dump();
+    r.signer_pubkey  = j["signer_pubkey"].get<std::string>();
+    r.signature      = j["signature"].get<std::string>();
+    r.timestamp      = j["timestamp"].get<uint64_t>();
+    return r;
 }
 
 // --- JSON serialization ---

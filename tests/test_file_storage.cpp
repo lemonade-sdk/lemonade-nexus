@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <fstream>
 #include <string>
 #ifdef _WIN32
 #  include <process.h>
@@ -279,4 +280,107 @@ TEST_F(FileStorageTest, DeltaSequenceRestoredOnRestart) {
     // Next delta should get seq 4
     auto seq = storage->append_delta(delta);
     EXPECT_EQ(seq, 4u);
+}
+
+// --- Delta transfer pool primitives ---
+
+namespace {
+// A valid 64-character lowercase hex identifier.
+const std::string kHash =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+}
+
+TEST_F(FileStorageTest, PoolGenerationRoundTripAndRefusal) {
+    EXPECT_FALSE(storage->read_pool_generation().has_value());
+    ASSERT_TRUE(storage->write_pool_generation("gen-1"));
+    ASSERT_TRUE(storage->read_pool_generation().has_value());
+    EXPECT_EQ(*storage->read_pool_generation(), "gen-1");
+    EXPECT_FALSE(storage->write_pool_generation(""));
+    ASSERT_TRUE(storage->read_pool_generation().has_value());
+    EXPECT_EQ(*storage->read_pool_generation(), "gen-1");  // unchanged
+}
+
+TEST_F(FileStorageTest, PoolRecordWriteReadRoundTripAndBoundedRead) {
+    const auto text = R"({"position":1,"operation":"create_node"})";
+    ASSERT_TRUE(storage->write_pool_record(kHash, text));
+    EXPECT_TRUE(storage->pool_record_exists(kHash));
+
+    FileStorageService::PoolRead result = FileStorageService::PoolRead::Ok;
+    auto read = storage->read_pool_record(kHash, 4096, result);
+    ASSERT_TRUE(read.has_value());
+    EXPECT_EQ(result, FileStorageService::PoolRead::Ok);
+    EXPECT_EQ(*read, text);
+
+    // The bound is applied before any read: a small cap reports Oversized
+    // without returning content.
+    auto big = storage->read_pool_record(kHash, 5, result);
+    EXPECT_FALSE(big.has_value());
+    EXPECT_EQ(result, FileStorageService::PoolRead::Oversized);
+
+    const std::string other =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    EXPECT_FALSE(storage->pool_record_exists(other));
+    auto absent = storage->read_pool_record(other, 4096, result);
+    EXPECT_FALSE(absent.has_value());
+    EXPECT_EQ(result, FileStorageService::PoolRead::Absent);
+}
+
+TEST_F(FileStorageTest, PoolListReportsRecordsTempFilesAndExcludesMeta) {
+    ASSERT_TRUE(storage->write_pool_generation("gen-x"));
+    ASSERT_TRUE(storage->write_pool_record(kHash, "{}"));
+
+    // A leftover in-flight temp file (e.g. from a crashed write) must be
+    // listed so it counts toward storage bounds, and never indexed.
+    std::ofstream(storage->pool_dir() / (kHash + ".json.tmp")) << "partial";
+
+    const auto entries = storage->list_pool_entries();
+    ASSERT_EQ(entries.size(), 2u);
+    bool saw_record = false, saw_tmp = false;
+    for (const auto& e : entries) {
+        if (e.hash == kHash && !e.temporary) {
+            saw_record = true;
+            EXPECT_EQ(e.size_bytes, 2u);  // "{}"
+        }
+        if (e.hash == kHash && e.temporary) saw_tmp = true;
+        EXPECT_NE(e.hash, "_meta");
+    }
+    EXPECT_TRUE(saw_record);
+    EXPECT_TRUE(saw_tmp);
+}
+
+TEST_F(FileStorageTest, PoolRecordIdentifierRefusesNonHexAndTraversal) {
+    EXPECT_FALSE(storage->write_pool_record("not-hex", "{}"));
+    EXPECT_FALSE(storage->write_pool_record(kHash.substr(0, 10), "{}"));
+    EXPECT_FALSE(storage->pool_record_exists("not-hex"));
+
+    FileStorageService::PoolRead result = FileStorageService::PoolRead::Ok;
+    EXPECT_FALSE(storage->read_pool_record("../etc", 100, result).has_value());
+}
+
+TEST_F(FileStorageTest, RetainedDeltaJsonRoundTrip) {
+    FileStorageService::RetainedDelta r;
+    r.position = 7;
+    r.record_hash = kHash;
+    r.operation = "update_node";
+    r.target_node_id = "node-1";
+    r.data = R"({"id":"node-1","parent_id":"root"})";
+    r.signer_pubkey = "ed25519:AAAA";
+    r.signature = "BBBB";
+    r.timestamp = 1234;
+
+    auto parsed = FileStorageService::RetainedDelta::from_json(r.to_json());
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->position, 7u);
+    EXPECT_EQ(parsed->record_hash, kHash);
+    EXPECT_EQ(parsed->operation, "update_node");
+    EXPECT_EQ(parsed->target_node_id, "node-1");
+    EXPECT_EQ(parsed->data, r.data);
+    EXPECT_EQ(parsed->signer_pubkey, "ed25519:AAAA");
+    EXPECT_EQ(parsed->signature, "BBBB");
+    EXPECT_EQ(parsed->timestamp, 1234u);
+
+    // Malformed structures are refused, not half-parsed.
+    EXPECT_FALSE(FileStorageService::RetainedDelta::from_json("not json").has_value());
+    EXPECT_FALSE(FileStorageService::RetainedDelta::from_json(
+        R"({"operation":"update_node"})").has_value());
 }
