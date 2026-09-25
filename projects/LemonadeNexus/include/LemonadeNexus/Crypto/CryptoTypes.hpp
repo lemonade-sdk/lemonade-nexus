@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <string_view>
+#include <initializer_list>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -38,17 +40,81 @@ struct X25519Keypair {
     X25519PrivateKey private_key{};
 };
 
-// --- AES-256-GCM / XChaCha20-Poly1305 AEAD ---
-static constexpr std::size_t kAesGcmKeySize        = 32;
-static constexpr std::size_t kAesGcmNonceSize       = 12;
-static constexpr std::size_t kAesGcmTagSize         = 16;
-using AesGcmKey   = std::array<uint8_t, kAesGcmKeySize>;
-using AesGcmNonce = std::array<uint8_t, kAesGcmNonceSize>;
+// --- Application AEAD: XChaCha20-Poly1305-IETF, and nothing else -------------
+//
+// One algorithm on every cpu. The cipher is NOT chosen from hardware
+// capability: a ciphertext written anywhere must open anywhere with the same
+// key, so AES-NI, cpu model, VM host and architecture are not inputs to the
+// format. libsodium ships AES-256-GCM only as aesni/armcrypto, so an
+// AES-encrypted object is unreadable on a machine without those instructions —
+// which is exactly the property this rules out.
+static constexpr std::size_t kAeadKeySize   = 32;
+static constexpr std::size_t kAeadNonceSize = 24;
+static constexpr std::size_t kAeadTagSize   = 16;
+using AeadKey = std::array<uint8_t, kAeadKeySize>;
 
-struct AesGcmCiphertext {
-    std::vector<uint8_t> ciphertext; // includes appended tag
-    std::vector<uint8_t> nonce;      // 12 bytes
+/// The one encrypted-object format. `version` names an exact construction, so a
+/// reader never infers the algorithm from field widths.
+///
+///   version 1 = XChaCha20-Poly1305-IETF, 24-byte random nonce, 16-byte tag
+///
+/// Unknown versions fail closed. There is deliberately no algorithm field:
+/// negotiation would put the choice back on the wire.
+static constexpr uint8_t kEncryptedBlobVersion = 1;
+
+struct EncryptedBlob {
+    uint8_t              version{kEncryptedBlobVersion};
+    std::vector<uint8_t> nonce;       // exactly kAeadNonceSize
+    std::vector<uint8_t> ciphertext;  // includes the appended tag
 };
+
+/// Canonical authenticated associated data for one encrypted object:
+///
+///     version || LP(purpose) || LP(context[0]) || LP(context[1]) ...
+///
+/// where LP(x) is a u32 little-endian length followed by the bytes. Every field
+/// is length-prefixed, so no two (purpose, context) pairs can produce the same
+/// AAD by moving a boundary.
+///
+/// The version is the COMPILED constant, not the value read off a blob. A
+/// tampered version field is already refused before decryption, and binding the
+/// constant is what stops a future version-2 ciphertext from being replayed as
+/// version 1: its AAD was computed with a different leading byte, so the tag
+/// fails. This is domain separation, not algorithm negotiation.
+///
+/// `purpose` is a fixed tag per construction; `context` carries the immutable
+/// identity the ciphertext belongs to, so a valid blob cannot be transplanted
+/// into another row, record or recipient.
+[[nodiscard]] inline std::vector<uint8_t> aead_aad(
+        std::string_view purpose,
+        std::initializer_list<std::span<const uint8_t>> context = {}) {
+    std::vector<uint8_t> aad;
+    const auto put = [&aad](const uint8_t* data, std::size_t size) {
+        const auto n = static_cast<uint32_t>(size);
+        aad.push_back(static_cast<uint8_t>(n & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 8) & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 16) & 0xFF));
+        aad.push_back(static_cast<uint8_t>((n >> 24) & 0xFF));
+        aad.insert(aad.end(), data, data + size);
+    };
+    aad.push_back(kEncryptedBlobVersion);
+    put(reinterpret_cast<const uint8_t*>(purpose.data()), purpose.size());
+    for (const auto& piece : context) {
+        put(piece.data(), piece.size());
+    }
+    return aad;
+}
+
+/// The fixed purpose tags. One per construction; never reused across objects.
+namespace aead_purpose {
+inline constexpr std::string_view kAclPermissions = "acl-permissions";
+inline constexpr std::string_view kDdnsAtRest = "ddns-at-rest";
+inline constexpr std::string_view kDdnsCredentialTransfer = "ddns-credential-transfer";
+inline constexpr std::string_view kCertBundle = "cert-bundle";
+inline constexpr std::string_view kKeyWrapping = "key-wrapping";
+inline constexpr std::string_view kChildKey = "child-key";
+inline constexpr std::string_view kDelegationWrappingKey = "delegation-wrapping-key";
+}  // namespace aead_purpose
 
 // --- HKDF ---
 static constexpr std::size_t kHkdfSaltSize = 32;

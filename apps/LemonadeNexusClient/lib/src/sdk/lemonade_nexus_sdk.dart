@@ -124,7 +124,7 @@ class LemonadeNexusSdk {
 
   /// Parses a list that the SDK nests inside an envelope object.
   ///
-  /// Some endpoints (e.g. `ln_enrollment_status`, `ln_attestation_manifests`)
+  /// Some endpoints (e.g. `ln_attestation_manifests`)
   /// return `{...meta, "<key>": [ ... ]}` rather than a bare array. This
   /// extracts the nested array under [key]; if the SDK instead returns a bare
   /// array, that is handled too.
@@ -396,6 +396,24 @@ class LemonadeNexusSdk {
       throw SdkException(LnError.auth, message: 'Passkey authentication failed');
     }
     return _parseJson(result, AuthResponse.fromJson);
+  }
+
+  /// Fetches the server-issued WebAuthn assertion challenge bound to [userId].
+  /// The assertion's clientDataJSON must carry it; it expires server-side and
+  /// is single-use.
+  Future<String> getPasskeyChallenge(String userId) async {
+    _checkDisposed();
+    _checkConnected();
+    final json = _ffi.authPasskeyChallenge(_client!, userId);
+    if (json == null) {
+      throw SdkException(LnError.connect,
+          message: 'Passkey challenge request failed');
+    }
+    final challenge = _parseJson(json, (m) => m)['challenge'] as String?;
+    if (challenge == null || challenge.isEmpty) {
+      throw SdkException(LnError.connect, message: 'Empty passkey challenge');
+    }
+    return challenge;
   }
 
   /// Authenticates with a token.
@@ -847,32 +865,6 @@ class LemonadeNexusSdk {
   }
 
   // =========================================================================
-  // Trust & Attestation
-  // =========================================================================
-
-  /// Gets trust status.
-  Future<TrustStatus> getTrustStatus() async {
-    _checkDisposed();
-    _checkConnected();
-    final json = _ffi.trustStatus(_client!);
-    if (json == null) {
-      throw SdkException(LnError.internal, message: 'Failed to get trust status');
-    }
-    return _parseJson(json, TrustStatus.fromJson);
-  }
-
-  /// Gets trust info for a specific peer.
-  Future<TrustPeerInfo> getTrustPeer(String pubkey) async {
-    _checkDisposed();
-    _checkConnected();
-    final json = _ffi.trustPeer(_client!, pubkey);
-    if (json == null) {
-      throw SdkException(LnError.notFound, message: 'Peer not found: $pubkey');
-    }
-    return _parseJson(json, TrustPeerInfo.fromJson);
-  }
-
-  // =========================================================================
   // DDNS
   // =========================================================================
 
@@ -885,52 +877,6 @@ class LemonadeNexusSdk {
       throw SdkException(LnError.internal, message: 'Failed to get DDNS status');
     }
     return _parseJson(json, DdnsStatus.fromJson);
-  }
-
-  // =========================================================================
-  // Enrollment
-  // =========================================================================
-
-  /// Gets enrollment status.
-  Future<List<EnrollmentEntry>> getEnrollmentStatus() async {
-    _checkDisposed();
-    _checkConnected();
-    final json = _ffi.enrollmentStatus(_client!);
-    if (json == null) {
-      throw SdkException(LnError.internal, message: 'Failed to get enrollment status');
-    }
-    // SDK returns an envelope `{enabled, ..., enrollments: [...]}`.
-    return _parseNestedList(json, 'enrollments', EnrollmentEntry.fromJson);
-  }
-
-  // =========================================================================
-  // Governance
-  // =========================================================================
-
-  /// Gets governance proposals.
-  Future<List<GovernanceProposal>> getGovernanceProposals() async {
-    _checkDisposed();
-    _checkConnected();
-    final json = _ffi.governanceProposals(_client!);
-    if (json == null) {
-      throw SdkException(LnError.internal, message: 'Failed to get proposals');
-    }
-    return _parseJsonList(json, GovernanceProposal.fromJson);
-  }
-
-  /// Submits a governance proposal.
-  Future<ProposeResponse> submitGovernanceProposal({
-    required int parameter,
-    required String newValue,
-    required String rationale,
-  }) async {
-    _checkDisposed();
-    _checkConnected();
-    final json = _ffi.governancePropose(_client!, parameter, newValue, rationale);
-    if (json == null) {
-      throw SdkException(LnError.internal, message: 'Failed to submit proposal');
-    }
-    return _parseJson(json, ProposeResponse.fromJson);
   }
 
   // =========================================================================
@@ -1008,17 +954,17 @@ class LemonadeNexusSdk {
 
   /// Requests a connection to an endpoint by [identifier].
   ///
-  /// [connNonceB64] is a client-chosen 16-byte nonce (base64). [clientWgPub]
+  /// [connNonceB64] is a client-chosen 16-byte nonce (base64). [clientMeshPubkey]
   /// is optional. Returns the raw {connection_id, state} JSON.
   Future<Map<String, dynamic>> routingRequest(
     String identifier,
     String connNonceB64, {
-    String clientWgPub = '',
+    String clientMeshPubkey = '',
   }) async {
     _checkDisposed();
     _checkConnected();
     final json = _ffi.routingRequest(_client!, identifier, connNonceB64,
-        clientWgPub: clientWgPub);
+        clientMeshPubkey: clientMeshPubkey);
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Routing request failed');
     }

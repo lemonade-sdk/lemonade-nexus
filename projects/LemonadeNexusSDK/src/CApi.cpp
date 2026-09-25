@@ -16,6 +16,20 @@ using json = nlohmann::json;
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+// Map an lnsdk::Result failure to a distinct ln_error_t. The SDK client
+// reports the transport failure (no HTTP status), the HTTP status it did
+// receive, and a text message. Without this split, e.g. ln_tree_get_node
+// collapsed auth / network / parse failures into one code and a C caller
+// could not tell "not authenticated" from "server unreachable" from a
+// malformed response.
+static ln_error_t ln_map_error(int http_status) {
+    if (http_status == 401 || http_status == 403) return LN_ERR_AUTH;
+    if (http_status == 404) return LN_ERR_NOT_FOUND;
+    if (http_status == 0)   return LN_ERR_CONNECT;
+    if (http_status >= 500) return LN_ERR_CONNECT;
+    return LN_ERR_REJECTED;
+}
+
 struct ln_client_s {
     lnsdk::LemonadeNexusClient client;
     explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {}
@@ -186,6 +200,22 @@ ln_error_t ln_auth_passkey(ln_client_t* client,
     return result.ok ? LN_OK : LN_ERR_AUTH;
 }
 
+ln_error_t ln_auth_passkey_challenge(ln_client_t* client,
+                                     const char* user_id,
+                                     char** out_json) {
+    if (!client || !user_id || !out_json) return LN_ERR_NULL_ARG;
+
+    auto result = client->client.issue_passkey_challenge(user_id);
+    json j;
+    if (result.ok) {
+        j["challenge"] = result.value;
+    } else {
+        j["error"] = result.error;
+    }
+    *out_json = strdup_json(j);
+    return result.ok ? LN_OK : ln_map_error(result.http_status);
+}
+
 ln_error_t ln_auth_token(ln_client_t* client,
                           const char* token,
                           char** out_json) {
@@ -221,7 +251,12 @@ ln_error_t ln_tree_get_node(ln_client_t* client,
     json err;
     err["error"] = result.error;
     *out_json = strdup_json(err);
-    return LN_ERR_NOT_FOUND;
+    // A 2xx response whose body failed to deserialize is a malformed-response
+    // failure (LN_ERR_PARSE), distinct from auth (401/403), not-found (404)
+    // and network (no transport / 5xx) failures.
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_tree_submit_delta(ln_client_t* client,
@@ -456,6 +491,7 @@ ln_error_t ln_cert_request(ln_client_t* client,
     j["domain"]           = result.value.domain;
     j["fullchain_pem"]    = result.value.fullchain_pem;
     j["encrypted_privkey"] = result.value.encrypted_privkey;
+    j["crypto_version"]    = result.value.crypto_version;
     j["nonce"]            = result.value.nonce;
     j["ephemeral_pubkey"] = result.value.ephemeral_pubkey;
     j["expires_at"]       = result.value.expires_at;
@@ -477,6 +513,7 @@ ln_error_t ln_cert_decrypt(ln_client_t* client,
     bundle.domain           = parsed.value("domain", "");
     bundle.fullchain_pem    = parsed.value("fullchain_pem", "");
     bundle.encrypted_privkey = parsed.value("encrypted_privkey", "");
+    bundle.crypto_version    = parsed.value("crypto_version", 0u);
     bundle.nonce            = parsed.value("nonce", "");
     bundle.ephemeral_pubkey = parsed.value("ephemeral_pubkey", "");
     bundle.expires_at       = parsed.value("expires_at", uint64_t{0});
@@ -509,7 +546,13 @@ ln_error_t ln_tree_get_children(ln_client_t* client,
         arr.push_back(j);
     }
     *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    // Symmetric with ln_tree_get_node: a 2xx response whose body did not
+    // parse is a malformed-response failure (LN_ERR_PARSE), not a network or
+    // auth failure.
+    if (result.ok) return LN_OK;
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +645,13 @@ ln_error_t ln_get_group_members(ln_client_t* client,
         });
     }
     *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_NOT_FOUND;
+    // Symmetric with ln_tree_get_node: a 2xx response whose body did not
+    // parse is a malformed-response failure (LN_ERR_PARSE), not a network or
+    // auth failure.
+    if (result.ok) return LN_OK;
+    return (result.http_status >= 200 && result.http_status < 300)
+        ? LN_ERR_PARSE
+        : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_join_group(ln_client_t* client,
@@ -638,7 +687,7 @@ ln_error_t ln_join_network(ln_client_t* client,
     j["node_id"]        = result.value.node_id;
     j["tunnel_ip"]      = result.value.tunnel_ip;
     j["private_subnet"] = result.value.private_subnet;
-    j["wg_pubkey"]      = result.value.wg_pubkey;
+    j["mesh_pubkey"]    = result.value.mesh_pubkey;
     if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);
@@ -856,47 +905,18 @@ ln_error_t ln_private_api_call(ln_client_t* client, const char* method,
 }
 
 ln_error_t ln_trust_status(ln_client_t* client, char** out_json) {
+    // Retired endpoint: /api/trust/status no longer exists. The symbol is
+    // kept for ABI stability and fails explicitly.
     if (!client || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_trust_status();
-    json j;
-    j["our_tier"]    = result.value.our_tier;
-    j["our_platform"] = result.value.our_platform;
-    j["require_tee"] = result.value.require_tee;
-    j["binary_hash"] = result.value.binary_hash;
-    j["peer_count"]  = result.value.peer_count;
-    json peers = json::array();
-    for (const auto& p : result.value.peers) {
-        peers.push_back({
-            {"pubkey",               p.pubkey},
-            {"tier",                 p.tier},
-            {"tier_name",            p.tier_name},
-            {"platform",             p.platform},
-            {"last_verified",        p.last_verified},
-            {"binary_hash",          p.binary_hash},
-            {"failed_verifications", p.failed_verifications},
-        });
-    }
-    j["peers"] = peers;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 ln_error_t ln_trust_peer(ln_client_t* client, const char* pubkey, char** out_json) {
+    // Retired endpoint: /api/trust/peer/{pubkey} no longer exists.
     if (!client || !pubkey || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_trust_peer(pubkey);
-    json j;
-    j["pubkey"]               = result.value.pubkey;
-    j["tier"]                 = result.value.tier;
-    j["tier_name"]            = result.value.tier_name;
-    j["platform"]             = result.value.platform;
-    j["last_verified"]        = result.value.last_verified;
-    j["attestation_hash"]     = result.value.attestation_hash;
-    j["binary_hash"]          = result.value.binary_hash;
-    j["failed_verifications"] = result.value.failed_verifications;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_NOT_FOUND;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,81 +937,21 @@ ln_error_t ln_ddns_status(ln_client_t* client, char** out_json) {
 }
 
 // ---------------------------------------------------------------------------
-// Enrollment
+// Retired endpoints (kept for ABI stability)
 // ---------------------------------------------------------------------------
 
 ln_error_t ln_enrollment_status(ln_client_t* client, char** out_json) {
+    // Retired endpoint: /api/enrollment/status no longer exists.
     if (!client || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_enrollment_status();
-    json j;
-    j["enabled"]          = result.value.enabled;
-    j["quorum_ratio"]     = result.value.quorum_ratio;
-    j["vote_timeout_sec"] = result.value.vote_timeout_sec;
-    j["pending_count"]    = result.value.pending_count;
-    json enrollments = json::array();
-    for (const auto& e : result.value.enrollments) {
-        json entry;
-        entry["request_id"]          = e.request_id;
-        entry["candidate_pubkey"]    = e.candidate_pubkey;
-        entry["candidate_server_id"] = e.candidate_server_id;
-        entry["sponsor_pubkey"]      = e.sponsor_pubkey;
-        entry["state"]               = e.state;
-        entry["state_name"]          = e.state_name;
-        entry["created_at"]          = e.created_at;
-        entry["timeout_at"]          = e.timeout_at;
-        entry["retries"]             = e.retries;
-        json votes = json::array();
-        for (const auto& v : e.votes) {
-            votes.push_back({
-                {"voter_pubkey", v.voter_pubkey},
-                {"approve",      v.approve},
-                {"reason",       v.reason},
-                {"timestamp",    v.timestamp},
-            });
-        }
-        entry["votes"] = votes;
-        enrollments.push_back(std::move(entry));
-    }
-    j["enrollments"] = enrollments;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
-// ---------------------------------------------------------------------------
-// Governance
-// ---------------------------------------------------------------------------
-
 ln_error_t ln_governance_proposals(ln_client_t* client, char** out_json) {
+    // Retired endpoint: /api/governance/proposals no longer exists.
     if (!client || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.get_governance_proposals();
-    json arr = json::array();
-    for (const auto& p : result.value) {
-        json entry;
-        entry["proposal_id"]    = p.proposal_id;
-        entry["proposer_pubkey"] = p.proposer_pubkey;
-        entry["parameter"]      = p.parameter;
-        entry["new_value"]      = p.new_value;
-        entry["old_value"]      = p.old_value;
-        entry["rationale"]      = p.rationale;
-        entry["created_at"]     = p.created_at;
-        entry["expires_at"]     = p.expires_at;
-        entry["state"]          = p.state;
-        entry["state_name"]     = p.state_name;
-        json votes = json::array();
-        for (const auto& v : p.votes) {
-            votes.push_back({
-                {"voter_pubkey", v.voter_pubkey},
-                {"approve",      v.approve},
-                {"reason",       v.reason},
-                {"timestamp",    v.timestamp},
-            });
-        }
-        entry["votes"] = votes;
-        arr.push_back(std::move(entry));
-    }
-    *out_json = strdup_json(arr);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 ln_error_t ln_governance_propose(ln_client_t* client,
@@ -999,14 +959,11 @@ ln_error_t ln_governance_propose(ln_client_t* client,
                                    const char* new_value,
                                    const char* rationale,
                                    char** out_json) {
+    // Retired endpoint: /api/governance/propose no longer exists.
     if (!client || !new_value || !rationale || !out_json) return LN_ERR_NULL_ARG;
-    auto result = client->client.submit_governance_proposal(parameter, new_value, rationale);
-    json j;
-    j["proposal_id"] = result.value.proposal_id;
-    j["status"]      = result.value.status;
-    if (!result.ok) j["error"] = result.error;
-    *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_REJECTED;
+    (void)parameter;
+    *out_json = strdup_str("{\"error\":\"endpoint retired\"}");
+    return LN_ERR_UNSUPPORTED;
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +1105,7 @@ ln_error_t ln_mesh_status(ln_client_t* client, char** out_json) {
         json pj;
         pj["node_id"]        = p.node_id;
         pj["hostname"]       = p.hostname;
-        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["mesh_pubkey"]    = p.mesh_pubkey;
         pj["tunnel_ip"]      = p.tunnel_ip;
         pj["private_subnet"] = p.private_subnet;
         pj["endpoint"]       = p.endpoint;
@@ -1176,7 +1133,7 @@ ln_error_t ln_mesh_peers(ln_client_t* client, char** out_json) {
         json pj;
         pj["node_id"]        = p.node_id;
         pj["hostname"]       = p.hostname;
-        pj["wg_pubkey"]      = p.wg_pubkey;
+        pj["mesh_pubkey"]    = p.mesh_pubkey;
         pj["tunnel_ip"]      = p.tunnel_ip;
         pj["private_subnet"] = p.private_subnet;
         pj["endpoint"]       = p.endpoint;
@@ -1225,11 +1182,11 @@ ln_error_t ln_routing_profile(ln_client_t* client, int page, int page_size,
 }
 
 ln_error_t ln_routing_request(ln_client_t* client, const char* identifier,
-                              const char* conn_nonce_b64, const char* client_wg_pub,
+                              const char* conn_nonce_b64, const char* client_mesh_pubkey,
                               char** out_json) {
     if (!client || !identifier || !conn_nonce_b64 || !out_json) return LN_ERR_NULL_ARG;
     auto r = client->client.request_endpoint(identifier, conn_nonce_b64,
-                                             client_wg_pub ? client_wg_pub : "");
+                                             client_mesh_pubkey ? client_mesh_pubkey : "");
     if (!r.ok) return r.http_status == 403 ? LN_ERR_REJECTED : LN_ERR_CONNECT;
     json j = {{"connection_id", r.value.connection_id}, {"state", r.value.state}};
     *out_json = strdup_json(j);

@@ -1,4 +1,5 @@
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
+#include <algorithm>
 
 #include <LemonadeNexus/Boringtun/IpRouter.hpp>
 #include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
@@ -200,12 +201,12 @@ StatusResult BoringtunMesh::sync_peers(const std::vector<MeshPeer>& desired) {
 
     std::unordered_set<std::string> want;
     for (const auto& p : desired) {
-        if (p.wg_pubkey.empty()) continue;
+        if (p.mesh_pubkey.empty()) continue;
         const std::string endpoint = p.endpoint.empty() ? p.relay_endpoint : p.endpoint;
         const std::string allowed = allowed_for(p.tunnel_ip, p.private_subnet);
         if (allowed.empty()) continue;
-        want.insert(p.wg_pubkey);
-        (void)impl_->dp.add_peer(p.wg_pubkey, allowed, endpoint,
+        want.insert(p.mesh_pubkey);
+        (void)impl_->dp.add_peer(p.mesh_pubkey, allowed, endpoint,
                                  static_cast<uint16_t>(p.keepalive ? p.keepalive : 25));
     }
 
@@ -238,7 +239,7 @@ MeshTunnelStatus BoringtunMesh::mesh_status() const {
     for (const auto& peer : impl_->dp.snapshot_peers()) {
         if (peer.public_key == impl_->server_pubkey) continue;
         MeshPeer mp;
-        mp.wg_pubkey     = peer.public_key;
+        mp.mesh_pubkey   = peer.public_key;
         mp.tunnel_ip     = addr_part(peer.allowed_ips);  // first cidr's address
         mp.endpoint      = peer.endpoint;
         mp.last_handshake = static_cast<int64_t>(peer.last_handshake);
@@ -285,6 +286,26 @@ std::pair<std::string, std::string> BoringtunMesh::derive_keypair(std::span<cons
     priv[0]  &= 248;
     priv[31] &= 127;
     priv[31] |= 64;
+    crypto_scalarmult_base(pub, priv);
+
+    char priv_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    char pub_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];
+    sodium_bin2base64(priv_b64, sizeof priv_b64, priv, 32, sodium_base64_VARIANT_ORIGINAL);
+    sodium_bin2base64(pub_b64, sizeof pub_b64, pub, 32, sodium_base64_VARIANT_ORIGINAL);
+
+    std::pair<std::string, std::string> keys{priv_b64, pub_b64};
+    sodium_memzero(priv, sizeof priv);
+    return keys;
+}
+
+std::pair<std::string, std::string> BoringtunMesh::identity_bound_keypair(
+    std::span<const uint8_t> ed25519_secret_key) {
+    unsigned char priv[32];
+    unsigned char pub[32];
+    if (ed25519_secret_key.size() != crypto_sign_SECRETKEYBYTES ||
+        crypto_sign_ed25519_sk_to_curve25519(priv, ed25519_secret_key.data()) != 0) {
+        return {};
+    }
     crypto_scalarmult_base(pub, priv);
 
     char priv_b64[sodium_base64_ENCODED_LEN(32, sodium_base64_VARIANT_ORIGINAL)];

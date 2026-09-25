@@ -24,7 +24,7 @@ struct ServerEndpoint {
 
 struct ServerConfig {
     /// Seed list of servers (at least one). Each host must be a cert FQDN.
-    std::vector<ServerEndpoint> servers{{{"127.0.0.1", 9100, true}}};
+    std::vector<ServerEndpoint> servers{{"127.0.0.1", 9100, true}};
 
     int  connect_timeout_sec{5};
     int  read_timeout_sec{10};
@@ -120,7 +120,7 @@ struct TreeNode {
     // Crypto
     std::string              mgmt_pubkey;
     std::string              wrapped_mgmt_privkey;
-    std::string              wg_pubkey;
+    std::string              mesh_pubkey;
 
     // Assignments
     std::vector<Assignment>  assignments;
@@ -229,12 +229,13 @@ struct CertStatus {
 
 /// An issued certificate bundle (borrowed license from server).
 /// The private key is encrypted with the client's Ed25519 key via
-/// ephemeral X25519 DH + HKDF + AES-256-GCM.
+/// ephemeral X25519 DH + HKDF + XChaCha20-Poly1305-IETF.
 struct IssuedCertBundle {
     std::string domain;             ///< e.g. "my-laptop.capi.lemonade-nexus.io"
     std::string fullchain_pem;      ///< Full certificate chain (PEM)
-    std::string encrypted_privkey;  ///< AES-GCM encrypted private key (base64)
-    std::string nonce;              ///< AES-GCM nonce (base64)
+    std::string encrypted_privkey;  ///< encrypted private key (base64)
+    unsigned    crypto_version{0};  ///< crypto format version; 1 = XChaCha20-Poly1305-IETF
+    std::string nonce;              ///< 24-byte nonce (base64)
     std::string ephemeral_pubkey;   ///< Server's ephemeral X25519 pubkey (base64)
     uint64_t    expires_at{0};      ///< Certificate expiry (Unix timestamp)
 };
@@ -256,7 +257,7 @@ struct JoinResult {
     std::string node_id;
     std::string tunnel_ip;
     std::string private_subnet;
-    std::string wg_pubkey;          ///< mesh public key (base64)
+    std::string mesh_pubkey;        ///< mesh public key (base64)
     std::string error;
 };
 
@@ -309,7 +310,7 @@ struct TunnelStatus {
     bool        is_up{false};
     std::string tunnel_ip;
     std::string server_endpoint;
-    int64_t     last_handshake{0};          ///< Unix timestamp of last WG handshake
+    int64_t     last_handshake{0};          ///< Unix timestamp of last Noise handshake
     uint64_t    rx_bytes{0};
     uint64_t    tx_bytes{0};
     int32_t     latency_ms{-1};             ///< -1 = unknown
@@ -323,7 +324,7 @@ struct TunnelStatus {
 struct MeshPeer {
     std::string node_id;
     std::string hostname;
-    std::string wg_pubkey;              ///< Curve25519 base64
+    std::string mesh_pubkey;            ///< Curve25519 base64
     std::string tunnel_ip;              ///< e.g. "10.64.0.5/32"
     std::string private_subnet;         ///< e.g. "10.128.17.4/30"
     std::string endpoint;               ///< Direct "ip:port" (from STUN/hole-punch)
@@ -380,30 +381,6 @@ struct ServerEntry {
 };
 
 // ---------------------------------------------------------------------------
-// Trust & attestation
-// ---------------------------------------------------------------------------
-
-struct TrustPeerInfo {
-    std::string pubkey;
-    uint8_t     tier{0};
-    std::string tier_name;
-    std::string platform;
-    uint64_t    last_verified{0};
-    std::string attestation_hash;
-    std::string binary_hash;
-    uint32_t    failed_verifications{0};
-};
-
-struct TrustStatus {
-    std::string              our_tier;
-    std::string              our_platform;
-    bool                     require_tee{false};
-    std::string              binary_hash;
-    std::size_t              peer_count{0};
-    std::vector<TrustPeerInfo> peers;
-};
-
-// ---------------------------------------------------------------------------
 // DDNS
 // ---------------------------------------------------------------------------
 
@@ -412,68 +389,6 @@ struct DdnsStatus {
     std::string last_ip;
     std::string binary_hash;
     bool        binary_approved{false};
-};
-
-// ---------------------------------------------------------------------------
-// Enrollment
-// ---------------------------------------------------------------------------
-
-struct EnrollmentVote {
-    std::string voter_pubkey;
-    bool        approve{false};
-    std::string reason;
-    uint64_t    timestamp{0};
-};
-
-struct EnrollmentEntry {
-    std::string              request_id;
-    std::string              candidate_pubkey;
-    std::string              candidate_server_id;
-    std::string              sponsor_pubkey;
-    uint8_t                  state{0};
-    std::string              state_name;
-    uint64_t                 created_at{0};
-    uint64_t                 timeout_at{0};
-    uint32_t                 retries{0};
-    std::vector<EnrollmentVote> votes;
-};
-
-struct EnrollmentStatus {
-    bool                         enabled{false};
-    float                        quorum_ratio{0.0f};
-    uint32_t                     vote_timeout_sec{0};
-    std::size_t                  pending_count{0};
-    std::vector<EnrollmentEntry> enrollments;
-};
-
-// ---------------------------------------------------------------------------
-// Governance
-// ---------------------------------------------------------------------------
-
-struct GovernanceVote {
-    std::string voter_pubkey;
-    bool        approve{false};
-    std::string reason;
-    uint64_t    timestamp{0};
-};
-
-struct GovernanceProposal {
-    std::string              proposal_id;
-    std::string              proposer_pubkey;
-    uint8_t                  parameter{0};
-    std::string              new_value;
-    std::string              old_value;
-    std::string              rationale;
-    uint64_t                 created_at{0};
-    uint64_t                 expires_at{0};
-    uint8_t                  state{0};
-    std::string              state_name;
-    std::vector<GovernanceVote> votes;
-};
-
-struct ProposalResult {
-    std::string proposal_id;
-    std::string status;
 };
 
 // ---------------------------------------------------------------------------
@@ -516,14 +431,7 @@ void from_json(const nlohmann::json& j, TreeDelta& d);
 
 void from_json(const nlohmann::json& j, StatsResponse& s);
 void from_json(const nlohmann::json& j, ServerEntry& s);
-void from_json(const nlohmann::json& j, TrustPeerInfo& p);
-void from_json(const nlohmann::json& j, TrustStatus& s);
 void from_json(const nlohmann::json& j, DdnsStatus& s);
-void from_json(const nlohmann::json& j, EnrollmentVote& v);
-void from_json(const nlohmann::json& j, EnrollmentEntry& e);
-void from_json(const nlohmann::json& j, EnrollmentStatus& s);
-void from_json(const nlohmann::json& j, GovernanceVote& v);
-void from_json(const nlohmann::json& j, GovernanceProposal& p);
 void from_json(const nlohmann::json& j, AttestationManifest& m);
 void from_json(const nlohmann::json& j, AttestationManifests& a);
 

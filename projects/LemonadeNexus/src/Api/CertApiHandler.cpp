@@ -25,64 +25,12 @@ using nexus::auth::SessionClaims;
 
 void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                         httplib::Server& priv) {
-    // POST /api/tls/reload — hot-reload TLS certificates
-    priv.Post("/api/tls/reload", require_auth(ctx_.auth,
-        [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
-        std::string reload_cert = ctx_.http_server.tls_cert_path();
-        std::string reload_key  = ctx_.http_server.tls_key_path();
-
-        auto body = nlohmann::json::parse(req.body, nullptr, false);
-        if (!body.is_discarded()) {
-            if (body.contains("cert_path")) reload_cert = body["cert_path"].get<std::string>();
-            if (body.contains("key_path"))  reload_key  = body["key_path"].get<std::string>();
-        }
-
-        if (!ctx_.http_server.is_tls()) {
-            if (reload_cert.empty() || reload_key.empty()) {
-                error_response(res, "not running TLS and no cert/key paths provided");
-                return;
-            }
-            error_response(res, "server is running plain HTTP — restart with TLS cert to enable HTTPS");
-            return;
-        }
-
-        bool ok = ctx_.http_server.reload_tls_certs(reload_cert, reload_key);
-        nlohmann::json resp = {
-            {"success",   ok},
-            {"cert_path", reload_cert},
-            {"key_path",  reload_key},
-        };
-        json_response(res, resp, ok ? 200 : 500);
-    }));
-
-    // POST /api/tls/renew — request ACME cert renewal and hot-reload
-    priv.Post("/api/tls/renew", require_auth(ctx_.auth,
-        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
-        if (ctx_.server_fqdn.empty()) {
-            error_response(res, "no server FQDN configured — set --server-hostname");
-            return;
-        }
-
-        auto result = ctx_.acme.renew_certificate(ctx_.server_fqdn);
-        if (!result.success) {
-            error_response(res, "ACME renewal failed", 502);
-            return;
-        }
-
-        bool reloaded = false;
-        if (ctx_.http_server.is_tls() && !result.cert_path.empty() && !result.key_path.empty()) {
-            reloaded = ctx_.http_server.reload_tls_certs(result.cert_path, result.key_path);
-        }
-
-        nlohmann::json resp = {
-            {"success",      true},
-            {"domain",       ctx_.server_fqdn},
-            {"cert_path",    result.cert_path},
-            {"key_path",     result.key_path},
-            {"hot_reloaded", reloaded},
-        };
-        json_response(res, resp);
-    }));
+    // /api/tls/reload and /api/tls/renew are intentionally not routed: no
+    // accepted authorization rule covers forcing a TLS reload or triggering
+    // certificate renewal (a valid session alone is insufficient, and no
+    // owner/admin/permission model for server TLS operations exists). Renewal
+    // happens only through the local scheduled ACME monitor, which calls
+    // renew_certificate + reload_tls_certs directly.
 
     // GET /api/certs/{domain} — get certificate status for a domain
     priv.Get(R"(/api/certs/(.+))", require_auth(ctx_.auth,
@@ -188,17 +136,26 @@ void CertApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         const std::string info_str = "lemonade-nexus-cert-issue";
         auto enc_key = ctx_.crypto.hkdf_sha256(shared_secret, {},
             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(info_str.data()), info_str.size()), 32);
-        crypto::AesGcmKey aes_key{};
+        crypto::AeadKey aes_key{};
         std::memcpy(aes_key.data(), enc_key.data(), std::min(enc_key.size(), aes_key.size()));
 
         auto privkey_bytes = std::vector<uint8_t>(
             existing->privkey_pem.begin(), existing->privkey_pem.end());
-        auto encrypted = ctx_.crypto.aes_gcm_encrypt(aes_key, privkey_bytes, {});
+        // Bound to the request it answers: this client and this domain. A
+        // bundle cannot be replayed at another client or another name.
+        const auto aad = crypto::aead_aad(
+            crypto::aead_purpose::kCertBundle,
+            {std::span<const uint8_t>(client_ed_pk.data(), client_ed_pk.size()),
+             std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fqdn.data()),
+                                      fqdn.size())});
+        auto encrypted =
+            ctx_.crypto.aead_encrypt(aes_key, privkey_bytes, std::span<const uint8_t>{aad});
 
         network::CertIssueResponse resp{
             .domain            = fqdn,
             .fullchain_pem     = existing->fullchain_pem,
             .encrypted_privkey = crypto::to_base64(encrypted.ciphertext),
+            .crypto_version    = encrypted.version,
             .nonce             = crypto::to_base64(encrypted.nonce),
             .ephemeral_pubkey  = crypto::to_base64(ephemeral.public_key),
             .expires_at        = existing->expires_at,

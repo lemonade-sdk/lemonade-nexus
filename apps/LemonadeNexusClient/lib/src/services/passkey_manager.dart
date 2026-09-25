@@ -57,9 +57,11 @@ class PasskeyManager {
         r['credentialId'] as String, r['publicKeyX'] as String, r['publicKeyY'] as String);
   }
 
-  Future<PasskeyAssertion> signAssertion(String rpId) async {
-    final r = await _channel
-        .invokeMapMethod<String, dynamic>('signAssertion', {'rpId': rpId});
+  /// [challenge] is server-issued (single-use, expiring); the native side
+  /// carries it verbatim in clientDataJSON.
+  Future<PasskeyAssertion> signAssertion(String rpId, String challenge) async {
+    final r = await _channel.invokeMapMethod<String, dynamic>(
+        'signAssertion', {'rpId': rpId, 'challenge': challenge});
     if (r == null) throw Exception('Passkey assertion returned no data');
     return PasskeyAssertion(
       credentialId: r['credentialId'] as String,

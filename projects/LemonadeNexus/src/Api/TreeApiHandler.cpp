@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <algorithm>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
@@ -104,6 +105,22 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // Normalize pubkey to "ed25519:base64..." format for tree storage
         auto norm_pubkey = normalize_pubkey(client_pubkey);
 
+        // A mesh transport key binds to one node identity. The Ed25519 challenge
+        // authenticated WHO is joining; this guard decides what that identity
+        // may claim: its own identity-bound static (possession proved
+        // transitively through the challenge), its previously registered key,
+        // or a fresh opaque one — never a key another node registered, and
+        // never another enrolled identity's bound form. Checked before any
+        // tree write or dataplane change, so a hostile claim moves no route.
+        if (const auto advertised = body.value("mesh_pubkey", std::string{});
+            !advertised.empty()) {
+            if (const auto refusal =
+                    api::mesh_key_claim_refusal(ctx_.tree, advertised, node_id, norm_pubkey)) {
+                error_response(res, *refusal, 409);
+                return;
+            }
+        }
+
         // Optional device-link token (single use, minted via POST /api/link/token):
         // places the new endpoint under the token owner's Customer group.
         auto link_token = body.value("link_token", std::string{});
@@ -132,65 +149,22 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             n.is_inference        = is_inference;
         };
 
-        auto existing_root = ctx_.tree.get_node("root");
+        // Root initialization is deferred: no public caller may create the
+        // application root, and this endpoint never modifies an existing
+        // root's data or assignments. Ownership below is pure validation of
+        // the stored root record for the closed-registration exemption.
+        const auto existing_root = ctx_.tree.get_node("root");
         if (!existing_root) {
-            // First user bootstraps root and gets a Customer group
-            tree::TreeNode root_node;
-            root_node.id        = "root";
-            root_node.parent_id = "";
-            root_node.type      = tree::NodeType::Root;
-            root_node.hostname  = ctx_.config.server_hostname.empty()
-                                      ? "root"
-                                      : ctx_.config.server_hostname;
-            root_node.mgmt_pubkey = norm_pubkey;
-            root_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node", "admin"},
-            }};
-            ctx_.tree.bootstrap_root(root_node);
+            error_response(res,
+                "application root not established — root initialization is unavailable",
+                409);
+            return;
+        }
+        const bool is_root_owner = !existing_root->mgmt_pubkey.empty() &&
+            tree::canonical_principal(existing_root->mgmt_pubkey) ==
+            tree::canonical_principal(norm_pubkey);
 
-            // Create a Customer group for the root owner
-            std::string customer_id = "customer-" + node_id;
-            tree::TreeNode customer_node;
-            customer_node.id          = customer_id;
-            customer_node.parent_id   = "root";
-            customer_node.type        = tree::NodeType::Customer;
-            customer_node.hostname    = body.value("hostname",
-                                                   "group-" + node_id.substr(0, 8));
-            customer_node.mgmt_pubkey = norm_pubkey;
-            customer_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node"},
-            }};
-            ctx_.tree.insert_join_node(customer_node);
-
-            // Create the user's Endpoint under their Customer group
-            tree::TreeNode endpoint_node;
-            endpoint_node.id          = node_id;
-            endpoint_node.parent_id   = customer_id;
-            endpoint_node.type        = tree::NodeType::Endpoint;
-            endpoint_node.hostname    = body.value("hostname",
-                                                   "endpoint-" + node_id.substr(0, 8));
-            endpoint_node.mgmt_pubkey = norm_pubkey;
-            // Explicit ACL grant for the endpoint's owner. Heartbeat authorizes
-            // via ownership, but node-scoped reads (GET /api/mesh/peers/<node>,
-            // /api/mesh/status/<node>) require an explicit Read permission on the
-            // node; without this assignment they 403. Mirrors the Customer grant
-            // so the owner has full control of their own endpoint.
-            endpoint_node.assignments = {{
-                .management_pubkey = norm_pubkey,
-                .permissions = {"read", "write", "add_child", "delete_node",
-                                "edit_node"},
-            }};
-            endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
-            stamp_endpoint_identity(endpoint_node);
-            if (!ctx_.tree.insert_join_node(endpoint_node)) {
-                error_response(res, "endpoint identifier conflict", 409);
-                return;
-            }
-        } else if (node_id != "root") {
+        if (node_id != "root") {
             std::string customer_id;
             auto existing_endpoint = ctx_.tree.get_node(node_id);
 
@@ -209,11 +183,6 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 // Under closed registration a brand-new identity needs a link
                 // token — except the root owner, who bootstraps their own
                 // account (their key already owns root via /api/auth).
-                bool is_root_owner = false;
-                if (auto root = ctx_.tree.get_node("root")) {
-                    is_root_owner = (tree::canonical_principal(root->mgmt_pubkey) ==
-                                     tree::canonical_principal(norm_pubkey));
-                }
                 if (!ctx_.config.open_registration && !is_root_owner &&
                     !ctx_.tree.get_node("customer-" + node_id)) {
                     error_response(res, "registration closed — link token required", 403);
@@ -270,7 +239,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         "edit_node"},
                     }};
                 }
-                endpoint_node.wg_pubkey   = body.value("wg_pubkey", std::string{});
+                endpoint_node.mesh_pubkey = body.value("mesh_pubkey", std::string{});
                 stamp_endpoint_identity(endpoint_node);
                 if (!ctx_.tree.insert_join_node(endpoint_node)) {
                     error_response(res, "endpoint identifier conflict", 409);
@@ -318,13 +287,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (!alloc.base_network.empty()) {
             auto existing_node = ctx_.tree.get_node(node_id);
             if (existing_node) {
-                auto new_wg = body.value("wg_pubkey", existing_node->wg_pubkey);
+                auto new_mesh_pubkey = body.value("mesh_pubkey", existing_node->mesh_pubkey);
                 rekey = api::plan_mesh_rekey(existing_node->tunnel_ip, alloc.base_network,
-                                             existing_node->wg_pubkey, new_wg);
+                                             existing_node->mesh_pubkey, new_mesh_pubkey);
                 if (rekey.update_node) {
                     tree::TreeNode updated = *existing_node;
                     updated.tunnel_ip = alloc.base_network;
-                    updated.wg_pubkey = new_wg;
+                    updated.mesh_pubkey = new_mesh_pubkey;
                     ctx_.tree.update_node_direct(node_id, updated);
                 }
             }
@@ -335,10 +304,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
 
         // Convert server's Ed25519 identity key to Curve25519 (X25519) for the mesh
-        std::string wg_server_pubkey;
+        std::string mesh_server_pubkey;
         if (auto ed_pk = ctx_.key_wrapping.load_identity_pubkey()) {
             auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(*ed_pk);
-            wg_server_pubkey = crypto::to_base64(
+            mesh_server_pubkey = crypto::to_base64(
                 std::span<const uint8_t>(x_pk.data(), x_pk.size()));
         }
 
@@ -347,31 +316,31 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         : ctx_.tunnel_bind_ip;
 
         // Add the client as a mesh peer on the server interface.
-        auto client_wg_pubkey = body.value("wg_pubkey", std::string{});
-        if (ctx_.boringtun && !client_wg_pubkey.empty() && !alloc.base_network.empty()) {
-            auto peer_wg_key = api::normalize_mesh_pubkey(client_wg_pubkey);
+        auto client_mesh_pubkey = body.value("mesh_pubkey", std::string{});
+        if (ctx_.boringtun && !client_mesh_pubkey.empty() && !alloc.base_network.empty()) {
+            auto peer_mesh_key = api::normalize_mesh_pubkey(client_mesh_pubkey);
 
             // Re-join with a rotated key: drop the stale peer first, or its
             // allowed_ips route shadows the new key and return traffic is
             // encrypted to a dead handshake.
             if (rekey.remove_stale_peer &&
                 ctx_.boringtun->remove_peer(rekey.stale_peer_key)) {
-                spdlog::info("[Join] removed stale WG peer {} for node {}",
+                spdlog::info("[Join] removed stale mesh peer {} for node {}",
                              rekey.stale_peer_key.substr(0, 12), node_id);
             }
 
-            if (ctx_.boringtun->add_peer(peer_wg_key, alloc.base_network, "")) {
-                spdlog::info("[Join] added WG peer {} allowed_ips={}",
-                             peer_wg_key.substr(0, 12), alloc.base_network);
+            if (ctx_.boringtun->add_peer(peer_mesh_key, alloc.base_network, "")) {
+                spdlog::info("[Join] added mesh peer {} allowed_ips={}",
+                             peer_mesh_key.substr(0, 12), alloc.base_network);
             } else {
-                spdlog::warn("[Join] failed to add WG peer for node {}", node_id);
+                spdlog::warn("[Join] failed to add mesh peer for node {}", node_id);
             }
         }
 
         // Build the mesh endpoint: public_ip:udp_port
-        std::string wg_endpoint;
+        std::string mesh_endpoint;
         if (!ctx_.server_public_ip.empty()) {
-            wg_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
+            mesh_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
         }
 
         // Register private DNS for this client: private.<node_id>.ep.<domain> -> tunnel IP
@@ -399,12 +368,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             {"private_api_port", !ctx_.tunnel_bind_ip.empty()
                                      ? ctx_.config.private_http_port
                                      : ctx_.config.http_port},
-            {"wg_server_pubkey", wg_server_pubkey},
-            {"wg_endpoint",      wg_endpoint},
+            {"mesh_server_pubkey", mesh_server_pubkey},
+            {"mesh_endpoint",      mesh_endpoint},
             {"dns_servers",      nlohmann::json::array({server_tunnel})},
         };
-        spdlog::info("[Join] node={} tunnel_ip={} wg_endpoint={} private_fqdn={}",
-                      node_id, alloc.base_network, wg_endpoint, client_private_fqdn);
+        spdlog::info("[Join] node={} tunnel_ip={} mesh_endpoint={} private_fqdn={}",
+                      node_id, alloc.base_network, mesh_endpoint, client_private_fqdn);
         json_response(res, resp);
     });
 
@@ -439,10 +408,19 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     // ========================================================================
     priv.Post("/api/tree/delta", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto body_opt = parse_body(req, res);
         if (!body_opt) return;
         auto& body = *body_opt;
+
+        // Legacy "wg_pubkey" is refused here with an explicit 400: the typed
+        // parse also rejects it (TreeDelta::from_json throws), and the manual
+        // fallback below would otherwise swallow that throw.
+        if (body.contains("node_data") && body["node_data"].is_object() &&
+            body["node_data"].contains("wg_pubkey")) {
+            error_response(res, "legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'", 400);
+            return;
+        }
 
         tree::TreeDelta delta;
         try {
@@ -457,6 +435,20 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
             delta.signer_pubkey = body.value("signer_pubkey", "");
             delta.signature     = body.value("signature", "");
+        }
+
+        // Two-plane agreement: the authenticated session identity must be the
+        // delta signer. apply_delta authorizes on delta.signer_pubkey's tree
+        // assignments plus a signature the caller claims to possess, so without
+        // this check any session holder could submit deltas signed with another
+        // principal's key (e.g. a captured management key). Compare by key bytes
+        // (canonical_principal), same as do_apply_delta.
+        if (delta.signer_pubkey.empty() ||
+            tree::canonical_principal(normalize_pubkey(claims.pubkey)) !=
+                tree::canonical_principal(delta.signer_pubkey)) {
+            spdlog::warn("[TreeApi] delta signer does not match authenticated session");
+            error_response(res, "delta signer does not match session", 403);
+            return;
         }
 
         bool ok = ctx_.tree.apply_delta(delta);
@@ -579,7 +571,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (body.contains("tunnel_ip"))   updated.tunnel_ip   = body["tunnel_ip"].get<std::string>();
         if (body.contains("private_subnet")) updated.private_subnet = body["private_subnet"].get<std::string>();
         if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
-        if (body.contains("wg_pubkey"))   updated.wg_pubkey   = body["wg_pubkey"].get<std::string>();
+        if (body.contains("mesh_pubkey")) {
+            // Same ownership rule as the join path: edit permission on this
+            // node never extends to claiming a static another node holds or
+            // another identity's bound form.
+            const auto claimed = body.value("mesh_pubkey", std::string{});
+            if (const auto refusal = api::mesh_key_claim_refusal(
+                    ctx_.tree, claimed, node_id, normalize_pubkey(claims.pubkey))) {
+                error_response(res, *refusal, 409);
+                return;
+            }
+            updated.mesh_pubkey = claimed;
+        }
         if (body.contains("listen_endpoint")) updated.listen_endpoint = body["listen_endpoint"].get<std::string>();
         if (body.contains("region"))      updated.region      = body["region"].get<std::string>();
         if (body.contains("capacity_mbps")) updated.capacity_mbps = body["capacity_mbps"].get<uint32_t>();
@@ -639,22 +642,22 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
             (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
             (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
-            // 3. Remove the mesh WG peer (mirror the join-time key conversion).
-            if (ctx_.boringtun && !doomed->wg_pubkey.empty()) {
-                std::string peer_wg_key = doomed->wg_pubkey;
+            // 3. Remove the mesh peer using the join-time key conversion.
+            if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
+                std::string peer_mesh_key = doomed->mesh_pubkey;
                 constexpr std::string_view ed_prefix = "ed25519:";
-                if (peer_wg_key.starts_with(ed_prefix)) {
-                    auto ed_bytes = crypto::from_base64(peer_wg_key.substr(ed_prefix.size()));
+                if (peer_mesh_key.starts_with(ed_prefix)) {
+                    auto ed_bytes = crypto::from_base64(peer_mesh_key.substr(ed_prefix.size()));
                     if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
                         crypto::Ed25519PublicKey ed_pk{};
                         std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
                         auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
-                        peer_wg_key = crypto::to_base64(
+                        peer_mesh_key = crypto::to_base64(
                             std::span<const uint8_t>(x_pk.data(), x_pk.size()));
                     }
                 }
-                if (ctx_.boringtun->remove_peer(peer_wg_key)) {
-                    spdlog::info("[TreeApi] removed WG peer for deleted node '{}'", node_id);
+                if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
+                    spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
                 }
             }
         }

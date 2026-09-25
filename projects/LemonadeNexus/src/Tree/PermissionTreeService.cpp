@@ -120,6 +120,16 @@ bool PermissionTreeService::insert_join_node(const TreeNode& node) {
         }
     }
 
+    // Same rule for the transport static: one key, one node. The API layer
+    // refuses equivalence-aware claims first; this exact-match backstop holds
+    // the invariant against any other caller.
+    if (mesh_pubkey_taken_locked(node.mesh_pubkey, node.id)) {
+        spdlog::error("[{}] insert_join_node: mesh public key already bound to another "
+                      "node — rejecting node '{}'",
+                      name(), node.id);
+        return false;
+    }
+
     nodes_[node.id] = node;
     if (!persist_node(node)) {
         spdlog::error("[{}] failed to persist join node '{}'", name(), node.id);
@@ -144,6 +154,13 @@ bool PermissionTreeService::update_node_direct(const std::string& node_id,
     auto it = nodes_.find(node_id);
     if (it == nodes_.end()) {
         spdlog::error("[{}] update_node_direct: node '{}' not found", name(), node_id);
+        return false;
+    }
+
+    if (mesh_pubkey_taken_locked(updated.mesh_pubkey, node_id)) {
+        spdlog::error("[{}] update_node_direct: mesh public key already bound to another "
+                      "node — rejecting update of '{}'",
+                      name(), node_id);
         return false;
     }
 
@@ -234,6 +251,15 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
     return true;
 }
 
+bool PermissionTreeService::mesh_pubkey_taken_locked(const std::string& mesh_pubkey,
+                                                     const std::string& own_id) const {
+    if (mesh_pubkey.empty()) return false;
+    for (const auto& [id, node] : nodes_) {
+        if (id != own_id && node.mesh_pubkey == mesh_pubkey) return true;
+    }
+    return false;
+}
+
 bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {
     if (mgmt_pubkey.empty()) return false;
     // Match on key bytes: this is the owner-protection guard on revocation, so a
@@ -281,19 +307,92 @@ bool PermissionTreeService::grant_assignment(const std::string& node_id,
 
 // --- ITreeProvider ---
 
+acl::Permission PermissionTreeService::required_permission_for(std::string_view op) {
+    if (op == "create_node") return acl::Permission::AddChild;
+    if (op == "update_node" || op == "allocate_ip" || op == "register_relay" ||
+        op == "update_assignment") return acl::Permission::EditNode;
+    if (op == "delete_node") return acl::Permission::DeleteNode;
+    return acl::Permission::None;
+}
+
+bool PermissionTreeService::signer_has_permission_locked(const TreeNode& node,
+                                                         std::string_view signer_pubkey,
+                                                         acl::Permission required) const {
+    // Same key-bytes match as check_permission, or reads and writes disagree
+    // on who a principal is.
+    const auto signer_canon = canonical_principal(signer_pubkey);
+    for (const auto& assignment : node.assignments) {
+        if (canonical_principal(assignment.management_pubkey) != signer_canon) continue;
+        for (const auto& perm_str : assignment.permissions) {
+            if (acl::has_permission(string_to_permission(perm_str), required)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+PermissionTreeService::DeltaAuthorization
+PermissionTreeService::authorize_delta_statement(std::string_view operation,
+                                                 std::string_view target_node_id,
+                                                 const nlohmann::json& node_data,
+                                                 std::string_view signer_pubkey) const {
+    const auto required = required_permission_for(operation);
+    if (required == acl::Permission::None) return DeltaAuthorization::Denied;
+
+    std::string check_node_id;
+    if (operation == "create_node") {
+        if (!node_data.contains("parent_id") || !node_data["parent_id"].is_string()) {
+            return DeltaAuthorization::ContextMissing;
+        }
+        check_node_id = node_data["parent_id"].get<std::string>();
+    } else {
+        check_node_id = std::string(target_node_id);
+    }
+    if (check_node_id.empty()) return DeltaAuthorization::ContextMissing;
+
+    std::lock_guard lock(mutex_);
+    auto it = nodes_.find(check_node_id);
+    if (it == nodes_.end()) return DeltaAuthorization::ContextMissing;
+    return signer_has_permission_locked(it->second, signer_pubkey, required)
+               ? DeltaAuthorization::Authorized
+               : DeltaAuthorization::Denied;
+}
+
+void PermissionTreeService::set_delta_retention_sink(
+        std::function<bool(const storage::FileStorageService::RetainedDelta&)> sink) {
+    delta_retention_sink_ = std::move(sink);
+}
+
+bool PermissionTreeService::retain_applied_delta(const TreeDelta& delta) {
+    if (!delta_retention_sink_) return true;  // retention not wired: nothing to do
+    storage::FileStorageService::RetainedDelta rec;
+    rec.operation      = delta.operation;
+    rec.target_node_id = delta.target_node_id;
+    rec.data           = nlohmann::json(delta.node_data).dump();
+    rec.signer_pubkey  = delta.signer_pubkey;
+    rec.signature      = delta.signature;
+    rec.timestamp      = delta.timestamp;
+    const auto canonical = canonical_delta_json(delta);
+    const auto digest = crypto_.sha256(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size()));
+    rec.record_hash = crypto::to_hex(digest);
+    if (!delta_retention_sink_(rec)) {
+        spdlog::warn("[{}] delta retention refused for {} on '{}' — transfer pool "
+                     "full, unavailable, or write failed; the applied mutation is "
+                     "unaffected",
+                     name(), delta.operation, delta.target_node_id);
+        return false;
+    }
+    return true;
+}
+
 bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
     std::lock_guard lock(mutex_);
 
     // 1. Determine required permission for the operation
-    acl::Permission required = acl::Permission::None;
-    if (delta.operation == "create_node") {
-        required = acl::Permission::AddChild;
-    } else if (delta.operation == "update_node" || delta.operation == "allocate_ip" ||
-               delta.operation == "register_relay" || delta.operation == "update_assignment") {
-        required = acl::Permission::EditNode;
-    } else if (delta.operation == "delete_node") {
-        required = acl::Permission::DeleteNode;
-    } else {
+    const acl::Permission required = required_permission_for(delta.operation);
+    if (required == acl::Permission::None) {
         spdlog::error("[{}] unknown delta operation '{}'", name(), delta.operation);
         return false;
     }
@@ -310,21 +409,9 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
         return false;
     }
 
-    // Verify signer has the required permission via assignments. Same key-bytes
-    // match as check_permission, or reads and writes disagree on who a principal is.
-    bool has_perm = false;
-    const auto signer_canon = canonical_principal(delta.signer_pubkey);
-    for (const auto& assignment : check_it->second.assignments) {
-        if (canonical_principal(assignment.management_pubkey) == signer_canon) {
-            for (const auto& perm_str : assignment.permissions) {
-                if (acl::has_permission(string_to_permission(perm_str), required)) {
-                    has_perm = true;
-                    break;
-                }
-            }
-            break;
-        }
-    }
+    // Verify signer has the required permission via assignments.
+    const bool has_perm =
+        signer_has_permission_locked(check_it->second, delta.signer_pubkey, required);
 
     if (!has_perm) {
         spdlog::warn("[{}] signer '{}' lacks permission for '{}' on node '{}'",
@@ -477,6 +564,10 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
         spdlog::warn("[{}] failed to append delta to log (operation '{}' on '{}')",
                       name(), delta.operation, delta.target_node_id);
     }
+
+    // Record transfer only: retain the signed statement in the transfer pool.
+    // A refusal never rolls back the applied local mutation.
+    retain_applied_delta(delta);
 
     spdlog::info("[{}] applied delta: {} on '{}' (seq {})",
                   name(), delta.operation, delta.target_node_id, seq);

@@ -2,15 +2,14 @@
 
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/ACL/IACLProvider.hpp>
+#include <LemonadeNexus/ACL/AclStore.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
-#include <filesystem>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string_view>
-
-struct sqlite3;  // forward-declare (C handle)
+#include <vector>
 
 namespace nexus::acl {
 
@@ -29,7 +28,7 @@ struct AclDelta {
 /// Callback type: called when a local ACL mutation needs to be broadcast via gossip.
 using AclDeltaCallback = std::function<void(const AclDelta&)>;
 
-/// SQLite-backed ACL service with AES-256-GCM encrypted permission values
+/// SQLite-backed ACL service with XChaCha20-Poly1305 encrypted permission values
 /// and distributed sync via gossip ACL deltas.
 ///
 /// Database: data/acl.db
@@ -41,9 +40,7 @@ class ACLService : public core::IService<ACLService>,
     friend class core::IService<ACLService>;
     friend class IACLProvider<ACLService>;
 public:
-    explicit ACLService(std::filesystem::path db_path,
-                        crypto::SodiumCryptoService& crypto);
-    ~ACLService();
+    explicit ACLService(AclStore& store, crypto::SodiumCryptoService& crypto);
 
     ACLService(const ACLService&) = delete;
     ACLService& operator=(const ACLService&) = delete;
@@ -62,37 +59,32 @@ public:
     /// Register a callback invoked when a local ACL mutation needs gossip broadcast.
     void set_delta_callback(AclDeltaCallback cb);
 
-    /// Apply a remote ACL delta received via gossip. Returns true if applied
-    /// (new delta), false if already seen (duplicate).
+    /// A remote ACL delta received via gossip. Always refused: authoritative
+    /// remote ACL mutation is unavailable until finalized mesh authority is
+    /// integrated. Performs no mutation and no seen-marking; existing rows
+    /// are preserved. Returns false in every case.
     bool apply_remote_delta(const AclDelta& delta);
 
 private:
     void derive_encryption_key();
-    [[nodiscard]] std::vector<uint8_t> encrypt_perms(uint32_t perms) const;
-    [[nodiscard]] std::optional<uint32_t> decrypt_perms(const std::vector<uint8_t>& blob) const;
-
-    /// Read current permissions. Caller must hold mutex_.
-    [[nodiscard]] uint32_t read_perms_locked(std::string_view user_id, std::string_view resource) const;
-
-    /// Write permissions. Caller must hold mutex_.
-    bool write_perms_locked(std::string_view user_id, std::string_view resource,
-                             uint32_t perms, uint64_t timestamp);
-
-    /// Delta deduplication. Caller must hold mutex_.
-    [[nodiscard]] bool is_delta_seen_locked(const std::string& delta_id) const;
-    void mark_delta_seen_locked(const std::string& delta_id);
+    /// The row identity is authenticated, so a permission blob cannot be moved
+    /// to another (user, resource) pair.
+    std::vector<uint8_t> encrypt_perms(uint32_t perms, std::string_view user_id,
+                                       std::string_view resource) const;
+    [[nodiscard]] std::optional<uint32_t> decrypt_perms(const std::vector<uint8_t>& blob,
+                                                        std::string_view user_id,
+                                                        std::string_view resource) const;
 
     [[nodiscard]] std::string generate_delta_id() const;
     void sign_delta(AclDelta& delta) const;
     [[nodiscard]] bool verify_delta_signature(const AclDelta& delta) const;
 
-    std::filesystem::path        db_path_;
+    AclStore&                    store_;
     crypto::SodiumCryptoService& crypto_;
     crypto::Ed25519Keypair       signing_keypair_{};
-    crypto::AesGcmKey            encryption_key_{};
+    crypto::AeadKey            encryption_key_{};
     bool                         has_key_{false};
 
-    sqlite3*                     db_{nullptr};
     mutable std::mutex           mutex_;
     AclDeltaCallback             delta_callback_;
 };

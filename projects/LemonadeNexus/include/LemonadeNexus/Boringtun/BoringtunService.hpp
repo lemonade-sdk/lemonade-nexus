@@ -18,7 +18,7 @@ namespace nexus::boringtun {
 /// (UserspaceDataplane): one UDP socket, per-peer boringtun Noise sessions, and
 /// a userspace cryptokey router. There is no kernel network interface and no
 /// TUN device, so the server needs no root / CAP_NET_ADMIN and host-level tools
-/// (`wg`, `tcpdump`) cannot observe tunnel keys or plaintext.
+/// cannot observe tunnel keys or plaintext through kernel networking tools.
 ///
 /// The interface name is retained only for config-file naming and log lines —
 /// it does not correspond to any kernel device. Callers (GossipService,
@@ -36,9 +36,9 @@ class BoringtunService : public core::IService<BoringtunService>,
 public:
     /// @param interface_name  Logical name (e.g. "nexus0"); used only for config
     ///                        file naming and logs — no kernel device is created.
-    /// @param config_dir      Directory for storing config files (e.g. "data/wireguard").
+    /// @param config_dir      Directory for storing config files (e.g. "data/mesh").
     explicit BoringtunService(std::string interface_name = "nexus0",
-                               std::filesystem::path config_dir = "data/wireguard");
+                               std::filesystem::path config_dir = "data/mesh");
     ~BoringtunService();
 
     // IService

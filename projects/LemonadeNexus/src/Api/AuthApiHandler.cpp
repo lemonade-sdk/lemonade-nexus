@@ -11,39 +11,6 @@
 namespace nexus::api {
 
 // ---------------------------------------------------------------------------
-// Private helper — shared root-bootstrap logic
-// ---------------------------------------------------------------------------
-
-void AuthApiHandler::ensure_root_node(const std::string& pubkey) {
-    if (pubkey.empty()) return;
-
-    auto prefixed = normalize_pubkey(pubkey);
-
-    if (!ctx_.tree.get_node("root")) {
-        // First authenticated Ed25519 key becomes the root owner.
-        tree::TreeNode root_node;
-        root_node.id          = "root";
-        root_node.parent_id   = "";
-        root_node.type        = tree::NodeType::Root;
-        root_node.hostname    = "root";
-        root_node.mgmt_pubkey = prefixed;
-        root_node.assignments = {{
-            .management_pubkey = prefixed,
-            .permissions = {"read", "write", "add_child", "delete_node",
-                            "edit_node", "admin"},
-        }};
-        ctx_.tree.bootstrap_root(root_node);
-    } else if (ctx_.config.open_registration) {
-        // Root already exists — grant basic access. With closed registration,
-        // new keys get no root grants; devices join via link tokens instead.
-        ctx_.tree.grant_assignment("root", {
-            .management_pubkey = prefixed,
-            .permissions       = {"read", "add_child"},
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Route registration
 // ---------------------------------------------------------------------------
 
@@ -59,10 +26,9 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
 
         auto result = ctx_.auth.authenticate(*body);
 
-        // After successful Ed25519 auth, bootstrap or extend root permissions.
-        if (result.authenticated && body->value("method", "") == "ed25519") {
-            ensure_root_node(body->value("pubkey", std::string{}));
-        }
+        // Authentication never creates, claims, or modifies the application
+        // root. Root initialization is deferred to the authority work; an
+        // existing root is left untouched by this endpoint.
 
         network::AuthResponse resp{
             .authenticated = result.authenticated,
@@ -74,10 +40,18 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
         json_response(res, j, result.authenticated ? 200 : 401);
     });
 
-    // POST /api/auth/register — passkey / FIDO2 registration
-    pub.Post("/api/auth/register", [this](const httplib::Request& req, httplib::Response& res) {
+    // POST /api/auth/register — passkey / FIDO2 credential registration.
+    // Requires a valid session: the credential binds to the session's
+    // verified identity. A caller-supplied user_id is never honored, so a
+    // session can never create or replace another identity's credentials.
+    pub.Post("/api/auth/register",
+             require_auth(ctx_.auth,
+                 [this](const httplib::Request& req, httplib::Response& res,
+                        const SessionClaims& claims) {
         auto body = parse_body(req, res);
         if (!body) return;
+
+        (*body)["user_id"] = claims.user_id;
 
         auto result = ctx_.auth.register_passkey(*body);
 
@@ -89,12 +63,37 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
         };
         nlohmann::json j = resp;
         json_response(res, j, result.authenticated ? 200 : 400);
-    });
+    }));
 
-    // POST /api/auth/challenge — issue an Ed25519 challenge nonce
+    // POST /api/auth/challenge — issue an Ed25519 challenge nonce, or a
+    // WebAuthn assertion challenge ({"type":"passkey","user_id":"..."}) bound
+    // to that user. The passkey assertion's clientDataJSON must carry the
+    // returned challenge; it expires and is single-use.
     pub.Post("/api/auth/challenge", [this](const httplib::Request& req, httplib::Response& res) {
         auto body = parse_body(req, res);
         if (!body) return;
+
+        if (body->value("type", std::string{}) == "passkey") {
+            auto user_id = body->value("user_id", std::string{});
+            if (user_id.empty()) {
+                error_response(res, "user_id required");
+                return;
+            }
+            // Same bound the provider enforces; checked here so callers get a
+            // 400 (bad request) instead of a 503 (capacity) for bad input.
+            if (user_id.size() > 128) {
+                error_response(res, "user_id too long (max 128)");
+                return;
+            }
+
+            auto challenge = ctx_.auth.issue_passkey_challenge(user_id);
+            if (!challenge) {
+                error_response(res, "too many pending passkey challenges", 503);
+                return;
+            }
+            json_response(res, *challenge);
+            return;
+        }
 
         auto pubkey = body->value("pubkey", std::string{});
         if (pubkey.empty()) {

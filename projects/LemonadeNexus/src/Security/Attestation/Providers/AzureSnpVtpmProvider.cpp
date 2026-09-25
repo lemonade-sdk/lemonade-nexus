@@ -1,0 +1,94 @@
+#include <LemonadeNexus/Security/Attestation/Providers/AzureSnpVtpmProvider.hpp>
+
+#include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
+
+#include <utility>
+
+namespace nexus::security {
+
+AzureSnpVtpmProvider::AzureSnpVtpmProvider(LinuxAttestationProfile profile,
+                                            AmdRevocationSource revocation)
+    : profile_(std::move(profile)),
+      revocation_(std::move(revocation)),
+      policy_digest_(profile_digest(profile_)) {}
+
+std::optional<AttestationFailure> AzureSnpVtpmProvider::readiness() const {
+    if (!profile_is_complete(profile_)) {
+        return AttestationFailure::ProfileIncomplete;
+    }
+    return std::nullopt;
+}
+
+PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& challenge,
+                                                    const AttestationEvidence& evidence) const {
+    PlatformVerification result;
+    result.claims.profile_id = profile_id();
+    result.claims.profile_ruleset = profile_ruleset();
+
+    const auto fail = [&result](AttestationFailure failure) {
+        result.failure = failure;
+        return result;
+    };
+
+    EvidenceRequirements requirements;
+    requirements.policy = profile_.snp;
+    // readiness() has already refused an unchosen policy, so the fallback is
+    // unreachable; it exists so no caller can read an uninitialised rule.
+    requirements.policy.vmpl_policy =
+        profile_.vmpl_policy.value_or(VmplPolicy::Unconstrained);
+    requirements.expected_ak_spki_b64 = profile_.required_ak_spki_b64;
+    requirements.require_ima = profile_.require_ima;
+    requirements.approved_paths = approved_path_list(profile_);
+    requirements.evidence_collector_path = profile_.evidence_collector_path;
+    requirements.expected_pcrs = profile_.expected_pcrs;
+    requirements.require_no_new_privs = profile_.require_no_new_privs;
+    requirements.require_seccomp = profile_.require_seccomp;
+    requirements.require_revocation_check = profile_.require_endorsement_revocation;
+    if (revocation_) {
+        requirements.revocation = revocation_();
+    }
+    // Unconditional: readiness() has already refused a profile with no pin.
+    if (profile_.ima_policy_digest != Digest{}) {
+        requirements.expected_ima_policy_sha256 = hex_of(profile_.ima_policy_digest);
+    }
+
+    // The quote nonce is the challenge digest, so one quote proves the platform
+    // answered THIS challenge as THIS identity.
+    const EvidenceVerdict platform = verify_snp_vtpm_evidence(
+        evidence.platform, evidence.challenge_digest, challenge.node_key, requirements);
+
+    // Record what held even on the failing path: the caller needs the claims
+    // that were proved, and the ones that were not stay false.
+    result.claims.hardware_confidentiality_valid =
+        platform.snp_signature_valid && platform.snp_policy_valid;
+    result.claims.tcb_valid = platform.tcb_valid;
+    result.claims.platform_identity_valid = platform.ak_bound_to_report;
+    result.claims.evidence_freshness_valid = platform.quote_bound_to_challenge;
+    result.claims.boot_integrity_valid = platform.boot_state_valid;
+    result.claims.ima_anchored = platform.ima_anchored;
+    result.claims.runtime_profile_enforced = platform.runtime_profile_valid;
+
+    if (!platform.ok) {
+        return fail(map_platform_failure(platform));
+    }
+
+    // The chain proved the log is the quoted one and that the binding came
+    // from the collector. This is the conjunction on top: EVERY required
+    // component measured, last measurement in its own approved set.
+    const auto log = parse_ima_ascii(evidence.platform.ima_log);
+    if (!log || !binary_approved(profile_, *log)) {
+        return fail(AttestationFailure::BinaryMeasurementInvalid);
+    }
+    result.claims.binary_approved = true;
+
+    result.claims.runtime_integrity_valid = result.claims.ima_anchored &&
+                                            result.claims.binary_approved &&
+                                            result.claims.runtime_profile_enforced;
+    if (!result.claims.runtime_integrity_valid) {
+        return fail(AttestationFailure::RuntimeProfileInvalid);
+    }
+    return result;
+}
+
+}  // namespace nexus::security

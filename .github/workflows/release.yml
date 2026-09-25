@@ -23,9 +23,15 @@ jobs:
           - os: macos-14
             platform: darwin-arm64
             binary_ext: ""
-          - os: windows-2022
-            platform: windows-x86_64
-            binary_ext: ".exe"
+          # TODO(windows): temporarily disabled, mirroring the ci.yml TODO — the
+          # security stores' durable write is POSIX-only, and the CI job's
+          # FetchContent cache is not keyed by generator, so Windows builds are
+          # no longer gated by CI, and we must not ship binaries for a platform
+          # CI does not gate. Re-enable this entry and the matching ci.yml entry
+          # together once those are fixed.
+          # - os: windows-2022
+          #   platform: windows-x86_64
+          #   binary_ext: ".exe"
 
     runs-on: ${{ matrix.os }}
 

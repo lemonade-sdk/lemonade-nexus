@@ -13,7 +13,7 @@ struct BoringtunKeypair {
     std::string private_key;
 };
 
-/// A mesh peer as reported by `wg show <iface> dump`.
+/// A mesh peer as reported by the BoringTun dataplane.
 struct BoringtunPeer {
     std::string public_key;
     std::string allowed_ips;

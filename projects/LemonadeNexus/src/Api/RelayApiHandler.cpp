@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Api/RelayApiHandler.hpp>
 
+#include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Relay/RelayDiscoveryService.hpp>
@@ -10,6 +11,8 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 #include <algorithm>
 #include <cstring>
@@ -146,7 +149,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     priv.Post("/api/relay/ticket", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto body_opt = parse_body(req, res);
         if (!body_opt) return;
 
@@ -154,6 +157,14 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         if (ticket_req.peer_id.empty() || ticket_req.relay_id.empty()) {
             error_response(res, "peer_id and relay_id required");
+            return;
+        }
+
+        // The ticket is signed with the server identity key: it may only be
+        // minted for the caller's own identity, never for a peer the caller
+        // merely names.
+        if (ticket_req.peer_id != claims.user_id) {
+            error_response(res, "peer_id must be the caller's own identity", 403);
             return;
         }
 
@@ -209,7 +220,7 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     priv.Post("/api/relay/register", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
-               const SessionClaims&) {
+               const SessionClaims& claims) {
         auto body_opt = parse_body(req, res);
         if (!body_opt) return;
 
@@ -217,6 +228,21 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
 
         if (reg_req.relay_id.empty() || reg_req.endpoint.empty()) {
             error_response(res, "relay_id and endpoint required");
+            return;
+        }
+
+        // A session alone is insufficient: relay registration mutates the
+        // network-wide relay list and requires the existing relay_register
+        // permission on the application root. With no root there is no
+        // established authority, so the operation is unavailable.
+        if (!ctx_.tree.get_node("root")) {
+            error_response(res, "relay registration unavailable: no established "
+                                "root with relay_register authority", 409);
+            return;
+        }
+        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), "root",
+                                        acl::Permission::RelayRegister)) {
+            error_response(res, "relay_register permission required on root", 403);
             return;
         }
 

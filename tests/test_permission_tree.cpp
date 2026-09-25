@@ -533,6 +533,124 @@ TEST_F(PermissionTreeTest, CanonicalDeltaJsonWithHostnameSet) {
     EXPECT_NE(canonical.find("\"hostname\":\"my-laptop\""), std::string::npos);
 }
 
+TEST_F(PermissionTreeTest, CanonicalJsonUsesMeshPubkeyLabel) {
+    // Wire and canonical (signed) forms both bind "mesh_pubkey". Signatures
+    // made under the retired "wg_pubkey" label are invalid by design.
+    tree::TreeNode node;
+    node.id = "ep-mesh-key";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mesh_pubkey = "mesh-key";
+
+    nlohmann::json current = node;
+    EXPECT_EQ(current.at("mesh_pubkey"), "mesh-key");
+    EXPECT_FALSE(current.contains("wg_pubkey"));
+
+    const auto canonical_node = tree::canonical_node_json(node);
+    EXPECT_NE(canonical_node.find("\"mesh_pubkey\":\"mesh-key\""), std::string::npos);
+    EXPECT_EQ(canonical_node.find("wg_pubkey"), std::string::npos);
+
+    tree::TreeDelta delta;
+    delta.operation = "create_node";
+    delta.target_node_id = node.id;
+    delta.node_data = node;
+    const auto canonical_delta = tree::canonical_delta_json(delta);
+    EXPECT_NE(canonical_delta.find("\"mesh_pubkey\":\"mesh-key\""), std::string::npos);
+    EXPECT_EQ(canonical_delta.find("wg_pubkey"), std::string::npos);
+}
+
+// --- Legacy "wg_pubkey" label: refused at the acceptance boundaries ---
+
+TEST_F(PermissionTreeTest, LegacyWgPubkeyDeltaJsonRejected) {
+    // node_data carrying only the retired label: the typed parse must refuse
+    // it (it would otherwise be silently dropped and the signature would be
+    // checked against different bytes).
+    nlohmann::json body = {
+        {"operation", "create_node"},
+        {"target_node_id", "legacy_ep"},
+        {"node_data", {{"id", "legacy_ep"}, {"wg_pubkey", "old-key"}}},
+        {"signer_pubkey", root_pubkey_str},
+        {"signature", "sig"},
+        {"timestamp", 1},
+    };
+    EXPECT_THROW(body.get<tree::TreeDelta>(), std::exception);
+}
+
+TEST_F(PermissionTreeTest, MixedOldNewLabelsRejected) {
+    nlohmann::json body = {
+        {"operation", "create_node"},
+        {"target_node_id", "mixed_ep"},
+        {"node_data", {{"id", "mixed_ep"}, {"mesh_pubkey", "new-key"},
+                       {"wg_pubkey", "old-key"}}},
+        {"signer_pubkey", root_pubkey_str},
+        {"signature", "sig"},
+        {"timestamp", 1},
+    };
+    EXPECT_THROW(body.get<tree::TreeDelta>(), std::exception);
+}
+
+TEST_F(PermissionTreeTest, LegacyWgPubkeyNodeJsonRejected) {
+    nlohmann::json node_json = nlohmann::json{
+        {"id", "legacy_node"}, {"parent_id", "root"}, {"type", "endpoint"},
+        {"tunnel_ip", ""}, {"private_subnet", ""}, {"private_shared_addresses", ""},
+        {"shared_domain", ""}, {"mgmt_pubkey", root_pubkey_str},
+        {"wrapped_mgmt_privkey", ""}, {"wg_pubkey", "old-key"},
+        {"assignments", nlohmann::json::array()}, {"signature", "sig"},
+        {"listen_endpoint", ""}, {"region", ""}, {"capacity_mbps", 0},
+        {"reputation_score", 0.0}, {"expires_at", 0},
+    };
+    EXPECT_THROW(node_json.get<tree::TreeNode>(), std::exception);
+}
+
+TEST_F(PermissionTreeTest, SignatureOverLegacyWgCanonicalFormRejected) {
+    // A delta signed with the OLD canonical form (node_data translated to
+    // "wg_pubkey") must fail verification: the acceptance path signs and
+    // verifies "mesh_pubkey" only, with no legacy fallback.
+    tree::TreeNode child;
+    child.id = "legacy_sig_ep";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Endpoint;
+    child.mesh_pubkey = "mesh-key";
+
+    tree::TreeDelta delta;
+    delta.operation      = "create_node";
+    delta.target_node_id = child.id;
+    delta.node_data      = child;
+    delta.signer_pubkey  = root_pubkey_str;
+    delta.timestamp = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    // Rebuild the retired canonical form by hand and sign it.
+    nlohmann::json legacy;
+    nlohmann::json node_data = child;
+    node_data["wg_pubkey"] = node_data["mesh_pubkey"];
+    node_data.erase("mesh_pubkey");
+    legacy["node_data"]      = node_data;
+    legacy["operation"]      = delta.operation;
+    legacy["signer_pubkey"]  = delta.signer_pubkey;
+    legacy["target_node_id"] = delta.target_node_id;
+    legacy["timestamp"]      = delta.timestamp;
+    const auto legacy_dump = legacy.dump();
+    auto legacy_bytes = std::vector<uint8_t>(legacy_dump.begin(), legacy_dump.end());
+    delta.signature = crypto::to_base64(
+        crypto_svc->ed25519_sign(root_keypair.private_key,
+                                 std::span<const uint8_t>(legacy_bytes)));
+
+    EXPECT_FALSE(tree_svc->apply_delta(delta));
+    EXPECT_FALSE(tree_svc->get_node(child.id).has_value());
+
+    // The same delta re-signed under the current canonical form is accepted:
+    // the rejection is the label, not the content.
+    auto canonical = tree::canonical_delta_json(delta);
+    auto msg = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+    delta.signature = crypto::to_base64(
+        crypto_svc->ed25519_sign(root_keypair.private_key, msg));
+    EXPECT_TRUE(tree_svc->apply_delta(delta));
+    EXPECT_TRUE(tree_svc->get_node(child.id).has_value());
+}
+
 TEST_F(PermissionTreeTest, CreateEndpointWithHostname) {
     // Create customer first
     tree::TreeNode customer;
@@ -581,7 +699,7 @@ TEST_F(PermissionTreeTest, CreateEndpointUnderCustomer) {
     endpoint.type = tree::NodeType::Endpoint;
     endpoint.mgmt_pubkey = root_pubkey_str;
     endpoint.tunnel_ip = "10.64.0.1/32";
-    endpoint.wg_pubkey = "wg_test_pubkey";
+    endpoint.mesh_pubkey = "mesh_test_pubkey";
 
     auto delta = make_signed_delta("create_node", "acme_ep1", endpoint, root_keypair);
     EXPECT_TRUE(tree_svc->apply_delta(delta));
@@ -594,4 +712,45 @@ TEST_F(PermissionTreeTest, CreateEndpointUnderCustomer) {
     // Verify it shows up as a child of the customer
     auto children = tree_svc->get_children("acme_corp");
     EXPECT_EQ(children.size(), 1u);
+}
+
+// A mesh transport static binds to exactly one node. The service holds the
+// invariant for every caller; the API layer additionally compares normalized
+// spellings before any dataplane change.
+TEST_F(PermissionTreeTest, MeshPubkeyBindsToExactlyOneNode) {
+    tree::TreeNode owner;
+    owner.id = "mesh_owner";
+    owner.parent_id = "root";
+    owner.type = tree::NodeType::Endpoint;
+    owner.mesh_pubkey = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    ASSERT_TRUE(tree_svc->insert_join_node(owner));
+
+    // A different node claiming the same static is refused outright.
+    tree::TreeNode squatter;
+    squatter.id = "mesh_squatter";
+    squatter.parent_id = "root";
+    squatter.type = tree::NodeType::Endpoint;
+    squatter.mesh_pubkey = owner.mesh_pubkey;
+    EXPECT_FALSE(tree_svc->insert_join_node(squatter));
+    EXPECT_FALSE(tree_svc->get_node("mesh_squatter").has_value());
+
+    // And a different node updating itself onto the static is refused too.
+    tree::TreeNode bystander;
+    bystander.id = "mesh_bystander";
+    bystander.parent_id = "root";
+    bystander.type = tree::NodeType::Endpoint;
+    bystander.mesh_pubkey = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=";
+    ASSERT_TRUE(tree_svc->insert_join_node(bystander));
+    tree::TreeNode stolen = bystander;
+    stolen.mesh_pubkey = owner.mesh_pubkey;
+    EXPECT_FALSE(tree_svc->update_node_direct("mesh_bystander", stolen));
+    EXPECT_EQ(tree_svc->get_node("mesh_bystander")->mesh_pubkey, bystander.mesh_pubkey);
+
+    // The owner itself may rotate and rebind freely.
+    tree::TreeNode rotated = owner;
+    rotated.mesh_pubkey = "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=";
+    EXPECT_TRUE(tree_svc->update_node_direct("mesh_owner", rotated));
+    tree::TreeNode back = rotated;
+    back.mesh_pubkey = owner.mesh_pubkey;
+    EXPECT_TRUE(tree_svc->update_node_direct("mesh_owner", back));
 }

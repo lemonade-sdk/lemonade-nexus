@@ -1,14 +1,17 @@
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 
+namespace nexus::tree { class PermissionTreeService; }
+
 namespace nexus::api {
 
-/// Map a stored/sent wg_pubkey to the Curve25519 key the mesh dataplane keys
+/// Map a stored or sent mesh public key to the Curve25519 key the dataplane keys
 /// on: a raw key passes through unchanged; an "ed25519:"-prefixed key is
 /// converted to X25519. Malformed input is returned unchanged (never throws).
-[[nodiscard]] std::string normalize_mesh_pubkey(std::string_view wg_pubkey);
+[[nodiscard]] std::string normalize_mesh_pubkey(std::string_view mesh_pubkey);
 
 /// What POST /api/join must do to a returning device's stored endpoint node and
 /// its dataplane peer. The decision is pure; the handler applies it (tree write,
@@ -16,17 +19,45 @@ namespace nexus::api {
 /// allowed_ips route shadowed the new key, so a rotation must both rewrite the
 /// stored key and drop the previous peer before adding the new one.
 struct MeshRekeyPlan {
-    bool        update_node       = false;  ///< rewrite node: tunnel_ip and/or wg_pubkey changed
+    bool        update_node       = false;  ///< rewrite node when its tunnel address or mesh key changed
     bool        remove_stale_peer = false;  ///< drop the previous dataplane peer first
     std::string stale_peer_key;             ///< normalized key to remove (when remove_stale_peer)
     std::string new_peer_key;               ///< normalized key to add
 };
 
 /// `prev_*` are the currently-stored values ("" when the node is new); `new_*`
-/// are from this join. `new_wg` empty means the join carried no key.
+/// are from this join. An empty new mesh key means the join carried no key.
 [[nodiscard]] MeshRekeyPlan plan_mesh_rekey(std::string_view prev_ip,
                                             std::string_view new_ip,
-                                            std::string_view prev_wg,
-                                            std::string_view new_wg);
+                                            std::string_view prev_mesh_pubkey,
+                                            std::string_view new_mesh_pubkey);
+
+/// The node that already holds this mesh transport key, compared on the
+/// normalized Curve25519 key so a respelled or "ed25519:"-prefixed claim
+/// cannot slip past. A transport static binds to exactly one node identity:
+/// the identity that first registered it under authentication owns it, and
+/// only that identity may rebind it. Clients derive the static from their own
+/// identity secret, so no two identities can legitimately arrive at one key —
+/// and nobody can compute another node's static before that node revealed it.
+[[nodiscard]] std::optional<std::string> mesh_pubkey_owner(
+    const tree::PermissionTreeService& tree, std::string_view mesh_pubkey);
+
+/// The identity-bound mesh static for an "ed25519:..." identity pubkey: the
+/// birational X25519 form of the identity key. A client whose static is this
+/// value has proved possession transitively — the Ed25519 challenge proved
+/// the identity secret, and the static's secret is its conversion. Empty when
+/// the identity does not convert.
+[[nodiscard]] std::string identity_mesh_pubkey(std::string_view identity_pubkey);
+
+/// Why a mesh public-key claim by `node_id` — authenticated as `identity_pubkey`
+/// ("ed25519:..." form) — must be refused, or nullopt when it may proceed.
+/// Refusals: the static is bound to another node; or it is the
+/// identity-bound form of a DIFFERENT enrolled identity, which only that
+/// identity could ever prove. An unrecognized opaque static is still
+/// accepted for legacy clients until the derivation cutover; the
+/// registering identity then owns it under the one-key-one-node rule.
+[[nodiscard]] std::optional<std::string> mesh_key_claim_refusal(
+    const tree::PermissionTreeService& tree, std::string_view claimed,
+    const std::string& node_id, const std::string& identity_pubkey);
 
 } // namespace nexus::api

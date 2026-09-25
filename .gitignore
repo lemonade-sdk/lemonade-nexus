@@ -48,3 +48,7 @@ target/
 .claude/
 *.bak
 dmg/
+build-asan/
+
+# CTest output (generated when ctest runs from the source root)
+Testing/

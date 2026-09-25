@@ -17,11 +17,6 @@ public:
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
 
-    /// Bootstrap or grant permissions on the root node for an Ed25519 pubkey.
-    /// If the root node does not exist, creates it with the given key as owner.
-    /// If the root node already exists, grants read + add_child on it.
-    void ensure_root_node(const std::string& pubkey);
-
     ApiContext& ctx_;
 };
 

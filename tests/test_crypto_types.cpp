@@ -95,9 +95,10 @@ TEST_F(CryptoTypesTest, KeySizeConstants) {
     EXPECT_EQ(kX25519PublicKeySize, 32u);
     EXPECT_EQ(kX25519PrivateKeySize, 32u);
     EXPECT_EQ(kX25519SharedSize, 32u);
-    EXPECT_EQ(kAesGcmKeySize, 32u);
-    EXPECT_EQ(kAesGcmNonceSize, 12u);
-    EXPECT_EQ(kAesGcmTagSize, 16u);
+    EXPECT_EQ(kAeadKeySize, 32u);
+    EXPECT_EQ(kAeadNonceSize, 24u);
+    EXPECT_EQ(kAeadTagSize, 16u);
+    EXPECT_EQ(kEncryptedBlobVersion, 1u);
     EXPECT_EQ(kHash256Size, 32u);
 }
 

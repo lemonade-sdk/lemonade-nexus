@@ -102,7 +102,7 @@ void RoutingCoordinationService::register_endpoint(const EndpointRegistration& r
     auto& e = endpoints_[reg.node_id];
     e.node_id             = reg.node_id;
     e.endpoint_identifier = reg.endpoint_identifier;
-    e.wg_pubkey           = reg.wg_pubkey;
+    e.mesh_pubkey         = reg.mesh_pubkey;
     e.mgmt_pubkey         = reg.mgmt_pubkey;
     if (is_wellformed_endpoint(reg.stun_endpoint)) {
         e.reflexive = Candidate{reg.stun_endpoint,
@@ -130,7 +130,7 @@ RequestResult RoutingCoordinationService::create_request(const ConnectionRequest
     s.connection_id       = mint_connection_id();
     s.client_node_id      = in.client_node_id;
     s.client_pubkey       = in.client_pubkey;
-    s.client_wg_pub       = in.client_wg_pub;
+    s.client_mesh_pubkey  = in.client_mesh_pubkey;
     s.client_candidates   = make_candidates(in.candidates, in.source_ip);
     s.endpoint_node_id    = in.target_node_id;
     s.endpoint_identifier = in.target_identifier;
@@ -142,7 +142,7 @@ RequestResult RoutingCoordinationService::create_request(const ConnectionRequest
     // Pre-fill the endpoint's identity hints if it already registered (the
     // endpoint discovers the request by polling, regardless of timing).
     if (auto eit = endpoints_.find(in.target_node_id); eit != endpoints_.end()) {
-        s.endpoint_wg_pub      = eit->second.wg_pubkey;
+        s.endpoint_mesh_pubkey = eit->second.mesh_pubkey;
         s.endpoint_mgmt_pubkey = eit->second.mgmt_pubkey;
     }
 
@@ -164,7 +164,9 @@ bool RoutingCoordinationService::endpoint_ready(const EndpointReadyInput& in,
     auto& s = it->second;
     if (s.endpoint_node_id != in.endpoint_node_id) { err = "endpoint mismatch"; return false; }
 
-    if (!in.endpoint_wg_pub.empty()) s.endpoint_wg_pub = in.endpoint_wg_pub;
+    if (!in.endpoint_mesh_pubkey.empty()) {
+        s.endpoint_mesh_pubkey = in.endpoint_mesh_pubkey;
+    }
     s.endpoint_candidates = make_candidates(in.candidates, in.source_ip);
 
     // Path selection: direct when both sides offered a candidate, else relay.
@@ -195,7 +197,7 @@ std::optional<ClientDirective> RoutingCoordinationService::build_client_directiv
     d.client_node_id       = s.client_node_id;
     d.endpoint_node_id     = s.endpoint_node_id;
     d.endpoint_identifier  = s.endpoint_identifier;
-    d.endpoint_wg_pub      = s.endpoint_wg_pub;
+    d.endpoint_mesh_pubkey = s.endpoint_mesh_pubkey;
     d.endpoint_mgmt_pubkey = s.endpoint_mgmt_pubkey;
     d.endpoint_candidates  = s.endpoint_candidates;
     d.conn_nonce           = s.conn_nonce;

@@ -10,7 +10,7 @@
 ///   1. Carry the mesh: peers fetched from the server are synced in via
 ///      sync_peers(); P2P traffic is cryptokey-routed in userspace.
 ///   2. Carry the private API: the server's private routes (/api/mesh/peers,
-///      /api/trust/status, /api/relay/list) are only reachable over this plane,
+///      /api/relay/list) are only reachable over this plane,
 ///      so tcp_egress() opens a 127.0.0.1 loopback bridged to the server's
 ///      tunnel IP through the netstack, and the client speaks plain HTTP to it.
 
@@ -71,6 +71,15 @@ public:
     /// {private, public}), domain-separated from other uses of that seed. The
     /// same seed always yields the same pair, so re-joins present the same key.
     static std::pair<std::string, std::string> derive_keypair(std::span<const uint8_t> seed);
+
+    /// The identity-bound mesh keypair: the birational X25519 form of the
+    /// device's Ed25519 identity (64-byte libsodium secret key). The server
+    /// can derive the public half from the authenticated identity alone, so
+    /// possession is proved transitively by the join challenge — no extra
+    /// handshake exists or is needed. This supersedes derive_keypair, which
+    /// remains only for pre-cutover devices.
+    static std::pair<std::string, std::string> identity_bound_keypair(
+        std::span<const uint8_t> ed25519_secret_key);
 
 private:
     struct Impl;

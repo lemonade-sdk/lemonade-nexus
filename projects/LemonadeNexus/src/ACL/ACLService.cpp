@@ -3,7 +3,6 @@
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
 
 #include <chrono>
 #include <cstring>
@@ -14,18 +13,11 @@ using json = nlohmann::json;
 
 static constexpr std::string_view kHkdfSalt = "lemonade-nexus-acl-db-key";
 
-ACLService::ACLService(std::filesystem::path db_path,
+ACLService::ACLService(AclStore& store,
                        crypto::SodiumCryptoService& crypto)
-    : db_path_{std::move(db_path)}
+    : store_{store}
     , crypto_{crypto}
 {
-}
-
-ACLService::~ACLService() {
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
 }
 
 void ACLService::set_signing_keypair(const crypto::Ed25519Keypair& kp) {
@@ -39,68 +31,17 @@ void ACLService::set_delta_callback(AclDeltaCallback cb) {
 
 void ACLService::on_start() {
     std::lock_guard lock(mutex_);
-    auto parent = db_path_.parent_path();
-    if (!parent.empty()) {
-        std::filesystem::create_directories(parent);
-    }
-
-    int rc = sqlite3_open(db_path_.string().c_str(), &db_);
-    if (rc != SQLITE_OK) {
-        spdlog::error("[{}] failed to open database {}: {}",
-                      name(), db_path_.string(), sqlite3_errmsg(db_));
-        return;
-    }
-
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-
-    // ACL table with last_modified for conflict resolution
-    const char* create_acl =
-        "CREATE TABLE IF NOT EXISTS acl ("
-        "  user_id TEXT NOT NULL,"
-        "  resource TEXT NOT NULL,"
-        "  perms_enc BLOB NOT NULL,"
-        "  last_modified INTEGER NOT NULL DEFAULT 0,"
-        "  PRIMARY KEY (user_id, resource)"
-        ");";
-
-    // Seen deltas for deduplication
-    const char* create_seen =
-        "CREATE TABLE IF NOT EXISTS acl_seen_deltas ("
-        "  delta_id TEXT PRIMARY KEY"
-        ");";
-
-    char* err_msg = nullptr;
-    rc = sqlite3_exec(db_, create_acl, nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("[{}] failed to create acl table: {}", name(), err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return;
-    }
-    rc = sqlite3_exec(db_, create_seen, nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        spdlog::error("[{}] failed to create seen deltas table: {}", name(), err_msg ? err_msg : "unknown");
-        sqlite3_free(err_msg);
-        return;
-    }
+    store_.open();
 
     // Count entries
-    sqlite3_stmt* stmt = nullptr;
-    rc = sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM acl;", -1, &stmt, nullptr);
-    int64_t count = 0;
-    if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
-        count = sqlite3_column_int64(stmt, 0);
-    }
-    sqlite3_finalize(stmt);
+    const int64_t count = store_.ready() ? store_.count() : 0;
 
-    spdlog::info("[{}] started (database: {}, {} entries)", name(), db_path_.string(), count);
+    spdlog::info("[{}] started (database: {}, {} entries)", name(), store_.db_path().string(), count);
 }
 
 void ACLService::on_stop() {
     std::lock_guard lock(mutex_);
-    if (db_) {
-        sqlite3_close(db_);
-        db_ = nullptr;
-    }
+    store_.close();
     spdlog::info("[{}] stopped", name());
 }
 
@@ -110,67 +51,12 @@ void ACLService::on_stop() {
 
 Permission ACLService::do_get_permissions(std::string_view user_id, std::string_view resource) const {
     std::lock_guard lock(mutex_);
-    if (!db_ || !has_key_) return Permission::None;
-    return static_cast<Permission>(read_perms_locked(user_id, resource));
-}
+    if (!store_.ready() || !has_key_) return Permission::None;
 
-uint32_t ACLService::read_perms_locked(std::string_view user_id, std::string_view resource) const {
-    const char* sql = "SELECT perms_enc FROM acl WHERE user_id = ? AND resource = ?;";
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) return 0;
-
-    sqlite3_bind_text(stmt, 1, user_id.data(), static_cast<int>(user_id.size()), SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, resource.data(), static_cast<int>(resource.size()), SQLITE_STATIC);
-
-    uint32_t result = 0;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        auto blob_ptr = static_cast<const uint8_t*>(sqlite3_column_blob(stmt, 0));
-        auto blob_len = sqlite3_column_bytes(stmt, 0);
-        if (blob_ptr && blob_len > 0) {
-            std::vector<uint8_t> blob(blob_ptr, blob_ptr + blob_len);
-            auto dec = decrypt_perms(blob);
-            if (dec) result = *dec;
-        }
-    }
-    sqlite3_finalize(stmt);
-    return result;
-}
-
-bool ACLService::write_perms_locked(std::string_view user_id, std::string_view resource,
-                                     uint32_t perms, uint64_t timestamp) {
-    if (perms == 0) {
-        // Delete the row
-        const char* sql = "DELETE FROM acl WHERE user_id = ? AND resource = ?;";
-        sqlite3_stmt* stmt = nullptr;
-        int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-        if (rc != SQLITE_OK) return false;
-        sqlite3_bind_text(stmt, 1, user_id.data(), static_cast<int>(user_id.size()), SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 2, resource.data(), static_cast<int>(resource.size()), SQLITE_STATIC);
-        rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        return rc == SQLITE_DONE;
-    }
-
-    auto enc = encrypt_perms(perms);
-    if (enc.empty()) return false;
-
-    const char* sql =
-        "INSERT INTO acl (user_id, resource, perms_enc, last_modified) VALUES (?, ?, ?, ?)"
-        " ON CONFLICT(user_id, resource) DO UPDATE SET perms_enc = excluded.perms_enc,"
-        " last_modified = excluded.last_modified;";
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) return false;
-
-    sqlite3_bind_text(stmt, 1, user_id.data(), static_cast<int>(user_id.size()), SQLITE_STATIC);
-    sqlite3_bind_text(stmt, 2, resource.data(), static_cast<int>(resource.size()), SQLITE_STATIC);
-    sqlite3_bind_blob(stmt, 3, enc.data(), static_cast<int>(enc.size()), SQLITE_STATIC);
-    sqlite3_bind_int64(stmt, 4, static_cast<int64_t>(timestamp));
-
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    return rc == SQLITE_DONE;
+    const auto blob = store_.load_perms(user_id, resource);
+    if (!blob) return Permission::None;
+    auto dec = decrypt_perms(*blob, user_id, resource);
+    return dec ? static_cast<Permission>(*dec) : Permission::None;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,16 +78,22 @@ bool ACLService::do_grant(std::string_view user_id, std::string_view resource, P
 
     {
         std::lock_guard lock(mutex_);
-        if (!db_ || !has_key_) return false;
+        if (!store_.ready() || !has_key_) return false;
 
-        uint32_t existing = read_perms_locked(user_id, resource);
+        const auto blob = store_.load_perms(user_id, resource);
+        uint32_t existing = 0;
+        if (blob) {
+            if (auto dec = decrypt_perms(*blob, user_id, resource)) existing = *dec;
+        }
         uint32_t updated = existing | static_cast<uint32_t>(perms);
 
-        if (!write_perms_locked(user_id, resource, updated, now)) {
+        auto enc = encrypt_perms(updated, user_id, resource);
+        if (enc.empty()) return false;
+        if (!store_.store_perms(user_id, resource, std::span<const uint8_t>{enc}, now)) {
             spdlog::warn("[{}] failed to persist grant for {} on {}", name(), user_id, resource);
             return false;
         }
-        mark_delta_seen_locked(delta.delta_id);
+        store_.mark_delta_seen(delta.delta_id);
     }
 
     spdlog::debug("[{}] granted permissions to {} on {}", name(), user_id, resource);
@@ -228,18 +120,29 @@ bool ACLService::do_revoke(std::string_view user_id, std::string_view resource, 
 
     {
         std::lock_guard lock(mutex_);
-        if (!db_ || !has_key_) return false;
+        if (!store_.ready() || !has_key_) return false;
 
-        uint32_t existing = read_perms_locked(user_id, resource);
+        uint32_t existing = 0;
+        if (auto blob = store_.load_perms(user_id, resource)) {
+            if (auto dec = decrypt_perms(*blob, user_id, resource)) existing = *dec;
+        }
         if (existing == 0) return false;
 
         uint32_t updated = existing & ~static_cast<uint32_t>(perms);
 
-        if (!write_perms_locked(user_id, resource, updated, now)) {
+        bool persisted;
+        if (updated == 0) {
+            persisted = store_.delete_perms(user_id, resource);
+        } else {
+            auto enc = encrypt_perms(updated, user_id, resource);
+            persisted = !enc.empty() &&
+                        store_.store_perms(user_id, resource, std::span<const uint8_t>{enc}, now);
+        }
+        if (!persisted) {
             spdlog::warn("[{}] failed to persist revoke for {} on {}", name(), user_id, resource);
             return false;
         }
-        mark_delta_seen_locked(delta.delta_id);
+        store_.mark_delta_seen(delta.delta_id);
     }
 
     spdlog::debug("[{}] revoked permissions from {} on {}", name(), user_id, resource);
@@ -255,68 +158,15 @@ bool ACLService::do_revoke(std::string_view user_id, std::string_view resource, 
 // ---------------------------------------------------------------------------
 
 bool ACLService::apply_remote_delta(const AclDelta& delta) {
-    // Verify signature
-    if (!verify_delta_signature(delta)) {
-        spdlog::warn("[{}] rejected ACL delta {} — invalid signature", name(), delta.delta_id);
-        return false;
-    }
-
-    std::lock_guard lock(mutex_);
-    if (!db_ || !has_key_) return false;
-
-    // Deduplication
-    if (is_delta_seen_locked(delta.delta_id)) {
-        return false;  // already applied
-    }
-
-    uint32_t existing = read_perms_locked(delta.user_id, delta.resource);
-    uint32_t updated = existing;
-
-    if (delta.operation == "grant") {
-        updated = existing | delta.permissions;
-    } else if (delta.operation == "revoke") {
-        updated = existing & ~delta.permissions;
-    } else {
-        spdlog::warn("[{}] unknown ACL delta operation: {}", name(), delta.operation);
-        return false;
-    }
-
-    if (!write_perms_locked(delta.user_id, delta.resource, updated, delta.timestamp)) {
-        spdlog::warn("[{}] failed to apply remote ACL delta {}", name(), delta.delta_id);
-        return false;
-    }
-
-    mark_delta_seen_locked(delta.delta_id);
-    spdlog::debug("[{}] applied remote ACL delta {} ({} {} on {})",
-                  name(), delta.delta_id, delta.operation, delta.user_id, delta.resource);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Delta deduplication
-// ---------------------------------------------------------------------------
-
-bool ACLService::is_delta_seen_locked(const std::string& delta_id) const {
-    const char* sql = "SELECT 1 FROM acl_seen_deltas WHERE delta_id = ?;";
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) return false;
-
-    sqlite3_bind_text(stmt, 1, delta_id.data(), static_cast<int>(delta_id.size()), SQLITE_STATIC);
-    bool seen = (sqlite3_step(stmt) == SQLITE_ROW);
-    sqlite3_finalize(stmt);
-    return seen;
-}
-
-void ACLService::mark_delta_seen_locked(const std::string& delta_id) {
-    const char* sql = "INSERT OR IGNORE INTO acl_seen_deltas (delta_id) VALUES (?);";
-    sqlite3_stmt* stmt = nullptr;
-    int rc = sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr);
-    if (rc != SQLITE_OK) return;
-
-    sqlite3_bind_text(stmt, 1, delta_id.data(), static_cast<int>(delta_id.size()), SQLITE_STATIC);
-    sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
+    // Explicit refusal at the service boundary: a certificate-verified author
+    // is not a permission authority, and authoritative remote ACL mutation is
+    // unavailable until finalized mesh authority is integrated. No mutation,
+    // no seen-marking (a delta id is not retained signed evidence), and no
+    // forwarding signal is produced. Existing rows are preserved untouched.
+    spdlog::warn("[{}] refusing remote ACL delta {} ({} {} on {}) — remote ACL "
+                 "mutation is unavailable pending finalized mesh authority",
+                 name(), delta.delta_id, delta.operation, delta.user_id, delta.resource);
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -402,15 +252,16 @@ void ACLService::derive_encryption_key() {
         std::span<const uint8_t>{ikm},
         std::span<const uint8_t>{salt_bytes},
         std::span<const uint8_t>{info},
-        crypto::kAesGcmKeySize);
+        crypto::kAeadKeySize);
 
-    if (derived.size() == crypto::kAesGcmKeySize) {
-        std::memcpy(encryption_key_.data(), derived.data(), crypto::kAesGcmKeySize);
+    if (derived.size() == crypto::kAeadKeySize) {
+        std::memcpy(encryption_key_.data(), derived.data(), crypto::kAeadKeySize);
         has_key_ = true;
     }
 }
 
-std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
+std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms, std::string_view user_id,
+                                               std::string_view resource) const {
     if (!has_key_) return {};
 
     std::array<uint8_t, 4> plaintext{};
@@ -419,24 +270,50 @@ std::vector<uint8_t> ACLService::encrypt_perms(uint32_t perms) const {
     plaintext[2] = static_cast<uint8_t>((perms >> 16) & 0xFF);
     plaintext[3] = static_cast<uint8_t>((perms >> 24) & 0xFF);
 
-    auto ct = crypto_.aes_gcm_encrypt(encryption_key_,
-                                       std::span<const uint8_t>{plaintext});
+    // The row this permission belongs to is authenticated, so a valid blob
+    // lifted out of one row fails in any other.
+    const auto aad = crypto::aead_aad(
+        crypto::aead_purpose::kAclPermissions,
+        {std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(user_id.data()), user_id.size()),
+         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(resource.data()),
+                                  resource.size())});
+    const auto ct = crypto_.aead_encrypt(encryption_key_, std::span<const uint8_t>{plaintext},
+                                         std::span<const uint8_t>{aad});
 
+    // version || nonce || ciphertext. The version leads so a reader names the
+    // construction outright instead of inferring it from a field width.
     std::vector<uint8_t> blob;
-    blob.reserve(ct.nonce.size() + ct.ciphertext.size());
+    blob.reserve(1 + ct.nonce.size() + ct.ciphertext.size());
+    blob.push_back(ct.version);
     blob.insert(blob.end(), ct.nonce.begin(), ct.nonce.end());
     blob.insert(blob.end(), ct.ciphertext.begin(), ct.ciphertext.end());
     return blob;
 }
 
-std::optional<uint32_t> ACLService::decrypt_perms(const std::vector<uint8_t>& blob) const {
-    if (!has_key_ || blob.size() <= crypto::kAesGcmNonceSize) return std::nullopt;
+std::optional<uint32_t> ACLService::decrypt_perms(const std::vector<uint8_t>& blob,
+                                                  std::string_view user_id,
+                                                  std::string_view resource) const {
+    if (!has_key_) return std::nullopt;
 
-    crypto::AesGcmCiphertext ct;
-    ct.nonce.assign(blob.begin(), blob.begin() + crypto::kAesGcmNonceSize);
-    ct.ciphertext.assign(blob.begin() + crypto::kAesGcmNonceSize, blob.end());
+    // version || nonce || ciphertext, with every length checked before any of
+    // it reaches the AEAD.
+    constexpr std::size_t kMinimum = 1 + crypto::kAeadNonceSize + crypto::kAeadTagSize;
+    if (blob.size() < kMinimum) return std::nullopt;
+    if (blob[0] != crypto::kEncryptedBlobVersion) return std::nullopt;
 
-    auto plaintext = crypto_.aes_gcm_decrypt(encryption_key_, ct);
+    crypto::EncryptedBlob ct;
+    ct.version = blob[0];
+    const auto nonce_begin = blob.begin() + 1;
+    const auto nonce_end = nonce_begin + static_cast<std::ptrdiff_t>(crypto::kAeadNonceSize);
+    ct.nonce.assign(nonce_begin, nonce_end);
+    ct.ciphertext.assign(nonce_end, blob.end());
+
+    const auto aad = crypto::aead_aad(
+        crypto::aead_purpose::kAclPermissions,
+        {std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(user_id.data()), user_id.size()),
+         std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(resource.data()),
+                                  resource.size())});
+    auto plaintext = crypto_.aead_decrypt(encryption_key_, ct, std::span<const uint8_t>{aad});
     if (!plaintext || plaintext->size() != 4) return std::nullopt;
 
     auto& pt = *plaintext;

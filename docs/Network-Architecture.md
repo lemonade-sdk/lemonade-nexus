@@ -19,7 +19,7 @@ title: Network Architecture
     Tunnel: 10.64.0.1    Tunnel: 10.64.0.1   Tunnel: 10.64.0.1
     BB: 172.16.0.66      BB: 172.16.0.120    BB: 172.16.0.45
          |                    |                    |
-         └──── WG Backbone (172.16.0.0/22) ────────┘
+         └──── Mesh backbone (172.16.0.0/22) ──────┘
               Encrypted server-to-server mesh
          |                    |                    |
     ┌────┴────┐          ┌───┴────┐          ┌───┴────┐
@@ -44,8 +44,8 @@ title: Network Architecture
                                        allocates tunnel IP, returns mesh config)
 
 3. Mesh Tunnel (UDP :51940)
-   Client ──WG handshake──> Server
-   Client <──WG keepalive (5s)──> Server
+   Client ──Noise handshake──> Server
+   Client <──mesh keepalive (5s)──> Server
    Tunnel established: client 10.64.0.10 ↔ server 10.64.0.1
 
 4. Private API (TCP :9101, reachable only through the tunnel)
@@ -55,7 +55,7 @@ title: Network Architecture
 
 `POST /api/join` is the whole bootstrap in one call. Its response carries the
 session JWT, `node_id`, `tunnel_ip` + `tunnel_subnet` (10.64.0.0/10),
-`server_tunnel_ip`, `wg_server_pubkey`, `wg_endpoint`, `private_api_port`,
+`server_tunnel_ip`, `mesh_server_pubkey`, `mesh_endpoint`, `private_api_port`,
 the server/client mesh FQDNs and the mesh DNS servers
 (`TreeApiHandler.cpp`).
 
@@ -73,11 +73,11 @@ Server A (us-west)                    Server B (eu-west)
     |                                      |
     │──── Gossip (UDP :9102) ──────────────│  (public internet)
     │     ServerHello exchange: signed     │
-    │     server certificate (incl. WG     │
+    │     server certificate (incl. mesh   │
     │     pubkey) + advertised endpoint;   │
     │     mutual TEE challenge follows     │
     │                                      │
-    │──── WG Backbone (UDP :51940) ────────│  (same socket as the client
+    │──── Mesh backbone (UDP :51940) ──────│  (same socket as the client
     │     172.16.0.66 ↔ 172.16.0.120      │   mesh — the backbone IP is a
     │     Private API, gossip preferred    │   second virtual address on
     │                                      │   the same dataplane)
@@ -151,7 +151,7 @@ Client A (behind NAT)         Server (coordinator)       Client B (behind NAT)
     │<── directive: B's candidates ─│─ directive: A's candidates >│
     │    punch_at = now + 1s        │    punch_at = now + 1s      │
     │                               │                             │
-    │──────── simultaneous WG handshake on UDP :51940 ──────────>│
+    │──────── simultaneous Noise handshake on UDP :51940 ───────>│
     │<────────────────────────────────────────────────────────────│
     │                                                             │
     │<═══════════ Direct P2P encrypted mesh tunnel ══════════════>│

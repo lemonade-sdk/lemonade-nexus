@@ -55,7 +55,7 @@ void to_json(json& j, const TreeNode& n) {
         {"shared_domain",            n.shared_domain},
         {"mgmt_pubkey",              n.mgmt_pubkey},
         {"wrapped_mgmt_privkey",     n.wrapped_mgmt_privkey},
-        {"wg_pubkey",                n.wg_pubkey},
+        {"mesh_pubkey",              n.mesh_pubkey},
         {"endpoint_identifier",      n.endpoint_identifier},
         {"cpu_id",                   n.cpu_id},
         {"net_mac",                  n.net_mac},
@@ -71,6 +71,9 @@ void to_json(json& j, const TreeNode& n) {
 }
 
 void from_json(const json& j, TreeNode& n) {
+    if (j.contains("wg_pubkey")) {
+        throw std::invalid_argument("legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'");
+    }
     j.at("id").get_to(n.id);
     j.at("parent_id").get_to(n.parent_id);
     n.type = string_to_node_type(j.at("type").get<std::string>());
@@ -81,7 +84,9 @@ void from_json(const json& j, TreeNode& n) {
     j.at("shared_domain").get_to(n.shared_domain);
     j.at("mgmt_pubkey").get_to(n.mgmt_pubkey);
     j.at("wrapped_mgmt_privkey").get_to(n.wrapped_mgmt_privkey);
-    j.at("wg_pubkey").get_to(n.wg_pubkey);
+    if (j.contains("mesh_pubkey")) {
+        j.at("mesh_pubkey").get_to(n.mesh_pubkey);
+    }
     // Optional: nodes persisted before the routing layer lack these.
     if (j.contains("endpoint_identifier")) j.at("endpoint_identifier").get_to(n.endpoint_identifier);
     if (j.contains("cpu_id"))              j.at("cpu_id").get_to(n.cpu_id);
@@ -110,6 +115,10 @@ void to_json(json& j, const TreeDelta& d) {
 }
 
 void from_json(const json& j, TreeDelta& d) {
+    if (j.contains("node_data") && j["node_data"].is_object() &&
+        j["node_data"].contains("wg_pubkey")) {
+        throw std::invalid_argument("legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'");
+    }
     j.at("operation").get_to(d.operation);
     j.at("target_node_id").get_to(d.target_node_id);
     j.at("node_data").get_to(d.node_data);
@@ -135,7 +144,9 @@ std::string canonical_node_json(const TreeNode& node) {
     j["shared_domain"]            = node.shared_domain;
     j["mgmt_pubkey"]              = node.mgmt_pubkey;
     j["wrapped_mgmt_privkey"]     = node.wrapped_mgmt_privkey;
-    j["wg_pubkey"]                = node.wg_pubkey;
+    // Canonical label is "mesh_pubkey". Signatures made under the retired
+    // "wg_pubkey" label are invalid by design; there is no compatibility path.
+    j["mesh_pubkey"]              = node.mesh_pubkey;
     j["endpoint_identifier"]      = node.endpoint_identifier;
     j["cpu_id"]                   = node.cpu_id;
     j["net_mac"]                  = node.net_mac;
@@ -153,6 +164,9 @@ std::string canonical_node_json(const TreeNode& node) {
 std::string canonical_delta_json(const TreeDelta& delta) {
     // Build a sorted JSON object excluding the "signature" field.
     json j;
+    // node_data is signed as-is under the "mesh_pubkey" label (see
+    // canonical_node_json). Legacy "wg_pubkey" input is rejected at the
+    // parse boundary and never reaches signing.
     j["node_data"]      = delta.node_data;
     j["operation"]      = delta.operation;
     j["signer_pubkey"]  = delta.signer_pubkey;

@@ -5,6 +5,9 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
+#include <nlohmann/json.hpp>
+
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -60,6 +63,36 @@ public:
     /// Used after Ed25519 key registration to give new keys add_child on root.
     bool grant_assignment(const std::string& node_id, const Assignment& assignment);
 
+    // --- Delta statement authorization (shared with record acceptance) ---
+
+    /// Outcome of evaluating a delta statement against the current tree.
+    /// ContextMissing means the check node (parent for create_node, target
+    /// otherwise) or its assignment context is absent — the statement cannot
+    /// be evaluated yet; it is not an authorization decision.
+    enum class DeltaAuthorization { Authorized, Denied, ContextMissing };
+
+    /// The permission an operation requires. None for unknown operations.
+    [[nodiscard]] static acl::Permission required_permission_for(
+            std::string_view operation);
+
+    /// Evaluate a delta statement's authorization against the current tree
+    /// with the same rules do_apply_delta enforces: the signer must hold the
+    /// operation-derived permission via an assignment on the check node
+    /// (parent for create_node, target otherwise). No certificate is part of
+    /// the author contract.
+    [[nodiscard]] DeltaAuthorization authorize_delta_statement(
+            std::string_view operation,
+            std::string_view target_node_id,
+            const nlohmann::json& node_data,
+            std::string_view signer_pubkey) const;
+
+    /// Retention sink for locally applied deltas (record transfer only —
+    /// applying the delta is independent of retention). The sink receives the
+    /// signed statement with a precomputed record hash; refusing it does not
+    /// roll back the applied mutation.
+    void set_delta_retention_sink(std::function<bool(const storage::FileStorageService::RetainedDelta&)> sink);
+    [[nodiscard]] bool retain_applied_delta(const TreeDelta& delta);
+
     // --- Endpoint identifier resolution (routing layer) ---
 
     /// Re-derive the canonical identifier from a node's inputs (pure).
@@ -110,6 +143,12 @@ public:
     [[nodiscard]] std::vector<TreeNode> do_get_nodes_by_type(NodeType type) const;
 
 private:
+    /// True when another node already stores exactly this mesh public key. Caller
+    /// holds mutex_. The API layer additionally compares normalized keys; this
+    /// backstop keeps the one-key-one-node invariant for every caller.
+    [[nodiscard]] bool mesh_pubkey_taken_locked(const std::string& mesh_pubkey,
+                                                const std::string& own_id) const;
+
     /// Persist a tree node to storage wrapped in a SignedEnvelope.
     bool persist_node(const TreeNode& node);
 
@@ -118,6 +157,14 @@ private:
 
     /// Map a permission string (from assignments) to an acl::Permission flag.
     [[nodiscard]] static acl::Permission string_to_permission(std::string_view perm_str);
+
+    /// Signer holds the required permission via an assignment on the node.
+    /// Caller holds mutex_.
+    [[nodiscard]] bool signer_has_permission_locked(const TreeNode& node,
+                                                    std::string_view signer_pubkey,
+                                                    acl::Permission required) const;
+
+    std::function<bool(const storage::FileStorageService::RetainedDelta&)> delta_retention_sink_;
 
     /// Evict stale entries from the replay cache.
     void evict_replay_cache();

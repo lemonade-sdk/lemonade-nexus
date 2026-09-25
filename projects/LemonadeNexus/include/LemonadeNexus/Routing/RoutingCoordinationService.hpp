@@ -20,7 +20,7 @@ namespace nexus::routing {
 struct EndpointRegistration {
     std::string node_id;
     std::string endpoint_identifier;
-    std::string wg_pubkey;
+    std::string mesh_pubkey;
     std::string mgmt_pubkey;
     std::string stun_endpoint;   // self-reported reflexive address
     std::string source_ip;       // observed TCP source (for return-routability)
@@ -29,7 +29,7 @@ struct EndpointRegistration {
 struct ConnectionRequestInput {
     std::string client_node_id;
     std::string client_pubkey;
-    std::string client_wg_pub;
+    std::string client_mesh_pubkey;
     std::string target_node_id;
     std::string target_identifier;
     std::array<uint8_t, 16> conn_nonce{};
@@ -40,7 +40,7 @@ struct ConnectionRequestInput {
 struct EndpointReadyInput {
     std::string connection_id;
     std::string endpoint_node_id;
-    std::string endpoint_wg_pub;
+    std::string endpoint_mesh_pubkey;
     std::vector<std::string> candidates;
     std::string source_ip;
 };
@@ -57,7 +57,7 @@ struct ClientDirective {
     std::string client_node_id;
     std::string endpoint_node_id;
     std::string endpoint_identifier;
-    std::string endpoint_wg_pub;
+    std::string endpoint_mesh_pubkey;
     std::string endpoint_mgmt_pubkey;
     std::vector<Candidate> endpoint_candidates;
     std::array<uint8_t, 16> conn_nonce{};

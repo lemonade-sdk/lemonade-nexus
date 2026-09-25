@@ -9,7 +9,7 @@
 /// Decrypted packets are routed in userspace:
 ///   - dst == one of our virtual IPs  -> inbound handler (in-process netstack)
 ///   - dst in another peer's allowed IPs -> re-encrypted and sent (hairpin)
-///   - anything else -> dropped (cryptokey-routing parity with kernel WG)
+///   - anything else -> dropped by cryptokey routing
 ///
 /// Incoming UDP datagrams are demultiplexed O(1): boringtun tags each local
 /// session receiver index with the tunnel index we assign per peer

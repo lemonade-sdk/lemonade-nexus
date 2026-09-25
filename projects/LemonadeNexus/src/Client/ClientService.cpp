@@ -666,8 +666,8 @@ ClientService::do_update_node(const std::string& node_id,
     if (updates_json.contains("shared_domain")) {
         partial.shared_domain = updates_json["shared_domain"].get<std::string>();
     }
-    if (updates_json.contains("wg_pubkey")) {
-        partial.wg_pubkey = updates_json["wg_pubkey"].get<std::string>();
+    if (updates_json.contains("mesh_pubkey")) {
+        partial.mesh_pubkey = updates_json.value("mesh_pubkey", std::string{});
     }
     if (updates_json.contains("listen_endpoint")) {
         partial.listen_endpoint = updates_json["listen_endpoint"].get<std::string>();

@@ -70,6 +70,7 @@ include(libraries/c-ares)
 include(libraries/sqlite3)
 include(libraries/boringtun)
 include(libraries/virtual-netstack)
+include(libraries/frost)
 
 #-----------------------------------------------------------------------------
 # Projects
@@ -77,6 +78,7 @@ include(libraries/virtual-netstack)
 add_subdirectory(projects/LemonadeNexus)
 add_subdirectory(projects/LemonadeNexusSDK)
 add_subdirectory(projects/LemonadeNexusSidecar)
+add_subdirectory(projects/LemonadeNexusAttestd)
 
 #-----------------------------------------------------------------------------
 # Tests (optional, enabled by default)

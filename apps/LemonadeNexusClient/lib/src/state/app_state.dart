@@ -265,7 +265,6 @@ class AppState {
   final List<CertStatus> certificates;
   final List<TreeNode> treeNodes;
   final TreeNode? rootNode;
-  final TrustStatus? trustStatus;
   final SidebarItem selectedSidebarItem;
   final bool isLoading;
   final bool isDiscovering;
@@ -296,7 +295,6 @@ class AppState {
     this.certificates = const [],
     this.treeNodes = const [],
     this.rootNode,
-    this.trustStatus,
     this.selectedSidebarItem = SidebarItem.dashboard,
     this.isLoading = false,
     this.isDiscovering = false,
@@ -324,7 +322,6 @@ class AppState {
     List<CertStatus>? certificates,
     List<TreeNode>? treeNodes,
     TreeNode? rootNode,
-    TrustStatus? trustStatus,
     SidebarItem? selectedSidebarItem,
     bool? isLoading,
     bool? isDiscovering,
@@ -353,7 +350,6 @@ class AppState {
       certificates: certificates ?? this.certificates,
       treeNodes: treeNodes ?? this.treeNodes,
       rootNode: rootNode ?? this.rootNode,
-      trustStatus: trustStatus ?? this.trustStatus,
       selectedSidebarItem: selectedSidebarItem ?? this.selectedSidebarItem,
       isLoading: isLoading ?? this.isLoading,
       isDiscovering: isDiscovering ?? this.isDiscovering,
@@ -903,7 +899,17 @@ class AppNotifier extends StateNotifier<AppState> {
     state = state.copyWith(isLoading: true, errorMessage: null);
     _log('signInWithPasskey: start (connStatus=${state.connectionStatus.name})');
     try {
-      final assertion = await _passkey.signAssertion('lemonade-nexus.local');
+      final userId = state.storedPasskeyUserId ?? '';
+      if (userId.isEmpty) {
+        state = state.copyWith(
+            isLoading: false, errorMessage: 'No passkey account stored');
+        return false;
+      }
+      // The assertion must carry a server-issued, single-use, expiring
+      // challenge bound to this account.
+      final challenge = await _sdk.getPasskeyChallenge(userId);
+      final assertion =
+          await _passkey.signAssertion('lemonade-nexus.local', challenge);
       final resp = await _sdk.authPasskey({
         'method': 'passkey',
         'assertion': assertion.toAssertionJson(),
@@ -1044,7 +1050,6 @@ class AppNotifier extends StateNotifier<AppState> {
       certificates: [],
       treeNodes: [],
       rootNode: null,
-      trustStatus: null,
       activityLog: [],
     );
     addActivity(ActivityLevel.info, 'Signed out');
@@ -1061,10 +1066,9 @@ class AppNotifier extends StateNotifier<AppState> {
       refreshHealth(),
       refreshStats(),
       refreshServers(),
-      // /api/relay/list and /api/trust/status are private-API endpoints reached
-      // through the mesh; they 404 on the plain public connection.
+      // /api/relay/list is a private-API endpoint reached through the mesh;
+      // it 404s on the plain public connection.
       if (state.isMeshEnabled) refreshRelays(),
-      if (state.isMeshEnabled) refreshTrustStatus(),
     ]);
     _log('refreshAllData done: isServerHealthy=${state.isServerHealthy} '
         'servers=${state.servers.length} stats=${state.stats != null}');
@@ -1155,18 +1159,6 @@ class AppNotifier extends StateNotifier<AppState> {
         ),
       );
       _log('refreshMeshStatus: FAILED -> $e');
-    }
-  }
-
-  /// Refresh trust status (private API — reached via the mesh routing layer).
-  Future<void> refreshTrustStatus() async {
-    try {
-      final trustStatus = await _sdk.getTrustStatus();
-      state = state.copyWith(trustStatus: trustStatus);
-      _log('refreshTrustStatus: OK tier=${trustStatus.trustTier} '
-          'peers=${trustStatus.peerCount}');
-    } catch (e) {
-      _log('refreshTrustStatus: FAILED -> $e');
     }
   }
 

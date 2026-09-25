@@ -72,7 +72,7 @@ class TreeNode {
   final String? tunnelIp;
   final String? privateSubnet;
   final String? mgmtPubkey;
-  final String? wgPubkey;
+  final String? meshPubkey;
   final List<NodeAssignment>? assignments;
   final String? region;
   final String? listenEndpoint;
@@ -90,7 +90,7 @@ class TreeNode {
     this.tunnelIp,
     this.privateSubnet,
     this.mgmtPubkey,
-    this.wgPubkey,
+    this.meshPubkey,
     this.assignments,
     this.region,
     this.listenEndpoint,
@@ -428,7 +428,7 @@ class TunnelStatus {
 class MeshPeer {
   final String nodeId;
   final String? hostname;
-  final String wgPubkey;
+  final String meshPubkey;
   final String? tunnelIp;
   final String? privateSubnet;
   final String? endpoint;
@@ -443,7 +443,7 @@ class MeshPeer {
   MeshPeer({
     required this.nodeId,
     this.hostname,
-    required this.wgPubkey,
+    required this.meshPubkey,
     this.tunnelIp,
     this.privateSubnet,
     this.endpoint,
@@ -465,7 +465,7 @@ class MeshPeer {
   factory MeshPeer.fromJson(Map<String, dynamic> json) => MeshPeer(
         nodeId: (json['node_id'] ?? '').toString(),
         hostname: json['hostname']?.toString(),
-        wgPubkey: (json['wg_pubkey'] ?? '').toString(),
+        meshPubkey: (json['mesh_pubkey'] ?? '').toString(),
         tunnelIp: json['tunnel_ip']?.toString(),
         privateSubnet: json['private_subnet']?.toString(),
         endpoint: json['endpoint']?.toString(),
@@ -591,78 +591,6 @@ class ServerInfo {
 
   Map<String, dynamic> toJson() => _$ServerInfoToJson(this);
 }
-
-// =========================================================================
-// Trust Models
-// =========================================================================
-
-/// Trust status information.
-@JsonSerializable()
-class TrustStatus {
-  final String trustTier;
-  final int peerCount;
-  final List<TrustPeerInfo>? peers;
-
-  TrustStatus({
-    required this.trustTier,
-    required this.peerCount,
-    this.peers,
-  });
-
-  /// Parses the SDK's `ln_trust_status` output.
-  ///
-  /// The SDK returns `{our_tier: int, our_platform, require_tee, peer_count,
-  /// peers}` (matching the macOS `TrustStatusResponse`) — NOT `trust_tier`. We
-  /// map `our_tier` -> [trustTier] (as a string for display) and tolerate the
-  /// alternate `trust_tier` shape.
-  factory TrustStatus.fromJson(Map<String, dynamic> json) {
-    final tier = json['our_tier'] ?? json['trust_tier'];
-    return TrustStatus(
-      trustTier: tier?.toString() ?? '0',
-      peerCount: ((json['peer_count']) as num?)?.toInt() ?? 0,
-      peers: (json['peers'] as List<dynamic>?)
-          ?.whereType<Map<String, dynamic>>()
-          .map(TrustPeerInfo.fromJson)
-          .toList(),
-    );
-  }
-
-  Map<String, dynamic> toJson() => _$TrustStatusToJson(this);
-}
-
-/// Individual trust peer information.
-@JsonSerializable()
-class TrustPeerInfo {
-  final String pubkey;
-  final String trustLevel;
-  final int attestations;
-  final String? lastSeen;
-
-  TrustPeerInfo({
-    required this.pubkey,
-    required this.trustLevel,
-    required this.attestations,
-    this.lastSeen,
-  });
-
-  /// Parses a peer from the SDK's trust status `peers` array.
-  ///
-  /// The SDK returns `{pubkey, tier: int, platform, last_verified}` (macOS
-  /// `TrustPeer`) — NOT `{trust_level, attestations, last_seen}`. We map
-  /// `tier` -> [trustLevel] and `last_verified` -> [lastSeen].
-  factory TrustPeerInfo.fromJson(Map<String, dynamic> json) {
-    final tier = json['tier'] ?? json['trust_level'];
-    return TrustPeerInfo(
-      pubkey: (json['pubkey'] ?? '').toString(),
-      trustLevel: tier?.toString() ?? '0',
-      attestations: ((json['attestations']) as num?)?.toInt() ?? 0,
-      lastSeen: (json['last_verified'] ?? json['last_seen'])?.toString(),
-    );
-  }
-
-  Map<String, dynamic> toJson() => _$TrustPeerInfoToJson(this);
-}
-
 // =========================================================================
 // DDNS Models
 // =========================================================================
@@ -692,106 +620,6 @@ class DdnsStatus {
 
   Map<String, dynamic> toJson() => _$DdnsStatusToJson(this);
 }
-
-// =========================================================================
-// Enrollment Models
-// =========================================================================
-
-/// Enrollment entry.
-///
-/// Mirrors an item of the `enrollments` array in `ln_enrollment_status` (SDK
-/// CApi.cpp): `{request_id, candidate_pubkey, candidate_server_id,
-/// sponsor_pubkey, state, state_name, created_at, timeout_at, retries, votes}`.
-@JsonSerializable()
-class EnrollmentEntry {
-  final String requestId;
-  final String? candidatePubkey;
-  final String? candidateServerId;
-  final String? sponsorPubkey;
-  final int state;
-  final String? stateName;
-  final String? createdAt;
-  final String? timeoutAt;
-  final int retries;
-
-  EnrollmentEntry({
-    required this.requestId,
-    this.candidatePubkey,
-    this.candidateServerId,
-    this.sponsorPubkey,
-    this.state = 0,
-    this.stateName,
-    this.createdAt,
-    this.timeoutAt,
-    this.retries = 0,
-  });
-
-  factory EnrollmentEntry.fromJson(Map<String, dynamic> json) =>
-      _$EnrollmentEntryFromJson(json);
-
-  Map<String, dynamic> toJson() => _$EnrollmentEntryToJson(this);
-}
-
-// =========================================================================
-// Governance Models
-// =========================================================================
-
-/// Governance proposal.
-///
-/// Mirrors an entry of `ln_governance_proposals` (SDK CApi.cpp):
-/// `{proposal_id, proposer_pubkey, parameter, new_value, old_value, rationale,
-/// created_at, expires_at, state, state_name, votes:[...]}`.
-@JsonSerializable()
-class GovernanceProposal {
-  final String proposalId;
-  final String? proposerPubkey;
-  final int parameter;
-  final String newValue;
-  final String oldValue;
-  final String rationale;
-  final String? createdAt;
-  final String? expiresAt;
-  final int state;
-  final String? stateName;
-
-  GovernanceProposal({
-    required this.proposalId,
-    this.proposerPubkey,
-    required this.parameter,
-    this.newValue = '',
-    this.oldValue = '',
-    this.rationale = '',
-    this.createdAt,
-    this.expiresAt,
-    this.state = 0,
-    this.stateName,
-  });
-
-  factory GovernanceProposal.fromJson(Map<String, dynamic> json) =>
-      _$GovernanceProposalFromJson(json);
-
-  Map<String, dynamic> toJson() => _$GovernanceProposalToJson(this);
-}
-
-/// Proposal submission response.
-@JsonSerializable()
-class ProposeResponse {
-  final String? proposalId;
-  final String status;
-  final String? error;
-
-  ProposeResponse({
-    this.proposalId,
-    required this.status,
-    this.error,
-  });
-
-  factory ProposeResponse.fromJson(Map<String, dynamic> json) =>
-      _$ProposeResponseFromJson(json);
-
-  Map<String, dynamic> toJson() => _$ProposeResponseToJson(this);
-}
-
 // =========================================================================
 // Attestation Models
 // =========================================================================
