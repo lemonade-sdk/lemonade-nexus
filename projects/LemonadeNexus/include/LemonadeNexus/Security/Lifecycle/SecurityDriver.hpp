@@ -197,9 +197,6 @@ private:
     void abandon_boundary(const char* reason);
     /// Sets and persists the verified authority anchor.
     void install_authority(VerifiedEpochAuthority authority);
-    /// Advances the anchor through any stored links past it. Local recovery
-    /// only: every link is re-verified before it counts.
-    void catch_up_authority_from_store();
     /// Asks the mesh for chain links when something hints this node is
     /// behind. The ask is idempotent and free of authority.
     void maybe_request_chain();

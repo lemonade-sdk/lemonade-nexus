@@ -36,6 +36,83 @@ namespace {
     return std::min(needed, reachable);
 }
 
+[[nodiscard]] bool bootstrap_valid_for(const BootstrapCertificate& certificate,
+                                       const crypto::Ed25519PublicKey& genesis_public_key,
+                                       const NetworkId& network_id) {
+    return certificate.network_id == network_id && certificate.epoch == 1 &&
+           certificate.security_ruleset == constants::kSecurityRulesetVersion &&
+           certificate.consensus_ruleset == constants::kConsensusRulesetVersion &&
+           certificate.authority_threshold ==
+               constants::authority_threshold(constants::kBootstrapThreshold) &&
+           verify_bootstrap_certificate(certificate, genesis_public_key);
+}
+
+[[nodiscard]] bool authority_cache_well_formed_for(const VerifiedEpochAuthority& authority,
+                                                   const NetworkId& network_id) {
+    const auto members = Tier1Set::from_nodes(authority.members);
+    if (authority.network_id != network_id || authority.epoch < 1 || !members.has_value() ||
+        members->members() != authority.members ||
+        authority.members.size() < constants::kMinActiveTier1 ||
+        authority.members.size() > constants::kMaxActiveTier1 ||
+        authority.vote_keys.size() != authority.members.size() ||
+        authority.incarnations.size() != authority.members.size() ||
+        authority.consensus_quorum != constants::consensus_quorum(authority.members.size()) ||
+        authority.authority_threshold != constants::authority_threshold(authority.members.size()) ||
+        authority.security_ruleset != constants::kSecurityRulesetVersion ||
+        authority.consensus_ruleset != constants::kConsensusRulesetVersion ||
+        authority.key_generation != KeyGeneration(authority.epoch.underlying()) ||
+        authority.checkpoint == Digest{} || authority.anchor_digest == Digest{}) {
+        return false;
+    }
+    for (const auto& node : authority.members) {
+        const auto incarnation = authority.incarnations.find(node);
+        if (!authority.vote_keys.contains(node) || incarnation == authority.incarnations.end() ||
+            incarnation->second == 0) {
+            return false;
+        }
+    }
+    return authority.epoch == 1
+               ? authority.previous_anchor == Digest{} &&
+                     authority.anchor_digest == authority.checkpoint
+               : authority.previous_anchor != Digest{};
+}
+
+[[nodiscard]] bool epoch_valid_for(const StoredEpoch& epoch, const NetworkId& network_id) {
+    if (epoch.state.id < 1 || epoch.state.network_id != network_id ||
+        epoch.state.tier1_members.size() < constants::kMinActiveTier1 ||
+        epoch.state.tier1_members.size() > constants::kMaxActiveTier1 ||
+        epoch.vote_keys.size() != epoch.state.tier1_members.size() ||
+        epoch.state.security_ruleset != constants::kSecurityRulesetVersion ||
+        epoch.state.consensus_ruleset != constants::kConsensusRulesetVersion ||
+        epoch.checkpoint == Digest{}) {
+        return false;
+    }
+    return std::all_of(epoch.state.tier1_members.members().begin(),
+                       epoch.state.tier1_members.members().end(),
+                       [&epoch](const NodeId& node) { return epoch.vote_keys.contains(node); });
+}
+
+[[nodiscard]] bool authority_matches_epoch(const VerifiedEpochAuthority& authority,
+                                           const StoredEpoch& epoch) {
+    return authority.epoch == epoch.state.id &&
+           authority.network_id == epoch.state.network_id &&
+           authority.members == epoch.state.tier1_members.members() &&
+           authority.vote_keys == epoch.vote_keys &&
+           authority.group_public_key == epoch.state.authority_public_key &&
+           authority.attestation_root == epoch.state.attestation_root &&
+           authority.checkpoint == epoch.checkpoint;
+}
+
+[[nodiscard]] bool epoch_matches_bootstrap(const StoredEpoch& epoch,
+                                           const BootstrapCertificate& certificate) {
+    return epoch.state.id != 1 ||
+           (epoch.state.network_id == certificate.network_id &&
+            epoch.state.participant_set_digest == certificate.tier1_set_digest &&
+            epoch.state.authority_public_key == certificate.authority_public_key &&
+            epoch.state.attestation_root == certificate.attestation_root &&
+            epoch.checkpoint == bootstrap_certificate_signing_digest(certificate));
+}
+
 }  // namespace
 
 SecurityDriver::SecurityDriver(SecurityDriverConfig config, SecurityRuntime& runtime,
@@ -94,34 +171,8 @@ std::optional<EpochId> SecurityDriver::current_epoch() const {
 void SecurityDriver::install_authority(VerifiedEpochAuthority authority) {
     authority_ = std::move(authority);
     (void)store_.store_authority_anchor(*authority_);
-}
-
-void SecurityDriver::catch_up_authority_from_store() {
-    if (!authority_.has_value()) {
-        return;
-    }
-    auto links = store_.load_chain_links();
-    const auto* stored = std::get_if<std::vector<std::vector<uint8_t>>>(&links);
-    if (stored == nullptr) {
-        return;  // Absent or corrupt: nothing to advance through.
-    }
-    // A stale anchor next to newer stored links happens when the anchor file
-    // was rolled back. Every link is re-verified from the anchor forward, so
-    // a modified link advances nothing.
-    for (const auto& bytes : *stored) {
-        auto decoded = decode_security_message(bytes);
-        const auto* message = std::get_if<SecurityMessage>(&decoded);
-        if (message == nullptr) {
-            continue;
-        }
-        const auto* link = std::get_if<EpochHandoffProofMsg>(&message->body);
-        if (link == nullptr || link->handoff.from_epoch != authority_->epoch) {
-            continue;
-        }
-        auto advanced = advance_epoch_authority(*authority_, link->handoff, link->proof);
-        if (auto* next = std::get_if<VerifiedEpochAuthority>(&advanced)) {
-            install_authority(std::move(*next));
-        }
+    if (genesis_node() && genesis_ != nullptr) {
+        genesis_->restore_finalized();
     }
 }
 
@@ -131,23 +182,142 @@ void SecurityDriver::start(uint64_t now_ms) {
     auto bootstrap = store_.load_bootstrap();
     auto epoch = store_.load_epoch();
     auto anchor = store_.load_authority_anchor();
+    auto chain_base = store_.load_chain_base();
+    auto chain_links = store_.load_chain_links();
     const auto corrupt = [](const auto& loaded) {
         const auto* result = std::get_if<EpochLoadResult>(&loaded);
         return result != nullptr && *result == EpochLoadResult::Corrupt;
     };
-    // Corrupt durable state can hide an epoch this node already acted in.
-    // Never continue as if fresh.
-    if (corrupt(bootstrap) || corrupt(epoch) || corrupt(anchor)) {
-        set_phase(DriverPhase::Failed, "durable security state is corrupt");
+    const auto fail = [this](const char* reason) {
+        if (genesis_node() && genesis_ != nullptr) {
+            genesis_->restore_finalized();
+        }
+        set_phase(DriverPhase::Failed, reason);
+    };
+    if (corrupt(bootstrap) || corrupt(epoch) || corrupt(anchor) || corrupt(chain_base) ||
+        corrupt(chain_links)) {
+        fail("durable security state is corrupt");
         return;
     }
-    if (auto* verified = std::get_if<VerifiedEpochAuthority>(&anchor)) {
-        authority_ = std::move(*verified);
-        catch_up_authority_from_store();
+
+    const NetworkId network_id = derive_network_id(
+        config_.genesis_public_key, constants::kSecurityRulesetVersion,
+        constants::kConsensusRulesetVersion);
+    const auto* certificate = std::get_if<BootstrapCertificate>(&bootstrap);
+    const auto* cached = std::get_if<VerifiedEpochAuthority>(&anchor);
+    const auto* stored_epoch = std::get_if<StoredEpoch>(&epoch);
+    const auto* base = std::get_if<
+        std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>>(&chain_base);
+    const auto* links = std::get_if<std::vector<std::vector<uint8_t>>>(&chain_links);
+
+    if ((certificate != nullptr &&
+         !bootstrap_valid_for(*certificate, config_.genesis_public_key, network_id)) ||
+        (cached != nullptr && !authority_cache_well_formed_for(*cached, network_id)) ||
+        (stored_epoch != nullptr && !epoch_valid_for(*stored_epoch, network_id))) {
+        fail("durable security state is invalid");
+        return;
+    }
+    if (certificate != nullptr) {
+        anchor_ = *certificate;
+    }
+    std::vector<VerifiedEpochAuthority> authenticated;
+    if (base != nullptr) {
+        if (certificate == nullptr) {
+            chain_hint_epoch_ = std::max(chain_hint_epoch_, EpochId(1));
+        } else {
+            auto epoch_one = verify_epoch_one_authority(*certificate, config_.genesis_public_key,
+                                                         *base);
+            if (!epoch_one.has_value()) {
+                fail("authority-chain base contradicts the bootstrap certificate");
+                return;
+            }
+            authenticated.push_back(std::move(*epoch_one));
+        }
     }
 
-    if (auto* stored = std::get_if<StoredEpoch>(&epoch)) {
-        if (authority_.has_value() && authority_->epoch > stored->state.id) {
+    if (stored_epoch != nullptr && certificate != nullptr &&
+        !epoch_matches_bootstrap(*stored_epoch, *certificate)) {
+        fail("stored epoch contradicts the bootstrap certificate");
+        return;
+    }
+    if (authenticated.empty() && links != nullptr && !links->empty()) {
+        fail("authority-chain history has no authenticated starting authority");
+        return;
+    }
+    if (!authenticated.empty() && links != nullptr) {
+        for (const auto& bytes : *links) {
+            auto decoded = decode_security_message(bytes);
+            const auto* message = std::get_if<SecurityMessage>(&decoded);
+            const auto* link = message != nullptr
+                                   ? std::get_if<EpochHandoffProofMsg>(&message->body)
+                                   : nullptr;
+            if (link == nullptr || link->handoff.from_epoch != authenticated.back().epoch) {
+                fail("stored authority-chain history is invalid");
+                return;
+            }
+            auto advanced =
+                advance_epoch_authority(authenticated.back(), link->handoff, link->proof);
+            auto* next = std::get_if<VerifiedEpochAuthority>(&advanced);
+            if (next == nullptr) {
+                fail("stored authority-chain history is invalid");
+                return;
+            }
+            authenticated.push_back(std::move(*next));
+        }
+    }
+
+    const auto authenticated_at = [&authenticated](EpochId epoch)
+        -> const VerifiedEpochAuthority* {
+        const auto match = std::find_if(
+            authenticated.begin(), authenticated.end(),
+            [epoch](const VerifiedEpochAuthority& authority) { return authority.epoch == epoch; });
+        return match != authenticated.end() ? &*match : nullptr;
+    };
+    bool missing_proofs = false;
+    if (cached != nullptr) {
+        chain_hint_epoch_ = std::max(chain_hint_epoch_, cached->epoch);
+        const auto* proved = authenticated_at(cached->epoch);
+        if (proved == nullptr) {
+            missing_proofs = true;
+        } else if (verified_epoch_authority_digest(*cached) !=
+                   verified_epoch_authority_digest(*proved)) {
+            fail("cached authority contradicts authenticated authority");
+            return;
+        }
+    }
+    if (stored_epoch != nullptr) {
+        chain_hint_epoch_ = std::max(chain_hint_epoch_, stored_epoch->state.id);
+        const auto* proved = authenticated_at(stored_epoch->state.id);
+        if (proved == nullptr) {
+            missing_proofs = true;
+        } else if (!authority_matches_epoch(*proved, *stored_epoch)) {
+            fail("stored epoch contradicts authenticated authority");
+            return;
+        }
+    }
+
+    if (!authenticated.empty()) {
+        authority_ = authenticated.back();
+    }
+    const bool genesis_consumed = certificate != nullptr || cached != nullptr ||
+                                  stored_epoch != nullptr || base != nullptr ||
+                                  (links != nullptr && !links->empty());
+    if (genesis_consumed && genesis_node() && genesis_ != nullptr) {
+        genesis_->restore_finalized();
+    }
+
+    if (missing_proofs) {
+        set_phase(DriverPhase::Idle,
+                  "durable authority awaits its authenticated proof chain");
+        return;
+    }
+    if (authority_.has_value() &&
+        (cached == nullptr || cached->epoch != authority_->epoch)) {
+        (void)store_.store_authority_anchor(*authority_);
+    }
+
+    if (stored_epoch != nullptr) {
+        if (authority_.has_value() && authority_->epoch > stored_epoch->state.id) {
             // The verified chain has moved past the stored epoch: this node's
             // membership is history, and resuming it could only replay a
             // finished role. It continues as an ordinary Tier 2 server; the
@@ -155,13 +325,14 @@ void SecurityDriver::start(uint64_t now_ms) {
             set_phase(DriverPhase::Idle, "stored epoch superseded by the verified chain");
             return;
         }
-        const EpochId id = stored->state.id;
-        const bool member = stored->state.tier1_members.contains(config_.self);
+        StoredEpoch stored = *stored_epoch;
+        const EpochId id = stored.state.id;
+        const bool member = stored.state.tier1_members.contains(config_.self);
         auto vote_key = store_.load_vote_key(id, config_.self);
         if (vote_key.has_value()) {
             vote_pubs_mine_[id] = vote_key->public_key;
         }
-        if (!runtime_.restore_epoch(std::move(*stored), std::move(vote_key))) {
+        if (!runtime_.restore_epoch(std::move(stored), std::move(vote_key))) {
             set_phase(DriverPhase::Failed, "durable epoch state did not restore");
             return;
         }
@@ -183,7 +354,7 @@ void SecurityDriver::start(uint64_t now_ms) {
         return;
     }
 
-    if (genesis_node() && genesis_ != nullptr) {
+    if (genesis_node() && genesis_ != nullptr && !genesis_->finalized()) {
         set_phase(DriverPhase::GenesisCollecting, "this identity is the genesis anchor");
     } else {
         set_phase(DriverPhase::Idle, "no durable epoch; awaiting the mesh");
@@ -738,9 +909,20 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     // Every node keeps the verified certificate as its trust anchor: the
     // pinned genesis signature is what a later candidate verifies a supplied
     // membership listing against. Storing it grants nothing.
-    if (!anchor_.has_value() &&
-        verify_bootstrap_certificate(certificate, config_.genesis_public_key)) {
+    if (!anchor_.has_value() && bootstrap_valid_for(
+                                    certificate, config_.genesis_public_key,
+                                    derive_network_id(config_.genesis_public_key,
+                                                      constants::kSecurityRulesetVersion,
+                                                      constants::kConsensusRulesetVersion))) {
         anchor_ = certificate;
+        if (genesis_node() && genesis_ != nullptr) {
+            genesis_->restore_finalized();
+            (void)store_.store_bootstrap(certificate);
+            if (runtime_.epochs() == nullptr) {
+                set_phase(DriverPhase::Idle,
+                          "authenticated bootstrap certificate ends genesis authority");
+            }
+        }
     }
     if (from != genesis_id() || phase_ != DriverPhase::AwaitingBootstrap ||
         !founding_.has_value() || !pending_dkg_.has_value() || runtime_.epochs() != nullptr) {
@@ -1686,7 +1868,7 @@ void SecurityDriver::maybe_request_chain() {
     // asks too, because unanswered sync may mean the mesh moved past its
     // epoch. Active members are at the head by construction, and Genesis is a
     // one-shot authority, not a walker.
-    if (genesis_node()) {
+    if (genesis_node() && (genesis_ == nullptr || !genesis_->finalized())) {
         return;
     }
     const bool idle_walker = runtime_.epochs() == nullptr && phase_ == DriverPhase::Idle;
@@ -1793,6 +1975,9 @@ void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, con
         install_authority(std::move(*next));
     }
     if (authority_->epoch > before) {
+        if (genesis_node() && runtime_.epochs() == nullptr) {
+            set_phase(DriverPhase::Idle, "authenticated authority chain ends genesis authority");
+        }
         // Progress: ask for the next page right away, and ask everyone — the
         // server this page came from may itself be mid-walk and hold no more.
         // A server with nothing newer stays silent, which ends the walk.

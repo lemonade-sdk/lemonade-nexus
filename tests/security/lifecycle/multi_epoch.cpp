@@ -43,6 +43,25 @@ TEST_F(MultiEpochMesh, AnIdleReserveWalksToTheChainHead) {
     EXPECT_FALSE(reserve->driver->is_tier1_member());
 }
 
+TEST_F(MultiEpochMesh, RestartAuthenticatesCompleteProofChainBeforeRestoringEpoch) {
+    bootstrap();
+    run_until_committed(1);
+    const auto members = rotate(founders, founders, 1);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_FALSE(members.empty());
+    Node& victim = *members.front();
+    ASSERT_EQ(victim.driver->current_epoch(), 2u);
+
+    restart_node(victim);
+    victim.driver->start(mesh.now_ms);
+
+    ASSERT_NE(victim.driver->verified_authority(), nullptr);
+    EXPECT_EQ(victim.driver->verified_authority()->epoch, 2u);
+    EXPECT_EQ(victim.driver->current_epoch(), 2u);
+    EXPECT_TRUE(victim.driver->is_tier1_member());
+    EXPECT_NE(victim.driver->phase(), DriverPhase::Failed);
+}
+
 // Four rotations, three promotions, one late joiner, one stale-state
 // recovery — one continuous scenario on one mesh.
 TEST_F(MultiEpochMesh, RepeatedPromotionAndLateJoiningAcrossFourEpochs) {

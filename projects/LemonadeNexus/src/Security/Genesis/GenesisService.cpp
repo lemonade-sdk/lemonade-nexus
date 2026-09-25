@@ -11,6 +11,14 @@ namespace nexus::security {
 
 GenesisService::GenesisService(NetworkId network_id) : network_id_(network_id) {}
 
+void GenesisService::restore_finalized() {
+    candidates_.clear();
+    verdicts_.clear();
+    transcript_attests_.clear();
+    eligibility_attests_.clear();
+    finalized_ = true;
+}
+
 bool GenesisService::admit_candidate(const NodeId& node) {
     if (finalized_) {
         return false;

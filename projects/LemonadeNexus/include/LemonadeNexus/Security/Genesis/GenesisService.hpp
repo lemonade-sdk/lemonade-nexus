@@ -73,6 +73,7 @@ public:
         const Digest& vote_key_set_digest,
         const crypto::Ed25519PrivateKey& genesis_private_key);
 
+    void restore_finalized();
     [[nodiscard]] bool finalized() const { return finalized_; }
 
 private:

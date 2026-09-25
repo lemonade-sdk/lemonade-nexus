@@ -34,6 +34,186 @@ TEST_F(DriverMesh, GenesisToEpochOneOverTheWire) {
     }
 }
 
+TEST_F(DriverMesh, RestartedGenesisConsumesASurvivingBootstrap) {
+    bootstrap();
+    const auto before = genesis_node->store->load_bootstrap();
+    ASSERT_TRUE(std::holds_alternative<BootstrapCertificate>(before));
+    ASSERT_FALSE(fs::exists(genesis_node->store->directory() / "epoch-current.json"));
+
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Idle);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+    EXPECT_FALSE(genesis_node->genesis->admit_candidate(founders[0]->id));
+    const auto after = genesis_node->store->load_bootstrap();
+    ASSERT_TRUE(std::holds_alternative<BootstrapCertificate>(after));
+    EXPECT_EQ(bootstrap_certificate_signing_digest(std::get<BootstrapCertificate>(after)),
+              bootstrap_certificate_signing_digest(std::get<BootstrapCertificate>(before)));
+}
+
+TEST_F(DriverMesh, MissingProofsForCachedAuthorityCannotRestartGenesis) {
+    bootstrap();
+    ASSERT_NE(founders[0]->driver->verified_authority(), nullptr);
+    ASSERT_TRUE(
+        genesis_node->store->store_authority_anchor(*founders[0]->driver->verified_authority()));
+    ASSERT_TRUE(fs::remove(genesis_node->store->directory() / "bootstrap-certificate.json"));
+
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Idle);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+    EXPECT_EQ(genesis_node->driver->verified_authority(), nullptr);
+    EXPECT_FALSE(genesis_node->genesis->admit_candidate(founders[0]->id));
+}
+
+TEST_F(DriverMesh, AuthenticatedChainBaseRestoresGenesisAuthorityState) {
+    bootstrap();
+    using ChainBase = std::vector<std::pair<NodeId, nexus::crypto::Ed25519PublicKey>>;
+    const auto base = founders[0]->store->load_chain_base();
+    ASSERT_TRUE(std::holds_alternative<ChainBase>(base));
+    ASSERT_TRUE(genesis_node->store->store_chain_base(std::get<ChainBase>(base)));
+
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Idle);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+    ASSERT_NE(genesis_node->driver->verified_authority(), nullptr);
+    EXPECT_EQ(genesis_node->driver->verified_authority()->epoch, 1u);
+}
+
+TEST_F(DriverMesh, RecomputedDigestCannotAuthenticateFabricatedHigherAuthority) {
+    bootstrap();
+    using ChainBase = std::vector<std::pair<NodeId, nexus::crypto::Ed25519PublicKey>>;
+    const auto base = founders[0]->store->load_chain_base();
+    ASSERT_TRUE(std::holds_alternative<ChainBase>(base));
+    ASSERT_TRUE(genesis_node->store->store_chain_base(std::get<ChainBase>(base)));
+
+    ASSERT_NE(founders[0]->driver->verified_authority(), nullptr);
+    const auto genuine = *founders[0]->driver->verified_authority();
+    auto fabricated = genuine;
+    fabricated.epoch = 2;
+    fabricated.key_generation = 2;
+    fabricated.previous_anchor = genuine.anchor_digest;
+    fabricated.anchor_digest.fill(0xA5);
+    fabricated.checkpoint.fill(0x5A);
+    fabricated.group_public_key[0] ^= 0x80;
+    for (auto& [node, key] : fabricated.vote_keys) {
+        key[0] ^= 0x40;
+    }
+    ASSERT_TRUE(genesis_node->store->store_authority_anchor(fabricated));
+
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+
+    ASSERT_NE(genesis_node->driver->verified_authority(), nullptr);
+    EXPECT_EQ(genesis_node->driver->verified_authority()->epoch, 1u);
+    EXPECT_EQ(verified_epoch_authority_digest(*genesis_node->driver->verified_authority()),
+              verified_epoch_authority_digest(genuine));
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Idle);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+}
+
+TEST_F(DriverMesh, RecomputedDigestCannotAuthenticateModifiedAuthorityKeys) {
+    bootstrap();
+    using ChainBase = std::vector<std::pair<NodeId, nexus::crypto::Ed25519PublicKey>>;
+    const auto base = founders[0]->store->load_chain_base();
+    ASSERT_TRUE(std::holds_alternative<ChainBase>(base));
+    ASSERT_TRUE(genesis_node->store->store_chain_base(std::get<ChainBase>(base)));
+
+    ASSERT_NE(founders[0]->driver->verified_authority(), nullptr);
+    auto fabricated = *founders[0]->driver->verified_authority();
+    fabricated.group_public_key[0] ^= 0x80;
+    for (auto& [node, key] : fabricated.vote_keys) {
+        key[0] ^= 0x40;
+    }
+    ASSERT_TRUE(genesis_node->store->store_authority_anchor(fabricated));
+
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Failed);
+    EXPECT_EQ(genesis_node->driver->verified_authority(), nullptr);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+    EXPECT_FALSE(genesis_node->genesis->admit_candidate(founders[0]->id));
+}
+
+TEST_F(DriverMesh, AgreeingForgedAuthorityAndEpochFailAgainstProofChain) {
+    bootstrap();
+    Node& victim = *founders[0];
+    ASSERT_NE(victim.driver->verified_authority(), nullptr);
+    auto fabricated = *victim.driver->verified_authority();
+    for (auto& [node, key] : fabricated.vote_keys) {
+        key[0] ^= 0x40;
+    }
+    auto members = Tier1Set::from_nodes(fabricated.members);
+    ASSERT_TRUE(members.has_value());
+    StoredEpoch epoch{make_epoch_state(fabricated.epoch, fabricated.network_id,
+                                       std::move(*members), fabricated.group_public_key,
+                                       fabricated.attestation_root),
+                      fabricated.vote_keys, fabricated.checkpoint};
+    ASSERT_TRUE(victim.store->store_authority_anchor(fabricated));
+    ASSERT_TRUE(victim.store->store_epoch(epoch));
+
+    restart_node(victim);
+    victim.driver->start(mesh.now_ms);
+
+    EXPECT_EQ(victim.driver->verified_authority(), nullptr);
+    EXPECT_EQ(victim.driver->phase(), DriverPhase::Failed);
+    EXPECT_FALSE(victim.driver->current_epoch().has_value());
+    EXPECT_FALSE(victim.driver->is_tier1_member());
+}
+
+TEST_F(DriverMesh, FormerGenesisRecoversThroughTheAuthorityChain) {
+    bootstrap();
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+    ASSERT_EQ(genesis_node->driver->phase(), DriverPhase::Idle);
+    ASSERT_EQ(genesis_node->driver->verified_authority(), nullptr);
+
+    mesh.now_ms += 2001;
+    genesis_node->driver->tick(mesh.now_ms);
+    mesh.pump();
+
+    ASSERT_NE(genesis_node->driver->verified_authority(), nullptr);
+    EXPECT_EQ(genesis_node->driver->verified_authority()->epoch, 1u);
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Idle);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+}
+
+TEST_F(DriverMesh, CorruptGenesisStateFailsClosedAtTheSigner) {
+    bootstrap();
+    restart_node(*genesis_node);
+    {
+        std::ofstream out(genesis_node->store->directory() / "bootstrap-certificate.json",
+                          std::ios::trunc);
+        out << "{corrupt";
+    }
+
+    genesis_node->driver->start(mesh.now_ms);
+
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Failed);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+    EXPECT_FALSE(genesis_node->genesis->admit_candidate(founders[0]->id));
+}
+
+TEST_F(DriverMesh, ContradictoryGenesisStateFailsClosedAtTheSigner) {
+    bootstrap();
+    ASSERT_NE(founders[0]->driver->verified_authority(), nullptr);
+    auto contradictory = *founders[0]->driver->verified_authority();
+    contradictory.network_id[0] ^= 0x01;
+    ASSERT_TRUE(genesis_node->store->store_authority_anchor(contradictory));
+
+    restart_node(*genesis_node);
+    genesis_node->driver->start(mesh.now_ms);
+
+    EXPECT_EQ(genesis_node->driver->phase(), DriverPhase::Failed);
+    EXPECT_TRUE(genesis_node->genesis->finalized());
+    EXPECT_FALSE(genesis_node->genesis->admit_candidate(founders[0]->id));
+}
+
 TEST_F(DriverMesh, TickPacedConsensusCommits) {
     bootstrap();
     run_until_committed(3);

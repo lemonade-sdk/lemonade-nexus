@@ -325,6 +325,31 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
             .has_value());
 }
 
+TEST_F(GenesisFixture, RestoredFinalizationBlocksTheSigningBoundary) {
+    admit_real_founders(constants::kBootstrapThreshold);
+
+    nexus::crypto::Ed25519PublicKey authority{};
+    authority.fill(0x77);
+    Digest transcript;
+    transcript.fill(0x55);
+    attest_all(transcript, authority);
+    attest_eligibility_all(founding_state());
+    const auto late_verdict = verdict_for(founders[0].id, true);
+    const auto late_transcript = attest_from(founders[0], transcript, authority);
+    const auto late_eligibility = eligibility_from(founders[0], founding_state());
+
+    service->restore_finalized();
+
+    EXPECT_TRUE(service->finalized());
+    EXPECT_FALSE(service->admit_candidate(node(0xEE)));
+    EXPECT_FALSE(service->record_verdict(late_verdict));
+    EXPECT_FALSE(service->record_transcript_attest(late_transcript));
+    EXPECT_FALSE(service->record_eligibility_attest(late_eligibility));
+    EXPECT_FALSE(service
+                     ->finalize_epoch_one(authority, transcript, Digest{}, Digest{}, genesis_priv)
+                     .has_value());
+}
+
 TEST(NetworkId, DerivationIsSensitiveToEveryInput) {
     nexus::crypto::Ed25519PublicKey key_a{};
     key_a.fill(0x01);

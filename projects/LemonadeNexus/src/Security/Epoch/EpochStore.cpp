@@ -315,8 +315,8 @@ bool EpochStore::store_authority_anchor(const VerifiedEpochAuthority& anchor) {
     j["checkpoint"] = b64(anchor.checkpoint);
     j["previous_anchor"] = b64(anchor.previous_anchor);
     j["anchor_digest"] = b64(anchor.anchor_digest);
-    // The record binds its own digest: a byte changed at rest loads as
-    // Corrupt, never as a different anchor.
+    // This detects accidental corruption. It is publicly recomputable and is
+    // not proof that the record came from the authority chain.
     j["record_digest"] = b64(verified_epoch_authority_digest(anchor));
     return write_atomic(directory_ / kAnchorFile, j.dump());
 }

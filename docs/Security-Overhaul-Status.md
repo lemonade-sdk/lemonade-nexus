@@ -3,7 +3,7 @@
 **Branch:** `tier-security-overhaul`
 **Baseline:** Security Architecture Final Draft 1.1 (the only architecture revision; 1.0 is removed)
 **Structure reference:** `.idea/lemonade-nexus-security-class-structure.md`
-**Updated:** 2026-08-26
+**Updated:** 2026-09-25
 
 This document records the state of the security foundation, the protocol
 details the implementation fixed, and the next implementation tasks.
@@ -777,6 +777,35 @@ Focused validation: 45 transfer, 38 storage, 15 ingress, 30 tree, 6 ACL,
 12 gossip-security-transport and 5 legacy-removal tests passed. AddressSanitizer
 passed the storage suite and callback-lifetime regressions (Apple leak detection
 is unavailable); ThreadSanitizer passed the full transfer suite with no report.
+
+### Genesis startup and restored-authority authentication correction
+
+The cumulative VM-workstream correction was integrated over `f9f8066` from
+Git base `6c08fe5`; its SHA-256 is
+`02d6491b39d8d6d0c033ce34825aee312347dad934962cbc8646029c64d74014`.
+The authority cache and stored epoch are now treated only as candidates.
+Startup authenticates Epoch 1 from the pinned Genesis signature and the exact
+founder/vote-key listing, then verifies every sequential handoff proof before
+restoring authority or membership. A recomputed public record digest provides
+corruption detection, not authentication.
+
+Any surviving post-Genesis durable state consumes Genesis signing authority
+before startup selects a phase. Missing proof material leaves the node Idle and
+non-authorizing; contradictory or corrupt state fails closed. A former Genesis
+node can walk the ordinary authenticated authority chain without recovering its
+one-shot bootstrap role. Certificate receipt and the Genesis signing boundary
+enforce the same finalization state.
+
+Focused local validation passed: 11 Genesis tests, 52 epoch and authority-chain
+tests, 10 startup/adversarial lifecycle tests, the complete Epoch-1 to Epoch-2
+proof-chain restart, and all 67 lifecycle tests. Independent Linux review is
+still pending, and this does not mark the PR complete.
+
+Explicitly deferred: deletion or rollback of the whole store to a valid
+pre-Epoch-1 snapshot, and proof that an authenticated historical chain is the
+latest chain. No replacement authority, reboot-recovery protocol, release
+approval model, packaging/provider change, production enrollment, or admission
+change is introduced here.
 
 ## M10 — Tier 2 eligibility and the witness bar
 

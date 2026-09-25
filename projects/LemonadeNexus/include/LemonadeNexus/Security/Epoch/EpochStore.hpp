@@ -59,9 +59,9 @@ public:
     [[nodiscard]] std::variant<std::vector<EpochAuthorityRecord>, EpochLoadResult>
     load_authority_history() const;
 
-    /// The latest verified authority anchor, so a restart resumes the chain
-    /// walk from here instead of Genesis. The record binds its own digest; a
-    /// mismatch loads as Corrupt, never as a different anchor.
+    /// Cache of the latest authority produced by verification. The public
+    /// record digest detects accidental corruption but does not authenticate
+    /// the cache; callers must reconstruct and compare its proof chain.
     [[nodiscard]] bool store_authority_anchor(const VerifiedEpochAuthority& anchor);
     [[nodiscard]] std::variant<VerifiedEpochAuthority, EpochLoadResult>
     load_authority_anchor() const;
