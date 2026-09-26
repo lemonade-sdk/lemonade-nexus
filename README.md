@@ -1,893 +1,330 @@
-# Lemonade-Nexus
+# 🍋 Lemonade Nexus
 
-> 🍋 **Lemonade Nexus** > 📖 [**Explore the DOCS ➔**](https://lemonade-sdk.github.io/lemonade-nexus/) 🚀
+**Your network. Your infrastructure.**
 
-A self-hosted, cryptographically secure userspace mesh VPN with zero-trust architecture, federated relay servers, and democratic governance.
+A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, cryptographic identity, and an attestation-based security protocol. This repository brings together the server, C++/C SDK, sidecar, and Flutter desktop client.
 
-## Features
+📖 [Explore the docs](https://lemonade-sdk.github.io/lemonade-nexus/) · 🚀 [Quick start](#-quick-start) · 🧩 [Client SDK](#-client-sdk) · 🤝 [Contribute](#-contributing)
 
-- **Zero-trust two-tier security** — TEE hardware attestation (SGX/TDX/SEV-SNP/Secure Enclave) for Tier 1 authority; certificate-based Tier 2 for all servers
-- **Ed25519 identity** — every server and client has a unique keypair; all gossip messages and deltas are signed
-- **Root key rotation** — automatic weekly rotation with chain-of-trust endorsement
-- **Shamir's Secret Sharing** — root private key distributed to 100% of Tier 1 peers; 75% quorum can reconstruct (25% fault tolerance)
-- **Peer health gating** — only servers with >= 90% uptime qualify for Tier 1 authority
-- **Democratic governance** — protocol parameters (rotation interval, quorum ratio, uptime threshold) can only change via Tier 1 majority vote
-- **Quorum-based enrollment** — new servers need root certificate + Tier 1 peer votes
-- **Binary attestation** — signed release manifests verify server binary integrity; auto-fetched from GitHub releases
-- **UDP gossip protocol** — epidemic-style state sync, peer exchange, health reporting
-- **Mesh tunnel** — automatic tunnel establishment with STUN hole-punching and relay fallback
-- **Federated relay servers** — community relays see only ciphertext; geo-aware selection
-- **IPAM** — automatic /10 tunnel IP allocation, private subnets, shared blocks
-- **ACME certificates** — automatic TLS via Let's Encrypt or ZeroSSL; server issues certs for clients
-- **Authoritative DNS** — public UDP+TCP 53 maps to local 5335, including Genesis bootstrap records and local ACME DNS-01 challenges
-- **Dynamic DNS** — automatic Namecheap DDNS updates for enrolled servers
-- **Permission tree** — hierarchical ACL with signed deltas and gossip propagation
-- **WebAuthn passkeys** — passwordless authentication for management
-- **Dual HTTP server** — public API for bootstrap, private VPN-only API for sensitive operations
-- **Client SDK** — C++ and C APIs for joining the mesh, with latency-based auto-switching
-- **No database** — all state stored as signed JSON files on disk
+> **Development status:** The Tier 1/Tier 2 security overhaul is merged. The protocol and evidence-collection code are present, but the shipped attestation profile still lacks the approved measurements needed to qualify a Tier 1 node. See [current limitations](#current-limitations) before planning a deployment. The documentation set is being refreshed to match this implementation.
 
-## Architecture
+## ✨ Features
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                   Lemonade-Nexus Server                     │
-├───────────────────┬──────────────────────────────────────┤
-│ Public API :9100  │  Private API :<tunnel_ip>:9101       │
-│ (bootstrap)       │  (VPN-only, auto-enabled)            │
-├───────────────────┴──────────────────────────────────────┤
-│  Auth  ACL  Tree  IPAM  ACME  Relay  DDNS  DNS           │
-├──────────────────────────────────────────────────────────┤
-│  Trust Policy  TEE Attestation  Binary Attestation        │
-├──────────────────────────────────────────────────────────┤
-│  Root Key Chain  Governance  Shamir SSS  Enrollment       │
-├──────────────────────────────────────────────────────────┤
-│ Gossip (:9102) STUN (:3478) Mesh+HolePunch (:51940) Relay │
-├──────────────────────────────────────────────────────────┤
-│  Crypto (libsodium + OpenSSL)    Storage (file-based)     │
-└──────────────────────────────────────────────────────────┘
-```
+- **Self-hosted mesh networking** — userspace WireGuard transport through BoringTun, with NAT traversal and relay support.
+- **Cryptographic identity** — Ed25519 identities, network-bound server certificates, and signed gossip messages.
+- **Two-tier security** — authenticated Tier 2 servers provide mesh services; eligible servers earn epoch-scoped Tier 1 authority through the security protocol.
+- **Consensus and threshold authority** — chained HotStuff finalizes security state; fresh dealerless FROST key generation establishes each epoch's authority key.
+- **Hardware evidence verification** — an AMD SEV-SNP/HCL/vTPM verification path, IMA runtime measurements, and a separate `nexus-attestd` evidence helper.
+- **Discovery and addressing** — regional DNS discovery, IP address management, authoritative DNS, and optional dynamic DNS.
+- **Certificates and access control** — ACME TLS certificates, identity authentication, WebAuthn passkeys, and a permission tree.
+- **Applications and integrations** — a Flutter desktop client, C++ SDK, C ABI, and sidecar integration.
 
-All services use **CRTP** (Curiously Recurring Template Pattern) — zero virtual dispatch overhead.
+The [security model](#-security-model) explains which operations derive authority from consensus and which application paths still need further work.
 
-### Dual HTTP Server
+## 🏗️ Architecture
 
-The server runs two HTTP listeners:
+The server separates mesh transport, application services, and the security protocol. A transport connection or valid certificate does not grant Tier 1 authority.
 
-- **Public API** (`0.0.0.0:9100`) — available before VPN is established. Handles health checks, authentication, server discovery, and the initial `/api/join` bootstrap.
-- **Private API** (`<tunnel_ip>:9101`) — only accessible over the encrypted mesh tunnel. Handles all sensitive operations: tree mutations, IPAM, relay, certificates, governance.
+| Component | Purpose |
+|---|---|
+| Public API | HTTPS discovery, authentication, client join, and server onboarding |
+| Private API | Authenticated application operations, reached through the userspace mesh in the normal dual-listener configuration |
+| BoringTun + virtual netstack | Encrypted UDP transport and userspace TCP/IP forwarding, without a kernel TUN device |
+| Gossip + security transport | Signed server messages, record transfer, attestation exchanges, consensus, and epoch transitions |
+| Security runtime | Eligibility, HotStuff finality, Genesis bootstrap, epoch membership, and FROST authority |
+| `nexus-attestd` | Collects platform evidence through a bounded local socket protocol |
+| Storage | File-backed records and durable security state, plus SQLite-backed application storage |
 
-The private API activates automatically once the server receives a tunnel IP — no configuration required. The first server in the mesh (genesis) self-allocates; joining servers receive their IP from an existing peer during the gossip ServerHello exchange.
+### Public and private APIs
 
-## Network Requirements
+The public API uses port **9100**. In the normal mesh configuration, the private API uses virtual mesh addresses on port **9101**, forwarded internally to a loopback listener by the userspace netstack. Server startup withholds HTTPS listeners until usable certificates are available.
 
-### Ports
+**Current fallback:** If no private listener is created, the server registers private routes on the public listener. Route authentication still applies, but network isolation does not. Check startup logs and listener configuration before exposing a server.
 
-Open the following ports on each server's firewall/security group/ACL:
+## 🌐 Network Requirements
 
-| Port | TCP/UDP | Direction | Source | Service | Required |
-|------|---------|-----------|--------|---------|----------|
-| 9100 | **TCP** | Inbound | Any (servers + clients) | Public HTTPS API (bootstrap, health, join) | Yes |
-| 51940 | **UDP** | Inbound | Mesh servers + clients | Mesh tunnel (boringtun) | Yes |
-| 51941 | **UDP** | Inbound | Mesh servers + clients | UDP hole punch (NAT traversal signaling) | Yes |
-| 9102 | **UDP** | Inbound | Mesh servers only | Gossip protocol (peer sync, state replication) | Yes |
-| 3478 | **UDP** | Inbound | Mesh servers only | STUN (NAT traversal, external IP discovery) | Yes |
-| 9103 | **UDP** | Inbound | Mesh servers | Relay (forwarded mesh traffic) | Only if relay |
-| 53 | **UDP** | Inbound | Internet / mesh | Authoritative DNS (NAT to 5335 on server) | Genesis/bootstrap and DNS-serving nodes |
-| 53 | **TCP** | Inbound | Internet / mesh | Authoritative DNS (NAT to 5335 on server) | Genesis/bootstrap and DNS-serving nodes |
+### Default ports
 
-> **Note on port 9101**: The Private HTTPS API (TCP :9101) binds to the **mesh tunnel IP** (10.64.x.x), not the external interface. It does **not** need a firewall rule — it is only reachable over the encrypted mesh tunnel. The server requests an ACME certificate for `private.<id>.<region>.seip.<domain>` to serve HTTPS on the tunnel.
+| Port | Transport | Purpose | Exposure |
+|---|---|---|---|
+| `9100` | TCP | Public HTTPS API | Clients and joining servers |
+| `51940` | UDP | Mesh transport **and hole punching** | Mesh servers and clients |
+| `9102` | UDP | Gossip and security protocol | Mesh servers |
+| `3478` | UDP | STUN | Peers using NAT discovery |
+| `9103` | UDP | Relay | Peers using the relay service |
+| `9101` | TCP | Private API | Virtual mesh addresses, forwarded to loopback in dual-listener mode |
+| `5335` | UDP + TCP | Local authoritative DNS listener | According to the DNS deployment |
+| `53` | UDP + TCP | Public authoritative DNS | Map to `5335` on DNS-serving nodes |
 
-**Firewall rule summary (minimum required):**
-```
-# Required on every server
-ALLOW TCP  9100  IN   FROM any             # Public HTTPS API (client bootstrap)
-ALLOW UDP 51940  IN   FROM any             # Mesh tunnels
-ALLOW UDP 51941  IN   FROM any             # UDP hole punch (NAT traversal)
-ALLOW UDP  9102  IN   FROM <mesh-servers>   # Gossip protocol
-ALLOW UDP  3478  IN   FROM <mesh-servers>   # STUN NAT traversal
+Hole punching shares `51940`; a separate `51941` rule is not required by the current server. Configure source restrictions for your mesh and expose public DNS only where it is served. Mapping port `53` to `5335` does not replace the rest of your firewall policy.
 
-# Optional
-ALLOW UDP  9103  IN   FROM <mesh-servers>   # Relay (only if acting as relay)
+### Addressing and discovery
 
-# Genesis/bootstrap and authoritative DNS: map public UDP+TCP 53 to local 5335.
-ALLOW UDP    53  IN   FROM any             # DNS
-ALLOW TCP    53  IN   FROM any             # DNS over TCP
-```
+| Range | Purpose |
+|---|---|
+| `10.64.0.0/10` | Client mesh addresses |
+| `172.16.0.0/22` | Server backbone addresses |
+| `10.128.0.0/9` | Private subnet allocation |
+| `172.20.0.0/14` | Shared address blocks |
 
-On a packaged install the mapping is one flag, and it lives in its own nftables
-table so no other firewall policy is touched:
-```bash
-sudo nexus-bootstrap --release-signing-pubkey <KEY> --install-dns-nat
-nft list table inet nexus-dns          # inspect
-systemctl disable --now nexus-dns-nat.service   # remove
-```
+Servers publish region-aware discovery records under the configured DNS base domain. Public endpoints use `<id>.<region>.seip.<domain>`; `private.` and `backend.` records identify virtual mesh endpoints. DNS helps peers find each other. Pinned keys, verified certificates, and finalized security state establish trust.
 
-**MikroTik example** (dst-nat to internal server at 10.10.12.16):
-```routeros
-/ip firewall filter add chain=forward action=accept protocol=tcp dst-address=10.10.12.16 dst-port=9100 comment="FRS-LMND-NXS-HTTPS-API"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=51940 comment="FRS-LMND-NXS-MESH"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=51941 comment="FRS-LMND-NXS-HOLEPUNCH"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9102 comment="FRS-LMND-NXS-GOSSIP"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=3478 comment="FRS-LMND-NXS-STUN"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=9103 comment="FRS-LMND-NXS-RELAY"
-/ip firewall filter add chain=forward action=accept protocol=udp dst-address=10.10.12.16 dst-port=5335 comment="FRS-LMND-NXS-DNS"
-/ip firewall filter add chain=forward action=accept protocol=tcp dst-address=10.10.12.16 dst-port=5335 comment="FRS-LMND-NXS-DNS-TCP"
-```
+Security messages travel over the signed gossip transport on `9102`; they are not all carried inside WireGuard. Sensitive pairwise DKG payloads have their own encryption.
 
-> Port **9100/tcp**, **51940/udp**, and **51941/udp** should allow `any` source since clients may connect from unknown IPs. Gossip (**9102/udp**) and STUN (**3478/udp**) can be restricted to known mesh server IPs if desired.
+## 🚀 Quick Start
 
-### IP Addresses
+### 1. Build the server
 
-| Range | Purpose | Allocation |
-|-------|---------|------------|
-| **10.64.0.0/10** | Client mesh tunnel | .0-.9 reserved, .1 = server gateway, clients get .10+ |
-| **172.16.0.0/22** | Server backbone mesh | Server-to-server mesh, pubkey-hash allocation, up to 1,022 servers |
-| **10.128.0.0/9** | Private subnets | Per-customer private addressing |
-| **172.20.0.0/14** | Shared blocks | Shared address space |
-
-| Address | How it's determined | Purpose |
-|---------|-------------------|---------|
-| **External (public) IP** | Auto-detected via STUN and HTTP-based detection | DNS glue records, client connections |
-| **Bind address** | `--bind-address` / `SP_BIND_ADDRESS` (default: `0.0.0.0`) | What interfaces the server listens on |
-| **Client tunnel IP** | IPAM auto-allocation from `10.64.0.0/10` | Mesh traffic, private API access |
-| **Server backbone IP** | Pubkey-hash allocation from `172.16.0.0/22` | Server-to-server encrypted backbone mesh |
-
-- **No manual external IP config needed** — the server discovers its public IP automatically.
-- **Seed peers** use the external IP: `--seed-peer <public-ip>:9102`
-- **Private API** binds to the tunnel IP automatically. Serves HTTPS via `private.<id>.<region>.seip.<domain>`.
-- **Server backbone** enables encrypted server-to-server communication on a dedicated IP range.
-
-### DNS Discovery (SEIP)
-
-Servers register under region-aware subdomains for scalable client discovery:
-
-**Server subdomains (SEIP = Server Endpoint IP):**
-```
-<id>.<region>.seip.lemonade-nexus.io              A  → public IP     (discovery)
-_config.<id>.<region>.seip.lemonade-nexus.io      TXT → ports + region + load
-private.<id>.<region>.seip.lemonade-nexus.io      A  → tunnel IP     (client HTTPS over mesh)
-backend.<id>.<region>.seip.lemonade-nexus.io      A  → backbone IP   (server-to-server mesh)
-```
-
-**Client subdomains (EP = Endpoint):**
-```
-private.<id>.ep.lemonade-nexus.io                 A  → client tunnel IP
-```
-
-**NS bootstrap:** The first 9 servers claim `ns1`–`ns9` via democratic gossip (LWW tiebreak). These serve as authoritative nameservers cached globally by recursive resolvers.
-
-**Client discovery flow:**
-1. Client determines own region via geo-IP lookup
-2. System DNS resolves `lemonade-nexus.io` NS → ns1–ns9 (our authoritative servers)
-3. Query `<own-region>.seip.lemonade-nexus.io` A records for servers in same region
-4. Query `_config` TXT for each → ports, region, load (connected clients)
-5. Probe health + measure latency. Score = `latency_ms + (load × 10)`
-6. If no servers in own region → expand to adjacent regions by geographic distance
-7. Connect to best server via HTTPS on port 9100
-- **Clients** connect to the server's public IP on port 9100 to bootstrap, then switch to the mesh tunnel for all subsequent traffic.
-
-### Traffic Flow: Public Internet vs Mesh Tunnel
-
-The system separates traffic into two planes:
-
-**Over the public internet (external IPs):**
-
-| Traffic | Protocol | Who | Purpose |
-|---------|----------|-----|---------|
-| Gossip | UDP :9102 | Server ↔ Server | Peer discovery, state sync, health, enrollment, IPAM sync |
-| STUN | UDP :3478 | Server ↔ Server | NAT traversal, external IP discovery |
-| Mesh tunnel (boringtun) | UDP :51940 | Server ↔ Server, Client ↔ Server | Encrypted tunnel (5s keepalive) |
-| Hole punch | UDP :51941 | Client ↔ Server | NAT traversal signaling for P2P mesh |
-| Public HTTPS API | TCP :9100 | Client → Server | Bootstrap: auth, join, health, SEIP discovery |
-| Relay forwarding | UDP :9103 | Server ↔ Relay | Encrypted mesh packets when direct fails |
-| DDNS updates | HTTPS outbound | Server → Namecheap | Dynamic DNS registration |
-
-**Over the mesh tunnel (10.64.x.x mesh):**
-
-| Traffic | Protocol | Who | Purpose |
-|---------|----------|-----|---------|
-| Private HTTP API | TCP :9101 | Server ↔ Server, Client → Server | Tree mutations, IPAM, certs, governance, relay tickets |
-| Shamir key shares | Via gossip | Server ↔ Server (Tier 1) | Root key distribution and reconstruction |
-| TEE attestation challenges | Via gossip | Server ↔ Server | Mutual hardware attestation verification |
-| DNS zone sync | Via gossip | Server ↔ Server (Tier 1) | Authoritative DNS record replication |
-| Application traffic | Any | Client ↔ Client, Client ↔ Server | User application data |
-
-> **Key principle**: Only bootstrap and peer discovery happen over the public internet. All sensitive operations (tree changes, IP allocation, certificate issuance, governance votes, key shares) happen exclusively over the encrypted mesh tunnel.
-
-### Servers vs Endpoints (Clients)
-
-| | Servers | Endpoints (Clients) |
-|---|---------|-------------------|
-| **Role** | Infrastructure — run the mesh | Devices/apps that use the mesh |
-| **Ports needed** | All inbound ports listed above | No inbound ports (outbound only) |
-| **Identity** | Server certificate signed by root key | Ed25519 keypair + node in permission tree |
-| **Gossip** | Full participant (send + receive) | Does not participate |
-| **IPAM** | Allocates IPs to peers and clients | Receives a tunnel IP during join |
-| **Trust tier** | Tier 1 (TEE+attestation) or Tier 2 (cert-only) | N/A — not part of trust hierarchy |
-| **Mesh** | Mesh tunnels to all peers + client tunnels | Single tunnel to one server (auto-switches) |
-| **Private API** | Serves it and calls other servers' | Calls server's private API over tunnel |
-| **Built with** | `LemonadeNexus` (server binary) | `LemonadeNexusSDK` (C++/C library) |
-
-### Connectivity Diagram
-
-```
-              Public Internet (external IPs)
-                         │
-     ┌───────────────────┼───────────────────┐
-     │                   │                   │
-┌────▼────┐        ┌─────▼─────┐       ┌─────▼─────┐
-│Server A │◄──────►│ Server B  │◄─────►│ Server C  │
-│ Tier 1  │gossip  │  Tier 1   │gossip │  Tier 2   │
-│         │:9102   │           │:9102  │           │
-└────┬────┘        └─────┬─────┘       └─────┬─────┘
-     │                   │                   │
-     └──────┬────────────┼────────────┬──────┘
-            │  userspace mesh (10.64.x.x)    │
-            │  Private API :9101 over tunnel │
-            │                                │
-     ┌──────▼──────┐               ┌─────────▼──┐
-     │  Client 1   │               │  Client 2   │
-     │ (laptop)    │               │ (phone)     │
-     │ joins :9100 │               │ joins :9100 │
-     │ then tunnel │               │ then tunnel │
-     └─────────────┘               └─────────────┘
-```
-
-1. **Server-to-server**: All servers must reach each other on ports 9102/udp (gossip) and 51940/udp (mesh). STUN hole-punching handles NAT traversal automatically.
-2. **Client-to-server**: Clients connect to any server's public IP on port 9100/tcp to bootstrap (authenticate, get tunnel IP, receive mesh config), then all subsequent communication goes over the encrypted mesh tunnel.
-3. **NAT traversal**: Servers behind NAT use the built-in STUN service (port 3478) to discover their external address and UDP hole-punching to establish direct mesh tunnels. If direct connection fails, traffic falls back through a relay server.
-4. **Endpoints need no open ports**: Clients only make outbound connections — they initiate the Noise handshake and the tunnel handles the rest.
-
-## Quick Start
-
-### Prerequisites
-
-- C++20 compiler (GCC 12+ or Clang 15+)
-- CMake 3.25.1+
-- Ninja (recommended)
-- OpenSSL 3.0+
-
-### Build
+Install the [build prerequisites](#-building-from-source), then run:
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
+git clone https://github.com/lemonade-sdk/lemonade-nexus.git
+cd lemonade-nexus
 
-### Test
-
-```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTING=ON
+cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-# 277 tests across 14+ test suites
 ```
 
-### Initialize the Server
+The server executable is `build/projects/LemonadeNexus/lemonade-nexus`. Hardware-dependent tests may skip when their required environment is absent; skipped tests do not establish hardware qualification.
 
-New servers are set up with `--first-run`:
+### 2. Install a Debian/Ubuntu package
+
+For a systemd deployment, packaging installs the service accounts, units, evidence helper, and bootstrap command together:
 
 ```bash
-./build/projects/LemonadeNexus/lemonade-nexus --first-run --data-root ./data
+cpack --config build/CPackConfig.cmake -G DEB -B build/packages
+sudo apt install ./build/packages/lemonade-nexus-*.deb
 ```
 
-This creates the data directory, generates the server's keypairs, and prints
-the two values you'll need next:
+Use the package produced by your build. The install enables the services without starting them.
 
-- **Identity pubkey (hex)** — for a genesis server, this is the mesh root
-  pubkey that every server passes as `--root-pubkey`
-- **Gossip pubkey (base64)** — the key a mesh admin enrolls to let this
-  server join an existing mesh
+### 3. Initialize a new Genesis server
 
-A server won't start until it has been initialized, so a typo'd `--data-root`
-fails fast instead of quietly starting a fresh mesh.
-
-### Run the Genesis Server
-
-The genesis server anchors the mesh: its identity pubkey from `--first-run`
-is the root of trust for every server that follows.
+Genesis starts a **new network**. Use `nexus-bootstrap` for the packaged Linux setup:
 
 ```bash
-./build/projects/LemonadeNexus/lemonade-nexus \
-    --root-pubkey <identity-pubkey-hex> \
-    --data-root ./data
+sudo nexus-bootstrap \
+  --release-signing-pubkey 'YOUR_RELEASE_SIGNING_PUBLIC_KEY'
 ```
 
-On startup it will:
-1. Initialize the root key chain from its identity
-2. Self-allocate the gateway tunnel IP (`10.64.0.1`)
-3. Start the public API on `:9100` and private API on `<tunnel_ip>:9101`
-4. Begin listening for gossip peers
+Replace the quoted value with the Ed25519 public key that verifies your release manifests, encoded as 64 hex characters or base64 for 32 bytes. Bootstrap creates the node identities, pins the root and Genesis public keys, and writes:
 
-You can also give the genesis its own certificate — handy for DDNS and a
-friendlier node ID — by enrolling its own gossip pubkey:
+- Configuration: `/var/lib/lemonade-nexus/lemonade-nexus.json`
+- Runtime state: `/var/lib/lemonade-nexus/data`
+
+If this host serves public authoritative DNS, add `--install-dns-nat` to the bootstrap command to map UDP/TCP `53` to `5335` with nftables. This option requires `nft` and `ip`; `--wan-interface` can select the external interface. You can also configure the mapping on your router.
+
+For a disposable development network, `sudo nexus-bootstrap --test-release-key` uses the node identity as a test release key. It does not bypass attestation requirements or enable Tier 1 qualification.
 
 ```bash
-./build/projects/LemonadeNexus/lemonade-nexus --enroll-server '<gossip-pubkey-base64>' <server-id>
+sudo systemctl start lemonade-nexus.service
+systemctl status lemonade-nexus.service nexus-attestd.service
+sudo journalctl -u lemonade-nexus.service -u nexus-attestd.service -f
 ```
 
-### Join a Server (onboarding)
+The server unit also requests `nexus-attestd`. A successful bootstrap or daemon start does **not** mean that Epoch 1 has formed. The current profile prevents Tier 1 qualification, and application-root initialization remains incomplete; see [current limitations](#current-limitations).
 
-A new server joins by asking an existing one over its public API — no manual
-file copying. The candidate proves it holds its gossip key, the mesh decides
-whether to admit it, and on approval the root-signed certificate is delivered
-back and installed automatically.
+### Joining an existing network
 
-All mesh HTTP runs over **verified, publicly-trusted TLS** — there is no
-plaintext or verification-disabled path. The candidate connects to the genesis
-by its **certificate FQDN** (`<id>.<region>.seip.<domain>`) and verifies the
-cert against the system trust store; `--onboard-server` refuses a bare IP.
-
-Onboarding also **requires the mesh root pubkey up front** (`--root-pubkey`,
-printed by the genesis at `--first-run`). The response can only confirm that
-pinned key — a server that delivers a different root is rejected, so an
-intermediary can never hand the candidate a substitute trust anchor.
+Use server onboarding instead of initializing another Genesis. The candidate contacts a server by its certificate FQDN over verified HTTPS, proves possession of its identity, and validates the returned network-bound certificate against pinned trust anchors.
 
 ```bash
-# On the new server. Give it a mesh server FQDN to contact (or omit it to
-# discover one via the region's DNS tier records). --onboard-addr optionally
-# pins the connect IP while still verifying the cert FQDN.
-./build/projects/LemonadeNexus/lemonade-nexus \
-    --onboard-server <genesis-fqdn>:9100 \
-    --root-pubkey <mesh-root-pubkey-hex> \
-    --onboard-id aws-use1-a \
-    --data-root ./data
+lemonade-nexus --help
+nexus-bootstrap --help
 ```
 
-The command initializes the data directory if needed, prints the candidate's
-key fingerprint, requests admission, waits for the decision, then writes
-`identity/server_cert.json` and records the pinned `root_pubkey` + seed peers
-into the config file before exiting. Start the server normally afterwards:
+The relevant candidate command is `--onboard-server`; normal daemon startup also requires the root, Genesis, and release-signing public keys described below. Admission currently uses root-gated approval or enrollment tokens. Admission grants a server identity, not Tier 1 membership. The application-root limitation also affects fresh-network administrative approval flows.
 
-```bash
-./build/projects/LemonadeNexus/lemonade-nexus --data-root ./data
-```
+## 🧩 Client SDK
 
-**How admission is decided**
+`LemonadeNexusSDK` exposes C++ and C interfaces for identity, authentication, mesh connections, tree operations, certificates, and latency-based server switching. The Flutter desktop client uses the C ABI through Dart FFI.
 
-- **Small mesh (below the Tier-1 vote threshold, default 6):** the genesis
-  server has sole discretion. By default every request waits for an admin to
-  approve it, confirming the candidate's fingerprint out of band:
-
-  ```bash
-  # On the genesis (private API, over the tunnel/loopback; needs an admin JWT)
-  curl -s http://127.0.0.1:9101/api/onboard/pending          # list requests
-  curl -X POST http://127.0.0.1:9101/api/onboard/approve/<request-id> \
-       -H 'Authorization: Bearer <admin-jwt>' \
-       -d '{"fingerprint":"<candidate-fingerprint>"}'
-  ```
-
-  For unattended joins, mint a **single-use enrollment token** on the root
-  server and hand it to the candidate out of band. A valid token admits the
-  request immediately and is consumed; tokens expire (default 10 min, max 1 h).
-  Because the onboarding transport is not authenticated, the token **must be
-  bound to the joining server's gossip pubkey** (printed as its `Gossip pubkey`
-  at `--first-run`) so an intermediary can't capture and spend it:
-
-  ```bash
-  # On the root server (locally; works while the daemon is running)
-  ./lemonade-nexus --mint-admission-token \
-      --token-candidate <candidate-gossip-pubkey-b64>   # required
-  # ...or over the private API with a root-admin JWT:
-  curl -X POST http://127.0.0.1:9101/api/onboard/token \
-       -H 'Authorization: Bearer <admin-jwt>' \
-       -d '{"candidate_pubkey":"<candidate-gossip-pubkey-b64>","ttl_sec":600}'
-
-  # On the joining server (its gossip pubkey must match the token binding)
-  ./lemonade-nexus --onboard-server <genesis-host>:9100 \
-      --root-pubkey <mesh-root-pubkey-hex> --onboard-token adm_...
-  ```
-
-- **Hardened mesh (≥6 Tier-1 servers):** admission requires a 75% vote of the
-  Tier-1 peers (`admission_quorum_ratio`), carried over the gossip layer.
-  Enrollment tokens are not honored in this regime — the quorum governs.
-
-`<server-id>` becomes the server's name across the mesh (DNS records, IPAM), so
-keep it a short, unique, DNS-friendly label like `aws-use1-a`. On cloud hosts
-behind NAT (EC2 and friends), pass `--public-ip <address>` when you start the
-server — it can't be detected from the interface.
-
-### Manual enrollment (fallback)
-
-If you'd rather issue a certificate by hand (e.g. to pin a TPM AK for Tier 1),
-`--enroll-server` still works:
-
-```bash
-# On the genesis: sign a cert for the candidate's gossip pubkey
-./build/projects/LemonadeNexus/lemonade-nexus \
-    --enroll-server '<gossip-pubkey-base64>' <server-id>
-# then copy data/identity/server_cert_<server-id>.json to the new server as
-# data/identity/server_cert.json and start it with --root-pubkey + --seed-peer.
-```
-
-## Client SDK
-
-The **LemonadeNexusSDK** provides a C++ and C API for endpoints (devices/applications) to join and participate in the mesh.
-
-### C++ API
+For example, query a server with a valid HTTPS certificate:
 
 ```cpp
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
-#include <LemonadeNexusSDK/BoringtunMesh.hpp>
+#include <iostream>
 
-// Connect to a server
-lnsdk::ServerConfig config;
-config.host = "server.example.com";
-config.port = 9100;
-lnsdk::LemonadeNexusClient client(config);
+int main() {
+    lnsdk::ServerConfig config{"server.example.com", 9100};
+    lnsdk::LemonadeNexusClient client{config};
 
-// Generate and set an identity
-lnsdk::Identity identity;
-identity.generate();
-client.set_identity(identity);
-
-// Join the network (authenticates, creates node, allocates tunnel IP)
-auto result = client.join_network("username", "password");
-if (result) {
-    // The mesh tunnel is automatically configured and brought up
-    std::cout << "Node ID: " << result->node_id << "\n";
-    std::cout << "Tunnel IP: " << result->tunnel_ip << "\n";
-}
-
-// All subsequent API calls go over the VPN tunnel automatically
-auto node = client.get_tree_node(result->node_id);
-auto health = client.check_health();
-
-// Enable latency-based auto-switching (optional)
-client.enable_auto_switching(); // 200ms threshold, 30% hysteresis, 60s cooldown
-
-// Request a TLS certificate for this client
-auto cert = client.request_certificate("my-laptop");
-if (cert) {
-    auto decrypted = client.decrypt_certificate(*cert);
-    // decrypted->fullchain_pem, decrypted->privkey_pem
-}
-
-// Leave the network
-client.leave_network();
-```
-
-### C API (FFI)
-
-The C API enables bindings from Python, Go, Rust, Swift, and other languages:
-
-```c
-#include <lemonade_nexus.h>
-
-// Create client and identity
-ln_client_t* client = ln_create("server.example.com", 9100);
-ln_identity_t* identity = ln_identity_generate();
-ln_set_identity(client, identity);
-
-// Join the network
-char* join_json = NULL;
-ln_error_t err = ln_join_network(client, "user", "pass", &join_json);
-if (err == LN_OK) {
-    printf("Joined: %s\n", join_json);
-    ln_free(join_json);
-}
-
-// Enable the mesh dataplane (boringtun)
-ln_mesh_enable(client);
-
-// Enable auto-switching
-ln_enable_auto_switching(client, 200.0, 0.3, 60);
-
-// Use the API
-char* health_json = NULL;
-ln_health(client, &health_json);
-printf("Health: %s\n", health_json);
-ln_free(health_json);
-
-// Check latency
-double latency = ln_current_latency_ms(client);
-printf("Current latency: %.1f ms\n", latency);
-
-// Cleanup
-ln_mesh_disable(client);
-ln_identity_destroy(identity);
-ln_destroy(client);
-```
-
-### Mesh Tunnel
-
-The SDK runs the mesh dataplane in userspace via boringtun — no kernel
-interface or TUN device required. The tunnel is started automatically at
-join; use `enable_mesh()` / `disable_mesh()` (C++) or `ln_mesh_enable()` /
-`ln_mesh_disable()` (C) to control it explicitly.
-
-### Latency-Based Auto-Switching
-
-The SDK monitors server latency and automatically switches to a faster server:
-
-- **EMA smoothing** — alpha=0.3 exponential moving average on RTT
-- **200ms threshold** — triggers switch evaluation when exceeded
-- **30% hysteresis** — new server must be at least 30% faster
-- **60s cooldown** — minimum time between switches
-- **Background probing** — periodically checks all known servers
-
-### Client TLS Certificates
-
-Clients can request TLS certificates for their hostname (e.g., `my-laptop.capi.lemonade-nexus.io`):
-
-1. Client calls `request_certificate("my-laptop")`
-2. Server obtains the cert from Let's Encrypt/ZeroSSL via ACME DNS-01
-3. Server encrypts the private key using X25519 DH + HKDF + XChaCha20-Poly1305 with the client's Ed25519 public key
-4. Client decrypts with `decrypt_certificate()` to get the PEM files
-
-## Configuration
-
-Configuration priority: **environment variables > CLI args > config file > compiled defaults**
-
-Use `--config <path>` to specify a JSON config file (default: `lemonade-nexus.json`). Every option below can be set via CLI flag, environment variable, or JSON key.
-
-### Network Ports
-
-All ports are fully configurable at runtime — no recompilation needed.
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--http-port <N>` | `SP_HTTP_PORT` | `http_port` | `9100` | Public HTTPS API (TCP) |
-| `--udp-port <N>` | `SP_UDP_PORT` | `udp_port` | `51940` | Mesh tunnel (UDP) |
-| `--gossip-port <N>` | `SP_GOSSIP_PORT` | `gossip_port` | `9102` | Gossip protocol (UDP) |
-| `--stun-port <N>` | `SP_STUN_PORT` | `stun_port` | `3478` | STUN NAT traversal (UDP) |
-| `--relay-port <N>` | `SP_RELAY_PORT` | `relay_port` | `9103` | Relay forwarding (UDP) |
-| `--dns-port <N>` | `SP_DNS_PORT` | `dns_port` | `5335` | Local authoritative DNS, UDP+TCP |
-| `--public-dns-port <N>` | `SP_PUBLIC_DNS_PORT` | `public_dns_port` | `53` | Public DNS, UDP+TCP mapped to local 5335 |
-| `--private-http-port <N>` | `SP_PRIVATE_HTTP_PORT` | `private_http_port` | `9101` | Private HTTPS API, binds to tunnel IP (TCP) |
-| `--bind-address <addr>` | `SP_BIND_ADDRESS` | `bind_address` | `0.0.0.0` | Listen address for all services |
-| `--region <code>` | `SP_REGION` | `region` | (auto-detect) | Cloud region code (e.g. `us-west`, `eu-central`) |
-
-> All ports must be unique and non-zero. The private HTTPS port binds to the mesh tunnel IP, not the external interface. Hole punch uses a hardcoded port 51941 (separate from the mesh on 51940).
-
-**Example — change ports via CLI:**
-```bash
-lemonade-nexus --http-port 8443 --udp-port 41820 --gossip-port 8102 --relay-port 8103
-```
-
-**Example — change ports via environment:**
-```bash
-SP_HTTP_PORT=8443 SP_UDP_PORT=41820 SP_GOSSIP_PORT=8102 lemonade-nexus
-```
-
-**Example — change ports via JSON config (`lemonade-nexus.json`):**
-```json
-{
-  "http_port": 8443,
-  "udp_port": 41820,
-  "gossip_port": 8102,
-  "stun_port": 3478,
-  "relay_port": 8103,
-  "dns_port": 5335,
-  "private_http_port": 9101
+    const auto health = client.check_health();
+    if (!health.ok) {
+        std::cerr << health.error << '\n';
+        return 1;
+    }
+    std::cout << health.value.status << '\n';
 }
 ```
 
-### Server Identity & Auth
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--root-pubkey <hex>` | `SP_ROOT_PUBKEY` | `root_pubkey` | | Mesh root Ed25519 public key (hex) — the genesis server's identity pubkey |
-| `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | Relying Party ID for WebAuthn passkeys |
-| | `SP_JWT_SECRET` | `jwt_secret` | (auto-generated) | JWT signing secret |
-
-### Storage & Logging
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--data-root <path>` | `SP_DATA_ROOT` | `data_root` | `data` | Data directory for all state files |
-| `--log-level <level>` | `SP_LOG_LEVEL` | `log_level` | `info` | Log level: `trace` / `debug` / `info` / `warn` / `error` |
-| `--config <path>` | | | `lemonade-nexus.json` | JSON config file path |
-
-### Gossip & Peer Discovery
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--seed-peer <host:port>` | `SP_SEED_PEERS` | `seed_peers` | | Gossip seed peers (CLI: repeatable; env: comma-separated) |
-| | | `gossip_interval_sec` | `5` | Seconds between gossip rounds |
-| | | `rate_limit_rpm` | `120` | API rate limit: requests per minute |
-| | | `rate_limit_burst` | `20` | API rate limit: burst size |
-
-### TLS & ACME Certificates
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| | `SP_ACME_PROVIDER` | `acme_provider` | `letsencrypt` | ACME provider: `letsencrypt` / `letsencrypt_staging` / `zerossl` |
-| | `ACME_EMAIL` | | | Contact email for ACME registration |
-| | `ZEROSSL_EAB_KID` | | | ZeroSSL External Account Binding key ID |
-| | `ZEROSSL_EAB_HMAC_KEY` | | | ZeroSSL EAB HMAC key |
-| | `CLOUDFLARE_API_TOKEN` | | | Cloudflare API token (for DNS-01 challenges) |
-
-### DNS Configuration
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--dns-base-domain <dom>` | `SP_DNS_BASE_DOMAIN` | `dns_base_domain` | `lemonade-nexus.io` | DNS zone suffix for network records |
-| `--dns-ns-hostname <fqdn>` | `SP_DNS_NS_HOSTNAME` | `dns_ns_hostname` | | This server's NS hostname (e.g. `ns1.example.com`) |
-| `--dns-provider <name>` | `SP_DNS_PROVIDER` | `dns_provider` | `local` | DNS provider: `local` (self-hosted) or `cloudflare` |
-
-### Dynamic DNS (DDNS)
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--ddns-domain <domain>` | `SP_DDNS_DOMAIN` | `ddns_domain` | | Base domain for DDNS (e.g. `example.com`) |
-| `--ddns-password <pass>` | `SP_DDNS_PASSWORD` | `ddns_password` | | Namecheap DDNS password (root server only) |
-| `--ddns-enabled` | `SP_DDNS_ENABLED` | `ddns_enabled` | `false` | Enable dynamic DNS updates |
-| | | `ddns_update_interval_sec` | `300` | DDNS update interval (seconds) |
-
-### Binary Attestation
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--release-signing-pubkey <b64>` | `SP_RELEASE_SIGNING_PUBKEY` | `release_signing_pubkey` | | Base64 Ed25519 pubkey for release manifest verification |
-| `--require-attestation` | `SP_REQUIRE_ATTESTATION` | `require_binary_attestation` | `false` | Require matching manifest for credential distribution |
-| `--github-releases-url <url>` | `SP_GITHUB_RELEASES_URL` | `github_releases_url` | | GitHub API URL for fetching release manifests |
-| `--manifest-fetch-interval <sec>` | `SP_MANIFEST_FETCH_INTERVAL` | `manifest_fetch_interval_sec` | `3600` | How often to check GitHub (seconds) |
-| `--minimum-version <semver>` | `SP_MINIMUM_VERSION` | `minimum_version` | | Minimum binary version allowed (e.g. `1.2.0`) |
-| | `SP_GITHUB_TOKEN` | | | GitHub API token for higher rate limits |
-
-### TEE Attestation & Trust
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--require-tee` | `SP_REQUIRE_TEE` | `require_tee_attestation` | `false` | Require TEE hardware attestation for Tier 1 |
-| `--tee-platform <name>` | `SP_TEE_PLATFORM` | `tee_platform_override` | (auto-detect) | Force TEE platform: `sgx` / `tdx` / `sev-snp` / `secure-enclave` |
-| | | `tee_attestation_validity_sec` | `3600` | TEE report validity period (seconds) |
-
-### Quorum-Based Enrollment
-
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--require-peer-confirmation` | `SP_REQUIRE_PEER_CONFIRMATION` | `require_peer_confirmation` | `false` | Require Tier 1 peer votes before full admission |
-| `--enrollment-quorum <ratio>` | `SP_ENROLLMENT_QUORUM` | `enrollment_quorum_ratio` | `0.5` | Fraction of Tier 1 peers needed (50%) |
-| | | `enrollment_vote_timeout_sec` | `60` | Vote collection window (seconds) |
-| | | `enrollment_max_retries` | `3` | Retries before permanent rejection |
-
-### CLI-Only Commands (non-server modes)
-
-| CLI Flag | Description |
-|----------|-------------|
-| `--first-run` | Initialize the data directory and print onboarding info |
-| `--enroll-server <b64> <id>` | Sign a certificate for a server's base64 gossip pubkey |
-| `--revoke-server <b64>` | Revoke a server by its base64 gossip pubkey |
-| `--add-manifest <path>` | Import a signed release manifest JSON |
-| `--help`, `-h` | Show usage |
-
-### Protocol Constants (governed by Tier 1 vote)
-
-These cannot be set via config — they can only change through democratic governance:
-
-| Parameter | Default | Range |
-|-----------|---------|-------|
-| Root key rotation interval | 7 days | 1-90 days |
-| Shamir quorum ratio | 75% | 51-100% |
-| Min Tier 1 uptime | 90% | 50-99.9% |
-
-## API Endpoints
-
-### Public API (pre-VPN bootstrap)
-
-| Method | Path | Auth | Description |
-|--------|------|------|-------------|
-| GET | `/api/health` | No | Health check |
-| GET | `/api/stats` | No | Server statistics |
-| GET | `/api/servers` | No | List known servers |
-| POST | `/api/auth` | No | Authenticate (password, passkey, or token) |
-| POST | `/api/auth/register` | No | Register a passkey credential |
-| POST | `/api/join` | No | Bootstrap: authenticate + create node + allocate IP + return mesh config |
-
-### Private API (VPN-only, JWT required)
-
-All private endpoints require `Authorization: Bearer <token>` header.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/tree/node/:id` | Get permission tree node |
-| GET | `/api/tree/children/:id` | Get child nodes |
-| POST | `/api/tree/delta` | Submit a signed tree delta |
-| POST | `/api/ipam/allocate` | Allocate tunnel/private/shared IP block |
-| GET | `/api/relay/list` | List all relays |
-| GET | `/api/relay/nearest` | Find nearest relays by region |
-| POST | `/api/relay/register` | Register a community relay |
-| POST | `/api/relay/ticket` | Generate relay session ticket |
-| GET | `/api/certs/:domain` | Check certificate status |
-| POST | `/api/certs/issue` | Request a TLS certificate |
-| GET | `/api/attestation/manifests` | List signed release manifests |
-| POST | `/api/attestation/fetch` | Trigger GitHub manifest fetch |
-| GET | `/api/trust/status` | Trust tier status for all peers |
-| GET | `/api/trust/peer/:pubkey` | Detailed trust state for a peer |
-| GET | `/api/enrollment/status` | Pending enrollment ballots |
-| GET | `/api/governance/params` | Current protocol parameters |
-| GET | `/api/governance/proposals` | All governance proposals |
-| POST | `/api/governance/propose` | Create a parameter change proposal |
-
-## Security Model
-
-### Trust Tiers
-
-| Tier | Requirements | Capabilities |
-|------|-------------|--------------|
-| **Tier 1** | Valid certificate + TEE attestation + binary attestation + 90% uptime | Full mesh participation, root key shares, governance voting, enrollment voting |
-| **Tier 2** | Valid certificate | Basic gossip, tree sync, relay usage |
-| **Untrusted** | None | Rejected from mesh |
-
-### Defense Layers
-
-1. **Root certificate** — every server must have a cert signed by a root key in the chain
-2. **Revocation list** — compromised servers can be revoked immediately
-3. **Certificate expiry** — time-limited trust
-4. **TEE hardware attestation** — proves code runs in a secure enclave
-5. **Binary attestation** — proves the server binary matches a signed release manifest
-6. **Per-message attestation tokens** — every gossip message carries a trust proof
-7. **Trust expiration** — peers must re-attest periodically (default: 1 hour)
-8. **Uptime gating** — unreliable servers cannot hold root key shares
-9. **Enrollment quorum** — new servers need peer votes, not just root signature
-10. **Democratic governance** — protocol parameters require majority Tier 1 vote
-11. **JWT authentication** — all private API endpoints require valid session tokens
-12. **VPN-only private API** — sensitive endpoints are unreachable from the public internet
-
-### Shamir's Secret Sharing
-
-The root Ed25519 private key is split using Shamir's Secret Sharing over GF(2^8):
-
-- **N** = all eligible Tier 1 peers (100% distribution)
-- **K** = ceil(75% of N), minimum 2 (reconstruction threshold)
-- Shares are encrypted per-peer using X25519 Diffie-Hellman + HKDF + XChaCha20-Poly1305
-- If the root server goes offline, any K Tier 1 peers can reconstruct the key
-
-## Building from Source
-
-### macOS
+Build the shared SDK with:
 
 ```bash
-brew install cmake ninja openssl@3
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake --build build --target LemonadeNexusSDKShared --parallel
 ```
 
-### Ubuntu/Debian
+- [C++ interface](projects/LemonadeNexusSDK/include/LemonadeNexusSDK/LemonadeNexusClient.hpp)
+- [C ABI](projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h)
+- [Flutter desktop client](apps/LemonadeNexusClient/README.md)
+
+The current authentication paths use Ed25519 challenge-response and WebAuthn. Password authentication is a deprecated server stub. Legacy trust, enrollment-status, and governance C functions remain for ABI compatibility and return `LN_ERR_UNSUPPORTED`.
+
+## ⚙️ Configuration
+
+A normal daemon start requires three separate trust values:
+
+| Setting | Purpose | Representation |
+|---|---|---|
+| `root_pubkey` | Verifies server admission certificates | Hex Ed25519 public key |
+| `genesis_pubkey` | Pins the Genesis anchor used to derive network identity and verify the epoch authority chain | Base64 Ed25519 public key |
+| `release_signing_pubkey` | Verifies signed release manifests | Ed25519 public key; packaged bootstrap accepts hex or base64 |
+
+Keep these roles distinct. `nexus-bootstrap` writes the packaged configuration; `/etc/lemonade-nexus/lemonade-nexus.env` is for deliberate operator overrides.
+
+Most settings follow **environment variables → CLI arguments → JSON configuration → defaults**, highest priority first. Explicit `--root-pubkey` and `--genesis-pubkey` arguments take precedence over their environment variables. Environment seed peers are appended to the configured list.
+
+Ports, data paths, discovery, logging, and certificate settings are operational configuration. Tier 1 prerequisites, consensus rules, and authority thresholds are compiled protocol rules. There is no supported configuration switch to force Tier 1 or bypass required evidence.
+
+See the [Configuration reference](docs/Configuration.md) and `lemonade-nexus --help` for the current options; the [`ServerConfig`](projects/LemonadeNexus/include/LemonadeNexus/Core/ServerConfig.hpp) struct is the source of truth.
+
+## 🔌 API Endpoints
+
+| API area | Examples |
+|---|---|
+| Public discovery and health | `/api/health`, `/api/servers` |
+| Authentication | `/api/auth`, `/api/auth/challenge`, `/api/auth/register` |
+| Server onboarding | `/api/onboard/info`, `/api/onboard/challenge`, `/api/onboard/request`, `/api/onboard/poll` |
+| Authenticated application services | Tree, IPAM, relay, certificates, account data, and onboarding administration |
+
+The [route handlers](projects/LemonadeNexus/src/Api) define the current methods and authorization checks. The old `/api/trust/*`, `/api/enrollment/status`, and `/api/governance/*` endpoints have been retired. Review the [private-listener fallback](#public-and-private-apis) when configuring exposure.
+
+## 🔐 Security Model
+
+### Server roles
+
+| Role | What establishes it | Capabilities |
+|---|---|---|
+| **Tier 2** | A valid network-bound server certificate and authenticated mesh participation | Mesh services and non-authoritative synchronization; no Tier 1 authority share |
+| **Pending member** | Selection in a finalized next-epoch plan | State synchronization and readiness preparation; no active Tier 1 authority |
+| **Tier 1** | Verified evidence and mesh eligibility, followed by the protocol's finalized activation | HotStuff consensus, epoch transitions, dealerless DKG, and threshold authority signing |
+
+Clients use the mesh under their application permissions; they do not become members of the server authority committee.
+
+### Epoch authority
+
+Tier 1 membership is scoped to an epoch. After Genesis, the current committee finalizes four transitions: **eligibility, the next-epoch plan, candidate readiness, and the epoch handoff**. A fresh dealerless distributed key generation (DKG) ceremony follows finalized readiness. The finalized handoff activates the new membership and key.
+
+HotStuff uses individual Ed25519 vote signatures. FROST supplies threshold authority signatures; it is not the consensus voting mechanism. Old authority shares are discarded on epoch replacement, and the full FROST private key is not routinely reconstructed.
+
+For a committee of `N` members, the compiled rules use:
+
+- Maximum Byzantine faults: `f = floor((N - 1) / 3)`.
+- Consensus quorum: `N - f`.
+- Authority-signing threshold: `max(5, N - f)`.
+
+These values are separate from the retired 75% Shamir reconstruction scheme. See the [compiled constants](projects/LemonadeNexus/include/LemonadeNexus/Security/Policy/SecurityConstants.hpp).
+
+### Genesis and trust continuity
+
+Genesis is a temporary bootstrap authority. The founding path requires five qualifying founders, agreement on the founding facts, and a fresh Epoch 1 DKG. Genesis signs the resulting bootstrap certificate; its unilateral **security-protocol authority ends when Epoch 1 activates**.
+
+Later authority is verified from the pinned Genesis anchor through finalized epoch handoffs. Certificates, announcements, local configuration, and attestation results cannot independently create Tier 1 authority. Some admission and application operations still use root- or identity-gated authorization; those are separate from epoch authority and remain an integration gap.
+
+### Attestation and key boundaries
+
+The implemented provider verifies the AMD SEV-SNP/HCL/vTPM evidence chain and IMA measurements. Required facts include launch and runtime integrity, fresh challenge binding, identity binding, and the approved release profile.
+
+`nexus-attestd` runs under a separate service identity with restricted TPM/IMA access, a scoped capability, and filesystem restrictions. It collects evidence without holding the server's Nexus identity key, consensus vote key, or FROST share.
+
+Attestation depends on the approved platform and threat model. Confidential computing protects against the host/hypervisor; it is not a claim that privileged root inside the guest cannot inspect guest processes.
+
+### Current limitations
+
+- **Tier 1 qualification is blocked in the shipped profile.** Launch measurements, the TCB floor, IMA policy digest, and approved component hashes still need qualified release values. The running server reports `ProfileIncomplete` until those are supplied in an approved build.
+- **Provider support is narrower than the design.** The SVSM-vTPM and direct-boot providers currently return `ProviderUnsupported`. SGX, TDX, and Secure Enclave are not implemented Tier 1 providers here.
+- **Application authority is not fully integrated.** Admission and several replicated application stores still use root- or identity-gated paths. Receiving an author-signed record does not by itself authorize remote tree/ACL mutation. Public authentication does not initialize an application-root owner.
+- **Recovery and freshness have limits.** The quorum-authorized incarnation-advance lifecycle is unfinished. A valid historical store or authority chain cannot, in isolation, prove it is the newest state.
+- **IMA checkpoint/resume acceptance is not implemented.** The bounded evidence path must satisfy the current complete verification requirements.
+
+These are implementation limits, not settings that an operator can disable to gain authority.
+
+## 🛠️ Building from Source
+
+The native build requires **C++20**, **CMake 3.25.1+**, **Ninja**, **Git**, and a **Rust/Cargo toolchain**. Rust builds the BoringTun, virtual-netstack, and FROST components.
+
+### Debian / Ubuntu
 
 ```bash
-sudo apt install cmake ninja-build g++ libssl-dev
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential cmake ninja-build pkg-config git python3 \
+  curl ca-certificates perl libssl-dev \
+  libjson-c-dev libcurl4-openssl-dev uuid-dev
 ```
 
-### Fedora
+Install Rust/Cargo through your development environment and ensure `rustc` and `cargo` are on `PATH`. Confirm the installed CMake version meets the minimum, then use the [quick-start build commands](#1-build-the-server).
 
-```bash
-sudo dnf install cmake ninja-build gcc-c++ openssl-devel
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
+The normal Linux build compiles TPM2-TSS from source and needs the system json-c, libcurl, and UUID development packages. TPM device access, a suitable runtime TCTI, IMA policy, and the evidence-helper service are separate deployment requirements.
 
-### Arch Linux
+### Other platforms
 
-```bash
-sudo pacman -S cmake ninja gcc openssl
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
+macOS builds use the same CMake targets. For distributable macOS binaries, configure with `-DOPENSSL_FORCE_BUNDLED=ON` as in CI. Windows build and packaging definitions exist, but Windows entries are disabled in the reviewed native and Flutter CI matrices; their presence is not current build qualification.
 
-### Windows
+Use [Building](docs/Building.md) and the [client guide](apps/LemonadeNexusClient/README.md) as navigation starting points, and check their examples against the current build files during the documentation refresh. Native platform support and Tier 1 attestation support are separate questions.
 
-```bash
-choco install cmake ninja
-vcpkg install openssl:x64-windows
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
-    -DCMAKE_TOOLCHAIN_FILE=%VCPKG_INSTALLATION_ROOT%/scripts/buildsystems/vcpkg.cmake
-cmake --build build
-```
+## 📦 Packaging
 
-## Packaging
+CPack generates packages after a successful native build:
 
-Packages are built with CMake/CPack. After building:
+| Platform / format | Command |
+|---|---|
+| Debian / Ubuntu | `cpack --config build/CPackConfig.cmake -G DEB -B build/packages` |
+| Fedora / RPM | `cpack --config build/CPackConfig.cmake -G RPM -B build/packages` |
+| macOS | `cpack --config build/CPackConfig.cmake -G productbuild -B build/packages` |
+| Portable archive | `cpack --config build/CPackConfig.cmake -G TGZ -B build/packages` |
 
-```bash
-# Debian/Ubuntu .deb
-cpack --config build/CPackConfig.cmake -G DEB -B build/packages
+Use the generator and packaging tools for the target platform. The current DEB/RPM metadata targets x86-64; review the packaging definitions before building for another architecture. Windows also has NSIS/ZIP definitions, subject to the validation limitation above.
 
-# Fedora/RHEL .rpm
-cpack --config build/CPackConfig.cmake -G RPM -B build/packages
+Linux packages include `lemonade-nexus`, `nexus-attestd`, systemd units, and `nexus-bootstrap`. Desktop-client packaging is maintained separately under [the Flutter app](apps/LemonadeNexusClient).
 
-# macOS .pkg
-cpack --config build/CPackConfig.cmake -G productbuild -B build/packages
+## 🗂️ Project Structure
 
-# Windows .exe installer
-cpack --config build/CPackConfig.cmake -G NSIS -B build/packages
+| Path | Contents |
+|---|---|
+| [`projects/LemonadeNexus/`](projects/LemonadeNexus) | Server and mesh services |
+| [`projects/LemonadeNexus/include/LemonadeNexus/Security/`](projects/LemonadeNexus/include/LemonadeNexus/Security) | Security protocol interfaces and compiled policy |
+| [`projects/LemonadeNexusSDK/`](projects/LemonadeNexusSDK) | C++ SDK and C ABI |
+| [`projects/LemonadeNexusAttestd/`](projects/LemonadeNexusAttestd) | Privilege-separated evidence helper |
+| [`projects/LemonadeNexusSidecar/`](projects/LemonadeNexusSidecar) | Sidecar integration |
+| [`apps/LemonadeNexusClient/`](apps/LemonadeNexusClient) | Flutter desktop client |
+| [`crates/`](crates) | Rust networking and FROST integrations |
+| [`tests/`](tests) | Unit, integration, lifecycle, and fuzzing coverage |
+| [`scripts/`](scripts) | Bootstrap, host inspection, and development tooling |
+| [`packaging/`](packaging) | Package and service configuration |
+| [`docs/`](docs) | Guides and reference documentation |
 
-# Portable tarball
-cpack --config build/CPackConfig.cmake -G TGZ -B build/packages
-```
+## 🧱 Dependencies
 
-### What's in the package
+The main components include libsodium and OpenSSL for cryptography; BoringTun and smoltcp for userspace networking; `frost-ed25519` for threshold signatures; TPM2-TSS for Linux TPM access; SQLite for application storage; and Asio, cpp-httplib, nlohmann/json, and spdlog for server infrastructure.
 
-| Platform | Binary | Service |
-|----------|--------|---------|
-| Linux | `/usr/bin/lemonade-nexus` | systemd (`lemonade-nexus.service`) |
-| macOS | `/usr/local/bin/lemonade-nexus` | launchd (`io.lemonade-nexus.plist`) |
-| Windows | `C:\Program Files\lemonade-nexus\bin\lemonade-nexus.exe` | — |
+Dependencies use a mix of CMake FetchContent, external source builds, system packages, and Cargo. The [CMake library definitions](cmake/libraries) and [Rust manifests and lockfiles](crates) are the source of truth for versions.
 
-### Install from packages
+## 📖 Documentation
 
-**Debian/Ubuntu**
-```bash
-sudo dpkg -i lemonade-nexus-*.deb
-sudo vi /etc/lemonade-nexus/lemonade-nexus.env
-sudo systemctl start lemonade-nexus
-```
+[Browse the documentation site](https://lemonade-sdk.github.io/lemonade-nexus/) or start with the [documentation index](docs/index.md).
 
-**macOS**
-```bash
-sudo installer -pkg lemonade-nexus-*.pkg -target /
-sudo launchctl load /Library/LaunchDaemons/io.lemonade-nexus.plist
-```
+The guides have been refreshed after the security overhaul. Older governance, Shamir root-share, universal TEE-support, and separate `51941` instructions in pre-refresh material are obsolete; use this README, the [documentation index](docs/index.md), and the linked implementation files to resolve conflicts.
 
-### systemd (Linux)
+## 🤝 Contributing
 
-```bash
-sudo systemctl enable lemonade-nexus
-sudo systemctl start lemonade-nexus
-sudo journalctl -u lemonade-nexus -f
-```
+Bug reports, documentation fixes, and focused pull requests are welcome. Include the commit you tested, your platform, and steps to reproduce the issue. Run the checks relevant to your change and report any skipped or unavailable validation.
 
-## Project Structure
+[Open an issue](https://github.com/lemonade-sdk/lemonade-nexus/issues) or browse the [pull requests](https://github.com/lemonade-sdk/lemonade-nexus/pulls).
 
-```
-lemonade-nexus/
-├── projects/
-│   ├── LemonadeNexus/              # Server application
-│   │   ├── include/LemonadeNexus/
-│   │   │   ├── ACL/                # Access control
-│   │   │   ├── Acme/               # ACME certificate management
-│   │   │   ├── Auth/               # Authentication + JWT middleware
-│   │   │   ├── Core/               # Coordinator, config, trust, governance
-│   │   │   ├── Crypto/             # Ed25519, X25519, Shamir, key wrapping
-│   │   │   ├── Gossip/             # UDP gossip protocol
-│   │   │   ├── IPAM/               # IP address management
-│   │   │   ├── Network/            # HTTP, STUN, DNS, DDNS, API types
-│   │   │   ├── Relay/              # Mesh relay + geo discovery
-│   │   │   ├── Storage/            # File-based signed JSON storage
-│   │   │   ├── Tree/               # Permission tree with signed deltas
-│   │   │   └── Boringtun/          # boringtun dataplane
-│   │   └── src/                    # Implementation files
-│   └── LemonadeNexusSDK/           # Client SDK
-│       ├── include/LemonadeNexusSDK/
-│       │   ├── LemonadeNexusClient.hpp  # C++ client API
-│       │   ├── BoringtunMesh.hpp        # Userspace boringtun mesh
-│       │   ├── LatencyMonitor.hpp       # Auto-switching monitor
-│       │   ├── Identity.hpp             # Ed25519 identity management
-│       │   ├── Types.hpp                # Request/response types
-│       │   ├── Error.hpp                # Error types
-│       │   └── lemonade_nexus.h         # C API (FFI)
-│       └── src/                         # Implementation files
-├── tests/                          # 277 test cases across 14+ suites
-├── scripts/                        # Key generation utilities
-├── packaging/                      # Debian, macOS, systemd configs
-├── cmake/                          # Build system + dependency management
-├── .github/workflows/              # CI/CD (build + release)
-└── .env.example                    # Environment variable reference
-```
+## 📄 License
 
-## Dependencies
-
-All dependencies are fetched automatically via CMake FetchContent:
-
-| Library | Version | Purpose |
-|---------|---------|---------|
-| libsodium | latest | Ed25519, X25519, XChaCha20-Poly1305, Shamir |
-| nlohmann_json | 3.12.0 | JSON serialization |
-| spdlog | 1.16.0 | Logging |
-| asio | 1.34.2 | Async I/O (UDP, timers) |
-| cpp-httplib | 0.18.3 | HTTP server/client |
-| jwt-cpp | 0.7.0 | JWT token generation/validation |
-| magic_enum | 0.9.7 | Enum reflection |
-| xxHash | 0.8.3 | Fast hashing |
-| c-ares | latest | DNS packet parsing |
-| sqlite3 | latest | Embedded database |
-| OpenSSL | 3.0+ (system) | TLS, ACME |
-
-## License
-
-Lemonade-Nexus is released under the [MIT License](LICENSE).
+Lemonade Nexus is released under the [MIT License](LICENSE).

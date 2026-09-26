@@ -1,9 +1,8 @@
-// Services Module
-// Business logic layer that wraps SDK calls with app-specific logic
-//
-// Files to be created by @state-management-agent:
-// - tunnel_service.dart      - Mesh tunnel management
-// - auth_service.dart        - Authentication flows
-// - dns_discovery.dart       - DNS-based peer discovery
-// - tree_service.dart        - CRDT tree operations
-// - cert_service.dart        - Certificate management
+# Services
+
+App-specific services that sit between the UI and the SDK.
+
+| File | Responsibility |
+|------|----------------|
+| `dns_discovery.dart` | Regional DNS discovery of mesh servers (SEIP records, `_config` TXT, health probing, scoring) |
+| `passkey_manager.dart` | WebAuthn passkey registration and assertion flows for client authentication |

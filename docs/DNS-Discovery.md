@@ -10,130 +10,131 @@ title: DNS Discovery
 - [SEIP — Server Endpoint IP](#seip--server-endpoint-ip)
 - [EP — Client Endpoints](#ep--client-endpoints)
 - [NS Bootstrap](#ns-bootstrap)
+- [Tier Records](#tier-records)
 - [Client Discovery Flow](#client-discovery-flow)
 - [Config TXT Format](#config-txt-format)
 - [Region Codes](#region-codes)
 
+All records are served by the servers' authoritative DNS (UDP+TCP on `5335`;
+public `53` where NAT-mapped) and kept consistent across servers by gossip.
+DNS provides reachability. Trust comes from pinned keys, verified
+certificates, and finalized security state.
+
 ## Subdomain Hierarchy
 
-All DNS records are served by our authoritative DNS (port 5335, NAT from 53 on both UDP and TCP) and gossip-synced across all servers.
+Base domain: `dns_base_domain` (default `lemonade-nexus.io`).
 
-### SEIP — Server Endpoint IP
-
-```
-<id>.<region>.seip.lemonade-nexus.io              A   → public IP
-_config.<id>.<region>.seip.lemonade-nexus.io      TXT → ports + region + load
-private.<id>.<region>.seip.lemonade-nexus.io      A   → tunnel IP (10.64.0.x)
-backend.<id>.<region>.seip.lemonade-nexus.io      A   → backbone IP (172.16.0.x)
-```
-
-**Example:**
-```
-server-0edf40003dfe0f7a.us-west.seip.lemonade-nexus.io       → 67.204.56.242
-private.server-0edf40003dfe0f7a.us-west.seip.lemonade-nexus.io → 10.64.0.1
-backend.server-0edf40003dfe0f7a.us-west.seip.lemonade-nexus.io → 172.16.0.66
+```text
+<base>
+├── ns1..ns9.<base>                     bootstrap nameservers
+├── <region>.seip.<base>                regional server list (discovery)
+│   ├── <id>.<region>.seip.<base>       per-server SEIP records
+│   ├── tier1.<region>.seip.<base>     onboarding / seed discovery
+│   └── tier2.<region>.seip.<base>     onboarding / seed discovery
+└── <node_id>.ep.<base>                 client endpoints
 ```
 
-### EP — Client Endpoints
+## SEIP — Server Endpoint IP
 
-```
-private.<node_id>.ep.lemonade-nexus.io    A → client tunnel IP
+```text
+<id>.<region>.seip.<domain>              A   -> public IP
+_config.<id>.<region>.seip.<domain>      TXT -> ports + region + load [+ host]
+private.<id>.<region>.seip.<domain>      A   -> tunnel IP (10.64.0.x)
+backend.<id>.<region>.seip.<domain>      A   -> backbone IP (172.16.0.x)
 ```
 
-**Example:**
-```
-private.09ba6947c069fe09.ep.lemonade-nexus.io → 10.64.0.10
+The `private.` record is what clients and joining servers use to reach the
+server's private API and onboarding endpoints by FQDN. The `backend.` record
+identifies the server's backbone address.
+
+## EP — Client Endpoints
+
+```text
+private.<node_id>.ep.<domain>    A -> client tunnel IP (10.64.0.x)
 ```
 
 Registered by the server when a client joins via `/api/join`.
 
 ## NS Bootstrap
 
-The first 9 servers claim `ns1` through `ns9` via democratic gossip:
+The first servers to claim slots become the bootstrap nameservers `ns1`
+through `ns9`:
 
+- A server claims the **lowest available slot** by gossip, or a pinned slot
+  when its `dns_ns_hostname` names one (the registrar's glue points that
+  name at that server, so it holds exactly that slot or none).
+- The claim is Ed25519-signed. The receiving server verifies the signature
+  and requires the **claimant** to hold a root-signed, non-revoked peer
+  certificate before applying it. Claims travel epidemically, so the gate
+  binds to the claimant, not the forwarder.
+- Claims survive restarts (persisted). When a holder is gone and another
+  server takes the slot, the old assignment is superseded by the new signed
+  claim.
+
+The base domain's NS records and glue must be set at your registrar to point
+at the claimed nameservers. (Optional DDNS keeps the base domain's records
+current when the server's public IP changes.)
+
+## Tier Records
+
+```text
+tier1.<region>.seip.<domain>    A -> server(s) currently serving that tier
+tier2.<region>.seip.<domain>    A -> ...
 ```
-ns1.lemonade-nexus.io → 67.204.56.242  (us-west)
-ns2.lemonade-nexus.io → 185.x.x.x     (eu-west)
-ns3.lemonade-nexus.io → 103.x.x.x     (ap-south)
-...
-ns9.lemonade-nexus.io → x.x.x.x
-```
 
-- **Claiming:** First-come-first-served with LWW timestamp tiebreak
-- **Conflict:** If two servers claim the same slot, higher pubkey wins
-- **Gossip message:** `NsSlotClaim` (0x14)
-- **Persistence:** Claims survive server restarts
-
-These NS records are set at the registrar (Namecheap) and cached globally by recursive resolvers.
+The onboarding client uses these to discover a target when no
+`--onboard-server` FQDN is given, and startup seed discovery
+(`dns_seed_discovery`) uses them to find gossip peers automatically.
 
 ## Client Discovery Flow
 
-```
+```text
 1. Determine own region
-   └─ ip-api.com geo lookup → nearest cloud region code
-   └─ Fallback: system locale
+   - geo lookup (ip-api.com) mapped to the nearest configured region label
+   - fallback: system locale
 
 2. Bootstrap DNS
-   └─ getaddrinfo("lemonade-nexus.io") → NS records
-   └─ Find ns1-ns9 with glue A records
+   - resolve <base> -> NS records with glue (ns1..ns9)
 
 3. Query regional servers
-   └─ A query: <our-region>.seip.lemonade-nexus.io
-   └─ Returns IPs of all servers in that region
+   - <region>.seip.<base> -> server public IPs
+   - _config TXT per server -> ports, region, load, host FQDN
 
-4. Get config for each server
-   └─ TXT query: _config.<id>.<region>.seip.lemonade-nexus.io
-   └─ Parse: ports, region, load, hostname
+4. Health probe + latency
+   - HTTPS GET /api/health on each candidate
 
-5. Health probe + latency
-   └─ HTTPS GET /api/health on each server
-   └─ Measure round-trip time
+5. Score and sort
+   - score = latency_ms + (load * 10); pick the lowest
 
-6. Score and sort
-   └─ score = latency_ms + (load × 10)
-   └─ Pick lowest score
-
-7. Region fallback
-   └─ If no servers in own region → try adjacent regions
-   └─ Order by geographic distance (haversine)
+6. Region fallback
+   - no servers in own region -> nearest regions by geographic distance
 ```
 
 ## Config TXT Format
 
-```
-v=sp1 http=9100 udp=51940 gossip=9102 stun=3478 relay=9103 dns=53 private_http=9101 region=us-west load=5 host=ns1.srv.lemonade-nexus.io
+```text
+v=sp1 http=9100 udp=51940 gossip=9102 stun=3478 relay=9103 dns=53 private_http=9101 region=us-west load=5 host=<server-fqdn>
 ```
 
 | Field | Description |
 |-------|-------------|
 | `v=sp1` | Protocol version |
 | `http=` | Public HTTPS API port |
-| `udp=` | Mesh port |
-| `gossip=` | Gossip protocol port |
+| `udp=` | Mesh port (mesh and hole punching share it) |
+| `gossip=` | Gossip + security protocol port |
 | `stun=` | STUN port |
 | `relay=` | Relay port |
-| `dns=` | Authoritative DNS port |
-| `private_http=` | Private HTTPS API port (over the mesh tunnel) |
-| `region=` | Server's cloud region code |
+| `dns=` | Authoritative DNS port advertised to clients (NAT-mapped to the local listener) |
+| `private_http=` | Private API port (over the mesh) |
+| `region=` | Server's region label |
 | `load=` | Connected client count |
-| `host=` | Server's TLS certificate FQDN |
+| `host=` | Server's TLS certificate FQDN (present when configured) |
 
 ## Region Codes
 
-| Code | Location |
-|------|----------|
-| `us-east` | US East (Virginia) |
-| `us-west` | US West (California) |
-| `us-central` | US Central (Iowa) |
-| `ca-central` | Canada (Montreal) |
-| `eu-west` | Europe West (Ireland) |
-| `eu-central` | Europe Central (Frankfurt) |
-| `eu-north` | Europe North (Stockholm) |
-| `ap-south` | Asia Pacific South (Mumbai) |
-| `ap-southeast` | Asia Pacific SE (Singapore) |
-| `ap-northeast` | Asia Pacific NE (Tokyo) |
-| `ap-east` | Asia Pacific East (Hong Kong) |
-| `sa-east` | South America (Sao Paulo) |
-| `af-south` | Africa South (Cape Town) |
-| `me-south` | Middle East (Bahrain) |
-| `oc-south` | Oceania (Sydney) |
+A region is a **lowercase DNS label** configured per server
+(`--region` / `SP_REGION` / JSON `region`), auto-detected from the public IP
+when omitted. There is no fixed global list: each deployment chooses its
+labels (for example `us-west`, `eu-central`), and discovery queries use them
+verbatim. The geo lookup maps a client's location to the nearest label the
+deployment actually uses.

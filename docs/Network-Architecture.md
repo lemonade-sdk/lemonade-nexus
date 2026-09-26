@@ -5,236 +5,233 @@ title: Network Architecture
 
 # Network Architecture
 
-## Network Topology
+## Table of Contents
+- [Topology](#topology)
+- [Traffic Planes](#traffic-planes)
+- [Userspace Dataplane](#userspace-dataplane)
+- [Client Connection Flow](#client-connection-flow)
+- [Private API Delivery](#private-api-delivery)
+- [Server-to-Server Traffic](#server-to-server-traffic)
+- [Security Transport](#security-transport)
+- [DNS Discovery](#dns-discovery)
+- [NAT Traversal](#nat-traversal)
+- [SDK Client](#sdk-client)
 
-```
-                           Internet
-                              |
-         ┌────────────────────┼────────────────────┐
-         |                    |                    |
-    [Server 1]           [Server 2]          [Server 3]
-    us-west               eu-west             ap-south
-    ns1                   ns2                 ns3
-    67.204.56.242         185.x.x.x           103.x.x.x
-    Tunnel: 10.64.0.1    Tunnel: 10.64.0.1   Tunnel: 10.64.0.1
-    BB: 172.16.0.66      BB: 172.16.0.120    BB: 172.16.0.45
-         |                    |                    |
-         └──── Mesh backbone (172.16.0.0/22) ──────┘
-              Encrypted server-to-server mesh
-         |                    |                    |
-    ┌────┴────┐          ┌───┴────┐          ┌───┴────┐
-    |         |          |        |          |        |
-  [Mac]    [Linux]    [Phone]  [PC]       [IoT]   [Laptop]
-  .10       .11        .10      .11        .10      .11
-         Client Tunnels (10.64.0.0/10)
-           Per-server IP allocation
-```
+## Topology
 
-## Connection Flow: Client → Server
-
-```
-1. DNS Discovery
-   Client ──getaddrinfo──> System DNS ──NS──> ns1.lemonade-nexus.io
-   Client ──A query──> us-west.seip.lemonade-nexus.io → 67.204.56.242
-   Client ──TXT query──> _config... → ports + region + load
-
-2. Public API (TCP :9100 — plain HTTP on first boot, HTTPS once ACME issues)
-   Client ──POST /api/auth/challenge──> Server  (one-time Ed25519 nonce)
-   Client ──POST /api/join──> Server  (signed challenge; creates tree node,
-                                       allocates tunnel IP, returns mesh config)
-
-3. Mesh Tunnel (UDP :51940)
-   Client ──Noise handshake──> Server
-   Client <──mesh keepalive (5s)──> Server
-   Tunnel established: client 10.64.0.10 ↔ server 10.64.0.1
-
-4. Private API (TCP :9101, reachable only through the tunnel)
-   Client ──GET /api/tree/children/root──> Server (via tunnel)
-   Client ──POST /api/mesh/heartbeat──> Server (via tunnel)
+```text
+                             Internet
+                                |
+             ┌──────────────────┼──────────────────┐
+             |                  |                  |
+        [Server A]         [Server B]         [Server C]
+        us-west            eu-west            ap-south
+        pub: <ip-a>        pub: <ip-b>        pub: <ip-c>
+        tun: 10.64.0.1     tun: 10.64.0.1     tun: 10.64.0.1
+        bb:  172.16.0.x    bb:  172.16.0.x    bb:  172.16.0.x
+             |                  |                  |
+             └──── Server backbone (172.16.0.0/22) ────┘
+             |                  |                  |
+        [clients]          [clients]          [clients]
+        client plane (10.64.0.0/10)
 ```
 
-`POST /api/join` is the whole bootstrap in one call. Its response carries the
-session JWT, `node_id`, `tunnel_ip` + `tunnel_subnet` (10.64.0.0/10),
-`server_tunnel_ip`, `mesh_server_pubkey`, `mesh_endpoint`, `private_api_port`,
-the server/client mesh FQDNs and the mesh DNS servers
-(`TreeApiHandler.cpp`).
-
-Besides join/auth, the public API serves only liveness and discovery reads
-(`GET /api/health`, `/api/stats`, `/api/servers`, `/api/tls/status`) and the
-`/api/onboard/*` server-admission flow. Everything a member does after joining
-— tree sync, heartbeats, IPAM, routing, relay tickets, certs, governance —
-moves to the private API over the tunnel.
-
-## Server-to-Server Backbone
-
-```
-Server A (us-west)                    Server B (eu-west)
-172.16.0.66                           172.16.0.120
-    |                                      |
-    │──── Gossip (UDP :9102) ──────────────│  (public internet)
-    │     ServerHello exchange: signed     │
-    │     server certificate (incl. mesh   │
-    │     pubkey) + advertised endpoint;   │
-    │     mutual TEE challenge follows     │
-    │                                      │
-    │──── Mesh backbone (UDP :51940) ──────│  (same socket as the client
-    │     172.16.0.66 ↔ 172.16.0.120      │   mesh — the backbone IP is a
-    │     Private API, gossip preferred    │   second virtual address on
-    │                                      │   the same dataplane)
-    │──── IPAM Sync (via gossip) ──────────│
-    │     BackboneIpamSync (0x13)          │
-    │     NsSlotClaim (0x14)              │
-```
-
-Sensitive server-to-server payloads are dedicated gossip message types:
-Shamir root-key shares (`ShamirShareOffer`/`Submit`, 0x0C/0x0D) and TEE
-attestation challenges (`TeeChallenge`/`Response`, 0x07/0x08). Gossip prefers
-the encrypted backbone once it is up.
-
-## DNS Discovery (SEIP)
-
-```
-                   lemonade-nexus.io
-                         |
-                    NS Records
-                   /     |     \
-              ns1        ns2       ns3     (first nine servers claim
-           us-west    eu-west   ap-south    ns1–ns9 via NsSlotClaim)
-                |
-           SEIP Records
-          /            \
-   A: server-xxx.     _config.server-xxx.
-   us-west.seip.      us-west.seip.
-   lemonade-nexus.io  lemonade-nexus.io
-   → 67.204.56.242    → v=sp1 http=9100 ...
-                          region=us-west load=5
-```
-
-The `_config` TXT record carries every advertised port plus placement data:
-
-```
-v=sp1 http=9100 udp=51940 gossip=9102 stun=3478 relay=9103 dns=53
-private_http=9101 region=us-west load=5
-```
-
-**Client selects best server** (scored client-side during discovery, after a
-health probe of each candidate):
-
-```
-Score = latency_ms + (load × 10)
-
-Server A: 30ms latency, 5 clients  → score = 80
-Server B: 90ms latency, 2 clients  → score = 110
-Server C: 25ms latency, 20 clients → score = 225
-
-Winner: Server A (lowest score)
-```
-
-## NAT Traversal (Hole Punch)
-
-Hole punching shares the mesh UDP port (:51940) — there is no separate
-signaling port. Coordination runs over the private routing API
-(`/api/routing/*`), with the server acting as rendezvous coordinator:
-
-```
-Client A (behind NAT)         Server (coordinator)       Client B (behind NAT)
-    |                               |                             |
-    │── POST /api/routing/request ─>│                             │
-    │   (B's identifier + A's       │<── /api/routing/endpoint/   │
-    │    candidates: local +        │    register (B's candidates │
-    │    STUN-witnessed reflexive)  │    + reflexive address)     │
-    │                               │                             │
-    │                     candidates are marked "verified"        │
-    │                     when they match the observed            │
-    │                     control-connection source               │
-    │                               │                             │
-    │<── directive: B's candidates ─│─ directive: A's candidates >│
-    │    punch_at = now + 1s        │    punch_at = now + 1s      │
-    │                               │                             │
-    │──────── simultaneous Noise handshake on UDP :51940 ───────>│
-    │<────────────────────────────────────────────────────────────│
-    │                                                             │
-    │<═══════════ Direct P2P encrypted mesh tunnel ══════════════>│
-    │              No server in the middle                        │
-```
-
-Path selection is `DirectP2P` when both sides offered a usable candidate,
-otherwise the coordinator issues a relay ticket (UDP :9103). Between servers,
-each ServerHello carries an *advertised* `public_ip:gossip_port`; third-party
-peer exchange shares that advertised endpoint rather than the observed UDP
-source, while direct replies still use the observed source.
-
-## Userspace dataplane
-
-The server terminates WireGuard **entirely in userspace** (boringtun Noise
-sessions + an in-process smoltcp netstack). There is no kernel WireGuard
-interface and no TUN device on the server, so:
-
-- The daemon needs **no root and no `CAP_NET_ADMIN`** — only `CAP_NET_BIND_SERVICE`
-  to bind privileged ports (HTTP/DNS).
-- Tunnel keys and decrypted plaintext never leave the process; host-level tools
-  (`wg show`, `tcpdump` on an interface) cannot observe mesh traffic.
-- Both the client plane (`10.64.0.0/10`) and the server backbone
-  (`172.16.0.0/22`) are virtual addresses that exist only inside the daemon.
-  Traffic addressed to them is delivered to in-process listeners; traffic for
-  other peers is re-encrypted and forwarded in userspace.
-
-The private API shows the delivery pattern: httplib binds a real socket on
-`127.0.0.1:9101` only, and the netstack adds TCP forwards so virtual
-connections to `10.64.0.1:9101` (tunnel) or the backbone IP are bridged into
-that loopback listener (`main.cpp` / `VirtualNetService::add_tcp_forward`).
-Every private route is JWT-gated. If a server has no tunnel address, private
-routes fall back onto the public server — logged as a security warning.
-
-Clients are unaffected on the wire — same WireGuard protocol, same UDP :51940,
-same `/api/join` contract.
-
-## The SDK client (LemonadeNexusSDK)
-
-The client side mirrors the server's userspace design. `LemonadeNexusSDK`
-(C ABI, `ln_*` functions, driven by the desktop/mobile app over FFI) is a
-consumer-only mesh client:
-
-- `ln_join_network` authenticates (Ed25519 challenge-response, or
-  password/passkey/token), calls `/api/join`, and brings the boringtun tunnel
-  up **in-process** — no TUN device, no admin rights. Fresh Curve25519 mesh
-  keys are generated on every join; only the Ed25519 identity
-  (`identity.json`) and session token persist.
-- Private-API calls ride an egress bridge: the netstack binds an ephemeral
-  `127.0.0.1` listener and bridges accepted connections to a virtual TCP
-  stream toward `<server_tunnel_ip>:9101` (`BoringtunMesh::tcp_egress`).
-- A background `MeshOrchestrator` refreshes peers (`GET /api/mesh/peers`),
-  sends heartbeats and tracks liveness; host apps poll `ln_mesh_status`.
-- Session tokens are per-server JWTs, so surviving a dead server means fresh
-  DNS discovery + re-join with the preserved identity (the app's recovery
-  loop does exactly this on health-probe failure).
-- The netstack's ingress primitive (`ns_add_tcp_forward` — the same call the
-  server uses to publish its private API on the tunnel IP) is **not yet
-  surfaced through the SDK**; exposing a local service to mesh peers requires
-  wiring it into `BoringtunMesh` and the C ABI.
+Both the client plane and the server backbone are **virtual addresses that
+exist only inside each daemon** (userspace netstack). There is no kernel
+WireGuard interface and no TUN device on the server.
 
 ## Traffic Planes
 
-### Public Internet
+### Public internet
+
 | Traffic | Port | Purpose |
 |---------|------|---------|
-| Public HTTP(S) API | TCP :9100 | Bootstrap, auth, join, discovery; HTTP until ACME issues, then HTTPS |
-| Mesh + hole punch (boringtun) | UDP :51940 | Client tunnels, server backbone and NAT traversal — one shared socket |
-| Gossip | UDP :9102 | Server state sync, ServerHello, TEE challenges, Shamir shares |
-| STUN | UDP :3478 | External IP discovery |
-| Relay | UDP :9103 (binds `[::]`) | Fallback mesh forwarding |
-| DNS | UDP :5335 listen / :53 advertised | Authoritative SEIP zone (UDP only; 53 is NAT-mapped externally) |
+| Public HTTPS API | TCP `9100` | Discovery, health, auth, join, onboarding. HTTPS or withheld — never plaintext. |
+| Mesh + hole punching (BoringTun) | UDP `51940` | Client tunnels, server backbone, and NAT traversal — one shared socket |
+| Gossip + security protocol | UDP `9102` | Signed server messages; state sync; security envelopes |
+| STUN | UDP `3478` | External address discovery |
+| Relay | UDP `9103` | Fallback mesh forwarding when direct P2P fails |
+| DNS | UDP+TCP `5335` local / `53` advertised | Authoritative SEIP zone (DNS-serving nodes; `53` is NAT-mapped) |
 
-### Over Mesh Tunnel (10.64.x.x)
+### Over the mesh (client plane `10.64.x.x`)
+
 | Traffic | Port | Purpose |
 |---------|------|---------|
-| Private HTTPS API | TCP :9101 | Tree, IPAM, mesh, routing, relay, certs, governance — via in-process netstack → loopback bridge |
+| Private HTTPS API | TCP `9101` | Tree, IPAM, mesh, routing, relay, certs, onboarding administration — via the in-process netstack to a loopback bridge |
 
-### Server Backbone (172.16.0.x)
+### Server backbone (`172.16.x.x`)
+
 | Traffic | Purpose |
 |---------|---------|
-| Private API (server-to-server) | Cross-server brokering/admin on the same :9101 virtual listener |
-| Gossip (preferred) | State sync over the encrypted backbone |
+| Private API (server-to-server) | Cross-server operations on the same virtual `9101` |
+| Mesh data | Encrypted server-to-server traffic over the same UDP socket |
 
-All public services listen on the wildcard address; the private API listens
+All public services listen on the wildcard address. The private API listens
 on loopback plus the virtual tunnel/backbone addresses only.
+
+## Userspace Dataplane
+
+The server terminates WireGuard **entirely in userspace**: BoringTun Noise
+sessions plus an in-process smoltcp netstack. Consequences:
+
+- The daemon needs **no root and no capabilities**. Every port it binds is
+  unprivileged (9100, 9101, 51940, 9102, 3478, 9103, 5335). Public `53` and
+  `443` are reached by firewall/NAT mapping, not by binding.
+- Tunnel keys and decrypted plaintext never leave the process.
+- Traffic addressed to the virtual addresses is delivered to in-process
+  listeners; traffic for other peers is re-encrypted and forwarded in
+  userspace.
+
+## Client Connection Flow
+
+```text
+1. DNS discovery
+   Client -> system DNS -> ns1..ns9 glue -> <region>.seip.<domain>
+   A record -> server public IP
+   _config TXT -> ports, region, load, host FQDN
+
+2. Public API (TCP 9100, verified HTTPS)
+   POST /api/auth/challenge -> Ed25519 nonce
+   POST /api/auth           -> identity authentication
+   POST /api/join           -> node creation, tunnel IP, mesh config, session JWT
+
+3. Mesh tunnel (UDP 51940)
+   BoringTun handshake -> client 10.64.0.x <-> server 10.64.0.1
+
+4. Private API (TCP 9101, via the mesh)
+   Tree, mesh, IPAM, routing, relay, certs
+```
+
+`POST /api/join` is the composite bootstrap: its response carries the session
+JWT, `node_id`, `tunnel_ip`, the server tunnel IP, the mesh server public key,
+the mesh endpoint, the private API port, the mesh FQDNs, and the mesh DNS
+servers.
+
+The client selects the best server client-side after a health probe of each
+discovered candidate (latency plus load scoring), with region fallback.
+
+## Private API Delivery
+
+The delivery pattern (server side):
+
+1. httplib binds a real socket on `127.0.0.1:9101` only.
+2. The netstack adds TCP forwards so virtual connections to
+   `<tunnel_ip>:9101` (client plane) or the backbone IP are bridged into that
+   loopback listener.
+3. Every private route is JWT-gated. The private listener uses the
+   `private.<id>.<region>.seip.<domain>` certificate.
+
+If a server has **no tunnel address**, no private listener is created and the
+private routes are registered on the public server instead. The server logs a
+security warning; authentication still applies, network isolation does not.
+
+## Server-to-Server Traffic
+
+```text
+Server A (us-west)                    Server B (eu-west)
+172.16.0.x                            172.16.0.x
+    |                                      |
+    |---- Gossip (UDP 9102, public) ----->|
+    |     ServerHello: signed certificate |
+    |     (with mesh pubkey), advertised  |
+    |     endpoint cross-checked against  |
+    |     the observed UDP source         |
+    |     security envelopes (0x16)       |
+    |                                      |
+    |---- Mesh backbone (UDP 51940) ----->|
+    |     same socket as the client mesh; |
+    |     the backbone IP is a second     |
+    |     virtual address on the same     |
+    |     dataplane                       |
+```
+
+Gossip messages are Ed25519-signed. State-mutating gossip ingress requires
+the sender to hold a root-signed, non-revoked peer certificate; the
+authentication binds to the **signer**, never to the NAT-able endpoint.
+
+Gossip and security envelopes are sent to the peer's mesh endpoint
+(advertised `public_ip:gossip_port` when confirmed against the observed
+source, otherwise the observed source). They are not routed through the
+backbone.
+
+## Security Transport
+
+Security-protocol messages (attestation challenge/evidence, HotStuff
+proposal/vote/timeout, DKG broadcast/pairwise, FROST commitment/signature
+share, epoch announcements, sync, and genesis/founding records) travel in a
+single gossip wire type, `SecurityEnvelope` (0x16):
+
+- Authenticated (signature) and size-bounded **before any parse**; never
+  relayed.
+- The router applies per-peer message budgets, deduplication, ruleset and
+  network checks, and epoch-window validation, then hands the envelope to the
+  one security service.
+- Sensitive pairwise DKG round-2 payloads are additionally **sealed to the
+  recipient identity** (X25519 sealed box) inside the envelope.
+- Wire types `0x07`–`0x10` are retired and reserved forever; `0x15` is a
+  logged refusal.
+
+Security messages are not all carried inside WireGuard: the gossip plane on
+`9102` is a signed UDP transport with its own authentication and bounds.
+
+## DNS Discovery
+
+See [DNS Discovery](DNS-Discovery) for the full record layout. In short:
+
+```text
+<id>.<region>.seip.<domain>            A   -> public IP
+_config.<id>.<region>.seip.<domain>    TXT -> v=sp1 http= udp= gossip= stun= relay= dns= private_http= region= load= [host=]
+private.<id>.<region>.seip.<domain>    A   -> tunnel IP
+backend.<id>.<region>.seip.<domain>    A   -> backbone IP
+tier1|tier2.<region>.seip.<domain>     A   -> onboarding/seed discovery
+ns1..ns9.<domain>                      A   -> bootstrap nameservers
+private.<node_id>.ep.<domain>          A   -> client tunnel IP
+```
+
+## NAT Traversal
+
+Hole punching **shares the mesh UDP port `51940`** — there is no separate
+signaling port. Coordination runs over the private routing API
+(`/api/routing/*`), with the server as rendezvous coordinator:
+
+```text
+Client A (NAT)          Server (coordinator)          Client B (NAT)
+    |                          |                            |
+    |-- routing/request ------>|                            |
+    |   (B's identifier +      |<--- endpoint/register ----|
+    |    A's candidates)       |                            |
+    |                          | candidates marked "verified"
+    |                          | when they match the observed
+    |                          | control-connection source
+    |<-- directive: B -------|- directive: A -->|
+    |     punch_at = now+1s   |     punch_at = now+1s       |
+    |                          |                            |
+    |=== simultaneous handshake on UDP 51940 ===============>|
+    |<=== direct P2P encrypted mesh tunnel =================>|
+```
+
+Path selection is `DirectP2P` when both sides offered a usable candidate;
+otherwise the coordinator issues a relay ticket (UDP `9103`). STUN (`3478`)
+supplies reflexive candidates.
+
+## SDK Client
+
+`LemonadeNexusSDK` mirrors the server's userspace design on the client:
+
+- `join_network` authenticates (Ed25519 challenge-response with the client
+  identity; password is a deprecated fallback stub), calls `/api/join`, and
+  brings the BoringTun dataplane up **in-process** — no TUN device, no admin
+  rights. The mesh keypair is derived from the authenticated identity.
+- Private-API calls ride an egress bridge: the netstack binds an ephemeral
+  `127.0.0.1` listener and bridges accepted connections to a virtual TCP
+  stream toward the server's `<tunnel_ip>:9101`.
+- A background orchestrator refreshes peers, sends heartbeats, and tracks
+  liveness.
+- **Local service publishing is now exposed:** `expose_service(vport, target)`
+  publishes a local service to mesh peers (the daemon bridges
+  `our-mesh-IP:vport` to, e.g., `tcp:127.0.0.1:PORT`), and
+  `open_egress(dst_ip, dst_port)` opens a loopback bridge to a mesh peer's
+  service. Both exist in the C++ API and the C ABI
+  (`ln_mesh_expose_service`, `ln_mesh_open_egress`).
+- Session tokens are per-server JWTs; surviving a dead server means fresh DNS
+  discovery plus re-join with the preserved identity.
