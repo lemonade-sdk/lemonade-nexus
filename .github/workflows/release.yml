@@ -505,6 +505,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
           files: |
             lemonade-nexus-linux-x86_64/*
             lemonade-nexus-linux-x86_64-deb/*
@@ -539,7 +540,6 @@ jobs:
             | Linux x86_64 (Arch) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
             | Linux x86_64 (Amazon Linux 2023 .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.amzn2023.rpm` | `manifest-linux-x86_64-amzn2023.json` |
             | macOS ARM64 | `lemonade-nexus-${{ github.ref_name }}-darwin-arm64` | `manifest-darwin-arm64.json` |
-            | Windows x86_64 | `lemonade-nexus-${{ github.ref_name }}-windows-x86_64.exe` | `manifest-windows-x86_64.json` |
 
             ### Install
 
