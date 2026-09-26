@@ -130,10 +130,11 @@ flutter pub get
 
 ### CI/CD Builds
 
-CI (`.github/workflows/flutter-clients.yml`) builds and sanity-checks the raw
-Windows release bundle on every push/PR touching the client, but does not yet
-produce installer packages. MSIX/MSI/portable packages are built locally with
-the scripts above.
+The Windows client job in `.github/workflows/flutter-clients.yml` is
+currently disabled (`if: false`), so the Windows release bundle is **not**
+CI-verified at this revision. MSIX/MSI/portable packaging is not automated
+either. Build the packages locally with the scripts above and verify them on
+a clean Windows machine before distributing.
 
 ## Code Signing
 
@@ -173,7 +174,7 @@ signtool sign /f code_signing.pfx /p <password> \
 ### 1. Direct Download (GitHub Releases)
 
 Packages are distributed via GitHub Releases:
-- Navigate to https://github.com/antmi/lemonade-nexus/releases
+- Navigate to https://github.com/lemonade-sdk/lemonade-nexus/releases
 - Download the appropriate package for your needs
 
 ### 2. Microsoft Store
@@ -189,12 +190,8 @@ To submit to Microsoft Store:
 
 ### 3. Winget (Windows Package Manager)
 
-Manifest is automatically created and submitted on release.
-
-```powershell
-# Install via winget
-winget install LemonadeNexus.LemonadeNexusVPN
-```
+A winget manifest must be created and submitted manually per release; there
+is no release automation for it at this revision.
 
 ### 4. Enterprise Deployment
 
@@ -257,13 +254,17 @@ winget install LemonadeNexus.LemonadeNexusVPN
 | Machine config | `%PROGRAMDATA%\LemonadeNexus\` |
 | Logs | `%LOCALAPPDATA%\LemonadeNexus\logs\` |
 
-## Version History
+## Bundled Runtime Pieces
 
-| Version | Date | Changes |
-|---------|------|---------|
-| 1.0.0.0 | 2026-04-09 | Initial release |
+Every package carries the full Release bundle produced by
+`flutter build windows --release`: the runner exe, `flutter_windows.dll`,
+`lemonade_nexus_sdk.dll` (self-contained — OpenSSL, libsodium, BoringTun, and
+the netstack are statically embedded), plugin DLLs, and `data/`
+(flutter_assets, icudtl.dat, app.so). The MSI installs the client and
+shortcuts only — no Windows service (the coordination server ships
+separately).
 
 ## Support
 
-- Issues: https://github.com/antmi/lemonade-nexus/issues
-- Documentation: https://github.com/antmi/lemonade-nexus/tree/main/docs
+- Issues: https://github.com/lemonade-sdk/lemonade-nexus/issues
+- Documentation: https://lemonade-sdk.github.io/lemonade-nexus/

@@ -1,96 +1,35 @@
-# Assets Directory for Lemonade Nexus VPN
+# Assets Directory
 
-This directory contains visual assets required for building Windows packages.
+Visual assets for the client and for Windows packaging.
 
-## Required Files
+## What is here
 
-### Icons
+| File | Used for |
+|------|----------|
+| `app_icon.png` | App icon source (256x256 PNG with transparency) |
+| `icons/app_icon.png` / `icons/app_icon.ico` / `icons/app_icon.svg` | Platform app icons (multi-size ICO for Windows) |
+| `icons/tray_icon.png` / `icons/tray_icon.ico` / `icons/tray_icon.svg` | System tray icon |
 
-1. **app_icon.png** (Required)
-   - Size: 256x256 pixels (recommended)
-   - Format: PNG with transparency
-   - Used for: MSIX package logo, Start menu, desktop shortcut
+## Windows packaging notes
 
-2. **app_icon.ico** (Required for MSI)
-   - Sizes: 16x16, 32x32, 48x48, 256x256
-   - Format: ICO
-   - Used for: MSI installer, executable icon, Control Panel
+- The MSIX logo and Windows app icon come from the assets above.
+- The MSI build uses the **WiX default UI bitmaps** (`banner.bmp`,
+  `dialog.bmp`, `error.ico`, `info.ico`, `up.ico`) when they are not
+  provided; supplying custom ones is optional polish, not a build
+  requirement.
+- `splash_screen.png` (620x300) is optional for the MSIX splash screen.
 
-3. **splash_screen.png** (Optional)
-   - Size: 620x300 pixels
-   - Format: PNG
-   - Used for: MSIX splash screen
-
-### MSI Installer Graphics
-
-4. **banner.bmp** (Required for MSI)
-   - Size: 493x58 pixels
-   - Format: BMP
-   - Used for: MSI installer banner
-
-5. **dialog.bmp** (Required for MSI)
-   - Size: 493x312 pixels
-   - Format: BMP
-   - Used for: MSI installer dialog background
-
-6. **error.ico** (Required for MSI)
-   - Size: 32x32 pixels
-   - Format: ICO
-   - Used for: MSI error dialog icon
-
-7. **info.ico** (Required for MSI)
-   - Size: 32x32 pixels
-   - Format: ICO
-   - Used for: MSI info dialog icon
-
-8. **up.ico** (Required for MSI)
-   - Size: 16x16 pixels
-   - Format: ICO
-   - Used for: MSI up navigation icon
-
-## Creating Icons
-
-### Using PowerShell (Windows)
+## Regenerating icons
 
 ```powershell
-# Convert PNG to ICO (requires ImageMagick)
+# From the PNG source (requires ImageMagick)
 magick convert app_icon.png -define icon:auto-resize=256,48,32,16 app_icon.ico
 ```
 
-### Using Online Tools
+or the `flutter_launcher_icons` package.
 
-- https://convertio.co/png-ico/
-- https://www.icoconverter.com/
+## Adding assets to pubspec.yaml
 
-### Using Flutter
-
-```bash
-# Use flutter_launcher_icons package
-flutter pub run flutter_launcher_icons:main
-```
-
-## Recommended Icon Design
-
-- **Style**: Clean, modern, professional
-- **Colors**: Green (#48BB78) for VPN/security theme
-- **Symbol**: Shield or lock icon representing security
-- **Background**: Transparent or solid color
-
-## File Checklist
-
-Before building packages, ensure you have:
-
-- [ ] app_icon.png (256x256)
-- [ ] app_icon.ico (multi-size)
-- [ ] splash_screen.png (optional)
-- [ ] banner.bmp (for MSI)
-- [ ] dialog.bmp (for MSI)
-
-## Adding Assets to pubspec.yaml
-
-```yaml
-flutter:
-  assets:
-    - assets/app_icon.png
-    - assets/splash_screen.png
-```
+List runtime assets under `flutter: assets:` in `pubspec.yaml`; build-time
+packaging assets are referenced by the packaging scripts and do not need to
+be in that list.

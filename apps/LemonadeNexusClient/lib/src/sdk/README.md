@@ -1,117 +1,58 @@
 # Lemonade Nexus SDK for Flutter
 
-Dart SDK for the Lemonade Nexus userspace mesh VPN platform.
+Dart FFI wrapper for the Lemonade Nexus C SDK.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `ffi_bindings.dart` | Low-level FFI bindings to the C SDK (~70 functions) |
-| `models.dart` | Type-safe Dart model classes for JSON responses |
+| `ffi_bindings.dart` | Low-level FFI bindings to the C ABI |
+| `models.dart` (+ `models.g.dart`) | Type-safe Dart models for JSON responses (`json_serializable`) |
 | `lemonade_nexus_sdk.dart` | High-level async Dart API |
-| `README.md` | This documentation |
+| `sdk.dart` | Barrel export |
 
-## C SDK Functions Wrapped
+The C ABI surface is defined in
+[`projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h`](../../../../../projects/LemonadeNexusSDK/include/LemonadeNexusSDK/lemonade_nexus.h).
+Keep the binding list in sync with that header; do not track a manual
+function count here.
 
-### Memory Management (1)
-- `ln_free` - Free strings returned by C SDK
+## Function groups (by C ABI section)
 
-### Client Lifecycle (3)
-- `ln_create` - Create client (plaintext HTTP)
-- `ln_create_tls` - Create client (TLS)
-- `ln_destroy` - Destroy client
-
-### Identity Management (8)
-- `ln_identity_generate` - Generate Ed25519 keypair
-- `ln_identity_load` - Load identity from file
-- `ln_identity_save` - Save identity to file
-- `ln_identity_pubkey` - Get public key string
-- `ln_identity_destroy` - Free identity
-- `ln_set_identity` - Attach identity to client
-- `ln_identity_from_seed` - Create identity from seed
-- `ln_derive_seed` - Derive seed from username/password
-
-### Health (1)
-- `ln_health` - GET /api/health
-
-### Authentication (5)
-- `ln_auth_password` - Username/password auth
-- `ln_auth_passkey` - Passkey/FIDO2 auth
-- `ln_auth_token` - Token auth
-- `ln_auth_ed25519` - Ed25519 challenge-response
-- `ln_register_passkey` - Register passkey credential
-
-### Tree Operations (6)
-- `ln_tree_get_node` - Get node by ID
-- `ln_tree_submit_delta` - Submit CRDT delta
-- `ln_create_child_node` - Create child node
-- `ln_update_node` - Update node
-- `ln_delete_node` - Delete node
-- `ln_tree_get_children` - Get children of node
-
-### IPAM (1)
-- `ln_ipam_allocate` - Allocate IP block
-
-### Relay (3)
-- `ln_relay_list` - List relay servers
-- `ln_relay_ticket` - Get relay ticket
-- `ln_relay_register` - Register with relay
-
-### Certificates (3)
-- `ln_cert_status` - Get cert status
-- `ln_cert_request` - Request TLS cert
-- `ln_cert_decrypt` - Decrypt cert bundle
-
-### Group Membership (4)
-- `ln_add_group_member` - Add member to group
-- `ln_remove_group_member` - Remove member
-- `ln_get_group_members` - List group members
-- `ln_join_group` - Join group (create endpoint + IP)
-
-### High-level Operations (2)
-- `ln_join_network` - Auth + create node + allocate IP
-- `ln_leave_network` - Leave network
-
-### Auto-switching (4)
-- `ln_enable_auto_switching` - Enable latency-based switching
-- `ln_disable_auto_switching` - Disable switching
-- `ln_current_latency_ms` - Get current RTT
-- `ln_server_latencies` - Get all server latencies
-
-### Mesh P2P (6)
-- `ln_mesh_enable` - Enable mesh (default config)
-- `ln_mesh_enable_config` - Enable mesh (custom config)
-- `ln_mesh_disable` - Disable mesh
-- `ln_mesh_status` - Get mesh status
-- `ln_mesh_peers` - Get mesh peers
-- `ln_mesh_refresh` - Force peer refresh
-
-### Stats & Server Listing (2)
-- `ln_stats` - GET /api/stats
-- `ln_servers` - GET /api/servers
-
-### DDNS (1)
-- `ln_ddns_status` - Get DDNS status
-
-### Retired endpoints (ABI stubs, 5)
-- `ln_trust_status`, `ln_trust_peer`, `ln_enrollment_status`,
-  `ln_governance_proposals`, `ln_governance_propose` — the server routes were
-  retired; the symbols remain exported and return `LN_ERR_UNSUPPORTED`.
-
-### Attestation Manifests (1)
-- `ln_attestation_manifests` - Get manifests
-
-### Session Management (4)
-- `ln_set_session_token` - Set session token
-- `ln_get_session_token` - Get session token
-- `ln_set_node_id` - Set node ID
-- `ln_get_node_id` - Get node ID
-
-**Total: 69 functions**
+- **Memory:** `ln_free`
+- **Lifecycle:** `ln_create`, `ln_create_tls`, `ln_destroy`
+- **Identity:** `ln_identity_generate`, `ln_identity_load`,
+  `ln_identity_save`, `ln_identity_pubkey`, `ln_identity_destroy`,
+  `ln_set_identity`, `ln_identity_from_seed`, `ln_derive_seed`
+- **Health/stats/discovery:** `ln_health`, `ln_stats`, `ln_servers`,
+  `ln_server_latencies`
+- **Authentication:** `ln_auth_ed25519` (primary), `ln_auth_passkey`,
+  `ln_auth_passkey_challenge`, `ln_register_passkey`, `ln_auth_password`
+  (deprecated server stub — kept for compatibility), `ln_auth_token`
+- **Join/leave:** `ln_join_network`, `ln_leave_network`
+- **Tree:** `ln_tree_get_node`, `ln_tree_get_children`,
+  `ln_tree_submit_delta`, `ln_create_child_node`, `ln_update_node`,
+  `ln_delete_node`, `ln_add_group_member`, `ln_remove_group_member`,
+  `ln_get_group_members`, `ln_join_group`
+- **IPAM / relay / certs:** `ln_ipam_allocate`, `ln_relay_list`,
+  `ln_relay_ticket`, `ln_relay_register`, `ln_cert_status`,
+  `ln_cert_request`, `ln_cert_decrypt`
+- **Mesh:** `ln_mesh_enable`, `ln_mesh_enable_config`, `ln_mesh_disable`,
+  `ln_mesh_status`, `ln_mesh_peers`, `ln_mesh_refresh`,
+  `ln_mesh_expose_service`, `ln_mesh_open_egress`, `ln_generate_keypair`
+- **Routing (connect-by-identifier):** `ln_routing_profile`,
+  `ln_routing_request`, `ln_routing_connection_status`
+- **Sessions/devices:** `ln_set_session_token`, `ln_get_session_token`,
+  `ln_set_node_id`, `ln_get_node_id`, `ln_set_link_token`,
+  `ln_link_token_create`
+- **Private API / misc:** `ln_private_api_call`, `ln_ddns_status`,
+  `ln_attestation_manifests`, group-key envelopes (`ln_group_key_generate`,
+  `ln_group_key_wrap`, `ln_group_key_unwrap`)
+- **Retired ABI stubs** — the server routes are gone; the symbols remain
+  exported and return `LN_ERR_UNSUPPORTED`: `ln_trust_status`,
+  `ln_trust_peer`, `ln_enrollment_status`, `ln_governance_proposals`,
+  `ln_governance_propose`
 
 ## Usage
-
-### Basic Connection
 
 ```dart
 import 'package:nexus_client/src/sdk/lemonade_nexus_sdk.dart';
@@ -119,137 +60,56 @@ import 'package:nexus_client/src/sdk/lemonade_nexus_sdk.dart';
 final sdk = LemonadeNexusSdk();
 
 try {
-  // Connect via TLS
-  await sdk.connectTls('vpn.example.com', 443);
+  // Connect via TLS; host must be the server's certificate FQDN
+  await sdk.connectTls('server.example.com', 9100);
 
-  // Generate identity
+  // Primary path: Ed25519 identity (generate once, persist, reload)
   final identity = await sdk.generateIdentity();
   print('Public key: ${identity.pubkey}');
 
-  // Authenticate
-  final auth = await sdk.authPassword('username', 'password');
+  final auth = await sdk.authEd25519();
   if (auth.authenticated) {
-    print('Logged in as: ${auth.userId}');
-  }
-
-  // Join network
-  final network = await sdk.joinNetwork(
-    username: 'username',
-    password: 'password',
-  );
-
-  if (network.success) {
-    print('Node ID: ${network.nodeId}');
-    print('Tunnel IP: ${network.tunnelIp}');
+    final network = await sdk.joinNetwork();
+    if (network.success) {
+      print('Node ID: ${network.nodeId}');
+      print('Tunnel IP: ${network.tunnelIp}');
+    }
   }
 } finally {
   sdk.dispose();
 }
 ```
 
-### Mesh P2P
-
-```dart
-// Enable mesh with custom config
-await sdk.enableMeshWithConfig({
-  'peer_refresh_interval_sec': 30,
-  'heartbeat_interval_sec': 10,
-  'stun_refresh_interval_sec': 60,
-  'prefer_direct': true,
-  'auto_connect': true,
-});
-
-// Get mesh status
-final meshStatus = await sdk.getMeshStatus();
-print('Peers: ${meshStatus.peerCount}');
-print('Online: ${meshStatus.onlineCount}');
-
-// List peers
-final peers = await sdk.getMeshPeers();
-for (final peer in peers) {
-  if (peer.isOnline) {
-    print('${peer.hostname}: ${peer.tunnelIp} (${peer.latencyMs}ms)');
-  }
-}
-```
-
-### Tree Operations
-
-```dart
-// Get root node children
-final children = await sdk.getChildren('root');
-
-// Create endpoint node
-final endpoint = await sdk.createChildNode(
-  parentId: 'customer-123',
-  nodeType: 'endpoint',
-);
-
-// Update node
-await sdk.updateNode(
-  nodeId: endpoint.id,
-  updates: {
-    'hostname': 'my-device',
-    'platform': 'windows',
-  },
-);
-```
-
-## Error Handling
-
-All SDK methods throw either `SdkException` or `JsonParseException`:
-
-```dart
-try {
-  await sdk.authPassword('user', 'pass');
-} on SdkException catch (e) {
-  print('SDK error: ${e.error.name} - ${e.message}');
-} on JsonParseException catch (e) {
-  print('JSON parse error: ${e.error}');
-  print('Raw JSON: ${e.rawJson}');
-}
-```
+`authPassword(...)` is bound for compatibility, but the server's password
+authentication is a deprecated stub that always fails.
 
 ## Error Codes
 
-| Code | Name | Description |
-|------|------|-------------|
-| 0 | `LN_OK` | Success |
-| -1 | `LN_ERR_NULL_ARG` | Null argument |
-| -2 | `LN_ERR_CONNECT` | Connection failed |
-| -3 | `LN_ERR_AUTH` | Authentication failed |
-| -4 | `LN_ERR_NOT_FOUND` | Resource not found |
-| -5 | `LN_ERR_REJECTED` | Request rejected |
-| -6 | `LN_ERR_NO_IDENTITY` | No identity attached |
-| -99 | `LN_ERR_INTERNAL` | Internal error |
+The C ABI returns `ln_error_t`: `LN_OK` (0), `LN_ERR_NULL_ARG` (-1),
+`LN_ERR_CONNECT` (-2), `LN_ERR_AUTH` (-3), `LN_ERR_NOT_FOUND` (-4),
+`LN_ERR_REJECTED` (-5), `LN_ERR_NO_IDENTITY` (-6), `LN_ERR_PARSE` (-7),
+`LN_ERR_UNSUPPORTED` (-8), `LN_ERR_INTERNAL` (-99).
+
+Dart methods throw `SdkException` (carrying the error code) or
+`JsonParseException`.
 
 ## Memory Management
 
-The SDK handles all FFI memory management automatically:
-- C strings are freed after conversion
-- Identity handles are tracked and freed on dispose
-- Client handles are freed on dispose
-
-Always call `sdk.dispose()` when done to release resources.
+The wrapper frees C strings after conversion and releases identity and
+client handles on dispose. Always call `sdk.dispose()` when done.
 
 ## Platform Support
 
 | Platform | Status | Library Name |
 |----------|--------|--------------|
-| Windows | Supported | `lemonade_nexus.dll` |
-| macOS | Supported | `liblemonade_nexus.dylib` |
-| Linux | Supported | `liblemonade_nexus.so` |
-
-## Building the C SDK
-
-See `projects/LemonadeNexusSDK/` for C SDK build instructions.
+| Windows | Build definitions present; CI disabled | `lemonade_nexus_sdk.dll` |
+| macOS | CI-verified | `liblemonade_nexus_sdk.dylib` |
+| Linux | Not a client target (server platform) | `liblemonade_nexus_sdk.so` |
 
 ## Code Generation
 
-The models use `json_serializable` for JSON parsing. Run:
+The models use `json_serializable`. Regenerate after changing `models.dart`:
 
 ```bash
 flutter pub run build_runner build --delete-conflicting-outputs
 ```
-
-This generates `models.g.dart` from the `models.dart` annotations.

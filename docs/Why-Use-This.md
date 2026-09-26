@@ -5,37 +5,77 @@ title: Why Use Lemonade-Nexus?
 
 # Why Use Lemonade-Nexus?
 
-## Self-Hosted, Self-Sovereign
-You own every server, every key, every byte of data. No SaaS dependency, no vendor lock-in, no monthly bill that scales with users.
+## Self-Hosted, No Kernel Module
 
-## Democratic Governance
-No single root authority. Servers are equal peers that vote on protocol changes, enrollment decisions, and key rotations. Governance proposals propagate via gossip and require quorum approval.
+You operate the servers and own every key. The whole mesh — BoringTun plus
+the TCP/IP stack — runs **in userspace**: no kernel WireGuard module, no TUN
+device, no root, no capabilities. A compromised or misconfigured server still
+cannot reach the kernel networking stack.
 
-## Zero-Trust by Default
-Every gossip message carries cryptographic proof. TEE hardware attestation (Intel SGX, AMD SEV-SNP, Apple Secure Enclave) proves servers are running in trusted execution environments. Binary attestation verifies the exact code running on each server.
+## Cryptographic Identity, Not Accounts
 
-## Encrypted Everything
-- **Encrypted mesh tunnel** for all data (Curve25519 + ChaCha20-Poly1305)
-- **Ed25519** identity for all signing and authentication
-- **HTTPS** with auto-provisioned ACME certificates (even the private API over the tunnel)
-- **XChaCha20-Poly1305** for credential encryption at rest
+Every server and client has an Ed25519 identity. Servers carry
+network-bound certificates signed by the root management key; clients
+authenticate by Ed25519 challenge-response or WebAuthn passkey. There is no
+password-derived trust to phish and no shared secret to leak.
 
-## Auto-Discovery
-Clients find the best server automatically via DNS. No manual IP configuration. Region-aware selection picks the lowest-latency, lowest-load server. If your region has no servers, it falls back to the next closest.
+## Authority That Can Be Verified
 
-## Federated Relay Servers
-Community relay servers forward encrypted mesh traffic when direct P2P fails. Relay operators see only ciphertext — they can't read, modify, or log your traffic.
+After the Genesis bootstrap, authority is **epoch-scoped and consensus-based**:
 
-## No Database
-All state is stored as signed JSON files on disk. Easy to backup, inspect, migrate, and version control. No PostgreSQL, no migrations, no schema drift.
+- Tier 1 membership is established by verified platform evidence and
+  finalized consensus state — not by configuration, not by uptime, not by a
+  root server's say-so.
+- Each epoch's authority key is generated **dealerless** by the committee
+  (FROST DKG); no single node or third party ever holds the full key.
+- The deterministic rules (fault tolerance, quorum, signing thresholds) are
+  **compiled into the binary**, so no operator setting can weaken them.
 
-## Cross-Platform
-- **Server:** Linux, macOS, Windows
-- **Client:** macOS (native SwiftUI with system tray), Linux, Windows, iOS, Android
-- **SDK:** C++ and C APIs for embedding in any application
+Genesis's unilateral authority ends when Epoch 1 activates, and restored
+authority is reauthenticated from the pinned Genesis anchor at every
+startup.
 
-## Scalable
-Designed for hundreds of community servers across regions. Server backbone mesh (172.16.0.0/22) supports up to 1,022 servers. Client address space (10.64.0.0/10) supports millions of endpoints.
+## Hardware-Rooted Evidence (with honest status)
 
-## 5-Second Liveness
-Persistent keepalive at 5 seconds gives near-instant peer online/offline detection. Server determines liveness from boringtun handshake timestamps — no extra protocol overhead.
+The implemented attestation path verifies an AMD SEV-SNP guest, a
+paravisor-bound vTPM, and IMA runtime measurements, bound to a fresh
+challenge and to the network. The evidence is collected by a
+privilege-separated helper daemon that holds no Nexus keys.
+
+The status is explicit: the shipped profile is not yet pinned with approved
+measurements, so no node can qualify for Tier 1 with the current release.
+That is a fail-closed limit we document rather than a gap we hide. See
+[Attestation](Attestation).
+
+## Encrypted End to End
+
+- Mesh traffic: WireGuard-protocol encryption (BoringTun), with NAT
+  traversal and relay fallback. Relays see only ciphertext.
+- Control planes: HTTPS only, with ACME-provisioned certificates. The
+  private API additionally lives behind the mesh.
+- At rest: one versioned AEAD construction (XChaCha20-Poly1305-IETF) for
+  wrapped keys and credentials.
+
+## Built-in Discovery and Addressing
+
+Servers publish regional DNS records (SEIP) and claim bootstrap nameserver
+slots; clients find the nearest healthy server automatically. IPAM assigns
+client, private, shared, and backbone addresses deterministically. You can
+use your own domain for the discovery zone.
+
+## Embedded, Not Just a Binary
+
+The C++ SDK and C ABI bring the whole dataplane into your application:
+identity, authentication, join, tree operations, P2P mesh, relay,
+certificates, and publishing local services to mesh peers. The Flutter
+desktop client is a reference consumer over the same C ABI.
+
+## What It Does Not Claim
+
+- It does not claim protection from privileged root inside the guest.
+- It does not claim universal TEE support: one provider is implemented, two
+  are declared-but-refusing, and the rest are absent.
+- It does not claim automatic reclamation of departed servers' backbone IPs,
+  or consensus authorization of every application write — those are listed
+  as current limits in [Security — Current
+  Limitations](Security#current-limitations) rather than papered over.

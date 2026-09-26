@@ -7,76 +7,141 @@ title: Frequently Asked Questions
 
 ## What is Lemonade-Nexus?
 
-A self-hosted, cryptographically secure userspace mesh VPN. Think of it as a decentralized alternative to Tailscale or ZeroTier that you fully own and control. All servers are equal peers — no central authority.
-
-## How is it different from Tailscale / ZeroTier / Nebula?
-
-| | Lemonade-Nexus | Tailscale | ZeroTier | Nebula |
-|--|---------------|-----------|----------|--------|
-| **Self-hosted** | Yes, fully | Coordination server is SaaS | Controllers are SaaS | Yes |
-| **Governance** | Democratic (server voting) | Company-controlled | Company-controlled | N/A |
-| **TEE attestation** | Yes (SGX, TDX, SEV-SNP, Secure Enclave) | No | No | No |
-| **Database** | None (signed JSON files) | PostgreSQL | SQLite | None |
-| **DNS** | Built-in authoritative DNS | MagicDNS (SaaS) | None | None |
-| **Binary attestation** | Yes (SHA-256 + Ed25519 manifests) | No | No | No |
-| **ACME TLS** | Auto-provisioned (ZeroSSL/Let's Encrypt) | Managed | N/A | N/A |
-| **Protocol** | boringtun (WireGuard protocol) | WireGuard | Custom (ZT) | Custom (Nebula) |
+A self-hosted userspace mesh VPN with encrypted peer-to-peer connections,
+cryptographic identity, and an attestation-based security protocol. You run
+the servers; the software provides the mesh, discovery, addressing,
+certificates, and the security protocol.
 
 ## Do I need to run my own server?
 
-Yes, at least one server. But it's simple — just run the binary and it auto-configures: generates identity, detects region, allocates IPs, obtains TLS certificates, and starts serving.
+Yes, at least one. A packaged install plus `nexus-bootstrap` gets a Genesis
+server configured in a few commands; see [Getting
+Started](Getting-Started).
 
-## How many servers can I have?
+## Is there a central authority?
 
-Up to ~1,000 on the server backbone (172.16.0.0/22). The first 9 servers also serve as authoritative DNS nameservers (ns1–ns9). All servers are equal peers with democratic governance.
+There is a **root management key** and a **Genesis bootstrap anchor**, both
+operator-pinned. The root key signs server admission certificates, and the
+Genesis anchor establishes the network identity. Neither is a live control
+plane: the root key does not grant Tier 1 authority, and Genesis's unilateral
+security authority ends at Epoch 1 activation. After that, authority is
+epoch-scoped and follows finalized consensus state. See
+[Security](Security).
 
-## Is it free / open source?
+## How does the two-tier model work?
 
-Yes. See the repository license.
+- **Tier 2** servers hold a valid network-bound certificate and serve mesh
+  services, clients, and non-authoritative state.
+- **Tier 1** servers are the epoch committee: verified platform evidence and
+  mesh observations establish eligibility, and finalized eligibility, plan,
+  readiness, and handoff establish the role. Tier 1 members run HotStuff
+  consensus and participate in the per-epoch FROST key generation.
 
-## What platforms are supported?
+Tier 1 is an **epoch-scoped** role, not a permanent status.
 
-- **Server:** Linux (primary), macOS, Windows
-- **Client:** macOS (native SwiftUI app), Linux, Windows, iOS (config), Android (config)
+## Can I run it without TEE hardware?
+
+Yes. Servers without qualifying platform evidence operate as Tier 2: they
+serve clients, participate in the mesh, and synchronize state. They simply
+do not qualify for Tier 1.
+
+**Important:** with the currently shipped attestation profile, *no* node can
+qualify for Tier 1, because the profile's required measurements and release
+hashes are not yet pinned in a qualifying release. This is a fail-closed
+blocker, not a configuration problem. See [Attestation](Attestation) and
+[Security — Current
+Limitations](Security#current-limitations).
+
+## Which attestation platforms are supported?
+
+The implemented provider verifies the **AMD SEV-SNP/HCL/vTPM** path (with
+IMA runtime measurements). The SVSM-vTPM and direct-boot providers are
+declared but refuse evidence (`ProviderUnsupported`), and there is no SGX,
+TDX, or Secure Enclave provider in this repository. See the
+[provider matrix](Attestation#provider-matrix).
 
 ## How does NAT traversal work?
 
-1. STUN service discovers each client's public IP and port
-2. Hole punch service (port 51941) coordinates port-mapping exchange between clients
-3. Both clients send Noise handshake packets (WireGuard protocol) to each other's discovered endpoints
-4. NAT mappings are "punched" and a direct P2P tunnel is established
-5. If direct fails, traffic falls back through a relay server
-
-## Can I use it without TEE hardware?
-
-Yes. Without TEE, servers operate as Tier 2 (certificate-only). They can serve clients and participate in gossip, but won't hold Shamir root key shares or vote on governance.
+1. STUN (UDP `3478`) discovers each peer's reflexive address.
+2. The routing API (`/api/routing/*`) coordinates candidate exchange and
+   verifies candidates against the observed control-connection source.
+3. Both sides send WireGuard-protocol (BoringTun) handshakes to each other's
+   discovered endpoints on the **shared mesh UDP port `51940`** — there is no
+   separate hole-punch port.
+4. If a direct path cannot be formed, the coordinator issues a relay ticket
+   and traffic flows through a relay server (UDP `9103`). Relays see only
+   ciphertext.
 
 ## How are IP addresses allocated?
 
-- **Clients:** Sequential allocation from 10.64.0.0/10, starting at .10 (first 10 reserved)
-- **Servers:** Pubkey-hash-based allocation from 172.16.0.0/22 (deterministic, collision-resistant)
-- **Conflict resolution:** If two servers allocate the same IP, the higher pubkey wins (democratic, no root authority)
+- **Clients:** sequential from `10.64.0.0/10`, starting at `.10` (first ten
+  reserved).
+- **Servers:** deterministic from the server's identity key, in
+  `172.16.0.0/22`, with pubkey-based conflict resolution.
+
+Details in [IP Ranges](IP-Ranges). Note that automatic reclamation of
+departed servers' backbone IPs is not yet wired.
 
 ## What happens if a server goes down?
 
-- Clients connected to that server lose their tunnel
-- The client SDK automatically discovers and switches to the next best server (latency + load scoring)
-- Other servers continue operating independently
-- The downed server's backbone IP is reclaimed after 72 hours of no contact
-
-## Can two servers accidentally give out the same client IP?
-
-Currently, IPAM is local to each server. If two servers allocate simultaneously, they could assign the same IP. The server backbone mesh (172.16.0.0/22) uses gossip to sync backbone allocations. Full client IPAM gossip sync is planned.
+- Clients of that server lose their tunnel; the client SDK re-discovers via
+  DNS and switches to the next best server (latency plus load scoring),
+  re-joining with the preserved identity.
+- Other servers continue operating.
+- The downed server's backbone IP is not automatically reclaimed in the
+  current revision (see [IP Ranges — Staleness and
+  Reclamation](IP-Ranges#staleness-and-reclamation)).
 
 ## How do I add a new server?
 
-```bash
-lemonade-nexus --seed-peer <existing-server-ip>:9102 --region eu-west
-```
+Use **server onboarding** against an existing server — never initialize a
+second Genesis for the same network:
 
-The new server will:
-1. Gossip with the seed peer to discover the mesh
-2. Self-allocate a backbone IP (172.16.0.x)
-3. Claim an NS slot if available (ns1–ns9)
-4. Register SEIP DNS records for client discovery
-5. Start serving clients
+1. Obtain the network's `root_pubkey` out of band.
+2. Run `lemonade-nexus --onboard-server <fqdn>:9100 --root-pubkey <hex>` as
+   the service user.
+3. Approve the pending request on the existing server (private API) or mint a
+   single-use enrollment token.
+4. Set `release_signing_pubkey` on the new server, then start the service.
+
+The full flow, including what onboarding persists and what you configure
+separately, is in [Getting Started — Join an existing
+network](Getting-Started#join-an-existing-network-server-onboarding).
+
+## What is stored on disk?
+
+File-backed signed JSON records for identity, tree, IPAM, and the durable
+security stores, plus a SQLite database for the application ACL store. There
+is no external database service. See [Architecture —
+Storage](Architecture#storage).
+
+## Is it free / open source?
+
+The repository is released under the [MIT
+License](https://github.com/lemonade-sdk/lemonade-nexus/blob/main/LICENSE).
+
+## What platforms are supported?
+
+- **Server:** Linux is the primary target (packaged install, systemd,
+  evidence helper). macOS builds run in CI. Windows build definitions exist
+  but the Windows CI jobs are disabled, so Windows is not a qualified
+  platform yet.
+- **Client:** macOS desktop (CI-verified) and Windows desktop (build
+  definitions present; CI disabled).
+- **SDK:** C++ and C ABI, consumed by the Flutter client and by embedders.
+
+Tier 1 attestation support and platform build support are separate questions;
+see [Building — Windows Status](Building#windows-status) and
+[Attestation](Attestation).
+
+## How is this different from Tailscale / ZeroTier / Nebula?
+
+| | Lemonade-Nexus | Tailscale | ZeroTier | Nebula |
+|---|---|---|---|---|
+| Coordination | Self-hosted servers you operate | SaaS coordination server | Controller (SaaS or self-hosted) | Self-hosted static config |
+| Transport | Userspace WireGuard (BoringTun) + userspace netstack | WireGuard (kernel) | Custom (ZT) | Custom (Nebula) |
+| Server authority | Epoch committee: attestation + consensus + threshold signing | Company-operated | Controller | Static root CA |
+| DNS | Built-in authoritative DNS | MagicDNS | None | None |
+| Hardware attestation | SEV-SNP/HCL/vTPM path implemented (qualification pending) | No | No | No |
+
+The comparison is structural, not a performance claim.
