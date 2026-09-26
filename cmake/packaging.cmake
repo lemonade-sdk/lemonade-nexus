@@ -71,8 +71,13 @@ endif()
 # Output: lemonade-nexus-0.1.0-Linux.deb, lemonade-nexus-0.1.0-Darwin.pkg, etc.
 set(CPACK_PACKAGE_FILE_NAME "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 
-# Strip binaries in release packages
-set(CPACK_STRIP_FILES ON)
+# Do NOT strip release binaries. The signed release manifest hashes the build
+# output, and the server compares the on-disk/IMA-measured binary against that
+# hash. Stripping changes the bytes, so a stripped package never matches its own
+# manifest and the node is reported as unapproved. Keep one byte sequence across
+# the manifest, the raw artifact, and the installed binary. (Debug info staying
+# in the release binary is deliberate: it supports crash and security forensics.)
+set(CPACK_STRIP_FILES OFF)
 
 # ── DEB (Debian/Ubuntu) ─────────────────────────────────────────────────────
 
