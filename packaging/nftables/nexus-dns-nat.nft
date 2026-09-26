@@ -23,14 +23,15 @@ delete table inet nexus-dns
 
 table inet nexus-dns {
     chain prerouting {
-        # This is a purpose-built chain that holds only the two redirects
-        # below, so a drop policy cannot touch any host traffic: packets this
-        # chain would otherwise accept would have matched no rule here anyway,
-        # and a drop in one NAT chain is not terminal, so the packet continues
-        # to every other chain and policy on the host. Denial-by-default here
-        # means unmatched packets are dropped by this table instead of passing
-        # straight through it.
-        type nat hook prerouting priority dstnat; policy drop;
+        # The policy MUST be accept. The policy is the verdict for packets that
+        # match no rule in the chain, and a drop verdict is terminal in every
+        # chain type, including nat: with policy drop this chain discards all
+        # inbound traffic on the WAN interface except port 53 (SSH, ICMP, ...)
+        # and takes the host offline. This chain only exists to redirect port
+        # 53; everything else must pass through unmodified and keep flowing to
+        # the rest of the stack. Inbound filtering belongs in a filter chain,
+        # never in this nat chain.
+        type nat hook prerouting priority dstnat; policy accept;
 
         # systemd-resolved's stub listens on 127.0.0.53:53. Matching only the
         # external interface leaves the host's own resolver untouched.
