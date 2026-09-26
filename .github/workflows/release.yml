@@ -434,7 +434,7 @@ jobs:
       - name: Build packages via CPack
         run: |
           for gen in ${{ matrix.cpack_generators }}; do
-            cpack --config build/CPackConfig.cmake -G "$gen" -B build/packages || true
+            cpack --config build/CPackConfig.cmake -G "$gen" -B build/packages
           done
 
       - name: Upload binary artifact
