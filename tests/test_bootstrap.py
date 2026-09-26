@@ -190,13 +190,17 @@ class BootstrapTest(unittest.TestCase):
         for transport in ("udp", "tcp"):
             self.assertIn(f"iifname $nexus_wan_if {transport} dport $nexus_public_dns_port redirect to :$nexus_dns_port", nat)
 
-    def test_dns_nat_ruleset_is_denial_by_default_and_uses_a_real_wan(self):
+    def test_dns_nat_ruleset_is_accept_by_default_and_uses_a_real_wan(self):
         nat = (REPO / "packaging/nftables/nexus-dns-nat.nft").read_text()
-        # Unmatched traffic in the NAT base chain must be dropped, not
-        # silently passed on. This chain only holds the two redirects, so a
-        # drop policy leaves every other packet's fate to the rest of the
-        # system's chains; it cannot intercept host traffic.
-        self.assertRegex(nat, r"policy drop;\s*\n")
+        # The nat chain policy MUST be accept. The policy is the verdict for
+        # packets that match no rule, and drop is terminal in every chain
+        # type, including nat: with policy drop this prerouting chain
+        # discarded all inbound traffic on the WAN interface except port 53
+        # and took the host offline (2026-09-26, UWB-NX01-MESH-ROOT). A NAT
+        # chain must never carry a terminal drop policy; inbound filtering
+        # belongs in a filter chain, which this ruleset deliberately does not
+        # create.
+        self.assertRegex(nat, r"policy accept;\s*\n")
         # The WAN interface must be guaranteed non-empty before the ruleset
         # is applied: an empty iifname makes both redirects no-ops.
         # parse_args keeps the default empty string, so the guard has to be
