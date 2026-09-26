@@ -48,9 +48,13 @@ set(CPACK_PACKAGE_DESCRIPTION
 set(CPACK_PACKAGE_HOMEPAGE_URL "https://github.com/geramyloveless/lemonade-nexus")
 set(CPACK_PACKAGE_CONTACT "admin@lemonade-nexus.io")
 
-if(EXISTS "${CMAKE_SOURCE_DIR}/LICENSE")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")
-endif()
+# productbuild only accepts .rtf/.rtfd/.html/.txt for the embedded license.
+foreach(_license_file LICENSE.txt LICENSE.rtf LICENSE.rtfd LICENSE.html)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/${_license_file}")
+        set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/${_license_file}")
+        break()
+    endif()
+endforeach()
 
 # ── Platform detection for default generators ────────────────────────────────
 
