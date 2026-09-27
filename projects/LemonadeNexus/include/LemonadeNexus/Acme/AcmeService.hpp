@@ -134,7 +134,9 @@ private:
     [[nodiscard]] std::vector<uint8_t> create_csr(const std::string& domain,
                                                     std::string& out_privkey);
 
-    /// Send a signed POST request to an ACME endpoint.
+    /// Send a signed POST request to an ACME endpoint. If the server
+    /// rejects the request with a badNonce error, the nonce is refreshed
+    /// and the same request is resent exactly once.
     /// @param url     The endpoint URL
     /// @param payload The JSON payload string
     /// @return        The response, or nullopt on network error
@@ -146,6 +148,11 @@ private:
     };
     [[nodiscard]] std::optional<AcmeResponse> acme_post(const std::string& url,
                                                          const std::string& payload);
+
+    /// Send an already-signed JWS. Returns the response, or nullopt on
+    /// network error.
+    [[nodiscard]] std::optional<AcmeResponse> acme_post_signed(const std::string& url,
+                                                                const std::string& jws);
 
     /// Send a signed POST-as-GET request (empty payload).
     [[nodiscard]] std::optional<AcmeResponse> acme_post_as_get(const std::string& url);

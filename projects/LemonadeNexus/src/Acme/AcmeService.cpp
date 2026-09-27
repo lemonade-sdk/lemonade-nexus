@@ -642,6 +642,18 @@ std::string AcmeService::sign_jws(const std::string& url,
 // ACME HTTP helpers
 // ---------------------------------------------------------------------------
 
+namespace {
+
+/// True if the response is an RFC 8555 §6.7 error of type badNonce.
+bool is_bad_nonce_response(int status, const std::string& body) {
+    if (status != 400) return false;
+    const auto j = nlohmann::json::parse(body, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return false;
+    return j.value("type", "") == "urn:ietf:params:acme:error:badNonce";
+}
+
+} // anonymous namespace
+
 std::optional<AcmeService::AcmeResponse>
 AcmeService::acme_post(const std::string& url, const std::string& payload) {
     auto jws = sign_jws(url, payload);
@@ -650,6 +662,28 @@ AcmeService::acme_post(const std::string& url, const std::string& payload) {
         return std::nullopt;
     }
 
+    auto response = acme_post_signed(url, jws);
+
+    // A badNonce response means our anti-replay nonce expired (e.g. after a
+    // long retry gap). Refresh it and resend the same request exactly once.
+    // A fresh nonce that is still rejected indicates a different fault, so
+    // never retry more than once here.
+    if (response && is_bad_nonce_response(response->status, response->body)) {
+        spdlog::warn("[{}] badNonce from {} — refreshing nonce, retrying once", name(), url);
+        current_nonce_.clear();
+        jws = sign_jws(url, payload);
+        if (jws.empty()) {
+            spdlog::error("[{}] failed to re-sign JWS after badNonce for {}", name(), url);
+            return std::nullopt;
+        }
+        response = acme_post_signed(url, jws);
+    }
+
+    return response;
+}
+
+std::optional<AcmeService::AcmeResponse>
+AcmeService::acme_post_signed(const std::string& url, const std::string& jws) {
     // Determine which host to use
     auto host = url_host(url);
     httplib::SSLClient client(host);
@@ -1269,6 +1303,11 @@ bool AcmeService::is_valid_domain(const std::string& domain) {
 
 AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
     std::lock_guard lock(mutex_);
+
+    // Start each certificate flow with a fresh anti-replay nonce. The cached
+    // nonce may be minutes or hours old (retry backoff), and ACME nonces
+    // expire; reusing a stale one fails the first request with badNonce.
+    current_nonce_.clear();
 
     spdlog::info("[{}] requesting certificate for '{}'", name(), domain);
 
