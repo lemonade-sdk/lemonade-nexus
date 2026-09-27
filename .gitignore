@@ -52,3 +52,11 @@ build-asan/
 
 # CTest output (generated when ctest runs from the source root)
 Testing/
+release-evidence/
+
+/.crew/
+/.crew
+!.crew/artifacts/
+!.crew/graphs/
+!.crew/artifacts/.gitkeep
+!.crew/graphs/.gitkeep
