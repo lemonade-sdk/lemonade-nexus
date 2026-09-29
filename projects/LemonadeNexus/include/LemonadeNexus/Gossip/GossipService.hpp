@@ -30,6 +30,13 @@ namespace nexus::tree { class PermissionTreeService; }
 
 namespace nexus::gossip {
 
+/// nlohmann serialization for GossipPeer, shared by load_peers() and
+/// save_peers(). The field set and names mirror the peers.json schema
+/// exactly; from_json applies the same defaults the schema has always
+/// allowed (missing field -> struct default).
+void to_json(nlohmann::json& j, const GossipPeer& p);
+void from_json(const nlohmann::json& j, GossipPeer& p);
+
 /// Gossip-based state synchronization service.
 ///
 /// Runs a UDP socket on the gossip port (default 9102). Every 5 seconds, picks a
@@ -204,6 +211,10 @@ private:
     // Peer persistence
     void load_peers();
     void save_peers();
+
+    // Initial ServerHello announcement to all known peers (startup only;
+    // runs before the async loops start).
+    void send_startup_server_hello();
 
     // Packet construction and sending
     void send_packet(const asio::ip::udp::endpoint& target,
@@ -445,7 +456,7 @@ private:
     crypto::Ed25519PublicKey         root_pubkey_{};
     std::string                      expected_network_id_;
     bool                             has_root_pubkey_{false};
-    std::vector<std::string>         revoked_pubkeys_;
+    std::unordered_set<std::string>  revoked_pubkeys_;
     /// Tier 1 membership per finalized state; unset denies tier1 labels.
     std::function<bool(const std::string&)> tier1_membership_;
 

@@ -215,65 +215,67 @@ void GossipService::on_start() {
     reconstruct_transfer_pool();
 
     // Send ServerHello to all known peers on startup (before starting async loops).
-    // If we need a tunnel IP, include the request flag so a peer allocates one for us.
-    {
-        std::vector<std::string> endpoints;
-        bool have_cert = false;
-        {
-            std::lock_guard lock(peers_mutex_);
-            spdlog::info("[{}] listening on UDP port {} (pubkey: {}, peers: {})",
-                          name(), port_,
-                          crypto::to_base64(keypair_.public_key),
-                          peers_.size());
-            if (our_certificate_ && !peers_.empty()) {
-                have_cert = true;
-                for (const auto& p : peers_) endpoints.push_back(p.endpoint);
-            }
-        }
-        if (have_cert) {
-            json hello = *our_certificate_;
-            bool need_tunnel_ip = false;
-            {
-                std::lock_guard lock(mesh_state_mutex_);
-                need_tunnel_ip = ipam_ && our_tunnel_ip_.empty();
-                // Check if IPAM already has our allocation
-                if (need_tunnel_ip) {
-                    auto existing = ipam_->get_allocation(our_certificate_->server_id);
-                    if (existing && existing->tunnel) {
-                        auto ip = existing->tunnel->base_network;
-                        if (auto slash = ip.find('/'); slash != std::string::npos)
-                            ip = ip.substr(0, slash);
-                        our_tunnel_ip_ = ip;
-                        need_tunnel_ip = false;
-                    }
-                }
-                if (need_tunnel_ip) {
-                    hello["request_tunnel_ip"] = true;
-                }
-                if (!our_region_.empty()) {
-                    hello["region"] = our_region_;
-                }
-                if (!our_advertised_endpoint_.empty()) {
-                    hello["advertised_endpoint"] = our_advertised_endpoint_;
-                }
-            }
-            auto payload_str = hello.dump();
-            std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
-
-            for (const auto& ep : endpoints) {
-                auto target = parse_endpoint(ep);
-                if (target) {
-                    send_packet(*target, GossipMsgType::ServerHello, payload_bytes);
-                }
-            }
-            spdlog::info("[{}] sent ServerHello to {} peers (request_tunnel_ip: {})",
-                          name(), endpoints.size(), need_tunnel_ip);
-        }
-    }
+    send_startup_server_hello();
 
     // Start async receive loop and gossip timer after initial ServerHello
     start_receive();
     start_gossip_timer();
+}
+
+void GossipService::send_startup_server_hello() {
+    // If we need a tunnel IP, include the request flag so a peer allocates one for us.
+    std::vector<std::string> endpoints;
+    bool have_cert = false;
+    {
+        std::lock_guard lock(peers_mutex_);
+        spdlog::info("[{}] listening on UDP port {} (pubkey: {}, peers: {})",
+                      name(), port_,
+                      crypto::to_base64(keypair_.public_key),
+                      peers_.size());
+        if (our_certificate_ && !peers_.empty()) {
+            have_cert = true;
+            for (const auto& p : peers_) endpoints.push_back(p.endpoint);
+        }
+    }
+    if (have_cert) {
+        json hello = *our_certificate_;
+        bool need_tunnel_ip = false;
+        {
+            std::lock_guard lock(mesh_state_mutex_);
+            need_tunnel_ip = ipam_ && our_tunnel_ip_.empty();
+            // Check if IPAM already has our allocation
+            if (need_tunnel_ip) {
+                auto existing = ipam_->get_allocation(our_certificate_->server_id);
+                if (existing && existing->tunnel) {
+                    auto ip = existing->tunnel->base_network;
+                    if (auto slash = ip.find('/'); slash != std::string::npos)
+                        ip = ip.substr(0, slash);
+                    our_tunnel_ip_ = ip;
+                    need_tunnel_ip = false;
+                }
+            }
+            if (need_tunnel_ip) {
+                hello["request_tunnel_ip"] = true;
+            }
+            if (!our_region_.empty()) {
+                hello["region"] = our_region_;
+            }
+            if (!our_advertised_endpoint_.empty()) {
+                hello["advertised_endpoint"] = our_advertised_endpoint_;
+            }
+        }
+        auto payload_str = hello.dump();
+        std::vector<uint8_t> payload_bytes(payload_str.begin(), payload_str.end());
+
+        for (const auto& ep : endpoints) {
+            auto target = parse_endpoint(ep);
+            if (target) {
+                send_packet(*target, GossipMsgType::ServerHello, payload_bytes);
+            }
+        }
+        spdlog::info("[{}] sent ServerHello to {} peers (request_tunnel_ip: {})",
+                      name(), endpoints.size(), need_tunnel_ip);
+    }
 }
 
 void GossipService::on_stop() {
@@ -1723,6 +1725,30 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
 // Peer persistence
 // ---------------------------------------------------------------------------
 
+void to_json(nlohmann::json& j, const GossipPeer& p) {
+    j = json{
+        {"pubkey",              p.pubkey},
+        {"endpoint",            p.endpoint},
+        {"advertised_endpoint", p.advertised_endpoint},
+        {"http_port",           p.http_port},
+        {"last_seen",           p.last_seen},
+        {"reputation",          p.reputation},
+        {"certificate_json",    p.certificate_json},
+    };
+}
+
+void from_json(const nlohmann::json& j, GossipPeer& p) {
+    // Same .value(field, default) defaults the inline load code has always
+    // applied: a missing field takes the schema default, never an error.
+    p.pubkey              = j.value("pubkey", "");
+    p.endpoint            = j.value("endpoint", "");
+    p.advertised_endpoint = j.value("advertised_endpoint", "");
+    p.http_port           = j.value("http_port", uint16_t{9100});
+    p.last_seen           = j.value("last_seen", uint64_t{0});
+    p.reputation          = j.value("reputation", 1.0f);
+    p.certificate_json    = j.value("certificate_json", "");
+}
+
 void GossipService::load_peers() {
     std::lock_guard lock(peers_mutex_);
     // Do NOT clear: seed peers added (with empty pubkey) before start() must
@@ -1745,14 +1771,7 @@ void GossipService::load_peers() {
         }
 
         for (const auto& p : j["peers"]) {
-            GossipPeer peer;
-            peer.pubkey              = p.value("pubkey", "");
-            peer.endpoint            = p.value("endpoint", "");
-            peer.advertised_endpoint = p.value("advertised_endpoint", "");
-            peer.http_port           = p.value("http_port", uint16_t{9100});
-            peer.last_seen           = p.value("last_seen", uint64_t{0});
-            peer.reputation          = p.value("reputation", 1.0f);
-            peer.certificate_json    = p.value("certificate_json", "");
+            GossipPeer peer = p.get<GossipPeer>();
 
             if (peer.pubkey.empty() || peer.endpoint.empty() ||
                 !known_endpoints.insert(peer.endpoint).second) {
@@ -1815,15 +1834,7 @@ void GossipService::save_peers() {
     json j;
     json peers_array = json::array();
     for (const auto& p : peers_) {
-        json peer_j;
-        peer_j["pubkey"]              = p.pubkey;
-        peer_j["endpoint"]            = p.endpoint;
-        peer_j["advertised_endpoint"] = p.advertised_endpoint;
-        peer_j["http_port"]           = p.http_port;
-        peer_j["last_seen"]           = p.last_seen;
-        peer_j["reputation"]          = p.reputation;
-        peer_j["certificate_json"]    = p.certificate_json;
-        peers_array.push_back(std::move(peer_j));
+        peers_array.push_back(json(p));
     }
     j["peers"] = std::move(peers_array);
 
@@ -1970,7 +1981,7 @@ void GossipService::load_server_certificate() {
             auto j = json::parse(revoked_env->data);
             if (j.is_array()) {
                 for (const auto& pk : j) {
-                    if (pk.is_string()) revoked_pubkeys_.push_back(pk.get<std::string>());
+                    if (pk.is_string()) revoked_pubkeys_.insert(pk.get<std::string>());
                 }
             }
             spdlog::info("[{}] loaded {} revoked server pubkeys", name(), revoked_pubkeys_.size());
@@ -2059,14 +2070,17 @@ bool GossipService::verify_cert_core(const ServerCertificate& cert) const {
 }
 
 bool GossipService::is_revoked(const std::string& server_pubkey) const {
-    return std::find(revoked_pubkeys_.begin(), revoked_pubkeys_.end(),
-                     server_pubkey) != revoked_pubkeys_.end();
+    return revoked_pubkeys_.count(server_pubkey) != 0;
 }
 
 // ---------------------------------------------------------------------------
 void GossipService::save_revoked_servers() const {
     json arr = json::array();
-    for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
+    // The set's iteration order is unspecified; sort so the persisted list
+    // is deterministic across runs.
+    std::vector<std::string> sorted(revoked_pubkeys_.begin(), revoked_pubkeys_.end());
+    std::sort(sorted.begin(), sorted.end());
+    for (const auto& pk : sorted) arr.push_back(pk);
 
     storage::SignedEnvelope env;
     env.type = "revocation_list";
@@ -2079,7 +2093,7 @@ void GossipService::save_revoked_servers() const {
 void GossipService::add_revoked_server(const std::string& server_pubkey) {
     const std::string pk = normalize_pubkey(server_pubkey);
     if (pk.empty() || is_revoked(pk)) return;  // idempotent
-    revoked_pubkeys_.push_back(pk);
+    revoked_pubkeys_.insert(pk);
     save_revoked_servers();
     spdlog::warn("[{}] revoked superseded server pubkey {}", name(), pk);
 }

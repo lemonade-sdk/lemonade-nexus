@@ -1383,6 +1383,50 @@ TEST_F(HttpEndpointTest, DeltaSignerMismatchWithSessionIsRejected) {
     EXPECT_FALSE(tree->get_node("p14_mismatch_child").has_value());
 }
 
+// --- Fail-closed delta body parsing ---
+//
+// The legacy manual fallback re-parsed operation/target_node_id/node_data/
+// signer_pubkey/signature by hand, silently zero-filling whatever was missing
+// and deferring rejection to apply_delta. The typed TreeDelta parse is now the
+// single source of truth: a body it rejects must get a 400 here and must not
+// reach the tree.
+
+TEST_F(HttpEndpointTest, DeltaMalformedBodyIsRejectedFailClosed) {
+    auto cli = make_client();
+
+    // Seed a live node so the malformed delta has a real target and we can
+    // prove the tree is unmutated.
+    tree::TreeNode child;
+    child.id = "p18_badbody_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = root_pubkey_str;
+    auto create = make_signed_delta("create_node", child.id, child);
+    auto create_res = post_auth_delta(cli, json(create).dump());
+    ASSERT_NE(create_res, nullptr);
+    ASSERT_EQ(create_res->status, 200) << create_res->body;
+
+    // Fallback-shaped body: no node_data, no timestamp — the old manual
+    // parse accepted this (zero-filled node_data) and only apply_delta
+    // rejected it. The typed parse must reject it at the boundary.
+    json body = {
+        {"operation", "update_node"},
+        {"target_node_id", child.id},
+        {"signer_pubkey", root_pubkey_str},
+        {"signature", ""},
+    };
+    auto res = post_auth_delta(cli, body.dump());
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 400) << res->body;
+    EXPECT_EQ(json::parse(res->body).value("error", std::string{}),
+              "invalid delta body");
+
+    // Node unchanged: still present with its original identity.
+    auto stored = tree->get_node(child.id);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->mgmt_pubkey, root_pubkey_str);
+}
+
 // --- P2-17: POST /api/routing/endpoint/register must not accept a
 // caller-supplied mesh key as authoritative. The node's mesh public key is
 // established at join/onboarding (tree->mesh_pubkey); a body override with a

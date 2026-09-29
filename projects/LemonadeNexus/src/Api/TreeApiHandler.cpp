@@ -18,8 +18,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <cstring>
-
 namespace nexus::api {
 
 namespace {
@@ -52,6 +50,20 @@ std::string client_ep_fqdn(const std::string& node_id, const std::string& base_d
     return "private." + node_id + ".ep." + base_domain;
 }
 
+// Strip the "ed25519:" identity prefix (when present) so bare base64 key
+// bytes can be compared.
+[[nodiscard]] std::string_view strip_ed25519_prefix(std::string_view key) {
+    constexpr std::string_view ed_prefix = "ed25519:";
+    return key.starts_with(ed_prefix) ? key.substr(ed_prefix.size()) : key;
+}
+
+// Apply an optional JSON field to `dst`, leaving it unchanged when the key
+// is absent. Mirrors the prior per-field body.contains/get chain.
+template <typename T>
+void apply_optional_field(const nlohmann::json& body, const char* key, T& dst) {
+    if (body.contains(key)) dst = body[key].get<T>();
+}
+
 } // namespace
 
 // Post-delete cascade shared by the direct-delete and delta-delete routes so
@@ -70,10 +82,8 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
     //    key, which owns only the endpoint just deleted.
     if (!doomed->mgmt_pubkey.empty() &&
         !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
-        constexpr std::string_view ed_prefix = "ed25519:";
-        std::string_view mk = doomed->mgmt_pubkey;
-        if (mk.starts_with(ed_prefix)) mk.remove_prefix(ed_prefix.size());
-        ctx_.auth.revoke_ed25519(std::string(mk));
+        ctx_.auth.revoke_ed25519(
+            std::string(strip_ed25519_prefix(doomed->mgmt_pubkey)));
     }
     // 2. Release the node's IP allocations back to the pools.
     (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
@@ -81,18 +91,9 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
     (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
     // 3. Remove the mesh peer using the join-time key conversion.
     if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
-        std::string peer_mesh_key = doomed->mesh_pubkey;
-        constexpr std::string_view ed_prefix = "ed25519:";
-        if (peer_mesh_key.starts_with(ed_prefix)) {
-            auto ed_bytes = crypto::from_base64(peer_mesh_key.substr(ed_prefix.size()));
-            if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
-                crypto::Ed25519PublicKey ed_pk{};
-                std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
-                auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
-                peer_mesh_key = crypto::to_base64(
-                    std::span<const uint8_t>(x_pk.data(), x_pk.size()));
-            }
-        }
+        // Same Ed25519->Curve25519 conversion the join route performs; the
+        // stored key must match the dataplane peer key byte-for-byte.
+        const auto peer_mesh_key = api::normalize_mesh_pubkey(doomed->mesh_pubkey);
         if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
             spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
         }
@@ -140,11 +141,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // not an unverified body field. Bind it to body.pubkey (already verified
         // against the challenge signature by ctx_.auth.authenticate above).
         {
-            constexpr std::string_view ed_prefix = "ed25519:";
-            std::string_view claimed_b64 = client_pubkey;
-            if (claimed_b64.starts_with(ed_prefix)) {
-                claimed_b64.remove_prefix(ed_prefix.size());
-            }
+            const auto claimed_b64 = strip_ed25519_prefix(client_pubkey);
             bool matches = false;
             try {
                 matches = crypto::from_base64(claimed_b64) ==
@@ -479,15 +476,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         try {
             delta = body.get<tree::TreeDelta>();
         } catch (...) {
-            delta.operation      = body.value("operation", "");
-            delta.target_node_id = body.value("target_node_id", "");
-            if (body.contains("node_data")) {
-                auto& nd = body["node_data"];
-                delta.node_data.id        = nd.value("id", "");
-                delta.node_data.parent_id = nd.value("parent_id", "");
-            }
-            delta.signer_pubkey = body.value("signer_pubkey", "");
-            delta.signature     = body.value("signature", "");
+            // Typed parse is the single source of truth for delta bodies;
+            // anything it rejects is rejected here (fail closed).
+            error_response(res, "invalid delta body", 400);
+            return;
         }
 
         // Two-plane agreement: the authenticated session identity must be the
@@ -630,10 +622,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         // Apply partial updates to the existing node
         auto updated = *existing;
-        if (body.contains("hostname"))    updated.hostname    = body["hostname"].get<std::string>();
-        if (body.contains("tunnel_ip"))   updated.tunnel_ip   = body["tunnel_ip"].get<std::string>();
-        if (body.contains("private_subnet")) updated.private_subnet = body["private_subnet"].get<std::string>();
-        if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
+        apply_optional_field(body, "hostname", updated.hostname);
+        apply_optional_field(body, "tunnel_ip", updated.tunnel_ip);
+        apply_optional_field(body, "private_subnet", updated.private_subnet);
+        apply_optional_field(body, "shared_domain", updated.shared_domain);
         if (body.contains("mesh_pubkey")) {
             // Same ownership rule as the join path: edit permission on this
             // node never extends to claiming a static another node holds or
@@ -646,11 +638,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
             updated.mesh_pubkey = claimed;
         }
-        if (body.contains("listen_endpoint")) updated.listen_endpoint = body["listen_endpoint"].get<std::string>();
-        if (body.contains("region"))      updated.region      = body["region"].get<std::string>();
-        if (body.contains("capacity_mbps")) updated.capacity_mbps = body["capacity_mbps"].get<uint32_t>();
-        if (body.contains("reputation_score")) updated.reputation_score = body["reputation_score"].get<float>();
-        if (body.contains("expires_at"))  updated.expires_at  = body["expires_at"].get<uint64_t>();
+        apply_optional_field(body, "listen_endpoint", updated.listen_endpoint);
+        apply_optional_field(body, "region", updated.region);
+        apply_optional_field(body, "capacity_mbps", updated.capacity_mbps);
+        apply_optional_field(body, "reputation_score", updated.reputation_score);
+        apply_optional_field(body, "expires_at", updated.expires_at);
 
         if (!ctx_.tree.update_node_direct(node_id, updated)) {
             error_response(res, "update failed", 500);
