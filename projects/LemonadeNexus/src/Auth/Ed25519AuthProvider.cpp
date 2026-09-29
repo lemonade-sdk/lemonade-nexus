@@ -16,6 +16,54 @@ namespace nexus::auth {
 
 using json = nlohmann::json;
 
+namespace {
+
+// File-local helpers. They take no locks; callers holding cache_mutex_ may
+// invoke them, but they never lock themselves (same discipline as before).
+
+/// Current Unix time in whole seconds.
+uint64_t now_unix_seconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+/// Read a credential file. Returns an empty object when the file is missing
+/// or contains invalid JSON, matching the semantics callers relied on
+/// (null initial json: operator[]/value() behaved like an empty object).
+json read_credential_file(const std::filesystem::path& path) {
+    std::ifstream ifs(path);
+    if (!ifs) return json::object();
+    std::ostringstream ss;
+    ss << ifs.rdbuf();
+    auto data = json::parse(ss.str(), nullptr, false);
+    return data.is_discarded() ? json::object() : data;
+}
+
+/// Write `data` to `path`, creating the parent directory if needed. Fail-
+/// closed: logs and returns false on any open, write, or exception failure.
+bool write_credential_file(const std::filesystem::path& path, const json& data) {
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream ofs(path, std::ios::trunc);
+        if (!ofs) {
+            spdlog::error("[ed25519] Failed to open credential file: {}", path.string());
+            return false;
+        }
+        ofs << data.dump(2);
+        if (!ofs.good()) {
+            spdlog::error("[ed25519] Failed to write credential file: {}", path.string());
+            return false;
+        }
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::error("[ed25519] Exception writing credential file: {}", e.what());
+        return false;
+    }
+}
+
+} // namespace
+
 // ============================================================================
 // Constructor
 // ============================================================================
@@ -43,9 +91,7 @@ json Ed25519AuthProvider::issue_challenge(const std::string& raw_pubkey_b64) {
     crypto_.random_bytes(std::span<uint8_t>(nonce));
 
     auto challenge_b64 = crypto::to_base64(std::span<const uint8_t>(nonce));
-    auto now = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+    auto now = now_unix_seconds();
 
     {
         std::lock_guard lock(challenge_mutex_);
@@ -133,9 +179,7 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
             };
         }
 
-        auto now = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto now = now_unix_seconds();
 
         if (it->second.expires_at <= now) {
             pending_challenges_.erase(it);
@@ -289,27 +333,58 @@ bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
     std::lock_guard lock(cache_mutex_);
     // Never silently drop a revocation: keep the raw string if it won't decode.
     const auto canon = crypto::canonical_key_b64(pubkey_b64);
-    revoked_pubkeys_.insert(canon.empty() ? pubkey_b64 : canon);
+    const auto key = canon.empty() ? pubkey_b64 : canon;
+    revoked_pubkeys_.insert(key);
 
-    // Persist the full blocklist to data/credentials/revoked.json.
-    auto revoked_path = storage_.data_root() / "credentials" / "revoked.json";
-    json arr = json::array();
-    for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
-    try {
-        std::filesystem::create_directories(revoked_path.parent_path());
-        std::ofstream ofs(revoked_path, std::ios::trunc);
-        if (!ofs) {
-            spdlog::error("[ed25519] Failed to open revocation file: {}", revoked_path.string());
-            return false;
+    // Scrub the stale identity so a future reader of ed25519_pubkeys[] that
+    // forgets the blocklist cannot resurrect a revoked key.
+    if (auto it = pubkey_to_user_.find(key); it != pubkey_to_user_.end()) {
+        const auto user_id = it->second;
+        pubkey_to_user_.erase(it);
+        if (!remove_ed25519_credential(user_id, key)) {
+            spdlog::warn("[ed25519] Revocation applied but credential file scrub failed for user {}",
+                         user_id);
         }
-        ofs << arr.dump(2);
-    } catch (const std::exception& e) {
-        spdlog::error("[ed25519] Exception writing revocation file: {}", e.what());
-        return false;
     }
+
+    if (!persist_revoked_list()) return false;
 
     spdlog::info("[ed25519] Revoked pubkey {}", pubkey_b64.substr(0, 16));
     return true;
+}
+
+bool Ed25519AuthProvider::unrevoke_pubkey(const std::string& pubkey_b64) {
+    if (pubkey_b64.empty()) return false;
+    if (!cache_loaded_.load(std::memory_order_acquire)) {
+        load_credentials_from_disk();
+    }
+
+    std::lock_guard lock(cache_mutex_);
+    const auto canon = crypto::canonical_key_b64(pubkey_b64);
+    const auto key = canon.empty() ? pubkey_b64 : canon;
+
+    const auto before = revoked_pubkeys_.size();
+    revoked_pubkeys_.erase(key);
+    // Legacy pre-canonicalization entries may hold other spellings of the same
+    // key; the blocklist is queried verbatim first, so those must go too.
+    if (!canon.empty()) {
+        std::erase_if(revoked_pubkeys_, [&canon](const std::string& s) {
+            return crypto::canonical_key_b64(s) == canon;
+        });
+    }
+    if (revoked_pubkeys_.size() == before) return false;  // nothing was revoked
+
+    if (!persist_revoked_list()) return false;
+
+    spdlog::info("[ed25519] Unrevoked pubkey {}", pubkey_b64.substr(0, 16));
+    return true;
+}
+
+bool Ed25519AuthProvider::persist_revoked_list() {
+    auto revoked_path = storage_.data_root() / "credentials" / "revoked.json";
+    json arr = json::array();
+    for (const auto& pk : revoked_pubkeys_) arr.push_back(pk);
+    return write_credential_file(revoked_path, arr);
 }
 
 // ============================================================================
@@ -320,20 +395,8 @@ bool Ed25519AuthProvider::save_ed25519_credential(const std::string& user_id,
                                                     const std::string& pubkey_b64) {
     auto cred_path = storage_.data_root() / "credentials" / (user_id + ".json");
 
-    json file_data;
-
     // Read existing file if present (may have passkey credentials too)
-    {
-        std::ifstream ifs(cred_path);
-        if (ifs) {
-            std::ostringstream ss;
-            ss << ifs.rdbuf();
-            file_data = json::parse(ss.str(), nullptr, false);
-            if (file_data.is_discarded()) {
-                file_data = json::object();
-            }
-        }
-    }
+    auto file_data = read_credential_file(cred_path);
 
     file_data["user_id"] = user_id;
 
@@ -353,9 +416,7 @@ bool Ed25519AuthProvider::save_ed25519_credential(const std::string& user_id,
     }
 
     if (!found) {
-        auto now = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+        auto now = now_unix_seconds();
 
         file_data["ed25519_pubkeys"].push_back(json{
             {"pubkey",     pubkey_b64},
@@ -363,24 +424,39 @@ bool Ed25519AuthProvider::save_ed25519_credential(const std::string& user_id,
         });
     }
 
-    try {
-        std::filesystem::create_directories(cred_path.parent_path());
-        std::ofstream ofs(cred_path, std::ios::trunc);
-        if (!ofs) {
-            spdlog::error("[ed25519] Failed to open credential file: {}", cred_path.string());
-            return false;
+    return write_credential_file(cred_path, file_data);
+}
+
+bool Ed25519AuthProvider::remove_ed25519_credential(const std::string& user_id,
+                                                     const std::string& pubkey_b64) {
+    auto cred_path = storage_.data_root() / "credentials" / (user_id + ".json");
+
+    // Read existing file if present (may have passkey credentials too)
+    auto file_data = read_credential_file(cred_path);
+
+    // User no longer in the file: nothing to scrub, and the blocklist still
+    // guards auth, so this is not an error.
+    if (file_data.value("user_id", std::string{}) != user_id) return true;
+
+    bool removed = false;
+    if (file_data.contains("ed25519_pubkeys") &&
+        file_data["ed25519_pubkeys"].is_array()) {
+        // Match on canonical bytes, mirroring save_ed25519_credential, so a
+        // legacy variant spelling in the file is removed too.
+        auto& pk_arr = file_data["ed25519_pubkeys"];
+        for (auto it = pk_arr.begin(); it != pk_arr.end();) {
+            if (crypto::canonical_key_b64(it->value("pubkey", std::string{})) == pubkey_b64) {
+                it = pk_arr.erase(it);
+                removed = true;
+            } else {
+                ++it;
+            }
         }
-        ofs << file_data.dump(2);
-        if (!ofs.good()) {
-            spdlog::error("[ed25519] Failed to write credential file: {}", cred_path.string());
-            return false;
-        }
-    } catch (const std::exception& e) {
-        spdlog::error("[ed25519] Exception writing credential file: {}", e.what());
-        return false;
     }
 
-    return true;
+    if (!removed) return true;  // key not in the file; already clean
+
+    return write_credential_file(cred_path, file_data);
 }
 
 void Ed25519AuthProvider::load_credentials_from_disk() {

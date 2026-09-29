@@ -215,7 +215,6 @@ TEST(Onboarding, CertificateMeshKeyJsonSerializesCurrentField) {
 
     nlohmann::json current = cert;
     EXPECT_EQ(current.at("mesh_pubkey"), "mesh-key");
-    EXPECT_FALSE(current.contains("wg_pubkey"));
     EXPECT_EQ(current.get<gossip::ServerCertificate>().mesh_pubkey, "mesh-key");
 }
 

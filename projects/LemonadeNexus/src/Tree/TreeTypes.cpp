@@ -71,9 +71,6 @@ void to_json(json& j, const TreeNode& n) {
 }
 
 void from_json(const json& j, TreeNode& n) {
-    if (j.contains("wg_pubkey")) {
-        throw std::invalid_argument("legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'");
-    }
     j.at("id").get_to(n.id);
     j.at("parent_id").get_to(n.parent_id);
     n.type = string_to_node_type(j.at("type").get<std::string>());
@@ -115,10 +112,6 @@ void to_json(json& j, const TreeDelta& d) {
 }
 
 void from_json(const json& j, TreeDelta& d) {
-    if (j.contains("node_data") && j["node_data"].is_object() &&
-        j["node_data"].contains("wg_pubkey")) {
-        throw std::invalid_argument("legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'");
-    }
     j.at("operation").get_to(d.operation);
     j.at("target_node_id").get_to(d.target_node_id);
     j.at("node_data").get_to(d.node_data);
@@ -144,8 +137,6 @@ std::string canonical_node_json(const TreeNode& node) {
     j["shared_domain"]            = node.shared_domain;
     j["mgmt_pubkey"]              = node.mgmt_pubkey;
     j["wrapped_mgmt_privkey"]     = node.wrapped_mgmt_privkey;
-    // Canonical label is "mesh_pubkey". Signatures made under the retired
-    // "wg_pubkey" label are invalid by design; there is no compatibility path.
     j["mesh_pubkey"]              = node.mesh_pubkey;
     j["endpoint_identifier"]      = node.endpoint_identifier;
     j["cpu_id"]                   = node.cpu_id;
@@ -164,9 +155,7 @@ std::string canonical_node_json(const TreeNode& node) {
 std::string canonical_delta_json(const TreeDelta& delta) {
     // Build a sorted JSON object excluding the "signature" field.
     json j;
-    // node_data is signed as-is under the "mesh_pubkey" label (see
-    // canonical_node_json). Legacy "wg_pubkey" input is rejected at the
-    // parse boundary and never reaches signing.
+    // node_data is signed as-is under the "mesh_pubkey" label
     j["node_data"]      = delta.node_data;
     j["operation"]      = delta.operation;
     j["signer_pubkey"]  = delta.signer_pubkey;

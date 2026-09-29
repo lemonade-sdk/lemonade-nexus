@@ -63,6 +63,10 @@ bool AuthService::revoke_ed25519(const std::string& pubkey_b64) {
     return ed25519_provider_.revoke_pubkey(pubkey_b64);
 }
 
+bool AuthService::unrevoke_ed25519(const std::string& pubkey_b64) {
+    return ed25519_provider_.unrevoke_pubkey(pubkey_b64);
+}
+
 bool AuthService::validate_session(std::string_view token) {
     // One validation path, so revocation can't be bypassed by picking this one.
     return validate_session_claims(std::string(token)).has_value();

@@ -142,8 +142,8 @@ the returned network-bound certificate.
 
 | Value | How the candidate obtains it | Where it goes |
 |---|---|---|
-| `root_pubkey` (hex Ed25519) | **Out of band**, before onboarding. On the Genesis server it is the `Identity pubkey` printed by `--first-run`; it is also in the Genesis server's protected configuration. | Passed as `--root-pubkey` and written to the candidate's config. Onboarding *confirms* it against the bundle but never establishes it. |
-| `genesis_pubkey` (base64 Ed25519) | **The onboarding bundle authenticates it**: the certificate's network ID must derive from the bundle's Genesis key. No separate out-of-band exchange is needed. | Written to the candidate's config by the onboarding client. |
+| `root_pubkey` (hex Ed25519) | **Out of band**, before onboarding. On the Genesis server it is the `Identity pubkey` printed by `--first-run`; it is also in the Genesis server's protected configuration. | Passed as `--root-pubkey`; the client verifies the bundle against it. Onboarding *confirms* it but never writes the config. |
+| `genesis_pubkey` (base64 Ed25519) | **The onboarding bundle authenticates it**: the certificate's network ID must derive from the bundle's Genesis key. No separate out-of-band exchange is needed. | The operator sets it in the candidate's config before start: copy it from the Genesis server at bootstrap time, or from the onboarding client's report (the bundle's Genesis binding is verified by the client, so the printed value is authenticated). Onboarding warns if the config's value differs from the admitted mesh's. |
 | `release_signing_pubkey` | **Not part of the bundle.** Configure it separately with the key that verifies the releases you will run. | Candidate's config. Required for a normal daemon start. |
 
 Do not copy security state (certificates, keypairs, epoch stores) from another
@@ -197,18 +197,21 @@ certificate; that is not a failure.
 4. The client polls, then verifies the returned bundle: the root key matches
    the pinned `--root-pubkey`, the certificate is bound to the candidate's
    public key and signed by the root, and the bundle's Genesis binding holds.
-5. The client persists:
-   - the certificate to `<data_root>/identity/server_cert.json`
-   - `root_pubkey`, `genesis_pubkey`, and the merged seed peers to the config
-     file (the address it just reached is seeded first)
+5. The client persists only the certificate to
+   `<data_root>/identity/server_cert.json`. It never modifies the config file
+   (the trust anchors stay root-protected); it prints the approved anchors for
+   verification and the recommended seed peers for the operator to apply
+   (the address it just reached is recommended first).
 
 It then prints the server ID, the installed paths, and the command to start
 the server.
 
 ### After onboarding
 
-1. Verify `release_signing_pubkey` is set in the protected configuration
-   (edit with `sudoedit`; it is not delivered by onboarding).
+1. Edit the protected configuration with `sudoedit`: verify
+   `release_signing_pubkey` is set (it is not delivered by onboarding), and
+   apply the recommended `seed_peers` from the onboarding report (if any).
+   Onboarding itself never writes this file.
 2. Start the packaged service:
 
    ```bash

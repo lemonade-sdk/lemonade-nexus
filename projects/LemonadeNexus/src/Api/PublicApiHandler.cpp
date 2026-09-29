@@ -2,6 +2,7 @@
 
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Network/HttpServer.hpp>
+#include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 
 namespace nexus::api {
@@ -69,7 +70,7 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
                 try {
                     auto sid = nlohmann::json::parse(p.certificate_json).value("server_id", "");
                     if (!sid.empty())
-                        fqdn = sid + "." + p.region + ".seip." + ctx_.config.dns_base_domain;
+                        fqdn = seip::seipFqdn(sid, p.region, ctx_.config.dns_base_domain);
                 } catch (...) {}
             }
             entries.push_back({

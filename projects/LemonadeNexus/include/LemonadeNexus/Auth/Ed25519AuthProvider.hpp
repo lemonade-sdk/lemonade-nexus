@@ -50,7 +50,16 @@ public:
     [[nodiscard]] nlohmann::json issue_challenge(const std::string& pubkey_b64);
 
     /// Revoke an Ed25519 public key (device deletion); persisted. Idempotent.
+    ///
+    /// Adds the canonical key to the authoritative blocklist and, so stale
+    /// readers of the credential store cannot resurrect a revoked key, also
+    /// removes it from the in-memory pubkey→user cache and from the owning
+    /// user's credential file (ed25519_pubkeys[]).
     bool revoke_pubkey(const std::string& pubkey_b64);
+
+    /// Lift a revocation (operator un-revoke). Returns false when the key was
+    /// not on the blocklist. Persisted.
+    bool unrevoke_pubkey(const std::string& pubkey_b64);
 
     /// True if this key is on the device-revocation blocklist.
     [[nodiscard]] bool is_pubkey_revoked(const std::string& pubkey_b64);
@@ -68,6 +77,14 @@ private:
 
     // Persist pubkey→user_id mapping to credential file.
     bool save_ed25519_credential(const std::string& user_id, const std::string& pubkey_b64);
+
+    // Remove a pubkey from the owning user's credential file (ed25519_pubkeys[]).
+    // Called with cache_mutex_ held. A missing user or a missing entry is not an error.
+    bool remove_ed25519_credential(const std::string& user_id, const std::string& pubkey_b64);
+
+    // Write the current blocklist to credentials/revoked.json.
+    // Called with cache_mutex_ held.
+    bool persist_revoked_list();
 
     // Load pubkey→user_id mappings from disk.
     void load_credentials_from_disk();

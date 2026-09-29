@@ -60,6 +60,10 @@ public:
     /// base64 key (no "ed25519:" prefix). Idempotent.
     bool revoke_ed25519(const std::string& pubkey_b64);
 
+    /// Lift an Ed25519 revocation (operator un-revoke). Returns false when the
+    /// key was not revoked. Admin authorization is enforced by the API layer.
+    bool unrevoke_ed25519(const std::string& pubkey_b64);
+
     /// Mint a single-use device-link token bound to the owner's Customer group.
     [[nodiscard]] std::optional<std::pair<std::string, LinkTokenRecord>>
     mint_link_token(const std::string& owner_user_id, const std::string& owner_pubkey,

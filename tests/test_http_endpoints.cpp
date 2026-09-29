@@ -17,6 +17,8 @@
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
+#include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/Core/ServerIdentity.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
@@ -31,6 +33,7 @@
 #include <jwt-cpp/jwt.h>
 
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <string>
 #include <thread>
@@ -92,6 +95,7 @@ inline void install(core::ServerConfig& cfg,
                     acme::AcmeService& acme,
                     network::HttpServer& http,
                     network::DdnsService& ddns,
+                    network::DnsService& dns,
                     relay::RelayService& relay,
                     relay::RelayDiscoveryService& rd,
                     routing::RoutingCoordinationService& routing,
@@ -118,7 +122,7 @@ inline void install(core::ServerConfig& cfg,
         .attestation      = att,
         .admission        = adm,
         .boringtun        = nullptr,
-        .dns              = nullptr,
+        .dns              = &dns,
         .server_fqdn      = "test.local",
         .server_seip_fqdn = "",
         .server_private_fqdn = "",
@@ -142,6 +146,10 @@ protected:
 
     fs::path temp_dir;
     asio::io_context io;
+    // Dedicated reactor for the DNS listener: the shared `io` above is never
+    // run in this fixture, and DnsService answers queries asynchronously.
+    asio::io_context dns_io;
+    std::thread dns_io_thread;
     std::unique_ptr<crypto::SodiumCryptoService> crypto;
     std::unique_ptr<storage::FileStorageService> storage;
     std::unique_ptr<crypto::KeyWrappingService> key_wrapping;
@@ -159,6 +167,7 @@ protected:
     std::unique_ptr<core::BinaryAttestationService> attestation;
     std::unique_ptr<core::ServerAdmissionService> admission;
     std::unique_ptr<network::DdnsService> ddns;
+    std::unique_ptr<network::DnsService> dns;
     std::unique_ptr<acme::AcmeService> acme;
     core::ServerConfig config;
 
@@ -219,8 +228,28 @@ protected:
             io, *crypto, *storage, *attestation, *gossip);
         acme = std::make_unique<acme::AcmeService>(*storage);
 
+        // Real, running DNS service on an ephemeral port so the issue #22
+        // assertions query the zone over UDP exactly like a client would.
+        for (int attempt = 0; attempt < 8 && !dns; ++attempt) {
+            try {
+                dns = std::make_unique<network::DnsService>(
+                    dns_io, 0, *tree, config.dns_base_domain);
+                dns->start();
+            } catch (const std::exception&) {
+                if (dns) {
+                    dns->stop();
+                    dns.reset();
+                }
+            }
+        }
+        ASSERT_TRUE(dns) << "could not bind the DNS service on an ephemeral port";
+        dns_io_thread = std::thread([this] {
+            auto guard = asio::make_work_guard(dns_io);
+            dns_io.run();
+        });
+
         test_api::install(config, *auth, *tree, *ipam, *gossip, *crypto,
-                          *key_wrapping, *storage, *acme, *http, *ddns,
+                          *key_wrapping, *storage, *acme, *http, *ddns, *dns,
                           *relay, *relay_discovery, *routing, *attestation,
                           *admission);
         register_routes();
@@ -234,6 +263,9 @@ protected:
 
     void TearDown() override {
         test_api::reset();
+        if (dns) dns->stop();
+        dns_io.stop();
+        if (dns_io_thread.joinable()) dns_io_thread.join();
         http->stop();
         ipam->stop();
         auth->stop();
@@ -518,6 +550,79 @@ protected:
         return httplib::Client("localhost", test_port_);
     }
 
+    /// Full Ed25519 challenge-response join; returns the /api/join response.
+    /// Uses the same AuthService instance the handler authenticates against,
+    /// so the challenge round-trip is exactly what the join route performs.
+    httplib::Result join_node(const crypto::Ed25519Keypair& kp) {
+        const auto bare = crypto::to_base64(
+            std::span<const uint8_t>(kp.public_key.data(),
+                                     kp.public_key.size()));
+        const auto challenge_b64 =
+            auth->issue_ed25519_challenge(bare).value("challenge", std::string{});
+        auto challenge = crypto::from_base64(challenge_b64);
+        auto sig = crypto->ed25519_sign(kp.private_key,
+                                        std::span<const uint8_t>(challenge));
+        json body = {
+            {"method", "ed25519"},
+            {"pubkey", bare},
+            {"public_key", "ed25519:" + bare},
+            {"challenge", challenge_b64},
+            {"signature", crypto::to_base64(sig)},
+        };
+        return make_client().Post("/api/join", body.dump(), "application/json");
+    }
+
+    /// Raw UDP A query for `fqdn` against the fixture's DNS service.
+    /// Returns the response bytes; empty on a transport or encode error.
+    std::vector<uint8_t> dns_a_query(const std::string& fqdn) {
+        const auto query = nexus::core::build_dns_query(fqdn, 1, 0x1234);
+        if (query.empty() || !dns || dns->local_port() == 0) return {};
+        asio::io_context client;
+        asio::ip::udp::socket sock(client,
+                                   asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+        asio::error_code ec;
+        sock.send_to(asio::buffer(query),
+                     {asio::ip::make_address("127.0.0.1"), dns->local_port()});
+        if (ec) return {};
+        std::vector<uint8_t> reply(512);
+        asio::ip::udp::endpoint from;
+        const std::size_t n = sock.receive_from(asio::buffer(reply), from, 0, ec);
+        if (ec) return {};
+        reply.resize(n);
+        return reply;
+    }
+
+    /// True when an A query for `fqdn` answers exactly one record whose
+    /// RDATA is `ip`.
+    bool dns_a_resolves_to(const std::string& fqdn, const std::string& ip) {
+        const auto reply = dns_a_query(fqdn);
+        if (reply.size() < 12 ||
+            static_cast<std::size_t>(reply[6]) * 256u + reply[7] != 1u) {
+            return false;
+        }
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        if (std::sscanf(ip.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) {
+            return false;
+        }
+        const uint8_t want[4] = {static_cast<uint8_t>(a), static_cast<uint8_t>(b),
+                                 static_cast<uint8_t>(c), static_cast<uint8_t>(d)};
+        for (std::size_t i = 0; i + 4 <= reply.size(); ++i) {
+            if (reply[i] == want[0] && reply[i + 1] == want[1] &&
+                reply[i + 2] == want[2] && reply[i + 3] == want[3]) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Number of answer records for an A query of `fqdn` (0 = NXDOMAIN or
+    /// unresolvable name).
+    std::size_t dns_a_answer_count(const std::string& fqdn) {
+        const auto reply = dns_a_query(fqdn);
+        if (reply.size() < 12) return 0;
+        return static_cast<std::size_t>(reply[6]) * 256u + reply[7];
+    }
+
     tree::TreeDelta make_signed_delta(const std::string& operation,
                                        const std::string& target_node_id,
                                        const tree::TreeNode& node_data) {
@@ -534,6 +639,30 @@ protected:
         auto msg = std::span<const uint8_t>(
             reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
         auto sig = crypto->ed25519_sign(root_keypair.private_key, msg);
+        delta.signature = crypto::to_base64(sig);
+        return delta;
+    }
+
+    /// Same as above but signed by an arbitrary identity (e.g. a device key
+    /// that holds its own node's delete_node grant).
+    tree::TreeDelta make_signed_delta(const std::string& operation,
+                                       const std::string& target_node_id,
+                                       const tree::TreeNode& node_data,
+                                       const crypto::Ed25519Keypair& signer_kp,
+                                       const std::string& signer_pubkey) {
+        tree::TreeDelta delta;
+        delta.operation = operation;
+        delta.target_node_id = target_node_id;
+        delta.node_data = node_data;
+        delta.signer_pubkey = signer_pubkey;
+        delta.timestamp = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+
+        auto canonical = tree::canonical_delta_json(delta);
+        auto msg = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+        auto sig = crypto->ed25519_sign(signer_kp.private_key, msg);
         delta.signature = crypto::to_base64(sig);
         return delta;
     }
@@ -729,6 +858,182 @@ TEST_F(HttpEndpointTest, DeltaInvalidJson) {
     auto res = post_auth_delta(cli, "not json");
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 400);
+}
+
+// --- Delete cascade via signed delta (issue #17: revocation bypass) ---
+//
+// The delta route must run the same post-delete cascade as the direct route:
+// credential revocation (owner-protected), IPAM release, mesh peer removal.
+// (boringtun is nullptr in this fixture, so only the first two are asserted.)
+
+TEST_F(HttpEndpointTest, DeltaDeleteRevokesKeyAndReleasesIpam) {
+    auto cli = make_client();
+
+    // Linked device holds its own Ed25519 key as the node's mgmt_pubkey.
+    auto device_kp = crypto->ed25519_keygen();
+    const auto device_b64 = crypto::to_base64(
+        std::span<const uint8_t>(device_kp.public_key.data(),
+                                 device_kp.public_key.size()));
+    const auto device_pubkey = "ed25519:" + device_b64;
+
+    // Baseline: an unrevoked device key passes session validation.
+    ASSERT_TRUE(auth->validate_session_claims(make_jwt(device_b64)).has_value());
+
+    // Create the node via delta: owned by the device key, deletable by root.
+    tree::TreeNode node;
+    node.id = "cascade_node1";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = device_pubkey;
+    node.assignments = {{root_pubkey_str, {"admin"}}};
+    auto create = make_signed_delta("create_node", node.id, node);
+    auto res = post_auth_delta(cli, json(create).dump());
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200);
+
+    // Allocate a tunnel IP; the delete cascade must release it.
+    auto alloc = ipam->allocate_tunnel_ip(node.id);
+    ASSERT_FALSE(alloc.base_network.empty());
+    ASSERT_TRUE(ipam->get_allocation(node.id)->tunnel.has_value());
+
+    // Delete via the signed-delta route.
+    auto del = make_signed_delta("delete_node", node.id, tree::TreeNode{});
+    auto del_res = post_auth_delta(cli, json(del).dump());
+    ASSERT_NE(del_res, nullptr);
+    ASSERT_EQ(del_res->status, 200);
+
+    // Node is gone.
+    auto get_res = cli.Get("/api/tree/node/" + node.id);
+    ASSERT_NE(get_res, nullptr);
+    EXPECT_EQ(get_res->status, 404);
+
+    // The device key was the only holder → revoked: sessions invalidate.
+    EXPECT_FALSE(auth->validate_session_claims(make_jwt(device_b64)).has_value());
+
+    // IPAM allocation released back to the pool.
+    EXPECT_FALSE(ipam->get_allocation(node.id).has_value());
+}
+
+TEST_F(HttpEndpointTest, DeltaDeleteKeepsSharedKey) {
+    auto cli = make_client();
+
+    // Owner-protection: two nodes share one mgmt key (an owner's own devices
+    // hold the same key as their group). Deleting one via delta must NOT
+    // revoke a key a surviving node still owns.
+    auto owner_kp = crypto->ed25519_keygen();
+    const auto owner_b64 = crypto::to_base64(
+        std::span<const uint8_t>(owner_kp.public_key.data(),
+                                 owner_kp.public_key.size()));
+    const auto owner_pubkey = "ed25519:" + owner_b64;
+
+    for (const auto& id : {"cascade_shared_a", "cascade_shared_b"}) {
+        tree::TreeNode node;
+        node.id = id;
+        node.parent_id = "root";
+        node.type = tree::NodeType::Endpoint;
+        node.mgmt_pubkey = owner_pubkey;
+        node.assignments = {{root_pubkey_str, {"admin"}}};
+        auto create = make_signed_delta("create_node", id, node);
+        auto res = post_auth_delta(cli, json(create).dump());
+        ASSERT_NE(res, nullptr);
+        ASSERT_EQ(res->status, 200);
+    }
+
+    // Delete one of the two via the signed-delta route.
+    auto del = make_signed_delta("delete_node", "cascade_shared_a", tree::TreeNode{});
+    auto del_res = post_auth_delta(cli, json(del).dump());
+    ASSERT_NE(del_res, nullptr);
+    ASSERT_EQ(del_res->status, 200);
+
+    // The surviving node still holds the key → it must NOT be revoked.
+    EXPECT_TRUE(auth->validate_session_claims(make_jwt(owner_b64)).has_value());
+
+    // Surviving node is intact.
+    auto get_res = cli.Get("/api/tree/node/cascade_shared_b");
+    ASSERT_NE(get_res, nullptr);
+    EXPECT_EQ(get_res->status, 200);
+}
+
+// --- Private EP DNS record removal (issue #22: stale A record after delete) ---
+//
+// Join registers a dynamic A record private.<node_id>.ep.<domain> -> tunnel
+// IP. Both delete routes must remove it through cascade_node_cleanup, or the
+// stale record keeps resolving to a tunnel IP IPAM has already recycled
+// (which may now belong to a different, live node).
+
+TEST_F(HttpEndpointTest, DirectDeleteRemovesPrivateEpDnsRecord) {
+    auto cli = make_client();
+
+    // Node joins; the join route registers its private EP A record.
+    auto device_kp = crypto->ed25519_keygen();
+    const auto device_b64 = crypto::to_base64(
+        std::span<const uint8_t>(device_kp.public_key.data(),
+                                 device_kp.public_key.size()));
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200);
+    auto join = json::parse(join_res->body);
+    const auto node_id = join.value("node_id", std::string{});
+    const auto fqdn = join.value("client_private_fqdn", std::string{});
+    const auto tunnel_ip = join.value("tunnel_ip", std::string{});
+    ASSERT_FALSE(node_id.empty());
+    ASSERT_FALSE(fqdn.empty());
+    // The FQDN matches the documented private EP format byte-for-byte.
+    EXPECT_EQ(fqdn, "private." + node_id + ".ep." + config.dns_base_domain);
+    const auto ip = tunnel_ip.substr(0, tunnel_ip.find('/'));
+    ASSERT_FALSE(ip.empty());
+
+    // The A record is present after join (served over UDP like a client query).
+    ASSERT_TRUE(dns_a_resolves_to(fqdn, ip));
+
+    // Delete via the DIRECT route; the owner holds delete_node on their own
+    // endpoint.
+    httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(device_b64)}};
+    auto del_res = cli.Post("/api/tree/node/delete/" + node_id, h);
+    ASSERT_NE(del_res, nullptr);
+    ASSERT_EQ(del_res->status, 200);
+
+    // Node is gone and its A record no longer answers over UDP.
+    auto get_res = cli.Get("/api/tree/node/" + node_id);
+    ASSERT_NE(get_res, nullptr);
+    EXPECT_EQ(get_res->status, 404);
+    EXPECT_EQ(dns_a_answer_count(fqdn), 0u);
+}
+
+TEST_F(HttpEndpointTest, DeltaDeleteRemovesPrivateEpDnsRecord) {
+    auto cli = make_client();
+
+    // Node joins; the join route registers its private EP A record.
+    auto device_kp = crypto->ed25519_keygen();
+    const auto device_b64 = crypto::to_base64(
+        std::span<const uint8_t>(device_kp.public_key.data(),
+                                 device_kp.public_key.size()));
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200);
+    auto join = json::parse(join_res->body);
+    const auto node_id = join.value("node_id", std::string{});
+    const auto fqdn = join.value("client_private_fqdn", std::string{});
+    ASSERT_FALSE(node_id.empty());
+    ASSERT_FALSE(fqdn.empty());
+    EXPECT_EQ(fqdn, "private." + node_id + ".ep." + config.dns_base_domain);
+    ASSERT_NE(dns_a_answer_count(fqdn), 0u);
+
+    // Delete via the SIGNED-DELTA route. The device holds delete_node on its
+    // own endpoint, so it signs the delta and authenticates as itself.
+    auto del = make_signed_delta("delete_node", node_id, tree::TreeNode{},
+                                 device_kp, "ed25519:" + device_b64);
+    httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(device_b64)}};
+    auto del_res = cli.Post("/api/tree/delta", h, json(del).dump(),
+                            "application/json");
+    ASSERT_NE(del_res, nullptr);
+    ASSERT_EQ(del_res->status, 200);
+
+    // Node is gone and its A record no longer answers over UDP.
+    auto get_res = cli.Get("/api/tree/node/" + node_id);
+    ASSERT_NE(get_res, nullptr);
+    EXPECT_EQ(get_res->status, 404);
+    EXPECT_EQ(dns_a_answer_count(fqdn), 0u);
 }
 
 // =========================================================================
@@ -1078,33 +1383,48 @@ TEST_F(HttpEndpointTest, DeltaSignerMismatchWithSessionIsRejected) {
     EXPECT_FALSE(tree->get_node("p14_mismatch_child").has_value());
 }
 
-TEST_F(HttpEndpointTest, DeltaWithLegacyWgPubkeyLabelIsRefused) {
-    // The retired "wg_pubkey" label is refused at the HTTP boundary with a
-    // clear 400 — before any signature work — whether it replaces or
-    // duplicates "mesh_pubkey".
+// --- Fail-closed delta body parsing ---
+//
+// The legacy manual fallback re-parsed operation/target_node_id/node_data/
+// signer_pubkey/signature by hand, silently zero-filling whatever was missing
+// and deferring rejection to apply_delta. The typed TreeDelta parse is now the
+// single source of truth: a body it rejects must get a 400 here and must not
+// reach the tree.
+
+TEST_F(HttpEndpointTest, DeltaMalformedBodyIsRejectedFailClosed) {
     auto cli = make_client();
-    auto token = make_jwt(root_pubkey_str);
-    httplib::Headers h = {{"Authorization", "Bearer " + token}};
 
-    auto legacy_body = nlohmann::json{
-        {"operation", "create_node"},
-        {"target_node_id", "p14_legacy_child"},
-        {"node_data", {{"id", "p14_legacy_child"}, {"parent_id", "root"},
-                       {"type", "customer"}, {"wg_pubkey", "old-key"}}},
+    // Seed a live node so the malformed delta has a real target and we can
+    // prove the tree is unmutated.
+    tree::TreeNode child;
+    child.id = "p18_badbody_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = root_pubkey_str;
+    auto create = make_signed_delta("create_node", child.id, child);
+    auto create_res = post_auth_delta(cli, json(create).dump());
+    ASSERT_NE(create_res, nullptr);
+    ASSERT_EQ(create_res->status, 200) << create_res->body;
+
+    // Fallback-shaped body: no node_data, no timestamp — the old manual
+    // parse accepted this (zero-filled node_data) and only apply_delta
+    // rejected it. The typed parse must reject it at the boundary.
+    json body = {
+        {"operation", "update_node"},
+        {"target_node_id", child.id},
         {"signer_pubkey", root_pubkey_str},
-        {"signature", "c2ln"},
-        {"timestamp", 1},
+        {"signature", ""},
     };
-    auto res = cli.Post("/api/tree/delta", h, legacy_body.dump(), "application/json");
+    auto res = post_auth_delta(cli, body.dump());
     ASSERT_NE(res, nullptr);
     EXPECT_EQ(res->status, 400) << res->body;
-    EXPECT_FALSE(tree->get_node("p14_legacy_child").has_value());
+    EXPECT_EQ(json::parse(res->body).value("error", std::string{}),
+              "invalid delta body");
 
-    auto mixed_body = legacy_body;
-    mixed_body["node_data"]["mesh_pubkey"] = "new-key";
-    res = cli.Post("/api/tree/delta", h, mixed_body.dump(), "application/json");
-    ASSERT_NE(res, nullptr);
-    EXPECT_EQ(res->status, 400) << res->body;
+    // Node unchanged: still present with its original identity.
+    auto stored = tree->get_node(child.id);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->mgmt_pubkey, root_pubkey_str);
 }
 
 // --- P2-17: POST /api/routing/endpoint/register must not accept a

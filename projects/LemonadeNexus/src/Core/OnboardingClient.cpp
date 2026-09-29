@@ -2,12 +2,13 @@
 
 #include <LemonadeNexus/Core/CliModes.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
+#include <LemonadeNexus/Core/NetUtil.hpp>
 #include <LemonadeNexus/Core/OnboardingTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
+#include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
-#include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Security/HclReport.hpp>
 #include <LemonadeNexus/Security/TpmQuote.hpp>
@@ -24,7 +25,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <span>
+#include <string_view>
 #include <thread>
 
 namespace nexus::core {
@@ -61,11 +65,50 @@ HttpResult http_call(const std::string& host, int port, const std::string& metho
     return {true, r->status, r->body};
 }
 
-/// host:port -> {host, port(default 9100)}.
-std::pair<std::string, int> split_hostport(const std::string& hp, int default_port) {
-    auto colon = hp.rfind(':');
-    if (colon == std::string::npos) return {hp, default_port};
-    return {hp.substr(0, colon), std::atoi(hp.substr(colon + 1).c_str())};
+enum class HttpJsonFailure { none, not_connected, bad_status, invalid_json, invalid_fields };
+
+template <typename T>
+struct HttpJsonResult {
+    HttpJsonFailure failure{HttpJsonFailure::none};
+    int status{0};
+    std::string body;
+    std::string decode_error;
+    std::optional<T> value;
+};
+
+/// POST `body` and decode a 200 response through `from_json`. Connection
+/// failure and non-200 responses are reported (not_connected / bad_status)
+/// without parsing, preserving the raw `body`; a 200 whose body is not JSON
+/// is invalid_json with decode_error "/: invalid json"; a 200 that parses but
+/// fails `from_json` is invalid_fields with the decode error in decode_error.
+template <typename T>
+HttpJsonResult<T> post_json(const std::string& host, int port, const std::string& path,
+                            const std::string& body, const std::string& connect_ip,
+                            const std::function<std::optional<T>(const json&, std::string&)>&
+                                from_json) {
+    HttpJsonResult<T> result;
+    const auto r = http_call(host, port, "POST", path, body, connect_ip);
+    result.status = r.status;
+    result.body = std::move(r.body);
+    if (!r.connected) {
+        result.failure = HttpJsonFailure::not_connected;
+        return result;
+    }
+    if (r.status != 200) {
+        result.failure = HttpJsonFailure::bad_status;
+        return result;
+    }
+    const auto parsed = json::parse(result.body, nullptr, false);
+    if (parsed.is_discarded()) {
+        result.failure = HttpJsonFailure::invalid_json;
+        result.decode_error = "/: invalid json";
+        return result;
+    }
+    if (auto value = from_json(parsed, result.decode_error))
+        result.value = std::move(*value);
+    else
+        result.failure = HttpJsonFailure::invalid_fields;
+    return result;
 }
 
 struct GossipKeys {
@@ -129,37 +172,57 @@ bool verify_issued_cert(crypto::SodiumCryptoService& crypto,
     return true;
 }
 
-// One atomic replacement: the root key, Genesis anchor, and seed peers land
-// together, so no state carries the root without the anchor. A config that
-// is not a JSON object, or that cannot be replaced with its ownership and
-// mode preserved, is refused.
-std::string install_onboarded_config(const std::string& config_path, const std::string& root_hex,
-                                     const std::string& genesis_b64,
-                                     const std::vector<std::string>& seeds) {
-    json j = json::object();
-    if (std::filesystem::exists(config_path)) {
+/// Read the candidate's config READ-ONLY and merge the server-reported seed
+/// peers into the existing list (existing seeds first, then any not already
+/// present). The config file is root-protected: onboarding never modifies it,
+/// it only reports what the operator should apply. A missing, unreadable, or
+/// malformed config (or a non-array seed_peers) warns once and treats the
+/// existing seeds as empty — a config-file condition never fails the run, by
+/// which point the certificate is already installed.
+/// `new_seeds` receives the merged peers absent from the config (the ones to
+/// recommend); `genesis_mismatch` is set when the config carries a
+/// genesis_pubkey that differs from `mesh_genesis_b64`.
+void plan_onboarded_seeds(const std::string& config_path,
+                          const std::string& mesh_genesis_b64,
+                          const std::vector<std::string>& server_seeds,
+                          std::vector<std::string>& new_seeds,
+                          bool& genesis_mismatch) {
+    std::vector<std::string> existing;
+    genesis_mismatch = false;
+    if (!std::filesystem::exists(config_path)) {
+        spdlog::warn("Onboard: config {} not found; treating seed_peers as empty",
+                     config_path);
+    } else {
         std::ifstream f(config_path);
-        if (!f) return "cannot read existing config " + config_path;
-        auto parsed = json::parse(f, nullptr, false);
-        if (parsed.is_discarded() || !parsed.is_object())
-            return "existing config " + config_path +
-                   " does not parse as a JSON object; refusing to overwrite it";
-        j = std::move(parsed);
+        if (!f) {
+            spdlog::warn("Onboard: cannot read config {}; treating seed_peers as empty",
+                         config_path);
+        } else {
+            auto parsed = json::parse(f, nullptr, false);
+            if (parsed.is_discarded() || !parsed.is_object()) {
+                spdlog::warn("Onboard: config {} does not parse as a JSON object; "
+                             "treating seed_peers as empty", config_path);
+            } else {
+                if (parsed.contains("seed_peers")) {
+                    if (parsed["seed_peers"].is_array())
+                        existing = parsed["seed_peers"].get<std::vector<std::string>>();
+                    else
+                        spdlog::warn("Onboard: config {} has a non-array seed_peers; "
+                                     "treating as empty", config_path);
+                }
+                if (parsed.contains("genesis_pubkey") && parsed["genesis_pubkey"].is_string()) {
+                    const auto config_genesis = parsed["genesis_pubkey"].get<std::string>();
+                    if (config_genesis != mesh_genesis_b64) genesis_mismatch = true;
+                }
+            }
+        }
     }
-    j["root_pubkey"] = root_hex;
-    j["genesis_pubkey"] = genesis_b64;
-    std::vector<std::string> merged;
-    if (j.contains("seed_peers")) {
-        if (!j["seed_peers"].is_array())
-            return "existing config " + config_path + " has a non-array seed_peers";
-        merged = j["seed_peers"].get<std::vector<std::string>>();
-    }
-    for (const auto& s : seeds)
-        if (std::find(merged.begin(), merged.end(), s) == merged.end()) merged.push_back(s);
-    j["seed_peers"] = merged;
-    if (!security::write_durable_preserving(config_path, j.dump(2) + "\n"))
-        return "failed to write the onboarded config to " + config_path;
-    return {};
+    std::vector<std::string> merged = existing;
+    for (const auto& s : server_seeds)
+        if (std::find(merged.begin(), merged.end(), s) == merged.end()) {
+            merged.push_back(s);
+            new_seeds.push_back(s);
+        }
 }
 
 /// Produce platform evidence bound to the admission challenge nonce, so the bundle
@@ -188,21 +251,80 @@ std::optional<security::SnpVtpmEvidence> collect_onboarding_evidence(
 }
 
 /// Probe candidate targets; return the first "host:port" that accepts onboarding.
+/// Logs why each candidate failed so an operator can see why discovery dead-ended
+/// (connection/TLS failure, non-200, bad JSON, or the server refusing onboarding).
 std::string pick_target(const std::vector<std::string>& targets,
                         const std::string& connect_ip) {
     for (const auto& t : targets) {
-        auto [host, port] = split_hostport(t, 9100);
+        const auto hp = nexus::net::splitHostPort(t, 9100);
+        if (!hp) {
+            spdlog::warn("Onboard: probe of {} failed: invalid host:port", t);
+            continue;
+        }
+        auto [host, port] = *hp;
         auto r = http_call(host, port, "GET", "/api/onboard/info", "", connect_ip);
-        if (!r.connected || r.status != 200) continue;
+        if (!r.connected) {
+            spdlog::warn("Onboard: probe of {} failed: not connected "
+                         "(no TCP/TLS handshake; hostname verification may have "
+                         "failed)", t);
+            continue;
+        }
+        if (r.status != 200) {
+            spdlog::warn("Onboard: probe of {} failed: HTTP {}", t, r.status);
+            continue;
+        }
         auto body = json::parse(r.body, nullptr, false);
-        if (body.is_discarded()) continue;
+        if (body.is_discarded()) {
+            spdlog::warn("Onboard: probe of {} failed: /api/onboard/info is not "
+                         "valid JSON", t);
+            continue;
+        }
         auto info = OnboardingInfoResponse::fromJson(body);
         if (info && info.value->accepts_onboarding) return t;
+        spdlog::warn("Onboard: probe of {} failed: server is not accepting "
+                     "onboarding", t);
     }
     return {};
 }
 
 } // namespace
+
+std::vector<std::string> parse_discovery_txt_hosts(
+    const std::vector<std::string>& txt_strings) {
+    std::vector<std::string> hosts;
+    static constexpr std::string_view kHostKey = "host=";
+    for (const auto& record : txt_strings) {
+        std::size_t pos = 0;
+        while (pos < record.size()) {
+            const auto space = record.find(' ', pos);
+            const std::string field = record.substr(
+                pos, space == std::string::npos ? std::string::npos : space - pos);
+            pos = (space == std::string::npos) ? record.size() : space + 1;
+            if (field.size() > kHostKey.size() &&
+                field.compare(0, kHostKey.size(), kHostKey) == 0) {
+                hosts.push_back(field.substr(kHostKey.size()));
+            }
+        }
+    }
+    return hosts;
+}
+
+std::vector<std::string> build_discovery_targets(
+    const std::vector<std::string>& tier1_members,
+    const std::vector<std::string>& tier2_members,
+    const std::string& region,
+    const std::string& dns_base_domain,
+    int http_port) {
+    std::vector<std::string> targets;
+    const std::string port_suffix = ":" + std::to_string(http_port);
+    for (int tier : {1, 2}) {
+        const auto& members = (tier == 1) ? tier1_members : tier2_members;
+        for (const auto& member : members)
+            if (!member.empty()) targets.push_back(member + port_suffix);
+        targets.push_back(nexus::seip::tierFqdn(tier, region, dns_base_domain) + port_suffix);
+    }
+    return targets;
+}
 
 std::string validate_pinned_root(const std::string& pinned_hex) {
     if (pinned_hex.empty())
@@ -269,10 +391,36 @@ int run_onboard_server(ServerConfig& config) {
     if (!config.onboard_target.empty()) {
         targets.push_back(config.onboard_target);
     } else if (!config.dns_base_domain.empty() && !region.empty()) {
+        // The server's ACME certificate covers the member FQDN
+        // (<id>.<region>.seip.<base>) — never the tier name — so a probe of the
+        // tier FQDN fails hostname verification. Fetch each tier's member list
+        // from the aggregated tier TXT record and probe the member FQDNs (their
+        // certificates verify and their own A records supply the IP); the tier
+        // FQDN itself stays as a fallback candidate for deployments whose
+        // certificate does cover tier names.
+        std::vector<std::string> tier1_members;
+        std::vector<std::string> tier2_members;
         for (int tier : {1, 2}) {
-            targets.push_back("tier" + std::to_string(tier) + "." + region + ".seip." +
-                              config.dns_base_domain + ":" + std::to_string(config.http_port));
+            const std::string tier_fqdn =
+                nexus::seip::tierFqdn(tier, region, config.dns_base_domain);
+            std::vector<std::string>& members =
+                (tier == 1) ? tier1_members : tier2_members;
+            const auto txt_strings = resolve_txt_records(tier_fqdn);
+            if (txt_strings.empty()) {
+                spdlog::warn("Onboard: tier TXT query for {} returned no records "
+                             "(tier membership unavailable)", tier_fqdn);
+                continue;
+            }
+            members = parse_discovery_txt_hosts(txt_strings);
+            if (members.empty()) {
+                spdlog::warn("Onboard: tier TXT record for {} lists no host= "
+                             "members", tier_fqdn);
+                continue;
+            }
+            spdlog::info("Onboard: tier{} member FQDNs: {}", tier, members.size());
         }
+        targets = build_discovery_targets(tier1_members, tier2_members, region,
+                                          config.dns_base_domain, config.http_port);
     }
     if (targets.empty()) {
         spdlog::error("Onboard: no target. Pass '--onboard-server <fqdn[:port]>' or configure "
@@ -286,27 +434,34 @@ int run_onboard_server(ServerConfig& config) {
                       "(tried {} target(s)).", targets.size());
         return 1;
     }
-    auto [host, port] = split_hostport(target, 9100);
+    const auto host_port = nexus::net::splitHostPort(target, 9100);
+    if (!host_port) {
+        spdlog::error("Onboard: invalid host:port in target '{}'", target);
+        return 1;
+    }
+    auto [host, port] = *host_port;
     spdlog::info("Onboard: requesting admission from {} as '{}'", target, server_id);
 
     // 1. Challenge.
     ChallengeRequest challenge_request;
     challenge_request.candidate_pubkey = keys.pub_b64;
-    auto ch = http_call(host, port, "POST", "/api/onboard/challenge",
-                        challenge_request.toJson().dump(), connect_ip);
-    if (!ch.connected || ch.status != 200) {
+    auto ch = post_json<ChallengeResponse>(
+        host, port, "/api/onboard/challenge", challenge_request.toJson().dump(),
+        connect_ip,
+        [](const json& j, std::string& error) -> std::optional<ChallengeResponse> {
+            auto r = ChallengeResponse::fromJson(j);
+            if (!r) { error = r.error; return std::nullopt; }
+            return r.value;
+        });
+    if (ch.failure == HttpJsonFailure::not_connected ||
+        ch.failure == HttpJsonFailure::bad_status) {
         spdlog::error("Onboard: challenge failed ({})", ch.body); return 1;
     }
-    auto challenge_json = json::parse(ch.body, nullptr, false);
-    auto challenge = challenge_json.is_discarded()
-        ? onboarding_json::DecodeResult<ChallengeResponse>{
-              std::nullopt, "/: invalid json"}
-        : ChallengeResponse::fromJson(challenge_json);
-    if (!challenge) {
-        spdlog::error("Onboard: invalid challenge response ({})", challenge.error);
+    if (!ch.value) {
+        spdlog::error("Onboard: invalid challenge response ({})", ch.decode_error);
         return 1;
     }
-    const std::string& nonce = challenge.value->nonce;
+    const std::string& nonce = ch.value->nonce;
 
     // 2. Platform evidence, bound to the challenge nonce so this bundle admits only
     //    this join. Absent evidence is a Tier-2 certificate, not a failure.
@@ -338,21 +493,22 @@ int run_onboard_server(ServerConfig& config) {
     in.signature = sign_b64(crypto, keys.priv, canonical_admission_request(in));
     if (!config.onboard_token.empty())
         in.enrollment_token = config.onboard_token;
-    auto rq = http_call(host, port, "POST", "/api/onboard/request",
-                        in.toJson().dump(), connect_ip);
-    if (!rq.connected || rq.status != 200) {
+    auto rq = post_json<AdmissionResponse>(
+        host, port, "/api/onboard/request", in.toJson().dump(), connect_ip,
+        [](const json& j, std::string& error) -> std::optional<AdmissionResponse> {
+            auto r = AdmissionResponse::fromJson(j);
+            if (!r) { error = r.error; return std::nullopt; }
+            return r.value;
+        });
+    if (rq.failure == HttpJsonFailure::not_connected ||
+        rq.failure == HttpJsonFailure::bad_status) {
         spdlog::error("Onboard: admission request rejected ({})", rq.body); return 1;
     }
-    auto response_json = json::parse(rq.body, nullptr, false);
-    auto response = response_json.is_discarded()
-        ? onboarding_json::DecodeResult<AdmissionResponse>{
-              std::nullopt, "/: invalid json"}
-        : AdmissionResponse::fromJson(response_json);
-    if (!response) {
-        spdlog::error("Onboard: invalid admission response ({})", response.error);
+    if (!rq.value) {
+        spdlog::error("Onboard: invalid admission response ({})", rq.decode_error);
         return 1;
     }
-    const std::string request_id = response.value->request_id;
+    const std::string request_id = rq.value->request_id;
 
     // Print our fingerprint for the admin's out-of-band comparison.
     std::printf("\nOnboarding request submitted.\n");
@@ -378,23 +534,24 @@ int run_onboard_server(ServerConfig& config) {
         poll.timestamp = pts;
         poll.signature = sign_b64(crypto, keys.priv,
             canonical_onboarding_status(kOnboardPollTag, request_id, pts));
-        auto pl = http_call(host, port, "POST", "/api/onboard/poll",
-                            poll.toJson().dump(), connect_ip);
-        if (pl.connected && pl.status == 200) {
-            auto poll_json = json::parse(pl.body, nullptr, false);
-            auto decoded = poll_json.is_discarded()
-                ? onboarding_json::DecodeResult<PollResponse>{
-                      std::nullopt, "/: invalid json"}
-                : poll_response_from_json(poll_json);
-            if (!decoded) {
-                spdlog::error("Onboard: invalid poll response ({})", decoded.error);
-                return 1;
-            }
-            if (auto* bundle = std::get_if<ApprovedOnboardingBundle>(&*decoded.value)) {
+        auto pl = post_json<PollResponse>(
+            host, port, "/api/onboard/poll", poll.toJson().dump(), connect_ip,
+            [](const json& j, std::string& error) -> std::optional<PollResponse> {
+                auto r = poll_response_from_json(j);
+                if (!r) { error = r.error; return std::nullopt; }
+                return r.value;
+            });
+        if (pl.failure == HttpJsonFailure::invalid_json ||
+            pl.failure == HttpJsonFailure::invalid_fields) {
+            spdlog::error("Onboard: invalid poll response ({})", pl.decode_error);
+            return 1;
+        }
+        if (pl.failure == HttpJsonFailure::none) {
+            if (auto* bundle = std::get_if<ApprovedOnboardingBundle>(&*pl.value)) {
                 approved = std::move(*bundle);
                 break;
             }
-            const auto& status = std::get<AdmissionStatusResponse>(*decoded.value);
+            const auto& status = std::get<AdmissionStatusResponse>(*pl.value);
             if (status.state == AdmissionState::Denied ||
                 status.state == AdmissionState::Expired) {
                 spdlog::error("Onboard: admission {} ({})",
@@ -447,11 +604,18 @@ int run_onboard_server(ServerConfig& config) {
     auto proven = host + ":" + std::to_string(approved->gossip_port);
     if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
         seeds.insert(seeds.begin(), proven);
-    if (auto err = install_onboarded_config(config.config_path, config.root_pubkey,
-                                            approved->genesis_pubkey, seeds);
-        !err.empty()) {
-        spdlog::error("Onboard: {}", err);
-        return 1;
+    // The config file is root-protected: merge the seeds read-only and report
+    // what the operator should apply instead of rewriting the file. A
+    // config-file condition never blocks the run; the ack still goes out.
+    std::vector<std::string> new_seeds;
+    bool genesis_mismatch = false;
+    plan_onboarded_seeds(config.config_path, approved->genesis_pubkey, seeds,
+                         new_seeds, genesis_mismatch);
+    if (genesis_mismatch) {
+        spdlog::warn("Onboard: the config at {} sets a genesis_pubkey that does not "
+                     "match the admitted mesh; correct it before start — the daemon "
+                     "will fail closed at startup against the wrong network",
+                     config.config_path);
     }
 
     // Align our hostname with the admitted server_id so DNS/NS records carry
@@ -475,8 +639,25 @@ int run_onboard_server(ServerConfig& config) {
     std::printf("  Onboarded as '%s'\n", server_id.c_str());
     std::printf("====================================================================\n");
     std::printf("Certificate installed: %s/identity/server_cert.json\n", config.data_root.c_str());
-    std::printf("Config updated:        %s (root_pubkey, genesis_pubkey + %zu seed peer(s))\n",
-                config.config_path.c_str(), seeds.size());
+    std::printf("Config file left untouched (root-protected trust anchors): %s\n",
+                config.config_path.c_str());
+    if (genesis_mismatch)
+        std::printf("WARNING: the config's genesis_pubkey does not match the admitted\n"
+                    "mesh. Correct it before start, or the daemon will fail closed at\n"
+                    "startup against the wrong network.\n");
+    std::printf("Approved anchors (verify they match your config):\n");
+    std::printf("  root_pubkey:    %s\n",
+                approved->root_pubkey.empty() ? config.root_pubkey.c_str()
+                                              : approved->root_pubkey.c_str());
+    std::printf("  genesis_pubkey: %s\n", approved->genesis_pubkey.c_str());
+    if (new_seeds.empty()) {
+        std::printf("No new seed peers to add.\n");
+    } else {
+        std::printf("Recommended seed_peers to add to %s (operator, as root):\n",
+                    config.config_path.c_str());
+        for (const auto& s : new_seeds)
+            std::printf("  - %s\n", s.c_str());
+    }
     std::printf("\nStart the server normally:\n");
     std::printf("  ./lemonade-nexus --data-root %s\n\n", config.data_root.c_str());
 

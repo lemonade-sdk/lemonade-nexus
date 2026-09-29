@@ -18,8 +18,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <cstring>
-
 namespace nexus::api {
 
 namespace {
@@ -45,7 +43,72 @@ nlohmann::json redact_node_for_caller(const tree::TreeNode& node,
     return j;
 }
 
+// Private EP FQDN registered at join (private.<node_id>.ep.<base_domain>).
+// Join and the delete cascade must construct this byte-identically, or the
+// cascade would remove a name the join never created.
+std::string client_ep_fqdn(const std::string& node_id, const std::string& base_domain) {
+    return "private." + node_id + ".ep." + base_domain;
+}
+
+// Strip the "ed25519:" identity prefix (when present) so bare base64 key
+// bytes can be compared.
+[[nodiscard]] std::string_view strip_ed25519_prefix(std::string_view key) {
+    constexpr std::string_view ed_prefix = "ed25519:";
+    return key.starts_with(ed_prefix) ? key.substr(ed_prefix.size()) : key;
+}
+
+// Apply an optional JSON field to `dst`, leaving it unchanged when the key
+// is absent. Mirrors the prior per-field body.contains/get chain.
+template <typename T>
+void apply_optional_field(const nlohmann::json& body, const char* key, T& dst) {
+    if (body.contains(key)) dst = body[key].get<T>();
+}
+
 } // namespace
+
+// Post-delete cascade shared by the direct-delete and delta-delete routes so
+// both stay behaviorally identical. Failures follow the direct route's
+// existing conventions: IPAM release results are ignored, and peer/DNS removal
+// is logged on success only.
+void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
+                                          const std::optional<tree::TreeNode>& doomed) {
+    if (!doomed) return;
+    // 1. Revoke the device's Ed25519 credential so a deleted device
+    //    cannot silently auto-re-register (node_id is key-deterministic).
+    //    Owner-protection: an owner's key is the mgmt_pubkey of their
+    //    customer group AND every sibling endpoint, so deleting ONE of
+    //    their own devices must NOT blocklist that shared key. Only revoke
+    //    a key that no surviving node still owns — i.e. a linked-device
+    //    key, which owns only the endpoint just deleted.
+    if (!doomed->mgmt_pubkey.empty() &&
+        !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
+        ctx_.auth.revoke_ed25519(
+            std::string(strip_ed25519_prefix(doomed->mgmt_pubkey)));
+    }
+    // 2. Release the node's IP allocations back to the pools.
+    (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
+    (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
+    (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
+    // 3. Remove the mesh peer using the join-time key conversion.
+    if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
+        // Same Ed25519->Curve25519 conversion the join route performs; the
+        // stored key must match the dataplane peer key byte-for-byte.
+        const auto peer_mesh_key = api::normalize_mesh_pubkey(doomed->mesh_pubkey);
+        if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
+            spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
+        }
+    }
+    // 4. Remove the private EP A record registered at join; otherwise the
+    //    stale record keeps serving a tunnel IP IPAM has already recycled
+    //    (it could resolve to a different, live node). Best-effort like the
+    //    other steps: absence is fine, a failure never aborts the cascade.
+    if (ctx_.dns) {
+        if (ctx_.dns->remove_record(client_ep_fqdn(node_id, ctx_.config.dns_base_domain), "A")) {
+            spdlog::info("[TreeApi] removed private EP DNS record for deleted node '{}'",
+                         node_id);
+        }
+    }
+}
 
 void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
     using nexus::auth::require_auth;
@@ -78,11 +141,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         // not an unverified body field. Bind it to body.pubkey (already verified
         // against the challenge signature by ctx_.auth.authenticate above).
         {
-            constexpr std::string_view ed_prefix = "ed25519:";
-            std::string_view claimed_b64 = client_pubkey;
-            if (claimed_b64.starts_with(ed_prefix)) {
-                claimed_b64.remove_prefix(ed_prefix.size());
-            }
+            const auto claimed_b64 = strip_ed25519_prefix(client_pubkey);
             bool matches = false;
             try {
                 matches = crypto::from_base64(claimed_b64) ==
@@ -350,7 +409,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
         std::string client_private_fqdn;
         if (ctx_.dns && !client_tunnel_ip_bare.empty()) {
-            client_private_fqdn = "private." + node_id + ".ep." + ctx_.config.dns_base_domain;
+            client_private_fqdn = client_ep_fqdn(node_id, ctx_.config.dns_base_domain);
             ctx_.dns->set_record(client_private_fqdn, "A", client_tunnel_ip_bare, 300);
             spdlog::info("[Join] registered DNS: {} -> {}", client_private_fqdn, client_tunnel_ip_bare);
         }
@@ -413,28 +472,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (!body_opt) return;
         auto& body = *body_opt;
 
-        // Legacy "wg_pubkey" is refused here with an explicit 400: the typed
-        // parse also rejects it (TreeDelta::from_json throws), and the manual
-        // fallback below would otherwise swallow that throw.
-        if (body.contains("node_data") && body["node_data"].is_object() &&
-            body["node_data"].contains("wg_pubkey")) {
-            error_response(res, "legacy 'wg_pubkey' label is not accepted; use 'mesh_pubkey'", 400);
-            return;
-        }
-
         tree::TreeDelta delta;
         try {
             delta = body.get<tree::TreeDelta>();
         } catch (...) {
-            delta.operation      = body.value("operation", "");
-            delta.target_node_id = body.value("target_node_id", "");
-            if (body.contains("node_data")) {
-                auto& nd = body["node_data"];
-                delta.node_data.id        = nd.value("id", "");
-                delta.node_data.parent_id = nd.value("parent_id", "");
-            }
-            delta.signer_pubkey = body.value("signer_pubkey", "");
-            delta.signature     = body.value("signature", "");
+            // Typed parse is the single source of truth for delta bodies;
+            // anything it rejects is rejected here (fail closed).
+            error_response(res, "invalid delta body", 400);
+            return;
         }
 
         // Two-plane agreement: the authenticated session identity must be the
@@ -451,7 +496,17 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
+        // Pre-delete snapshot so the post-delete cascade (credential revocation,
+        // IPAM release, mesh peer removal) has the node's identity and keys.
+        std::optional<tree::TreeNode> doomed =
+            (delta.operation == "delete_node" && !delta.target_node_id.empty())
+                ? ctx_.tree.get_node(delta.target_node_id)
+                : std::nullopt;
+
         bool ok = ctx_.tree.apply_delta(delta);
+        if (ok && doomed) {
+            cascade_node_cleanup(delta.target_node_id, doomed);
+        }
         network::DeltaResponse resp{.success = ok};
         if (!ok) resp.error = "delta rejected";
         nlohmann::json j = resp;
@@ -567,10 +622,10 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         // Apply partial updates to the existing node
         auto updated = *existing;
-        if (body.contains("hostname"))    updated.hostname    = body["hostname"].get<std::string>();
-        if (body.contains("tunnel_ip"))   updated.tunnel_ip   = body["tunnel_ip"].get<std::string>();
-        if (body.contains("private_subnet")) updated.private_subnet = body["private_subnet"].get<std::string>();
-        if (body.contains("shared_domain"))  updated.shared_domain  = body["shared_domain"].get<std::string>();
+        apply_optional_field(body, "hostname", updated.hostname);
+        apply_optional_field(body, "tunnel_ip", updated.tunnel_ip);
+        apply_optional_field(body, "private_subnet", updated.private_subnet);
+        apply_optional_field(body, "shared_domain", updated.shared_domain);
         if (body.contains("mesh_pubkey")) {
             // Same ownership rule as the join path: edit permission on this
             // node never extends to claiming a static another node holds or
@@ -583,11 +638,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
             updated.mesh_pubkey = claimed;
         }
-        if (body.contains("listen_endpoint")) updated.listen_endpoint = body["listen_endpoint"].get<std::string>();
-        if (body.contains("region"))      updated.region      = body["region"].get<std::string>();
-        if (body.contains("capacity_mbps")) updated.capacity_mbps = body["capacity_mbps"].get<uint32_t>();
-        if (body.contains("reputation_score")) updated.reputation_score = body["reputation_score"].get<float>();
-        if (body.contains("expires_at"))  updated.expires_at  = body["expires_at"].get<uint64_t>();
+        apply_optional_field(body, "listen_endpoint", updated.listen_endpoint);
+        apply_optional_field(body, "region", updated.region);
+        apply_optional_field(body, "capacity_mbps", updated.capacity_mbps);
+        apply_optional_field(body, "reputation_score", updated.reputation_score);
+        apply_optional_field(body, "expires_at", updated.expires_at);
 
         if (!ctx_.tree.update_node_direct(node_id, updated)) {
             error_response(res, "update failed", 500);
@@ -623,44 +678,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        if (doomed) {
-            // 1. Revoke the device's Ed25519 credential so a deleted device
-            //    cannot silently auto-re-register (node_id is key-deterministic).
-            //    Owner-protection: an owner's key is the mgmt_pubkey of their
-            //    customer group AND every sibling endpoint, so deleting ONE of
-            //    their own devices must NOT blocklist that shared key. Only revoke
-            //    a key that no surviving node still owns — i.e. a linked-device
-            //    key, which owns only the endpoint just deleted.
-            if (!doomed->mgmt_pubkey.empty() &&
-                !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
-                constexpr std::string_view ed_prefix = "ed25519:";
-                std::string_view mk = doomed->mgmt_pubkey;
-                if (mk.starts_with(ed_prefix)) mk.remove_prefix(ed_prefix.size());
-                ctx_.auth.revoke_ed25519(std::string(mk));
-            }
-            // 2. Release the node's IP allocations back to the pools.
-            (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
-            (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
-            (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
-            // 3. Remove the mesh peer using the join-time key conversion.
-            if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
-                std::string peer_mesh_key = doomed->mesh_pubkey;
-                constexpr std::string_view ed_prefix = "ed25519:";
-                if (peer_mesh_key.starts_with(ed_prefix)) {
-                    auto ed_bytes = crypto::from_base64(peer_mesh_key.substr(ed_prefix.size()));
-                    if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
-                        crypto::Ed25519PublicKey ed_pk{};
-                        std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
-                        auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
-                        peer_mesh_key = crypto::to_base64(
-                            std::span<const uint8_t>(x_pk.data(), x_pk.size()));
-                    }
-                }
-                if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
-                    spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
-                }
-            }
-        }
+        cascade_node_cleanup(node_id, doomed);
 
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);

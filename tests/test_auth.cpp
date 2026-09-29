@@ -405,6 +405,118 @@ TEST_F(AuthTest, AltBase64SessionDiesOnCanonicalRevoke) {
     EXPECT_FALSE(auth->validate_session_claims(login.session_token).has_value());
 }
 
+// Revoking must scrub the stale identity: the credential file entry and the
+// in-memory warm cache, while the blocklist stays authoritative.
+TEST_F(AuthTest, RevokeScrubsCredentialFileAndCache) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = canonical_b64(kp);
+
+    auto login = ed25519_login(*auth, *crypto, kp);
+    ASSERT_TRUE(login.authenticated);
+    auto user_id = login.user_id;
+
+    auto cred_path = temp_dir / "credentials" / (user_id + ".json");
+    auto revoked_path = temp_dir / "credentials" / "revoked.json";
+
+    nlohmann::json cred;
+    {
+        std::ifstream ifs(cred_path);
+        ASSERT_TRUE(static_cast<bool>(ifs));
+        ifs >> cred;
+    }
+    auto pubkeys_before = cred.value("ed25519_pubkeys", nlohmann::json::array());
+    ASSERT_EQ(pubkeys_before.size(), 1u);
+    EXPECT_EQ(pubkeys_before[0].value("pubkey", std::string{}), pk_b64);
+
+    ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
+
+    // The blocklist still lists the key (it stays authoritative).
+    nlohmann::json revoked;
+    {
+        std::ifstream ifs(revoked_path);
+        ASSERT_TRUE(static_cast<bool>(ifs));
+        ifs >> revoked;
+    }
+    EXPECT_TRUE(revoked.is_array());
+    bool in_blocklist = false;
+    for (const auto& e : revoked) {
+        if (e == pk_b64) in_blocklist = true;
+    }
+    EXPECT_TRUE(in_blocklist);
+
+    // The credential file no longer holds the revoked key.
+    nlohmann::json scrubbed;
+    {
+        std::ifstream ifs(cred_path);
+        ASSERT_TRUE(static_cast<bool>(ifs));
+        ifs >> scrubbed;
+    }
+    auto arr = scrubbed.value("ed25519_pubkeys", nlohmann::json::array());
+    EXPECT_EQ(arr.size(), 0u);
+}
+
+// After an un-revoke the key authenticates again, and the credential file is
+// rebuilt. If the in-memory pubkey→user map had not been erased on revoke,
+// re-login would hit the stale cache entry, skip auto-registration, and the
+// scrubbed credential file would still be empty — so this double-checks that
+// the cache was scrubbed too.
+TEST_F(AuthTest, UnrevokeRestoresAuthentication) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = canonical_b64(kp);
+
+    auto login = ed25519_login(*auth, *crypto, kp);
+    ASSERT_TRUE(login.authenticated);
+    auto user_id = login.user_id;
+
+    ASSERT_TRUE(auth->revoke_ed25519(pk_b64));
+    EXPECT_FALSE(ed25519_login(*auth, *crypto, kp).authenticated);
+
+    ASSERT_TRUE(auth->unrevoke_ed25519(pk_b64));
+
+    auto after = ed25519_login(*auth, *crypto, kp);
+    ASSERT_TRUE(after.authenticated);
+    EXPECT_EQ(after.user_id, user_id);
+
+    // The blocklist no longer lists the key.
+    nlohmann::json revoked;
+    {
+        std::ifstream ifs(temp_dir / "credentials" / "revoked.json");
+        ASSERT_TRUE(static_cast<bool>(ifs));
+        ifs >> revoked;
+    }
+    for (const auto& e : revoked) {
+        EXPECT_NE(e, pk_b64);
+    }
+
+    // Re-registration rewrote the credential file with the key.
+    nlohmann::json cred;
+    {
+        std::ifstream ifs(temp_dir / "credentials" / (user_id + ".json"));
+        ASSERT_TRUE(static_cast<bool>(ifs));
+        ifs >> cred;
+    }
+    bool restored = false;
+    for (const auto& e : cred.value("ed25519_pubkeys", nlohmann::json::array())) {
+        if (e.value("pubkey", std::string{}) == pk_b64) restored = true;
+    }
+    EXPECT_TRUE(restored);
+}
+
+// Un-revoking a key that was never revoked must fail.
+TEST_F(AuthTest, UnrevokeNeverRevokedFails) {
+    auto kp = crypto->ed25519_keygen();
+    auto pk_b64 = canonical_b64(kp);
+
+    EXPECT_FALSE(auth->unrevoke_ed25519(pk_b64));
+    EXPECT_FALSE(auth->unrevoke_ed25519(""));
+
+    // Revoking a different key does not make this one un-revocable-in-reverse.
+    auto kp2 = crypto->ed25519_keygen();
+    auto pk2 = canonical_b64(kp2);
+    ASSERT_TRUE(auth->revoke_ed25519(pk2));
+    EXPECT_FALSE(auth->unrevoke_ed25519(pk_b64));
+}
+
 // --- Service interface ---
 
 TEST_F(AuthTest, ServiceName) {

@@ -29,8 +29,8 @@ Base domain: `dns_base_domain` (default `lemonade-nexus.io`).
 ├── ns1..ns9.<base>                     bootstrap nameservers
 ├── <region>.seip.<base>                regional server list (discovery)
 │   ├── <id>.<region>.seip.<base>       per-server SEIP records
-│   ├── tier1.<region>.seip.<base>     onboarding / seed discovery
-│   └── tier2.<region>.seip.<base>     onboarding / seed discovery
+│   ├── tier1.<region>.seip.<base>     onboarding / seed discovery (A + TXT)
+│   └── tier2.<region>.seip.<base>     onboarding / seed discovery (A + TXT)
 └── <node_id>.ep.<base>                 client endpoints
 ```
 
@@ -78,13 +78,24 @@ current when the server's public IP changes.)
 ## Tier Records
 
 ```text
-tier1.<region>.seip.<domain>    A -> server(s) currently serving that tier
-tier2.<region>.seip.<domain>    A -> ...
+tier1.<region>.seip.<domain>    A   -> server(s) currently serving that tier
+tier2.<region>.seip.<domain>    A   -> ...
+tier1.<region>.seip.<domain>    TXT -> "v=sp1 host=<id1>.<region>.seip.<domain> host=<id2>..."
+tier2.<region>.seip.<domain>    TXT -> ...
 ```
 
+The `A` record aggregates the public IPs of the servers currently serving
+that tier; startup seed discovery (`dns_seed_discovery`) uses it to find
+gossip peers automatically. The `TXT` record lists each member's SEIP FQDN
+(`<id>.<region>.seip.<domain>`). A tier with no members returns NXDOMAIN for
+both types.
+
 The onboarding client uses these to discover a target when no
-`--onboard-server` FQDN is given, and startup seed discovery
-(`dns_seed_discovery`) uses them to find gossip peers automatically.
+`--onboard-server` FQDN is given. It reads the TXT record and probes the
+member FQDNs, not the tier name: the server's ACME certificate covers the
+member FQDN, so a probe of the tier FQDN would fail hostname verification.
+Onboarding is a per-region, single-server operation, so the TXT record lists
+members, not IPs.
 
 ## Client Discovery Flow
 
@@ -108,6 +119,25 @@ The onboarding client uses these to discover a target when no
 
 6. Region fallback
    - no servers in own region -> nearest regions by geographic distance
+```
+
+Onboarding discovery (no `--onboard-server` given) follows the same region
+resolution, then:
+
+```text
+1. Query the tier member list
+   - TXT tier1.<region>.seip.<base> -> "v=sp1 host=<id>.<region>.seip.<base> ..."
+   - NXDOMAIN or an empty member list falls back to tier2, then to the tier
+     FQDNs themselves
+
+2. Verified HTTPS probe of each member FQDN
+   - GET /api/onboard/info over TLS, certificate verified against the member
+     FQDN (never against a bare IP; --onboard-addr can still pin the
+     connect IP)
+   - the member's own A record supplies the IP
+
+3. First target that reports accepts_onboarding wins; the onboarding flow
+   (challenge, signed request, poll) continues against it
 ```
 
 ## Config TXT Format

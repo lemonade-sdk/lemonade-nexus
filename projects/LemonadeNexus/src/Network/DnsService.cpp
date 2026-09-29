@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Relay/GeoRegion.hpp>
 
 #include <spdlog/spdlog.h>
@@ -26,6 +27,57 @@ namespace nexus::network {
 
 using asio::ip::udp;
 
+namespace {
+
+/// ASCII-lowercase a string (same per-character std::tolower semantics the
+/// file used to apply inline).
+std::string to_lower(std::string_view in) {
+    std::string out(in);
+    std::transform(out.begin(), out.end(), out.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return out;
+}
+
+[[nodiscard]] bool ends_with(std::string_view s, std::string_view suffix) {
+    return s.size() >= suffix.size() &&
+           s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+[[nodiscard]] bool starts_with(std::string_view s, std::string_view prefix) {
+    return s.size() >= prefix.size() &&
+           s.compare(0, prefix.size(), prefix) == 0;
+}
+
+/// s with a trailing suffix removed; empty when s does not end with suffix.
+[[nodiscard]] std::string_view strip_suffix(std::string_view s, std::string_view suffix) {
+    return ends_with(s, suffix) ? std::string_view(s.data(), s.size() - suffix.size())
+                                : std::string_view{};
+}
+
+/// Unix time in seconds (zone record timestamps).
+[[nodiscard]] uint64_t now_seconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+/// RAII owner for a c-ares DNS record so the response builders cannot leak
+/// a created record on a failure path.
+class DnsRecordGuard {
+public:
+    explicit DnsRecordGuard(ares_dns_record_t* rec) : rec_(rec) {}
+    ~DnsRecordGuard() { if (rec_) ares_dns_record_destroy(rec_); }
+    DnsRecordGuard(const DnsRecordGuard&) = delete;
+    DnsRecordGuard& operator=(const DnsRecordGuard&) = delete;
+
+    ares_dns_record_t* get() const { return rec_; }
+
+private:
+    ares_dns_record_t* rec_;
+};
+
+}  // namespace
+
 DnsService::DnsService(asio::io_context& io,
                          uint16_t port,
                          tree::PermissionTreeService& tree,
@@ -37,6 +89,9 @@ DnsService::DnsService(asio::io_context& io,
     while (!base_domain_.empty() && base_domain_.front() == '.') {
         base_domain_.erase(base_domain_.begin());
     }
+    // base_domain_ is immutable after construction (no setter), so the
+    // lowercase copy can be cached for the lifetime of the service.
+    base_domain_lower_ = to_lower(base_domain_);
     soa_email_ = "admin." + base_domain_;
 }
 
@@ -303,28 +358,60 @@ void DnsService::start_accept() {
     });
 }
 
-void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
-                              const ResponseSink& send_response) {
-    if (bytes < kDnsMinMessageBytes) return; // Too short for DNS header
+namespace {
+
+/// The "<tierlabel>.<region>" prefix of a tier wildcard name
+/// ("tier<N>.<region>.seip.<base_domain>"), or empty when the name is not a
+/// well-formed tier query: the tier label must be "tier" plus one or more
+/// digits and the region must be a single DNS label. Shared by the tier A
+/// and tier TXT aggregation branches so both apply identical validation.
+std::string tier_wildcard_prefix(const std::string& query_lower,
+                                 const std::string& base_lower) {
+    const std::string seip_suffix = ".seip." + base_lower;
+    if (query_lower.size() <= seip_suffix.size() ||
+        !ends_with(query_lower, seip_suffix)) {
+        return {};
+    }
+    const std::string prefix = std::string(strip_suffix(query_lower, seip_suffix));
+    const auto dot = prefix.find('.');
+    if (dot == std::string::npos || dot <= 4 ||
+        prefix.find('.', dot + 1) != std::string::npos ||
+        prefix.rfind("tier", 0) != 0) {
+        return {};
+    }
+    for (std::size_t i = 4; i < dot; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(prefix[i]))) return {};
+    }
+    return prefix;
+}
+
+}  // namespace
+
+namespace {
+
+/// Parse a received DNS packet exactly once. Returns false — meaning: send no
+/// response — when the packet is too short, unparseable, is a response rather
+/// than a query, has no question, or has no qname (the same conditions
+/// handle_query used to check inline, in the same order).
+bool parse_dns_query(const uint8_t* data, std::size_t bytes, ParsedQuery& out) {
+    if (bytes < kDnsMinMessageBytes) return false; // Too short for DNS header
 
     // Parse the query using c-ares
     ares_dns_record_t* dnsrec = nullptr;
     ares_status_t status = ares_dns_parse(data, bytes, 0, &dnsrec);
     if (status != ARES_SUCCESS || !dnsrec) {
-        return;
+        return false;
     }
+    DnsRecordGuard guard(dnsrec);
 
     // Only handle standard queries
-    unsigned short flags = ares_dns_record_get_flags(dnsrec);
-    if (flags & ARES_FLAG_QR) {
-        ares_dns_record_destroy(dnsrec);
-        return; // Not a query
+    if (ares_dns_record_get_flags(dnsrec) & ARES_FLAG_QR) {
+        return false; // Not a query
     }
 
     // Get the first question
     if (ares_dns_record_query_cnt(dnsrec) == 0) {
-        ares_dns_record_destroy(dnsrec);
-        return;
+        return false;
     }
 
     const char* qname_ptr = nullptr;
@@ -333,207 +420,242 @@ void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
     ares_dns_record_query_get(dnsrec, 0, &qname_ptr, &qtype, &qclass);
 
     if (!qname_ptr) {
-        ares_dns_record_destroy(dnsrec);
-        return;
+        return false;
     }
 
-    std::string qname = qname_ptr;
-    ares_dns_record_destroy(dnsrec);
+    out.qname = qname_ptr;
 
     // Normalize query: lowercase + strip trailing dot
-    std::string query_lower = qname;
-    std::transform(query_lower.begin(), query_lower.end(), query_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    if (!query_lower.empty() && query_lower.back() == '.') {
-        query_lower.pop_back();
+    out.qname_lower = to_lower(qname_ptr);
+    if (!out.qname_lower.empty() && out.qname_lower.back() == '.') {
+        out.qname_lower.pop_back();
     }
 
-    std::string base_lower = base_domain_;
-    std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    out.qtype = qtype;
+    out.qclass = qclass;
+    out.id = ares_dns_record_get_id(dnsrec);
+    return true;
+}
 
-    // --- SOA queries ---
-    if (qtype == ARES_REC_TYPE_SOA && qclass == ARES_CLASS_IN) {
-        if (query_lower == base_lower) {
-            auto resp = build_soa_response(data, bytes, qname);
-            if (!resp.empty()) {
-                spdlog::debug("[{}] SOA {} -> serial {}", name(), qname, soa_serial_.load());
-                send_response(std::move(resp));
-                return;
-            }
-        }
-        send_response(build_nxdomain(data, bytes));
+}  // namespace
+
+void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
+                              const ResponseSink& send_response) {
+    ParsedQuery q;
+    if (!parse_dns_query(data, bytes, q)) return;
+
+    // Branch dispatch order is a wire contract — do not reorder. Each branch
+    // consumes its qtype/qclass combination and never falls through:
+    //   1. SOA (IN)   — apex SOA, else NXDOMAIN
+    //   2. NS  (IN)   — apex NS, else NXDOMAIN
+    //   3. TXT (IN)   — dynamic TXT → _config TXT → tier+region wildcard TXT
+    //                    → NXDOMAIN
+    //   4. A   (IN)   — zone apex → tier+region wildcard multi-A → region
+    //                    wildcard multi-A → dynamic A → tree resolve → NXDOMAIN
+    //   5. anything else → NXDOMAIN
+    if (q.qtype == ARES_REC_TYPE_SOA && q.qclass == ARES_CLASS_IN) {
+        answer_soa_query(q, send_response);
         return;
     }
 
-    // --- NS queries ---
-    if (qtype == ARES_REC_TYPE_NS && qclass == ARES_CLASS_IN) {
-        if (query_lower == base_lower) {
-            auto resp = build_ns_response(data, bytes, qname);
-            if (!resp.empty()) {
-                spdlog::debug("[{}] NS {} -> nameservers", name(), qname);
-                send_response(std::move(resp));
-                return;
-            }
-        }
-        send_response(build_nxdomain(data, bytes));
+    if (q.qtype == ARES_REC_TYPE_NS && q.qclass == ARES_CLASS_IN) {
+        answer_ns_query(q, send_response);
         return;
     }
 
-    // --- TXT queries ---
-    if (qtype == ARES_REC_TYPE_TXT && qclass == ARES_CLASS_IN) {
-        // 1. Check dynamic TXT records (ACME challenges, etc.)
-        auto dyn_txt = lookup_dynamic_txt(query_lower);
-        if (dyn_txt) {
-            spdlog::debug("[{}] TXT {} -> {} (dynamic)", name(), qname, *dyn_txt);
-            send_response(build_txt_response(data, bytes, qname, *dyn_txt, 60));
-            return;
-        }
-
-        // 2. Check _config. subdomain (per-server port config, gossip-synced)
-        std::string suffix = "." + base_lower;
-        if (query_lower.size() > suffix.size() &&
-            query_lower.compare(query_lower.size() - suffix.size(), suffix.size(), suffix) == 0) {
-            std::string prefix = query_lower.substr(0, query_lower.size() - suffix.size());
-            if (prefix.starts_with("_config.")) {
-                std::string hostname = prefix.substr(8); // strip "_config."
-                auto txt = resolve_config_txt(hostname);
-                if (txt) {
-                    spdlog::debug("[{}] TXT {} -> {}", name(), qname, *txt);
-                    send_response(build_txt_response(data, bytes, qname, *txt, 300));
-                    return;
-                }
-            }
-        }
-
-        spdlog::debug("[{}] TXT {} -> NXDOMAIN", name(), qname);
-        send_response(build_nxdomain(data, bytes));
+    if (q.qtype == ARES_REC_TYPE_TXT && q.qclass == ARES_CLASS_IN) {
+        answer_txt_query(q, send_response);
         return;
     }
 
-    // --- A record queries ---
-    if (qtype == ARES_REC_TYPE_A && qclass == ARES_CLASS_IN) {
-        // 0. Zone apex: return our own IP so getaddrinfo(base_domain) works
-        if (query_lower == base_lower && !our_ns_ip_.empty()) {
-            spdlog::debug("[{}] {} -> {} (zone apex)", name(), qname, our_ns_ip_);
-            send_response(build_response(data, bytes, qname, our_ns_ip_, 300));
-            return;
-        }
-
-        // 0b. Tier+region wildcard: tier<N>.<region>.seip.<base_domain> -> multi-A.
-        // Aggregates per-server records <id>.tier<N>.<region>.seip.<base_domain> so a
-        // bootstrapping node can resolve all servers of a given tier in a region.
-        // More specific than the plain region wildcard below, so checked first.
-        {
-            std::string seip_suffix = ".seip." + base_lower;
-            if (query_lower.size() > seip_suffix.size() &&
-                query_lower.compare(query_lower.size() - seip_suffix.size(),
-                                     seip_suffix.size(), seip_suffix) == 0) {
-                std::string prefix = query_lower.substr(
-                    0, query_lower.size() - seip_suffix.size());  // "tier<N>.<region>"
-                auto dot = prefix.find('.');
-                // Require exactly "<tierlabel>.<region>": one dot, region has no further
-                // dots, first label is "tier" + one-or-more digits.
-                bool is_tier_query =
-                    dot != std::string::npos &&
-                    dot > 4 &&  // "tier" + >=1 digit
-                    prefix.find('.', dot + 1) == std::string::npos &&
-                    prefix.rfind("tier", 0) == 0;
-                if (is_tier_query) {
-                    for (std::size_t i = 4; i < dot; ++i) {
-                        if (!std::isdigit(static_cast<unsigned char>(prefix[i]))) {
-                            is_tier_query = false;
-                            break;
-                        }
-                    }
-                }
-                if (is_tier_query) {
-                    std::string match_suffix = "." + query_lower;  // ".tier<N>.<region>.seip.<base>"
-                    std::set<std::string> ipset;
-                    {
-                        std::lock_guard<std::mutex> lock(zone_mutex_);
-                        for (const auto& [key, rec] : zone_records_) {
-                            if (key.starts_with("A:") &&
-                                key.size() > (2 + match_suffix.size()) &&
-                                key.compare(key.size() - match_suffix.size(),
-                                            match_suffix.size(), match_suffix) == 0) {
-                                ipset.insert(rec.value);
-                            }
-                        }
-                    }
-                    if (!ipset.empty()) {
-                        std::vector<std::string> ips(ipset.begin(), ipset.end());
-                        spdlog::debug("[{}] {} -> {} tier A records",
-                                       name(), qname, ips.size());
-                        send_response(build_multi_a_response(data, bytes, qname, ips, 300));
-                        return;
-                    }
-                    // No servers for this tier+region — fall through to NXDOMAIN.
-                }
-            }
-        }
-
-        // 1. SEIP region-wildcard: <region>.seip.<base_domain> -> multi-A response
-        {
-            std::string seip_suffix = ".seip." + base_lower;
-            if (query_lower.size() > seip_suffix.size() &&
-                query_lower.compare(query_lower.size() - seip_suffix.size(),
-                                     seip_suffix.size(), seip_suffix) == 0) {
-                std::string region_part = query_lower.substr(
-                    0, query_lower.size() - seip_suffix.size());
-                // Only match if region_part has no dots (i.e. it's just "<region>", not "<id>.<region>")
-                if (region_part.find('.') == std::string::npos) {
-                    // Collect all A records for servers in this region. This also picks up
-                    // per-server tier records (<id>.tier<N>.<region>.seip.<base>), so dedupe
-                    // by IP to avoid a server appearing twice (plain SEIP + tier record).
-                    std::string match_suffix = "." + region_part + ".seip." + base_lower;
-                    std::set<std::string> ipset;
-                    {
-                        std::lock_guard<std::mutex> lock(zone_mutex_);
-                        for (const auto& [key, rec] : zone_records_) {
-                            if (key.starts_with("A:") &&
-                                key.size() > (2 + match_suffix.size()) &&
-                                key.compare(key.size() - match_suffix.size(),
-                                            match_suffix.size(), match_suffix) == 0) {
-                                ipset.insert(rec.value);
-                            }
-                        }
-                    }
-                    if (!ipset.empty()) {
-                        std::vector<std::string> ips(ipset.begin(), ipset.end());
-                        spdlog::debug("[{}] {} -> {} SEIP A records (region {})",
-                                       name(), qname, ips.size(), region_part);
-                        send_response(build_multi_a_response(data, bytes, qname, ips, 300));
-                        return;
-                    }
-                    // No servers in this region — fall through to NXDOMAIN
-                }
-            }
-        }
-
-        // 2. Check dynamic A records (NS glue records, etc.)
-        auto dyn_a = lookup_dynamic_a(query_lower);
-        if (dyn_a) {
-            spdlog::debug("[{}] {} -> {} (dynamic)", name(), qname, *dyn_a);
-            send_response(build_response(data, bytes, qname, *dyn_a, 60));
-            return;
-        }
-
-        // 3. Tree-based resolution
-        auto record = do_resolve(qname);
-        if (record) {
-            spdlog::debug("[{}] {} -> {}", name(), qname, record->ipv4_address);
-            send_response(build_response(data, bytes, qname, record->ipv4_address, record->ttl));
-            return;
-        }
-
-        spdlog::debug("[{}] {} -> NXDOMAIN", name(), qname);
-        send_response(build_nxdomain(data, bytes));
+    if (q.qtype == ARES_REC_TYPE_A && q.qclass == ARES_CLASS_IN) {
+        answer_a_query(q, send_response);
         return;
     }
 
     // --- Unsupported query type ---
-    send_response(build_nxdomain(data, bytes));
+    send_response(build_nxdomain(q));
+}
+
+void DnsService::answer_soa_query(const ParsedQuery& q, const ResponseSink& send) {
+    if (q.qname_lower == base_domain_lower_) {
+        auto resp = build_soa_response(q);
+        if (!resp.empty()) {
+            spdlog::debug("[{}] SOA {} -> serial {}", name(), q.qname, soa_serial_.load());
+            send(std::move(resp));
+            return;
+        }
+    }
+    send(build_nxdomain(q));
+}
+
+void DnsService::answer_ns_query(const ParsedQuery& q, const ResponseSink& send) {
+    if (q.qname_lower == base_domain_lower_) {
+        auto resp = build_ns_response(q);
+        if (!resp.empty()) {
+            spdlog::debug("[{}] NS {} -> nameservers", name(), q.qname);
+            send(std::move(resp));
+            return;
+        }
+    }
+    send(build_nxdomain(q));
+}
+
+void DnsService::answer_txt_query(const ParsedQuery& q, const ResponseSink& send) {
+    // 1. Check dynamic TXT records (ACME challenges, etc.)
+    auto dyn_txt = lookup_dynamic_txt(q.qname_lower);
+    if (dyn_txt) {
+        spdlog::debug("[{}] TXT {} -> {} (dynamic)", name(), q.qname, *dyn_txt);
+        send(build_txt_response(q, *dyn_txt, 60));
+        return;
+    }
+
+    // 2. Check _config. subdomain (per-server port config, gossip-synced)
+    const std::string suffix = "." + base_domain_lower_;
+    if (q.qname_lower.size() > suffix.size() &&
+        ends_with(q.qname_lower, suffix)) {
+        std::string prefix = std::string(strip_suffix(q.qname_lower, suffix));
+        if (starts_with(prefix, "_config.")) {
+            std::string hostname = prefix.substr(8); // strip "_config."
+            auto txt = resolve_config_txt(hostname);
+            if (txt) {
+                spdlog::debug("[{}] TXT {} -> {}", name(), q.qname, *txt);
+                send(build_txt_response(q, *txt, 300));
+                return;
+            }
+        }
+    }
+
+    // 3. Tier+region wildcard TXT: tier<N>.<region>.seip.<base_domain> ->
+    // "v=sp1 host=<id>.<region>.seip.<base_domain> ..." listing every
+    // member's SEIP FQDN. Members are the servers that published
+    // per-server tier A records (<id>.tier<N>.<region>.seip.<base>);
+    // each member FQDN is the record key with the tier label stripped.
+    // Onboarding probes those FQDNs because the ACME certificate covers
+    // them — the tier name is never covered, so probing it would fail
+    // hostname verification.
+    if (auto prefix = tier_wildcard_prefix(q.qname_lower, base_domain_lower_);
+        !prefix.empty()) {
+        const std::string match_suffix =
+            "." + prefix + ".seip." + base_domain_lower_;  // ".tier<N>.<region>.seip.<base>"
+        // ".<region>.seip.<base>" — everything after "<tierlabel>.". The tier
+        // label ends at prefix.find('.') (the dot before the region label),
+        // so skip 1 (leading dot) + label length = dot + 1 characters.
+        const std::string fqdn_suffix = match_suffix.substr(prefix.find('.') + 1);
+        std::set<std::string> members;
+        for (const auto& id : scan_a_prefixes(match_suffix)) {
+            members.insert(id + fqdn_suffix);
+        }
+        if (!members.empty()) {
+            std::string txt = "v=sp1";
+            for (const auto& member : members) txt += " host=" + member;
+            spdlog::debug("[{}] TXT {} -> {} tier member(s)",
+                           name(), q.qname, members.size());
+            send(build_txt_response(q, txt, 300));
+            return;
+        }
+        // No servers for this tier+region — fall through to NXDOMAIN.
+    }
+
+    spdlog::debug("[{}] TXT {} -> NXDOMAIN", name(), q.qname);
+    send(build_nxdomain(q));
+}
+
+void DnsService::answer_a_query(const ParsedQuery& q, const ResponseSink& send) {
+    // 0. Zone apex: return our own IP so getaddrinfo(base_domain) works
+    if (q.qname_lower == base_domain_lower_ && !our_ns_ip_.empty()) {
+        spdlog::debug("[{}] {} -> {} (zone apex)", name(), q.qname, our_ns_ip_);
+        send(build_response(q, our_ns_ip_, 300));
+        return;
+    }
+
+    // 0b. Tier+region wildcard: tier<N>.<region>.seip.<base_domain> -> multi-A.
+    // Aggregates per-server records <id>.tier<N>.<region>.seip.<base_domain> so a
+    // bootstrapping node can resolve all servers of a given tier in a region.
+    // More specific than the plain region wildcard below, so checked first.
+    if (auto prefix = tier_wildcard_prefix(q.qname_lower, base_domain_lower_);
+        !prefix.empty()) {
+        std::string match_suffix = "." + q.qname_lower;  // ".tier<N>.<region>.seip.<base>"
+        std::set<std::string> ipset = scan_a_values(match_suffix);
+        if (!ipset.empty()) {
+            std::vector<std::string> ips(ipset.begin(), ipset.end());
+            spdlog::debug("[{}] {} -> {} tier A records",
+                           name(), q.qname, ips.size());
+            send(build_multi_a_response(q, ips, 300));
+            return;
+        }
+        // No servers for this tier+region — fall through to NXDOMAIN.
+    }
+
+    // 1. SEIP region-wildcard: <region>.seip.<base_domain> -> multi-A response
+    {
+        std::string seip_suffix = ".seip." + base_domain_lower_;
+        if (q.qname_lower.size() > seip_suffix.size() &&
+            ends_with(q.qname_lower, seip_suffix)) {
+            std::string region_part = std::string(strip_suffix(q.qname_lower, seip_suffix));
+            // Only match if region_part has no dots (i.e. it's just "<region>", not "<id>.<region>")
+            if (region_part.find('.') == std::string::npos) {
+                // Collect all A records for servers in this region. This also picks up
+                // per-server tier records (<id>.tier<N>.<region>.seip.<base>), so dedupe
+                // by IP to avoid a server appearing twice (plain SEIP + tier record).
+                std::string match_suffix = "." + region_part + ".seip." + base_domain_lower_;
+                std::set<std::string> ipset = scan_a_values(match_suffix);
+                if (!ipset.empty()) {
+                    std::vector<std::string> ips(ipset.begin(), ipset.end());
+                    spdlog::debug("[{}] {} -> {} SEIP A records (region {})",
+                                   name(), q.qname, ips.size(), region_part);
+                    send(build_multi_a_response(q, ips, 300));
+                    return;
+                }
+                // No servers in this region — fall through to NXDOMAIN
+            }
+        }
+    }
+
+    // 2. Check dynamic A records (NS glue records, etc.)
+    auto dyn_a = lookup_dynamic_a(q.qname_lower);
+    if (dyn_a) {
+        spdlog::debug("[{}] {} -> {} (dynamic)", name(), q.qname, *dyn_a);
+        send(build_response(q, *dyn_a, 60));
+        return;
+    }
+
+    // 3. Tree-based resolution
+    auto record = do_resolve(q.qname);
+    if (record) {
+        spdlog::debug("[{}] {} -> {}", name(), q.qname, record->ipv4_address);
+        send(build_response(q, record->ipv4_address, record->ttl));
+        return;
+    }
+
+    spdlog::debug("[{}] {} -> NXDOMAIN", name(), q.qname);
+    send(build_nxdomain(q));
+}
+
+std::set<std::string> DnsService::scan_a_values(std::string_view suffix) const {
+    std::set<std::string> values;
+    std::lock_guard<std::mutex> lock(zone_mutex_);
+    for (const auto& [key, rec] : zone_records_) {
+        if (!starts_with(key, "A:") || key.size() <= 2 + suffix.size() ||
+            !ends_with(key, suffix)) {
+            continue;
+        }
+        values.insert(rec.value);
+    }
+    return values;
+}
+
+std::set<std::string> DnsService::scan_a_prefixes(std::string_view suffix) const {
+    std::set<std::string> prefixes;
+    std::lock_guard<std::mutex> lock(zone_mutex_);
+    for (const auto& [key, rec] : zone_records_) {
+        if (!starts_with(key, "A:") || key.size() <= 2 + suffix.size() ||
+            !ends_with(key, suffix)) {
+            continue;
+        }
+        prefixes.insert(key.substr(2, key.size() - (2 + suffix.size())));
+    }
+    return prefixes;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,40 +664,29 @@ void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
 
 std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
     // Lowercase the input
-    std::string query = fqdn;
-    std::transform(query.begin(), query.end(), query.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string query = to_lower(fqdn);
 
     // Strip trailing dot
     if (!query.empty() && query.back() == '.') {
         query.pop_back();
     }
 
-    // Lowercase the base domain for comparison
-    std::string base = base_domain_;
-    std::transform(base.begin(), base.end(), base.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-
     // Check if query ends with .<base_domain>
-    std::string suffix = "." + base;
-    if (query.size() <= suffix.size() ||
-        query.compare(query.size() - suffix.size(), suffix.size(), suffix) != 0) {
+    std::string suffix = "." + base_domain_lower_;
+    if (query.size() <= suffix.size() || !ends_with(query, suffix)) {
         return std::nullopt; // Not in our zone
     }
 
     // Strip the base domain suffix
     // e.g. "my-laptop.ep.lemonade-nexus.io" -> "my-laptop.ep"
-    std::string prefix = query.substr(0, query.size() - suffix.size());
+    std::string prefix = std::string(strip_suffix(query, suffix));
 
     // Check for SEIP subdomain: <id>.<region>.seip
     // This handles: server1.us-west.seip.lemonade-nexus.io -> specific server A record
     {
         const std::string seip_tag = ".seip";
-        if (prefix.size() > seip_tag.size() &&
-            prefix.compare(prefix.size() - seip_tag.size(), seip_tag.size(), seip_tag) == 0) {
-            // prefix = "<id>.<region>.seip" or "<region>.seip"
-            std::string seip_prefix = prefix.substr(0, prefix.size() - seip_tag.size());
-            // seip_prefix is now "<id>.<region>" or "<region>"
+        if (prefix.size() > seip_tag.size() && ends_with(prefix, seip_tag)) {
+            // prefix is "<id>.<region>.seip" or "<region>.seip"
 
             // Look up the specific dynamic A record
             std::string a_fqdn = query; // full fqdn
@@ -596,9 +707,8 @@ std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
     //               relay1.relays.lemonade-nexus.io
     {
         const std::string relays_tag = ".relays";
-        if (prefix.size() > relays_tag.size() &&
-            prefix.compare(prefix.size() - relays_tag.size(), relays_tag.size(), relays_tag) == 0) {
-            std::string relay_prefix = prefix.substr(0, prefix.size() - relays_tag.size());
+        if (prefix.size() > relays_tag.size() && ends_with(prefix, relays_tag)) {
+            std::string relay_prefix = std::string(strip_suffix(prefix, relays_tag));
             auto result = resolve_relay_subdomain(relay_prefix);
             if (result) {
                 result->name = fqdn;
@@ -635,8 +745,7 @@ std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
         hostname = parts[0];
     }
 
-    std::transform(hostname.begin(), hostname.end(), hostname.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    hostname = to_lower(hostname);
 
     // Search types in priority order
     auto search_types = std::vector<tree::NodeType>{
@@ -653,10 +762,7 @@ std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
     for (auto node_type : search_types) {
         auto nodes = tree_.get_nodes_by_type(node_type);
         for (const auto& node : nodes) {
-            std::string node_hostname = node.hostname;
-            std::transform(node_hostname.begin(), node_hostname.end(),
-                           node_hostname.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
+            std::string node_hostname = to_lower(node.hostname);
 
             if (node_hostname == hostname && !node.tunnel_ip.empty()) {
                 std::string ip = strip_cidr(node.tunnel_ip);
@@ -711,28 +817,20 @@ std::optional<DnsRecord> DnsService::resolve_relay_subdomain(
         hostname = parts[0];
     }
 
-    std::transform(hostname.begin(), hostname.end(), hostname.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::transform(region_filter.begin(), region_filter.end(), region_filter.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    hostname = to_lower(hostname);
+    region_filter = to_lower(region_filter);
 
     // Search only relay nodes
     auto nodes = tree_.get_nodes_by_type(tree::NodeType::Relay);
     for (const auto& node : nodes) {
-        std::string node_hostname = node.hostname;
-        std::transform(node_hostname.begin(), node_hostname.end(),
-                       node_hostname.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+        std::string node_hostname = to_lower(node.hostname);
 
         if (node_hostname != hostname) continue;
         if (node.tunnel_ip.empty()) continue;
 
         // If region filter is specified, check the node's region
         if (!region_filter.empty()) {
-            std::string node_region = node.region;
-            std::transform(node_region.begin(), node_region.end(),
-                           node_region.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
+            std::string node_region = to_lower(node.region);
             if (node_region != region_filter) continue;
         }
 
@@ -775,19 +873,10 @@ void DnsService::publish_port_config(const std::string& server_id, const std::st
     if (!has_port_config_ || server_id.empty()) return;
 
     std::string fqdn = "_config." + server_id + "." + base_domain_;
-    std::string txt = "v=sp1"
-                      " http=" + std::to_string(port_config_.http_port) +
-                      " udp=" + std::to_string(port_config_.udp_port) +
-                      " gossip=" + std::to_string(port_config_.gossip_port) +
-                      " stun=" + std::to_string(port_config_.stun_port) +
-                      " relay=" + std::to_string(port_config_.relay_port) +
-                      " dns=" + std::to_string(port_config_.public_dns_port) +
-                      " private_http=" + std::to_string(port_config_.private_http_port) +
-                      " region=" + port_config_.region +
-                      " load=" + std::to_string(port_config_.connected_clients);
-    if (!server_fqdn.empty()) {
-        txt += " host=" + server_fqdn;
-    }
+    // "v=sp1" TXT body is shared with build_port_config_txt(); an empty
+    // server_fqdn omits the trailing " host=..." field.
+    std::string txt = build_port_config_txt(port_config_.region, server_fqdn,
+                                            port_config_.connected_clients);
 
     // Publish as a dynamic TXT record — gossip callback broadcasts to peers
     set_record(fqdn, "TXT", txt, 300);
@@ -800,19 +889,18 @@ std::optional<std::string> DnsService::resolve_config_txt(
     // Check for SEIP _config queries: <id>.<region>.seip
     // These are stored as dynamic TXT records, not in the permission tree.
     {
-        std::string host_lower_check = hostname;
-        std::transform(host_lower_check.begin(), host_lower_check.end(),
-                       host_lower_check.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
+        std::string host_lower_check = to_lower(hostname);
 
         // If the hostname ends with ".seip", look up the dynamic TXT record
         const std::string seip_tag = ".seip";
         if (host_lower_check.size() > seip_tag.size() &&
-            host_lower_check.compare(host_lower_check.size() - seip_tag.size(),
-                                      seip_tag.size(), seip_tag) == 0) {
-            std::string txt_fqdn = "_config." + host_lower_check + "." + base_domain_;
-            std::transform(txt_fqdn.begin(), txt_fqdn.end(), txt_fqdn.begin(),
-                [](unsigned char c) { return std::tolower(c); });
+            ends_with(host_lower_check, seip_tag)) {
+            // "_config.<id>.<region>.seip.<base>": host_lower_check is one
+            // opaque "<id>.<region>.seip" string that cannot be split into
+            // (id, region) without assuming a single-label id, so the
+            // "_config." + hostname + "." + base concatenation is kept.
+            std::string txt_fqdn =
+                to_lower("_config." + host_lower_check + "." + base_domain_);
             return lookup_dynamic_txt(txt_fqdn);
         }
     }
@@ -820,9 +908,7 @@ std::optional<std::string> DnsService::resolve_config_txt(
     if (!has_port_config_) return std::nullopt;
 
     // Verify the hostname exists in the tree (any node type)
-    std::string host_lower = hostname;
-    std::transform(host_lower.begin(), host_lower.end(), host_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string host_lower = to_lower(hostname);
 
     // Check for a type qualifier (e.g. config_.my-laptop.ep)
     std::vector<std::string> parts;
@@ -866,23 +952,12 @@ std::optional<std::string> DnsService::resolve_config_txt(
     for (auto node_type : search_types) {
         auto nodes = tree_.get_nodes_by_type(node_type);
         for (const auto& node : nodes) {
-            std::string node_hostname = node.hostname;
-            std::transform(node_hostname.begin(), node_hostname.end(),
-                           node_hostname.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
+            std::string node_hostname = to_lower(node.hostname);
 
             if (node_hostname == search_hostname && !node.tunnel_ip.empty()) {
                 // Build TXT record with all port info for peer discovery
-                return "v=sp1"
-                       " http=" + std::to_string(port_config_.http_port) +
-                       " udp=" + std::to_string(port_config_.udp_port) +
-                       " gossip=" + std::to_string(port_config_.gossip_port) +
-                       " stun=" + std::to_string(port_config_.stun_port) +
-                       " relay=" + std::to_string(port_config_.relay_port) +
-                       " dns=" + std::to_string(port_config_.public_dns_port) +
-                       " private_http=" + std::to_string(port_config_.private_http_port) +
-                       " region=" + port_config_.region +
-                       " load=" + std::to_string(port_config_.connected_clients);
+                return build_port_config_txt(port_config_.region, "",
+                                             port_config_.connected_clients);
             }
         }
     }
@@ -895,38 +970,30 @@ std::optional<std::string> DnsService::resolve_config_txt(
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> DnsService::build_response(
-    const unsigned char* query_data, std::size_t query_len,
-    const std::string& qname, const std::string& ipv4_addr, uint32_t ttl) {
+    const ParsedQuery& q, const std::string& ipv4_addr, uint32_t ttl) {
 
     // Parse the IPv4 address
     struct in_addr addr{};
     if (inet_pton(AF_INET, ipv4_addr.c_str(), &addr) != 1) {
-        return build_nxdomain(query_data, query_len);
+        return build_nxdomain(q);
     }
-
-    // Parse original query to extract the ID
-    ares_dns_record_t* query_rec = nullptr;
-    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
-        return {};
-    }
-    unsigned short id = ares_dns_record_get_id(query_rec);
-    ares_dns_record_destroy(query_rec);
 
     // Create response record
     ares_dns_record_t* response = nullptr;
     unsigned short flags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t status = ares_dns_record_create(
-        &response, id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
+        &response, q.id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
     if (status != ARES_SUCCESS || !response) return {};
+    DnsRecordGuard response_guard(response);
 
     // Add the question section
-    ares_dns_record_query_add(response, qname.c_str(),
+    ares_dns_record_query_add(response, q.qname.c_str(),
                                ARES_REC_TYPE_A, ARES_CLASS_IN);
 
     // Add the answer A record
     ares_dns_rr_t* rr = nullptr;
     status = ares_dns_record_rr_add(&rr, response, ARES_SECTION_ANSWER,
-                                     qname.c_str(), ARES_REC_TYPE_A,
+                                     q.qname.c_str(), ARES_REC_TYPE_A,
                                      ARES_CLASS_IN, ttl);
     if (status == ARES_SUCCESS && rr) {
         ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &addr);
@@ -936,7 +1003,6 @@ std::vector<uint8_t> DnsService::build_response(
     unsigned char* buf = nullptr;
     size_t buf_len = 0;
     status = ares_dns_write(response, &buf, &buf_len);
-    ares_dns_record_destroy(response);
 
     if (status != ARES_SUCCESS || !buf) return {};
 
@@ -946,32 +1012,24 @@ std::vector<uint8_t> DnsService::build_response(
 }
 
 std::vector<uint8_t> DnsService::build_txt_response(
-    const unsigned char* query_data, std::size_t query_len,
-    const std::string& qname, const std::string& txt_data, uint32_t ttl) {
-
-    // Parse original query to extract the ID
-    ares_dns_record_t* query_rec = nullptr;
-    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
-        return {};
-    }
-    unsigned short id = ares_dns_record_get_id(query_rec);
-    ares_dns_record_destroy(query_rec);
+    const ParsedQuery& q, const std::string& txt_data, uint32_t ttl) {
 
     // Create response record
     ares_dns_record_t* response = nullptr;
     unsigned short flags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t status = ares_dns_record_create(
-        &response, id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
+        &response, q.id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
     if (status != ARES_SUCCESS || !response) return {};
+    DnsRecordGuard response_guard(response);
 
     // Add the question section (echo back TXT type)
-    ares_dns_record_query_add(response, qname.c_str(),
+    ares_dns_record_query_add(response, q.qname.c_str(),
                                ARES_REC_TYPE_TXT, ARES_CLASS_IN);
 
     // Add the answer TXT record
     ares_dns_rr_t* rr = nullptr;
     status = ares_dns_record_rr_add(&rr, response, ARES_SECTION_ANSWER,
-                                     qname.c_str(), ARES_REC_TYPE_TXT,
+                                     q.qname.c_str(), ARES_REC_TYPE_TXT,
                                      ARES_CLASS_IN, ttl);
     if (status == ARES_SUCCESS && rr) {
         ares_dns_rr_add_abin(rr, ARES_RR_TXT_DATA,
@@ -983,7 +1041,6 @@ std::vector<uint8_t> DnsService::build_txt_response(
     unsigned char* buf = nullptr;
     size_t buf_len = 0;
     status = ares_dns_write(response, &buf, &buf_len);
-    ares_dns_record_destroy(response);
 
     if (status != ARES_SUCCESS || !buf) return {};
 
@@ -992,45 +1049,25 @@ std::vector<uint8_t> DnsService::build_txt_response(
     return result;
 }
 
-std::vector<uint8_t> DnsService::build_nxdomain(
-    const unsigned char* query_data, std::size_t query_len) {
-
-    // Parse original query
-    ares_dns_record_t* query_rec = nullptr;
-    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
-        return {};
-    }
-
-    unsigned short id = ares_dns_record_get_id(query_rec);
-
-    // Get original question info
-    const char* qname = nullptr;
-    ares_dns_rec_type_t qtype = ARES_REC_TYPE_A;
-    ares_dns_class_t qclass = ARES_CLASS_IN;
-    if (ares_dns_record_query_cnt(query_rec) > 0) {
-        ares_dns_record_query_get(query_rec, 0, &qname, &qtype, &qclass);
-    }
-
-    std::string qname_str = qname ? qname : "";
-    ares_dns_record_destroy(query_rec);
+std::vector<uint8_t> DnsService::build_nxdomain(const ParsedQuery& q) {
 
     // Create NXDOMAIN response
     ares_dns_record_t* response = nullptr;
     unsigned short flags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t status = ares_dns_record_create(
-        &response, id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NXDOMAIN);
+        &response, q.id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NXDOMAIN);
     if (status != ARES_SUCCESS || !response) return {};
+    DnsRecordGuard response_guard(response);
 
     // Echo the question
-    if (!qname_str.empty()) {
-        ares_dns_record_query_add(response, qname_str.c_str(), qtype, qclass);
+    if (!q.qname.empty()) {
+        ares_dns_record_query_add(response, q.qname.c_str(), q.qtype, q.qclass);
     }
 
     // Serialize
     unsigned char* buf = nullptr;
     size_t buf_len = 0;
     status = ares_dns_write(response, &buf, &buf_len);
-    ares_dns_record_destroy(response);
 
     if (status != ARES_SUCCESS || !buf) return {};
 
@@ -1055,14 +1092,10 @@ std::string DnsService::strip_cidr(const std::string& addr) {
 
 bool DnsService::set_record(const std::string& fqdn, const std::string& record_type,
                              const std::string& value, uint32_t ttl) {
-    std::string fqdn_lower = fqdn;
-    std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string fqdn_lower = to_lower(fqdn);
 
     std::string key = record_type + ":" + fqdn_lower;
-    auto now = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+    auto now = now_seconds();
 
     DnsZoneRecord rec;
     rec.fqdn = fqdn_lower;
@@ -1090,9 +1123,7 @@ bool DnsService::set_record(const std::string& fqdn, const std::string& record_t
 }
 
 bool DnsService::remove_record(const std::string& fqdn, const std::string& record_type) {
-    std::string fqdn_lower = fqdn;
-    std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string fqdn_lower = to_lower(fqdn);
 
     std::string key = record_type + ":" + fqdn_lower;
     DnsZoneRecord removed;
@@ -1138,9 +1169,7 @@ bool DnsService::apply_remote_delta(const std::string& delta_id,
         }
     }
 
-    std::string fqdn_lower = record.fqdn;
-    std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string fqdn_lower = to_lower(record.fqdn);
     std::string key = record.record_type + ":" + fqdn_lower;
 
     if (operation == "set") {
@@ -1195,9 +1224,7 @@ void DnsService::add_nameserver(const std::string& hostname, const std::string& 
     rec.record_type = "A";
     rec.value = ip;
     rec.ttl = 3600;
-    rec.timestamp = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+    rec.timestamp = now_seconds();
     zone_records_["A:" + hostname] = rec;
 
     spdlog::info("[{}] added nameserver {} -> {}", name(), hostname, ip);
@@ -1275,9 +1302,7 @@ std::optional<std::string> DnsService::lookup_dynamic_a(const std::string& fqdn)
 // NS response building
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> DnsService::build_ns_response(
-    const unsigned char* query_data, std::size_t query_len,
-    const std::string& qname) {
+std::vector<uint8_t> DnsService::build_ns_response(const ParsedQuery& q) {
 
     std::lock_guard<std::mutex> lock(zone_mutex_);
 
@@ -1285,29 +1310,22 @@ std::vector<uint8_t> DnsService::build_ns_response(
         return {}; // No NS records to serve
     }
 
-    // Parse query ID
-    ares_dns_record_t* query_rec = nullptr;
-    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
-        return {};
-    }
-    unsigned short id = ares_dns_record_get_id(query_rec);
-    ares_dns_record_destroy(query_rec);
-
     // Create response
     ares_dns_record_t* response = nullptr;
     unsigned short rflags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t st = ares_dns_record_create(
-        &response, id, rflags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
+        &response, q.id, rflags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
     if (st != ARES_SUCCESS || !response) return {};
+    DnsRecordGuard response_guard(response);
 
     // Echo the question
-    ares_dns_record_query_add(response, qname.c_str(), ARES_REC_TYPE_NS, ARES_CLASS_IN);
+    ares_dns_record_query_add(response, q.qname.c_str(), ARES_REC_TYPE_NS, ARES_CLASS_IN);
 
     // Add NS records in answer section
     for (const auto& ns : nameservers_) {
         ares_dns_rr_t* rr = nullptr;
         st = ares_dns_record_rr_add(&rr, response, ARES_SECTION_ANSWER,
-                                     qname.c_str(), ARES_REC_TYPE_NS,
+                                     q.qname.c_str(), ARES_REC_TYPE_NS,
                                      ARES_CLASS_IN, 3600);
         if (st == ARES_SUCCESS && rr) {
             ares_dns_rr_set_str(rr, ARES_RR_NS_NSDNAME, ns.hostname.c_str());
@@ -1333,7 +1351,6 @@ std::vector<uint8_t> DnsService::build_ns_response(
     unsigned char* buf = nullptr;
     size_t buf_len = 0;
     st = ares_dns_write(response, &buf, &buf_len);
-    ares_dns_record_destroy(response);
 
     if (st != ARES_SUCCESS || !buf) return {};
 
@@ -1346,18 +1363,7 @@ std::vector<uint8_t> DnsService::build_ns_response(
 // SOA response building
 // ---------------------------------------------------------------------------
 
-std::vector<uint8_t> DnsService::build_soa_response(
-    const unsigned char* query_data, std::size_t query_len,
-    const std::string& qname) {
-
-    // Parse query ID
-    ares_dns_record_t* query_rec = nullptr;
-    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
-        return {};
-    }
-    unsigned short id = ares_dns_record_get_id(query_rec);
-    ares_dns_record_destroy(query_rec);
-
+std::vector<uint8_t> DnsService::build_soa_response(const ParsedQuery& q) {
     // Determine MNAME (primary NS)
     std::string mname;
     {
@@ -1375,16 +1381,17 @@ std::vector<uint8_t> DnsService::build_soa_response(
     ares_dns_record_t* response = nullptr;
     unsigned short rflags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t st = ares_dns_record_create(
-        &response, id, rflags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
+        &response, q.id, rflags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
     if (st != ARES_SUCCESS || !response) return {};
+    DnsRecordGuard response_guard(response);
 
     // Echo the question
-    ares_dns_record_query_add(response, qname.c_str(), ARES_REC_TYPE_SOA, ARES_CLASS_IN);
+    ares_dns_record_query_add(response, q.qname.c_str(), ARES_REC_TYPE_SOA, ARES_CLASS_IN);
 
     // Add SOA record
     ares_dns_rr_t* rr = nullptr;
     st = ares_dns_record_rr_add(&rr, response, ARES_SECTION_ANSWER,
-                                 qname.c_str(), ARES_REC_TYPE_SOA,
+                                 q.qname.c_str(), ARES_REC_TYPE_SOA,
                                  ARES_CLASS_IN, 3600);
     if (st == ARES_SUCCESS && rr) {
         ares_dns_rr_set_str(rr, ARES_RR_SOA_MNAME, mname.c_str());
@@ -1400,7 +1407,6 @@ std::vector<uint8_t> DnsService::build_soa_response(
     unsigned char* buf = nullptr;
     size_t buf_len = 0;
     st = ares_dns_write(response, &buf, &buf_len);
-    ares_dns_record_destroy(response);
 
     if (st != ARES_SUCCESS || !buf) return {};
 
@@ -1427,37 +1433,22 @@ void DnsService::publish_seip_records(const std::string& server_id,
     port_config_.region = region;
 
     // Normalize components
-    std::string id_lower = server_id;
-    std::transform(id_lower.begin(), id_lower.end(), id_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::string region_lower = region;
-    std::transform(region_lower.begin(), region_lower.end(), region_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::string base_lower = base_domain_;
-    std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string id_lower = to_lower(server_id);
+    std::string region_lower = to_lower(region);
 
     // 1. A record: <server_id>.<region>.seip.<base_domain> -> public_ip
-    std::string a_fqdn = id_lower + "." + region_lower + ".seip." + base_lower;
-    set_record(a_fqdn, "A", public_ip, 300);
+    const std::string server_fqdn =
+        seip::seipFqdn(id_lower, region_lower, base_domain_lower_);
+    set_record(server_fqdn, "A", public_ip, 300);
 
     // 2. _config TXT: _config.<server_id>.<region>.seip.<base_domain> -> full port config
-    std::string server_fqdn = id_lower + "." + region_lower + ".seip." + base_lower;
     seip_server_fqdn_ = server_fqdn;
 
-    std::string txt = "v=sp1"
-                      " http=" + std::to_string(port_config_.http_port) +
-                      " udp=" + std::to_string(port_config_.udp_port) +
-                      " gossip=" + std::to_string(port_config_.gossip_port) +
-                      " stun=" + std::to_string(port_config_.stun_port) +
-                      " relay=" + std::to_string(port_config_.relay_port) +
-                      " dns=" + std::to_string(port_config_.public_dns_port) +
-                      " private_http=" + std::to_string(port_config_.private_http_port) +
-                      " region=" + region_lower +
-                      " load=" + std::to_string(port_config_.connected_clients) +
-                      " host=" + server_fqdn;
+    std::string txt = build_port_config_txt(region_lower, server_fqdn,
+                                            port_config_.connected_clients);
 
-    std::string txt_fqdn = "_config." + id_lower + "." + region_lower + ".seip." + base_lower;
+    std::string txt_fqdn =
+        seip::configFqdn(id_lower, region_lower, base_domain_lower_);
     set_record(txt_fqdn, "TXT", txt, 300);
 
     spdlog::info("[{}] published SEIP records: {}.{}.seip.{}",
@@ -1470,21 +1461,14 @@ void DnsService::publish_tier_record(const std::string& server_id,
                                       const std::string& public_ip) {
     if (server_id.empty() || region.empty() || public_ip.empty() || tier < 1) return;
 
-    std::string id_lower = server_id;
-    std::transform(id_lower.begin(), id_lower.end(), id_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::string region_lower = region;
-    std::transform(region_lower.begin(), region_lower.end(), region_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::string base_lower = base_domain_;
-    std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string id_lower = to_lower(server_id);
+    std::string region_lower = to_lower(region);
 
     // <id>.tier<N>.<region>.seip.<base> -> public_ip
     // The tier+region wildcard (tier<N>.<region>.seip.<base>) aggregates these into
     // a multi-A answer used by DNS seed discovery.
-    std::string a_fqdn = id_lower + ".tier" + std::to_string(tier) + "." +
-                         region_lower + ".seip." + base_lower;
+    std::string a_fqdn =
+        seip::memberTierFqdn(id_lower, tier, region_lower, base_domain_lower_);
     set_record(a_fqdn, "A", public_ip, 300);
 
     spdlog::info("[{}] published tier record: tier{}.{}.seip.{} -> {}",
@@ -1504,21 +1488,32 @@ void DnsService::update_load(uint32_t connected_client_count) {
         return; // SEIP records haven't been published yet
     }
 
-    std::string id_lower = seip_server_id_;
-    std::transform(id_lower.begin(), id_lower.end(), id_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::string region_lower = server_region_;
-    std::transform(region_lower.begin(), region_lower.end(), region_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-    std::string base_lower = base_domain_;
-    std::transform(base_lower.begin(), base_lower.end(), base_lower.begin(),
-        [](unsigned char c) { return std::tolower(c); });
+    std::string id_lower = to_lower(seip_server_id_);
+    std::string region_lower = to_lower(server_region_);
 
     std::string server_fqdn = seip_server_fqdn_;
     if (server_fqdn.empty()) {
-        server_fqdn = id_lower + "." + region_lower + ".seip." + base_lower;
+        server_fqdn = seip::seipFqdn(id_lower, region_lower, base_domain_lower_);
     }
 
+    std::string txt = build_port_config_txt(region_lower, server_fqdn,
+                                            port_config_.connected_clients);
+
+    std::string txt_fqdn =
+        seip::configFqdn(id_lower, region_lower, base_domain_lower_);
+    set_record(txt_fqdn, "TXT", txt, 300);
+
+    spdlog::debug("[{}] updated SEIP load: {} -> {} clients",
+                   name(), txt_fqdn, connected_client_count);
+}
+
+// ---------------------------------------------------------------------------
+// Port config TXT body (shared by all "v=sp1" builders)
+// ---------------------------------------------------------------------------
+
+std::string DnsService::build_port_config_txt(const std::string& region,
+                                               std::string_view host,
+                                               uint32_t load) const {
     std::string txt = "v=sp1"
                       " http=" + std::to_string(port_config_.http_port) +
                       " udp=" + std::to_string(port_config_.udp_port) +
@@ -1527,15 +1522,12 @@ void DnsService::update_load(uint32_t connected_client_count) {
                       " relay=" + std::to_string(port_config_.relay_port) +
                       " dns=" + std::to_string(port_config_.public_dns_port) +
                       " private_http=" + std::to_string(port_config_.private_http_port) +
-                      " region=" + region_lower +
-                      " load=" + std::to_string(port_config_.connected_clients) +
-                      " host=" + server_fqdn;
-
-    std::string txt_fqdn = "_config." + id_lower + "." + region_lower + ".seip." + base_lower;
-    set_record(txt_fqdn, "TXT", txt, 300);
-
-    spdlog::debug("[{}] updated SEIP load: {} -> {} clients",
-                   name(), txt_fqdn, connected_client_count);
+                      " region=" + region +
+                      " load=" + std::to_string(load);
+    if (!host.empty()) {
+        txt += " host=" + std::string(host);
+    }
+    return txt;
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,28 +1535,20 @@ void DnsService::update_load(uint32_t connected_client_count) {
 // ---------------------------------------------------------------------------
 
 std::vector<uint8_t> DnsService::build_multi_a_response(
-    const unsigned char* query_data, std::size_t query_len,
-    const std::string& qname,
+    const ParsedQuery& q,
     const std::vector<std::string>& ips,
     uint32_t ttl) {
-
-    // Parse original query to extract the ID
-    ares_dns_record_t* query_rec = nullptr;
-    if (ares_dns_parse(query_data, query_len, 0, &query_rec) != ARES_SUCCESS) {
-        return {};
-    }
-    unsigned short id = ares_dns_record_get_id(query_rec);
-    ares_dns_record_destroy(query_rec);
 
     // Create response record
     ares_dns_record_t* response = nullptr;
     unsigned short flags = ARES_FLAG_QR | ARES_FLAG_AA;
     ares_status_t status = ares_dns_record_create(
-        &response, id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
+        &response, q.id, flags, ARES_OPCODE_QUERY, ARES_RCODE_NOERROR);
     if (status != ARES_SUCCESS || !response) return {};
+    DnsRecordGuard response_guard(response);
 
     // Add the question section
-    ares_dns_record_query_add(response, qname.c_str(),
+    ares_dns_record_query_add(response, q.qname.c_str(),
                                ARES_REC_TYPE_A, ARES_CLASS_IN);
 
     // Add multiple A records — cap at 5 to stay within 512-byte UDP limit
@@ -1577,7 +1561,7 @@ std::vector<uint8_t> DnsService::build_multi_a_response(
 
         ares_dns_rr_t* rr = nullptr;
         status = ares_dns_record_rr_add(&rr, response, ARES_SECTION_ANSWER,
-                                         qname.c_str(), ARES_REC_TYPE_A,
+                                         q.qname.c_str(), ARES_REC_TYPE_A,
                                          ARES_CLASS_IN, ttl);
         if (status == ARES_SUCCESS && rr) {
             ares_dns_rr_set_addr(rr, ARES_RR_A_ADDR, &addr);
@@ -1588,7 +1572,6 @@ std::vector<uint8_t> DnsService::build_multi_a_response(
     unsigned char* buf = nullptr;
     size_t buf_len = 0;
     status = ares_dns_write(response, &buf, &buf_len);
-    ares_dns_record_destroy(response);
 
     if (status != ARES_SUCCESS || !buf) return {};
 

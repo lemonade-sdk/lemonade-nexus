@@ -40,6 +40,7 @@ add_nexus_test(test_routing_security  test_routing_security.cpp)
 add_nexus_test(test_rate_limiter       test_rate_limiter.cpp)
 add_nexus_test(test_ipam              test_ipam.cpp)
 add_nexus_test(test_auth              test_auth.cpp)
+add_nexus_test(test_credential_unrevoke test_credential_unrevoke.cpp)
 add_nexus_test(test_passkey_challenge test_passkey_challenge.cpp)
 add_nexus_test(test_passkey_challenge_http test_passkey_challenge_http.cpp)
 add_nexus_test(test_root_bootstrap test_root_bootstrap.cpp)
@@ -54,6 +55,7 @@ add_nexus_test(test_server_config_discovery test_server_config_discovery.cpp)
 add_nexus_test(test_ddns_credentials_format test_ddns_credentials_format.cpp)
 add_nexus_test(test_geo_region        test_geo_region.cpp)
 add_nexus_test(test_seed_discovery    test_seed_discovery.cpp)
+add_nexus_test(test_seip_naming       test_seip_naming.cpp)
 
 add_nexus_test(test_boringtun_wire_protocol  test_boringtun_wire_protocol.cpp)
 add_nexus_test(test_ip_router         test_ip_router.cpp)
@@ -61,6 +63,7 @@ add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
 add_nexus_test(test_onboarding        test_onboarding.cpp)
+add_nexus_test(test_onboarding_discovery test_onboarding_discovery.cpp)
 # Internal onboarding validation lives in the library's src tree, not the
 # public include tree; only the onboarding unit tests get a path to it.
 target_include_directories(test_onboarding PRIVATE
