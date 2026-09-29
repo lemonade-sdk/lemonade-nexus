@@ -1,6 +1,7 @@
-// Onboarding e2e: the supported flow carries, verifies, and persists the
-// Genesis anchor; a restart through start_security_mesh (the production
-// startup path) runs the security lifecycle from the persisted config.
+// Onboarding e2e: the supported flow carries and verifies the Genesis anchor
+// (never writing the root-protected config); a restart through
+// start_security_mesh (the production startup path) runs the security
+// lifecycle from the persisted config.
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/OnboardApiHandler.hpp>
@@ -398,20 +399,27 @@ protected:
     } while (0)
 #endif
 
-// The supported flow persists the verified anchor, and a restart through the
-// production startup path runs the security lifecycle for a Tier 2 candidate.
-TEST_F(GenesisAnchorOnboarding, FullFlowPersistsAnchorAndRestartRunsTheMesh) {
+// The supported flow persists the certificate and never touches the
+// root-protected config, and a restart through the production startup path
+// runs the security lifecycle for a Tier 2 candidate.
+TEST_F(GenesisAnchorOnboarding, FullFlowLeavesConfigUntouchedAndRestartRunsTheMesh) {
     REQUIRE_DEFAULT_TRUST();
     auto token = admission->mint_admission_token(
         b64_array(candidate_key.public_key), std::chrono::seconds{600});
     ASSERT_TRUE(token.has_value());
 
-    // An unknown key the installer must preserve, and a mode the replacement
-    // must keep.
+    // The production shape of the pre-onboard config: the trust anchors were
+    // re-anchored at --first-run, and the canary fields must survive byte for
+    // byte because onboarding never writes this file.
+    nlohmann::json pre;
+    pre["root_pubkey"] = config.root_pubkey;
+    pre["genesis_pubkey"] = config.genesis_pubkey;
+    pre["release_signing_pubkey"] = "U0FNVExFUEtWSU5HTEVLV0FZSQ==";
+    pre["log_level"] = "debug";
+    const std::string pre_bytes = pre.dump(2) + "\n";
     {
         std::ofstream f(candidate_config_path);
-        f << "{\n  \"release_signing_pubkey\": \"U0FNVExFUEtWSU5HTEVLV0FZSQ==\",\n"
-           "  \"log_level\": \"debug\"\n}\n";
+        f << pre_bytes;
     }
     const auto pre_mode = fs::status(candidate_config_path).permissions();
 
@@ -419,15 +427,19 @@ TEST_F(GenesisAnchorOnboarding, FullFlowPersistsAnchorAndRestartRunsTheMesh) {
     auto rc = core::run_onboard_server(candidate);
     ASSERT_EQ(rc, 0) << "supported onboarding flow failed";
 
-    // --- Persisted state: the exact anchors, atomically, metadata kept. ---
+    // --- The config file is left byte-identical, with its mode and no .tmp. ---
+    std::ifstream pre_f(candidate_config_path);
+    const std::string post_bytes((std::istreambuf_iterator<char>(pre_f)),
+                                 std::istreambuf_iterator<char>());
+    EXPECT_EQ(post_bytes, pre_bytes);
+    EXPECT_EQ(fs::status(candidate_config_path).permissions(), pre_mode);
+    EXPECT_FALSE(fs::exists(candidate_config_path.string() + ".tmp"));
+
     const auto reloaded = load_config_file(candidate_config_path);
     EXPECT_EQ(reloaded.root_pubkey, config.root_pubkey);
     EXPECT_EQ(reloaded.genesis_pubkey, config.genesis_pubkey);
     EXPECT_EQ(reloaded.release_signing_pubkey, "U0FNVExFUEtWSU5HTEVLV0FZSQ==");
     EXPECT_EQ(reloaded.log_level, "debug");
-    ASSERT_FALSE(reloaded.seed_peers.empty());
-    EXPECT_EQ(fs::status(candidate_config_path).permissions(), pre_mode);
-    EXPECT_FALSE(fs::exists(candidate_config_path.string() + ".tmp"));
 
     // --- Installed certificate: Tier 2 (no evidence on this host), bound to
     // --- the network the anchor derives.
@@ -563,9 +575,10 @@ TEST_F(GenesisAnchorOnboarding, TamperedAdmissionStoreIsNotServedAsApprovedBundl
     EXPECT_FALSE(is_bundle);
 }
 
-// A pre-existing config that does not parse as a JSON object is never
-// overwritten by onboarding: the run fails and the bytes stay untouched.
-TEST_F(GenesisAnchorOnboarding, MalformedExistingConfigRefusedAndUntouched) {
+// A pre-existing config that does not parse as a JSON object only earns a
+// warning: onboarding never writes the config, so the run still completes and
+// the bytes stay untouched.
+TEST_F(GenesisAnchorOnboarding, MalformedExistingConfigWarnedAndUntouched) {
     REQUIRE_DEFAULT_TRUST();
     auto token = admission->mint_admission_token(
         b64_array(candidate_key.public_key), std::chrono::seconds{600});
@@ -576,26 +589,22 @@ TEST_F(GenesisAnchorOnboarding, MalformedExistingConfigRefusedAndUntouched) {
 
     auto candidate = candidate_config(token->first);
     auto rc = core::run_onboard_server(candidate);
-    EXPECT_NE(rc, 0);
-    // The refusal must be the config install, not the transport.
-    auto env = storage->read_file("onboarding", "admissions.json");
-    ASSERT_TRUE(env.has_value());
-    auto doc = core::admission_store_from_json(nlohmann::json::parse(env->data));
-    ASSERT_TRUE(static_cast<bool>(doc));
-    EXPECT_TRUE(std::any_of(doc.value->admissions.begin(),
-                            doc.value->admissions.end(),
-                            [&](const auto& r) {
-                                return r.candidate_pubkey ==
-                                       b64_array(candidate_key.public_key);
-                            }));
+    EXPECT_EQ(rc, 0);
     std::ifstream f(candidate_config_path);
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     EXPECT_EQ(content, broken);
+    EXPECT_FALSE(fs::exists(candidate_config_path.string() + ".tmp"));
+    // The run reached the end: the certificate was installed.
+    storage::FileStorageService cstorage{candidate_dir};
+    cstorage.start();
+    EXPECT_TRUE(cstorage.read_file("identity", "server_cert.json").has_value());
+    cstorage.stop();
 }
 
-// If the process cannot safely replace the config, onboarding fails closed
-// and leaves the config unmodified.
-TEST_F(GenesisAnchorOnboarding, UnwritableConfigDirectoryRefusedAndUntouched) {
+// A config in a read-only directory is tolerable: onboarding reads it but
+// never writes, so the run still completes, leaves the file unmodified, and
+// drops no .tmp in the unwritable directory.
+TEST_F(GenesisAnchorOnboarding, UnwritableConfigDirectoryToleratedAndUntouched) {
     REQUIRE_DEFAULT_TRUST();
     auto token = admission->mint_admission_token(
         b64_array(candidate_key.public_key), std::chrono::seconds{600});
@@ -610,20 +619,7 @@ TEST_F(GenesisAnchorOnboarding, UnwritableConfigDirectoryRefusedAndUntouched) {
     auto candidate = candidate_config(token->first);
     candidate.config_path = ro_config.string();
     auto rc = core::run_onboard_server(candidate);
-    EXPECT_NE(rc, 0);
-
-    // The refusal must be the config install, not the transport.
-    auto env = storage->read_file("onboarding", "admissions.json");
-    ASSERT_TRUE(env.has_value());
-    auto doc = core::admission_store_from_json(nlohmann::json::parse(env->data));
-    ASSERT_TRUE(static_cast<bool>(doc));
-    const bool reached = std::any_of(doc.value->admissions.begin(),
-                                     doc.value->admissions.end(),
-                                     [&](const auto& r) {
-                                         return r.candidate_pubkey ==
-                                                b64_array(candidate_key.public_key);
-                                     });
-    EXPECT_TRUE(reached);
+    EXPECT_EQ(rc, 0);
 
     std::ifstream f(ro_config);
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

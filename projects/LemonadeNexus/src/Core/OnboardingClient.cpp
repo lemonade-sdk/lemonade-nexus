@@ -9,7 +9,6 @@
 #include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
-#include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Security/HclReport.hpp>
 #include <LemonadeNexus/Security/TpmQuote.hpp>
@@ -173,37 +172,57 @@ bool verify_issued_cert(crypto::SodiumCryptoService& crypto,
     return true;
 }
 
-// One atomic replacement: the root key, Genesis anchor, and seed peers land
-// together, so no state carries the root without the anchor. A config that
-// is not a JSON object, or that cannot be replaced with its ownership and
-// mode preserved, is refused.
-std::string install_onboarded_config(const std::string& config_path, const std::string& root_hex,
-                                     const std::string& genesis_b64,
-                                     const std::vector<std::string>& seeds) {
-    json j = json::object();
-    if (std::filesystem::exists(config_path)) {
+/// Read the candidate's config READ-ONLY and merge the server-reported seed
+/// peers into the existing list (existing seeds first, then any not already
+/// present). The config file is root-protected: onboarding never modifies it,
+/// it only reports what the operator should apply. A missing, unreadable, or
+/// malformed config (or a non-array seed_peers) warns once and treats the
+/// existing seeds as empty — a config-file condition never fails the run, by
+/// which point the certificate is already installed.
+/// `new_seeds` receives the merged peers absent from the config (the ones to
+/// recommend); `genesis_mismatch` is set when the config carries a
+/// genesis_pubkey that differs from `mesh_genesis_b64`.
+void plan_onboarded_seeds(const std::string& config_path,
+                          const std::string& mesh_genesis_b64,
+                          const std::vector<std::string>& server_seeds,
+                          std::vector<std::string>& new_seeds,
+                          bool& genesis_mismatch) {
+    std::vector<std::string> existing;
+    genesis_mismatch = false;
+    if (!std::filesystem::exists(config_path)) {
+        spdlog::warn("Onboard: config {} not found; treating seed_peers as empty",
+                     config_path);
+    } else {
         std::ifstream f(config_path);
-        if (!f) return "cannot read existing config " + config_path;
-        auto parsed = json::parse(f, nullptr, false);
-        if (parsed.is_discarded() || !parsed.is_object())
-            return "existing config " + config_path +
-                   " does not parse as a JSON object; refusing to overwrite it";
-        j = std::move(parsed);
+        if (!f) {
+            spdlog::warn("Onboard: cannot read config {}; treating seed_peers as empty",
+                         config_path);
+        } else {
+            auto parsed = json::parse(f, nullptr, false);
+            if (parsed.is_discarded() || !parsed.is_object()) {
+                spdlog::warn("Onboard: config {} does not parse as a JSON object; "
+                             "treating seed_peers as empty", config_path);
+            } else {
+                if (parsed.contains("seed_peers")) {
+                    if (parsed["seed_peers"].is_array())
+                        existing = parsed["seed_peers"].get<std::vector<std::string>>();
+                    else
+                        spdlog::warn("Onboard: config {} has a non-array seed_peers; "
+                                     "treating as empty", config_path);
+                }
+                if (parsed.contains("genesis_pubkey") && parsed["genesis_pubkey"].is_string()) {
+                    const auto config_genesis = parsed["genesis_pubkey"].get<std::string>();
+                    if (config_genesis != mesh_genesis_b64) genesis_mismatch = true;
+                }
+            }
+        }
     }
-    j["root_pubkey"] = root_hex;
-    j["genesis_pubkey"] = genesis_b64;
-    std::vector<std::string> merged;
-    if (j.contains("seed_peers")) {
-        if (!j["seed_peers"].is_array())
-            return "existing config " + config_path + " has a non-array seed_peers";
-        merged = j["seed_peers"].get<std::vector<std::string>>();
-    }
-    for (const auto& s : seeds)
-        if (std::find(merged.begin(), merged.end(), s) == merged.end()) merged.push_back(s);
-    j["seed_peers"] = merged;
-    if (!security::write_durable_preserving(config_path, j.dump(2) + "\n"))
-        return "failed to write the onboarded config to " + config_path;
-    return {};
+    std::vector<std::string> merged = existing;
+    for (const auto& s : server_seeds)
+        if (std::find(merged.begin(), merged.end(), s) == merged.end()) {
+            merged.push_back(s);
+            new_seeds.push_back(s);
+        }
 }
 
 /// Produce platform evidence bound to the admission challenge nonce, so the bundle
@@ -585,11 +604,18 @@ int run_onboard_server(ServerConfig& config) {
     auto proven = host + ":" + std::to_string(approved->gossip_port);
     if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
         seeds.insert(seeds.begin(), proven);
-    if (auto err = install_onboarded_config(config.config_path, config.root_pubkey,
-                                            approved->genesis_pubkey, seeds);
-        !err.empty()) {
-        spdlog::error("Onboard: {}", err);
-        return 1;
+    // The config file is root-protected: merge the seeds read-only and report
+    // what the operator should apply instead of rewriting the file. A
+    // config-file condition never blocks the run; the ack still goes out.
+    std::vector<std::string> new_seeds;
+    bool genesis_mismatch = false;
+    plan_onboarded_seeds(config.config_path, approved->genesis_pubkey, seeds,
+                         new_seeds, genesis_mismatch);
+    if (genesis_mismatch) {
+        spdlog::warn("Onboard: the config at {} sets a genesis_pubkey that does not "
+                     "match the admitted mesh; correct it before start — the daemon "
+                     "will fail closed at startup against the wrong network",
+                     config.config_path);
     }
 
     // Align our hostname with the admitted server_id so DNS/NS records carry
@@ -613,8 +639,25 @@ int run_onboard_server(ServerConfig& config) {
     std::printf("  Onboarded as '%s'\n", server_id.c_str());
     std::printf("====================================================================\n");
     std::printf("Certificate installed: %s/identity/server_cert.json\n", config.data_root.c_str());
-    std::printf("Config updated:        %s (root_pubkey, genesis_pubkey + %zu seed peer(s))\n",
-                config.config_path.c_str(), seeds.size());
+    std::printf("Config file left untouched (root-protected trust anchors): %s\n",
+                config.config_path.c_str());
+    if (genesis_mismatch)
+        std::printf("WARNING: the config's genesis_pubkey does not match the admitted\n"
+                    "mesh. Correct it before start, or the daemon will fail closed at\n"
+                    "startup against the wrong network.\n");
+    std::printf("Approved anchors (verify they match your config):\n");
+    std::printf("  root_pubkey:    %s\n",
+                approved->root_pubkey.empty() ? config.root_pubkey.c_str()
+                                              : approved->root_pubkey.c_str());
+    std::printf("  genesis_pubkey: %s\n", approved->genesis_pubkey.c_str());
+    if (new_seeds.empty()) {
+        std::printf("No new seed peers to add.\n");
+    } else {
+        std::printf("Recommended seed_peers to add to %s (operator, as root):\n",
+                    config.config_path.c_str());
+        for (const auto& s : new_seeds)
+            std::printf("  - %s\n", s.c_str());
+    }
     std::printf("\nStart the server normally:\n");
     std::printf("  ./lemonade-nexus --data-root %s\n\n", config.data_root.c_str());
 

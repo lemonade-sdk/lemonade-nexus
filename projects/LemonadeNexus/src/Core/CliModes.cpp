@@ -106,9 +106,12 @@ int run_first_run(const ServerConfig& config) {
     std::printf("JOIN an existing mesh:\n");
     std::printf("  ./lemonade-nexus --onboard-server [host:port] --data-root %s\n",
                 config.data_root.c_str());
-    std::printf("  (requests admission over the mesh's public API. Admission is decided\n");
-    std::printf("   by the mesh itself: Tier 1 members vote, and the candidate must pass\n");
-    std::printf("   attestation. No file copying, and no single administrator approval.)\n");
+    std::printf("  (requests admission over the mesh's public API. Admission is granted\n");
+    std::printf("   by the mesh root: a single-use enrollment token, or administrator\n");
+    std::printf("   approval over the verified public API. A Tier 1 certificate\n");
+    std::printf("   additionally requires passing attestation. Onboarding installs the\n");
+    std::printf("   certificate into the data directory and reports recommended seed\n");
+    std::printf("   peers; it never modifies the root-protected config.)\n");
     std::printf("\n");
 
     return 0;

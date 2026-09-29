@@ -129,8 +129,8 @@ data/
 - The security stores treat corruption as a distinct state from absence:
   corrupt files fail closed; they are never silently treated as absent.
 - The trust configuration file is **outside** the data root and mounted
-  read-only for the service; onboarding write-back (root/Genesis keys and
-  seed peers) is the one documented config mutation.
+  read-only for the service; onboarding only reads it (reporting the approved
+  anchors and recommended seed peers) and makes no config mutation.
 
 ## API Routing
 

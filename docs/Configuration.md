@@ -60,10 +60,10 @@ A normal daemon start refuses to run without all three values:
 ```
 
 On the Genesis server, `nexus-bootstrap` writes all three (see
-[Getting Started](Getting-Started)). On a joining server, onboarding writes
-`root_pubkey` (confirmed against your pinned value) and `genesis_pubkey`
-(authenticated in the bundle); `release_signing_pubkey` is always configured
-by the operator.
+[Getting Started](Getting-Started)). On a joining server, the operator sets
+`root_pubkey` and `genesis_pubkey` in the config before start; onboarding
+verifies the bundle against them and never writes the config
+(`release_signing_pubkey` is always configured by the operator).
 
 These are the only trust inputs. There is no supported configuration switch to
 force Tier 1, skip evidence, or change quorums or thresholds: those are

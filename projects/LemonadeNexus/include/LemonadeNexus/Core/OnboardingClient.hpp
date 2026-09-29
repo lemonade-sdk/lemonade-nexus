@@ -9,9 +9,12 @@ struct ServerConfig;
 
 /// Run the candidate-side onboarding flow (`--onboard-server`): discover a mesh
 /// server, prove possession of our gossip key, request admission, wait for the
-/// decision, install the issued certificate + seed peers, and exit. Requires a
-/// preconfigured root pubkey (--root-pubkey); the response may confirm it but
-/// never establishes it. Returns a process exit code.
+/// decision, install the issued certificate into the data directory, and exit.
+/// The config file is never modified (the trust anchors stay root-protected);
+/// instead the approved anchors and the recommended seed peers are printed for
+/// the operator to apply. Requires a preconfigured root pubkey (--root-pubkey);
+/// the response may confirm it but never establishes it. Returns a process exit
+/// code.
 [[nodiscard]] int run_onboard_server(ServerConfig& config);
 
 /// "" when `pinned_hex` is a usable root anchor (32-byte hex), else an
