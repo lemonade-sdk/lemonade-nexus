@@ -2772,23 +2772,31 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
         }
 
         // A per-server SEIP record is an ORDINARY resource owned by exactly
-        // one server: the FQDN embeds that server's id. An enrolled author may
-        // write only its own — never another node's address record. The real
-        // names are "<id>.<region>.seip.<base>", "<id>.tier<N>.<region>.seip"
-        // and "private.<id>.<region>.seip"; the owner id is the FIRST label,
-        // after dropping a leading "private." qualifier.
-        if (fqdn_lower.find(".seip.") != std::string::npos) {
-            std::string_view head(fqdn_lower);
-            if (head.substr(0, 8) == "private.") {
-                head.remove_prefix(8);
+        // one server: the author owns it iff its certified server id appears
+        // as one of the labels strictly before the "seip" label. Real names
+        // embed that id at any depth — "<id>.<region>.seip.<base>",
+        // "<id>.tier<N>.<region>.seip", "private.<id>...", "_config.<id>...",
+        // "backend.<id>...", "_acme-challenge[.private].<id>..." — while a
+        // record that names another id (or no id at all) stays foreign.
+        if (const auto seip_pos = fqdn_lower.find(".seip.");
+            seip_pos != std::string::npos) {
+            const std::string prefix = fqdn_lower.substr(0, seip_pos);
+            const std::string own_id = certified_server_id(delta.signer_pubkey);
+            bool owned = false;
+            std::size_t start = 0;
+            while (start < prefix.size() && !owned) {
+                const auto dot = prefix.find('.', start);
+                const std::size_t len =
+                    dot == std::string::npos ? prefix.size() - start : dot - start;
+                owned = !own_id.empty() && prefix.compare(start, len, own_id) == 0;
+                if (dot == std::string::npos) break;
+                start = dot + 1;
             }
-            const auto dot = head.find('.');
-            const std::string owner_id(dot == std::string_view::npos ? head
-                                                                     : head.substr(0, dot));
-            if (!owner_id.empty() && owner_id != certified_server_id(delta.signer_pubkey)) {
-                spdlog::warn("[{}] DENIED SEIP DNS record from {}:{} — author does not "
-                              "own the server id '{}'", name(),
-                              sender.address().to_string(), sender.port(), owner_id);
+            if (!owned) {
+                spdlog::warn("[{}] DENIED SEIP DNS record '{}' from {}:{} — server id "
+                              "'{}' not found in the owner labels before .seip", name(),
+                              fqdn_lower, sender.address().to_string(), sender.port(),
+                              own_id);
                 return;
             }
         }

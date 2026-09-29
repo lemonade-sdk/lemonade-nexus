@@ -330,12 +330,13 @@ protected:
     std::vector<uint8_t> dns_delta_payload(const crypto::Ed25519Keypair& signer,
                                            const std::string& delta_id,
                                            const std::string& fqdn,
-                                           const std::string& value) {
+                                           const std::string& value,
+                                           const std::string& record_type = "A") {
         nlohmann::json canonical;
         canonical["delta_id"]    = delta_id;
         canonical["fqdn"]        = fqdn;
         canonical["operation"]   = "set";
-        canonical["record_type"] = "A";
+        canonical["record_type"] = record_type;
         canonical["timestamp"]   = uint64_t{1000};
         canonical["ttl"]         = uint32_t{60};
         canonical["value"]       = value;
@@ -1118,6 +1119,101 @@ TEST_F(GossipIngressSecurityTest, SeipDnsRecordsAreOwnedByTheirServerId) {
     inject(build_packet(other, gossip::GossipMsgType::DnsRecordSync, poach_priv), a);
     pump_for(std::chrono::milliseconds(200));
     EXPECT_EQ(a.dns->resolve(private_fqdn)->ipv4_address, "10.64.0.1");
+}
+
+// v0.9.4 fix 2: the author owns an SEIP record iff its certified server id
+// appears as ONE OF the labels strictly before the "seip" label, at any depth.
+// Prefixed record forms (tier labels, private, _config, backend,
+// _acme-challenge) authored by the owner land; the same shapes naming another
+// server's id, or no id at all, are refused.
+TEST_F(GossipIngressSecurityTest, SeipDnsOwnershipChecksEveryLabelBeforeSeip) {
+    auto root_kp = kc->ed25519_keygen();
+    auto srv_a   = kc->ed25519_keygen();
+    auto srv_b   = kc->ed25519_keygen();
+    const auto a_b64 = crypto::to_base64(srv_a.public_key);
+    const auto b_b64 = crypto::to_base64(srv_b.public_key);
+    const auto a_cert = issue_cert(a_b64, "srv-a", root_kp);
+    const auto b_cert = issue_cert(b_b64, "srv-b", root_kp);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(a_b64, "127.0.0.1:9", a_cert),
+                 peer_entry(b_b64, "127.0.0.2:9", b_cert)}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    const std::string seip = ".seip.lemonade-nexus.io";
+
+    // Every shape below is srv-a's OWN record: the id is some label before
+    // .seip, at any depth.
+    struct Accept {
+        std::string fqdn;
+        std::string value;
+        std::string rtype;
+    };
+    const std::vector<Accept> accepts = {
+        {"srv-a.us-x" + seip,                    "10.1.0.1", "A"   },
+        {"srv-a.tier2.us-x" + seip,              "10.1.0.2", "A"   },
+        {"private.srv-a.us-x" + seip,            "10.1.0.3", "A"   },
+        {"_config.srv-a.us-x" + seip,            "nexus-config=abc", "TXT"},
+        {"backend.srv-a.us-x" + seip,            "10.1.0.4", "A"   },
+        {"_acme-challenge.srv-a.us-x" + seip,    "acme-chal-a", "TXT"},
+        {"_acme-challenge.private.srv-a.us-x" + seip, "acme-chal-a2", "TXT"},
+    };
+    const auto serial_before = a.dns->soa_serial();
+    for (std::size_t i = 0; i < accepts.size(); ++i) {
+        const auto& r = accepts[i];
+        const auto id = "delta-seip-acc-" + std::to_string(i);
+        inject(build_packet(srv_a, gossip::GossipMsgType::DnsRecordSync,
+                            dns_delta_payload(srv_a, id, r.fqdn, r.value, r.rtype)), a);
+    }
+    ASSERT_TRUE(pump_until([&] {
+        return a.dns->soa_serial() == serial_before + accepts.size() &&
+               a.dns->resolve(accepts[0].fqdn) &&
+               a.dns->resolve(accepts[1].fqdn) &&
+               a.dns->resolve(accepts[2].fqdn) &&
+               a.dns->resolve(accepts[4].fqdn);
+    }));
+    EXPECT_EQ(a.dns->resolve(accepts[0].fqdn)->ipv4_address, "10.1.0.1");
+    EXPECT_EQ(a.dns->resolve(accepts[1].fqdn)->ipv4_address, "10.1.0.2");
+    EXPECT_EQ(a.dns->resolve(accepts[2].fqdn)->ipv4_address, "10.1.0.3");
+    EXPECT_EQ(a.dns->resolve(accepts[4].fqdn)->ipv4_address, "10.1.0.4");
+    // The three TXT records have no A lookup path, but their application is
+    // pinned by the SOA serial: every accepted delta bumps it exactly once.
+    EXPECT_EQ(a.dns->soa_serial(), serial_before + accepts.size());
+
+    // The same shapes naming srv-b's id are srv-a's foreign records and must
+    // all be refused — the serial stays where the accepts left it, and no A
+    // record appears under the foreign name.
+    const std::vector<Accept> denials = {
+        {"_config.srv-b.us-x" + seip,        "nexus-config=evil", "TXT"},
+        {"backend.srv-b.us-x" + seip,        "10.66.0.1",         "A"  },
+        {"_acme-challenge.srv-b.us-x" + seip, "acme-chal-b",       "TXT"},
+        {"_config.us-x" + seip,              "no-id-in-prefix",   "TXT"},
+    };
+    for (std::size_t i = 0; i < denials.size(); ++i) {
+        const auto& r = denials[i];
+        const auto id = "delta-seip-deny-" + std::to_string(i);
+        inject(build_packet(srv_a, gossip::GossipMsgType::DnsRecordSync,
+                            dns_delta_payload(srv_a, id, r.fqdn, r.value, r.rtype)), a);
+    }
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.dns->soa_serial(), serial_before + accepts.size());
+    EXPECT_FALSE(a.dns->resolve(denials[1].fqdn).has_value());
+
+    // Control: srv-b ITSELF may author the same records — ownership, not the
+    // record shape, was the gate.
+    const auto self_b = dns_delta_payload(srv_b, "delta-seip-self-b",
+                                          "backend.srv-b.us-x" + seip, "10.1.1.1");
+    inject(build_packet(srv_b, gossip::GossipMsgType::DnsRecordSync, self_b), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(denials[1].fqdn).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(denials[1].fqdn)->ipv4_address, "10.1.1.1");
 }
 
 // A permissions row exactly as the pre-change code stored it: nonce||ciphertext
