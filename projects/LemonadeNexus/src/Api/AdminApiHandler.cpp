@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
 
+#include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
@@ -7,6 +8,7 @@
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -100,6 +102,36 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             .total_manifests = ctx_.attestation.get_manifests().size(),
         };
         nlohmann::json j = resp;
+        json_response(res, j);
+    }));
+
+    // POST /api/credentials/unrevoke — Operator un-revoke of a revoked Ed25519
+    // key. Root-admin only: a valid JWT alone is not enough.
+    priv.Post("/api/credentials/unrevoke", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res, const SessionClaims& claims) {
+        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), "root",
+                                         acl::Permission::Admin)) {
+            error_response(res, "admin authorization required", 403);
+            return;
+        }
+
+        auto body_opt = parse_body(req, res);
+        if (!body_opt || !body_opt->is_object()) {
+            error_response(res, "body must be a JSON object");
+            return;
+        }
+
+        auto pubkey = body_opt->value("pubkey", std::string{});
+        if (pubkey.empty()) {
+            error_response(res, "pubkey is required");
+            return;
+        }
+
+        if (!ctx_.auth.unrevoke_ed25519(pubkey)) {
+            error_response(res, "pubkey was not revoked", 400);
+            return;
+        }
+        nlohmann::json j{{"success", true}};
         json_response(res, j);
     }));
 
