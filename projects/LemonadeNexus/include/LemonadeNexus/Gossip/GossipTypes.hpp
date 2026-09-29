@@ -181,14 +181,18 @@ struct DnsRecordDelta {
 // ---------------------------------------------------------------------------
 
 /// A signed NS slot claim that propagates via gossip.
-/// The first 9 servers to join the mesh claim ns1-ns9 slots (LWW conflict resolution).
+/// The first 9 servers to join the mesh claim ns1-ns9 slots. A claim is
+/// accepted only on an empty slot, by the current holder (renewal), or by a
+/// pinned claimant displacing an unpinned holder — never silently clobbered.
+/// An empty `server_ip` marks a release (only the holder may release).
 struct NsSlotClaimData {
-    uint8_t     slot{0};           // 1-9
+    uint8_t     slot{0};           // 1-9 (0 = released/empty)
     std::string server_pubkey;     // base64 Ed25519
-    std::string server_ip;         // public IP
+    std::string server_ip;         // public IP ("" = release marker)
     std::string region;            // cloud region code
-    uint64_t    timestamp{0};      // LWW conflict resolution
+    uint64_t    timestamp{0};      // renewal refresh
     std::string signature;         // Ed25519 signature
+    bool        pinned{false};     // claimant's config pins it to this slot
 };
 
 } // namespace nexus::gossip

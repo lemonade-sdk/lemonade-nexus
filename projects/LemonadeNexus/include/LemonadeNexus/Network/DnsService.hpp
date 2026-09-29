@@ -142,6 +142,11 @@ public:
     /// Set our own server's hostname and IP for the SOA MNAME field.
     void set_our_nameserver(const std::string& hostname, const std::string& ip);
 
+    /// The glue IP registered for a nameserver hostname by add_nameserver,
+    /// or nullopt when no nameserver is registered under that hostname.
+    /// Read-only view over the NS table (public for testing).
+    [[nodiscard]] std::optional<std::string> nameserver_ip(const std::string& hostname) const;
+
     // -----------------------------------------------------------------
     // SOA configuration
     // -----------------------------------------------------------------

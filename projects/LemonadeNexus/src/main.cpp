@@ -54,6 +54,7 @@
 #  include <LemonadeNexusAttestd/AttestdClient.hpp>
 #endif
 
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -360,9 +361,17 @@ int main(int argc, char* argv[]) {
     nexus::core::resolve_server_hostname(config, data_root, gossip);
     // (region already resolved before gossip.start() for DNS seed discovery)
 
-    // NS hostname: explicit > derived from server_hostname
-    std::string ns_hostname = config.dns_ns_hostname;
-    if (ns_hostname.empty() && !config.server_hostname.empty()) {
+    // NS hostname: explicit > derived from server_hostname. The special value
+    // "none" (case-insensitive) opts this server out of NS slot claiming: it
+    // claims no slot and releases any slot it still holds.
+    bool ns_opt_out = false;
+    {
+        std::string probe = config.dns_ns_hostname;
+        for (auto& c : probe) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        ns_opt_out = (probe == "none");
+    }
+    std::string ns_hostname = ns_opt_out ? "" : config.dns_ns_hostname;
+    if (!ns_opt_out && ns_hostname.empty() && !config.server_hostname.empty()) {
         ns_hostname = config.server_hostname + "." + config.dns_base_domain;
         spdlog::info("DNS: auto-derived NS hostname: {}", ns_hostname);
     }
@@ -420,9 +429,10 @@ int main(int argc, char* argv[]) {
             ? server_seip_fqdn
             : nexus::core::build_server_fqdn(config.server_hostname, config.dns_base_domain);
 
-        // Determine the NS hostname prefix (e.g. "ns1" from "ns1.lemonade-nexus.io")
+        // Determine the NS hostname prefix (e.g. "ns1" from "ns1.lemonade-nexus.io").
+        // An opt-out node has no NS identity, so no ns-prefixed _config record.
         std::string ns_prefix;
-        std::string ns_fqdn = config.dns_ns_hostname;
+        std::string ns_fqdn = ns_opt_out ? "" : config.dns_ns_hostname;
         if (ns_fqdn.empty() && !config.server_hostname.empty()) {
             ns_prefix = config.server_hostname;
         } else if (!ns_fqdn.empty()) {
@@ -449,21 +459,30 @@ int main(int argc, char* argv[]) {
     // NS slot claiming: first 9 servers claim ns1-ns9 for DNS bootstrap.
     // An explicit ns<N> identity pins the slot: the registrar's glue points
     // that exact name at this IP, so claiming any other slot would publish a
-    // nameserver record the registry contradicts.
-    if (!ns_hostname.empty()) {
-        auto dot = ns_hostname.find('.');
-        auto label = ns_hostname.substr(0, dot == std::string::npos ? ns_hostname.size() : dot);
-        if (label.size() == 3 && label.starts_with("ns") &&
-            label[2] >= '1' && label[2] <= '9') {
-            gossip.set_preferred_ns_slot(static_cast<uint8_t>(label[2] - '0'));
-        }
-    }
+    // nameserver record the registry contradicts. "none" opts out: no slot
+    // is claimed, and any slot this node still holds is released.
     gossip.set_our_region(config.region);
     gossip.set_dns_base_domain(config.dns_base_domain);
-    if (!server_public_ip.empty()) {
-        gossip.try_claim_ns_slot(server_public_ip);
+    if (ns_opt_out) {
+        gossip.set_ns_opt_out(true);
+        spdlog::info("NS slot: opt-out (dns_ns_hostname=none) — not claiming a slot");
         if (auto slot = gossip.our_ns_slot()) {
-            spdlog::info("SEIP: claimed NS slot ns{} for {}", *slot, server_public_ip);
+            gossip.release_ns_slot(*slot);
+        }
+    } else {
+        if (!ns_hostname.empty()) {
+            auto dot = ns_hostname.find('.');
+            auto label = ns_hostname.substr(0, dot == std::string::npos ? ns_hostname.size() : dot);
+            if (label.size() == 3 && label.starts_with("ns") &&
+                label[2] >= '1' && label[2] <= '9') {
+                gossip.set_preferred_ns_slot(static_cast<uint8_t>(label[2] - '0'));
+            }
+        }
+        if (!server_public_ip.empty()) {
+            gossip.try_claim_ns_slot(server_public_ip);
+            if (auto slot = gossip.our_ns_slot()) {
+                spdlog::info("SEIP: claimed NS slot ns{} for {}", *slot, server_public_ip);
+            }
         }
     }
 

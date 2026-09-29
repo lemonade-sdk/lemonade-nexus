@@ -144,8 +144,24 @@ public:
     /// Set the DNS base domain for NS slot FQDN construction (default: "lemonade-nexus.io").
     void set_dns_base_domain(const std::string& domain);
 
-    /// Attempt to claim the lowest available NS slot (ns1-ns9) via gossip.
+    /// Attempt to claim an NS slot (ns1-ns9) via gossip: the pinned slot when
+    /// one is configured, otherwise the lowest free slot. The claim is
+    /// deferred (and retried on the gossip tick) until slot state has been
+    /// synced from the mesh, so a restarting node never claims from a stale
+    /// or empty table. Pinned slot held by someone else, or no free slot:
+    /// stays pending and retries each tick.
     void try_claim_ns_slot(const std::string& our_public_ip);
+
+    /// Release an NS slot this node holds: broadcasts a signed release (the
+    /// claim message with an empty server_ip) and removes the ns<N> A record
+    /// from the DNS zone. No-op unless the slot is currently held by this
+    /// node. Used by opt-out (dns_ns_hostname: "none").
+    void release_ns_slot(uint8_t slot);
+
+    /// Opt out of NS slot claiming (dns_ns_hostname: "none"). Cancels any
+    /// pending claim, and a slot this node holds is released on the next
+    /// gossip tick (or immediately if it is already held). Call before start().
+    void set_ns_opt_out(bool opt_out);
 
     /// Returns our claimed NS slot number (1-9), or nullopt if we don't hold one.
     [[nodiscard]] std::optional<uint8_t> our_ns_slot() const;
@@ -379,6 +395,11 @@ private:
     /// Register an NS slot claim in the local DNS service (if available).
     void register_ns_slot_in_dns(const NsSlotClaimData& claim);
 
+    /// Sign an NS slot claim in place. Unpinned claims sign the legacy
+    /// 5-field preimage (wire-identical to v0.9.3); pinned claims sign the
+    /// 6-field preimage that includes "pinned".
+    void sign_ns_claim(NsSlotClaimData& claim);
+
     // Verify a server certificate against the root pubkey
     [[nodiscard]] bool verify_server_certificate(const ServerCertificate& cert) const;
 
@@ -533,6 +554,18 @@ private:
     std::array<NsSlotClaimData, 9>   ns_slots_{};       // slot 0 = ns1, slot 8 = ns9
     std::optional<uint8_t>           our_ns_slot_;
     uint8_t                          preferred_ns_slot_{0};  // 0 = auto (lowest free)
+    // True once slot state is known exchanged with the mesh (first accepted
+    // peer ServerHello or first applied slot claim). Claims before that are
+    // made from a stale/empty table and are deferred until this is set.
+    bool                             ns_state_synced_{false};
+    // A claim was requested but deferred (unsynced) or lost (displaced by a
+    // pinned claim); the gossip tick re-attempts while this stays set.
+    bool                             ns_claim_pending_{false};
+    // The public IP used for (re-)claiming; remembered so the tick can
+    // retry without a new call site.
+    std::string                      ns_claim_ip_;
+    // Opt-out (dns_ns_hostname: "none"): never claim; release a held slot.
+    bool                             ns_opt_out_{false};
 
     // Permission tree for evaluating received records' existing permissions
     // (nullptr = no permission context; acceptance refuses as ContextMissing).

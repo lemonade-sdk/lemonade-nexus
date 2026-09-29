@@ -1243,6 +1243,14 @@ void DnsService::remove_nameserver(const std::string& hostname) {
     }
 }
 
+std::optional<std::string> DnsService::nameserver_ip(const std::string& hostname) const {
+    std::lock_guard<std::mutex> lock(zone_mutex_);
+    for (const auto& ns : nameservers_) {
+        if (ns.hostname == hostname) return ns.ip;
+    }
+    return std::nullopt;
+}
+
 void DnsService::set_our_nameserver(const std::string& hostname, const std::string& ip) {
     std::lock_guard<std::mutex> lock(zone_mutex_);
     our_ns_hostname_ = hostname;

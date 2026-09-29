@@ -66,6 +66,11 @@ struct GossipBallotTestAccess {
     static const NsSlotClaimData& ns_slot(GossipService& g, uint8_t slot) {
         return g.ns_slots_[slot - 1];
     }
+    static bool ns_synced(GossipService& g) { return g.ns_state_synced_; }
+    static bool ns_claim_pending(GossipService& g) { return g.ns_claim_pending_; }
+    // Drives one 5 s gossip tick (NS claim deferral/retry, opt-out release)
+    // without waiting for the timer.
+    static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
     static bool revoked(GossipService& g, const std::string& pubkey) {
         return g.is_revoked(pubkey);
     }
@@ -371,14 +376,18 @@ protected:
 
     // An NS slot claim exactly as try_claim_ns_slot signs one. `named` is the
     // claimant the claim NAMES; `signer` is the key that actually signs it.
-    // Splitting the two is what makes the binding testable.
+    // Splitting the two is what makes the binding testable. `server_ip` of
+    // "" builds a release; `pinned` signs the v0.9.4 six-field preimage.
     std::vector<uint8_t> ns_claim_payload(const crypto::Ed25519Keypair& signer,
                                           const std::string& named_pubkey_b64,
-                                          uint8_t slot) {
+                                          uint8_t slot,
+                                          const std::string& server_ip = "10.0.0.7",
+                                          bool pinned = false) {
         nlohmann::json sign_payload;
+        if (pinned) sign_payload["pinned"] = true;
         sign_payload["slot"]          = slot;
         sign_payload["server_pubkey"] = named_pubkey_b64;
-        sign_payload["server_ip"]     = "10.0.0.7";
+        sign_payload["server_ip"]     = server_ip;
         sign_payload["region"]        = "eu-west";
         sign_payload["timestamp"]     = uint64_t{1000};
 
@@ -950,6 +959,338 @@ TEST_F(GossipIngressSecurityTest, NsClaimSignatureMustBindTheNamedClaimant) {
                         ns_claim_payload(claimant, claimant_b64, 5)),
            a);
     ASSERT_TRUE(pump_until([&] { return a.ns_holder(5) == claimant_b64; }));
+}
+
+// ---------------------------------------------------------------------------
+// NS slot claiming: deterministic allocation, no clobber, opt-out + release
+// ---------------------------------------------------------------------------
+
+// v0.9.4 fix 3: a claim lands on an EMPTY slot, but an unpinned claim on an
+// OCCUPIED slot never clobbers the current holder. Control: the same
+// claimant's claim on a free slot lands, so the refusal is the acceptance
+// rule, not the payload.
+TEST_F(GossipIngressSecurityTest, NsClaimOnOccupiedSlotIsRejectedAndHolderUnchanged) {
+    auto root_kp   = kc->ed25519_keygen();
+    auto holder    = kc->ed25519_keygen();
+    auto claimant  = kc->ed25519_keygen();
+    const auto holder_b64   = crypto::to_base64(holder.public_key);
+    const auto claimant_b64 = crypto::to_base64(claimant.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(holder_b64, "127.0.0.1:9",
+                           issue_cert(holder_b64, "peer-holder", root_kp)),
+                peer_entry(claimant_b64, "127.0.0.1:10",
+                           issue_cert(claimant_b64, "peer-claimant", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    ASSERT_TRUE(a.certified_peer(holder_b64));
+    ASSERT_TRUE(a.certified_peer(claimant_b64));
+
+    // Holder takes ns3.
+    inject(build_packet(holder, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(holder, holder_b64, 3, "10.0.0.30")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == holder_b64; }));
+
+    // Unpinned non-holder claims the occupied slot: rejected, holder kept.
+    inject(build_packet(claimant, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(claimant, claimant_b64, 3, "10.0.0.40")),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.ns_holder(3), holder_b64);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 3).server_ip,
+              "10.0.0.30");
+
+    // Control: the same claimant takes the EMPTY slot ns4.
+    inject(build_packet(claimant, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(claimant, claimant_b64, 4, "10.0.0.40")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(4) == claimant_b64; }));
+}
+
+// v0.9.4 fix 3: the current holder may re-claim its own slot (idempotent
+// renewal) and the refresh lands; a different claimant against the same slot
+// does not.
+TEST_F(GossipIngressSecurityTest, NsClaimRenewalByHolderRefreshesFields) {
+    auto root_kp = kc->ed25519_keygen();
+    auto holder  = kc->ed25519_keygen();
+    auto other   = kc->ed25519_keygen();
+    const auto holder_b64 = crypto::to_base64(holder.public_key);
+    const auto other_b64  = crypto::to_base64(other.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(holder_b64, "127.0.0.1:9",
+                           issue_cert(holder_b64, "peer-holder", root_kp)),
+                peer_entry(other_b64, "127.0.0.1:10",
+                           issue_cert(other_b64, "peer-other", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    inject(build_packet(holder, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(holder, holder_b64, 3, "10.0.0.30")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == holder_b64; }));
+
+    // Renewal by the holder: same slot, refreshed IP.
+    inject(build_packet(holder, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(holder, holder_b64, 3, "10.0.0.31")),
+           a);
+    ASSERT_TRUE(pump_until(
+        [&] { return gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 3).server_ip == "10.0.0.31"; }));
+
+    // A different claimant still cannot take the renewed slot.
+    inject(build_packet(other, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(other, other_b64, 3, "10.0.0.99")),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.ns_holder(3), holder_b64);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 3).server_ip,
+              "10.0.0.31");
+}
+
+// v0.9.4 fix 3: a PINNED claim takes the slot from an UNPINNED holder; the
+// displaced holder (this node) does not re-claim one-shot — it re-claims the
+// lowest free slot on the next gossip tick.
+TEST_F(GossipIngressSecurityTest, NsPinnedClaimDisplacesUnpinnedHolderAndDisplacedReclaimsNextTick) {
+    auto root_kp = kc->ed25519_keygen();
+    auto pinned  = kc->ed25519_keygen();
+    auto filler  = kc->ed25519_keygen();
+    const auto pinned_b64 = crypto::to_base64(pinned.public_key);
+    const auto filler_b64 = crypto::to_base64(filler.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(pinned_b64, "127.0.0.1:9",
+                           issue_cert(pinned_b64, "peer-pinned", root_kp)),
+                peer_entry(filler_b64, "127.0.0.1:10",
+                           issue_cert(filler_b64, "peer-filler", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // Two unrelated servers hold ns1 and ns2; a claim from them also syncs
+    // this node's slot state, so its own claim is legal.
+    inject(build_packet(filler, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(filler, filler_b64, 1, "10.0.0.10")),
+           a);
+    inject(build_packet(filler, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(filler, filler_b64, 2, "10.0.0.11")),
+           a);
+    ASSERT_TRUE(pump_until([&] {
+        return a.ns_holder(1) == filler_b64 && a.ns_holder(2) == filler_b64;
+    }));
+
+    // This node claims the lowest free slot: ns3.
+    a.gossip->try_claim_ns_slot("10.0.0.50");
+    ASSERT_EQ(a.gossip->our_ns_slot(), 3);
+
+    // The pinned node claims ns3: it takes it from this UNPINNED holder.
+    inject(build_packet(pinned, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(pinned, pinned_b64, 3, "10.0.0.60", true)),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == pinned_b64; }));
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 3).pinned);
+
+    // Displaced: this node holds nothing but stays pending...
+    EXPECT_FALSE(a.gossip->our_ns_slot().has_value());
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_claim_pending(*a.gossip));
+
+    // ...and re-claims the lowest free slot (ns4) on the next tick.
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    EXPECT_EQ(a.gossip->our_ns_slot(), 4);
+    EXPECT_EQ(a.ns_holder(4), a.pubkey_b64());
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 4).server_ip,
+              "10.0.0.50");
+}
+
+// v0.9.4 fix 3: a pinned claim on a slot held by the SAME pinned holder is a
+// renewal only; a DIFFERENT pinned claimant cannot displace a pinned holder
+// (pinned takes from unpinned only).
+TEST_F(GossipIngressSecurityTest, NsPinnedClaimIsRenewalOnlyAgainstPinnedHolder) {
+    auto root_kp = kc->ed25519_keygen();
+    auto pinned  = kc->ed25519_keygen();
+    auto other   = kc->ed25519_keygen();
+    const auto pinned_b64 = crypto::to_base64(pinned.public_key);
+    const auto other_b64  = crypto::to_base64(other.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(pinned_b64, "127.0.0.1:9",
+                           issue_cert(pinned_b64, "peer-pinned", root_kp)),
+                peer_entry(other_b64, "127.0.0.1:10",
+                           issue_cert(other_b64, "peer-other", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    inject(build_packet(pinned, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(pinned, pinned_b64, 5, "10.0.0.70", true)),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(5) == pinned_b64; }));
+
+    // Same pin, same holder: renewal, IP refreshed.
+    inject(build_packet(pinned, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(pinned, pinned_b64, 5, "10.0.0.71", true)),
+           a);
+    ASSERT_TRUE(pump_until(
+        [&] { return gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 5).server_ip == "10.0.0.71"; }));
+    EXPECT_EQ(a.ns_holder(5), pinned_b64);
+
+    // A different pinned claimant: rejected, holder unchanged.
+    inject(build_packet(other, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(other, other_b64, 5, "10.0.0.90", true)),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.ns_holder(5), pinned_b64);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 5).server_ip,
+              "10.0.0.71");
+}
+
+// v0.9.4 fix 3: a release is the claim message with an empty server_ip. Only
+// the holder's release clears the slot and removes the ns<N> A record; a
+// non-holder's release is rejected.
+TEST_F(GossipIngressSecurityTest, NsReleaseByHolderClearsSlotAndNonHolderReleaseRejected) {
+    auto root_kp   = kc->ed25519_keygen();
+    auto holder    = kc->ed25519_keygen();
+    auto outsider  = kc->ed25519_keygen();
+    const auto holder_b64   = crypto::to_base64(holder.public_key);
+    const auto outsider_b64 = crypto::to_base64(outsider.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) { attach_dns(n); },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(holder_b64, "127.0.0.1:9",
+                           issue_cert(holder_b64, "peer-holder", root_kp)),
+                peer_entry(outsider_b64, "127.0.0.1:10",
+                           issue_cert(outsider_b64, "peer-outsider", root_kp)),
+            }));
+        });
+
+    const std::string ns3_fqdn = "ns3.lemonade-nexus.io";
+
+    // Holder takes ns3; the ns3 glue A record appears in the zone.
+    inject(build_packet(holder, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(holder, holder_b64, 3, "10.0.0.30")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == holder_b64; }));
+    ASSERT_EQ(a.dns->nameserver_ip(ns3_fqdn), "10.0.0.30");
+
+    // The outsider's release is rejected; the holder is unchanged.
+    inject(build_packet(outsider, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(outsider, outsider_b64, 3, "")),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.ns_holder(3), holder_b64);
+    ASSERT_EQ(a.dns->nameserver_ip(ns3_fqdn), "10.0.0.30");
+
+    // The holder's release clears the slot and removes the A record.
+    inject(build_packet(holder, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(holder, holder_b64, 3, "")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3).empty(); }));
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 3).server_pubkey.empty());
+    EXPECT_FALSE(a.dns->nameserver_ip(ns3_fqdn).has_value());
+}
+
+// v0.9.4 fix 3: a claim requested BEFORE the slot state is synced is deferred
+// (pending, nothing claimed); after the mesh's claims arrive, the next tick
+// claims the LOWEST free slot against the synced table.
+TEST_F(GossipIngressSecurityTest, NsClaimBeforeSyncIsDeferredThenClaimsLowestFreeOnTick) {
+    auto root_kp    = kc->ed25519_keygen();
+    auto peer_ns1   = kc->ed25519_keygen();  // .40
+    auto peer_ns4   = kc->ed25519_keygen();  // azure
+    const auto ns1_b64 = crypto::to_base64(peer_ns1.public_key);
+    const auto ns4_b64 = crypto::to_base64(peer_ns4.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(ns1_b64, "127.0.0.1:9",
+                           issue_cert(ns1_b64, "peer-ns1", root_kp)),
+                peer_entry(ns4_b64, "127.0.0.1:10",
+                           issue_cert(ns4_b64, "peer-ns4", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // Before any slot state arrives: no claim, claim goes pending.
+    a.gossip->try_claim_ns_slot("10.0.0.90");
+    EXPECT_FALSE(a.gossip->our_ns_slot().has_value());
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_claim_pending(*a.gossip));
+    for (uint8_t s = 1; s <= 9; ++s) EXPECT_TRUE(a.ns_holder(s).empty());
+
+    // The mesh's slot table arrives: {ns1: .40, ns4: azure}.
+    inject(build_packet(peer_ns1, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(peer_ns1, ns1_b64, 1, "10.0.0.40")),
+           a);
+    inject(build_packet(peer_ns4, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(peer_ns4, ns4_b64, 4, "20.36.135.145")),
+           a);
+    ASSERT_TRUE(pump_until([&] {
+        return a.ns_holder(1) == ns1_b64 && a.ns_holder(4) == ns4_b64 &&
+               gossip::GossipBallotTestAccess::ns_synced(*a.gossip);
+    }));
+
+    // The next tick claims the lowest FREE slot: ns2 (ns1 is occupied).
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    EXPECT_EQ(a.gossip->our_ns_slot(), 2);
+    EXPECT_EQ(a.ns_holder(2), a.pubkey_b64());
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::ns_claim_pending(*a.gossip));
+}
+
+// v0.9.4 fix 3: an opt-out node that holds a slot releases it on the next
+// tick (slot empties, the node holds nothing), and stops claiming.
+TEST_F(GossipIngressSecurityTest, NsOptOutReleasesHeldSlotOnTick) {
+    auto root_kp = kc->ed25519_keygen();
+    auto peer    = kc->ed25519_keygen();
+    const auto peer_b64 = crypto::to_base64(peer.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(peer_b64, "127.0.0.1:9",
+                           issue_cert(peer_b64, "peer-a", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // A peer claim syncs slot state; this node then holds ns1.
+    inject(build_packet(peer, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(peer, peer_b64, 3, "10.0.0.20")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == peer_b64; }));
+    a.gossip->try_claim_ns_slot("10.0.0.50");
+    ASSERT_EQ(a.gossip->our_ns_slot(), 1);
+
+    // Opt out: the held slot is released on the next tick.
+    a.gossip->set_ns_opt_out(true);
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    EXPECT_FALSE(a.gossip->our_ns_slot().has_value());
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 1).server_pubkey.empty());
+
+    // And it does not claim again on subsequent ticks.
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    EXPECT_FALSE(a.gossip->our_ns_slot().has_value());
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 1).server_pubkey.empty());
 }
 
 // ---------------------------------------------------------------------------
