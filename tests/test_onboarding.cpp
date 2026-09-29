@@ -15,6 +15,9 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
+#include <LemonadeNexus/Core/NetUtil.hpp>
+
+#include <OnboardingSeeds.hpp>
 #include <OnboardingValidation.hpp>
 
 #include <asio.hpp>
@@ -683,6 +686,114 @@ TEST(Onboarding, PinnedRootGuards) {
                                                              other.public_key.size()));
     EXPECT_FALSE(core::check_root_confirmation(hex, other_hex).empty());
     c.stop();
+}
+
+// ===========================================================================
+// plan_onboarded_seeds — the onboarding target ("proven seed") must be IP-
+// only: gossip peer parsing never does DNS.
+// ===========================================================================
+
+class ProvenSeedPlanTest : public ::testing::Test {
+protected:
+    fs::path temp_dir;
+
+    void SetUp() override {
+        temp_dir = fs::temp_directory_path() /
+                   ("nexus_test_provenseed_" + std::to_string(getpid()));
+        fs::remove_all(temp_dir);
+        fs::create_directories(temp_dir);
+    }
+
+    void TearDown() override {
+        fs::remove_all(temp_dir);
+    }
+
+    fs::path write_config(const std::string& body) {
+        const auto path = temp_dir / "config.json";
+        std::ofstream f(path);
+        f << body;
+        return path;
+    }
+
+    std::string read_config(const fs::path& path) {
+        std::ifstream f(path);
+        return std::string((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
+    }
+};
+
+TEST_F(ProvenSeedPlanTest, IpTargetSeedInsertedAndConfigByteIdentical) {
+    const std::string pre =
+        "{\n  \"seed_peers\": [\"10.9.8.1:9102\"],\n  \"genesis_pubkey\": \"GEN\"\n}\n";
+    const auto cfg = write_config(pre);
+
+    std::vector<std::string> new_seeds;
+    bool mismatch = true;
+    std::string note;
+    core::onboarding_seeds::plan_onboarded_seeds(
+        cfg.string(), "GEN", {"10.9.8.2:9102"}, "10.9.8.5", 9102,
+        new_seeds, mismatch, note);
+
+    // The proven IP target is recommended first; the config's existing seed
+    // is not re-recommended. No hostname note for an IP target.
+    EXPECT_EQ(new_seeds,
+              (std::vector<std::string>{"10.9.8.5:9102", "10.9.8.2:9102"}));
+    EXPECT_EQ(note, "");
+    EXPECT_FALSE(mismatch);
+    // The config is read-only: byte-identical after planning.
+    EXPECT_EQ(read_config(cfg), pre);
+}
+
+TEST_F(ProvenSeedPlanTest, ProvenIpAlreadyInServerSeedsIsNotDuplicated) {
+    const auto cfg = write_config("{}");
+
+    std::vector<std::string> new_seeds;
+    bool mismatch = false;
+    std::string note;
+    core::onboarding_seeds::plan_onboarded_seeds(
+        cfg.string(), "", {"10.9.8.5:9102"}, "10.9.8.5", 9102,
+        new_seeds, mismatch, note);
+
+    EXPECT_EQ(new_seeds, (std::vector<std::string>{"10.9.8.5:9102"}));
+    EXPECT_EQ(note, "");
+}
+
+TEST_F(ProvenSeedPlanTest, FqdnTargetNotInsertedAndSkipNoteReported) {
+    const auto cfg = write_config("{\"seed_peers\": []}");
+
+    std::vector<std::string> new_seeds;
+    bool mismatch = false;
+    std::string note;
+    core::onboarding_seeds::plan_onboarded_seeds(
+        cfg.string(), "", {"10.9.8.2:9102"}, "server.example", 9102,
+        new_seeds, mismatch, note);
+
+    // A hostname is not a usable gossip peer: seed_peers are unchanged and
+    // the note tells the operator to use the server's public IP.
+    EXPECT_EQ(new_seeds, (std::vector<std::string>{"10.9.8.2:9102"}));
+    EXPECT_EQ(note, "proven seed skipped: server.example is a hostname; "
+                    "gossip peers are IP-only — use the server's public IP "
+                    "(see anchors above) for seed_peers");
+}
+
+TEST_F(ProvenSeedPlanTest, FqdnWithPortTargetSkippedLikeFqdn) {
+    // The call site passes the target through splitHostPort first.
+    const auto hp = nexus::net::splitHostPort("server.example:9102", 9100);
+    ASSERT_TRUE(hp.has_value());
+    const auto [host, port] = *hp;
+
+    const auto cfg = write_config("{}");
+
+    std::vector<std::string> new_seeds;
+    bool mismatch = false;
+    std::string note;
+    core::onboarding_seeds::plan_onboarded_seeds(
+        cfg.string(), "", {}, host, port, new_seeds, mismatch, note);
+
+    EXPECT_TRUE(new_seeds.empty());
+    EXPECT_EQ(note, "proven seed skipped: server.example is a hostname; "
+                    "gossip peers are IP-only — use the server's public IP "
+                    "(see anchors above) for seed_peers");
 }
 
 // ===========================================================================

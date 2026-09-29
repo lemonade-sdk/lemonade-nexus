@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/TpmQuote.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
+#include "OnboardingSeeds.hpp"
 #include "OnboardingValidation.hpp"
 
 #include <httplib.h>
@@ -170,59 +171,6 @@ bool verify_issued_cert(crypto::SodiumCryptoService& crypto,
         err = "certificate signature does not verify against the root pubkey"; return false;
     }
     return true;
-}
-
-/// Read the candidate's config READ-ONLY and merge the server-reported seed
-/// peers into the existing list (existing seeds first, then any not already
-/// present). The config file is root-protected: onboarding never modifies it,
-/// it only reports what the operator should apply. A missing, unreadable, or
-/// malformed config (or a non-array seed_peers) warns once and treats the
-/// existing seeds as empty — a config-file condition never fails the run, by
-/// which point the certificate is already installed.
-/// `new_seeds` receives the merged peers absent from the config (the ones to
-/// recommend); `genesis_mismatch` is set when the config carries a
-/// genesis_pubkey that differs from `mesh_genesis_b64`.
-void plan_onboarded_seeds(const std::string& config_path,
-                          const std::string& mesh_genesis_b64,
-                          const std::vector<std::string>& server_seeds,
-                          std::vector<std::string>& new_seeds,
-                          bool& genesis_mismatch) {
-    std::vector<std::string> existing;
-    genesis_mismatch = false;
-    if (!std::filesystem::exists(config_path)) {
-        spdlog::warn("Onboard: config {} not found; treating seed_peers as empty",
-                     config_path);
-    } else {
-        std::ifstream f(config_path);
-        if (!f) {
-            spdlog::warn("Onboard: cannot read config {}; treating seed_peers as empty",
-                         config_path);
-        } else {
-            auto parsed = json::parse(f, nullptr, false);
-            if (parsed.is_discarded() || !parsed.is_object()) {
-                spdlog::warn("Onboard: config {} does not parse as a JSON object; "
-                             "treating seed_peers as empty", config_path);
-            } else {
-                if (parsed.contains("seed_peers")) {
-                    if (parsed["seed_peers"].is_array())
-                        existing = parsed["seed_peers"].get<std::vector<std::string>>();
-                    else
-                        spdlog::warn("Onboard: config {} has a non-array seed_peers; "
-                                     "treating as empty", config_path);
-                }
-                if (parsed.contains("genesis_pubkey") && parsed["genesis_pubkey"].is_string()) {
-                    const auto config_genesis = parsed["genesis_pubkey"].get<std::string>();
-                    if (config_genesis != mesh_genesis_b64) genesis_mismatch = true;
-                }
-            }
-        }
-    }
-    std::vector<std::string> merged = existing;
-    for (const auto& s : server_seeds)
-        if (std::find(merged.begin(), merged.end(), s) == merged.end()) {
-            merged.push_back(s);
-            new_seeds.push_back(s);
-        }
 }
 
 /// Produce platform evidence bound to the admission challenge nonce, so the bundle
@@ -597,20 +545,20 @@ int run_onboard_server(ServerConfig& config) {
         spdlog::error("Onboard: failed to write server_cert.json"); return 1;
     }
 
-    std::vector<std::string> seeds = approved->seed_peers;
-    // The server-reported seeds use its self-detected public IP, which can be
-    // wrong (multihomed/NAT). The address we just onboarded through is proven
-    // reachable — seed it first.
-    auto proven = host + ":" + std::to_string(approved->gossip_port);
-    if (std::find(seeds.begin(), seeds.end(), proven) == seeds.end())
-        seeds.insert(seeds.begin(), proven);
     // The config file is root-protected: merge the seeds read-only and report
     // what the operator should apply instead of rewriting the file. A
     // config-file condition never blocks the run; the ack still goes out.
+    // The onboarding target is the proven-reachable seed; a hostname target
+    // is skipped (gossip peers are IP-only) with an operator note instead.
     std::vector<std::string> new_seeds;
     bool genesis_mismatch = false;
-    plan_onboarded_seeds(config.config_path, approved->genesis_pubkey, seeds,
-                         new_seeds, genesis_mismatch);
+    std::string proven_skip_note;
+    onboarding_seeds::plan_onboarded_seeds(config.config_path,
+                                           approved->genesis_pubkey,
+                                           approved->seed_peers,
+                                           host, approved->gossip_port,
+                                           new_seeds, genesis_mismatch,
+                                           proven_skip_note);
     if (genesis_mismatch) {
         spdlog::warn("Onboard: the config at {} sets a genesis_pubkey that does not "
                      "match the admitted mesh; correct it before start — the daemon "
@@ -658,6 +606,8 @@ int run_onboard_server(ServerConfig& config) {
         for (const auto& s : new_seeds)
             std::printf("  - %s\n", s.c_str());
     }
+    if (!proven_skip_note.empty())
+        std::printf("WARNING: %s\n", proven_skip_note.c_str());
     std::printf("\nStart the server normally:\n");
     std::printf("  ./lemonade-nexus --data-root %s\n\n", config.data_root.c_str());
 
