@@ -1235,3 +1235,127 @@ TEST_F(GossipIngressSecurityTest, APermissionBlobCannotBeTransplantedToAnotherRo
     // The row it legitimately belongs to still opens.
     EXPECT_NE(a.acl->get_permissions("alice", "secret-resource"), acl::Permission::None);
 }
+
+// ---------------------------------------------------------------------------
+// (7) Peer persistence: ban durability and load-time re-checks
+// ---------------------------------------------------------------------------
+
+// A removed peer must not be resurrected after an unclean shutdown:
+// do_remove_peer rewrites peers.json immediately, so the file no longer
+// contains the banned entry even without on_stop's save. Control: a peer that
+// was NOT removed survives the same restart, still certified.
+TEST_F(GossipIngressSecurityTest, RemovePeerPersistsTheBanAcrossRestart) {
+    auto root_kp = kc->ed25519_keygen();
+    auto banned  = kc->ed25519_keygen();
+    auto keeper  = kc->ed25519_keygen();
+    const auto banned_b64 = crypto::to_base64(banned.public_key);
+    const auto keeper_b64 = crypto::to_base64(keeper.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(banned_b64, "127.0.0.1:9",
+                           issue_cert(banned_b64, "peer-banned", root_kp)),
+                peer_entry(keeper_b64, "127.0.0.1:10",
+                           issue_cert(keeper_b64, "peer-keeper", root_kp)),
+            }));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+        });
+
+    ASSERT_TRUE(a.has_peer(banned_b64));
+    ASSERT_TRUE(a.has_peer(keeper_b64));
+
+    a.gossip->remove_peer(banned_b64);
+    EXPECT_FALSE(a.has_peer(banned_b64));
+
+    // The ban is in the file immediately — no stop() required.
+    const auto env = a.storage->read_file("identity", "peers.json");
+    ASSERT_TRUE(env.has_value());
+    const auto j = nlohmann::json::parse(env->data);
+    ASSERT_TRUE(j.contains("peers"));
+    for (const auto& p : j["peers"]) {
+        EXPECT_NE(p.value("pubkey", ""), banned_b64);
+    }
+
+    // Restart on the same storage: the banned peer stays gone, and the
+    // untouched keeper loads with its certificate still verifying.
+    a.gossip->stop();
+    a.gossip = std::make_unique<gossip::GossipService>(io, 0, *a.storage, *a.crypto);
+    a.gossip->set_root_pubkey(root_kp.public_key);
+    a.gossip->set_network_id(kTestNetworkHex);
+    a.gossip->start();
+    EXPECT_FALSE(a.has_peer(banned_b64));
+    EXPECT_TRUE(a.has_peer(keeper_b64));
+    EXPECT_TRUE(a.certified_peer(keeper_b64));
+}
+
+// A persisted peer whose pubkey is in the revocation list must not be
+// resurrected from peers.json. The revoked peer holds a VALID certificate, so
+// only the revocation check can explain its absence. Control: the healthy
+// peer stored alongside it loads and certifies.
+TEST_F(GossipIngressSecurityTest, ReloadDropsRevokedPeers) {
+    auto root_kp    = kc->ed25519_keygen();
+    auto revoked_kp = kc->ed25519_keygen();
+    auto valid      = kc->ed25519_keygen();
+    const auto revoked_b64 = crypto::to_base64(revoked_kp.public_key);
+    const auto valid_b64   = crypto::to_base64(valid.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(revoked_b64, "127.0.0.1:9",
+                           issue_cert(revoked_b64, "peer-revoked", root_kp)),
+                peer_entry(valid_b64, "127.0.0.1:10",
+                           issue_cert(valid_b64, "peer-valid", root_kp)),
+            }));
+            storage::SignedEnvelope env;
+            env.type = "revocation_list";
+            env.data = nlohmann::json::array({revoked_b64}).dump();
+            ASSERT_TRUE(n.storage->write_file("identity", "revoked_servers.json", env));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+        });
+
+    EXPECT_FALSE(a.has_peer(revoked_b64));
+    EXPECT_TRUE(a.has_peer(valid_b64));
+    EXPECT_TRUE(a.certified_peer(valid_b64));
+}
+
+// A stored certificate that no longer verifies must not be trusted after
+// reload. The certificate is genuinely root-signed but was edited afterwards
+// (a different server_id), so only the signature check fails. The peer stays
+// tracked as uncertified — membership without a certificate is a valid state
+// elsewhere — and only the bad certificate is dropped.
+TEST_F(GossipIngressSecurityTest, ReloadDropsUnverifiableStoredCertificate) {
+    auto root_kp = kc->ed25519_keygen();
+    auto peer_kp = kc->ed25519_keygen();
+    const auto peer_b64 = crypto::to_base64(peer_kp.public_key);
+
+    auto cert = nlohmann::json::parse(
+                    issue_cert(peer_b64, "peer-edited", root_kp))
+                    .get<gossip::ServerCertificate>();
+    cert.server_id = "peer-evil";
+    const auto tampered = nlohmann::json(cert).dump();
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(peer_b64, "127.0.0.1:9", tampered)}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+        });
+
+    EXPECT_TRUE(a.has_peer(peer_b64));
+    EXPECT_TRUE(a.peer_cert_json(peer_b64).empty());
+    EXPECT_FALSE(a.certified_peer(peer_b64));
+}

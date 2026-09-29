@@ -337,13 +337,23 @@ void GossipService::do_add_peer(std::string_view endpoint, std::string_view pubk
 }
 
 void GossipService::do_remove_peer(std::string_view pubkey) {
-    std::lock_guard lock(peers_mutex_);
-    auto it = std::remove_if(peers_.begin(), peers_.end(),
-        [&](const GossipPeer& p) { return p.pubkey == pubkey; });
+    bool removed = false;
+    {
+        std::lock_guard lock(peers_mutex_);
+        auto it = std::remove_if(peers_.begin(), peers_.end(),
+            [&](const GossipPeer& p) { return p.pubkey == pubkey; });
 
-    if (it != peers_.end()) {
-        peers_.erase(it, peers_.end());
-        spdlog::info("[{}] removed peer {}", name(), pubkey);
+        if (it != peers_.end()) {
+            peers_.erase(it, peers_.end());
+            removed = true;
+            spdlog::info("[{}] removed peer {}", name(), pubkey);
+        }
+    }
+    if (removed) {
+        // Persist the ban immediately, outside the lock (save_peers takes
+        // peers_mutex_ itself): a ban must survive an unclean shutdown, so it
+        // cannot wait for the on_stop save.
+        save_peers();
     }
 }
 
@@ -1744,10 +1754,52 @@ void GossipService::load_peers() {
             peer.reputation          = p.value("reputation", 1.0f);
             peer.certificate_json    = p.value("certificate_json", "");
 
-            if (!peer.pubkey.empty() && !peer.endpoint.empty() &&
-                known_endpoints.insert(peer.endpoint).second) {
-                peers_.push_back(std::move(peer));
+            if (peer.pubkey.empty() || peer.endpoint.empty() ||
+                !known_endpoints.insert(peer.endpoint).second) {
+                continue;
             }
+
+            // A revoked pubkey must not be resurrected from disk. The revoked
+            // set is loaded in load_server_certificate(), which on_start runs
+            // before this function, so the check is against the persisted
+            // revocation list.
+            if (is_revoked(peer.pubkey)) {
+                spdlog::warn("[{}] dropping persisted peer {} — pubkey is "
+                             "revoked", name(), peer.pubkey);
+                continue;
+            }
+
+            // Re-verify a stored certificate with the same path the adopt
+            // path uses. The root pubkey and network id are the anchors;
+            // without them verification is impossible, so the stored value is
+            // left in place — every use site still fails closed (verify_cert_core
+            // rejects an empty network, and peer_certificate_is_root_signed
+            // requires the root pubkey).
+            if (!peer.certificate_json.empty() && has_root_pubkey_ &&
+                !expected_network_id_.empty()) {
+                bool valid = false;
+                try {
+                    auto cert = json::parse(peer.certificate_json)
+                                    .get<ServerCertificate>();
+                    valid = cert.server_pubkey == peer.pubkey &&
+                            verify_cert_core(cert);
+                } catch (...) {
+                    valid = false;
+                }
+                if (!valid) {
+                    // Keep the peer but drop the certificate: an uncertified
+                    // peer is a valid tracked state elsewhere (peer exchange
+                    // and add_peer accept peers with no certificate) — only the
+                    // unverified certificate is discarded. verify_cert_core
+                    // already logged the specific reason.
+                    spdlog::warn("[{}] dropping unverifiable stored "
+                                 "certificate for peer {}", name(),
+                                 peer.pubkey);
+                    peer.certificate_json.clear();
+                }
+            }
+
+            peers_.push_back(std::move(peer));
         }
 
         spdlog::info("[{}] {} peer(s) after loading storage", name(), peers_.size());
