@@ -57,6 +57,8 @@ using DnsRecordCallback = std::function<void(const std::string& delta_id,
 ///   <hostname>.relays.<base_domain>            -> Relay by hostname (any region)
 ///   <id>.<region>.seip.<base_domain>              -> Server's public IP (SEIP A record)
 ///   <region>.seip.<base_domain>                  -> All servers in region (multi-A)
+///   tier<N>.<region>.seip.<base_domain>          -> Tier's servers (multi-A) +
+///                                                    member FQDN list (TXT, "v=sp1 host=...")
 ///   _config.<id>.<region>.seip.<base_domain>     -> Server config TXT (SEIP)
 ///   _config.<hostname>.<base_domain>             -> TXT record with port config
 ///   _acme-challenge.<domain>                     -> ACME DNS-01 TXT challenge
@@ -199,8 +201,10 @@ public:
                               const std::string& public_ip);
 
     /// Publish a per-server tier A record under <id>.tier<tier>.<region>.seip.<domain>.
-    /// Aggregated by the tier+region wildcard so a bootstrapping node can resolve
-    /// tier<tier>.<region>.seip.<domain> to all servers of that tier in that region.
+    /// Aggregated by the tier+region wildcard: tier<tier>.<region>.seip.<domain>
+    /// resolves to all servers of that tier in that region (multi-A), and its TXT
+    /// record lists each member's SEIP FQDN (<id>.<region>.seip.<domain>) so
+    /// onboarding can probe a FQDN its certificate actually covers.
     void publish_tier_record(const std::string& server_id,
                              const std::string& region,
                              int tier,

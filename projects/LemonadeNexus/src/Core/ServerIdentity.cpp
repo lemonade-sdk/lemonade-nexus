@@ -27,6 +27,7 @@
 #include <array>
 #include <chrono>
 #include <fstream>
+#include <random>
 #include <set>
 #include <thread>
 #include <unordered_set>
@@ -267,6 +268,191 @@ std::vector<std::string> resolve_a_records(const std::string& hostname) {
     }
     ::freeaddrinfo(res);
     return ips;
+}
+
+namespace {
+
+/// Read a DNS name (RFC 1035, with compression pointers) starting at `*p`
+/// and advance `*p` past the name's wire encoding — the byte after the root
+/// label for a literal name, or after the 2-byte pointer for a pointer name
+/// (the RR fields that follow start there, NOT after the expanded name).
+/// Returns false on truncation, a label longer than 63 octets, or a
+/// compression pointer that does not point backward into the message (which
+/// also rules out pointer loops). Every byte is bounds-checked against
+/// [origin, end).
+bool read_dns_name(const uint8_t* origin, const uint8_t* end, const uint8_t*& p,
+                   std::string& out) {
+    out.clear();
+    int pointer_jumps = 0;
+    const uint8_t* walk = p;
+    for (;;) {
+        if (walk >= end) return false;
+        const uint8_t len = *walk;
+        if ((len & 0xC0) == 0xC0) {                    // compression pointer
+            if (walk + 1 >= end) return false;
+            if (++pointer_jumps > 16) return false;    // pointer loop guard
+            const uint16_t offset =
+                static_cast<uint16_t>(((len & 0x3F) << 8) | walk[1]);
+            if (origin + offset >= walk) return false; // must point backward
+            p = walk + 2;                              // RR continues after pointer
+            walk = origin + offset;
+            continue;
+        }
+        ++walk;
+        if (len == 0) {                                 // root label: name done
+            if (pointer_jumps == 0) p = walk;           // literal name
+            return true;
+        }
+        if (len > 63 || walk + len > end) return false; // bad label / truncated
+        out.append(reinterpret_cast<const char*>(walk), len);
+        out.push_back('.');
+        walk += len;
+    }
+}
+
+}  // namespace
+
+std::vector<std::string> parse_dns_txt_records(const std::vector<uint8_t>& message) {
+    std::vector<std::string> results;
+    if (message.size() < 12) return results;
+
+    const uint8_t* origin = message.data();
+    const uint8_t* end = origin + message.size();
+    const auto rd16 = [](const uint8_t* p) {
+        return static_cast<uint16_t>((p[0] << 8) | p[1]);
+    };
+
+    const uint16_t flags = rd16(origin + 2);
+    if (!(flags & 0x8000)) return results;      // not a response
+    if (flags & 0x000F) return results;         // rcode must be NOERROR
+
+    const uint16_t qdcount = rd16(origin + 4);
+    const uint16_t ancount = rd16(origin + 6);
+    if (qdcount < 1) return results;
+
+    const uint8_t* p = origin + 12;
+    std::string name;
+    // Skip the question section (name + qtype + qclass).
+    for (uint16_t i = 0; i < qdcount; ++i) {
+        if (!read_dns_name(origin, end, p, name) || p + 4 > end) return results;
+        p += 4;
+    }
+
+    for (uint16_t i = 0; i < ancount; ++i) {
+        // name, type, class, ttl, rdlength
+        if (!read_dns_name(origin, end, p, name) || p + 10 > end) return results;
+        const uint16_t rtype = rd16(p);
+        p += 2;                     // type
+        p += 2;                     // class
+        p += 4;                     // ttl
+        const uint16_t rdlength = rd16(p);
+        p += 2;
+        if (p + rdlength > end) return results;
+
+        if (rtype == 16 /* TXT */) {
+            std::string txt;
+            const uint8_t* r = p;
+            const uint8_t* r_end = p + rdlength;
+            while (r < r_end) {
+                const uint8_t chunk = *r++;
+                if (r + chunk > r_end) return results;   // bad chunk: fail closed
+                txt.append(reinterpret_cast<const char*>(r), chunk);
+                r += chunk;
+            }
+            if (!txt.empty()) results.push_back(std::move(txt));
+        }
+        p += rdlength;
+    }
+    return results;
+}
+
+std::vector<std::string> resolve_txt_records(const std::string& hostname) {
+    std::vector<std::string> results;
+    if (hostname.empty()) return results;
+
+#ifdef _WIN32
+    // No /etc/resolv.conf on Windows; discovery is unavailable (fail closed).
+    return results;
+#else
+    // First IPv4 nameserver from /etc/resolv.conf — the same configuration
+    // getaddrinfo uses, which cannot return TXT data.
+    std::string resolver;
+    {
+        std::ifstream f("/etc/resolv.conf");
+        std::string line;
+        while (resolver.empty() && std::getline(f, line)) {
+            const auto comment = line.find_first_of("#;");
+            if (comment != std::string::npos) line = line.substr(0, comment);
+            const auto start = line.find_first_not_of(" \t");
+            if (start == std::string::npos ||
+                line.compare(start, 10, "nameserver") != 0) {
+                continue;
+            }
+            std::string word = line.substr(start + 10);
+            const auto ws = word.find_first_not_of(" \t");
+            if (ws == std::string::npos) continue;
+            const auto stop = word.find_first_of(" \t\r\n", ws);
+            resolver = word.substr(ws,
+                                   stop == std::string::npos ? std::string::npos
+                                                             : stop - ws);
+        }
+    }
+    struct sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(53);
+    if (resolver.empty() ||
+        inet_pton(AF_INET, resolver.c_str(), &dest.sin_addr) != 1) {
+        spdlog::debug("TXT DNS: no usable IPv4 nameserver in /etc/resolv.conf");
+        return results;
+    }
+
+    // Build the query: random ID + recursion-desired, one TXT/IN question.
+    std::vector<uint8_t> q;
+    const uint16_t id = static_cast<uint16_t>(std::random_device{}() & 0xFFFF);
+    q.push_back(static_cast<uint8_t>(id >> 8));
+    q.push_back(static_cast<uint8_t>(id & 0xFF));
+    q.push_back(0x01); q.push_back(0x00);      // RD
+    q.push_back(0x00); q.push_back(0x01);      // QDCOUNT = 1
+    q.push_back(0x00); q.push_back(0x00);      // ANCOUNT
+    q.push_back(0x00); q.push_back(0x00);      // NSCOUNT
+    q.push_back(0x00); q.push_back(0x00);      // ARCOUNT
+    std::size_t start = 0;
+    for (;;) {
+        const auto dot = hostname.find('.', start);
+        const auto stop = (dot == std::string::npos) ? hostname.size() : dot;
+        if (stop - start == 0 || stop - start > 63) return results;  // bad label
+        q.push_back(static_cast<uint8_t>(stop - start));
+        q.insert(q.end(), hostname.begin() + start, hostname.begin() + stop);
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    q.push_back(0x00);                         // root label
+    q.push_back(0x00); q.push_back(16);        // qtype TXT
+    q.push_back(0x00); q.push_back(0x01);      // qclass IN
+
+    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return results;
+    struct timeval tv{};
+    tv.tv_sec = 2;
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const ssize_t sent =
+        ::sendto(fd, q.data(), q.size(), 0,
+                 reinterpret_cast<const struct sockaddr*>(&dest), sizeof(dest));
+    std::vector<uint8_t> reply(4096);
+    const ssize_t n = (sent == static_cast<ssize_t>(q.size()))
+        ? ::recv(fd, reply.data(), reply.size(), 0)
+        : -1;
+    ::close(fd);
+    if (n < 2) {
+        spdlog::debug("TXT DNS: query for {} timed out or failed", hostname);
+        return results;
+    }
+    reply.resize(static_cast<std::size_t>(n));
+
+    // The reply must echo our random ID, or drop it (fail closed).
+    if (static_cast<uint16_t>((reply[0] << 8) | reply[1]) != id) return results;
+    return parse_dns_txt_records(reply);
+#endif
 }
 
 std::vector<std::string> select_seed_endpoints(

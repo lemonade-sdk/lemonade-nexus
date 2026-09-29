@@ -1,3 +1,4 @@
+#include <LemonadeNexus/Core/ServerIdentity.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
@@ -202,6 +203,93 @@ TEST_F(DnsTcpTest, TheReplyPrefixDescribesExactlyWhatFollows) {
     EXPECT_FALSE(ec);
     EXPECT_EQ(body[0], 0x12);  // the query id, echoed
     EXPECT_EQ(body[1], 0x34);
+}
+
+// ---------------------------------------------------------------------------
+// Tier records: aggregated A + member-list TXT (onboarding discovery)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::size_t count_host_fields(const std::string& record) {
+    std::size_t count = 0;
+    for (std::size_t i = record.find("host="); i != std::string::npos;
+         i = record.find("host=", i + 1)) {
+        ++count;
+    }
+    return count;
+}
+
+}  // namespace
+
+TEST_F(DnsTcpTest, TierTxtAggregatesMemberFqdnsFromPerServerTierRecords) {
+    dns_->publish_tier_record("alpha", "us", 1, "10.9.0.1");
+    dns_->publish_tier_record("beta", "us", 1, "10.9.0.2");
+
+    const auto reply =
+        udp_query(make_query("tier1.us.seip.test.local", 0x7A11, kTypeTxt));
+    ASSERT_FALSE(reply.empty());
+
+    const auto txt = nexus::core::parse_dns_txt_records(reply);
+    ASSERT_EQ(txt.size(), 1u);
+    EXPECT_EQ(txt[0].rfind("v=sp1", 0), 0u);
+    EXPECT_NE(txt[0].find("host=alpha.us.seip.test.local"), std::string::npos);
+    EXPECT_NE(txt[0].find("host=beta.us.seip.test.local"), std::string::npos);
+    EXPECT_EQ(count_host_fields(txt[0]), 2u);
+    // The member list carries FQDNs only — no bare IPs or tier names.
+    EXPECT_EQ(txt[0].find("10.9.0."), std::string::npos);
+    EXPECT_EQ(txt[0].find("tier1"), std::string::npos);
+}
+
+TEST_F(DnsTcpTest, TierTxtDedupesMembersByFqdn) {
+    dns_->publish_tier_record("alpha", "us", 1, "10.9.0.1");
+    dns_->publish_tier_record("ALPHA", "US", 1, "10.9.0.5");  // same label, new IP
+
+    const auto reply =
+        udp_query(make_query("tier1.us.seip.test.local", 0x7A12, kTypeTxt));
+    ASSERT_FALSE(reply.empty());
+
+    const auto txt = nexus::core::parse_dns_txt_records(reply);
+    ASSERT_EQ(txt.size(), 1u);
+    EXPECT_EQ(count_host_fields(txt[0]), 1u);
+    EXPECT_NE(txt[0].find("host=alpha.us.seip.test.local"), std::string::npos);
+}
+
+TEST_F(DnsTcpTest, TierTxtWithNoMembersIsNxdomain) {
+    const auto reply =
+        udp_query(make_query("tier9.us.seip.test.local", 0x7A13, kTypeTxt));
+    ASSERT_FALSE(reply.empty());
+    ASSERT_GE(reply.size(), 4u);
+    EXPECT_EQ(reply[3] & 0x0F, 3);  // NXDOMAIN
+    EXPECT_TRUE(nexus::core::parse_dns_txt_records(reply).empty());
+}
+
+TEST_F(DnsTcpTest, TierTxtIgnoresMalformedTierNames) {
+    dns_->publish_tier_record("alpha", "us", 1, "10.9.0.1");
+
+    // Not a tier label: must not be answered by the tier TXT branch.
+    for (const std::string& bogus :
+         {"tiers.us.seip.test.local",    // no digits
+          "tierx1.us.seip.test.local",   // non-digit tier
+          "tier1.us.extra.seip.test.local"}) {  // region with an extra label
+        const auto reply = udp_query(make_query(bogus, 0x7A14, kTypeTxt));
+        ASSERT_FALSE(reply.empty());
+        ASSERT_GE(reply.size(), 4u);
+        EXPECT_EQ(reply[3] & 0x0F, 3) << bogus << " must be NXDOMAIN";
+    }
+}
+
+TEST_F(DnsTcpTest, TierAAggregationIsUnchangedByTheTxtPath) {
+    dns_->publish_tier_record("alpha", "eu", 2, "10.9.1.1");
+    dns_->publish_tier_record("beta", "eu", 2, "10.9.1.2");
+
+    const auto reply = udp_query(make_query("tier2.eu.seip.test.local", 0x7A15));
+    ASSERT_FALSE(reply.empty());
+    ASSERT_GE(reply.size(), 12u);
+    const std::size_t ancount =
+        (static_cast<std::size_t>(reply[6]) << 8) | static_cast<std::size_t>(reply[7]);
+    EXPECT_EQ(ancount, 2u);  // both member IPs, as before
+    EXPECT_EQ(reply[3] & 0x0F, 0);  // NOERROR, not NXDOMAIN
 }
 
 TEST_F(DnsTcpTest, AQueryDribbledOneByteAtATimeIsStillAnswered) {

@@ -25,6 +25,7 @@
 #include <cstring>
 #include <fstream>
 #include <span>
+#include <string_view>
 #include <thread>
 
 namespace nexus::core {
@@ -188,21 +189,76 @@ std::optional<security::SnpVtpmEvidence> collect_onboarding_evidence(
 }
 
 /// Probe candidate targets; return the first "host:port" that accepts onboarding.
+/// Logs why each candidate failed so an operator can see why discovery dead-ended
+/// (connection/TLS failure, non-200, bad JSON, or the server refusing onboarding).
 std::string pick_target(const std::vector<std::string>& targets,
                         const std::string& connect_ip) {
     for (const auto& t : targets) {
         auto [host, port] = split_hostport(t, 9100);
         auto r = http_call(host, port, "GET", "/api/onboard/info", "", connect_ip);
-        if (!r.connected || r.status != 200) continue;
+        if (!r.connected) {
+            spdlog::warn("Onboard: probe of {} failed: not connected "
+                         "(no TCP/TLS handshake; hostname verification may have "
+                         "failed)", t);
+            continue;
+        }
+        if (r.status != 200) {
+            spdlog::warn("Onboard: probe of {} failed: HTTP {}", t, r.status);
+            continue;
+        }
         auto body = json::parse(r.body, nullptr, false);
-        if (body.is_discarded()) continue;
+        if (body.is_discarded()) {
+            spdlog::warn("Onboard: probe of {} failed: /api/onboard/info is not "
+                         "valid JSON", t);
+            continue;
+        }
         auto info = OnboardingInfoResponse::fromJson(body);
         if (info && info.value->accepts_onboarding) return t;
+        spdlog::warn("Onboard: probe of {} failed: server is not accepting "
+                     "onboarding", t);
     }
     return {};
 }
 
 } // namespace
+
+std::vector<std::string> parse_discovery_txt_hosts(
+    const std::vector<std::string>& txt_strings) {
+    std::vector<std::string> hosts;
+    static constexpr std::string_view kHostKey = "host=";
+    for (const auto& record : txt_strings) {
+        std::size_t pos = 0;
+        while (pos < record.size()) {
+            const auto space = record.find(' ', pos);
+            const std::string field = record.substr(
+                pos, space == std::string::npos ? std::string::npos : space - pos);
+            pos = (space == std::string::npos) ? record.size() : space + 1;
+            if (field.size() > kHostKey.size() &&
+                field.compare(0, kHostKey.size(), kHostKey) == 0) {
+                hosts.push_back(field.substr(kHostKey.size()));
+            }
+        }
+    }
+    return hosts;
+}
+
+std::vector<std::string> build_discovery_targets(
+    const std::vector<std::string>& tier1_members,
+    const std::vector<std::string>& tier2_members,
+    const std::string& region,
+    const std::string& dns_base_domain,
+    int http_port) {
+    std::vector<std::string> targets;
+    const std::string port_suffix = ":" + std::to_string(http_port);
+    for (int tier : {1, 2}) {
+        const auto& members = (tier == 1) ? tier1_members : tier2_members;
+        for (const auto& member : members)
+            if (!member.empty()) targets.push_back(member + port_suffix);
+        targets.push_back("tier" + std::to_string(tier) + "." + region + ".seip." +
+                          dns_base_domain + port_suffix);
+    }
+    return targets;
+}
 
 std::string validate_pinned_root(const std::string& pinned_hex) {
     if (pinned_hex.empty())
@@ -269,10 +325,36 @@ int run_onboard_server(ServerConfig& config) {
     if (!config.onboard_target.empty()) {
         targets.push_back(config.onboard_target);
     } else if (!config.dns_base_domain.empty() && !region.empty()) {
+        // The server's ACME certificate covers the member FQDN
+        // (<id>.<region>.seip.<base>) — never the tier name — so a probe of the
+        // tier FQDN fails hostname verification. Fetch each tier's member list
+        // from the aggregated tier TXT record and probe the member FQDNs (their
+        // certificates verify and their own A records supply the IP); the tier
+        // FQDN itself stays as a fallback candidate for deployments whose
+        // certificate does cover tier names.
+        std::vector<std::string> tier1_members;
+        std::vector<std::string> tier2_members;
         for (int tier : {1, 2}) {
-            targets.push_back("tier" + std::to_string(tier) + "." + region + ".seip." +
-                              config.dns_base_domain + ":" + std::to_string(config.http_port));
+            const std::string tier_fqdn = "tier" + std::to_string(tier) + "." +
+                                          region + ".seip." + config.dns_base_domain;
+            std::vector<std::string>& members =
+                (tier == 1) ? tier1_members : tier2_members;
+            const auto txt_strings = resolve_txt_records(tier_fqdn);
+            if (txt_strings.empty()) {
+                spdlog::warn("Onboard: tier TXT query for {} returned no records "
+                             "(tier membership unavailable)", tier_fqdn);
+                continue;
+            }
+            members = parse_discovery_txt_hosts(txt_strings);
+            if (members.empty()) {
+                spdlog::warn("Onboard: tier TXT record for {} lists no host= "
+                             "members", tier_fqdn);
+                continue;
+            }
+            spdlog::info("Onboard: tier{} member FQDNs: {}", tier, members.size());
         }
+        targets = build_discovery_targets(tier1_members, tier2_members, region,
+                                          config.dns_base_domain, config.http_port);
     }
     if (targets.empty()) {
         spdlog::error("Onboard: no target. Pass '--onboard-server <fqdn[:port]>' or configure "

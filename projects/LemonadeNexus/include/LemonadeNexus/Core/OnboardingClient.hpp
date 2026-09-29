@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace nexus::core {
 
@@ -21,5 +22,24 @@ struct ServerConfig;
 /// comparison; empty `delivered_hex` is fine — confirm-only), else an error.
 [[nodiscard]] std::string check_root_confirmation(const std::string& pinned_hex,
                                                   const std::string& delivered_hex);
+
+/// Extract the member FQDNs listed by tier discovery TXT record(s) of the
+/// form "v=sp1 host=<id>.<region>.seip.<base> [host=... ...]". The input is
+/// untrusted DNS data: fields are whitespace-delimited, only "host=" fields
+/// are collected, and empty values are skipped. Empty when no members.
+/// Exposed for unit testing.
+[[nodiscard]] std::vector<std::string> parse_discovery_txt_hosts(
+    const std::vector<std::string>& txt_strings);
+
+/// Build the onboarding discovery candidate list ("fqdn:port" per entry):
+/// per tier (1, then 2), the tier's member FQDNs in record order, followed by
+/// the tier wildcard FQDN itself as a fallback (deployments whose certificate
+/// covers the tier name). Exposed for unit testing.
+[[nodiscard]] std::vector<std::string> build_discovery_targets(
+    const std::vector<std::string>& tier1_members,
+    const std::vector<std::string>& tier2_members,
+    const std::string& region,
+    const std::string& dns_base_domain,
+    int http_port);
 
 } // namespace nexus::core

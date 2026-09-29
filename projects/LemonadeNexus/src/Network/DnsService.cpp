@@ -303,6 +303,37 @@ void DnsService::start_accept() {
     });
 }
 
+namespace {
+
+/// The "<tierlabel>.<region>" prefix of a tier wildcard name
+/// ("tier<N>.<region>.seip.<base_domain>"), or empty when the name is not a
+/// well-formed tier query: the tier label must be "tier" plus one or more
+/// digits and the region must be a single DNS label. Shared by the tier A
+/// and tier TXT aggregation branches so both apply identical validation.
+std::string tier_wildcard_prefix(const std::string& query_lower,
+                                 const std::string& base_lower) {
+    const std::string seip_suffix = ".seip." + base_lower;
+    if (query_lower.size() <= seip_suffix.size() ||
+        query_lower.compare(query_lower.size() - seip_suffix.size(),
+                            seip_suffix.size(), seip_suffix) != 0) {
+        return {};
+    }
+    const std::string prefix =
+        query_lower.substr(0, query_lower.size() - seip_suffix.size());
+    const auto dot = prefix.find('.');
+    if (dot == std::string::npos || dot <= 4 ||
+        prefix.find('.', dot + 1) != std::string::npos ||
+        prefix.rfind("tier", 0) != 0) {
+        return {};
+    }
+    for (std::size_t i = 4; i < dot; ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(prefix[i]))) return {};
+    }
+    return prefix;
+}
+
+}  // namespace
+
 void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
                               const ResponseSink& send_response) {
     if (bytes < kDnsMinMessageBytes) return; // Too short for DNS header
@@ -406,6 +437,47 @@ void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
             }
         }
 
+        // 3. Tier+region wildcard TXT: tier<N>.<region>.seip.<base_domain> ->
+        // "v=sp1 host=<id>.<region>.seip.<base_domain> ..." listing every
+        // member's SEIP FQDN. Members are the servers that published
+        // per-server tier A records (<id>.tier<N>.<region>.seip.<base>);
+        // each member FQDN is the record key with the tier label stripped.
+        // Onboarding probes those FQDNs because the ACME certificate covers
+        // them — the tier name is never covered, so probing it would fail
+        // hostname verification.
+        if (auto prefix = tier_wildcard_prefix(query_lower, base_lower);
+            !prefix.empty()) {
+            const std::string match_suffix =
+                "." + prefix + ".seip." + base_lower;  // ".tier<N>.<region>.seip.<base>"
+            // ".<region>.seip.<base>" — everything after "<tierlabel>.". The tier
+            // label ends at prefix.find('.') (the dot before the region label),
+            // so skip 1 (leading dot) + label length = dot + 1 characters.
+            const std::string fqdn_suffix = match_suffix.substr(prefix.find('.') + 1);
+            std::set<std::string> members;
+            {
+                std::lock_guard<std::mutex> lock(zone_mutex_);
+                for (const auto& [key, rec] : zone_records_) {
+                    if (key.starts_with("A:") &&
+                        key.size() > (2 + match_suffix.size()) &&
+                        key.compare(key.size() - match_suffix.size(),
+                                    match_suffix.size(), match_suffix) == 0) {
+                        const std::string id =
+                            key.substr(2, key.size() - (2 + match_suffix.size()));
+                        members.insert(id + fqdn_suffix);
+                    }
+                }
+            }
+            if (!members.empty()) {
+                std::string txt = "v=sp1";
+                for (const auto& member : members) txt += " host=" + member;
+                spdlog::debug("[{}] TXT {} -> {} tier member(s)",
+                               name(), qname, members.size());
+                send_response(build_txt_response(data, bytes, qname, txt, 300));
+                return;
+            }
+            // No servers for this tier+region — fall through to NXDOMAIN.
+        }
+
         spdlog::debug("[{}] TXT {} -> NXDOMAIN", name(), qname);
         send_response(build_nxdomain(data, bytes));
         return;
@@ -424,53 +496,29 @@ void DnsService::handle_query(const uint8_t* data, std::size_t bytes,
         // Aggregates per-server records <id>.tier<N>.<region>.seip.<base_domain> so a
         // bootstrapping node can resolve all servers of a given tier in a region.
         // More specific than the plain region wildcard below, so checked first.
-        {
-            std::string seip_suffix = ".seip." + base_lower;
-            if (query_lower.size() > seip_suffix.size() &&
-                query_lower.compare(query_lower.size() - seip_suffix.size(),
-                                     seip_suffix.size(), seip_suffix) == 0) {
-                std::string prefix = query_lower.substr(
-                    0, query_lower.size() - seip_suffix.size());  // "tier<N>.<region>"
-                auto dot = prefix.find('.');
-                // Require exactly "<tierlabel>.<region>": one dot, region has no further
-                // dots, first label is "tier" + one-or-more digits.
-                bool is_tier_query =
-                    dot != std::string::npos &&
-                    dot > 4 &&  // "tier" + >=1 digit
-                    prefix.find('.', dot + 1) == std::string::npos &&
-                    prefix.rfind("tier", 0) == 0;
-                if (is_tier_query) {
-                    for (std::size_t i = 4; i < dot; ++i) {
-                        if (!std::isdigit(static_cast<unsigned char>(prefix[i]))) {
-                            is_tier_query = false;
-                            break;
-                        }
+        if (auto prefix = tier_wildcard_prefix(query_lower, base_lower);
+            !prefix.empty()) {
+            std::string match_suffix = "." + query_lower;  // ".tier<N>.<region>.seip.<base>"
+            std::set<std::string> ipset;
+            {
+                std::lock_guard<std::mutex> lock(zone_mutex_);
+                for (const auto& [key, rec] : zone_records_) {
+                    if (key.starts_with("A:") &&
+                        key.size() > (2 + match_suffix.size()) &&
+                        key.compare(key.size() - match_suffix.size(),
+                                    match_suffix.size(), match_suffix) == 0) {
+                        ipset.insert(rec.value);
                     }
-                }
-                if (is_tier_query) {
-                    std::string match_suffix = "." + query_lower;  // ".tier<N>.<region>.seip.<base>"
-                    std::set<std::string> ipset;
-                    {
-                        std::lock_guard<std::mutex> lock(zone_mutex_);
-                        for (const auto& [key, rec] : zone_records_) {
-                            if (key.starts_with("A:") &&
-                                key.size() > (2 + match_suffix.size()) &&
-                                key.compare(key.size() - match_suffix.size(),
-                                            match_suffix.size(), match_suffix) == 0) {
-                                ipset.insert(rec.value);
-                            }
-                        }
-                    }
-                    if (!ipset.empty()) {
-                        std::vector<std::string> ips(ipset.begin(), ipset.end());
-                        spdlog::debug("[{}] {} -> {} tier A records",
-                                       name(), qname, ips.size());
-                        send_response(build_multi_a_response(data, bytes, qname, ips, 300));
-                        return;
-                    }
-                    // No servers for this tier+region — fall through to NXDOMAIN.
                 }
             }
+            if (!ipset.empty()) {
+                std::vector<std::string> ips(ipset.begin(), ipset.end());
+                spdlog::debug("[{}] {} -> {} tier A records",
+                               name(), qname, ips.size());
+                send_response(build_multi_a_response(data, bytes, qname, ips, 300));
+                return;
+            }
+            // No servers for this tier+region — fall through to NXDOMAIN.
         }
 
         // 1. SEIP region-wildcard: <region>.seip.<base_domain> -> multi-A response

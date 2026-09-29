@@ -57,6 +57,25 @@ void resolve_server_region(
 /// Returns de-duplicated dotted-quad strings; empty on failure.
 [[nodiscard]] std::vector<std::string> resolve_a_records(const std::string& hostname);
 
+/// Extract TXT record strings from a raw DNS response message.
+///
+/// Bounds-checked and fail-closed: malformed input (truncated fields, labels
+/// longer than 63 octets, name pointers that do not point backward into the
+/// message, RDATA overruns) returns empty, as do non-responses and responses
+/// with a nonzero rcode. Length-prefixed chunks within one TXT answer RR are
+/// concatenated; each TXT answer RR yields one string.
+[[nodiscard]] std::vector<std::string> parse_dns_txt_records(
+    const std::vector<uint8_t>& message);
+
+/// Resolve TXT records for a hostname via a raw UDP DNS query to the system
+/// resolver (first IPv4 `nameserver` line of /etc/resolv.conf, port 53).
+/// getaddrinfo cannot return TXT data, so the query and reply are hand-rolled;
+/// the reply must echo the query's random ID or is dropped. The TXT payload
+/// is decoded by parse_dns_txt_records. Fails closed: returns empty on any
+/// error, timeout, or malformed response, and on platforms without a
+/// /etc/resolv.conf (e.g. Windows) where discovery is unavailable.
+[[nodiscard]] std::vector<std::string> resolve_txt_records(const std::string& hostname);
+
 /// Pure selection step (no network): turn an ordered list of candidate IPs into a
 /// de-duplicated list of "ip:port" seed endpoints, excluding our own public IP and
 /// preserving priority order. Factored out of discover_seed_endpoints for testing.

@@ -61,6 +61,7 @@ add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
 
 add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
 add_nexus_test(test_onboarding        test_onboarding.cpp)
+add_nexus_test(test_onboarding_discovery test_onboarding_discovery.cpp)
 # Internal onboarding validation lives in the library's src tree, not the
 # public include tree; only the onboarding unit tests get a path to it.
 target_include_directories(test_onboarding PRIVATE
