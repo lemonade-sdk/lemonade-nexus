@@ -731,6 +731,100 @@ TEST_F(HttpEndpointTest, DeltaInvalidJson) {
     EXPECT_EQ(res->status, 400);
 }
 
+// --- Delete cascade via signed delta (issue #17: revocation bypass) ---
+//
+// The delta route must run the same post-delete cascade as the direct route:
+// credential revocation (owner-protected), IPAM release, mesh peer removal.
+// (boringtun is nullptr in this fixture, so only the first two are asserted.)
+
+TEST_F(HttpEndpointTest, DeltaDeleteRevokesKeyAndReleasesIpam) {
+    auto cli = make_client();
+
+    // Linked device holds its own Ed25519 key as the node's mgmt_pubkey.
+    auto device_kp = crypto->ed25519_keygen();
+    const auto device_b64 = crypto::to_base64(
+        std::span<const uint8_t>(device_kp.public_key.data(),
+                                 device_kp.public_key.size()));
+    const auto device_pubkey = "ed25519:" + device_b64;
+
+    // Baseline: an unrevoked device key passes session validation.
+    ASSERT_TRUE(auth->validate_session_claims(make_jwt(device_b64)).has_value());
+
+    // Create the node via delta: owned by the device key, deletable by root.
+    tree::TreeNode node;
+    node.id = "cascade_node1";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = device_pubkey;
+    node.assignments = {{root_pubkey_str, {"admin"}}};
+    auto create = make_signed_delta("create_node", node.id, node);
+    auto res = post_auth_delta(cli, json(create).dump());
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200);
+
+    // Allocate a tunnel IP; the delete cascade must release it.
+    auto alloc = ipam->allocate_tunnel_ip(node.id);
+    ASSERT_FALSE(alloc.base_network.empty());
+    ASSERT_TRUE(ipam->get_allocation(node.id)->tunnel.has_value());
+
+    // Delete via the signed-delta route.
+    auto del = make_signed_delta("delete_node", node.id, tree::TreeNode{});
+    auto del_res = post_auth_delta(cli, json(del).dump());
+    ASSERT_NE(del_res, nullptr);
+    ASSERT_EQ(del_res->status, 200);
+
+    // Node is gone.
+    auto get_res = cli.Get("/api/tree/node/" + node.id);
+    ASSERT_NE(get_res, nullptr);
+    EXPECT_EQ(get_res->status, 404);
+
+    // The device key was the only holder → revoked: sessions invalidate.
+    EXPECT_FALSE(auth->validate_session_claims(make_jwt(device_b64)).has_value());
+
+    // IPAM allocation released back to the pool.
+    EXPECT_FALSE(ipam->get_allocation(node.id).has_value());
+}
+
+TEST_F(HttpEndpointTest, DeltaDeleteKeepsSharedKey) {
+    auto cli = make_client();
+
+    // Owner-protection: two nodes share one mgmt key (an owner's own devices
+    // hold the same key as their group). Deleting one via delta must NOT
+    // revoke a key a surviving node still owns.
+    auto owner_kp = crypto->ed25519_keygen();
+    const auto owner_b64 = crypto::to_base64(
+        std::span<const uint8_t>(owner_kp.public_key.data(),
+                                 owner_kp.public_key.size()));
+    const auto owner_pubkey = "ed25519:" + owner_b64;
+
+    for (const auto& id : {"cascade_shared_a", "cascade_shared_b"}) {
+        tree::TreeNode node;
+        node.id = id;
+        node.parent_id = "root";
+        node.type = tree::NodeType::Endpoint;
+        node.mgmt_pubkey = owner_pubkey;
+        node.assignments = {{root_pubkey_str, {"admin"}}};
+        auto create = make_signed_delta("create_node", id, node);
+        auto res = post_auth_delta(cli, json(create).dump());
+        ASSERT_NE(res, nullptr);
+        ASSERT_EQ(res->status, 200);
+    }
+
+    // Delete one of the two via the signed-delta route.
+    auto del = make_signed_delta("delete_node", "cascade_shared_a", tree::TreeNode{});
+    auto del_res = post_auth_delta(cli, json(del).dump());
+    ASSERT_NE(del_res, nullptr);
+    ASSERT_EQ(del_res->status, 200);
+
+    // The surviving node still holds the key → it must NOT be revoked.
+    EXPECT_TRUE(auth->validate_session_claims(make_jwt(owner_b64)).has_value());
+
+    // Surviving node is intact.
+    auto get_res = cli.Get("/api/tree/node/cascade_shared_b");
+    ASSERT_NE(get_res, nullptr);
+    EXPECT_EQ(get_res->status, 200);
+}
+
 // =========================================================================
 // Mesh API security tests
 // =========================================================================

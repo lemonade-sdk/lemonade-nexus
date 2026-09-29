@@ -47,6 +47,51 @@ nlohmann::json redact_node_for_caller(const tree::TreeNode& node,
 
 } // namespace
 
+// Post-delete cascade shared by the direct-delete and delta-delete routes so
+// both stay behaviorally identical. Failures follow the direct route's
+// existing conventions: IPAM release results are ignored and peer removal is
+// logged on success only.
+void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
+                                          const std::optional<tree::TreeNode>& doomed) {
+    if (!doomed) return;
+    // 1. Revoke the device's Ed25519 credential so a deleted device
+    //    cannot silently auto-re-register (node_id is key-deterministic).
+    //    Owner-protection: an owner's key is the mgmt_pubkey of their
+    //    customer group AND every sibling endpoint, so deleting ONE of
+    //    their own devices must NOT blocklist that shared key. Only revoke
+    //    a key that no surviving node still owns — i.e. a linked-device
+    //    key, which owns only the endpoint just deleted.
+    if (!doomed->mgmt_pubkey.empty() &&
+        !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
+        constexpr std::string_view ed_prefix = "ed25519:";
+        std::string_view mk = doomed->mgmt_pubkey;
+        if (mk.starts_with(ed_prefix)) mk.remove_prefix(ed_prefix.size());
+        ctx_.auth.revoke_ed25519(std::string(mk));
+    }
+    // 2. Release the node's IP allocations back to the pools.
+    (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
+    (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
+    (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
+    // 3. Remove the mesh peer using the join-time key conversion.
+    if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
+        std::string peer_mesh_key = doomed->mesh_pubkey;
+        constexpr std::string_view ed_prefix = "ed25519:";
+        if (peer_mesh_key.starts_with(ed_prefix)) {
+            auto ed_bytes = crypto::from_base64(peer_mesh_key.substr(ed_prefix.size()));
+            if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
+                crypto::Ed25519PublicKey ed_pk{};
+                std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
+                auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
+                peer_mesh_key = crypto::to_base64(
+                    std::span<const uint8_t>(x_pk.data(), x_pk.size()));
+            }
+        }
+        if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
+            spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
+        }
+    }
+}
+
 void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
     using nexus::auth::require_auth;
     using nexus::auth::SessionClaims;
@@ -451,7 +496,17 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
+        // Pre-delete snapshot so the post-delete cascade (credential revocation,
+        // IPAM release, mesh peer removal) has the node's identity and keys.
+        std::optional<tree::TreeNode> doomed =
+            (delta.operation == "delete_node" && !delta.target_node_id.empty())
+                ? ctx_.tree.get_node(delta.target_node_id)
+                : std::nullopt;
+
         bool ok = ctx_.tree.apply_delta(delta);
+        if (ok && doomed) {
+            cascade_node_cleanup(delta.target_node_id, doomed);
+        }
         network::DeltaResponse resp{.success = ok};
         if (!ok) resp.error = "delta rejected";
         nlohmann::json j = resp;
@@ -623,44 +678,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        if (doomed) {
-            // 1. Revoke the device's Ed25519 credential so a deleted device
-            //    cannot silently auto-re-register (node_id is key-deterministic).
-            //    Owner-protection: an owner's key is the mgmt_pubkey of their
-            //    customer group AND every sibling endpoint, so deleting ONE of
-            //    their own devices must NOT blocklist that shared key. Only revoke
-            //    a key that no surviving node still owns — i.e. a linked-device
-            //    key, which owns only the endpoint just deleted.
-            if (!doomed->mgmt_pubkey.empty() &&
-                !ctx_.tree.is_mgmt_pubkey_in_use(doomed->mgmt_pubkey)) {
-                constexpr std::string_view ed_prefix = "ed25519:";
-                std::string_view mk = doomed->mgmt_pubkey;
-                if (mk.starts_with(ed_prefix)) mk.remove_prefix(ed_prefix.size());
-                ctx_.auth.revoke_ed25519(std::string(mk));
-            }
-            // 2. Release the node's IP allocations back to the pools.
-            (void)ctx_.ipam.release(node_id, ipam::BlockType::Tunnel);
-            (void)ctx_.ipam.release(node_id, ipam::BlockType::Private);
-            (void)ctx_.ipam.release(node_id, ipam::BlockType::Shared);
-            // 3. Remove the mesh peer using the join-time key conversion.
-            if (ctx_.boringtun && !doomed->mesh_pubkey.empty()) {
-                std::string peer_mesh_key = doomed->mesh_pubkey;
-                constexpr std::string_view ed_prefix = "ed25519:";
-                if (peer_mesh_key.starts_with(ed_prefix)) {
-                    auto ed_bytes = crypto::from_base64(peer_mesh_key.substr(ed_prefix.size()));
-                    if (ed_bytes.size() == crypto::kEd25519PublicKeySize) {
-                        crypto::Ed25519PublicKey ed_pk{};
-                        std::memcpy(ed_pk.data(), ed_bytes.data(), ed_bytes.size());
-                        auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(ed_pk);
-                        peer_mesh_key = crypto::to_base64(
-                            std::span<const uint8_t>(x_pk.data(), x_pk.size()));
-                    }
-                }
-                if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
-                    spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
-                }
-            }
-        }
+        cascade_node_cleanup(node_id, doomed);
 
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);
