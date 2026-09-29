@@ -45,12 +45,19 @@ nlohmann::json redact_node_for_caller(const tree::TreeNode& node,
     return j;
 }
 
+// Private EP FQDN registered at join (private.<node_id>.ep.<base_domain>).
+// Join and the delete cascade must construct this byte-identically, or the
+// cascade would remove a name the join never created.
+std::string client_ep_fqdn(const std::string& node_id, const std::string& base_domain) {
+    return "private." + node_id + ".ep." + base_domain;
+}
+
 } // namespace
 
 // Post-delete cascade shared by the direct-delete and delta-delete routes so
 // both stay behaviorally identical. Failures follow the direct route's
-// existing conventions: IPAM release results are ignored and peer removal is
-// logged on success only.
+// existing conventions: IPAM release results are ignored, and peer/DNS removal
+// is logged on success only.
 void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
                                           const std::optional<tree::TreeNode>& doomed) {
     if (!doomed) return;
@@ -88,6 +95,16 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
         }
         if (ctx_.boringtun->remove_peer(peer_mesh_key)) {
             spdlog::info("[TreeApi] removed mesh peer for deleted node '{}'", node_id);
+        }
+    }
+    // 4. Remove the private EP A record registered at join; otherwise the
+    //    stale record keeps serving a tunnel IP IPAM has already recycled
+    //    (it could resolve to a different, live node). Best-effort like the
+    //    other steps: absence is fine, a failure never aborts the cascade.
+    if (ctx_.dns) {
+        if (ctx_.dns->remove_record(client_ep_fqdn(node_id, ctx_.config.dns_base_domain), "A")) {
+            spdlog::info("[TreeApi] removed private EP DNS record for deleted node '{}'",
+                         node_id);
         }
     }
 }
@@ -395,7 +412,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
         std::string client_private_fqdn;
         if (ctx_.dns && !client_tunnel_ip_bare.empty()) {
-            client_private_fqdn = "private." + node_id + ".ep." + ctx_.config.dns_base_domain;
+            client_private_fqdn = client_ep_fqdn(node_id, ctx_.config.dns_base_domain);
             ctx_.dns->set_record(client_private_fqdn, "A", client_tunnel_ip_bare, 300);
             spdlog::info("[Join] registered DNS: {} -> {}", client_private_fqdn, client_tunnel_ip_bare);
         }
