@@ -567,6 +567,14 @@ private:
     // Opt-out (dns_ns_hostname: "none"): never claim; release a held slot.
     bool                             ns_opt_out_{false};
 
+    // PeerExchange initiator (v0.9.4 fix 4): at most one request per 60 s of
+    // internal cadence (last_peer_exchange_tick_); peer_exchange_last_ holds
+    // the last request time per peer pubkey for the 300 s per-peer cooldown.
+    // Both are guarded by peers_mutex_.
+    std::chrono::steady_clock::time_point last_peer_exchange_tick_{};
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+        peer_exchange_last_;
+
     // Permission tree for evaluating received records' existing permissions
     // (nullptr = no permission context; acceptance refuses as ContextMissing).
     tree::PermissionTreeService*     tree_{nullptr};

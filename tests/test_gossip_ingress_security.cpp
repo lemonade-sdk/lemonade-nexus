@@ -71,6 +71,18 @@ struct GossipBallotTestAccess {
     // Drives one 5 s gossip tick (NS claim deferral/retry, opt-out release)
     // without waiting for the timer.
     static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
+    // v0.9.4 fix 4: the PeerExchange initiator runs on steady_clock, which no
+    // datagram can advance; the cadence tests set these clocks directly.
+    static void set_last_peer_exchange(GossipService& g,
+                                       std::chrono::steady_clock::time_point t) {
+        std::lock_guard lock(g.peers_mutex_);
+        g.last_peer_exchange_tick_ = t;
+    }
+    static void set_peer_exchange_last(GossipService& g, const std::string& pubkey,
+                                       std::chrono::steady_clock::time_point t) {
+        std::lock_guard lock(g.peers_mutex_);
+        g.peer_exchange_last_[pubkey] = t;
+    }
     static bool revoked(GossipService& g, const std::string& pubkey) {
         return g.is_revoked(pubkey);
     }
@@ -1795,4 +1807,195 @@ TEST_F(GossipIngressSecurityTest, ReloadDropsUnverifiableStoredCertificate) {
     EXPECT_TRUE(a.has_peer(peer_b64));
     EXPECT_TRUE(a.peer_cert_json(peer_b64).empty());
     EXPECT_FALSE(a.certified_peer(peer_b64));
+}
+
+// v0.9.4 fix 4: the tick initiates exactly one PeerExchange request per 60 s
+// of internal cadence, aimed at the eligible handshaked peer with the oldest
+// last-request time. A re-tick inside the window sends nothing; once the
+// window elapses the 300 s per-peer cooldown steers the request to the other
+// peer. The peers are raw sockets the test controls so the request count is
+// exact (the tick also sends a digest, which the filter ignores).
+TEST_F(GossipIngressSecurityTest, PeerExchangeInitiatorCadenceAndPeerCooldown) {
+    auto root_kp = kc->ed25519_keygen();
+    auto peer_b  = kc->ed25519_keygen();
+    auto peer_c  = kc->ed25519_keygen();
+    const auto b64_b = crypto::to_base64(peer_b.public_key);
+    const auto b64_c = crypto::to_base64(peer_c.public_key);
+
+    udp::socket sb{io, udp::endpoint{udp::v4(), 0}};
+    udp::socket sc{io, udp::endpoint{udp::v4(), 0}};
+    const uint16_t port_b = sb.local_endpoint().port();
+    const uint16_t port_c = sc.local_endpoint().port();
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b64_b, "127.0.0.1:" + std::to_string(port_b),
+                           issue_cert(b64_b, "peer-b", root_kp)),
+                peer_entry(b64_c, "127.0.0.1:" + std::to_string(port_c),
+                           issue_cert(b64_c, "peer-c", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // Collect the PeerExchange request payloads waiting on a raw socket;
+    // every other message type (digest) is discarded.
+    std::vector<std::string> requests_b;
+    std::vector<std::string> requests_c;
+    auto drain = [](udp::socket& s, std::vector<std::string>& out) {
+        char buf[65536];
+        udp::endpoint from;
+        while (s.available() > 0) {
+            const std::size_t n = s.receive_from(asio::buffer(buf), from);
+            if (n <= gossip::kGossipHeaderSize) continue;
+            gossip::GossipPacketHeader h{};
+            std::memcpy(&h, buf, gossip::kGossipHeaderSize);
+            if (h.msg_type == gossip::GossipMsgType::PeerExchange &&
+                n >= gossip::kGossipHeaderSize + h.payload_length) {
+                out.emplace_back(buf + gossip::kGossipHeaderSize, h.payload_length);
+            }
+        }
+    };
+
+    // First tick: exactly ONE request, to the first-listed peer (both are
+    // never-requested, so the tie keeps the oldest-listed).
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    pump_for(std::chrono::milliseconds(100));
+    drain(sb, requests_b);
+    drain(sc, requests_c);
+    ASSERT_EQ(requests_b.size() + requests_c.size(), 1u);
+    ASSERT_EQ(requests_b.size(), 1u);
+    {
+        const auto req = nlohmann::json::parse(requests_b[0]);
+        EXPECT_FALSE(req.value("is_response", true));
+        EXPECT_TRUE(req["peers"].is_array());
+        EXPECT_TRUE(req["peers"].empty());
+    }
+
+    // Second tick inside the 60 s window: nothing more.
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    pump_for(std::chrono::milliseconds(100));
+    drain(sb, requests_b);
+    drain(sc, requests_c);
+    EXPECT_EQ(requests_b.size(), 1u);
+    EXPECT_EQ(requests_c.size(), 0u);
+
+    // The window elapses (61 s). Peer B was requested 61 s ago, still inside
+    // its 300 s per-peer cooldown; peer C was last requested 301 s ago.
+    // The request goes to C.
+    const auto now = std::chrono::steady_clock::now();
+    gossip::GossipBallotTestAccess::set_last_peer_exchange(
+        *a.gossip, now - std::chrono::seconds(61));
+    gossip::GossipBallotTestAccess::set_peer_exchange_last(
+        *a.gossip, b64_b, now - std::chrono::seconds(61));
+    gossip::GossipBallotTestAccess::set_peer_exchange_last(
+        *a.gossip, b64_c, now - std::chrono::seconds(301));
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    pump_for(std::chrono::milliseconds(100));
+    drain(sb, requests_b);
+    drain(sc, requests_c);
+    EXPECT_EQ(requests_b.size(), 1u);
+    EXPECT_EQ(requests_c.size(), 1u);
+}
+
+// v0.9.4 fix 4: end-to-end introduction through the REAL response path. A
+// knows only B (handshaked); B knows C, whose certificate and
+// source-confirmed advertised endpoint B holds from C's hello. A's tick asks
+// B; B's existing response relays C; A adds C as a peer and adopts the
+// verified relayed certificate at the relayed (confirmed) endpoint.
+TEST_F(GossipIngressSecurityTest, PeerExchangeRequestIntroducesUnseenPeerFromHubResponse) {
+    auto root_kp = kc->ed25519_keygen();
+    auto kp_b    = kc->ed25519_keygen();
+    auto kp_c    = kc->ed25519_keygen();
+    const auto b64_b = crypto::to_base64(kp_b.public_key);
+    const auto b64_c = crypto::to_base64(kp_c.public_key);
+
+    // The identity keypair is generated in start(), so it must be pre-seeded
+    // (with its matching certificate) for the hello exchange to pass the
+    // proof-of-possession check.
+    auto seed_identity = [&](Node& n, const crypto::Ed25519Keypair& kp,
+                             const std::string& id) {
+        storage::SignedEnvelope kenv;
+        kenv.type = "identity_keypair";
+        kenv.data = nlohmann::json{{"public_key", crypto::to_base64(kp.public_key)},
+                                   {"private_key", crypto::to_base64(kp.private_key)}}
+                              .dump();
+        EXPECT_TRUE(n.storage->write_file("identity", "keypair.json", kenv));
+        storage::SignedEnvelope env;
+        env.type = "server_certificate";
+        env.data = issue_cert(crypto::to_base64(kp.public_key), id, root_kp);
+        EXPECT_TRUE(n.storage->write_file("identity", "server_cert.json", env));
+    };
+
+    // C: advertises its real loopback endpoint so B can confirm it against
+    // the observed UDP source.
+    auto& c = make_node(
+        "c",
+        [&](Node& n) { seed_identity(n, kp_c, "srv-c"); },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_our_advertised_endpoint(n.endpoint());
+        });
+
+    // B: knows C by endpoint, certificate not yet exchanged.
+    auto& b = make_node(
+        "b",
+        [&](Node& n) {
+            seed_identity(n, kp_b, "srv-b");
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b64_c, c.endpoint(), "")}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+        });
+
+    // C discovers B and introduces itself with a real ServerHello.
+    c.gossip->add_peer(b.endpoint(), b64_b);
+    gossip::GossipBallotTestAccess::run_gossip_tick(*c.gossip);
+    ASSERT_TRUE(pump_until([&] {
+        for (const auto& p : b.gossip->get_peers())
+            if (p.pubkey == b64_c && !p.certificate_json.empty())
+                return true;
+        return false;
+    }));
+    // B's view of C: certificate stored and the advertised endpoint
+    // source-confirmed (it equals the observed UDP source).
+    const auto b_view_c = [&] {
+        for (const auto& p : b.gossip->get_peers())
+            if (p.pubkey == b64_c) return p;
+        return gossip::GossipPeer{};
+    };
+    ASSERT_TRUE(b_view_c().advertised_confirmed);
+    ASSERT_EQ(b_view_c().advertised_endpoint, c.endpoint());
+
+    // A: knows only B (handshaked — B's certificate is stored); C is unknown.
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b64_b, b.endpoint(),
+                           issue_cert(b64_b, "srv-b", root_kp))}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+        });
+
+    // A's tick initiates the exchange with B (its only handshaked peer); B's
+    // EXISTING response path relays C.
+    EXPECT_FALSE(a.has_peer(b64_c));
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return a.has_peer(b64_c) && !a.peer_cert_json(b64_c).empty();
+    }));
+
+    // The relayed endpoint is C's source-confirmed advertised endpoint, and
+    // the adopted certificate is exactly what B verified from C.
+    ASSERT_EQ(a.peer_cert_json(b64_c), b_view_c().certificate_json);
+    for (const auto& p : a.gossip->get_peers()) {
+        if (p.pubkey == b64_c) ASSERT_EQ(p.endpoint, c.endpoint());
+    }
 }

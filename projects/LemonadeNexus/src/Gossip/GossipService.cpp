@@ -1682,6 +1682,55 @@ void GossipService::on_gossip_tick() {
         }
     }
 
+    // v0.9.4 fix 4: ask one handshaked peer for its peer list so this node
+    // discovers peers it was never told about (e.g. cross-region joiners).
+    // Internal cadence: at most one request per 60 s; a peer is not
+    // re-requested within 300 s so requests round-robin over the mesh.
+    // Relay safety (relayed certificates are fully verified on adoption, only
+    // source-confirmed endpoints are relayed) lives in handle_peer_exchange
+    // and is unchanged here.
+    {
+        GossipPeer target;
+        std::chrono::steady_clock::time_point target_last{};
+        bool have_target = false;
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard lock(peers_mutex_);
+            if (now - last_peer_exchange_tick_ >= std::chrono::seconds(60)) {
+                for (const auto& p : peers_) {
+                    if (p.certificate_json.empty()) continue;  // not handshaked
+                    const auto it = peer_exchange_last_.find(p.pubkey);
+                    const auto last = (it != peer_exchange_last_.end())
+                        ? it->second : std::chrono::steady_clock::time_point{};
+                    if (now - last < std::chrono::seconds(300)) continue;  // cooldown
+                    // Oldest last-request wins; a tie keeps the first-listed peer.
+                    if (!have_target || last < target_last) {
+                        target = p;
+                        target_last = last;
+                        have_target = true;
+                    }
+                }
+            }
+        }
+        if (have_target) {
+            if (auto target_ep = parse_endpoint(target.endpoint)) {
+                std::lock_guard lock(peers_mutex_);
+                last_peer_exchange_tick_ = now;
+                peer_exchange_last_[target.pubkey] = now;
+                // The empty peers array is load-bearing: the receiver drops
+                // any payload without a peers array before the is_response
+                // dispatch, so a bare {"is_response": false} would elicit no reply.
+                json request;
+                request["is_response"] = false;
+                request["peers"] = json::array();
+                auto request_str = request.dump();
+                std::vector<uint8_t> request_bytes(request_str.begin(), request_str.end());
+                send_packet(*target_ep, GossipMsgType::PeerExchange, request_bytes);
+                spdlog::debug("[{}] initiated peer exchange with {}", name(), target.endpoint);
+            }
+        }
+    }
+
     GossipPeer chosen;
 
     {
