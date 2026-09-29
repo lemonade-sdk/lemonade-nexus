@@ -5,6 +5,7 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Relay/GeoRegion.hpp>
 
 #include <httplib.h>
@@ -366,6 +367,34 @@ std::vector<std::string> parse_dns_txt_records(const std::vector<uint8_t>& messa
     return results;
 }
 
+std::vector<uint8_t> build_dns_query(
+    const std::string& name, uint16_t qtype, uint16_t id)
+{
+    std::vector<uint8_t> q;
+    q.push_back(static_cast<uint8_t>(id >> 8));
+    q.push_back(static_cast<uint8_t>(id & 0xFF));
+    q.push_back(0x01); q.push_back(0x00);      // RD
+    q.push_back(0x00); q.push_back(0x01);      // QDCOUNT = 1
+    q.push_back(0x00); q.push_back(0x00);      // ANCOUNT
+    q.push_back(0x00); q.push_back(0x00);      // NSCOUNT
+    q.push_back(0x00); q.push_back(0x00);      // ARCOUNT
+    std::size_t start = 0;
+    for (;;) {
+        const auto dot = name.find('.', start);
+        const auto stop = (dot == std::string::npos) ? name.size() : dot;
+        if (stop - start == 0 || stop - start > 63) return {};  // bad label
+        q.push_back(static_cast<uint8_t>(stop - start));
+        q.insert(q.end(), name.begin() + start, name.begin() + stop);
+        if (dot == std::string::npos) break;
+        start = dot + 1;
+    }
+    q.push_back(0x00);                         // root label
+    q.push_back(static_cast<uint8_t>(qtype >> 8));
+    q.push_back(static_cast<uint8_t>(qtype & 0xFF));
+    q.push_back(0x00); q.push_back(0x01);      // qclass IN
+    return q;
+}
+
 std::vector<std::string> resolve_txt_records(const std::string& hostname) {
     std::vector<std::string> results;
     if (hostname.empty()) return results;
@@ -407,28 +436,9 @@ std::vector<std::string> resolve_txt_records(const std::string& hostname) {
     }
 
     // Build the query: random ID + recursion-desired, one TXT/IN question.
-    std::vector<uint8_t> q;
     const uint16_t id = static_cast<uint16_t>(std::random_device{}() & 0xFFFF);
-    q.push_back(static_cast<uint8_t>(id >> 8));
-    q.push_back(static_cast<uint8_t>(id & 0xFF));
-    q.push_back(0x01); q.push_back(0x00);      // RD
-    q.push_back(0x00); q.push_back(0x01);      // QDCOUNT = 1
-    q.push_back(0x00); q.push_back(0x00);      // ANCOUNT
-    q.push_back(0x00); q.push_back(0x00);      // NSCOUNT
-    q.push_back(0x00); q.push_back(0x00);      // ARCOUNT
-    std::size_t start = 0;
-    for (;;) {
-        const auto dot = hostname.find('.', start);
-        const auto stop = (dot == std::string::npos) ? hostname.size() : dot;
-        if (stop - start == 0 || stop - start > 63) return results;  // bad label
-        q.push_back(static_cast<uint8_t>(stop - start));
-        q.insert(q.end(), hostname.begin() + start, hostname.begin() + stop);
-        if (dot == std::string::npos) break;
-        start = dot + 1;
-    }
-    q.push_back(0x00);                         // root label
-    q.push_back(0x00); q.push_back(16);        // qtype TXT
-    q.push_back(0x00); q.push_back(0x01);      // qclass IN
+    const std::vector<uint8_t> q = build_dns_query(hostname, 16 /* TXT */, id);
+    if (q.empty()) return results;             // bad label: fail closed
 
     const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return results;
@@ -504,8 +514,7 @@ std::vector<std::string> discover_seed_endpoints(
     std::vector<std::string> candidate_ips;
     for (const auto& region : region_order) {
         for (int tier : {1, 2}) {
-            std::string host = "tier" + std::to_string(tier) + "." + region +
-                               ".seip." + base_domain;
+            const std::string host = nexus::seip::tierFqdn(tier, region, base_domain);
             for (const auto& ip : resolve_a_records(host)) {
                 spdlog::info("DNS discovery: found tier{} server {} in region '{}'",
                               tier, ip, region);

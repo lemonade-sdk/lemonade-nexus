@@ -2,9 +2,11 @@
 
 #include <LemonadeNexus/Core/CliModes.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
+#include <LemonadeNexus/Core/NetUtil.hpp>
 #include <LemonadeNexus/Core/OnboardingTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Core/ServerIdentity.hpp>
+#include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/Security/DurableWrite.hpp>
@@ -24,6 +26,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <thread>
@@ -62,11 +66,50 @@ HttpResult http_call(const std::string& host, int port, const std::string& metho
     return {true, r->status, r->body};
 }
 
-/// host:port -> {host, port(default 9100)}.
-std::pair<std::string, int> split_hostport(const std::string& hp, int default_port) {
-    auto colon = hp.rfind(':');
-    if (colon == std::string::npos) return {hp, default_port};
-    return {hp.substr(0, colon), std::atoi(hp.substr(colon + 1).c_str())};
+enum class HttpJsonFailure { none, not_connected, bad_status, invalid_json, invalid_fields };
+
+template <typename T>
+struct HttpJsonResult {
+    HttpJsonFailure failure{HttpJsonFailure::none};
+    int status{0};
+    std::string body;
+    std::string decode_error;
+    std::optional<T> value;
+};
+
+/// POST `body` and decode a 200 response through `from_json`. Connection
+/// failure and non-200 responses are reported (not_connected / bad_status)
+/// without parsing, preserving the raw `body`; a 200 whose body is not JSON
+/// is invalid_json with decode_error "/: invalid json"; a 200 that parses but
+/// fails `from_json` is invalid_fields with the decode error in decode_error.
+template <typename T>
+HttpJsonResult<T> post_json(const std::string& host, int port, const std::string& path,
+                            const std::string& body, const std::string& connect_ip,
+                            const std::function<std::optional<T>(const json&, std::string&)>&
+                                from_json) {
+    HttpJsonResult<T> result;
+    const auto r = http_call(host, port, "POST", path, body, connect_ip);
+    result.status = r.status;
+    result.body = std::move(r.body);
+    if (!r.connected) {
+        result.failure = HttpJsonFailure::not_connected;
+        return result;
+    }
+    if (r.status != 200) {
+        result.failure = HttpJsonFailure::bad_status;
+        return result;
+    }
+    const auto parsed = json::parse(result.body, nullptr, false);
+    if (parsed.is_discarded()) {
+        result.failure = HttpJsonFailure::invalid_json;
+        result.decode_error = "/: invalid json";
+        return result;
+    }
+    if (auto value = from_json(parsed, result.decode_error))
+        result.value = std::move(*value);
+    else
+        result.failure = HttpJsonFailure::invalid_fields;
+    return result;
 }
 
 struct GossipKeys {
@@ -194,7 +237,12 @@ std::optional<security::SnpVtpmEvidence> collect_onboarding_evidence(
 std::string pick_target(const std::vector<std::string>& targets,
                         const std::string& connect_ip) {
     for (const auto& t : targets) {
-        auto [host, port] = split_hostport(t, 9100);
+        const auto hp = nexus::net::splitHostPort(t, 9100);
+        if (!hp) {
+            spdlog::warn("Onboard: probe of {} failed: invalid host:port", t);
+            continue;
+        }
+        auto [host, port] = *hp;
         auto r = http_call(host, port, "GET", "/api/onboard/info", "", connect_ip);
         if (!r.connected) {
             spdlog::warn("Onboard: probe of {} failed: not connected "
@@ -254,8 +302,7 @@ std::vector<std::string> build_discovery_targets(
         const auto& members = (tier == 1) ? tier1_members : tier2_members;
         for (const auto& member : members)
             if (!member.empty()) targets.push_back(member + port_suffix);
-        targets.push_back("tier" + std::to_string(tier) + "." + region + ".seip." +
-                          dns_base_domain + port_suffix);
+        targets.push_back(nexus::seip::tierFqdn(tier, region, dns_base_domain) + port_suffix);
     }
     return targets;
 }
@@ -335,8 +382,8 @@ int run_onboard_server(ServerConfig& config) {
         std::vector<std::string> tier1_members;
         std::vector<std::string> tier2_members;
         for (int tier : {1, 2}) {
-            const std::string tier_fqdn = "tier" + std::to_string(tier) + "." +
-                                          region + ".seip." + config.dns_base_domain;
+            const std::string tier_fqdn =
+                nexus::seip::tierFqdn(tier, region, config.dns_base_domain);
             std::vector<std::string>& members =
                 (tier == 1) ? tier1_members : tier2_members;
             const auto txt_strings = resolve_txt_records(tier_fqdn);
@@ -368,27 +415,34 @@ int run_onboard_server(ServerConfig& config) {
                       "(tried {} target(s)).", targets.size());
         return 1;
     }
-    auto [host, port] = split_hostport(target, 9100);
+    const auto host_port = nexus::net::splitHostPort(target, 9100);
+    if (!host_port) {
+        spdlog::error("Onboard: invalid host:port in target '{}'", target);
+        return 1;
+    }
+    auto [host, port] = *host_port;
     spdlog::info("Onboard: requesting admission from {} as '{}'", target, server_id);
 
     // 1. Challenge.
     ChallengeRequest challenge_request;
     challenge_request.candidate_pubkey = keys.pub_b64;
-    auto ch = http_call(host, port, "POST", "/api/onboard/challenge",
-                        challenge_request.toJson().dump(), connect_ip);
-    if (!ch.connected || ch.status != 200) {
+    auto ch = post_json<ChallengeResponse>(
+        host, port, "/api/onboard/challenge", challenge_request.toJson().dump(),
+        connect_ip,
+        [](const json& j, std::string& error) -> std::optional<ChallengeResponse> {
+            auto r = ChallengeResponse::fromJson(j);
+            if (!r) { error = r.error; return std::nullopt; }
+            return r.value;
+        });
+    if (ch.failure == HttpJsonFailure::not_connected ||
+        ch.failure == HttpJsonFailure::bad_status) {
         spdlog::error("Onboard: challenge failed ({})", ch.body); return 1;
     }
-    auto challenge_json = json::parse(ch.body, nullptr, false);
-    auto challenge = challenge_json.is_discarded()
-        ? onboarding_json::DecodeResult<ChallengeResponse>{
-              std::nullopt, "/: invalid json"}
-        : ChallengeResponse::fromJson(challenge_json);
-    if (!challenge) {
-        spdlog::error("Onboard: invalid challenge response ({})", challenge.error);
+    if (!ch.value) {
+        spdlog::error("Onboard: invalid challenge response ({})", ch.decode_error);
         return 1;
     }
-    const std::string& nonce = challenge.value->nonce;
+    const std::string& nonce = ch.value->nonce;
 
     // 2. Platform evidence, bound to the challenge nonce so this bundle admits only
     //    this join. Absent evidence is a Tier-2 certificate, not a failure.
@@ -420,21 +474,22 @@ int run_onboard_server(ServerConfig& config) {
     in.signature = sign_b64(crypto, keys.priv, canonical_admission_request(in));
     if (!config.onboard_token.empty())
         in.enrollment_token = config.onboard_token;
-    auto rq = http_call(host, port, "POST", "/api/onboard/request",
-                        in.toJson().dump(), connect_ip);
-    if (!rq.connected || rq.status != 200) {
+    auto rq = post_json<AdmissionResponse>(
+        host, port, "/api/onboard/request", in.toJson().dump(), connect_ip,
+        [](const json& j, std::string& error) -> std::optional<AdmissionResponse> {
+            auto r = AdmissionResponse::fromJson(j);
+            if (!r) { error = r.error; return std::nullopt; }
+            return r.value;
+        });
+    if (rq.failure == HttpJsonFailure::not_connected ||
+        rq.failure == HttpJsonFailure::bad_status) {
         spdlog::error("Onboard: admission request rejected ({})", rq.body); return 1;
     }
-    auto response_json = json::parse(rq.body, nullptr, false);
-    auto response = response_json.is_discarded()
-        ? onboarding_json::DecodeResult<AdmissionResponse>{
-              std::nullopt, "/: invalid json"}
-        : AdmissionResponse::fromJson(response_json);
-    if (!response) {
-        spdlog::error("Onboard: invalid admission response ({})", response.error);
+    if (!rq.value) {
+        spdlog::error("Onboard: invalid admission response ({})", rq.decode_error);
         return 1;
     }
-    const std::string request_id = response.value->request_id;
+    const std::string request_id = rq.value->request_id;
 
     // Print our fingerprint for the admin's out-of-band comparison.
     std::printf("\nOnboarding request submitted.\n");
@@ -460,23 +515,24 @@ int run_onboard_server(ServerConfig& config) {
         poll.timestamp = pts;
         poll.signature = sign_b64(crypto, keys.priv,
             canonical_onboarding_status(kOnboardPollTag, request_id, pts));
-        auto pl = http_call(host, port, "POST", "/api/onboard/poll",
-                            poll.toJson().dump(), connect_ip);
-        if (pl.connected && pl.status == 200) {
-            auto poll_json = json::parse(pl.body, nullptr, false);
-            auto decoded = poll_json.is_discarded()
-                ? onboarding_json::DecodeResult<PollResponse>{
-                      std::nullopt, "/: invalid json"}
-                : poll_response_from_json(poll_json);
-            if (!decoded) {
-                spdlog::error("Onboard: invalid poll response ({})", decoded.error);
-                return 1;
-            }
-            if (auto* bundle = std::get_if<ApprovedOnboardingBundle>(&*decoded.value)) {
+        auto pl = post_json<PollResponse>(
+            host, port, "/api/onboard/poll", poll.toJson().dump(), connect_ip,
+            [](const json& j, std::string& error) -> std::optional<PollResponse> {
+                auto r = poll_response_from_json(j);
+                if (!r) { error = r.error; return std::nullopt; }
+                return r.value;
+            });
+        if (pl.failure == HttpJsonFailure::invalid_json ||
+            pl.failure == HttpJsonFailure::invalid_fields) {
+            spdlog::error("Onboard: invalid poll response ({})", pl.decode_error);
+            return 1;
+        }
+        if (pl.failure == HttpJsonFailure::none) {
+            if (auto* bundle = std::get_if<ApprovedOnboardingBundle>(&*pl.value)) {
                 approved = std::move(*bundle);
                 break;
             }
-            const auto& status = std::get<AdmissionStatusResponse>(*decoded.value);
+            const auto& status = std::get<AdmissionStatusResponse>(*pl.value);
             if (status.state == AdmissionState::Denied ||
                 status.state == AdmissionState::Expired) {
                 spdlog::error("Onboard: admission {} ({})",

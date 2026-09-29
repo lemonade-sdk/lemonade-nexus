@@ -14,6 +14,7 @@
 #include <mutex>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -67,6 +68,17 @@ inline constexpr std::size_t kDnsMinMessageBytes = 12;
 inline constexpr int kDnsTcpMaxSessions = 64;
 inline constexpr int kDnsTcpIdleTimeoutSeconds = 10;
 inline constexpr std::size_t kDnsTcpMaxQueuedResponses = 16;
+
+/// A received DNS query, parsed exactly once. Carries everything the response
+/// builders used to re-extract by re-parsing the raw query bytes (the query id,
+/// the question echo data), so each packet is parsed a single time.
+struct ParsedQuery {
+    std::string         qname;        ///< raw qname exactly as it appeared in the query
+    std::string         qname_lower;  ///< qname lowercased, one trailing dot stripped
+    ares_dns_rec_type_t qtype{ARES_REC_TYPE_A};
+    ares_dns_class_t    qclass{ARES_CLASS_IN};
+    unsigned short      id{0};        ///< query id echoed in the response
+};
 
 class DnsService : public core::IService<DnsService>,
                     public IDnsProvider<DnsService> {
@@ -220,6 +232,22 @@ private:
     using ResponseSink = std::function<void(std::vector<uint8_t>)>;
     void handle_query(const uint8_t* data, std::size_t bytes, const ResponseSink& reply);
 
+    // Per-branch query handlers. The dispatch order in handle_query is a
+    // wire contract — see the branch-order comment there.
+    void answer_soa_query(const ParsedQuery& q, const ResponseSink& send);
+    void answer_ns_query(const ParsedQuery& q, const ResponseSink& send);
+    void answer_txt_query(const ParsedQuery& q, const ResponseSink& send);
+    void answer_a_query(const ParsedQuery& q, const ResponseSink& send);
+
+    // Zone scan helpers: one owner each for lock + scan + "A:<key>" suffix
+    // matching over zone_records_.
+    /// Values of A records whose fqdn ends with `suffix` (prefix must be
+    /// non-empty, so a bare "A:<suffix>" key is not matched).
+    [[nodiscard]] std::set<std::string> scan_a_values(std::string_view suffix) const;
+    /// Fqdn prefixes (the part before `suffix`) of matching A records, as in
+    /// `scan_a_values`.
+    [[nodiscard]] std::set<std::string> scan_a_prefixes(std::string_view suffix) const;
+
     void start_accept();
 
     using TcpQueryHandler =
@@ -240,32 +268,32 @@ private:
     std::shared_ptr<AsyncState> async_state_ = std::make_shared<AsyncState>();
 
     // --- Response builders ---
+    // All take the already-parsed query instead of re-parsing the raw bytes.
+
     [[nodiscard]] std::vector<uint8_t> build_response(
-        const unsigned char* query_data, std::size_t query_len,
-        const std::string& qname, const std::string& ipv4_addr, uint32_t ttl);
+        const ParsedQuery& q, const std::string& ipv4_addr, uint32_t ttl);
 
     [[nodiscard]] std::vector<uint8_t> build_txt_response(
-        const unsigned char* query_data, std::size_t query_len,
-        const std::string& qname, const std::string& txt_data, uint32_t ttl);
+        const ParsedQuery& q, const std::string& txt_data, uint32_t ttl);
 
-    [[nodiscard]] std::vector<uint8_t> build_ns_response(
-        const unsigned char* query_data, std::size_t query_len,
-        const std::string& qname);
+    [[nodiscard]] std::vector<uint8_t> build_ns_response(const ParsedQuery& q);
 
-    [[nodiscard]] std::vector<uint8_t> build_soa_response(
-        const unsigned char* query_data, std::size_t query_len,
-        const std::string& qname);
+    [[nodiscard]] std::vector<uint8_t> build_soa_response(const ParsedQuery& q);
 
-    [[nodiscard]] std::vector<uint8_t> build_nxdomain(
-        const unsigned char* query_data, std::size_t query_len);
+    [[nodiscard]] std::vector<uint8_t> build_nxdomain(const ParsedQuery& q);
 
     /// Build a DNS response with multiple A records (for region-wildcard SEIP queries).
     /// Caps at 5 IPs to stay within the 512-byte UDP limit.
     [[nodiscard]] std::vector<uint8_t> build_multi_a_response(
-        const unsigned char* query_data, std::size_t query_len,
-        const std::string& qname,
+        const ParsedQuery& q,
         const std::vector<std::string>& ips,
         uint32_t ttl);
+
+    /// Build the "v=sp1" port-config TXT body. An empty `host` omits the
+    /// trailing " host=..." field — all callers must stay byte-identical.
+    [[nodiscard]] std::string build_port_config_txt(const std::string& region,
+                                                     std::string_view host,
+                                                     uint32_t load) const;
 
     // --- Dynamic record lookup ---
     [[nodiscard]] std::optional<std::string> lookup_dynamic_txt(const std::string& fqdn);
@@ -284,6 +312,7 @@ private:
 
     tree::PermissionTreeService& tree_;
     std::string                  base_domain_;
+    std::string                  base_domain_lower_;  // base_domain_ lowercased; base_domain_ has no setter, so this is safe to cache
     PortConfig                   port_config_;
     bool                         has_port_config_{false};
 

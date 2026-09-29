@@ -22,6 +22,7 @@
 #include <LemonadeNexus/Relay/RelayDiscoveryService.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
@@ -386,8 +387,11 @@ int main(int argc, char* argv[]) {
     {
         auto seip_id = nexus::core::resolve_server_node_id(storage);
         if (!seip_id.empty() && !config.region.empty() && !server_public_ip.empty()) {
-            server_seip_fqdn = seip_id + "." + config.region + ".seip." + config.dns_base_domain;
-            server_private_fqdn = "private." + server_seip_fqdn;
+            // No lowercasing here: main.cpp keeps the raw id/region case.
+            server_seip_fqdn =
+                nexus::seip::seipFqdn(seip_id, config.region, config.dns_base_domain);
+            server_private_fqdn =
+                nexus::seip::privateFqdn(seip_id, config.region, config.dns_base_domain);
 
             dns.publish_seip_records(seip_id, config.region, server_public_ip);
             spdlog::info("SEIP: published {} -> {}", server_seip_fqdn, server_public_ip);
@@ -618,8 +622,9 @@ int main(int argc, char* argv[]) {
         if (!seip_id.empty() && !config.region.empty()) {
             // private.<id>.<region>.seip.<domain> → server tunnel IP (for client HTTPS)
             if (!tunnel_bind_ip.empty()) {
-                server_private_fqdn = "private." + seip_id + "." + config.region +
-                                      ".seip." + config.dns_base_domain;
+                server_private_fqdn =
+                    nexus::seip::privateFqdn(seip_id, config.region,
+                                             config.dns_base_domain);
                 dns.set_record(server_private_fqdn, "A", tunnel_bind_ip, 300);
                 spdlog::info("DNS: private {} -> {}", server_private_fqdn, tunnel_bind_ip);
             }
@@ -628,8 +633,9 @@ int main(int argc, char* argv[]) {
             auto slash = backbone_ip.find('/');
             auto bb_bare = (slash != std::string::npos) ? backbone_ip.substr(0, slash) : backbone_ip;
             if (!bb_bare.empty()) {
-                auto backend_fqdn = "backend." + seip_id + "." + config.region +
-                                    ".seip." + config.dns_base_domain;
+                auto backend_fqdn =
+                    nexus::seip::backendFqdn(seip_id, config.region,
+                                             config.dns_base_domain);
                 dns.set_record(backend_fqdn, "A", bb_bare, 300);
                 spdlog::info("DNS: backend {} -> {}", backend_fqdn, bb_bare);
             }

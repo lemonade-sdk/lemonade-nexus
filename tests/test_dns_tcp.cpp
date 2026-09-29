@@ -38,26 +38,9 @@ constexpr uint16_t kTypeTxt = 16;
 
 std::vector<uint8_t> make_query(const std::string& name, uint16_t id = 0x1234,
                                 uint16_t qtype = 1 /* A */) {
-    std::vector<uint8_t> q{static_cast<uint8_t>(id >> 8), static_cast<uint8_t>(id & 0xFF),
-                           0x01, 0x00,    // standard query, RD
-                           0x00, 0x01,    // QDCOUNT
-                           0x00, 0x00,    // ANCOUNT
-                           0x00, 0x00,    // NSCOUNT
-                           0x00, 0x00};   // ARCOUNT
-    std::size_t start = 0;
-    while (true) {
-        const auto dot = name.find('.', start);
-        const auto end = (dot == std::string::npos) ? name.size() : dot;
-        q.push_back(static_cast<uint8_t>(end - start));
-        for (std::size_t i = start; i < end; ++i) q.push_back(static_cast<uint8_t>(name[i]));
-        if (dot == std::string::npos) break;
-        start = dot + 1;
-    }
-    q.push_back(0x00);                    // root label
-    q.push_back(static_cast<uint8_t>(qtype >> 8));
-    q.push_back(static_cast<uint8_t>(qtype & 0xFF));
-    q.push_back(0x00); q.push_back(0x01); // QCLASS IN
-    return q;
+    // Same wire format as ServerIdentity's build_dns_query (RD, QDCOUNT=1,
+    // one IN question); reuse it so the two encoders cannot drift.
+    return nexus::core::build_dns_query(name, qtype, id);
 }
 
 std::vector<uint8_t> frame(const std::vector<uint8_t>& payload, std::size_t declared) {

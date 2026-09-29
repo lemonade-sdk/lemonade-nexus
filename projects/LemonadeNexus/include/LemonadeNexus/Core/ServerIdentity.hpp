@@ -67,6 +67,17 @@ void resolve_server_region(
 [[nodiscard]] std::vector<std::string> parse_dns_txt_records(
     const std::vector<uint8_t>& message);
 
+/// Encode a minimal DNS query: header (given ID, RD set, QDCOUNT=1) plus one
+/// question (name, qtype, class IN), per RFC 1035 wire format.
+/// Label encoding is fail-closed: an empty label or a label longer than 63
+/// octets (including a trailing dot) returns an empty vector instead of a
+/// truncated/oversized query. Callers must not send an empty result.
+/// @param name  Query name, e.g. "tier1.us.seip.example.com".
+/// @param qtype Question type (1 = A, 16 = TXT, ...).
+/// @param id    Transaction ID to place in the header.
+[[nodiscard]] std::vector<uint8_t> build_dns_query(
+    const std::string& name, uint16_t qtype, uint16_t id);
+
 /// Resolve TXT records for a hostname via a raw UDP DNS query to the system
 /// resolver (first IPv4 `nameserver` line of /etc/resolv.conf, port 53).
 /// getaddrinfo cannot return TXT data, so the query and reply are hand-rolled;
