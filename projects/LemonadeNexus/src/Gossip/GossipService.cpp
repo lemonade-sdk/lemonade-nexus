@@ -226,6 +226,11 @@ void GossipService::on_start() {
     // Load known peers
     load_peers();
 
+    // Load persisted NS slot state (restarting nodes must remember the slots
+    // the mesh assigned them; the sync gate stays closed until live mesh
+    // evidence opens it).
+    load_ns_slots();
+
     // Reconstruct the transfer pool index before any transfer state can move
     // (bounded; pool files are preserved on any failure).
     reconstruct_transfer_pool();
@@ -1650,6 +1655,28 @@ void GossipService::on_gossip_tick() {
     if (retry_claim) try_claim_ns_slot(ns_claim_ip_);
     if (slot_to_release != 0) release_ns_slot(slot_to_release);
 
+    // One-shot startup claim refresh: restarting/empty nodes must re-learn
+    // slot state the mesh already holds. Re-encoding the stored struct is
+    // byte-identical (deterministic encoding), so the holder's original
+    // signature stays valid and holders re-learn their own slot via the
+    // existing self-relearn rule — enabling the opt-out tick release.
+    std::vector<NsSlotClaimData> refresh_claims;
+    {
+        std::lock_guard lock(mesh_state_mutex_);
+        if (ns_state_synced_ && !ns_refresh_sent_) {
+            ns_refresh_sent_ = true;
+            for (const auto& s : ns_slots_) {
+                if (s.slot > 0 && !s.server_pubkey.empty())
+                    refresh_claims.push_back(s);
+            }
+        }
+    }
+    if (!refresh_claims.empty()) {
+        spdlog::info("[{}] NS slot state refresh: re-broadcasting {} claim(s)",
+                     name(), refresh_claims.size());
+        for (const auto& c : refresh_claims) broadcast_ns_slot_claim(c);
+    }
+
     // Re-introduce ourselves (ServerHello) to any peer we haven't handshaked with
     // yet — e.g. seeds added after startup by background DNS discovery, or peers
     // that were unreachable during the initial hello. Once a peer responds its
@@ -1935,6 +1962,104 @@ void GossipService::save_peers() {
         spdlog::debug("[{}] saved {} peers to storage", name(), peers_.size());
     } else {
         spdlog::warn("[{}] failed to save peers to storage", name());
+    }
+}
+
+void GossipService::load_ns_slots() {
+    std::lock_guard lock(mesh_state_mutex_);
+
+    auto envelope = storage_.read_file("identity", "ns_slots.json");
+    if (!envelope) return;
+
+    try {
+        auto j = json::parse(envelope->data);
+        if (!j.contains("slots") || !j["slots"].is_array()) {
+            spdlog::warn("[{}] ns_slots.json has invalid format", name());
+            return;
+        }
+
+        const auto& arr = j["slots"];
+        for (size_t i = 0; i < arr.size() && i < ns_slots_.size(); ++i) {
+            if (!arr[i].is_object()) continue;
+            const auto& e = arr[i];
+            NsSlotClaimData s;
+            s.slot          = e.value("slot", uint8_t{0});
+            s.server_pubkey = e.value("server_pubkey", "");
+            s.server_ip     = e.value("server_ip", "");
+            s.region        = e.value("region", "");
+            s.timestamp     = e.value("timestamp", uint64_t{0});
+            s.signature     = e.value("signature", "");
+            s.pinned        = e.value("pinned", false);
+            // A cleared slot is persisted as null and never restored.
+            if (s.slot == 0 || s.server_pubkey.empty()) continue;
+            ns_slots_[i] = s;
+        }
+
+        if (j.contains("our_slot") && j["our_slot"].is_number_integer()) {
+            const uint8_t slot = j["our_slot"].get<uint8_t>();
+            // Fail closed: our_ns_slot_ is trusted only when the stored
+            // table agrees the slot is held by this server's key.
+            if (slot >= 1 && slot <= 9 &&
+                ns_slots_[slot - 1].server_pubkey ==
+                    crypto::to_base64(keypair_.public_key)) {
+                our_ns_slot_ = slot;
+            }
+        }
+
+        // Do NOT set ns_state_synced_: the loaded table is our own memory,
+        // not mesh evidence. The gate must open from a live accepted
+        // ServerHello or applied claim (fail closed).
+        spdlog::info("[{}] loaded NS slot state (held: {})", name(),
+                     our_ns_slot_.has_value()
+                         ? std::to_string(*our_ns_slot_)
+                         : std::string("none"));
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse ns_slots.json: {}", name(), e.what());
+    }
+}
+
+void GossipService::save_ns_slots() {
+    // mesh_state_mutex_ is taken here, like save_peers takes peers_mutex_;
+    // callers must run OUTSIDE the mesh lock.
+    std::lock_guard lock(mesh_state_mutex_);
+
+    json j;
+    if (our_ns_slot_.has_value()) j["our_slot"] = *our_ns_slot_;
+    json slots_array = json::array();
+    for (const auto& s : ns_slots_) {
+        if (s.slot == 0 || s.server_pubkey.empty()) {
+            slots_array.push_back(nullptr);
+            continue;
+        }
+        json e;
+        e["slot"]          = s.slot;
+        e["server_pubkey"] = s.server_pubkey;
+        e["server_ip"]     = s.server_ip;
+        e["region"]        = s.region;
+        e["timestamp"]     = s.timestamp;
+        e["signature"]     = s.signature;
+        // Mirror the wire scheme: only pinned entries carry the key.
+        if (s.pinned) e["pinned"] = true;
+        slots_array.push_back(std::move(e));
+    }
+    j["slots"] = std::move(slots_array);
+
+    storage::SignedEnvelope envelope;
+    envelope.type = "ns_slot_state";
+    envelope.data = j.dump();
+    envelope.signer_pubkey = "ed25519:" + crypto::to_base64(keypair_.public_key);
+    envelope.timestamp = static_cast<uint64_t>(
+        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+    // Sign the slot state data
+    auto data_bytes = std::vector<uint8_t>(envelope.data.begin(), envelope.data.end());
+    auto sig = crypto_.ed25519_sign(keypair_.private_key, data_bytes);
+    envelope.signature = crypto::to_base64(sig);
+
+    if (storage_.write_file("identity", "ns_slots.json", envelope)) {
+        spdlog::debug("[{}] saved NS slot state to storage", name());
+    } else {
+        spdlog::warn("[{}] failed to save NS slot state to storage", name());
     }
 }
 
@@ -2953,80 +3078,116 @@ std::vector<NsSlotClaimData> GossipService::get_ns_slots() const {
 void GossipService::try_claim_ns_slot(const std::string& our_public_ip) {
     NsSlotClaimData claim;
     bool claimed = false;
+    bool renewed = false;
     {
         std::lock_guard lock(mesh_state_mutex_);
         ns_claim_ip_ = our_public_ip;
 
-        // Don't claim if we already hold a slot
+        // Don't claim if we already hold a slot. Exception: a pinned holder
+        // whose public IP changed (e.g. a restart behind a new address) must
+        // renew the claim, or the ns<N> A record keeps advertising the old IP.
         if (our_ns_slot_.has_value()) {
-            spdlog::debug("[{}] already hold NS slot ns{}, skipping claim",
-                           name(), *our_ns_slot_);
-            return;
-        }
+            const auto slot = *our_ns_slot_;
+            const auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+            const auto& s = ns_slots_[slot - 1];
+            if (preferred_ns_slot_ == slot &&
+                !s.server_pubkey.empty() &&
+                s.server_pubkey == our_pubkey_b64 &&
+                s.server_ip != our_public_ip) {
+                const std::string old_ip = s.server_ip;
+                const auto now = static_cast<uint64_t>(
+                    chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
-        // Claim only after the mesh's slot state is known: a restarting or
-        // joining node with an empty table would otherwise claim ns1 and
-        // clobber a slot a peer holds. Until then the claim is deferred and
-        // re-attempted on the gossip tick.
-        if (!ns_state_synced_) {
-            ns_claim_pending_ = true;
-            spdlog::info("[{}] NS slot claim deferred — slot state not yet synced from the mesh",
-                         name());
-            return;
-        }
+                claim.slot          = slot;
+                claim.server_pubkey = our_pubkey_b64;
+                claim.server_ip     = our_public_ip;
+                claim.region        = our_region_;
+                claim.timestamp     = now;
+                claim.pinned        = true;
+                sign_ns_claim(claim);
 
-        // Pinned: claim exactly that slot or none — the registrar's glue points
-        // ns<pin> at us, so holding any other slot advertises a nameserver the
-        // registry contradicts. Otherwise take the lowest available slot (1-9).
-        uint8_t chosen_slot = 0;
-        if (preferred_ns_slot_ != 0) {
-            const auto& s = ns_slots_[preferred_ns_slot_ - 1];
-            if (s.slot == 0 || s.server_pubkey.empty()) {
-                chosen_slot = preferred_ns_slot_;
-                claim.pinned = true;
+                // Store locally (same claimant, same slot: peers apply this
+                // as an idempotent renewal and refresh the A record).
+                ns_slots_[slot - 1] = claim;
+                ns_claim_pending_ = false;
+                renewed = true;
+
+                spdlog::info("[{}] NS slot ns{} public IP changed ({} -> {}); "
+                              "renewing pinned claim",
+                              name(), slot, old_ip, our_public_ip);
             } else {
-                spdlog::warn("[{}] pinned NS slot ns{} is held by {}; not claiming a slot",
-                              name(), preferred_ns_slot_, s.server_pubkey.substr(0, 12));
-                ns_claim_pending_ = true; // retry each tick until it is ours
-                return;
+                spdlog::debug("[{}] already hold NS slot ns{}, skipping claim",
+                               name(), *our_ns_slot_);
             }
         } else {
-            for (uint8_t i = 0; i < 9; ++i) {
-                if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
-                    chosen_slot = i + 1; // slots are 1-based
-                    break;
+            // Claim only after the mesh's slot state is known: a restarting or
+            // joining node with an empty table would otherwise claim ns1 and
+            // clobber a slot a peer holds. Until then the claim is deferred and
+            // re-attempted on the gossip tick.
+            if (!ns_state_synced_) {
+                ns_claim_pending_ = true;
+                spdlog::info("[{}] NS slot claim deferred — slot state not yet synced from the mesh",
+                             name());
+                return;
+            }
+
+            // Pinned: claim exactly that slot or none — the registrar's glue
+            // points ns<pin> at us, so holding any other slot advertises a
+            // nameserver the registry contradicts. Otherwise take the lowest
+            // available slot (1-9).
+            uint8_t chosen_slot = 0;
+            if (preferred_ns_slot_ != 0) {
+                const auto& s = ns_slots_[preferred_ns_slot_ - 1];
+                if (s.slot == 0 || s.server_pubkey.empty()) {
+                    chosen_slot = preferred_ns_slot_;
+                    claim.pinned = true;
+                } else {
+                    spdlog::warn("[{}] pinned NS slot ns{} is held by {}; not claiming a slot",
+                                  name(), preferred_ns_slot_, s.server_pubkey.substr(0, 12));
+                    ns_claim_pending_ = true; // retry each tick until it is ours
+                    return;
+                }
+            } else {
+                for (uint8_t i = 0; i < 9; ++i) {
+                    if (ns_slots_[i].slot == 0 || ns_slots_[i].server_pubkey.empty()) {
+                        chosen_slot = i + 1; // slots are 1-based
+                        break;
+                    }
                 }
             }
+
+            if (chosen_slot == 0) {
+                spdlog::warn("[{}] all 9 NS slots are claimed, cannot claim a slot", name());
+                ns_claim_pending_ = true; // retry each tick until a slot frees
+                return;
+            }
+
+            auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+            auto now = static_cast<uint64_t>(
+                chrono::system_clock::to_time_t(chrono::system_clock::now()));
+
+            claim.slot          = chosen_slot;
+            claim.server_pubkey = our_pubkey_b64;
+            claim.server_ip     = our_public_ip;
+            claim.region        = our_region_;
+            claim.timestamp     = now;
+
+            sign_ns_claim(claim);
+
+            // Store locally
+            ns_slots_[chosen_slot - 1] = claim;
+            our_ns_slot_ = chosen_slot;
+            ns_claim_pending_ = false;
+            claimed = true;
+
+            spdlog::info("[{}] claimed NS slot ns{} (ip={}, region={}, pinned={})",
+                          name(), chosen_slot, our_public_ip, our_region_, claim.pinned);
         }
-
-        if (chosen_slot == 0) {
-            spdlog::warn("[{}] all 9 NS slots are claimed, cannot claim a slot", name());
-            ns_claim_pending_ = true; // retry each tick until a slot frees
-            return;
-        }
-
-        auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
-        auto now = static_cast<uint64_t>(
-            chrono::system_clock::to_time_t(chrono::system_clock::now()));
-
-        claim.slot          = chosen_slot;
-        claim.server_pubkey = our_pubkey_b64;
-        claim.server_ip     = our_public_ip;
-        claim.region        = our_region_;
-        claim.timestamp     = now;
-
-        sign_ns_claim(claim);
-
-        // Store locally
-        ns_slots_[chosen_slot - 1] = claim;
-        our_ns_slot_ = chosen_slot;
-        ns_claim_pending_ = false;
-        claimed = true;
-
-        spdlog::info("[{}] claimed NS slot ns{} (ip={}, region={}, pinned={})",
-                      name(), chosen_slot, our_public_ip, our_region_, claim.pinned);
     }
-    if (!claimed) return;
+    if (!claimed && !renewed) return;
+
+    // Persist outside the mesh lock (save takes it itself).
+    save_ns_slots();
 
     // Register in DNS and broadcast outside the mesh lock (external calls)
     register_ns_slot_in_dns(claim);
@@ -3083,6 +3244,9 @@ void GossipService::release_ns_slot(uint8_t slot) {
     }
     if (!released) return;
 
+    // Persist outside the mesh lock (save takes it itself).
+    save_ns_slots();
+
     // Remove the ns<N> A record and propagate the release outside the mesh
     // lock (external calls).
     if (dns_) {
@@ -3092,6 +3256,7 @@ void GossipService::release_ns_slot(uint8_t slot) {
 }
 
 void GossipService::broadcast_ns_slot_claim(const NsSlotClaimData& claim) {
+    ++test_ns_claim_broadcast_count_;
     json j;
     j["slot"]          = claim.slot;
     j["server_pubkey"] = claim.server_pubkey;
@@ -3291,6 +3456,9 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             }
         }
         if (released) {
+            // Slot state changed: persist before propagating, outside the
+            // mesh lock (save takes it itself).
+            save_ns_slots();
             // Remove the ns<N> A record and propagate the release outside the
             // mesh lock (external calls).
             if (dns_) {
@@ -3312,6 +3480,10 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             return;
         }
         if (!accepted) return;
+
+        // Slot state changed: persist before propagating, outside the mesh
+        // lock (save takes it itself).
+        save_ns_slots();
 
         // Register in DNS and forward outside the mesh lock (external calls)
         register_ns_slot_in_dns(accepted_claim);

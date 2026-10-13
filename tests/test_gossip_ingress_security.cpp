@@ -68,6 +68,11 @@ struct GossipBallotTestAccess {
     }
     static bool ns_synced(GossipService& g) { return g.ns_state_synced_; }
     static bool ns_claim_pending(GossipService& g) { return g.ns_claim_pending_; }
+    // One-shot refresh test: how many NsSlotClaim messages this service
+    // broadcast (every send goes through broadcast_ns_slot_claim).
+    static std::uint64_t ns_broadcast_count(const GossipService& g) {
+        return g.test_ns_claim_broadcast_count_;
+    }
     // Drives one 5 s gossip tick (NS claim deferral/retry, opt-out release)
     // without waiting for the timer.
     static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
@@ -247,6 +252,17 @@ protected:
         (void)pump_until([] { return false; }, d);
     }
 
+    // Models a process restart: stops the gossip service and rebuilds it over
+    // the SAME storage directory (keypair, peers.json and ns_slots.json are
+    // re-loaded from disk). `configure` runs before start().
+    void restart_node(Node& n, const std::function<void(Node&)>& configure = {}) {
+        n.gossip->stop();
+        n.gossip.reset();
+        n.gossip = std::make_unique<gossip::GossipService>(io, 0, *n.storage, *n.crypto);
+        if (configure) configure(n);
+        n.gossip->start();
+    }
+
     // A raw packet in gossip framing, signed by `kp` (the shape send_packet
     // emits).
     std::vector<uint8_t> build_packet(const crypto::Ed25519Keypair& kp,
@@ -294,6 +310,48 @@ protected:
                                      const std::string& cert_json) {
         return {{"pubkey", pubkey_b64}, {"endpoint", endpoint},
                 {"certificate_json", cert_json}};
+    }
+
+    // Persist an identity keypair into storage BEFORE the gossip service is
+    // constructed, so on_start loads it: the "restart" helpers rebuild the
+    // service over the same directory with the SAME identity.
+    static void seed_keypair(storage::FileStorageService& s,
+                             const crypto::Ed25519Keypair& kp) {
+        storage::SignedEnvelope env;
+        env.type = "identity_keypair";
+        env.data = nlohmann::json{{"public_key", crypto::to_base64(kp.public_key)},
+                                  {"private_key", crypto::to_base64(kp.private_key)}}
+            .dump();
+        ASSERT_TRUE(s.write_file("identity", "keypair.json", env));
+    }
+
+    // The v0.9.5 slot-state file, shaped exactly like save_ns_slots emits
+    // it (our_slot + 9 entries, null when empty, pinned key only when set).
+    static void seed_ns_slot_state(storage::FileStorageService& s,
+                                   const std::vector<nlohmann::json>& slots,
+                                   int our_slot = -1) {
+        nlohmann::json arr = nlohmann::json::array();
+        for (int i = 0; i < 9; ++i) {
+            arr.push_back(i < static_cast<int>(slots.size()) ? slots[i] : nullptr);
+        }
+        nlohmann::json j{{"slots", arr}};
+        if (our_slot > 0) j["our_slot"] = our_slot;
+        storage::SignedEnvelope env;
+        env.type = "ns_slot_state";
+        env.data = j.dump();
+        ASSERT_TRUE(s.write_file("identity", "ns_slots.json", env));
+    }
+
+    static nlohmann::json slot_entry(uint8_t slot, const std::string& server_pubkey_b64,
+                                     const std::string& server_ip,
+                                     uint64_t timestamp,
+                                     const std::string& signature,
+                                     bool pinned = false) {
+        nlohmann::json e{{"slot", slot}, {"server_pubkey", server_pubkey_b64},
+                         {"server_ip", server_ip}, {"region", "eu-west"},
+                         {"timestamp", timestamp}, {"signature", signature}};
+        if (pinned) e["pinned"] = true;
+        return e;
     }
 
     // The REAL certificate path: root-signed by `root_kp`, verifiable by any
@@ -394,14 +452,15 @@ protected:
                                           const std::string& named_pubkey_b64,
                                           uint8_t slot,
                                           const std::string& server_ip = "10.0.0.7",
-                                          bool pinned = false) {
+                                          bool pinned = false,
+                                          uint64_t timestamp = 1000) {
         nlohmann::json sign_payload;
         if (pinned) sign_payload["pinned"] = true;
         sign_payload["slot"]          = slot;
         sign_payload["server_pubkey"] = named_pubkey_b64;
         sign_payload["server_ip"]     = server_ip;
         sign_payload["region"]        = "eu-west";
-        sign_payload["timestamp"]     = uint64_t{1000};
+        sign_payload["timestamp"]     = timestamp;
 
         nlohmann::json wire = sign_payload;
         wire["signature"] = sign_b64(signer, sign_payload.dump());
@@ -1303,6 +1362,432 @@ TEST_F(GossipIngressSecurityTest, NsOptOutReleasesHeldSlotOnTick) {
     gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
     EXPECT_FALSE(a.gossip->our_ns_slot().has_value());
     EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 1).server_pubkey.empty());
+}
+
+// ---------------------------------------------------------------------------
+// NS slot state persistence and startup refresh (v0.9.5)
+// ---------------------------------------------------------------------------
+
+// v0.9.5: slot state is persisted as a signed envelope on every mutation
+// and restored on startup. Load restores the table and the held slot but
+// never opens the sync gate — the loaded table is memory, not mesh evidence.
+TEST_F(GossipIngressSecurityTest, NsSlotStatePersistsAcrossRestartAndLoadKeepsGateClosed) {
+    auto root_kp = kc->ed25519_keygen();
+    auto peer    = kc->ed25519_keygen();
+    const auto peer_b64 = crypto::to_base64(peer.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(peer_b64, "127.0.0.1:9",
+                           issue_cert(peer_b64, "peer-ns4", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    const auto a_b64 = a.pubkey_b64();
+
+    // A peer claim opens the sync gate; this node then claims ns1.
+    inject(build_packet(peer, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(peer, peer_b64, 4, "10.0.0.40")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(4) == peer_b64; }));
+    a.gossip->try_claim_ns_slot("10.0.0.50");
+    ASSERT_EQ(a.gossip->our_ns_slot(), 1);
+
+    // The state is on disk, wrapped and signed by this node's key.
+    auto env = a.storage->read_file("identity", "ns_slots.json");
+    ASSERT_TRUE(env.has_value());
+    EXPECT_EQ(env->type, "ns_slot_state");
+    EXPECT_EQ(env->signer_pubkey, "ed25519:" + a_b64);
+    const auto& data = env->data;
+    const auto sig_bytes = crypto::from_base64(env->signature);
+    ASSERT_EQ(sig_bytes.size(), crypto::kEd25519SignatureSize);
+    crypto::Ed25519Signature sig{};
+    std::memcpy(sig.data(), sig_bytes.data(), sig_bytes.size());
+    EXPECT_TRUE(kc->ed25519_verify(
+        a.gossip->keypair().public_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(data.data()),
+                                 data.size()),
+        sig));
+
+    // Restart over the same storage: table and held slot are restored...
+    restart_node(a);
+    ASSERT_EQ(a.gossip->our_ns_slot(), 1);
+    EXPECT_EQ(a.ns_holder(1), a_b64);
+    EXPECT_EQ(a.ns_holder(4), peer_b64);
+    // ...but the sync gate stays closed (fail closed).
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::ns_synced(*a.gossip));
+}
+
+// v0.9.5: the live incident — a restarted opt-out holder that re-loads its
+// held slot from disk must release it. Before persistence the holder could
+// never re-learn the slot and the release never fired.
+TEST_F(GossipIngressSecurityTest, NsOptOutHolderReleasesPersistedSlotAfterRestart) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    const auto a_b64  = crypto::to_base64(a_kp.public_key);
+    const std::string a_cert = issue_cert(a_b64, "node-a", root_kp);
+
+    // The peer: real DNS zone, certified view of the holder.
+    auto& p = make_node(
+        "p",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(a_b64, "127.0.0.1:9", a_cert),
+            }));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    // The holder, with a fixed identity seeded before construction so the
+    // restart below re-loads the SAME keypair.
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            const auto p_pk = crypto::to_base64(p.gossip->keypair().public_key);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(p_pk, p.endpoint(), issue_cert(p_pk, "peer-p", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    const auto& p_kp = p.gossip->keypair();
+    const auto p_b64 = crypto::to_base64(p_kp.public_key);
+
+    // Pre-restart: a peer claim opens the sync gate; the holder claims ns1
+    // and the peer applies it (A record lands in the zone).
+    inject(build_packet(p_kp, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(p_kp, p_b64, 7, "10.0.0.20")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(7) == p_b64; }));
+    a.gossip->try_claim_ns_slot("10.0.0.30");
+    ASSERT_EQ(a.gossip->our_ns_slot(), 1);
+    const std::string ns1_fqdn = "ns1.lemonade-nexus.io";
+    ASSERT_TRUE(pump_until([&] { return p.ns_holder(1) == a_b64; }));
+    ASSERT_EQ(p.dns->nameserver_ip(ns1_fqdn), "10.0.0.30");
+
+    // Restart as an OPT-OUT node: the persisted table re-loads {ns1: a} with
+    // the held slot; the first tick releases it.
+    restart_node(a, [&](Node& n) {
+        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_network_id(kTestNetworkHex);
+        n.gossip->set_ns_opt_out(true);
+    });
+    ASSERT_EQ(a.gossip->our_ns_slot(), 1);  // re-learned from disk
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+
+    // The peer applies the release: slot cleared, A record removed.
+    EXPECT_FALSE(a.gossip->our_ns_slot().has_value());
+    ASSERT_TRUE(pump_until([&] { return p.ns_holder(1).empty(); }));
+    EXPECT_FALSE(p.dns->nameserver_ip(ns1_fqdn).has_value());
+}
+
+// v0.9.5: after the sync gate opens, the FIRST tick re-broadcasts every
+// stored claim so a restarted node with an empty table re-learns the mesh's
+// slot state; for its own slot it re-learns the held slot (self rule).
+TEST_F(GossipIngressSecurityTest, NsStartupRefreshRelearnsSlotStateToRestartedPeer) {
+    auto root_kp = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto b_b64 = crypto::to_base64(b_kp.public_key);
+    const auto c_b64 = crypto::to_base64(c_kp.public_key);
+    const std::string b_cert = issue_cert(b_b64, "node-b", root_kp);
+    const std::string c_cert = issue_cert(c_b64, "node-c", root_kp);
+
+    // B "restarts": fixed identity, EMPTY slot table, certified view of the
+    // mesh (its own certificate included — the claim gate verifies the
+    // claimant through the peer table, own slot included).
+    auto& b = make_node(
+        "b",
+        [&](Node& n) {
+            seed_keypair(*n.storage, b_kp);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b_b64, "127.0.0.1:9", b_cert),
+                peer_entry(c_b64, "127.0.0.1:10", c_cert),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // A holds the mesh's slot table {ns1: B, ns2: C}.
+    // B's entry points at a DEAD endpoint while the table is filled: the
+    // accept path forwards every applied claim to all peers except the
+    // sender, and a raw injection's sender is not B — B must stay empty
+    // until the refresh under test reaches it.
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b_b64, "127.0.0.1:12", b_cert),
+                peer_entry(c_b64, "127.0.0.1:11", c_cert),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    inject(build_packet(b_kp, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(b_kp, b_b64, 1, "10.0.0.31")),
+           a);
+    inject(build_packet(c_kp, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(c_kp, c_b64, 2, "10.0.0.32")),
+           a);
+    ASSERT_TRUE(pump_until([&] {
+        return a.ns_holder(1) == b_b64 && a.ns_holder(2) == c_b64;
+    }));
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_synced(*a.gossip));
+
+    // Now point A at B's real socket so the refresh reaches it.
+    a.gossip->add_peer(b.endpoint(), b_b64);
+
+    // B knows nothing yet; the first tick after the gate opens re-broadcasts.
+    EXPECT_TRUE(b.ns_holder(1).empty());
+    EXPECT_FALSE(b.gossip->our_ns_slot().has_value());
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+
+    // B re-learns both slots verbatim (holder signatures and timestamps
+    // intact) and re-learns ITS OWN slot.
+    ASSERT_TRUE(pump_until([&] {
+        return b.ns_holder(1) == b_b64 && b.ns_holder(2) == c_b64;
+    }));
+    EXPECT_EQ(b.gossip->our_ns_slot(), 1);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*b.gossip, 1).server_ip, "10.0.0.31");
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*b.gossip, 1).timestamp, uint64_t{1000});
+}
+
+// v0.9.5 regression proof: a claim for an EMPTY slot is accepted no matter
+// how old its timestamp is — there is deliberately no freshness guard
+// (slots must stay re-learnable from old relays).
+TEST_F(GossipIngressSecurityTest, NsClaimOnEmptySlotAcceptsStaleTimestamp) {
+    auto root_kp = kc->ed25519_keygen();
+    auto peer    = kc->ed25519_keygen();
+    const auto peer_b64 = crypto::to_base64(peer.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(peer_b64, "127.0.0.1:9",
+                           issue_cert(peer_b64, "peer-stale", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    const uint64_t stale_ts = 1700000000;  // 2023-11-14
+    inject(build_packet(peer, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(peer, peer_b64, 2, "10.0.0.40", false, stale_ts)),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(2) == peer_b64; }));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 2).timestamp, stale_ts);
+}
+
+// v0.9.5: a pinned holder that restarts behind a NEW public IP must renew
+// its claim, or the ns<N> A record keeps advertising the old IP. The peer
+// applies the renewal (IP and A record refreshed, holder kept, no release).
+TEST_F(GossipIngressSecurityTest, NsPinnedHolderRenewsClaimOnIpChangeAfterRestart) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    const auto a_b64  = crypto::to_base64(a_kp.public_key);
+    const std::string a_cert = issue_cert(a_b64, "node-a", root_kp);
+
+    // Pre-restart claim state: pinned ns1 on the OLD IP.
+    const uint64_t old_ts = 1760000000;
+    nlohmann::json old_preimage;
+    old_preimage["pinned"]        = true;
+    old_preimage["slot"]          = 1;
+    old_preimage["server_pubkey"] = a_b64;
+    old_preimage["server_ip"]     = "10.0.0.51";
+    old_preimage["region"]        = "eu-west";
+    old_preimage["timestamp"]     = old_ts;
+    const auto old_sig = sign_b64(a_kp, old_preimage.dump());
+    const std::string ns1_fqdn = "ns1.lemonade-nexus.io";
+
+    // The peer: real DNS zone, certified view of the holder.
+    auto& p = make_node(
+        "p",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(a_b64, "127.0.0.1:9", a_cert),
+            }));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    // The peer learned the OLD claim pre-restart.
+    nlohmann::json old_wire = old_preimage;
+    old_wire["signature"] = old_sig;
+    inject(build_packet(a_kp, gossip::GossipMsgType::NsSlotClaim, msgpack_of(old_wire)), p);
+    ASSERT_TRUE(pump_until([&] { return p.ns_holder(1) == a_b64; }));
+    ASSERT_EQ(p.dns->nameserver_ip(ns1_fqdn), "10.0.0.51");
+
+    // The holder comes back behind a new public IP, with the persisted claim.
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            const auto p_pk = crypto::to_base64(p.gossip->keypair().public_key);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(p_pk, p.endpoint(), issue_cert(p_pk, "peer-p", root_kp)),
+            }));
+            seed_ns_slot_state(*n.storage, {slot_entry(1, a_b64, "10.0.0.51", old_ts, old_sig, true)},
+                               /*our_slot=*/1);
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_our_region("eu-west");
+            n.gossip->set_preferred_ns_slot(1);
+        });
+
+    // Re-learned: pinned holder of ns1 on the old IP.
+    ASSERT_EQ(a.gossip->our_ns_slot(), 1);
+
+    // The node re-claims with the NEW public IP: the stored claim is renewed
+    // (same slot, new IP, fresh timestamp, still pinned) — no new claim, no
+    // release.
+    a.gossip->try_claim_ns_slot("10.0.0.52");
+    EXPECT_EQ(a.gossip->our_ns_slot(), 1);
+    const auto& s1 = gossip::GossipBallotTestAccess::ns_slot(*a.gossip, 1);
+    EXPECT_EQ(s1.server_ip, "10.0.0.52");
+    EXPECT_EQ(s1.server_pubkey, a_b64);
+    EXPECT_TRUE(s1.pinned);
+    EXPECT_GT(s1.timestamp, old_ts);
+    // Exactly one broadcast: the renewal itself.
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_broadcast_count(*a.gossip), 1u);
+
+    // The peer applies it as a holder renewal: IP and A record refreshed,
+    // holder kept, slot never emptied.
+    ASSERT_TRUE(pump_until([&] {
+        return p.ns_holder(1) == a_b64 &&
+               gossip::GossipBallotTestAccess::ns_slot(*p.gossip, 1).server_ip == "10.0.0.52";
+    }));
+    ASSERT_EQ(p.dns->nameserver_ip(ns1_fqdn), "10.0.0.52");
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::ns_slot(*p.gossip, 1).pinned);
+}
+
+// v0.9.5: the startup refresh is ONE-SHOT — the first synced tick
+// re-broadcasts the stored table; later ticks send nothing new.
+TEST_F(GossipIngressSecurityTest, NsStartupRefreshIsOneShot) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    const auto a_b64 = crypto::to_base64(a_kp.public_key);
+    const auto b_b64 = crypto::to_base64(b_kp.public_key);
+    const std::string a_cert = issue_cert(a_b64, "node-a", root_kp);
+    const std::string b_cert = issue_cert(b_b64, "node-b", root_kp);
+
+    auto make_preimage = [](uint8_t slot, const std::string& pk_b64,
+                            const std::string& ip, uint64_t ts) {
+        nlohmann::json p;
+        p["slot"]          = slot;
+        p["server_pubkey"] = pk_b64;
+        p["server_ip"]     = ip;
+        p["region"]        = "eu-west";
+        p["timestamp"]     = ts;
+        return p;
+    };
+
+    // B: certified view of the mesh (own certificate + A).
+    auto& b = make_node(
+        "b",
+        [&](Node& n) {
+            seed_keypair(*n.storage, b_kp);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(a_b64, "127.0.0.1:9", a_cert),
+                peer_entry(b_b64, "127.0.0.1:10", b_cert),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // A restarts with the persisted table {ns3: A, ns7: B}.
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b_b64, b.endpoint(), b_cert),
+            }));
+            seed_ns_slot_state(*n.storage, {
+                nullptr, nullptr,
+                slot_entry(3, a_b64, "10.0.0.61", 1760000000,
+                          sign_b64(a_kp, make_preimage(3, a_b64, "10.0.0.61", 1760000000).dump())),
+                nullptr, nullptr, nullptr,
+                slot_entry(7, b_b64, "10.0.0.62", 1760000010,
+                          sign_b64(b_kp, make_preimage(7, b_b64, "10.0.0.62", 1760000010).dump())),
+            }, /*our_slot=*/3);
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+    ASSERT_EQ(a.gossip->our_ns_slot(), 3);  // re-learned from disk
+
+    // Open A's sync gate with a live mesh claim (ns5 -> B).
+    inject(build_packet(b_kp, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(b_kp, b_b64, 5, "10.0.0.63")),
+           a);
+    ASSERT_TRUE(pump_until([&] {
+        return a.ns_holder(5) == b_b64 &&
+               gossip::GossipBallotTestAccess::ns_synced(*a.gossip);
+    }));
+
+    // First tick: the three stored claims are re-broadcast exactly once.
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return b.ns_holder(3) == a_b64 && b.ns_holder(5) == b_b64 &&
+               b.ns_holder(7) == b_b64;
+    }));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_broadcast_count(*a.gossip), 3u);
+
+    // Later ticks: no re-broadcast.
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    gossip::GossipBallotTestAccess::run_gossip_tick(*a.gossip);
+    pump_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_broadcast_count(*a.gossip), 3u);
+}
+
+// v0.9.5: persistence does not relax the no-clobber rule — a rejected
+// claim never reaches the persisted table.
+TEST_F(GossipIngressSecurityTest, NsRejectedClaimNeverReachesPersistedTable) {
+    auto root_kp   = kc->ed25519_keygen();
+    auto holder    = kc->ed25519_keygen();
+    auto claimant  = kc->ed25519_keygen();
+    const auto holder_b64   = crypto::to_base64(holder.public_key);
+    const auto claimant_b64 = crypto::to_base64(claimant.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(holder_b64, "127.0.0.1:9",
+                           issue_cert(holder_b64, "peer-holder", root_kp)),
+                peer_entry(claimant_b64, "127.0.0.1:10",
+                           issue_cert(claimant_b64, "peer-claimant", root_kp)),
+            }));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    // Holder takes ns3; the file reflects exactly that.
+    inject(build_packet(holder, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(holder, holder_b64, 3, "10.0.0.30")),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == holder_b64; }));
+
+    // Unpinned non-holder clobber attempt: rejected...
+    inject(build_packet(claimant, gossip::GossipMsgType::NsSlotClaim,
+                        ns_claim_payload(claimant, claimant_b64, 3, "10.0.0.40")),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.ns_holder(3), holder_b64);
+
+    // ...and the persisted table still names the holder, not the claimant.
+    auto env = a.storage->read_file("identity", "ns_slots.json");
+    ASSERT_TRUE(env.has_value());
+    const auto j = nlohmann::json::parse(env->data);
+    ASSERT_EQ(j["slots"].size(), 9u);
+    EXPECT_EQ(j["slots"][2].value("server_pubkey", ""), holder_b64);
 }
 
 // ---------------------------------------------------------------------------

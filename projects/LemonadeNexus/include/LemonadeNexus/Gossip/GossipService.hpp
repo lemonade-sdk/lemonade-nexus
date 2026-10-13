@@ -228,6 +228,11 @@ private:
     void load_peers();
     void save_peers();
 
+    // NS slot state persistence (identity/ns_slots.json, same envelope
+    // pattern as peers.json). Load never opens the sync gate.
+    void load_ns_slots();
+    void save_ns_slots();
+
     // Initial ServerHello announcement to all known peers (startup only;
     // runs before the async loops start).
     void send_startup_server_hello();
@@ -520,6 +525,9 @@ private:
     // Test seam: largest serialized delta page emitted (bytes, envelope
     // included).
     std::uint64_t test_max_page_bytes_{0};
+    // Test seam: NS slot claim messages broadcast (every claim/release send
+    // goes through broadcast_ns_slot_claim).
+    std::uint64_t test_ns_claim_broadcast_count_{0};
 
     // Test seams (friend GossipBallotTestAccess): zero selects production.
     std::size_t   test_peer_log_cap_{0};
@@ -566,6 +574,11 @@ private:
     std::string                      ns_claim_ip_;
     // Opt-out (dns_ns_hostname: "none"): never claim; release a held slot.
     bool                             ns_opt_out_{false};
+    // One-shot startup claim refresh (v0.9.5): once the sync gate has
+    // opened, the first gossip tick re-broadcasts every stored claim so
+    // restarting/empty nodes re-learn slot state the mesh already holds.
+    // Set once per process life; never reset.
+    bool                             ns_refresh_sent_{false};
 
     // PeerExchange initiator (v0.9.4 fix 4): at most one request per 60 s of
     // internal cadence (last_peer_exchange_tick_); peer_exchange_last_ holds
