@@ -11,7 +11,7 @@
 	     cannot persist Cluster keys. -->
 	<key>keychain-access-groups</key>
 	<array>
-		<string>$(AppIdentifierPrefix)io.lemonadenexus.lemonadeNexus</string>
+		<string>$(AppIdentifierPrefix)com.lemonade.nexus.client</string>
 	</array>
 </dict>
 </plist>

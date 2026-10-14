@@ -8,7 +8,7 @@
 PRODUCT_NAME = nexus-client
 
 // The application's bundle identifier
-PRODUCT_BUNDLE_IDENTIFIER = io.lemonadenexus.lemonadeNexus
+PRODUCT_BUNDLE_IDENTIFIER = com.lemonade.nexus.client
 
 // The copyright displayed in application information
 PRODUCT_COPYRIGHT = Copyright © 2026 io.lemonadenexus. All rights reserved.
