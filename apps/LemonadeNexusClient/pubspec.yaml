@@ -1,5 +1,5 @@
 name: nexus_client
-description: Lemonade Nexus VPN Client (macOS, Windows; mobile-ready)
+description: Lemonade Nexus VPN Client (macOS, Windows, Linux; mobile-ready)
 publish_to: 'none'
 version: 1.0.0+1
 

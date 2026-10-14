@@ -1,8 +1,11 @@
 name: Flutter Desktop Clients
 
 # Builds the self-contained native SDK shared library and the Flutter desktop
-# client (apps/LemonadeNexusClient) on macOS and Windows, and runs analyze + tests.
-# Packaging (DMG / MSIX) is layered on top of these artifacts separately.
+# client (apps/LemonadeNexusClient) on macOS, Windows and Linux, and runs
+# analyze + tests. When a release tag is supplied (a published release, or the
+# release_tag input of a manual run), each job also packages its app and
+# attaches it to that GitHub release. Signed installers (DMG / MSIX) are
+# layered on top of these artifacts separately.
 
 on:
   push:
@@ -20,9 +23,20 @@ on:
       - 'projects/LemonadeNexusSDK/**'
       - 'cmake/**'
       - '.github/workflows/flutter-clients.yml'
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to attach the built apps to (leave empty to only build)'
+        required: false
+        default: ''
+        type: string
 
 env:
   BUILD_TYPE: Release
+  # Release to attach the packaged apps to; empty means build only.
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
   FLUTTER_VERSION: "3.44.4"
   # Keep pub downloads inside the workspace so actions/cache can persist them.
   PUB_CACHE: ${{ github.workspace }}/.pub-cache
@@ -30,6 +44,8 @@ env:
 jobs:
   macos:
     runs-on: macos-14
+    permissions:
+      contents: write  # gh release upload
     steps:
       - uses: actions/checkout@v5
 
@@ -99,23 +115,34 @@ jobs:
           name: nexus-client-macos
           path: apps/LemonadeNexusClient/build/macos/Build/Products/Release/*.app
 
+      - name: Attach to release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          app=$(find apps/LemonadeNexusClient/build/macos/Build/Products/Release -maxdepth 1 -name '*.app' | head -n 1)
+          out="nexus-client-${RELEASE_TAG}-macos-arm64-unsigned.zip"
+          ditto -c -k --keepParent "$app" "$out"
+          gh release upload "$RELEASE_TAG" "$out" --clobber
+
   windows:
-    # TODO(windows): temporarily disabled. This job fails in "Build shared SDK"
-    # before any Dart runs: the cache key below is not keyed by CMake generator,
-    # so a Visual Studio FetchContent cache is restored into a Ninja configure
-    # and asio's sub-build aborts. The macOS job still runs flutter analyze and
-    # flutter test, so Dart coverage is unaffected.
-    if: false
     runs-on: windows-2022
+    permissions:
+      contents: write  # gh release upload
     steps:
       - uses: actions/checkout@v5
 
+      # FetchContent sub-builds record their CMake generator, so the key names
+      # the workflow and generator: the old `fetchcontent-windows-2022-` prefix
+      # also matched ci.yml's Visual Studio caches, which then aborted asio's
+      # sub-build under this job's Ninja configure.
       - name: Cache CMake FetchContent dependencies
         uses: actions/cache@v5
         with:
           path: build/_deps
-          key: fetchcontent-windows-2022-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
-          restore-keys: fetchcontent-windows-2022-
+          key: fetchcontent-flutter-windows-2022-ninja-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: fetchcontent-flutter-windows-2022-ninja-
 
       - name: Install Ninja + static OpenSSL (vcpkg)
         shell: pwsh
@@ -207,3 +234,125 @@ jobs:
         with:
           name: nexus-client-windows
           path: apps/LemonadeNexusClient/build/windows/x64/runner/Release/
+
+      - name: Attach to release
+        if: env.RELEASE_TAG != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $stage = "dist/nexus-client"
+          New-Item -ItemType Directory -Force -Path "dist" | Out-Null
+          Copy-Item -Recurse "apps/LemonadeNexusClient/build/windows/x64/runner/Release" $stage
+          $out = "nexus-client-$env:RELEASE_TAG-windows-x64.zip"
+          Compress-Archive -Path $stage -DestinationPath $out -Force
+          gh release upload "$env:RELEASE_TAG" $out --clobber
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  linux:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write  # gh release upload
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v5
+        with:
+          path: build/_deps
+          key: fetchcontent-flutter-ubuntu-24.04-ninja-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: fetchcontent-flutter-ubuntu-24.04-ninja-
+
+      # SDK: cmake + ninja (Rust is preinstalled on the runner). Flutter Linux
+      # toolchain: clang + GTK 3. Plugins: libsecret + jsoncpp
+      # (flutter_secure_storage), ayatana appindicator (tray_manager).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake ninja-build pkg-config clang \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev \
+            libsecret-1-dev libjsoncpp-dev libayatana-appindicator3-dev
+
+      # OpenSSL is built from source (static, PIC) so the .so carries no
+      # libssl/libcrypto dependency. The SDK does not use TPM FAPI, so skip
+      # the tss2 dependency chain.
+      - name: Build shared SDK
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF \
+            -DOPENSSL_FORCE_BUNDLED=ON \
+            -DLEMONADE_NEXUS_MINIMAL_DEPS=ON \
+            -DBUILD_SDK_SHARED=ON
+          cmake --build build --target LemonadeNexusSDKShared --parallel
+
+      - name: Verify SDK .so exports and is self-contained
+        run: |
+          so=build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.so
+          # Sanity floor: the public C API is ~64 ln_* functions.
+          n=$(nm -D --defined-only "$so" | grep -c ' T ln_')
+          echo "ln_* exports: $n"
+          test "$n" -ge 60
+          # Static deps (OpenSSL, libsodium, ...) must be embedded, not linked.
+          if ldd "$so" | grep -E 'libssl|libcrypto|libsodium|not found'; then
+            echo "::error::SDK .so links non-system libraries"; exit 1
+          fi
+
+      - name: Cache pub dependencies
+        uses: actions/cache@v5
+        with:
+          path: .pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('apps/LemonadeNexusClient/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+
+      - name: Analyze + test
+        working-directory: apps/LemonadeNexusClient
+        run: |
+          flutter pub get
+          flutter analyze
+          flutter test
+
+      - name: Build Linux app
+        working-directory: apps/LemonadeNexusClient
+        run: flutter build linux --release
+
+      # The runner's install step bundles the SDK OPTIONALly (warning only);
+      # assert the runtime-critical pieces made it into the bundle.
+      - name: Verify Linux bundle is complete
+        run: |
+          bundle=apps/LemonadeNexusClient/build/linux/x64/release/bundle
+          test -x "$bundle/nexus-client"
+          test -f "$bundle/lib/liblemonade_nexus_sdk.so"
+          test -f "$bundle/lib/libapp.so"
+          test -f "$bundle/lib/libflutter_linux_gtk.so"
+          test -f "$bundle/data/icudtl.dat"
+          test -d "$bundle/data/flutter_assets"
+          plugins=$(find "$bundle/lib" -name '*_plugin.so' | wc -l)
+          echo "plugin libraries: $plugins"
+          test "$plugins" -ge 3
+          if ldd "$bundle/nexus-client" | grep 'not found'; then
+            echo "::error::bundle executable has unresolved libraries"; exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nexus-client-linux
+          path: apps/LemonadeNexusClient/build/linux/x64/release/bundle/
+
+      - name: Attach to release
+        if: env.RELEASE_TAG != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p dist
+          cp -a apps/LemonadeNexusClient/build/linux/x64/release/bundle dist/nexus-client
+          out="nexus-client-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          tar -czf "$out" -C dist nexus-client
+          gh release upload "$RELEASE_TAG" "$out" --clobber

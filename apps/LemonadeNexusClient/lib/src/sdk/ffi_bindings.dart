@@ -878,7 +878,14 @@ class LemonadeNexusFfi {
       } else if (Platform.isMacOS) {
         _lib = ffi.DynamicLibrary.open('liblemonade_nexus_sdk.dylib');
       } else if (Platform.isLinux) {
-        _lib = ffi.DynamicLibrary.open('liblemonade_nexus_sdk.so');
+        // The Linux runner installs the library into <bundle>/lib. Open that
+        // copy by absolute path so loading does not depend on the dynamic
+        // loader's search path; fall back to the leaf name (LD_LIBRARY_PATH,
+        // system install) when running outside a bundle.
+        final bundled = '${File(Platform.resolvedExecutable).parent.path}'
+            '/lib/liblemonade_nexus_sdk.so';
+        _lib = ffi.DynamicLibrary.open(
+            File(bundled).existsSync() ? bundled : 'liblemonade_nexus_sdk.so');
       } else {
         throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
       }

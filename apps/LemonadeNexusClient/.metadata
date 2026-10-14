@@ -18,6 +18,9 @@ migration:
     - platform: macos
       create_revision: ad70ec4617166f1c38e5d2bfd388af71fda14f06
       base_revision: ad70ec4617166f1c38e5d2bfd388af71fda14f06
+    - platform: linux
+      create_revision: 00b0c91f06209d9e4a41f71b7a512d6eb3b9c694
+      base_revision: 00b0c91f06209d9e4a41f71b7a512d6eb3b9c694
 
   # User provided section
 
