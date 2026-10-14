@@ -73,6 +73,16 @@ struct GossipBallotTestAccess {
     static std::uint64_t ns_broadcast_count(const GossipService& g) {
         return g.test_ns_claim_broadcast_count_;
     }
+    // v0.9.6 relay-loop tests: how many NsSlotClaim messages this service
+    // RECEIVED (all ingress, before validation).
+    static std::uint64_t ns_receive_count(const GossipService& g) {
+        return g.test_ns_claim_received_count_;
+    }
+    // v0.9.6: drive the denial-log rate limiter with synthetic clock values.
+    static bool denial_log_allowed(GossipService& g, const std::string& key,
+                                   std::chrono::steady_clock::time_point now) {
+        return g.denial_log_allowed(key, now);
+    }
     // Drives one 5 s gossip tick (NS claim deferral/retry, opt-out release)
     // without waiting for the timer.
     static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
@@ -1798,6 +1808,273 @@ TEST_F(GossipIngressSecurityTest, NsRejectedClaimNeverReachesPersistedTable) {
 // hello: a relayed certificate is adopted only after the same full
 // verification a direct hello gets, and a bogus one changes nothing. Once
 // adopted, a delta authored by that origin verifies end to end.
+// ---------------------------------------------------------------------------
+// v0.9.6: NS claim relay-loop guard, self-echo, and denial rate limiting
+// ---------------------------------------------------------------------------
+//
+// Topology notes: a node never re-forwards its OWN claim (the self-claimant
+// path), so a claimant's original broadcast is simulated by injecting the
+// claim into the claimant AND into each peer (as if the claimant had sent it
+// to all of them). One-shot startup refreshes fire on the 5 s gossip tick, so
+// the stability windows drain 5.5 s first; after that the mesh must be fully
+// quiet (no refresh pending, no duplicates to relay).
+// ---------------------------------------------------------------------------
+
+// Each triad test defines a make_relayer lambda: a node knowing two peers
+// (dead seeded endpoints + root-signed certificates; real endpoints are wired
+// after construction via add_peer, which preserves the seeded certificate).
+
+// v0.9.6: with three or more relayers, the epidemic claim relay (forward to
+// every peer except the sender) sustained itself: each node re-"renewed" the
+// byte-identical copy and re-forwarded it, so a single claim circulated
+// forever. Field evidence (10-13): four new relayers drove ~2350 claim
+// copies/sec at the root. A byte-identical redelivery must be a silent no-op:
+// no state change, no log, no forward — the loop dies after one round.
+TEST_F(GossipIngressSecurityTest, NsClaimDuplicateRedeliveryDoesNotSustainRelayLoop) {
+    auto root_kp = kc->ed25519_keygen();
+    auto h_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto h_b64 = crypto::to_base64(h_kp.public_key);
+    const auto b_b64 = crypto::to_base64(b_kp.public_key);
+    const auto c_b64 = crypto::to_base64(c_kp.public_key);
+    const auto h_cert = issue_cert(h_b64, "node-h", root_kp);
+    const auto b_cert = issue_cert(b_b64, "node-b", root_kp);
+    const auto c_cert = issue_cert(c_b64, "node-c", root_kp);
+
+    auto make_relayer = [&](const char* tag,
+                            const crypto::Ed25519Keypair* kp,
+                            const std::string& p1_b64, const std::string& p1_cert,
+                            const std::string& p2_b64, const std::string& p2_cert) {
+        return &make_node(
+            tag,
+            [&](Node& n) {
+                if (kp) seed_keypair(*n.storage, *kp);
+                seed_peers(*n.storage, nlohmann::json::array({
+                    peer_entry(p1_b64, "127.0.0.1:9", p1_cert),
+                    peer_entry(p2_b64, "127.0.0.1:10", p2_cert),
+                }));
+            },
+            [&](Node& n) {
+                n.gossip->set_root_pubkey(root_kp.public_key);
+                n.gossip->set_network_id(kTestNetworkHex);
+            });
+    };
+
+    Node* h = make_relayer("h", &h_kp, b_b64, b_cert, c_b64, c_cert);
+    Node* b = make_relayer("b", nullptr, h_b64, h_cert, c_b64, c_cert);
+    Node* c = make_relayer("c", nullptr, h_b64, h_cert, b_b64, b_cert);
+    h->gossip->add_peer(b->endpoint(), b_b64);
+    h->gossip->add_peer(c->endpoint(), c_b64);
+    b->gossip->add_peer(h->endpoint(), h_b64);
+    b->gossip->add_peer(c->endpoint(), c_b64);
+    c->gossip->add_peer(h->endpoint(), h_b64);
+    c->gossip->add_peer(b->endpoint(), b_b64);
+
+    // h claims ns3. h's original broadcast reaches h (self echo) plus b and c
+    // directly; each relay then forwards to its other peers. With the dedup,
+    // the circulation stops after this one round: identical redeliveries are
+    // silent no-ops that do not re-forward.
+    const auto claim = ns_claim_payload(h_kp, h_b64, 3, "10.0.0.30");
+    for (Node* n : {h, b, c})
+        inject(build_packet(h_kp, gossip::GossipMsgType::NsSlotClaim, claim), *n);
+
+    ASSERT_TRUE(pump_until([&] {
+        return h->ns_holder(3) == h_b64 && b->ns_holder(3) == h_b64 &&
+               c->ns_holder(3) == h_b64;
+    }));
+    // Drain the one-shot startup refreshes (5 s tick) so the mesh is at its
+    // steady state before measuring.
+    pump_for(std::chrono::milliseconds(5500));
+
+    // Bounded: each node saw the claim a handful of times (direct + relay
+    // hops + one-shot refreshes). The pre-fix loop adds hundreds within a
+    // second; the fixed mesh is quiet.
+    const auto h0 = gossip::GossipBallotTestAccess::ns_receive_count(*h->gossip);
+    const auto b0 = gossip::GossipBallotTestAccess::ns_receive_count(*b->gossip);
+    const auto c0 = gossip::GossipBallotTestAccess::ns_receive_count(*c->gossip);
+    EXPECT_LE(h0, 8u);
+    EXPECT_LE(b0, 8u);
+    EXPECT_LE(c0, 8u);
+
+    pump_for(std::chrono::milliseconds(1500));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*h->gossip), h0);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*b->gossip), b0);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*c->gossip), c0);
+
+    // The dedup must not have dropped the claim content: holder, ip, and the
+    // holder's original timestamp are intact on every node.
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*b->gossip, 3).server_ip, "10.0.0.30");
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*c->gossip, 3).timestamp, uint64_t{1000});
+    EXPECT_EQ(h->ns_holder(3), h_b64);
+}
+
+// v0.9.6: a relayed copy of a node's OWN claim (production form: the node's
+// own key is NOT in its own peer table) must be applied — the claimant gate
+// previously denied a node's own claims because the root's/self's key is not
+// an enrolled peer of itself — and it must never be re-forwarded (the
+// original sender already propagated it).
+TEST_F(GossipIngressSecurityTest, NsClaimSelfEchoAppliesBookkeepingAndNeverRelays) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    const auto a_b64 = crypto::to_base64(a_kp.public_key);
+    const auto b_b64 = crypto::to_base64(b_kp.public_key);
+    const auto a_cert = issue_cert(a_b64, "node-a", root_kp);
+    const auto b_cert = issue_cert(b_b64, "node-b", root_kp);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(b_b64, "127.0.0.1:9", b_cert)}));
+        },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+    auto& b = make_node(
+        "b",
+        [&](Node& n) { seed_peers(*n.storage, nlohmann::json::array({
+            peer_entry(a_b64, "127.0.0.1:10", a_cert)})); },
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+    a.gossip->add_peer(b.endpoint(), b_b64);
+    b.gossip->add_peer(a.endpoint(), a_b64);
+
+    // A relayed echo of a's own claim arrives at a. Pre-fix: the certificate
+    // gate denied it (a's key is not in a's own peer table) and a could never
+    // re-learn its slot. Post-fix: applied, bookkeeping set, not re-forwarded.
+    const auto claim = ns_claim_payload(a_kp, a_b64, 3, "10.0.0.30");
+    inject(build_packet(a_kp, gossip::GossipMsgType::NsSlotClaim, claim), a);
+    ASSERT_TRUE(pump_until([&] { return a.ns_holder(3) == a_b64; }));
+    EXPECT_EQ(a.gossip->our_ns_slot().value_or(0), 3);
+    // a did not re-forward its own claim: b never heard it.
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(b.ns_holder(3).empty());
+
+    // The ORIGINAL broadcast (a -> b) still propagates through b normally, and
+    // b's relay copy returning to a is an identical redelivery: silent no-op
+    // that keeps a's bookkeeping. (Both happen well under the 5 s tick, so no
+    // one-shot refresh interferes with the counts.)
+    inject(build_packet(a_kp, gossip::GossipMsgType::NsSlotClaim, claim), b);
+    ASSERT_TRUE(pump_until([&] { return b.ns_holder(3) == a_b64; }));
+    pump_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(a.ns_holder(3), a_b64);
+    EXPECT_EQ(a.gossip->our_ns_slot().value_or(0), 3);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*a.gossip), 2u);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*b.gossip), 1u);
+}
+
+// v0.9.6: the dedup keys on the full claim content, so a GENUINE renewal
+// (same slot and claimant, new timestamp/ip) must still be applied and
+// relayed — the guard must not freeze slot state.
+TEST_F(GossipIngressSecurityTest, NsClaimGenuineRenewalStillPropagatesOncePerNode) {
+    auto root_kp = kc->ed25519_keygen();
+    auto h_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto h_b64 = crypto::to_base64(h_kp.public_key);
+    const auto b_b64 = crypto::to_base64(b_kp.public_key);
+    const auto c_b64 = crypto::to_base64(c_kp.public_key);
+    const auto h_cert = issue_cert(h_b64, "node-h", root_kp);
+    const auto b_cert = issue_cert(b_b64, "node-b", root_kp);
+    const auto c_cert = issue_cert(c_b64, "node-c", root_kp);
+
+    auto make_relayer = [&](const char* tag,
+                            const crypto::Ed25519Keypair* kp,
+                            const std::string& p1_b64, const std::string& p1_cert,
+                            const std::string& p2_b64, const std::string& p2_cert) {
+        return &make_node(
+            tag,
+            [&](Node& n) {
+                if (kp) seed_keypair(*n.storage, *kp);
+                seed_peers(*n.storage, nlohmann::json::array({
+                    peer_entry(p1_b64, "127.0.0.1:9", p1_cert),
+                    peer_entry(p2_b64, "127.0.0.1:10", p2_cert),
+                }));
+            },
+            [&](Node& n) {
+                n.gossip->set_root_pubkey(root_kp.public_key);
+                n.gossip->set_network_id(kTestNetworkHex);
+            });
+    };
+
+    Node* h = make_relayer("h", &h_kp, b_b64, b_cert, c_b64, c_cert);
+    Node* b = make_relayer("b", nullptr, h_b64, h_cert, c_b64, c_cert);
+    Node* c = make_relayer("c", nullptr, h_b64, h_cert, b_b64, b_cert);
+    h->gossip->add_peer(b->endpoint(), b_b64);
+    h->gossip->add_peer(c->endpoint(), c_b64);
+    b->gossip->add_peer(h->endpoint(), h_b64);
+    b->gossip->add_peer(c->endpoint(), c_b64);
+    c->gossip->add_peer(h->endpoint(), h_b64);
+    c->gossip->add_peer(b->endpoint(), b_b64);
+
+    // Initial claim (ts 1000, ip .30): h's original broadcast reaches all
+    // three; relays settle. Drain the one-shot refreshes first.
+    const auto first = ns_claim_payload(h_kp, h_b64, 3, "10.0.0.30");
+    for (Node* n : {h, b, c})
+        inject(build_packet(h_kp, gossip::GossipMsgType::NsSlotClaim, first), *n);
+    ASSERT_TRUE(pump_until([&] {
+        return h->ns_holder(3) == h_b64 && b->ns_holder(3) == h_b64 &&
+               c->ns_holder(3) == h_b64;
+    }));
+    pump_for(std::chrono::milliseconds(5500));
+
+    // Genuine renewal: same slot + claimant, new timestamp and ip. h's
+    // renewal broadcast reaches b and c directly (h itself re-applies its own
+    // renewal when a relayed copy returns).
+    const auto renewal = ns_claim_payload(h_kp, h_b64, 3, "10.0.0.31", false, 2000);
+    for (Node* n : {b, c})
+        inject(build_packet(h_kp, gossip::GossipMsgType::NsSlotClaim, renewal), *n);
+    ASSERT_TRUE(pump_until([&] {
+        return gossip::GossipBallotTestAccess::ns_slot(*h->gossip, 3).timestamp == 2000 &&
+               gossip::GossipBallotTestAccess::ns_slot(*b->gossip, 3).timestamp == 2000 &&
+               gossip::GossipBallotTestAccess::ns_slot(*c->gossip, 3).timestamp == 2000;
+    }));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*h->gossip, 3).server_ip, "10.0.0.31");
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*b->gossip, 3).server_ip, "10.0.0.31");
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_slot(*c->gossip, 3).server_ip, "10.0.0.31");
+
+    // No node re-relayed the settled renewal: the mesh is quiet again.
+    const auto h1 = gossip::GossipBallotTestAccess::ns_receive_count(*h->gossip);
+    const auto b1 = gossip::GossipBallotTestAccess::ns_receive_count(*b->gossip);
+    const auto c1 = gossip::GossipBallotTestAccess::ns_receive_count(*c->gossip);
+    pump_for(std::chrono::milliseconds(1500));
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*h->gossip), h1);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*b->gossip), b1);
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*c->gossip), c1);
+}
+
+TEST_F(GossipIngressSecurityTest, NsClaimDenialLogIsRateLimitedPerKey) {
+    auto root_kp = kc->ed25519_keygen();
+    auto& a = make_node(
+        "a",
+        [](Node&) {},
+        [&](Node& n) { n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex); });
+
+    using T = std::chrono::steady_clock;
+    const auto t0 = T::now();
+    const auto key = "ns-claim-cert|ns1|pk|127.0.0.1";
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::denial_log_allowed(*a.gossip, key, t0));
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::denial_log_allowed(*a.gossip, key, t0 + std::chrono::seconds(30)));
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::denial_log_allowed(*a.gossip, key, t0 + std::chrono::seconds(61)));
+    // A different key is independent.
+    EXPECT_TRUE(gossip::GossipBallotTestAccess::denial_log_allowed(
+        *a.gossip, "ns-claim-cert|ns2|pk|127.0.0.1", t0));
+
+    // Functional: repeated hostile claims (bad signature) are all refused and
+    // leave no state; the limiter only bounds the log, never the rejection.
+    auto attacker = kc->ed25519_keygen();
+    const auto att_b64 = crypto::to_base64(attacker.public_key);
+    for (int i = 0; i < 5; ++i) {
+        inject(build_packet(attacker, gossip::GossipMsgType::NsSlotClaim,
+                            ns_claim_payload(attacker, att_b64, 1, "10.0.0.60", false,
+                                             static_cast<uint64_t>(1000) + i)),
+               a);
+    }
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(a.ns_holder(1).empty());
+    EXPECT_EQ(gossip::GossipBallotTestAccess::ns_receive_count(*a.gossip), 5u);
+}
+
 TEST_F(GossipIngressSecurityTest, PeerExchangeAdoptsOnlyVerifiedRelayedCertificates) {
     auto root_kp = kc->ed25519_keygen();
     auto origin  = kc->ed25519_keygen();

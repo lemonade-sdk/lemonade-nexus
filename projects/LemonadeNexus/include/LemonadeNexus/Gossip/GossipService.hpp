@@ -528,6 +528,18 @@ private:
     // Test seam: NS slot claim messages broadcast (every claim/release send
     // goes through broadcast_ns_slot_claim).
     std::uint64_t test_ns_claim_broadcast_count_{0};
+    // Test seam: NS slot claim messages received (every NsSlotClaim ingress
+    // increments this, before any validation).
+    std::uint64_t test_ns_claim_received_count_{0};
+
+    // v0.9.6: denial-log rate limit for NS slot ingress. A looping or hostile
+    // sender must not be able to fill the journal: each denial key is logged
+    // at most once per 60 s. The map is bounded by pruning expired entries
+    // when it grows.
+    std::mutex denial_log_mutex_;
+    std::map<std::string, std::chrono::steady_clock::time_point> denial_log_last_;
+    bool denial_log_allowed(const std::string& key,
+                            std::chrono::steady_clock::time_point now);
 
     // Test seams (friend GossipBallotTestAccess): zero selects production.
     std::size_t   test_peer_log_cap_{0};

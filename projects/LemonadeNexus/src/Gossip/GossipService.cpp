@@ -3287,6 +3287,7 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
                                            const uint8_t* payload,
                                            std::size_t payload_len) {
     try {
+        ++test_ns_claim_received_count_;
         auto j = json::from_msgpack(payload, payload + payload_len);
 
         NsSlotClaimData claim;
@@ -3297,15 +3298,29 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
         claim.timestamp     = j.value("timestamp", uint64_t{0});
         claim.signature     = j.value("signature", "");
 
+        // v0.9.6: the claimant may be this node itself (a relayed copy of our
+        // own claim). Our own key is never in our own peer table, so the
+        // certificate gate below would deny our own claims; the verified claim
+        // signature already proves possession of the claimant key, so a
+        // self-claim skips that gate (and is never re-forwarded, below).
+        const auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
+        const bool self_claim = (claim.server_pubkey == our_pubkey_b64);
+
         // Validate basic fields
         if (claim.slot < 1 || claim.slot > 9) {
-            spdlog::warn("[{}] received NS slot claim with invalid slot {} from {}:{}",
-                          name(), claim.slot, sender.address().to_string(), sender.port());
+            if (denial_log_allowed(
+                    "ns-claim-malformed|" + sender.address().to_string(),
+                    std::chrono::steady_clock::now()))
+                spdlog::warn("[{}] received NS slot claim with invalid slot {} from {}:{}",
+                              name(), claim.slot, sender.address().to_string(), sender.port());
             return;
         }
         if (claim.server_pubkey.empty()) {
-            spdlog::warn("[{}] received NS slot claim with empty pubkey from {}:{}",
-                          name(), sender.address().to_string(), sender.port());
+            if (denial_log_allowed(
+                    "ns-claim-nopubkey|" + sender.address().to_string(),
+                    std::chrono::steady_clock::now()))
+                spdlog::warn("[{}] received NS slot claim with empty pubkey from {}:{}",
+                              name(), sender.address().to_string(), sender.port());
             return;
         }
 
@@ -3347,17 +3362,25 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
                 }
             } catch (...) {}
             if (!sig_ok) {
-                spdlog::warn("[{}] DENIED NS slot claim for ns{} from {}:{} — claim "
-                              "signature does not verify against the claimant key",
-                              name(), claim.slot, sender.address().to_string(),
-                              sender.port());
+                if (denial_log_allowed(
+                        "ns-claim-sig|ns" + std::to_string(claim.slot) + "|" +
+                            claim.server_pubkey + "|" + sender.address().to_string(),
+                        std::chrono::steady_clock::now()))
+                    spdlog::warn("[{}] DENIED NS slot claim for ns{} from {}:{} — claim "
+                                  "signature does not verify against the claimant key",
+                                  name(), claim.slot, sender.address().to_string(),
+                                  sender.port());
                 return;
             }
         }
-        if (!peer_certificate_is_root_signed(claim.server_pubkey)) {
-            spdlog::warn("[{}] DENIED NS slot claim for ns{} from {}:{} — claimant is "
-                          "not a cert-verified enrolled peer", name(), claim.slot,
-                          sender.address().to_string(), sender.port());
+        if (!self_claim && !peer_certificate_is_root_signed(claim.server_pubkey)) {
+            if (denial_log_allowed(
+                    "ns-claim-cert|ns" + std::to_string(claim.slot) + "|" +
+                        claim.server_pubkey + "|" + sender.address().to_string(),
+                    std::chrono::steady_clock::now()))
+                spdlog::warn("[{}] DENIED NS slot claim for ns{} from {}:{} — claimant is "
+                              "not a cert-verified enrolled peer", name(), claim.slot,
+                              sender.address().to_string(), sender.port());
             return;
         }
 
@@ -3368,11 +3391,27 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
             std::lock_guard lock(mesh_state_mutex_);
 
             auto& existing = ns_slots_[claim.slot - 1];
-            const auto our_pubkey_b64 = crypto::to_base64(keypair_.public_key);
             const bool displaced_ours =
                 !existing.server_pubkey.empty() && existing.server_pubkey == our_pubkey_b64;
             const std::string old_holder = existing.server_pubkey;
             const std::string our_old_ip = existing.server_ip;
+
+            // v0.9.6 relay-loop guard: a byte-identical copy of a claim we
+            // already hold is a duplicate delivery, not a renewal. Re-accepting
+            // it would re-forward the claim to every peer; with three or more
+            // relayers the copies circulate indefinitely (10-13 storm: four
+            // new relayers drove ~2350 claim copies/sec at the root).
+            if (!existing.server_pubkey.empty() && existing.slot == claim.slot &&
+                existing.server_pubkey == claim.server_pubkey &&
+                existing.server_ip == claim.server_ip &&
+                existing.region == claim.region &&
+                existing.timestamp == claim.timestamp &&
+                existing.signature == claim.signature &&
+                existing.pinned == claim.pinned) {
+                if (self_claim && !our_ns_slot_.has_value())
+                    our_ns_slot_ = claim.slot; // bookkeeping only
+                return; // silent: no state change, no log, no forward
+            }
 
             if (claim.server_ip.empty()) {
                 // Release: an empty server_ip is the release marker. Only the
@@ -3389,11 +3428,19 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
                     released = true;
                     spdlog::info("[{}] NS slot ns{} released by its holder",
                                   name(), claim.slot);
+                } else if (existing.slot == 0 || existing.server_pubkey.empty()) {
+                    // Already empty: duplicate delivery of a release we have
+                    // applied. Silent no-op (v0.9.6).
+                    return;
                 } else {
-                    spdlog::warn("[{}] rejected NS slot release for ns{} — release "
-                                  "claimant {} but the slot is held by {}",
-                                  name(), claim.slot, claim.server_pubkey,
-                                  existing.server_pubkey);
+                    if (denial_log_allowed(
+                            "ns-claim-release|ns" + std::to_string(claim.slot) + "|" +
+                                claim.server_pubkey + "|" + sender.address().to_string(),
+                            std::chrono::steady_clock::now()))
+                        spdlog::warn("[{}] rejected NS slot release for ns{} — release "
+                                      "claimant {} but the slot is held by {}",
+                                      name(), claim.slot, claim.server_pubkey,
+                                      existing.server_pubkey);
                     return;
                 }
             } else if (existing.slot == 0 || existing.server_pubkey.empty()) {
@@ -3424,10 +3471,14 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
                               "to pinned claimant {}",
                               name(), claim.slot, old_holder, claim.server_pubkey);
             } else {
-                spdlog::warn("[{}] rejected NS slot claim for ns{} — claimant {} does "
-                              "not hold the slot (holder {}) and does not displace it "
-                              "(holder renewal or pinned-over-unpinned only)",
-                              name(), claim.slot, claim.server_pubkey,
+                if (denial_log_allowed(
+                        "ns-claim-holder|ns" + std::to_string(claim.slot) + "|" +
+                            claim.server_pubkey + "|" + sender.address().to_string(),
+                        std::chrono::steady_clock::now()))
+                    spdlog::warn("[{}] rejected NS slot claim for ns{} — claimant {} does "
+                                  "not hold the slot (holder {}) and does not displace it "
+                                  "(holder renewal or pinned-over-unpinned only)",
+                                  name(), claim.slot, claim.server_pubkey,
                               existing.server_pubkey);
                 return;
             }
@@ -3488,6 +3539,10 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
         // Register in DNS and forward outside the mesh lock (external calls)
         register_ns_slot_in_dns(accepted_claim);
 
+        // v0.9.6: never re-forward our own claim — we are its original
+        // sender; a relayed copy reaching us re-applies bookkeeping only.
+        if (self_claim) return;
+
         {
             std::vector<asio::ip::udp::endpoint> targets;
             std::lock_guard lock(peers_mutex_);
@@ -3513,6 +3568,25 @@ void GossipService::register_ns_slot_in_dns(const NsSlotClaimData& claim) {
     dns_->add_nameserver(ns_fqdn, claim.server_ip);
     spdlog::debug("[{}] registered DNS NS record: {} -> {}",
                    name(), ns_fqdn, claim.server_ip);
+}
+
+bool GossipService::denial_log_allowed(const std::string& key,
+                                       std::chrono::steady_clock::time_point now) {
+    std::lock_guard lock(denial_log_mutex_);
+    // Bound the map: prune expired entries once it grows past the cap.
+    if (denial_log_last_.size() > 512) {
+        for (auto it = denial_log_last_.begin(); it != denial_log_last_.end();) {
+            if (now - it->second > std::chrono::seconds(60))
+                it = denial_log_last_.erase(it);
+            else
+                ++it;
+        }
+    }
+    const auto it = denial_log_last_.find(key);
+    if (it != denial_log_last_.end() && now - it->second < std::chrono::seconds(60))
+        return false;
+    denial_log_last_[key] = now;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
