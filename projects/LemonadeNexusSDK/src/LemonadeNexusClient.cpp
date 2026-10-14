@@ -321,7 +321,13 @@ struct LemonadeNexusClient::Impl {
                 mark_success();
                 status_out = res->status;
                 if (res->status < 200 || res->status >= 300) {
-                    spdlog::warn("[LemonadeNexusClient] POST {} returned status {}", path, res->status);
+                    std::string reason;
+                    try {
+                        auto err = json::parse(res->body);
+                        reason = err.value("error", std::string{});
+                    } catch (...) {}
+                    spdlog::warn("[LemonadeNexusClient] POST {} returned status {}{}{}", path,
+                                 res->status, reason.empty() ? "" : ": ", reason);
                     try {
                         return json::parse(res->body);
                     } catch (...) {
