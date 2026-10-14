@@ -10,6 +10,7 @@ import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
+import 'invite_member_dialog.dart';
 
 class DashboardView extends ConsumerStatefulWidget {
   const DashboardView({super.key});
@@ -48,6 +49,12 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
             children: [
               const SectionHeader(title: 'Dashboard', icon: Icons.dashboard_outlined),
               const Spacer(),
+              ElevatedButton.icon(
+                onPressed: () => showInviteMemberDialog(context),
+                icon: const Icon(Icons.person_add_alt_1, size: 16),
+                label: const Text('Invite member'),
+              ),
+              const SizedBox(width: 8),
               IconButton(
                 tooltip: 'Refresh',
                 icon: const Icon(Icons.refresh, size: 20),
@@ -133,7 +140,7 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
             _kv('Online', _mono('${mesh?.onlineCount ?? 0} / ${mesh?.peerCount ?? 0}')),
             _kv('Direct', _mono('${appState.meshPeers.where((p) => (p.endpoint ?? '').isNotEmpty).length}')),
             _kv('Relayed', _mono('${appState.meshPeers.where((p) => (p.endpoint ?? '').isEmpty && (p.relayEndpoint ?? '').isNotEmpty).length}')),
-          ]),
+          ], trailing: _inviteIconButton()),
         ),
         const SizedBox(width: 16),
         Expanded(
@@ -299,6 +306,19 @@ class _DashboardViewState extends ConsumerState<DashboardView> {
   }
 
   // ---- helpers --------------------------------------------------------------
+
+  /// Small header button that opens the Invite member dialog.
+  Widget _inviteIconButton() {
+    return IconButton(
+      tooltip: 'Invite member',
+      icon: const Icon(Icons.person_add_alt_1, size: 16),
+      color: AppTheme.lemonYellowDark,
+      visualDensity: VisualDensity.compact,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
+      onPressed: () => showInviteMemberDialog(context),
+    );
+  }
 
   Widget _card(String title, IconData icon, List<Widget> rows, {Widget? trailing}) {
     final scheme = Theme.of(context).colorScheme;

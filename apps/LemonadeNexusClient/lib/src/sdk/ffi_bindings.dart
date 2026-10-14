@@ -1020,15 +1020,15 @@ class LemonadeNexusFfi {
     return LnError.fromCode(result);
   }
 
-  /// Mint a link token so another device can join this account; returns
-  /// {link_token, group_node_id, expires_at} JSON, or null on failure.
-  String? linkTokenCreate(LnClientHandle client, int ttlSec) {
+  /// Mint a link token so another device can join this account. On success
+  /// the JSON is {link_token, group_node_id, expires_at}; on failure it is the
+  /// SDK's {error} body, so callers can show the server's reason.
+  (LnError, String?) linkTokenCreate(LnClientHandle client, int ttlSec) {
     final outJson = calloc<ffi.Pointer<ffi.Char>>();
     try {
       final result = _lnLinkTokenCreate(client, ttlSec, outJson);
-      if (result == 0) return toStringAndFree(outJson.value);
-      freeString(outJson.value);
-      return null;
+      final json = outJson.value == ffi.nullptr ? null : toStringAndFree(outJson.value);
+      return (LnError.fromCode(result), json);
     } finally {
       calloc.free(outJson);
     }

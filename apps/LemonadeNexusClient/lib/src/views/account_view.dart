@@ -14,6 +14,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/cluster_keyring.dart';
+import 'invite_member_dialog.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 
@@ -254,6 +255,12 @@ class _AccountViewState extends ConsumerState<AccountView> {
                   title: appState.activeCluster?.name ?? 'Cluster',
                   icon: Icons.account_circle_outlined),
               const Spacer(),
+              ElevatedButton.icon(
+                onPressed: () => showInviteMemberDialog(context),
+                icon: const Icon(Icons.person_add_alt_1, size: 16),
+                label: const Text('Invite member'),
+              ),
+              const SizedBox(width: 8),
               if (appState.isMeshEnabled) ...[
                 IconButton(
                   tooltip: 'New chat',
@@ -373,9 +380,14 @@ class _AccountViewState extends ConsumerState<AccountView> {
                   label: const Text('Share key with all'),
                 ),
               TextButton.icon(
-                onPressed: _isBusyDevices ? null : _addDevice,
-                icon: const Icon(Icons.add_to_queue, size: 16),
-                label: const Text('Add device'),
+                onPressed: _isBusyDevices
+                    ? null
+                    : () async {
+                        await showInviteMemberDialog(context);
+                        await _load();
+                      },
+                icon: const Icon(Icons.person_add_alt_1, size: 16),
+                label: const Text('Invite member'),
               ),
             ],
           ),
@@ -465,76 +477,6 @@ class _AccountViewState extends ConsumerState<AccountView> {
                   size: 16, color: AppTheme.errorColor),
               onPressed: _isBusyDevices ? null : () => _removeDevice(device),
             ),
-        ],
-      ),
-    );
-  }
-
-  /// Mint an invitation code and show it for transfer to the new device.
-  Future<void> _addDevice() async {
-    setState(() => _isBusyDevices = true);
-    try {
-      final invite =
-          await ref.read(appNotifierProvider.notifier).createDeviceInvite();
-      final code = invite['link_token']?.toString() ?? '';
-      if (code.isEmpty) {
-        _toast(invite['error']?.toString() ?? 'Could not create an invitation',
-            error: true);
-        return;
-      }
-      if (!mounted) return;
-      await _showInviteDialog(code);
-    } catch (e) {
-      _toast('Could not create an invitation: $e', error: true);
-    } finally {
-      if (mounted) setState(() => _isBusyDevices = false);
-    }
-  }
-
-  Future<void> _showInviteDialog(String code) {
-    final scheme = Theme.of(context).colorScheme;
-    return showDialog<void>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        backgroundColor: scheme.surface,
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: BorderSide(color: scheme.outline)),
-        title: const Text('Invitation code'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Enter this on the new device via "Have an invitation code?". It '
-              'is single-use and expires in 10 minutes. Come back here to share '
-              'the account key once it has joined.',
-              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: scheme.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: SelectableText(code,
-                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace')),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton.icon(
-            onPressed: () {
-              Clipboard.setData(ClipboardData(text: code));
-              _toast('Invitation code copied');
-            },
-            icon: const Icon(Icons.copy, size: 16),
-            label: const Text('Copy'),
-          ),
-          ElevatedButton(
-              onPressed: () => Navigator.pop(ctx), child: const Text('Done')),
         ],
       ),
     );

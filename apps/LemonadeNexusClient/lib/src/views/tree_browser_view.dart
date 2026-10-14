@@ -17,6 +17,7 @@ import '../state/app_state.dart';
 import '../sdk/models.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
+import 'invite_member_dialog.dart';
 
 class TreeBrowserView extends ConsumerStatefulWidget {
   const TreeBrowserView({super.key});
@@ -99,18 +100,34 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
           ),
           child: Column(
             children: [
-              // Search Bar
+              // Search Bar + invite
               Padding(
                 padding: const EdgeInsets.all(12),
-                child: TextField(
-                  controller: _searchController
-                    ..addListener(() => setState(() => _searchText = _searchController.text)),
-                  decoration: const InputDecoration(
-                    hintText: 'Search nodes...',
-                    prefixIcon: Icon(Icons.search, size: 20),
-                    contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                  ),
-                  style: const TextStyle(fontSize: 13),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _searchController
+                          ..addListener(() => setState(() => _searchText = _searchController.text)),
+                        decoration: const InputDecoration(
+                          hintText: 'Search nodes...',
+                          prefixIcon: Icon(Icons.search, size: 20),
+                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                        style: const TextStyle(fontSize: 13),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton.filled(
+                      tooltip: 'Invite member',
+                      icon: const Icon(Icons.add, size: 20),
+                      style: IconButton.styleFrom(
+                        backgroundColor: AppTheme.lemonYellowDark,
+                        foregroundColor: Colors.black,
+                      ),
+                      onPressed: () => showInviteMemberDialog(context),
+                    ),
+                  ],
                 ),
               ),
               Divider(color: scheme.outline, height: 1),

@@ -349,9 +349,16 @@ class LemonadeNexusSdk {
   Future<Map<String, dynamic>> createLinkToken({int ttlSec = 600}) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.linkTokenCreate(_client!, ttlSec);
-    if (json == null) {
-      throw SdkException(LnError.internal, message: 'Failed to create link token');
+    final (error, json) = _ffi.linkTokenCreate(_client!, ttlSec);
+    if (error != LnError.success || json == null) {
+      String? reason;
+      if (json != null) {
+        try {
+          reason = (jsonDecode(json) as Map<String, dynamic>)['error']?.toString();
+        } catch (_) {}
+      }
+      throw SdkException(error == LnError.success ? LnError.internal : error,
+          message: reason ?? 'Failed to create link token', rawJson: json);
     }
     return _parseJson<Map<String, dynamic>>(json, (m) => m);
   }

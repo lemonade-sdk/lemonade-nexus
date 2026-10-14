@@ -16,6 +16,7 @@ import '../state/app_state.dart';
 import '../sdk/models.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
+import 'invite_member_dialog.dart';
 
 class PeersView extends ConsumerStatefulWidget {
   const PeersView({super.key});
@@ -128,6 +129,13 @@ class _PeersViewState extends ConsumerState<PeersView> {
           if (appState.meshPeers.isNotEmpty)
             Text('$onlineCount/${appState.meshPeers.length} online', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 12)),
           const SizedBox(width: 8),
+          IconButton(
+            tooltip: 'Invite member',
+            icon: const Icon(Icons.person_add_alt_1, size: 18),
+            color: AppTheme.lemonYellowDark,
+            onPressed: () => showInviteMemberDialog(context),
+            padding: EdgeInsets.zero,
+          ),
           IconButton(
             icon: const Icon(Icons.refresh, size: 18),
             color: scheme.onSurfaceVariant,
