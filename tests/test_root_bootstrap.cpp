@@ -29,6 +29,7 @@
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
 
 #include <gtest/gtest.h>
+#include "test_http_ready.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -232,7 +233,10 @@ protected:
         join_holder().auth_handler = new api::AuthApiHandler(*join_holder().ctx);
         join_holder().auth_handler->register_routes(http->server(), http->server());
         http->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait until the server thread actually accepts connections; a fixed
+        // sleep races on loaded CI runners (first request refused, 10-14).
+        ASSERT_TRUE(wait_http_ready(test_port_))
+            << "HTTP server not accepting on port " << test_port_;
     }
 
     void TearDown() override {

@@ -28,6 +28,7 @@
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 
 #include <gtest/gtest.h>
+#include "test_http_ready.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <jwt-cpp/jwt.h>
@@ -257,8 +258,10 @@ protected:
         test_api::routing_handler().register_routes(http->server(), http->server());
         http->start();
 
-        // Brief pause to let the server thread bind
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait until the server thread actually accepts connections; a fixed
+        // sleep races on loaded CI runners (first request refused, 10-14).
+        ASSERT_TRUE(wait_http_ready(test_port_))
+            << "HTTP server not accepting on port " << test_port_;
     }
 
     void TearDown() override {

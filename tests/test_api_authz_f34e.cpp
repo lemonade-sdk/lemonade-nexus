@@ -33,6 +33,7 @@
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 
 #include <gtest/gtest.h>
+#include "test_http_ready.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -177,7 +178,10 @@ protected:
         holder().cert_handler = new api::CertApiHandler(*holder().ctx);
         holder().cert_handler->register_routes(http->server(), http->server());
         http->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait until the server thread actually accepts connections; a fixed
+        // sleep races on loaded CI runners (first request refused, 10-14).
+        ASSERT_TRUE(wait_http_ready(test_port_))
+            << "HTTP server not accepting on port " << test_port_;
     }
 
     // Secondary HTTPS server carrying only the cert routes, used to prove
@@ -260,7 +264,10 @@ protected:
         tls_cert_handler = new api::CertApiHandler(*tls_ctx);
         tls_cert_handler->register_routes(tls_http->server(), tls_http->server());
         tls_http->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait until the server thread actually accepts connections; a fixed
+        // sleep races on loaded CI runners (first request refused, 10-14).
+        EXPECT_TRUE(wait_http_ready(port))
+            << "TLS HTTP server not accepting on port " << port;
         return port;
     }
 

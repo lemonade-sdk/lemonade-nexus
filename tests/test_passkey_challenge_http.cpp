@@ -23,6 +23,7 @@
 
 #include <gtest/gtest.h>
 #include <httplib.h>
+#include "test_http_ready.hpp"
 #include <nlohmann/json.hpp>
 
 #include <openssl/ec.h>
@@ -255,7 +256,10 @@ protected:
         holder().handler = new api::AuthApiHandler(*holder().ctx);
         holder().handler->register_routes(http->server(), http->server());
         http->start();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Wait until the server thread actually accepts connections; a fixed
+        // sleep races on loaded CI runners (first request refused, 10-14).
+        ASSERT_TRUE(wait_http_ready(test_port_))
+            << "HTTP server not accepting on port " << test_port_;
     }
 
     void TearDown() override {
