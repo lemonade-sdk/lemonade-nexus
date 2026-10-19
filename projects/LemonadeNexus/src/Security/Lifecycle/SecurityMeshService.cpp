@@ -129,6 +129,13 @@ void SecurityMeshService::refresh_members() {
     std::vector<NodeId> members;
     if (const EpochManager* epochs = runtime_.epochs(); epochs != nullptr) {
         members = epochs->current().tier1_members.members();
+    } else if (const VerifiedEpochAuthority* authority = driver_.verified_authority();
+               authority != nullptr) {
+        // Tier 2 path: a non-member has no EpochManager, but it walks the
+        // authority chain and holds the current epoch's verified membership.
+        // Without this it recognizes no node as Tier 1 and denies their
+        // records — the Tier 2 node must still trust the real Tier 1 set.
+        members = authority->members;
     }
     std::lock_guard lock(members_mutex_);
     current_members_ = std::move(members);

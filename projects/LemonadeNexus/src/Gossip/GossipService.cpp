@@ -1558,6 +1558,7 @@ void GossipService::handle_peer_exchange(const asio::ip::udp::endpoint& sender,
         for (const auto& p : j["peers"]) {
             auto pk = p.value("pubkey", "");
             auto ep = p.value("endpoint", "");
+            auto region = p.value("region", "");
             if (pk.empty() || ep.empty()) continue;
 
             // Don't add ourselves
@@ -1574,6 +1575,16 @@ void GossipService::handle_peer_exchange(const asio::ip::udp::endpoint& sender,
             if (!known) {
                 do_add_peer(ep, pk);
                 ++added;
+            }
+
+            // Learn the peer's region from the relay so this node can hand a
+            // client its SEIP FQDN without a direct hello. Only fill a blank
+            // region: a value learned directly outranks a relayed one.
+            if (!region.empty()) {
+                std::lock_guard lock(peers_mutex_);
+                auto it = std::find_if(peers_.begin(), peers_.end(),
+                    [&](const GossipPeer& e) { return e.pubkey == pk; });
+                if (it != peers_.end() && it->region.empty()) it->region = region;
             }
 
             // A relayed certificate is candidate data: it counts only after
@@ -1607,6 +1618,7 @@ void GossipService::handle_peer_exchange(const asio::ip::udp::endpoint& sender,
                                                  : p.endpoint;
                 peer_j["http_port"]        = p.http_port;
                 peer_j["certificate_json"] = p.certificate_json;
+                peer_j["region"]           = p.region;
                 peers_array.push_back(std::move(peer_j));
             }
             response["peers"] = std::move(peers_array);

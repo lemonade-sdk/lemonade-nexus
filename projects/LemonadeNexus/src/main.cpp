@@ -179,6 +179,10 @@ int main(int argc, char* argv[]) {
         gossip.set_our_advertised_endpoint(
             server_public_ip + ":" + std::to_string(gossip_port));
     }
+    // Region must be set before start: the first ServerHellos carry it (there is
+    // no periodic re-hello), and a peer learned from a region-less hello never
+    // gets a SEIP FQDN, so clients can't reach or fail over to it.
+    gossip.set_our_region(config.region);
 
     gossip.start();
 
@@ -461,7 +465,6 @@ int main(int argc, char* argv[]) {
     // that exact name at this IP, so claiming any other slot would publish a
     // nameserver record the registry contradicts. "none" opts out: no slot
     // is claimed, and any slot this node still holds is released.
-    gossip.set_our_region(config.region);
     gossip.set_dns_base_domain(config.dns_base_domain);
     if (ns_opt_out) {
         gossip.set_ns_opt_out(true);
