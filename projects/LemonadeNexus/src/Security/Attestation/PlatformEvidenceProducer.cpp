@@ -9,10 +9,17 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <utility>
 
 namespace nexus::security {
+
+namespace {
+// Warn once a node has answered enrollment challenges this long with no
+// activation, then repeat at the same interval (#48c).
+constexpr std::chrono::seconds kEnrollmentWarnInterval{120};
+}  // namespace
 
 PlatformEvidenceProducer::PlatformEvidenceProducer(EvidenceProducerSources sources)
     : sources_(std::move(sources)) {}
@@ -153,7 +160,32 @@ std::optional<AttestationEvidence> PlatformEvidenceProducer::produce(
     const Digest digest = evidence_signing_digest(evidence);
     crypto_sign_detached(evidence.identity_signature.data(), nullptr, digest.data(),
                          digest.size(), sources_.identity.private_key.data());
+    note_produced(challenge);
     return evidence;
+}
+
+void PlatformEvidenceProducer::note_produced(const AttestationChallenge& challenge) {
+    // A non-enrollment answer means the verifier moved past enrollment.
+    if (challenge.purpose != AttestationPurpose::PlatformEnrollment) {
+        enrollment_streak_ = 0;
+        enrollment_warnings_ = 0;
+        return;
+    }
+    const auto now = sources_.clock ? sources_.clock() : std::chrono::steady_clock::now();
+    if (enrollment_streak_ == 0) {
+        enrollment_first_ = now;
+        enrollment_warn_at_ = now;
+    }
+    ++enrollment_streak_;
+    if (now - enrollment_warn_at_ < kEnrollmentWarnInterval) {
+        return;
+    }
+    spdlog::warn("[producer] enrollment unanswered: produced enrollment evidence {} times over "
+                 "{} s with no activation offer accepted",
+                 enrollment_streak_,
+                 std::chrono::duration_cast<std::chrono::seconds>(now - enrollment_first_).count());
+    enrollment_warn_at_ = now;
+    ++enrollment_warnings_;
 }
 
 std::optional<SvsmAkActivationResponseMessage> PlatformEvidenceProducer::activate(
@@ -191,6 +223,9 @@ std::optional<SvsmAkActivationResponseMessage> PlatformEvidenceProducer::activat
     const Digest digest = svsm_ak_activation_response_digest(response);
     crypto_sign_detached(response.identity_signature.data(), nullptr, digest.data(), digest.size(),
                          sources_.identity.private_key.data());
+    // Activation accepted: the enrollment loop is over.
+    enrollment_streak_ = 0;
+    enrollment_warnings_ = 0;
     return response;
 }
 

@@ -13,6 +13,8 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
 
+#include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <functional>
 #include <optional>
@@ -59,6 +61,10 @@ struct EvidenceProducerSources {
     /// Optional out-of-process activation source; see PlatformActivationSource.
     /// When unset, activate() refuses and the candidate cannot enroll.
     PlatformActivationSource activation_source;
+
+    /// Optional time source for the enrollment-loop warn; unset means
+    /// std::chrono::steady_clock::now(). Last so positional init keeps working.
+    std::function<std::chrono::steady_clock::time_point()> clock;
 };
 
 class PlatformEvidenceProducer final : public IEvidenceProducer {
@@ -79,11 +85,27 @@ public:
     /// a device node proves nothing (see PlatformProbe).
     [[nodiscard]] bool platform_available() const;
 
+    /// Enrollment-loop observability: consecutive enrollment-evidence
+    /// productions since the last activation or non-enrollment produce, and
+    /// warns emitted for the current streak.
+    [[nodiscard]] std::size_t enrollment_streak() const { return enrollment_streak_; }
+    [[nodiscard]] std::size_t enrollment_warnings() const { return enrollment_warnings_; }
+
 private:
     [[nodiscard]] PlatformEvidence platform_bundle(const AttestationChallenge& challenge,
                                                     const Digest& nonce) const;
+    /// Streak bookkeeping behind the enrollment-loop warn; called on every
+    /// successful produce().
+    void note_produced(const AttestationChallenge& challenge);
 
     EvidenceProducerSources sources_;
+
+    // A candidate stuck re-answering enrollment challenges warns after ~2
+    // minutes, then at that backoff. Reset by activation or any other produce.
+    std::size_t enrollment_streak_ = 0;
+    std::size_t enrollment_warnings_ = 0;
+    std::chrono::steady_clock::time_point enrollment_first_{};
+    std::chrono::steady_clock::time_point enrollment_warn_at_{};
 };
 
 }  // namespace nexus::security
