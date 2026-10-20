@@ -102,6 +102,8 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
               runtime_, router_, store_, genesis_.get()),
       timer_(io) {
     events_.target = &driver_;
+    if (config.on_epoch_established)
+        driver_.set_epoch_established_callback(config.on_epoch_established);
 }
 
 uint64_t SecurityMeshService::now_ms() const {

@@ -7,6 +7,7 @@
 
 #include <asio.hpp>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,7 @@ struct SecurityMeshStartup {
     crypto::KeyWrappingService& key_wrapping,
     security::PlatformEvidenceSource platform_source,
     security::PlatformActivationSource activation_source,
-    std::string& error);
+    std::string& error,
+    std::function<void()> on_epoch_established = {});
 
 }  // namespace nexus::core
