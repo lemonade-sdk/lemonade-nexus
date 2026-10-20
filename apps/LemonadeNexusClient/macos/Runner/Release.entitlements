@@ -6,6 +6,11 @@
 	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<!-- The mesh dataplane binds a UDP socket to receive peer traffic; without
+	     this a sandboxed release build fails bind() with EPERM while HTTPS
+	     still works (debug builds already carry it). -->
+	<key>com.apple.security.network.server</key>
+	<true/>
 	<!-- Required for the Keychain-backed secure store (Cluster keyring + session).
 	     Without it a sandboxed app gets errSecMissingEntitlement (-34018) and
 	     cannot persist Cluster keys. -->

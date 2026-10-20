@@ -2014,7 +2014,8 @@ void LemonadeNexusClient::enable_mesh(const MeshConfig& config) {
 
     if (!impl_->meshplane.is_active()) {
         spdlog::warn("[LemonadeNexusClient] enable_mesh: dataplane not up "
-                     "(join the network first)");
+                     "(it failed to start — see the [dataplane] error above — "
+                     "or the network was never joined)");
         return;
     }
 
