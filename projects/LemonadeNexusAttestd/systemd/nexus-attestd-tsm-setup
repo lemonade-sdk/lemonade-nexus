@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+base=/sys/kernel/config/tsm/report
+service_object="$base/nexus-attestd-svsm"
+guest_object="$base/nexus-attestd-guest"
+access_group=nexus
+
+if [ "${1:-}" = "--remove" ]; then
+    # rmdir cannot remove anything except the two exact configfs objects and
+    # fails while either is in use.  It never recurses.
+    rmdir "$guest_object" 2>/dev/null || true
+    rmdir "$service_object" 2>/dev/null || true
+    exit 0
+fi
+
+[ -d "$base" ] || {
+    echo "TSM configfs report interface is unavailable: $base" >&2
+    exit 1
+}
+getent group "$access_group" >/dev/null
+
+create_object() {
+    object=$1
+    [ ! -L "$object" ] || {
+        echo "refusing symlink at dedicated TSM object: $object" >&2
+        exit 1
+    }
+    mkdir -p "$object"
+    [ -d "$object" ] && [ ! -L "$object" ]
+}
+
+grant_object() {
+    object=$1
+    chgrp "$access_group" "$object/inblob" "$object/outblob" \
+        "$object/auxblob" "$object/generation" "$object/provider"
+    chmod 0620 "$object/inblob"
+    chmod 0440 "$object/outblob" "$object/auxblob" \
+        "$object/generation" "$object/provider"
+}
+
+create_object "$service_object"
+printf '%s' svsm >"$service_object/service_provider"
+printf '%s' c476f1eb-0123-45a5-9641-b4e7dde5bfe3 >"$service_object/service_guid"
+printf '%s' 0 >"$service_object/service_manifest_version"
+chgrp "$access_group" "$service_object/manifestblob"
+chmod 0440 "$service_object/manifestblob"
+grant_object "$service_object"
+
+create_object "$guest_object"
+printf '%s' 2 >"$guest_object/privlevel"
+grant_object "$guest_object"

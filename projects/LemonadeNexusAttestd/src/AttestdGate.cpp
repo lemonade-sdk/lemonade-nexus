@@ -22,6 +22,8 @@ std::string_view refusal_name(Refusal r) {
         case Refusal::PlatformUnavailable:    return "platform_unavailable";
         case Refusal::EvidenceUnavailable:    return "evidence_unavailable";
         case Refusal::EvidenceOversized:      return "evidence_oversized";
+        case Refusal::ActivationUnavailable:  return "activation_unavailable";
+        case Refusal::ActivationFailed:       return "activation_failed";
     }
     return "unknown";
 }
@@ -33,7 +35,7 @@ std::string_view refusal_reason(Refusal r) {
         case Refusal::MalformedRequest:
             return "the request is not a well-formed attestation challenge";
         case Refusal::ProfileNotSupported:
-            return "this daemon produces snp-vtpm evidence only";
+            return "the request does not name this build's selected Tier-1 profile";
         case Refusal::ProfileRulesetMismatch:
             return "the challenge names a profile ruleset this binary does not implement";
         case Refusal::RulesetMismatch:
@@ -51,6 +53,10 @@ std::string_view refusal_reason(Refusal r) {
             return "the platform produced no evidence";
         case Refusal::EvidenceOversized:
             return "the produced evidence exceeds what one local operation may stream";
+        case Refusal::ActivationUnavailable:
+            return "this daemon cannot run credential activation: no TPM stack or no reachable TPM";
+        case Refusal::ActivationFailed:
+            return "the TPM ran the credential activation and refused it";
     }
     return "unknown";
 }
@@ -99,6 +105,15 @@ Refusal check_challenge(const security::AttestationChallenge& challenge) {
     if (challenge.purpose == security::AttestationPurpose::FinalEpochReadiness &&
         all_zero(challenge.context_digest)) {
         return Refusal::ContextUnbound;
+    }
+
+    const bool checkpoint_empty = all_zero(challenge.ima_checkpoint_digest) &&
+                                  challenge.ima_prior_event_count == 0 &&
+                                  all_zero(challenge.ima_prior_pcr10) &&
+                                  challenge.ima_checkpoint_paths.empty();
+    if ((challenge.ima_mode == security::ImaEvidenceMode::Full && !checkpoint_empty) ||
+        (challenge.ima_mode == security::ImaEvidenceMode::Resume && checkpoint_empty)) {
+        return Refusal::MalformedRequest;
     }
 
     return Refusal::None;

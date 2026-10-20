@@ -16,6 +16,7 @@
 // one past an older daemon.
 
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexusAttestd/AttestdFraming.hpp>
 #include <LemonadeNexusAttestd/AttestdGate.hpp>
 
@@ -28,28 +29,55 @@
 namespace nexus::attestd {
 
 /// Wire format version. Bumped when the grammar below changes; a request
-/// carrying anything else is malformed.
-inline constexpr int kAttestdWireVersion = 1;
+/// carrying anything else is malformed. Owned by SecurityConstants.hpp so the
+/// release-approval verifier checks the same number this codec speaks.
+inline constexpr int kAttestdWireVersion = security::constants::kAttestdWireVersion;
 
 inline constexpr std::string_view kRequestType = "attestation_challenge";
+inline constexpr std::string_view kActivationRequestType = "svsm_ak_activation_offer";
 inline constexpr std::string_view kBundleType = "platform_evidence_bundle";
 inline constexpr std::string_view kRefusalType = "attestation_refusal";
+inline constexpr std::string_view kActivationResultType = "svsm_ak_activation_result";
 
-/// Largest request the daemon will read off the socket. A challenge is a few
-/// hundred bytes of hex; this is generous by two orders of magnitude and still
-/// bounds a local caller that decides to stream forever.
-inline constexpr std::size_t kMaxRequestBytes = 8 * 1024;
+/// Largest request the daemon will read off the socket. A challenge carries up
+/// to kMaxSummarisedPaths checkpoint paths of up to 4 KiB each; this covers
+/// that and still bounds a local caller that decides to stream forever.
+inline constexpr std::size_t kMaxRequestBytes = 128 * 1024;
 
 /// Parse a request into a challenge. Returns nullopt on ANY deviation from the
 /// closed grammar: wrong version, wrong type, missing field, wrong JSON type,
 /// wrong hex width, unknown purpose value, or an unrecognised key.
 [[nodiscard]] std::optional<security::AttestationChallenge> decode_challenge(std::string_view json);
 
+/// One SVSM AK activation request. The fields pass to the TPM as-is — the
+/// daemon never parses or alters them — and no persistent handle is created.
+struct SvsmAkActivationRequest {
+    /// TPM2B_PUBLIC of the enrollment EK (outer TPM2B wrapper, wire form).
+    std::vector<uint8_t> ek_public;
+    /// TPM2B_PUBLIC of the proposed quote AK.
+    std::vector<uint8_t> ak_public;
+    /// TPM2B_ID_OBJECT credential blob from TPM2_MakeCredential.
+    std::vector<uint8_t> credential_blob;
+    /// TPM2B_ENCRYPTED_SECRET from TPM2_MakeCredential.
+    std::vector<uint8_t> encrypted_secret;
+};
+
+/// Largest single activation field. A TPM2B_PUBLIC for an RSA-3072 key is under
+/// 2 KiB; the credential and secret values are bounded by the RSA modulus.
+inline constexpr std::size_t kMaxActivationFieldBytes = 4096;
+
+/// Same closed-grammar discipline as decode_challenge. Any deviation is
+/// nullopt, never a partial value.
+[[nodiscard]] std::optional<SvsmAkActivationRequest> decode_activation_request(std::string_view json);
+
+/// The one-connection request bytes for an activation, newline terminated.
+[[nodiscard]] std::string encode_activation_request(const SvsmAkActivationRequest& request);
+
 /// Takes one complete frame's bytes. False stops the emitter where it stands.
 using FrameSink = std::function<bool(std::string_view frame)>;
 
 /// Header, chunks, End. The platform bundle travels as the exact canonical
-/// string encode_snp_vtpm_evidence() produced: re-nesting it as JSON would risk
+/// string encode_platform_evidence() produced: re-nesting it as JSON would risk
 /// a consumer computing a different digest than the one signed. False when the
 /// sink refused, or when the bundle needs more than kMaxLocalChunks.
 [[nodiscard]] bool emit_bundle(const PlatformEvidenceBundle& bundle, const FrameSink& sink);
@@ -58,6 +86,11 @@ using FrameSink = std::function<bool(std::string_view frame)>;
 /// branches on.
 [[nodiscard]] bool emit_refusal(Refusal refusal, const FrameSink& sink,
                                  std::string_view detail = {});
+
+/// One Result frame: the activated secret in hex. A single frame — no chunks,
+/// no End — so there is no reassembly state to get wrong.
+[[nodiscard]] bool emit_activation_result(const std::vector<uint8_t>& activated_secret,
+                                           const FrameSink& sink);
 
 /// Reassembles a framed response under the local bounds, with no transport of
 /// its own, so every bound is testable without a socket.
@@ -81,6 +114,10 @@ public:
     /// the bytes do not match the length and digest End committed to.
     [[nodiscard]] bool finish(PlatformEvidenceBundle& out);
 
+    /// The activated secret, when the stream was a single Result frame;
+    /// nullopt when the stream was anything else.
+    [[nodiscard]] std::optional<std::vector<uint8_t>> result_secret() const;
+
     /// Bytes accepted so far, frame headers included.
     [[nodiscard]] std::size_t accepted() const { return accepted_; }
 
@@ -98,6 +135,7 @@ private:
     FrameError       error_{FrameError::None};
     Refusal          refusal_{Refusal::None};
     std::string      detail_;
+    std::vector<uint8_t> result_secret_;
 };
 
 }  // namespace nexus::attestd

@@ -34,6 +34,15 @@ struct AttestdFetchResult {
     std::string detail;
 };
 
+/// AttestdFetchResult's shape plus the activated secret on success.
+struct AttestdActivationResult {
+    bool        ok{false};
+    Refusal     refusal{Refusal::None};
+    FrameError  transport{FrameError::None};
+    std::string detail;
+    std::vector<uint8_t> activated_secret;
+};
+
 class AttestdClient {
 public:
     explicit AttestdClient(AttestdClientConfig config) : config_(std::move(config)) {}
@@ -47,6 +56,10 @@ public:
     [[nodiscard]] AttestdFetchResult fetch(const security::AttestationChallenge& challenge,
                                            PlatformEvidenceBundle& out);
 
+    /// One connection, one activation request, one framed answer: a Result
+    /// frame or a Refusal.
+    [[nodiscard]] AttestdActivationResult activate(const SvsmAkActivationRequest& request) const;
+
 private:
     AttestdClientConfig config_;
 };
@@ -55,6 +68,10 @@ private:
 /// exercisable over a socketpair with no daemon and no TPM.
 [[nodiscard]] AttestdFetchResult read_framed_response(int fd, int deadline_seconds,
                                                        PlatformEvidenceBundle& out);
+
+/// Read one framed activation answer — a single Result or Refusal frame —
+/// under the same local bounds as the evidence path.
+[[nodiscard]] AttestdActivationResult read_activation_response(int fd, int deadline_seconds);
 
 /// The request bytes for one challenge: the closed JSON grammar, newline
 /// terminated. Separate from the socket so a test can drive a server with it.
@@ -65,5 +82,11 @@ private:
 /// verifier refuses empty evidence, so a bad daemon costs an attestation rather
 /// than buying one.
 [[nodiscard]] security::PlatformEvidenceSource attestd_platform_source(AttestdClientConfig config);
+
+/// The activation seam, wired to the same daemon. nullopt on any failure; the
+/// producer treats that as "no activated secret", which is a hard refusal in
+/// the verifier.
+[[nodiscard]] security::PlatformActivationSource attestd_activation_source(
+    AttestdClientConfig config);
 
 }  // namespace nexus::attestd

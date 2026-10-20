@@ -5,6 +5,8 @@ Documentation=https://github.com/lemonade-sdk/lemonade-nexus
 # for a VCEK it has not cached, which is a best-effort fetch, not a start
 # condition.
 After=local-fs.target
+Requires=nexus-attestd-tsm-setup.service
+After=nexus-attestd-tsm-setup.service
 
 [Service]
 Type=simple
@@ -21,7 +23,9 @@ RestartSec=5
 #
 # This unit is the reason the component exists. The Nexus server must NOT have
 # TPM or IMA access; this daemon has exactly that and nothing else, and answers
-# one question over one socket. Everything granted below is listed with why.
+# its two questions over one socket: platform evidence, and the one TPM
+# operation the server may not run itself (SVSM AK credential activation).
+# Everything granted below is listed with why.
 #
 # Dedicated identity. Not root, and not the server's account: a compromise of
 # the mesh server must not inherit TPM access, and a compromise of this daemon
@@ -40,7 +44,7 @@ Group=nexus-attestd
 SupplementaryGroups=tss nexus
 
 # GRANTED — the single capability:
-#   CAP_DAC_READ_SEARCH   read /sys/kernel/security/ima/ascii_runtime_measurements
+#   CAP_DAC_READ_SEARCH   read /sys/kernel/security/ima/binary_runtime_measurements
 #          and traverse /sys/kernel/security to reach it. securityfs is 0700
 #          root and the log itself is 0440 root, so there is no group to join;
 #          the kernel exposes no other interface to the IMA measurement log, and
@@ -130,11 +134,11 @@ SystemCallFilter=chown fchown fchownat lchown chown32 fchown32 lchown32
 SystemCallErrorNumber=EPERM
 
 # A core dump would carry live TPM session state and the platform bundle.
-# LimitCORE=0 stops the kernel writing one; CoreDumpFilter=0x00 needs systemd
+# LimitCORE=0 stops the kernel writing one; CoredumpFilter=0x00 needs systemd
 # 252, so where it is understood it also strips mapped pages from any dump a
 # handler with its own limits might still take.
 LimitCORE=0
-CoreDumpFilter=0x00
+CoredumpFilter=0x00
 
 # Bounded work: one request at a time, a few file descriptors, no forking.
 LimitNOFILE=256
