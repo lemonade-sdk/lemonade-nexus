@@ -33,6 +33,8 @@ enum class GossipMsgType : uint8_t {
     NsSlotClaim           = 0x14, // "democratic NS slot claim — ns1-ns9 bootstrap nameservers"
     MisbehaviorProofBroadcast = 0x15, // reserved; the misbehavior proof path is retired — refused, never processed
     SecurityEnvelope      = 0x16,  // opaque security-protocol envelope; routed to SecurityRuntime, never relayed
+    SyncDigest            = 0x17,  // "here is my per-origin replica summary" (backbone only)
+    SyncRequest           = 0x18,  // "send me these origins' entries after seq N" (backbone only)
 };
 
 // Compile-time pin on the retired range: a new enumerator inside [0x07, 0x10]
@@ -55,7 +57,9 @@ static_assert(detail::outside_retired_range(GossipMsgType::Digest) &&
               detail::outside_retired_range(GossipMsgType::BackboneIpamSync) &&
               detail::outside_retired_range(GossipMsgType::NsSlotClaim) &&
               detail::outside_retired_range(GossipMsgType::MisbehaviorProofBroadcast) &&
-              detail::outside_retired_range(GossipMsgType::SecurityEnvelope),
+              detail::outside_retired_range(GossipMsgType::SecurityEnvelope) &&
+              detail::outside_retired_range(GossipMsgType::SyncDigest) &&
+              detail::outside_retired_range(GossipMsgType::SyncRequest),
               "gossip wire values 0x07-0x10 are retired and reserved forever");
 
 #pragma pack(push, 1)
@@ -174,6 +178,13 @@ struct DnsRecordDelta {
     uint64_t    timestamp{0};
     std::string signer_pubkey;    // server that originated the change
     std::string signature;        // Ed25519 over canonical JSON (excludes this field)
+    /// Origin-assigned sequence number for catch-up sync; 0 on deltas from
+    /// servers that predate it. Covered by seq_signature, not by signature,
+    /// so older servers still verify `signature` and ignore both fields.
+    uint64_t    origin_seq{0};
+    /// Ed25519 over the canonical JSON plus origin_seq. Required when
+    /// origin_seq is nonzero.
+    std::string seq_signature;
 };
 
 // ---------------------------------------------------------------------------

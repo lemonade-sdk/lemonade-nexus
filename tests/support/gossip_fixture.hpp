@@ -72,6 +72,8 @@ struct GossipBallotTestAccess {
     // Drives one 5 s gossip tick (NS claim deferral/retry, opt-out release)
     // without waiting for the timer.
     static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
+    // DNS catch-up runs on a 30 s cadence; tests send a digest round directly.
+    static void send_dns_digests(GossipService& g) { g.send_dns_sync_digests(); }
     // v0.9.4 fix 4: the PeerExchange initiator runs on steady_clock, which no
     // datagram can advance; the cadence tests set these clocks directly.
     static void set_last_peer_exchange(GossipService& g,
@@ -403,6 +405,35 @@ protected:
         wire["signer_pubkey"] = nexus::crypto::to_base64(signer.public_key);
         wire["signature"]     = sign_b64(signer, canonical.dump());
         return msgpack_of(wire);
+    }
+
+    // A sequenced DNS delta: `signature` over the legacy preimage, and
+    // `seq_signature` over the same fields plus origin_seq, as
+    // broadcast_dns_record_delta emits.
+    nlohmann::json dns_seq_delta_wire(const nexus::crypto::Ed25519Keypair& signer,
+                                      const std::string& delta_id,
+                                      const std::string& fqdn,
+                                      const std::string& value,
+                                      uint64_t timestamp,
+                                      uint64_t origin_seq,
+                                      const std::string& operation = "set") {
+        nlohmann::json canonical;
+        canonical["delta_id"]    = delta_id;
+        canonical["fqdn"]        = fqdn;
+        canonical["operation"]   = operation;
+        canonical["record_type"] = "A";
+        canonical["timestamp"]   = timestamp;
+        canonical["ttl"]         = uint32_t{60};
+        canonical["value"]       = value;
+        nlohmann::json seq_canonical = canonical;
+        seq_canonical["origin_seq"] = origin_seq;
+
+        nlohmann::json wire = canonical;
+        wire["signer_pubkey"] = nexus::crypto::to_base64(signer.public_key);
+        wire["signature"]     = sign_b64(signer, canonical.dump());
+        wire["origin_seq"]    = origin_seq;
+        wire["seq_signature"] = sign_b64(signer, seq_canonical.dump());
+        return wire;
     }
 
 private:

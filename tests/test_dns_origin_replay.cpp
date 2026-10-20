@@ -1,11 +1,13 @@
 // DNS record-delta origin verification after a restart, driven through the
 // REAL implementation. The origin check in GossipService::handle_dns_record_sync
 // runs AFTER the immediate-sender certificate gate and requires the ORIGINAL
-// signer to be enrolled in the receiver's own peer table. A node's own key is
-// never placed in its own table, so a restarted origin denies a replay of its
-// own delta (S_SelfOriginReplay); an enrolled third-party origin passes
-// (T_ThirdPartyOrigin); an unknown signer and a corrupted signature fail their
-// own sub-conditions (T_MissingEnrollment, T_BadSignature).
+// signer to be enrolled: in the receiver's own peer table, or, for the node's
+// own key (never placed in its own table), by its own loaded certificate under
+// the same rules. A restarted origin therefore accepts a replay of its own
+// delta and restores its own records from disk (S_SelfOriginReplay); an
+// enrolled third-party origin passes (T_ThirdPartyOrigin); an unknown signer
+// and a corrupted signature fail their own sub-conditions
+// (T_MissingEnrollment, T_BadSignature).
 //
 // Conventions and fixture state match tests/test_gossip_ingress_security.cpp;
 // no verification logic is mocked. There is no production re-push for DNS
@@ -116,9 +118,8 @@ protected:
         return std::nullopt;
     }
 
-    // restart_node (base) rebuilds only the gossip service; the DnsService is
-    // intentionally NOT rebuilt here: the zone is in-memory only, so a
-    // restarted process starts with the same empty zone a fresh one would.
+    // restart_node (base) rebuilds only the gossip service; a test that needs
+    // a restarted process's empty zone rebuilds the DnsService itself.
 
     // Common configure: anchor the test root and wire the pure DNS service.
     // The advertised endpoint lets the hello handler confirm it against the
@@ -245,28 +246,41 @@ TEST_F(DnsOriginReplayTest, S_SelfOriginReplay) {
 
     // Model A's restart: fresh GossipService over the SAME storage. The
     // keypair and peer table (B, with cert, saved by A1's on_stop) are
-    // re-loaded; A's own key is not among them.
-    restart_node(a, [&](Node& n) { configure(n, root_kp); });
+    // re-loaded; A's own key is not among them. A1's saved DNS replica is
+    // removed first, so only the replay below can restore the record.
+    restart_node(a, [&](Node& n) {
+        fs::remove(n.dir / "dns" / "replica.json");
+        configure(n, root_kp);
+    });
 
     // Fixture state of the restarted instance A2, asserted individually so
     // the expected branch below is uniquely determined:
     EXPECT_EQ(a.pubkey_b64(), a_b64);             // same identity keypair
     EXPECT_TRUE(a.certified_peer(b_b64));         // sender B still enrolled
-    EXPECT_FALSE(a.certified_peer(a_b64));        // own key NOT self-enrolled
+    EXPECT_FALSE(a.certified_peer(a_b64));        // own key NOT in the peer table
     ASSERT_FALSE(zone_a(a, fqdn).has_value());  // zone still empty
     EXPECT_EQ(a.dns->soa_serial(), serial_before);
 
     // Labelled injection: the exact bytes of B's production forward, re-sent
     // at A2 with B as immediate sender (no production re-push exists).
     inject(fwd, a);
-    pump_for(std::chrono::milliseconds(300));
 
-    // DENIED: origin enrollment of A's own key fails; zone unchanged, no crash.
-    EXPECT_FALSE(zone_a(a, fqdn).has_value());
-    EXPECT_EQ(a.dns->soa_serial(), serial_before);
-    // B still holds the record: the delta itself is healthy everywhere; only
-    // the origin's self-enrollment is absent on the restarted origin.
+    // APPLIED: A's own key is enrolled by A's own root-verified certificate,
+    // so A2 takes back the record it authored.
+    ASSERT_TRUE(pump_until([&] { return zone_a(a, fqdn).has_value(); }));
+    EXPECT_EQ(zone_a(a, fqdn).value_or(""), "10.9.30.40");
+    EXPECT_NE(a.dns->soa_serial(), serial_before);
     EXPECT_TRUE(zone_a(b, fqdn).has_value());
+
+    // A restart that keeps the saved replica restores the record from disk
+    // into a fresh, empty DNS service, with no replay and no peer contact.
+    restart_node(a, [&](Node& n) {
+        n.dns->stop();
+        n.dns = std::make_unique<network::DnsService>(io, 0, *n.tree, "lemonade-nexus.io");
+        n.dns->start();
+        configure(n, root_kp);
+    });
+    EXPECT_EQ(zone_a(a, fqdn).value_or(""), "10.9.30.40");
 }
 
 // ---------------------------------------------------------------------------

@@ -48,7 +48,9 @@ On a normal start (`main.cpp`), the server:
 4. Brings up the userspace dataplane: BoringTun sessions on UDP `51940`, the
    smoltcp netstack for the client plane (`10.64.0.0/10`) and the server
    backbone (`172.16.0.0/22`), and TCP forwards from the virtual addresses to
-   the loopback private listener on `9101`.
+   the loopback private listener on `9101`. Gossip binds virtual UDP on the
+   backbone address for Tier 1 catch-up sync; the netstack delivers those
+   datagrams in process, with no socket bridge.
 5. Starts the HTTP listeners. **Both control-plane listeners are withheld
    until usable TLS certificates exist** — HTTPS or nothing, no plaintext
    fallback. A background ACME thread retries with backoff and upgrades the

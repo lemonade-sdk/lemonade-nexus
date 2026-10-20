@@ -87,7 +87,19 @@ Backbone allocations sync via gossip:
 - Ingress is certificate-gated (root-signed, non-revoked peer).
 - Deltas are deduplicated by `delta_id`; new allocations are forwarded to all
   peers.
-- Late joiners receive the allocation table through anti-entropy sync.
+- Each server announces its own claim directly to every certified peer after
+  each accepted ServerHello and every 300 seconds, so late joiners and
+  restarted servers learn it without a full table transfer.
+- A direct claim also carries the server's mesh public key. The key is outside
+  the signed claim, so a receiver accepts it only when the packet signer is
+  the claim's subject. With both the address and the key, the receiver adds
+  the BoringTun backbone peer.
+
+Gossip catch-up sync (`SyncDigest` 0x17, `SyncRequest` 0x18) runs over the
+backbone on virtual UDP at the backbone address and the gossip port. It is
+not a new public port. Tier 1 servers serve catch-up to every certified
+server; Tier 2 servers catch up from Tier 1 and report their sync status to
+Tier 1, but never supply records to it.
 
 Client tunnel, private, and shared allocations are currently managed per
 server; full cross-server IPAM sync for those pools is not implemented. Two

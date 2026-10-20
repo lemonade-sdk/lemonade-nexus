@@ -23,6 +23,7 @@
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/IPAM/IPAMTypes.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/Network/VirtualNetService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
@@ -40,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <set>
 #include <memory>
 #include <span>
 #include <string>
@@ -2449,4 +2451,415 @@ TEST_F(GossipIngressSecurityTest, PeerExchangeRequestIntroducesUnseenPeerFromHub
     for (const auto& p : a.gossip->get_peers()) {
         if (p.pubkey == b64_c) ASSERT_EQ(p.endpoint, c.endpoint());
     }
+}
+
+// ---------------------------------------------------------------------------
+// DNS catch-up: Tier 1 authority, sequenced deltas, backbone claims, and the
+// backbone transport.
+// ---------------------------------------------------------------------------
+
+// A Tier 1 server changes its zone only on Tier 1 authority: the delivering
+// sender and the author must both be current members. A server that is not
+// Tier 1 keeps the enrolled-peer rule.
+TEST_F(GossipIngressSecurityTest, Tier1AcceptsDnsOnlyFromTier1SendersAndAuthors) {
+    auto root_kp = kc->ed25519_keygen();
+    auto t1      = kc->ed25519_keygen();
+    auto t2      = kc->ed25519_keygen();
+    const auto t1_b64 = crypto::to_base64(t1.public_key);
+    const auto t2_b64 = crypto::to_base64(t2.public_key);
+
+    std::set<std::string> members{t1_b64};
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(t1_b64, "127.0.0.1:9", issue_cert(t1_b64, "srv-t1", root_kp)),
+                 peer_entry(t2_b64, "127.0.0.1:10", issue_cert(t2_b64, "srv-t2", root_kp))}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+            n.gossip->set_tier1_membership_source(
+                [&](const std::string& pk) { return members.count(pk) > 0; });
+        });
+    members.insert(a.pubkey_b64());
+
+    const std::string seip = ".us-x.seip.lemonade-nexus.io";
+    const std::string t1_name = "srv-t1" + seip;
+    const std::string t2_name = "srv-t2" + seip;
+
+    // Tier 2 author and sender.
+    inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t2, "t1g-1", t2_name, "10.2.0.1")), a);
+    // Tier 1 author, Tier 2 relay.
+    inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t1, "t1g-2", t1_name, "10.1.0.1")), a);
+    // Tier 2 author, Tier 1 relay.
+    inject(build_packet(t1, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t2, "t1g-3", t2_name, "10.2.0.3")), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(t1_name).has_value());
+    EXPECT_FALSE(a.dns->resolve(t2_name).has_value());
+
+    // Positive control: Tier 1 author and sender.
+    inject(build_packet(t1, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t1, "t1g-4", t1_name, "10.1.0.4")), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(t1_name).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(t1_name)->ipv4_address, "10.1.0.4");
+
+    // The receiver leaves Tier 1: the enrolled-peer rule applies again.
+    members.erase(a.pubkey_b64());
+    inject(build_packet(t2, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(t2, "t1g-5", t2_name, "10.2.0.5")), a);
+    ASSERT_TRUE(pump_until([&] { return a.dns->resolve(t2_name).has_value(); }));
+    EXPECT_EQ(a.dns->resolve(t2_name)->ipv4_address, "10.2.0.5");
+}
+
+// origin_seq is bound by seq_signature, orders changes within one second, and
+// keeps a removal from being undone by an older entry. Unsequenced deltas
+// from older servers still apply by timestamp.
+TEST_F(GossipIngressSecurityTest, SequencedDnsDeltaBindsAndOrdersByOriginSeq) {
+    auto root_kp = kc->ed25519_keygen();
+    auto origin  = kc->ed25519_keygen();
+    const auto origin_b64 = crypto::to_base64(origin.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(origin_b64, "127.0.0.1:9", issue_cert(origin_b64, "srv-s", root_kp))}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    const std::string name = "srv-s.us-x.seip.lemonade-nexus.io";
+    const auto send = [&](const nlohmann::json& wire) {
+        inject(build_packet(origin, gossip::GossipMsgType::DnsRecordSync, msgpack_of(wire)), a);
+    };
+    const auto value_is = [&](const std::string& v) {
+        return pump_until([&] {
+            auto r = a.dns->resolve(name);
+            return r && r->ipv4_address == v;
+        });
+    };
+
+    send(dns_seq_delta_wire(origin, "seq-1", name, "10.0.0.1", 1000, 10));
+    ASSERT_TRUE(value_is("10.0.0.1"));
+
+    // A relay raising origin_seq breaks seq_signature.
+    auto tampered = dns_seq_delta_wire(origin, "seq-2", name, "10.0.0.2", 1000, 20);
+    tampered["origin_seq"] = uint64_t{21};
+    send(tampered);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.dns->resolve(name)->ipv4_address, "10.0.0.1");
+
+    // Untampered, the same change applies: same second, higher sequence.
+    send(dns_seq_delta_wire(origin, "seq-3", name, "10.0.0.3", 1000, 20));
+    ASSERT_TRUE(value_is("10.0.0.3"));
+
+    // A lower sequence in the same second is stale.
+    send(dns_seq_delta_wire(origin, "seq-4", name, "10.0.0.4", 1000, 15));
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.dns->resolve(name)->ipv4_address, "10.0.0.3");
+
+    // A removal, then an older set: the tombstone holds.
+    send(dns_seq_delta_wire(origin, "seq-5", name, "10.0.0.3", 1000, 30, "remove"));
+    ASSERT_TRUE(pump_until([&] { return !a.dns->resolve(name).has_value(); }));
+    send(dns_seq_delta_wire(origin, "seq-6", name, "10.0.0.6", 1000, 25));
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(a.dns->resolve(name).has_value());
+
+    // Positive control: a newer set restores the record.
+    send(dns_seq_delta_wire(origin, "seq-7", name, "10.0.0.7", 1000, 40));
+    ASSERT_TRUE(value_is("10.0.0.7"));
+
+    // An unsequenced delta from an older server in the same second is older
+    // than every sequenced entry; a later second applies.
+    inject(build_packet(origin, gossip::GossipMsgType::DnsRecordSync,
+                        dns_delta_payload(origin, "legacy-1", name, "10.0.0.8")), a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a.dns->resolve(name)->ipv4_address, "10.0.0.7");
+    auto later = nlohmann::json::from_msgpack(dns_delta_payload(origin, "legacy-2", name, "10.0.0.9"));
+    later["timestamp"] = uint64_t{2000};
+    nlohmann::json canonical;
+    for (const char* k : {"delta_id", "fqdn", "operation", "record_type", "timestamp", "ttl", "value"}) {
+        canonical[k] = later[k];
+    }
+    later["signature"] = sign_b64(origin, canonical.dump());
+    send(later);
+    ASSERT_TRUE(value_is("10.0.0.9"));
+}
+
+// The mesh key rides outside the claim's signed preimage, so it is accepted
+// only when the claim's subject sent it directly. A relayed claim still
+// records the address.
+TEST_F(GossipIngressSecurityTest, BackboneClaimMeshKeyOnlyFromTheSubjectDirectly) {
+    auto root_kp = kc->ed25519_keygen();
+    auto subject = kc->ed25519_keygen();
+    auto relay   = kc->ed25519_keygen();
+    const auto subject_b64 = crypto::to_base64(subject.public_key);
+    const auto relay_b64   = crypto::to_base64(relay.public_key);
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            attach_ipam(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(subject_b64, "127.0.0.1:9", issue_cert(subject_b64, "srv-s", root_kp)),
+                 peer_entry(relay_b64, "127.0.0.1:10", issue_cert(relay_b64, "srv-r", root_kp))}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_ipam(n.ipam.get());
+        });
+
+    const auto peer_of = [&](const std::string& pk) {
+        for (const auto& p : a.gossip->get_peers()) {
+            if (p.pubkey == pk) return p;
+        }
+        return gossip::GossipPeer{};
+    };
+    const auto key_b64 = [](uint8_t fill) {
+        std::array<uint8_t, crypto::kX25519PublicKeySize> k{};
+        k.fill(fill);
+        return crypto::to_base64(std::span<const uint8_t>(k.data(), k.size()));
+    };
+    auto claim = nlohmann::json::from_msgpack(
+        ipam_delta_payload(subject, subject_b64, "bb-claim-1", "node-s", "172.16.0.50/32"));
+
+    // Relayed: the address is recorded, the mesh key is not.
+    claim["mesh_pubkey"] = key_b64(0x11);
+    inject(build_packet(relay, gossip::GossipMsgType::BackboneIpamSync, msgpack_of(claim)), a);
+    ASSERT_TRUE(pump_until([&] { return peer_of(subject_b64).backbone_ip == "172.16.0.50"; }));
+    pump_for(std::chrono::milliseconds(100));
+    EXPECT_TRUE(peer_of(subject_b64).mesh_pubkey.empty());
+
+    // A malformed key from the subject itself is ignored.
+    claim["mesh_pubkey"] = "not-a-key";
+    inject(build_packet(subject, gossip::GossipMsgType::BackboneIpamSync, msgpack_of(claim)), a);
+    pump_for(std::chrono::milliseconds(200));
+    EXPECT_TRUE(peer_of(subject_b64).mesh_pubkey.empty());
+
+    // Direct from the subject: accepted, although IPAM already saw this
+    // delta id.
+    claim["mesh_pubkey"] = key_b64(0x22);
+    inject(build_packet(subject, gossip::GossipMsgType::BackboneIpamSync, msgpack_of(claim)), a);
+    ASSERT_TRUE(pump_until([&] { return peer_of(subject_b64).mesh_pubkey == key_b64(0x22); }));
+}
+
+// End to end over the backbone (three in-process netstacks routed by
+// destination address): a Tier 1 server that missed another's records while
+// it was away catches up, a Tier 2 server catches up from Tier 1 and reports
+// its status back, Tier 1 never takes records from Tier 2, a digest on the
+// public socket is refused, and a restarted server restores its zone from
+// disk.
+TEST_F(GossipIngressSecurityTest, DnsCatchUpRunsOverTheBackbone) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    auto b_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto a_b64  = crypto::to_base64(a_kp.public_key);
+    const auto b_b64  = crypto::to_base64(b_kp.public_key);
+    const auto c_b64  = crypto::to_base64(c_kp.public_key);
+    const auto a_cert = issue_cert(a_b64, "srv-a", root_kp);
+    const auto b_cert = issue_cert(b_b64, "srv-b", root_kp);
+    const auto c_cert = issue_cert(c_b64, "srv-c", root_kp);
+    const std::set<std::string> members{a_b64, b_b64};  // C is Tier 2
+    const auto seed_own_cert = [](Node& n, const std::string& cert) {
+        storage::SignedEnvelope env;
+        env.type = "server_certificate";
+        env.data = cert;
+        ASSERT_TRUE(n.storage->write_file("identity", "server_cert.json", env));
+    };
+
+    const auto wire_dns_to_gossip = [](Node& n) {
+        n.dns->set_record_callback([g = n.gossip.get()](const std::string& id,
+                                                        const std::string& op,
+                                                        const network::DnsZoneRecord& rec) {
+            gossip::DnsRecordDelta d;
+            d.delta_id = id; d.operation = op; d.fqdn = rec.fqdn;
+            d.record_type = rec.record_type; d.value = rec.value;
+            d.ttl = rec.ttl; d.timestamp = rec.timestamp;
+            g->broadcast_dns_record_delta(d);
+        });
+    };
+    const auto configure = [&](Node& n) {
+        n.gossip->set_root_pubkey(root_kp.public_key); n.gossip->set_network_id(kTestNetworkHex);
+        n.gossip->set_dns(n.dns.get());
+        n.gossip->set_ipam(n.ipam.get());
+        n.gossip->set_tier1_membership_source(
+            [&members](const std::string& pk) { return members.count(pk) > 0; });
+    };
+
+    // A authors its records while B and C are away: their entries point at
+    // dead ports.
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            seed_own_cert(n, a_cert);
+            attach_dns(n);
+            attach_ipam(n);
+            seed_peers(*n.storage, nlohmann::json::array(
+                {peer_entry(b_b64, "127.0.0.1:9", b_cert), peer_entry(c_b64, "127.0.0.1:10", c_cert)}));
+        },
+        [&](Node& n) { configure(n); wire_dns_to_gossip(n); });
+    const std::string seip = ".us-x.seip.lemonade-nexus.io";
+    ASSERT_TRUE(a.dns->set_record("srv-a" + seip, "A", "10.9.0.1", 300));
+    ASSERT_TRUE(a.dns->set_record("backend.srv-a" + seip, "A", "172.16.0.1", 300));
+    ASSERT_TRUE(a.dns->set_record("private.srv-a" + seip, "A", "10.64.0.9", 300));
+
+    const auto make_late = [&](const std::string& tag, const crypto::Ed25519Keypair& kp,
+                               const std::string& cert) -> Node& {
+        return make_node(
+            tag,
+            [&](Node& n) {
+                seed_keypair(*n.storage, kp);
+                seed_own_cert(n, cert);
+                attach_dns(n);
+                attach_ipam(n);
+                seed_peers(*n.storage, nlohmann::json::array({peer_entry(a_b64, a.endpoint(), a_cert)}));
+            },
+            [&](Node& n) { configure(n); wire_dns_to_gossip(n); });
+    };
+    auto& b = make_late("b", b_kp, b_cert);
+    auto& c = make_late("c", c_kp, c_cert);
+    a.gossip->add_peer(b.endpoint(), b_b64);
+    a.gossip->add_peer(c.endpoint(), c_b64);
+    pump_for(std::chrono::milliseconds(200));
+    EXPECT_FALSE(b.dns->resolve("srv-a" + seip).has_value());
+    EXPECT_FALSE(c.dns->resolve("srv-a" + seip).has_value());
+
+    // Backbone: route each emitted IPv4 packet to the stack that owns its
+    // destination address.
+    network::VirtualNetService va, vb, vc;
+    std::map<std::string, network::VirtualNetService*> by_ip{
+        {"172.16.0.1", &va}, {"172.16.0.2", &vb}, {"172.16.0.3", &vc}};
+    const auto route = [&by_ip](std::span<const uint8_t> p) {
+        if (p.size() < 20) return;
+        const std::string dst = std::to_string(p[16]) + "." + std::to_string(p[17]) + "." +
+                                std::to_string(p[18]) + "." + std::to_string(p[19]);
+        if (auto it = by_ip.find(dst); it != by_ip.end()) it->second->deliver_inbound_ip_packet(p);
+    };
+    const auto mesh_key = [](uint8_t fill) {
+        std::array<uint8_t, crypto::kX25519PublicKeySize> k{};
+        k.fill(fill);
+        return crypto::to_base64(std::span<const uint8_t>(k.data(), k.size()));
+    };
+    struct Wire { Node* n; network::VirtualNetService* v; const char* ip; const char* id; uint8_t key; };
+    for (const auto& w : {Wire{&a, &va, "172.16.0.1", "node-a", 0xA1},
+                          Wire{&b, &vb, "172.16.0.2", "node-b", 0xB2},
+                          Wire{&c, &vc, "172.16.0.3", "node-c", 0xC3}}) {
+        w.v->start();
+        w.v->set_outbound_sink(route);
+        ASSERT_TRUE(w.v->add_local_ip(std::string(w.ip) + "/22"));
+        w.n->gossip->set_our_mesh_pubkey(mesh_key(w.key));
+        w.n->gossip->set_our_backbone_claim(w.id, w.ip);
+        w.n->gossip->set_virtual_net(w.v);
+    }
+
+    const auto status_for = [](Node& n, const std::string& pk) {
+        const auto status = n.gossip->dns_sync_status();
+        for (const auto& p : status["peers"]) {
+            if (p["pubkey"] == pk) return p;
+        }
+        return nlohmann::json::object();
+    };
+
+    // Refused: a digest on the public socket, even from a Tier 1 peer.
+    const auto public_digest =
+        msgpack_of(sync::encode_digest_page({"dns", 1, 0, 1, {{a_b64, {1, 1, 1}}}}));
+    inject(build_packet(a_kp, gossip::GossipMsgType::SyncDigest, public_digest), b);
+    pump_for(std::chrono::milliseconds(200));
+    ASSERT_FALSE(status_for(b, a_b64).empty()) << b.gossip->dns_sync_status().dump();
+    EXPECT_FALSE(status_for(b, a_b64).contains("last_digest_ms"));
+
+    // The first tick announces each backbone claim with its mesh key.
+    for (Node* n : {&a, &b, &c}) gossip::GossipBallotTestAccess::run_gossip_tick(*n->gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return status_for(a, b_b64).value("mesh_key_known", false) &&
+               status_for(a, c_b64).value("mesh_key_known", false) &&
+               status_for(b, a_b64).value("mesh_key_known", false) &&
+               status_for(c, a_b64).value("mesh_key_known", false);
+    }));
+
+    // One digest round from A: both B (Tier 1) and C (Tier 2) catch up.
+    gossip::GossipBallotTestAccess::send_dns_digests(*a.gossip);
+    for (Node* n : {&b, &c}) {
+        ASSERT_TRUE(pump_until([&] {
+            return n->dns->resolve("srv-a" + seip).has_value() &&
+                   n->dns->resolve("backend.srv-a" + seip).has_value() &&
+                   n->dns->resolve("private.srv-a" + seip).has_value();
+        }, std::chrono::seconds(5)));
+        EXPECT_EQ(n->dns->resolve("srv-a" + seip)->ipv4_address, "10.9.0.1");
+    }
+
+    // The next round finds both in sync with A, and C reports its status to A.
+    gossip::GossipBallotTestAccess::send_dns_digests(*a.gossip);
+    gossip::GossipBallotTestAccess::send_dns_digests(*c.gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return status_for(b, a_b64).value("in_sync", false) &&
+               status_for(c, a_b64).value("in_sync", false) &&
+               status_for(a, c_b64).value("in_sync", false);
+    }));
+    EXPECT_FALSE(status_for(a, c_b64).value("tier1", true));
+
+    // Tier 2 does not change Tier 1: C's own record reaches A live and is
+    // refused, and C's digest makes A request nothing from C.
+    ASSERT_TRUE(c.dns->set_record("srv-c" + seip, "A", "10.9.3.3", 300));
+    gossip::GossipBallotTestAccess::send_dns_digests(*c.gossip);
+    pump_for(std::chrono::milliseconds(400));
+    EXPECT_FALSE(a.dns->resolve("srv-c" + seip).has_value());
+
+    // B restarts with an empty zone and restores A's records from disk, with
+    // no backbone and no peer contact.
+    restart_node(b, [&](Node& n) {
+        n.dns = std::make_unique<network::DnsService>(io, 0, *n.tree, "lemonade-nexus.io");
+        configure(n);
+    });
+    ASSERT_TRUE(b.dns->resolve("srv-a" + seip).has_value());
+    EXPECT_EQ(b.dns->resolve("srv-a" + seip)->ipv4_address, "10.9.0.1");
+    EXPECT_TRUE(b.dns->resolve("private.srv-a" + seip).has_value());
+
+    // A restores the records it authored itself (enrolled by its own
+    // certificate, not the peer table).
+    restart_node(a, [&](Node& n) {
+        n.dns = std::make_unique<network::DnsService>(io, 0, *n.tree, "lemonade-nexus.io");
+        configure(n);
+    });
+    ASSERT_TRUE(a.dns->resolve("private.srv-a" + seip).has_value());
+    EXPECT_EQ(a.dns->resolve("private.srv-a" + seip)->ipv4_address, "10.64.0.9");
+
+    for (auto* v : {&va, &vb, &vc}) v->stop();
+}
+
+// A removal is a change made now. Its delta carries the removal time, not the
+// removed record's creation time, so receivers order it after that record
+// and its marker expires relative to the removal.
+TEST_F(GossipIngressSecurityTest, DnsRemovalCarriesTheRemovalTime) {
+    auto& a = make_node("a", [&](Node& n) { attach_dns(n); });
+    network::DnsZoneRecord old_rec;
+    old_rec.fqdn = "old.example.lemonade-nexus.io";
+    old_rec.record_type = "A";
+    old_rec.value = "10.1.1.1";
+    old_rec.ttl = 60;
+    old_rec.timestamp = 1000;  // long ago
+    ASSERT_TRUE(a.dns->apply_remote_delta("old-1", "set", old_rec));
+
+    std::optional<network::DnsZoneRecord> sent;
+    a.dns->set_record_callback([&](const std::string&, const std::string& op,
+                                   const network::DnsZoneRecord& rec) {
+        if (op == "remove") sent = rec;
+    });
+    const auto before = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    ASSERT_TRUE(a.dns->remove_record(old_rec.fqdn, "A"));
+    ASSERT_TRUE(sent.has_value());
+    EXPECT_GE(sent->timestamp, before);
+    EXPECT_EQ(sent->value, "10.1.1.1");
 }
