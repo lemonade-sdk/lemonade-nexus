@@ -263,7 +263,9 @@ LinuxAttestationProfile linux_attestation_profile_v3_svsm_release() {
         "module-tree-sha256=8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be";
     profile.snp.expected_measurements_hex = {
         "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
-        "c6e84c2490814e22a2b5ba860a37208d1d9a"};
+        "c6e84c2490814e22a2b5ba860a37208d1d9a",
+        "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e"
+        "79313e3df3f88b9798a7eb53ab1b3ff59a54"};
     // AMD-SB-3030 (bootloader) and AMD-SB-3034 (SNP firmware). The live host's
     // 0x09/0x17 values are observations, never policy. No cited current release
     // requirement sets nonzero TEE or microcode floors, so those stay zero.

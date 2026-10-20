@@ -44,6 +44,8 @@ constexpr std::string_view kExpectedImaPolicy =
 constexpr std::string_view kExpectedLaunchMeasurements[] = {
     "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
     "c6e84c2490814e22a2b5ba860a37208d1d9a",
+    "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e"
+    "79313e3df3f88b9798a7eb53ab1b3ff59a54",
 };
 
 json approved_paths_json(const std::vector<ApprovedPath>& paths) {

@@ -65,7 +65,9 @@ struct SignedFixture {
         };
         a.svsm_launch_measurements_hex = {
             "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
-            "c6e84c2490814e22a2b5ba860a37208d1d9a"};
+            "c6e84c2490814e22a2b5ba860a37208d1d9a",
+            "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e"
+            "79313e3df3f88b9798a7eb53ab1b3ff59a54"};
         a.min_tcb = {0x0c, 0, 0x1c, 0};
         a.approved_paths = {
             {"/usr/bin/lemonade-nexus", {std::string(64, '1')}},
@@ -300,7 +302,7 @@ TEST(ReleaseApproval, TemplatePinsTheCurrentReleaseLine) {
     EXPECT_EQ(t.starting_patched_tree,
               "148bcf279cd18a7c46295fcd76db022ed5451422");
     // The compiled measurement set must already be canonical: sorted, unique,
-    // and still anchored on the one qualified shape.
+    // and anchored on the qualified 2-vCPU shape as its first member.
     ASSERT_FALSE(t.svsm_launch_measurements_hex.empty());
     EXPECT_TRUE(std::is_sorted(t.svsm_launch_measurements_hex.begin(),
                                t.svsm_launch_measurements_hex.end()));
