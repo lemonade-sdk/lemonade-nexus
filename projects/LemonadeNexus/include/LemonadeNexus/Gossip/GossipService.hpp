@@ -526,6 +526,12 @@ private:
                                              const std::string& signer_pubkey_b64,
                                              const std::string& signature_b64) const;
 
+    /// Whether this node's own loaded certificate is valid under the rules
+    /// applied to peers: root key present, key not revoked, certificate bound
+    /// to our gossip key and root-verified. The peers table never lists this
+    /// node, so this answers for it. Takes peers_mutex_.
+    [[nodiscard]] bool own_certificate_valid() const;
+
     /// The Ed25519 signature check of delta_origin_verified, without the
     /// enrollment lookup.
     [[nodiscard]] bool author_signature_valid(const std::string& canonical,

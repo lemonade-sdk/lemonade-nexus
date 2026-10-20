@@ -3357,9 +3357,7 @@ std::optional<std::string> GossipService::dns_delta_authorship_error(
     // Our own deltas come back from peers and from disk. Our key is not in
     // the peer table, so its enrollment is our own root-verified certificate.
     const bool self_authored = delta.signer_pubkey == crypto::to_base64(keypair_.public_key);
-    const bool self_enrolled = self_authored && our_certificate_ &&
-                               our_certificate_->server_pubkey == delta.signer_pubkey &&
-                               verify_cert_core(*our_certificate_);
+    const bool self_enrolled = self_authored && own_certificate_valid();
     const bool origin_ok =
         self_authored
             ? self_enrolled && author_signature_valid(canonical, delta.signer_pubkey, sig)
@@ -4420,20 +4418,24 @@ void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
     security_sink_(sender, std::span<const uint8_t>{payload, len});
 }
 
+bool GossipService::own_certificate_valid() const {
+    const auto b64 = crypto::to_base64(keypair_.public_key);
+    std::lock_guard lock(peers_mutex_);
+    if (!has_root_pubkey_ || is_revoked(b64) || !our_certificate_) return false;
+    try {
+        return our_certificate_->server_pubkey == b64 && verify_cert_core(*our_certificate_);
+    } catch (...) {
+        return false;
+    }
+}
+
 bool GossipService::peer_is_root_certified(const security::NodeId& peer) const {
     const auto b64 = crypto::to_base64(peer.bytes);
     if (peer.bytes == keypair_.public_key) {
         // The peers table never lists this node; its own loaded certificate
         // answers for it under the same rules, or every node computes an
         // eligibility state no other node can agree with.
-        std::lock_guard lock(peers_mutex_);
-        if (!has_root_pubkey_ || is_revoked(b64) || !our_certificate_) return false;
-        try {
-            return our_certificate_->server_pubkey == b64 &&
-                   verify_cert_core(*our_certificate_);
-        } catch (...) {
-            return false;
-        }
+        return own_certificate_valid();
     }
     return peer_certificate_is_root_signed(b64);
 }
