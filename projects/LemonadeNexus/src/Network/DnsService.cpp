@@ -1137,6 +1137,9 @@ bool DnsService::remove_record(const std::string& fqdn, const std::string& recor
         removed = it->second;
         zone_records_.erase(it);
     }
+    // The removal is a change made now: receivers order it, and expire its
+    // marker, by this time rather than the removed record's creation time.
+    removed.timestamp = now_seconds();
 
     bump_serial();
     spdlog::info("[{}] removed dynamic {} {}", name(), record_type, fqdn_lower);
@@ -1152,7 +1155,8 @@ bool DnsService::remove_record(const std::string& fqdn, const std::string& recor
 
 bool DnsService::apply_remote_delta(const std::string& delta_id,
                                       const std::string& operation,
-                                      const DnsZoneRecord& record) {
+                                      const DnsZoneRecord& record,
+                                      bool caller_ordered) {
     std::lock_guard<std::mutex> lock(zone_mutex_);
 
     // Deduplication check
@@ -1175,7 +1179,8 @@ bool DnsService::apply_remote_delta(const std::string& delta_id,
     if (operation == "set") {
         // Only apply if timestamp is newer than existing
         auto it = zone_records_.find(key);
-        if (it != zone_records_.end() && it->second.timestamp >= record.timestamp) {
+        if (!caller_ordered && it != zone_records_.end() &&
+            it->second.timestamp >= record.timestamp) {
             return false; // Stale update
         }
         zone_records_[key] = record;

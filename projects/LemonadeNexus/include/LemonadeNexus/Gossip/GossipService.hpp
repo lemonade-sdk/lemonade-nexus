@@ -8,11 +8,14 @@
 #include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Sync/OriginReplica.hpp>
 
 #include <asio.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -24,7 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace nexus::network { class DnsService; }
+namespace nexus::network { class DnsService; class VirtualNetService; }
 namespace nexus::boringtun { class BoringtunService; }
 namespace nexus::tree { class PermissionTreeService; }
 
@@ -121,14 +124,34 @@ public:
                                 : std::nullopt;
     }
 
-    /// Set our backbone IP for inclusion in ServerHello messages.
-    void set_our_backbone_ip(const std::string& ip) { our_backbone_ip_ = ip; }
+    /// Set this server's backbone allocation (bare IPv4, no prefix) and the
+    /// IPAM node id it is held under. The claim is announced directly to each
+    /// certified peer, signed by and naming this gossip identity, after every
+    /// accepted ServerHello and every 300 s. Peers add the backbone mesh peer
+    /// once they hold both the claim and our mesh public key.
+    void set_our_backbone_claim(const std::string& server_node_id,
+                                const std::string& backbone_ip);
 
     /// Get our backbone IP.
-    [[nodiscard]] std::string our_backbone_ip() const { return our_backbone_ip_; }
+    [[nodiscard]] std::string our_backbone_ip() const;
 
-    /// Set our mesh public key for inclusion in ServerHello messages.
-    void set_our_mesh_pubkey(const std::string& pubkey) { our_mesh_pubkey_ = pubkey; }
+    /// Set our mesh public key (base64 X25519). Carried only in backbone claims
+    /// this server sends directly, so a relaying peer cannot substitute it.
+    void set_our_mesh_pubkey(const std::string& pubkey);
+
+    /// Attach the in-process virtual netstack. Once our backbone IP is also
+    /// set, gossip binds virtual UDP <backbone_ip>:<gossip port> and carries
+    /// catch-up sync (SyncDigest, SyncRequest and catch-up DnsRecordSync) over
+    /// the encrypted backbone. Tier 1 servers serve catch-up to every
+    /// certified server; Tier 2 servers catch up from Tier 1 and never feed
+    /// records back. The netstack must outlive this service's start.
+    void set_virtual_net(network::VirtualNetService* vnet);
+
+    /// DNS catch-up state: whether this server is Tier 1, its per-origin
+    /// summaries, and each certified peer's tier, backbone readiness and sync
+    /// status (known for peers whose digests reach this server: Tier 1 peers
+    /// on every server, and every peer on a Tier 1 server).
+    [[nodiscard]] nlohmann::json dns_sync_status() const;
 
     /// Set the "ip:port" this server is reachable at, carried in ServerHello so
     /// peers share it instead of the UDP source they happen to observe. Call
@@ -380,10 +403,71 @@ private:
                            const std::string& sender_pubkey,
                            const uint8_t* payload, std::size_t payload_len);
 
+    /// Path a datagram arrived on. Backbone datagrams were decrypted by the
+    /// mesh dataplane from a peer's mesh key; only sync messages are accepted
+    /// on that path.
+    enum class Via { Public, Backbone };
+
+    /// Header, size and signature checks, then dispatch. Shared by the public
+    /// socket and the backbone transport so both run identical verification.
+    void process_datagram(const uint8_t* data, std::size_t len,
+                          const asio::ip::udp::endpoint& from, Via via);
+
     // DNS record sync handler
     void handle_dns_record_sync(const asio::ip::udp::endpoint& sender,
                                  const std::string& sender_pubkey,
-                                 const uint8_t* payload, std::size_t payload_len);
+                                 const uint8_t* payload, std::size_t payload_len,
+                                 Via via = Via::Public);
+
+    // Catch-up sync (backbone only, Tier 1 to Tier 1)
+    void handle_sync_digest(const asio::ip::udp::endpoint& sender,
+                            const std::string& sender_pubkey,
+                            const uint8_t* payload, std::size_t payload_len, Via via);
+    void handle_sync_request(const asio::ip::udp::endpoint& sender,
+                             const std::string& sender_pubkey,
+                             const uint8_t* payload, std::size_t payload_len, Via via);
+
+    /// Sends our DNS digest, paged to fit, over the backbone. Tier 1 sends to
+    /// every certified peer with a backbone path; Tier 2 sends to Tier 1 peers
+    /// only, as status. No-op until the backbone transport is bound.
+    void send_dns_sync_digests();
+
+    /// Common gate for catch-up messages: arrived on the backbone, from the
+    /// sender's own backbone IP, sender certified. Tier rules are per message.
+    [[nodiscard]] bool backbone_sender_verified(const asio::ip::udp::endpoint& sender,
+                                                const std::string& sender_pubkey, Via via,
+                                                std::string_view what);
+    void deny_sync(const asio::ip::udp::endpoint& sender, const std::string& sender_pubkey,
+                   std::string_view what, std::string_view reason);
+
+    /// Why a DNS delta's author may not make this change (origin signature,
+    /// tier1 label, SEIP ownership), or nullopt when it may. Shared by
+    /// network ingress and restore from disk.
+    [[nodiscard]] std::optional<std::string> dns_delta_authorship_error(
+        const DnsRecordDelta& delta) const;
+
+    /// Apply an authorized delta to the zone and the replica. Returns true
+    /// when it changed the zone (not stale, not a duplicate).
+    bool apply_dns_delta(const DnsRecordDelta& delta);
+
+    /// Persist the replica (dns/replica.json) when it changed since the last
+    /// save. Restore it once both the identity and the peer table (on_start)
+    /// and the DNS service (set_dns) are present; entries are re-verified.
+    void save_dns_replica();
+    void load_dns_replica();
+
+    [[nodiscard]] bool self_is_tier1() const;
+    [[nodiscard]] bool is_tier1(const std::string& pubkey_b64) const;
+
+    // Backbone transport and claims
+    void start_backbone_transport();
+    [[nodiscard]] std::vector<uint8_t> build_signed_packet(GossipMsgType msg_type,
+                                                           const std::vector<uint8_t>& payload) const;
+    bool send_backbone_packet(const GossipPeer& peer, GossipMsgType msg_type,
+                              const std::vector<uint8_t>& payload);
+    /// Our backbone claim with our mesh key, sent directly to `target`, or to
+    /// every certified peer when `target` is empty.
+    void announce_backbone_claim(const std::optional<asio::ip::udp::endpoint>& target);
 
     // Backbone IPAM sync handler
     void handle_backbone_ipam_sync(const asio::ip::udp::endpoint& sender,
@@ -441,6 +525,12 @@ private:
     [[nodiscard]] bool delta_origin_verified(const std::string& canonical,
                                              const std::string& signer_pubkey_b64,
                                              const std::string& signature_b64) const;
+
+    /// The Ed25519 signature check of delta_origin_verified, without the
+    /// enrollment lookup.
+    [[nodiscard]] bool author_signature_valid(const std::string& canonical,
+                                              const std::string& signer_pubkey_b64,
+                                              const std::string& signature_b64) const;
 
     /// Stores a certificate relayed through peer exchange, but only after the
     /// same full verification a direct hello gets, and never over one already
@@ -564,9 +654,36 @@ private:
     ipam::IPAMService*               ipam_{nullptr};
     boringtun::BoringtunService*     boringtun_{nullptr};
     std::string                      our_tunnel_ip_;     // assigned by peer or self
+    // Backbone identity, under mesh_state_mutex_.
     std::string                      our_backbone_ip_;   // 172.16.0.X backbone
+    std::string                      our_backbone_node_id_;
+    uint64_t                         our_backbone_claim_ts_{0};
     std::string                      our_mesh_pubkey_;   // base64 X25519
     std::string                      our_advertised_endpoint_;  // "ip:port" we are reachable at
+
+    // Backbone transport. vnet_ is set once before the io loop runs; the
+    // rest is touched only on the io thread except where noted.
+    network::VirtualNetService*      vnet_{nullptr};
+    std::atomic<bool>                backbone_bound_{false};
+    // Cleared in on_stop so datagrams already posted from the netstack thread
+    // are dropped instead of reaching a stopped service.
+    std::shared_ptr<std::atomic<bool>> backbone_alive_ =
+        std::make_shared<std::atomic<bool>>(true);
+    // "<mesh_pubkey>|<backbone_ip>" pairs already handed to the dataplane
+    // (under peers_mutex_).
+    std::set<std::string>            backbone_peers_added_;
+    std::chrono::steady_clock::time_point last_backbone_announce_{};
+
+    // DNS catch-up replica (created in on_start, once the identity is known).
+    std::unique_ptr<sync::OriginReplica> dns_replica_;
+    uint64_t                              dns_digest_round_{0};
+    uint64_t                              dns_replica_saved_version_{0};
+    bool                                  dns_replica_loaded_{false};
+    std::chrono::steady_clock::time_point last_dns_sync_digest_{};
+    std::chrono::steady_clock::time_point last_dns_replica_save_{};
+    std::chrono::steady_clock::time_point last_tombstone_prune_{};
+    // Last SyncRequest served per peer, for rate limiting (io thread only).
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> sync_request_served_;
 
     // Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
     std::string                      our_region_;

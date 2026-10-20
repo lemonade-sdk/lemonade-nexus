@@ -7,14 +7,18 @@
 /// client plane, its backbone IP on the server plane) are handed here. This
 /// service owns the embedded smoltcp netstack (crates/virtual-netstack) and
 /// byte-pipes virtual TCP connections to the unchanged httplib private API
-/// server listening on a loopback or Unix-domain socket. No kernel network
-/// interface is involved, so host root cannot observe tunnel traffic and no
-/// CAP_NET_ADMIN is required.
+/// server listening on a loopback or Unix-domain socket. Virtual UDP ports
+/// deliver datagrams to an in-process callback (bind_udp / send_udp). No
+/// kernel network interface is involved, so host root cannot observe tunnel
+/// traffic and no CAP_NET_ADMIN is required.
 
 #include <LemonadeNexus/Core/IService.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <list>
+#include <memory>
 #include <span>
 #include <string>
 
@@ -66,6 +70,30 @@ public:
     uint16_t add_tcp_egress(const std::string& dst_ip, uint16_t dst_port,
                             const std::string& src_ip);
 
+    /// Receiver for datagrams on a bound virtual UDP port. `src_ip` is IPv4 in
+    /// host byte order. Runs on the netstack thread; `data` is valid only for
+    /// the call, so copy it and hand off to your own thread.
+    using UdpReceiver =
+        std::function<void(uint32_t src_ip, uint16_t src_port, std::span<const uint8_t> data)>;
+
+    /// Bind virtual UDP `vip:vport` (an address registered with add_local_ip)
+    /// and deliver every datagram addressed to it to `receiver`. The receiver
+    /// lives until on_stop. Returns false when the stack is down or the
+    /// arguments are invalid.
+    bool bind_udp(const std::string& vip, uint16_t vport, UdpReceiver receiver);
+
+    /// Send one datagram from bound virtual `src_ip:src_port`. Thread-safe;
+    /// never blocks. Like a kernel UDP socket, a datagram larger than the MTU
+    /// is sent as IPv4 fragments, and any number may be sent in series.
+    /// Returns false on a parameter error, including a payload larger than
+    /// max_udp_payload(). Delivery is not guaranteed, as with any UDP.
+    bool send_udp(const std::string& src_ip, uint16_t src_port,
+                  const std::string& dst_ip, uint16_t dst_port,
+                  std::span<const uint8_t> data);
+
+    /// Largest datagram send_udp accepts: the IPv4 UDP maximum (65507 bytes).
+    [[nodiscard]] static constexpr std::size_t max_udp_payload() { return 65507; }
+
     // ---- IService ----------------------------------------------------------
 
     void on_start();
@@ -80,6 +108,9 @@ private:
     VirtualNetConfig config_;
     NsHandle*        stack_{nullptr};
     OutboundSink     sink_;
+    // The C callback context points into these, so each receiver needs a
+    // stable address for the stack's lifetime.
+    std::list<std::unique_ptr<UdpReceiver>> udp_receivers_;
 };
 
 } // namespace nexus::network

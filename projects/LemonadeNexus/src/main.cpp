@@ -600,10 +600,11 @@ int main(int argc, char* argv[]) {
     }
 
     if (!server_node_id.empty() && !mesh_server_public_key_b64.empty()) {
-        auto ed25519_pubkey_b64 = nexus::crypto::to_base64(
-            std::span<const uint8_t>(root_pubkey->data(), root_pubkey->size()));
+        // Keyed on the gossip identity: it signs and is named in the backbone
+        // claim peers verify. An existing allocation is returned unchanged.
+        auto gossip_pubkey_b64 = nexus::crypto::to_base64(gossip.keypair().public_key);
 
-        auto bb_alloc = ipam.allocate_backbone_ip(server_node_id, ed25519_pubkey_b64);
+        auto bb_alloc = ipam.allocate_backbone_ip(server_node_id, gossip_pubkey_b64);
         backbone_ip = bb_alloc.base_network;
         // Strip CIDR for display
         auto slash = backbone_ip.find('/');
@@ -616,10 +617,13 @@ int main(int argc, char* argv[]) {
             spdlog::info("Backbone: registered virtual {}/22", backbone_ip_bare);
         }
 
-        // Give gossip the mesh dataplane and backbone identity.
+        // Give gossip the mesh dataplane, the backbone identity it announces
+        // to peers, and the virtual netstack that carries catch-up sync over
+        // the backbone.
         gossip.set_boringtun(&boringtun_service);
-        gossip.set_our_backbone_ip(backbone_ip_bare);
         gossip.set_our_mesh_pubkey(mesh_server_public_key_b64);
+        gossip.set_our_backbone_claim(server_node_id, backbone_ip_bare);
+        gossip.set_virtual_net(&vnet);
 
         // Set up IPAM callback to broadcast backbone allocations via gossip
         ipam.set_backbone_callback(

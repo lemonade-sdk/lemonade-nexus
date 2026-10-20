@@ -119,10 +119,17 @@ public:
     bool remove_record(const std::string& fqdn, const std::string& record_type);
 
     /// Apply a remote DNS record delta received via gossip. Returns true if
-    /// applied (new), false if already seen (duplicate).
+    /// applied (new), false if already seen (duplicate) or, for a "set", older
+    /// than the held record.
+    /// @param caller_ordered  true when the caller already established that
+    ///        this delta is the newest for its record (the gossip replica
+    ///        orders sequenced deltas by timestamp and origin sequence). The
+    ///        seconds-resolution timestamp check is then skipped, so two
+    ///        changes from one origin within the same second both apply.
     bool apply_remote_delta(const std::string& delta_id,
                             const std::string& operation,
-                            const DnsZoneRecord& record);
+                            const DnsZoneRecord& record,
+                            bool caller_ordered = false);
 
     /// Register a callback invoked when local DNS mutations need gossip broadcast.
     void set_record_callback(DnsRecordCallback cb);
