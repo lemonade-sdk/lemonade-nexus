@@ -50,6 +50,15 @@ struct AttestdConfig {
         "/sys/kernel/config/tsm/report/nexus-attestd-guest"};
 };
 
+/// #49: heal hint appended to the refusal log line when the prover's detail
+/// names the dedicated TSM report objects — the setup unit was skipped or
+/// failed. Empty for every other detail.
+[[nodiscard]] std::string_view tsm_heal_hint(std::string_view detail);
+
+/// #12/#48e: true when the prover's failure is AMD endorsement discovery — the
+/// one failure that clearing the in-memory resolve and re-probing KDS can heal.
+[[nodiscard]] bool endorsement_discovery_failed(std::string_view detail);
+
 class AttestdService {
 public:
     explicit AttestdService(AttestdConfig config);
@@ -85,6 +94,13 @@ private:
                                             std::string* detail);
 
     AttestdConfig config_;
+
+    /// #12/#48e: chip/TCB the last verified AMD endorsement covered. While it
+    /// stands, evidence is produced with networking off — the disk cache already
+    /// holds that VCEK — so KDS is not probed per request. Cleared, and the
+    /// produce retried online once, when the offline resolve fails. Set only
+    /// after a fully verified produce, so nothing unverified is ever cached.
+    std::string endorsed_chip_tcb_;
 };
 
 }  // namespace nexus::attestd

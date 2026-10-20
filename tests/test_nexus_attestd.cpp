@@ -436,6 +436,30 @@ TEST_F(AttestdServiceTest, RefusesBeforeConsultingThePlatform) {
 
 
 
+TEST(AttestdHealHints, TheTsmRefusalNamesTheSetupUnit) {
+    // #49: the hint appended to the refusal log line must name the unit an
+    // operator restarts, and must stay out of every other refusal.
+    const auto hint = nexus::attestd::tsm_heal_hint(
+        "dedicated TSM report objects are absent or not writable");
+    EXPECT_NE(hint.find("nexus-attestd-tsm-setup.service"), std::string_view::npos);
+    EXPECT_TRUE(nexus::attestd::tsm_heal_hint("the TPM path refused the activation").empty());
+    EXPECT_TRUE(nexus::attestd::tsm_heal_hint("").empty());
+}
+
+TEST(AttestdEndorsementCache, OnlyDiscoveryFailuresInvalidateTheCachedResolve) {
+    // #12/#48e: the in-memory resolve is dropped (and KDS re-probed) only on the
+    // producers' endorsement-discovery failures — both start "no AMD endorsement".
+    EXPECT_TRUE(nexus::attestd::endorsement_discovery_failed(
+        "no AMD endorsement verifies the SVSM report"));
+    EXPECT_TRUE(nexus::attestd::endorsement_discovery_failed(
+        "no AMD endorsement for this chip and TCB: nothing cached"));
+    EXPECT_FALSE(nexus::attestd::endorsement_discovery_failed(
+        "dedicated TSM report objects are absent or not writable"));
+    EXPECT_FALSE(nexus::attestd::endorsement_discovery_failed(
+        "PCRs moved during all three quote/read attempts"));
+    EXPECT_FALSE(nexus::attestd::endorsement_discovery_failed(""));
+}
+
 TEST_F(AttestdServiceTest, TheWirePathAlwaysAnswersTyped) {
     AttestdService service{config()};
 
@@ -454,6 +478,22 @@ TEST_F(AttestdServiceTest, TheWirePathAlwaysAnswersTyped) {
     const std::string refusal = document["refusal"];
     EXPECT_TRUE(refusal == "platform_unavailable" || refusal == "evidence_unavailable")
         << "unexpected refusal: " << refusal;
+}
+
+TEST_F(AttestdServiceTest, RepeatedAnswersStayTypedAndStable) {
+    // #12/#48e: the produce path now runs through a retry wrapper. With no
+    // platform (or no TSM) every pass must keep answering the same typed
+    // refusal — never crash, never a second behavior on the second request.
+    AttestdService service{config()};
+    PlatformEvidenceBundle bundle;
+    std::string first_detail;
+    std::string second_detail;
+    const auto first = service.answer(mine(), bundle, &first_detail);
+    const auto second = service.answer(mine(), bundle, &second_detail);
+    EXPECT_EQ(first, second);
+    EXPECT_EQ(first_detail, second_detail);
+    EXPECT_TRUE(first == Refusal::PlatformUnavailable || first == Refusal::EvidenceUnavailable)
+        << static_cast<int>(first);
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,9 @@ Documentation=https://github.com/lemonade-sdk/lemonade-nexus
 # for a VCEK it has not cached, which is a best-effort fetch, not a start
 # condition.
 After=local-fs.target
+# Requires= (not Wants=), paired with the setup unit's bounded wait (#49): a
+# failed setup keeps this daemon down visibly instead of up and refusing every
+# evidence request.
 Requires=nexus-attestd-tsm-setup.service
 After=nexus-attestd-tsm-setup.service
 
