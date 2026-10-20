@@ -43,6 +43,12 @@ struct BootstrapCertificate {
     /// tier1_set_digest, keys by this, both under the pinned genesis signature.
     Digest vote_key_set_digest{};
 
+    /// The accepted release approval, as the digest of its canonical form.
+    /// Committed here so the selection survives Genesis: after Epoch 1 a
+    /// different Genesis-signed approval cannot replace it. All-zero means the
+    /// network bootstrapped without a release binding (test meshes only).
+    Digest release_approval_digest{};
+
     SecurityRulesetVersion security_ruleset = 0;
     ConsensusRulesetVersion consensus_ruleset = 0;
 

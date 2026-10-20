@@ -209,7 +209,15 @@ std::vector<DkgMessage> DkgSession::round2_messages() {
         messages.push_back(
             make_message(DkgRound::Round2Pairwise, node_of_.at(recipient_index), payload));
     }
+    round2_cache_ = messages;
     return messages;
+}
+
+std::optional<DkgMessage> DkgSession::own_round1() const {
+    if (own_round1_payload_.empty() || phase_ == DkgPhase::Failed) {
+        return std::nullopt;
+    }
+    return make_message(DkgRound::Round1Broadcast, NodeId{}, own_round1_payload_);
 }
 
 DkgFailure DkgSession::receive_pairwise(const DkgMessage& message) {

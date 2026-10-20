@@ -47,6 +47,17 @@ bool GenesisService::quorum_ready() const {
     return qualifying >= constants::kBootstrapThreshold;
 }
 
+std::set<NodeId> GenesisService::unverdicted_candidates() const {
+    std::set<NodeId> out;
+    for (const auto& node : candidates_) {
+        const auto held = verdicts_.find(node);
+        if (held == verdicts_.end() || !held->second.passed) {
+            out.insert(node);
+        }
+    }
+    return out;
+}
+
 std::optional<Tier1Set> GenesisService::founding_set() const {
     std::vector<NodeId> qualifying;
     for (const auto& [node, verdict] : verdicts_) {
@@ -159,6 +170,7 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     const Digest& dkg_transcript_digest,
     const Digest& attestation_root,
     const Digest& vote_key_set_digest,
+    const Digest& release_approval_digest,
     const crypto::Ed25519PrivateKey& genesis_private_key) {
     if (finalized_) {
         return std::nullopt;
@@ -196,6 +208,7 @@ std::optional<BootstrapCertificate> GenesisService::finalize_epoch_one(
     certificate.attestation_root = attestation_root;
     certificate.founding_eligibility_digest = *eligibility;
     certificate.vote_key_set_digest = vote_key_set_digest;
+    certificate.release_approval_digest = release_approval_digest;
     certificate.security_ruleset = constants::kSecurityRulesetVersion;
     certificate.consensus_ruleset = constants::kConsensusRulesetVersion;
 

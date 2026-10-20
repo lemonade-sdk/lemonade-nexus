@@ -49,6 +49,10 @@ struct SecurityDriverConfig {
     NodeId self;
     crypto::Ed25519Keypair identity;
     crypto::Ed25519PublicKey genesis_public_key{};
+    /// Digest of the verified release approval this process loaded; all-zero
+    /// when none is packaged. The founding and the bootstrap certificate must
+    /// name this exact value or they are refused.
+    Digest release_approval_digest{};
     uint64_t sync_window_ms = 2000;
 
     /// Answers whether a candidate holds a root-signed transport certificate.
@@ -151,6 +155,11 @@ public:
     /// commitment and nothing else.
     [[nodiscard]] bool accepts_transition(const Digest& transitions_digest) const;
 
+    /// True when `node` is in the anchor-authenticated founding this driver
+    /// accepted. Feeds the router's pre-epoch challenger gate so founders can
+    /// run the mutual eligibility round.
+    [[nodiscard]] bool is_founding_member(const NodeId& node) const;
+
     /// The canonical final-attestation context for one selected node under
     /// one plan, or an empty digest when the plan does not name the node.
     /// Pure derivation; public so a verifier of captured traffic can rebuild
@@ -216,6 +225,10 @@ private:
     [[nodiscard]] bool epoch_aged(uint64_t now_ms) const;
     void publish(const EligibilityObservation& observation, EpochId epoch);
     void begin_founding_observations();
+    /// Paced retries (re-challenge, re-broadcast) that keep the bootstrap live.
+    void run_bootstrap_liveness(uint64_t now_ms);
+    void challenge_founding_edge(const NodeId& peer);
+    void broadcast_eligibility_attest();
     void challenge_participation(const NodeId& candidate);
     void record_founding_observation(const AttestationVerdict& verdict);
     void maybe_attest_founding_eligibility();
@@ -250,6 +263,16 @@ private:
     /// Before Epoch 1 there is no certified height, so the founding round
     /// counts its own rounds to keep observation heights monotonic.
     Height founding_round_ = 0;
+    uint64_t last_bootstrap_retry_ms_ = 0;
+    uint64_t founding_dkg_started_ms_ = 0;
+    /// When each founding edge was last challenged; answers can outlive the
+    /// cadence, so an edge is re-asked only after a grace period.
+    std::map<NodeId, uint64_t> founding_challenge_ms_;
+    /// Re-sent on the cadence while awaiting the certificate / for a bounded
+    /// tail after issuing it: both are otherwise single datagrams.
+    std::optional<DkgTranscriptAttest> pending_transcript_attest_;
+    std::optional<BootstrapCertificate> issued_certificate_;
+    uint64_t certificate_issued_ms_ = 0;
 
     // Consensus driving.
     Pacemaker pacemaker_;

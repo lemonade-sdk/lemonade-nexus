@@ -43,6 +43,7 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           .self = self_id(config),
           .network_id = mesh_network_id(config),
           .consensus_directory = config.data_root / "security" / "consensus",
+          .attestation_state_directory = config.data_root / "security" / "attestation-state",
           .profile = config.profile,
           // The cache hands over whatever is on disk; verify_snp_revocation
           // decides whether it is any good. With nothing cached the state is
@@ -70,18 +71,26 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
       // taken here, never its state.
       router_(SecurityRouterConfig{
                   .network_id = mesh_network_id(config),
-                  .genesis_anchor_id = genesis_anchor_id(config)},
+                  .genesis_anchor_id = genesis_anchor_id(config),
+                  // Address-only capture: the driver is constructed after the
+                  // router and the callback runs only once messages flow.
+                  .founding_member =
+                      [this](const NodeId& node) {
+                          return driver_.is_founding_member(node);
+                      }},
               runtime_, transport_, events_, sealer_, &producer_),
       producer_(EvidenceProducerSources{
           config.identity,
           [this](EpochId epoch) { return driver_.vote_key_for_epoch(epoch); },
           config.data_root / "security" / "attestation-cache",
           {},
-          config.platform_source}),
+          config.platform_source,
+          config.activation_source}),
       driver_(SecurityDriverConfig{
                   .self = self_id(config),
                   .identity = config.identity,
                   .genesis_public_key = config.genesis_public_key,
+                  .release_approval_digest = config.release_approval_digest,
                   // The transport certificate is a mesh fact, and the gossip
                   // layer is where the root signature was already checked. The
                   // security layer reads that answer; it does not re-derive it

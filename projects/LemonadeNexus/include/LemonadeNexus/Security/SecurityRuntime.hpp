@@ -30,6 +30,7 @@ struct SecurityRuntimeConfig {
     /// so evidence cannot cross networks.
     NetworkId network_id{};
     std::filesystem::path consensus_directory;
+    std::filesystem::path attestation_state_directory;
     LinuxAttestationProfile profile;
 
     /// Supplies the cached AMD CRL and the current time to the attestation
