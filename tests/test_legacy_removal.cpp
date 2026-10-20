@@ -13,12 +13,15 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+
+#include "support/attestation_fixtures.hpp"
 
 #include <asio.hpp>
 #include <gtest/gtest.h>
@@ -177,6 +180,19 @@ protected:
         node.mesh = std::make_unique<security::SecurityMeshService>(io, config, *node.gossip,
                                                                     node.wrapping.get());
         node.mesh->start();
+    }
+
+    // Seeds EK -> AK enrollment (covered by its own suites) so a live
+    // ServerHello drives a normal, fail-closed attestation.
+    void preactivate(Node& observer, const Node& subject,
+                     const crypto::Ed25519PublicKey& genesis_pub) {
+        nexus_test::seed_svsm_activation(
+            security::derive_network_id(genesis_pub,
+                                        security::constants::kSecurityRulesetVersion,
+                                        security::constants::kConsensusRulesetVersion),
+            subject.id(), subject.gossip->keypair().public_key,
+            observer.dir / "mesh" / "security" / "attestation-state" /
+                "svsm-activations");
     }
 
     void peer_all() {
@@ -479,6 +495,7 @@ TEST_F(LegacyRemovalTest, RetiredTypesDoNotTouchSecurityState) {
     peer_all();
     make_mesh(a, a.pubkey());  // A's own identity is the pinned anchor
     make_mesh(b, a.pubkey());
+    preactivate(a, b, a.pubkey());
 
     ASSERT_EQ(a.mesh->driver().phase(), security::DriverPhase::GenesisCollecting);
     ASSERT_EQ(b.mesh->driver().phase(), security::DriverPhase::Idle);

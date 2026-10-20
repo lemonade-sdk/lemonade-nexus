@@ -120,8 +120,8 @@ std::vector<SecurityMessage> all_kinds() {
     e.security_ruleset = constants::kSecurityRulesetVersion;
     e.consensus_ruleset = constants::kConsensusRulesetVersion;
     e.epoch_vote_key.fill(0x22);
-    e.platform.binary_sha256 = "abcd";
-    e.platform.ima_log = "10 aaaa ima-ng sha256:bbbb /usr/local/bin/nexus\n";
+    azure_evidence(e.platform).binary_sha256 = "abcd";
+    azure_evidence(e.platform).ima_log = "10 aaaa ima-ng sha256:bbbb /usr/local/bin/nexus\n";
     e.identity_signature = signature(0x23);
     messages.push_back(envelope(SecurityMessageKind::AttestationEvidence, e));
 
@@ -188,6 +188,7 @@ std::vector<SecurityMessage> all_kinds() {
         founding.members.emplace_back(node(i), vote_key);
     }
     founding.attestation_root = digest(0x91);
+    founding.release_approval_digest = digest(0x97);
     messages.push_back(envelope(SecurityMessageKind::GenesisFounding, founding));
 
     DkgTranscriptAttest attest;
@@ -207,6 +208,7 @@ std::vector<SecurityMessage> all_kinds() {
     bootstrap.authority_public_key.fill(0x94);
     bootstrap.dkg_transcript_digest = digest(0x93);
     bootstrap.attestation_root = digest(0x91);
+    bootstrap.release_approval_digest = digest(0x98);
     bootstrap.security_ruleset = constants::kSecurityRulesetVersion;
     bootstrap.consensus_ruleset = constants::kConsensusRulesetVersion;
     bootstrap.genesis_signature = signature(0x96);
@@ -272,7 +274,7 @@ TEST(SecurityCodec, OversizedBufferRejectedBeforeParsing) {
 TEST(SecurityCodec, VersionAndKindAreChecked) {
     auto bytes = encode_security_message(all_kinds()[3]);
     auto bad_version = bytes;
-    bad_version[0] = 2;
+    bad_version[0] = static_cast<uint8_t>(constants::kSecurityWireVersion + 1);
     EXPECT_EQ(std::get<CodecError>(decode_security_message(bad_version)), CodecError::BadVersion);
 
     auto bad_kind = bytes;
@@ -317,14 +319,15 @@ TEST(SecurityCodec, LengthFieldsAreBoundedBeforeAllocation) {
     ASSERT_FALSE(bytes.empty());
     constexpr std::size_t kEnvelopeHeader = 1 + 2 + 2 + 2 + 32 + 8 + 32 + 4;
     // network_id, challenge_digest, node_id, incarnation, epoch, both rulesets,
-    // the profile id and its ruleset, purpose and context, vote key.
-    constexpr std::size_t kEvidenceFixed = 32 + 32 + 32 + 8 + 8 + 2 + 2 + 2 + 2 + 2 + 32 + 32;
+    // profile id/ruleset, purpose/context, IMA mode/length/digest, vote key.
+    constexpr std::size_t kEvidenceFixed =
+        32 + 32 + 32 + 8 + 8 + 2 + 2 + 2 + 2 + 2 + 32 + 2 + 8 + 32 + 32;
     const std::size_t length_offset = kEnvelopeHeader + kEvidenceFixed;
     for (int i = 0; i < 4; ++i) bytes[length_offset + static_cast<std::size_t>(i)] = 0xFF;
     EXPECT_EQ(std::get<CodecError>(decode_security_message(bytes)), CodecError::LengthTooLarge);
 
     // Encoding refuses a platform bundle above the wire bound.
-    std::get<AttestationEvidence>(message.body).platform.ima_log =
+    azure_evidence(std::get<AttestationEvidence>(message.body).platform).ima_log =
         std::string(constants::kMaxPlatformEvidenceWireBytes + 1, 'x');
     EXPECT_TRUE(encode_security_message(message).empty());
 
@@ -381,8 +384,42 @@ TEST(SecurityCodec, EmptyPlatformBundleDecodesToEmptyEvidence) {
     ASSERT_FALSE(bytes.empty());
     const auto decoded = decode_security_message(bytes);
     ASSERT_TRUE(std::holds_alternative<SecurityMessage>(decoded));
-    EXPECT_TRUE(std::get<AttestationEvidence>(std::get<SecurityMessage>(decoded).body)
-                    .platform.hcl_blob.empty());
+    EXPECT_TRUE(azure_evidence(
+        std::get<AttestationEvidence>(std::get<SecurityMessage>(decoded).body).platform)
+                    .hcl_blob.empty());
+}
+
+TEST(SecurityCodec, ChallengeCheckpointHashMustBe64Chars) {
+    AttestationChallenge c;
+    c.network_id = digest(0xAA);
+    c.nonce.fill(0x11);
+    c.node_id = node(0x03);
+    c.node_key.fill(0x12);
+    c.security_ruleset = constants::kSecurityRulesetVersion;
+    c.consensus_ruleset = constants::kConsensusRulesetVersion;
+    c.ima_mode = ImaEvidenceMode::Resume;
+    c.ima_checkpoint_digest = digest(0x44);
+    c.ima_prior_event_count = 3;
+    c.ima_prior_pcr10 = digest(0x45);
+    c.ima_checkpoint_paths.push_back({"/usr/local/bin/nexus", std::string(64, 'a')});
+    const auto good = envelope(SecurityMessageKind::AttestationChallenge, c);
+    auto bytes = encode_security_message(good);
+    ASSERT_FALSE(bytes.empty());
+    ASSERT_TRUE(std::holds_alternative<SecurityMessage>(decode_security_message(bytes)));
+
+    // Encoding refuses a wrong-size hash instead of deferring to the peer.
+    auto bad = good;
+    std::get<AttestationChallenge>(bad.body).ima_checkpoint_paths[0].sha256.pop_back();
+    EXPECT_TRUE(encode_security_message(bad).empty());
+
+    // A hash the reader accepts but with the wrong size is BadValue, not a
+    // reader error. The hash is the trailing field: shorten it in place.
+    constexpr std::size_t kEnvelopeHeader = 1 + 2 + 2 + 2 + 32 + 8 + 32 + 4;
+    // 4-byte LE body length: decrement by one.
+    for (std::size_t i = kEnvelopeHeader - 4; bytes[i]-- == 0; ++i) {}
+    bytes[bytes.size() - 64 - 4] = 63;  // the hash's own length prefix
+    bytes.pop_back();
+    EXPECT_EQ(std::get<CodecError>(decode_security_message(bytes)), CodecError::BadValue);
 }
 
 TEST(SecurityCodec, SingleByteCorruptionNeverCrashesAndNeverSilentlyReinterprets) {

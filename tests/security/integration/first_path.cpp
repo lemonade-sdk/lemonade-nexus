@@ -330,7 +330,7 @@ TEST_F(FirstPath, GenesisToEpochTwo) {
     ASSERT_TRUE(genesis.eligibility_agreed());
     const auto certificate = genesis.finalize_epoch_one(
         dkg_1.results[0].group_public_key, dkg_1.transcript, attestation_root(verdicts),
-        vote_key_set_digest(vote_keys_1), genesis_priv);
+        vote_key_set_digest(vote_keys_1), Digest{}, genesis_priv);
     ASSERT_TRUE(certificate.has_value());
     ASSERT_TRUE(verify_bootstrap_certificate(*certificate, genesis_pub));
     EXPECT_TRUE(genesis.finalized());

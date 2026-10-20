@@ -21,6 +21,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Policy/Tier1Evidence.hpp>
 
+#include "support/attestation_fixtures.hpp"
 #include "support/provider_conformance.hpp"
 #include "support/tpm_quote_fixtures.hpp"
 
@@ -61,7 +62,6 @@ using nexus::security::VerifiedPlatformClaims;
 using nexus::security::challenge_digest;
 using nexus::security::evidence_signing_digest;
 using nexus::security::kAttestationProfileRulesetVersion;
-using nexus::security::kTier1AttestationProfileId;
 using nexus::security::profile_digest;
 using nexus::security::profile_is_complete;
 using nexus::security::tier1_eligibility;
@@ -112,7 +112,8 @@ public:
         return refusal_;
     }
     [[nodiscard]] PlatformVerification examine(const AttestationChallenge&,
-                                                const AttestationEvidence&) const override {
+                                                const AttestationEvidence&,
+                                                const nexus::security::PlatformVerificationState&) const override {
         PlatformVerification result;
         result.claims = claims_;
         result.claims.profile_id = id_;
@@ -169,9 +170,12 @@ protected:
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
+        profile_.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
         ASSERT_TRUE(profile_is_complete(profile_));
 
-        challenge_ = issue(kTier1AttestationProfileId);
+        // This matrix's baseline bundle is Azure-shaped. Keep that legacy
+        // provider coverage independent of the compiled production selector.
+        challenge_ = issue(AttestationProfileId::AzureSnpVtpm);
         evidence_ = answer(challenge_);
         sign_evidence();
     }
@@ -264,16 +268,16 @@ TEST_F(ProviderBoundaryTest, ANamedProfileWithNoCompiledProviderIsRefused) {
               Tier1Eligibility::Ineligible);
 }
 
-TEST_F(ProviderBoundaryTest, AnUnsupportedProviderRefusesBeforeItExaminesAnything) {
-    // The SVSM provider is declared but its evidence format is not invented.
-    // It must refuse rather than accept under a guessed binding.
+TEST_F(ProviderBoundaryTest, AnUnpinnedSvsmProviderRefusesBeforeItExaminesAnything) {
+    // The Azure release profile pins no EK/AK receipt or SVSM PCRs, so the
+    // SVSM provider must refuse before reading the Azure-shaped bundle.
     challenge_.profile_id = AttestationProfileId::SnpSvsmVtpm;
     evidence_.profile_id = AttestationProfileId::SnpSvsmVtpm;
     sign_evidence();
 
     const auto verdict = examine();
     EXPECT_FALSE(verdict.passed);
-    EXPECT_EQ(verdict.failure, AttestationFailure::ProviderUnsupported);
+    EXPECT_EQ(verdict.failure, AttestationFailure::ProfileIncomplete);
     EXPECT_EQ(nexus::security::missing_platform_claims(verdict.claims).size(), 11u);
 }
 
@@ -289,11 +293,11 @@ TEST_F(ProviderBoundaryTest, TheDirectBootProviderIsNotTier1Capable) {
     sign_evidence();
     EXPECT_EQ(examine().failure, AttestationFailure::ProviderUnsupported);
 
-    // The SVSM provider IS capable once implemented. Capability and permission
-    // are separate: readiness still refuses it today.
+    // The SVSM provider is implemented and capable. Capability and release
+    // selection are separate: the unpinned template remains incomplete.
     SnpSvsmVtpmProvider svsm;
     EXPECT_TRUE(svsm.tier1_capable());
-    EXPECT_EQ(svsm.readiness(), AttestationFailure::ProviderUnsupported);
+    EXPECT_EQ(svsm.readiness(), AttestationFailure::ProfileIncomplete);
 }
 
 TEST_F(ProviderBoundaryTest, AnIncompleteProfileRefusesBeforeAnyEvidenceIsRead) {
@@ -391,7 +395,7 @@ TEST_F(ProviderBoundaryTest, CrossProviderReplayFailsEvenWhenResigned) {
     sign(for_svsm);
 
     // Relabelled to the profile this verifier challenged under, and re-signed.
-    for_svsm.profile_id = kTier1AttestationProfileId;
+    for_svsm.profile_id = AttestationProfileId::AzureSnpVtpm;
     sign(for_svsm);
 
     const auto verdict = AttestationVerifier(profile_).examine(challenge_, for_svsm);
@@ -414,7 +418,7 @@ TEST_F(ProviderBoundaryTest, OneMissingRequiredClaimGivesNoTier1) {
         VerifiedPlatformClaims claims = every_platform_claim();
         claims.*field = false;
         const auto verdict = examine_with(std::make_shared<ScriptedProvider>(
-            kTier1AttestationProfileId, claims, profile_digest(profile_)));
+            AttestationProfileId::AzureSnpVtpm, claims, profile_digest(profile_)));
 
         // The provider reported no failure, so the verdict passed. The claim it
         // did not prove is still missing, and Tier 1 turns on the claims.
@@ -428,7 +432,8 @@ TEST_F(ProviderBoundaryTest, OneMissingRequiredClaimGivesNoTier1) {
 // The headline rule of Revision 1.1: `passed` is not the Tier 1 decision.
 TEST_F(ProviderBoundaryTest, APassingVerdictThatProvedNothingConfersNothing) {
     const auto verdict = examine_with(std::make_shared<ScriptedProvider>(
-        kTier1AttestationProfileId, VerifiedPlatformClaims{}, profile_digest(profile_)));
+        AttestationProfileId::AzureSnpVtpm, VerifiedPlatformClaims{},
+        profile_digest(profile_)));
 
     EXPECT_TRUE(verdict.passed);
     EXPECT_FALSE(nexus::security::all_platform_claims_proved(verdict.claims));
@@ -447,7 +452,7 @@ TEST_F(ProviderBoundaryTest, ProvenBootIntegrityWithoutRuntimeIntegrityIsNotTier
     claims.runtime_integrity_valid = false;
 
     const auto verdict = examine_with(std::make_shared<ScriptedProvider>(
-        kTier1AttestationProfileId, claims, profile_digest(profile_)));
+        AttestationProfileId::AzureSnpVtpm, claims, profile_digest(profile_)));
 
     EXPECT_TRUE(verdict.claims.boot_integrity_valid);
     EXPECT_TRUE(verdict.claims.hardware_confidentiality_valid);
@@ -467,7 +472,7 @@ TEST_F(ProviderBoundaryTest, AProviderCannotAssertRuntimeIntegrityWithoutItsStep
     claims.ima_anchored = false;  // runtime_integrity_valid left true
 
     const auto verdict = examine_with(std::make_shared<ScriptedProvider>(
-        kTier1AttestationProfileId, claims, profile_digest(profile_)));
+        AttestationProfileId::AzureSnpVtpm, claims, profile_digest(profile_)));
 
     EXPECT_FALSE(verdict.passed);
     EXPECT_EQ(verdict.failure, AttestationFailure::ProviderUnsupported);
@@ -521,6 +526,9 @@ LinuxAttestationProfile profile_for_the_captured_host() {
     profile.ima_policy_digest.fill(0x60);
     profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
     profile.evidence_collector_path = "/usr/bin/nexus";
+    // Completeness only: pins are compared after quote verification, which no
+    // test under this profile clears.
+    profile.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
     // The captured fixture predates any cached CRL, and revocation is checked
     // right after the AMD signature. Leaving it on here would stop every test
     // below at the same step; the revocation rule has its own tests instead.
@@ -543,16 +551,16 @@ TEST_F(ProviderBoundaryTest, AQuoteFromAnUnvouchedTpmIsRejected) {
     challenge_.policy_digest = profile_digest(profile);
     evidence_ = answer(challenge_);
     evidence_.platform = real_platform_bundle();
-    evidence_.platform.binary_sha256.clear();
+    azure_evidence(evidence_.platform).binary_sha256.clear();
 
     auto impostor = nexus_test::gen_rsa_key();
     const auto binding = nexus::security::evidence_binding(
         evidence_.challenge_digest, node_pk_, {});
-    evidence_.platform.tpms_attest = nexus_test::build_quote(
+    azure_evidence(evidence_.platform).tpms_attest = nexus_test::build_quote(
         std::vector<uint8_t>(binding.begin(), binding.end()),
         nexus_test::sha256_of({}), {0x00, 0x04, 0x00});
-    evidence_.platform.tpm_signature =
-        nexus_test::sign_tpmt_rsa(impostor->pkey, evidence_.platform.tpms_attest);
+    azure_evidence(evidence_.platform).tpm_signature =
+        nexus_test::sign_tpmt_rsa(impostor->pkey, azure_evidence(evidence_.platform).tpms_attest);
     sign_evidence();
 
     const auto verdict = AttestationVerifier(profile).examine(challenge_, evidence_);
@@ -582,11 +590,11 @@ TEST_F(ProviderBoundaryTest, AQuoteWithNoConfidentialBindingIsRejected) {
     auto key = nexus_test::gen_rsa_key();
     const auto binding = nexus::security::evidence_binding(
         evidence_.challenge_digest, node_pk_, {});
-    evidence_.platform.tpms_attest = nexus_test::build_quote(
+    azure_evidence(evidence_.platform).tpms_attest = nexus_test::build_quote(
         std::vector<uint8_t>(binding.begin(), binding.end()),
         nexus_test::sha256_of({}), {0x00, 0x04, 0x00});
-    evidence_.platform.tpm_signature =
-        nexus_test::sign_tpmt_rsa(key->pkey, evidence_.platform.tpms_attest);
+    azure_evidence(evidence_.platform).tpm_signature =
+        nexus_test::sign_tpmt_rsa(key->pkey, azure_evidence(evidence_.platform).tpms_attest);
     sign_evidence();
 
     const auto verdict = AttestationVerifier(profile).examine(challenge_, evidence_);
@@ -902,7 +910,8 @@ TEST_F(ProviderBoundaryTest, ACapableProviderThatIsNotReadyConfersNothing) {
     for (const auto refusal : {AttestationFailure::ProviderUnsupported,
                                AttestationFailure::ProfileIncomplete}) {
         auto provider = std::make_shared<ScriptedProvider>(
-            kTier1AttestationProfileId, every_platform_claim(), profile_digest(profile_));
+            AttestationProfileId::AzureSnpVtpm, every_platform_claim(),
+            profile_digest(profile_));
         provider->tier1_capable_ = true;
         provider->refusal_ = refusal;
 
@@ -922,7 +931,7 @@ TEST_F(ProviderBoundaryTest, ACapableReadyProviderStillNeedsEveryClaim) {
     claims.boot_integrity_valid = false;
 
     auto provider = std::make_shared<ScriptedProvider>(
-        kTier1AttestationProfileId, claims, profile_digest(profile_));
+        AttestationProfileId::AzureSnpVtpm, claims, profile_digest(profile_));
     provider->tier1_capable_ = true;
     provider->refusal_.reset();  // ready
 
@@ -941,7 +950,8 @@ TEST_F(ProviderBoundaryTest, ACapableReadyProviderStillNeedsEveryClaim) {
 // prove runtime integrity, not because of this flag.
 TEST_F(ProviderBoundaryTest, EligibilityDoesNotConsultTierOneCapable) {
     auto incapable = std::make_shared<ScriptedProvider>(
-        kTier1AttestationProfileId, every_platform_claim(), profile_digest(profile_));
+        AttestationProfileId::AzureSnpVtpm, every_platform_claim(),
+        profile_digest(profile_));
     incapable->tier1_capable_ = false;
 
     const auto verdict = examine_with(incapable);
@@ -1018,7 +1028,9 @@ TEST_F(ProviderBoundaryTest, AzureSnpVtpmSatisfiesTheProviderContract) {
     subject.name = "AzureSnpVtpmProvider";
     subject.profile_id = AttestationProfileId::AzureSnpVtpm;
     subject.verifier = [this] { return AttestationVerifier(profile_); };
-    subject.challenge = [this] { return issue(kTier1AttestationProfileId); };
+    subject.challenge = [this] {
+        return issue(AttestationProfileId::AzureSnpVtpm);
+    };
     subject.answer = [this](const AttestationChallenge& challenge) {
         AttestationEvidence evidence = answer(challenge);
         evidence.platform = real_platform_bundle();
@@ -1030,23 +1042,21 @@ TEST_F(ProviderBoundaryTest, AzureSnpVtpmSatisfiesTheProviderContract) {
     nexus_test::run_provider_conformance(subject);
 }
 
-// The unimplemented providers are not Tier 1-capable in practice yet, but the
-// contract still holds for them: not ready means no claim and no pass.
-TEST_F(ProviderBoundaryTest, UnimplementedProvidersSatisfyTheContractByRefusing) {
-    for (const auto id : {AttestationProfileId::SnpSvsmVtpm,
-                          AttestationProfileId::SnpDirectBoot}) {
-        nexus_test::ConformanceSubject subject;
-        subject.name = std::string(nexus::security::attestation_profile_id_name(id));
-        subject.profile_id = id;
-        subject.verifier = [this] { return AttestationVerifier(profile_); };
-        subject.challenge = [this, id] { return issue(id); };
-        subject.answer = [this](const AttestationChallenge& challenge) {
-            AttestationEvidence evidence = answer(challenge);
-            sign(evidence);
-            return evidence;
-        };
-        subject.resign = [this](AttestationEvidence& evidence) { sign(evidence); };
+// The direct-boot provider remains unsupported. SVSM is implemented and has
+// its own conformance and signed-mutation suites.
+TEST_F(ProviderBoundaryTest, UnsupportedDirectBootProviderRefusesByContract) {
+    constexpr auto id = AttestationProfileId::SnpDirectBoot;
+    nexus_test::ConformanceSubject subject;
+    subject.name = std::string(nexus::security::attestation_profile_id_name(id));
+    subject.profile_id = id;
+    subject.verifier = [this] { return AttestationVerifier(profile_); };
+    subject.challenge = [this] { return issue(AttestationProfileId::SnpDirectBoot); };
+    subject.answer = [this](const AttestationChallenge& challenge) {
+        AttestationEvidence evidence = answer(challenge);
+        sign(evidence);
+        return evidence;
+    };
+    subject.resign = [this](AttestationEvidence& evidence) { sign(evidence); };
 
-        nexus_test::run_provider_conformance(subject);
-    }
+    nexus_test::run_provider_conformance(subject);
 }

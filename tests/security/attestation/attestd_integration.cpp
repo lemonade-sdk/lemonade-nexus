@@ -123,12 +123,15 @@ TEST_F(AttestdIntegration, TheDaemonReturnsNoSignatureAndNoVoteKey) {
 
 // --- Eligibility -----------------------------------------------------------
 
-TEST_F(AttestdIntegration, EligibilityEvidenceIsAssembledAndSignedByNexus) {
+TEST_F(AttestdIntegration, EligibilityIsRedirectedToEnrollmentAndSignedByNexus) {
     const auto challenge = challenge_for(AttestationPurpose::Eligibility);
     const auto evidence = run(challenge);
     ASSERT_TRUE(evidence.has_value());
 
-    EXPECT_EQ(evidence->purpose, AttestationPurpose::Eligibility);
+    // An unenrolled SVSM node is deliberately redirected to the EK/AK
+    // activation handshake before its requested eligibility operation.
+    EXPECT_EQ(challenge.purpose, AttestationPurpose::PlatformEnrollment);
+    EXPECT_EQ(evidence->purpose, challenge.purpose);
     EXPECT_EQ(evidence->challenge_digest, challenge_digest(challenge));
     EXPECT_EQ(evidence->node_id.bytes, identity_.public_key);
 
@@ -141,7 +144,7 @@ TEST_F(AttestdIntegration, EligibilityEvidenceIsAssembledAndSignedByNexus) {
 
 // --- FinalEpochReadiness: the vote key must survive the whole path ----------
 
-TEST_F(AttestdIntegration, FinalReadinessCarriesTheFutureVoteKeyThroughToTheSignature) {
+TEST_F(AttestdIntegration, FinalReadinessRedirectsToEnrollmentButStillCarriesTheVoteKey) {
     const auto challenge = challenge_for(AttestationPurpose::FinalEpochReadiness);
     const auto evidence = run(challenge);
     ASSERT_TRUE(evidence.has_value());
@@ -149,7 +152,10 @@ TEST_F(AttestdIntegration, FinalReadinessCarriesTheFutureVoteKeyThroughToTheSign
     // The regression this exists for: the vote key must not arrive as zero.
     EXPECT_EQ(evidence->epoch_vote_key, vote_key_);
     EXPECT_NE(evidence->epoch_vote_key, crypto::Ed25519PublicKey{});
-    EXPECT_EQ(evidence->purpose, AttestationPurpose::FinalEpochReadiness);
+    // The original final-readiness request is deferred until activation; the
+    // first signed bundle is therefore enrollment evidence.
+    EXPECT_EQ(challenge.purpose, AttestationPurpose::PlatformEnrollment);
+    EXPECT_EQ(evidence->purpose, challenge.purpose);
     EXPECT_NE(evidence->context_digest, Digest{});
 
     const Digest signing = evidence_signing_digest(*evidence);

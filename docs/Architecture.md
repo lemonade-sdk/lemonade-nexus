@@ -76,8 +76,9 @@ Shutdown is ordered: security driver, gossip, dataplane, then HTTP.
   envelopes are never relayed. Sensitive pairwise DKG payloads are additionally
   sealed to the recipient.
 - **Evidence helper (local socket):** the server asks `nexus-attestd` for
-  platform evidence. The helper holds the TPM/IMA access; the server holds
-  the identity and never touches the TPM. See [Attestation](Attestation).
+  platform evidence, and routes SVSM AK activation to it. The helper holds the
+  TPM/IMA access; the server holds the identity and never touches the TPM.
+  See [Attestation](Attestation).
 
 **Fallback:** if no tunnel address exists, no private listener is created and
 the private routes are registered on the public listener instead. The server

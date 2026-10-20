@@ -12,9 +12,12 @@
 
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+
+#include "support/attestation_fixtures.hpp"
 
 #include <gtest/gtest.h>
 #include <sodium.h>
@@ -190,6 +193,9 @@ struct Node {
     nexus::crypto::Ed25519Keypair identity;
     NodeId id;
     fs::path dir;
+    /// Release approval claimed at the next build_node/restart_node; zero means
+    /// no packaged approval.
+    Digest release_approval_digest{};
     // The wrapping stack persists the epoch vote key at rest, so a restarted
     // node can resume voting after its certified sync.
     std::unique_ptr<nexus::crypto::SodiumCryptoService> crypto;
@@ -365,6 +371,14 @@ struct DriverMeshBase : ::testing::Test {
             build_node(*node);
             mesh.nodes[node->id] = node;
         }
+
+        // Seed EK -> AK enrollment for every observer/subject pair so challenges
+        // keep their requested purpose instead of being redirected to enrollment.
+        for (const auto& observer : nodes) {
+            for (const auto& subject : nodes) {
+                preactivate(*observer, *subject);
+            }
+        }
     }
 
     // Rebuilds the runtime-side objects from the node's directories, as a
@@ -384,6 +398,7 @@ struct DriverMeshBase : ::testing::Test {
         runtime_config.self = node.id;
         runtime_config.network_id = network;
         runtime_config.consensus_directory = node.dir / "consensus";
+        runtime_config.attestation_state_directory = node.dir / "attestation";
         // Mirrors production: a replica votes for a handoff only when it has
         // independently arrived at the same one. Node addresses are stable, and
         // the driver exists long before consensus runs.
@@ -396,7 +411,13 @@ struct DriverMeshBase : ::testing::Test {
         node.router = std::make_unique<SecurityRouter>(
             SecurityRouterConfig{
                 .network_id = network,
-                .genesis_anchor_id = genesis_node->id},
+                .genesis_anchor_id = genesis_node->id,
+                // Deferred like transition_validator: the driver is built
+                // below and the gate only fires once messages flow.
+                .founding_member =
+                    [&node](const NodeId& peer) {
+                        return node.driver && node.driver->is_founding_member(peer);
+                    }},
             *node.runtime, *node.transport, node.events, *node.sealer, nullptr);
         if (&node == genesis_node) {
             node.genesis = std::make_unique<GenesisService>(network);
@@ -406,6 +427,7 @@ struct DriverMeshBase : ::testing::Test {
         driver_config.self = node.id;
         driver_config.identity = node.identity;
         driver_config.genesis_public_key = genesis_node->identity.public_key;
+        driver_config.release_approval_digest = node.release_approval_digest;
         // Stands in for the gossip layer's root-signature check.
         driver_config.certificate_source = [this, self = node.id](const NodeId& peer) {
             const auto view = mesh.uncertified_for.find(self);
@@ -418,6 +440,12 @@ struct DriverMeshBase : ::testing::Test {
                                                        *node.router, *node.store,
                                                        node.genesis.get());
         node.events.target = node.driver.get();
+    }
+
+    void preactivate(Node& observer, const Node& subject) {
+        nexus_test::seed_svsm_activation(network, subject.id, subject.identity.public_key,
+                                         observer.dir / "attestation" /
+                                             "svsm-activations");
     }
 
     void TearDown() override {

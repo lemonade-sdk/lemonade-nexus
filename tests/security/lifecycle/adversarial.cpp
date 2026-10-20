@@ -12,9 +12,12 @@
 #include <LemonadeNexus/Crypto/FrostProvider.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+
+#include "support/attestation_fixtures.hpp"
 
 #include <gtest/gtest.h>
 #include <sodium.h>
@@ -393,12 +396,13 @@ Digest filled(uint8_t byte) {
 // Step 0 of the verifier refuses every candidate under an incomplete profile,
 // so the attestation tests need a profile that pins everything.
 LinuxAttestationProfile complete_profile() {
-    LinuxAttestationProfile profile = linux_attestation_profile_v1();
+    LinuxAttestationProfile profile = linux_attestation_profile_v2_svsm();
     profile.snp.min_tcb = {2, 0, 6, 55};
     profile.snp.expected_measurement_hex = std::string(96, 'a');
     profile.ima_policy_digest = filled(0x60);
     profile.approved_paths = {{"/usr/bin/nexus", {std::string(64, 'b')}}};
     profile.evidence_collector_path = "/usr/bin/nexus";
+    profile.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
     return profile;
 }
 
@@ -454,6 +458,7 @@ struct AdversarialMesh : ::testing::Test {
         runtime_config.self = node.id;
         runtime_config.network_id = network;
         runtime_config.consensus_directory = node.dir / "consensus";
+        runtime_config.attestation_state_directory = node.dir / "attestation";
         runtime_config.profile = complete_profile();
         // Mirrors production: a replica votes for a handoff only when it has
         // independently arrived at the same one. Node addresses are stable, and
@@ -485,6 +490,14 @@ struct AdversarialMesh : ::testing::Test {
                                                        *node.router, *node.store,
                                                        node.genesis.get());
         node.events.target = node.driver.get();
+    }
+
+    // Replay/transport tests below start after node-specific EK -> AK
+    // activation. Enrollment itself has dedicated protocol coverage.
+    void preactivate(Node& observer, const Node& subject) {
+        nexus_test::seed_svsm_activation(network, subject.id, subject.identity.public_key,
+                                         observer.dir / "attestation" /
+                                             "svsm-activations");
     }
 
     // Rebuilds the runtime-side objects from the node's directories, as a
@@ -1575,6 +1588,7 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     Node* verifier = founders[0];
     Node* prover = founders[1];
     Node* other_verifier = founders[2];
+    preactivate(*verifier, *prover);
 
     const auto build_evidence = [&](const AttestationChallenge& challenge, Node& signer) {
         AttestationEvidence evidence;
@@ -1590,13 +1604,13 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
         evidence.purpose = challenge.purpose;
         evidence.context_digest = challenge.context_digest;
         evidence.epoch_vote_key = *signer.driver->vote_key_for_epoch(1);
-        evidence.platform.hcl_blob.assign(64, 0xA5);
-        evidence.platform.tpms_attest.assign(48, 0x5A);
-        evidence.platform.tpm_signature.assign(32, 0x3C);
-        evidence.platform.pcr_values.assign(32, 0xC3);
-        evidence.platform.ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
-        evidence.platform.binary_path = "/opt/nexus";
-        evidence.platform.binary_sha256 = std::string(64, 'b');
+        azure_evidence(evidence.platform).hcl_blob.assign(64, 0xA5);
+        azure_evidence(evidence.platform).tpms_attest.assign(48, 0x5A);
+        azure_evidence(evidence.platform).tpm_signature.assign(32, 0x3C);
+        azure_evidence(evidence.platform).pcr_values.assign(32, 0xC3);
+        azure_evidence(evidence.platform).ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
+        azure_evidence(evidence.platform).binary_path = "/opt/nexus";
+        azure_evidence(evidence.platform).binary_sha256 = std::string(64, 'b');
         const Digest digest = evidence_signing_digest(evidence);
         crypto_sign_detached(evidence.identity_signature.data(), nullptr, digest.data(),
                              digest.size(), signer.identity.private_key.data());
@@ -1670,6 +1684,7 @@ TEST_F(AdversarialMesh, AttestationEvidenceAnswersOneChallengeForOneNode) {
     // Over the wire, evidence claiming another node never reaches the verifier.
     // A fresh prover keeps this clear of the per-epoch challenge budget.
     Node* second_prover = founders[3];
+    preactivate(*verifier, *second_prover);
     auto wire_challenge = verifier->runtime->attestation().create_challenge(
         second_prover->id, second_prover->identity.public_key, 1, 1,
         AttestationPurpose::Eligibility);
