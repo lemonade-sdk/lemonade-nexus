@@ -138,6 +138,19 @@ bool encode_challenge(Writer& w, const AttestationChallenge& c) {
     w.fixed(c.policy_digest);
     w.u16(static_cast<uint16_t>(c.purpose));
     w.fixed(c.context_digest);
+    w.u16(static_cast<uint16_t>(c.ima_mode));
+    w.fixed(c.ima_checkpoint_digest);
+    w.u64(c.ima_prior_event_count);
+    w.fixed(c.ima_prior_pcr10);
+    if (c.ima_checkpoint_paths.size() > constants::kMaxSummarisedPaths) return false;
+    w.u16(static_cast<uint16_t>(c.ima_checkpoint_paths.size()));
+    for (const auto& path : c.ima_checkpoint_paths) {
+        // Decode requires exactly 64 hex chars; refuse to emit anything else.
+        if (path.sha256.size() != 64) return false;
+        if (!w.bytes({reinterpret_cast<const uint8_t*>(path.path.data()), path.path.size()}, 4096) ||
+            !w.bytes({reinterpret_cast<const uint8_t*>(path.sha256.data()), path.sha256.size()}, 64))
+            return false;
+    }
     return true;
 }
 
@@ -153,14 +166,57 @@ bool encode_evidence(Writer& w, const AttestationEvidence& e) {
     w.u16(e.profile_ruleset);
     w.u16(static_cast<uint16_t>(e.purpose));
     w.fixed(e.context_digest);
+    w.u16(static_cast<uint16_t>(e.ima_mode));
+    w.u64(e.ima_bytes);
+    w.fixed(e.ima_digest);
     w.fixed(e.epoch_vote_key);
-    const std::string platform = encode_snp_vtpm_evidence(e.platform);
+    const std::string platform = encode_platform_evidence(e.platform);
     if (!w.bytes({reinterpret_cast<const uint8_t*>(platform.data()), platform.size()},
                  constants::kMaxPlatformEvidenceWireBytes)) {
         return false;
     }
     w.fixed(e.identity_signature);
     return true;
+}
+
+bool encode_transfer_start(Writer& w, const AttestationEvidenceStart& s) {
+    w.fixed(s.challenge_digest); w.fixed(s.transfer_id);
+    w.u16(static_cast<uint16_t>(s.mode)); w.u64(s.total_transfer_bytes);
+    w.u64(s.ima_bytes); w.u32(s.total_chunks); w.fixed(s.ima_digest);
+    w.fixed(s.platform_digest);
+    return encode_evidence(w, s.evidence);
+}
+
+bool encode_transfer_chunk(Writer& w, const AttestationEvidenceChunk& c) {
+    w.fixed(c.challenge_digest); w.fixed(c.transfer_id); w.u32(c.chunk_index);
+    return w.bytes(c.bytes, constants::kMaxEvidenceChunkBytes);
+}
+
+bool encode_transfer_end(Writer& w, const AttestationEvidenceEnd& e) {
+    w.fixed(e.challenge_digest); w.fixed(e.transfer_id); w.u64(e.total_transfer_bytes);
+    w.u64(e.ima_bytes); w.u32(e.total_chunks); w.fixed(e.ima_digest);
+    w.fixed(e.platform_digest); return true;
+}
+
+bool encode_activation_offer(Writer& w, const SvsmAkActivationOfferMessage& o) {
+    w.fixed(o.network_id); put_node(w, o.subject_node); w.fixed(o.subject_key);
+    w.u64(o.incarnation); w.u64(o.epoch); w.u16(static_cast<uint16_t>(o.profile_id));
+    w.u16(o.profile_ruleset); put_node(w, o.observer);
+    w.fixed(o.enrollment_challenge_digest); w.fixed(o.verifier_nonce);
+    if (!w.bytes(o.ek_public, 4096) || !w.bytes(o.ak_public, 4096) ||
+        !w.bytes(o.ek_name, 64) || !w.bytes(o.ak_name, 64)) return false;
+    w.fixed(o.ak_spki_digest); w.u32(o.activation.version);
+    w.fixed(o.activation.enrollment_context);
+    return w.bytes(o.activation.credential_blob, 4096) &&
+           w.bytes(o.activation.encrypted_secret, 4096);
+}
+
+bool encode_activation_response(Writer& w, const SvsmAkActivationResponseMessage& r) {
+    w.fixed(r.network_id); put_node(w, r.subject_node); w.u64(r.incarnation); w.u64(r.epoch);
+    w.u16(static_cast<uint16_t>(r.profile_id)); w.u16(r.profile_ruleset);
+    put_node(w, r.observer); w.fixed(r.activation_context);
+    if (!w.bytes(r.activated_secret, 64)) return false;
+    w.fixed(r.identity_signature); return true;
 }
 
 bool encode_certificate(Writer& w, const QuorumCertificate& qc) {
@@ -287,6 +343,7 @@ bool encode_founding(Writer& w, const GenesisFounding& f) {
         w.fixed(vote_key);
     }
     w.fixed(f.attestation_root);
+    w.fixed(f.release_approval_digest);
     return true;
 }
 
@@ -310,6 +367,7 @@ bool encode_bootstrap(Writer& w, const BootstrapCertificate& c) {
     w.fixed(c.attestation_root);
     w.fixed(c.founding_eligibility_digest);
     w.fixed(c.vote_key_set_digest);
+    w.fixed(c.release_approval_digest);
     w.u16(c.security_ruleset);
     w.u16(c.consensus_ruleset);
     w.fixed(c.genesis_signature);
@@ -568,20 +626,51 @@ bool get_purpose(Reader& r, AttestationPurpose& purpose) {
     if (!r.u16(raw)) return false;
     const auto candidate = static_cast<AttestationPurpose>(raw);
     if (candidate != AttestationPurpose::Eligibility &&
-        candidate != AttestationPurpose::FinalEpochReadiness) {
+        candidate != AttestationPurpose::FinalEpochReadiness &&
+        candidate != AttestationPurpose::PlatformEnrollment) {
         return r.fail(CodecError::BadValue);
     }
     purpose = candidate;
     return true;
 }
 
+bool get_ima_mode(Reader& r, ImaEvidenceMode& mode) {
+    uint16_t raw = 0;
+    if (!r.u16(raw)) return false;
+    if (raw != static_cast<uint16_t>(ImaEvidenceMode::Full) &&
+        raw != static_cast<uint16_t>(ImaEvidenceMode::Resume))
+        return r.fail(CodecError::BadValue);
+    mode = static_cast<ImaEvidenceMode>(raw);
+    return true;
+}
+
 bool decode_challenge(Reader& r, AttestationChallenge& c) {
-    return r.fixed(c.network_id) && r.fixed(c.nonce) && get_node(r, c.node_id) &&
+    if (!(r.fixed(c.network_id) && r.fixed(c.nonce) && get_node(r, c.node_id) &&
            r.fixed(c.node_key) &&
            r.u64(c.incarnation) && r.u64(c.epoch) && r.u16(c.security_ruleset) &&
            r.u16(c.consensus_ruleset) && get_profile_id(r, c.profile_id) &&
            r.u16(c.profile_ruleset) && r.fixed(c.policy_digest) &&
-           get_purpose(r, c.purpose) && r.fixed(c.context_digest);
+           get_purpose(r, c.purpose) && r.fixed(c.context_digest) &&
+           get_ima_mode(r, c.ima_mode) && r.fixed(c.ima_checkpoint_digest) &&
+           r.u64(c.ima_prior_event_count) && r.fixed(c.ima_prior_pcr10))) return false;
+    uint16_t count = 0;
+    if (!r.u16(count)) return false;
+    if (count > constants::kMaxSummarisedPaths) return r.fail(CodecError::CountTooLarge);
+    c.ima_checkpoint_paths.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+        std::vector<uint8_t> path, hash;
+        // A reader failure keeps the reader's own error; only a hash that read
+        // fine but has the wrong size is a bad value.
+        if (!r.bytes(path, 4096) || !r.bytes(hash, 64)) return false;
+        if (hash.size() != 64) return r.fail(CodecError::BadValue);
+        c.ima_checkpoint_paths.push_back({std::string(path.begin(), path.end()),
+                                          std::string(hash.begin(), hash.end())});
+    }
+    const bool full = c.ima_mode == ImaEvidenceMode::Full;
+    if (full != (c.ima_checkpoint_digest == Digest{} && c.ima_prior_event_count == 0 &&
+                 c.ima_prior_pcr10 == Digest{} && c.ima_checkpoint_paths.empty()))
+        return r.fail(CodecError::BadValue);
+    return true;
 }
 
 bool decode_evidence(Reader& r, AttestationEvidence& e) {
@@ -591,6 +680,7 @@ bool decode_evidence(Reader& r, AttestationEvidence& e) {
           r.u64(e.epoch) && r.u16(e.security_ruleset) && r.u16(e.consensus_ruleset) &&
           get_profile_id(r, e.profile_id) && r.u16(e.profile_ruleset) &&
           get_purpose(r, e.purpose) && r.fixed(e.context_digest) &&
+          get_ima_mode(r, e.ima_mode) && r.u64(e.ima_bytes) && r.fixed(e.ima_digest) &&
           r.fixed(e.epoch_vote_key) &&
           r.bytes(platform, constants::kMaxPlatformEvidenceWireBytes))) {
         return false;
@@ -598,7 +688,7 @@ bool decode_evidence(Reader& r, AttestationEvidence& e) {
     // An empty bundle is a prover with nothing to show; it decodes to empty
     // evidence and fails verification later, never here.
     if (!platform.empty()) {
-        auto decoded = decode_snp_vtpm_evidence(
+        auto decoded = decode_platform_evidence(
             std::string_view(reinterpret_cast<const char*>(platform.data()), platform.size()));
         if (!decoded.has_value()) {
             return r.fail(CodecError::BadValue);
@@ -606,6 +696,44 @@ bool decode_evidence(Reader& r, AttestationEvidence& e) {
         e.platform = std::move(*decoded);
     }
     return r.fixed(e.identity_signature);
+}
+
+bool decode_transfer_start(Reader& r, AttestationEvidenceStart& s) {
+    return r.fixed(s.challenge_digest) && r.fixed(s.transfer_id) && get_ima_mode(r, s.mode) &&
+           r.u64(s.total_transfer_bytes) && r.u64(s.ima_bytes) && r.u32(s.total_chunks) &&
+           r.fixed(s.ima_digest) && r.fixed(s.platform_digest) && decode_evidence(r, s.evidence);
+}
+
+bool decode_transfer_chunk(Reader& r, AttestationEvidenceChunk& c) {
+    return r.fixed(c.challenge_digest) && r.fixed(c.transfer_id) && r.u32(c.chunk_index) &&
+           r.bytes(c.bytes, constants::kMaxEvidenceChunkBytes);
+}
+
+bool decode_transfer_end(Reader& r, AttestationEvidenceEnd& e) {
+    return r.fixed(e.challenge_digest) && r.fixed(e.transfer_id) &&
+           r.u64(e.total_transfer_bytes) && r.u64(e.ima_bytes) && r.u32(e.total_chunks) &&
+           r.fixed(e.ima_digest) && r.fixed(e.platform_digest);
+}
+
+bool decode_activation_offer(Reader& r, SvsmAkActivationOfferMessage& o) {
+    return r.fixed(o.network_id) && get_node(r, o.subject_node) && r.fixed(o.subject_key) &&
+           r.u64(o.incarnation) && r.u64(o.epoch) && get_profile_id(r, o.profile_id) &&
+           r.u16(o.profile_ruleset) && get_node(r, o.observer) &&
+           r.fixed(o.enrollment_challenge_digest) && r.fixed(o.verifier_nonce) &&
+           r.bytes(o.ek_public, 4096) && r.bytes(o.ak_public, 4096) &&
+           r.bytes(o.ek_name, 64) && r.bytes(o.ak_name, 64) &&
+           r.fixed(o.ak_spki_digest) && r.u32(o.activation.version) &&
+           r.fixed(o.activation.enrollment_context) &&
+           r.bytes(o.activation.credential_blob, 4096) &&
+           r.bytes(o.activation.encrypted_secret, 4096);
+}
+
+bool decode_activation_response(Reader& r, SvsmAkActivationResponseMessage& m) {
+    return r.fixed(m.network_id) && get_node(r, m.subject_node) && r.u64(m.incarnation) &&
+           r.u64(m.epoch) &&
+           get_profile_id(r, m.profile_id) && r.u16(m.profile_ruleset) &&
+           get_node(r, m.observer) && r.fixed(m.activation_context) &&
+           r.bytes(m.activated_secret, 64) && r.fixed(m.identity_signature);
 }
 
 bool decode_certificate(Reader& r, QuorumCertificate& qc) {
@@ -716,7 +844,7 @@ bool decode_founding(Reader& r, GenesisFounding& f) {
             return false;
         }
     }
-    return r.fixed(f.attestation_root);
+    return r.fixed(f.attestation_root) && r.fixed(f.release_approval_digest);
 }
 
 bool decode_transcript_attest(Reader& r, DkgTranscriptAttest& a) {
@@ -729,7 +857,7 @@ bool decode_bootstrap(Reader& r, BootstrapCertificate& c) {
     if (!(r.fixed(c.network_id) && r.u64(c.epoch) && r.fixed(c.tier1_set_digest) &&
           r.u64(threshold) && r.fixed(c.authority_public_key) && r.fixed(c.dkg_transcript_digest) &&
           r.fixed(c.attestation_root) && r.fixed(c.founding_eligibility_digest) &&
-          r.fixed(c.vote_key_set_digest) &&
+          r.fixed(c.vote_key_set_digest) && r.fixed(c.release_approval_digest) &&
           r.u16(c.security_ruleset) && r.u16(c.consensus_ruleset) &&
           r.fixed(c.genesis_signature))) {
         return false;
@@ -1131,13 +1259,38 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(m);
             return true;
         }
+        case SecurityMessageKind::AttestationEvidenceStart: {
+            AttestationEvidenceStart m;
+            if (!decode_transfer_start(r, m)) return false;
+            body = std::move(m); return true;
+        }
+        case SecurityMessageKind::AttestationEvidenceChunk: {
+            AttestationEvidenceChunk m;
+            if (!decode_transfer_chunk(r, m)) return false;
+            body = std::move(m); return true;
+        }
+        case SecurityMessageKind::AttestationEvidenceEnd: {
+            AttestationEvidenceEnd m;
+            if (!decode_transfer_end(r, m)) return false;
+            body = std::move(m); return true;
+        }
+        case SecurityMessageKind::SvsmAkActivationOffer: {
+            SvsmAkActivationOfferMessage m;
+            if (!decode_activation_offer(r, m)) return false;
+            body = std::move(m); return true;
+        }
+        case SecurityMessageKind::SvsmAkActivationResponse: {
+            SvsmAkActivationResponseMessage m;
+            if (!decode_activation_response(r, m)) return false;
+            body = std::move(m); return true;
+        }
     }
     return r.fail(CodecError::UnknownKind);
 }
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::AuthorityChainPage);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::SvsmAkActivationResponse);
 }
 
 }  // namespace
@@ -1208,8 +1361,18 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::EpochHandoffProof;
             } else if constexpr (std::is_same_v<T, AuthorityChainRequest>) {
                 return SecurityMessageKind::AuthorityChainRequest;
-            } else {
+            } else if constexpr (std::is_same_v<T, AuthorityChainPage>) {
                 return SecurityMessageKind::AuthorityChainPage;
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceStart>) {
+                return SecurityMessageKind::AttestationEvidenceStart;
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceChunk>) {
+                return SecurityMessageKind::AttestationEvidenceChunk;
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceEnd>) {
+                return SecurityMessageKind::AttestationEvidenceEnd;
+            } else if constexpr (std::is_same_v<T, SvsmAkActivationOfferMessage>) {
+                return SecurityMessageKind::SvsmAkActivationOffer;
+            } else {
+                return SecurityMessageKind::SvsmAkActivationResponse;
             }
         },
         body);
@@ -1271,8 +1434,18 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_handoff_proof(body, value);
             } else if constexpr (std::is_same_v<T, AuthorityChainRequest>) {
                 return encode_chain_request(body, value);
-            } else {
+            } else if constexpr (std::is_same_v<T, AuthorityChainPage>) {
                 return encode_chain_page(body, value);
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceStart>) {
+                return encode_transfer_start(body, value);
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceChunk>) {
+                return encode_transfer_chunk(body, value);
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceEnd>) {
+                return encode_transfer_end(body, value);
+            } else if constexpr (std::is_same_v<T, SvsmAkActivationOfferMessage>) {
+                return encode_activation_offer(body, value);
+            } else {
+                return encode_activation_response(body, value);
             }
         },
         message.body);

@@ -1,0 +1,42 @@
+[Unit]
+Description=Create the two dedicated TSM report objects for nexus-attestd
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus
+DefaultDependencies=no
+After=sys-kernel-config.mount systemd-tmpfiles-setup.service
+Before=nexus-attestd.service
+ConditionPathIsDirectory=/sys/kernel/config/tsm/report
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/lemonade-nexus/nexus-attestd-tsm-setup
+ExecStop=/usr/lib/lemonade-nexus/nexus-attestd-tsm-setup --remove
+RemainAfterExit=yes
+User=root
+Group=root
+UMask=0077
+
+# This short-lived process owns no Nexus or TPM secret.  Its only mutation is
+# creating and permissioning the two exact configfs objects in the helper.
+CapabilityBoundingSet=CAP_CHOWN
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=false
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@resources @obsolete @debug @mount @swap @reboot @module @clock @cpu-emulation @raw-io @keyring
+
+[Install]
+WantedBy=multi-user.target

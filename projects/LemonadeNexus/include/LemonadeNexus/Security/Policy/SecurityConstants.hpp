@@ -129,6 +129,11 @@ inline constexpr uint32_t kMaxTier1AttestAttemptsPerEpoch = 4;
 // eligibility budget: one initial exchange plus three renewals.
 inline constexpr uint32_t kMaxFinalAttestAttemptsPerPlan = kMaxTier1AttestAttemptsPerEpoch;
 
+// Bootstrap retry cadence, offset per node by identity-derived jitter so
+// founding-set retries do not land as one synchronized burst.
+inline constexpr uint64_t kBootstrapRetryMs = 15000;
+inline constexpr uint64_t kBootstrapRetryJitterMs = 5000;
+
 // --- Mesh eligibility observations ------------------------------------------
 
 // Distinct attestations one observer must have verified before it counts
@@ -188,9 +193,36 @@ inline constexpr std::size_t kMaxQcSignatures = kMaxActiveTier1;
 
 // --- Security transport bounds (applied before any parse or crypto work) ----
 
-inline constexpr uint8_t kSecurityWireVersion = 1;
+// v2 added the bounded evidence-transfer state machine and the SVSM AK
+// activation messages; v3 the release-approval commitment in GenesisFounding
+// and the bootstrap certificate.
+inline constexpr uint8_t kSecurityWireVersion = 3;
 inline constexpr std::size_t kMaxSecurityMessageBytes = 60000;
 inline constexpr std::size_t kMaxPlatformEvidenceWireBytes = 56 * 1024;
+
+// The collector IPC wire version. Authoritative here so the release-approval
+// verifier and the attestd codec cannot drift; AttestdCodec.hpp aliases it.
+// Version 4 added the SVSM AK activation operation to the evidence socket.
+inline constexpr uint16_t kAttestdWireVersion = 4;
+
+// Raw IMA chunk payload cap, leaving over 10 KiB of a mesh envelope for the
+// authenticated envelope fields and typed chunk metadata.
+inline constexpr std::size_t kMaxEvidenceChunkBytes = 48 * 1024;
+
+// Full carries the fixed platform bundle plus raw IMA: a measured ~2.3 MB log
+// with reports, endorsements and metadata fits with >1.7 MiB headroom. Resume
+// caps the suffix an ordinary cadence may add before a Full refresh.
+inline constexpr std::size_t kMaxFullEvidenceTransferBytes = 4 * 1024 * 1024;
+inline constexpr std::size_t kMaxResumeImaSuffixBytes = 512 * 1024;
+inline constexpr std::size_t kMaxEvidenceTransferChunks =
+    (kMaxFullEvidenceTransferBytes + kMaxEvidenceChunkBytes - 1) /
+    kMaxEvidenceChunkBytes;
+inline constexpr std::size_t kMaxConcurrentEvidenceTransfers = 8;
+inline constexpr uint64_t kEvidenceTransferDeadlineMs = 30000;
+
+// Verifier-owned state is finite even if every observed identity rotates.
+inline constexpr std::size_t kMaxAttestationCheckpoints = 128;
+inline constexpr std::size_t kMaxSvsmActivationRecords = 128;
 
 // Most components one attestation profile may approve. This is what makes a
 // checkpoint summary sizeable from the compiled profile instead of from the

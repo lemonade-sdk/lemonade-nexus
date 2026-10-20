@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# The precompiled blob is byte-pinned by the Tier-1 kernel. Copying its parser
+# and dependencies into the PCR9-measured initramfs lets the profile load before
+# any rootfs process can run. A different blob is rejected by the kernel.
+copy_exec /usr/sbin/apparmor_parser /usr/sbin
+install -d "$DESTDIR/usr/lib/lemonade-nexus/apparmor"
+cp -p /usr/lib/lemonade-nexus/apparmor/nexus-tier1-authority-probe.bin \
+    "$DESTDIR/usr/lib/lemonade-nexus/apparmor/nexus-tier1-authority-probe.bin"

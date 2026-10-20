@@ -37,6 +37,7 @@ LinuxAttestationProfile base_profile() {
     profile.require_ima = true;
     profile.approved_paths = {{"/usr/bin/nexus", {"01ab", "02cd"}}};
     profile.evidence_collector_path = "/usr/bin/nexus";
+    profile.expected_pcrs = {{8, "88aa"}, {9, "99bb"}};
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = 1;
@@ -73,6 +74,8 @@ const ProfileMutation kProfileMutations[] = {
      [](LinuxAttestationProfile& p) {
          std::swap(p.approved_paths[0].sha256[0], p.approved_paths[0].sha256[1]);
      }},
+    {"expected_pcrs value", [](LinuxAttestationProfile& p) { p.expected_pcrs[0].second = "88cc"; }},
+    {"expected_pcrs index", [](LinuxAttestationProfile& p) { p.expected_pcrs[0].first = 7; }},
     {"require_no_new_privs", [](LinuxAttestationProfile& p) { p.require_no_new_privs = false; }},
     {"require_seccomp", [](LinuxAttestationProfile& p) { p.require_seccomp = false; }},
     {"security_ruleset", [](LinuxAttestationProfile& p) { p.security_ruleset += 1; }},
@@ -192,6 +195,8 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
     EXPECT_FALSE(has_gap(v1, ProfileGap::NoEvidenceCollector));
     EXPECT_FALSE(has_gap(v1, ProfileGap::CollectorNotApproved));
     EXPECT_TRUE(has_gap(v1, ProfileGap::NoApprovedBinary));
+    // Boot PCR pins are release observations too; the template ships none.
+    EXPECT_TRUE(has_gap(v1, ProfileGap::NoExpectedPcrs));
     // The rules it DOES fix are already right, so these are not gaps.
     EXPECT_FALSE(has_gap(v1, ProfileGap::ProfileVersionUnset));
     EXPECT_FALSE(has_gap(v1, ProfileGap::SecurityRulesetMismatch));
@@ -238,6 +243,12 @@ TEST(LinuxAttestationProfileCompleteness, EachUnpinnedPrerequisiteIsItsOwnGap) {
         p.security_ruleset = nexus::security::constants::kSecurityRulesetVersion + 1;
         EXPECT_FALSE(profile_is_complete(p));
         EXPECT_TRUE(has_gap(p, ProfileGap::SecurityRulesetMismatch));
+    }
+    {   // Evidence verification rejects empty boot pins; completeness must say so.
+        auto p = complete_profile();
+        p.expected_pcrs.clear();
+        EXPECT_FALSE(profile_is_complete(p));
+        EXPECT_TRUE(has_gap(p, ProfileGap::NoExpectedPcrs));
     }
 }
 

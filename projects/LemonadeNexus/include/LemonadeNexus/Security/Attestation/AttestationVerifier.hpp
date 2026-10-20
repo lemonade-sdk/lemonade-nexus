@@ -33,7 +33,7 @@ namespace nexus::security {
 inline constexpr std::size_t kMaxPlatformEvidenceBytes = 4 * 1024 * 1024;
 
 /// Total bytes of the variable-length fields in a platform bundle.
-[[nodiscard]] std::size_t platform_evidence_size(const SnpVtpmEvidence& platform);
+[[nodiscard]] std::size_t platform_evidence_size(const PlatformEvidence& platform);
 
 /// True when `binary_sha256_hex` is an approved release OF `binary_path`.
 /// Digests do not cross paths: an approved release of one component never
@@ -49,6 +49,8 @@ inline constexpr std::size_t kMaxPlatformEvidenceBytes = 4 * 1024 * 1024;
 /// unapproved required component fails the whole set — there is no
 /// prover-selected subset. An empty required set approves nothing.
 [[nodiscard]] bool binary_approved(const LinuxAttestationProfile& profile, const ImaLog& log);
+[[nodiscard]] bool binary_approved(const LinuxAttestationProfile& profile,
+                                   const ImaBinaryLog& log);
 
 /// Just the paths, in profile order — what the platform chain needs to refuse a
 /// prover-chosen path. The digests stay with the profile.
@@ -83,7 +85,8 @@ public:
     /// Runs the neutral checks in a fixed order, cheap and binding first, then
     /// the provider's. The first failure wins and no check can be waived.
     [[nodiscard]] AttestationVerdict examine(const AttestationChallenge& challenge,
-                                             const AttestationEvidence& evidence) const;
+                                             const AttestationEvidence& evidence,
+                                             const PlatformVerificationState& state = {}) const;
 
     /// The provider that claims `id`, or nullptr when none does.
     [[nodiscard]] const PlatformEvidenceProvider* provider_for(AttestationProfileId id) const;

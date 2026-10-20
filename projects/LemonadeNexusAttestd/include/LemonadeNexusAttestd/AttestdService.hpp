@@ -1,13 +1,18 @@
 #pragma once
 
-// The daemon's single operation, with the platform underneath it.
+// The daemon's two operations, with the platform underneath them.
 //
-//   serialized AttestationChallenge  ->  serialized PlatformEvidenceBundle
+//   serialized AttestationChallenge   ->  serialized PlatformEvidenceBundle
+//   serialized activation offer       ->  one Result frame (or a refusal)
 //
 // A platform evidence helper, not an identity service. It holds no node secret
 // and signs nothing: assembling and signing an AttestationEvidence around this
 // bundle belongs to Nexus, which owns the identity key. That split is why the
 // privileged component can be small.
+//
+// Activation lives here because this daemon is the only component the unit
+// file gives TPM access to. It creates no persistent TPM state and decides
+// nothing about eligibility.
 //
 // Nothing else is exposed. There is no "quote these PCRs", no "sign these
 // bytes", no "give me the SNP report", and no eligibility verdict: deciding
@@ -16,7 +21,8 @@
 // The prover half of the snp-vtpm chain needs Linux plus a TPM stack. On every
 // other build the service still constructs, still refuses correctly, and answers
 // Refusal::PlatformUnavailable — so the target compiles and the gate stays
-// testable on a developer machine.
+// testable on a developer machine. Activation answers
+// Refusal::ActivationUnavailable on those builds.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
@@ -37,6 +43,11 @@ struct AttestdConfig {
     /// May the prover reach AMD KDS for a VCEK it has not cached. Off in a
     /// network-isolated deployment, where the cache must be pre-seeded.
     bool allow_network{true};
+
+    std::filesystem::path svsm_report_object{
+        "/sys/kernel/config/tsm/report/nexus-attestd-svsm"};
+    std::filesystem::path guest_report_object{
+        "/sys/kernel/config/tsm/report/nexus-attestd-guest"};
 };
 
 class AttestdService {
@@ -61,10 +72,18 @@ public:
     /// The wire path: bytes in, frames out. Always emits a response — a caller
     /// that sends garbage gets a typed refusal, never a closed socket with no
     /// explanation. Streams rather than returning a string, so the evidence is
-    /// never held twice.
+    /// never held twice. Dispatches on the request type: a challenge gets the
+    /// evidence path, an activation offer gets the TPM path.
     void handle_request(std::string_view request, const FrameSink& sink);
 
 private:
+    /// The activation answer: run TPM2_ActivateCredential inside the protected
+    /// vTPM and return the activated secret digest. Typed refusal when this
+    /// build or host cannot run it, or the TPM refuses the keys.
+    [[nodiscard]] Refusal answer_activation(const SvsmAkActivationRequest& request,
+                                            std::vector<uint8_t>& activated_secret,
+                                            std::string* detail);
+
     AttestdConfig config_;
 };
 

@@ -95,6 +95,7 @@ enum class DkgFailure : uint16_t {
     InvalidPackage,
     CryptoFailure,
     WrongPhase,
+    Stalled,
 };
 
 struct DkgResult {
@@ -134,6 +135,11 @@ public:
     /// Runs FROST part 2 once round 1 is complete. Returns one pairwise
     /// message per other participant; empty with failure() set on error.
     [[nodiscard]] std::vector<DkgMessage> round2_messages();
+
+    /// The own round-1 broadcast and produced round-2 packages, for the
+    /// liveness cadence to re-emit; receivers treat duplicates as benign.
+    [[nodiscard]] std::optional<DkgMessage> own_round1() const;
+    [[nodiscard]] const std::vector<DkgMessage>& round2_cached() const { return round2_cache_; }
 
     /// Accepts one round-2 package addressed to this participant.
     [[nodiscard]] DkgFailure receive_pairwise(const DkgMessage& message);
@@ -175,6 +181,7 @@ private:
     crypto::FrostDkgRound1 round1_;
     crypto::FrostDkgRound2 round2_;
     std::vector<uint8_t> own_round1_payload_;
+    std::vector<DkgMessage> round2_cache_;
 
     std::map<NodeId, std::vector<uint8_t>> round1_payloads_;
     std::map<NodeId, std::vector<uint8_t>> round2_payloads_;

@@ -19,17 +19,20 @@ After=nexus-attestd.service
 Type=simple
 User=lemonade-nexus
 Group=lemonade-nexus
-# No arguments. Configuration comes from
-# /var/lib/lemonade-nexus/lemonade-nexus.json, discovered via WorkingDirectory
-# and written by nexus-bootstrap. The env file is operator overrides only.
-ExecStart=/usr/bin/lemonade-nexus
+# Tier-1 candidate's fixed authority contract: the binary reads exactly this
+# JSON and the packaged /etc/lemonade-nexus/lemonade-nexus.env itself. It does
+# not consume inherited SP_* variables; the env file allows only SP_LOG_LEVEL.
+# This does not enable Tier-1 admission by itself.
+ExecStart=/usr/bin/lemonade-nexus --config /var/lib/lemonade-nexus/lemonade-nexus.json --tier1-authority-contract
 WorkingDirectory=/var/lib/lemonade-nexus
 # The nexus-attestd socket is mode 0660 group 'nexus', and that group membership
 # IS its access control list. Without this the server cannot ask for platform
 # evidence and can never reach Tier 1. It grants nothing else: the group owns
 # one socket. postinst creates the group so this never blocks startup.
 SupplementaryGroups=nexus
-EnvironmentFile=-/etc/lemonade-nexus/lemonade-nexus.env
+# Intentionally no systemd EnvironmentFile=: that would also expose inherited
+# manager/drop-in environment as a hidden config source. The explicit file is
+# parsed by the binary under the strict contract above.
 # Restart after an unexpected failure, but leave a clean exit stopped.
 # The package enables this unit without starting it; bootstrap must write a
 # valid configuration before the operator starts the service.
@@ -96,10 +99,10 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 # --- core dumps -----------------------------------------------------------
 # A core file would spill mesh key material to disk. Refused twice: no size
 # budget, and no segments selected even if something raised the limit.
-# CoreDumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
+# CoredumpFilter needs systemd 252; LimitCORE=0 already forbids the dump on
 # older systemd, which warns about the unknown key and ignores it.
 LimitCORE=0
-CoreDumpFilter=0x00
+CoredumpFilter=0x00
 
 [Install]
 WantedBy=multi-user.target

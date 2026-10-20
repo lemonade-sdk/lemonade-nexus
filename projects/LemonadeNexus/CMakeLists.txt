@@ -46,6 +46,11 @@ if(WIN32)
     target_link_libraries(LemonadeNexusApp PRIVATE ws2_32 mswsock iphlpapi urlmon wintrust shell32)
 endif()
 
+# Build-time generator for the unsigned release-approval bundle. Not installed;
+# the separately authorized signing ceremony consumes its output.
+add_executable(nexus-release-bundle tools/release_bundle_main.cpp)
+target_link_libraries(nexus-release-bundle PRIVATE LemonadeNexus)
+
 # ── Install targets ──────────────────────────────────────────────────────────
 
 # Rename binary from LemonadeNexusApp → lemonade-nexus
@@ -66,6 +71,21 @@ if(UNIX AND NOT APPLE)
     # the unit runs on, so it ships with the unit rather than beside it.
     install(PROGRAMS "${CMAKE_SOURCE_DIR}/scripts/nexus-bootstrap"
             DESTINATION bin
+            COMPONENT Runtime)
+    # Verifier-owned release policy: generated after the final tree and ELF
+    # hashes are known, so it is an external package input, not a tracked file.
+    # Runtime accepts it only after Genesis delegation and release-authority
+    # signatures verify; replacing it cannot change the executable digest.
+    set(LEMONADE_RELEASE_APPROVAL_FILE
+        "${CMAKE_SOURCE_DIR}/packaging/release/release-approval.UNSIGNED.example.json"
+        CACHE FILEPATH "Externally generated signed release-approval v1 object")
+    if(NOT EXISTS "${LEMONADE_RELEASE_APPROVAL_FILE}")
+        message(FATAL_ERROR
+            "LEMONADE_RELEASE_APPROVAL_FILE does not exist: ${LEMONADE_RELEASE_APPROVAL_FILE}")
+    endif()
+    install(FILES "${LEMONADE_RELEASE_APPROVAL_FILE}"
+            RENAME release-approval.json
+            DESTINATION lib/lemonade-nexus/release
             COMPONENT Runtime)
     # Public DNS port -> unprivileged dns_port. Both files are inert on install:
     # the unit has ConditionPathExists on a conf that only

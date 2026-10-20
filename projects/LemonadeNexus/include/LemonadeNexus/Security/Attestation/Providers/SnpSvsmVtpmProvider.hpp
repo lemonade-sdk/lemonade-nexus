@@ -2,11 +2,8 @@
 
 // AMD SEV-SNP with a COCONUT-SVSM vTPM.
 //
-// Unimplemented on purpose: the SVSM service binding is read from real evidence,
-// never guessed. readiness() refuses, so SVSM evidence fails closed rather than
-// passing under an assumed format.
-//
-// Two traps for whoever implements it:
+// The service binding is the COCONUT-SVSM protocol, not an inferred HCL shape.
+// readiness() still refuses an unpinned release or node enrollment.
 //
 // The VMPL rule inverts against AzureSnpVtpmProvider. Lower VMPL is more
 // privileged, and here the SVSM holds VMPL0 while Linux runs above it, so a
@@ -19,11 +16,15 @@
 // and a bundle would verify against a rule the platform never enforced.
 
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProvider.hpp>
+#include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 
 namespace nexus::security {
 
 class SnpSvsmVtpmProvider final : public PlatformEvidenceProvider {
 public:
+    explicit SnpSvsmVtpmProvider(
+        LinuxAttestationProfile profile = linux_attestation_profile_v2_svsm(),
+        AmdRevocationSource revocation = {});
     [[nodiscard]] AttestationProfileId profile_id() const override {
         return AttestationProfileId::SnpSvsmVtpm;
     }
@@ -31,20 +32,23 @@ public:
         return kAttestationProfileRulesetVersion;
     }
 
-    /// Nothing is pinned until real SVSM evidence defines what to pin.
-    [[nodiscard]] Digest policy_digest() const override { return Digest{}; }
+    [[nodiscard]] Digest policy_digest() const override { return policy_digest_; }
 
-    /// True: the SVSM shape can prove every Tier 1 platform claim once it is
-    /// implemented. Capability is not permission — readiness() still refuses.
     [[nodiscard]] bool tier1_capable() const override { return true; }
 
-    [[nodiscard]] std::optional<AttestationFailure> readiness() const override {
-        return AttestationFailure::ProviderUnsupported;
-    }
+    [[nodiscard]] std::optional<AttestationFailure> readiness() const override;
 
     [[nodiscard]] PlatformVerification examine(
         const AttestationChallenge& challenge,
-        const AttestationEvidence& evidence) const override;
+        const AttestationEvidence& evidence,
+        const PlatformVerificationState& state) const override;
+
+    [[nodiscard]] const LinuxAttestationProfile& profile() const { return profile_; }
+
+private:
+    LinuxAttestationProfile profile_;
+    AmdRevocationSource revocation_;
+    Digest policy_digest_{};
 };
 
 }  // namespace nexus::security

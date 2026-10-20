@@ -46,12 +46,20 @@ struct SecurityMeshConfig {
     // The gossip identity keypair: the node identity on the security wire.
     crypto::Ed25519Keypair identity{};
     LinuxAttestationProfile profile;
+    /// Digest of the verified release approval this process loaded, all-zero
+    /// when none is packaged. Bound through the bootstrap certificate so the
+    /// founding and every adoption agree on one release selection.
+    Digest release_approval_digest{};
     /// Where platform evidence comes from. Unset means this process collects
     /// it itself, which needs TPM and IMA access here; the assembled server
     /// sets it to the nexus-attestd socket so it needs neither. There is no
     /// fallback: once set, a helper that fails yields empty evidence and the
     /// verifier refuses it.
     PlatformEvidenceSource platform_source;
+    /// Where SVSM AK credential activation runs. Same daemon, same rule: the
+    /// server process holds no TPM device. Unset means the candidate cannot
+    /// complete enrollment and the producer refuses the offer.
+    PlatformActivationSource activation_source;
 };
 
 class SecurityMeshService : public core::IService<SecurityMeshService> {

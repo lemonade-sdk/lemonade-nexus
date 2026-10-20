@@ -182,8 +182,20 @@ std::vector<uint8_t> fetch_vcek(const fs::path& cache_dir, const SnpReport& r,
 
 AmdEndorsement discover_amd_endorsement(const fs::path& cache_dir, const SnpReport& report,
                                          bool allow_network, const VcekSource& source) {
+    // One chip per node: try the product that last endorsed a report first.
+    const auto hint_path = cache_dir / "vcek" / "product-hint";
+    std::vector<std::string> order;
     for (const auto product_view : pinned_amd_products()) {
-        const std::string product{product_view};
+        order.emplace_back(product_view);
+    }
+    if (const auto hint = read_file(hint_path); !hint.empty()) {
+        const std::string hinted(hint.begin(), hint.end());
+        const auto it = std::find(order.begin(), order.end(), hinted);
+        if (it != order.end()) {
+            std::rotate(order.begin(), it, it + 1);
+        }
+    }
+    for (const std::string& product : order) {
         // A product with no compiled-in root is not a candidate: nothing it
         // returned could be checked against anything.
         const std::string chain = pinned_amd_chain(product);
@@ -203,6 +215,8 @@ AmdEndorsement discover_amd_endorsement(const fs::path& cache_dir, const SnpRepo
             continue;
         }
         spdlog::info("[probe] AMD endorsement resolved to product '{}'", product);
+        const std::vector<uint8_t> hint_bytes(product.begin(), product.end());
+        (void)write_file(hint_path, hint_bytes);
         return AmdEndorsement{product, std::move(der)};
     }
     spdlog::warn("[probe] no compiled-in AMD product endorses this report");

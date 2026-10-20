@@ -143,6 +143,9 @@ public:
     /// restart resumes from what the mesh actually said.
     [[nodiscard]] bool persist();
 
+    [[nodiscard]] Height max_observed_height() const {
+        return ledger_.max_height(context_.epoch);
+    }
     [[nodiscard]] const MeshFactContext& context() const { return context_; }
     [[nodiscard]] const EligibilityLedger& ledger() const { return ledger_; }
     [[nodiscard]] const EligibilityStore& store() const { return store_; }

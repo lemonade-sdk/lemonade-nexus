@@ -6,6 +6,8 @@
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Security/TpmQuote.hpp>
 
+#include "AttestationDetail.hpp"
+
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -29,18 +31,8 @@ using json = nlohmann::json;
 
 namespace {
 
-std::string b64(std::span<const uint8_t> bytes) {
-    return bytes.empty() ? std::string{} : crypto::to_base64(bytes);
-}
-
-std::vector<uint8_t> unb64(const std::string& s) {
-    if (s.empty()) return {};
-    try {
-        return crypto::from_base64(s);
-    } catch (...) {
-        return {};
-    }
-}
+using detail::b64;
+using detail::unb64;
 
 EvidenceVerdict deny(EvidenceVerdict v, std::string why) {
     v.ok = false;

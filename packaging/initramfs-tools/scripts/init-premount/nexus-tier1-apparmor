@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+    prereqs) prereqs; exit 0 ;;
+esac
+
+mkdir -p /sys/kernel/security
+if ! grep -q ' /sys/kernel/security securityfs ' /proc/mounts; then
+    mount -t securityfs -o nosuid,nodev,noexec securityfs /sys/kernel/security
+fi
+
+# Normal exec attachment is the only permitted entry to this immutable label;
+# the kernel accepts only the blob digest compiled into the approved image.
+/usr/sbin/apparmor_parser -a -B \
+    /usr/lib/lemonade-nexus/apparmor/nexus-tier1-authority-probe.bin
+grep -q '^nexus-tier1-authority-probe (enforce)$' \
+    /sys/kernel/security/apparmor/profiles

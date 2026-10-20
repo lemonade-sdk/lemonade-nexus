@@ -177,7 +177,7 @@ TEST_F(GenesisFixture, FinalizeBeforeQuorumRefused) {
     admit_passing(constants::kBootstrapThreshold - 1);
     nexus::crypto::Ed25519PublicKey authority{};
     EXPECT_FALSE(
-        service->finalize_epoch_one(authority, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
+        service->finalize_epoch_one(authority, Digest{}, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
     EXPECT_FALSE(service->finalized());
 }
 
@@ -195,7 +195,7 @@ TEST_F(GenesisFixture, FoundingEligibilityMustBeUnanimous) {
     // The DKG transcript alone is not enough.
     EXPECT_FALSE(service->eligibility_agreed());
     EXPECT_FALSE(
-        service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, genesis_priv).has_value());
+        service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
 
     // A non-founder and a forged signature are refused.
     Founder outsider;
@@ -217,14 +217,14 @@ TEST_F(GenesisFixture, FoundingEligibilityMustBeUnanimous) {
     ASSERT_TRUE(service->record_eligibility_attest(eligibility_from(founders.back(), dissenting)));
     EXPECT_FALSE(service->eligibility_agreed());
     EXPECT_FALSE(
-        service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, genesis_priv).has_value());
+        service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
 
     // Once every founder signs the same transcript the certificate carries it.
     ASSERT_TRUE(service->record_eligibility_attest(eligibility_from(founders.back(),
                                                                     founding_state())));
     EXPECT_TRUE(service->eligibility_agreed());
     const auto certificate =
-        service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, genesis_priv);
+        service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, Digest{}, genesis_priv);
     ASSERT_TRUE(certificate.has_value());
     EXPECT_EQ(certificate->founding_eligibility_digest, founding_state());
     EXPECT_TRUE(verify_bootstrap_certificate(*certificate, genesis_pub));
@@ -266,7 +266,7 @@ TEST_F(GenesisFixture, TranscriptAttestRules) {
     other.fill(0x56);
     ASSERT_TRUE(service->record_transcript_attest(attest_from(founders.back(), other, group)));
     EXPECT_FALSE(service->transcript_agreed());
-    EXPECT_FALSE(service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, genesis_priv).has_value());
+    EXPECT_FALSE(service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
 
     // The dissenter re-attests the agreed transcript.
     ASSERT_TRUE(service->record_transcript_attest(attest_from(founders.back(), transcript, group)));
@@ -275,9 +275,9 @@ TEST_F(GenesisFixture, TranscriptAttestRules) {
     // Genesis signs only what the founders attested.
     nexus::crypto::Ed25519PublicKey other_group{};
     other_group.fill(0x78);
-    EXPECT_FALSE(service->finalize_epoch_one(other_group, transcript, Digest{}, Digest{}, genesis_priv).has_value());
-    EXPECT_FALSE(service->finalize_epoch_one(group, other, Digest{}, Digest{}, genesis_priv).has_value());
-    EXPECT_TRUE(service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, genesis_priv).has_value());
+    EXPECT_FALSE(service->finalize_epoch_one(other_group, transcript, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
+    EXPECT_FALSE(service->finalize_epoch_one(group, other, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
+    EXPECT_TRUE(service->finalize_epoch_one(group, transcript, Digest{}, Digest{}, Digest{}, genesis_priv).has_value());
 }
 
 TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
@@ -289,18 +289,26 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
     dkg_digest.fill(0x55);
     Digest attestation_root;
     attestation_root.fill(0x66);
+    Digest release_approval;
+    release_approval.fill(0x44);
     attest_all(dkg_digest, authority);
     attest_eligibility_all(founding_state());
 
-    const auto certificate =
-        service->finalize_epoch_one(authority, dkg_digest, attestation_root, Digest{}, genesis_priv);
+    const auto certificate = service->finalize_epoch_one(
+        authority, dkg_digest, attestation_root, Digest{}, release_approval, genesis_priv);
     ASSERT_TRUE(certificate.has_value());
 
     EXPECT_EQ(certificate->network_id, network_id);
     EXPECT_EQ(certificate->epoch, 1u);
     EXPECT_EQ(certificate->authority_threshold, constants::kBootstrapThreshold);
     EXPECT_EQ(certificate->tier1_set_digest, service->founding_set()->digest());
+    EXPECT_EQ(certificate->release_approval_digest, release_approval);
     EXPECT_TRUE(verify_bootstrap_certificate(*certificate, genesis_pub));
+
+    // The committed release selection is a signed fact, not advisory metadata.
+    auto reselected = *certificate;
+    reselected.release_approval_digest.fill(0x45);
+    EXPECT_FALSE(verify_bootstrap_certificate(reselected, genesis_pub));
 
     // A different key must not verify it.
     nexus::crypto::Ed25519PublicKey other_pub{};
@@ -321,7 +329,7 @@ TEST_F(GenesisFixture, FinalizeSignsVerifiableCertificateAndEndsAuthority) {
     EXPECT_FALSE(service->record_eligibility_attest(eligibility_from(founders[0],
                                                                      founding_state())));
     EXPECT_FALSE(
-        service->finalize_epoch_one(authority, dkg_digest, attestation_root, Digest{}, genesis_priv)
+        service->finalize_epoch_one(authority, dkg_digest, attestation_root, Digest{}, Digest{}, genesis_priv)
             .has_value());
 }
 
@@ -346,7 +354,7 @@ TEST_F(GenesisFixture, RestoredFinalizationBlocksTheSigningBoundary) {
     EXPECT_FALSE(service->record_transcript_attest(late_transcript));
     EXPECT_FALSE(service->record_eligibility_attest(late_eligibility));
     EXPECT_FALSE(service
-                     ->finalize_epoch_one(authority, transcript, Digest{}, Digest{}, genesis_priv)
+                     ->finalize_epoch_one(authority, transcript, Digest{}, Digest{}, Digest{}, genesis_priv)
                      .has_value());
 }
 

@@ -15,7 +15,8 @@ NetworkId derive_network_id(const crypto::Ed25519PublicKey& genesis_public_key,
 }
 
 Digest bootstrap_certificate_signing_digest(const BootstrapCertificate& certificate) {
-    CanonicalEncoder encoder("lemonade-nexus/bootstrap-certificate:v1");
+    // v2: release_approval_digest joined the signed facts.
+    CanonicalEncoder encoder("lemonade-nexus/bootstrap-certificate:v2");
     encoder.add_bytes(certificate.network_id);
     encoder.add_u64(certificate.epoch.underlying());
     encoder.add_bytes(certificate.tier1_set_digest);
@@ -25,6 +26,7 @@ Digest bootstrap_certificate_signing_digest(const BootstrapCertificate& certific
     encoder.add_bytes(certificate.attestation_root);
     encoder.add_bytes(certificate.founding_eligibility_digest);
     encoder.add_bytes(certificate.vote_key_set_digest);
+    encoder.add_bytes(certificate.release_approval_digest);
     encoder.add_u16(certificate.security_ruleset);
     encoder.add_u16(certificate.consensus_ruleset);
     return encoder.digest();

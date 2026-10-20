@@ -42,9 +42,9 @@ enum class Refusal : uint16_t {
     /// any field this daemon does not know: see decode_challenge.
     MalformedRequest,
 
-    /// The challenge names a profile this daemon does not produce. Only
-    /// AzureSnpVtpm has a prover here; anything else goes unanswered rather than
-    /// being answered with the wrong evidence shape.
+    /// The challenge does not name the one Tier-1 profile selected by this
+    /// build. Other compiled providers go unanswered rather than being used as
+    /// a negotiation or downgrade path.
     ProfileNotSupported,
 
     /// Same profile, different rules. Old evidence cannot answer new rules, so a
@@ -81,6 +81,14 @@ enum class Refusal : uint16_t {
     /// (kMaxLocalFrameBytes x kMaxLocalChunks). A LOCAL resource bound, not the
     /// mesh's kMaxPlatformEvidenceWireBytes — see AttestdFraming.hpp.
     EvidenceOversized,
+
+    /// The activation request is well-formed, but this daemon cannot run it:
+    /// the build has no TPM stack, or no TPM is reachable.
+    ActivationUnavailable,
+
+    /// The TPM ran the activation and refused (public-area mismatch, policy
+    /// failure, TPM2_RC error). The detail string is diagnostic only.
+    ActivationFailed,
 };
 
 [[nodiscard]] std::string_view refusal_name(Refusal r);
@@ -111,7 +119,7 @@ enum class Refusal : uint16_t {
 /// identity — belongs to Nexus, which owns that key.
 struct PlatformEvidenceBundle {
     security::Digest          challenge_digest{};
-    security::SnpVtpmEvidence platform;
+    security::PlatformEvidence platform;
 };
 
 /// The value the vTPM will sign as qualifyingData, derived and never supplied.

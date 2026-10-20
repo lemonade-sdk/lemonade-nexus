@@ -4,6 +4,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <sodium.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 
@@ -12,6 +13,9 @@ namespace nexus::security {
 namespace {
 
 RouteResult drop(DropReason reason, std::optional<uint16_t> code = std::nullopt) {
+    // Debug, not warn: the plane must stay quiet under flood.
+    spdlog::debug("[security] route drop reason={} code={}",
+                  static_cast<uint16_t>(reason), code.value_or(0));
     RouteResult result;
     result.dropped = reason;
     result.service_code = code;
@@ -82,22 +86,22 @@ bool SecurityRouter::within_budget(const NodeId& sender, uint64_t now_ms) {
 }
 
 bool SecurityRouter::challenger_is_member(const NodeId& from) const {
+    // Pre-epoch: the pinned anchor and the anchor-authenticated founding set
+    // may challenge. Attestation never certifies, so a self-signature must not
+    // open this gate.
+    const auto pre_epoch_challenger = [this](const NodeId& node) {
+        return node == config_.genesis_anchor_id ||
+               (config_.founding_member && config_.founding_member(node));
+    };
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
-        // Genesis window. Only the pinned anchor issues founding challenges,
-        // and its identity is network state: the network id derives from it,
-        // so every node of this network knows it without any certificate.
-        // Transport enrollment happens before attestation; attestation never
-        // certifies, which is exactly why a stranger's self-signature must
-        // not open this gate.
-        return from == config_.genesis_anchor_id;
+        return pre_epoch_challenger(from);
     }
     const EpochState& cur = epochs->current();
     if (cur.id == 0) {
         // EpochManager exists but no epoch is activated yet (GenesisCollecting
-        // / selection): the anchor is still running the founding round, and
-        // only it may challenge. Same rule as above.
-        return from == config_.genesis_anchor_id;
+        // / selection): same rule as above.
+        return pre_epoch_challenger(from);
     }
     return cur.tier1_members.contains(from);
 }
@@ -171,6 +175,12 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.header.sender == authenticated_sender;
             } else if constexpr (std::is_same_v<T, AttestationEvidence>) {
                 return body.node_id == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, AttestationEvidenceStart>) {
+                return body.evidence.node_id == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, SvsmAkActivationOfferMessage>) {
+                return body.observer == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, SvsmAkActivationResponseMessage>) {
+                return body.subject_node == authenticated_sender;
             } else if constexpr (std::is_same_v<T, DkgTranscriptAttest>) {
                 return body.node == authenticated_sender;
             } else if constexpr (std::is_same_v<T, EligibilityObservation>) {
@@ -216,6 +226,11 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
         message.kind == SecurityMessageKind::EpochHandoffProof ||
         message.kind == SecurityMessageKind::AttestationChallenge ||
         message.kind == SecurityMessageKind::AttestationEvidence ||
+        message.kind == SecurityMessageKind::AttestationEvidenceStart ||
+        message.kind == SecurityMessageKind::AttestationEvidenceChunk ||
+        message.kind == SecurityMessageKind::AttestationEvidenceEnd ||
+        message.kind == SecurityMessageKind::SvsmAkActivationOffer ||
+        message.kind == SecurityMessageKind::SvsmAkActivationResponse ||
         message.kind == SecurityMessageKind::DkgBroadcast ||
         message.kind == SecurityMessageKind::DkgPairwise ||
         message.kind == SecurityMessageKind::SyncRequest ||
@@ -246,6 +261,11 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
                              message.kind == SecurityMessageKind::DkgPairwise ||
                              message.kind == SecurityMessageKind::AttestationChallenge ||
                              message.kind == SecurityMessageKind::AttestationEvidence ||
+                             message.kind == SecurityMessageKind::AttestationEvidenceStart ||
+                             message.kind == SecurityMessageKind::AttestationEvidenceChunk ||
+                             message.kind == SecurityMessageKind::AttestationEvidenceEnd ||
+                             message.kind == SecurityMessageKind::SvsmAkActivationOffer ||
+                             message.kind == SecurityMessageKind::SvsmAkActivationResponse ||
                              message.kind == SecurityMessageKind::DkgTranscriptAttest ||
                              message.kind == SecurityMessageKind::EpochAnnouncement;
     return preparation && message.epoch == current + 1;
@@ -281,13 +301,21 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
     if (!epoch_in_window(message)) {
         return drop(DropReason::EpochOutOfWindow);
     }
-    // A sync request has no nonce, so a retry is byte-identical to the first
-    // ask. It is an idempotent query answered only to its sender and paid for
-    // by the per-peer budget, so it skips the replay window rather than
-    // starving a restarted node of its own retries.
-    const bool idempotent_ask = message.kind == SecurityMessageKind::SyncRequest ||
-                                message.kind == SecurityMessageKind::AuthorityChainRequest;
-    if (!idempotent_ask && !remember(envelope)) {
+    // Idempotent kinds skip the replay window, still paid for by the per-peer
+    // budget: nonce-less queries, evidence transfer pieces repeated against
+    // loss, and the byte-identical bootstrap/ceremony re-broadcasts.
+    const bool idempotent = message.kind == SecurityMessageKind::SyncRequest ||
+                            message.kind == SecurityMessageKind::AuthorityChainRequest ||
+                            message.kind == SecurityMessageKind::AttestationEvidenceStart ||
+                            message.kind == SecurityMessageKind::AttestationEvidenceChunk ||
+                            message.kind == SecurityMessageKind::AttestationEvidenceEnd ||
+                            message.kind == SecurityMessageKind::GenesisFounding ||
+                            message.kind == SecurityMessageKind::GenesisEligibilityAttest ||
+                            message.kind == SecurityMessageKind::DkgBroadcast ||
+                            message.kind == SecurityMessageKind::DkgPairwise ||
+                            message.kind == SecurityMessageKind::DkgTranscriptAttest ||
+                            message.kind == SecurityMessageKind::BootstrapCertificate;
+    if (!idempotent && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
     return dispatch(message, now_ms);
@@ -309,6 +337,20 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
                                    now_ms);
         case SecurityMessageKind::AttestationEvidence:
             return route_evidence(std::get<AttestationEvidence>(message.body));
+        case SecurityMessageKind::AttestationEvidenceStart:
+            return route_evidence_start(std::get<AttestationEvidenceStart>(message.body), now_ms);
+        case SecurityMessageKind::AttestationEvidenceChunk:
+            return route_evidence_chunk(std::get<AttestationEvidenceChunk>(message.body),
+                                        message.sender, now_ms);
+        case SecurityMessageKind::AttestationEvidenceEnd:
+            return route_evidence_end(std::get<AttestationEvidenceEnd>(message.body),
+                                      message.sender, now_ms);
+        case SecurityMessageKind::SvsmAkActivationOffer:
+            return route_activation_offer(std::get<SvsmAkActivationOfferMessage>(message.body),
+                                          message.sender);
+        case SecurityMessageKind::SvsmAkActivationResponse:
+            return route_activation_response(
+                std::get<SvsmAkActivationResponseMessage>(message.body));
         case SecurityMessageKind::HotStuffProposal:
             return route_proposal(std::get<ProposalMessage>(message.body));
         case SecurityMessageKind::HotStuffVote:
@@ -621,20 +663,105 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
     if (!evidence.has_value()) {
         return drop(DropReason::NoService);
     }
-    SecurityMessage out =
-        compose(SecurityMessageKind::AttestationEvidence, *evidence, challenge.epoch);
-    if (from == runtime_.self()) {
-        // Loopback attestation: this node examines its own evidence.
-        (void)deliver_local(std::move(out), now_ms);
+    if (challenge.profile_id == AttestationProfileId::SnpSvsmVtpm &&
+        challenge.purpose != AttestationPurpose::PlatformEnrollment) {
+        const auto transfer = make_evidence_transfer(*evidence);
+        if (!transfer) return drop(DropReason::NoService);
+        const auto send_burst = [&](const auto& emit_one) {
+            if (!emit_one(compose(SecurityMessageKind::AttestationEvidenceStart,
+                                  transfer->start, challenge.epoch)))
+                return false;
+            for (const auto& chunk : transfer->chunks) {
+                if (!emit_one(compose(SecurityMessageKind::AttestationEvidenceChunk,
+                                      chunk, challenge.epoch)))
+                    return false;
+            }
+            return emit_one(compose(SecurityMessageKind::AttestationEvidenceEnd,
+                                    transfer->end, challenge.epoch));
+        };
+        if (!send_burst([&](SecurityMessage message) {
+                return from == runtime_.self()
+                           ? deliver_local(std::move(message), now_ms).delivered
+                           : send(from, message);
+            }))
+            return drop(DropReason::NoService);
+        if (from != runtime_.self()) {
+            // Second copy: UDP may drop a datagram; the receiver ignores duplicates.
+            (void)send_burst([&](const SecurityMessage& message) {
+                (void)send(from, message);
+                return true;
+            });
+        }
     } else {
-        (void)send(from, out);
+        SecurityMessage out = compose(SecurityMessageKind::AttestationEvidence,
+                                      *evidence, challenge.epoch);
+        if (from == runtime_.self()) (void)deliver_local(std::move(out), now_ms);
+        else (void)send(from, out);
     }
     return delivered();
 }
 
 RouteResult SecurityRouter::route_evidence(const AttestationEvidence& evidence) {
+    if (evidence.purpose == AttestationPurpose::PlatformEnrollment) {
+        auto offer = runtime_.attestation().receive_enrollment_evidence(evidence,
+                                                                        runtime_.self());
+        if (!offer) return drop(DropReason::ServiceRejected);
+        (void)send(evidence.node_id,
+                   compose(SecurityMessageKind::SvsmAkActivationOffer, *offer,
+                           evidence.epoch));
+        return delivered();
+    }
     const AttestationVerdict verdict = runtime_.attestation().receive_evidence(evidence);
     events_.on_attestation_verdict(verdict, evidence);
+    return delivered();
+}
+
+RouteResult SecurityRouter::route_evidence_start(const AttestationEvidenceStart& start,
+                                                 uint64_t now_ms) {
+    const auto challenge = runtime_.attestation().pending_challenge(start.evidence.node_id);
+    if (!challenge) return drop(DropReason::ServiceRejected,
+                                code(EvidenceTransferFailure::NoLiveChallenge));
+    return settle_transfer(
+        transfer_receiver_.begin(start.evidence.node_id, start, *challenge, now_ms));
+}
+
+RouteResult SecurityRouter::route_evidence_chunk(const AttestationEvidenceChunk& chunk,
+                                                 const NodeId& from, uint64_t now_ms) {
+    return settle_transfer(transfer_receiver_.chunk(from, chunk, now_ms));
+}
+
+RouteResult SecurityRouter::route_evidence_end(const AttestationEvidenceEnd& end,
+                                               const NodeId& from, uint64_t now_ms) {
+    return settle_transfer(transfer_receiver_.end(from, end, now_ms));
+}
+
+RouteResult SecurityRouter::settle_transfer(EvidenceTransferResult result) {
+    if (result.ok()) return route_evidence(*result.evidence);
+    return result.failure == EvidenceTransferFailure::None
+               ? delivered() : drop(DropReason::ServiceRejected, code(result.failure));
+}
+
+RouteResult SecurityRouter::route_activation_offer(const SvsmAkActivationOfferMessage& offer,
+                                                   const NodeId& from) {
+    if (offer.subject_node != runtime_.self() || offer.observer != from ||
+        !challenger_is_member(from))
+        return drop(DropReason::NotMember);
+    if (evidence_producer_ == nullptr) return drop(DropReason::NoService);
+    auto response = evidence_producer_->activate(offer);
+    if (!response) return drop(DropReason::NoService);
+    (void)send(from, compose(SecurityMessageKind::SvsmAkActivationResponse,
+                             *response, response->epoch));
+    return delivered();
+}
+
+RouteResult SecurityRouter::route_activation_response(
+    const SvsmAkActivationResponseMessage& response) {
+    if (response.observer != runtime_.self()) return drop(DropReason::SenderMismatch);
+    auto challenge = runtime_.attestation().receive_activation_response(response);
+    if (!challenge) return drop(DropReason::ServiceRejected);
+    (void)send(response.subject_node,
+               compose(SecurityMessageKind::AttestationChallenge, *challenge,
+                       challenge->epoch));
     return delivered();
 }
 

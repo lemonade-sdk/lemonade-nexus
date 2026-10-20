@@ -217,6 +217,13 @@ void SecurityDriver::start(uint64_t now_ms) {
         fail("durable security state is invalid");
         return;
     }
+    // Recovery fails closed when the stored certificate commits a different
+    // release approval than this process loaded.
+    if (certificate != nullptr &&
+        certificate->release_approval_digest != config_.release_approval_digest) {
+        fail("epoch state commits a different release approval than this process loaded");
+        return;
+    }
     if (certificate != nullptr) {
         anchor_ = *certificate;
     }
@@ -407,6 +414,7 @@ void SecurityDriver::tick(uint64_t now_ms) {
     }
 
     maybe_request_chain();
+    run_bootstrap_liveness(now_ms);
 
     if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value() &&
         !adoption_->state_synced &&
@@ -546,7 +554,9 @@ void SecurityDriver::send_founding() {
         founding.members.emplace_back(node, founder_vote_keys_.at(node));
     }
     founding.attestation_root = genesis_attestation_root(*founders);
-    spdlog::info("[security] genesis founding: {} attested founders", founders->size());
+    founding.release_approval_digest = config_.release_approval_digest;
+    spdlog::log(founding_sent_ ? spdlog::level::debug : spdlog::level::info,
+                "[security] genesis founding: {} attested founders", founders->size());
     for (const auto& node : founders->members()) {
         (void)router_.send(node,
                            router_.compose(SecurityMessageKind::GenesisFounding, founding, 1));
@@ -554,8 +564,105 @@ void SecurityDriver::send_founding() {
     founding_sent_ = true;
 }
 
+void SecurityDriver::run_bootstrap_liveness(uint64_t now_ms) {
+    if (phase_ == DriverPhase::FoundingDkg && founding_dkg_started_ms_ != 0 &&
+        now_ms - founding_dkg_started_ms_ >= constants::kDkgStallSeconds * 1000) {
+        on_dkg_failed(DkgFailure::Stalled, std::nullopt);
+        return;
+    }
+    const bool anchor_collecting = phase_ == DriverPhase::GenesisCollecting &&
+                                   genesis_ != nullptr && !genesis_->finalized();
+    const bool founder_round = phase_ == DriverPhase::GenesisEligibility && founding_.has_value();
+    const bool founder_dkg = phase_ == DriverPhase::FoundingDkg && founding_.has_value();
+    const bool founder_awaiting = phase_ == DriverPhase::AwaitingBootstrap &&
+                                  pending_transcript_attest_.has_value();
+    const bool certificate_tail =
+        issued_certificate_.has_value() &&
+        now_ms - certificate_issued_ms_ <= constants::kDkgStallSeconds * 2000;
+    if (!anchor_collecting && !founder_round && !founder_dkg && !founder_awaiting &&
+        !certificate_tail) {
+        return;
+    }
+    const uint64_t jitter =
+        (static_cast<uint64_t>(config_.self.bytes[0]) * 20) % constants::kBootstrapRetryJitterMs;
+    if (now_ms - last_bootstrap_retry_ms_ < constants::kBootstrapRetryMs + jitter) {
+        return;
+    }
+    last_bootstrap_retry_ms_ = now_ms;
+
+    if (anchor_collecting) {
+        if (founding_sent_) {
+            send_founding();
+            return;
+        }
+        for (const auto& peer : genesis_->unverdicted_candidates()) {
+            runtime_.attestation().reset_attempts(1, peer);
+            issue_genesis_challenge(peer);
+        }
+        return;
+    }
+    if (certificate_tail) {
+        // A founder that missed the one certificate broadcast has no other
+        // way to get it; repeat it for a bounded tail after issuance.
+        (void)router_.broadcast(router_.compose(SecurityMessageKind::BootstrapCertificate,
+                                                *issued_certificate_, 1));
+        return;
+    }
+    if (founder_dkg) {
+        // Re-attest so a straggler still assembling attests can finish.
+        broadcast_eligibility_attest();
+        // Datagrams are mortal: re-emit round-1 and produced round-2 packages.
+        if (DkgSession* dkg = runtime_.authority().dkg();
+            dkg != nullptr && !dkg->complete()) {
+            if (const auto round1 = dkg->own_round1()) {
+                (void)router_.broadcast(
+                    router_.compose(SecurityMessageKind::DkgBroadcast, *round1, 1));
+            }
+            for (const auto& package : dkg->round2_cached()) {
+                (void)router_.send_sealed_dkg(package);
+            }
+        }
+        return;
+    }
+    if (founder_awaiting) {
+        (void)router_.send(genesis_id(),
+                           router_.compose(SecurityMessageKind::DkgTranscriptAttest,
+                                           *pending_transcript_attest_, 1));
+        return;
+    }
+    if (founding_eligibility_digest_ != Digest{}) {
+        if (founding_eligibility_attests_.size() >= founding_->members.size()) {
+            return;
+        }
+        broadcast_eligibility_attest();
+        // No return: fresh observations at higher heights are the only way a
+        // starved peer's round can finish.
+    }
+    for (const auto& [node, key] : founding_->members) {
+        if (node != config_.self) {
+            challenge_founding_edge(node);
+        }
+    }
+}
+
 void SecurityDriver::on_genesis_founding(const GenesisFounding& founding, const NodeId& from) {
-    if (from != genesis_id() || phase_ != DriverPhase::Idle || runtime_.epochs() != nullptr) {
+    if (from != genesis_id() || runtime_.epochs() != nullptr) {
+        return;
+    }
+    if (phase_ == DriverPhase::GenesisEligibility && founding_.has_value()) {
+        // The root commits to every founder's evidence, vote key included, so
+        // it alone identifies the round; an equal one is the anchor keep-alive.
+        if (founding.attestation_root == founding_->attestation_root) {
+            return;
+        }
+        // A different founding from the anchor supersedes a round that can no
+        // longer complete (a founder restarted or the anchor re-collected).
+        spdlog::info("[security] newer genesis founding received; restarting the mutual round");
+        founding_eligibility_digest_ = Digest{};
+        founding_eligibility_attests_.clear();
+        // Stale ask times would suppress the fresh round's first challenges.
+        founding_challenge_ms_.clear();
+    } else if (phase_ != DriverPhase::Idle) {
         return;
     }
     const auto self_entry =
@@ -567,6 +674,12 @@ void SecurityDriver::on_genesis_founding(const GenesisFounding& founding, const 
     // The founding must echo the vote key this node's evidence bound.
     const auto own_key = vote_key_for_epoch(1);
     if (!own_key.has_value() || self_entry->second != *own_key) {
+        return;
+    }
+    // One release selection per network: a founding naming a different (or no)
+    // release approval than this node loaded is refused, not reconciled.
+    if (founding.release_approval_digest != config_.release_approval_digest) {
+        spdlog::warn("[security] genesis founding names a different release approval; refusing");
         return;
     }
     founding_ = founding;
@@ -582,37 +695,62 @@ void SecurityDriver::on_genesis_founding(const GenesisFounding& founding, const 
         set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
         return;
     }
+    // Heights are monotonic per record; a round counter behind the kept
+    // ledger would publish nothing but rewinds.
+    founding_round_ = std::max(founding_round_, eligibility_.max_observed_height());
     set_phase(DriverPhase::GenesisEligibility,
               "founding received; running the mutual eligibility round");
     begin_founding_observations();
 }
 
+bool SecurityDriver::is_founding_member(const NodeId& node) const {
+    if (!founding_.has_value()) {
+        return false;
+    }
+    return std::any_of(founding_->members.begin(), founding_->members.end(),
+                       [&node](const auto& entry) { return entry.first == node; });
+}
+
 void SecurityDriver::begin_founding_observations() {
-    // Continuity counts distinct attestations, so each founder is challenged
-    // the compiled minimum number of times.
-    //
-    // These name epoch 0, the bootstrap window. The founding round is not
-    // Epoch 1 work, and spending Epoch 1's per-node attestation budget here
-    // would leave the first epoch's re-attestation cadence short of it.
+    // One challenge per peer per pass: the service holds one pending challenge
+    // per subject. The liveness cadence repeats the pass until continuity has
+    // kMinContinuityObservations distinct attestations.
+    spdlog::info("[security] founding round: observing {} founders",
+                 founding_->members.size() - 1);
     for (const auto& [node, key] : founding_->members) {
-        if (node == config_.self) {
-            continue;
-        }
-        for (std::size_t round = 0; round < constants::kMinContinuityObservations; ++round) {
-            crypto::Ed25519PublicKey node_key{};
-            node_key = node.bytes;
-            auto challenge = runtime_.attestation().create_challenge(
-                node, node_key, 1, 0, AttestationPurpose::Eligibility);
-            if (!challenge.has_value()) {
-                break;
-            }
-            (void)router_.send(
-                node, router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, 0));
+        if (node != config_.self) {
+            challenge_founding_edge(node);
         }
     }
 }
 
+void SecurityDriver::challenge_founding_edge(const NodeId& peer) {
+    // Re-challenging over an outstanding ask orphans its answer; give each
+    // edge two cadence periods before asking again.
+    uint64_t& asked = founding_challenge_ms_[peer];
+    if (asked != 0 && now_ms_ - asked < constants::kBootstrapRetryMs * 2) {
+        return;
+    }
+    asked = now_ms_;
+    // Epoch 0, the bootstrap window: the founding round is not Epoch 1 work,
+    // and must not spend Epoch 1's per-node attestation budget.
+    runtime_.attestation().reset_attempts(0, peer);
+    crypto::Ed25519PublicKey peer_key{};
+    peer_key = peer.bytes;
+    auto challenge = runtime_.attestation().create_challenge(peer, peer_key, 1, 0,
+                                                             AttestationPurpose::Eligibility);
+    if (!challenge.has_value()) {
+        return;
+    }
+    (void)router_.send(peer,
+                       router_.compose(SecurityMessageKind::AttestationChallenge, *challenge, 0));
+}
+
 void SecurityDriver::record_founding_observation(const AttestationVerdict& verdict) {
+    spdlog::info("[security] founding verdict for {}: {} (failure={})",
+                 crypto::to_hex(std::span<const uint8_t>(verdict.node_id.bytes.data(), 8)),
+                 verdict.passed ? "PASSED" : "failed",
+                 static_cast<uint16_t>(verdict.failure));
     eligibility_.record_verdict(verdict);
     // Before Epoch 1 nothing is certified, so the round counter stands in for
     // the certified height an established epoch would supply.
@@ -649,7 +787,13 @@ void SecurityDriver::maybe_attest_founding_eligibility() {
         return;
     }
     founding_eligibility_digest_ = eligibility_state_digest(eligibility_.compute_state(1));
+    spdlog::info("[security] founding mutual round complete; attesting state {}",
+                 crypto::to_hex(std::span<const uint8_t>(founding_eligibility_digest_.data(), 8)));
+    founding_eligibility_attests_[config_.self] = founding_eligibility_digest_;
+    broadcast_eligibility_attest();
+}
 
+void SecurityDriver::broadcast_eligibility_attest() {
     GenesisEligibilityAttest attest;
     attest.epoch = 1;
     attest.founding_state_digest = founding_eligibility_digest_;
@@ -657,8 +801,6 @@ void SecurityDriver::maybe_attest_founding_eligibility() {
     const Digest digest = genesis_eligibility_attest_digest(attest);
     crypto_sign_detached(attest.identity_signature.data(), nullptr, digest.data(), digest.size(),
                          config_.identity.private_key.data());
-
-    founding_eligibility_attests_[config_.self] = founding_eligibility_digest_;
     (void)router_.broadcast(
         router_.compose(SecurityMessageKind::GenesisEligibilityAttest, attest, 1));
     (void)router_.send(genesis_id(),
@@ -668,7 +810,10 @@ void SecurityDriver::maybe_attest_founding_eligibility() {
 
 void SecurityDriver::on_genesis_eligibility_attest(const GenesisEligibilityAttest& attest) {
     if (genesis_ != nullptr && genesis_node() && !genesis_->finalized()) {
-        (void)genesis_->record_eligibility_attest(attest);
+        if (genesis_->record_eligibility_attest(attest)) {
+            spdlog::debug("[security] genesis: eligibility attest from {}",
+                          crypto::to_hex(std::span<const uint8_t>(attest.node.bytes.data(), 8)));
+        }
         return;
     }
     if (phase_ != DriverPhase::GenesisEligibility || !founding_.has_value() || attest.epoch != 1) {
@@ -685,6 +830,11 @@ void SecurityDriver::on_genesis_eligibility_attest(const GenesisEligibilityAttes
                                     attest.node.bytes.data()) != 0) {
         return;
     }
+    if (!founding_eligibility_attests_.contains(attest.node)) {
+        spdlog::info("[security] founding eligibility attest from {} ({}/{})",
+                     crypto::to_hex(std::span<const uint8_t>(attest.node.bytes.data(), 8)),
+                     founding_eligibility_attests_.size() + 1, founding_->members.size());
+    }
     founding_eligibility_attests_[attest.node] = attest.founding_state_digest;
 
     // Every founder, and the same transcript from each. One disagreement stops
@@ -695,6 +845,12 @@ void SecurityDriver::on_genesis_eligibility_attest(const GenesisEligibilityAttes
     }
     for (const auto& [node, value] : founding_eligibility_attests_) {
         if (value != founding_eligibility_digest_) {
+            spdlog::warn("[security] founding eligibility attest from {} disagrees: "
+                         "theirs {} ours {}; the round cannot conclude",
+                         crypto::to_hex(std::span<const uint8_t>(node.bytes.data(), 8)),
+                         crypto::to_hex(std::span<const uint8_t>(value.data(), 8)),
+                         crypto::to_hex(std::span<const uint8_t>(
+                             founding_eligibility_digest_.data(), 8)));
             return;
         }
     }
@@ -703,6 +859,7 @@ void SecurityDriver::on_genesis_eligibility_attest(const GenesisEligibilityAttes
 }
 
 void SecurityDriver::start_founding_dkg() {
+    founding_dkg_started_ms_ = now_ms_;
     std::vector<NodeId> ids;
     std::map<NodeId, IncarnationId> incarnations;
     for (const auto& [node, key] : founding_->members) {
@@ -749,6 +906,7 @@ void SecurityDriver::on_dkg_complete(EpochId target) {
                              digest.size(), config_.identity.private_key.data());
         (void)router_.send(genesis_id(),
                            router_.compose(SecurityMessageKind::DkgTranscriptAttest, attest, 1));
+        pending_transcript_attest_ = attest;
         set_phase(DriverPhase::AwaitingBootstrap,
                   "DKG transcript attested; awaiting the bootstrap certificate");
         return;
@@ -822,11 +980,16 @@ void SecurityDriver::on_dkg_failed(DkgFailure, std::optional<NodeId> culprit) {
     runtime_.authority().abandon_dkg();
     if (phase_ == DriverPhase::GenesisEligibility || phase_ == DriverPhase::FoundingDkg ||
         phase_ == DriverPhase::AwaitingBootstrap) {
-        // Await a fresh founding round; nothing was activated.
+        // Await a fresh founding round; nothing was activated, and nothing of
+        // this attempt may outlive it.
         founding_.reset();
         pending_dkg_.reset();
+        pending_transcript_attest_.reset();
         founding_eligibility_digest_ = Digest{};
         founding_eligibility_attests_.clear();
+        founding_challenge_ms_.clear();
+        founding_dkg_started_ms_ = 0;
+        issued_certificate_.reset();
         set_phase(DriverPhase::Idle, "founding DKG failed; awaiting a fresh round");
         return;
     }
@@ -892,11 +1055,14 @@ void SecurityDriver::on_dkg_transcript_attest(const DkgTranscriptAttest& attest)
     }
     const auto certificate = genesis_->finalize_epoch_one(
         attest.group_public_key, attest.transcript_digest, genesis_attestation_root(*founders),
-        vote_key_set_digest(founder_keys), config_.identity.private_key);
+        vote_key_set_digest(founder_keys), config_.release_approval_digest,
+        config_.identity.private_key);
     if (!certificate.has_value()) {
         return;
     }
     (void)store_.store_bootstrap(*certificate);
+    issued_certificate_ = *certificate;
+    certificate_issued_ms_ = now_ms_;
     (void)router_.broadcast(
         router_.compose(SecurityMessageKind::BootstrapCertificate, *certificate, 1));
     // Genesis unilateral authority ends here; this node continues as an
@@ -931,6 +1097,13 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
     // Genesis may only certify the founding eligibility the founders computed.
     // A certificate naming anything else is refused rather than adopted.
     if (certificate.founding_eligibility_digest != founding_eligibility_digest_) {
+        return;
+    }
+    // And only the release selection this node bootstrapped under. After this
+    // adoption the commitment is epoch state; Genesis cannot replace it.
+    if (certificate.release_approval_digest != config_.release_approval_digest) {
+        spdlog::warn("[security] bootstrap certificate commits a different release approval; "
+                     "refusing adoption");
         return;
     }
     std::vector<NodeId> ids;
@@ -1036,9 +1209,10 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
         if (!genesis_->record_verdict(verdict)) {
             return;
         }
-        spdlog::info("[security] genesis verdict for {}: {}",
+        spdlog::info("[security] genesis verdict for {}: {} (failure={})",
                      crypto::to_hex(std::span<const uint8_t>(verdict.node_id.bytes.data(), 8)),
-                     verdict.passed ? "PASSED" : "failed");
+                     verdict.passed ? "PASSED" : "failed",
+                     static_cast<uint16_t>(verdict.failure));
         if (verdict.passed) {
             founder_vote_keys_[verdict.node_id] = evidence.epoch_vote_key;
             founder_evidence_digests_[verdict.node_id] = verdict.evidence_digest;

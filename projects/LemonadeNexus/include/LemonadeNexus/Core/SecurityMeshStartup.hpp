@@ -22,6 +22,9 @@ struct SecurityMeshStartup {
     std::unique_ptr<security::SecurityMeshService> service;
     /// Hex network id the pinned anchor derives; certificate issuance binds to it.
     std::string network_id_hex;
+    /// Present only after Genesis delegation and release signature verification.
+    std::string release_signing_pubkey_b64;
+    std::string release_approval_digest_hex;
 };
 
 /// Decode the pinned Genesis anchor, derive the network it names, gate gossip
@@ -33,6 +36,7 @@ struct SecurityMeshStartup {
     gossip::GossipService& gossip,
     crypto::KeyWrappingService& key_wrapping,
     security::PlatformEvidenceSource platform_source,
+    security::PlatformActivationSource activation_source,
     std::string& error);
 
 }  // namespace nexus::core

@@ -97,8 +97,12 @@ observed on an unqualified host would make the profile decide nothing.
 ## The Evidence Helper: nexus-attestd
 
 `nexus-attestd` is a separate daemon (`/usr/bin/nexus-attestd`) that answers
-one question over one local socket: produce this host's platform evidence for
-a challenge.
+two questions over one local socket: produce this host's platform evidence for
+a challenge, and — for an SVSM candidate — run the one TPM operation the Nexus
+server may not run itself, the AK credential activation for enrollment. The
+activation request carries the verifier's credential material as-is and returns
+the activated secret digest; the daemon never decides eligibility, persists
+nothing, and creates no persistent TPM handle.
 
 The unit file draws the privilege boundary explicitly:
 

@@ -1,7 +1,8 @@
 #include <LemonadeNexusAttestd/AttestdCodec.hpp>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
-#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+#include <LemonadeNexus/Security/Attestation/PlatformEvidence.hpp>
+#include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <nlohmann/json.hpp>
 #include <sodium.h>
@@ -28,6 +29,8 @@ constexpr std::string_view kChallengeKeys[] = {
     "node_id",       "node_key",      "incarnation",      "epoch",
     "security_ruleset", "consensus_ruleset", "profile_id", "profile_ruleset",
     "policy_digest", "purpose",       "context_digest",
+    "ima_mode", "ima_checkpoint_digest", "ima_prior_event_count",
+    "ima_prior_pcr10", "ima_checkpoint_paths",
 };
 
 [[nodiscard]] std::string hex_of(std::span<const uint8_t> bytes) { return crypto::to_hex(bytes); }
@@ -72,6 +75,7 @@ template <typename Tag>
     switch (static_cast<security::AttestationPurpose>(raw)) {
         case security::AttestationPurpose::Eligibility:
         case security::AttestationPurpose::FinalEpochReadiness:
+        case security::AttestationPurpose::PlatformEnrollment:
             out = static_cast<security::AttestationPurpose>(raw);
             return true;
     }
@@ -120,6 +124,25 @@ std::optional<security::AttestationChallenge> decode_challenge(std::string_view 
     if (!read_hex(j["policy_digest"], c.policy_digest)) return std::nullopt;
     if (!read_purpose(j["purpose"], c.purpose)) return std::nullopt;
     if (!read_hex(j["context_digest"], c.context_digest)) return std::nullopt;
+    uint16_t mode = 0;
+    if (!read_uint(j["ima_mode"], mode) ||
+        (mode != static_cast<uint16_t>(security::ImaEvidenceMode::Full) &&
+         mode != static_cast<uint16_t>(security::ImaEvidenceMode::Resume))) return std::nullopt;
+    c.ima_mode = static_cast<security::ImaEvidenceMode>(mode);
+    if (!read_hex(j["ima_checkpoint_digest"], c.ima_checkpoint_digest) ||
+        !read_uint(j["ima_prior_event_count"], c.ima_prior_event_count) ||
+        !read_hex(j["ima_prior_pcr10"], c.ima_prior_pcr10) ||
+        !j["ima_checkpoint_paths"].is_array() ||
+        j["ima_checkpoint_paths"].size() > security::constants::kMaxSummarisedPaths)
+        return std::nullopt;
+    for (const auto& item : j["ima_checkpoint_paths"]) {
+        if (!item.is_object() || item.size() != 2 || !item.contains("path") ||
+            !item.contains("sha256") || !item["path"].is_string() ||
+            !item["sha256"].is_string() || item["path"].get<std::string>().size() > 4096 ||
+            item["sha256"].get<std::string>().size() != 64) return std::nullopt;
+        c.ima_checkpoint_paths.push_back({item["path"].get<std::string>(),
+                                          item["sha256"].get<std::string>()});
+    }
 
     // An ID no compiled provider names stays Unknown, which check_challenge
     // refuses. Parsing it faithfully keeps the diagnosis honest.
@@ -130,8 +153,77 @@ std::optional<security::AttestationChallenge> decode_challenge(std::string_view 
     return c;
 }
 
+namespace {
+
+/// The complete activation request grammar. Same closed-grammar rule as the
+/// challenge: unknown keys are a refusal, so a caller cannot append a field an
+/// older daemon would silently ignore.
+constexpr std::string_view kActivationKeys[] = {
+    "version", "type", "ek_public", "ak_public", "credential_blob", "encrypted_secret",
+};
+
+/// base64 into a bounded field. An empty field is a refusal — an empty
+/// TPM2B_PUBLIC is not a key.
+[[nodiscard]] bool read_activation_field(const json& value, std::vector<uint8_t>& out) {
+    if (!value.is_string() || value.get<std::string>().empty()) return false;
+    try {
+        auto bytes = crypto::from_base64(value.get<std::string>());
+        if (bytes.empty() || bytes.size() > kMaxActivationFieldBytes) return false;
+        out = std::move(bytes);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+}  // namespace
+
+std::optional<SvsmAkActivationRequest> decode_activation_request(std::string_view text) {
+    if (text.empty() || text.size() > kMaxRequestBytes) return std::nullopt;
+
+    json j = json::parse(text, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+
+    for (const auto& [key, unused] : j.items()) {
+        (void)unused;
+        const bool known = std::any_of(std::begin(kActivationKeys), std::end(kActivationKeys),
+                                       [&key](std::string_view k) { return k == key; });
+        if (!known) return std::nullopt;
+    }
+    for (std::string_view key : kActivationKeys) {
+        if (!j.contains(std::string(key))) return std::nullopt;
+    }
+
+    if (!j["version"].is_number_integer() || j["version"].get<int>() != kAttestdWireVersion) {
+        return std::nullopt;
+    }
+    if (!j["type"].is_string() || j["type"].get<std::string>() != kActivationRequestType) {
+        return std::nullopt;
+    }
+
+    SvsmAkActivationRequest request;
+    if (!read_activation_field(j["ek_public"], request.ek_public) ||
+        !read_activation_field(j["ak_public"], request.ak_public) ||
+        !read_activation_field(j["credential_blob"], request.credential_blob) ||
+        !read_activation_field(j["encrypted_secret"], request.encrypted_secret)) {
+        return std::nullopt;
+    }
+    return request;
+}
+
+std::string encode_activation_request(const SvsmAkActivationRequest& request) {
+    json j;
+    j["version"] = kAttestdWireVersion;
+    j["type"] = std::string(kActivationRequestType);
+    j["ek_public"] = crypto::to_base64(request.ek_public);
+    j["ak_public"] = crypto::to_base64(request.ak_public);
+    j["credential_blob"] = crypto::to_base64(request.credential_blob);
+    j["encrypted_secret"] = crypto::to_base64(request.encrypted_secret);
+    return j.dump() + "\n";
+}
+
 bool emit_bundle(const PlatformEvidenceBundle& bundle, const FrameSink& sink) {
-    const std::string evidence = security::encode_snp_vtpm_evidence(bundle.platform);
+    const std::string evidence = security::encode_platform_evidence(bundle.platform);
 
     // Refuse before emitting: a Header already sent commits the stream to a
     // length the chunk budget cannot deliver.
@@ -166,6 +258,14 @@ bool emit_bundle(const PlatformEvidenceBundle& bundle, const FrameSink& sink) {
     end["chunks"] = chunks;
     end["platform_sha256"] = hex_of(digest);
     return sink(encode_frame(FrameKind::End, end.dump()));
+}
+
+bool emit_activation_result(const std::vector<uint8_t>& activated_secret, const FrameSink& sink) {
+    json j;
+    j["version"] = kAttestdWireVersion;
+    j["type"] = std::string(kActivationResultType);
+    j["activated_secret"] = hex_of(activated_secret);
+    return sink(encode_frame(FrameKind::Result, j.dump()));
 }
 
 bool emit_refusal(Refusal refusal, const FrameSink& sink, std::string_view detail) {
@@ -268,8 +368,37 @@ bool ResponseAssembler::offer(FrameKind kind, std::string_view payload) {
             done_ = true;
             return false;  // complete
         }
+
+        case FrameKind::Result: {
+            // One frame, same position Refusal holds: before any other frame.
+            if (header_seen_) return fail(FrameError::Malformed);
+            if (!j.contains("version") || !j["version"].is_number_integer() ||
+                j["version"].get<int>() != kAttestdWireVersion) {
+                return fail(FrameError::Malformed);
+            }
+            if (!j.contains("type") || !j["type"].is_string() ||
+                j["type"].get<std::string>() != kActivationResultType) {
+                return fail(FrameError::Malformed);
+            }
+            if (!j.contains("activated_secret") || !j["activated_secret"].is_string() ||
+                j["activated_secret"].get<std::string>().size() != 2 * security::kDigestSize) {
+                return fail(FrameError::Malformed);
+            }
+            try {
+                result_secret_ = crypto::from_hex(j["activated_secret"].get<std::string>());
+            } catch (const std::exception&) {
+                return fail(FrameError::Malformed);
+            }
+            done_ = true;
+            return false;  // over, carrying a result
+        }
     }
     return fail(FrameError::Malformed);
+}
+
+std::optional<std::vector<uint8_t>> ResponseAssembler::result_secret() const {
+    if (!done_ || error_ != FrameError::None || result_secret_.empty()) return std::nullopt;
+    return result_secret_;
 }
 
 bool ResponseAssembler::finish(PlatformEvidenceBundle& out) {
@@ -287,7 +416,7 @@ bool ResponseAssembler::finish(PlatformEvidenceBundle& out) {
         return false;
     }
 
-    auto platform = security::decode_snp_vtpm_evidence(evidence_);
+    auto platform = security::decode_platform_evidence(evidence_);
     if (!platform) {
         error_ = FrameError::Malformed;
         return false;
