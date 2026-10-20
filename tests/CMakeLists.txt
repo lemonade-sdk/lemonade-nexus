@@ -69,6 +69,7 @@ add_nexus_test(test_onboarding_discovery test_onboarding_discovery.cpp)
 target_include_directories(test_onboarding PRIVATE
     ${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/Core)
 add_nexus_test(test_onboarding_genesis test_onboarding_genesis.cpp)
+add_nexus_test(test_genesis_anchor    test_genesis_anchor.cpp)
 
 # Uses httplib SSLClient/SSLServer + OpenSSL X509 directly for the TLS transport test.
 add_nexus_test(test_tls_transport     test_tls_transport.cpp)
@@ -109,6 +110,8 @@ add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
 # Hostile packets at the real wire boundary: cert-gated sync, ServerHello
 # proof-of-possession, retired misbehavior proofs, and NS slot claim laundering.
 add_nexus_test(test_gossip_ingress_security test_gossip_ingress_security.cpp)
+add_nexus_test(test_dns_origin_replay test_dns_origin_replay.cpp)
+add_nexus_test(test_ns_claim_ip_change test_ns_claim_ip_change.cpp)
 # Delta record transfer: generation-bound pagination, request binding, pool
 # retention and refusal, backoff survival, and the mesh-state race.
 add_nexus_test(test_gossip_delta_transfer test_gossip_delta_transfer.cpp)
@@ -191,6 +194,13 @@ add_nexus_test(test_security_attestation
     security/attestation/providers.cpp
     security/attestation/attestd_integration.cpp
     security/attestation/attestd_live.cpp
+    security/attestation/svsm_service_live.cpp
+    security/attestation/svsm_provider.cpp
+    security/attestation/svsm_signed_mutations.cpp
+    security/attestation/protocol_closeout.cpp
+    security/attestation/release_approval.cpp
+    security/attestation/release_bundle.cpp
+    security/attestation/activation_delegation.cpp
     security/attestation/tier1_path.cpp)
 # providers.cpp runs the substitution negatives against the captured SNP blob.
 target_link_libraries(test_security_attestation PRIVATE LemonadeNexusAttestdCore)

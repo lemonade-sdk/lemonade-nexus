@@ -18,7 +18,7 @@
 //
 // One Header (or one Refusal), then chunks in order, then one End. The reader
 // stops at End and never reads to EOF. Chunks carry the canonical
-// encode_snp_vtpm_evidence() bytes verbatim, so the client decodes exactly what
+// encode_platform_evidence() bytes verbatim, so the client decodes exactly what
 // the daemon encoded.
 
 #include <cstddef>
@@ -31,9 +31,10 @@ namespace nexus::attestd {
 /// Largest single frame payload, and so the most a reader ever holds at once.
 inline constexpr std::size_t kMaxLocalFrameBytes = 64 * 1024;
 
-/// Most chunks in one response: 2 MiB of evidence. Past that, producing it is
-/// no longer a bounded operation and becomes the checkpoint protocol's problem.
-inline constexpr std::size_t kMaxLocalChunks = 32;
+/// Most chunks in one response: 4 MiB. A Full IMA acquisition runs to a few
+/// MiB inside the local JSON envelope, so 64 frames carry it while retaining a
+/// hard operation bound.
+inline constexpr std::size_t kMaxLocalChunks = 64;
 
 /// Total bytes per operation, frame headers included. A running sum, so no
 /// combination of legal frames exceeds it.
@@ -49,6 +50,7 @@ enum class FrameKind : uint8_t {
     EvidenceChunk = 2,  ///< one slice of the canonical evidence bytes, in order
     End = 3,            ///< chunk count and digest of the reassembled bytes, as JSON
     Refusal = 4,        ///< a typed Refusal instead of a bundle; terminates the stream
+    Result = 5,         ///< a small typed JSON result (activation); terminates the stream
 };
 
 /// Bytes of one frame. Empty when `payload` is over the frame bound; a caller

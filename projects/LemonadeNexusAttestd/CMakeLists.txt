@@ -43,11 +43,52 @@ install(TARGETS nexus-attestd
         RUNTIME DESTINATION bin
         COMPONENT Runtime)
 
+if(UNIX AND NOT APPLE)
+    # POSIX-only sources (unistd/dirent); keep the library, link, and probe
+    # binary together under one guard so no other platform sees the target.
+    add_library(Tier1AuthorityProbeCore src/Tier1AuthorityProbe.cpp)
+    target_compile_features(Tier1AuthorityProbeCore PUBLIC cxx_std_20)
+    target_include_directories(Tier1AuthorityProbeCore PUBLIC
+            "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(LemonadeNexusAttestdCore PUBLIC Tier1AuthorityProbeCore)
+
+    add_executable(nexus-tier1-authority-probe src/tier1_authority_probe_main.cpp)
+    target_compile_features(nexus-tier1-authority-probe PRIVATE cxx_std_20)
+    target_link_libraries(nexus-tier1-authority-probe PRIVATE Tier1AuthorityProbeCore)
+    install(TARGETS nexus-tier1-authority-probe RUNTIME DESTINATION bin COMPONENT Runtime)
+    install(FILES "${CMAKE_SOURCE_DIR}/packaging/tier1-authority-probe.complete"
+            DESTINATION lib/lemonade-nexus COMPONENT Runtime)
+    install(FILES "${CMAKE_SOURCE_DIR}/packaging/apparmor/nexus-tier1-authority-probe"
+            DESTINATION /etc/apparmor.d COMPONENT Runtime)
+    install(FILES "${CMAKE_SOURCE_DIR}/packaging/apparmor/nexus-tier1-authority-probe.bin"
+            DESTINATION lib/lemonade-nexus/apparmor COMPONENT Runtime)
+    install(PROGRAMS "${CMAKE_SOURCE_DIR}/packaging/initramfs-tools/hooks/nexus-tier1-apparmor"
+            DESTINATION share/initramfs-tools/hooks COMPONENT Runtime)
+    install(PROGRAMS
+            "${CMAKE_SOURCE_DIR}/packaging/initramfs-tools/scripts/init-premount/nexus-tier1-apparmor"
+            DESTINATION share/initramfs-tools/scripts/init-premount COMPONENT Runtime)
+    install(PROGRAMS
+            "${CMAKE_SOURCE_DIR}/packaging/dracut/76nexus-tier1-apparmor/module-setup.sh"
+            DESTINATION lib/dracut/modules.d/76nexus-tier1-apparmor COMPONENT Runtime)
+    # Both backends execute the same loader source, keeping the securityfs
+    # mount, pinned-blob load, and enforcing-state check identical.
+    install(PROGRAMS
+            "${CMAKE_SOURCE_DIR}/packaging/initramfs-tools/scripts/init-premount/nexus-tier1-apparmor"
+            DESTINATION lib/dracut/modules.d/76nexus-tier1-apparmor
+            RENAME nexus-tier1-apparmor.sh COMPONENT Runtime)
+endif()
+
 # The hardening in this unit is the point of the whole component; ship it with
 # the binary rather than leaving the privilege boundary to a deployment note.
 if(UNIX AND NOT APPLE)
     install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/systemd/nexus-attestd.service"
             DESTINATION lib/systemd/system
+            COMPONENT Runtime)
+    install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/systemd/nexus-attestd-tsm-setup.service"
+            DESTINATION lib/systemd/system
+            COMPONENT Runtime)
+    install(PROGRAMS "${CMAKE_CURRENT_SOURCE_DIR}/systemd/nexus-attestd-tsm-setup"
+            DESTINATION lib/lemonade-nexus
             COMPONENT Runtime)
 endif()
 

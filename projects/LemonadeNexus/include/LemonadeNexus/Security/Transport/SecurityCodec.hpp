@@ -11,6 +11,7 @@
 // transport bytes.
 
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/SvsmAkEnrollment.hpp>
 #include <LemonadeNexus/Security/Authority/AuthorityService.hpp>
 #include <LemonadeNexus/Security/Authority/DkgSession.hpp>
 #include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
@@ -56,6 +57,11 @@ enum class SecurityMessageKind : uint16_t {
     EpochHandoffProof = 23,
     AuthorityChainRequest = 24,
     AuthorityChainPage = 25,
+    AttestationEvidenceStart = 26,
+    AttestationEvidenceChunk = 27,
+    AttestationEvidenceEnd = 28,
+    SvsmAkActivationOffer = 29,
+    SvsmAkActivationResponse = 30,
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -179,7 +185,12 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   ReadinessProofMsg,
                                   EpochHandoffProofMsg,
                                   AuthorityChainRequest,
-                                  AuthorityChainPage>;
+                                  AuthorityChainPage,
+                                  AttestationEvidenceStart,
+                                  AttestationEvidenceChunk,
+                                  AttestationEvidenceEnd,
+                                  SvsmAkActivationOfferMessage,
+                                  SvsmAkActivationResponseMessage>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

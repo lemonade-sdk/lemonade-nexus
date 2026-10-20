@@ -1,0 +1,59 @@
+#!/bin/bash
+set -e
+
+package_is_installed() {
+    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null |
+        grep -qx 'install ok installed'
+}
+
+rebuild_supported_initramfs() {
+    local have_dracut=0
+    local have_initramfs_tools=0
+    local rebuilt=0
+    local module_dir kernel
+
+    package_is_installed dracut && have_dracut=1
+    package_is_installed initramfs-tools && have_initramfs_tools=1
+
+    if [ "$have_dracut" -eq 1 ] && [ "$have_initramfs_tools" -eq 1 ]; then
+        echo "lemonade-nexus: both dracut and initramfs-tools are installed; preferring dracut" >&2
+        have_initramfs_tools=0
+    fi
+
+    if [ "$have_dracut" -eq 1 ]; then
+        [ -x /usr/bin/dracut ] || {
+            echo "lemonade-nexus: dracut is installed but /usr/bin/dracut is unavailable" >&2
+            return 1
+        }
+        for module_dir in /lib/modules/*; do
+            [ -d "$module_dir" ] || continue
+            kernel=${module_dir##*/}
+            [ -f "/boot/vmlinuz-$kernel" ] || continue
+            /usr/bin/dracut --force "/boot/initrd.img-$kernel" "$kernel"
+            rebuilt=1
+        done
+    elif [ "$have_initramfs_tools" -eq 1 ]; then
+        [ -x /usr/sbin/update-initramfs ] || {
+            echo "lemonade-nexus: initramfs-tools is installed but update-initramfs is unavailable" >&2
+            return 1
+        }
+        /usr/sbin/update-initramfs -u -k all
+        rebuilt=1
+    else
+        echo "lemonade-nexus: no supported initramfs backend is installed (need dracut or initramfs-tools)" >&2
+        return 1
+    fi
+
+    if [ "$rebuilt" -ne 1 ]; then
+        echo "lemonade-nexus: no installed kernel image was available for initramfs rebuild" >&2
+        return 1
+    fi
+}
+
+case "${1:-}" in
+    remove|purge|disappear)
+        rebuild_supported_initramfs
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|"")
+        ;;
+esac

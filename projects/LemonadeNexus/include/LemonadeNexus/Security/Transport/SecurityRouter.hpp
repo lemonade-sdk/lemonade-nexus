@@ -12,6 +12,7 @@
 // Outbound: the services tell the router what to send and to whom. The
 // transport never fans out on its own.
 
+#include <LemonadeNexus/Security/Attestation/AttestationTransfer.hpp>
 #include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
 #include <LemonadeNexus/Security/SecurityRuntime.hpp>
 #include <LemonadeNexus/Security/Transport/PairwiseSeal.hpp>
@@ -120,6 +121,10 @@ struct SecurityRouterConfig {
     /// active, current members are. It is network state — the network id
     /// derives from it — not a certificate this node has seen.
     NodeId genesis_anchor_id{};
+    /// Answers whether an identity is in the anchor-authenticated founding
+    /// set, so founders can challenge one another before any epoch exists.
+    /// The list is accepted only from the anchor; unset admits only the anchor.
+    std::function<bool(const NodeId&)> founding_member;
 };
 
 class SecurityRouter {
@@ -170,6 +175,15 @@ private:
     RouteResult route_challenge(const AttestationChallenge& challenge, const NodeId& from,
                                 uint64_t now_ms);
     RouteResult route_evidence(const AttestationEvidence& evidence);
+    RouteResult route_evidence_start(const AttestationEvidenceStart& start, uint64_t now_ms);
+    RouteResult route_evidence_chunk(const AttestationEvidenceChunk& chunk,
+                                     const NodeId& from, uint64_t now_ms);
+    RouteResult route_evidence_end(const AttestationEvidenceEnd& end,
+                                   const NodeId& from, uint64_t now_ms);
+    RouteResult settle_transfer(EvidenceTransferResult result);
+    RouteResult route_activation_offer(const SvsmAkActivationOfferMessage& offer,
+                                       const NodeId& from);
+    RouteResult route_activation_response(const SvsmAkActivationResponseMessage& response);
     RouteResult route_announcement(const EpochAnnouncement& announcement, const NodeId& from);
     RouteResult route_sync_request(const SyncRequest& request, const NodeId& from);
     RouteResult route_sync_response(const SyncResponse& response, const NodeId& from);
@@ -190,6 +204,7 @@ private:
     ISecurityEvents& events_;
     PairwiseSealer& sealer_;
     IEvidenceProducer* evidence_producer_;
+    AttestationTransferReceiver transfer_receiver_;
 
     std::map<NodeId, PeerBudget> budgets_;
     std::map<NodeId, ChallengeBudget> challenge_budgets_;

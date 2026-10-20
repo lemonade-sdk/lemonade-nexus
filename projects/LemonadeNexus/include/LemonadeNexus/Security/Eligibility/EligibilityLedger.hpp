@@ -162,6 +162,11 @@ public:
     /// subjects nobody else has seen.
     [[nodiscard]] std::vector<NodeId> subjects(EpochId epoch, std::size_t min_observers) const;
 
+    /// The highest height any held record carries for `epoch`. Heights are
+    /// monotonic per (subject, observer), so a publisher resuming against a
+    /// kept ledger must start above this or its statements are rewinds.
+    [[nodiscard]] Height max_height(EpochId epoch) const;
+
     /// One observer's accumulated view of one subject, in a form that survives
     /// a restart. The latest statement carries the signature; the digests are
     /// what continuity counts.

@@ -2,7 +2,9 @@
 
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
+#include <LemonadeNexus/Core/GenesisAnchor.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
+#include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
@@ -16,6 +18,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -356,11 +359,17 @@ int run_add_manifest(const ServerConfig& config) {
     manifest_storage.start();
 
     BinaryAttestationService manifest_attestation{manifest_crypto, manifest_storage};
-    // if release signing pubkey is empty we need to really throw, it should always
-    //be there no matter what, even if our platform doesnt support TEE
-    if (!config.release_signing_pubkey.empty()) {
-        manifest_attestation.set_release_signing_pubkey(config.release_signing_pubkey);
+    const auto anchor = load_genesis_anchor(config.genesis_pubkey);
+    if (!anchor) {
+        spdlog::error("Cannot add manifest: invalid Genesis anchor");
+        return 1;
     }
+    if (!anchor->release) {
+        spdlog::error("Cannot add manifest: {}", anchor->release_error);
+        return 1;
+    }
+    manifest_attestation.set_release_signing_pubkey(
+        anchor->release->authority.release_signing_pubkey_b64);
 
     try {
         std::ifstream f(config.add_manifest_path);

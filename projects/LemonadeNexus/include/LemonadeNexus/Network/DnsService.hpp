@@ -255,7 +255,13 @@ private:
     // matching over zone_records_.
     /// Values of A records whose fqdn ends with `suffix` (prefix must be
     /// non-empty, so a bare "A:<suffix>" key is not matched).
-    [[nodiscard]] std::set<std::string> scan_a_values(std::string_view suffix) const;
+    /// A-record values whose name ends in `suffix`. With `bare_label_only`, the
+    /// label immediately before `suffix` must be the only one — so a region
+    /// lookup returns `<id>.<region>.seip.<base>` but not `private.<id>…`,
+    /// `backend.<id>…`, or `<id>.tier<N>…` (whose address the bare name already
+    /// carries). Keeps per-node private/backend IPs out of the region answer.
+    [[nodiscard]] std::set<std::string> scan_a_values(std::string_view suffix,
+                                                      bool bare_label_only = false) const;
     /// Fqdn prefixes (the part before `suffix`) of matching A records, as in
     /// `scan_a_values`.
     [[nodiscard]] std::set<std::string> scan_a_prefixes(std::string_view suffix) const;

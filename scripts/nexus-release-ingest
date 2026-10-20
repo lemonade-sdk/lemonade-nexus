@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# nexus-release-ingest
+#
+# The ingestion half of the release ceremony: verify that candidate artifacts
+# really came from this repository's release workflow before any approval is
+# signed. Provenance verification lives in operator tooling, never in the
+# node. A PASS is one required input to the separately authorized signing
+# act; this tool signs nothing, touches no key material, deploys nothing, and
+# never trusts a repository or workflow named by the artifact itself.
+#
+# Usage:
+#   nexus-release-ingest --repo lemonade-sdk/lemonade-nexus \
+#       --workflow release.yml --tag v0.9.7 <artifact> [<artifact>...]
+#
+# Requires: gh (authenticated), sha256sum.
+
+set -euo pipefail
+
+REPO="" WORKFLOW="release.yml" TAG=""
+ARTIFACTS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --repo)     REPO="$2"; shift 2 ;;
+        --workflow) WORKFLOW="$2"; shift 2 ;;
+        --tag)      TAG="$2"; shift 2 ;;
+        -*)         echo "nexus-release-ingest: unknown option $1" >&2; exit 2 ;;
+        *)          ARTIFACTS+=("$1"); shift ;;
+    esac
+done
+if [ -z "$REPO" ] || [ -z "$TAG" ] || [ "${#ARTIFACTS[@]}" -eq 0 ]; then
+    echo "usage: nexus-release-ingest --repo <owner/repo> [--workflow <file>] --tag <vX.Y.Z> <artifact>..." >&2
+    exit 2
+fi
+
+command -v gh >/dev/null || { echo "nexus-release-ingest: gh is required" >&2; exit 2; }
+
+status=0
+for artifact in "${ARTIFACTS[@]}"; do
+    [ -f "$artifact" ] || { echo "MISSING  $artifact" >&2; status=1; continue; }
+    sha="$(sha256sum "$artifact" | awk '{print $1}')"
+    # The signer identity must be this repo's release workflow on the tag ref;
+    # a generic repository build or arbitrary ref is not an official release.
+    if gh attestation verify "$artifact" \
+            --repo "$REPO" \
+            --signer-workflow "${REPO}/.github/workflows/${WORKFLOW}@refs/tags/${TAG}" \
+            >/dev/null 2>&1; then
+        echo "PASS     $sha  $artifact"
+    else
+        echo "FAIL     $sha  $artifact" >&2
+        status=1
+    fi
+done
+
+if [ "$status" -ne 0 ]; then
+    echo "nexus-release-ingest: verification FAILED; do not sign or deploy these artifacts" >&2
+fi
+exit "$status"

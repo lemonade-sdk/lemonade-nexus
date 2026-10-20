@@ -2,6 +2,8 @@
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
+#include "support/attestation_fixtures.hpp"
+
 #include <gtest/gtest.h>
 #include <sodium.h>
 
@@ -51,12 +53,13 @@ protected:
 
         // A COMPLETE profile: examine() refuses everything under an incomplete
         // one, so the binding checks below would otherwise be unreachable.
-        profile_ = nexus::security::linux_attestation_profile_v1();
+        profile_ = nexus::security::linux_attestation_profile_v2_svsm();
         profile_.snp.min_tcb = {2, 0, 6, 55};
         profile_.snp.expected_measurement_hex = std::string(96, 'a');
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
+        profile_.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
         ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
 
         challenge_.nonce = patterned<32>(0x01);
@@ -177,7 +180,7 @@ TEST_F(PlatformEvidenceProducerTest, VerifierPassesEveryBindingCheck) {
     // This build has no platform path: the bundle is empty and the platform
     // chain rejects it as garbage.
     EXPECT_FALSE(producer.platform_available());
-    EXPECT_TRUE(evidence->platform.empty());
+    EXPECT_TRUE(platform_evidence_empty(evidence->platform));
     EXPECT_EQ(verdict.failure, AttestationFailure::SnpInvalid);
 #endif
 }
@@ -235,8 +238,8 @@ TEST_F(PlatformEvidenceProducerTest, TheExternalSourceIsWhatProducesThePlatformH
     // The whole challenge crosses, never a bare nonce: the helper derives the
     // quote binding itself and cannot be handed one.
     EXPECT_EQ(challenge_digest(seen), challenge_digest(challenge_));
-    EXPECT_EQ(evidence->platform.hcl_blob, (std::vector<uint8_t>{0xDE, 0xAD}));
-    EXPECT_EQ(evidence->platform.tpms_attest, (std::vector<uint8_t>{0xBE, 0xEF}));
+    EXPECT_EQ(azure_evidence(evidence->platform).hcl_blob, (std::vector<uint8_t>{0xDE, 0xAD}));
+    EXPECT_EQ(azure_evidence(evidence->platform).tpms_attest, (std::vector<uint8_t>{0xBE, 0xEF}));
 }
 
 TEST_F(PlatformEvidenceProducerTest, AnUnavailableSourceFailsClosedWithNoFallback) {
@@ -256,11 +259,11 @@ TEST_F(PlatformEvidenceProducerTest, AnUnavailableSourceFailsClosedWithNoFallbac
     // verifier's to state, not the producer's to hide.
     ASSERT_TRUE(evidence.has_value());
     EXPECT_EQ(calls, 1);
-    EXPECT_TRUE(evidence->platform.empty());
-    EXPECT_TRUE(evidence->platform.hcl_blob.empty());
-    EXPECT_TRUE(evidence->platform.tpms_attest.empty());
-    EXPECT_TRUE(evidence->platform.ima_log.empty());
-    EXPECT_TRUE(evidence->platform.binary_sha256.empty());
+    EXPECT_TRUE(platform_evidence_empty(evidence->platform));
+    EXPECT_TRUE(azure_evidence(evidence->platform).hcl_blob.empty());
+    EXPECT_TRUE(azure_evidence(evidence->platform).tpms_attest.empty());
+    EXPECT_TRUE(azure_evidence(evidence->platform).ima_log.empty());
+    EXPECT_TRUE(azure_evidence(evidence->platform).binary_sha256.empty());
 
     // And the verifier refuses it, rather than any of it being treated as proven.
     const auto verdict = examine(*evidence);
@@ -283,6 +286,31 @@ TEST_F(PlatformEvidenceProducerTest, AConfiguredSourceIsNeverBypassed) {
     PlatformEvidenceProducer producer{std::move(with_source)};
     const auto evidence = producer.produce(challenge_);
     ASSERT_TRUE(evidence.has_value());
-    EXPECT_EQ(evidence->platform.ima_unavailable, "from the helper");
-    EXPECT_TRUE(evidence->platform.hcl_blob.empty());
+    EXPECT_EQ(azure_evidence(evidence->platform).ima_unavailable, "from the helper");
+    EXPECT_TRUE(azure_evidence(evidence->platform).hcl_blob.empty());
+}
+
+TEST_F(PlatformEvidenceProducerTest, ExternalSourceOwnsResumeCheckpointFiltering) {
+    challenge_.ima_mode = nexus::security::ImaEvidenceMode::Resume;
+    challenge_.ima_checkpoint_digest.fill(0x31);
+    challenge_.ima_prior_event_count = 397;
+    challenge_.ima_prior_pcr10.fill(0x42);
+    challenge_.ima_checkpoint_paths.push_back({"/usr/bin/nexus", kApprovedBinary});
+
+    auto with_source = sources();
+    with_source.platform_source = [&](const AttestationChallenge& challenge) {
+        EXPECT_EQ(challenge.ima_mode, nexus::security::ImaEvidenceMode::Resume);
+        EXPECT_EQ(challenge.ima_prior_event_count, 397);
+        nexus::security::SnpSvsmVtpmEvidence platform;
+        platform.ima_binary_log.clear();
+        return nexus::security::PlatformEvidence{std::move(platform)};
+    };
+
+    const auto evidence = PlatformEvidenceProducer(std::move(with_source)).produce(challenge_);
+    ASSERT_TRUE(evidence.has_value());
+    const auto* platform = std::get_if<nexus::security::SnpSvsmVtpmEvidence>(&evidence->platform);
+    ASSERT_NE(platform, nullptr);
+    EXPECT_TRUE(platform->ima_binary_log.empty());
+    EXPECT_EQ(evidence->ima_mode, nexus::security::ImaEvidenceMode::Resume);
+    EXPECT_EQ(evidence->ima_bytes, 0);
 }

@@ -63,9 +63,28 @@ pkg_check_modules(UUID  IMPORTED_TARGET REQUIRED uuid)
 # its install prefix; prepend its pkgconfig dir so tpm2-tss's ./configure finds
 # our libcrypto rather than a system one.
 set(_TSS2_PKGCONFIG_PATH "$ENV{PKG_CONFIG_PATH}")
+set(_TSS2_CPPFLAGS "$ENV{CPPFLAGS}")
+# TPM2-TSS bakes __FILE__ into its diagnostic strings; remap both trees so the
+# compiled objects are build-directory-independent.
+set(_TSS2_CFLAGS
+    "-O2 -ffile-prefix-map=${CMAKE_BINARY_DIR}=build -ffile-prefix-map=${CMAKE_SOURCE_DIR}=source")
+foreach(_TSS2_INCLUDE_DIR IN LISTS
+        JSONC_INCLUDE_DIRS CURL_INCLUDE_DIRS UUID_INCLUDE_DIRS)
+    string(APPEND _TSS2_CPPFLAGS " -I${_TSS2_INCLUDE_DIR}")
+endforeach()
 if(OPENSSL_ROOT_DIR)
     set(_TSS2_PKGCONFIG_PATH "${OPENSSL_ROOT_DIR}/lib/pkgconfig:${_TSS2_PKGCONFIG_PATH}")
 endif()
+set(_TSS2_ENV
+    "PKG_CONFIG_PATH=${_TSS2_PKGCONFIG_PATH}"
+    "CPPFLAGS=${_TSS2_CPPFLAGS}"
+    "CFLAGS=${_TSS2_CFLAGS}"
+    "CC=${CMAKE_C_COMPILER}")
+foreach(_TSS2_VARIABLE IN ITEMS PKG_CONFIG_SYSROOT_DIR PKG_CONFIG_LIBDIR)
+    if(NOT "$ENV{${_TSS2_VARIABLE}}" STREQUAL "")
+        list(APPEND _TSS2_ENV "${_TSS2_VARIABLE}=$ENV{${_TSS2_VARIABLE}}")
+    endif()
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Version / source
@@ -74,7 +93,8 @@ set(TSS2_VERSION "4.1.3")
 set(TSS2_URL "https://github.com/tpm2-software/tpm2-tss/releases/download/${TSS2_VERSION}/tpm2-tss-${TSS2_VERSION}.tar.gz")
 set(TSS2_URL_HASH "SHA256=37f1580200ab78305d1fc872d89241aaee0c93cbe85bc559bf332737a60d3be8")
 
-set(TSS2_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/tss2-install")
+set(TSS2_STAGE_ROOT     "${CMAKE_BINARY_DIR}/tss2-stage")
+set(TSS2_INSTALL_PREFIX "${TSS2_STAGE_ROOT}/usr")
 set(TSS2_INCLUDE_DIR    "${TSS2_INSTALL_PREFIX}/include")
 set(TSS2_LIB_DIR        "${TSS2_INSTALL_PREFIX}/lib")
 
@@ -104,11 +124,12 @@ ExternalProject_Add(tss2_external
     BINARY_DIR        "${CMAKE_BINARY_DIR}/_deps/tss2-build"   # out-of-source (VPATH) build
     INSTALL_DIR       "${TSS2_INSTALL_PREFIX}"
     CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
-                      "PKG_CONFIG_PATH=${_TSS2_PKGCONFIG_PATH}"
-                      "CC=${CMAKE_C_COMPILER}"
+                      ${_TSS2_ENV}
                       <SOURCE_DIR>/configure
-                      --prefix=${TSS2_INSTALL_PREFIX}
-                      --libdir=${TSS2_LIB_DIR}
+                      --prefix=/usr
+                      --libdir=/usr/lib
+                      --sysconfdir=/etc
+                      --localstatedir=/var
                       --disable-shared --enable-static --with-pic
                       --enable-fapi
                       --with-crypto=ossl
@@ -116,7 +137,7 @@ ExternalProject_Add(tss2_external
                       --disable-unit
                       --disable-integration
     BUILD_COMMAND     make -j${NPROC}
-    INSTALL_COMMAND   make install
+    INSTALL_COMMAND   make DESTDIR=${TSS2_STAGE_ROOT} install
     BUILD_BYPRODUCTS  ${TSS2_FAPI_LIB} ${TSS2_ESYS_LIB} ${TSS2_SYS_LIB}
                       ${TSS2_TCTILDR_LIB} ${TSS2_MU_LIB} ${TSS2_RC_LIB}
     LOG_DOWNLOAD      TRUE

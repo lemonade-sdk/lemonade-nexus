@@ -70,7 +70,7 @@ struct AttestdLive : ::testing::Test {
     /// not in the log at all.
     std::optional<LinuxAttestationProfile> pinned_profile_from(
         const AttestationEvidence& evidence, const EvidenceVerdict& seen) {
-        auto log = parse_ima_ascii(evidence.platform.ima_log);
+        auto log = parse_ima_ascii(azure_evidence(evidence.platform).ima_log);
         if (!log) return std::nullopt;
 
         auto profile = linux_attestation_profile_v1();
@@ -133,15 +133,17 @@ TEST_F(AttestdLive, TheApplicationPathProducesSignedHardwareBackedEvidence) {
     ASSERT_TRUE(evidence.has_value());
 
     // The daemon answered, over the socket, with real platform material.
-    EXPECT_FALSE(evidence->platform.empty()) << "nexus-attestd returned no platform evidence";
-    EXPECT_FALSE(evidence->platform.hcl_blob.empty());
-    EXPECT_FALSE(evidence->platform.tpms_attest.empty());
-    EXPECT_FALSE(evidence->platform.vcek_der.empty());
+    EXPECT_FALSE(platform_evidence_empty(evidence->platform))
+        << "nexus-attestd returned no platform evidence";
+    const auto& azure = azure_evidence(evidence->platform);
+    EXPECT_FALSE(azure.hcl_blob.empty());
+    EXPECT_FALSE(azure.tpms_attest.empty());
+    EXPECT_FALSE(azure.vcek_der.empty());
 
     // The log it returned is the one the quote covers.
-    EXPECT_FALSE(evidence->platform.ima_log.empty());
-    EXPECT_FALSE(evidence->platform.binary_sha256.empty())
-        << "no IMA measurement: " << evidence->platform.ima_unavailable;
+    EXPECT_FALSE(azure.ima_log.empty());
+    EXPECT_FALSE(azure.binary_sha256.empty())
+        << "no IMA measurement: " << azure.ima_unavailable;
 
     // Identity and vote key are bound HERE, outside the daemon.
     EXPECT_EQ(evidence->node_id.bytes, identity_.public_key);
@@ -158,11 +160,12 @@ TEST_F(AttestdLive, TheEvidenceSizeRefusalDoesNotReturn) {
     const auto challenge = challenge_for(AttestationPurpose::Eligibility);
     const auto evidence = PlatformEvidenceProducer(production_sources()).produce(challenge);
     ASSERT_TRUE(evidence.has_value());
-    ASSERT_FALSE(evidence->platform.empty()) << "the daemon refused; check its log for the reason";
+    ASSERT_FALSE(platform_evidence_empty(evidence->platform))
+        << "the daemon refused; check its log for the reason";
 
-    const auto encoded = encode_snp_vtpm_evidence(evidence->platform);
+    const auto encoded = encode_platform_evidence(evidence->platform);
     RecordProperty("local_evidence_bytes", static_cast<int>(encoded.size()));
-    RecordProperty("ima_log_bytes", static_cast<int>(evidence->platform.ima_log.size()));
+    RecordProperty("ima_log_bytes", static_cast<int>(azure_evidence(evidence->platform).ima_log.size()));
     // Whether it fits the mesh is a separate question, decided elsewhere. What
     // matters here is that the LOCAL path delivered it either way.
     EXPECT_LE(encoded.size(), attestd::kMaxLocalFrameBytes * attestd::kMaxLocalChunks);
@@ -177,7 +180,7 @@ TEST_F(AttestdLive, FinalReadinessCarriesTheVoteKeyThroughRealHardware) {
     EXPECT_EQ(evidence->epoch_vote_key, vote_key_);
     EXPECT_NE(evidence->epoch_vote_key, crypto::Ed25519PublicKey{});
     EXPECT_NE(evidence->context_digest, Digest{});
-    EXPECT_FALSE(evidence->platform.empty());
+    EXPECT_FALSE(platform_evidence_empty(evidence->platform));
 }
 
 TEST_F(AttestdLive, TheVerifierReachesTheImaPolicyAndRefusesThere) {
@@ -187,12 +190,13 @@ TEST_F(AttestdLive, TheVerifierReachesTheImaPolicyAndRefusesThere) {
     const auto challenge = challenge_for(AttestationPurpose::Eligibility);
     const auto evidence = PlatformEvidenceProducer(production_sources()).produce(challenge);
     ASSERT_TRUE(evidence.has_value());
-    ASSERT_FALSE(evidence->platform.empty());
+    ASSERT_FALSE(platform_evidence_empty(evidence->platform));
 
     EvidenceRequirements probe;
     probe.require_ima = false;
     probe.require_revocation_check = false;
-    const auto seen = verify_snp_vtpm_evidence(evidence->platform, evidence->challenge_digest,
+    const auto seen = verify_snp_vtpm_evidence(azure_evidence(evidence->platform),
+                                               evidence->challenge_digest,
                                                identity_.public_key, probe);
     ASSERT_TRUE(seen.quote_verified) << "the platform chain failed before the quote: "
                                      << seen.failure;
@@ -221,7 +225,7 @@ TEST_F(AttestdLive, TheVerifierReachesTheImaPolicyAndRefusesThere) {
 
     // What is left is the IMA policy the kernel will not publish.
     EXPECT_EQ(verdict.failure, AttestationFailure::ImaMeasurementInvalid);
-    EXPECT_TRUE(refreshed->platform.ima_policy_sha256.empty())
+    EXPECT_TRUE(azure_evidence(refreshed->platform).ima_policy_sha256.empty())
         << "the kernel published a policy digest; KernelReadback may now be satisfiable";
 }
 
@@ -229,16 +233,16 @@ TEST_F(AttestdLive, TheWholeRequiredRuntimeSetIsMeasuredAndApproved) {
     const auto challenge = challenge_for(AttestationPurpose::Eligibility);
     const auto evidence = PlatformEvidenceProducer(production_sources()).produce(challenge);
     ASSERT_TRUE(evidence.has_value());
-    ASSERT_FALSE(evidence->platform.empty());
+    ASSERT_FALSE(platform_evidence_empty(evidence->platform));
+    const auto& azure = azure_evidence(evidence->platform);
 
     // The deployed collector is the compiled one — policy matches reality.
-    EXPECT_EQ(evidence->platform.binary_path,
-              linux_attestation_profile_v1().evidence_collector_path);
+    EXPECT_EQ(azure.binary_path, linux_attestation_profile_v1().evidence_collector_path);
 
     EvidenceRequirements probe;
     probe.require_ima = false;
     probe.require_revocation_check = false;
-    const auto seen = verify_snp_vtpm_evidence(evidence->platform, evidence->challenge_digest,
+    const auto seen = verify_snp_vtpm_evidence(azure, evidence->challenge_digest,
                                                identity_.public_key, probe);
     ASSERT_TRUE(seen.quote_verified);
 
@@ -250,7 +254,7 @@ TEST_F(AttestdLive, TheWholeRequiredRuntimeSetIsMeasuredAndApproved) {
 
     // The conjunction holds against the real post-quote history: every
     // required component measured, every last measurement in its own set.
-    auto log = parse_ima_ascii(evidence->platform.ima_log);
+    auto log = parse_ima_ascii(azure.ima_log);
     ASSERT_TRUE(log.has_value());
     ASSERT_TRUE(binary_approved(*profile, *log));
 

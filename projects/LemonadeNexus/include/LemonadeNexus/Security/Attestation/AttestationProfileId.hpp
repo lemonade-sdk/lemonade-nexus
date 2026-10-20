@@ -19,6 +19,13 @@
 
 namespace nexus::security {
 
+/// How much IMA history a challenge requests. Lives below AttestationTypes.hpp
+/// because PlatformEvidence, embedded by AttestationEvidence, needs it.
+enum class ImaEvidenceMode : uint16_t {
+    Full = 1,
+    Resume = 2,
+};
+
 enum class AttestationProfileId : uint16_t {
     /// No profile. A default-constructed challenge or bundle lands here, so it
     /// fails closed instead of defaulting into a real profile.
@@ -28,8 +35,8 @@ enum class AttestationProfileId : uint16_t {
     /// paravisor shape. The one profile implemented today.
     AzureSnpVtpm = 1,
 
-    /// AMD SEV-SNP with a COCONUT-SVSM vTPM at VMPL0. Declared, not
-    /// implemented: the SVSM service binding is not invented here (1.1 6.4).
+    /// AMD SEV-SNP with a COCONUT-SVSM vTPM at VMPL0, bound to a Linux guest
+    /// report above VMPL0 and an enrolled AK through credential activation.
     SnpSvsmVtpm = 2,
 
     /// AMD SEV-SNP direct measured boot, no TPM. Cannot reach Tier 1: it has
@@ -45,14 +52,16 @@ using AttestationProfileRuleset = uint16_t;
 /// Ruleset version shared by every compiled profile. A change to what any
 /// provider requires is a bump here, and a bump invalidates every outstanding
 /// challenge rather than letting old evidence answer new rules.
-inline constexpr AttestationProfileRuleset kAttestationProfileRulesetVersion = 1;
+// Ruleset 3: verifier-owned Full/Resume IMA checkpoints and a required,
+// durably verified EK/AK activation record.
+inline constexpr AttestationProfileRuleset kAttestationProfileRulesetVersion = 3;
 
 /// The profile this binary issues challenges under, and the one its own prover
 /// answers with. The verified binary picks it; no host input reaches this
-/// value. Only one provider is implemented today, so it is the only profile a
-/// candidate can be asked to answer.
+/// value. A release switches this only after its selected provider and pinned
+/// profile have passed qualification.
 inline constexpr AttestationProfileId kTier1AttestationProfileId =
-    AttestationProfileId::AzureSnpVtpm;
+    AttestationProfileId::SnpSvsmVtpm;
 
 [[nodiscard]] std::string_view attestation_profile_id_name(AttestationProfileId id);
 

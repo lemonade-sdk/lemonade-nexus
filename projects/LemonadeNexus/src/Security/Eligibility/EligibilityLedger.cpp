@@ -196,6 +196,16 @@ MeshFactEvidence EligibilityLedger::evaluate(const NodeId& subject,
     return evidence;
 }
 
+Height EligibilityLedger::max_height(EpochId epoch) const {
+    Height max = 0;
+    for (const auto& [key, record] : records_) {
+        if (key.epoch == epoch) {
+            max = std::max(max, record.latest.height);
+        }
+    }
+    return max;
+}
+
 std::optional<IncarnationId> EligibilityLedger::quorum_incarnation(
     const NodeId& subject, const MeshFactContext& context) const {
     const std::size_t required = witness_threshold(context, subject);

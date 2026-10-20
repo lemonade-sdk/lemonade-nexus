@@ -324,18 +324,55 @@ TEST_F(Tier2Path, AFinalizedPoolCanReplaceFailedMembersWithReserves) {
     }
 }
 
+// While the mutual round is incomplete every edge is re-challenged on the
+// liveness cadence: observations are one-shot broadcasts, so only a fresh
+// verdict can feed a peer that missed one. Challenges stop with the round.
+TEST_F(Tier2Path, FoundingRoundRechallengesEveryEdgeUntilRoundCompletes) {
+    collect_founding();
+    Node* observer = founders[0];
+    Node* done = founders[1];
+    ASSERT_EQ(observer->driver->phase(), DriverPhase::GenesisEligibility);
+
+    // Even an edge this observer already proved twice is challenged again.
+    for (std::size_t round = 0; round < constants::kMinContinuityObservations; ++round) {
+        observer->driver->on_attestation_verdict(
+            eligibility_verdict(network, done->id, 0, static_cast<uint8_t>(round + 1)),
+            evidence_for(done->id, *done->driver->vote_key_for_epoch(1)));
+    }
+    const auto held = observer->runtime->attestation().pending_challenge(done->id);
+    ASSERT_TRUE(held.has_value());
+
+    mesh.now_ms += 2 * constants::kBootstrapRetryMs + constants::kBootstrapRetryJitterMs;
+    for (Node* founder : founders) founder->driver->tick(mesh.now_ms);
+    mesh.pump();
+    EXPECT_NE(challenge_digest(*observer->runtime->attestation().pending_challenge(done->id)),
+              challenge_digest(*held));
+
+    // A complete round stops the cadence.
+    run_founding_eligibility();
+    const auto settled = observer->runtime->attestation().pending_challenge(done->id);
+    mesh.now_ms += 2 * constants::kBootstrapRetryMs + constants::kBootstrapRetryJitterMs;
+    observer->driver->tick(mesh.now_ms);
+    mesh.pump();
+    const auto after = observer->runtime->attestation().pending_challenge(done->id);
+    EXPECT_EQ(settled.has_value(), after.has_value());
+    if (settled && after) {
+        EXPECT_EQ(challenge_digest(*after), challenge_digest(*settled));
+    }
+}
+
 // The Genesis founding round attests under epoch 0, so it spends none of
 // Epoch 1's per-node attestation budget, and epoch-0 evidence answers no
 // Epoch 1 challenge.
 TEST_F(Tier2Path, GenesisRoundsDoNotSpendEpochOneBudget) {
     bootstrap();
 
-    // Every founder challenged every other one twice during the founding round.
+    // Every founder challenged every other one once in the opening pass; the
+    // liveness cadence drives later passes.
     for (Node* observer : founders) {
         for (Node* subject : founders) {
             if (observer == subject) continue;
-            EXPECT_EQ(observer->runtime->attestation().attempts(subject->id, 0),
-                      constants::kMinContinuityObservations)
+            EXPECT_EQ(observer->runtime->attestation().attempts(subject->id, 0), 1u)
                 << "the founding round is epoch-0 work";
             EXPECT_EQ(observer->runtime->attestation().attempts(subject->id, 1), 0u)
                 << "and left Epoch 1's budget untouched";

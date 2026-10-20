@@ -95,11 +95,21 @@ struct MemoryTransport : ISecurityTransport {
 
 struct RecordingProducer : IEvidenceProducer {
     int calls = 0;
+    int activation_calls = 0;
     std::optional<AttestationEvidence> answer = std::nullopt;
+    std::optional<SvsmAkActivationResponseMessage> activation_answer = std::nullopt;
+    std::optional<SvsmAkActivationOfferMessage> last_activation_offer = std::nullopt;
 
     std::optional<AttestationEvidence> produce(const AttestationChallenge&) override {
         ++calls;
         return answer;
+    }
+
+    std::optional<SvsmAkActivationResponseMessage> activate(
+        const SvsmAkActivationOfferMessage& offer) override {
+        ++activation_calls;
+        last_activation_offer = offer;
+        return activation_answer;
     }
 };
 
@@ -280,7 +290,7 @@ struct RouterMesh : ::testing::Test {
         certificate = *genesis.finalize_epoch_one(results[0].group_public_key,
                                                   results[0].transcript_digest, root_digest,
                                                   vote_key_set_digest(vote_keys_1),
-                                                  genesis_priv);
+                                                  Digest{}, genesis_priv);
         for (std::size_t i = 0; i < kFounders; ++i) {
             ASSERT_TRUE(founders[i]->runtime->adopt_epoch_one(certificate, genesis_pub,
                                                               *founding_set, vote_keys_1,
@@ -530,6 +540,45 @@ AttestationChallenge gate_passing_challenge(const NetworkId& network, const Node
     return challenge;
 }
 
+SvsmAkActivationOfferMessage routed_activation_offer(
+    const NetworkId& network, const NodeId& observer, const NodeId& subject, EpochId epoch) {
+    SvsmAkActivationOfferMessage offer;
+    offer.network_id = network;
+    offer.subject_node = subject;
+    offer.subject_key = subject.bytes;
+    offer.incarnation = 1;
+    offer.epoch = epoch;
+    offer.profile_id = AttestationProfileId::SnpSvsmVtpm;
+    offer.profile_ruleset = kAttestationProfileRulesetVersion;
+    offer.observer = observer;
+    offer.enrollment_challenge_digest.fill(0x31);
+    offer.verifier_nonce.fill(0x32);
+    offer.ek_public = {1};
+    offer.ak_public = {2};
+    offer.ek_name = {0, 0x0b, 3};
+    offer.ak_name = {0, 0x0b, 4};
+    offer.ak_spki_digest.fill(0x35);
+    offer.activation.enrollment_context.fill(0x36);
+    offer.activation.credential_blob = {5};
+    offer.activation.encrypted_secret = {6};
+    return offer;
+}
+
+SvsmAkActivationResponseMessage routed_activation_response(
+    const SvsmAkActivationOfferMessage& offer) {
+    SvsmAkActivationResponseMessage response;
+    response.network_id = offer.network_id;
+    response.subject_node = offer.subject_node;
+    response.incarnation = offer.incarnation;
+    response.epoch = offer.epoch;
+    response.profile_id = offer.profile_id;
+    response.profile_ruleset = offer.profile_ruleset;
+    response.observer = offer.observer;
+    response.activation_context = offer.activation.enrollment_context;
+    response.activated_secret = {7};
+    return response;
+}
+
 TEST_F(RouterMesh, ChallengeWithoutProducerYieldsNoEvidence) {
     bootstrap_epoch_one();
     Node* a = founders[0];
@@ -709,6 +758,75 @@ TEST_F(RouterMesh, PreQuorumAnchorChallengeIsAnswered) {
     const auto result = b->deliver(anchor->id, encode_security_message(envelope), mesh.now_ms);
     EXPECT_TRUE(result.delivered);
     EXPECT_EQ(b->producer.calls, 1);
+}
+
+TEST_F(RouterMesh, PreQuorumActivationOfferIsAnchorOnlyAndRejectedBeforeTpmWork) {
+    Node* anchor = founders[0];
+    Node* candidate = founders[1];
+    auto offer = routed_activation_offer(network, anchor->id, candidate->id, 1);
+    candidate->producer.activation_answer = routed_activation_response(offer);
+    const auto message = anchor->router->compose(
+        SecurityMessageKind::SvsmAkActivationOffer, offer, 1);
+    EXPECT_TRUE(candidate->deliver(anchor->id, encode_security_message(message),
+                                   mesh.now_ms).delivered);
+    EXPECT_EQ(candidate->producer.activation_calls, 1);
+    ASSERT_TRUE(candidate->producer.last_activation_offer);
+    EXPECT_EQ(candidate->producer.last_activation_offer->observer, anchor->id);
+
+    auto hostile = routed_activation_offer(network, outsider->id, candidate->id, 1);
+    const auto hostile_message = outsider->router->compose(
+        SecurityMessageKind::SvsmAkActivationOffer, hostile, 1);
+    EXPECT_EQ(candidate->deliver(outsider->id, encode_security_message(hostile_message),
+                                 mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(candidate->producer.activation_calls, 1);
+}
+
+TEST_F(RouterMesh, ActiveEpochActivationOfferIsCurrentMemberOnly) {
+    bootstrap_epoch_one();
+    Node* member = founders[0];
+    Node* candidate = founders[1];
+    auto offer = routed_activation_offer(network, member->id, candidate->id, 1);
+    candidate->producer.activation_answer = routed_activation_response(offer);
+    const auto message = member->router->compose(
+        SecurityMessageKind::SvsmAkActivationOffer, offer, 1);
+    EXPECT_TRUE(candidate->deliver(member->id, encode_security_message(message),
+                                   mesh.now_ms).delivered);
+    EXPECT_EQ(candidate->producer.activation_calls, 1);
+
+    auto hostile = routed_activation_offer(network, outsider->id, candidate->id, 1);
+    const auto hostile_message = outsider->router->compose(
+        SecurityMessageKind::SvsmAkActivationOffer, hostile, 1);
+    EXPECT_EQ(candidate->deliver(outsider->id, encode_security_message(hostile_message),
+                                 mesh.now_ms).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(candidate->producer.activation_calls, 1);
+}
+
+TEST_F(RouterMesh, ActivationOfferWithoutProducerIsNoService) {
+    bootstrap_epoch_one();
+    Node* member = founders[0];
+    Node* candidate = founders[1];
+    // Same gates, no producer wired: a member's offer clears membership and
+    // the drop names the missing service, not the sender.
+    SecurityRouterConfig config;
+    config.network_id = network;
+    config.genesis_anchor_id = founders[0]->id;
+    SecurityRouter bare(config, *candidate->runtime, *candidate->transport,
+                        candidate->events, *candidate->sealer, nullptr);
+    const auto offer = routed_activation_offer(network, member->id, candidate->id, 1);
+    const auto message = member->router->compose(
+        SecurityMessageKind::SvsmAkActivationOffer, offer, 1);
+    EXPECT_EQ(bare.receive(member->id, encode_security_message(message), mesh.now_ms).dropped,
+              DropReason::NoService);
+
+    // A non-member stays a membership drop, producer or not.
+    const auto hostile = routed_activation_offer(network, outsider->id, candidate->id, 1);
+    const auto hostile_message = outsider->router->compose(
+        SecurityMessageKind::SvsmAkActivationOffer, hostile, 1);
+    EXPECT_EQ(bare.receive(outsider->id, encode_security_message(hostile_message),
+                           mesh.now_ms).dropped,
+              DropReason::NotMember);
 }
 
 TEST_F(RouterMesh, PreQuorumAnchorChallengeIsBoundedPerWindow) {

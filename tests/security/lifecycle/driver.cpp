@@ -52,6 +52,85 @@ TEST_F(DriverMesh, RestartedGenesisConsumesASurvivingBootstrap) {
               bootstrap_certificate_signing_digest(std::get<BootstrapCertificate>(before)));
 }
 
+TEST_F(DriverMesh, TheFoundingCarriesTheReleaseApprovalCommitmentToEpochOne) {
+    Digest release;
+    release.fill(0x4C);
+    for (auto& node : nodes) {
+        node->release_approval_digest = release;
+        restart_node(*node);
+    }
+    bootstrap();
+    for (Node* founder : founders) {
+        const auto stored = founder->store->load_bootstrap();
+        ASSERT_TRUE(std::holds_alternative<BootstrapCertificate>(stored));
+        EXPECT_EQ(std::get<BootstrapCertificate>(stored).release_approval_digest, release);
+    }
+}
+
+TEST_F(DriverMesh, AFounderRunningADifferentReleaseRefusesTheFounding) {
+    Digest release;
+    release.fill(0x4C);
+    for (auto& node : nodes) {
+        node->release_approval_digest = release;
+        restart_node(*node);
+    }
+    founders[1]->release_approval_digest.fill(0x4D);
+    restart_node(*founders[1]);
+
+    collect_founding();
+    // The mismatched founder refused the founding outright; the agreeing
+    // founders proceeded into the mutual round.
+    EXPECT_EQ(founders[1]->driver->phase(), DriverPhase::Idle);
+    EXPECT_EQ(founders[0]->driver->phase(), DriverPhase::GenesisEligibility);
+}
+
+// A superseding founding restarts the mutual round, and the restarted round's
+// first challenges go out immediately: the superseded round's ask times must
+// not rate-limit them for up to two cadence periods.
+TEST_F(DriverMesh, ASupersedingFoundingChallengesEveryEdgeImmediately) {
+    collect_founding();
+    Node* founder = founders[0];
+    ASSERT_EQ(founder->driver->phase(), DriverPhase::GenesisEligibility);
+    ASSERT_TRUE(mesh.queue.empty());
+
+    // What the anchor sends after re-collecting: the same members and vote
+    // keys under a different attestation root (a founder re-attested).
+    GenesisFounding superseding;
+    superseding.epoch = 1;
+    for (Node* member : founders) {
+        superseding.members.emplace_back(member->id, *member->driver->vote_key_for_epoch(1));
+    }
+    superseding.attestation_root.fill(0x77);
+
+    // No time passes, so the superseded round's challenges are still inside
+    // the re-ask grace; only a round that cleared its ask times asks now.
+    founder->driver->on_genesis_founding(superseding, genesis_node->id);
+    EXPECT_EQ(founder->driver->phase(), DriverPhase::GenesisEligibility);
+    std::size_t challenges = 0;
+    for (const auto& item : mesh.queue) {
+        const auto decoded = decode_security_message(item.bytes);
+        if (!std::holds_alternative<SecurityMessage>(decoded)) {
+            continue;
+        }
+        if (std::holds_alternative<AttestationChallenge>(
+                std::get<SecurityMessage>(decoded).body)) {
+            ++challenges;
+        }
+    }
+    EXPECT_EQ(challenges, kFounders - 1);
+}
+
+TEST_F(DriverMesh, RestartUnderADifferentReleaseFailsClosed) {
+    bootstrap();
+    Node* founder = founders[0];
+    founder->release_approval_digest.fill(0x4E);
+    restart_node(*founder);
+    founder->driver->start(mesh.now_ms);
+    // The stored certificate commits the bootstrapped selection; a process
+    // loading a different approval cannot recover Tier-1 authority under it.
+    EXPECT_EQ(founder->driver->phase(), DriverPhase::Failed);
+}
+
 TEST_F(DriverMesh, MissingProofsForCachedAuthorityCannotRestartGenesis) {
     bootstrap();
     ASSERT_NE(founders[0]->driver->verified_authority(), nullptr);

@@ -25,13 +25,24 @@ std::array<uint8_t, N> patterned(uint8_t seed) {
 
 AttestationChallenge base_challenge() {
     AttestationChallenge challenge;
+    challenge.network_id = patterned<32>(0x08);
     challenge.nonce = patterned<32>(0x10);
     challenge.node_id.bytes = patterned<32>(0x20);
     challenge.node_key = patterned<32>(0x30);
     challenge.incarnation = 7;
     challenge.epoch = 42;
     challenge.security_ruleset = 1;
+    challenge.consensus_ruleset = 1;
+    challenge.profile_id = nexus::security::AttestationProfileId::SnpSvsmVtpm;
+    challenge.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
     challenge.policy_digest = patterned<32>(0x40);
+    challenge.purpose = nexus::security::AttestationPurpose::FinalEpochReadiness;
+    challenge.context_digest = patterned<32>(0x60);
+    challenge.ima_mode = nexus::security::ImaEvidenceMode::Resume;
+    challenge.ima_checkpoint_digest = patterned<32>(0x70);
+    challenge.ima_prior_event_count = 12;
+    challenge.ima_prior_pcr10 = patterned<32>(0x80);
+    challenge.ima_checkpoint_paths = {{"/usr/bin/nexus-attestd", std::string(64, 'a')}};
     return challenge;
 }
 
@@ -39,13 +50,21 @@ AttestationEvidence base_evidence() {
     AttestationEvidence evidence;
     evidence.challenge_digest = challenge_digest(base_challenge());
     evidence.node_id.bytes = patterned<32>(0x20);
+    evidence.network_id = patterned<32>(0x08);
     evidence.incarnation = 7;
     evidence.security_ruleset = 1;
     evidence.consensus_ruleset = 1;
+    evidence.profile_id = nexus::security::AttestationProfileId::AzureSnpVtpm;
+    evidence.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
+    evidence.purpose = nexus::security::AttestationPurpose::Eligibility;
+    evidence.context_digest = patterned<32>(0x60);
+    evidence.ima_mode = nexus::security::ImaEvidenceMode::Full;
+    evidence.ima_digest = patterned<32>(0x70);
     evidence.epoch_vote_key = patterned<32>(0x50);
-    evidence.platform.ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
-    evidence.platform.binary_path = "/opt/nexus";
-    evidence.platform.binary_sha256 = "bb";
+    azure_evidence(evidence.platform).ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
+    evidence.ima_bytes = azure_evidence(evidence.platform).ima_log.size();
+    azure_evidence(evidence.platform).binary_path = "/opt/nexus";
+    azure_evidence(evidence.platform).binary_sha256 = "bb";
     return evidence;
 }
 
@@ -55,13 +74,34 @@ struct ChallengeMutation {
 };
 
 const ChallengeMutation kChallengeMutations[] = {
+    {"network_id", [](AttestationChallenge& c) { c.network_id[0] ^= 1; }},
     {"nonce", [](AttestationChallenge& c) { c.nonce[0] ^= 1; }},
     {"node_id", [](AttestationChallenge& c) { c.node_id.bytes[0] ^= 1; }},
     {"node_key", [](AttestationChallenge& c) { c.node_key[0] ^= 1; }},
     {"incarnation", [](AttestationChallenge& c) { c.incarnation += 1; }},
     {"epoch", [](AttestationChallenge& c) { c.epoch += 1; }},
     {"security_ruleset", [](AttestationChallenge& c) { c.security_ruleset += 1; }},
+    {"consensus_ruleset", [](AttestationChallenge& c) { c.consensus_ruleset += 1; }},
+    {"profile_id", [](AttestationChallenge& c) {
+         c.profile_id = nexus::security::AttestationProfileId::AzureSnpVtpm;
+     }},
+    {"profile_ruleset", [](AttestationChallenge& c) { c.profile_ruleset += 1; }},
     {"policy_digest", [](AttestationChallenge& c) { c.policy_digest[0] ^= 1; }},
+    {"purpose", [](AttestationChallenge& c) {
+         c.purpose = nexus::security::AttestationPurpose::Eligibility;
+     }},
+    {"context_digest", [](AttestationChallenge& c) { c.context_digest[0] ^= 1; }},
+    {"ima_mode", [](AttestationChallenge& c) {
+         c.ima_mode = nexus::security::ImaEvidenceMode::Full;
+     }},
+    {"ima_checkpoint_digest", [](AttestationChallenge& c) {
+         c.ima_checkpoint_digest[0] ^= 1;
+     }},
+    {"ima_prior_event_count", [](AttestationChallenge& c) { ++c.ima_prior_event_count; }},
+    {"ima_prior_pcr10", [](AttestationChallenge& c) { c.ima_prior_pcr10[0] ^= 1; }},
+    {"ima_checkpoint_paths", [](AttestationChallenge& c) {
+         c.ima_checkpoint_paths.front().sha256[0] = 'b';
+     }},
 };
 
 struct EvidenceMutation {
@@ -70,16 +110,30 @@ struct EvidenceMutation {
 };
 
 const EvidenceMutation kEvidenceMutations[] = {
+    {"network_id", [](AttestationEvidence& e) { e.network_id[0] ^= 1; }},
     {"challenge_digest", [](AttestationEvidence& e) { e.challenge_digest[0] ^= 1; }},
     {"node_id", [](AttestationEvidence& e) { e.node_id.bytes[0] ^= 1; }},
     {"incarnation", [](AttestationEvidence& e) { e.incarnation += 1; }},
     {"security_ruleset", [](AttestationEvidence& e) { e.security_ruleset += 1; }},
     {"consensus_ruleset", [](AttestationEvidence& e) { e.consensus_ruleset += 1; }},
+    {"profile_id", [](AttestationEvidence& e) {
+         e.profile_id = nexus::security::AttestationProfileId::SnpSvsmVtpm;
+     }},
+    {"profile_ruleset", [](AttestationEvidence& e) { e.profile_ruleset += 1; }},
+    {"purpose", [](AttestationEvidence& e) {
+         e.purpose = nexus::security::AttestationPurpose::FinalEpochReadiness;
+     }},
+    {"context_digest", [](AttestationEvidence& e) { e.context_digest[0] ^= 1; }},
+    {"ima_mode", [](AttestationEvidence& e) {
+         e.ima_mode = nexus::security::ImaEvidenceMode::Resume;
+     }},
+    {"ima_bytes", [](AttestationEvidence& e) { ++e.ima_bytes; }},
+    {"ima_digest", [](AttestationEvidence& e) { e.ima_digest[0] ^= 1; }},
     {"epoch_vote_key", [](AttestationEvidence& e) { e.epoch_vote_key[0] ^= 1; }},
-    {"platform.hcl_blob", [](AttestationEvidence& e) { e.platform.hcl_blob.push_back(1); }},
-    {"platform.tpms_attest", [](AttestationEvidence& e) { e.platform.tpms_attest.push_back(1); }},
-    {"platform.ima_log", [](AttestationEvidence& e) { e.platform.ima_log += "x"; }},
-    {"platform.binary_sha256", [](AttestationEvidence& e) { e.platform.binary_sha256 = "cc"; }},
+    {"platform.hcl_blob", [](AttestationEvidence& e) { azure_evidence(e.platform).hcl_blob.push_back(1); }},
+    {"platform.tpms_attest", [](AttestationEvidence& e) { azure_evidence(e.platform).tpms_attest.push_back(1); }},
+    {"platform.ima_log", [](AttestationEvidence& e) { azure_evidence(e.platform).ima_log += "x"; }},
+    {"platform.binary_sha256", [](AttestationEvidence& e) { azure_evidence(e.platform).binary_sha256 = "cc"; }},
 };
 
 TEST(AttestationChallenge, DigestIsDeterministic) {
@@ -99,12 +153,23 @@ TEST(AttestationChallenge, IdenticalFieldsGiveIdenticalDigestAcrossInstances) {
     const AttestationChallenge left = base_challenge();
     AttestationChallenge right;
     right.nonce = left.nonce;
+    right.network_id = left.network_id;
     right.node_id = left.node_id;
     right.node_key = left.node_key;
     right.incarnation = left.incarnation;
     right.epoch = left.epoch;
     right.security_ruleset = left.security_ruleset;
+    right.consensus_ruleset = left.consensus_ruleset;
+    right.profile_id = left.profile_id;
+    right.profile_ruleset = left.profile_ruleset;
     right.policy_digest = left.policy_digest;
+    right.purpose = left.purpose;
+    right.context_digest = left.context_digest;
+    right.ima_mode = left.ima_mode;
+    right.ima_checkpoint_digest = left.ima_checkpoint_digest;
+    right.ima_prior_event_count = left.ima_prior_event_count;
+    right.ima_prior_pcr10 = left.ima_prior_pcr10;
+    right.ima_checkpoint_paths = left.ima_checkpoint_paths;
     EXPECT_EQ(challenge_digest(left), challenge_digest(right));
 }
 

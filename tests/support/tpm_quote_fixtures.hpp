@@ -24,6 +24,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -53,6 +54,13 @@ inline void put_u32(std::vector<uint8_t>& v, uint32_t x) {
 inline void put_tpm2b(std::vector<uint8_t>& v, const std::vector<uint8_t>& b) {
     put_u16(v, static_cast<uint16_t>(b.size()));
     v.insert(v.end(), b.begin(), b.end());
+}
+
+inline void put_le32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x));
+    v.push_back(static_cast<uint8_t>(x >> 8));
+    v.push_back(static_cast<uint8_t>(x >> 16));
+    v.push_back(static_cast<uint8_t>(x >> 24));
 }
 
 /// A spec-shaped TPMS_ATTEST quote over `pcr_bitmap` in the SHA-256 bank.
@@ -97,6 +105,72 @@ inline std::vector<uint8_t> build_two_bank_quote(const std::vector<uint8_t>& ext
     a.push_back(0x00); a.push_back(0x04); a.push_back(0x00);  // 10
     put_tpm2b(a, pcr_digest);
     return a;
+}
+
+/// A raw TPMT_PUBLIC for an RSA-2048 key: the SVSM vTPM EK shape when `ek`,
+/// the Nexus quote AK shape otherwise. The modulus is 256 bytes of `fill`,
+/// oddified: positive and odd, but never a valid RSA product — enough for
+/// parser and Name tests.
+inline std::vector<uint8_t> rsa_public(uint8_t fill, bool ek) {
+    using namespace nexus::security;
+    std::vector<uint8_t> out;
+    put_u16(out, 0x0001);  // RSA
+    put_u16(out, kTpmAlgSha256);
+    put_u32(out, ek ? 0x000300b2u : 0x00050072u);
+    if (ek) {
+        static constexpr std::array<uint8_t, 32> kTcgEkPolicyASha256{
+            0x83, 0x71, 0x97, 0x67, 0x44, 0x84, 0xb3, 0xf8,
+            0x1a, 0x90, 0xcc, 0x8d, 0x46, 0xa5, 0xd7, 0x24,
+            0xfd, 0x52, 0xd7, 0x6e, 0x06, 0x52, 0x0b, 0x64,
+            0xf2, 0xa1, 0xda, 0x1b, 0x33, 0x14, 0x69, 0xaa,
+        };
+        put_u16(out, static_cast<uint16_t>(kTcgEkPolicyASha256.size()));
+        out.insert(out.end(), kTcgEkPolicyASha256.begin(), kTcgEkPolicyASha256.end());
+        put_u16(out, 0x0006);  // AES
+        put_u16(out, 128);
+        put_u16(out, 0x0043);  // CFB
+        put_u16(out, 0x0010);  // NULL scheme
+    } else {
+        put_u16(out, 0);
+        put_u16(out, 0x0010);  // NULL symmetric
+        put_u16(out, kTpmAlgRsassa);
+        put_u16(out, kTpmAlgSha256);
+    }
+    put_u16(out, 2048);
+    put_u32(out, 0);  // canonical exponent 65537
+    put_u16(out, 256);
+    out.insert(out.end(), 256, fill);
+    out[out.size() - 256] |= 0x80;
+    out.back() |= 1;
+    return out;
+}
+
+/// One binary_runtime_measurements ima-ng entry (PCR 10, SHA-1 template hash)
+/// whose file digest is 32 bytes of `file_fill`. A `name` other than "ima-ng"
+/// builds an unsupported-template negative.
+inline std::vector<uint8_t> binary_entry(std::string_view path, uint8_t file_fill,
+                                         std::string_view name = "ima-ng") {
+    std::vector<uint8_t> template_data;
+    const std::string algorithm{"sha256:\0", 8};
+    put_le32(template_data, static_cast<uint32_t>(algorithm.size() + 32));
+    template_data.insert(template_data.end(), algorithm.begin(), algorithm.end());
+    template_data.insert(template_data.end(), 32, file_fill);
+    put_le32(template_data, static_cast<uint32_t>(path.size() + 1));
+    template_data.insert(template_data.end(), path.begin(), path.end());
+    template_data.push_back(0);
+
+    std::array<uint8_t, 20> sha1{};
+    unsigned size = 0;
+    EXPECT_EQ(EVP_Digest(template_data.data(), template_data.size(), sha1.data(), &size,
+                         EVP_sha1(), nullptr), 1);
+    std::vector<uint8_t> entry;
+    put_le32(entry, 10);  // kImaPcr
+    entry.insert(entry.end(), sha1.begin(), sha1.end());
+    put_le32(entry, static_cast<uint32_t>(name.size()));
+    entry.insert(entry.end(), name.begin(), name.end());
+    put_le32(entry, static_cast<uint32_t>(template_data.size()));
+    entry.insert(entry.end(), template_data.begin(), template_data.end());
+    return entry;
 }
 
 /// An RSA-2048 keypair standing in for the paravisor's HCLAkPub.

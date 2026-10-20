@@ -10,6 +10,8 @@
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
+#include "support/attestation_fixtures.hpp"
+
 #include <gtest/gtest.h>
 #include <sodium.h>
 
@@ -103,6 +105,7 @@ protected:
         profile_.ima_policy_digest = patterned<32>(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
+        profile_.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
         ASSERT_TRUE(profile_is_complete(profile_));
 
         challenge_ = issue(profile_);
@@ -121,7 +124,9 @@ protected:
         challenge.epoch = 12;
         challenge.security_ruleset = constants::kSecurityRulesetVersion;
         challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
-        challenge.profile_id = nexus::security::kTier1AttestationProfileId;
+        // This legacy end-to-end rejection ladder uses the Azure evidence
+        // variant. Production SVSM has a separate rejection matrix.
+        challenge.profile_id = nexus::security::AttestationProfileId::AzureSnpVtpm;
         challenge.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
         challenge.policy_digest = profile_digest(profile);
         return challenge;
@@ -141,13 +146,13 @@ protected:
         evidence.profile_id = challenge.profile_id;
         evidence.profile_ruleset = challenge.profile_ruleset;
         evidence.epoch_vote_key = patterned<32>(0x33);
-        evidence.platform.hcl_blob.assign(64, 0xA5);
-        evidence.platform.tpms_attest.assign(48, 0x5A);
-        evidence.platform.tpm_signature.assign(32, 0x3C);
-        evidence.platform.pcr_values.assign(32, 0xC3);
-        evidence.platform.ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
-        evidence.platform.binary_path = "/opt/nexus";
-        evidence.platform.binary_sha256 = kApprovedBinary;
+        azure_evidence(evidence.platform).hcl_blob.assign(64, 0xA5);
+        azure_evidence(evidence.platform).tpms_attest.assign(48, 0x5A);
+        azure_evidence(evidence.platform).tpm_signature.assign(32, 0x3C);
+        azure_evidence(evidence.platform).pcr_values.assign(32, 0xC3);
+        azure_evidence(evidence.platform).ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
+        azure_evidence(evidence.platform).binary_path = "/opt/nexus";
+        azure_evidence(evidence.platform).binary_sha256 = kApprovedBinary;
         return evidence;
     }
 
@@ -202,7 +207,7 @@ TEST_F(Tier1PathTest, ProfileCompletenessWinsOverEveryOtherFault) {
     evidence_.challenge_digest = patterned<32>(0x77);
     evidence_.node_id.bytes = patterned<32>(0x55);
     evidence_.incarnation = challenge_.incarnation - 1;
-    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i');
+    azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i');
     evidence_.identity_signature.fill(0);
 
     EXPECT_EQ(examine().failure, AttestationFailure::ProfileIncomplete);
@@ -454,12 +459,12 @@ TEST_F(Tier1PathTest, NoProfileRelaxationSurvivesThePolicyDigestCheck) {
 TEST_F(Tier1PathTest, OversizedPlatformEvidenceIsRejectedOnTheSumOfItsFields) {
     // No single field exceeds the cap. The bound covers their total, so a
     // bundle cannot be spread across fields to slip past it.
-    evidence_.platform.hcl_blob.assign(2 * 1024 * 1024, 0xAB);
-    evidence_.platform.amd_chain_pem.assign(1024 * 1024, 'p');
-    evidence_.platform.ima_log.clear();
+    azure_evidence(evidence_.platform).hcl_blob.assign(2 * 1024 * 1024, 0xAB);
+    azure_evidence(evidence_.platform).amd_chain_pem.assign(1024 * 1024, 'p');
+    azure_evidence(evidence_.platform).ima_log.clear();
     const std::size_t without_log = platform_evidence_size(evidence_.platform);
     ASSERT_LT(without_log, kMaxPlatformEvidenceBytes);
-    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes - without_log + 1, 'i');
+    azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes - without_log + 1, 'i');
     ASSERT_EQ(platform_evidence_size(evidence_.platform), kMaxPlatformEvidenceBytes + 1);
 
     const auto verdict = examine();
@@ -470,7 +475,7 @@ TEST_F(Tier1PathTest, OversizedPlatformEvidenceIsRejectedOnTheSumOfItsFields) {
     EXPECT_EQ(verdict.evidence_digest, Digest{});
 
     // One byte less and the same bundle reaches the platform stage.
-    evidence_.platform.ima_log.pop_back();
+    azure_evidence(evidence_.platform).ima_log.pop_back();
     ASSERT_EQ(platform_evidence_size(evidence_.platform), kMaxPlatformEvidenceBytes);
     sign_evidence();
     const auto at_limit = examine();
@@ -505,7 +510,7 @@ TEST_F(Tier1PathTest, IdentityCheckWinsOverStaleIncarnation) {
 TEST_F(Tier1PathTest, SizeBoundWinsOverInvalidSignature) {
     // The size gate is what keeps an unauthenticated peer from making the
     // verifier hash megabytes, so it must run before the signature check.
-    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i');
+    azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i');
     evidence_.identity_signature.fill(0);
     const auto verdict = examine();
     EXPECT_EQ(verdict.failure, AttestationFailure::EvidenceOversized);
@@ -530,7 +535,7 @@ TEST_F(Tier1PathTest, RepairingEachLinkExposesExactlyTheNextCheck) {
     evidence_.challenge_digest = challenge_digest(foreign);
     evidence_.node_id.bytes = patterned<32>(0x55);
     evidence_.incarnation = challenge_.incarnation - 1;
-    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i');
+    azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i');
     evidence_.identity_signature.fill(0);
 
     EXPECT_EQ(examine().failure, AttestationFailure::ProfileIncomplete);
@@ -550,7 +555,7 @@ TEST_F(Tier1PathTest, RepairingEachLinkExposesExactlyTheNextCheck) {
     evidence_.incarnation = challenge_.incarnation;
     EXPECT_EQ(examine().failure, AttestationFailure::EvidenceOversized);
 
-    evidence_.platform.ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
+    azure_evidence(evidence_.platform).ima_log = "10 aa ima-ng sha256:bb /opt/nexus\n";
     EXPECT_EQ(examine().failure, AttestationFailure::IdentitySignatureInvalid);
 
     sign_evidence();
@@ -600,7 +605,7 @@ TEST_F(Tier1PathTest, EveryRejectionPathIsDeterministic) {
              sign_evidence();
          }},
         {"oversized bundle", AttestationFailure::EvidenceOversized,
-         [this] { evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i'); }},
+         [this] { azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'i'); }},
         {"signature from another key", AttestationFailure::IdentitySignatureInvalid,
          [this] { sign_with(evidence_, rogue_sk_); }},
     };

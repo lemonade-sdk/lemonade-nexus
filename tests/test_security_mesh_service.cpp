@@ -9,9 +9,12 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+
+#include "support/attestation_fixtures.hpp"
 
 #include <asio.hpp>
 #include <gtest/gtest.h>
@@ -142,6 +145,19 @@ protected:
                 if (a != b) a->gossip->add_peer(b->endpoint(), b->pubkey_b64());
     }
 
+    // Seeds EK -> AK enrollment (covered by its own suites) so the challenge
+    // keeps its eligibility purpose and the empty bundle fails closed.
+    void preactivate(Node& observer, const Node& subject,
+                     const crypto::Ed25519PublicKey& genesis_pub) {
+        nexus_test::seed_svsm_activation(
+            security::derive_network_id(genesis_pub,
+                                        security::constants::kSecurityRulesetVersion,
+                                        security::constants::kConsensusRulesetVersion),
+            subject.id(), subject.pubkey(),
+            observer.dir / "mesh" / "security" / "attestation-state" /
+                "svsm-activations");
+    }
+
     bool pump_until(const std::function<bool()>& done,
                     std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -230,6 +246,7 @@ TEST_F(SecurityMeshServiceTest, IneligibleHostFailsAttestationOverUdp) {
     peer_all();
     make_mesh(a, a.pubkey());
     make_mesh(b, a.pubkey());
+    preactivate(a, b, a.pubkey());
 
     // The callback seam stands in for a root-signed ServerHello exchange.
     gossip::GossipBallotTestAccess::certify(*a.gossip, b.id());
@@ -253,6 +270,7 @@ TEST_F(SecurityMeshServiceTest, GarbageAndForgedEnvelopesAreContained) {
     peer_all();
     make_mesh(a, a.pubkey());
     make_mesh(b, a.pubkey());
+    preactivate(a, b, a.pubkey());
 
     // Garbage from an authenticated peer: reaches the router, dies as
     // Malformed, and must not disturb the service.
@@ -297,6 +315,7 @@ TEST_F(SecurityMeshServiceTest, PreQuorumStrangerChallengeProducesNoEvidence) {
     make_mesh(s1, a.pubkey());
     make_mesh(s2, a.pubkey());
     make_mesh(s3, a.pubkey());
+    preactivate(a, b, a.pubkey());
 
     const auto network = security::derive_network_id(
         a.pubkey(), security::constants::kSecurityRulesetVersion,

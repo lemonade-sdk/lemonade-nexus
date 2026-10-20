@@ -124,24 +124,7 @@ AttestationChallenge good_challenge() {
 
 /// The request form of the challenge above.
 json good_request() {
-    const auto c = good_challenge();
-    json j;
-    j["version"] = nexus::attestd::kAttestdWireVersion;
-    j["type"] = std::string(nexus::attestd::kRequestType);
-    j["network_id"] = nexus::crypto::to_hex(c.network_id);
-    j["nonce"] = nexus::crypto::to_hex(c.nonce);
-    j["node_id"] = nexus::crypto::to_hex(c.node_id.bytes);
-    j["node_key"] = nexus::crypto::to_hex(c.node_key);
-    j["incarnation"] = c.incarnation.underlying();
-    j["epoch"] = c.epoch.underlying();
-    j["security_ruleset"] = c.security_ruleset;
-    j["consensus_ruleset"] = c.consensus_ruleset;
-    j["profile_id"] = static_cast<uint16_t>(c.profile_id);
-    j["profile_ruleset"] = c.profile_ruleset;
-    j["policy_digest"] = nexus::crypto::to_hex(c.policy_digest);
-    j["purpose"] = static_cast<uint16_t>(c.purpose);
-    j["context_digest"] = nexus::crypto::to_hex(c.context_digest);
-    return j;
+    return json::parse(nexus::attestd::encode_challenge_request(good_challenge()));
 }
 
 }  // namespace
@@ -154,8 +137,8 @@ TEST(AttestdGate, AnswersAWellFormedChallenge) {
     EXPECT_EQ(check_challenge(good_challenge()), Refusal::None);
 }
 
-TEST(AttestdGate, RefusesEveryProfileButAzureSnpVtpm) {
-    for (const auto id : {AttestationProfileId::Unknown, AttestationProfileId::SnpSvsmVtpm,
+TEST(AttestdGate, RefusesEveryProfileButCompiledSnpSvsmVtpm) {
+    for (const auto id : {AttestationProfileId::Unknown, AttestationProfileId::AzureSnpVtpm,
                           AttestationProfileId::SnpDirectBoot, AttestationProfileId::Tdx}) {
         auto c = good_challenge();
         c.profile_id = id;
@@ -304,7 +287,9 @@ TEST(AttestdCodec, RefusesAnyFieldThatWouldSteerTheQuote) {
 TEST(AttestdCodec, RefusesAMissingField) {
     for (const char* field : {"network_id", "nonce", "node_id", "node_key", "incarnation", "epoch",
                               "security_ruleset", "consensus_ruleset", "profile_id",
-                              "profile_ruleset", "policy_digest", "purpose", "context_digest"}) {
+                              "profile_ruleset", "policy_digest", "purpose", "context_digest",
+                              "ima_mode", "ima_checkpoint_digest", "ima_prior_event_count",
+                              "ima_prior_pcr10", "ima_checkpoint_paths"}) {
         auto request = good_request();
         request.erase(field);
         EXPECT_FALSE(decode_challenge(request.dump()).has_value()) << field;
@@ -338,7 +323,7 @@ TEST(AttestdCodec, RefusesAWrongWidthOrWrongTypeField) {
 }
 
 TEST(AttestdCodec, RefusesAnUnknownPurpose) {
-    for (const int purpose : {0, 3, 65535}) {
+    for (const int purpose : {0, 4, 65535}) {
         auto request = good_request();
         request["purpose"] = purpose;
         EXPECT_FALSE(decode_challenge(request.dump()).has_value()) << purpose;
@@ -505,9 +490,10 @@ using nexus::attestd::read_framed_response;
 PlatformEvidenceBundle bundle_with_log(std::size_t log_bytes) {
     PlatformEvidenceBundle b;
     b.challenge_digest = patterned<32>(0x77);
-    b.platform.ima_log.assign(log_bytes, 'x');
-    b.platform.hcl_blob.assign(64, 0x5A);
-    b.platform.tpms_attest.assign(64, 0x5B);
+    auto& azure = nexus::security::azure_evidence(b.platform);
+    azure.ima_log.assign(log_bytes, 'x');
+    azure.hcl_blob.assign(64, 0x5A);
+    azure.tpms_attest.assign(64, 0x5B);
     return b;
 }
 
@@ -555,7 +541,7 @@ TEST(AttestdFraming, ALocalResponseMayExceedTheMeshWireBound) {
     // The layering D3 fixes. 56 KiB is what a PEER will accept; it is not a
     // limit on what the local daemon may hand its own Nexus process.
     const auto bundle = bundle_with_log(100 * 1024);
-    const auto encoded = nexus::security::encode_snp_vtpm_evidence(bundle.platform);
+    const auto encoded = nexus::security::encode_platform_evidence(bundle.platform);
     ASSERT_GT(encoded.size(), constants::kMaxPlatformEvidenceWireBytes);
 
     bool emitted = false;
@@ -565,7 +551,8 @@ TEST(AttestdFraming, ALocalResponseMayExceedTheMeshWireBound) {
     PlatformEvidenceBundle got;
     EXPECT_EQ(read_bytes(wire, /*close_write=*/true, 5, &got), FrameError::None);
     EXPECT_EQ(got.challenge_digest, bundle.challenge_digest);
-    EXPECT_EQ(got.platform.ima_log, bundle.platform.ima_log);
+    EXPECT_EQ(nexus::security::azure_evidence(got.platform).ima_log,
+              nexus::security::azure_evidence(bundle.platform).ima_log);
 }
 
 TEST(AttestdFraming, AFrameOverTheSizeBoundIsRefusedBeforeItsBodyIsRead) {
@@ -685,7 +672,7 @@ TEST(AttestdFraming, ARefusalTerminatesTheStreamAndCarriesNoBundle) {
     EXPECT_EQ(result.refusal, Refusal::PlatformUnavailable);
     EXPECT_EQ(result.transport, FrameError::None);
     EXPECT_EQ(result.detail, "no TPM here");
-    EXPECT_TRUE(out.platform.empty());
+    EXPECT_TRUE(nexus::security::platform_evidence_empty(out.platform));
 }
 
 TEST(AttestdFraming, TheRequestSurfaceIsStillOneChallengeAndNothingElse) {
@@ -694,7 +681,7 @@ TEST(AttestdFraming, TheRequestSurfaceIsStillOneChallengeAndNothingElse) {
     // selection, no bytes to sign.
     const auto request = nexus::attestd::encode_challenge_request(good_challenge());
     const auto parsed = json::parse(request);
-    EXPECT_EQ(parsed.size(), 15u);
+    EXPECT_EQ(parsed.size(), 20u);
     for (const char* forbidden : {"qualifying_data", "pcr_selection", "path", "offset",
                                   "sign", "report_data", "length"}) {
         EXPECT_FALSE(parsed.contains(forbidden)) << forbidden;
@@ -716,12 +703,16 @@ TEST(AttestdBoundary, NothingInTheDaemonConfigCanCarryKeyMaterial) {
     // Structured binding, so a new field breaks the BUILD rather than slipping
     // past a runtime check. Both members are named here; neither can hold a key.
     AttestdConfig config;
-    auto& [cache_dir, allow_network] = config;
+    auto& [cache_dir, allow_network, svsm_report_object, guest_report_object] = config;
     cache_dir = "/var/lib/nexus-attestd/cache";
     allow_network = false;
+    svsm_report_object = "/sys/kernel/config/tsm/report/nexus-attestd-svsm";
+    guest_report_object = "/sys/kernel/config/tsm/report/nexus-attestd-guest";
 
     static_assert(std::is_same_v<decltype(cache_dir), std::filesystem::path>);
     static_assert(std::is_same_v<decltype(allow_network), bool>);
+    static_assert(std::is_same_v<decltype(svsm_report_object), std::filesystem::path>);
+    static_assert(std::is_same_v<decltype(guest_report_object), std::filesystem::path>);
     EXPECT_EQ(config.cache_dir, "/var/lib/nexus-attestd/cache");
 }
 
@@ -863,7 +854,8 @@ TEST(AttestdFramingHostile, TrailingBytesAfterEndCannotAlterTheResult) {
 
     PlatformEvidenceBundle got;
     EXPECT_EQ(read_bytes(wire, /*close_write=*/true, 5, &got), FrameError::None);
-    EXPECT_EQ(got.platform.ima_log, bundle.platform.ima_log);
+    EXPECT_EQ(nexus::security::azure_evidence(got.platform).ima_log,
+              nexus::security::azure_evidence(bundle.platform).ima_log);
 }
 
 TEST(AttestdFramingHostile, TheServerRefusesToEmitABundleOverItsOwnBudget) {
@@ -917,7 +909,10 @@ TEST(AttestdGrammarHostile, WrongJsonShapesAreRefusedTyped) {
     refuse("{}", "empty object");
     refuse(good_request().dump() + good_request().dump(), "second JSON object");
     refuse(good_request().dump() + " x", "trailing data");
-    refuse(std::string(9 * 1024, ' ') + good_request().dump(), "over the request byte cap");
+    refuse(std::string(nexus::attestd::kMaxRequestBytes + 1, ' '),
+           "over the request byte cap");
+    refuse(std::string(nexus::attestd::kMaxRequestBytes, ' ') + good_request().dump(),
+           "well-formed request pushed over the cap");
 
     // Deep nesting parses or fails, but never crashes and never authorizes.
     std::string deep(2000, '[');
@@ -1051,7 +1046,7 @@ TEST_F(FakeAttestdSocket, TheClientDiscardsEvidenceBoundToAnotherChallenge) {
     const auto decoded = decode_challenge(std::string_view(request).substr(0, request.size() - 1));
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(challenge_digest(*decoded), challenge_digest(asked));
-    EXPECT_TRUE(evidence.empty());
+    EXPECT_TRUE(nexus::security::platform_evidence_empty(evidence));
 }
 
 TEST_F(FakeAttestdSocket, TheClientAcceptsEvidenceBoundToItsOwnChallenge) {
@@ -1060,7 +1055,7 @@ TEST_F(FakeAttestdSocket, TheClientAcceptsEvidenceBoundToItsOwnChallenge) {
     const auto asked = good_challenge();
     auto bundle = bundle_with_log(64);
     bundle.challenge_digest = challenge_digest(asked);
-    const auto encoded = nexus::security::encode_snp_vtpm_evidence(bundle.platform);
+    const auto encoded = nexus::security::encode_platform_evidence(bundle.platform);
     ASSERT_FALSE(encoded.empty());
     const std::string wire = frames_for(bundle);
 
@@ -1073,8 +1068,8 @@ TEST_F(FakeAttestdSocket, TheClientAcceptsEvidenceBoundToItsOwnChallenge) {
     const auto decoded = decode_challenge(std::string_view(request).substr(0, request.size() - 1));
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(challenge_digest(*decoded), challenge_digest(asked));
-    // SnpVtpmEvidence has no operator==; compare the canonical form.
-    EXPECT_EQ(nexus::security::encode_snp_vtpm_evidence(evidence), encoded);
+    // PlatformEvidence has no operator==; compare the tagged canonical form.
+    EXPECT_EQ(nexus::security::encode_platform_evidence(evidence), encoded);
 }
 
 TEST_F(FakeAttestdSocket, TheClientReturnsNothingOnAFramedRefusal) {
@@ -1096,5 +1091,124 @@ TEST_F(FakeAttestdSocket, TheClientReturnsNothingOnAFramedRefusal) {
     join_server();
 
     EXPECT_FALSE(request.empty());
-    EXPECT_TRUE(evidence.empty());
+    EXPECT_TRUE(nexus::security::platform_evidence_empty(evidence));
+}
+
+// ---------------------------------------------------------------------------
+// The activation operation: the one request that drives a TPM object creation
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// A well-formed activation request: base64 fields, legal sizes.
+nexus::attestd::SvsmAkActivationRequest good_activation_request() {
+    nexus::attestd::SvsmAkActivationRequest request;
+    auto v = [](auto a) { return std::vector<uint8_t>{std::begin(a), std::end(a)}; };
+    request.ek_public = v(patterned<200>(0x10));
+    request.ak_public = v(patterned<200>(0x20));
+    request.credential_blob = v(patterned<128>(0x60));
+    request.encrypted_secret = v(patterned<64>(0x70));
+    return request;
+}
+
+}  // namespace
+
+TEST(AttestdActivationCodec, RoundTripsAnActivationRequest) {
+    const auto request = good_activation_request();
+    const std::string text = nexus::attestd::encode_activation_request(request);
+    const auto decoded = nexus::attestd::decode_activation_request(text);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->ek_public, request.ek_public);
+    EXPECT_EQ(decoded->ak_public, request.ak_public);
+    EXPECT_EQ(decoded->credential_blob, request.credential_blob);
+    EXPECT_EQ(decoded->encrypted_secret, request.encrypted_secret);
+    // The two operations are distinct closed grammars; neither parses the other.
+    EXPECT_FALSE(nexus::attestd::decode_challenge(text).has_value());
+    EXPECT_FALSE(nexus::attestd::decode_activation_request(
+                     nexus::attestd::encode_challenge_request(good_challenge())).has_value());
+}
+
+TEST(AttestdActivationCodec, RefusesAnySmuggledOrMissingField) {
+    const std::string good = nexus::attestd::encode_activation_request(good_activation_request());
+    auto smuggled = json::parse(good);
+    smuggled["qualifying_data"] = "00";
+    EXPECT_FALSE(nexus::attestd::decode_activation_request(smuggled.dump()).has_value());
+
+    for (const char* field : {"ek_public", "ak_public", "credential_blob", "encrypted_secret"}) {
+        auto missing = json::parse(good);
+        missing.erase(field);
+        EXPECT_FALSE(nexus::attestd::decode_activation_request(missing.dump()).has_value())
+            << field;
+    }
+}
+
+TEST(AttestdActivationCodec, RefusesWrongEnvelopeAndBadBase64) {
+    const std::string good = nexus::attestd::encode_activation_request(good_activation_request());
+    auto wrong_type = json::parse(good);
+    wrong_type["type"] = "attestation_challenge";
+    EXPECT_FALSE(nexus::attestd::decode_activation_request(wrong_type.dump()).has_value());
+
+    auto bad_b64 = json::parse(good);
+    bad_b64["ak_public"] = "not-base64-!!!";
+    EXPECT_FALSE(nexus::attestd::decode_activation_request(bad_b64.dump()).has_value());
+
+    auto empty = json::parse(good);
+    empty["credential_blob"] = "";
+    EXPECT_FALSE(nexus::attestd::decode_activation_request(empty.dump()).has_value());
+
+    auto oversized = json::parse(good);
+    oversized["encrypted_secret"] =
+        std::string(nexus::attestd::kMaxActivationFieldBytes + 1, 'A');
+    EXPECT_FALSE(nexus::attestd::decode_activation_request(oversized.dump()).has_value());
+}
+
+TEST(AttestdActivationCodec, TheResultFrameCarriesExactlyOneDigest) {
+    const auto digest = patterned<32>(0xA0);
+    const std::vector<uint8_t> secret{std::begin(digest), std::end(digest)};
+    std::string wire;
+    ASSERT_TRUE(nexus::attestd::emit_activation_result(secret, [&](std::string_view f) {
+        wire.append(f);
+        return true;
+    }));
+
+    // One frame, and it round-trips through the assembler.
+    auto frames = split_frames(wire);
+    ASSERT_EQ(frames.size(), 1u);
+    EXPECT_EQ(frames.front().first, FrameKind::Result);
+
+    nexus::attestd::ResponseAssembler assembler;
+    (void)assembler.offer(frames.front().first, frames.front().second);
+    EXPECT_TRUE(assembler.done());
+    EXPECT_EQ(assembler.result_secret(), secret);
+}
+
+TEST_F(AttestdServiceTest, TheActivationPathRefusesTypedWithoutAWorkingTpm) {
+    AttestdService service{config()};
+    const std::string wire =
+        collect_frames(service, nexus::attestd::encode_activation_request(good_activation_request()));
+    auto frames = split_frames(wire);
+    ASSERT_EQ(frames.size(), 1u);
+    const auto document = json::parse(frames.front().second, nullptr, false);
+    ASSERT_FALSE(document.is_discarded());
+    // No TPM here: a typed refusal, never a bundle or a closed socket. Which
+    // refusal depends on whether this build has the TPM stack at all.
+    EXPECT_EQ(document["type"], std::string(nexus::attestd::kRefusalType));
+    const std::string refusal = document["refusal"];
+    EXPECT_TRUE(refusal == "activation_unavailable" || refusal == "activation_failed")
+        << "unexpected refusal: " << refusal;
+}
+
+TEST_F(AttestdServiceTest, AMalformedActivationRequestIsMalformedNotActivated) {
+    AttestdService service{config()};
+    for (const char* garbage : {"{}", "[1,2]", "not json"}) {
+        const auto document = json::parse(one_frame(service, garbage).second, nullptr, false);
+        ASSERT_FALSE(document.is_discarded()) << garbage;
+        EXPECT_EQ(document["refusal"], "malformed_request") << garbage;
+    }
+    // An unknown key is refused too: the closed grammar holds for activation.
+    auto smuggled = json::parse(nexus::attestd::encode_activation_request(good_activation_request()));
+    smuggled["pcr_selection"] = 3;
+    const auto document = json::parse(one_frame(service, smuggled.dump()).second, nullptr, false);
+    ASSERT_FALSE(document.is_discarded());
+    EXPECT_EQ(document["refusal"], "malformed_request");
 }

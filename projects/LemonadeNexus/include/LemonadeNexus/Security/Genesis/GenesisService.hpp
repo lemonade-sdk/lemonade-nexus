@@ -39,6 +39,10 @@ public:
     /// passing verdict.
     [[nodiscard]] bool quorum_ready() const;
 
+    /// Admitted candidates still without a passing verdict; the collection
+    /// re-challenges these on its cadence.
+    [[nodiscard]] std::set<NodeId> unverdicted_candidates() const;
+
     /// The founding Tier 1 set: the kBootstrapThreshold qualifying candidates
     /// with the lowest node identities. Sorting by identity keeps the choice
     /// deterministic when more than the threshold qualify.
@@ -71,6 +75,7 @@ public:
         const Digest& dkg_transcript_digest,
         const Digest& attestation_root,
         const Digest& vote_key_set_digest,
+        const Digest& release_approval_digest,
         const crypto::Ed25519PrivateKey& genesis_private_key);
 
     void restore_finalized();

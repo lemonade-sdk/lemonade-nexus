@@ -13,14 +13,6 @@
 
 namespace nexus::security {
 
-std::size_t platform_evidence_size(const SnpVtpmEvidence& platform) {
-    return platform.hcl_blob.size() + platform.vcek_der.size() +
-           platform.amd_chain_pem.size() + platform.tpms_attest.size() +
-           platform.tpm_signature.size() + platform.pcr_values.size() +
-           platform.ima_log.size() + platform.binary_path.size() +
-           platform.binary_sha256.size() + platform.ima_unavailable.size();
-}
-
 bool path_approved(const LinuxAttestationProfile& profile, std::string_view binary_path,
                    std::string_view binary_sha256_hex) {
     if (binary_path.empty() || binary_sha256_hex.empty()) {
@@ -44,6 +36,18 @@ bool binary_approved(const LinuxAttestationProfile& profile, const ImaLog& log) 
     for (const auto& required : profile.approved_paths) {
         const auto entry = ima_entry_for_path(log, required.path);
         if (!entry || entry->file_hash_algo != "sha256" ||
+            !path_approved(profile, required.path, entry->file_hash_hex)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool binary_approved(const LinuxAttestationProfile& profile, const ImaBinaryLog& log) {
+    if (profile.approved_paths.empty()) return false;
+    for (const auto& required : profile.approved_paths) {
+        const auto entry = ima_binary_entry_for_path(log, required.path);
+        if (!entry || entry->violation || entry->file_hash_algo != "sha256" ||
             !path_approved(profile, required.path, entry->file_hash_hex)) {
             return false;
         }
@@ -82,6 +86,11 @@ AttestationFailure map_platform_failure(const EvidenceVerdict& verdict) {
         if (why.starts_with("the platform binding key")) {
             return AttestationFailure::VtpmBindingInvalid;
         }
+        if (why.starts_with("the EK manifest") ||
+            why.starts_with("the AK has no matching") ||
+            why.starts_with("SVSM REPORT_DATA")) {
+            return AttestationFailure::VtpmBindingInvalid;
+        }
         if (why.starts_with("the claimed binary measurement is not hex")) {
             return AttestationFailure::BinaryMeasurementInvalid;
         }
@@ -112,8 +121,9 @@ ProviderSet compiled_providers(LinuxAttestationProfile profile,
                                AmdRevocationSource revocation) {
     ProviderSet providers;
     providers.push_back(
-        std::make_shared<AzureSnpVtpmProvider>(std::move(profile), std::move(revocation)));
-    providers.push_back(std::make_shared<SnpSvsmVtpmProvider>());
+        std::make_shared<AzureSnpVtpmProvider>(profile, revocation));
+    providers.push_back(std::make_shared<SnpSvsmVtpmProvider>(std::move(profile),
+                                                               std::move(revocation)));
     providers.push_back(std::make_shared<SnpDirectBootProvider>());
     return providers;
 }
@@ -139,7 +149,8 @@ const PlatformEvidenceProvider* AttestationVerifier::provider_for(
 }
 
 AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& challenge,
-                                                 const AttestationEvidence& evidence) const {
+                                                 const AttestationEvidence& evidence,
+                                                 const PlatformVerificationState& state) const {
     AttestationVerdict verdict;
     verdict.node_id = challenge.node_id;
     verdict.epoch = challenge.epoch;
@@ -233,6 +244,9 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     if (evidence.context_digest != challenge.context_digest) {
         return fail(AttestationFailure::ContextMismatch);
     }
+    if (evidence.ima_mode != challenge.ima_mode) {
+        return fail(AttestationFailure::ChallengeMismatch);
+    }
 
     // 9. The evidence must answer this challenge.
     if (evidence.challenge_digest != challenge_digest(challenge)) {
@@ -272,7 +286,7 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     verdict.claims.incarnation_binding_valid = true;
 
     // 14. The platform chain, whichever profile owns it.
-    const PlatformVerification platform = provider->examine(challenge, evidence);
+    const PlatformVerification platform = provider->examine(challenge, evidence, state);
     verdict.claims.hardware_confidentiality_valid =
         platform.claims.hardware_confidentiality_valid;
     verdict.claims.platform_identity_valid   = platform.claims.platform_identity_valid;

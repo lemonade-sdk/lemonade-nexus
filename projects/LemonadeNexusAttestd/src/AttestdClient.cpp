@@ -32,6 +32,13 @@ AttestdFetchResult transport_fault(FrameError e, std::string detail = {}) {
     return r;
 }
 
+AttestdActivationResult activation_fault(FrameError e, std::string detail = {}) {
+    AttestdActivationResult r;
+    r.transport = e;
+    r.detail = std::move(detail);
+    return r;
+}
+
 #ifndef _WIN32
 
 /// Read exactly `count` bytes, or fail. Never reads to end-of-file, and never
@@ -98,6 +105,14 @@ std::string encode_challenge_request(const security::AttestationChallenge& chall
     j["policy_digest"] = crypto::to_hex(challenge.policy_digest);
     j["purpose"] = static_cast<uint16_t>(challenge.purpose);
     j["context_digest"] = crypto::to_hex(challenge.context_digest);
+    j["ima_mode"] = static_cast<uint16_t>(challenge.ima_mode);
+    j["ima_checkpoint_digest"] = crypto::to_hex(challenge.ima_checkpoint_digest);
+    j["ima_prior_event_count"] = challenge.ima_prior_event_count;
+    j["ima_prior_pcr10"] = crypto::to_hex(challenge.ima_prior_pcr10);
+    j["ima_checkpoint_paths"] = json::array();
+    for (const auto& path : challenge.ima_checkpoint_paths) {
+        j["ima_checkpoint_paths"].push_back({{"path", path.path}, {"sha256", path.sha256}});
+    }
     return j.dump() + "\n";
 }
 
@@ -167,6 +182,58 @@ AttestdFetchResult read_framed_response(int fd, int deadline_seconds,
     return result;
 }
 
+AttestdActivationResult read_activation_response(int fd, int deadline_seconds) {
+    const auto expires = Clock::now() + std::chrono::seconds(deadline_seconds);
+
+    ResponseAssembler assembler;
+    std::vector<uint8_t> payload;
+
+    for (;;) {
+        uint8_t head[kFrameHeaderBytes];
+        if (!read_exact(fd, expires, head, sizeof(head))) {
+            return activation_fault(FrameError::Truncated,
+                                    "the daemon stopped writing before the answer was complete");
+        }
+        const std::size_t length = (static_cast<std::size_t>(head[0]) << 24) |
+                                   (static_cast<std::size_t>(head[1]) << 16) |
+                                   (static_cast<std::size_t>(head[2]) << 8) |
+                                   static_cast<std::size_t>(head[3]);
+        if (length > kMaxLocalFrameBytes) {
+            return activation_fault(FrameError::Oversized,
+                                    "frame declares " + std::to_string(length) + " bytes");
+        }
+
+        payload.resize(length);
+        if (length > 0 && !read_exact(fd, expires, payload.data(), length)) {
+            return activation_fault(FrameError::Truncated, "frame body did not arrive");
+        }
+
+        const auto kind = static_cast<FrameKind>(head[4]);
+        const std::string_view body(reinterpret_cast<const char*>(payload.data()), length);
+        if (assembler.offer(kind, body)) continue;
+        if (!assembler.done()) {
+            return activation_fault(assembler.error(),
+                                    std::string(frame_error_name(assembler.error())));
+        }
+        break;
+    }
+
+    AttestdActivationResult result;
+    if (assembler.refusal() != Refusal::None) {
+        result.refusal = assembler.refusal();
+        result.detail = assembler.detail();
+        return result;
+    }
+    if (auto secret = assembler.result_secret()) {
+        result.ok = true;
+        result.activated_secret = std::move(*secret);
+        return result;
+    }
+    result.transport = FrameError::Malformed;
+    result.detail = "the daemon answered with neither a result nor a refusal";
+    return result;
+}
+
 AttestdFetchResult AttestdClient::fetch(const security::AttestationChallenge& challenge,
                                         PlatformEvidenceBundle& out) {
     const std::string path = config_.path.string();
@@ -202,6 +269,39 @@ AttestdFetchResult AttestdClient::fetch(const security::AttestationChallenge& ch
     return result;
 }
 
+AttestdActivationResult AttestdClient::activate(const SvsmAkActivationRequest& request) const {
+    const std::string path = config_.path.string();
+    ::sockaddr_un addr{};
+    if (path.size() + 1 > sizeof(addr.sun_path)) {
+        return activation_fault(FrameError::Malformed, "socket path is too long: " + path);
+    }
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return activation_fault(FrameError::Truncated,
+                                std::string("socket(AF_UNIX): ") + std::strerror(errno));
+    }
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+
+    AttestdActivationResult result;
+    if (::connect(fd, reinterpret_cast<const ::sockaddr*>(&addr), sizeof(addr)) != 0) {
+        result = activation_fault(FrameError::Truncated,
+                                  "connect(" + path + "): " + std::strerror(errno));
+    } else {
+        const auto expires = Clock::now() + std::chrono::seconds(kLocalStreamDeadlineSeconds);
+        if (!write_all(fd, expires, encode_activation_request(request))) {
+            result = activation_fault(FrameError::Truncated,
+                                      "could not send the activation request");
+        } else {
+            ::shutdown(fd, SHUT_WR);
+            result = read_activation_response(fd, kLocalStreamDeadlineSeconds);
+        }
+    }
+    ::close(fd);
+    return result;
+}
+
 #else  // _WIN32 — no unix domain socket transport
 
 AttestdFetchResult read_framed_response(int, int, PlatformEvidenceBundle&) {
@@ -213,11 +313,20 @@ AttestdFetchResult AttestdClient::fetch(const security::AttestationChallenge&,
     return transport_fault(FrameError::Truncated, "nexus-attestd has no transport on Windows");
 }
 
+AttestdActivationResult AttestdClient::activate(const SvsmAkActivationRequest&) const {
+    return activation_fault(FrameError::Truncated, "nexus-attestd has no transport on Windows");
+}
+
 #endif
 
 security::PlatformEvidenceSource attestd_platform_source(AttestdClientConfig config) {
     return [client = AttestdClient(std::move(config))](
                const security::AttestationChallenge& challenge) mutable {
+        const auto empty_evidence = [&] {
+            return challenge.profile_id == security::AttestationProfileId::SnpSvsmVtpm
+                       ? security::PlatformEvidence{security::SnpSvsmVtpmEvidence{}}
+                       : security::PlatformEvidence{security::SnpVtpmEvidence{}};
+        };
         PlatformEvidenceBundle bundle;
         const auto result = client.fetch(challenge, bundle);
         if (!result.ok) {
@@ -225,16 +334,40 @@ security::PlatformEvidenceSource attestd_platform_source(AttestdClientConfig con
                          result.refusal != Refusal::None ? refusal_name(result.refusal)
                                                          : frame_error_name(result.transport),
                          result.detail.empty() ? "" : " — " + result.detail);
-            return security::SnpVtpmEvidence{};
+            return empty_evidence();
         }
         // The daemon derived its own nonce. Evidence bound to a different
         // challenge answers a question we did not ask, so it is discarded here
         // rather than signed and gossiped.
         if (bundle.challenge_digest != security::challenge_digest(challenge)) {
             spdlog::error("[attestd-client] the daemon bound its evidence to another challenge");
-            return security::SnpVtpmEvidence{};
+            return empty_evidence();
         }
         return std::move(bundle.platform);
+    };
+}
+
+security::PlatformActivationSource attestd_activation_source(AttestdClientConfig config) {
+    return [client = AttestdClient(std::move(config))](std::span<const uint8_t> ek_public,
+                                                      std::span<const uint8_t> ak_public,
+                                                      std::span<const uint8_t> credential_blob,
+                                                      std::span<const uint8_t> encrypted_secret,
+                                                      std::string* failure) -> std::optional<std::vector<uint8_t>> {
+        SvsmAkActivationRequest request;
+        request.ek_public.assign(ek_public.begin(), ek_public.end());
+        request.ak_public.assign(ak_public.begin(), ak_public.end());
+        request.credential_blob.assign(credential_blob.begin(), credential_blob.end());
+        request.encrypted_secret.assign(encrypted_secret.begin(), encrypted_secret.end());
+
+        const auto result = client.activate(request);
+        if (result.ok) return result.activated_secret;
+        const auto why = result.refusal != Refusal::None
+                             ? std::string(refusal_name(result.refusal))
+                             : std::string(frame_error_name(result.transport));
+        spdlog::warn("[attestd-client] no activation: {}{}", why,
+                     result.detail.empty() ? "" : " — " + result.detail);
+        if (failure) *failure = why + (result.detail.empty() ? "" : ": " + result.detail);
+        return std::nullopt;
     };
 }
 
