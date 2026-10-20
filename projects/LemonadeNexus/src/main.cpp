@@ -112,16 +112,12 @@ int main(int argc, char* argv[]) {
     key_wrapping.start();
 
     nexus::core::BinaryAttestationService attestation{crypto, storage};
-    if (!config.release_signing_pubkey.empty()) {
-        attestation.set_release_signing_pubkey(config.release_signing_pubkey);
-    }
     if (!config.github_releases_url.empty()) {
         attestation.set_io_context(coordinator.io_context());
         attestation.set_github_config(config.github_releases_url,
                                        config.manifest_fetch_interval_sec,
                                        config.minimum_version);
     }
-    attestation.start();
 
     // The old TEE/trust services are gone: attestation, eligibility, and
     // Tier 1 authority live in the mesh security system.
@@ -217,18 +213,21 @@ int main(int argc, char* argv[]) {
     // destroyed first.
     // ========================================================================
     nexus::security::PlatformEvidenceSource platform_source;
+    nexus::security::PlatformActivationSource activation_source;
 #ifdef LEMONADE_HAVE_ATTESTD_CLIENT
-    // Platform evidence comes from nexus-attestd over its unix socket, so
-    // this process needs neither TPM access nor the root-only IMA log.
-    // There is no in-process fallback: if the daemon is absent or refuses,
-    // the source yields empty evidence and the verifier fails it closed.
+    // Platform evidence and SVSM AK activation come from nexus-attestd over
+    // its unix socket, so this process needs neither TPM access nor the
+    // root-only IMA log. No in-process fallback: an absent or refusing daemon
+    // fails closed at the verifier.
     {
         nexus::attestd::AttestdClientConfig attestd;
         platform_source = nexus::attestd::attestd_platform_source(attestd);
+        activation_source = nexus::attestd::attestd_activation_source(attestd);
         std::error_code sock_ec;
         if (!std::filesystem::exists(attestd.path, sock_ec)) {
             spdlog::warn("nexus-attestd socket {} is absent; platform evidence will be "
-                         "empty and every attestation will fail until the daemon runs",
+                         "empty, SVSM AK activation will be refused, and every attestation "
+                         "will fail until the daemon runs",
                          attestd.path.string());
         } else {
             spdlog::info("platform evidence source: nexus-attestd at {}",
@@ -239,11 +238,18 @@ int main(int argc, char* argv[]) {
     std::string mesh_error;
     auto security_mesh = nexus::core::start_security_mesh(
         coordinator.io_context(), config, gossip, key_wrapping,
-        std::move(platform_source), mesh_error);
+        std::move(platform_source), std::move(activation_source), mesh_error);
     if (!security_mesh) {
         spdlog::error("Config: {}", mesh_error);
         return 1;
     }
+    // Legacy manifest consumers reuse the Genesis-delegated release authority;
+    // config and environment never select this key.
+    if (!security_mesh->release_signing_pubkey_b64.empty()) {
+        attestation.set_release_signing_pubkey(
+            security_mesh->release_signing_pubkey_b64);
+    }
+    attestation.start();
 
     // ========================================================================
     // Dynamic DNS
