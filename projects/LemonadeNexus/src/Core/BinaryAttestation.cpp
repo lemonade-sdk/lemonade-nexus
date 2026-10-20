@@ -16,11 +16,35 @@
 #include <windows.h>
 #elif defined(__linux__)
 // Uses /proc/self/exe
+#include <cerrno>
+#include <unistd.h>
 #endif
 
 namespace nexus::core {
 
 using json = nlohmann::json;
+
+namespace {
+
+/// #13: an IMA log that exists but is unreadable here is a permission fact, not
+/// a missing measurement — securityfs is root-only and attestd is the
+/// privileged reader.
+bool ima_log_access_denied() {
+#if defined(__linux__)
+    static constexpr const char* kImaAsciiPaths[] = {
+        "/sys/kernel/security/ima/ascii_runtime_measurements",
+        "/sys/kernel/security/integrity/ima/ascii_runtime_measurements",
+    };
+    for (const char* path : kImaAsciiPaths) {
+        errno = 0;
+        if (::access(path, R_OK) == 0) return false;  // readable: emptiness is real
+        if (errno == EACCES || errno == EPERM) return true;
+    }
+#endif
+    return false;
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // ReleaseManifest serialization
@@ -84,8 +108,15 @@ void BinaryAttestationService::on_start() {
         spdlog::info("[{}] binary SHA-256 (diagnostic, self-computed): {}", name(), self_hash_);
     }
     if (measured_hash_.empty()) {
-        spdlog::warn("[{}] no IMA measurement of this executable — the running binary cannot be "
-                      "proven to a peer, so this node cannot reach Tier 1", name());
+        if (ima_log_access_denied()) {
+            // #13: expected for this unprivileged process; not a missing measurement.
+            spdlog::info("[{}] IMA log is present but not readable by this unprivileged process — "
+                          "nexus-attestd is the privileged reader and supplies the binary "
+                          "measurement in evidence", name());
+        } else {
+            spdlog::warn("[{}] no IMA measurement of this executable — the running binary cannot be "
+                          "proven to a peer, so this node cannot reach Tier 1", name());
+        }
     } else {
         spdlog::info("[{}] IMA-measured binary SHA-256: {}", name(), measured_hash_);
         if (measured_hash_ != self_hash_ && !self_hash_.empty()) {
