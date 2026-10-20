@@ -63,9 +63,11 @@ struct SnpPolicyRequirements {
     /// is running firmware with known issues.
     TcbVersion min_tcb{};
 
-    /// Hex SHA-384 launch measurement to pin. Empty = accept any (used by the
-    /// startup probe, which reports the value so it can be pinned at enrollment).
-    std::string expected_measurement_hex;
+    /// Hex SHA-384 launch measurements to pin, one per approved VM shape. A
+    /// report passes only on an exact, verbatim match with a member. Empty =
+    /// accept any (used by the startup probe, which reports the value so it
+    /// can be pinned at enrollment); a Tier 1 profile must not leave it empty.
+    std::vector<std::string> expected_measurements_hex;
 };
 
 struct SnpVerifyResult {

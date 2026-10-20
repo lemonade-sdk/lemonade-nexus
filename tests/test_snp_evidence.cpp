@@ -197,7 +197,7 @@ TEST_F(SnpEvidenceTest, MissingVcekIsRejected) {
 TEST_F(SnpEvidenceTest, LivePlatformSatisfiesTheTier1Bar) {
     SnpPolicyRequirements req;
     req.min_tcb = {4, 0, 28, 222};
-    req.expected_measurement_hex = kMeasurement;
+    req.expected_measurements_hex = {kMeasurement};
     auto r = verify_snp_policy(parsed().snp, req);
     EXPECT_TRUE(r.ok) << r.failure;
 }
@@ -256,7 +256,7 @@ TEST_F(SnpEvidenceTest, TcbBelowFloorIsRejected) {
 
 TEST_F(SnpEvidenceTest, MeasurementMismatchIsRejected) {
     SnpPolicyRequirements req;
-    req.expected_measurement_hex = std::string(96, 'a');
+    req.expected_measurements_hex = {std::string(96, 'a')};
     EXPECT_FALSE(verify_snp_policy(parsed().snp, req).ok);
 }
 

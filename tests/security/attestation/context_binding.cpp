@@ -88,7 +88,7 @@ LinuxAttestationProfile pinned_profile() {
     LinuxAttestationProfile profile =
         nexus::security::linux_attestation_profile_v2_svsm();
     profile.snp.min_tcb = {2, 0, 6, 55};
-    profile.snp.expected_measurement_hex = "aa11";
+    profile.snp.expected_measurements_hex = {"aa11"};
     profile.required_ak_spki_b64 = "QUsx";
     profile.ima_policy_digest = patterned<32>(0x60);
     profile.require_ima = true;

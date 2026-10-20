@@ -578,10 +578,12 @@ SnpVerifyResult verify_snp_policy(const SnpReport& report, const SnpPolicyRequir
         return fail("platform TCB [" + report.reported_tcb.to_string() +
                     "] is below the required floor [" + req.min_tcb.to_string() + "]");
     }
-    if (!req.expected_measurement_hex.empty() &&
-        req.expected_measurement_hex != report.measurement_hex()) {
+    if (!req.expected_measurements_hex.empty() &&
+        std::find(req.expected_measurements_hex.begin(),
+                  req.expected_measurements_hex.end(),
+                  report.measurement_hex()) == req.expected_measurements_hex.end()) {
         return fail("launch measurement " + report.measurement_hex().substr(0, 16) +
-                    "... does not match the pinned value");
+                    "... does not match any pinned value");
     }
     return pass();
 }

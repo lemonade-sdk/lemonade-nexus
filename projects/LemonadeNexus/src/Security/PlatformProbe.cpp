@@ -318,9 +318,8 @@ PlatformProbeResult probe_platform(const PlatformProbeConfig& cfg) {
     out.evidence_bytes = encode_snp_vtpm_evidence(*evidence).size();
 
     EvidenceRequirements req;
-    req.policy                  = cfg.policy;
-    req.expected_measurement_hex = cfg.policy.expected_measurement_hex;
-    req.require_ima             = cfg.require_ima;
+    req.policy      = cfg.policy;
+    req.require_ima = cfg.require_ima;
 
     auto verdict = verify_snp_vtpm_evidence(*evidence, nonce, cfg.identity_pubkey, req);
     out.measurement_hex = verdict.measurement_hex;

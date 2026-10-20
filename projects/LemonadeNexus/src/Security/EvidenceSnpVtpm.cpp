@@ -636,7 +636,9 @@ EvidenceVerdict verify_snp_vtpm_evidence(const SnpVtpmEvidence& ev,
     // --- guest policy: where "pause the VM and dump memory" is ruled out ------
     SnpPolicyRequirements policy = req.policy;
     if (!req.expected_measurement_hex.empty()) {
-        policy.expected_measurement_hex = req.expected_measurement_hex;
+        // The enrollment pin names this one node's launch, so it narrows the
+        // policy to a single-member set.
+        policy.expected_measurements_hex = {req.expected_measurement_hex};
     }
     if (auto pol = verify_snp_policy(hcl->snp, policy); !pol.ok) {
         return deny(std::move(v), "platform policy check failed: " + pol.failure);

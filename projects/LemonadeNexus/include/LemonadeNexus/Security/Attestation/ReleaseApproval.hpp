@@ -18,7 +18,9 @@
 namespace nexus::security {
 
 inline constexpr uint32_t kReleaseAuthorityFormatVersion = 1;
-inline constexpr uint32_t kReleaseApprovalFormatVersion = 1;
+/// Version 2: svsm_launch_measurements is a set, one entry per approved VM
+/// shape. A version-1 verifier must refuse the new form, never half-read it.
+inline constexpr uint32_t kReleaseApprovalFormatVersion = 2;
 inline constexpr std::string_view kReleaseApprovalPath =
     "/usr/lib/lemonade-nexus/release/release-approval.json";
 
@@ -56,7 +58,12 @@ struct ReleaseApprovalV1 {
     std::string ima_policy_id;
     std::string ima_policy_sha256;
     ReleaseKernelIdentityV1 kernel;
-    std::string svsm_launch_measurement_hex;
+    /// Approved SVSM launch measurements, one per approved VM shape (the
+    /// measurement is a function of launch inputs, vCPU topology included).
+    /// Canonical form, enforced at verification: non-empty, each entry 96
+    /// lowercase hex characters, sorted ascending, no duplicates. A live
+    /// measurement passes only on an exact match with a member.
+    std::vector<std::string> svsm_launch_measurements_hex;
     TcbVersion min_tcb{};
     std::vector<ApprovedPath> approved_paths;
     std::string evidence_collector_path;

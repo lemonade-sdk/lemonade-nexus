@@ -171,7 +171,7 @@ TEST(PlatformEvidence, ProviderTypeIsInsideTheIdentitySigningDigest) {
 TEST(SvsmProviderReadiness, RequiresReleaseBootPcrPinsButNotDynamicImaPcr10) {
     auto profile = linux_attestation_profile_v2_svsm();
     profile.snp.min_tcb = {1, 1, 1, 1};
-    profile.snp.expected_measurement_hex = std::string(96, 'a');
+    profile.snp.expected_measurements_hex = {std::string(96, 'a')};
     profile.ima_policy_digest.fill(0x31);
     profile.approved_paths = {{"/usr/bin/nexus-attestd", {std::string(64, '3')}}};
     profile.evidence_collector_path = "/usr/bin/nexus-attestd";

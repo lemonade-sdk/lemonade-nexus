@@ -141,7 +141,7 @@ struct SignedFixture {
         const auto guest_data = svsm_report_nonce(challenge);
         evidence.svsm_report = report(0, 0x44, 0x55, service_data, signer.key);
         evidence.guest_report = report(2, 0x44, 0x55, guest_data, signer.key);
-        requirements.expected_measurement_hex = std::string(96, '4');
+        requirements.expected_measurements_hex = {std::string(96, '4')};
         requirements.policy.min_tcb = {9, 0, 23, 72};
         requirements.signature_verifier = [this](const SnpReport& value,
                                                   std::span<const uint8_t>,
@@ -338,11 +338,48 @@ TEST(SvsmSignedMutations, IndependentlySignedReportsMustStillPair) {
         EXPECT_EQ(f.failure(), SvsmEvidenceFailure::PairChipMismatch);
     }
     {
+        // Both measurements are release-approved shapes, so only the pairing
+        // rule can reject: one bundle must not span two launches.
         SignedFixture f;
-        f.requirements.expected_measurement_hex.clear();
+        f.requirements.expected_measurements_hex = {std::string(96, '4'),
+                                                    std::string(96, '6')};
         std::fill_n(f.evidence.guest_report.begin() + snp_off::kMeasurement, 48, 0x66);
         f.resign_guest();
         EXPECT_EQ(f.failure(), SvsmEvidenceFailure::PairMeasurementMismatch);
+    }
+}
+
+TEST(SvsmSignedMutations, TheReleaseMeasurementSetIsExactMatchAny) {
+    {
+        // Two approved shapes: a bundle from either one clears the measurement
+        // stage (the baseline then stops at enrollment, as in Baseline*).
+        SignedFixture f;
+        f.requirements.expected_measurements_hex = {std::string(96, '4'),
+                                                    std::string(96, '6')};
+        EXPECT_EQ(f.failure(), SvsmEvidenceFailure::EkMismatch);
+    }
+    {
+        SignedFixture f;
+        f.requirements.expected_measurements_hex = {std::string(96, '4'),
+                                                    std::string(96, '6')};
+        std::fill_n(f.evidence.svsm_report.begin() + snp_off::kMeasurement, 48, 0x66);
+        std::fill_n(f.evidence.guest_report.begin() + snp_off::kMeasurement, 48, 0x66);
+        f.resign_service();
+        f.resign_guest();
+        EXPECT_EQ(f.failure(), SvsmEvidenceFailure::EkMismatch);
+    }
+    {
+        // A third shape is not in the set, however validly signed.
+        SignedFixture f;
+        f.requirements.expected_measurements_hex = {std::string(96, '5'),
+                                                    std::string(96, '6')};
+        EXPECT_EQ(f.failure(), SvsmEvidenceFailure::ServiceMeasurementInvalid);
+    }
+    {
+        // An empty set approves nothing; it never degrades into "skip".
+        SignedFixture f;
+        f.requirements.expected_measurements_hex.clear();
+        EXPECT_EQ(f.failure(), SvsmEvidenceFailure::ServiceMeasurementInvalid);
     }
 }
 

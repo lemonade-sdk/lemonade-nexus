@@ -75,6 +75,24 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "unknown qualification_state";
         return std::nullopt;
     }
+    // Producer side canonicalizes by sorting; verification then enforces the
+    // sorted-unique form. Duplicates are an authoring error, not repairable.
+    auto measurements = spec.svsm_launch_measurements;
+    if (!measurements.empty()) {
+        for (const auto& measurement : measurements) {
+            if (!valid_hex(measurement, 96)) {
+                error = "svsm_launch_measurements entries must be 96 lowercase hex: " +
+                        measurement;
+                return std::nullopt;
+            }
+        }
+        std::sort(measurements.begin(), measurements.end());
+        if (std::adjacent_find(measurements.begin(), measurements.end()) !=
+            measurements.end()) {
+            error = "duplicate svsm_launch_measurements entry";
+            return std::nullopt;
+        }
+    }
     if (spec.artifacts.empty()) {
         error = "no artifacts given";
         return std::nullopt;
@@ -92,6 +110,9 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
     approval.signer_pubkey_b64 = spec.signer_pubkey_b64;
     approval.qualification_state = spec.qualification_state;
     approval.expected_pcrs = spec.expected_pcrs;
+    if (!measurements.empty()) {
+        approval.svsm_launch_measurements_hex = std::move(measurements);
+    }
 
     approval.approved_paths.clear();
     std::set<std::string> seen;

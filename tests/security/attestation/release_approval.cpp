@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include <sodium.h>
 
+#include <algorithm>
 #include <array>
 #include <optional>
 #include <string>
@@ -62,9 +63,9 @@ struct SignedFixture {
             "8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be",
             "a43447d3a1658efc13eb1349f1d14e9727630280e5449c5c5459885f9eb88de5",
         };
-        a.svsm_launch_measurement_hex =
+        a.svsm_launch_measurements_hex = {
             "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
-            "c6e84c2490814e22a2b5ba860a37208d1d9a";
+            "c6e84c2490814e22a2b5ba860a37208d1d9a"};
         a.min_tcb = {0x0c, 0, 0x1c, 0};
         a.approved_paths = {
             {"/usr/bin/lemonade-nexus", {std::string(64, '1')}},
@@ -223,12 +224,91 @@ TEST(ReleaseApproval, ThePreviousReleaseLineIdentityIsRejectedEvenResigned) {
     EXPECT_EQ(error, "release source identity does not match this current-head line");
 }
 
+TEST(ReleaseApproval, TheSingleMeasurementFormatVersionIsRetired) {
+    // Format 2 made the measurement a set; a re-signed format-1 marker must
+    // not let an approval straddle the two readings.
+    SignedFixture fixture;
+    std::string error;
+    fixture.bundle.approval.format_version = 1;
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release identity is incomplete or has an unsupported format");
+}
+
+TEST(ReleaseApproval, MeasurementOutsideTheApprovedSetIsRejectedEvenResigned) {
+    SignedFixture fixture;
+    std::string error;
+    const auto approved = fixture.bundle.approval.svsm_launch_measurements_hex.front();
+
+    fixture.bundle.approval.svsm_launch_measurements_hex = {std::string(96, 'a')};
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release kernel, IMA, or SVSM launch identity is not approved");
+
+    // A signed superset does not widen the compiled approval either.
+    fixture.bundle.approval.svsm_launch_measurements_hex = {approved, std::string(96, 'a')};
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release kernel, IMA, or SVSM launch identity is not approved");
+}
+
+TEST(ReleaseApproval, AnEmptyMeasurementSetIsRefused) {
+    SignedFixture fixture;
+    std::string error;
+    fixture.bundle.approval.svsm_launch_measurements_hex.clear();
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release approval pins no SVSM launch measurement");
+}
+
+TEST(ReleaseApproval, NonCanonicalMeasurementSetsAreRefused) {
+    SignedFixture fixture;
+    std::string error;
+    const auto approved = fixture.bundle.approval.svsm_launch_measurements_hex.front();
+
+    fixture.bundle.approval.svsm_launch_measurements_hex = {approved, approved};
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "SVSM launch measurements are duplicated or not sorted");
+
+    // "aa..." sorts after the 2f... pin, so this order is not canonical.
+    fixture.bundle.approval.svsm_launch_measurements_hex = {std::string(96, 'a'), approved};
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "SVSM launch measurements are duplicated or not sorted");
+
+    for (const std::string bad : {std::string(96, 'A'), std::string("2f07"),
+                                  std::string(96, 'a') + "aa"}) {
+        fixture.bundle.approval.svsm_launch_measurements_hex = {bad};
+        fixture.resign();
+        EXPECT_FALSE(verify_release_approval_bundle(
+            fixture.bundle, fixture.genesis_pk, fixture.network, error));
+        EXPECT_EQ(error, "an SVSM launch measurement is not 96 lowercase hex characters");
+    }
+}
+
 TEST(ReleaseApproval, TemplatePinsTheCurrentReleaseLine) {
     // Pins are re-issued at each release cut; this names the line in force.
     const auto t = release_approval_template();
     EXPECT_EQ(t.source_commit, "dd80e7f99d104e6be71ee9c30e32d39ea911bec8");
     EXPECT_EQ(t.starting_patched_tree,
               "148bcf279cd18a7c46295fcd76db022ed5451422");
+    // The compiled measurement set must already be canonical: sorted, unique,
+    // and still anchored on the one qualified shape.
+    ASSERT_FALSE(t.svsm_launch_measurements_hex.empty());
+    EXPECT_TRUE(std::is_sorted(t.svsm_launch_measurements_hex.begin(),
+                               t.svsm_launch_measurements_hex.end()));
+    EXPECT_EQ(std::adjacent_find(t.svsm_launch_measurements_hex.begin(),
+                                 t.svsm_launch_measurements_hex.end()),
+              t.svsm_launch_measurements_hex.end());
+    EXPECT_EQ(t.svsm_launch_measurements_hex.front().substr(0, 16),
+              "2f073e15d2501910");
 }
 
 TEST(ReleaseApproval, GenoaFloorBoundariesRejectObservedHost) {

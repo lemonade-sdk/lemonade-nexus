@@ -398,7 +398,7 @@ Digest filled(uint8_t byte) {
 LinuxAttestationProfile complete_profile() {
     LinuxAttestationProfile profile = linux_attestation_profile_v2_svsm();
     profile.snp.min_tcb = {2, 0, 6, 55};
-    profile.snp.expected_measurement_hex = std::string(96, 'a');
+    profile.snp.expected_measurements_hex = {std::string(96, 'a')};
     profile.ima_policy_digest = filled(0x60);
     profile.approved_paths = {{"/usr/bin/nexus", {std::string(64, 'b')}}};
     profile.evidence_collector_path = "/usr/bin/nexus";

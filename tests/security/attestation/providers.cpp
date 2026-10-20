@@ -166,7 +166,7 @@ protected:
         // any provider check, so nothing below would be reachable.
         profile_ = nexus::security::linux_attestation_profile_v1();
         profile_.snp.min_tcb = {2, 0, 6, 55};
-        profile_.snp.expected_measurement_hex = std::string(96, 'a');
+        profile_.snp.expected_measurements_hex = {std::string(96, 'a')};
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
@@ -522,7 +522,7 @@ LinuxAttestationProfile profile_for_the_captured_host() {
     // The TCB the captured report actually carries, so the chain reaches the
     // quote instead of stopping at the floor.
     profile.snp.min_tcb = {4, 0, 28, 222};
-    profile.snp.expected_measurement_hex = captured_measurement_hex();
+    profile.snp.expected_measurements_hex = {captured_measurement_hex()};
     profile.ima_policy_digest.fill(0x60);
     profile.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
     profile.evidence_collector_path = "/usr/bin/nexus";
@@ -611,7 +611,7 @@ TEST_F(ProviderBoundaryTest, AQuoteWithNoConfidentialBindingIsRejected) {
 // pinned from a host already known good, never from the host being qualified.
 TEST_F(ProviderBoundaryTest, TheLaunchMeasurementPinIsCheckedBeforeTheQuote) {
     LinuxAttestationProfile profile = profile_for_the_captured_host();
-    profile.snp.expected_measurement_hex = std::string(96, 'f');  // not this host
+    profile.snp.expected_measurements_hex = {std::string(96, 'f')};  // not this host
     ASSERT_TRUE(profile_is_complete(profile));
 
     challenge_.policy_digest = profile_digest(profile);

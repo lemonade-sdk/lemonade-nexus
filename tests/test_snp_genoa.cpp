@@ -216,10 +216,23 @@ TEST_F(GenoaSnpTest, PassesTheTier1PolicyBar) {
 TEST_F(GenoaSnpTest, PinnedMeasurementIsEnforced) {
     const auto r = parsed();
     SnpPolicyRequirements req;
-    req.expected_measurement_hex = std::string(kLaunchMeasurement);
+    req.expected_measurements_hex = {std::string(kLaunchMeasurement)};
     EXPECT_TRUE(verify_snp_policy(r, req).ok);
 
-    req.expected_measurement_hex = std::string(96, 'a');
+    req.expected_measurements_hex = {std::string(96, 'a')};
+    EXPECT_FALSE(verify_snp_policy(r, req).ok);
+}
+
+// Two approved VM shapes carry two measurements; membership is exact and a
+// third shape is still refused.
+TEST_F(GenoaSnpTest, AMultiShapeMeasurementSetIsExactMatchAny) {
+    const auto r = parsed();
+    SnpPolicyRequirements req;
+    req.expected_measurements_hex = {std::string(kLaunchMeasurement),
+                                     std::string(96, 'a')};
+    EXPECT_TRUE(verify_snp_policy(r, req).ok);
+
+    req.expected_measurements_hex = {std::string(96, 'a'), std::string(96, 'b')};
     EXPECT_FALSE(verify_snp_policy(r, req).ok);
 }
 

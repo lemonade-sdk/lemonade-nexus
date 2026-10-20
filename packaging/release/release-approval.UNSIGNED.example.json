@@ -6,7 +6,7 @@
     "genesis_signature": ""
   },
   "approval": {
-    "format_version": 1,
+    "format_version": 2,
     "release_id": "lemonade-nexus-0.9.7-current-head-svsm-tier1",
     "nexus_version": "0.9.7",
     "source_commit": "dd80e7f99d104e6be71ee9c30e32d39ea911bec8",
@@ -30,7 +30,9 @@
       "module_tree_sha256": "8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be",
       "module_certificate_der_sha256": "a43447d3a1658efc13eb1349f1d14e9727630280e5449c5c5459885f9eb88de5"
     },
-    "svsm_launch_measurement": "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821c6e84c2490814e22a2b5ba860a37208d1d9a",
+    "svsm_launch_measurements": [
+      "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821c6e84c2490814e22a2b5ba860a37208d1d9a"
+    ],
     "min_tcb": {
       "bootloader": 12,
       "tee": 0,

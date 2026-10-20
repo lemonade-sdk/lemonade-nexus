@@ -21,12 +21,11 @@ bool checkpoint_matches_release_and_activation(
     const AttestationCheckpoint& checkpoint,
     const SvsmAkActivationRecord& activation,
     const LinuxAttestationProfile& profile) {
-    std::vector<uint8_t> measurement;
-    try { measurement = crypto::from_hex(profile.snp.expected_measurement_hex); }
-    catch (...) { return false; }
-    return measurement.size() == checkpoint.launch_measurement.size() &&
-           std::equal(measurement.begin(), measurement.end(),
-                      checkpoint.launch_measurement.begin()) &&
+    // Exact-match-any against the release set; an empty set matches nothing.
+    const auto& approved = profile.snp.expected_measurements_hex;
+    const auto measurement_hex = hex_of(checkpoint.launch_measurement);
+    return std::find(approved.begin(), approved.end(), measurement_hex) !=
+               approved.end() &&
            checkpoint.ek_name == activation.ek_name &&
            checkpoint.ak_name == activation.ak_name &&
            checkpoint.network_id == activation.network_id &&
