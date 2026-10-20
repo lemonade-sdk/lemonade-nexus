@@ -21,7 +21,8 @@ std::optional<AttestationFailure> AzureSnpVtpmProvider::readiness() const {
 }
 
 PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& challenge,
-                                                    const AttestationEvidence& evidence) const {
+                                                    const AttestationEvidence& evidence,
+                                                    const PlatformVerificationState&) const {
     PlatformVerification result;
     result.claims.profile_id = profile_id();
     result.claims.profile_ruleset = profile_ruleset();
@@ -30,6 +31,9 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
         result.failure = failure;
         return result;
     };
+
+    const auto* azure = std::get_if<SnpVtpmEvidence>(&evidence.platform);
+    if (!azure) return fail(AttestationFailure::ProfileIdMismatch);
 
     EvidenceRequirements requirements;
     requirements.policy = profile_.snp;
@@ -56,7 +60,7 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
     // The quote nonce is the challenge digest, so one quote proves the platform
     // answered THIS challenge as THIS identity.
     const EvidenceVerdict platform = verify_snp_vtpm_evidence(
-        evidence.platform, evidence.challenge_digest, challenge.node_key, requirements);
+        *azure, evidence.challenge_digest, challenge.node_key, requirements);
 
     // Record what held even on the failing path: the caller needs the claims
     // that were proved, and the ones that were not stay false.
@@ -76,7 +80,7 @@ PlatformVerification AzureSnpVtpmProvider::examine(const AttestationChallenge& c
     // The chain proved the log is the quoted one and that the binding came
     // from the collector. This is the conjunction on top: EVERY required
     // component measured, last measurement in its own approved set.
-    const auto log = parse_ima_ascii(evidence.platform.ima_log);
+    const auto log = parse_ima_ascii(azure->ima_log);
     if (!log || !binary_approved(profile_, *log)) {
         return fail(AttestationFailure::BinaryMeasurementInvalid);
     }

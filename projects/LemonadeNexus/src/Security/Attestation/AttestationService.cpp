@@ -1,17 +1,97 @@
 #include <LemonadeNexus/Security/Attestation/AttestationService.hpp>
 
+#include <LemonadeNexus/Security/EvidenceSnpSvsmVtpm.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexus/Security/SnpReport.hpp>
 
 #include <sodium.h>
 
+#include <algorithm>
+
 namespace nexus::security {
 
+namespace {
+
+bool checkpoint_matches_release_and_activation(
+    const AttestationCheckpoint& checkpoint,
+    const SvsmAkActivationRecord& activation,
+    const LinuxAttestationProfile& profile) {
+    std::vector<uint8_t> measurement;
+    try { measurement = crypto::from_hex(profile.snp.expected_measurement_hex); }
+    catch (...) { return false; }
+    return measurement.size() == checkpoint.launch_measurement.size() &&
+           std::equal(measurement.begin(), measurement.end(),
+                      checkpoint.launch_measurement.begin()) &&
+           checkpoint.ek_name == activation.ek_name &&
+           checkpoint.ak_name == activation.ak_name &&
+           checkpoint.network_id == activation.network_id &&
+           checkpoint.node_id == activation.node_id &&
+           checkpoint.incarnation == activation.incarnation &&
+           checkpoint.profile_id == activation.profile_id &&
+           checkpoint.profile_ruleset == activation.profile_ruleset;
+}
+
+}  // namespace
+
 AttestationService::AttestationService(NetworkId network_id, LinuxAttestationProfile profile,
-                                       AmdRevocationSource revocation)
+                                       AmdRevocationSource revocation,
+                                       std::filesystem::path state_directory)
     : network_id_(network_id),
       profile_(std::move(profile)),
       policy_digest_(profile_digest(profile_)),
-      verifier_(profile_, std::move(revocation)) {}
+      revocation_(std::move(revocation)),
+      verifier_(profile_, revocation_),
+      checkpoints_(state_directory.empty() ? std::filesystem::path{}
+                                           : state_directory / "attestation-checkpoints"),
+      activations_(state_directory.empty() ? std::filesystem::path{}
+                                           : state_directory / "svsm-activations") {}
+
+AttestationChallenge AttestationService::make_challenge(
+    const NodeId& node, const crypto::Ed25519PublicKey& node_key,
+    IncarnationId incarnation, EpochId epoch, AttestationPurpose purpose,
+    const Digest& context) {
+    AttestationChallenge challenge;
+    challenge.network_id = network_id_;
+    randombytes_buf(challenge.nonce.data(), challenge.nonce.size());
+    challenge.node_id = node;
+    challenge.node_key = node_key;
+    challenge.incarnation = incarnation;
+    challenge.epoch = epoch;
+    challenge.security_ruleset = constants::kSecurityRulesetVersion;
+    challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
+    // The challenge names the profile. A candidate answers under this one or it
+    // answers nothing: there is no negotiation and no weaker second choice.
+    challenge.profile_id = kTier1AttestationProfileId;
+    challenge.profile_ruleset = kAttestationProfileRulesetVersion;
+    challenge.policy_digest = policy_digest_;
+    challenge.purpose = purpose;
+    challenge.context_digest = context;
+
+    if (challenge.profile_id == AttestationProfileId::SnpSvsmVtpm &&
+        purpose != AttestationPurpose::PlatformEnrollment) {
+        const auto loaded = checkpoints_.load(network_id_, node, incarnation,
+                                              challenge.profile_id);
+        const auto enrolled = activations_.load(network_id_, node, incarnation,
+                                                 challenge.profile_id);
+        if (const auto* checkpoint = std::get_if<AttestationCheckpoint>(&loaded);
+            checkpoint &&
+            std::holds_alternative<SvsmAkActivationRecord>(enrolled) &&
+            checkpoint->profile_ruleset == challenge.profile_ruleset &&
+            checkpoint->policy_digest == policy_digest_ &&
+            checkpoint_matches_release_and_activation(
+                *checkpoint, std::get<SvsmAkActivationRecord>(enrolled), profile_)) {
+            challenge.ima_mode = ImaEvidenceMode::Resume;
+            challenge.ima_checkpoint_digest = checkpoint->checkpoint_digest;
+            challenge.ima_prior_event_count = checkpoint->event_count;
+            challenge.ima_prior_pcr10 = checkpoint->pcr10;
+            challenge.ima_checkpoint_paths = checkpoint->required_paths;
+        }
+    }
+    // A new challenge replaces any unanswered one: only the latest is live.
+    pending_[node] = challenge;
+    return challenge;
+}
 
 std::optional<AttestationChallenge> AttestationService::create_challenge(
     const NodeId& node, const crypto::Ed25519PublicKey& node_key,
@@ -43,29 +123,22 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
         ++used;
     }
 
-    AttestationChallenge challenge;
-    challenge.network_id = network_id_;
-    randombytes_buf(challenge.nonce.data(), challenge.nonce.size());
-    challenge.node_id = node;
-    challenge.node_key = node_key;
-    challenge.incarnation = incarnation;
-    challenge.epoch = epoch;
-    challenge.security_ruleset = constants::kSecurityRulesetVersion;
-    challenge.consensus_ruleset = constants::kConsensusRulesetVersion;
-    // The challenge names the profile. A candidate answers under this one or it
-    // answers nothing: there is no negotiation and no weaker second choice.
-    challenge.profile_id = kTier1AttestationProfileId;
-    challenge.profile_ruleset = kAttestationProfileRulesetVersion;
-    challenge.policy_digest = policy_digest_;
-    challenge.purpose = purpose;
-    challenge.context_digest =
+    const Digest bound_context =
         purpose == AttestationPurpose::Eligibility
             ? eligibility_attestation_context(network_id_, epoch, node, incarnation)
             : context;
-
-    // A new challenge replaces any unanswered one: only the latest is live.
-    pending_[node] = challenge;
-    return challenge;
+    if (kTier1AttestationProfileId == AttestationProfileId::SnpSvsmVtpm) {
+        const auto activation = activations_.load(network_id_, node, incarnation,
+                                                  kTier1AttestationProfileId);
+        const auto* record = std::get_if<SvsmAkActivationRecord>(&activation);
+        if (!record || record->node_key != node_key) {
+            deferred_[node] = {purpose, bound_context, epoch};
+            return make_challenge(node, node_key, incarnation, epoch,
+                                  AttestationPurpose::PlatformEnrollment,
+                                  bound_context);
+        }
+    }
+    return make_challenge(node, node_key, incarnation, epoch, purpose, bound_context);
 }
 
 AttestationVerdict AttestationService::receive_evidence(const AttestationEvidence& evidence) {
@@ -93,9 +166,189 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
     const AttestationChallenge challenge = pending->second;
     pending_.erase(pending);
 
-    AttestationVerdict verdict = verifier_.examine(challenge, evidence);
+    PlatformVerificationState state;
+    std::optional<SvsmAkActivationRecord> activation;
+    std::optional<AttestationCheckpoint> checkpoint;
+    if (challenge.profile_id == AttestationProfileId::SnpSvsmVtpm) {
+        auto loaded_activation = activations_.load(network_id_, challenge.node_id,
+                                                   challenge.incarnation,
+                                                   challenge.profile_id);
+        if (const auto* value = std::get_if<SvsmAkActivationRecord>(&loaded_activation)) {
+            activation = *value;
+            state.activation = &*activation;
+        }
+        if (challenge.ima_mode == ImaEvidenceMode::Resume) {
+            auto loaded_checkpoint = checkpoints_.load(network_id_, challenge.node_id,
+                                                       challenge.incarnation,
+                                                       challenge.profile_id);
+            if (const auto* value = std::get_if<AttestationCheckpoint>(&loaded_checkpoint);
+                value && value->checkpoint_digest == challenge.ima_checkpoint_digest &&
+                value->event_count == challenge.ima_prior_event_count &&
+                value->pcr10 == challenge.ima_prior_pcr10) {
+                checkpoint = *value;
+                state.checkpoint = &*checkpoint;
+            }
+        }
+    }
+    AttestationVerdict verdict = verifier_.examine(challenge, evidence, state);
+    if (!verdict.passed && verdict.failure == AttestationFailure::VtpmBindingInvalid &&
+        activation) {
+        // The AK rotates on reboot; drop the record pinning the old one so the
+        // next challenge re-runs enrollment.
+        (void)activations_.remove(network_id_, challenge.node_id, challenge.incarnation,
+                                  challenge.profile_id);
+    }
+    if (verdict.passed && activation) {
+        const auto* svsm = std::get_if<SnpSvsmVtpmEvidence>(&evidence.platform);
+        const auto log = svsm ? parse_ima_binary(svsm->ima_binary_log) : std::nullopt;
+        // One replay of the transferred log; the next checkpoint is built from
+        // the returned state.
+        std::optional<ImaBinaryPrefixReplay> replay;
+        if (log && challenge.ima_mode == ImaEvidenceMode::Full) {
+            std::array<uint8_t, 32> zero{};
+            replay = replay_ima_binary_prefix(*log, log->entries.size(), 0, zero);
+        } else if (log && checkpoint) {
+            std::vector<ImaBinaryPathState> prior;
+            for (const auto& path : checkpoint->required_paths)
+                prior.push_back({path.path, path.sha256});
+            replay = replay_ima_binary_prefix(*log, log->entries.size(),
+                                              checkpoint->event_count,
+                                              checkpoint->pcr10, prior);
+        }
+        const auto report = svsm ? parse_snp_report(svsm->svsm_report) : std::nullopt;
+        if (!svsm || !replay || !report) {
+            verdict.passed = false;
+            verdict.failure = AttestationFailure::CheckpointInvalid;
+        } else {
+            AttestationCheckpoint next;
+            next.network_id = network_id_;
+            next.node_id = challenge.node_id;
+            next.incarnation = challenge.incarnation;
+            next.profile_id = challenge.profile_id;
+            next.profile_ruleset = challenge.profile_ruleset;
+            next.policy_digest = policy_digest_;
+            next.launch_measurement = report->measurement;
+            next.ek_name = activation->ek_name;
+            next.ak_name = activation->ak_name;
+            next.ima_bank = kTpmAlgSha256;
+            next.event_count = replay->state.event_count;
+            std::copy(replay->state.pcr10.begin(), replay->state.pcr10.end(),
+                      next.pcr10.begin());
+            for (const auto& required : profile_.approved_paths) {
+                const auto found = std::find_if(replay->state.paths.begin(),
+                                                replay->state.paths.end(),
+                    [&required](const auto& path) { return path.path == required.path; });
+                if (found != replay->state.paths.end())
+                    next.required_paths.push_back({found->path, found->sha256});
+            }
+            next.previous_evidence_digest = verdict.evidence_digest;
+            if (next.required_paths.size() != profile_.approved_paths.size() ||
+                !checkpoints_.store(std::move(next))) {
+                verdict.passed = false;
+                verdict.failure = AttestationFailure::CheckpointInvalid;
+            }
+        }
+    }
     verdicts_[evidence.node_id] = verdict;
     return verdict;
+}
+
+std::optional<SvsmAkActivationOfferMessage>
+AttestationService::receive_enrollment_evidence(const AttestationEvidence& evidence,
+                                                const NodeId& observer) {
+    const auto it = pending_.find(evidence.node_id);
+    if (it == pending_.end() || it->second.purpose != AttestationPurpose::PlatformEnrollment ||
+        evidence.challenge_digest != challenge_digest(it->second) ||
+        evidence.purpose != AttestationPurpose::PlatformEnrollment ||
+        evidence.node_id != it->second.node_id || evidence.incarnation != it->second.incarnation ||
+        evidence.profile_id != AttestationProfileId::SnpSvsmVtpm ||
+        evidence.profile_ruleset != kAttestationProfileRulesetVersion ||
+        crypto_sign_verify_detached(evidence.identity_signature.data(),
+                                    evidence_signing_digest(evidence).data(), kDigestSize,
+                                    it->second.node_key.data()) != 0) {
+        return std::nullopt;
+    }
+    const auto* svsm = std::get_if<SnpSvsmVtpmEvidence>(&evidence.platform);
+    if (!svsm || !svsm->ima_binary_log.empty()) return std::nullopt;
+    SvsmAkEnrollmentRequirements requirements;
+    requirements.policy = profile_.snp;
+    requirements.require_revocation_check = profile_.require_endorsement_revocation;
+    if (revocation_) requirements.revocation = revocation_();
+    const auto identity = verify_svsm_ak_enrollment_identity(
+        *svsm, evidence.challenge_digest, requirements);
+    if (!identity.ok) return std::nullopt;
+    auto activation = make_svsm_ak_activation_challenge(svsm->ek_manifest, svsm->ak_public);
+    if (!activation) return std::nullopt;
+
+    SvsmAkActivationOfferMessage offer;
+    offer.network_id = network_id_;
+    offer.subject_node = evidence.node_id;
+    offer.subject_key = it->second.node_key;
+    offer.incarnation = evidence.incarnation;
+    offer.epoch = evidence.epoch;
+    offer.profile_id = evidence.profile_id;
+    offer.profile_ruleset = evidence.profile_ruleset;
+    offer.observer = observer;
+    offer.enrollment_challenge_digest = evidence.challenge_digest;
+    randombytes_buf(offer.verifier_nonce.data(), offer.verifier_nonce.size());
+    offer.ek_public = svsm->ek_manifest;
+    offer.ak_public = svsm->ak_public;
+    offer.ek_name = identity.ek_name;
+    offer.ak_name = identity.ak_name;
+    const auto spki = crypto::from_base64(identity.ak_spki_b64);
+    offer.ak_spki_digest = raw_ima_digest(spki);
+    offer.activation = svsm_ak_activation_offer(evidence.challenge_digest, *activation);
+    offer.activation.enrollment_context = svsm_ak_activation_offer_context(offer);
+    const auto deferred = deferred_.find(evidence.node_id);
+    if (deferred == deferred_.end()) return std::nullopt;
+    PendingActivation pending;
+    pending.exchange.emplace(*activation, offer);
+    pending.enrollment_evidence_digest = evidence_signing_digest(evidence);
+    pending.ak_spki_b64 = identity.ak_spki_b64;
+    pending.deferred = deferred->second;
+    pending_activations_.insert_or_assign(evidence.node_id, std::move(pending));
+    pending_.erase(it);
+    return offer;
+}
+
+std::optional<AttestationChallenge> AttestationService::receive_activation_response(
+    const SvsmAkActivationResponseMessage& response) {
+    const auto it = pending_activations_.find(response.subject_node);
+    if (it == pending_activations_.end()) return std::nullopt;
+    auto& pending = it->second;
+    if (!pending.exchange || response.network_id != network_id_) return std::nullopt;
+    const auto receipt = pending.exchange->complete(response);
+    if (!receipt) return std::nullopt;
+    const auto& activation_offer = pending.exchange->offer();
+    SvsmAkActivationRecord record;
+    record.network_id = network_id_;
+    record.node_id = response.subject_node;
+    record.node_key = activation_offer.subject_key;
+    record.incarnation = response.incarnation;
+    record.profile_id = response.profile_id;
+    record.profile_ruleset = response.profile_ruleset;
+    record.ek_name = activation_offer.ek_name;
+    record.ak_name = activation_offer.ak_name;
+    record.ak_spki_b64 = pending.ak_spki_b64;
+    record.ak_spki_digest = activation_offer.ak_spki_digest;
+    record.activation_receipt = *receipt;
+    record.enrollment_evidence_digest = pending.enrollment_evidence_digest;
+    if (!activations_.store(std::move(record))) return std::nullopt;
+    // Copies: the erase below invalidates pending and activation_offer.
+    const DeferredChallenge deferred = pending.deferred;
+    const auto subject_key = activation_offer.subject_key;
+    const auto incarnation = activation_offer.incarnation;
+    pending_activations_.erase(it);
+    deferred_.erase(response.subject_node);
+    return make_challenge(response.subject_node, subject_key, incarnation,
+                          deferred.epoch, deferred.purpose, deferred.context);
+}
+
+std::optional<AttestationChallenge> AttestationService::pending_challenge(
+    const NodeId& node) const {
+    const auto it = pending_.find(node);
+    return it == pending_.end() ? std::nullopt
+                                : std::optional<AttestationChallenge>{it->second};
 }
 
 std::optional<AttestationVerdict> AttestationService::verdict(const NodeId& node) const {

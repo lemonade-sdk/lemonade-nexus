@@ -41,7 +41,8 @@ public:
 
     [[nodiscard]] PlatformVerification examine(
         const AttestationChallenge& challenge,
-        const AttestationEvidence& evidence) const override;
+        const AttestationEvidence& evidence,
+        const PlatformVerificationState& state) const override;
 
     [[nodiscard]] const LinuxAttestationProfile& profile() const { return profile_; }
 

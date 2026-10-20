@@ -21,6 +21,17 @@ enum class ImaPolicyProof : uint16_t {
     /// Prover forwards the kernel's own active-rule digest. Needs
     /// CONFIG_IMA_READ_POLICY.
     KernelReadback = 1,
+    /// The approved SNP launch measurement plus pinned boot PCR state names a
+    /// release whose kernel contains the immutable IMA policy.  The mapping is
+    /// verifier-owned; no guest-supplied policy identifier participates.
+    MeasuredKernelBinding = 2,
+};
+
+/// Profile-level bank selector, bound into profile_digest. NOT the TPM
+/// algorithm ids replay_ima_binary_pcr takes (kTpmAlgSha1/kTpmAlgSha256).
+enum class ImaReplayBank : uint16_t {
+    Sha1 = 1,
+    Sha256 = 2,
 };
 
 [[nodiscard]] std::string_view ima_policy_proof_name(ImaPolicyProof proof);
@@ -49,7 +60,8 @@ struct LinuxAttestationProfile {
 
     SnpPolicyRequirements snp;
 
-    /// Per-node enrollment state, not global policy: excluded from profile_gaps.
+    /// Legacy Azure/HCL release pin; SVSM never reads it. SVSM EK/AK state
+    /// lives only in SvsmActivationStore.
     std::string required_ak_spki_b64;
 
     /// Require IMA log replay and approved binary measurement.
@@ -57,7 +69,14 @@ struct LinuxAttestationProfile {
 
     /// The approved IMA policy. The digest is mandatory under every method.
     Digest ima_policy_digest{};
+    /// Verifier-owned name of the immutable policy, bound into profile_digest;
+    /// the guest never supplies it. The digest above is the security value.
+    std::string ima_policy_id;
+    /// Reproducible kernel/release artifact identity that selected the built-in
+    /// policy.  Boot-derived PCR8/PCR9 remain separate pins.
+    std::string kernel_artifact_identity;
     ImaPolicyProof ima_policy_proof{ImaPolicyProof::KernelReadback};
+    ImaReplayBank ima_replay_bank{ImaReplayBank::Sha1};
 
     /// The required runtime components — every entry mandatory, see
     /// ApprovedPath. Bounded by kMaxSummarisedPaths so a checkpoint summary can
@@ -107,6 +126,7 @@ enum class ProfileGap : uint16_t {
     NoImaPolicyDigest,
     NoVmplPolicy,
     SecurityRulesetMismatch,
+    NoExpectedPcrs,
 };
 
 [[nodiscard]] std::string_view profile_gap_name(ProfileGap gap);
@@ -120,6 +140,15 @@ enum class ProfileGap : uint16_t {
 /// every candidate fails ProfileIncomplete until a release pins them from an
 /// already-qualified host.
 [[nodiscard]] LinuxAttestationProfile linux_attestation_profile_v1();
+
+/// SVSM release template.  Like v1 it intentionally carries no release or
+/// enrollment pins and is incomplete until the release process supplies them.
+[[nodiscard]] LinuxAttestationProfile linux_attestation_profile_v2_svsm();
+
+/// Current SVSM release-pin preparation. It contains independently known
+/// static release facts and the advisory-derived Genoa TCB floor. Clean-boot
+/// PCR8/PCR9 and executable/dependency hashes remain external approval inputs.
+[[nodiscard]] LinuxAttestationProfile linux_attestation_profile_v3_svsm_release();
 
 /// The attestation_policy_digest carried in every challenge. Every field is
 /// encoded, so two profiles differing in effect differ in digest.
