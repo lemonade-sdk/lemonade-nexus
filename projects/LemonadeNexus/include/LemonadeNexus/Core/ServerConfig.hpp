@@ -62,8 +62,9 @@ struct ServerConfig {
     std::string dns_ns_hostname;            // this server's NS hostname (e.g. "ns1.lemonade-nexus.io")
     bool        dns_seed_discovery{true};   // auto-discover seed peers from tier/region DNS records on startup
 
-    // Binary attestation
-    std::string release_signing_pubkey;       // base64 Ed25519 pubkey for release manifest verification
+    // Deprecated, parse-only: release authority is the Genesis-delegated key
+    // in the packaged approval; never consulted as a trust input.
+    std::string release_signing_pubkey;
 
     // GitHub release manifest fetching (auto-fetch signed manifests for older versions)
     std::string github_releases_url;              // e.g. "https://api.github.com/repos/owner/repo/releases"
@@ -94,6 +95,11 @@ struct ServerConfig {
 
     // Runtime-only: path the config was loaded from (not persisted to JSON).
     std::string config_path{"lemonade-nexus.json"};
+    // Linux Tier-1 package contract. Process-inherited SP_* variables are
+    // ignored; the fixed JSON and explicitly parsed measured env file are the
+    // only configuration sources. Any error refuses startup.
+    bool        tier1_authority_contract{false};
+    std::string tier1_contract_error;
 
     // Onboarding — candidate side (--onboard-server [host:port])
     bool        onboard_server{false};       // run the onboarding client and exit
@@ -127,6 +133,10 @@ struct ServerConfig {
 
 /// Load config: CLI args > env vars > config file > defaults.
 [[nodiscard]] ServerConfig load_config(int argc, char* argv[]);
+
+[[nodiscard]] bool load_tier1_environment_file(ServerConfig& config,
+                                                const std::string& path,
+                                                std::string& error);
 
 /// Validate and log errors. Returns false if config is fatally invalid.
 [[nodiscard]] bool validate_config(const ServerConfig& config);

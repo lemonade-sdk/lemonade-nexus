@@ -17,6 +17,7 @@
 // 5.5 and 32.
 
 #include <LemonadeNexus/Security/Attestation/AttestationProfileId.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/VerifiedPlatformClaims.hpp>
 
@@ -29,6 +30,11 @@ namespace nexus::security {
 struct PlatformVerification {
     VerifiedPlatformClaims claims;
     AttestationFailure failure{AttestationFailure::None};
+};
+
+struct PlatformVerificationState {
+    const SvsmAkActivationRecord* activation{nullptr};
+    const AttestationCheckpoint* checkpoint{nullptr};
 };
 
 class PlatformEvidenceProvider {
@@ -58,8 +64,11 @@ public:
 
     /// Examines evidence the caller has already matched to this challenge and
     /// to this provider. Returns proved facts, never an eligibility result.
+    /// The default lives here only: a default on an override binds by static
+    /// type and could silently diverge.
     [[nodiscard]] virtual PlatformVerification examine(
-        const AttestationChallenge& challenge, const AttestationEvidence& evidence) const = 0;
+        const AttestationChallenge& challenge, const AttestationEvidence& evidence,
+        const PlatformVerificationState& state = {}) const = 0;
 };
 
 }  // namespace nexus::security

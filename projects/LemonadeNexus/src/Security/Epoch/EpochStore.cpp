@@ -110,6 +110,7 @@ bool EpochStore::store_bootstrap(const BootstrapCertificate& c) {
     j["attestation_root"] = b64(c.attestation_root);
     j["founding_eligibility_digest"] = b64(c.founding_eligibility_digest);
     j["vote_key_set_digest"] = b64(c.vote_key_set_digest);
+    j["release_approval_digest"] = b64(c.release_approval_digest);
     j["security_ruleset"] = c.security_ruleset;
     j["consensus_ruleset"] = c.consensus_ruleset;
     j["genesis_signature"] = b64(c.genesis_signature);
@@ -140,6 +141,8 @@ std::variant<BootstrapCertificate, EpochLoadResult> EpochStore::load_bootstrap()
           from_b64(j["founding_eligibility_digest"], c.founding_eligibility_digest) &&
           j.contains("vote_key_set_digest") &&
           from_b64(j["vote_key_set_digest"], c.vote_key_set_digest) &&
+          j.contains("release_approval_digest") &&
+          from_b64(j["release_approval_digest"], c.release_approval_digest) &&
           j.contains("security_ruleset") && get_u16(j["security_ruleset"], c.security_ruleset) &&
           j.contains("consensus_ruleset") && get_u16(j["consensus_ruleset"], c.consensus_ruleset) &&
           j.contains("genesis_signature") && from_b64(j["genesis_signature"], c.genesis_signature))) {

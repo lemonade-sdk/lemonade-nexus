@@ -13,7 +13,7 @@ namespace nexus::security {
 
 namespace {
 
-inline constexpr std::string_view kProfileDomain = "lemonade-nexus/attestation-profile:v1";
+inline constexpr std::string_view kProfileDomain = "lemonade-nexus/attestation-profile:v3";
 
 void add_bool(CanonicalEncoder& encoder, bool value) {
     encoder.add_u16(value ? 1 : 0);
@@ -30,6 +30,7 @@ std::string canonical_path(const std::string& path) {
 std::string_view ima_policy_proof_name(ImaPolicyProof proof) {
     switch (proof) {
         case ImaPolicyProof::KernelReadback: return "kernel-readback";
+        case ImaPolicyProof::MeasuredKernelBinding: return "measured-kernel-binding";
     }
     return "unknown";
 }
@@ -63,6 +64,8 @@ std::string_view profile_gap_name(ProfileGap gap) {
             return "no VMPL policy chosen: which level may request a report is undecided";
         case ProfileGap::SecurityRulesetMismatch:
             return "profile security_ruleset is not the compiled ruleset";
+        case ProfileGap::NoExpectedPcrs:
+            return "no boot PCRs pinned: evidence verification rejects empty pins";
     }
     return "unknown gap";
 }
@@ -137,6 +140,10 @@ std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile) {
     if (profile.security_ruleset != constants::kSecurityRulesetVersion) {
         gaps.push_back(ProfileGap::SecurityRulesetMismatch);
     }
+    // Provider readiness already refuses empty pins; report the gap too.
+    if (profile.expected_pcrs.empty()) {
+        gaps.push_back(ProfileGap::NoExpectedPcrs);
+    }
     return gaps;
 }
 
@@ -174,6 +181,15 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     return profile;
 }
 
+LinuxAttestationProfile linux_attestation_profile_v2_svsm() {
+    LinuxAttestationProfile profile = linux_attestation_profile_v1();
+    profile.profile_version = 2;
+    profile.vmpl_policy = VmplPolicy::RequireAboveVmpl0;
+    profile.ima_policy_proof = ImaPolicyProof::MeasuredKernelBinding;
+    profile.ima_replay_bank = ImaReplayBank::Sha256;
+    return profile;
+}
+
 Digest profile_digest(const LinuxAttestationProfile& profile) {
     CanonicalEncoder encoder(kProfileDomain);
     encoder.add_u32(profile.profile_version);
@@ -195,7 +211,10 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
 
     encoder.add_string(profile.required_ak_spki_b64);
     encoder.add_bytes(profile.ima_policy_digest);
+    encoder.add_string(profile.ima_policy_id);
+    encoder.add_string(profile.kernel_artifact_identity);
     encoder.add_u16(static_cast<uint16_t>(profile.ima_policy_proof));
+    encoder.add_u16(static_cast<uint16_t>(profile.ima_replay_bank));
     add_bool(encoder, profile.require_ima);
 
     // Path and digests together, in declaration order. Moving a digest between
@@ -222,6 +241,30 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
     add_bool(encoder, profile.require_endorsement_revocation);
     encoder.add_u16(profile.security_ruleset);
     return encoder.digest();
+}
+
+LinuxAttestationProfile linux_attestation_profile_v3_svsm_release() {
+    LinuxAttestationProfile profile = linux_attestation_profile_v2_svsm();
+    profile.profile_version = 3;
+    profile.ima_policy_id = "nexus-tier1-ima-v1";
+    const auto policy = crypto::from_hex(
+        "b3cabc30317af8b7127a175d7b4f906a40203e7ebe28122d82a713e03dad4092");
+    std::copy(policy.begin(), policy.end(), profile.ima_policy_digest.begin());
+    profile.kernel_artifact_identity =
+        "linux=7.1.0-coconut-svsm-tier1+;"
+        "bzImage-sha256=d9854417fea45a490b632b0e7860827b34443f94da0877e34a0633bbb5078584;"
+        "vmlinux-sha256=dfb88d060ef4fca3b51ce87b95803ad6b64addaad840d4aecb63bc85e9bcd552;"
+        "module-tree-sha256=8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be";
+    profile.snp.expected_measurement_hex =
+        "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
+        "c6e84c2490814e22a2b5ba860a37208d1d9a";
+    // AMD-SB-3030 (bootloader) and AMD-SB-3034 (SNP firmware). The live host's
+    // 0x09/0x17 values are observations, never policy. No cited current release
+    // requirement sets nonzero TEE or microcode floors, so those stay zero.
+    profile.snp.min_tcb = {0x0c, 0x00, 0x1c, 0x00};
+    // Clean PCR8/PCR9 and current-candidate executable/dependency hashes remain
+    // authenticated release-approval inputs, not compiled observations.
+    return profile;
 }
 
 }  // namespace nexus::security

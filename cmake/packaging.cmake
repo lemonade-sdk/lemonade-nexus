@@ -84,11 +84,18 @@ set(CPACK_STRIP_FILES OFF)
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Lemonade-Nexus Team <admin@lemonade-nexus.io>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "python3")
+# The statically linked TPM2 TCTI loader dlopens the device transport at
+# runtime; shlibdeps cannot discover that edge. Ubuntu 26.04's device package
+# pulls its matching libtss2-mu runtime dependency. The t64 name is Ubuntu's
+# time_t ABI rename; Debian proper still ships libtss2-tcti-device0.
+set(CPACK_DEBIAN_PACKAGE_DEPENDS
+    "python3, apparmor, libtss2-tcti-device0t64 (>= 4.1.3) | libtss2-tcti-device0, dracut | initramfs-tools")
+set(CPACK_DEBIAN_PACKAGE_RELEASE "1")
+set(CPACK_DEBIAN_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_ARCHITECTURE "amd64")
 set(CPACK_DEBIAN_PACKAGE_CONTROL_EXTRA
-    "${CMAKE_SOURCE_DIR}/packaging/debian/postinst;${CMAKE_SOURCE_DIR}/packaging/debian/prerm")
+    "${CMAKE_SOURCE_DIR}/packaging/debian/postinst;${CMAKE_SOURCE_DIR}/packaging/debian/prerm;${CMAKE_SOURCE_DIR}/packaging/debian/postrm")
 
 # ── RPM (Fedora/RHEL/CentOS) ────────────────────────────────────────────────
 

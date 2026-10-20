@@ -21,6 +21,9 @@ struct GenesisFounding {
     /// Each founder with the epoch vote key its passing evidence bound.
     std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>> members;
     Digest attestation_root{};
+    /// The release approval Genesis bootstrapped under. A founder running a
+    /// different (or no) approved release refuses the founding.
+    Digest release_approval_digest{};
 };
 
 struct DkgTranscriptAttest {

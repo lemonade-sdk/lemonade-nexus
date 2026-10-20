@@ -23,6 +23,7 @@
 //     per-bank template digest widths (20 = SHA-1, 32 = SHA-256, ...):
 //     https://docs.kernel.org/security/IMA-ABI.html#template-digest-format
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -49,6 +50,98 @@ struct ImaLog {
     /// https://docs.kernel.org/security/IMA-ABI.html#template-digest-format
     [[nodiscard]] std::size_t template_hash_size() const;
 };
+
+/// One entry from binary_runtime_measurements.  template_data is retained so
+/// the SHA-256 bank digest can be recomputed exactly rather than trusting the
+/// legacy SHA-1 template digest stored in the entry header.
+struct ImaBinaryEntry {
+    uint32_t pcr{10};
+    std::array<uint8_t, 20> header_template_sha1{};
+    std::string template_name;
+    std::vector<uint8_t> template_data;
+    std::string file_hash_algo;
+    std::string file_hash_hex;
+    std::string path;
+    bool violation{false};
+    /// Byte offset immediately after this entry in the exact source stream.
+    /// Used only to cut a suffix after a verifier checkpoint; it is never a
+    /// trusted input and is produced by the strict parser itself.
+    std::size_t wire_end{};
+};
+
+struct ImaBinaryLog {
+    std::vector<ImaBinaryEntry> entries;
+};
+
+struct ImaBinaryPathState {
+    std::string path;
+    std::string sha256;
+
+    auto operator<=>(const ImaBinaryPathState&) const = default;
+};
+
+struct ImaBinaryReplayState {
+    uint64_t event_count{};
+    std::vector<uint8_t> pcr10;
+    std::vector<ImaBinaryPathState> paths;
+};
+
+/// Strict native-little-endian Linux IMA binary ABI parser.  Tier 1 accepts
+/// only ima-ng and ima-sig.  Every length is bounded by the supplied byte span,
+/// every NUL terminator is checked, the legacy header SHA-1 is recomputed, and
+/// trailing/truncated data is rejected.
+[[nodiscard]] std::optional<ImaBinaryLog> parse_ima_binary(
+    std::span<const uint8_t> bytes);
+
+/// Replay SHA-256 PCR `pcr_index` by hashing each entry's exact template_data
+/// with SHA-256 and extending SHA256(old || event_digest).  An IMA violation
+/// marker or unsupported bank returns an empty vector.
+[[nodiscard]] std::vector<uint8_t> replay_ima_binary_pcr(
+    const ImaBinaryLog& log, uint32_t pcr_index, uint16_t bank_hash_alg);
+
+/// Replay a parsed suffix from a verifier-owned state.  `event_count` counts
+/// every binary-log record (not only PCR10 records), preserving the exact
+/// sequence position.  Last-path state begins with `prior_paths` and is
+/// updated by the suffix.  Any violation or malformed initial PCR fails.
+[[nodiscard]] std::optional<ImaBinaryReplayState> replay_ima_binary_from(
+    const ImaBinaryLog& suffix, uint64_t prior_event_count,
+    std::span<const uint8_t> prior_pcr10,
+    std::span<const ImaBinaryPathState> prior_paths = {});
+
+/// One replay, both uses: the state after a log prefix plus the wire cut point,
+/// so a caller derives the suffix and the next checkpoint without a second pass.
+struct ImaBinaryPrefixReplay {
+    ImaBinaryReplayState state;
+    /// Source-stream byte offset immediately after the replayed entries.
+    std::size_t wire_end{};
+};
+
+/// Replay the first `entry_count` entries from a prior state, with
+/// replay_ima_binary_from semantics (any violation fails).  `entry_count`
+/// beyond the log fails; entries after the prefix are not examined.
+[[nodiscard]] std::optional<ImaBinaryPrefixReplay> replay_ima_binary_prefix(
+    const ImaBinaryLog& log, uint64_t entry_count, uint64_t prior_event_count,
+    std::span<const uint8_t> prior_pcr10,
+    std::span<const ImaBinaryPathState> prior_paths = {});
+
+/// Locate exactly `prior_event_count` entries in a current strict binary log,
+/// replay that prefix from zero, require `prior_pcr10`, and return only the raw
+/// bytes after it.  This is the producer-side stale-checkpoint/reboot gate.
+[[nodiscard]] std::optional<std::vector<uint8_t>> ima_binary_suffix_after_checkpoint(
+    std::span<const uint8_t> bytes, uint64_t prior_event_count,
+    std::span<const uint8_t> prior_pcr10);
+
+/// Cut the binary log at the unique entry whose replay reaches `target`.
+/// None or more than one matching prefix fails closed.
+[[nodiscard]] std::optional<std::vector<uint8_t>> ima_binary_truncate_to_pcr(
+    std::span<const uint8_t> bytes, uint32_t pcr_index, uint16_t bank_hash_alg,
+    std::span<const uint8_t> target);
+
+[[nodiscard]] std::optional<ImaBinaryEntry> ima_binary_entry_for_path(
+    const ImaBinaryLog& log, std::string_view path);
+
+/// Read binary_runtime_measurements to EOF. Empty means unavailable.
+[[nodiscard]] std::vector<uint8_t> read_ima_binary_log();
 
 /// Parse the ASCII log. Returns nullopt only if the text is not an IMA log at all;
 /// an empty log (no lines) parses to an empty entry list.

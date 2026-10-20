@@ -11,6 +11,8 @@
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
+#include "support/attestation_fixtures.hpp"
+
 #include <gtest/gtest.h>
 
 #include <array>
@@ -83,11 +85,8 @@ AttestationEvidence answering(const AttestationChallenge& challenge) {
 // A fully pinned profile, so the verifier reaches the purpose and context
 // checks instead of refusing at readiness.
 LinuxAttestationProfile pinned_profile() {
-    LinuxAttestationProfile profile;
-    profile.profile_version = 1;
-    profile.snp.require_debug_disabled = true;
-    profile.snp.require_no_migration_agent = true;
-    profile.vmpl_policy = nexus::security::VmplPolicy::RequireVmpl0;
+    LinuxAttestationProfile profile =
+        nexus::security::linux_attestation_profile_v2_svsm();
     profile.snp.min_tcb = {2, 0, 6, 55};
     profile.snp.expected_measurement_hex = "aa11";
     profile.required_ak_spki_b64 = "QUsx";
@@ -95,6 +94,7 @@ LinuxAttestationProfile pinned_profile() {
     profile.require_ima = true;
     profile.approved_paths = {{"/usr/bin/nexus", {"01ab"}}};
     profile.evidence_collector_path = "/usr/bin/nexus";
+    profile.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
     profile.require_no_new_privs = true;
     profile.require_seccomp = true;
     profile.security_ruleset = nexus::security::constants::kSecurityRulesetVersion;

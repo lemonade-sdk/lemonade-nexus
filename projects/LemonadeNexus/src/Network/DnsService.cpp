@@ -599,7 +599,11 @@ void DnsService::answer_a_query(const ParsedQuery& q, const ResponseSink& send) 
                 // per-server tier records (<id>.tier<N>.<region>.seip.<base>), so dedupe
                 // by IP to avoid a server appearing twice (plain SEIP + tier record).
                 std::string match_suffix = "." + region_part + ".seip." + base_domain_lower_;
-                std::set<std::string> ipset = scan_a_values(match_suffix);
+                // Bare per-server names only: a region query answers the servers'
+                // reachable (public) addresses, never their private/backend IPs,
+                // which a client off-mesh cannot reach and which would otherwise
+                // sort ahead of the public ones and fill the answer.
+                std::set<std::string> ipset = scan_a_values(match_suffix, /*bare_label_only=*/true);
                 if (!ipset.empty()) {
                     std::vector<std::string> ips(ipset.begin(), ipset.end());
                     spdlog::debug("[{}] {} -> {} SEIP A records (region {})",
@@ -632,13 +636,24 @@ void DnsService::answer_a_query(const ParsedQuery& q, const ResponseSink& send) 
     send(build_nxdomain(q));
 }
 
-std::set<std::string> DnsService::scan_a_values(std::string_view suffix) const {
+std::set<std::string> DnsService::scan_a_values(std::string_view suffix,
+                                                bool bare_label_only) const {
     std::set<std::string> values;
     std::lock_guard<std::mutex> lock(zone_mutex_);
     for (const auto& [key, rec] : zone_records_) {
         if (!starts_with(key, "A:") || key.size() <= 2 + suffix.size() ||
             !ends_with(key, suffix)) {
             continue;
+        }
+        if (bare_label_only) {
+            // The label just before `suffix` must stand alone: "A:<id><suffix>"
+            // with no dot in <id>. Drops private./backend./tier<N> variants.
+            std::string_view id(key);
+            id.remove_prefix(2);                 // "A:"
+            id.remove_suffix(suffix.size());     // leaves "<id>" or "private.<id>"…
+            if (id.find('.') != std::string_view::npos) {
+                continue;
+            }
         }
         values.insert(rec.value);
     }
@@ -1559,8 +1574,12 @@ std::vector<uint8_t> DnsService::build_multi_a_response(
     ares_dns_record_query_add(response, q.qname.c_str(),
                                ARES_REC_TYPE_A, ARES_CLASS_IN);
 
-    // Add multiple A records — cap at 5 to stay within 512-byte UDP limit
-    std::size_t count = std::min(ips.size(), static_cast<std::size_t>(5));
+    // Cap the answer to stay within the 512-byte classic UDP limit. With name
+    // compression each A RR is ~16 bytes, so ~25 fit after the header and
+    // question; 20 leaves margin. A larger region spilling past this wants a
+    // TC-flag + TCP retry or a rotating window (follow-up), not a silent cut
+    // that drops whole servers.
+    std::size_t count = std::min(ips.size(), static_cast<std::size_t>(20));
     for (std::size_t i = 0; i < count; ++i) {
         struct in_addr addr{};
         if (inet_pton(AF_INET, ips[i].c_str(), &addr) != 1) {

@@ -35,6 +35,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # contents for checkout; id-token + attestations for build provenance.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
     steps:
       - uses: actions/checkout@v4
         with:
@@ -159,6 +165,32 @@ jobs:
             echo "binary_hash=${{ steps.hash.outputs.binary_hash }}" >> "$GITHUB_OUTPUT"
             echo "binary_path=${{ steps.hash.outputs.binary_path }}" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Locate collector binary (Linux)
+        if: runner.os == 'Linux'
+        id: hash-attestd
+        run: |
+          ATTESTD_PATH="build/projects/LemonadeNexusAttestd/nexus-attestd"
+          if [ ! -f "$ATTESTD_PATH" ]; then
+            ATTESTD_PATH="build/projects/LemonadeNexusAttestd/${{ env.BUILD_TYPE }}/nexus-attestd"
+          fi
+          echo "attestd_path=$ATTESTD_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload collector artifact (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-attestd-${{ matrix.platform }}
+          path: ${{ steps.hash-attestd.outputs.attestd_path }}
+
+      # Verified by scripts/nexus-release-ingest before approval signing; the node never consumes it.
+      - name: Attest build provenance (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            ${{ steps.hash-final.outputs.binary_path }}
+            ${{ steps.hash-attestd.outputs.attestd_path }}
 
       - name: Create release manifest
         id: manifest
@@ -323,6 +355,12 @@ jobs:
     runs-on: ubuntu-latest
     container: ${{ matrix.container }}
 
+    # id-token + attestations for build provenance (Tier-1 pair + package).
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
     steps:
       - name: Install dependencies
         run: ${{ matrix.install_cmd }}
@@ -437,11 +475,26 @@ jobs:
             cpack --config build/CPackConfig.cmake -G "$gen" -B build/packages
           done
 
+      - name: Locate collector binary
+        id: hash-attestd
+        run: |
+          ATTESTD_PATH="build/projects/LemonadeNexusAttestd/nexus-attestd"
+          if [ ! -f "$ATTESTD_PATH" ]; then
+            ATTESTD_PATH="build/projects/LemonadeNexusAttestd/${{ env.BUILD_TYPE }}/nexus-attestd"
+          fi
+          echo "attestd_path=$ATTESTD_PATH" >> "$GITHUB_OUTPUT"
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: lemonade-nexus-${{ matrix.platform }}
           path: ${{ steps.hash.outputs.binary_path }}
+
+      - name: Upload collector artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-attestd-${{ matrix.platform }}
+          path: ${{ steps.hash-attestd.outputs.attestd_path }}
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v4
@@ -452,6 +505,20 @@ jobs:
             build/packages/*.rpm
             build/packages/*.tar.gz
           if-no-files-found: ignore
+
+      # Verified by scripts/nexus-release-ingest before approval signing; the node never consumes it.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            ${{ steps.hash.outputs.binary_path }}
+            ${{ steps.hash-attestd.outputs.attestd_path }}
+
+      - name: Attest package provenance (deb)
+        if: matrix.platform == 'linux-x86_64-deb'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: build/packages/*.deb
 
       - name: Upload manifest artifact
         uses: actions/upload-artifact@v4

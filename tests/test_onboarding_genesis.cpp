@@ -464,7 +464,8 @@ TEST_F(GenesisAnchorOnboarding, FullFlowLeavesConfigUntouchedAndRestartRunsTheMe
 
     std::string mesh_error;
     auto startup = core::start_security_mesh(io2, reloaded, rgossip, rkw,
-                                             security::PlatformEvidenceSource{}, mesh_error);
+                                             security::PlatformEvidenceSource{},
+                                             security::PlatformActivationSource{}, mesh_error);
     ASSERT_TRUE(startup.has_value()) << mesh_error;
     EXPECT_EQ(startup->network_id_hex, derived_network_hex(gossip->keypair().public_key));
     // Not the anchor: a Tier 2 candidate runs the lifecycle with no assumed role.
@@ -504,7 +505,8 @@ TEST_F(GenesisAnchorOnboarding, AnchorNodeRestartFromPersistedConfigCollectsGene
 
     std::string mesh_error;
     auto startup = core::start_security_mesh(io2, reloaded, rgossip, rkw,
-                                             security::PlatformEvidenceSource{}, mesh_error);
+                                             security::PlatformEvidenceSource{},
+                                             security::PlatformActivationSource{}, mesh_error);
     ASSERT_TRUE(startup.has_value()) << mesh_error;
     EXPECT_EQ(startup->service->driver().phase(),
               security::DriverPhase::GenesisCollecting);
@@ -650,7 +652,8 @@ TEST(SecurityMeshStartup, MalformedAnchorRefused) {
     config.genesis_pubkey = "not-a-key";
     std::string error;
     EXPECT_FALSE(core::start_security_mesh(io, config, g, kw,
-                                           security::PlatformEvidenceSource{}, error)
+                                           security::PlatformEvidenceSource{},
+                                           security::PlatformActivationSource{}, error)
                      .has_value());
     EXPECT_FALSE(error.empty());
 

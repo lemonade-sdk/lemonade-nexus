@@ -3,6 +3,8 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <algorithm>
 
+#include "support/attestation_fixtures.hpp"
+
 #include <gtest/gtest.h>
 #include <sodium.h>
 
@@ -58,6 +60,7 @@ protected:
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
+        profile_.expected_pcrs = nexus_test::svsm_boot_pcr_pins();
         ASSERT_TRUE(nexus::security::profile_is_complete(profile_));
 
         challenge_.nonce = patterned<32>(0x01);
@@ -67,7 +70,9 @@ protected:
         challenge_.epoch = 9;
         challenge_.security_ruleset = constants::kSecurityRulesetVersion;
         challenge_.consensus_ruleset = constants::kConsensusRulesetVersion;
-        challenge_.profile_id = nexus::security::kTier1AttestationProfileId;
+        // This fixture exercises the Azure evidence variant explicitly. The
+        // production-selected profile is SVSM and has its own signed matrices.
+        challenge_.profile_id = nexus::security::AttestationProfileId::AzureSnpVtpm;
         challenge_.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
         challenge_.policy_digest = profile_digest(profile_);
 
@@ -187,7 +192,7 @@ TEST_F(AttestationVerifierTest, PolicyCheckWinsWhenEveryLinkIsBroken) {
 // --- Evidence size bound ------------------------------------------------------
 
 TEST_F(AttestationVerifierTest, RejectsOversizedPlatformBundle) {
-    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'a');
+    azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes + 1, 'a');
     const auto verdict = examine();
     EXPECT_FALSE(verdict.passed);
     EXPECT_EQ(verdict.failure, AttestationFailure::EvidenceOversized);
@@ -199,7 +204,7 @@ TEST_F(AttestationVerifierTest, RejectsOversizedPlatformBundle) {
 TEST_F(AttestationVerifierTest, ExactSizeLimitPassesTheGate) {
     const std::size_t current = platform_evidence_size(evidence_.platform);
     ASSERT_LT(current, kMaxPlatformEvidenceBytes);
-    evidence_.platform.ima_log.assign(kMaxPlatformEvidenceBytes - current, 'a');
+    azure_evidence(evidence_.platform).ima_log.assign(kMaxPlatformEvidenceBytes - current, 'a');
     ASSERT_EQ(platform_evidence_size(evidence_.platform), kMaxPlatformEvidenceBytes);
     sign_evidence();
 

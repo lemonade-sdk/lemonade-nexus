@@ -9,10 +9,52 @@
 #include <system_error>
 #include <fstream>
 #include <set>
+#include <utility>
 
 namespace nexus::core {
 
 using json = nlohmann::json;
+
+namespace {
+constexpr const char* kTier1Json = "/var/lib/lemonade-nexus/lemonade-nexus.json";
+constexpr const char* kTier1Env = "/etc/lemonade-nexus/lemonade-nexus.env";
+}
+
+bool load_tier1_environment_file(ServerConfig& config, const std::string& path,
+                                 std::string& error) {
+    error.clear();
+    std::ifstream file(path);
+    if (!file) {
+        error = "Tier-1 environment file is missing or unreadable: " + path;
+        return false;
+    }
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(file, line)) {
+        ++line_number;
+        const auto first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || line[first] == '#') continue;
+        if (line.compare(first, 13, "SP_LOG_LEVEL=") == 0) {
+            const auto value = line.substr(first + 13);
+            if (value != "trace" && value != "debug" && value != "info" &&
+                value != "warn" && value != "error") {
+                error = "invalid Tier-1 SP_LOG_LEVEL at line " +
+                        std::to_string(line_number);
+                return false;
+            }
+            config.log_level = value;
+            continue;
+        }
+        error = "unapproved Tier-1 environment entry at line " +
+                std::to_string(line_number);
+        return false;
+    }
+    if (!file.eof()) {
+        error = "failed reading Tier-1 environment file";
+        return false;
+    }
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // JSON serialization
@@ -107,7 +149,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --ddns-domain <domain>     Base domain for DDNS (e.g. example.com)");
     spdlog::info("  --ddns-password <pass>     Namecheap DDNS password");
     spdlog::info("  --ddns-enabled             Enable dynamic DNS updates");
-    spdlog::info("  --release-signing-pubkey <b64>  Release signing pubkey (base64 Ed25519)");
     spdlog::info("  --github-releases-url <url>  GitHub API URL for fetching release manifests");
     spdlog::info("  --manifest-fetch-interval <sec>  How often to fetch manifests (default 3600)");
     spdlog::info("  --minimum-version <semver>   Minimum binary version allowed (e.g. 1.2.0)");
@@ -140,7 +181,12 @@ ServerConfig load_config(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             config_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--tier1-authority-contract") == 0) {
+            config.tier1_authority_contract = true;
         }
+    }
+    if (config.tier1_authority_contract && config_path != kTier1Json) {
+        config.tier1_contract_error = "Tier-1 JSON path must be the packaged fixed path";
     }
 
     // --- Load JSON config file ---
@@ -150,14 +196,23 @@ ServerConfig load_config(int argc, char* argv[]) {
         spdlog::warn("Cannot check for config at {}: {} — continuing without a config file",
                      config_path, config_ec.message());
     }
+    if (config.tier1_authority_contract && (config_ec || !config_exists)) {
+        config.tier1_contract_error = "Tier-1 JSON is missing or unreadable";
+    }
     if (config_exists) {
         try {
             std::ifstream f(config_path);
             auto j = json::parse(f);
-            config = j.get<ServerConfig>();
+            auto loaded = j.get<ServerConfig>();
+            loaded.tier1_authority_contract = config.tier1_authority_contract;
+            loaded.tier1_contract_error = config.tier1_contract_error;
+            config = std::move(loaded);
             spdlog::info("Loaded config from {}", config_path);
         } catch (const std::exception& e) {
             spdlog::warn("Failed to parse config {}: {}", config_path, e.what());
+            if (config.tier1_authority_contract) {
+                config.tier1_contract_error = "Tier-1 JSON failed to parse";
+            }
         }
     }
     config.config_path = config_path;  // remembered for onboarding write-back
@@ -173,6 +228,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             std::exit(0);
         } else if (std::strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
             ++i; // already handled
+        } else if (std::strcmp(argv[i], "--tier1-authority-contract") == 0) {
+            // Handled before loading the fixed JSON and environment file.
         } else if (std::strcmp(argv[i], "--http-port") == 0 && i + 1 < argc) {
             config.http_port = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (std::strcmp(argv[i], "--udp-port") == 0 && i + 1 < argc) {
@@ -196,9 +253,13 @@ ServerConfig load_config(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--seed-peer") == 0 && i + 1 < argc) {
             config.seed_peers.push_back(argv[++i]);
         } else if (std::strcmp(argv[i], "--root-pubkey") == 0 && i + 1 < argc) {
+            if (config.tier1_authority_contract)
+                config.tier1_contract_error = "Tier-1 trust key CLI override is forbidden";
             config.root_pubkey = argv[++i];
             root_pubkey_from_cli = true;
         } else if (std::strcmp(argv[i], "--genesis-pubkey") == 0 && i + 1 < argc) {
+            if (config.tier1_authority_contract)
+                config.tier1_contract_error = "Tier-1 trust key CLI override is forbidden";
             config.genesis_pubkey = argv[++i];
             genesis_pubkey_from_cli = true;
         } else if (std::strcmp(argv[i], "--rp-id") == 0 && i + 1 < argc) {
@@ -225,8 +286,6 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.ddns_password = argv[++i];
         } else if (std::strcmp(argv[i], "--ddns-enabled") == 0) {
             config.ddns_enabled = true;
-        } else if (std::strcmp(argv[i], "--release-signing-pubkey") == 0 && i + 1 < argc) {
-            config.release_signing_pubkey = argv[++i];
         } else if (std::strcmp(argv[i], "--github-releases-url") == 0 && i + 1 < argc) {
             config.github_releases_url = argv[++i];
         } else if (std::strcmp(argv[i], "--manifest-fetch-interval") == 0 && i + 1 < argc) {
@@ -283,6 +342,15 @@ ServerConfig load_config(int argc, char* argv[]) {
     }
 
     // --- Pass 3: environment variable overrides ---
+    // The Tier-1 unit never consumes process-inherited SP_* values. Its only
+    // permitted env-file entry is non-authority SP_LOG_LEVEL.
+    if (config.tier1_authority_contract) {
+        std::string env_error;
+        if (!load_tier1_environment_file(config, kTier1Env, env_error)) {
+            config.tier1_contract_error = std::move(env_error);
+        }
+        return config;
+    }
     //
     // The trust anchors are exempt from this pass when the operator named them
     // on the command line. Everything else may be overridden by the
@@ -329,7 +397,6 @@ ServerConfig load_config(int argc, char* argv[]) {
         config.dns_seed_discovery = !(s == "0" || s == "false" || s == "no");
     }
     if (const char* v = std::getenv("SP_DNS_NS_HOSTNAME")) config.dns_ns_hostname = v;
-    if (const char* v = std::getenv("SP_RELEASE_SIGNING_PUBKEY")) config.release_signing_pubkey = v;
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;
     if (const char* v = std::getenv("SP_DDNS_PASSWORD"))  config.ddns_password = v;
     if (std::getenv("SP_DDNS_ENABLED"))                   config.ddns_enabled  = true;
@@ -364,6 +431,10 @@ ServerConfig load_config(int argc, char* argv[]) {
 // ---------------------------------------------------------------------------
 
 bool validate_config(const ServerConfig& config) {
+    if (config.tier1_authority_contract && !config.tier1_contract_error.empty()) {
+        spdlog::error("Config: {}", config.tier1_contract_error);
+        return false;
+    }
     bool valid = true;
 
     // Check ports are non-zero
@@ -408,12 +479,9 @@ bool validate_config(const ServerConfig& config) {
     }
 
 
-    // Trust anchors are mandatory for a normal server start. Both used to be
-    // warnings, and both are now load-bearing: without root_pubkey no certificate
-    // can be verified (verify_server_certificate fails closed), and without
-    // release_signing_pubkey no release manifest can be authenticated, so no binary
-    // can ever be approved. A server missing either can never reach Tier 1 — say so
-    // at startup instead of running in a permanently degraded state.
+    // Bootstrap trust anchors are mandatory for a normal server start. Release
+    // authority is no longer a config/environment trust input: it is delegated
+    // by Genesis in the fixed signed release-approval object.
     //
     // CLI modes are exempt: --first-run generates the identity these anchor to, and
     // the enroll/onboard/manifest modes exit before any of it is used.
@@ -446,12 +514,6 @@ bool validate_config(const ServerConfig& config) {
                 spdlog::error("Config: genesis_pubkey is not a base64 Ed25519 public key");
                 valid = false;
             }
-        }
-        if (config.release_signing_pubkey.empty()) {
-            spdlog::error("Config: release_signing_pubkey is required — without it no release "
-                           "manifest can be authenticated, so no binary can be approved and "
-                           "this server can never reach Tier 1");
-            valid = false;
         }
     }
 

@@ -1,0 +1,47 @@
+{
+  "authority": {
+    "format_version": 1,
+    "network_id": "OPERATOR_NETWORK_ID_REQUIRED",
+    "release_signing_pubkey": "OPERATOR_RELEASE_AUTHORITY_REQUIRED",
+    "genesis_signature": ""
+  },
+  "approval": {
+    "format_version": 1,
+    "release_id": "lemonade-nexus-0.9.7-current-head-svsm-tier1",
+    "nexus_version": "0.9.7",
+    "source_commit": "dd80e7f99d104e6be71ee9c30e32d39ea911bec8",
+    "starting_patched_tree": "148bcf279cd18a7c46295fcd76db022ed5451422",
+    "final_patched_tree": "EXTERNAL_FINAL_TREE_REQUIRED",
+    "network_id": "OPERATOR_NETWORK_ID_REQUIRED",
+    "security_wire_version": 3,
+    "security_ruleset": 1,
+    "consensus_ruleset": 1,
+    "attestation_profile": "SnpSvsmVtpm",
+    "attestation_profile_ruleset": 3,
+    "attestd_wire_version": 4,
+    "ima_policy": {
+      "id": "nexus-tier1-ima-v1",
+      "sha256": "b3cabc30317af8b7127a175d7b4f906a40203e7ebe28122d82a713e03dad4092"
+    },
+    "kernel": {
+      "release": "7.1.0-coconut-svsm-tier1+",
+      "bzimage_sha256": "d9854417fea45a490b632b0e7860827b34443f94da0877e34a0633bbb5078584",
+      "vmlinux_sha256": "dfb88d060ef4fca3b51ce87b95803ad6b64addaad840d4aecb63bc85e9bcd552",
+      "module_tree_sha256": "8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be",
+      "module_certificate_der_sha256": "a43447d3a1658efc13eb1349f1d14e9727630280e5449c5c5459885f9eb88de5"
+    },
+    "svsm_launch_measurement": "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821c6e84c2490814e22a2b5ba860a37208d1d9a",
+    "min_tcb": {
+      "bootloader": 12,
+      "tee": 0,
+      "snp": 28,
+      "microcode": 0
+    },
+    "approved_paths": [],
+    "evidence_collector_path": "/usr/bin/nexus-attestd",
+    "expected_pcrs": [],
+    "qualification_state": "PENDING_LIVE_QUALIFICATION",
+    "signer_pubkey": "OPERATOR_RELEASE_AUTHORITY_REQUIRED",
+    "signature": ""
+  }
+}

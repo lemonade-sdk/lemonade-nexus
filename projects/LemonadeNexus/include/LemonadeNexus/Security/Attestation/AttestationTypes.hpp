@@ -11,11 +11,14 @@
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationProfileId.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Security/Attestation/VerifiedPlatformClaims.hpp>
-#include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
+#include <LemonadeNexus/Security/Attestation/PlatformEvidence.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <cstdint>
+#include <span>
+#include <vector>
 
 namespace nexus::security {
 
@@ -30,6 +33,10 @@ enum class AttestationPurpose : uint16_t {
     /// context binds the plan digest, the attempt and the selected set, so a
     /// replacement attempt needs a new attestation by construction.
     FinalEpochReadiness = 2,
+    /// Profile-specific platform enrollment.  It proves the SVSM service EK
+    /// and proposed AK so an authorized observer can issue MakeCredential.
+    /// It grants no eligibility and is never accepted as a Tier-1 verdict.
+    PlatformEnrollment = 3,
 };
 
 /// The canonical context for an ordinary eligibility attestation.
@@ -71,6 +78,18 @@ struct AttestationChallenge {
     /// inside challenge_digest(), so the quote commits to them.
     AttestationPurpose purpose{AttestationPurpose::Eligibility};
     Digest context_digest{};
+
+    ImaEvidenceMode ima_mode{ImaEvidenceMode::Full};
+    /// Zero for Full.  For Resume these identify the exact verifier-owned
+    /// checkpoint and redundantly state its replay position.  All four fields
+    /// enter challenge_digest(), and therefore the TPM quote.
+    Digest ima_checkpoint_digest{};
+    uint64_t ima_prior_event_count{};
+    Digest ima_prior_pcr10{};
+    /// Verifier-owned required-path state at the named checkpoint.  The
+    /// checkpoint digest commits to it; the producer uses it only to refuse a
+    /// stale/inconsistent Resume, never as an authorization input.
+    std::vector<ImaCheckpointPath> ima_checkpoint_paths;
 };
 
 /// The challenge value C from architecture 9. The prover uses this digest as
@@ -107,17 +126,59 @@ struct AttestationEvidence {
     AttestationPurpose purpose{AttestationPurpose::Eligibility};
     Digest context_digest{};
 
+    /// Explicit transfer commitment.  The identity signature covers the mode,
+    /// exact raw IMA length and SHA-256 digest in addition to the canonical
+    /// platform bundle.  Chunk signatures are neither needed nor accepted.
+    ImaEvidenceMode ima_mode{ImaEvidenceMode::Full};
+    uint64_t ima_bytes{};
+    Digest ima_digest{};
+
     crypto::Ed25519PublicKey epoch_vote_key{};
-    SnpVtpmEvidence platform;
+    PlatformEvidence platform;
     crypto::Ed25519Signature identity_signature{};
 };
+
+/// Start of one bounded SVSM evidence transfer.  `evidence.platform` carries
+/// all fixed platform fields with an empty ima_binary_log; its signature is the
+/// candidate's signature over the COMPLETE evidence reconstructed at End.
+struct AttestationEvidenceStart {
+    Digest challenge_digest{};
+    Digest transfer_id{};
+    ImaEvidenceMode mode{ImaEvidenceMode::Full};
+    uint64_t total_transfer_bytes{};
+    uint64_t ima_bytes{};
+    uint32_t total_chunks{};
+    Digest ima_digest{};
+    Digest platform_digest{};
+    AttestationEvidence evidence;
+};
+
+struct AttestationEvidenceChunk {
+    Digest challenge_digest{};
+    Digest transfer_id{};
+    uint32_t chunk_index{};
+    std::vector<uint8_t> bytes;
+};
+
+struct AttestationEvidenceEnd {
+    Digest challenge_digest{};
+    Digest transfer_id{};
+    uint64_t total_transfer_bytes{};
+    uint64_t ima_bytes{};
+    uint32_t total_chunks{};
+    Digest ima_digest{};
+    Digest platform_digest{};
+};
+
+[[nodiscard]] Digest evidence_transfer_id(const AttestationEvidenceStart& start);
+[[nodiscard]] Digest platform_evidence_digest(const PlatformEvidence& platform);
+[[nodiscard]] Digest raw_ima_digest(std::span<const uint8_t> bytes);
 
 /// Preimage of the identity signature. The chain from architecture 18: the
 /// quote binds the platform to the node identity, and this signature binds the
 /// epoch vote key to that identity. The platform bundle enters as one digest —
-/// a CanonicalEncoder digest over the canonical wire form from
-/// encode_snp_vtpm_evidence() — so the signature covers the exact transported
-/// bytes.
+/// a CanonicalEncoder digest over the tagged platform envelope.  The evidence
+/// type and its exact canonical profile-specific bytes are both signed.
 [[nodiscard]] Digest evidence_signing_digest(const AttestationEvidence& evidence);
 
 /// One deterministic failure model for the whole protocol. The typed result
@@ -165,6 +226,10 @@ enum class AttestationFailure : uint16_t {
     /// A final-readiness challenge with no context bound. Never issued; a
     /// hostile one proves nothing.
     ContextUnbound,
+    ActivationRequired,
+    CheckpointRequired,
+    CheckpointInvalid,
+    TransferInvalid,
 };
 
 /// The bounded result of one verification. It states facts about one candidate

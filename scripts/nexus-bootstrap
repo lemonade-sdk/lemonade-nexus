@@ -28,6 +28,8 @@ class BootstrapConfig:
     ddns_enabled: bool = False
     root_pubkey: str = ""
     genesis_pubkey: str = ""
+    # Legacy compatibility field. The Tier-1 runtime never treats this value as
+    # release authority; only the Genesis-delegated packaged approval can do so.
     release_signing_pubkey: str = ""
 
 
@@ -71,9 +73,13 @@ def interface(value):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    key = parser.add_mutually_exclusive_group(required=True)
-    key.add_argument("--release-signing-pubkey", type=public_key)
-    key.add_argument("--test-release-key", action="store_true", help="throwaway meshes only: use the node identity key")
+    # Optional: these only feed the legacy manifest field. Without one the
+    # field stays empty; actions like --install-dns-nat need no key at all.
+    key = parser.add_mutually_exclusive_group()
+    key.add_argument("--release-signing-pubkey", type=public_key,
+                     help="legacy manifest key; not a Tier-1 release authority")
+    key.add_argument("--test-release-key", action="store_true",
+                     help="throwaway legacy manifests only: use the node identity key")
     parser.add_argument("--public-ip", type=ip_address)
     parser.add_argument("--log-level", choices=("trace", "debug", "info", "warn", "error"), default="info")
     parser.add_argument("--acme-provider", choices=("letsencrypt", "letsencrypt_staging", "zerossl"), default="letsencrypt")
@@ -214,7 +220,8 @@ def bootstrap(args):
         config.genesis_pubkey = public_key(gossip[1])
         if args.test_release_key:
             config.release_signing_pubkey = config.root_pubkey
-            print("WARNING: using the node identity as a test release key")
+            print("WARNING: using the node identity as a legacy test manifest key; "
+                  "this is not Tier-1 release authority")
         write_config(target, config, account.pw_gid, args.test_release_key)
     dns_nat(args, account.pw_gid)
     print(f"Wrote {target}; runtime state: {data}")

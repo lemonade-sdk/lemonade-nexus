@@ -28,7 +28,16 @@ namespace nexus::security {
 /// It takes the whole challenge rather than a nonce so the helper cannot be
 /// handed one — it derives the quote nonce itself, and the caller checks the
 /// evidence came back bound to the digest it expected.
-using PlatformEvidenceSource = std::function<SnpVtpmEvidence(const AttestationChallenge&)>;
+using PlatformEvidenceSource = std::function<PlatformEvidence(const AttestationChallenge&)>;
+
+/// SVSM AK credential activation, run by the daemon that holds the node's TPM
+/// access. All four fields travel as-is; returns the activated secret digest,
+/// or nullopt with the daemon's typed reason in `failure`.
+using PlatformActivationSource =
+    std::function<std::optional<std::vector<uint8_t>>(
+        std::span<const uint8_t> ek_public, std::span<const uint8_t> ak_public,
+        std::span<const uint8_t> credential_blob, std::span<const uint8_t> encrypted_secret,
+        std::string* failure)>;
 
 struct EvidenceProducerSources {
     /// This node's identity. The NodeId is identity.public_key.
@@ -46,6 +55,10 @@ struct EvidenceProducerSources {
     /// Optional out-of-process platform source; see PlatformEvidenceSource.
     /// Last so existing positional initialisation keeps working.
     PlatformEvidenceSource platform_source;
+
+    /// Optional out-of-process activation source; see PlatformActivationSource.
+    /// When unset, activate() refuses and the candidate cannot enroll.
+    PlatformActivationSource activation_source;
 };
 
 class PlatformEvidenceProducer final : public IEvidenceProducer {
@@ -57,6 +70,8 @@ public:
     /// whose platform part is whatever the host produced — possibly empty.
     [[nodiscard]] std::optional<AttestationEvidence> produce(
         const AttestationChallenge& challenge) override;
+    [[nodiscard]] std::optional<SvsmAkActivationResponseMessage> activate(
+        const SvsmAkActivationOfferMessage& offer) override;
 
     /// True when this build has a platform path (Linux + TPM stack). False
     /// means every produced bundle is empty. A host on a capable build can
@@ -65,8 +80,8 @@ public:
     [[nodiscard]] bool platform_available() const;
 
 private:
-    [[nodiscard]] SnpVtpmEvidence platform_bundle(const AttestationChallenge& challenge,
-                                                   const Digest& nonce) const;
+    [[nodiscard]] PlatformEvidence platform_bundle(const AttestationChallenge& challenge,
+                                                    const Digest& nonce) const;
 
     EvidenceProducerSources sources_;
 };

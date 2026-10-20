@@ -9,6 +9,7 @@
 // signs the envelope that carries the epoch vote key.
 
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
+#include <LemonadeNexus/Security/Attestation/SvsmAkEnrollment.hpp>
 
 #include <optional>
 
@@ -19,6 +20,11 @@ public:
     virtual ~IEvidenceProducer() = default;
     [[nodiscard]] virtual std::optional<AttestationEvidence> produce(
         const AttestationChallenge& challenge) = 0;
+
+    /// Candidate half of the profile-specific activation round.  Providers
+    /// without a protected SVSM vTPM return nullopt.
+    [[nodiscard]] virtual std::optional<SvsmAkActivationResponseMessage> activate(
+        const SvsmAkActivationOfferMessage&) { return std::nullopt; }
 };
 
 }  // namespace nexus::security
