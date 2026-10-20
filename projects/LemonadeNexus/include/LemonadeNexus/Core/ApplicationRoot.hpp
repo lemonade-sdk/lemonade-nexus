@@ -11,6 +11,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <cctype>
 #include <span>
 #include <string>
 
@@ -23,12 +25,18 @@ namespace nexus::core {
 inline bool ensure_application_root(tree::PermissionTreeService& tree,
                                     const std::string& root_pubkey_hex) {
     if (tree.get_node("root")) return false;
-    const auto bytes = crypto::from_hex(root_pubkey_hex);
-    if (bytes.size() != crypto::kEd25519PublicKeySize) {
+    // Validate before decoding: from_hex throws, and this runs on the io
+    // thread inside the epoch-established callback.
+    const bool well_formed =
+        root_pubkey_hex.size() == 2 * crypto::kEd25519PublicKeySize &&
+        std::all_of(root_pubkey_hex.begin(), root_pubkey_hex.end(),
+                    [](unsigned char c) { return std::isxdigit(c) != 0; });
+    if (!well_formed) {
         spdlog::warn("[tree] application root not established: root_pubkey is "
                      "not a 32-byte Ed25519 hex key");
         return false;
     }
+    const auto bytes = crypto::from_hex(root_pubkey_hex);
     tree::TreeNode root;
     root.id          = "root";
     root.parent_id   = "";
