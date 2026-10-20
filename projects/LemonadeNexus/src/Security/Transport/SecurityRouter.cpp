@@ -12,16 +12,6 @@ namespace nexus::security {
 
 namespace {
 
-RouteResult drop(DropReason reason, std::optional<uint16_t> code = std::nullopt) {
-    // Debug, not warn: the plane must stay quiet under flood.
-    spdlog::debug("[security] route drop reason={} code={}",
-                  static_cast<uint16_t>(reason), code.value_or(0));
-    RouteResult result;
-    result.dropped = reason;
-    result.service_code = code;
-    return result;
-}
-
 RouteResult delivered() {
     RouteResult result;
     result.delivered = true;
@@ -56,6 +46,35 @@ SecurityRouter::SecurityRouter(SecurityRouterConfig config, SecurityRuntime& run
       sealer_(sealer),
       evidence_producer_(evidence_producer),
       seen_ring_(constants::kSecurityDedupeWindow) {}
+
+RouteResult SecurityRouter::drop(DropReason reason, std::optional<uint16_t> code) {
+    // Debug, not warn: the plane must stay quiet under flood.
+    spdlog::debug("[security] route drop reason={} code={}",
+                  static_cast<uint16_t>(reason), code.value_or(0));
+    ++drop_counts_[reason];
+    // One info line per (reason, code) and window; the flood stays countable
+    // without becoming the flood.
+    const std::pair<uint16_t, uint16_t> key{static_cast<uint16_t>(reason), code.value_or(0)};
+    const auto it = drop_log_.find(key);
+    if (it == drop_log_.end()) {
+        spdlog::info("[security] route drop reason={} code={}", key.first, key.second);
+        drop_log_.emplace(key, DropLogWindow{drop_now_ms_, 0});
+    } else if (drop_now_ms_ - it->second.window_start_ms >= kDropLogWindowMs) {
+        if (it->second.suppressed > 0) {
+            spdlog::info("[security] route drop reason={} code={} ({} suppressed)",
+                         key.first, key.second, it->second.suppressed);
+        } else {
+            spdlog::info("[security] route drop reason={} code={}", key.first, key.second);
+        }
+        it->second = {drop_now_ms_, 0};
+    } else {
+        ++it->second.suppressed;
+    }
+    RouteResult result;
+    result.dropped = reason;
+    result.service_code = code;
+    return result;
+}
 
 // --- Gates ------------------------------------------------------------------
 
@@ -275,6 +294,7 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
 
 RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
                                     std::span<const uint8_t> envelope, uint64_t now_ms) {
+    drop_now_ms_ = now_ms;
     if (envelope.size() > constants::kMaxSecurityMessageBytes) {
         return drop(DropReason::Oversized);
     }
@@ -703,9 +723,10 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
 
 RouteResult SecurityRouter::route_evidence(const AttestationEvidence& evidence) {
     if (evidence.purpose == AttestationPurpose::PlatformEnrollment) {
-        auto offer = runtime_.attestation().receive_enrollment_evidence(evidence,
-                                                                        runtime_.self());
-        if (!offer) return drop(DropReason::ServiceRejected);
+        EnrollmentRefusal refusal{EnrollmentRefusal::None};
+        auto offer = runtime_.attestation().receive_enrollment_evidence(
+            evidence, runtime_.self(), &refusal);
+        if (!offer) return drop(DropReason::ServiceRejected, code(refusal));
         (void)send(evidence.node_id,
                    compose(SecurityMessageKind::SvsmAkActivationOffer, *offer,
                            evidence.epoch));

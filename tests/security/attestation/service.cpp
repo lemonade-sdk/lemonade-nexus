@@ -1,7 +1,15 @@
 #include <LemonadeNexus/Security/Attestation/AttestationService.hpp>
+#include <LemonadeNexus/Security/EvidenceSnpSvsmVtpm.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include <gtest/gtest.h>
+#include <sodium.h>
+#include <spdlog/sinks/base_sink.h>
+#include <spdlog/spdlog.h>
+
+#include <memory>
+#include <mutex>
+#include <string_view>
 
 using nexus::security::AttestationEvidence;
 using nexus::security::AttestationFailure;
@@ -128,6 +136,126 @@ TEST(AttestationService, StaleEvidenceDoesNotConsumeTheLiveChallenge) {
     const auto verdict = service.receive_evidence(answer(*live));
     EXPECT_NE(verdict.failure, AttestationFailure::ChallengeMismatch);
     EXPECT_TRUE(service.verdict(node(0x01)).has_value());
+}
+
+/// Counts the rate-limited enrollment-refusal warn lines.
+struct CountingWarnSink : spdlog::sinks::base_sink<std::mutex> {
+    int refusals = 0;
+
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        const std::string_view text(msg.payload.data(), msg.payload.size());
+        if (msg.level == spdlog::level::warn &&
+            text.find("enrollment refused") != std::string_view::npos) {
+            ++refusals;
+        }
+    }
+    void flush_() override {}
+};
+
+struct EnrollmentFixture {
+    nexus::crypto::Ed25519PublicKey pub{};
+    nexus::crypto::Ed25519PrivateKey priv{};
+    NodeId id;
+
+    EnrollmentFixture() {
+        EXPECT_GE(sodium_init(), 0);
+        crypto_sign_keypair(pub.data(), priv.data());
+        id.bytes = pub;
+    }
+
+    /// Enrollment evidence that clears every protocol gate; the attested
+    /// platform half is garbage, so the identity verification refuses it.
+    AttestationEvidence enrollment_answer(
+        const nexus::security::AttestationChallenge& challenge) const {
+        AttestationEvidence evidence;
+        evidence.network_id = challenge.network_id;
+        evidence.challenge_digest = nexus::security::challenge_digest(challenge);
+        evidence.node_id = challenge.node_id;
+        evidence.incarnation = challenge.incarnation;
+        evidence.epoch = challenge.epoch;
+        evidence.security_ruleset = challenge.security_ruleset;
+        evidence.consensus_ruleset = challenge.consensus_ruleset;
+        evidence.profile_id = challenge.profile_id;
+        evidence.profile_ruleset = challenge.profile_ruleset;
+        evidence.purpose = challenge.purpose;
+        evidence.context_digest = challenge.context_digest;
+        evidence.platform = nexus::security::SnpSvsmVtpmEvidence{};
+        sign(evidence);
+        return evidence;
+    }
+
+    void sign(AttestationEvidence& evidence) const {
+        const auto digest = nexus::security::evidence_signing_digest(evidence);
+        crypto_sign_detached(evidence.identity_signature.data(), nullptr, digest.data(),
+                             digest.size(), priv.data());
+    }
+};
+
+// The silent-refusal bug: a refused enrollment must name its condition so the
+// router's drop carries a distinguishing nonzero code, and the refusal string
+// must reach warn once per node, not once per retry.
+TEST(AttestationService, EnrollmentRefusalIsTypedAndWarnsOncePerNode) {
+    using nexus::security::EnrollmentRefusal;
+    AttestationService service{network(0xA0), LinuxAttestationProfile{}};
+    EnrollmentFixture subject;
+    const NodeId observer = node(0x0B);
+
+    // kTier1AttestationProfileId is SnpSvsmVtpm and no activation record
+    // exists, so the issued challenge is the deferred enrollment challenge.
+    const auto challenge = service.create_challenge(subject.id, subject.pub, 1, 9,
+                                                    AttestationPurpose::Eligibility);
+    ASSERT_TRUE(challenge.has_value());
+    ASSERT_EQ(challenge->purpose, nexus::security::AttestationPurpose::PlatformEnrollment);
+
+    auto sink = std::make_shared<CountingWarnSink>();
+    spdlog::set_level(spdlog::level::info);
+    spdlog::default_logger()->sinks().push_back(sink);
+
+    // Evidence that answers no live challenge names the gate, not the platform.
+    AttestationEvidence stranger = subject.enrollment_answer(*challenge);
+    stranger.node_id = node(0x5E);
+    EnrollmentRefusal refusal{};
+    EXPECT_FALSE(service.receive_enrollment_evidence(stranger, observer, &refusal));
+    EXPECT_EQ(refusal, EnrollmentRefusal::ChallengeMismatch);
+
+    // A wrong platform payload shape is its own condition.
+    AttestationEvidence with_log = subject.enrollment_answer(*challenge);
+    std::get<nexus::security::SnpSvsmVtpmEvidence>(with_log.platform).ima_binary_log = {1};
+    subject.sign(with_log);
+    EXPECT_FALSE(service.receive_enrollment_evidence(with_log, observer, &refusal));
+    EXPECT_EQ(refusal, EnrollmentRefusal::EvidenceMalformed);
+    EXPECT_EQ(sink->refusals, 0);
+
+    // The garbage SVSM report passes every gate and fails identity
+    // verification: the typed reason distinguishes it, and the refusal string
+    // reaches warn.
+    const AttestationEvidence evidence = subject.enrollment_answer(*challenge);
+    EXPECT_FALSE(service.receive_enrollment_evidence(evidence, observer, &refusal));
+    EXPECT_EQ(refusal, EnrollmentRefusal::IdentityRejected);
+    EXPECT_EQ(sink->refusals, 1);
+    // A refusal does not consume the live challenge.
+    EXPECT_TRUE(service.pending_challenge(subject.id).has_value());
+
+    // The same node looping inside the window is counted, not logged again.
+    EXPECT_FALSE(service.receive_enrollment_evidence(evidence, observer, &refusal));
+    EXPECT_EQ(refusal, EnrollmentRefusal::IdentityRejected);
+    EXPECT_EQ(sink->refusals, 1);
+
+    // Another node gets its own first line.
+    EnrollmentFixture other;
+    const auto other_challenge = service.create_challenge(other.id, other.pub, 1, 9,
+                                                          AttestationPurpose::Eligibility);
+    ASSERT_TRUE(other_challenge.has_value());
+    EXPECT_FALSE(service.receive_enrollment_evidence(
+        other.enrollment_answer(*other_challenge), observer, &refusal));
+    EXPECT_EQ(refusal, EnrollmentRefusal::IdentityRejected);
+    EXPECT_EQ(sink->refusals, 2);
+
+    // The out-parameter is optional: the old shape still refuses.
+    EXPECT_FALSE(service.receive_enrollment_evidence(evidence, observer));
+
+    spdlog::default_logger()->sinks().pop_back();
 }
 
 // Two meshes, one node identity, one platform. A bundle built for the first

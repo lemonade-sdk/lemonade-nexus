@@ -14,14 +14,34 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/SvsmAkEnrollment.hpp>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <utility>
 
 namespace nexus::security {
+
+/// Why receive_enrollment_evidence produced no offer. The router carries the
+/// value as its ServiceRejected code, so a refused enrollment is diagnosable
+/// from the drop line alone.
+enum class EnrollmentRefusal : uint16_t {
+    None = 0,
+    /// No live enrollment challenge this evidence answers, or the identity
+    /// signature does not verify.
+    ChallengeMismatch,
+    /// The platform payload is not an SVSM enrollment bundle.
+    EvidenceMalformed,
+    /// verify_svsm_ak_enrollment_identity refused the attested identity.
+    IdentityRejected,
+    /// MakeCredential material could not be built for the attested EK/AK.
+    ActivationUnavailable,
+    /// No deferred challenge exists to resume after activation.
+    DeferredMissing,
+};
 
 class AttestationService {
 public:
@@ -52,8 +72,10 @@ public:
 
     /// Enrollment evidence creates exactly one short-lived activation offer.
     /// Ordinary evidence returns nullopt here and is handled by receive_evidence.
+    /// On nullopt, `refusal` (when given) names the refusing condition.
     [[nodiscard]] std::optional<SvsmAkActivationOfferMessage> receive_enrollment_evidence(
-        const AttestationEvidence& evidence, const NodeId& observer);
+        const AttestationEvidence& evidence, const NodeId& observer,
+        EnrollmentRefusal* refusal = nullptr);
 
     /// Complete one live activation, persist it, and issue the deferred normal
     /// challenge.  No challenge is returned unless the durable record exists.
@@ -111,6 +133,11 @@ private:
     /// Size-capped: a pruned stale bucket could only re-open a superseded
     /// attempt's budget, whose challenges no current context accepts.
     std::map<std::pair<NodeId, Digest>, uint32_t> final_attempts_;
+    /// Last enrollment-refusal warn per node: one line per node per window,
+    /// so a looping candidate cannot flood warn. Size-capped like the above.
+    std::map<NodeId, std::chrono::steady_clock::time_point> refusal_logged_;
+
+    void log_enrollment_refusal(const NodeId& node, const std::string& failure);
 
     [[nodiscard]] AttestationChallenge make_challenge(
         const NodeId& node, const crypto::Ed25519PublicKey& node_key,

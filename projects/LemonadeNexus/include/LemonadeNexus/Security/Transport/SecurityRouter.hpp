@@ -23,9 +23,14 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace nexus::security {
+
+/// Window for the rate-limited drop log line. A logging knob, not a protocol
+/// constant: it never changes what is dropped.
+inline constexpr uint64_t kDropLogWindowMs = 60'000;
 
 enum class DropReason : uint16_t {
     Oversized,
@@ -152,7 +157,18 @@ public:
     /// Sends a pairwise DKG message with its payload sealed to the recipient.
     [[nodiscard]] bool send_sealed_dkg(const DkgMessage& message);
 
+    /// Total drops recorded for one reason since construction.
+    [[nodiscard]] uint64_t drops(DropReason reason) const {
+        const auto it = drop_counts_.find(reason);
+        return it == drop_counts_.end() ? 0 : it->second;
+    }
+
 private:
+    /// Counts the drop, keeps the verbose debug line, and emits one info line
+    /// per (reason, code) and window; repeats inside the window are counted
+    /// and reported by the next line.
+    RouteResult drop(DropReason reason, std::optional<uint16_t> code = std::nullopt);
+
     [[nodiscard]] bool within_budget(const NodeId& sender, uint64_t now_ms);
     /// True when `from` is authorized to issue a challenge to this node in
     /// the current lifecycle phase: the pinned anchor while no epoch is
@@ -198,6 +214,11 @@ private:
         uint32_t count = 0;
     };
 
+    struct DropLogWindow {
+        uint64_t window_start_ms = 0;
+        uint64_t suppressed = 0;
+    };
+
     SecurityRouterConfig config_;
     SecurityRuntime& runtime_;
     ISecurityTransport& transport_;
@@ -211,6 +232,14 @@ private:
     std::vector<Digest> seen_ring_;
     std::set<Digest> seen_;
     std::size_t seen_next_ = 0;
+
+    // Drop accounting. The router runs on one io thread, so plain integers.
+    // Keys are bounded: reasons by the enum, codes by the services' failure
+    // enums. drop_now_ms_ is the last transport-stamped time, for the log
+    // window only — a local message never advances it.
+    std::map<DropReason, uint64_t> drop_counts_;
+    std::map<std::pair<uint16_t, uint16_t>, DropLogWindow> drop_log_;
+    uint64_t drop_now_ms_ = 0;
 };
 
 }  // namespace nexus::security

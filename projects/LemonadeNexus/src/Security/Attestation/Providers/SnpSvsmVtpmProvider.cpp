@@ -162,6 +162,9 @@ PlatformVerification SnpSvsmVtpmProvider::examine(
     if (!result.claims.runtime_integrity_valid) {
         return fail(AttestationFailure::RuntimeProfileInvalid);
     }
+    // The chain already replayed the transferred log once; hand that state out
+    // so the caller never replays it again for the next checkpoint.
+    if (state.ima_state_out) *state.ima_state_out = platform.ima_state;
     return result;
 }
 
