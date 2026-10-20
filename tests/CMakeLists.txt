@@ -116,6 +116,9 @@ add_nexus_test(test_ns_claim_ip_change test_ns_claim_ip_change.cpp)
 # retention and refusal, backoff survival, and the mesh-state race.
 add_nexus_test(test_gossip_delta_transfer test_gossip_delta_transfer.cpp)
 add_nexus_test(test_gossip_security_transport test_gossip_security_transport.cpp)
+# Origin-sequenced replica used by DNS catch-up: ordering, tombstones, digest
+# comparison, catch-up planning and the bounded wire codec.
+add_nexus_test(test_origin_replica test_origin_replica.cpp)
 add_nexus_test(test_security_mesh_service test_security_mesh_service.cpp)
 
 # --- Security overhaul tests (mirror include/LemonadeNexus/Security/) ---

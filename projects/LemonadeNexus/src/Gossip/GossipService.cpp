@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/Network/VirtualNetService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityCodec.hpp>
@@ -29,6 +30,37 @@ std::uint64_t steady_ms() {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+
+std::uint64_t unix_ms() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// Canonical preimages, defined with the other delta families below.
+std::string dns_delta_canonical(const DnsRecordDelta& d);
+std::string dns_delta_seq_canonical(const DnsRecordDelta& d);
+std::string ipam_delta_canonical(const ipam::BackboneAllocationDelta& d);
+DnsRecordDelta dns_delta_from_wire(const json& j);
+
+// Replica key for a DNS record: one entry per (type, lowercased name).
+std::string dns_replica_key(const std::string& record_type, std::string fqdn) {
+    std::transform(fqdn.begin(), fqdn.end(), fqdn.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    return record_type + ":" + fqdn;
+}
+
+constexpr auto kBackboneAnnounceInterval = std::chrono::seconds(300);
+constexpr auto kDnsSyncDigestInterval    = std::chrono::seconds(30);
+constexpr auto kSyncRequestMinInterval   = std::chrono::seconds(5);
+constexpr auto kDnsReplicaSaveInterval   = std::chrono::seconds(30);
+constexpr auto kTombstonePruneInterval   = std::chrono::minutes(10);
+// Long enough that every server sees a removal; a server offline for longer
+// than this can hand back a record removed while it was away.
+constexpr auto kTombstoneRetention       = std::chrono::hours(24 * 30);
+// Entries sent per SyncRequest; the requester asks again next cycle.
+constexpr std::size_t kSyncMaxEntriesPerRequest = 256;
+constexpr std::string_view kDnsSyncStream = "dns";
 
 // Strip an optional "ed25519:" prefix to the bare base64 certificate form
 // used by the revocation list.
@@ -234,8 +266,16 @@ void GossipService::on_start() {
     // Load server certificate and root pubkey
     load_server_certificate();
 
+    // The replica's local origin is this gossip identity, the same key that
+    // signs our DNS deltas.
+    dns_replica_ = std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
+
     // Load known peers
     load_peers();
+
+    // Restored DNS entries are re-verified against the peer table, so this
+    // follows load_peers. Runs here or in set_dns, whichever comes last.
+    load_dns_replica();
 
     // Load persisted NS slot state (restarting nodes must remember the slots
     // the mesh assigned them; the sync gate stays closed until live mesh
@@ -313,7 +353,9 @@ void GossipService::send_startup_server_hello() {
 void GossipService::on_stop() {
     spdlog::info("[{}] stopping...", name());
 
+    backbone_alive_->store(false);
     gossip_timer_.cancel();
+    save_dns_replica();
 
     asio::error_code ec;
     socket_.close(ec);
@@ -1021,16 +1063,19 @@ void GossipService::arm_receive() {
 }
 
 void GossipService::handle_receive(std::size_t bytes_received) {
+    process_datagram(recv_buffer_.data(), bytes_received, remote_endpoint_, Via::Public);
+}
+
+void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_received,
+                                     const asio::ip::udp::endpoint& from, Via via) {
     // Minimum packet: header + signature (no payload)
     if (bytes_received < kGossipHeaderSize) {
         spdlog::debug("[{}] packet too small ({} bytes) from {}:{}",
                        name(), bytes_received,
-                       remote_endpoint_.address().to_string(),
-                       remote_endpoint_.port());
+                       from.address().to_string(),
+                       from.port());
         return;
     }
-
-    const auto* data = recv_buffer_.data();
 
     // Parse header
     GossipPacketHeader header;
@@ -1040,16 +1085,16 @@ void GossipService::handle_receive(std::size_t bytes_received) {
     if (header.magic != kGossipMagic) {
         spdlog::debug("[{}] invalid magic 0x{:04X} from {}:{}",
                        name(), header.magic,
-                       remote_endpoint_.address().to_string(),
-                       remote_endpoint_.port());
+                       from.address().to_string(),
+                       from.port());
         return;
     }
 
     if (header.version != kGossipVersion) {
         spdlog::debug("[{}] unsupported version {} from {}:{}",
                        name(), header.version,
-                       remote_endpoint_.address().to_string(),
-                       remote_endpoint_.port());
+                       from.address().to_string(),
+                       from.port());
         return;
     }
 
@@ -1060,16 +1105,16 @@ void GossipService::handle_receive(std::size_t bytes_received) {
     if (bytes_received < expected_size) {
         spdlog::debug("[{}] truncated packet ({} < {} expected) from {}:{}",
                        name(), bytes_received, expected_size,
-                       remote_endpoint_.address().to_string(),
-                       remote_endpoint_.port());
+                       from.address().to_string(),
+                       from.port());
         return;
     }
 
     // Verify packet signature
     if (!verify_packet_signature(data, expected_size)) {
         spdlog::warn("[{}] invalid packet signature from {}:{}",
-                      name(), remote_endpoint_.address().to_string(),
-                      remote_endpoint_.port());
+                      name(), from.address().to_string(),
+                      from.port());
         return;
     }
 
@@ -1089,52 +1134,70 @@ void GossipService::handle_receive(std::size_t bytes_received) {
     const auto* payload = data + kGossipHeaderSize;
     const auto payload_len = header.payload_length;
 
+    // The backbone carries catch-up sync only. Everything else keeps its
+    // public path, where its existing gates were designed.
+    if (via == Via::Backbone &&
+        header.msg_type != GossipMsgType::SyncDigest &&
+        header.msg_type != GossipMsgType::SyncRequest &&
+        header.msg_type != GossipMsgType::DnsRecordSync) {
+        spdlog::debug("[{}] dropped type 0x{:02X} on the backbone from {}",
+                      name(), static_cast<uint8_t>(header.msg_type),
+                      from.address().to_string());
+        return;
+    }
+
     // Dispatch by message type
     switch (header.msg_type) {
         case GossipMsgType::Digest:
-            handle_digest_message(remote_endpoint_, payload, payload_len,
+            handle_digest_message(from, payload, payload_len,
                                   sender_pubkey_b64);
             break;
         case GossipMsgType::DeltaRequest:
-            handle_delta_request(remote_endpoint_, payload, payload_len,
+            handle_delta_request(from, payload, payload_len,
                                  sender_pubkey_b64);
             break;
         case GossipMsgType::DeltaResponse:
-            handle_delta_response(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
+            handle_delta_response(from, sender_pubkey_b64, payload, payload_len);
             break;
         case GossipMsgType::AntiEntropy:
-            handle_anti_entropy(remote_endpoint_, payload, payload_len);
+            handle_anti_entropy(from, payload, payload_len);
             break;
         case GossipMsgType::PeerExchange:
-            handle_peer_exchange(remote_endpoint_, payload, payload_len);
+            handle_peer_exchange(from, payload, payload_len);
             break;
         case GossipMsgType::ServerHello:
-            handle_server_hello(remote_endpoint_, payload, payload_len,
+            handle_server_hello(from, payload, payload_len,
                                 sender_pubkey_b64);
             break;
         case GossipMsgType::AclDelta:
-            handle_acl_delta(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
+            handle_acl_delta(from, sender_pubkey_b64, payload, payload_len);
             break;
         case GossipMsgType::DnsRecordSync:
-            handle_dns_record_sync(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
+            handle_dns_record_sync(from, sender_pubkey_b64, payload, payload_len, via);
             break;
         case GossipMsgType::BackboneIpamSync:
-            handle_backbone_ipam_sync(remote_endpoint_, sender_pubkey_b64, payload, payload_len);
+            handle_backbone_ipam_sync(from, sender_pubkey_b64, payload, payload_len);
             break;
         case GossipMsgType::NsSlotClaim:
-            handle_ns_slot_claim(remote_endpoint_, payload, payload_len);
+            handle_ns_slot_claim(from, payload, payload_len);
             break;
         case GossipMsgType::MisbehaviorProofBroadcast:
-            handle_misbehavior_proof(remote_endpoint_, payload, payload_len);
+            handle_misbehavior_proof(from, payload, payload_len);
             break;
         case GossipMsgType::SecurityEnvelope:
             handle_security_envelope(header.sender_pubkey, payload, payload_len);
             break;
+        case GossipMsgType::SyncDigest:
+            handle_sync_digest(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
+        case GossipMsgType::SyncRequest:
+            handle_sync_request(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
                           name(), static_cast<uint8_t>(header.msg_type),
-                          remote_endpoint_.address().to_string(),
-                          remote_endpoint_.port());
+                          from.address().to_string(),
+                          from.port());
             break;
     }
 }
@@ -1781,6 +1844,34 @@ void GossipService::on_gossip_tick() {
         }
     }
 
+    // Backbone claims and DNS catch-up keep their own cadence; the first tick
+    // runs both.
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_backbone_announce_ >= kBackboneAnnounceInterval) {
+            last_backbone_announce_ = now;
+            announce_backbone_claim(std::nullopt);
+        }
+        if (now - last_dns_sync_digest_ >= kDnsSyncDigestInterval) {
+            last_dns_sync_digest_ = now;
+            send_dns_sync_digests();
+        }
+        if (dns_replica_ && now - last_tombstone_prune_ >= kTombstonePruneInterval) {
+            last_tombstone_prune_ = now;
+            const uint64_t now_s = unix_ms() / 1000;
+            const uint64_t window = std::chrono::seconds(kTombstoneRetention).count();
+            if (now_s > window) {
+                if (const auto n = dns_replica_->prune_tombstones(now_s - window)) {
+                    spdlog::info("[{}] expired {} DNS removal marker(s)", name(), n);
+                }
+            }
+        }
+        if (now - last_dns_replica_save_ >= kDnsReplicaSaveInterval) {
+            last_dns_replica_save_ = now;
+            save_dns_replica();
+        }
+    }
+
     GossipPeer chosen;
 
     {
@@ -1806,9 +1897,8 @@ void GossipService::on_gossip_tick() {
 // Packet construction and sending
 // ---------------------------------------------------------------------------
 
-void GossipService::send_packet(const asio::ip::udp::endpoint& target,
-                                  GossipMsgType msg_type,
-                                  const std::vector<uint8_t>& payload) {
+std::vector<uint8_t> GossipService::build_signed_packet(GossipMsgType msg_type,
+                                                       const std::vector<uint8_t>& payload) const {
     // Build packet: header + payload + signature
     GossipPacketHeader header{};
     header.magic = kGossipMagic;
@@ -1818,7 +1908,7 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
                 crypto::kEd25519PublicKeySize);
     if (payload.size() > 65000) {
         spdlog::error("[{}] payload too large ({} bytes) for gossip packet", name(), payload.size());
-        return;
+        return {};
     }
     header.payload_length = static_cast<uint16_t>(payload.size());
 
@@ -1838,6 +1928,14 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
     // Append signature
     std::memcpy(packet.data() + kGossipHeaderSize + payload.size(),
                 signature.data(), kGossipSignatureSize);
+    return packet;
+}
+
+void GossipService::send_packet(const asio::ip::udp::endpoint& target,
+                                  GossipMsgType msg_type,
+                                  const std::vector<uint8_t>& payload) {
+    auto packet = build_signed_packet(msg_type, payload);
+    if (packet.empty()) return;
 
     // Send asynchronously
     auto send_buf = std::make_shared<std::vector<uint8_t>>(std::move(packet));
@@ -1851,6 +1949,40 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
                                   ec.message());
             }
         });
+}
+
+bool GossipService::send_backbone_packet(const GossipPeer& peer, GossipMsgType msg_type,
+                                         const std::vector<uint8_t>& payload) {
+    if (!vnet_ || !backbone_bound_.load() || peer.backbone_ip.empty()) return false;
+    // The peer binds its virtual gossip port to the same number as its
+    // public gossip port.
+    const auto colon = peer.endpoint.rfind(':');
+    if (colon == std::string::npos) return false;
+    uint16_t dst_port = 0;
+    try {
+        const auto v = std::stoul(peer.endpoint.substr(colon + 1));
+        if (v == 0 || v > 65535) return false;
+        dst_port = static_cast<uint16_t>(v);
+    } catch (...) {
+        return false;
+    }
+    std::string src_ip;
+    {
+        std::lock_guard lock(mesh_state_mutex_);
+        src_ip = our_backbone_ip_;
+    }
+    const auto packet = build_signed_packet(msg_type, payload);
+    if (packet.empty()) return false;
+    if (packet.size() > vnet_->max_udp_payload()) {
+        spdlog::warn("[{}] backbone packet type 0x{:02X} too large ({} > {} bytes); not sent",
+                     name(), static_cast<uint8_t>(msg_type), packet.size(),
+                     vnet_->max_udp_payload());
+        return false;
+    }
+    asio::error_code ec;
+    const uint16_t src_port = socket_.local_endpoint(ec).port();
+    if (ec) return false;
+    return vnet_->send_udp(src_ip, src_port, peer.backbone_ip, dst_port, packet);
 }
 
 // ---------------------------------------------------------------------------
@@ -2501,6 +2633,10 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
         spdlog::info("[{}] accepted ServerHello from {} ({})",
                       name(), cert.server_id, ep);
 
+        // Tell this peer our backbone address and mesh key directly, so a
+        // restarted or late-joining server can add us to the backbone.
+        announce_backbone_claim(sender);
+
         // The first accepted handshake is the point where peer state exchange
         // begins: from here on, this node's slot table is no longer trusted
         // over the mesh's, so deferred NS slot claims may proceed.
@@ -2613,10 +2749,136 @@ void GossipService::try_add_backbone_mesh_peer(const GossipPeer& peer) {
         mesh_endpoint = peer.endpoint.substr(0, colon) + ":51940";
     }
 
+    const std::string key = peer.mesh_pubkey + "|" + peer.backbone_ip;
+    {
+        std::lock_guard lock(peers_mutex_);
+        if (backbone_peers_added_.count(key)) return;
+    }
     if (boringtun_->add_peer(peer.mesh_pubkey, peer.backbone_ip + "/32", mesh_endpoint)) {
+        {
+            std::lock_guard lock(peers_mutex_);
+            backbone_peers_added_.insert(key);
+        }
         spdlog::info("[{}] added backbone mesh peer {} ({}) endpoint={}",
                       name(), peer.backbone_ip, peer.pubkey.substr(0, 12), mesh_endpoint);
     }
+}
+
+void GossipService::set_our_backbone_claim(const std::string& server_node_id,
+                                           const std::string& backbone_ip) {
+    {
+        std::lock_guard lock(mesh_state_mutex_);
+        our_backbone_node_id_ = server_node_id;
+        our_backbone_ip_      = backbone_ip;
+        // Fixed for the process lifetime, so every re-announcement is the same
+        // delta and receivers deduplicate it.
+        our_backbone_claim_ts_ = static_cast<uint64_t>(
+            chrono::system_clock::to_time_t(chrono::system_clock::now()));
+    }
+    start_backbone_transport();
+}
+
+std::string GossipService::our_backbone_ip() const {
+    std::lock_guard lock(mesh_state_mutex_);
+    return our_backbone_ip_;
+}
+
+void GossipService::set_our_mesh_pubkey(const std::string& pubkey) {
+    std::lock_guard lock(mesh_state_mutex_);
+    our_mesh_pubkey_ = pubkey;
+}
+
+void GossipService::set_virtual_net(network::VirtualNetService* vnet) {
+    vnet_ = vnet;
+    start_backbone_transport();
+}
+
+void GossipService::start_backbone_transport() {
+    std::string ip;
+    {
+        std::lock_guard lock(mesh_state_mutex_);
+        ip = our_backbone_ip_;
+    }
+    if (!vnet_ || ip.empty() || backbone_bound_.load()) return;
+    // The socket's bound port, which differs from port_ when port_ is 0.
+    asio::error_code ec;
+    const uint16_t port = socket_.local_endpoint(ec).port();
+    if (ec || port == 0) return;
+
+    // Runs on the netstack thread: copy the datagram and hand it to the io
+    // thread, where every gossip handler runs.
+    auto alive = backbone_alive_;
+    auto executor = socket_.get_executor();
+    const bool bound = vnet_->bind_udp(
+        ip, port,
+        [this, alive, executor](uint32_t src_ip, uint16_t src_port,
+                                std::span<const uint8_t> data) {
+            auto bytes = std::make_shared<std::vector<uint8_t>>(data.begin(), data.end());
+            const asio::ip::udp::endpoint from{asio::ip::address_v4(src_ip), src_port};
+            asio::post(executor, [this, alive, bytes, from] {
+                if (!alive->load()) return;
+                process_datagram(bytes->data(), bytes->size(), from, Via::Backbone);
+            });
+        });
+    if (bound) {
+        backbone_bound_.store(true);
+        spdlog::info("[{}] backbone transport on virtual {}:{}", name(), ip, port);
+    }
+}
+
+void GossipService::announce_backbone_claim(
+    const std::optional<asio::ip::udp::endpoint>& target) {
+    ipam::BackboneAllocationDelta delta;
+    std::string mesh_pubkey;
+    {
+        std::lock_guard lock(mesh_state_mutex_);
+        if (our_backbone_ip_.empty() || our_backbone_node_id_.empty()) return;
+        delta.delta_id       = "backbone:" + our_backbone_node_id_ + ":" + our_backbone_ip_ +
+                               ":" + std::to_string(our_backbone_claim_ts_);
+        delta.server_node_id = our_backbone_node_id_;
+        delta.backbone_ip    = our_backbone_ip_ + "/32";
+        delta.timestamp      = our_backbone_claim_ts_;
+        mesh_pubkey          = our_mesh_pubkey_;
+    }
+    delta.operation     = "allocate";
+    // The claim names the key that signs it, which the self-claim rule in
+    // handle_backbone_ipam_sync requires.
+    delta.server_pubkey = crypto::to_base64(keypair_.public_key);
+    delta.signer_pubkey = delta.server_pubkey;
+    const std::string canonical = ipam_delta_canonical(delta);
+    delta.signature = crypto::to_base64(crypto_.ed25519_sign(
+        keypair_.private_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                 canonical.size())));
+
+    json j;
+    j["delta_id"]       = delta.delta_id;
+    j["operation"]      = delta.operation;
+    j["server_node_id"] = delta.server_node_id;
+    j["server_pubkey"]  = delta.server_pubkey;
+    j["backbone_ip"]    = delta.backbone_ip;
+    j["timestamp"]      = delta.timestamp;
+    j["signer_pubkey"]  = delta.signer_pubkey;
+    j["signature"]      = delta.signature;
+    // Outside the signed preimage: receivers trust it only when the packet
+    // signer is the claim's subject, i.e. on this direct send.
+    if (!mesh_pubkey.empty()) j["mesh_pubkey"] = mesh_pubkey;
+    const auto packed = json::to_msgpack(j);
+    const std::vector<uint8_t> payload(packed.begin(), packed.end());
+
+    if (target) {
+        send_packet(*target, GossipMsgType::BackboneIpamSync, payload);
+        return;
+    }
+    std::vector<asio::ip::udp::endpoint> targets;
+    {
+        std::lock_guard lock(peers_mutex_);
+        for (const auto& p : peers_) {
+            if (p.certificate_json.empty()) continue;
+            if (auto ep = parse_endpoint(p.endpoint)) targets.push_back(*ep);
+        }
+    }
+    for (const auto& ep : targets) send_packet(ep, GossipMsgType::BackboneIpamSync, payload);
 }
 
 namespace {
@@ -2634,6 +2896,48 @@ std::string dns_delta_canonical(const DnsRecordDelta& d) {
     j["ttl"]         = d.ttl;
     j["value"]       = d.value;
     return j.dump();
+}
+
+// The sequenced preimage: the same fields plus origin_seq. A distinct key set,
+// so a signature over one form never verifies as the other.
+std::string dns_delta_seq_canonical(const DnsRecordDelta& d) {
+    json j = json::parse(dns_delta_canonical(d));
+    j["origin_seq"] = d.origin_seq;
+    return j.dump();
+}
+
+DnsRecordDelta dns_delta_from_wire(const json& j) {
+    DnsRecordDelta d;
+    d.delta_id      = j.value("delta_id", "");
+    d.operation     = j.value("operation", "");
+    d.fqdn          = j.value("fqdn", "");
+    d.record_type   = j.value("record_type", "");
+    d.value         = j.value("value", "");
+    d.ttl           = j.value("ttl", uint32_t{60});
+    d.timestamp     = j.value("timestamp", uint64_t{0});
+    d.signer_pubkey = j.value("signer_pubkey", "");
+    d.signature     = j.value("signature", "");
+    d.origin_seq    = j.value("origin_seq", uint64_t{0});
+    d.seq_signature = j.value("seq_signature", "");
+    return d;
+}
+
+json dns_delta_wire(const DnsRecordDelta& d) {
+    json j;
+    j["delta_id"]      = d.delta_id;
+    j["operation"]     = d.operation;
+    j["fqdn"]          = d.fqdn;
+    j["record_type"]   = d.record_type;
+    j["value"]         = d.value;
+    j["ttl"]           = d.ttl;
+    j["timestamp"]     = d.timestamp;
+    j["signer_pubkey"] = d.signer_pubkey;
+    j["signature"]     = d.signature;
+    if (d.origin_seq != 0) {
+        j["origin_seq"]    = d.origin_seq;
+        j["seq_signature"] = d.seq_signature;
+    }
+    return j;
 }
 
 std::string ipam_delta_canonical(const ipam::BackboneAllocationDelta& d) {
@@ -2694,6 +2998,13 @@ bool GossipService::delta_origin_verified(const std::string& canonical,
     // delta applies only when the author signed exactly these fields AND the
     // root enrolled the author — a self-minted key authors nothing the mesh
     // accepts, no matter who relays it.
+    return author_signature_valid(canonical, signer_pubkey_b64, signature_b64) &&
+           peer_certificate_is_root_signed(signer_pubkey_b64);
+}
+
+bool GossipService::author_signature_valid(const std::string& canonical,
+                                           const std::string& signer_pubkey_b64,
+                                           const std::string& signature_b64) const {
     if (signer_pubkey_b64.empty() || signature_b64.empty()) {
         return false;
     }
@@ -2718,7 +3029,7 @@ bool GossipService::delta_origin_verified(const std::string& canonical,
     } catch (...) {
         return false;
     }
-    return peer_certificate_is_root_signed(signer_pubkey_b64);
+    return true;
 }
 
 void GossipService::broadcast_backbone_ipam_delta(const ipam::BackboneAllocationDelta& delta) {
@@ -2808,24 +3119,43 @@ void GossipService::handle_backbone_ipam_sync(
                     send_packet(*ep, GossipMsgType::BackboneIpamSync, fwd_payload);
                 }
             }
+        }
 
-            // If allocate operation, try to add it as a mesh peer.
-            if (delta.operation == "allocate") {
-                // Find the peer in our list and update backbone_ip
-                for (auto& peer : peers_) {
-                    if (peer.pubkey == delta.server_pubkey) {
-                        peer.backbone_ip = delta.backbone_ip;
-                        // Strip CIDR prefix for the stored IP
-                        auto slash = peer.backbone_ip.find('/');
-                        if (slash != std::string::npos) {
-                            peer.backbone_ip = peer.backbone_ip.substr(0, slash);
-                        }
-                        try_add_backbone_mesh_peer(peer);
-                        break;
-                    }
+        if (delta.operation != "allocate") return;
+
+        // The mesh key is outside the signed preimage, so it is taken only
+        // from a direct claim: the packet signer is then the claim's subject.
+        std::string mesh_pubkey;
+        if (sender_pubkey == delta.server_pubkey) {
+            const auto candidate = j.value("mesh_pubkey", std::string{});
+            try {
+                if (crypto::from_base64(candidate).size() == crypto::kX25519PublicKeySize) {
+                    mesh_pubkey = candidate;
                 }
+            } catch (...) {}
+        }
+
+        // Record the address only when IPAM holds it for this server: a claim
+        // that lost a conflict is still forwarded but must not route.
+        const auto alloc = ipam_->get_allocation(delta.server_node_id);
+        if (!alloc || !alloc->backbone || alloc->backbone->base_network != delta.backbone_ip) {
+            return;
+        }
+        std::optional<GossipPeer> ready;
+        {
+            std::lock_guard lock(peers_mutex_);
+            for (auto& peer : peers_) {
+                if (peer.pubkey != delta.server_pubkey) continue;
+                peer.backbone_ip = delta.backbone_ip;
+                if (auto slash = peer.backbone_ip.find('/'); slash != std::string::npos) {
+                    peer.backbone_ip = peer.backbone_ip.substr(0, slash);
+                }
+                if (!mesh_pubkey.empty()) peer.mesh_pubkey = mesh_pubkey;
+                ready = peer;
+                break;
             }
         }
+        if (ready) try_add_backbone_mesh_peer(*ready);
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse backbone IPAM delta from {}:{}: {}",
                       name(), sender.address().to_string(), sender.port(), e.what());
@@ -2929,32 +3259,35 @@ void GossipService::handle_acl_delta(const asio::ip::udp::endpoint& sender,
 
 void GossipService::set_dns(network::DnsService* dns) {
     dns_ = dns;
+    load_dns_replica();
 }
 
 void GossipService::broadcast_dns_record_delta(const DnsRecordDelta& delta) {
     // The origin signs what it asserts; forwarding never re-signs.
     DnsRecordDelta signed_delta = delta;
     signed_delta.signer_pubkey = crypto::to_base64(keypair_.public_key);
-    const std::string canonical = dns_delta_canonical(signed_delta);
-    const auto sig = crypto_.ed25519_sign(
-        keypair_.private_key,
-        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
-                                 canonical.size()));
-    signed_delta.signature = crypto::to_base64(sig);
+    const auto sign = [&](const std::string& canonical) {
+        return crypto::to_base64(crypto_.ed25519_sign(
+            keypair_.private_key,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                     canonical.size())));
+    };
+    signed_delta.signature = sign(dns_delta_canonical(signed_delta));
+    if (dns_replica_) {
+        signed_delta.origin_seq    = dns_replica_->next_local_seq(unix_ms());
+        signed_delta.seq_signature = sign(dns_delta_seq_canonical(signed_delta));
+    }
 
-    json j;
-    j["delta_id"]      = signed_delta.delta_id;
-    j["operation"]     = signed_delta.operation;
-    j["fqdn"]          = signed_delta.fqdn;
-    j["record_type"]   = signed_delta.record_type;
-    j["value"]         = signed_delta.value;
-    j["ttl"]           = signed_delta.ttl;
-    j["timestamp"]     = signed_delta.timestamp;
-    j["signer_pubkey"] = signed_delta.signer_pubkey;
-    j["signature"]     = signed_delta.signature;
-
-    auto packed = json::to_msgpack(j);
+    auto packed = json::to_msgpack(dns_delta_wire(signed_delta));
     std::vector<uint8_t> payload(packed.begin(), packed.end());
+
+    // Our own changes enter the replica so Tier 1 peers can catch up on them.
+    if (dns_replica_) {
+        (void)dns_replica_->offer({dns_replica_key(signed_delta.record_type, signed_delta.fqdn),
+                                   signed_delta.signer_pubkey, signed_delta.origin_seq,
+                                   signed_delta.timestamp,
+                                   signed_delta.operation == "remove", payload});
+    }
 
     std::lock_guard lock(peers_mutex_);
     for (const auto& peer : peers_) {
@@ -2967,7 +3300,8 @@ void GossipService::broadcast_dns_record_delta(const DnsRecordDelta& delta) {
 
 void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender,
                                              const std::string& sender_pubkey,
-                                             const uint8_t* payload, std::size_t payload_len) {
+                                             const uint8_t* payload, std::size_t payload_len,
+                                             Via via) {
     if (!dns_) return;
 
     // Cert-gated ingress; rule in handle_delta_response.
@@ -2979,18 +3313,11 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
     }
 
     try {
-        auto j = json::from_msgpack(payload, payload + payload_len);
-
-        DnsRecordDelta delta;
-        delta.delta_id      = j.value("delta_id", "");
-        delta.operation     = j.value("operation", "");
-        delta.fqdn          = j.value("fqdn", "");
-        delta.record_type   = j.value("record_type", "");
-        delta.value         = j.value("value", "");
-        delta.ttl           = j.value("ttl", uint32_t{60});
-        delta.timestamp     = j.value("timestamp", uint64_t{0});
-        delta.signer_pubkey = j.value("signer_pubkey", "");
-        delta.signature     = j.value("signature", "");
+        const auto j = json::from_msgpack(payload, payload + payload_len);
+        const DnsRecordDelta delta = dns_delta_from_wire(j);
+        // Catch-up replays an entry the requester asked for; it is not news
+        // to the rest of the mesh, so it is applied without forwarding.
+        const bool catch_up = via == Via::Backbone && j.value("catch_up", false);
 
         if (delta.delta_id.empty() || delta.fqdn.empty()) {
             spdlog::warn("[{}] received invalid DNS record delta from {}:{}",
@@ -2998,89 +3325,421 @@ void GossipService::handle_dns_record_sync(const asio::ip::udp::endpoint& sender
             return;
         }
 
-        // Zone writes are authored, not relayed into existence: the origin
-        // signed exactly these fields and is a root-enrolled server, or the
-        // record does not change.
-        if (!delta_origin_verified(dns_delta_canonical(delta), delta.signer_pubkey,
-                                   delta.signature)) {
-            spdlog::warn("[{}] DENIED DNS record delta from {}:{} — origin signature "
-                          "or enrollment failed", name(),
-                          sender.address().to_string(), sender.port());
+        if (const auto error = dns_delta_authorship_error(delta)) {
+            spdlog::warn("[{}] DENIED DNS record delta from {}:{} — {}", name(),
+                         sender.address().to_string(), sender.port(), *error);
             return;
         }
 
-        // A tier1 label asserts finalized membership, not enrollment. Only a
-        // CURRENT Tier 1 member may author one, judged against finalized mesh
-        // state; with no membership source configured, nothing qualifies.
-        std::string fqdn_lower = delta.fqdn;
-        std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (fqdn_lower.find(".tier1.") != std::string::npos &&
-            (!tier1_membership_ || !tier1_membership_(delta.signer_pubkey))) {
-            spdlog::warn("[{}] DENIED tier1-labelled DNS record from {}:{} — author is "
-                          "not a current Tier 1 member", name(),
-                          sender.address().to_string(), sender.port());
+        // A Tier 1 server's zone changes only on Tier 1 authority: both the
+        // server that delivered the record and the server that authored it
+        // must be current Tier 1 members.
+        if (self_is_tier1() &&
+            (!is_tier1(sender_pubkey) || !is_tier1(delta.signer_pubkey))) {
+            if (denial_log_allowed("dns-non-tier1:" + sender_pubkey,
+                                   std::chrono::steady_clock::now())) {
+                spdlog::warn("[{}] DENIED DNS record delta from {}:{} — Tier 1 accepts DNS "
+                             "only from Tier 1 senders and authors", name(),
+                             sender.address().to_string(), sender.port());
+            }
             return;
         }
 
-        // A per-server SEIP record is an ORDINARY resource owned by exactly
-        // one server: the author owns it iff its certified server id appears
-        // as one of the labels strictly before the "seip" label. Real names
-        // embed that id at any depth — "<id>.<region>.seip.<base>",
-        // "<id>.tier<N>.<region>.seip", "private.<id>...", "_config.<id>...",
-        // "backend.<id>...", "_acme-challenge[.private].<id>..." — while a
-        // record that names another id (or no id at all) stays foreign.
-        if (const auto seip_pos = fqdn_lower.find(".seip.");
-            seip_pos != std::string::npos) {
-            const std::string prefix = fqdn_lower.substr(0, seip_pos);
-            const std::string own_id = certified_server_id(delta.signer_pubkey);
-            bool owned = false;
-            std::size_t start = 0;
-            while (start < prefix.size() && !owned) {
-                const auto dot = prefix.find('.', start);
-                const std::size_t len =
-                    dot == std::string::npos ? prefix.size() - start : dot - start;
-                owned = !own_id.empty() && prefix.compare(start, len, own_id) == 0;
-                if (dot == std::string::npos) break;
-                start = dot + 1;
-            }
-            if (!owned) {
-                spdlog::warn("[{}] DENIED SEIP DNS record '{}' from {}:{} — server id "
-                              "'{}' not found in the owner labels before .seip", name(),
-                              fqdn_lower, sender.address().to_string(), sender.port(),
-                              own_id);
-                return;
-            }
-        }
+        if (!apply_dns_delta(delta) || catch_up) return;
 
-        // Convert to DnsZoneRecord for DnsService
-        network::DnsZoneRecord zone_rec;
-        zone_rec.fqdn        = delta.fqdn;
-        zone_rec.record_type = delta.record_type;
-        zone_rec.value       = delta.value;
-        zone_rec.ttl         = delta.ttl;
-        zone_rec.timestamp   = delta.timestamp;
+        spdlog::debug("[{}] applied DNS delta {} {} {} from {}:{}",
+                       name(), delta.operation, delta.record_type,
+                       delta.fqdn, sender.address().to_string(), sender.port());
 
-        // apply_remote_delta deduplicates and applies timestamp ordering
-        if (dns_->apply_remote_delta(delta.delta_id, delta.operation, zone_rec)) {
-            spdlog::debug("[{}] applied DNS delta {} {} {} from {}:{}",
-                           name(), delta.operation, delta.record_type,
-                           delta.fqdn, sender.address().to_string(), sender.port());
-
-            // New delta — forward to all peers except sender (epidemic spread)
-            std::vector<uint8_t> fwd_payload(payload, payload + payload_len);
-            std::lock_guard lock(peers_mutex_);
-            for (const auto& peer : peers_) {
-                auto ep = parse_endpoint(peer.endpoint);
-                if (ep && *ep != sender) {
-                    send_packet(*ep, GossipMsgType::DnsRecordSync, fwd_payload);
-                }
+        // New delta — forward to all peers except sender (epidemic spread)
+        std::vector<uint8_t> fwd_payload(payload, payload + payload_len);
+        std::lock_guard lock(peers_mutex_);
+        for (const auto& peer : peers_) {
+            auto ep = parse_endpoint(peer.endpoint);
+            if (ep && *ep != sender) {
+                send_packet(*ep, GossipMsgType::DnsRecordSync, fwd_payload);
             }
         }
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse DNS record delta from {}:{}: {}",
                       name(), sender.address().to_string(), sender.port(), e.what());
     }
+}
+
+std::optional<std::string> GossipService::dns_delta_authorship_error(
+    const DnsRecordDelta& delta) const {
+    // Zone writes are authored, not relayed into existence: the origin
+    // signed exactly these fields and is a root-enrolled server, or the
+    // record does not change. A sequenced delta is verified over the
+    // preimage that includes its sequence number, so no relay can move it
+    // in the replica's order.
+    const std::string& sig = delta.origin_seq != 0 ? delta.seq_signature : delta.signature;
+    const std::string canonical = delta.origin_seq != 0 ? dns_delta_seq_canonical(delta)
+                                                        : dns_delta_canonical(delta);
+    // Our own deltas come back from peers and from disk. Our key is not in
+    // the peer table, so its enrollment is our own root-verified certificate.
+    const bool self_authored = delta.signer_pubkey == crypto::to_base64(keypair_.public_key);
+    const bool self_enrolled = self_authored && own_certificate_valid();
+    const bool origin_ok =
+        self_authored
+            ? self_enrolled && author_signature_valid(canonical, delta.signer_pubkey, sig)
+            : delta_origin_verified(canonical, delta.signer_pubkey, sig);
+    if (!origin_ok) return "origin signature or enrollment failed";
+
+    // A tier1 label asserts finalized membership, not enrollment. Only a
+    // CURRENT Tier 1 member may author one, judged against finalized mesh
+    // state; with no membership source configured, nothing qualifies.
+    std::string fqdn_lower = delta.fqdn;
+    std::transform(fqdn_lower.begin(), fqdn_lower.end(), fqdn_lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (fqdn_lower.find(".tier1.") != std::string::npos &&
+        (!tier1_membership_ || !tier1_membership_(delta.signer_pubkey))) {
+        return "tier1-labelled record from an author that is not a current Tier 1 member";
+    }
+
+    // A per-server SEIP record is an ORDINARY resource owned by exactly
+    // one server: the author owns it iff its certified server id appears
+    // as one of the labels strictly before the "seip" label. Real names
+    // embed that id at any depth — "<id>.<region>.seip.<base>",
+    // "<id>.tier<N>.<region>.seip", "private.<id>...", "_config.<id>...",
+    // "backend.<id>...", "_acme-challenge[.private].<id>..." — while a
+    // record that names another id (or no id at all) stays foreign.
+    if (const auto seip_pos = fqdn_lower.find(".seip.");
+        seip_pos != std::string::npos) {
+        const std::string prefix = fqdn_lower.substr(0, seip_pos);
+        const std::string own_id = self_authored ? our_certificate_->server_id
+                                                 : certified_server_id(delta.signer_pubkey);
+        bool owned = false;
+        std::size_t start = 0;
+        while (start < prefix.size() && !owned) {
+            const auto dot = prefix.find('.', start);
+            const std::size_t len =
+                dot == std::string::npos ? prefix.size() - start : dot - start;
+            owned = !own_id.empty() && prefix.compare(start, len, own_id) == 0;
+            if (dot == std::string::npos) break;
+            start = dot + 1;
+        }
+        if (!owned) {
+            return "SEIP record '" + fqdn_lower + "': server id '" + own_id +
+                   "' not found in the owner labels before .seip";
+        }
+    }
+    return std::nullopt;
+}
+
+bool GossipService::apply_dns_delta(const DnsRecordDelta& delta) {
+    network::DnsZoneRecord zone_rec;
+    zone_rec.fqdn        = delta.fqdn;
+    zone_rec.record_type = delta.record_type;
+    zone_rec.value       = delta.value;
+    zone_rec.ttl         = delta.ttl;
+    zone_rec.timestamp   = delta.timestamp;
+
+    // The replica orders sequenced deltas by (timestamp, origin_seq) and
+    // remembers removals, so an older record cannot undo a newer change.
+    const auto key = dns_replica_key(delta.record_type, delta.fqdn);
+    if (dns_replica_ && dns_replica_->holds_newer(key, delta.timestamp, delta.origin_seq)) {
+        return false;
+    }
+
+    // apply_remote_delta deduplicates; it applies timestamp ordering itself
+    // only for unsequenced deltas, which the replica cannot order.
+    const bool ordered = dns_replica_ != nullptr && delta.origin_seq != 0;
+    if (!dns_->apply_remote_delta(delta.delta_id, delta.operation, zone_rec, ordered)) {
+        return false;
+    }
+    if (dns_replica_) {
+        const auto packed = json::to_msgpack(dns_delta_wire(delta));
+        (void)dns_replica_->offer({key, delta.signer_pubkey, delta.origin_seq,
+                                   delta.timestamp, delta.operation == "remove",
+                                   std::vector<uint8_t>(packed.begin(), packed.end())});
+    }
+    return true;
+}
+
+void GossipService::save_dns_replica() {
+    if (!dns_replica_) return;
+    const auto version = dns_replica_->version();
+    if (version == dns_replica_saved_version_) return;
+
+    json entries = json::array();
+    for (const auto& e : dns_replica_->snapshot()) {
+        entries.push_back(crypto::to_base64(std::span<const uint8_t>(e.payload)));
+    }
+    storage::SignedEnvelope envelope;
+    envelope.type = "dns_replica";
+    envelope.data = json{{"entries", std::move(entries)}}.dump();
+    envelope.signer_pubkey = "ed25519:" + crypto::to_base64(keypair_.public_key);
+    envelope.timestamp = static_cast<uint64_t>(
+        chrono::system_clock::to_time_t(chrono::system_clock::now()));
+    const std::vector<uint8_t> data_bytes(envelope.data.begin(), envelope.data.end());
+    envelope.signature = crypto::to_base64(crypto_.ed25519_sign(keypair_.private_key, data_bytes));
+
+    if (storage_.write_file("dns", "replica.json", envelope)) {
+        dns_replica_saved_version_ = version;
+    } else {
+        spdlog::warn("[{}] failed to save the DNS replica", name());
+    }
+}
+
+void GossipService::load_dns_replica() {
+    if (!dns_ || !dns_replica_ || dns_replica_loaded_) return;
+    dns_replica_loaded_ = true;
+    const auto envelope = storage_.read_file("dns", "replica.json");
+    if (!envelope) return;
+
+    // Each entry is an origin-signed delta and is re-verified exactly as on
+    // receipt, so the file's own signature is not what grants authority.
+    std::size_t restored = 0, refused = 0;
+    try {
+        const auto j = json::parse(envelope->data);
+        for (const auto& item : j.value("entries", json::array())) {
+            if (!item.is_string()) { ++refused; continue; }
+            const auto bytes = crypto::from_base64(item.get<std::string>());
+            const DnsRecordDelta delta = dns_delta_from_wire(json::from_msgpack(bytes));
+            if (delta.delta_id.empty() || delta.fqdn.empty() ||
+                dns_delta_authorship_error(delta)) {
+                ++refused;
+                continue;
+            }
+            if (apply_dns_delta(delta)) ++restored;
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] DNS replica file unreadable: {}", name(), e.what());
+        return;
+    }
+    dns_replica_saved_version_ = dns_replica_->version();
+    spdlog::info("[{}] restored {} DNS record(s) from disk ({} refused)", name(), restored,
+                 refused);
+}
+
+// ---------------------------------------------------------------------------
+// Catch-up sync over the backbone (Tier 1 to Tier 1)
+// ---------------------------------------------------------------------------
+
+bool GossipService::self_is_tier1() const {
+    return tier1_membership_ && tier1_membership_(crypto::to_base64(keypair_.public_key));
+}
+
+bool GossipService::is_tier1(const std::string& pubkey_b64) const {
+    return tier1_membership_ && tier1_membership_(pubkey_b64);
+}
+
+bool GossipService::backbone_sender_verified(const asio::ip::udp::endpoint& sender,
+                                             const std::string& sender_pubkey, Via via,
+                                             std::string_view what) {
+    const char* reason = nullptr;
+    if (via != Via::Backbone) {
+        reason = "not received on the backbone";
+    } else if (!peer_certificate_is_root_signed(sender_pubkey)) {
+        reason = "sender is not a cert-verified enrolled peer";
+    } else {
+        // The dataplane only delivers a backbone IP's packets under that
+        // peer's mesh key; requiring the signer's own backbone IP binds the
+        // gossip identity to that path.
+        const auto peer = find_peer_by_pubkey(sender_pubkey);
+        if (!peer || peer->backbone_ip.empty() ||
+            sender.address().to_string() != peer->backbone_ip) {
+            reason = "source is not the sender's backbone address";
+        }
+    }
+    if (!reason) return true;
+    deny_sync(sender, sender_pubkey, what, reason);
+    return false;
+}
+
+void GossipService::deny_sync(const asio::ip::udp::endpoint& sender,
+                              const std::string& sender_pubkey, std::string_view what,
+                              std::string_view reason) {
+    if (denial_log_allowed("sync:" + std::string(what) + ":" + sender_pubkey,
+                           std::chrono::steady_clock::now())) {
+        spdlog::warn("[{}] DENIED {} from {}:{} — {}", name(), what,
+                     sender.address().to_string(), sender.port(), reason);
+    }
+}
+
+void GossipService::send_dns_sync_digests() {
+    if (!dns_replica_ || !backbone_bound_.load()) return;
+    const bool tier1 = self_is_tier1();
+
+    std::vector<GossipPeer> candidates;
+    {
+        std::lock_guard lock(peers_mutex_);
+        for (const auto& p : peers_) {
+            if (p.certificate_json.empty() || p.backbone_ip.empty() || p.mesh_pubkey.empty()) continue;
+            // With a dataplane attached, wait until it holds the peer; without
+            // one (an in-process stack wired directly) the route exists already.
+            if (boringtun_ && !backbone_peers_added_.count(p.mesh_pubkey + "|" + p.backbone_ip)) {
+                continue;
+            }
+            candidates.push_back(p);
+        }
+    }
+    // Tier 1 offers its state to every server; Tier 2 reports its state to
+    // Tier 1 only, for status (Tier 1 never pulls from Tier 2).
+    std::vector<GossipPeer> targets;
+    for (auto& p : candidates) {
+        if (tier1 || is_tier1(p.pubkey)) targets.push_back(std::move(p));
+    }
+    if (targets.empty()) return;
+
+    // Each page must fit one gossip packet in one virtual UDP datagram.
+    const std::size_t budget = network::VirtualNetService::max_udp_payload() -
+                               kGossipHeaderSize - kGossipSignatureSize;
+    const auto pages = sync::encode_digest_pages(kDnsSyncStream, dns_replica_->digest(),
+                                                 ++dns_digest_round_, budget);
+    if (pages.empty()) {
+        spdlog::warn("[{}] DNS digest does not fit {} pages; not sent", name(),
+                     sync::kMaxDigestPages);
+        return;
+    }
+    for (const auto& page : pages) {
+        const auto packed = json::to_msgpack(page);
+        const std::vector<uint8_t> payload(packed.begin(), packed.end());
+        for (const auto& p : targets) (void)send_backbone_packet(p, GossipMsgType::SyncDigest, payload);
+    }
+}
+
+void GossipService::handle_sync_digest(const asio::ip::udp::endpoint& sender,
+                                       const std::string& sender_pubkey,
+                                       const uint8_t* payload, std::size_t payload_len, Via via) {
+    if (!dns_replica_ || !backbone_sender_verified(sender, sender_pubkey, via, "SyncDigest")) return;
+    const bool sender_tier1 = is_tier1(sender_pubkey);
+    if (!sender_tier1 && !self_is_tier1()) {
+        deny_sync(sender, sender_pubkey, "SyncDigest", "digests flow from or to Tier 1 only");
+        return;
+    }
+    try {
+        const auto page = sync::decode_digest_page(json::from_msgpack(payload, payload + payload_len));
+        if (!page) {
+            spdlog::warn("[{}] malformed SyncDigest from {}", name(), sender.address().to_string());
+            return;
+        }
+        if (page->stream != kDnsSyncStream) return;
+
+        if (dns_replica_->record_peer_digest_page(sender_pubkey, *page, unix_ms())) {
+            const auto status = dns_replica_->peer_status()[sender_pubkey];
+            const char* role = sender_tier1 ? "Tier 1" : "Tier 2";
+            if (status.in_sync) {
+                spdlog::info("[{}] DNS in sync with {} peer {}", name(), role,
+                             sender_pubkey.substr(0, 12));
+            } else {
+                spdlog::info("[{}] DNS out of sync with {} peer {}: we lack {} origin(s), "
+                             "peer lacks {}", name(), role, sender_pubkey.substr(0, 12),
+                             status.origins_we_lack, status.origins_peer_lacks);
+            }
+        }
+
+        // Records are pulled only from Tier 1. A Tier 2 digest is status.
+        if (!sender_tier1) return;
+        const auto requests = dns_replica_->plan_catch_up(page->origins);
+        const auto peer = find_peer_by_pubkey(sender_pubkey);
+        if (requests.empty() || !peer) return;
+        const auto req = json::to_msgpack(sync::encode_catch_up(kDnsSyncStream, requests));
+        (void)send_backbone_packet(*peer, GossipMsgType::SyncRequest,
+                                   std::vector<uint8_t>(req.begin(), req.end()));
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse SyncDigest from {}: {}", name(),
+                     sender.address().to_string(), e.what());
+    }
+}
+
+void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
+                                        const std::string& sender_pubkey,
+                                        const uint8_t* payload, std::size_t payload_len, Via via) {
+    if (!dns_replica_ || !backbone_sender_verified(sender, sender_pubkey, via, "SyncRequest")) return;
+    // Any certified server may catch up, but only from Tier 1.
+    if (!self_is_tier1()) {
+        deny_sync(sender, sender_pubkey, "SyncRequest", "only Tier 1 serves catch-up");
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (auto it = sync_request_served_.find(sender_pubkey);
+        it != sync_request_served_.end() && now - it->second < kSyncRequestMinInterval) {
+        return;
+    }
+    try {
+        const auto decoded = sync::decode_catch_up(json::from_msgpack(payload, payload + payload_len));
+        if (!decoded) {
+            spdlog::warn("[{}] malformed SyncRequest from {}", name(), sender.address().to_string());
+            return;
+        }
+        if (decoded->first != kDnsSyncStream) return;
+        const auto peer = find_peer_by_pubkey(sender_pubkey);
+        if (!peer) return;
+        sync_request_served_[sender_pubkey] = now;
+
+        // Entries are replayed with their origin signatures intact; the
+        // receiver verifies each exactly as a live update.
+        std::size_t sent = 0;
+        for (const auto& req : decoded->second) {
+            if (sent >= kSyncMaxEntriesPerRequest) break;
+            for (const auto& e : dns_replica_->entries_since(req.origin, req.since,
+                                                             kSyncMaxEntriesPerRequest - sent)) {
+                auto j = json::from_msgpack(e.payload);
+                j["catch_up"] = true;
+                const auto bytes = json::to_msgpack(j);
+                (void)send_backbone_packet(*peer, GossipMsgType::DnsRecordSync,
+                                           std::vector<uint8_t>(bytes.begin(), bytes.end()));
+                ++sent;
+            }
+        }
+        spdlog::debug("[{}] served {} DNS catch-up entr{} to {}", name(), sent,
+                      sent == 1 ? "y" : "ies", sender_pubkey.substr(0, 12));
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to parse SyncRequest from {}: {}", name(),
+                     sender.address().to_string(), e.what());
+    }
+}
+
+nlohmann::json GossipService::dns_sync_status() const {
+    json out;
+    out["tier1"]          = self_is_tier1();
+    out["backbone_ip"]    = our_backbone_ip();
+    out["backbone_bound"] = backbone_bound_.load();
+
+    json origins = json::array();
+    std::map<std::string, sync::PeerSyncStatus> status;
+    if (dns_replica_) {
+        for (const auto& [origin, s] : dns_replica_->digest()) {
+            origins.push_back({{"origin", origin}, {"max_seq", s.max_seq}, {"count", s.count}});
+        }
+        status = dns_replica_->peer_status();
+    }
+    out["origins"] = std::move(origins);
+
+    // The membership source reaches into the security layer, so it is
+    // consulted outside peers_mutex_.
+    std::vector<std::pair<GossipPeer, bool>> snapshot;
+    {
+        std::lock_guard lock(peers_mutex_);
+        for (const auto& p : peers_) {
+            if (p.certificate_json.empty()) continue;
+            snapshot.emplace_back(
+                p, backbone_peers_added_.count(p.mesh_pubkey + "|" + p.backbone_ip) > 0);
+        }
+    }
+    json peers = json::array();
+    for (const auto& [p, backbone_peer] : snapshot) {
+        json e;
+        e["pubkey"]          = p.pubkey;
+        e["tier1"]           = is_tier1(p.pubkey);
+        e["backbone_ip"]     = p.backbone_ip;
+        e["mesh_key_known"]  = !p.mesh_pubkey.empty();
+        e["backbone_peer"]   = backbone_peer;
+        if (auto it = status.find(p.pubkey); it != status.end()) {
+            e["in_sync"]            = it->second.in_sync;
+            e["origins_we_lack"]    = it->second.origins_we_lack;
+            e["origins_peer_lacks"] = it->second.origins_peer_lacks;
+            e["last_digest_ms"]     = it->second.last_digest_ms;
+        } else {
+            e["in_sync"] = false;
+        }
+        peers.push_back(std::move(e));
+    }
+    out["peers"] = std::move(peers);
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -3816,20 +4475,24 @@ void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
     security_sink_(sender, std::span<const uint8_t>{payload, len});
 }
 
+bool GossipService::own_certificate_valid() const {
+    const auto b64 = crypto::to_base64(keypair_.public_key);
+    std::lock_guard lock(peers_mutex_);
+    if (!has_root_pubkey_ || is_revoked(b64) || !our_certificate_) return false;
+    try {
+        return our_certificate_->server_pubkey == b64 && verify_cert_core(*our_certificate_);
+    } catch (...) {
+        return false;
+    }
+}
+
 bool GossipService::peer_is_root_certified(const security::NodeId& peer) const {
     const auto b64 = crypto::to_base64(peer.bytes);
     if (peer.bytes == keypair_.public_key) {
         // The peers table never lists this node; its own loaded certificate
         // answers for it under the same rules, or every node computes an
         // eligibility state no other node can agree with.
-        std::lock_guard lock(peers_mutex_);
-        if (!has_root_pubkey_ || is_revoked(b64) || !our_certificate_) return false;
-        try {
-            return our_certificate_->server_pubkey == b64 &&
-                   verify_cert_core(*our_certificate_);
-        } catch (...) {
-            return false;
-        }
+        return own_certificate_valid();
     }
     return peer_certificate_is_root_signed(b64);
 }
