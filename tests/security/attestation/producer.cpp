@@ -177,11 +177,12 @@ TEST_F(PlatformEvidenceProducerTest, VerifierPassesEveryBindingCheck) {
     EXPECT_EQ(again.evidence_digest, verdict.evidence_digest);
 
 #ifndef LEMONADE_HAVE_TPM_FAPI
-    // This build has no platform path: the bundle is empty and the platform
-    // chain rejects it as garbage.
+    // This build has no platform path: the bundle is empty and, with no
+    // activation record, the verifier refuses at the enrollment gate before
+    // any platform parsing.
     EXPECT_FALSE(producer.platform_available());
     EXPECT_TRUE(platform_evidence_empty(evidence->platform));
-    EXPECT_EQ(verdict.failure, AttestationFailure::SnpInvalid);
+    EXPECT_EQ(verdict.failure, AttestationFailure::ActivationRequired);
 #endif
 }
 
