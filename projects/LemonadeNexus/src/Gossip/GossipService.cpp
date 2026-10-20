@@ -409,7 +409,7 @@ void GossipService::do_send_digest(const GossipPeer& peer) {
     std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
 
     send_packet(*target, GossipMsgType::Digest, payload);
-    spdlog::debug("[{}] sent digest to {} (pos={}, generation={})",
+    spdlog::trace("[{}] sent digest to {} (pos={}, generation={})",
                    name(), peer.endpoint, latest_pos, generation.substr(0, 8));
 }
 
@@ -3110,11 +3110,22 @@ void GossipService::try_claim_ns_slot(const std::string& our_public_ip) {
                 const auto now = static_cast<uint64_t>(
                     chrono::system_clock::to_time_t(chrono::system_clock::now()));
 
+                // Peers reject a same-holder renewal at or below their accepted
+                // timestamp, so a renewal must advance strictly even against a
+                // same-second or rolled-back wall clock. At UINT64_MAX no larger
+                // value exists: fail closed, leaving the accepted claim untouched.
+                if (s.timestamp == UINT64_MAX) {
+                    spdlog::warn("[{}] NS slot ns{} renewal refused — held timestamp is "
+                                 "at UINT64_MAX and cannot be advanced (fail closed)",
+                                 name(), slot);
+                    return;
+                }
+
                 claim.slot          = slot;
                 claim.server_pubkey = our_pubkey_b64;
                 claim.server_ip     = our_public_ip;
                 claim.region        = our_region_;
-                claim.timestamp     = now;
+                claim.timestamp     = (now > s.timestamp + 1) ? now : (s.timestamp + 1);
                 claim.pinned        = true;
                 sign_ns_claim(claim);
 
@@ -3464,8 +3475,25 @@ void GossipService::handle_ns_slot_claim(const asio::ip::udp::endpoint& sender,
                               name(), claim.slot, claim.server_pubkey, claim.server_ip,
                               claim.region, claim.pinned);
             } else if (existing.server_pubkey == claim.server_pubkey) {
-                // Idempotent renewal by the current holder: refresh
-                // ip/region/timestamp.
+                // Idempotent renewal by the current holder: refresh ip/region/timestamp,
+                // but only with a strictly greater timestamp. An older or equal claim is
+                // a replayed or conflicting renewal and would roll back an accepted
+                // cutover; the holder always advances strictly (try_claim_ns_slot).
+                // Residual: legacy equal-timestamp pairs can still diverge first-wins
+                // across peers; a full fix needs a sequence in the signed preimage.
+                if (claim.timestamp <= existing.timestamp) {
+                    if (denial_log_allowed(
+                            "ns-claim-stale|ns" + std::to_string(claim.slot) + "|" +
+                                claim.server_pubkey + "|" + sender.address().to_string(),
+                            std::chrono::steady_clock::now()))
+                        spdlog::warn("[{}] rejected stale/conflicting NS slot renewal "
+                                     "for ns{} from holder {} — claim ts {} not greater "
+                                     "than accepted ts {} (replay or equal-version "
+                                     "conflict)",
+                                     name(), claim.slot, claim.server_pubkey,
+                                     claim.timestamp, existing.timestamp);
+                    return;
+                }
                 existing = claim;
                 accepted_claim = claim;
                 accepted = true;
@@ -3732,7 +3760,21 @@ void GossipService::handle_security_envelope(const uint8_t* sender_pubkey,
 }
 
 bool GossipService::peer_is_root_certified(const security::NodeId& peer) const {
-    return peer_certificate_is_root_signed(crypto::to_base64(peer.bytes));
+    const auto b64 = crypto::to_base64(peer.bytes);
+    if (peer.bytes == keypair_.public_key) {
+        // The peers table never lists this node; its own loaded certificate
+        // answers for it under the same rules, or every node computes an
+        // eligibility state no other node can agree with.
+        std::lock_guard lock(peers_mutex_);
+        if (!has_root_pubkey_ || is_revoked(b64) || !our_certificate_) return false;
+        try {
+            return our_certificate_->server_pubkey == b64 &&
+                   verify_cert_core(*our_certificate_);
+        } catch (...) {
+            return false;
+        }
+    }
+    return peer_certificate_is_root_signed(b64);
 }
 
 bool GossipService::send_to(const security::NodeId& peer,
