@@ -41,10 +41,12 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace nexus;
@@ -622,6 +624,61 @@ TEST_F(GossipIngressSecurityTest, ServerHelloRequiresProofOfPossession) {
     EXPECT_FALSE(a.peer_cert_json(holder_b64).empty());
     EXPECT_TRUE(a.certified_peer(holder_b64));
     EXPECT_FALSE(a.has_peer(replayer_b64));
+}
+
+// (5e) Tracked #6: a stale stored endpoint is not permanent. A direct hello
+// whose packet signer IS the certificate identity refreshes the stored
+// endpoint from its advertisement. Hostile control first: the same bytes
+// replayed by a third party fail proof-of-possession and move nothing — the
+// refresh is reachable only through the authenticated path.
+TEST_F(GossipIngressSecurityTest, AuthenticatedHelloRefreshesAStaleStoredEndpoint) {
+    auto root_kp  = kc->ed25519_keygen();
+    auto holder   = kc->ed25519_keygen();
+    auto replayer = kc->ed25519_keygen();
+    const auto holder_b64 = crypto::to_base64(holder.public_key);
+    const auto cert_json  = issue_cert(holder_b64, "peer-holder", root_kp);
+
+    // Onboarded with an endpoint that is now dead.
+    const std::string stale = "203.0.113.9:9102";
+    const std::string fresh = "198.51.100.66:9102";
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_peers(*n.storage, nlohmann::json::array({
+                peer_entry(holder_b64, stale, cert_json)}));
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+        });
+
+    const auto a_view = [&] {
+        for (const auto& p : a.gossip->get_peers())
+            if (p.pubkey == holder_b64) return p;
+        return gossip::GossipPeer{};
+    };
+    ASSERT_EQ(a_view().endpoint, stale);
+
+    auto hello = nlohmann::json::parse(cert_json);
+    hello["advertised_endpoint"] = fresh;
+
+    // Replayed by a key that is not the certificate identity: refused
+    // upstream, the stored endpoint does not move.
+    inject(build_packet(replayer, gossip::GossipMsgType::ServerHello,
+                        bytes_of(hello.dump())),
+           a);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_EQ(a_view().endpoint, stale);
+
+    // Control: the holder itself advertises its new address.
+    inject(build_packet(holder, gossip::GossipMsgType::ServerHello,
+                        bytes_of(hello.dump())),
+           a);
+    ASSERT_TRUE(pump_until([&] { return a_view().endpoint == fresh; }));
+    EXPECT_EQ(a_view().advertised_endpoint, fresh);
+    // The advertisement did not match the observed UDP source, so it stays
+    // unconfirmed for third-party relay.
+    EXPECT_FALSE(a_view().advertised_confirmed);
 }
 
 // ---------------------------------------------------------------------------
@@ -2449,4 +2506,50 @@ TEST_F(GossipIngressSecurityTest, PeerExchangeRequestIntroducesUnseenPeerFromHub
     for (const auto& p : a.gossip->get_peers()) {
         if (p.pubkey == b64_c) ASSERT_EQ(p.endpoint, c.endpoint());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Socket ownership and send observability (tracked #7, #9)
+// ---------------------------------------------------------------------------
+
+// Tracked #7: the service owns its socket buffer sizing instead of inheriting
+// kernel defaults. 8 MiB is requested; the OS may clamp, so the assertion
+// pins the floor the service guarantees itself on every platform.
+TEST_F(GossipIngressSecurityTest, SocketBuffersAreRaisedAtOpen) {
+    auto& a = make_node("a");
+    const auto [rcv, snd] = gossip::GossipBallotTestAccess::socket_buffers(*a.gossip);
+    EXPECT_GE(rcv, 4 * 65536);
+    EXPECT_GE(snd, 2 * 65536);
+}
+
+// Tracked #9 (gossip half): send failures warn rate-limited per destination —
+// the first logs immediately, repeats within 60 s are counted, and the next
+// log carries the suppressed count. Driven with synthetic clocks through the
+// same seam pattern as the denial-log limiter.
+TEST_F(GossipIngressSecurityTest, SendFailureWarnsAreRateLimitedPerDestination) {
+    auto& a = make_node("a");
+    using T = std::chrono::steady_clock;
+    const auto t0 = T::now();
+    const auto due = [&](const std::string& dest, T::time_point t) {
+        return gossip::GossipBallotTestAccess::send_fail_log_due(*a.gossip, dest, t);
+    };
+
+    // First failure logs immediately, nothing suppressed yet.
+    auto first = due("10.0.0.1:9102", t0);
+    ASSERT_TRUE(first.has_value());
+    EXPECT_EQ(*first, 0u);
+
+    // Repeats within the window are counted, not logged.
+    EXPECT_FALSE(due("10.0.0.1:9102", t0 + std::chrono::seconds(10)).has_value());
+    EXPECT_FALSE(due("10.0.0.1:9102", t0 + std::chrono::seconds(20)).has_value());
+
+    // Another destination is independent.
+    auto other = due("10.0.0.2:9102", t0 + std::chrono::seconds(20));
+    ASSERT_TRUE(other.has_value());
+    EXPECT_EQ(*other, 0u);
+
+    // Past the window: the next failure logs and carries the suppressed count.
+    auto summary = due("10.0.0.1:9102", t0 + std::chrono::seconds(61));
+    ASSERT_TRUE(summary.has_value());
+    EXPECT_EQ(*summary, 2u);
 }

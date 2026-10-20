@@ -157,12 +157,23 @@ GossipService::GossipService(asio::io_context& io, uint16_t port,
     , crypto_{crypto}
     , port_{port}
 {
-    // A security envelope can approach the datagram limit. The default
-    // socket buffers on some platforms (macOS: 9 KiB send) reject such a
-    // datagram at the kernel, so both buffers are raised to the packet size.
+    // Tracked #7: kernel-default buffers (~212 KiB rcv on Linux) drop
+    // concurrent ~110 KiB evidence bursts wholesale, so the service owns its
+    // sizing (8 MiB each). BSD kernels FAIL an oversized request instead of
+    // clamping, so fall back to the packet-sized minimum (macOS default send
+    // is 9 KiB). Never fatal: the granted sizes are logged.
+    constexpr int kSocketBufBytes = 8 * 1024 * 1024;
     asio::error_code ec;
-    socket_.set_option(asio::socket_base::send_buffer_size(2 * 65536), ec);
-    socket_.set_option(asio::socket_base::receive_buffer_size(4 * 65536), ec);
+    socket_.set_option(asio::socket_base::send_buffer_size(kSocketBufBytes), ec);
+    if (ec) socket_.set_option(asio::socket_base::send_buffer_size(2 * 65536), ec);
+    socket_.set_option(asio::socket_base::receive_buffer_size(kSocketBufBytes), ec);
+    if (ec) socket_.set_option(asio::socket_base::receive_buffer_size(4 * 65536), ec);
+    asio::socket_base::send_buffer_size snd{};
+    asio::socket_base::receive_buffer_size rcv{};
+    socket_.get_option(snd, ec);
+    socket_.get_option(rcv, ec);
+    spdlog::info("[{}] UDP socket buffers: requested {} bytes, granted rcv {} / snd {}",
+                 name(), kSocketBufBytes, rcv.value(), snd.value());
 }
 
 void GossipService::set_root_pubkey(const crypto::Ed25519PublicKey& pk) {
@@ -1833,10 +1844,11 @@ void GossipService::send_packet(const asio::ip::udp::endpoint& target,
     socket_.async_send_to(
         asio::buffer(*send_buf), target,
         [send_buf, this, target](const asio::error_code& ec, std::size_t /*bytes*/) {
+            // Tracked #9: rate-limited per destination; only failures pay.
             if (ec) {
-                spdlog::warn("[{}] failed to send to {}:{}: {}",
-                              name(), target.address().to_string(),
-                              target.port(), ec.message());
+                note_send_failure(target.address().to_string() + ":" +
+                                      std::to_string(target.port()),
+                                  ec.message());
             }
         });
 }
@@ -2449,6 +2461,16 @@ void GossipService::handle_server_hello(const asio::ip::udp::endpoint& sender,
                 it->certificate_json = j.dump();
                 it->region = j.value("region", "");
                 if (!advertised.empty()) {
+                    // Tracked #6: an authenticated direct hello (PoP enforced
+                    // above) refreshes a stale stored endpoint — otherwise a
+                    // bad advertisement persists forever. Relayed data never
+                    // reaches here: peer exchange only adds unknown peers.
+                    if (it->endpoint != advertised) {
+                        spdlog::info("[{}] peer {} endpoint refreshed by "
+                                     "authenticated hello: {} -> {}",
+                                     name(), cert.server_id, it->endpoint, advertised);
+                        it->endpoint = advertised;
+                    }
                     it->advertised_endpoint  = advertised;
                     it->advertised_confirmed = advertised_confirmed;
                 }
@@ -3629,6 +3651,41 @@ bool GossipService::denial_log_allowed(const std::string& key,
     return true;
 }
 
+std::optional<std::uint64_t> GossipService::send_fail_log_due(
+        const std::string& dest, std::chrono::steady_clock::time_point now) {
+    std::lock_guard lock(send_fail_mutex_);
+    // Bound the map: prune quiet destinations once it grows past the cap.
+    if (send_fail_.size() > 512) {
+        for (auto it = send_fail_.begin(); it != send_fail_.end();) {
+            if (now - it->second.last_log > std::chrono::seconds(60))
+                it = send_fail_.erase(it);
+            else
+                ++it;
+        }
+    }
+    auto& st = send_fail_[dest];
+    if (st.last_log != std::chrono::steady_clock::time_point{} &&
+        now - st.last_log < std::chrono::seconds(60)) {
+        ++st.suppressed;
+        return std::nullopt;
+    }
+    const auto suppressed = st.suppressed;
+    st.last_log = now;
+    st.suppressed = 0;
+    return suppressed;
+}
+
+void GossipService::note_send_failure(const std::string& dest, const std::string& error) {
+    const auto due = send_fail_log_due(dest, std::chrono::steady_clock::now());
+    if (!due) return;
+    if (*due > 0) {
+        spdlog::warn("[{}] send to {} failed: {} ({} earlier failure(s) suppressed "
+                     "in the last 60 s)", name(), dest, error, *due);
+    } else {
+        spdlog::warn("[{}] send to {} failed: {}", name(), dest, error);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Security transport (ISecurityTransport)
 // ---------------------------------------------------------------------------
@@ -3779,11 +3836,20 @@ bool GossipService::peer_is_root_certified(const security::NodeId& peer) const {
 
 bool GossipService::send_to(const security::NodeId& peer,
                             std::span<const uint8_t> envelope) {
-    if (envelope.size() > security::constants::kMaxSecurityMessageBytes) return false;
+    if (envelope.size() > security::constants::kMaxSecurityMessageBytes) {
+        note_send_failure(crypto::to_base64(peer.bytes),
+                          "envelope exceeds the security message bound");
+        return false;
+    }
     if (peer.bytes == keypair_.public_key) return false;
 
+    const auto peer_b64 = crypto::to_base64(peer.bytes);
     asio::ip::udp::endpoint target;
-    if (!find_peer_endpoint_by_pubkey(crypto::to_base64(peer.bytes), target)) return false;
+    if (!find_peer_endpoint_by_pubkey(peer_b64, target)) {
+        // Tracked #9: callers rarely check the bool; record the drop here.
+        note_send_failure(peer_b64, "no usable endpoint for peer");
+        return false;
+    }
 
     send_packet(target, GossipMsgType::SecurityEnvelope,
                 std::vector<uint8_t>(envelope.begin(), envelope.end()));
