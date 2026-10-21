@@ -428,11 +428,6 @@ void GossipService::do_remove_peer(std::string_view pubkey) {
 }
 
 void GossipService::do_send_digest(const GossipPeer& peer) {
-    auto target = parse_endpoint(peer.endpoint);
-    if (!target) {
-        spdlog::warn("[{}] invalid peer endpoint: {}", name(), peer.endpoint);
-        return;
-    }
 
     std::string generation;
     std::uint64_t latest_pos = 0;
@@ -455,9 +450,13 @@ void GossipService::do_send_digest(const GossipPeer& peer) {
     auto payload_str = digest.dump();
     std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
 
-    send_packet(*target, GossipMsgType::Digest, payload);
+    if (!send_backbone_packet(peer, GossipMsgType::Digest, payload)) {
+        spdlog::trace("[{}] no backbone path to {}; digest not sent", name(),
+                      peer.pubkey.substr(0, 12));
+        return;
+    }
     spdlog::trace("[{}] sent digest to {} (pos={}, generation={})",
-                   name(), peer.endpoint, latest_pos, generation.substr(0, 8));
+                   name(), peer.backbone_ip, latest_pos, generation.substr(0, 8));
 }
 
 void GossipService::do_handle_digest(const GossipPeer& peer, uint64_t their_pos,
@@ -503,7 +502,7 @@ void GossipService::do_handle_digest(const GossipPeer& peer, uint64_t their_pos,
 
     spdlog::debug("[{}] digest from {} (their_pos={}, generation={})",
                    name(), peer.endpoint, their_pos, their_generation.substr(0, 8));
-    maybe_request_from(peer.pubkey, peer.endpoint, from_pos);
+    maybe_request_from(peer.pubkey, from_pos);
 }
 
 // ---------------------------------------------------------------------------
@@ -939,11 +938,11 @@ GossipService::Admission GossipService::admit_received_record(const nlohmann::js
     }
 }
 
-void GossipService::maybe_request_from(const std::string& peer_pubkey,
-                                        std::string_view endpoint, uint64_t from_pos) {
+void GossipService::maybe_request_from(const std::string& peer_pubkey, uint64_t from_pos) {
     if (peer_pubkey.empty()) return;
-    auto target = parse_endpoint(endpoint);
-    if (!target) return;
+    // Requests go over the backbone; without a path, no slot is taken.
+    const auto peer = find_peer_by_pubkey(peer_pubkey);
+    if (!peer || !backbone_path_ready(*peer)) return;
 
     bool will_send = false;
     std::uint64_t nonce = 0;
@@ -981,7 +980,11 @@ void GossipService::maybe_request_from(const std::string& peer_pubkey,
     request["from_pos"] = from_pos;
     auto s = request.dump();
     std::vector<uint8_t> payload(s.begin(), s.end());
-    send_packet(*target, GossipMsgType::DeltaRequest, payload);
+    if (!send_backbone_packet(*peer, GossipMsgType::DeltaRequest, payload)) {
+        // The slot expires at its deadline like an unanswered request.
+        spdlog::debug("[{}] delta request to {} not sent", name(), peer_pubkey);
+        return;
+    }
     spdlog::debug("[{}] delta request to {} (nonce={}, from_pos={})",
                    name(), peer_pubkey, nonce, from_pos);
 }
@@ -1128,13 +1131,29 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
     const auto* payload = data + kGossipHeaderSize;
     const auto payload_len = header.payload_length;
 
-    // The backbone carries catch-up sync only. Everything else keeps its
+    // Replicated state that exposes members (tree records, account
+    // envelopes) and catch-up sync travel only on the encrypted backbone;
+    // they are refused on the public socket. Everything else keeps its
     // public path, where its existing gates were designed.
-    if (via == Via::Backbone &&
-        header.msg_type != GossipMsgType::SyncDigest &&
-        header.msg_type != GossipMsgType::SyncRequest &&
-        header.msg_type != GossipMsgType::DnsRecordSync &&
-        header.msg_type != GossipMsgType::AccountEnvelopeSync) {
+    const bool backbone_only =
+        header.msg_type == GossipMsgType::Digest ||
+        header.msg_type == GossipMsgType::DeltaRequest ||
+        header.msg_type == GossipMsgType::DeltaResponse ||
+        header.msg_type == GossipMsgType::SyncDigest ||
+        header.msg_type == GossipMsgType::SyncRequest ||
+        header.msg_type == GossipMsgType::AccountEnvelopeSync;
+    if (via == Via::Public && backbone_only) {
+        if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
+                               std::chrono::steady_clock::now())) {
+            spdlog::warn("[{}] DENIED type 0x{:02X} from {}:{} on the public socket — "
+                         "accepted only on the backbone", name(),
+                         static_cast<uint8_t>(header.msg_type), from.address().to_string(),
+                         from.port());
+        }
+        return;
+    }
+    if (via == Via::Backbone && !backbone_only &&
+        header.msg_type != GossipMsgType::DnsRecordSync) {
         spdlog::debug("[{}] dropped type 0x{:02X} on the backbone from {}",
                       name(), static_cast<uint8_t>(header.msg_type),
                       from.address().to_string());
@@ -1145,14 +1164,14 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
     switch (header.msg_type) {
         case GossipMsgType::Digest:
             handle_digest_message(from, payload, payload_len,
-                                  sender_pubkey_b64);
+                                  sender_pubkey_b64, via);
             break;
         case GossipMsgType::DeltaRequest:
             handle_delta_request(from, payload, payload_len,
-                                 sender_pubkey_b64);
+                                 sender_pubkey_b64, via);
             break;
         case GossipMsgType::DeltaResponse:
-            handle_delta_response(from, sender_pubkey_b64, payload, payload_len);
+            handle_delta_response(from, sender_pubkey_b64, payload, payload_len, via);
             break;
         case GossipMsgType::AntiEntropy:
             handle_anti_entropy(from, payload, payload_len);
@@ -1207,15 +1226,11 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
 void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
                                             const uint8_t* payload,
                                             std::size_t payload_len,
-                                            const std::string& signer_pubkey) {
+                                            const std::string& signer_pubkey, Via via) {
     // Transport authorization before any transfer state is allocated: an
-    // uncertified digest allocates nothing and triggers no request.
-    if (!peer_certificate_is_root_signed(signer_pubkey)) {
-        spdlog::warn("[{}] DENIED digest from {}:{} — sender is not a "
-                      "cert-verified enrolled peer", name(),
-                      sender.address().to_string(), sender.port());
-        return;
-    }
+    // uncertified digest, or one off the signer's backbone address,
+    // allocates nothing and triggers no request.
+    if (!backbone_sender_verified(sender, signer_pubkey, via, "Digest")) return;
 
     try {
         auto j = json::parse(std::string_view{
@@ -1248,14 +1263,9 @@ void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
 void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
                                            const uint8_t* payload,
                                            std::size_t payload_len,
-                                           const std::string& signer_pubkey) {
+                                           const std::string& signer_pubkey, Via via) {
     // Data-returning path: same transport gate as digest and response.
-    if (!peer_certificate_is_root_signed(signer_pubkey)) {
-        spdlog::warn("[{}] DENIED delta request from {}:{} — sender is not a "
-                      "cert-verified enrolled peer", name(),
-                      sender.address().to_string(), sender.port());
-        return;
-    }
+    if (!backbone_sender_verified(sender, signer_pubkey, via, "DeltaRequest")) return;
 
     std::uint64_t nonce = 0, from_pos = 0;
     try {
@@ -1379,7 +1389,10 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
         test_max_page_bytes_ = payload_str.size();
     }
     std::vector<uint8_t> pkt(payload_str.begin(), payload_str.end());
-    send_packet(sender, GossipMsgType::DeltaResponse, pkt);
+    // The request arrived on the backbone from the requester's backbone
+    // address, so the page goes back the same way.
+    (void)send_backbone_to(sender.address().to_string(), sender.port(),
+                           GossipMsgType::DeltaResponse, pkt);
     spdlog::debug("[{}] delta page served to {} (from_pos={}, latest_pos={}, failed={})",
                    name(), signer_pubkey, from_pos, latest_pos, page_failed);
 }
@@ -1387,17 +1400,13 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
 void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
                                             const std::string& sender_pubkey,
                                             const uint8_t* payload,
-                                            std::size_t payload_len) {
+                                            std::size_t payload_len, Via via) {
     // Fail-closed gate, no tokens: state-mutating gossip ingress requires the
-    // packet signer to be an enrolled peer with a root-signed certificate.
-    // Gossip is Tier-2 transport and never decides Tier 1 — that authority
-    // lives in the security plane (SecurityEnvelope → SecurityRouter).
-    if (!peer_certificate_is_root_signed(sender_pubkey)) {
-        spdlog::warn("[{}] DENIED delta response from {}:{} — sender is not a "
-                      "cert-verified enrolled peer", name(),
-                      sender.address().to_string(), sender.port());
-        return;
-    }
+    // packet signer to be an enrolled peer with a root-signed certificate,
+    // sending from its own backbone address. Gossip is Tier-2 transport and
+    // never decides Tier 1 — that authority lives in the security plane
+    // (SecurityEnvelope → SecurityRouter).
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "DeltaResponse")) return;
 
     try {
         // The receive side enforces the page bounds itself: a hostile or
@@ -1584,12 +1593,7 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
                 next_cursor = it->second.cursor;
             }
         }
-        if (auto peer_opt = find_peer_by_pubkey(sender_pubkey)) {
-            ep = peer_opt->endpoint;
-        } else {
-            ep = sender.address().to_string() + ":" + std::to_string(sender.port());
-        }
-        if (!in_backoff) maybe_request_from(sender_pubkey, ep, next_cursor);
+        if (!in_backoff) maybe_request_from(sender_pubkey, next_cursor);
     }
 
         spdlog::info("[{}] delta page from {}: {} record(s), cursor now {} (latest {})",
@@ -1876,15 +1880,21 @@ void GossipService::on_gossip_tick() {
     {
         std::lock_guard lock(peers_mutex_);
 
-        if (peers_.empty()) {
+        // Tree digests travel only on the backbone, so pick among peers
+        // with a ready backbone path.
+        std::vector<const GossipPeer*> ready;
+        for (const auto& p : peers_) {
+            if (backbone_path_ready_locked(p)) ready.push_back(&p);
+        }
+        if (ready.empty()) {
             return;
         }
 
         // Pick a random peer
-        std::uniform_int_distribution<std::size_t> dist(0, peers_.size() - 1);
+        std::uniform_int_distribution<std::size_t> dist(0, ready.size() - 1);
         {
             std::lock_guard rng_lock(rng_mutex_);
-            chosen = peers_[dist(rng_)];
+            chosen = *ready[dist(rng_)];
         }
     }
 
@@ -1964,6 +1974,13 @@ bool GossipService::send_backbone_packet(const GossipPeer& peer, GossipMsgType m
     } catch (...) {
         return false;
     }
+    return send_backbone_to(peer.backbone_ip, dst_port, msg_type, payload);
+}
+
+bool GossipService::send_backbone_to(const std::string& dst_ip, uint16_t dst_port,
+                                     GossipMsgType msg_type,
+                                     const std::vector<uint8_t>& payload) {
+    if (!vnet_ || !backbone_bound_.load() || dst_ip.empty() || dst_port == 0) return false;
     std::string src_ip;
     {
         std::lock_guard lock(mesh_state_mutex_);
@@ -1980,7 +1997,7 @@ bool GossipService::send_backbone_packet(const GossipPeer& peer, GossipMsgType m
     asio::error_code ec;
     const uint16_t src_port = socket_.local_endpoint(ec).port();
     if (ec) return false;
-    return vnet_->send_udp(src_ip, src_port, peer.backbone_ip, dst_port, packet);
+    return vnet_->send_udp(src_ip, src_port, dst_ip, dst_port, packet);
 }
 
 // ---------------------------------------------------------------------------
@@ -3549,18 +3566,24 @@ void GossipService::deny_sync(const asio::ip::udp::endpoint& sender,
     }
 }
 
+bool GossipService::backbone_path_ready_locked(const GossipPeer& p) const {
+    if (p.certificate_json.empty() || p.backbone_ip.empty() || p.mesh_pubkey.empty()) return false;
+    // With a dataplane attached, wait until it holds the peer; without one
+    // (an in-process stack wired directly) the route exists already.
+    return !boringtun_ || backbone_peers_added_.count(p.mesh_pubkey + "|" + p.backbone_ip) > 0;
+}
+
+bool GossipService::backbone_path_ready(const GossipPeer& p) const {
+    std::lock_guard lock(peers_mutex_);
+    return backbone_path_ready_locked(p);
+}
+
 std::vector<GossipPeer> GossipService::backbone_targets(bool tier1_only) const {
     std::vector<GossipPeer> candidates;
     {
         std::lock_guard lock(peers_mutex_);
         for (const auto& p : peers_) {
-            if (p.certificate_json.empty() || p.backbone_ip.empty() || p.mesh_pubkey.empty()) continue;
-            // With a dataplane attached, wait until it holds the peer; without
-            // one (an in-process stack wired directly) the route exists already.
-            if (boringtun_ && !backbone_peers_added_.count(p.mesh_pubkey + "|" + p.backbone_ip)) {
-                continue;
-            }
-            candidates.push_back(p);
+            if (backbone_path_ready_locked(p)) candidates.push_back(p);
         }
     }
     if (!tier1_only) return candidates;

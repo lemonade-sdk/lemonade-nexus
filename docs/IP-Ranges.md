@@ -102,6 +102,11 @@ server; Tier 2 servers catch up from Tier 1 and report their sync status to
 Tier 1, but never supply records to it. Two streams use it: DNS records and
 account group-key envelopes.
 
+Permission tree sync (`Digest`, `DeltaRequest`, `DeltaResponse`) also runs
+only on the backbone, between every pair of certified servers with a ready
+backbone path, Tier 1 or Tier 2. A server that has no backbone path to a
+peer exchanges no tree records with it.
+
 Account group-key envelopes (`AccountEnvelopeSync` 0x19) travel only on the
 backbone. A Tier 1 server that accepts an envelope from a device signs it
 with its gossip key and sends it to every certified peer; peers that miss it

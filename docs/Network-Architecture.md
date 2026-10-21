@@ -142,17 +142,32 @@ Server A (us-west)                    Server B (eu-west)
     |     same socket as the client mesh; |
     |     the backbone IP is a second     |
     |     virtual address on the same     |
-    |     dataplane                       |
+    |     dataplane. Carries gossip on    |
+    |     virtual UDP 9102: tree sync,    |
+    |     DNS catch-up, account envelopes |
 ```
 
 Gossip messages are Ed25519-signed. State-mutating gossip ingress requires
 the sender to hold a root-signed, non-revoked peer certificate; the
 authentication binds to the **signer**, never to the NAT-able endpoint.
 
-Gossip and security envelopes are sent to the peer's mesh endpoint
-(advertised `public_ip:gossip_port` when confirmed against the observed
-source, otherwise the observed source). They are not routed through the
-backbone.
+Gossip that replicates member data travels only on the backbone, on virtual
+UDP from one backbone address to the other at the gossip port: permission
+tree sync (`Digest`, `DeltaRequest`, `DeltaResponse`), DNS catch-up
+(`SyncDigest`, `SyncRequest`), and account group-key envelopes
+(`AccountEnvelopeSync`). The BoringTun dataplane encrypts it. A server
+refuses these types on the public socket, and accepts them only from the
+signer's own backbone address. Tree records carry members' mesh public keys,
+tunnel and private addresses, and permission assignments, so they must not
+cross the internet in the clear.
+
+All other gossip and security envelopes are sent to the peer's public
+gossip endpoint (advertised `public_ip:gossip_port` when confirmed against
+the observed source, otherwise the observed source). This includes
+ServerHello, peer exchange, backbone claims, live DNS deltas, ACL deltas and
+NS slot claims, which are signed but not encrypted. A server reaches the
+backbone only after the public exchange gives it the peer's backbone claim
+and mesh key.
 
 ## Security Transport
 

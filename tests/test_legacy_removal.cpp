@@ -444,9 +444,8 @@ TEST_F(LegacyRemovalTest, StateMutatingSyncRequiresRootSignedCertificate) {
     EXPECT_EQ(a.storage->latest_delta_seq(), 0u);
 
     // State-mutating sync ingress under the current protocol: a digest
-    // allocates per-peer transfer session state. The cert gate decides: the
-    // cert-verified sender's digest is admitted; the unenrolled key's
-    // identical digest allocates nothing.
+    // allocates per-peer transfer session state. The unenrolled key's digest
+    // allocates nothing.
     auto digest_bytes = []() {
         nlohmann::json d;
         d["latest_pos"]     = 1u;
@@ -462,12 +461,14 @@ TEST_F(LegacyRemovalTest, StateMutatingSyncRequiresRootSignedCertificate) {
     pump_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(gossip::GossipBallotTestAccess::has_peer_log(*a.gossip, unenrolled_b64))
         << "an unenrolled digest must allocate no transfer state";
+    // Tree sync is accepted only on the backbone, so on the public socket
+    // even the cert-verified sender's digest allocates nothing. The cert
+    // gate on the backbone path is covered by test_gossip_delta_transfer.
     inject(build_packet(*b.crypto, b.gossip->keypair(),
                         gossip::GossipMsgType::Digest, digest_bytes()),
            a);
-    ASSERT_TRUE(pump_until([&] {
-        return gossip::GossipBallotTestAccess::has_peer_log(*a.gossip, b.pubkey_b64());
-    }));
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::has_peer_log(*a.gossip, b.pubkey_b64()));
     EXPECT_EQ(a.storage->latest_delta_seq(), 0u);
 }
 

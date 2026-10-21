@@ -141,8 +141,11 @@ public:
 
     /// Attach the in-process virtual netstack. Once our backbone IP is also
     /// set, gossip binds virtual UDP <backbone_ip>:<gossip port> and carries
-    /// catch-up sync (SyncDigest, SyncRequest, catch-up DnsRecordSync and
-    /// AccountEnvelopeSync) over the encrypted backbone. Tier 1 servers serve catch-up to every
+    /// over the encrypted backbone: permission tree sync (Digest,
+    /// DeltaRequest, DeltaResponse) with every certified peer, catch-up sync
+    /// (SyncDigest, SyncRequest, catch-up DnsRecordSync) and
+    /// AccountEnvelopeSync. Without a backbone path to a peer, no tree
+    /// records move to or from it. Tier 1 servers serve catch-up to every
     /// certified server; Tier 2 servers catch up from Tier 1 and never feed
     /// records back. The netstack must outlive this service's start.
     void set_virtual_net(network::VirtualNetService* vnet);
@@ -269,18 +272,25 @@ private:
                       GossipMsgType msg_type,
                       const std::vector<uint8_t>& payload);
 
+    /// Path a datagram arrived on. Backbone datagrams were decrypted by the
+    /// mesh dataplane from a peer's mesh key. Tree sync, account envelopes and
+    /// catch-up sync are accepted only on the backbone; other types only on
+    /// the public socket, except DnsRecordSync, which uses both.
+    enum class Via { Public, Backbone };
+
     // Message handlers by type. signer_pubkey is the packet-authenticated
     // sender (proven by verify_packet_signature); it is the transport
-    // identity for gating and binding.
+    // identity for gating and binding. Tree sync (digest, request,
+    // response) requires Via::Backbone from the signer's backbone address.
     void handle_digest_message(const asio::ip::udp::endpoint& sender,
                                 const uint8_t* payload, std::size_t payload_len,
-                                const std::string& signer_pubkey);
+                                const std::string& signer_pubkey, Via via);
     void handle_delta_request(const asio::ip::udp::endpoint& sender,
                                const uint8_t* payload, std::size_t payload_len,
-                               const std::string& signer_pubkey);
+                               const std::string& signer_pubkey, Via via);
     void handle_delta_response(const asio::ip::udp::endpoint& sender,
                                 const std::string& sender_pubkey,
-                                const uint8_t* payload, std::size_t payload_len);
+                                const uint8_t* payload, std::size_t payload_len, Via via);
     void handle_anti_entropy(const asio::ip::udp::endpoint& sender,
                               const uint8_t* payload, std::size_t payload_len);
     void handle_peer_exchange(const asio::ip::udp::endpoint& sender,
@@ -361,10 +371,10 @@ private:
     /// all retention refusals; RefusedFinal covers statement defects.
     [[nodiscard]] Admission admit_received_record(const nlohmann::json& record);
 
-    /// Request the next page from a peer, subject to the outstanding rules
-    /// (one per peer, global cap, generation-bound). No-op when not allowed.
-    void maybe_request_from(const std::string& peer_pubkey,
-                            std::string_view endpoint, uint64_t from_pos);
+    /// Request the next page from a peer over the backbone, subject to the
+    /// outstanding rules (one per peer, global cap, generation-bound). No-op
+    /// when not allowed or when the peer has no ready backbone path.
+    void maybe_request_from(const std::string& peer_pubkey, uint64_t from_pos);
 
     /// Retention entry point implementation (publishes through the storage
     /// pool; called for locally applied deltas).
@@ -407,11 +417,6 @@ private:
                            const std::string& sender_pubkey,
                            const uint8_t* payload, std::size_t payload_len);
 
-    /// Path a datagram arrived on. Backbone datagrams were decrypted by the
-    /// mesh dataplane from a peer's mesh key; only sync messages are accepted
-    /// on that path.
-    enum class Via { Public, Backbone };
-
     /// Header, size and signature checks, then dispatch. Shared by the public
     /// socket and the backbone transport so both run identical verification.
     void process_datagram(const uint8_t* data, std::size_t len,
@@ -440,6 +445,12 @@ private:
     /// Certified peers with a ready backbone path. With `tier1_only`, only
     /// current Tier 1 members.
     [[nodiscard]] std::vector<GossipPeer> backbone_targets(bool tier1_only) const;
+
+    /// True when the peer is certified and has a backbone address, a known
+    /// mesh key and, with a dataplane attached, a dataplane peer entry.
+    /// The _locked form requires peers_mutex_.
+    [[nodiscard]] bool backbone_path_ready(const GossipPeer& p) const;
+    [[nodiscard]] bool backbone_path_ready_locked(const GossipPeer& p) const;
 
     /// Replica and entry message type of a named sync stream; nullptr for an
     /// unknown stream.
@@ -498,6 +509,11 @@ private:
     void start_backbone_transport();
     [[nodiscard]] std::vector<uint8_t> build_signed_packet(GossipMsgType msg_type,
                                                            const std::vector<uint8_t>& payload) const;
+    /// Signed packet over virtual UDP from our backbone address and gossip
+    /// port to `dst_ip:dst_port`. False when the backbone is not bound or the
+    /// packet does not fit one datagram.
+    bool send_backbone_to(const std::string& dst_ip, uint16_t dst_port, GossipMsgType msg_type,
+                          const std::vector<uint8_t>& payload);
     bool send_backbone_packet(const GossipPeer& peer, GossipMsgType msg_type,
                               const std::vector<uint8_t>& payload);
     /// Our backbone claim with our mesh key, sent directly to `target`, or to
