@@ -13,6 +13,8 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
+#include <LemonadeNexus/IPAM/IPAMService.hpp>
+#include <LemonadeNexus/Network/VirtualNetService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
@@ -22,6 +24,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -29,6 +32,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <memory>
 #include <span>
 #include <string>
@@ -50,6 +54,10 @@ namespace nexus::gossip {
 // Observation + declared test knobs only.
 struct GossipBallotTestAccess {
     static uint16_t port(GossipService& g) { return g.socket_.local_endpoint().port(); }
+    // Sends this node's backbone claim to every certified peer, as the 300 s
+    // tick does (the harness injects hellos from a throwaway socket, so the
+    // reply-to-hello announcement does not reach the peer).
+    static void announce_backbone(GossipService& g) { g.announce_backbone_claim(std::nullopt); }
     static bool certified(GossipService& g, const std::string& pk) {
         return g.peer_certificate_is_root_signed(pk);
     }
@@ -167,6 +175,13 @@ struct Node {
     std::unique_ptr<storage::FileStorageService>    storage;
     std::unique_ptr<tree::PermissionTreeService>    tree;
     std::unique_ptr<gossip::GossipService>          gossip;
+    // Backbone: tree sync travels only over virtual UDP between backbone
+    // addresses, so each node has an in-process stack and an IPAM table that
+    // records its peers' backbone claims.
+    std::unique_ptr<ipam::IPAMService>              ipam;
+    std::unique_ptr<network::VirtualNetService>     vnet;
+    std::string                                     backbone_ip;
+    uint8_t                                         mesh_fill{0};
 
     [[nodiscard]] const crypto::Ed25519Keypair& keypair() const { return gossip->keypair(); }
     [[nodiscard]] std::string pubkey_b64() const { return crypto::to_base64(keypair().public_key); }
@@ -218,6 +233,10 @@ protected:
     }
 
     void TearDown() override {
+        for (auto& n : nodes) {
+            if (n->vnet) n->vnet->stop();
+        }
+        for (auto& r : raw_backbones) r->vnet->stop();
         for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
             if ((*it)->tree) {
                 (*it)->tree->set_delta_retention_sink(
@@ -234,6 +253,7 @@ protected:
         retired_gossip.clear();
         for (auto it = nodes.rbegin(); it != nodes.rend(); ++it) {
             if ((*it)->tree) (*it)->tree->stop();
+            if ((*it)->ipam) (*it)->ipam->stop();
             (*it)->storage->stop();
             (*it)->crypto->stop();
         }
@@ -291,9 +311,11 @@ protected:
                 });
         }
         n.gossip = std::move(g);
+        n.gossip->set_ipam(n.ipam.get());
         if (configure) configure(*n.gossip);
         if (io.stopped()) io.restart();
         n.gossip->start();
+        attach_backbone(n);
     }
 
     Node& make_node(const std::string& tag,
@@ -317,10 +339,136 @@ protected:
                 return g->retain_local_delta(rec);
             });
         n->gossip->set_tree(n->tree.get());
+        n->ipam = std::make_unique<ipam::IPAMService>(*n->storage);
+        n->ipam->start();
+        n->gossip->set_ipam(n->ipam.get());
         if (configure) configure(*n);
         n->gossip->start();
         nodes.push_back(std::move(n));
+        attach_backbone(*nodes.back());
         return *nodes.back();
+    }
+
+    // Backbone: route each emitted IPv4 packet to the stack that owns its
+    // destination address.
+    std::map<std::string, network::VirtualNetService*> backbone_by_ip;
+
+    // Give the node's current gossip service a backbone address and claim.
+    // The claim reaches each peer after their ServerHello exchange.
+    void attach_backbone(Node& n) {
+        if (!n.vnet) {
+            const auto index = static_cast<unsigned>(backbone_by_ip.size() + 1);
+            n.backbone_ip = "172.16.0." + std::to_string(index);
+            n.mesh_fill = static_cast<uint8_t>(0xA0 + index);
+            n.vnet = std::make_unique<network::VirtualNetService>();
+            n.vnet->start();
+            n.vnet->set_outbound_sink([this](std::span<const uint8_t> p) {
+                if (p.size() < 20) return;
+                const std::string dst = std::to_string(p[16]) + "." + std::to_string(p[17]) +
+                                        "." + std::to_string(p[18]) + "." +
+                                        std::to_string(p[19]);
+                if (auto it = backbone_by_ip.find(dst); it != backbone_by_ip.end()) {
+                    it->second->deliver_inbound_ip_packet(p);
+                }
+            });
+            ASSERT_TRUE(n.vnet->add_local_ip(n.backbone_ip + "/22"));
+            backbone_by_ip[n.backbone_ip] = n.vnet.get();
+        }
+        std::array<uint8_t, crypto::kX25519PublicKeySize> key{};
+        key.fill(n.mesh_fill);
+        n.gossip->set_our_mesh_pubkey(crypto::to_base64(std::span<const uint8_t>(key)));
+        n.gossip->set_our_backbone_claim("node-" + n.backbone_ip, n.backbone_ip);
+        n.gossip->set_virtual_net(n.vnet.get());
+    }
+
+    // True once `n` holds the peer's backbone address and mesh key.
+    bool backbone_known(Node& n, const std::string& pubkey_b64, const std::string& ip) {
+        const auto status = n.gossip->dns_sync_status();
+        for (const auto& p : status["peers"]) {
+            if (p["pubkey"] == pubkey_b64) {
+                return p.value("mesh_key_known", false) &&
+                       p.value("backbone_ip", std::string{}) == ip;
+            }
+        }
+        return false;
+    }
+    bool backbone_known(Node& n, Node& peer) {
+        return backbone_known(n, peer.pubkey_b64(), peer.backbone_ip);
+    }
+
+    // A bare key on the backbone: its own stack at `ip`, with a bound port
+    // that counts what it receives. No gossip service answers on it.
+    struct RawBackbone {
+        std::unique_ptr<network::VirtualNetService> vnet;
+        std::string ip;
+        uint16_t port{40000};
+        std::shared_ptr<std::atomic<int>> received = std::make_shared<std::atomic<int>>(0);
+    };
+    std::vector<std::unique_ptr<RawBackbone>> raw_backbones;
+
+    RawBackbone& raw_backbone(const std::string& ip) {
+        auto r = std::make_unique<RawBackbone>();
+        r->ip = ip;
+        r->vnet = std::make_unique<network::VirtualNetService>();
+        r->vnet->start();
+        r->vnet->set_outbound_sink([this](std::span<const uint8_t> p) {
+            if (p.size() < 20) return;
+            const std::string dst = std::to_string(p[16]) + "." + std::to_string(p[17]) + "." +
+                                    std::to_string(p[18]) + "." + std::to_string(p[19]);
+            if (auto it = backbone_by_ip.find(dst); it != backbone_by_ip.end()) {
+                it->second->deliver_inbound_ip_packet(p);
+            }
+        });
+        EXPECT_TRUE(r->vnet->add_local_ip(ip + "/22"));
+        EXPECT_TRUE(r->vnet->bind_udp(ip, r->port,
+            [count = r->received](uint32_t, uint16_t, std::span<const uint8_t>) { ++*count; }));
+        backbone_by_ip[ip] = r->vnet.get();
+        raw_backbones.push_back(std::move(r));
+        return *raw_backbones.back();
+    }
+
+    // `kp` announces its backbone claim, with its mesh key, straight to `to`
+    // (the public BackboneIpamSync path), and `to` records it. `kp` must
+    // already be a certified peer of `to`.
+    void claim_backbone(const crypto::Ed25519Keypair& kp, const RawBackbone& at, uint8_t fill,
+                        Node& to) {
+        claim_backbone(kp, at.ip, fill, to);
+    }
+    void claim_backbone(const crypto::Ed25519Keypair& kp, const std::string& ip, uint8_t fill,
+                        Node& to) {
+        const auto pk = crypto::to_base64(kp.public_key);
+        json canonical;
+        canonical["backbone_ip"]    = ip + "/32";
+        canonical["delta_id"]       = "claim-" + ip;
+        canonical["operation"]      = "allocate";
+        canonical["server_node_id"] = "node-" + ip;
+        canonical["server_pubkey"]  = pk;
+        canonical["timestamp"]      = uint64_t{1000};
+        const auto text = canonical.dump();
+        json wire = canonical;
+        wire["signer_pubkey"] = pk;
+        wire["signature"] = crypto::to_base64(kc->ed25519_sign(
+            kp.private_key,
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(text.data()), text.size())));
+        std::array<uint8_t, crypto::kX25519PublicKeySize> key{};
+        key.fill(fill);
+        wire["mesh_pubkey"] = crypto::to_base64(std::span<const uint8_t>(key));
+        const auto packed = json::to_msgpack(wire);
+        inject(build_packet(kp, gossip::GossipMsgType::BackboneIpamSync,
+                            std::vector<uint8_t>(packed.begin(), packed.end())),
+               to);
+        ASSERT_TRUE(pump_until([&] { return backbone_known(to, pk, ip); }));
+    }
+
+    void inject_backbone(const std::vector<uint8_t>& pkt, RawBackbone& from, Node& to) {
+        ASSERT_TRUE(from.vnet->send_udp(from.ip, from.port, to.backbone_ip, to.port(), pkt));
+    }
+
+    // A packet sent over the backbone from `from`'s backbone address and
+    // gossip port to `to`, the only path tree sync is accepted on.
+    void inject_backbone(const std::vector<uint8_t>& pkt, Node& from, Node& to) {
+        ASSERT_TRUE(from.vnet->send_udp(from.backbone_ip, from.port(), to.backbone_ip,
+                                        to.port(), pkt));
     }
 
     // Bootstrap a root node that grants the author admin, directly into
@@ -523,6 +671,9 @@ protected:
         pump_for(std::chrono::milliseconds(200));
         EXPECT_TRUE(a.certified_peer(b.pubkey_b64()));
         EXPECT_TRUE(b.certified_peer(a.pubkey_b64()));
+        gossip::GossipBallotTestAccess::announce_backbone(*a.gossip);
+        gossip::GossipBallotTestAccess::announce_backbone(*b.gossip);
+        EXPECT_TRUE(pump_until([&] { return backbone_known(a, b) && backbone_known(b, a); }));
     }
 };
 
@@ -927,7 +1078,10 @@ TEST_F(DeltaTransferTest, DigestFromUncertifiedPeerAllocatesNothingAndRequestsNo
     digest["log_generation"] = "ffffffffffffffffffffffffffffffff";
     digest["peer_count"] = 1;
     digest["timestamp"] = 1000;
-    inject(build_packet(stranger, gossip::GossipMsgType::Digest, bytes_of(digest.dump())), a);
+    // Over the backbone, the only path a digest is accepted on.
+    auto& from = raw_backbone("172.16.0.200");
+    inject_backbone(build_packet(stranger, gossip::GossipMsgType::Digest, bytes_of(digest.dump())),
+                    from, a);
     pump_for(std::chrono::milliseconds(300));
 
     const auto stranger_b64 = crypto::to_base64(stranger.public_key);
@@ -948,21 +1102,19 @@ TEST_F(DeltaTransferTest, DeltaRequestFromUncertifiedPeerReturnsNoData) {
     auto d = signed_delta("create_node", "child-1", child_node("child-1", "root"));
     ASSERT_TRUE(a.tree->apply_delta(d));
 
-    // A request from the stranger's own socket; a response would be answerable
-    // on it.
-    udp::socket raw{io, udp::endpoint{udp::v4(), 0}};
+    // A request over the backbone from the stranger's own bound port; a
+    // response would be answerable on it.
+    auto& from = raw_backbone("172.16.0.200");
     json request;
     request["nonce"] = 7;
     request["from_pos"] = 0;
-    raw.send_to(
-        asio::buffer(build_packet(stranger, gossip::GossipMsgType::DeltaRequest,
-                                  bytes_of(request.dump()))),
-        a.udp_endpoint());
+    inject_backbone(build_packet(stranger, gossip::GossipMsgType::DeltaRequest,
+                                 bytes_of(request.dump())),
+                    from, a);
     pump_for(std::chrono::milliseconds(300));
 
-    // Nothing was sent back (no datagram is pending on the requester's
-    // socket).
-    EXPECT_EQ(raw.available(), 0u) << "an uncertified delta request must receive no data";
+    // Nothing was sent back.
+    EXPECT_EQ(from.received->load(), 0) << "an uncertified delta request must receive no data";
 }
 
 TEST_F(DeltaTransferTest, DeltaResponseFromUncertifiedPeerIsDropped) {
@@ -983,12 +1135,46 @@ TEST_F(DeltaTransferTest, DeltaResponseFromUncertifiedPeerIsDropped) {
     auto rec = record_json(d);
     rec["position"] = 1;
     response["records"] = json::array({rec});
-    inject(build_packet(stranger, gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           a);
+    auto& from = raw_backbone("172.16.0.200");
+    inject_backbone(build_packet(stranger, gossip::GossipMsgType::DeltaResponse,
+                                 bytes_of(response.dump())),
+                    from, a);
     pump_for(std::chrono::milliseconds(300));
 
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip), 0u);
+}
+
+// Tree records name members' mesh keys, addresses and permissions, so tree
+// sync travels only on the encrypted backbone. A certified peer's digest is
+// refused on the public socket and from another server's backbone address,
+// and accepted from its own backbone address.
+TEST_F(DeltaTransferTest, TreeSyncIsAcceptedOnlyFromTheSendersBackboneAddress) {
+    auto root_kp = kc->ed25519_keygen();
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    auto& c = make_node("c");
+    make_certified_pair(a, b, root_kp);
+    make_certified_pair(c, b, root_kp);
+    auto d = signed_delta("create_node", "child-1", child_node("child-1", "root"));
+    ASSERT_TRUE(a.tree->apply_delta(d));
+    const auto a_b64 = a.pubkey_b64();
+
+    // Public socket: refused.
+    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::has_log(*b.gossip, a_b64));
+
+    // A's packet from C's backbone address: refused.
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), c, b);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_FALSE(gossip::GossipBallotTestAccess::has_log(*b.gossip, a_b64));
+
+    // A's own backbone address: accepted, and the record moves over the
+    // backbone.
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
+    ASSERT_TRUE(pump_until([&] {
+        return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) == 1u;
+    }, std::chrono::seconds(5)));
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,7 +1198,7 @@ TEST_F(DeltaTransferTest, EndToEndDigestDrivesBoundedPageTransfer) {
     ASSERT_EQ(gossip::GossipBallotTestAccess::pool_latest(*a.gossip), 3u);
 
     // The digest drives the transfer.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) == 3u;
     }, std::chrono::seconds(5)));
@@ -1054,7 +1240,7 @@ TEST_F(DeltaTransferTest, PageBoundSplitsTransferIntoContinuedRequests) {
     ASSERT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*a.gossip),
               static_cast<uint64_t>(kRecords));
 
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until(
         [&] { return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) ==
                     static_cast<uint64_t>(kRecords); },
@@ -1148,7 +1334,7 @@ TEST_F(DeltaTransferTest, PagesNearTheByteLimitCompletePagination) {
               gossip::GossipService::kPageMaxPayloadBytes)
         << "the fixture must reproduce the records-only accounting defect";
 
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) ==
                static_cast<std::size_t>(kRecords);
@@ -1178,7 +1364,7 @@ TEST_F(DeltaTransferTest, DuplicateRecordIsIdempotentAndAdvancesTheCursor) {
     ASSERT_TRUE(b.tree->apply_delta(d));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*b.gossip), 1u);
 
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     pump_for(std::chrono::milliseconds(500));
 
     // The served duplicate advances the cursor to the peer's latest position
@@ -1208,14 +1394,13 @@ TEST_F(DeltaTransferTest, ResponseBindsToOutstandingRequestOrIsDropped) {
     response["latest_pos"] = 1;
     response["complete"] = true;
     response["records"] = json::array({rec1});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, b);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*b.gossip), 0u);
 
     // (b) Real transfer: the digest drives `b` to request, `a` serves record 1.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) == 1u;
     }, std::chrono::seconds(5)));
@@ -1233,13 +1418,12 @@ TEST_F(DeltaTransferTest, ResponseBindsToOutstandingRequestOrIsDropped) {
                                                   child_node("evil", "root")));
     stranger_rec["position"] = 2;
     response["records"] = json::array({stranger_rec});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     // The digest drives a real request; the stale answer is in flight
     // alongside whatever `a` sends. Whichever binds first, the crafted
     // record cannot bind: its nonce is the one from step (a).
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, b);
 
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) == 2u;
@@ -1267,7 +1451,7 @@ TEST_F(DeltaTransferTest, LateResponseAfterGenerationChangeIsDropped) {
     // Capture the request `b` actually issues so the late answer below
     // matches its nonce and position EXACTLY: the only mismatch is the
     // generation, and no unrelated field difference can explain a pass.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1286,9 +1470,8 @@ TEST_F(DeltaTransferTest, LateResponseAfterGenerationChangeIsDropped) {
     gen2_digest["log_generation"] = "ffffffffffffffffffffffffffffffff";
     gen2_digest["peer_count"] = 1;
     gen2_digest["timestamp"] = 1001;
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest,
-                        bytes_of(gen2_digest.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest,
+                        bytes_of(gen2_digest.dump())), a, b);
     pump_for(std::chrono::milliseconds(200));
     // The superseded request is gone: the cursor is back at 0 (any new
     // outstanding request is from the reset position under the new
@@ -1310,9 +1493,8 @@ TEST_F(DeltaTransferTest, LateResponseAfterGenerationChangeIsDropped) {
     response["latest_pos"] = 1;
     response["complete"] = true;
     response["records"] = json::array({rec});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, b);
     pump_for(std::chrono::milliseconds(400));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*b.gossip),
               count_before)
@@ -1341,7 +1523,7 @@ TEST_F(DeltaTransferTest, UnservableRecordStopsThePageAndTheCursor) {
     ASSERT_TRUE(a.tree->apply_delta(d3));
     corrupt_pool_record(a, hash_of(d2), "garbage-not-json");
 
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     pump_for(std::chrono::milliseconds(700));
 
     // The page served position 1 and stopped at 2: `b` retained exactly one
@@ -1372,7 +1554,7 @@ TEST_F(DeltaTransferTest, RepeatedIncompletePagesExhaustTheStallBudgetAndBackOff
     // after the stall budget the requester must enter backoff and stop
     // requesting.
     for (int i = 0; i < static_cast<int>(gossip::GossipService::kStallBudget) + 1; ++i) {
-        inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+        inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
         pump_for(std::chrono::milliseconds(400));
     }
     EXPECT_EQ(gossip::GossipBallotTestAccess::cursor_of(*b.gossip, a_b64), 0u);
@@ -1380,7 +1562,7 @@ TEST_F(DeltaTransferTest, RepeatedIncompletePagesExhaustTheStallBudgetAndBackOff
         << "repeated transfer failure must exhaust the stall budget into backoff";
 
     // A further digest while in backoff issues no request.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_FALSE(gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64));
 }
@@ -1402,7 +1584,7 @@ TEST_F(DeltaTransferTest, BackoffSurvivesGenerationChangeAndEviction) {
     ASSERT_TRUE(a.tree->apply_delta(d1));
     corrupt_pool_record(a, hash_of(d1), "garbage");
     for (int i = 0; i < static_cast<int>(gossip::GossipService::kStallBudget) + 1; ++i) {
-        inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+        inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
         pump_for(std::chrono::milliseconds(400));
     }
     const auto backoff = gossip::GossipBallotTestAccess::backoff_until(*b.gossip, a_b64);
@@ -1414,7 +1596,7 @@ TEST_F(DeltaTransferTest, BackoffSurvivesGenerationChangeAndEviction) {
     gen2["log_generation"] = "ffffffffffffffffffffffffffffffff";
     gen2["peer_count"] = 1;
     gen2["timestamp"] = 2000;
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, bytes_of(gen2.dump())), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, bytes_of(gen2.dump())), a, b);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_TRUE(gossip::GossipBallotTestAccess::backoff_until(*b.gossip, a_b64) >= backoff)
         << "a generation change must not reset an exhausted retry budget";
@@ -1429,7 +1611,9 @@ TEST_F(DeltaTransferTest, BackoffSurvivesGenerationChangeAndEviction) {
     s3["log_generation"] = "abcdefabcdefabcdefabcdefabcdefab";
     s3["peer_count"] = 1;
     s3["timestamp"] = 2001;
-    inject(build_packet(stranger, gossip::GossipMsgType::Digest, bytes_of(s3.dump())), b);
+    auto& stranger_bb = raw_backbone("172.16.0.200");
+    inject_backbone(build_packet(stranger, gossip::GossipMsgType::Digest, bytes_of(s3.dump())),
+                    stranger_bb, b);
     pump_for(std::chrono::milliseconds(300));
     EXPECT_TRUE(gossip::GossipBallotTestAccess::has_log(*b.gossip, a_b64))
         << "an entry in backoff must not be evicted";
@@ -1469,6 +1653,8 @@ TEST_F(DeltaTransferTest, MalformedRecordIsFinalAndAdvancesTheCursor) {
     pump_for(std::chrono::milliseconds(200));
     ASSERT_TRUE(b.certified_peer(a.pubkey_b64()));
     ASSERT_FALSE(a.certified_peer(b.pubkey_b64()));
+    // `a` announces only to peers it trusts, so its claim reaches `b` directly.
+    claim_backbone(a.keypair(), a.backbone_ip, a.mesh_fill, b);
 
     auto d1 = signed_delta("create_node", "c-1", child_node("c-1", "root"));
     ASSERT_TRUE(a.tree->apply_delta(d1));
@@ -1476,7 +1662,7 @@ TEST_F(DeltaTransferTest, MalformedRecordIsFinalAndAdvancesTheCursor) {
 
     // The digest drives `b` to request; `a` denies the uncertified request,
     // so the outstanding stays live.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1500,9 +1686,8 @@ TEST_F(DeltaTransferTest, MalformedRecordIsFinalAndAdvancesTheCursor) {
     response["latest_pos"] = from_pos + 2;
     response["complete"] = true;
     response["records"] = json::array({valid, malformed});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, b);
     pump_for(std::chrono::milliseconds(400));
 
     // The valid record was retained; the malformed one was refused (final)
@@ -1525,7 +1710,7 @@ TEST_F(DeltaTransferTest, RetentionRefusalIsRetryableAndStopsTheCursor) {
     // Exhaust `b`'s pool byte budget before the transfer.
     gossip::GossipBallotTestAccess::set_pool_max_bytes(*b.gossip, 1);
 
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     pump_for(std::chrono::milliseconds(700));
 
     // The record is refused retryably: no retention, no cursor advance, and
@@ -1548,9 +1733,13 @@ TEST_F(DeltaTransferTest, MissingPermissionContextIsRetryableNotFinal) {
     b->storage = std::make_unique<storage::FileStorageService>(b->dir);
     b->storage->start();
     b->gossip = std::make_unique<gossip::GossipService>(io, 0, *b->storage, *b->crypto);
+    b->ipam = std::make_unique<ipam::IPAMService>(*b->storage);
+    b->ipam->start();
+    b->gossip->set_ipam(b->ipam.get());
     b->gossip->start();
     nodes.push_back(std::move(b));
     auto& bn = *nodes.back();
+    attach_backbone(bn);
     a.gossip->set_root_pubkey(root_kp.public_key);
     bn.gossip->set_root_pubkey(root_kp.public_key);
     a.gossip->set_network_id(kTestNetworkHex);
@@ -1568,6 +1757,8 @@ TEST_F(DeltaTransferTest, MissingPermissionContextIsRetryableNotFinal) {
     pump_for(std::chrono::milliseconds(200));
     ASSERT_TRUE(bn.certified_peer(a.pubkey_b64()));
     ASSERT_FALSE(a.certified_peer(bn.pubkey_b64()));
+    // `a` announces only to peers it trusts, so its claim reaches `bn` directly.
+    claim_backbone(a.keypair(), a.backbone_ip, a.mesh_fill, bn);
     const auto a_b64 = a.pubkey_b64();
 
     auto d = signed_delta("create_node", "c-1", child_node("c-1", "root"));
@@ -1575,7 +1766,7 @@ TEST_F(DeltaTransferTest, MissingPermissionContextIsRetryableNotFinal) {
 
     // The digest drives a real outstanding request; `a` denies it (b is not
     // certified by a), so the request stays live.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), bn);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, bn);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*bn.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1594,9 +1785,8 @@ TEST_F(DeltaTransferTest, MissingPermissionContextIsRetryableNotFinal) {
     response["latest_pos"] = from_pos + 1;
     response["complete"] = true;
     response["records"] = json::array({rec});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           bn);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, bn);
     pump_for(std::chrono::milliseconds(500));
 
     // Refused retryably: nothing retained, and the cursor did not advance —
@@ -1626,7 +1816,7 @@ TEST_F(DeltaTransferTest, PageBoundsAreEnforcedOnReceipt) {
 
     // A live request with a captured nonce: the hostile pages below must
     // not consume it.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1651,7 +1841,7 @@ TEST_F(DeltaTransferTest, PageBoundsAreEnforcedOnReceipt) {
         page["pad"] = std::string(61000, 'x');
         const auto big = bytes_of(page.dump());
         ASSERT_GT(big.size(), 60000u);
-        inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse, big), b);
+        inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse, big), a, b);
         pump_for(std::chrono::milliseconds(400));
     }
     // (b) More than 100 records in one page.
@@ -1670,9 +1860,8 @@ TEST_F(DeltaTransferTest, PageBoundsAreEnforcedOnReceipt) {
             arr.push_back(json{{"position", from_pos + 1 + i}});
         }
         page["records"] = arr;
-        inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                            bytes_of(page.dump())),
-               b);
+        inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                            bytes_of(page.dump())), a, b);
         pump_for(std::chrono::milliseconds(400));
     }
 
@@ -1711,12 +1900,14 @@ TEST_F(DeltaTransferTest, MalformedEnvelopeFieldsAreDroppedNotThrown) {
     pump_for(std::chrono::milliseconds(200));
     ASSERT_TRUE(b.certified_peer(a.pubkey_b64()));
     EXPECT_FALSE(a.certified_peer(b.pubkey_b64()));
+    // `a` announces only to peers it trusts, so its claim reaches `b` directly.
+    claim_backbone(a.keypair(), a.backbone_ip, a.mesh_fill, b);
     const auto a_b64 = a.pubkey_b64();
 
     // a advertises a non-empty log so b has something to request.
     auto d0 = signed_delta("create_node", "seed-1", child_node("seed-1", "root"));
     ASSERT_TRUE(a.tree->apply_delta(d0));
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1729,9 +1920,8 @@ TEST_F(DeltaTransferTest, MalformedEnvelopeFieldsAreDroppedNotThrown) {
         gossip::GossipBallotTestAccess::pool_record_count(*b.gossip);
 
     auto send = [&](json page) {
-        inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                            bytes_of(page.dump())),
-               b);
+        inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                            bytes_of(page.dump())), a, b);
         pump_for(std::chrono::milliseconds(250));
     };
 
@@ -1772,9 +1962,10 @@ TEST_F(DeltaTransferTest, MalformedEnvelopeFieldsAreDroppedNotThrown) {
                a);
     }
     pump_for(std::chrono::milliseconds(200));
+    claim_backbone(b.keypair(), b.backbone_ip, b.mesh_fill, a);
     auto d2 = signed_delta("create_node", "c-2", child_node("c-2", "root"));
     ASSERT_TRUE(a.tree->apply_delta(d2));
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         // Both of a's records (seed-1 and c-2) arrive over the wire.
         return gossip::GossipBallotTestAccess::pool_record_count(*b.gossip) == 2u;
@@ -1814,7 +2005,7 @@ TEST_F(DeltaTransferTest, ExpiredRequestResponseChangesNothing) {
     }
     pump_for(std::chrono::milliseconds(200));
 
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1834,9 +2025,8 @@ TEST_F(DeltaTransferTest, ExpiredRequestResponseChangesNothing) {
     response["latest_pos"] = from_pos + 1;
     response["complete"] = true;
     response["records"] = json::array({rec});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, b);
     pump_for(std::chrono::milliseconds(400));
 
     // The exact-bound answer to an expired request changes nothing.
@@ -1847,7 +2037,7 @@ TEST_F(DeltaTransferTest, ExpiredRequestResponseChangesNothing) {
 
     // The session recovers: a new digest issues a fresh request and the
     // same (now fresh-bound) page is retained.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*b.gossip, a_b64);
     }, std::chrono::seconds(5)));
@@ -1859,9 +2049,8 @@ TEST_F(DeltaTransferTest, ExpiredRequestResponseChangesNothing) {
     response["from_pos"] = from_pos2;
     response["generation"] = generation2;
     response["records"] = json::array({rec});
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), a, b);
     pump_for(std::chrono::milliseconds(400));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*b.gossip), 1u);
     EXPECT_EQ(gossip::GossipBallotTestAccess::cursor_of(*b.gossip, a_b64),
@@ -2106,7 +2295,7 @@ TEST_F(DeltaTransferTest, ServingReverifiesContentAgainstTheIndex) {
               storage::FileStorageService::PoolWrite::Ok);
 
     // A fresh transfer session must not receive the swapped content.
-    inject(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), b);
+    inject_backbone(build_packet(a.keypair(), gossip::GossipMsgType::Digest, digest_bytes(a)), a, b);
     pump_for(std::chrono::milliseconds(800));
     EXPECT_EQ(gossip::GossipBallotTestAccess::pool_record_count(*b.gossip), 0u)
         << "a record whose content no longer matches its identifier must not be served";
@@ -2252,9 +2441,13 @@ TEST_F(DeltaTransferTest, DeniedInCurrentTreeIsRetryableAndSucceedsAfterGrant) {
     c->tree->start();
     c->gossip = std::make_unique<gossip::GossipService>(io, 0, *c->storage, *c->crypto);
     c->gossip->set_tree(c->tree.get());
+    c->ipam = std::make_unique<ipam::IPAMService>(*c->storage);
+    c->ipam->start();
+    c->gossip->set_ipam(c->ipam.get());
     c->gossip->start();
     nodes.push_back(std::move(c));
     auto& cv = *nodes.back();
+    attach_backbone(cv);
     cv.gossip->set_root_pubkey(root_kp.public_key);
     cv.gossip->set_network_id(kTestNetworkHex);
 
@@ -2273,6 +2466,8 @@ TEST_F(DeltaTransferTest, DeniedInCurrentTreeIsRetryableAndSucceedsAfterGrant) {
     }
     pump_for(std::chrono::milliseconds(200));
     ASSERT_TRUE(cv.certified_peer(fwd_b64));
+    auto& fwd_bb = raw_backbone("172.16.0.201");
+    claim_backbone(fwd, fwd_bb, 0xF1, cv);
 
     // A second author with no assignment on `root`.
     auto kp2 = kc->ed25519_keygen();
@@ -2305,8 +2500,7 @@ TEST_F(DeltaTransferTest, DeniedInCurrentTreeIsRetryableAndSucceedsAfterGrant) {
         digest["log_generation"] = "abcdef0123456789abcdef0123456789";
         digest["peer_count"] = 1;
         digest["timestamp"] = 1000;
-        inject(build_packet(fwd, gossip::GossipMsgType::Digest, bytes_of(digest.dump())),
-               cv);
+        inject_backbone(build_packet(fwd, gossip::GossipMsgType::Digest, bytes_of(digest.dump())), fwd_bb, cv);
         ASSERT_TRUE(pump_until([&] {
             return gossip::GossipBallotTestAccess::has_outstanding(*cv.gossip, fwd_b64);
         }, std::chrono::seconds(5)));
@@ -2323,9 +2517,8 @@ TEST_F(DeltaTransferTest, DeniedInCurrentTreeIsRetryableAndSucceedsAfterGrant) {
         response["latest_pos"] = position;
         response["complete"] = true;
         response["records"] = json::array({r});
-        inject(build_packet(fwd, gossip::GossipMsgType::DeltaResponse,
-                            bytes_of(response.dump())),
-               cv);
+        inject_backbone(build_packet(fwd, gossip::GossipMsgType::DeltaResponse,
+                            bytes_of(response.dump())), fwd_bb, cv);
         pump_for(std::chrono::milliseconds(300));
     };
 
@@ -2385,9 +2578,13 @@ TEST_F(DeltaTransferTest, UnknownOperationIsFinalAndAdvancesTheCursor) {
     c->tree->start();
     c->gossip = std::make_unique<gossip::GossipService>(io, 0, *c->storage, *c->crypto);
     c->gossip->set_tree(c->tree.get());
+    c->ipam = std::make_unique<ipam::IPAMService>(*c->storage);
+    c->ipam->start();
+    c->gossip->set_ipam(c->ipam.get());
     c->gossip->start();
     nodes.push_back(std::move(c));
     auto& cv = *nodes.back();
+    attach_backbone(cv);
     (void)a; (void)b; (void)a_b64;
 
     auto fwd = kc->ed25519_keygen();
@@ -2405,6 +2602,8 @@ TEST_F(DeltaTransferTest, UnknownOperationIsFinalAndAdvancesTheCursor) {
     }
     pump_for(std::chrono::milliseconds(200));
     ASSERT_TRUE(cv.certified_peer(fwd_b64));
+    auto& fwd_bb = raw_backbone("172.16.0.201");
+    claim_backbone(fwd, fwd_bb, 0xF1, cv);
 
     // One page: the valid record at position 1, the unknown-operation
     // record (validly signed by the author) at position 2.
@@ -2413,7 +2612,7 @@ TEST_F(DeltaTransferTest, UnknownOperationIsFinalAndAdvancesTheCursor) {
     digest["log_generation"] = "abcdef0123456789abcdef0123456789";
     digest["peer_count"] = 1;
     digest["timestamp"] = 1000;
-    inject(build_packet(fwd, gossip::GossipMsgType::Digest, bytes_of(digest.dump())), cv);
+    inject_backbone(build_packet(fwd, gossip::GossipMsgType::Digest, bytes_of(digest.dump())), fwd_bb, cv);
     ASSERT_TRUE(pump_until([&] {
         return gossip::GossipBallotTestAccess::has_outstanding(*cv.gossip, fwd_b64);
     }, std::chrono::seconds(5)));
@@ -2430,9 +2629,8 @@ TEST_F(DeltaTransferTest, UnknownOperationIsFinalAndAdvancesTheCursor) {
     response["latest_pos"] = 2;
     response["complete"] = true;
     response["records"] = json::array({r1, r2});
-    inject(build_packet(fwd, gossip::GossipMsgType::DeltaResponse,
-                        bytes_of(response.dump())),
-           cv);
+    inject_backbone(build_packet(fwd, gossip::GossipMsgType::DeltaResponse,
+                        bytes_of(response.dump())), fwd_bb, cv);
     pump_for(std::chrono::milliseconds(400));
 
     // The valid record was retained; the unknown-operation record was

@@ -61,6 +61,7 @@ constexpr auto kTombstoneRetention       = std::chrono::hours(24 * 30);
 // Entries sent per SyncRequest; the requester asks again next cycle.
 constexpr std::size_t kSyncMaxEntriesPerRequest = 256;
 constexpr std::string_view kDnsSyncStream = "dns";
+constexpr std::string_view kAccountSyncStream = "account";
 
 // Strip an optional "ed25519:" prefix to the bare base64 certificate form
 // used by the revocation list.
@@ -258,6 +259,8 @@ void GossipService::on_start() {
     // The replica's local origin is this gossip identity, the same key that
     // signs our DNS deltas.
     dns_replica_ = std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
+    account_replica_ =
+        std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
 
     // Load known peers
     load_peers();
@@ -265,6 +268,7 @@ void GossipService::on_start() {
     // Restored DNS entries are re-verified against the peer table, so this
     // follows load_peers. Runs here or in set_dns, whichever comes last.
     load_dns_replica();
+    load_account_replica();
 
     // Load persisted NS slot state (restarting nodes must remember the slots
     // the mesh assigned them; the sync gate stays closed until live mesh
@@ -345,6 +349,7 @@ void GossipService::on_stop() {
     backbone_alive_->store(false);
     gossip_timer_.cancel();
     save_dns_replica();
+    save_account_replica();
 
     asio::error_code ec;
     socket_.close(ec);
@@ -423,11 +428,6 @@ void GossipService::do_remove_peer(std::string_view pubkey) {
 }
 
 void GossipService::do_send_digest(const GossipPeer& peer) {
-    auto target = parse_endpoint(peer.endpoint);
-    if (!target) {
-        spdlog::warn("[{}] invalid peer endpoint: {}", name(), peer.endpoint);
-        return;
-    }
 
     std::string generation;
     std::uint64_t latest_pos = 0;
@@ -450,9 +450,13 @@ void GossipService::do_send_digest(const GossipPeer& peer) {
     auto payload_str = digest.dump();
     std::vector<uint8_t> payload(payload_str.begin(), payload_str.end());
 
-    send_packet(*target, GossipMsgType::Digest, payload);
+    if (!send_backbone_packet(peer, GossipMsgType::Digest, payload)) {
+        spdlog::trace("[{}] no backbone path to {}; digest not sent", name(),
+                      peer.pubkey.substr(0, 12));
+        return;
+    }
     spdlog::trace("[{}] sent digest to {} (pos={}, generation={})",
-                   name(), peer.endpoint, latest_pos, generation.substr(0, 8));
+                   name(), peer.backbone_ip, latest_pos, generation.substr(0, 8));
 }
 
 void GossipService::do_handle_digest(const GossipPeer& peer, uint64_t their_pos,
@@ -498,7 +502,7 @@ void GossipService::do_handle_digest(const GossipPeer& peer, uint64_t their_pos,
 
     spdlog::debug("[{}] digest from {} (their_pos={}, generation={})",
                    name(), peer.endpoint, their_pos, their_generation.substr(0, 8));
-    maybe_request_from(peer.pubkey, peer.endpoint, from_pos);
+    maybe_request_from(peer.pubkey, from_pos);
 }
 
 // ---------------------------------------------------------------------------
@@ -934,11 +938,11 @@ GossipService::Admission GossipService::admit_received_record(const nlohmann::js
     }
 }
 
-void GossipService::maybe_request_from(const std::string& peer_pubkey,
-                                        std::string_view endpoint, uint64_t from_pos) {
+void GossipService::maybe_request_from(const std::string& peer_pubkey, uint64_t from_pos) {
     if (peer_pubkey.empty()) return;
-    auto target = parse_endpoint(endpoint);
-    if (!target) return;
+    // Requests go over the backbone; without a path, no slot is taken.
+    const auto peer = find_peer_by_pubkey(peer_pubkey);
+    if (!peer || !backbone_path_ready(*peer)) return;
 
     bool will_send = false;
     std::uint64_t nonce = 0;
@@ -976,7 +980,11 @@ void GossipService::maybe_request_from(const std::string& peer_pubkey,
     request["from_pos"] = from_pos;
     auto s = request.dump();
     std::vector<uint8_t> payload(s.begin(), s.end());
-    send_packet(*target, GossipMsgType::DeltaRequest, payload);
+    if (!send_backbone_packet(*peer, GossipMsgType::DeltaRequest, payload)) {
+        // The slot expires at its deadline like an unanswered request.
+        spdlog::debug("[{}] delta request to {} not sent", name(), peer_pubkey);
+        return;
+    }
     spdlog::debug("[{}] delta request to {} (nonce={}, from_pos={})",
                    name(), peer_pubkey, nonce, from_pos);
 }
@@ -1123,11 +1131,28 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
     const auto* payload = data + kGossipHeaderSize;
     const auto payload_len = header.payload_length;
 
-    // The backbone carries catch-up sync only. Everything else keeps its
+    // Replicated state that exposes members (tree records, account
+    // envelopes) and catch-up sync travel only on the encrypted backbone;
+    // they are refused on the public socket. Everything else keeps its
     // public path, where its existing gates were designed.
-    if (via == Via::Backbone &&
-        header.msg_type != GossipMsgType::SyncDigest &&
-        header.msg_type != GossipMsgType::SyncRequest &&
+    const bool backbone_only =
+        header.msg_type == GossipMsgType::Digest ||
+        header.msg_type == GossipMsgType::DeltaRequest ||
+        header.msg_type == GossipMsgType::DeltaResponse ||
+        header.msg_type == GossipMsgType::SyncDigest ||
+        header.msg_type == GossipMsgType::SyncRequest ||
+        header.msg_type == GossipMsgType::AccountEnvelopeSync;
+    if (via == Via::Public && backbone_only) {
+        if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
+                               std::chrono::steady_clock::now())) {
+            spdlog::warn("[{}] DENIED type 0x{:02X} from {}:{} on the public socket — "
+                         "accepted only on the backbone", name(),
+                         static_cast<uint8_t>(header.msg_type), from.address().to_string(),
+                         from.port());
+        }
+        return;
+    }
+    if (via == Via::Backbone && !backbone_only &&
         header.msg_type != GossipMsgType::DnsRecordSync) {
         spdlog::debug("[{}] dropped type 0x{:02X} on the backbone from {}",
                       name(), static_cast<uint8_t>(header.msg_type),
@@ -1139,14 +1164,14 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
     switch (header.msg_type) {
         case GossipMsgType::Digest:
             handle_digest_message(from, payload, payload_len,
-                                  sender_pubkey_b64);
+                                  sender_pubkey_b64, via);
             break;
         case GossipMsgType::DeltaRequest:
             handle_delta_request(from, payload, payload_len,
-                                 sender_pubkey_b64);
+                                 sender_pubkey_b64, via);
             break;
         case GossipMsgType::DeltaResponse:
-            handle_delta_response(from, sender_pubkey_b64, payload, payload_len);
+            handle_delta_response(from, sender_pubkey_b64, payload, payload_len, via);
             break;
         case GossipMsgType::AntiEntropy:
             handle_anti_entropy(from, payload, payload_len);
@@ -1182,6 +1207,9 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
         case GossipMsgType::SyncRequest:
             handle_sync_request(from, sender_pubkey_b64, payload, payload_len, via);
             break;
+        case GossipMsgType::AccountEnvelopeSync:
+            handle_account_envelope_sync(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
                           name(), static_cast<uint8_t>(header.msg_type),
@@ -1198,15 +1226,11 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
 void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
                                             const uint8_t* payload,
                                             std::size_t payload_len,
-                                            const std::string& signer_pubkey) {
+                                            const std::string& signer_pubkey, Via via) {
     // Transport authorization before any transfer state is allocated: an
-    // uncertified digest allocates nothing and triggers no request.
-    if (!peer_certificate_is_root_signed(signer_pubkey)) {
-        spdlog::warn("[{}] DENIED digest from {}:{} — sender is not a "
-                      "cert-verified enrolled peer", name(),
-                      sender.address().to_string(), sender.port());
-        return;
-    }
+    // uncertified digest, or one off the signer's backbone address,
+    // allocates nothing and triggers no request.
+    if (!backbone_sender_verified(sender, signer_pubkey, via, "Digest")) return;
 
     try {
         auto j = json::parse(std::string_view{
@@ -1239,14 +1263,9 @@ void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
 void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
                                            const uint8_t* payload,
                                            std::size_t payload_len,
-                                           const std::string& signer_pubkey) {
+                                           const std::string& signer_pubkey, Via via) {
     // Data-returning path: same transport gate as digest and response.
-    if (!peer_certificate_is_root_signed(signer_pubkey)) {
-        spdlog::warn("[{}] DENIED delta request from {}:{} — sender is not a "
-                      "cert-verified enrolled peer", name(),
-                      sender.address().to_string(), sender.port());
-        return;
-    }
+    if (!backbone_sender_verified(sender, signer_pubkey, via, "DeltaRequest")) return;
 
     std::uint64_t nonce = 0, from_pos = 0;
     try {
@@ -1370,7 +1389,10 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
         test_max_page_bytes_ = payload_str.size();
     }
     std::vector<uint8_t> pkt(payload_str.begin(), payload_str.end());
-    send_packet(sender, GossipMsgType::DeltaResponse, pkt);
+    // The request arrived on the backbone from the requester's backbone
+    // address, so the page goes back the same way.
+    (void)send_backbone_to(sender.address().to_string(), sender.port(),
+                           GossipMsgType::DeltaResponse, pkt);
     spdlog::debug("[{}] delta page served to {} (from_pos={}, latest_pos={}, failed={})",
                    name(), signer_pubkey, from_pos, latest_pos, page_failed);
 }
@@ -1378,17 +1400,13 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
 void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
                                             const std::string& sender_pubkey,
                                             const uint8_t* payload,
-                                            std::size_t payload_len) {
+                                            std::size_t payload_len, Via via) {
     // Fail-closed gate, no tokens: state-mutating gossip ingress requires the
-    // packet signer to be an enrolled peer with a root-signed certificate.
-    // Gossip is Tier-2 transport and never decides Tier 1 — that authority
-    // lives in the security plane (SecurityEnvelope → SecurityRouter).
-    if (!peer_certificate_is_root_signed(sender_pubkey)) {
-        spdlog::warn("[{}] DENIED delta response from {}:{} — sender is not a "
-                      "cert-verified enrolled peer", name(),
-                      sender.address().to_string(), sender.port());
-        return;
-    }
+    // packet signer to be an enrolled peer with a root-signed certificate,
+    // sending from its own backbone address. Gossip is Tier-2 transport and
+    // never decides Tier 1 — that authority lives in the security plane
+    // (SecurityEnvelope → SecurityRouter).
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "DeltaResponse")) return;
 
     try {
         // The receive side enforces the page bounds itself: a hostile or
@@ -1575,12 +1593,7 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
                 next_cursor = it->second.cursor;
             }
         }
-        if (auto peer_opt = find_peer_by_pubkey(sender_pubkey)) {
-            ep = peer_opt->endpoint;
-        } else {
-            ep = sender.address().to_string() + ":" + std::to_string(sender.port());
-        }
-        if (!in_backoff) maybe_request_from(sender_pubkey, ep, next_cursor);
+        if (!in_backoff) maybe_request_from(sender_pubkey, next_cursor);
     }
 
         spdlog::info("[{}] delta page from {}: {} record(s), cursor now {} (latest {})",
@@ -1843,7 +1856,7 @@ void GossipService::on_gossip_tick() {
         }
         if (now - last_dns_sync_digest_ >= kDnsSyncDigestInterval) {
             last_dns_sync_digest_ = now;
-            send_dns_sync_digests();
+            send_sync_digests();
         }
         if (dns_replica_ && now - last_tombstone_prune_ >= kTombstonePruneInterval) {
             last_tombstone_prune_ = now;
@@ -1858,6 +1871,7 @@ void GossipService::on_gossip_tick() {
         if (now - last_dns_replica_save_ >= kDnsReplicaSaveInterval) {
             last_dns_replica_save_ = now;
             save_dns_replica();
+            save_account_replica();
         }
     }
 
@@ -1866,15 +1880,21 @@ void GossipService::on_gossip_tick() {
     {
         std::lock_guard lock(peers_mutex_);
 
-        if (peers_.empty()) {
+        // Tree digests travel only on the backbone, so pick among peers
+        // with a ready backbone path.
+        std::vector<const GossipPeer*> ready;
+        for (const auto& p : peers_) {
+            if (backbone_path_ready_locked(p)) ready.push_back(&p);
+        }
+        if (ready.empty()) {
             return;
         }
 
         // Pick a random peer
-        std::uniform_int_distribution<std::size_t> dist(0, peers_.size() - 1);
+        std::uniform_int_distribution<std::size_t> dist(0, ready.size() - 1);
         {
             std::lock_guard rng_lock(rng_mutex_);
-            chosen = peers_[dist(rng_)];
+            chosen = *ready[dist(rng_)];
         }
     }
 
@@ -1954,6 +1974,13 @@ bool GossipService::send_backbone_packet(const GossipPeer& peer, GossipMsgType m
     } catch (...) {
         return false;
     }
+    return send_backbone_to(peer.backbone_ip, dst_port, msg_type, payload);
+}
+
+bool GossipService::send_backbone_to(const std::string& dst_ip, uint16_t dst_port,
+                                     GossipMsgType msg_type,
+                                     const std::vector<uint8_t>& payload) {
+    if (!vnet_ || !backbone_bound_.load() || dst_ip.empty() || dst_port == 0) return false;
     std::string src_ip;
     {
         std::lock_guard lock(mesh_state_mutex_);
@@ -1970,7 +1997,7 @@ bool GossipService::send_backbone_packet(const GossipPeer& peer, GossipMsgType m
     asio::error_code ec;
     const uint16_t src_port = socket_.local_endpoint(ec).port();
     if (ec) return false;
-    return vnet_->send_udp(src_ip, src_port, peer.backbone_ip, dst_port, packet);
+    return vnet_->send_udp(src_ip, src_port, dst_ip, dst_port, packet);
 }
 
 // ---------------------------------------------------------------------------
@@ -3439,25 +3466,28 @@ void GossipService::save_dns_replica() {
     if (!dns_replica_) return;
     const auto version = dns_replica_->version();
     if (version == dns_replica_saved_version_) return;
+    if (save_replica_file(*dns_replica_, "dns", "dns_replica")) {
+        dns_replica_saved_version_ = version;
+    } else {
+        spdlog::warn("[{}] failed to save the DNS replica", name());
+    }
+}
 
+bool GossipService::save_replica_file(const sync::OriginReplica& replica,
+                                      const std::string& category, const std::string& type) {
     json entries = json::array();
-    for (const auto& e : dns_replica_->snapshot()) {
+    for (const auto& e : replica.snapshot()) {
         entries.push_back(crypto::to_base64(std::span<const uint8_t>(e.payload)));
     }
     storage::SignedEnvelope envelope;
-    envelope.type = "dns_replica";
+    envelope.type = type;
     envelope.data = json{{"entries", std::move(entries)}}.dump();
     envelope.signer_pubkey = "ed25519:" + crypto::to_base64(keypair_.public_key);
     envelope.timestamp = static_cast<uint64_t>(
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
     const std::vector<uint8_t> data_bytes(envelope.data.begin(), envelope.data.end());
     envelope.signature = crypto::to_base64(crypto_.ed25519_sign(keypair_.private_key, data_bytes));
-
-    if (storage_.write_file("dns", "replica.json", envelope)) {
-        dns_replica_saved_version_ = version;
-    } else {
-        spdlog::warn("[{}] failed to save the DNS replica", name());
-    }
+    return storage_.write_file(category, "replica.json", envelope);
 }
 
 void GossipService::load_dns_replica() {
@@ -3536,52 +3566,81 @@ void GossipService::deny_sync(const asio::ip::udp::endpoint& sender,
     }
 }
 
-void GossipService::send_dns_sync_digests() {
-    if (!dns_replica_ || !backbone_bound_.load()) return;
-    const bool tier1 = self_is_tier1();
+bool GossipService::backbone_path_ready_locked(const GossipPeer& p) const {
+    if (p.certificate_json.empty() || p.backbone_ip.empty() || p.mesh_pubkey.empty()) return false;
+    // With a dataplane attached, wait until it holds the peer; without one
+    // (an in-process stack wired directly) the route exists already.
+    return !boringtun_ || backbone_peers_added_.count(p.mesh_pubkey + "|" + p.backbone_ip) > 0;
+}
 
+bool GossipService::backbone_path_ready(const GossipPeer& p) const {
+    std::lock_guard lock(peers_mutex_);
+    return backbone_path_ready_locked(p);
+}
+
+std::vector<GossipPeer> GossipService::backbone_targets(bool tier1_only) const {
     std::vector<GossipPeer> candidates;
     {
         std::lock_guard lock(peers_mutex_);
         for (const auto& p : peers_) {
-            if (p.certificate_json.empty() || p.backbone_ip.empty() || p.mesh_pubkey.empty()) continue;
-            // With a dataplane attached, wait until it holds the peer; without
-            // one (an in-process stack wired directly) the route exists already.
-            if (boringtun_ && !backbone_peers_added_.count(p.mesh_pubkey + "|" + p.backbone_ip)) {
-                continue;
-            }
-            candidates.push_back(p);
+            if (backbone_path_ready_locked(p)) candidates.push_back(p);
         }
     }
+    if (!tier1_only) return candidates;
+    // The membership source reaches into the security layer, so it is
+    // consulted outside peers_mutex_.
+    std::vector<GossipPeer> out;
+    for (auto& p : candidates) {
+        if (is_tier1(p.pubkey)) out.push_back(std::move(p));
+    }
+    return out;
+}
+
+sync::OriginReplica* GossipService::replica_for_stream(std::string_view stream) const {
+    if (stream == kDnsSyncStream) return dns_replica_.get();
+    if (stream == kAccountSyncStream) return account_replica_.get();
+    return nullptr;
+}
+
+GossipMsgType GossipService::entry_type_for_stream(std::string_view stream) const {
+    return stream == kAccountSyncStream ? GossipMsgType::AccountEnvelopeSync
+                                        : GossipMsgType::DnsRecordSync;
+}
+
+void GossipService::send_sync_digests() {
+    if (!backbone_bound_.load()) return;
     // Tier 1 offers its state to every server; Tier 2 reports its state to
     // Tier 1 only, for status (Tier 1 never pulls from Tier 2).
-    std::vector<GossipPeer> targets;
-    for (auto& p : candidates) {
-        if (tier1 || is_tier1(p.pubkey)) targets.push_back(std::move(p));
-    }
+    const auto targets = backbone_targets(!self_is_tier1());
     if (targets.empty()) return;
 
     // Each page must fit one gossip packet in one virtual UDP datagram.
     const std::size_t budget = network::VirtualNetService::max_udp_payload() -
                                kGossipHeaderSize - kGossipSignatureSize;
-    const auto pages = sync::encode_digest_pages(kDnsSyncStream, dns_replica_->digest(),
-                                                 ++dns_digest_round_, budget);
-    if (pages.empty()) {
-        spdlog::warn("[{}] DNS digest does not fit {} pages; not sent", name(),
-                     sync::kMaxDigestPages);
-        return;
-    }
-    for (const auto& page : pages) {
-        const auto packed = json::to_msgpack(page);
-        const std::vector<uint8_t> payload(packed.begin(), packed.end());
-        for (const auto& p : targets) (void)send_backbone_packet(p, GossipMsgType::SyncDigest, payload);
+    const uint64_t round = ++sync_digest_round_;
+    for (const auto stream : {kDnsSyncStream, kAccountSyncStream}) {
+        const auto* replica = replica_for_stream(stream);
+        if (!replica) continue;
+        const auto pages = sync::encode_digest_pages(stream, replica->digest(), round, budget);
+        if (pages.empty()) {
+            spdlog::warn("[{}] {} digest does not fit {} pages; not sent", name(), stream,
+                         sync::kMaxDigestPages);
+            continue;
+        }
+        for (const auto& page : pages) {
+            const auto packed = json::to_msgpack(page);
+            const std::vector<uint8_t> payload(packed.begin(), packed.end());
+            for (const auto& p : targets) {
+                (void)send_backbone_packet(p, GossipMsgType::SyncDigest, payload);
+            }
+        }
     }
 }
 
 void GossipService::handle_sync_digest(const asio::ip::udp::endpoint& sender,
                                        const std::string& sender_pubkey,
                                        const uint8_t* payload, std::size_t payload_len, Via via) {
-    if (!dns_replica_ || !backbone_sender_verified(sender, sender_pubkey, via, "SyncDigest")) return;
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "SyncDigest")) return;
     const bool sender_tier1 = is_tier1(sender_pubkey);
     if (!sender_tier1 && !self_is_tier1()) {
         deny_sync(sender, sender_pubkey, "SyncDigest", "digests flow from or to Tier 1 only");
@@ -3593,27 +3652,29 @@ void GossipService::handle_sync_digest(const asio::ip::udp::endpoint& sender,
             spdlog::warn("[{}] malformed SyncDigest from {}", name(), sender.address().to_string());
             return;
         }
-        if (page->stream != kDnsSyncStream) return;
+        auto* replica = replica_for_stream(page->stream);
+        if (!replica) return;
 
-        if (dns_replica_->record_peer_digest_page(sender_pubkey, *page, unix_ms())) {
-            const auto status = dns_replica_->peer_status()[sender_pubkey];
+        if (replica->record_peer_digest_page(sender_pubkey, *page, unix_ms())) {
+            const auto status = replica->peer_status()[sender_pubkey];
             const char* role = sender_tier1 ? "Tier 1" : "Tier 2";
             if (status.in_sync) {
-                spdlog::info("[{}] DNS in sync with {} peer {}", name(), role,
+                spdlog::info("[{}] {} in sync with {} peer {}", name(), page->stream, role,
                              sender_pubkey.substr(0, 12));
             } else {
-                spdlog::info("[{}] DNS out of sync with {} peer {}: we lack {} origin(s), "
-                             "peer lacks {}", name(), role, sender_pubkey.substr(0, 12),
-                             status.origins_we_lack, status.origins_peer_lacks);
+                spdlog::info("[{}] {} out of sync with {} peer {}: we lack {} origin(s), "
+                             "peer lacks {}", name(), page->stream, role,
+                             sender_pubkey.substr(0, 12), status.origins_we_lack,
+                             status.origins_peer_lacks);
             }
         }
 
         // Records are pulled only from Tier 1. A Tier 2 digest is status.
         if (!sender_tier1) return;
-        const auto requests = dns_replica_->plan_catch_up(page->origins);
+        const auto requests = replica->plan_catch_up(page->origins);
         const auto peer = find_peer_by_pubkey(sender_pubkey);
         if (requests.empty() || !peer) return;
-        const auto req = json::to_msgpack(sync::encode_catch_up(kDnsSyncStream, requests));
+        const auto req = json::to_msgpack(sync::encode_catch_up(page->stream, requests));
         (void)send_backbone_packet(*peer, GossipMsgType::SyncRequest,
                                    std::vector<uint8_t>(req.begin(), req.end()));
     } catch (const std::exception& e) {
@@ -3625,45 +3686,50 @@ void GossipService::handle_sync_digest(const asio::ip::udp::endpoint& sender,
 void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
                                         const std::string& sender_pubkey,
                                         const uint8_t* payload, std::size_t payload_len, Via via) {
-    if (!dns_replica_ || !backbone_sender_verified(sender, sender_pubkey, via, "SyncRequest")) return;
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "SyncRequest")) return;
     // Any certified server may catch up, but only from Tier 1.
     if (!self_is_tier1()) {
         deny_sync(sender, sender_pubkey, "SyncRequest", "only Tier 1 serves catch-up");
         return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
-    if (auto it = sync_request_served_.find(sender_pubkey);
-        it != sync_request_served_.end() && now - it->second < kSyncRequestMinInterval) {
-        return;
-    }
     try {
         const auto decoded = sync::decode_catch_up(json::from_msgpack(payload, payload + payload_len));
         if (!decoded) {
             spdlog::warn("[{}] malformed SyncRequest from {}", name(), sender.address().to_string());
             return;
         }
-        if (decoded->first != kDnsSyncStream) return;
+        const auto& stream = decoded->first;
+        const auto* replica = replica_for_stream(stream);
+        if (!replica) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto rate_key = stream + "|" + sender_pubkey;
+        if (auto it = sync_request_served_.find(rate_key);
+            it != sync_request_served_.end() && now - it->second < kSyncRequestMinInterval) {
+            return;
+        }
         const auto peer = find_peer_by_pubkey(sender_pubkey);
         if (!peer) return;
-        sync_request_served_[sender_pubkey] = now;
+        sync_request_served_[rate_key] = now;
+        const auto entry_type = entry_type_for_stream(stream);
 
         // Entries are replayed with their origin signatures intact; the
         // receiver verifies each exactly as a live update.
         std::size_t sent = 0;
         for (const auto& req : decoded->second) {
             if (sent >= kSyncMaxEntriesPerRequest) break;
-            for (const auto& e : dns_replica_->entries_since(req.origin, req.since,
-                                                             kSyncMaxEntriesPerRequest - sent)) {
+            for (const auto& e : replica->entries_since(req.origin, req.since,
+                                                        kSyncMaxEntriesPerRequest - sent)) {
                 auto j = json::from_msgpack(e.payload);
                 j["catch_up"] = true;
                 const auto bytes = json::to_msgpack(j);
-                (void)send_backbone_packet(*peer, GossipMsgType::DnsRecordSync,
+                (void)send_backbone_packet(*peer, entry_type,
                                            std::vector<uint8_t>(bytes.begin(), bytes.end()));
                 ++sent;
             }
         }
-        spdlog::debug("[{}] served {} DNS catch-up entr{} to {}", name(), sent,
+        spdlog::debug("[{}] served {} {} catch-up entr{} to {}", name(), sent, stream,
                       sent == 1 ? "y" : "ies", sender_pubkey.substr(0, 12));
     } catch (const std::exception& e) {
         spdlog::warn("[{}] failed to parse SyncRequest from {}: {}", name(),
@@ -3671,7 +3737,236 @@ void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Account envelope replication (backbone only)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::size_t kMaxEnvelopeIdBytes  = 128;   // group id, principals, origin key
+constexpr std::size_t kMaxEnvelopeKeyBytes = kMaxAccountEnvelopeFieldBytes;
+constexpr std::size_t kMaxSignatureBytes   = 128;
+
+json account_envelope_fields(const AccountEnvelopeRecord& r) {
+    return json{{"group_id", r.group_id},
+                {"recipient_pubkey", r.recipient_pubkey},
+                {"key_id", r.key_id},
+                {"ephemeral_pubkey", r.ephemeral_pubkey},
+                {"wrapped_key", r.wrapped_key},
+                {"created_by", r.created_by},
+                {"timestamp", r.timestamp},
+                {"origin_pubkey", r.origin_pubkey},
+                {"origin_seq", r.origin_seq}};
+}
+
+// The type label separates this signature domain from every other record
+// the gossip key signs.
+std::string account_envelope_canonical(const AccountEnvelopeRecord& r) {
+    auto j = account_envelope_fields(r);
+    j["type"] = "nexus.account_envelope.v1";
+    return j.dump();
+}
+
+json account_envelope_wire(const AccountEnvelopeRecord& r) {
+    auto j = account_envelope_fields(r);
+    j["signature"] = r.signature;
+    return j;
+}
+
+std::optional<AccountEnvelopeRecord> account_envelope_from_wire(const json& j) {
+    if (!j.is_object()) return std::nullopt;
+    const auto text = [&](const char* k, std::string& out, std::size_t max, bool required) {
+        const auto it = j.find(k);
+        if (it == j.end() || !it->is_string()) return false;
+        out = it->get<std::string>();
+        return out.size() <= max && (!required || !out.empty());
+    };
+    const auto positive = [&](const char* k, uint64_t& out) {
+        const auto it = j.find(k);
+        if (it == j.end()) return false;
+        if (it->is_number_unsigned()) {
+            out = it->get<uint64_t>();
+        } else if (it->is_number_integer() && it->get<int64_t>() > 0) {
+            out = static_cast<uint64_t>(it->get<int64_t>());
+        } else {
+            return false;
+        }
+        return out != 0;
+    };
+    AccountEnvelopeRecord r;
+    if (!text("group_id", r.group_id, kMaxEnvelopeIdBytes, true) ||
+        !text("recipient_pubkey", r.recipient_pubkey, kMaxEnvelopeIdBytes, true) ||
+        !text("key_id", r.key_id, kMaxEnvelopeKeyBytes, false) ||
+        !text("ephemeral_pubkey", r.ephemeral_pubkey, kMaxEnvelopeKeyBytes, false) ||
+        !text("wrapped_key", r.wrapped_key, kMaxEnvelopeKeyBytes, true) ||
+        !text("created_by", r.created_by, kMaxEnvelopeIdBytes, true) ||
+        !text("origin_pubkey", r.origin_pubkey, kMaxEnvelopeIdBytes, true) ||
+        !text("signature", r.signature, kMaxSignatureBytes, true) ||
+        !positive("timestamp", r.timestamp) || !positive("origin_seq", r.origin_seq)) {
+        return std::nullopt;
+    }
+    return r;
+}
+
+// One replica entry per (group, recipient device): a newer envelope for the
+// same device replaces the older one, as on disk.
+std::string account_envelope_key(const AccountEnvelopeRecord& r) {
+    return "keyenv:" + r.group_id + ":" + r.recipient_pubkey;
+}
+
+}  // namespace
+
+void GossipService::set_account_envelope_sink(
+    std::function<bool(const AccountEnvelopeRecord&)> sink) {
+    account_envelope_sink_ = std::move(sink);
+    load_account_replica();
+}
+
+void GossipService::broadcast_account_envelope(AccountEnvelopeRecord record) {
+    if (!account_replica_) return;
+    // Servers accept replicated envelopes only from Tier 1, so a Tier 2
+    // server keeps what it stores local.
+    if (!self_is_tier1()) {
+        spdlog::debug("[{}] not Tier 1; account envelope for {} stays local", name(),
+                      record.recipient_pubkey);
+        return;
+    }
+    record.origin_pubkey = crypto::to_base64(keypair_.public_key);
+    record.origin_seq    = account_replica_->next_local_seq(unix_ms());
+    const auto canonical = account_envelope_canonical(record);
+    record.signature = crypto::to_base64(crypto_.ed25519_sign(
+        keypair_.private_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                 canonical.size())));
+
+    const auto packed = json::to_msgpack(account_envelope_wire(record));
+    std::vector<uint8_t> payload(packed.begin(), packed.end());
+    (void)account_replica_->offer({account_envelope_key(record), record.origin_pubkey,
+                                   record.origin_seq, record.timestamp, false, payload});
+
+    // Called from HTTP threads; the socket and peer sends belong to the io
+    // thread. Peers that miss this catch up from the next digest.
+    asio::post(socket_.get_executor(),
+               [this, alive = backbone_alive_, payload = std::move(payload)] {
+        if (!alive->load()) return;
+        for (const auto& p : backbone_targets(false)) {
+            (void)send_backbone_packet(p, GossipMsgType::AccountEnvelopeSync, payload);
+        }
+    });
+}
+
+void GossipService::handle_account_envelope_sync(const asio::ip::udp::endpoint& sender,
+                                                 const std::string& sender_pubkey,
+                                                 const uint8_t* payload,
+                                                 std::size_t payload_len, Via via) {
+    if (!account_replica_ || !account_envelope_sink_) return;
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "AccountEnvelopeSync")) return;
+    // Tier 1 vouches for every envelope it delivers: it accepted it from a
+    // device, or from another Tier 1 server under this same rule.
+    if (!is_tier1(sender_pubkey)) {
+        deny_sync(sender, sender_pubkey, "AccountEnvelopeSync",
+                  "sender is not a current Tier 1 member");
+        return;
+    }
+    try {
+        const auto record = account_envelope_from_wire(
+            json::from_msgpack(payload, payload + payload_len));
+        if (!record) {
+            spdlog::warn("[{}] malformed AccountEnvelopeSync from {}", name(),
+                         sender.address().to_string());
+            return;
+        }
+        if (const auto error = account_envelope_origin_error(*record)) {
+            deny_sync(sender, sender_pubkey, "AccountEnvelopeSync", *error);
+            return;
+        }
+        if (apply_account_envelope(*record)) {
+            spdlog::debug("[{}] stored account envelope for {} from origin {}", name(),
+                          record->recipient_pubkey, record->origin_pubkey.substr(0, 12));
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to process AccountEnvelopeSync from {}: {}", name(),
+                     sender.address().to_string(), e.what());
+    }
+}
+
+std::optional<std::string> GossipService::account_envelope_origin_error(
+    const AccountEnvelopeRecord& record) const {
+    // The origin must still be a certified server. It need not still be
+    // Tier 1: it was when a Tier 1 server first accepted the envelope, and
+    // the envelope outlives later membership changes.
+    const auto canonical = account_envelope_canonical(record);
+    const bool self_authored = record.origin_pubkey == crypto::to_base64(keypair_.public_key);
+    const bool verified =
+        self_authored
+            ? own_certificate_valid() &&
+                  author_signature_valid(canonical, record.origin_pubkey, record.signature)
+            : delta_origin_verified(canonical, record.origin_pubkey, record.signature);
+    if (!verified) return "origin signature invalid or origin not a certified server";
+    return std::nullopt;
+}
+
+bool GossipService::apply_account_envelope(const AccountEnvelopeRecord& record) {
+    const auto key = account_envelope_key(record);
+    if (account_replica_->holds_newer(key, record.timestamp, record.origin_seq)) return false;
+    if (!account_envelope_sink_(record)) return false;
+    const auto packed = json::to_msgpack(account_envelope_wire(record));
+    (void)account_replica_->offer({key, record.origin_pubkey, record.origin_seq,
+                                   record.timestamp, false,
+                                   std::vector<uint8_t>(packed.begin(), packed.end())});
+    return true;
+}
+
+void GossipService::save_account_replica() {
+    if (!account_replica_) return;
+    const auto version = account_replica_->version();
+    if (version == account_replica_saved_version_) return;
+    if (save_replica_file(*account_replica_, "account", "account_replica")) {
+        account_replica_saved_version_ = version;
+    } else {
+        spdlog::warn("[{}] failed to save the account envelope replica", name());
+    }
+}
+
+void GossipService::load_account_replica() {
+    if (!account_replica_ || !account_envelope_sink_ || account_replica_loaded_) return;
+    account_replica_loaded_ = true;
+    const auto envelope = storage_.read_file("account", "replica.json");
+    if (!envelope) return;
+
+    // Each entry is re-verified exactly as on receipt, so the file's own
+    // signature is not what grants authority.
+    std::size_t restored = 0, refused = 0;
+    try {
+        const auto j = json::parse(envelope->data);
+        for (const auto& item : j.value("entries", json::array())) {
+            if (!item.is_string()) { ++refused; continue; }
+            const auto record = account_envelope_from_wire(
+                json::from_msgpack(crypto::from_base64(item.get<std::string>())));
+            if (!record || account_envelope_origin_error(*record)) {
+                ++refused;
+                continue;
+            }
+            if (apply_account_envelope(*record)) ++restored;
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] account envelope replica file unreadable: {}", name(), e.what());
+        return;
+    }
+    account_replica_saved_version_ = account_replica_->version();
+    spdlog::info("[{}] restored {} account envelope(s) from disk ({} refused)", name(),
+                 restored, refused);
+}
+
 nlohmann::json GossipService::dns_sync_status() const {
+    return sync_status(dns_replica_.get());
+}
+
+nlohmann::json GossipService::account_sync_status() const {
+    return sync_status(account_replica_.get());
+}
+
+nlohmann::json GossipService::sync_status(const sync::OriginReplica* replica) const {
     json out;
     out["tier1"]          = self_is_tier1();
     out["backbone_ip"]    = our_backbone_ip();
@@ -3679,11 +3974,11 @@ nlohmann::json GossipService::dns_sync_status() const {
 
     json origins = json::array();
     std::map<std::string, sync::PeerSyncStatus> status;
-    if (dns_replica_) {
-        for (const auto& [origin, s] : dns_replica_->digest()) {
+    if (replica) {
+        for (const auto& [origin, s] : replica->digest()) {
             origins.push_back({{"origin", origin}, {"max_seq", s.max_seq}, {"count", s.count}});
         }
-        status = dns_replica_->peer_status();
+        status = replica->peer_status();
     }
     out["origins"] = std::move(origins);
 
