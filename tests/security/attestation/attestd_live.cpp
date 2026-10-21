@@ -75,7 +75,7 @@ struct AttestdLive : ::testing::Test {
 
         auto profile = linux_attestation_profile_v1();
         profile.snp.min_tcb = {1, 0, 1, 1};
-        profile.snp.expected_measurement_hex = seen.measurement_hex;
+        profile.snp.expected_measurements_hex = {seen.measurement_hex};
         profile.required_ak_spki_b64 = seen.ak_spki_b64;
         profile.require_endorsement_revocation = false;
         profile.require_no_new_privs = false;

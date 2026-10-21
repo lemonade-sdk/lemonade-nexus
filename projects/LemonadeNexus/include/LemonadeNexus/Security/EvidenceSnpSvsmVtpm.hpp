@@ -146,7 +146,9 @@ struct SvsmEvidenceRequirements {
     SnpPolicyRequirements policy;
     bool require_revocation_check{false};
     AmdRevocationState revocation;
-    std::string expected_measurement_hex;
+    /// Release-approved launch measurements, one per approved VM shape. Both
+    /// reports must match a member exactly; an empty set refuses everything.
+    std::vector<std::string> expected_measurements_hex;
     std::string expected_ek_name_hex;
     std::string expected_ak_name_hex;
     std::string expected_ak_spki_b64;
@@ -214,7 +216,8 @@ struct SvsmEvidenceVerdict : EvidenceVerdict {
 };
 
 struct SvsmAkEnrollmentRequirements {
-    /// Carries the release measurement pin (policy.expected_measurement_hex).
+    /// Carries the release measurement set (policy.expected_measurements_hex);
+    /// enrollment refuses an empty set.
     SnpPolicyRequirements policy;
     bool require_revocation_check{false};
     AmdRevocationState revocation;

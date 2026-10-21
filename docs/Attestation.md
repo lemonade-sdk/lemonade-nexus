@@ -84,7 +84,7 @@ observations):
 
 | Field | Gap name | Consequence while unset |
 |---|---|---|
-| `snp.expected_measurement_hex` | `NoPinnedLaunchMeasurement` | Any SNP guest image would pass |
+| `snp.expected_measurements_hex` | `NoPinnedLaunchMeasurement` | Any SNP guest image would pass |
 | `snp.min_tcb` | `NoTcbFloor` | Firmware with known issues would pass |
 | `ima_policy_digest` | `NoImaPolicyDigest` | The measuring policy is unproven |
 | Approved path digests | `NoApprovedBinary` | No measured component can be looked up |

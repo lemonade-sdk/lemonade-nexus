@@ -29,6 +29,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <thread>
@@ -85,6 +86,20 @@ struct GossipBallotTestAccess {
                                        std::chrono::steady_clock::time_point t) {
         std::lock_guard lock(g.peers_mutex_);
         g.peer_exchange_last_[pubkey] = t;
+    }
+    // Tracked #7: socket buffer sizes as granted by the OS (rcv, snd).
+    static std::pair<int, int> socket_buffers(GossipService& g) {
+        asio::socket_base::receive_buffer_size rcv{};
+        asio::socket_base::send_buffer_size snd{};
+        g.socket_.get_option(rcv);
+        g.socket_.get_option(snd);
+        return {rcv.value(), snd.value()};
+    }
+    // Tracked #9: drive the send-failure rate limiter with synthetic clocks.
+    static std::optional<std::uint64_t> send_fail_log_due(
+        GossipService& g, const std::string& dest,
+        std::chrono::steady_clock::time_point now) {
+        return g.send_fail_log_due(dest, now);
     }
     static bool revoked(GossipService& g, const std::string& pubkey) {
         return g.is_revoked(pubkey);

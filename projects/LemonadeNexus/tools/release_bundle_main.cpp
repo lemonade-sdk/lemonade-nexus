@@ -11,6 +11,8 @@
 //     "network_id": "<64-hex>", "signer_pubkey": "<base64 Ed25519>",
 //     "qualification_state": "PENDING_LIVE_QUALIFICATION" | "LIVE_BOOT_APPROVED",
 //     "expected_pcrs": [{"index": 8, "sha256": "..."}, {"index": 9, "sha256": "..."}],
+//     "svsm_launch_measurements": ["<96-hex>", ...],   // optional; one per approved
+//                                                      // VM shape, else the compiled set
 //     "artifacts": [{"path": "/usr/bin/lemonade-nexus", "file": "build/bin/lemonade-nexus"}, ...]
 //   }
 //
@@ -71,6 +73,10 @@ int main(int argc, char** argv) {
         for (const auto& pcr : spec_json.value("expected_pcrs", nlohmann::json::array())) {
             spec.expected_pcrs.emplace_back(pcr.at("index").get<uint32_t>(),
                                             pcr.at("sha256").get<std::string>());
+        }
+        for (const auto& measurement :
+             spec_json.value("svsm_launch_measurements", nlohmann::json::array())) {
+            spec.svsm_launch_measurements.push_back(measurement.get<std::string>());
         }
         for (const auto& artifact : spec_json.at("artifacts")) {
             spec.artifacts.push_back({artifact.at("path").get<std::string>(),

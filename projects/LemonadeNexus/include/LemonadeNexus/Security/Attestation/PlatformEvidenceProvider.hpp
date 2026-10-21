@@ -20,6 +20,7 @@
 #include <LemonadeNexus/Security/Attestation/AttestationState.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/VerifiedPlatformClaims.hpp>
+#include <LemonadeNexus/Security/MeasurementIma.hpp>
 
 #include <optional>
 
@@ -35,6 +36,10 @@ struct PlatformVerification {
 struct PlatformVerificationState {
     const SvsmAkActivationRecord* activation{nullptr};
     const AttestationCheckpoint* checkpoint{nullptr};
+    /// Caller-owned slot. A provider that replays the transferred IMA log
+    /// writes its replay state here on success, so the caller builds the next
+    /// checkpoint without a second parse+replay. Left untouched on failure.
+    std::optional<ImaBinaryReplayState>* ima_state_out{nullptr};
 };
 
 class PlatformEvidenceProvider {

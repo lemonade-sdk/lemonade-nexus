@@ -75,7 +75,38 @@ TEST_F(GeneratorFixture, DigestsComeFromTheActualBytes) {
     EXPECT_EQ(approval->approved_paths[2].sha256.front(), hex_sha256("libc bytes"));
     // The template supplied the compiled line; the spec supplied observations.
     EXPECT_EQ(approval->evidence_collector_path, "/usr/bin/nexus-attestd");
-    EXPECT_FALSE(approval->svsm_launch_measurement_hex.empty());
+    EXPECT_FALSE(approval->svsm_launch_measurements_hex.empty());
+}
+
+TEST_F(GeneratorFixture, SpecMeasurementsAreCanonicalizedAndFailClosed) {
+    std::string error;
+    {   // Empty keeps the compiled template set.
+        const auto approval = generate_release_approval(spec, error);
+        ASSERT_TRUE(approval.has_value()) << error;
+        EXPECT_EQ(approval->svsm_launch_measurements_hex,
+                  release_approval_template().svsm_launch_measurements_hex);
+    }
+    {   // One entry per approved shape, sorted into canonical order.
+        auto s = spec;
+        s.svsm_launch_measurements = {std::string(96, 'b'), std::string(96, 'a')};
+        const auto approval = generate_release_approval(s, error);
+        ASSERT_TRUE(approval.has_value()) << error;
+        const std::vector<std::string> expected{std::string(96, 'a'),
+                                                std::string(96, 'b')};
+        EXPECT_EQ(approval->svsm_launch_measurements_hex, expected);
+    }
+    {   // Duplicates are an authoring error, never silently merged.
+        auto s = spec;
+        s.svsm_launch_measurements = {std::string(96, 'a'), std::string(96, 'a')};
+        EXPECT_FALSE(generate_release_approval(s, error).has_value());
+    }
+    {   // Uppercase and short values are not measurements.
+        auto s = spec;
+        s.svsm_launch_measurements = {std::string(96, 'A')};
+        EXPECT_FALSE(generate_release_approval(s, error).has_value());
+        s.svsm_launch_measurements = {std::string(95, 'a')};
+        EXPECT_FALSE(generate_release_approval(s, error).has_value());
+    }
 }
 
 TEST_F(GeneratorFixture, ATestSignedGeneratedBundlePassesTheProductionVerifier) {

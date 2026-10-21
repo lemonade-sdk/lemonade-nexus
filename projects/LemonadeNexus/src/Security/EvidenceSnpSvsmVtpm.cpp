@@ -100,6 +100,14 @@ bool matches_hex(std::span<const uint8_t> bytes, const std::string& expected) {
     return !expected.empty() && hex_of(bytes) == expected;
 }
 
+/// Exact-match-any against the release measurement set; empty matches nothing.
+bool matches_any_hex(std::span<const uint8_t> bytes,
+                     const std::vector<std::string>& expected) {
+    const auto hex = hex_of(bytes);
+    return std::any_of(expected.begin(), expected.end(),
+                       [&hex](const std::string& value) { return value == hex; });
+}
+
 // RSA exponent as big-endian bytes with leading zeros trimmed.
 std::vector<uint8_t> exponent_be(uint32_t exponent) {
     std::vector<uint8_t> bytes{
@@ -314,6 +322,10 @@ SvsmAkEnrollmentIdentity verify_svsm_ak_enrollment_identity(
             return refuse("AMD revocation check failed: " + revocation.failure);
         }
     }
+    // Enrollment pins the release set; an empty set must refuse, never skip.
+    if (req.policy.expected_measurements_hex.empty()) {
+        return refuse("no release-approved SVSM launch measurement is pinned");
+    }
     SnpPolicyRequirements policy = req.policy;
     policy.vmpl_policy = VmplPolicy::RequireVmpl0;
     if (const auto checked = verify_snp_policy(*service, policy); !checked.ok) {
@@ -402,10 +414,12 @@ SvsmEvidenceVerdict verify_snp_svsm_vtpm_evidence(
     if (!service->reported_tcb.at_least(req.policy.min_tcb))
         return fail(SvsmEvidenceFailure::ServiceTcbTooOld,
                     "the SVSM report TCB is below the release floor");
-    // Empty pin is for paired signed test fixtures only; readiness() requires
-    // a release measurement pin in production.
-    if (!req.expected_measurement_hex.empty() &&
-        !matches_hex(service->measurement, req.expected_measurement_hex))
+    // The release pin is a set, one measurement per approved VM shape.
+    // Membership is exact; an empty set approves nothing.
+    if (req.expected_measurements_hex.empty())
+        return fail(SvsmEvidenceFailure::ServiceMeasurementInvalid,
+                    "no release-approved SVSM launch measurement is pinned");
+    if (!matches_any_hex(service->measurement, req.expected_measurements_hex))
         return fail(SvsmEvidenceFailure::ServiceMeasurementInvalid,
                     "the SVSM launch measurement is not release-approved");
 
@@ -420,8 +434,7 @@ SvsmEvidenceVerdict verify_snp_svsm_vtpm_evidence(
     if (!guest->reported_tcb.at_least(req.policy.min_tcb))
         return fail(SvsmEvidenceFailure::GuestTcbTooOld,
                     "the guest report TCB is below the release floor");
-    if (!req.expected_measurement_hex.empty() &&
-        !matches_hex(guest->measurement, req.expected_measurement_hex))
+    if (!matches_any_hex(guest->measurement, req.expected_measurements_hex))
         return fail(SvsmEvidenceFailure::GuestMeasurementInvalid,
                     "the guest launch measurement is not release-approved");
     if (service->chip_id != guest->chip_id)

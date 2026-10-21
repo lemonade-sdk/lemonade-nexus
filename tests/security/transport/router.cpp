@@ -5,6 +5,7 @@
 // commitment, and share crosses the codec. The attestation verifier's
 // positive path needs a confidential VM, so verdicts are constructed.
 
+#include <LemonadeNexus/Security/Attestation/AttestationService.hpp>
 #include <LemonadeNexus/Security/Consensus/VoteKey.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
@@ -12,10 +13,15 @@
 
 #include <gtest/gtest.h>
 #include <sodium.h>
+#include <spdlog/sinks/base_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <deque>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
 #include <unistd.h>
 #include <vector>
 
@@ -852,6 +858,87 @@ TEST_F(RouterMesh, PreQuorumAnchorChallengeIsBoundedPerWindow) {
                   .dropped,
               DropReason::BudgetExceeded);
     EXPECT_EQ(b->producer.calls, constants::kChallengeProductionsPerWindow);
+}
+
+/// Counts the router's rate-limited info drop lines and keeps the last one.
+struct CountingDropSink : spdlog::sinks::base_sink<std::mutex> {
+    int drop_infos = 0;
+    std::string last;
+
+protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
+        const std::string_view text(msg.payload.data(), msg.payload.size());
+        if (msg.level == spdlog::level::info &&
+            text.find("route drop") != std::string_view::npos) {
+            ++drop_infos;
+            last.assign(text);
+        }
+    }
+    void flush_() override {}
+};
+
+TEST_F(RouterMesh, DropsAreCountedAndTheInfoLineIsRateLimited) {
+    Node* a = founders[0];
+    Node* b = founders[1];
+    auto sink = std::make_shared<CountingDropSink>();
+    spdlog::set_level(spdlog::level::info);
+    spdlog::default_logger()->sinks().push_back(sink);
+
+    // First occurrence of a (reason, code) logs immediately and is counted.
+    std::vector<uint8_t> junk(8, 0);
+    const uint64_t start = mesh.now_ms;
+    EXPECT_EQ(a->deliver(b->id, junk, start).dropped, DropReason::Malformed);
+    EXPECT_EQ(a->router->drops(DropReason::Malformed), 1u);
+    EXPECT_EQ(sink->drop_infos, 1);
+
+    // Repeats inside the window are counted, not logged.
+    for (int i = 0; i < 5; ++i) {
+        EXPECT_EQ(a->deliver(b->id, junk, start + 1).dropped, DropReason::Malformed);
+    }
+    EXPECT_EQ(a->router->drops(DropReason::Malformed), 6u);
+    EXPECT_EQ(sink->drop_infos, 1);
+
+    // A different reason is its own line despite the open window.
+    std::vector<uint8_t> huge(constants::kMaxSecurityMessageBytes + 1, 0);
+    EXPECT_EQ(a->deliver(b->id, huge, start + 1).dropped, DropReason::Oversized);
+    EXPECT_EQ(a->router->drops(DropReason::Oversized), 1u);
+    EXPECT_EQ(sink->drop_infos, 2);
+
+    // Past the window the next drop logs and names what was suppressed.
+    EXPECT_EQ(a->deliver(b->id, junk, start + kDropLogWindowMs).dropped,
+              DropReason::Malformed);
+    EXPECT_EQ(a->router->drops(DropReason::Malformed), 7u);
+    EXPECT_EQ(sink->drop_infos, 3);
+    EXPECT_NE(sink->last.find("(5 suppressed)"), std::string::npos) << sink->last;
+
+    spdlog::default_logger()->sinks().pop_back();
+}
+
+TEST_F(RouterMesh, RefusedEnrollmentEvidenceCarriesATypedRejectCode) {
+    Node* a = founders[0];
+    Node* b = founders[1];
+
+    // Enrollment-purpose evidence with no live enrollment challenge on the
+    // verifier: the drop names ServiceRejected with the typed refusal, not
+    // code 0.
+    AttestationEvidence evidence;
+    evidence.network_id = network;
+    evidence.node_id = b->id;
+    evidence.incarnation = 1;
+    evidence.epoch = 1;
+    evidence.security_ruleset = constants::kSecurityRulesetVersion;
+    evidence.consensus_ruleset = constants::kConsensusRulesetVersion;
+    evidence.profile_id = AttestationProfileId::SnpSvsmVtpm;
+    evidence.profile_ruleset = kAttestationProfileRulesetVersion;
+    evidence.purpose = AttestationPurpose::PlatformEnrollment;
+    const auto message = b->router->compose(SecurityMessageKind::AttestationEvidence,
+                                            evidence, 1);
+    const auto result = a->deliver(b->id, encode_security_message(message), mesh.now_ms);
+    EXPECT_EQ(result.dropped, DropReason::ServiceRejected);
+    ASSERT_TRUE(result.service_code.has_value());
+    EXPECT_EQ(*result.service_code,
+              static_cast<uint16_t>(EnrollmentRefusal::ChallengeMismatch));
+    EXPECT_EQ(a->router->drops(DropReason::ServiceRejected), 1u);
 }
 
 TEST_F(RouterMesh, SyncResponseCarriesAValidatedCertificate) {

@@ -10,6 +10,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+#include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
@@ -511,4 +512,50 @@ TEST_F(RootClaimHttpTest, ClosedRegistrationExemptionUsesExistingOwnershipOnly) 
     ASSERT_EQ(res->status, 403) << res->body;
     EXPECT_NE(res->body.find("registration closed"), std::string::npos);
     EXPECT_FALSE(find_customer(stranger_kp).has_value());
+}
+
+// --- Post-epoch establishment (the deferred root-initialization authority) ---
+
+// Once a node holds finalized epoch authority, ensure_application_root creates
+// the root from the configured root management key, and joining works.
+TEST_F(RootClaimHttpTest, PostEpochEstablishmentCreatesTheRootFromTheConfiguredKey) {
+    const auto hex = crypto::to_hex(std::span<const uint8_t>(
+        owner_kp.public_key.data(), owner_kp.public_key.size()));
+    EXPECT_TRUE(core::ensure_application_root(*tree, hex));
+
+    auto root = tree->get_node("root");
+    ASSERT_TRUE(root.has_value());
+    EXPECT_EQ(root->type, tree::NodeType::Root);
+    EXPECT_EQ(tree::canonical_principal(root->mgmt_pubkey),
+              tree::canonical_principal(prefixed_b64(owner_kp)));
+    ASSERT_EQ(root->assignments.size(), 1u);
+    EXPECT_EQ(root->assignments[0].permissions.size(), 6u);
+
+    auto res = join(stranger_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 200) << res->body;
+
+    // One-shot: a second establishment changes nothing.
+    EXPECT_FALSE(core::ensure_application_root(*tree, hex));
+}
+
+TEST_F(RootClaimHttpTest, EstablishmentNeverOverwritesAnExistingRoot) {
+    seed_root(owner_kp);
+    const auto other_hex = crypto::to_hex(std::span<const uint8_t>(
+        stranger_kp.public_key.data(), stranger_kp.public_key.size()));
+    EXPECT_FALSE(core::ensure_application_root(*tree, other_hex));
+    EXPECT_EQ(tree->get_node("root")->mgmt_pubkey, prefixed_b64(owner_kp));
+}
+
+// A missing or malformed configured key establishes nothing: join keeps
+// refusing with 409, never a default owner.
+TEST_F(RootClaimHttpTest, AMalformedConfiguredKeyEstablishesNothing) {
+    EXPECT_FALSE(core::ensure_application_root(*tree, ""));
+    EXPECT_FALSE(core::ensure_application_root(*tree, "zz"));
+    EXPECT_FALSE(core::ensure_application_root(*tree, std::string(63, 'a')));
+    EXPECT_FALSE(tree->get_node("root").has_value());
+
+    auto res = join(stranger_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 409) << res->body;
 }

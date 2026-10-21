@@ -60,6 +60,9 @@ struct SecurityMeshConfig {
     /// server process holds no TPM device. Unset means the candidate cannot
     /// complete enrollment and the producer refuses the offer.
     PlatformActivationSource activation_source;
+    /// Fires when this node first holds finalized epoch authority (entry into
+    /// Active, or genesis certificate issuance). io-thread context.
+    std::function<void()> on_epoch_established;
 };
 
 class SecurityMeshService : public core::IService<SecurityMeshService> {

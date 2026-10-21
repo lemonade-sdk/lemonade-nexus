@@ -7,8 +7,8 @@
 #include <spdlog/spdlog.h>
 
 #include <array>
-#include <chrono>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>

@@ -36,6 +36,10 @@ struct ReleaseBundleSpec {
     /// PCR8 and PCR9).
     std::string qualification_state;
     std::vector<std::pair<uint32_t, std::string>> expected_pcrs;
+    /// Approved SVSM launch measurements, one per approved VM shape, each 96
+    /// lowercase hex. Empty keeps the compiled template set. The generator
+    /// sorts them; duplicates fail closed.
+    std::vector<std::string> svsm_launch_measurements;
     /// Both required executables plus the audited dependency closure.
     std::vector<ReleaseArtifact> artifacts;
 };

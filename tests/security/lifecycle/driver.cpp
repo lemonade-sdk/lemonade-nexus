@@ -482,5 +482,23 @@ TEST_F(DriverMesh, CorruptEpochStateFailsClosed) {
     EXPECT_EQ(victim->driver->phase(), DriverPhase::Failed);
 }
 
+
+// The epoch-established hook fires exactly when finalized authority appears:
+// each founder on entry into Active, the anchor at certificate issuance.
+TEST_F(DriverMesh, EpochEstablishmentFiresOnActivationAndIssuance) {
+    int anchor_fired = 0;
+    genesis_node->driver->set_epoch_established_callback([&] { ++anchor_fired; });
+    std::vector<int> founder_fired(founders.size(), 0);
+    for (size_t i = 0; i < founders.size(); ++i) {
+        founders[i]->driver->set_epoch_established_callback(
+            [&founder_fired, i] { ++founder_fired[i]; });
+    }
+
+    bootstrap();
+
+    EXPECT_EQ(anchor_fired, 1);
+    for (int fired : founder_fired) EXPECT_EQ(fired, 1);
+}
+
 }  // namespace
 }  // namespace lifecycle_test

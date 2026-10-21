@@ -2,8 +2,15 @@
 set -e
 
 package_is_installed() {
-    dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null |
-        grep -qx 'install ok installed'
+    # This script is also CPack's RPM post-install; rpm hosts have no dpkg-query.
+    if command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Status}\n' "$1" 2>/dev/null |
+            grep -qx 'install ok installed'
+    elif command -v rpm >/dev/null 2>&1; then
+        rpm -q "$1" >/dev/null 2>&1
+    else
+        return 1
+    fi
 }
 
 rebuild_supported_initramfs() {

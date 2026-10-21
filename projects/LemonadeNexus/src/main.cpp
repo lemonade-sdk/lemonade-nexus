@@ -25,6 +25,7 @@
 #include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
+#include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
@@ -238,7 +239,10 @@ int main(int argc, char* argv[]) {
     std::string mesh_error;
     auto security_mesh = nexus::core::start_security_mesh(
         coordinator.io_context(), config, gossip, key_wrapping,
-        std::move(platform_source), std::move(activation_source), mesh_error);
+        std::move(platform_source), std::move(activation_source), mesh_error,
+        [&tree, &config] {
+            nexus::core::ensure_application_root(tree, config.root_pubkey);
+        });
     if (!security_mesh) {
         spdlog::error("Config: {}", mesh_error);
         return 1;

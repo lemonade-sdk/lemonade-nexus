@@ -17,7 +17,8 @@ std::optional<SecurityMeshStartup> start_security_mesh(
         asio::io_context& io, const ServerConfig& config,
         gossip::GossipService& gossip, crypto::KeyWrappingService& key_wrapping,
         security::PlatformEvidenceSource platform_source,
-        security::PlatformActivationSource activation_source, std::string& error) {
+        security::PlatformActivationSource activation_source, std::string& error,
+        std::function<void()> on_epoch_established) {
     const auto anchor = load_genesis_anchor(config.genesis_pubkey);
     if (!anchor) {
         error = "genesis_pubkey is not a base64 Ed25519 public key";
@@ -54,6 +55,7 @@ std::optional<SecurityMeshStartup> start_security_mesh(
     }
     mesh_config.platform_source = std::move(platform_source);
     mesh_config.activation_source = std::move(activation_source);
+    mesh_config.on_epoch_established = std::move(on_epoch_established);
     auto startup = std::make_optional<SecurityMeshStartup>();
     startup->service =
         std::make_unique<security::SecurityMeshService>(io, mesh_config, gossip,

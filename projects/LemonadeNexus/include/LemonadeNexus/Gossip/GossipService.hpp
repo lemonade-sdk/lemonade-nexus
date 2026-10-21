@@ -688,6 +688,22 @@ private:
     bool denial_log_allowed(const std::string& key,
                             std::chrono::steady_clock::time_point now);
 
+    // Send-failure observability (tracked #9, gossip half): failures are
+    // counted per destination; the first per destination warns immediately,
+    // repeats within 60 s are counted and summarized on the next warn.
+    // Touched only on the failure path; bounded by pruning quiet entries.
+    struct SendFailState {
+        std::chrono::steady_clock::time_point last_log{};
+        std::uint64_t suppressed{0};
+    };
+    std::mutex send_fail_mutex_;
+    std::unordered_map<std::string, SendFailState> send_fail_;
+    // Suppressed-since-last-warn count when a warn is due; nullopt when the
+    // failure is only counted.
+    [[nodiscard]] std::optional<std::uint64_t> send_fail_log_due(
+        const std::string& dest, std::chrono::steady_clock::time_point now);
+    void note_send_failure(const std::string& dest, const std::string& error);
+
     // Test seams (friend GossipBallotTestAccess): zero selects production.
     std::size_t   test_peer_log_cap_{0};
     std::size_t   test_pool_max_records_{0};

@@ -101,7 +101,7 @@ protected:
         // profile must pin everything before any later check is reachable.
         profile_ = linux_attestation_profile_v1();
         profile_.snp.min_tcb = {2, 0, 6, 55};
-        profile_.snp.expected_measurement_hex = std::string(96, 'a');
+        profile_.snp.expected_measurements_hex = {std::string(96, 'a')};
         profile_.ima_policy_digest = patterned<32>(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
@@ -186,7 +186,7 @@ TEST_F(Tier1PathTest, IncompleteProfileRejectsAnOtherwiseFlawlessCandidate) {
     // never examined, so it must accept nobody instead. The challenge is
     // re-issued under the gapped profile, so step 1 agrees and step 0 is the
     // only possible cause.
-    profile_.snp.expected_measurement_hex.clear();
+    profile_.snp.expected_measurements_hex.clear();
     ASSERT_FALSE(profile_is_complete(profile_));
     challenge_ = issue(profile_);
     evidence_ = answer(challenge_);
@@ -530,7 +530,7 @@ TEST_F(Tier1PathTest, RepairingEachLinkExposesExactlyTheNextCheck) {
     ASSERT_NE(patterned<32>(0x66), profile_digest(profile_));
 
     const LinuxAttestationProfile complete = profile_;
-    profile_.snp.expected_measurement_hex.clear();
+    profile_.snp.expected_measurements_hex.clear();
     challenge_.policy_digest = patterned<32>(0x66);
     evidence_.challenge_digest = challenge_digest(foreign);
     evidence_.node_id.bytes = patterned<32>(0x55);
@@ -574,7 +574,7 @@ TEST_F(Tier1PathTest, EveryRejectionPathIsDeterministic) {
     };
     const Scenario scenarios[] = {
         {"incomplete profile", AttestationFailure::ProfileIncomplete,
-         [this] { profile_.snp.expected_measurement_hex.clear(); }},
+         [this] { profile_.snp.expected_measurements_hex.clear(); }},
         {"challenge for another policy", AttestationFailure::RulesetMismatch,
          [this] { challenge_.policy_digest = patterned<32>(0x66); }},
         {"older evidence security ruleset", AttestationFailure::RulesetMismatch,

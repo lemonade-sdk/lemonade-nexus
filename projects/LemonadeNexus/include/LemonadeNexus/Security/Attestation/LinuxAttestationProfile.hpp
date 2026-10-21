@@ -93,7 +93,7 @@ struct LinuxAttestationProfile {
     std::string evidence_collector_path;
 
     /// Approved boot state, one pinned hex value per quoted PCR. One of two
-    /// boot-integrity inputs; snp.expected_measurement_hex is the other, and
+    /// boot-integrity inputs; snp.expected_measurements_hex is the other, and
     /// completeness requires both.
     std::vector<std::pair<uint32_t, std::string>> expected_pcrs;
 

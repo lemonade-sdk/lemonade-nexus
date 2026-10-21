@@ -31,7 +31,7 @@ LinuxAttestationProfile base_profile() {
     profile.snp.require_no_migration_agent = true;
     profile.vmpl_policy = nexus::security::VmplPolicy::RequireVmpl0;
     profile.snp.min_tcb = {2, 0, 6, 55};
-    profile.snp.expected_measurement_hex = "aa11";
+    profile.snp.expected_measurements_hex = {"aa11"};
     profile.required_ak_spki_b64 = "QUsx";
     profile.ima_policy_digest = patterned_digest(0x60);
     profile.require_ima = true;
@@ -62,8 +62,10 @@ const ProfileMutation kProfileMutations[] = {
     {"snp.min_tcb.tee", [](LinuxAttestationProfile& p) { p.snp.min_tcb.tee += 1; }},
     {"snp.min_tcb.snp", [](LinuxAttestationProfile& p) { p.snp.min_tcb.snp += 1; }},
     {"snp.min_tcb.microcode", [](LinuxAttestationProfile& p) { p.snp.min_tcb.microcode += 1; }},
-    {"snp.expected_measurement_hex",
-     [](LinuxAttestationProfile& p) { p.snp.expected_measurement_hex = "bb22"; }},
+    {"snp.expected_measurements_hex value",
+     [](LinuxAttestationProfile& p) { p.snp.expected_measurements_hex = {"bb22"}; }},
+    {"snp.expected_measurements_hex extra entry",
+     [](LinuxAttestationProfile& p) { p.snp.expected_measurements_hex.push_back("bb22"); }},
     {"required_ak_spki_b64", [](LinuxAttestationProfile& p) { p.required_ak_spki_b64 = "QUsy"; }},
     {"ima_policy_digest", [](LinuxAttestationProfile& p) { p.ima_policy_digest[0] ^= 1; }},
     {"require_ima", [](LinuxAttestationProfile& p) { p.require_ima = false; }},
@@ -126,6 +128,20 @@ TEST(LinuxAttestationProfile, ListBoundariesCannotShift) {
     LinuxAttestationProfile joined = base_profile();
     joined.approved_paths = {{"/usr/bin/nexus", {"abcd"}}};
 
+    EXPECT_NE(profile_digest(split), profile_digest(joined));
+}
+
+TEST(LinuxAttestationProfile, MeasurementSetOrderAndBoundariesAreEncoded) {
+    LinuxAttestationProfile one = base_profile();
+    one.snp.expected_measurements_hex = {"aa11", "bb22"};
+    LinuxAttestationProfile swapped = base_profile();
+    swapped.snp.expected_measurements_hex = {"bb22", "aa11"};
+    EXPECT_NE(profile_digest(one), profile_digest(swapped));
+
+    LinuxAttestationProfile split = base_profile();
+    split.snp.expected_measurements_hex = {"aa", "11"};
+    LinuxAttestationProfile joined = base_profile();
+    joined.snp.expected_measurements_hex = {"aa11"};
     EXPECT_NE(profile_digest(split), profile_digest(joined));
 }
 
@@ -205,7 +221,7 @@ TEST(LinuxAttestationProfileCompleteness, ShippedV1IsDeliberatelyIncomplete) {
 TEST(LinuxAttestationProfileCompleteness, EachUnpinnedPrerequisiteIsItsOwnGap) {
     {   // No launch measurement: any SNP guest image would pass.
         auto p = complete_profile();
-        p.snp.expected_measurement_hex.clear();
+        p.snp.expected_measurements_hex.clear();
         EXPECT_FALSE(profile_is_complete(p));
         EXPECT_TRUE(has_gap(p, ProfileGap::NoPinnedLaunchMeasurement));
     }

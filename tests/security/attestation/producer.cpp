@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
+#include <LemonadeNexus/Security/Attestation/SvsmAkEnrollment.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include "support/attestation_fixtures.hpp"
@@ -8,9 +9,13 @@
 #include <sodium.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <optional>
+#include <span>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace constants = nexus::security::constants;
 
@@ -55,7 +60,7 @@ protected:
         // one, so the binding checks below would otherwise be unreachable.
         profile_ = nexus::security::linux_attestation_profile_v2_svsm();
         profile_.snp.min_tcb = {2, 0, 6, 55};
-        profile_.snp.expected_measurement_hex = std::string(96, 'a');
+        profile_.snp.expected_measurements_hex = {std::string(96, 'a')};
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";
@@ -314,4 +319,79 @@ TEST_F(PlatformEvidenceProducerTest, ExternalSourceOwnsResumeCheckpointFiltering
     EXPECT_TRUE(platform->ima_binary_log.empty());
     EXPECT_EQ(evidence->ima_mode, nexus::security::ImaEvidenceMode::Resume);
     EXPECT_EQ(evidence->ima_bytes, 0);
+}
+
+// --- The enrollment loop warn ---------------------------------------------------
+//
+// #48c: a candidate stuck re-answering enrollment challenges was invisible at
+// info level. These pin the warn-state: armed after ~2 minutes of enrollment-only
+// production, repeated at a backoff, reset by progress.
+
+TEST_F(PlatformEvidenceProducerTest, AStuckEnrollmentLoopWarnsAfterTwoMinutesWithBackoff) {
+    auto now = std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    auto with_clock = sources();
+    with_clock.clock = [&now] { return now; };
+    PlatformEvidenceProducer producer{std::move(with_clock)};
+
+    // The production cadence: one enrollment answer every 17 s.
+    challenge_.purpose = nexus::security::AttestationPurpose::PlatformEnrollment;
+    for (int i = 0; i < 8; ++i) {
+        ASSERT_TRUE(producer.produce(challenge_).has_value());
+        now += std::chrono::seconds(17);
+    }
+    // 119 s in: tracked, not yet loud.
+    EXPECT_EQ(producer.enrollment_streak(), 8u);
+    EXPECT_EQ(producer.enrollment_warnings(), 0u);
+
+    // The next production crosses two minutes and warns once.
+    ASSERT_TRUE(producer.produce(challenge_).has_value());
+    EXPECT_EQ(producer.enrollment_streak(), 9u);
+    EXPECT_EQ(producer.enrollment_warnings(), 1u);
+
+    // Inside the backoff window the warn does not repeat per cycle.
+    for (int i = 0; i < 7; ++i) {
+        now += std::chrono::seconds(17);
+        ASSERT_TRUE(producer.produce(challenge_).has_value());
+    }
+    EXPECT_EQ(producer.enrollment_warnings(), 1u);
+
+    // Past the backoff it repeats.
+    now += std::chrono::seconds(17);
+    ASSERT_TRUE(producer.produce(challenge_).has_value());
+    EXPECT_EQ(producer.enrollment_warnings(), 2u);
+
+    // A non-enrollment challenge is the verifier moving on: full reset.
+    challenge_.purpose = nexus::security::AttestationPurpose::Eligibility;
+    ASSERT_TRUE(producer.produce(challenge_).has_value());
+    EXPECT_EQ(producer.enrollment_streak(), 0u);
+    EXPECT_EQ(producer.enrollment_warnings(), 0u);
+}
+
+TEST_F(PlatformEvidenceProducerTest, ASuccessfulActivationResetsTheEnrollmentStreak) {
+    auto with_activation = sources();
+    with_activation.activation_source =
+        [](std::span<const uint8_t>, std::span<const uint8_t>, std::span<const uint8_t>,
+           std::span<const uint8_t>, std::string*) -> std::optional<std::vector<uint8_t>> {
+        return std::vector<uint8_t>(32, 0xA0);
+    };
+    PlatformEvidenceProducer producer{std::move(with_activation)};
+
+    challenge_.purpose = nexus::security::AttestationPurpose::PlatformEnrollment;
+    ASSERT_TRUE(producer.produce(challenge_).has_value());
+    ASSERT_TRUE(producer.produce(challenge_).has_value());
+    EXPECT_EQ(producer.enrollment_streak(), 2u);
+
+    // A minimal valid offer: identity fields match and the context is derived.
+    nexus::security::SvsmAkActivationOfferMessage offer;
+    offer.network_id = patterned<32>(0x08);
+    offer.subject_node.bytes = identity_.public_key;
+    offer.subject_key = identity_.public_key;
+    offer.incarnation = challenge_.incarnation;
+    offer.epoch = challenge_.epoch;
+    offer.profile_id = nexus::security::kTier1AttestationProfileId;
+    offer.profile_ruleset = nexus::security::kAttestationProfileRulesetVersion;
+    offer.activation.enrollment_context = nexus::security::svsm_ak_activation_offer_context(offer);
+    ASSERT_TRUE(producer.activate(offer).has_value());
+    EXPECT_EQ(producer.enrollment_streak(), 0u);
+    EXPECT_EQ(producer.enrollment_warnings(), 0u);
 }

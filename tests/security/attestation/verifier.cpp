@@ -56,7 +56,7 @@ protected:
         // one, so every check below would otherwise be unreachable.
         profile_ = nexus::security::linux_attestation_profile_v1();
         profile_.snp.min_tcb = {2, 0, 6, 55};
-        profile_.snp.expected_measurement_hex = std::string(96, 'a');
+        profile_.snp.expected_measurements_hex = {std::string(96, 'a')};
         profile_.ima_policy_digest.fill(0x60);
         profile_.approved_paths = {{"/usr/bin/nexus", {kApprovedBinary}}};
         profile_.evidence_collector_path = "/usr/bin/nexus";

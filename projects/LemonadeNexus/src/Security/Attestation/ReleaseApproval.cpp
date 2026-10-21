@@ -39,9 +39,14 @@ constexpr std::string_view kExpectedModuleCertificate =
 constexpr std::string_view kExpectedImaPolicyId = "nexus-tier1-ima-v1";
 constexpr std::string_view kExpectedImaPolicy =
     "b3cabc30317af8b7127a175d7b4f906a40203e7ebe28122d82a713e03dad4092";
-constexpr std::string_view kExpectedLaunchMeasurement =
+// One entry per approved VM shape. Keep sorted ascending and unique: the
+// entries are the canonical set the preimage encodes verbatim.
+constexpr std::string_view kExpectedLaunchMeasurements[] = {
     "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
-    "c6e84c2490814e22a2b5ba860a37208d1d9a";
+    "c6e84c2490814e22a2b5ba860a37208d1d9a",
+    "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e"
+    "79313e3df3f88b9798a7eb53ab1b3ff59a54",
+};
 
 json approved_paths_json(const std::vector<ApprovedPath>& paths) {
     json out = json::array();
@@ -89,7 +94,7 @@ json approval_preimage(const ReleaseApprovalV1& approval) {
                      {"module_tree_sha256", approval.kernel.module_tree_sha256},
                      {"module_certificate_der_sha256",
                       approval.kernel.module_certificate_der_sha256}}},
-        {"svsm_launch_measurement", approval.svsm_launch_measurement_hex},
+        {"svsm_launch_measurements", approval.svsm_launch_measurements_hex},
         {"min_tcb", tcb_json(approval.min_tcb)},
         {"approved_paths", approved_paths_json(approval.approved_paths)},
         {"evidence_collector_path", approval.evidence_collector_path},
@@ -102,6 +107,28 @@ json approval_preimage(const ReleaseApprovalV1& approval) {
 using detail::valid_hex;
 
 bool valid_sha256(std::string_view value) { return valid_hex(value, 64); }
+
+// Canonical measurement set: non-empty, 96 lowercase hex each, strictly
+// ascending. Strict order makes the signed preimage deterministic and rejects
+// duplicates in the same comparison.
+bool valid_measurement_set(const std::vector<std::string>& measurements,
+                           std::string& error) {
+    if (measurements.empty()) {
+        error = "release approval pins no SVSM launch measurement";
+        return false;
+    }
+    for (std::size_t i = 0; i < measurements.size(); ++i) {
+        if (!valid_hex(measurements[i], 96)) {
+            error = "an SVSM launch measurement is not 96 lowercase hex characters";
+            return false;
+        }
+        if (i != 0 && measurements[i - 1] >= measurements[i]) {
+            error = "SVSM launch measurements are duplicated or not sorted";
+            return false;
+        }
+    }
+    return true;
+}
 
 bool verify_ed25519(std::string_view public_key_b64, std::string_view signature_b64,
                     std::string_view message) {
@@ -139,6 +166,9 @@ bool compiled_release_fields_match(const ReleaseApprovalV1& a, std::string& erro
         error = "release protocol identity does not match the compiled protocol";
         return false;
     }
+    if (!valid_measurement_set(a.svsm_launch_measurements_hex, error)) return false;
+    // Set equality: both sides are canonically sorted and unique, so
+    // element-wise comparison is the whole check.
     if (a.kernel.release != kExpectedKernelRelease ||
         a.kernel.bzimage_sha256 != kExpectedBzImage ||
         a.kernel.vmlinux_sha256 != kExpectedVmlinux ||
@@ -146,7 +176,10 @@ bool compiled_release_fields_match(const ReleaseApprovalV1& a, std::string& erro
         a.kernel.module_certificate_der_sha256 != kExpectedModuleCertificate ||
         a.ima_policy_id != kExpectedImaPolicyId ||
         a.ima_policy_sha256 != kExpectedImaPolicy ||
-        a.svsm_launch_measurement_hex != kExpectedLaunchMeasurement) {
+        a.svsm_launch_measurements_hex.size() != std::size(kExpectedLaunchMeasurements) ||
+        !std::equal(a.svsm_launch_measurements_hex.begin(),
+                    a.svsm_launch_measurements_hex.end(),
+                    std::begin(kExpectedLaunchMeasurements))) {
         error = "release kernel, IMA, or SVSM launch identity is not approved";
         return false;
     }
@@ -193,7 +226,8 @@ ReleaseApprovalBundleV1 parse_bundle(const json& root) {
     a.kernel.module_tree_sha256 = kernel.at("module_tree_sha256").get<std::string>();
     a.kernel.module_certificate_der_sha256 =
         kernel.at("module_certificate_der_sha256").get<std::string>();
-    a.svsm_launch_measurement_hex = j.at("svsm_launch_measurement").get<std::string>();
+    a.svsm_launch_measurements_hex =
+        j.at("svsm_launch_measurements").get<std::vector<std::string>>();
     const auto& tcb = j.at("min_tcb");
     a.min_tcb.bootloader = tcb.at("bootloader").get<uint8_t>();
     a.min_tcb.tee = tcb.at("tee").get<uint8_t>();
@@ -253,7 +287,8 @@ ReleaseApprovalV1 release_approval_template() {
     a.kernel = {std::string(kExpectedKernelRelease), std::string(kExpectedBzImage),
                 std::string(kExpectedVmlinux), std::string(kExpectedModuleTree),
                 std::string(kExpectedModuleCertificate)};
-    a.svsm_launch_measurement_hex = std::string(kExpectedLaunchMeasurement);
+    a.svsm_launch_measurements_hex.assign(std::begin(kExpectedLaunchMeasurements),
+                                          std::end(kExpectedLaunchMeasurements));
     a.min_tcb = {0x0c, 0, 0x1c, 0};
     a.evidence_collector_path = "/usr/bin/nexus-attestd";
     return a;
@@ -367,7 +402,7 @@ std::optional<ReleaseApprovalBundleV1> load_release_approval_bundle(
 LinuxAttestationProfile profile_from_release_approval(const ReleaseApprovalV1& approval) {
     auto profile = linux_attestation_profile_v3_svsm_release();
     profile.snp.min_tcb = approval.min_tcb;
-    profile.snp.expected_measurement_hex = approval.svsm_launch_measurement_hex;
+    profile.snp.expected_measurements_hex = approval.svsm_launch_measurements_hex;
     profile.approved_paths = approval.approved_paths;
     profile.evidence_collector_path = approval.evidence_collector_path;
     profile.expected_pcrs = approval.expected_pcrs;

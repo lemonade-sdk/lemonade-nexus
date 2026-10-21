@@ -82,6 +82,13 @@ public:
     [[nodiscard]] std::optional<crypto::Ed25519PublicKey> vote_key_for_epoch(EpochId epoch);
 
     [[nodiscard]] DriverPhase phase() const { return phase_; }
+
+    /// Fires on every entry into Active and once at genesis certificate
+    /// issuance: the moments this node first holds finalized epoch authority.
+    /// Runs on the io thread; set before start.
+    void set_epoch_established_callback(std::function<void()> cb) {
+        on_epoch_established_ = std::move(cb);
+    }
     [[nodiscard]] bool genesis_node() const;
     [[nodiscard]] std::optional<EpochId> current_epoch() const;
     [[nodiscard]] Height last_committed_height() const { return last_committed_height_; }
@@ -241,6 +248,7 @@ private:
     GenesisService* genesis_;
 
     DriverPhase phase_ = DriverPhase::Idle;
+    std::function<void()> on_epoch_established_;
     uint64_t now_ms_ = 0;
 
     // Own per-epoch vote keys; the private halves live here and in the store.

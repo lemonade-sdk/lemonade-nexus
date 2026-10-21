@@ -10,14 +10,19 @@ namespace nexus::security {
 
 namespace {
 
+// Exact-match-any against the release set; an empty set matches nothing.
+bool launch_measurement_approved(const LinuxAttestationProfile& profile,
+                                 const std::array<uint8_t, 48>& measurement) {
+    const auto hex = hex_of(measurement);
+    const auto& approved = profile.snp.expected_measurements_hex;
+    return std::find(approved.begin(), approved.end(), hex) != approved.end();
+}
+
 bool checkpoint_matches_challenge_and_activation(
     const AttestationCheckpoint& checkpoint,
     const AttestationChallenge& challenge,
     const SvsmAkActivationRecord& activation,
     const LinuxAttestationProfile& profile) {
-    std::vector<uint8_t> measurement;
-    try { measurement = crypto::from_hex(profile.snp.expected_measurement_hex); }
-    catch (...) { return false; }
     return checkpoint.network_id == challenge.network_id &&
            checkpoint.node_id == challenge.node_id &&
            checkpoint.incarnation == challenge.incarnation &&
@@ -30,9 +35,7 @@ bool checkpoint_matches_challenge_and_activation(
            checkpoint.required_paths == challenge.ima_checkpoint_paths &&
            checkpoint.ek_name == activation.ek_name &&
            checkpoint.ak_name == activation.ak_name &&
-           measurement.size() == checkpoint.launch_measurement.size() &&
-           std::equal(measurement.begin(), measurement.end(),
-                      checkpoint.launch_measurement.begin());
+           launch_measurement_approved(profile, checkpoint.launch_measurement);
 }
 
 bool has_pcr(const LinuxAttestationProfile& profile, uint32_t index) {
@@ -115,7 +118,7 @@ PlatformVerification SnpSvsmVtpmProvider::examine(
 
     SvsmEvidenceRequirements requirements;
     requirements.policy = profile_.snp;
-    requirements.expected_measurement_hex = profile_.snp.expected_measurement_hex;
+    requirements.expected_measurements_hex = profile_.snp.expected_measurements_hex;
     requirements.expected_ek_name_hex = crypto::to_hex(state.activation->ek_name);
     requirements.expected_ak_name_hex = crypto::to_hex(state.activation->ak_name);
     requirements.expected_ak_spki_b64 = state.activation->ak_spki_b64;
@@ -162,6 +165,9 @@ PlatformVerification SnpSvsmVtpmProvider::examine(
     if (!result.claims.runtime_integrity_valid) {
         return fail(AttestationFailure::RuntimeProfileInvalid);
     }
+    // The chain already replayed the transferred log once; hand that state out
+    // so the caller never replays it again for the next checkpoint.
+    if (state.ima_state_out) *state.ima_state_out = platform.ima_state;
     return result;
 }
 

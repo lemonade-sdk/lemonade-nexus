@@ -145,6 +145,7 @@ void SecurityDriver::set_phase(DriverPhase next, const char* reason) {
                      reason);
     }
     phase_ = next;
+    if (next == DriverPhase::Active && on_epoch_established_) on_epoch_established_();
 }
 
 NodeId SecurityDriver::genesis_id() const {
@@ -1068,6 +1069,9 @@ void SecurityDriver::on_dkg_transcript_attest(const DkgTranscriptAttest& attest)
     // Genesis unilateral authority ends here; this node continues as an
     // ordinary server.
     set_phase(DriverPhase::Idle, "bootstrap certificate issued; genesis authority ends");
+    // The anchor never enters Active, but the certificate it just issued is
+    // the same finalized authority.
+    if (on_epoch_established_) on_epoch_established_();
 }
 
 void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certificate,

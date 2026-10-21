@@ -13,7 +13,8 @@ namespace nexus::security {
 
 namespace {
 
-inline constexpr std::string_view kProfileDomain = "lemonade-nexus/attestation-profile:v3";
+// v4: the launch measurement is encoded as a counted set, no longer one string.
+inline constexpr std::string_view kProfileDomain = "lemonade-nexus/attestation-profile:v4";
 
 void add_bool(CanonicalEncoder& encoder, bool value) {
     encoder.add_u16(value ? 1 : 0);
@@ -75,7 +76,7 @@ std::vector<ProfileGap> profile_gaps(const LinuxAttestationProfile& profile) {
     if (profile.profile_version == 0) {
         gaps.push_back(ProfileGap::ProfileVersionUnset);
     }
-    if (profile.snp.expected_measurement_hex.empty()) {
+    if (profile.snp.expected_measurements_hex.empty()) {
         gaps.push_back(ProfileGap::NoPinnedLaunchMeasurement);
     }
     // An all-zero floor accepts every firmware level, which is the same as
@@ -176,7 +177,7 @@ LinuxAttestationProfile linux_attestation_profile_v1() {
     profile.require_seccomp = true;
     profile.security_ruleset = constants::kSecurityRulesetVersion;
 
-    // snp.min_tcb, snp.expected_measurement_hex, ima_policy_digest and every
+    // snp.min_tcb, snp.expected_measurements_hex, ima_policy_digest and every
     // approved digest set stay unset on purpose. See the header.
     return profile;
 }
@@ -207,7 +208,12 @@ Digest profile_digest(const LinuxAttestationProfile& profile) {
     encoder.add_u16(profile.snp.min_tcb.tee);
     encoder.add_u16(profile.snp.min_tcb.snp);
     encoder.add_u16(profile.snp.min_tcb.microcode);
-    encoder.add_string(profile.snp.expected_measurement_hex);
+    // Count-prefixed, in stored order; a verified approval stores the set
+    // sorted and unique, so equal policies share one digest.
+    encoder.add_u64(profile.snp.expected_measurements_hex.size());
+    for (const auto& measurement_hex : profile.snp.expected_measurements_hex) {
+        encoder.add_string(measurement_hex);
+    }
 
     encoder.add_string(profile.required_ak_spki_b64);
     encoder.add_bytes(profile.ima_policy_digest);
@@ -255,9 +261,11 @@ LinuxAttestationProfile linux_attestation_profile_v3_svsm_release() {
         "bzImage-sha256=d9854417fea45a490b632b0e7860827b34443f94da0877e34a0633bbb5078584;"
         "vmlinux-sha256=dfb88d060ef4fca3b51ce87b95803ad6b64addaad840d4aecb63bc85e9bcd552;"
         "module-tree-sha256=8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be";
-    profile.snp.expected_measurement_hex =
+    profile.snp.expected_measurements_hex = {
         "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
-        "c6e84c2490814e22a2b5ba860a37208d1d9a";
+        "c6e84c2490814e22a2b5ba860a37208d1d9a",
+        "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e"
+        "79313e3df3f88b9798a7eb53ab1b3ff59a54"};
     // AMD-SB-3030 (bootloader) and AMD-SB-3034 (SNP firmware). The live host's
     // 0x09/0x17 values are observations, never policy. No cited current release
     // requirement sets nonzero TEE or microcode floors, so those stay zero.

@@ -4,10 +4,18 @@ Documentation=https://github.com/lemonade-sdk/lemonade-nexus
 DefaultDependencies=no
 After=sys-kernel-config.mount systemd-tmpfiles-setup.service
 Before=nexus-attestd.service
-ConditionPathIsDirectory=/sys/kernel/config/tsm/report
+# #49: no ConditionPathIsDirectory on the TSM configfs dir. systemd samples a
+# Condition ONCE at job start, so a kernel that brought the interface up late
+# skipped this unit silently and attestd then refused every evidence request.
+# The ExecStartPre poll below waits instead: a late interface delays setup, a
+# truly absent one fails this unit visibly (and attestd, which Requires= it,
+# stays down instead of running useless).
 
 [Service]
 Type=oneshot
+# Bounded wait (~60s) for the kernel to publish the TSM report interface.
+# $$ is systemd escaping for a literal $ in the shell fragment.
+ExecStartPre=/bin/sh -c 'n=60; while [ ! -d /sys/kernel/config/tsm/report ]; do n=$$((n-1)); if [ "$$n" -le 0 ]; then echo "TSM configfs report interface did not appear within 60s: /sys/kernel/config/tsm/report" >&2; exit 1; fi; sleep 1; done'
 ExecStart=/usr/lib/lemonade-nexus/nexus-attestd-tsm-setup
 ExecStop=/usr/lib/lemonade-nexus/nexus-attestd-tsm-setup --remove
 RemainAfterExit=yes
@@ -37,6 +45,11 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@resources @obsolete @debug @mount @swap @reboot @module @clock @cpu-emulation @raw-io @keyring
+# The ExecStartPre poll runs sh + test + sleep. sh and test were always needed
+# (ExecStart is a shell script); sleep's nanosleep is in @default on current
+# systemd but is allowed explicitly for older filter tables. @clock stays
+# denied — it covers setting the clock, not sleeping.
+SystemCallFilter=nanosleep clock_nanosleep
 
 [Install]
 WantedBy=multi-user.target

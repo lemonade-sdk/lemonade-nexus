@@ -171,7 +171,7 @@ TEST(PlatformEvidence, ProviderTypeIsInsideTheIdentitySigningDigest) {
 TEST(SvsmProviderReadiness, RequiresReleaseBootPcrPinsButNotDynamicImaPcr10) {
     auto profile = linux_attestation_profile_v2_svsm();
     profile.snp.min_tcb = {1, 1, 1, 1};
-    profile.snp.expected_measurement_hex = std::string(96, 'a');
+    profile.snp.expected_measurements_hex = {std::string(96, 'a')};
     profile.ima_policy_digest.fill(0x31);
     profile.approved_paths = {{"/usr/bin/nexus-attestd", {std::string(64, '3')}}};
     profile.evidence_collector_path = "/usr/bin/nexus-attestd";
@@ -191,6 +191,22 @@ TEST(SvsmProviderReadiness, RequiresReleaseBootPcrPinsButNotDynamicImaPcr10) {
     profile.expected_pcrs.emplace_back(kImaPcr, std::string(64, '5'));
     EXPECT_EQ(SnpSvsmVtpmProvider(profile).readiness(),
               AttestationFailure::ProfileIncomplete);
+}
+
+TEST(SvsmProvider, ReplayStateSlotIsLeftUntouchedOnFailure) {
+    // The caller's checkpoint slot is written only by a fully successful
+    // chain; any earlier refusal must leave it empty so no checkpoint can be
+    // built from a failed verification.
+    SnpSvsmVtpmProvider provider(linux_attestation_profile_v2_svsm());
+    AttestationChallenge challenge;
+    AttestationEvidence evidence;
+    evidence.platform = SnpSvsmVtpmEvidence{};
+    std::optional<ImaBinaryReplayState> slot;
+    PlatformVerificationState state;
+    state.ima_state_out = &slot;
+    EXPECT_EQ(provider.examine(challenge, evidence, state).failure,
+              AttestationFailure::ActivationRequired);
+    EXPECT_FALSE(slot.has_value());
 }
 
 TEST(BinaryIma, ReplaysExactSha256TemplateDataAndKeepsLastPathMeasurement) {

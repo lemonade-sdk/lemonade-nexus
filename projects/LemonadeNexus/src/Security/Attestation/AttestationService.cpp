@@ -6,6 +6,7 @@
 #include <LemonadeNexus/Security/SnpReport.hpp>
 
 #include <sodium.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 
@@ -13,16 +14,18 @@ namespace nexus::security {
 
 namespace {
 
+/// Warn-log window for repeated enrollment refusals from one node.
+constexpr auto kEnrollmentRefusalLogWindow = std::chrono::seconds(60);
+
 bool checkpoint_matches_release_and_activation(
     const AttestationCheckpoint& checkpoint,
     const SvsmAkActivationRecord& activation,
     const LinuxAttestationProfile& profile) {
-    std::vector<uint8_t> measurement;
-    try { measurement = crypto::from_hex(profile.snp.expected_measurement_hex); }
-    catch (...) { return false; }
-    return measurement.size() == checkpoint.launch_measurement.size() &&
-           std::equal(measurement.begin(), measurement.end(),
-                      checkpoint.launch_measurement.begin()) &&
+    // Exact-match-any against the release set; an empty set matches nothing.
+    const auto& approved = profile.snp.expected_measurements_hex;
+    const auto measurement_hex = hex_of(checkpoint.launch_measurement);
+    return std::find(approved.begin(), approved.end(), measurement_hex) !=
+               approved.end() &&
            checkpoint.ek_name == activation.ek_name &&
            checkpoint.ak_name == activation.ak_name &&
            checkpoint.network_id == activation.network_id &&
@@ -167,6 +170,8 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
     pending_.erase(pending);
 
     PlatformVerificationState state;
+    std::optional<ImaBinaryReplayState> ima_state;
+    state.ima_state_out = &ima_state;
     std::optional<SvsmAkActivationRecord> activation;
     std::optional<AttestationCheckpoint> checkpoint;
     if (challenge.profile_id == AttestationProfileId::SnpSvsmVtpm) {
@@ -200,23 +205,10 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
     }
     if (verdict.passed && activation) {
         const auto* svsm = std::get_if<SnpSvsmVtpmEvidence>(&evidence.platform);
-        const auto log = svsm ? parse_ima_binary(svsm->ima_binary_log) : std::nullopt;
-        // One replay of the transferred log; the next checkpoint is built from
-        // the returned state.
-        std::optional<ImaBinaryPrefixReplay> replay;
-        if (log && challenge.ima_mode == ImaEvidenceMode::Full) {
-            std::array<uint8_t, 32> zero{};
-            replay = replay_ima_binary_prefix(*log, log->entries.size(), 0, zero);
-        } else if (log && checkpoint) {
-            std::vector<ImaBinaryPathState> prior;
-            for (const auto& path : checkpoint->required_paths)
-                prior.push_back({path.path, path.sha256});
-            replay = replay_ima_binary_prefix(*log, log->entries.size(),
-                                              checkpoint->event_count,
-                                              checkpoint->pcr10, prior);
-        }
+        // The provider already replayed the transferred log once; the next
+        // checkpoint is built from the state it carried out.
         const auto report = svsm ? parse_snp_report(svsm->svsm_report) : std::nullopt;
-        if (!svsm || !replay || !report) {
+        if (!svsm || !ima_state || !report) {
             verdict.passed = false;
             verdict.failure = AttestationFailure::CheckpointInvalid;
         } else {
@@ -231,14 +223,14 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
             next.ek_name = activation->ek_name;
             next.ak_name = activation->ak_name;
             next.ima_bank = kTpmAlgSha256;
-            next.event_count = replay->state.event_count;
-            std::copy(replay->state.pcr10.begin(), replay->state.pcr10.end(),
+            next.event_count = ima_state->event_count;
+            std::copy(ima_state->pcr10.begin(), ima_state->pcr10.end(),
                       next.pcr10.begin());
             for (const auto& required : profile_.approved_paths) {
-                const auto found = std::find_if(replay->state.paths.begin(),
-                                                replay->state.paths.end(),
+                const auto found = std::find_if(ima_state->paths.begin(),
+                                                ima_state->paths.end(),
                     [&required](const auto& path) { return path.path == required.path; });
-                if (found != replay->state.paths.end())
+                if (found != ima_state->paths.end())
                     next.required_paths.push_back({found->path, found->sha256});
             }
             next.previous_evidence_digest = verdict.evidence_digest;
@@ -255,7 +247,14 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
 
 std::optional<SvsmAkActivationOfferMessage>
 AttestationService::receive_enrollment_evidence(const AttestationEvidence& evidence,
-                                                const NodeId& observer) {
+                                                const NodeId& observer,
+                                                EnrollmentRefusal* refusal) {
+    const auto refuse = [refusal](EnrollmentRefusal reason)
+        -> std::optional<SvsmAkActivationOfferMessage> {
+        if (refusal) *refusal = reason;
+        return std::nullopt;
+    };
+    if (refusal) *refusal = EnrollmentRefusal::None;
     const auto it = pending_.find(evidence.node_id);
     if (it == pending_.end() || it->second.purpose != AttestationPurpose::PlatformEnrollment ||
         evidence.challenge_digest != challenge_digest(it->second) ||
@@ -266,19 +265,23 @@ AttestationService::receive_enrollment_evidence(const AttestationEvidence& evide
         crypto_sign_verify_detached(evidence.identity_signature.data(),
                                     evidence_signing_digest(evidence).data(), kDigestSize,
                                     it->second.node_key.data()) != 0) {
-        return std::nullopt;
+        return refuse(EnrollmentRefusal::ChallengeMismatch);
     }
     const auto* svsm = std::get_if<SnpSvsmVtpmEvidence>(&evidence.platform);
-    if (!svsm || !svsm->ima_binary_log.empty()) return std::nullopt;
+    if (!svsm || !svsm->ima_binary_log.empty())
+        return refuse(EnrollmentRefusal::EvidenceMalformed);
     SvsmAkEnrollmentRequirements requirements;
     requirements.policy = profile_.snp;
     requirements.require_revocation_check = profile_.require_endorsement_revocation;
     if (revocation_) requirements.revocation = revocation_();
     const auto identity = verify_svsm_ak_enrollment_identity(
         *svsm, evidence.challenge_digest, requirements);
-    if (!identity.ok) return std::nullopt;
+    if (!identity.ok) {
+        log_enrollment_refusal(evidence.node_id, identity.failure);
+        return refuse(EnrollmentRefusal::IdentityRejected);
+    }
     auto activation = make_svsm_ak_activation_challenge(svsm->ek_manifest, svsm->ak_public);
-    if (!activation) return std::nullopt;
+    if (!activation) return refuse(EnrollmentRefusal::ActivationUnavailable);
 
     SvsmAkActivationOfferMessage offer;
     offer.network_id = network_id_;
@@ -300,7 +303,7 @@ AttestationService::receive_enrollment_evidence(const AttestationEvidence& evide
     offer.activation = svsm_ak_activation_offer(evidence.challenge_digest, *activation);
     offer.activation.enrollment_context = svsm_ak_activation_offer_context(offer);
     const auto deferred = deferred_.find(evidence.node_id);
-    if (deferred == deferred_.end()) return std::nullopt;
+    if (deferred == deferred_.end()) return refuse(EnrollmentRefusal::DeferredMissing);
     PendingActivation pending;
     pending.exchange.emplace(*activation, offer);
     pending.enrollment_evidence_digest = evidence_signing_digest(evidence);
@@ -309,6 +312,22 @@ AttestationService::receive_enrollment_evidence(const AttestationEvidence& evide
     pending_activations_.insert_or_assign(evidence.node_id, std::move(pending));
     pending_.erase(it);
     return offer;
+}
+
+void AttestationService::log_enrollment_refusal(const NodeId& node,
+                                                const std::string& failure) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto logged = refusal_logged_.find(node);
+    if (logged != refusal_logged_.end() &&
+        now - logged->second < kEnrollmentRefusalLogWindow) {
+        return;
+    }
+    refusal_logged_[node] = now;
+    while (refusal_logged_.size() > 4 * constants::kMaxActiveTier1) {
+        refusal_logged_.erase(refusal_logged_.begin());
+    }
+    spdlog::warn("[security] enrollment refused for {}: {}",
+                 crypto::to_hex(node.span().first(8)), failure);
 }
 
 std::optional<AttestationChallenge> AttestationService::receive_activation_response(
