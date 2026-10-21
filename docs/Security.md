@@ -227,7 +227,8 @@ root:
 - **Server admission** (certificate issuance, enrollment tokens, supersede)
   is root-gated or token-gated. It grants transport membership, not Tier 1.
 - **Replicated application stores** (ACL, DNS records, backbone IPAM, NS
-  slots) sync through gossip under root-signed peer certificates. Their
+  slots, account group-key envelopes) sync through gossip under root-signed
+  peer certificates. Their
   mutation paths are audited against permission rules but are not yet
   consensus-authorized.
 - **Author-signed record receipt is not authorization.** Receiving a

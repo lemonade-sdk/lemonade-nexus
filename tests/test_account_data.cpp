@@ -279,6 +279,85 @@ TEST_F(AccountDataTest, PendingEnvelopesTracksProvisioning) {
     EXPECT_EQ(store->pending_envelopes("endpointA", a_pub()).body.at("pending").size(), 0u);
 }
 
+// --- Replication between servers ---
+
+TEST_F(AccountDataTest, AcceptedEnvelopeIsPublishedForReplication) {
+    std::vector<gossip::AccountEnvelopeRecord> published;
+    store->set_envelope_publisher(
+        [&published](gossip::AccountEnvelopeRecord r) { published.push_back(std::move(r)); });
+
+    json for_b = {{"target_pubkey", b_pub()}, {"key_id", "gk1"},
+                  {"ephemeral_pubkey", "eph"}, {"wrapped_key", "WK-B"}};
+    ASSERT_EQ(store->put_envelope("endpointA", a_pub(), for_b, for_b.dump().size()).status, 200);
+    ASSERT_EQ(published.size(), 1u);
+    EXPECT_EQ(published[0].group_id, "customer-g1");
+    EXPECT_EQ(published[0].recipient_pubkey,
+              tree::canonical_principal(account::with_ed25519_prefix(b_pub())));
+    EXPECT_EQ(published[0].created_by, account::with_ed25519_prefix(a_pub()));
+    EXPECT_EQ(published[0].wrapped_key, "WK-B");
+    EXPECT_NE(published[0].timestamp, 0u);
+
+    // A refused upload publishes nothing.
+    json to_outsider = {{"target_pubkey", c_pub()}, {"wrapped_key", "leak"}};
+    EXPECT_EQ(store->put_envelope("endpointA", a_pub(), to_outsider, to_outsider.dump().size()).status, 404);
+    EXPECT_EQ(published.size(), 1u);
+}
+
+TEST_F(AccountDataTest, EnvelopeFieldsAreBoundedSoEveryServerCanHoldThem) {
+    json missing = {{"target_pubkey", b_pub()}, {"ephemeral_pubkey", "eph"}};
+    EXPECT_EQ(store->put_envelope("endpointA", a_pub(), missing, missing.dump().size()).status, 400);
+    json huge = {{"target_pubkey", b_pub()},
+                 {"wrapped_key", std::string(gossip::kMaxAccountEnvelopeFieldBytes + 1, 'x')}};
+    EXPECT_EQ(store->put_envelope("endpointA", a_pub(), huge, huge.dump().size()).status, 413);
+    EXPECT_EQ(store->get_envelope("endpointB", b_pub()).status, 404);
+}
+
+TEST_F(AccountDataTest, ReplicatedEnvelopeIsCheckedAgainstTheLocalTree) {
+    const auto principal = [](const std::string& pub) {
+        return tree::canonical_principal(account::with_ed25519_prefix(pub));
+    };
+    gossip::AccountEnvelopeRecord r;
+    r.group_id         = "customer-g1";
+    r.recipient_pubkey = principal(b_pub());
+    r.key_id           = "gk1";
+    r.ephemeral_pubkey = "eph";
+    r.wrapped_key      = "WK-FROM-PEER";
+    r.created_by       = principal(a_pub());
+    r.timestamp        = 1'700'000'000;
+    r.origin_pubkey    = "origin";
+    r.origin_seq       = 1;
+
+    // Refused: the uploader cannot write the group (B is read-only in g1).
+    auto by_reader = r;
+    by_reader.created_by = principal(b_pub());
+    EXPECT_FALSE(store->apply_replicated_envelope(by_reader));
+    // Refused: the recipient is not a device in the group (C is in g2).
+    auto to_outsider = r;
+    to_outsider.recipient_pubkey = principal(c_pub());
+    EXPECT_FALSE(store->apply_replicated_envelope(to_outsider));
+    // Refused: a group this server does not know.
+    auto unknown_group = r;
+    unknown_group.group_id = "customer-missing";
+    EXPECT_FALSE(store->apply_replicated_envelope(unknown_group));
+    // Refused: a second spelling of the recipient's key.
+    auto respelled = r;
+    std::string url_safe = b_pub();  // the SDK's url-safe unpadded spelling
+    for (auto& ch : url_safe) ch = ch == '+' ? '-' : ch == '/' ? '_' : ch;
+    while (!url_safe.empty() && url_safe.back() == '=') url_safe.pop_back();
+    respelled.recipient_pubkey = "ed25519:" + url_safe;
+    ASSERT_NE(respelled.recipient_pubkey, r.recipient_pubkey);
+    EXPECT_FALSE(store->apply_replicated_envelope(respelled));
+    EXPECT_EQ(store->get_envelope("endpointB", b_pub()).status, 404);
+
+    // Accepted: B reads it exactly as if A had uploaded it here.
+    ASSERT_TRUE(store->apply_replicated_envelope(r));
+    auto got = store->get_envelope("endpointB", b_pub());
+    ASSERT_EQ(got.status, 200);
+    EXPECT_EQ(got.body.at("wrapped_key"), "WK-FROM-PEER");
+    EXPECT_EQ(got.body.at("created_by"), principal(a_pub()));
+    EXPECT_EQ(store->pending_envelopes("endpointA", a_pub()).body.at("pending").size(), 1u);
+}
+
 // --- Persistence across a full restart (the demo flow) ---
 
 TEST_F(AccountDataTest, SurvivesRestart) {

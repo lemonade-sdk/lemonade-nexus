@@ -63,6 +63,13 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         json_response(res, ctx_.gossip.dns_sync_status());
     }));
 
+    // GET /api/account/sync — account envelope replication state, in the same
+    // shape as /api/dns/sync
+    priv.Get("/api/account/sync", require_auth(ctx_.auth,
+        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
+        json_response(res, ctx_.gossip.account_sync_status());
+    }));
+
     // POST /api/ddns/update — Force DDNS update
     priv.Post("/api/ddns/update", require_auth(ctx_.auth,
         [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {

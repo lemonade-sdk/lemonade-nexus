@@ -2,6 +2,10 @@
 
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 
+#include <memory>
+
+namespace nexus::account { class AccountDataStore; }
+
 namespace nexus::api {
 
 /// Zero-knowledge account data sync over the PRIVATE mesh API. Stores opaque,
@@ -12,16 +16,21 @@ namespace nexus::api {
 /// Ownership is structural (the on-disk category is derived from the caller's
 /// own group, never from client input) and additionally gated by tree
 /// Read/Write on the Customer node. All routes are private + auth-required.
+/// Envelopes replicate between servers through gossip; construct the handler
+/// before the gossip io loop runs, since it installs the gossip sink.
 class AccountDataApiHandler : public IRequestHandler<AccountDataApiHandler> {
     friend class IRequestHandler<AccountDataApiHandler>;
 
 public:
-    explicit AccountDataApiHandler(ApiContext& ctx) : ctx_(ctx) {}
+    explicit AccountDataApiHandler(ApiContext& ctx);
 
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
 
     ApiContext& ctx_;
+    // One store for every registration (routes are re-registered when a
+    // listener's certificate changes); shared with the gossip sink.
+    std::shared_ptr<account::AccountDataStore> store_;
 };
 
 } // namespace nexus::api

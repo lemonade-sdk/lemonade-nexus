@@ -737,6 +737,7 @@ class AppNotifier extends StateNotifier<AppState> {
 
       // Pick up the group key if an owner provisioned it since last time.
       final groupKey = entry.groupKeyB64 ?? await fetchGroupKey();
+      if (entry.groupKeyB64 != null) await _ensureOwnEnvelope(entry.groupKeyB64!);
       await _saveActiveCluster(entry.copyWith(
         groupKeyB64: groupKey,
         userId: state.userId ?? entry.userId,
@@ -793,6 +794,20 @@ class AppNotifier extends StateNotifier<AppState> {
       'ephemeral_pubkey': env['ephemeral_pubkey'],
       'wrapped_key': env['wrapped_key'],
     });
+  }
+
+  /// Re-seal the group key to this device when the server holds no envelope
+  /// for it. The upload at registration fails while the mesh is down, so this
+  /// retries it on every connect.
+  Future<void> _ensureOwnEnvelope(String groupKey) async {
+    try {
+      final env = await callPrivateApi('GET', '/api/account/keys/envelope');
+      if (!env.containsKey('error')) return;
+      await _provisionGroupKeyTo(_sdk.identityPubkey ?? '', groupKey);
+      _log('_ensureOwnEnvelope: re-provisioned this device');
+    } catch (e) {
+      _log('_ensureOwnEnvelope: deferred -> $e');
+    }
   }
 
   /// Provision the group key to every device still waiting for it. Returns the

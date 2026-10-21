@@ -99,6 +99,11 @@ Two distinct state domains exist, with different authority models:
 | Replication | Gossip (signed, root-certificate-gated) | Security envelopes on the gossip transport |
 | Recovery | Rebuilt/synced from peers | Reauthenticated from the pinned Genesis anchor at startup |
 
+Account data replicates only in part: group-key envelopes sync between
+servers over the backbone, and each receiver re-checks the uploading
+device's permission against its own tree. Encrypted chat blobs stay on the
+server that stored them. See [IP Ranges](IP-Ranges) for the envelope rules.
+
 Receiving an author-signed application record transfers it; it does not
 authorize or apply a remote mutation. See
 [Security — Application Authority Gaps](Security#application-authority-gaps).

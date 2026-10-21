@@ -141,8 +141,8 @@ public:
 
     /// Attach the in-process virtual netstack. Once our backbone IP is also
     /// set, gossip binds virtual UDP <backbone_ip>:<gossip port> and carries
-    /// catch-up sync (SyncDigest, SyncRequest and catch-up DnsRecordSync) over
-    /// the encrypted backbone. Tier 1 servers serve catch-up to every
+    /// catch-up sync (SyncDigest, SyncRequest, catch-up DnsRecordSync and
+    /// AccountEnvelopeSync) over the encrypted backbone. Tier 1 servers serve catch-up to every
     /// certified server; Tier 2 servers catch up from Tier 1 and never feed
     /// records back. The netstack must outlive this service's start.
     void set_virtual_net(network::VirtualNetService* vnet);
@@ -152,6 +152,10 @@ public:
     /// status (known for peers whose digests reach this server: Tier 1 peers
     /// on every server, and every peer on a Tier 1 server).
     [[nodiscard]] nlohmann::json dns_sync_status() const;
+
+    /// Account envelope replication state, in the same shape as
+    /// dns_sync_status().
+    [[nodiscard]] nlohmann::json account_sync_status() const;
 
     /// Set the "ip:port" this server is reachable at, carried in ServerHello so
     /// peers share it instead of the UDP source they happen to observe. Call
@@ -427,10 +431,41 @@ private:
                              const std::string& sender_pubkey,
                              const uint8_t* payload, std::size_t payload_len, Via via);
 
-    /// Sends our DNS digest, paged to fit, over the backbone. Tier 1 sends to
-    /// every certified peer with a backbone path; Tier 2 sends to Tier 1 peers
-    /// only, as status. No-op until the backbone transport is bound.
-    void send_dns_sync_digests();
+    /// Sends the digest of every sync stream (DNS, account envelopes), paged
+    /// to fit, over the backbone. Tier 1 sends to every certified peer with a
+    /// backbone path; Tier 2 sends to Tier 1 peers only, as status. No-op
+    /// until the backbone transport is bound.
+    void send_sync_digests();
+
+    /// Certified peers with a ready backbone path. With `tier1_only`, only
+    /// current Tier 1 members.
+    [[nodiscard]] std::vector<GossipPeer> backbone_targets(bool tier1_only) const;
+
+    /// Replica and entry message type of a named sync stream; nullptr for an
+    /// unknown stream.
+    [[nodiscard]] sync::OriginReplica* replica_for_stream(std::string_view stream) const;
+    [[nodiscard]] GossipMsgType entry_type_for_stream(std::string_view stream) const;
+
+    /// Sync status of one stream's replica, shared by the status endpoints.
+    [[nodiscard]] nlohmann::json sync_status(const sync::OriginReplica* replica) const;
+
+    // Account envelope replication (backbone only)
+    void handle_account_envelope_sync(const asio::ip::udp::endpoint& sender,
+                                      const std::string& sender_pubkey,
+                                      const uint8_t* payload, std::size_t payload_len, Via via);
+    /// Origin signature and origin certification of a record, or a reason it
+    /// fails. Shared by network ingress and restore from disk.
+    [[nodiscard]] std::optional<std::string> account_envelope_origin_error(
+        const AccountEnvelopeRecord& record) const;
+    /// Hand an origin-verified record to the account store and the replica.
+    /// Returns true when the store accepted it (not stale, authorized).
+    bool apply_account_envelope(const AccountEnvelopeRecord& record);
+    void save_account_replica();
+    void load_account_replica();
+
+    /// Sign and persist a replica snapshot as <category>/replica.json.
+    bool save_replica_file(const sync::OriginReplica& replica, const std::string& category,
+                           const std::string& type);
 
     /// Common gate for catch-up messages: arrived on the backbone, from the
     /// sender's own backbone IP, sender certified. Tier rules are per message.
@@ -682,13 +717,20 @@ private:
 
     // DNS catch-up replica (created in on_start, once the identity is known).
     std::unique_ptr<sync::OriginReplica> dns_replica_;
-    uint64_t                              dns_digest_round_{0};
+    uint64_t                              sync_digest_round_{0};
     uint64_t                              dns_replica_saved_version_{0};
     bool                                  dns_replica_loaded_{false};
     std::chrono::steady_clock::time_point last_dns_sync_digest_{};
     std::chrono::steady_clock::time_point last_dns_replica_save_{};
+
+    // Account envelope replica and the store it feeds.
+    std::unique_ptr<sync::OriginReplica>  account_replica_;
+    uint64_t                              account_replica_saved_version_{0};
+    bool                                  account_replica_loaded_{false};
+    std::function<bool(const AccountEnvelopeRecord&)> account_envelope_sink_;
     std::chrono::steady_clock::time_point last_tombstone_prune_{};
-    // Last SyncRequest served per peer, for rate limiting (io thread only).
+    // Last SyncRequest served per "<stream>|<peer>", for rate limiting (io
+    // thread only).
     std::unordered_map<std::string, std::chrono::steady_clock::time_point> sync_request_served_;
 
     // Democratic NS slot claiming (ns1-ns9 bootstrap nameservers)
@@ -762,6 +804,19 @@ public:
 
     /// Broadcast a DNS record delta to all known peers.
     void broadcast_dns_record_delta(const DnsRecordDelta& delta);
+
+    /// Set the store that receives replicated account envelopes. The sink
+    /// re-checks the uploading device's authority against the local tree and
+    /// returns true only when it stored the envelope. It runs on the io
+    /// thread. Restores the persisted replica once start() has also run.
+    void set_account_envelope_sink(std::function<bool(const AccountEnvelopeRecord&)> sink);
+
+    /// Replicate an envelope this server just stored for an authenticated
+    /// device. Fills in the origin fields, signs the record, and sends it over
+    /// the backbone to every certified peer. Only a Tier 1 server replicates;
+    /// a Tier 2 server keeps the envelope local. Thread-safe: the send runs on
+    /// the io thread.
+    void broadcast_account_envelope(AccountEnvelopeRecord record);
 
     /// Pin the NS slot this server claims (1-9); 0 = auto (lowest free). Set
     /// when the operator's ns<N> identity matches registrar glue for that name.

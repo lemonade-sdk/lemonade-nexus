@@ -73,7 +73,7 @@ struct GossipBallotTestAccess {
     // without waiting for the timer.
     static void run_gossip_tick(GossipService& g) { g.on_gossip_tick(); }
     // DNS catch-up runs on a 30 s cadence; tests send a digest round directly.
-    static void send_dns_digests(GossipService& g) { g.send_dns_sync_digests(); }
+    static void send_sync_digests(GossipService& g) { g.send_sync_digests(); }
     // v0.9.4 fix 4: the PeerExchange initiator runs on steady_clock, which no
     // datagram can advance; the cadence tests set these clocks directly.
     static void set_last_peer_exchange(GossipService& g,
@@ -433,6 +433,27 @@ protected:
         wire["signature"]     = sign_b64(signer, canonical.dump());
         wire["origin_seq"]    = origin_seq;
         wire["seq_signature"] = sign_b64(signer, seq_canonical.dump());
+        return wire;
+    }
+
+    // An account envelope record in AccountEnvelopeSync wire form, signed by
+    // `origin` over the canonical form the server uses (pins that form).
+    nlohmann::json account_envelope_wire(const nexus::crypto::Ed25519Keypair& origin,
+                                         const nexus::gossip::AccountEnvelopeRecord& r) {
+        nlohmann::json fields;
+        fields["group_id"]         = r.group_id;
+        fields["recipient_pubkey"] = r.recipient_pubkey;
+        fields["key_id"]           = r.key_id;
+        fields["ephemeral_pubkey"] = r.ephemeral_pubkey;
+        fields["wrapped_key"]      = r.wrapped_key;
+        fields["created_by"]       = r.created_by;
+        fields["timestamp"]        = r.timestamp;
+        fields["origin_pubkey"]    = nexus::crypto::to_base64(origin.public_key);
+        fields["origin_seq"]       = r.origin_seq;
+        nlohmann::json canonical = fields;
+        canonical["type"] = "nexus.account_envelope.v1";
+        nlohmann::json wire = fields;
+        wire["signature"] = sign_b64(origin, canonical.dump());
         return wire;
     }
 

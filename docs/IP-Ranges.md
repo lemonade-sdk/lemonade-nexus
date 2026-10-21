@@ -99,7 +99,18 @@ Gossip catch-up sync (`SyncDigest` 0x17, `SyncRequest` 0x18) runs over the
 backbone on virtual UDP at the backbone address and the gossip port. It is
 not a new public port. Tier 1 servers serve catch-up to every certified
 server; Tier 2 servers catch up from Tier 1 and report their sync status to
-Tier 1, but never supply records to it.
+Tier 1, but never supply records to it. Two streams use it: DNS records and
+account group-key envelopes.
+
+Account group-key envelopes (`AccountEnvelopeSync` 0x19) travel only on the
+backbone. A Tier 1 server that accepts an envelope from a device signs it
+with its gossip key and sends it to every certified peer; peers that miss it
+catch up from the next digest. A receiver accepts an envelope only from a
+current Tier 1 sender, verifies the origin server's signature and
+certificate, and re-checks against its own permission tree that the
+uploading device may write the account group and that the recipient is a
+device in that group. A Tier 2 server keeps the envelopes it accepts local.
+Chat blobs are not replicated; they stay on the server that stored them.
 
 Client tunnel, private, and shared allocations are currently managed per
 server; full cross-server IPAM sync for those pools is not implemented. Two

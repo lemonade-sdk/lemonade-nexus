@@ -3,10 +3,25 @@
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Account/AccountDataStore.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
 
 #include <memory>
 
 namespace nexus::api {
+
+AccountDataApiHandler::AccountDataApiHandler(ApiContext& ctx)
+    : ctx_(ctx),
+      store_(std::make_shared<account::AccountDataStore>(ctx.crypto, ctx.tree, ctx.storage)) {
+    // Envelopes replicate to the other servers over the backbone; the store
+    // re-checks each replicated envelope against this server's tree.
+    store_->set_envelope_publisher([&g = ctx_.gossip](gossip::AccountEnvelopeRecord r) {
+        g.broadcast_account_envelope(std::move(r));
+    });
+    ctx_.gossip.set_account_envelope_sink(
+        [store = store_](const gossip::AccountEnvelopeRecord& r) {
+            return store->apply_replicated_envelope(r);
+        });
+}
 
 // Thin HTTP translator over account::AccountDataStore. All authorization and
 // storage logic lives in the store (context-light, unit-tested); this maps
@@ -16,9 +31,7 @@ void AccountDataApiHandler::do_register_routes(httplib::Server& /*pub*/,
     using nexus::auth::require_auth;
     using nexus::auth::SessionClaims;
 
-    // Holds refs to services that outlive the server; shared into each lambda.
-    auto store = std::make_shared<account::AccountDataStore>(
-        ctx_.crypto, ctx_.tree, ctx_.storage);
+    auto store = store_;
 
     auto reply = [](httplib::Response& res, const account::Result& r) {
         json_response(res, r.body, r.status);

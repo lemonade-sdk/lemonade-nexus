@@ -1,8 +1,11 @@
 #pragma once
 
+#include <LemonadeNexus/Gossip/GossipTypes.hpp>
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 
@@ -36,6 +39,11 @@ public:
     // disk. 4 MiB covers a large conversation with headroom.
     static constexpr std::size_t kMaxBlobBytes = 4u * 1024 * 1024;
 
+    /// Receives each envelope this store accepts from an authenticated
+    /// device, for replication to the other servers. Called on the request
+    /// thread after the envelope is on disk.
+    using EnvelopePublisher = std::function<void(gossip::AccountEnvelopeRecord)>;
+
     AccountDataStore(crypto::SodiumCryptoService& crypto,
                      tree::PermissionTreeService& tree,
                      storage::FileStorageService& storage);
@@ -66,12 +74,30 @@ public:
     [[nodiscard]] Result pending_envelopes(const std::string& caller_node,
                                            const std::string& caller_pubkey) const;
 
+    /// Set the replication hook for envelopes accepted by put_envelope.
+    /// Call before the store serves requests.
+    void set_envelope_publisher(EnvelopePublisher publisher);
+
+    /// Store an envelope that another server accepted. The record's origin
+    /// signature must already be verified; this re-checks, against the local
+    /// tree, the same authority put_envelope requires: `created_by` may write
+    /// the group, and `recipient_pubkey` is the canonical principal of an
+    /// Endpoint device in that group. Ordering is the caller's job. Returns
+    /// true when the envelope was written.
+    [[nodiscard]] bool apply_replicated_envelope(const gossip::AccountEnvelopeRecord& record);
+
 private:
     // Caller's owning Customer group (Endpoint node's parent); nullopt if the
     // caller has no node or is topless (root).
     [[nodiscard]] std::optional<std::string> group_of(const std::string& caller_node) const;
     [[nodiscard]] bool can_read(const std::string& caller_pubkey, const std::string& group) const;
     [[nodiscard]] bool can_write(const std::string& caller_pubkey, const std::string& group) const;
+    // True if `principal` (canonical) is an Endpoint device under `group`.
+    [[nodiscard]] bool is_member_device(const std::string& group,
+                                        const std::string& principal) const;
+    [[nodiscard]] bool write_envelope(const std::string& group,
+                                      const gossip::AccountEnvelopeRecord& record,
+                                      const std::string& signature);
 
     [[nodiscard]] std::string hex_sha256(const std::string& s) const;
     [[nodiscard]] std::string chat_category(const std::string& group) const;   // "chat-"+hash
@@ -82,6 +108,7 @@ private:
     crypto::SodiumCryptoService&  crypto_;
     tree::PermissionTreeService&  tree_;
     storage::FileStorageService&  storage_;
+    EnvelopePublisher             publisher_;
 };
 
 /// True if `s` is 1..64 lowercase hex chars (a server-generated chat id). Used

@@ -35,6 +35,7 @@ enum class GossipMsgType : uint8_t {
     SecurityEnvelope      = 0x16,  // opaque security-protocol envelope; routed to SecurityRuntime, never relayed
     SyncDigest            = 0x17,  // "here is my per-origin replica summary" (backbone only)
     SyncRequest           = 0x18,  // "send me these origins' entries after seq N" (backbone only)
+    AccountEnvelopeSync   = 0x19,  // "account group-key envelope stored" (backbone only, Tier 1 origin)
 };
 
 // Compile-time pin on the retired range: a new enumerator inside [0x07, 0x10]
@@ -59,7 +60,8 @@ static_assert(detail::outside_retired_range(GossipMsgType::Digest) &&
               detail::outside_retired_range(GossipMsgType::MisbehaviorProofBroadcast) &&
               detail::outside_retired_range(GossipMsgType::SecurityEnvelope) &&
               detail::outside_retired_range(GossipMsgType::SyncDigest) &&
-              detail::outside_retired_range(GossipMsgType::SyncRequest),
+              detail::outside_retired_range(GossipMsgType::SyncRequest) &&
+              detail::outside_retired_range(GossipMsgType::AccountEnvelopeSync),
               "gossip wire values 0x07-0x10 are retired and reserved forever");
 
 #pragma pack(push, 1)
@@ -185,6 +187,34 @@ struct DnsRecordDelta {
     /// Ed25519 over the canonical JSON plus origin_seq. Required when
     /// origin_seq is nonzero.
     std::string seq_signature;
+};
+
+// ---------------------------------------------------------------------------
+// Account group-key envelope replication
+// ---------------------------------------------------------------------------
+
+/// An account group-key envelope that a Tier 1 server accepted from an
+/// authenticated device, replicated to the other servers over the backbone.
+/// The envelope is opaque: the group key inside is sealed to the recipient
+/// device and no server can open it. The origin signature binds every field
+/// except `signature`; each receiver re-checks the device's authority against
+/// its own permission tree before it stores the envelope.
+/// Bound on each opaque envelope field (key id, ephemeral key, wrapped key),
+/// enforced on upload and on the wire. A sealed 32-byte key is ~110 base64
+/// characters.
+static constexpr std::size_t kMaxAccountEnvelopeFieldBytes = 1024;
+
+struct AccountEnvelopeRecord {
+    std::string group_id;          // Customer group node id
+    std::string recipient_pubkey;  // canonical tree principal ("ed25519:<b64>")
+    std::string key_id;
+    std::string ephemeral_pubkey;
+    std::string wrapped_key;
+    std::string created_by;        // device principal that uploaded it ("ed25519:<b64>")
+    uint64_t    timestamp{0};      // Unix seconds when the origin accepted it
+    std::string origin_pubkey;     // base64 Ed25519 gossip key of the accepting server
+    uint64_t    origin_seq{0};     // origin-assigned sequence number, never 0
+    std::string signature;         // origin Ed25519 over the canonical form
 };
 
 // ---------------------------------------------------------------------------

@@ -175,6 +175,37 @@ Result AccountDataStore::delete_chat(const std::string& caller_node,
 
 // --- Group-key envelopes ---
 
+bool AccountDataStore::is_member_device(const std::string& group,
+                                        const std::string& principal) const {
+    for (const auto& child : tree_.get_children(group)) {
+        if (child.type == tree::NodeType::Endpoint &&
+            tree::canonical_principal(with_ed25519_prefix(child.mgmt_pubkey)) == principal) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool AccountDataStore::write_envelope(const std::string& group,
+                                      const gossip::AccountEnvelopeRecord& record,
+                                      const std::string& signature) {
+    nlohmann::json data = {
+        {"recipient_pubkey", record.recipient_pubkey},
+        {"key_id",           record.key_id},
+        {"ephemeral_pubkey", record.ephemeral_pubkey},
+        {"wrapped_key",      record.wrapped_key},
+        {"created_by",       record.created_by},
+    };
+    storage::SignedEnvelope env;
+    env.type          = "group_key_envelope";
+    env.data          = data.dump();
+    env.signer_pubkey = record.created_by;
+    env.signature     = signature;
+    env.timestamp     = record.timestamp;
+    return storage_.write_file(keyenv_category(group),
+                               principal_hash(record.recipient_pubkey) + ".json", env);
+}
+
 Result AccountDataStore::put_envelope(const std::string& caller_node,
                                       const std::string& caller_pubkey,
                                       const nlohmann::json& body, std::size_t body_size) {
@@ -189,33 +220,44 @@ Result AccountDataStore::put_envelope(const std::string& caller_node,
     // The target must be an Endpoint device under the SAME Customer group, so a
     // member cannot provision the group key to a non-member.
     const auto target_principal = tree::canonical_principal(with_ed25519_prefix(target));
-    bool is_member = false;
-    for (const auto& child : tree_.get_children(*group)) {
-        if (child.type == tree::NodeType::Endpoint &&
-            tree::canonical_principal(with_ed25519_prefix(child.mgmt_pubkey)) == target_principal) {
-            is_member = true;
-            break;
-        }
-    }
-    if (!is_member) return not_found();
+    if (!is_member_device(*group, target_principal)) return not_found();
 
-    nlohmann::json data = {
-        {"recipient_pubkey", target_principal},
-        {"key_id",           body.value("key_id", std::string{})},
-        {"ephemeral_pubkey", body.value("ephemeral_pubkey", std::string{})},
-        {"wrapped_key",      body.value("wrapped_key", std::string{})},
-        {"created_by",       with_ed25519_prefix(caller_pubkey)},
-    };
-    storage::SignedEnvelope env;
-    env.type          = "group_key_envelope";
-    env.data          = data.dump();
-    env.signer_pubkey = with_ed25519_prefix(caller_pubkey);
-    env.signature     = body.value("signature", std::string{});
-    env.timestamp     = static_cast<uint64_t>(std::time(nullptr));
+    gossip::AccountEnvelopeRecord record;
+    record.group_id         = *group;
+    record.recipient_pubkey = target_principal;
+    record.key_id           = body.value("key_id", std::string{});
+    record.ephemeral_pubkey = body.value("ephemeral_pubkey", std::string{});
+    record.wrapped_key      = body.value("wrapped_key", std::string{});
+    record.created_by       = with_ed25519_prefix(caller_pubkey);
+    record.timestamp        = static_cast<uint64_t>(std::time(nullptr));
+    // Every server must be able to hold what one server accepts.
+    if (record.wrapped_key.empty()) return err(400, "missing wrapped_key");
+    if (record.key_id.size() > gossip::kMaxAccountEnvelopeFieldBytes ||
+        record.ephemeral_pubkey.size() > gossip::kMaxAccountEnvelopeFieldBytes ||
+        record.wrapped_key.size() > gossip::kMaxAccountEnvelopeFieldBytes)
+        return err(413, "envelope too large");
 
-    if (!storage_.write_file(keyenv_category(*group), principal_hash(target) + ".json", env))
+    if (!write_envelope(*group, record, body.value("signature", std::string{})))
         return err(500, "write failed");
+    if (publisher_) publisher_(record);
     return Result{200, {{"success", true}, {"recipient", target_principal}}};
+}
+
+void AccountDataStore::set_envelope_publisher(EnvelopePublisher publisher) {
+    publisher_ = std::move(publisher);
+}
+
+bool AccountDataStore::apply_replicated_envelope(const gossip::AccountEnvelopeRecord& record) {
+    // One spelling per device: a non-canonical principal would name the same
+    // file under a second replica key and defeat its ordering.
+    if (record.recipient_pubkey != tree::canonical_principal(record.recipient_pubkey) ||
+        record.created_by != with_ed25519_prefix(record.created_by)) {
+        return false;
+    }
+    // Authority comes from this server's tree, not from the origin's word.
+    if (!can_write(record.created_by, record.group_id)) return false;
+    if (!is_member_device(record.group_id, record.recipient_pubkey)) return false;
+    return write_envelope(record.group_id, record, {});
 }
 
 Result AccountDataStore::get_envelope(const std::string& caller_node,
