@@ -4,6 +4,10 @@
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
+	<!-- Required for the mesh dataplane: bind() on its UDP socket fails with
+	     EPERM in the App Sandbox without it, so the mesh never comes up. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
 	<key>com.apple.security.network.client</key>
 	<true/>
 	<!-- Required for the Keychain-backed secure store (Cluster keyring + session).
