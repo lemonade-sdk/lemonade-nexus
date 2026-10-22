@@ -1595,3 +1595,57 @@ TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
     ASSERT_NE(bad, nullptr);
     EXPECT_EQ(bad->status, 400);
 }
+
+// A group admin administers the group's devices even without an entry on the
+// device itself: it reads the device's full assignments and removes it. A
+// member without admin does neither, and the root is never removed.
+TEST_F(HttpEndpointTest, GroupAdminReadsAndRemovesTheGroupsDevices) {
+    auto cli = make_client();
+    auto bare_of = [](const crypto::Ed25519Keypair& kp) {
+        return crypto::to_base64(std::span<const uint8_t>(kp.public_key.data(),
+                                                          kp.public_key.size()));
+    };
+    auto owner_kp = crypto->ed25519_keygen();
+    auto device_kp = crypto->ed25519_keygen();
+    const auto owner_b64 = bare_of(owner_kp);
+    const auto device_b64 = bare_of(device_kp);
+    auto owner_join = join_node(owner_kp);
+    ASSERT_NE(owner_join, nullptr);
+    ASSERT_EQ(owner_join->status, 200) << owner_join->body;
+    const auto owner_node = json::parse(owner_join->body).value("node_id", std::string{});
+    const auto group = tree->get_node(owner_node)->parent_id;
+
+    // A device in the group whose own node names only itself.
+    tree::TreeNode device;
+    device.id = "grp-device";
+    device.parent_id = group;
+    device.type = tree::NodeType::Endpoint;
+    device.mgmt_pubkey = "ed25519:" + device_b64;
+    device.assignments = {{"ed25519:" + device_b64, {"read", "write", "edit_node"}}};
+    ASSERT_TRUE(tree->insert_join_node(device));
+    ASSERT_FALSE(tree->check_permission("ed25519:" + owner_b64, "grp-device",
+                                        acl::Permission::Read));
+
+    httplib::Headers owner_h = {{"Authorization", "Bearer " + make_jwt(owner_b64)}};
+    auto read = cli.Get("/api/tree/node/grp-device", owner_h);
+    ASSERT_NE(read, nullptr);
+    ASSERT_EQ(read->status, 200) << read->body;
+    EXPECT_EQ(json::parse(read->body)["assignments"].size(), 1u);  // full list, not redacted away
+
+    // The device itself is not an admin of the group's other nodes.
+    httplib::Headers device_h = {{"Authorization", "Bearer " + make_jwt(device_b64)}};
+    auto refused = cli.Post("/api/tree/node/delete/" + owner_node, device_h);
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 403);
+
+    auto removed = cli.Post("/api/tree/node/delete/grp-device", owner_h);
+    ASSERT_NE(removed, nullptr);
+    EXPECT_EQ(removed->status, 200) << removed->body;
+    EXPECT_FALSE(tree->get_node("grp-device").has_value());
+
+    httplib::Headers root_h = {{"Authorization", "Bearer " + make_jwt(root_pubkey_str)}};
+    auto root_delete = cli.Post("/api/tree/node/delete/root", root_h);
+    ASSERT_NE(root_delete, nullptr);
+    EXPECT_EQ(root_delete->status, 403);
+    EXPECT_TRUE(tree->get_node("root").has_value());
+}
