@@ -23,6 +23,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -467,6 +469,47 @@ TEST_F(SdkMeshPrivateApiTest, RefreshNowFetchesPeersImmediately) {
     EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > before; }, std::chrono::seconds(3)))
         << "refresh_mesh_peers did not wake the orchestrator";
     client->disable_mesh();
+}
+
+// A mesh state callback runs on the orchestrator thread and may call back into
+// the client. leave_network stops the orchestrator; it must not hold the
+// client mutex while it waits for that thread, or the callback and the leave
+// wait on each other forever.
+TEST_F(SdkMeshPrivateApiTest, LeaveDoesNotDeadlockWithACallbackThatCallsTheClient) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    auto* raw = client.get();
+    std::atomic<bool> in_callback{false};
+    std::atomic<bool> callback_done{false};
+    client->set_mesh_callback([&, raw](const lnsdk::MeshTunnelStatus&) {
+        if (in_callback.exchange(true)) return;
+        // Hold the orchestrator thread here until the leave has deleted the
+        // node and is stopping the orchestrator, then call into the client.
+        (void)wait_for([&] { return delete_posts.load() > 0; }, std::chrono::seconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        (void)raw->get_mesh_peers();
+        (void)raw->mesh_status();
+        callback_done = true;
+    });
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return in_callback.load(); }, std::chrono::seconds(15)));
+
+    auto left = std::make_shared<std::promise<bool>>();
+    auto done = left->get_future();
+    std::thread leaver([left, raw] { left->set_value(raw->leave_network().ok); });
+    if (done.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+        // The threads are deadlocked and cannot be joined; end the process so
+        // the run reports the failure instead of hanging.
+        ADD_FAILURE() << "leave_network deadlocked with the mesh state callback";
+        std::fprintf(stderr, "deadlock detected; exiting\n");
+        std::_Exit(1);
+    }
+    leaver.join();
+    EXPECT_TRUE(done.get());
+    EXPECT_TRUE(callback_done.load());
+    EXPECT_FALSE(client->is_mesh_active());
 }
 
 // The orchestrator takes a peer's handshake time from the dataplane entry with

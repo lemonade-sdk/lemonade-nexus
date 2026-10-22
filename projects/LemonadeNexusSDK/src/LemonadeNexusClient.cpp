@@ -2136,11 +2136,15 @@ void LemonadeNexusClient::enable_mesh(const MeshConfig& config) {
 }
 
 void LemonadeNexusClient::disable_mesh() {
-    std::lock_guard lock(impl_->mutex);
-    if (impl_->mesh_orchestrator) {
-        impl_->mesh_orchestrator->stop();
-        impl_->mesh_orchestrator.reset();
+    // stop() joins the orchestrator thread, and a state callback on that
+    // thread may call a client method that takes impl_->mutex. Detach the
+    // orchestrator under the lock, then stop it without the lock.
+    std::unique_ptr<MeshOrchestrator> orchestrator;
+    {
+        std::lock_guard lock(impl_->mutex);
+        orchestrator = std::move(impl_->mesh_orchestrator);
     }
+    if (orchestrator) orchestrator->stop();
 }
 
 MeshTunnelStatus LemonadeNexusClient::mesh_status() const {
