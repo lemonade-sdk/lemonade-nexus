@@ -129,13 +129,33 @@ class ClusterDevice {
   /// True for the device we're running on.
   final bool isThisDevice;
 
+  /// The device's management key ("ed25519:..."), which assignments name.
+  final String mgmtPubkey;
+
+  /// True when this device's key holds `admin` on the Cluster group: it can
+  /// change who holds what in the group and on its devices.
+  final bool isAdmin;
+
   const ClusterDevice({
     required this.nodeId,
     required this.hostname,
     required this.needsKey,
     required this.isThisDevice,
     this.tunnelIp,
+    this.mgmtPubkey = '',
+    this.isAdmin = false,
   });
+}
+
+/// Compare management keys by key bytes: the SDK writes url-safe unpadded
+/// base64 while the server writes standard base64, so both spellings occur.
+String canonicalPrincipal(String key) {
+  var b64 = key.startsWith('ed25519:') ? key.substring(8) : key;
+  b64 = b64.replaceAll('-', '+').replaceAll('_', '/').replaceAll('=', '');
+  while (b64.length % 4 != 0) {
+    b64 += '=';
+  }
+  return 'ed25519:$b64';
 }
 
 /// Persists the Clusters this install can reach as a single JSON blob in the OS

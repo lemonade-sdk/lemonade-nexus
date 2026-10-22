@@ -678,6 +678,50 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
     }));
 
     // ========================================================================
+    // POST /api/tree/node/assignments/{id} (PRIVATE, auth required)
+    // Body: {"pubkey": "<key>", "permissions": ["read", ...]}. Sets exactly
+    // those permissions for the key on the node; an empty list removes it.
+    // The tree enforces who may administer and who may be granted.
+    // ========================================================================
+    priv.Post(R"(/api/tree/node/assignments/(.+))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto node_id = req.matches[1].str();
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        auto& body = *body_opt;
+
+        const auto principal = body.value("pubkey", std::string{});
+        if (principal.empty() || !body.contains("permissions") ||
+            !body["permissions"].is_array()) {
+            error_response(res, "pubkey and permissions[] required");
+            return;
+        }
+        std::vector<std::string> permissions;
+        for (const auto& p : body["permissions"]) {
+            if (!p.is_string()) {
+                error_response(res, "permissions must be strings");
+                return;
+            }
+            permissions.push_back(p.get<std::string>());
+        }
+
+        std::string reason;
+        using Change = tree::PermissionTreeService::AssignmentChange;
+        switch (ctx_.tree.set_assignment(node_id, normalize_pubkey(claims.pubkey),
+                                         normalize_pubkey(principal), permissions,
+                                         reason)) {
+            case Change::Applied:
+                json_response(res, {{"success", true}, {"node_id", node_id}});
+                return;
+            case Change::NotFound:     error_response(res, reason, 404); return;
+            case Change::Forbidden:    error_response(res, reason, 403); return;
+            case Change::Invalid:      error_response(res, reason, 400); return;
+            case Change::StorageError: error_response(res, reason, 500); return;
+        }
+    }));
+
+    // ========================================================================
     // POST /api/tree/node/delete/{id} (PRIVATE, auth required)
     // Delete a node. Server handles cleanup.
     // ========================================================================

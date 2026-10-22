@@ -345,6 +345,9 @@ ServerInfo _$ServerInfoFromJson(Map<String, dynamic> json) => ServerInfo(
       region: json['region'] as String,
       available: json['available'] as bool,
       latencyMs: (json['latency_ms'] as num?)?.toDouble(),
+      endpoint: json['endpoint'] as String? ?? '',
+      pubkey: json['pubkey'] as String? ?? '',
+      lastSeen: (json['last_seen'] as num?)?.toInt() ?? 0,
     );
 
 Map<String, dynamic> _$ServerInfoToJson(ServerInfo instance) =>
@@ -355,6 +358,9 @@ Map<String, dynamic> _$ServerInfoToJson(ServerInfo instance) =>
       'region': instance.region,
       'available': instance.available,
       'latency_ms': instance.latencyMs,
+      'endpoint': instance.endpoint,
+      'pubkey': instance.pubkey,
+      'last_seen': instance.lastSeen,
     };
 
 DdnsStatus _$DdnsStatusFromJson(Map<String, dynamic> json) => DdnsStatus(

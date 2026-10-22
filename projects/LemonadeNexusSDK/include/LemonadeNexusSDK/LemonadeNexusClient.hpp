@@ -165,11 +165,22 @@ public:
     // Group membership management
     // -----------------------------------------------------------------
 
-    /// Add a member to a group node's assignments.
+    /// Set exactly the permissions `pubkey` holds on `node_id`, replacing its
+    /// entry; an empty list removes it. The caller must be an admin of the node
+    /// or an ancestor, and `pubkey` must have joined inside that admin's group.
+    /// The server refuses an admin's change to its own entry on the node that
+    /// grants its admin. Errors: 403 not allowed, 400 unknown permission, 404
+    /// no such node.
+    [[nodiscard]] Result<DeltaResult> set_member_permissions(
+            const std::string& node_id, const std::string& pubkey,
+            const std::vector<std::string>& permissions);
+
+    /// Give a member the listed permissions on a node (replaces its entry).
+    /// Same rules as set_member_permissions.
     [[nodiscard]] Result<DeltaResult> add_group_member(const std::string& node_id,
                                                          const GroupMember& member);
 
-    /// Remove a member from a group node's assignments by pubkey.
+    /// Remove a member's entry from a node. Same rules as set_member_permissions.
     [[nodiscard]] Result<DeltaResult> remove_group_member(const std::string& node_id,
                                                             const std::string& pubkey);
 

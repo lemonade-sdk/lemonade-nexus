@@ -63,6 +63,22 @@ public:
     /// Used after Ed25519 key registration to give new keys add_child on root.
     bool grant_assignment(const std::string& node_id, const Assignment& assignment);
 
+    /// Outcome of an administrative assignment change.
+    enum class AssignmentChange { Applied, NotFound, Forbidden, Invalid, StorageError };
+
+    /// Set exactly the permissions `principal` holds on `node_id`, replacing
+    /// any entries it had (an empty list removes it). The same rules as an
+    /// assignment delta apply: `signer` must hold `admin` on the node or an
+    /// ancestor, and a principal given any permission must have joined inside
+    /// that admin's subtree. A signer cannot change its own entry on the node
+    /// that grants its admin, so no admin locks itself out. Unknown
+    /// permission names are Invalid. `reason` receives the refusal text.
+    [[nodiscard]] AssignmentChange set_assignment(const std::string& node_id,
+                                                  std::string_view signer,
+                                                  std::string_view principal,
+                                                  const std::vector<std::string>& permissions,
+                                                  std::string& reason);
+
     // --- Delta statement authorization (shared with record acceptance) ---
 
     /// Outcome of evaluating a delta statement against the current tree.

@@ -1541,3 +1541,57 @@ TEST_F(HttpEndpointTest, RoutingRegisterRejectsForeignMeshKey) {
     ASSERT_TRUE(stored.has_value());
     EXPECT_EQ(stored->mesh_pubkey, trusted);
 }
+
+// --- Assignment administration endpoint ---
+
+TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
+    auto cli = make_client();
+    auto bare_of = [](const crypto::Ed25519Keypair& kp) {
+        return crypto::to_base64(std::span<const uint8_t>(kp.public_key.data(),
+                                                          kp.public_key.size()));
+    };
+    auto owner_kp = crypto->ed25519_keygen();
+    auto other_kp = crypto->ed25519_keygen();
+    const auto owner_b64 = bare_of(owner_kp);
+    const auto other_b64 = bare_of(other_kp);
+
+    auto owner_join = join_node(owner_kp);
+    ASSERT_NE(owner_join, nullptr);
+    ASSERT_EQ(owner_join->status, 200) << owner_join->body;
+    const auto owner_node = json::parse(owner_join->body).value("node_id", std::string{});
+    const auto group = tree->get_node(owner_node)->parent_id;
+    auto other_join = join_node(other_kp);
+    ASSERT_NE(other_join, nullptr);
+    ASSERT_EQ(other_join->status, 200) << other_join->body;
+
+    auto post = [&](const std::string& as_b64, const std::string& node, json body) {
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(as_b64)}};
+        return cli.Post("/api/tree/node/assignments/" + node, h, body.dump(),
+                        "application/json");
+    };
+
+    // The group owner administers its own device: node-level access applies.
+    auto ok = post(owner_b64, owner_node,
+                   {{"pubkey", owner_b64}, {"permissions", {"read", "connect_private"}}});
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(ok->status, 200) << ok->body;
+    EXPECT_TRUE(tree->check_permission("ed25519:" + owner_b64, owner_node,
+                                       acl::Permission::ConnectPrivate));
+
+    // Someone from another group is not an admin here...
+    auto not_admin = post(other_b64, owner_node,
+                          {{"pubkey", other_b64}, {"permissions", {"admin"}}});
+    ASSERT_NE(not_admin, nullptr);
+    EXPECT_EQ(not_admin->status, 403);
+    // ...and has not joined this group, so the owner cannot grant it either.
+    auto not_joined = post(owner_b64, group,
+                           {{"pubkey", other_b64}, {"permissions", {"read"}}});
+    ASSERT_NE(not_joined, nullptr);
+    EXPECT_EQ(not_joined->status, 403);
+    EXPECT_FALSE(tree->check_permission("ed25519:" + other_b64, group,
+                                        acl::Permission::Read));
+
+    auto bad = post(owner_b64, owner_node, {{"pubkey", owner_b64}});
+    ASSERT_NE(bad, nullptr);
+    EXPECT_EQ(bad->status, 400);
+}

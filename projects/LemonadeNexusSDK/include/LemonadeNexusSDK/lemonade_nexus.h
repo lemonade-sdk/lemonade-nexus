@@ -236,14 +236,17 @@ ln_error_t ln_register_passkey(ln_client_t* client,
 /* Group membership                                                    */
 /* ------------------------------------------------------------------ */
 
-/** Add a member to a group node's assignments. permissions_json is a JSON array of strings. */
+/** Set a member's permissions on a node, replacing its entry. permissions_json
+ *  is a JSON array of permission names. The caller must hold "admin" on the node
+ *  or an ancestor, and pubkey must belong to a device that joined inside that
+ *  admin's group; the server refuses anything else. */
 ln_error_t ln_add_group_member(ln_client_t* client,
                                 const char* node_id,
                                 const char* pubkey,
                                 const char* permissions_json,
                                 char** out_json);
 
-/** Remove a member from a group node's assignments by pubkey. */
+/** Remove a member's entry from a node. Same rules as ln_add_group_member. */
 ln_error_t ln_remove_group_member(ln_client_t* client,
                                    const char* node_id,
                                    const char* pubkey,
