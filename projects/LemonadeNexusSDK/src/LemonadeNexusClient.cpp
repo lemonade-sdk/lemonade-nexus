@@ -109,6 +109,27 @@ struct LemonadeNexusClient::Impl {
     uint16_t     private_port{9101};
     mutable std::mutex mutex;
 
+    // The Dart client calls in from worker isolates, so the public transport is
+    // used from several threads at once. transport_mtx guards server_pool,
+    // current_server, has_discovered, session_token, latency_monitor and
+    // public_clients. It is never held across network I/O and never held while
+    // taking `mutex` (lock order: mutex, then transport_mtx).
+    //
+    // Declared before mesh_orchestrator: members are destroyed in reverse
+    // order, and the orchestrator's thread uses this lock until it is stopped.
+    mutable std::mutex transport_mtx;
+
+    // One keep-alive client per server base URL. A client per request meant a
+    // TCP + TLS handshake every call (about three round trips); reusing the
+    // connection leaves one. httplib::Client is not safe for concurrent
+    // requests, so each pooled client serializes its own users.
+    struct PooledClient {
+        std::mutex      in_use;
+        httplib::Client cli;
+        explicit PooledClient(const std::string& url) : cli(url) {}
+    };
+    std::map<std::string, std::shared_ptr<PooledClient>> public_clients;
+
     // Server pool with health state
     struct ServerState {
         ServerEndpoint endpoint;
@@ -181,24 +202,6 @@ struct LemonadeNexusClient::Impl {
     }
 
     // --- Public transport state ---------------------------------------------
-    //
-    // The Dart client calls in from worker isolates, so the public transport is
-    // used from several threads at once. transport_mtx guards server_pool,
-    // current_server, has_discovered, session_token, latency_monitor and
-    // public_clients. It is never held across network I/O and never held while
-    // taking `mutex` (lock order: mutex, then transport_mtx).
-    mutable std::mutex transport_mtx;
-
-    // One keep-alive client per server base URL. A client per request meant a
-    // TCP + TLS handshake every call (about three round trips); reusing the
-    // connection leaves one. httplib::Client is not safe for concurrent
-    // requests, so each pooled client serializes its own users.
-    struct PooledClient {
-        std::mutex      in_use;
-        httplib::Client cli;
-        explicit PooledClient(const std::string& url) : cli(url) {}
-    };
-    std::map<std::string, std::shared_ptr<PooledClient>> public_clients;
 
     std::string token() const {
         std::lock_guard lock(transport_mtx);
