@@ -64,8 +64,9 @@ enum class Refusal : uint16_t {
     /// nothing about any identity.
     NodeUnbound,
 
-    /// A final-readiness challenge with no context bound. Never legitimately
-    /// issued; a hostile one proves nothing (AttestationFailure::ContextUnbound).
+    /// A final-readiness or storage-unlock challenge with no context bound.
+    /// Never legitimately issued; a hostile one proves nothing
+    /// (AttestationFailure::ContextUnbound).
     ContextUnbound,
 
     /// This build or this host has no platform prover: not Linux, no TPM FAPI,

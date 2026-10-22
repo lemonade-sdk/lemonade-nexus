@@ -65,6 +65,11 @@ enum class SecurityMessageKind : uint16_t {
     SvsmAkActivationOffer = 29,
     SvsmAkActivationResponse = 30,
     TreeOpSubmit = 31,
+    StoragePlanProof = 32,
+    StorageKeyPackage = 33,
+    StorageUnlockRequest = 34,
+    StorageUnlockPartial = 35,
+    StoragePlanRequest = 36,
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -94,6 +99,72 @@ struct ProposalMessage {
 struct TreeOpSubmitMsg {
     std::vector<uint8_t> encoded_op;
     crypto::Ed25519Signature signature{};
+};
+
+/// A finalized storage record (design B4, B5a) with the three-chain proof
+/// that committed it. A holder or requester outside Tier 1 verifies the
+/// finality itself against the committing epoch's vote keys; the sender
+/// supplies bytes, never trust.
+struct StoragePlanProofMsg {
+    /// Kind StorageHolderPlan or StorageKeyRotation; the body is the record.
+    BlockPayload payload;
+    CommitProof proof;
+};
+
+/// Asks a Tier 1 member for the live storage records after `have_sequence`.
+/// Idempotent and answered from local records.
+struct StoragePlanRequestMsg {
+    uint64_t have_sequence = 0;
+};
+
+/// The step of a storage key-generation or refresh session a package carries.
+enum class StorageRound : uint8_t {
+    /// The holder's round-1 package, broadcast.
+    Round1 = 1,
+    /// One secret round-2 package, sealed to its recipient.
+    Round2 = 2,
+    /// The holder's signed confirmation of the holder plan it derived,
+    /// broadcast. The payload is the plan.
+    Confirm = 3,
+};
+
+/// One message of a storage-key session (design B5). `session` is the digest
+/// of the finalized holder selection, which binds the network, the record
+/// sequence, the operation, and the holder list. Delivery grants nothing: the
+/// storage service checks the session, the sender's place in it, and the
+/// round before any library call.
+struct StorageKeyPackageMsg {
+    Digest session{};
+    NodeId sender{};
+    StorageRound round = StorageRound::Round1;
+    /// The addressed holder for Round2; all-zero otherwise.
+    NodeId recipient{};
+    /// At most constants::kMaxStorageMessageBytes.
+    std::vector<uint8_t> payload;
+    /// Confirm only: the sender's identity signature over
+    /// storage_confirmation_digest(); all-zero otherwise.
+    crypto::Ed25519Signature signature{};
+};
+
+/// A request for partial decryptions of one wrapped data key (design B7).
+struct StorageUnlockRequestMsg {
+    NodeId requester{};
+    EpochId epoch{};
+    /// The finalized holder plan the requester unlocks under.
+    Digest plan_digest{};
+    /// R = r*G of the wrapped data key.
+    std::array<uint8_t, 32> ephemeral_point{};
+    Nonce nonce{};
+};
+
+/// One holder's answer: s_i*R and its DLEQ proof, sealed to the requester with
+/// the request digest bound inside the seal.
+struct StorageUnlockPartialMsg {
+    NodeId holder{};
+    Digest request_digest{};
+    uint16_t holder_id = 0;
+    /// At most 256 bytes.
+    std::vector<uint8_t> sealed_partial;
 };
 
 struct SyncResponse {
@@ -208,7 +279,12 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   AttestationEvidenceEnd,
                                   SvsmAkActivationOfferMessage,
                                   SvsmAkActivationResponseMessage,
-                                  TreeOpSubmitMsg>;
+                                  TreeOpSubmitMsg,
+                                  StoragePlanProofMsg,
+                                  StorageKeyPackageMsg,
+                                  StorageUnlockRequestMsg,
+                                  StorageUnlockPartialMsg,
+                                  StoragePlanRequestMsg>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

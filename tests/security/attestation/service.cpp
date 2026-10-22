@@ -2,13 +2,17 @@
 #include <LemonadeNexus/Security/EvidenceSnpSvsmVtpm.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
+#include "support/attestation_fixtures.hpp"
+
 #include <gtest/gtest.h>
 #include <sodium.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
 
+#include <filesystem>
 #include <memory>
 #include <mutex>
+#include <unistd.h>
 #include <string_view>
 
 using nexus::security::AttestationEvidence;
@@ -337,4 +341,57 @@ TEST(AttestationService, PurposeBudgetsAreIndependentAndFinalIsPerPlan) {
     EXPECT_EQ(service.final_attempts(node(0x01), attempt_zero),
               constants::kMaxFinalAttestAttemptsPerPlan);
     EXPECT_EQ(service.final_attempts(node(0x01), attempt_one), 1u);
+}
+
+// A holder's StorageUnlock challenge lives in its own lane: it cannot cancel a
+// member's pending eligibility challenge for the same node, it needs a bound
+// context, and its per-epoch budget is separate.
+TEST(AttestationService, StorageUnlockChallengesHaveTheirOwnLaneAndBudget) {
+    // An enrolled subject: challenges keep their purpose instead of first
+    // asking for SVSM enrollment.
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("nexus_storage_lane_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    nexus_test::seed_svsm_activation(network(0xA0), node(0x11), key(0x11),
+                                     dir / "svsm-activations");
+    AttestationService service(network(0xA0), LinuxAttestationProfile{}, {}, dir);
+    nexus::security::Digest context{};
+    context.fill(0x33);
+    EXPECT_FALSE(service
+                     .create_challenge(node(0x11), key(0x11), 1, 9,
+                                       AttestationPurpose::StorageUnlock)
+                     .has_value());
+
+    const auto eligibility =
+        service.create_challenge(node(0x11), key(0x11), 1, 9, AttestationPurpose::Eligibility);
+    ASSERT_TRUE(eligibility.has_value());
+    const auto unlock = service.create_challenge(node(0x11), key(0x11), 1, 9,
+                                                 AttestationPurpose::StorageUnlock, context);
+    ASSERT_TRUE(unlock.has_value());
+    EXPECT_EQ(unlock->purpose, AttestationPurpose::StorageUnlock);
+    EXPECT_EQ(unlock->context_digest, context);
+    // Both stay live, each in its own lane.
+    const auto mesh_lane = service.pending_challenge(node(0x11));
+    const auto storage_lane =
+        service.pending_challenge(node(0x11), AttestationPurpose::StorageUnlock);
+    ASSERT_TRUE(mesh_lane.has_value());
+    ASSERT_TRUE(storage_lane.has_value());
+    EXPECT_EQ(nexus::security::challenge_digest(*mesh_lane),
+              nexus::security::challenge_digest(*eligibility));
+    EXPECT_EQ(nexus::security::challenge_digest(*storage_lane),
+              nexus::security::challenge_digest(*unlock));
+
+    // The unlock budget per node and epoch is spent independently.
+    for (uint32_t i = 1; i < constants::kStorageUnlocksPerRequesterPerEpoch; ++i) {
+        EXPECT_TRUE(service
+                        .create_challenge(node(0x11), key(0x11), 1, 9,
+                                          AttestationPurpose::StorageUnlock, context)
+                        .has_value());
+    }
+    EXPECT_FALSE(service
+                     .create_challenge(node(0x11), key(0x11), 1, 9,
+                                       AttestationPurpose::StorageUnlock, context)
+                     .has_value());
+    EXPECT_EQ(service.attempts(node(0x11), 9), 1u);
+    std::filesystem::remove_all(dir);
 }

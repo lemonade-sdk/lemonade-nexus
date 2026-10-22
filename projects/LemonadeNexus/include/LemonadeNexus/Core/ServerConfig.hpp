@@ -127,6 +127,16 @@ struct ServerConfig {
     // proposed, voted for, or applied.
     bool        tree_ops_enabled{false};
 
+    // Experimental, Phase 5 of docs/Design-Tree-Consensus-and-Storage-Key.md:
+    // the threshold storage key. Tier 1 finalizes storage holder plans and key
+    // rotations through consensus, holders run the key sessions and answer
+    // attested unlock requests, and this server keeps a data key wrapped to
+    // the storage key (no file is encrypted yet). Off: no storage record is
+    // proposed or voted for, and no storage message is sent or answered. The
+    // storage-threshold crate paths are not externally reviewed; keep this
+    // off in production until that review is done.
+    bool        storage_key_enabled{false};
+
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
 

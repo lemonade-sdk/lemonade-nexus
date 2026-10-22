@@ -128,12 +128,14 @@ protected:
 
     // The gossip identity exists only after gossip->start(), so the mesh
     // service is built afterwards — the same order main.cpp uses.
-    void make_mesh(Node& node, const crypto::Ed25519PublicKey& genesis_pub) {
+    void make_mesh(Node& node, const crypto::Ed25519PublicKey& genesis_pub,
+                   bool storage_key = false) {
         security::SecurityMeshConfig config;
         config.data_root = node.dir / "mesh";
         config.genesis_public_key = genesis_pub;
         config.identity = node.gossip->keypair();
         config.profile.security_ruleset = security::constants::kSecurityRulesetVersion;
+        config.storage_key_enabled = storage_key;
         node.mesh = std::make_unique<security::SecurityMeshService>(io, config, *node.gossip,
                                                                     node.wrapping.get());
         node.mesh->start();
@@ -235,6 +237,30 @@ TEST_F(SecurityMeshServiceTest, StartStopIsCleanAndIdempotent) {
     pump_for(std::chrono::milliseconds(350));
     EXPECT_EQ(a.mesh->driver().phase(), security::DriverPhase::GenesisCollecting);
     EXPECT_EQ(b.mesh->driver().phase(), security::DriverPhase::Idle);
+}
+
+// The storage key exists only when its setting is on. Off, nothing is built and
+// no storage state is written; on, the service starts with no key and no data
+// key, and stops cleanly.
+TEST_F(SecurityMeshServiceTest, StorageKeyRunsOnlyWhenEnabled) {
+    auto& a = make_node("a");
+    auto& b = make_node("b");
+    peer_all();
+    make_mesh(a, a.pubkey());
+    make_mesh(b, a.pubkey(), true);
+    EXPECT_EQ(a.mesh->storage_key(), nullptr);
+    ASSERT_NE(b.mesh->storage_key(), nullptr);
+    EXPECT_TRUE(b.mesh->storage_key()->healthy());
+
+    pump_for(std::chrono::milliseconds(350));
+    EXPECT_FALSE(b.mesh->storage_key()->chain().current.has_value());
+    EXPECT_EQ(b.mesh->storage_key()->data_keys().state(),
+              security::DataKeyState::NoStorageKey);
+    EXPECT_FALSE(b.mesh->storage_key()->data_keys().data_key().has_value());
+    EXPECT_FALSE(fs::exists(a.dir / "mesh" / "security" / "storage"));
+
+    b.mesh->stop();
+    a.mesh->stop();
 }
 
 // (b) The honest ineligible-host path over real sockets: Genesis challenges a

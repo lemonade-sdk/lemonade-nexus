@@ -853,6 +853,13 @@ int main(int argc, char* argv[]) {
                      "tree writes.");
     }
 
+    if (config.storage_key_enabled) {
+        spdlog::warn("EXPERIMENTAL: threshold storage key enabled (Phase 5). Tier 1 finalizes "
+                     "storage holder plans and daily key rotations; this server keeps a data key "
+                     "wrapped to the storage key but encrypts no file yet. The storage-threshold "
+                     "library paths are not externally reviewed: keep this off in production.");
+    }
+
     // ========================================================================
     // Register CRTP request handlers
     // ========================================================================

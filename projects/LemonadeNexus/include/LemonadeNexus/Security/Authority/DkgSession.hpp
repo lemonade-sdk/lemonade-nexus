@@ -14,6 +14,7 @@
 // reshared.
 
 #include <LemonadeNexus/Crypto/FrostProvider.hpp>
+#include <LemonadeNexus/Security/Authority/RoundRelay.hpp>
 #include <LemonadeNexus/Security/Epoch/Tier1Set.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
@@ -190,10 +191,10 @@ private:
     std::vector<DkgMessage> round2_cache_;
 
     std::map<NodeId, std::vector<uint8_t>> round1_payloads_;
-    std::map<NodeId, std::vector<uint8_t>> round2_payloads_;
-    // Round-2 packages received before round 1 completed; merged into
-    // round2_payloads_ when this participant enters round 2.
-    std::map<NodeId, std::vector<uint8_t>> early_round2_;
+    // Round-2 packages, one per sender. A package received before round 1
+    // completed is held early and counts when this participant enters round 2
+    // (design Part C).
+    RoundInbox<NodeId, std::vector<uint8_t>> round2_inbox_;
 
     std::optional<DkgResult> result_;
 };

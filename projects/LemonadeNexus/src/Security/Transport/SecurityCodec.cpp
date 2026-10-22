@@ -281,6 +281,55 @@ bool encode_tree_op_submit(Writer& w, const TreeOpSubmitMsg& m) {
     return true;
 }
 
+constexpr std::size_t kMaxSealedPartialBytes = 256;
+
+bool encode_commit_proof(Writer& w, const CommitProof& p);
+
+bool encode_storage_plan_proof(Writer& w, const StoragePlanProofMsg& m) {
+    if (m.payload.kind != BlockPayloadKind::StorageHolderPlan &&
+        m.payload.kind != BlockPayloadKind::StorageKeyRotation) {
+        return false;
+    }
+    w.u16(static_cast<uint16_t>(m.payload.kind));
+    if (!w.bytes(m.payload.body, constants::kMaxBlockPayloadBytes)) {
+        return false;
+    }
+    return encode_commit_proof(w, m.proof);
+}
+
+bool encode_storage_key_package(Writer& w, const StorageKeyPackageMsg& m) {
+    w.fixed(m.session);
+    put_node(w, m.sender);
+    w.u8(static_cast<uint8_t>(m.round));
+    put_node(w, m.recipient);
+    if (!w.bytes(m.payload, constants::kMaxStorageMessageBytes)) {
+        return false;
+    }
+    w.fixed(m.signature);
+    return true;
+}
+
+bool encode_storage_unlock_request(Writer& w, const StorageUnlockRequestMsg& m) {
+    put_node(w, m.requester);
+    w.u64(m.epoch);
+    w.fixed(m.plan_digest);
+    w.fixed(m.ephemeral_point);
+    w.fixed(m.nonce);
+    return true;
+}
+
+bool encode_storage_unlock_partial(Writer& w, const StorageUnlockPartialMsg& m) {
+    put_node(w, m.holder);
+    w.fixed(m.request_digest);
+    w.u16(m.holder_id);
+    return w.bytes(m.sealed_partial, kMaxSealedPartialBytes);
+}
+
+bool encode_storage_plan_request(Writer& w, const StoragePlanRequestMsg& m) {
+    w.u64(m.have_sequence);
+    return true;
+}
+
 bool encode_vote(Writer& w, const Vote& v) {
     w.u16(v.consensus_ruleset);
     w.fixed(v.network_id);
@@ -652,7 +701,8 @@ bool get_purpose(Reader& r, AttestationPurpose& purpose) {
     const auto candidate = static_cast<AttestationPurpose>(raw);
     if (candidate != AttestationPurpose::Eligibility &&
         candidate != AttestationPurpose::FinalEpochReadiness &&
-        candidate != AttestationPurpose::PlatformEnrollment) {
+        candidate != AttestationPurpose::PlatformEnrollment &&
+        candidate != AttestationPurpose::StorageUnlock) {
         return r.fail(CodecError::BadValue);
     }
     purpose = candidate;
@@ -818,6 +868,46 @@ bool decode_proposal_message(Reader& r, ProposalMessage& m) {
 bool decode_tree_op_submit(Reader& r, TreeOpSubmitMsg& m) {
     return r.bytes(m.encoded_op, constants::kMaxConsensusBlockBytes) && !m.encoded_op.empty() &&
            r.fixed(m.signature);
+}
+
+bool decode_commit_proof(Reader& r, CommitProof& p);
+
+bool decode_storage_plan_proof(Reader& r, StoragePlanProofMsg& m) {
+    uint16_t kind = 0;
+    if (!r.u16(kind)) {
+        return false;
+    }
+    if (kind != static_cast<uint16_t>(BlockPayloadKind::StorageHolderPlan) &&
+        kind != static_cast<uint16_t>(BlockPayloadKind::StorageKeyRotation)) {
+        return r.fail(CodecError::BadValue);
+    }
+    m.payload.kind = static_cast<BlockPayloadKind>(kind);
+    return r.bytes(m.payload.body, constants::kMaxBlockPayloadBytes) &&
+           decode_commit_proof(r, m.proof);
+}
+
+bool decode_storage_key_package(Reader& r, StorageKeyPackageMsg& m) {
+    uint8_t round = 0;
+    if (!(r.fixed(m.session) && get_node(r, m.sender) && r.u8(round))) {
+        return false;
+    }
+    if (round < static_cast<uint8_t>(StorageRound::Round1) ||
+        round > static_cast<uint8_t>(StorageRound::Confirm)) {
+        return r.fail(CodecError::BadValue);
+    }
+    m.round = static_cast<StorageRound>(round);
+    return get_node(r, m.recipient) && r.bytes(m.payload, constants::kMaxStorageMessageBytes) &&
+           r.fixed(m.signature);
+}
+
+bool decode_storage_unlock_request(Reader& r, StorageUnlockRequestMsg& m) {
+    return get_node(r, m.requester) && r.u64(m.epoch) && r.fixed(m.plan_digest) &&
+           r.fixed(m.ephemeral_point) && r.fixed(m.nonce);
+}
+
+bool decode_storage_unlock_partial(Reader& r, StorageUnlockPartialMsg& m) {
+    return get_node(r, m.holder) && r.fixed(m.request_digest) && r.u16(m.holder_id) &&
+           r.bytes(m.sealed_partial, kMaxSealedPartialBytes);
 }
 
 bool decode_vote(Reader& r, Vote& v) {
@@ -1191,6 +1281,36 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(m);
             return true;
         }
+        case SecurityMessageKind::StoragePlanProof: {
+            StoragePlanProofMsg m;
+            if (!decode_storage_plan_proof(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::StorageKeyPackage: {
+            StorageKeyPackageMsg m;
+            if (!decode_storage_key_package(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::StorageUnlockRequest: {
+            StorageUnlockRequestMsg m;
+            if (!decode_storage_unlock_request(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::StorageUnlockPartial: {
+            StorageUnlockPartialMsg m;
+            if (!decode_storage_unlock_partial(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::StoragePlanRequest: {
+            StoragePlanRequestMsg m;
+            if (!r.u64(m.have_sequence)) return false;
+            body = std::move(m);
+            return true;
+        }
         case SecurityMessageKind::HotStuffVote: {
             Vote v;
             if (!decode_vote(r, v)) return false;
@@ -1349,7 +1469,7 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::TreeOpSubmit);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::StoragePlanRequest);
 }
 
 }  // namespace
@@ -1432,6 +1552,16 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::SvsmAkActivationOffer;
             } else if constexpr (std::is_same_v<T, TreeOpSubmitMsg>) {
                 return SecurityMessageKind::TreeOpSubmit;
+            } else if constexpr (std::is_same_v<T, StoragePlanProofMsg>) {
+                return SecurityMessageKind::StoragePlanProof;
+            } else if constexpr (std::is_same_v<T, StorageKeyPackageMsg>) {
+                return SecurityMessageKind::StorageKeyPackage;
+            } else if constexpr (std::is_same_v<T, StorageUnlockRequestMsg>) {
+                return SecurityMessageKind::StorageUnlockRequest;
+            } else if constexpr (std::is_same_v<T, StorageUnlockPartialMsg>) {
+                return SecurityMessageKind::StorageUnlockPartial;
+            } else if constexpr (std::is_same_v<T, StoragePlanRequestMsg>) {
+                return SecurityMessageKind::StoragePlanRequest;
             } else {
                 return SecurityMessageKind::SvsmAkActivationResponse;
             }
@@ -1457,6 +1587,16 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_proposal_message(body, value);
             } else if constexpr (std::is_same_v<T, TreeOpSubmitMsg>) {
                 return encode_tree_op_submit(body, value);
+            } else if constexpr (std::is_same_v<T, StoragePlanProofMsg>) {
+                return encode_storage_plan_proof(body, value);
+            } else if constexpr (std::is_same_v<T, StorageKeyPackageMsg>) {
+                return encode_storage_key_package(body, value);
+            } else if constexpr (std::is_same_v<T, StorageUnlockRequestMsg>) {
+                return encode_storage_unlock_request(body, value);
+            } else if constexpr (std::is_same_v<T, StorageUnlockPartialMsg>) {
+                return encode_storage_unlock_partial(body, value);
+            } else if constexpr (std::is_same_v<T, StoragePlanRequestMsg>) {
+                return encode_storage_plan_request(body, value);
             } else if constexpr (std::is_same_v<T, Vote>) {
                 return encode_vote(body, value);
             } else if constexpr (std::is_same_v<T, TimeoutVote>) {

@@ -47,4 +47,32 @@ std::optional<std::vector<uint8_t>> PairwiseSealer::unseal(
     return out;
 }
 
+std::optional<std::vector<uint8_t>> PairwiseSealer::seal_bound_for(
+    const NodeId& recipient, const Digest& binding, std::span<const uint8_t> plaintext) const {
+    std::vector<uint8_t> bound;
+    bound.reserve(binding.size() + plaintext.size());
+    bound.insert(bound.end(), binding.begin(), binding.end());
+    bound.insert(bound.end(), plaintext.begin(), plaintext.end());
+    auto sealed = seal_for(recipient, bound);
+    sodium_memzero(bound.data(), bound.size());
+    return sealed;
+}
+
+std::optional<std::vector<uint8_t>> PairwiseSealer::unseal_bound(
+    const Digest& binding, std::span<const uint8_t> ciphertext) const {
+    auto opened = unseal(ciphertext);
+    if (!opened.has_value()) {
+        return std::nullopt;
+    }
+    if (opened->size() < binding.size() ||
+        sodium_memcmp(opened->data(), binding.data(), binding.size()) != 0) {
+        sodium_memzero(opened->data(), opened->size());
+        return std::nullopt;
+    }
+    std::vector<uint8_t> out(opened->begin() + static_cast<std::ptrdiff_t>(binding.size()),
+                             opened->end());
+    sodium_memzero(opened->data(), opened->size());
+    return out;
+}
+
 }  // namespace nexus::security

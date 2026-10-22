@@ -56,6 +56,7 @@ std::optional<SecurityMeshStartup> start_security_mesh(
     mesh_config.platform_source = std::move(platform_source);
     mesh_config.activation_source = std::move(activation_source);
     mesh_config.on_epoch_established = std::move(on_epoch_established);
+    mesh_config.storage_key_enabled = config.storage_key_enabled;
     auto startup = std::make_optional<SecurityMeshStartup>();
     startup->service =
         std::make_unique<security::SecurityMeshService>(io, mesh_config, gossip,

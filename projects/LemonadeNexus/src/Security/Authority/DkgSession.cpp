@@ -204,8 +204,7 @@ std::vector<DkgMessage> DkgSession::round2_messages() {
     round2_ = std::move(*round2.value);
     phase_ = DkgPhase::Round2;
     // Packages that arrived early were checked on receipt; they count now.
-    round2_payloads_.merge(early_round2_);
-    early_round2_.clear();
+    round2_inbox_.release_early();
 
     std::vector<DkgMessage> messages;
     for (const auto& [recipient_index, payload] : round2_.packages_for_recipients()) {
@@ -238,22 +237,21 @@ DkgFailure DkgSession::receive_pairwise(const DkgMessage& message) {
     if (message.sender == config_.self) {
         return DkgFailure::UnknownSender;
     }
-    auto& held = early ? early_round2_ : round2_payloads_;
-    const auto existing = held.find(message.sender);
-    if (existing != held.end()) {
-        if (existing->second == message.payload) {
+    switch (round2_inbox_.accept(message.sender, message.payload, early)) {
+        case RoundAccept::Duplicate:
             return DkgFailure::DuplicateMessage;
-        }
-        fail(DkgFailure::Equivocation, message.sender);
-        return DkgFailure::Equivocation;
+        case RoundAccept::Equivocation:
+            fail(DkgFailure::Equivocation, message.sender);
+            return DkgFailure::Equivocation;
+        case RoundAccept::Accepted:
+            break;
     }
-    held[message.sender] = message.payload;
     return DkgFailure::None;
 }
 
 bool DkgSession::finish() {
     if (phase_ != DkgPhase::Round2 ||
-        round2_payloads_.size() + 1 != config_.participants.size()) {
+        round2_inbox_.size() + 1 != config_.participants.size()) {
         return false;
     }
 
@@ -264,7 +262,7 @@ bool DkgSession::finish() {
         }
     }
     crypto::FrostPeerBytesMap round2_for_me;
-    for (const auto& [sender, payload] : round2_payloads_) {
+    for (const auto& [sender, payload] : round2_inbox_.messages()) {
         round2_for_me[index_of_.at(sender)] = payload;
     }
 

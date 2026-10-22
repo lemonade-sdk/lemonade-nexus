@@ -232,6 +232,43 @@ std::vector<SecurityMessage> all_kinds() {
     op.signature = signature(0x97);
     messages.push_back(envelope(SecurityMessageKind::TreeOpSubmit, op));
 
+    // Storage key (Phase 5).
+    StoragePlanProofMsg plan_proof;
+    plan_proof.payload = BlockPayload{BlockPayloadKind::StorageKeyRotation,
+                                      std::vector<uint8_t>(120, 0x3D)};
+    for (int i = 0; i < 3; ++i) {
+        const ProposalMessage block = proposal_message();
+        plan_proof.proof.chain.push_back({block.proposal, block.justify});
+    }
+    plan_proof.proof.certifying = certificate(4);
+    messages.push_back(envelope(SecurityMessageKind::StoragePlanProof, plan_proof));
+
+    StorageKeyPackageMsg package;
+    package.session = digest(0x3E);
+    package.sender = node(0x01);
+    package.round = StorageRound::Confirm;
+    package.payload = std::vector<uint8_t>(90, 0x3F);
+    package.signature = signature(0x40);
+    messages.push_back(envelope(SecurityMessageKind::StorageKeyPackage, package));
+
+    StorageUnlockRequestMsg request;
+    request.requester = node(0x01);
+    request.epoch = 7;
+    request.plan_digest = digest(0x41);
+    request.ephemeral_point.fill(0x42);
+    request.nonce.fill(0x43);
+    messages.push_back(envelope(SecurityMessageKind::StorageUnlockRequest, request));
+
+    StorageUnlockPartialMsg partial;
+    partial.holder = node(0x01);
+    partial.request_digest = digest(0x44);
+    partial.holder_id = 3;
+    partial.sealed_partial = std::vector<uint8_t>(144, 0x45);
+    messages.push_back(envelope(SecurityMessageKind::StorageUnlockPartial, partial));
+
+    messages.push_back(
+        envelope(SecurityMessageKind::StoragePlanRequest, StoragePlanRequestMsg{12}));
+
     return messages;
 }
 
@@ -254,6 +291,37 @@ TEST(SecurityCodec, EveryKindRoundTrips) {
         EXPECT_EQ(back.body.index(), message.body.index());
         EXPECT_TRUE(same_wire(back, message));
     }
+}
+
+TEST(SecurityCodec, StorageMessagesRefuseUnknownValuesAndOversizedFields) {
+    // A plan proof carries only a storage payload kind.
+    StoragePlanProofMsg proof;
+    proof.payload = BlockPayload{BlockPayloadKind::TreeBatch, std::vector<uint8_t>(8, 1)};
+    for (int i = 0; i < 3; ++i) {
+        const ProposalMessage block = proposal_message();
+        proof.proof.chain.push_back({block.proposal, block.justify});
+    }
+    proof.proof.certifying = certificate(4);
+    EXPECT_TRUE(
+        encode_security_message(envelope(SecurityMessageKind::StoragePlanProof, proof)).empty());
+
+    // A round outside Round1..Confirm does not decode.
+    StorageKeyPackageMsg package;
+    package.sender = node(0x01);
+    package.payload = {1};
+    auto bytes = encode_security_message(envelope(SecurityMessageKind::StorageKeyPackage, package));
+    ASSERT_FALSE(bytes.empty());
+    // The round byte follows the envelope header, the session, and the sender.
+    const std::size_t header = bytes.size() - (32 + 32 + 1 + 32 + 4 + 1 + 64) - 4;
+    const std::size_t round_at = header + 4 + 32 + 32;
+    ASSERT_EQ(bytes[round_at], static_cast<uint8_t>(StorageRound::Round1));
+    bytes[round_at] = 9;
+    EXPECT_TRUE(std::holds_alternative<CodecError>(decode_security_message(bytes)));
+
+    // An oversized session payload is not encodable.
+    package.payload.assign(constants::kMaxStorageMessageBytes + 1, 0x01);
+    EXPECT_TRUE(
+        encode_security_message(envelope(SecurityMessageKind::StorageKeyPackage, package)).empty());
 }
 
 TEST(SecurityCodec, EveryPrefixIsRejected) {

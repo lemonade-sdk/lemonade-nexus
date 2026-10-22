@@ -11,10 +11,16 @@ consensus and apply them only after commit. Tier 2 replication and the merge
 ceremony (Phase 3) are not implemented. See
 [Configuration](Configuration#experimental-tree-operations) for the behavior
 and limits. Phase 4, the `storage-threshold` library
-(`crates/storage-threshold`), is implemented and tested; the server does not
-call it yet, and its unaudited paths still need the external review in
-[B3](#b3-library). The design changes the trust model, so `AGENTS.md` requires
-review of each later phase and its migration plan before code.
+(`crates/storage-threshold`), is implemented and tested. Phase 5 (holder
+plans and key rotations in consensus, the unlock protocol, the `StorageUnlock`
+attestation purpose, per-epoch share refresh, and daily rotation) is
+implemented behind the experimental `storage_key_enabled` setting; see
+[B11](#b11-phase-5-implementation) and
+[Configuration](Configuration#experimental-threshold-storage-key). The
+setting must stay off in production until the external review of the
+unaudited library paths in [B3](#b3-library) is done. The design changes the
+trust model, so `AGENTS.md` requires review of each later phase and its
+migration plan before code.
 
 ## Table of Contents
 - [Summary](#summary)
@@ -336,7 +342,8 @@ rotates the key when the threshold must change.
   the next-epoch plan: the holder list, the threshold, `S`, and each holder's
   public share commitment.
 - **Threshold:** `t = ceil(0.65 × n)`, with at least 5 holders before the
-  storage key is created.
+  storage key is created. After holders are lost, re-sharing continues while
+  at least 3 holders remain (see [Open Decisions](#open-decisions)).
 
 ### B5. Re-sharing
 
@@ -440,6 +447,52 @@ snapshots, and account data. `wrap_local.key` is retired.
    plaintext.
 3. A server that cannot reach `t` holders keeps its old files and retries.
 
+### B11. Phase 5 implementation
+
+Behind `storage_key_enabled` (`Security/Storage/`):
+
+- **Records.** Two block payload kinds carry storage records:
+  `StorageHolderPlan` (first key and share refresh) and `StorageKeyRotation`.
+  A record is a *selection* (holders, `t`, operation) or a *final plan* (`S`,
+  the share commitments, and every selected holder's identity signature over
+  the exact plan bytes). Records chain by sequence and previous digest. A
+  replica votes for a selection only when its own derivation gives the same
+  bytes, and for a final plan only when every check in
+  `check_storage_final` passes. Servers outside Tier 1 receive each record
+  with its commit proof (`StoragePlanProof`) and verify the proof against the
+  committing epoch's vote keys.
+- **Selection.** At each epoch boundary the holders come from the finalized
+  eligibility pool, ranked by `H(checkpoint_seed ‖ node_id)` with the
+  finalized state root as the seed, at most 50. With no key and at least 5
+  holders, the key is created. With a key, the shares refresh when the new
+  holders are a subset of the current ones, `t` is unchanged, and no rotation
+  is due; otherwise the key rotates. A rotation is due when block time is 24 h
+  past the block time that created `S`. New holders join through a rotation;
+  the crate's share repair is not used yet.
+- **Holder loss.** A session that has no final plan 120 s of block time after
+  its selection may be replaced: by the next boundary's selection, or by a
+  retry without the holders whose round-1 package the replica never observed
+  (at most 3 attempts). Below 3 holders nothing is selected and the last plan
+  stays.
+- **Sessions.** Round 1 is broadcast; each round-2 package is sealed to its
+  recipient with the network, the session (selection digest), and both holder
+  identifiers bound inside the seal. Early round-2 packages are held and own
+  packages are re-sent every 5 s (Part C, `RoundRelay.hpp`, shared with the
+  FROST DKG). A holder seals its new share before it signs its confirmation.
+- **Unlock.** A holder answers a `StorageUnlockRequest` only for the current
+  plan, or the retiring plan through the epoch after the rotation's effective
+  epoch, after a passing `StorageUnlock` attestation bound to that request.
+  Budgets: one pending request per requester, 8 per requester per epoch, 64
+  pending in all; a replayed request digest is refused. The partial is sealed
+  to the requester with the request digest bound inside the seal.
+- **Data key.** `DataKeyService` creates the DEK, wraps it to `S`, proves the
+  unwrap through the holders, unlocks at startup, and rewraps after a
+  rotation. No file is encrypted yet (Phase 7).
+- **Share storage.** Until Phase 6 is merged, shares are kept by
+  `FileStorageShareStore` under today's machine-bound wrapping (the B6
+  limit); `IStorageShareStore` maps one-to-one onto `SealedBlobStore` with the
+  domain `storage-share`.
+
 ## Part C: Key-Generation Race Fix
 
 The first r17 founding split because round-2 messages that arrive before round
@@ -500,4 +553,10 @@ Decided: libraries for `storage-threshold` (B3), with an external review of
 the unaudited paths before Phase 5; a threshold change rotates the key
 instead of re-sharing to a new threshold (B5); no offline recovery key (B8); nodes hold per-node versions and the
 sync library replicates (A7); the API waits up to 10 s, then reports pending
-(A2).
+(A2); holder counts (B4, B5, B10): the storage key is created only with at
+least 5 eligible, attested holders; after holders are lost, Tier 1 refreshes
+or rotates promptly while at least 3 holders remain (a refresh when `t` stays
+the same, otherwise a rotation at the new count: 4 holders give `t = 3`, 3
+holders give `t = 2`); below 3 holders the last plan stays and no rotation
+runs; holders are added back through rotation; the crate permits 3 to 50
+holders for a refresh or rotation and 5 to 50 for the first key.

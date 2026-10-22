@@ -101,6 +101,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
     if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("tree_ops_enabled"))           j.at("tree_ops_enabled").get_to(c.tree_ops_enabled);
+    if (j.contains("storage_key_enabled"))        j.at("storage_key_enabled").get_to(c.storage_key_enabled);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
     if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
     if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
@@ -167,6 +168,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
     spdlog::info("  --tree-ops                 Experimental: order tree writes through Tier 1 consensus (Phase 2)");
+    spdlog::info("  --storage-key              Experimental: threshold storage key and data key (Phase 5; not for production)");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --help, -h                 Show this help");
 }
@@ -340,6 +342,8 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.open_registration = false;
         } else if (std::strcmp(argv[i], "--tree-ops") == 0) {
             config.tree_ops_enabled = true;
+        } else if (std::strcmp(argv[i], "--storage-key") == 0) {
+            config.storage_key_enabled = true;
         } else if (std::strcmp(argv[i], "--region") == 0 && i + 1 < argc) {
             config.region = argv[++i];
         }
@@ -414,6 +418,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
     if (std::getenv("SP_CLOSED_REGISTRATION"))           config.open_registration     = false;
     if (std::getenv("SP_TREE_OPS"))                      config.tree_ops_enabled      = true;
+    if (std::getenv("SP_STORAGE_KEY"))                   config.storage_key_enabled   = true;
 
     if (const char* v = std::getenv("SP_SEED_PEERS")) {
         // Comma-separated list

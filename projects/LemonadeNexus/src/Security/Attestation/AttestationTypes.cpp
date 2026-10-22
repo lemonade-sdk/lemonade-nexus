@@ -41,6 +41,18 @@ Digest final_readiness_attestation_context(const NetworkId& network_id, EpochId 
     return encoder.digest();
 }
 
+Digest storage_unlock_attestation_context(const NetworkId& network_id, EpochId epoch,
+                                          const Digest& plan_digest,
+                                          const Digest& request_digest) {
+    CanonicalEncoder encoder(kAttestationContextDomain);
+    encoder.add_u16(static_cast<uint16_t>(AttestationPurpose::StorageUnlock));
+    encoder.add_bytes(network_id);
+    encoder.add_u64(epoch.underlying());
+    encoder.add_bytes(plan_digest);
+    encoder.add_bytes(request_digest);
+    return encoder.digest();
+}
+
 Digest challenge_digest(const AttestationChallenge& challenge) {
     CanonicalEncoder encoder(constants::kTier1AttestDomain);
     encoder.add_string("challenge");

@@ -12,6 +12,7 @@
 // The service wrapper runs it from timers; tests run it from a counter.
 
 #include <LemonadeNexus/Security/Attestation/EvidenceProducer.hpp>
+#include <LemonadeNexus/Security/Authority/RoundRelay.hpp>
 #include <LemonadeNexus/Security/Consensus/Pacemaker.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityService.hpp>
 #include <LemonadeNexus/Security/Epoch/AuthorityChain.hpp>
@@ -136,6 +137,7 @@ public:
                                     const NodeId& from) override;
     void on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) override;
     void on_tree_op_submit(const TreeOpSubmitMsg& message, const NodeId& from) override;
+    void on_storage_message(const SecurityMessage& message) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
@@ -179,6 +181,27 @@ public:
     /// (SecurityRouter checked the membership). Unset drops them.
     void set_tree_op_sink(std::function<void(const TreeOpSubmitMsg&, const NodeId&)> sink) {
         tree_op_sink_ = std::move(sink);
+    }
+
+    /// Receives storage-key traffic (SecurityRouter checked the sender binding
+    /// and the network only). Unset drops it.
+    void set_storage_sink(std::function<void(const SecurityMessage&)> sink) {
+        storage_sink_ = std::move(sink);
+    }
+
+    /// Receives every verdict for the StorageUnlock purpose. Such a verdict
+    /// never reaches eligibility or final readiness. Unset drops it.
+    void set_storage_verdict_sink(std::function<void(const AttestationVerdict&)> sink) {
+        storage_verdict_sink_ = std::move(sink);
+    }
+
+    /// Fires when this node finalizes the eligibility state for the next epoch
+    /// and its own recomputation reproduces it: `pool` is the frozen eligible
+    /// pool and `finalized` the commit that finalized it. A read of finalized
+    /// facts; the storage holder selection derives from it (design B4).
+    void set_eligibility_finalized_callback(
+        std::function<void(const FinalizedEligibility& finalized, const Tier1Set& pool)> cb) {
+        on_eligibility_finalized_ = std::move(cb);
     }
 
     /// True when `node` is in the anchor-authenticated founding this driver
@@ -311,7 +334,7 @@ private:
     Height founding_round_ = 0;
     uint64_t last_bootstrap_retry_ms_ = 0;
     uint64_t founding_dkg_started_ms_ = 0;
-    uint64_t last_dkg_resend_ms_ = 0;
+    ResendCadence dkg_resend_{constants::kDkgResendMs};
     /// When each founding edge was last challenged; answers can outlive the
     /// cadence, so an edge is re-asked only after a grace period.
     std::map<NodeId, uint64_t> founding_challenge_ms_;
@@ -397,6 +420,9 @@ private:
     /// fixed order. Not owning.
     std::map<BlockPayloadKind, IBlockPayloadHandler*> payload_handlers_;
     std::function<void(const TreeOpSubmitMsg&, const NodeId&)> tree_op_sink_;
+    std::function<void(const SecurityMessage&)> storage_sink_;
+    std::function<void(const AttestationVerdict&)> storage_verdict_sink_;
+    std::function<void(const FinalizedEligibility&, const Tier1Set&)> on_eligibility_finalized_;
 };
 
 }  // namespace nexus::security

@@ -67,8 +67,8 @@ template <typename Tag>
     return true;
 }
 
-/// Only the two purposes the protocol defines. An unknown value is refused
-/// rather than defaulting into Eligibility, which is the weaker context.
+/// Only the purposes the protocol defines. An unknown value is refused rather
+/// than defaulting into Eligibility, which is the weaker context.
 [[nodiscard]] bool read_purpose(const json& value, security::AttestationPurpose& out) {
     uint16_t raw = 0;
     if (!read_uint(value, raw)) return false;
@@ -76,6 +76,7 @@ template <typename Tag>
         case security::AttestationPurpose::Eligibility:
         case security::AttestationPurpose::FinalEpochReadiness:
         case security::AttestationPurpose::PlatformEnrollment:
+        case security::AttestationPurpose::StorageUnlock:
             out = static_cast<security::AttestationPurpose>(raw);
             return true;
     }

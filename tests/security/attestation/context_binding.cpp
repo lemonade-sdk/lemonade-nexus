@@ -201,3 +201,39 @@ TEST_F(ContextBinding, FinalEvidenceCannotAnswerEligibility) {
 }
 
 }  // namespace
+
+// StorageUnlock evidence answers exactly one unlock request: another request,
+// another plan, or another network is another context, and evidence labelled
+// with another purpose answers nothing.
+TEST_F(ContextBinding, UnlockEvidenceAnswersExactlyOneRequest) {
+    Digest request_a{};
+    request_a.fill(0x70);
+    Digest request_b{};
+    request_b.fill(0x71);
+    Digest plan{};
+    plan.fill(0x72);
+    const Digest a = nexus::security::storage_unlock_attestation_context(network(0x01), 5, plan, request_a);
+    EXPECT_NE(nexus::security::storage_unlock_attestation_context(network(0x01), 5, plan, request_b), a);
+    EXPECT_NE(nexus::security::storage_unlock_attestation_context(network(0x02), 5, plan, request_a), a);
+    EXPECT_NE(nexus::security::storage_unlock_attestation_context(network(0x01), 6, plan, request_a), a);
+    EXPECT_NE(final_context(0x50, 0, 0x60), a);
+
+    auto challenge = service.create_challenge(node(0x21), key(0x22), 1, 5,
+                                              AttestationPurpose::StorageUnlock, a);
+    ASSERT_TRUE(challenge.has_value());
+    AttestationEvidence evidence = answering(*challenge);
+    evidence.context_digest =
+        nexus::security::storage_unlock_attestation_context(network(0x01), 5, plan, request_b);
+    AttestationVerdict verdict = service.receive_evidence(evidence);
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_EQ(verdict.failure, AttestationFailure::ContextMismatch);
+
+    challenge = service.create_challenge(node(0x21), key(0x22), 1, 5,
+                                         AttestationPurpose::StorageUnlock, a);
+    ASSERT_TRUE(challenge.has_value());
+    evidence = answering(*challenge);
+    evidence.purpose = AttestationPurpose::Eligibility;
+    verdict = service.receive_evidence(evidence);
+    EXPECT_FALSE(verdict.passed);
+    EXPECT_NE(verdict.failure, AttestationFailure::None);
+}

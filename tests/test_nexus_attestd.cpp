@@ -186,6 +186,15 @@ TEST(AttestdGate, RefusesADefaultConstructedChallenge) {
 }
 
 
+TEST(AttestdGate, RefusesStorageUnlockWithNoContext) {
+    auto c = good_challenge();
+    c.purpose = AttestationPurpose::StorageUnlock;
+    c.context_digest.fill(0);
+    EXPECT_EQ(check_challenge(c), Refusal::ContextUnbound);
+    c.context_digest = patterned<32>(0x51);
+    EXPECT_EQ(check_challenge(c), Refusal::None);
+}
+
 TEST(AttestdGate, RefusesFinalReadinessWithNoContext) {
     auto c = good_challenge();
     c.purpose = AttestationPurpose::FinalEpochReadiness;
@@ -323,11 +332,19 @@ TEST(AttestdCodec, RefusesAWrongWidthOrWrongTypeField) {
 }
 
 TEST(AttestdCodec, RefusesAnUnknownPurpose) {
-    for (const int purpose : {0, 4, 65535}) {
+    for (const int purpose : {0, 5, 65535}) {
         auto request = good_request();
         request["purpose"] = purpose;
         EXPECT_FALSE(decode_challenge(request.dump()).has_value()) << purpose;
     }
+}
+
+TEST(AttestdCodec, AcceptsTheStorageUnlockPurpose) {
+    auto request = good_request();
+    request["purpose"] = static_cast<int>(AttestationPurpose::StorageUnlock);
+    const auto decoded = decode_challenge(request.dump());
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->purpose, AttestationPurpose::StorageUnlock);
 }
 
 TEST(AttestdCodec, RefusesTheWrongEnvelope) {

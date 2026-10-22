@@ -58,9 +58,14 @@ public:
     /// node spent its attestation budget for this epoch.
     ///
     /// The purpose decides the context: Eligibility computes its canonical
-    /// context here and `context` must stay empty; FinalEpochReadiness must
-    /// supply the plan-bound context and an empty one is refused. There is no
-    /// unbound final challenge.
+    /// context here and `context` must stay empty; FinalEpochReadiness and
+    /// StorageUnlock must supply their bound context and an empty one is
+    /// refused. There is no unbound final or storage-unlock challenge.
+    ///
+    /// StorageUnlock challenges live in their own lane: one never replaces a
+    /// pending eligibility or final-readiness challenge for the same node, and
+    /// the reverse. Their budget is kStorageUnlocksPerRequesterPerEpoch per
+    /// node and epoch.
     [[nodiscard]] std::optional<AttestationChallenge> create_challenge(
         const NodeId& node, const crypto::Ed25519PublicKey& node_key,
         IncarnationId incarnation, EpochId epoch, AttestationPurpose purpose,
@@ -82,8 +87,10 @@ public:
     [[nodiscard]] std::optional<AttestationChallenge> receive_activation_response(
         const SvsmAkActivationResponseMessage& response);
 
+    /// The live challenge for `node` in the lane of `purpose` (the mesh lane
+    /// for every purpose except StorageUnlock).
     [[nodiscard]] std::optional<AttestationChallenge> pending_challenge(
-        const NodeId& node) const;
+        const NodeId& node, AttestationPurpose purpose = AttestationPurpose::Eligibility) const;
 
     /// Frees the attempt budget for one subject. Only the lifecycle driver's
     /// paced bootstrap retries call this; the budget still caps each burst.
@@ -124,7 +131,20 @@ private:
         DeferredChallenge deferred;
     };
 
-    std::map<NodeId, AttestationChallenge> pending_;
+    /// Pending challenges keyed by node and lane. The storage-unlock lane is
+    /// separate, so a holder's unlock challenge cannot cancel a member's
+    /// eligibility or final-readiness challenge. A PlatformEnrollment
+    /// challenge uses the mesh lane whatever purpose it defers, so an
+    /// enrollment for an unlock can still replace a pending mesh challenge for
+    /// a node not yet enrolled here; the replaced exchange fails and is
+    /// retried.
+    enum class ChallengeLane : uint8_t { Mesh, StorageUnlock };
+    [[nodiscard]] static ChallengeLane lane_of(AttestationPurpose purpose) {
+        return purpose == AttestationPurpose::StorageUnlock ? ChallengeLane::StorageUnlock
+                                                            : ChallengeLane::Mesh;
+    }
+    std::map<std::pair<NodeId, ChallengeLane>, AttestationChallenge> pending_;
+    std::map<std::pair<EpochId, NodeId>, uint32_t> storage_attempts_;
     std::map<NodeId, DeferredChallenge> deferred_;
     std::map<NodeId, PendingActivation> pending_activations_;
     std::map<NodeId, AttestationVerdict> verdicts_;

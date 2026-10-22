@@ -26,6 +26,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <set>
 #include <unistd.h>
@@ -65,6 +66,11 @@ struct MemoryMesh {
     /// challenge to an offline subject is never captured, which is exactly a
     /// node refusing to attest.
     std::vector<std::pair<NodeId, AttestationChallenge>> captured_final_challenges;
+    /// Storage-unlock challenges in flight, with their challenger (a holder).
+    std::vector<std::pair<NodeId, AttestationChallenge>> captured_storage_challenges;
+    /// Drops one delivery when it returns true: a per-message transport fault
+    /// (for example, one holder's storage packages never arriving).
+    std::function<bool(const Queued&, const SecurityMessage&)> drop_if;
     // Unreachable nodes: nothing is delivered to or from them. Offline is a
     // transport fact, not a protocol one.
     std::set<NodeId> offline;
@@ -193,6 +199,9 @@ struct EventsProxy : ISecurityEvents {
     void on_tree_op_submit(const TreeOpSubmitMsg& m, const NodeId& n) override {
         if (target) target->on_tree_op_submit(m, n);
     }
+    void on_storage_message(const SecurityMessage& m) override {
+        if (target) target->on_storage_message(m);
+    }
 };
 
 struct Node {
@@ -215,6 +224,8 @@ struct Node {
     std::unique_ptr<GenesisService> genesis;
     std::unique_ptr<EpochStore> store;
     std::unique_ptr<SecurityDriver> driver;
+    /// The router's StorageUnlock challenge gate; a storage fixture sets it.
+    std::function<bool(const NodeId&, const Digest&)> storage_gate;
 
     void deliver(const NodeId& from, std::span<const uint8_t> bytes, uint64_t now) {
         (void)router->receive(from, bytes, now);
@@ -230,6 +241,8 @@ inline void MemoryMesh::capture(std::span<const uint8_t> bytes) {
     if (const auto* challenge = std::get_if<AttestationChallenge>(&message.body)) {
         if (challenge->purpose == AttestationPurpose::FinalEpochReadiness) {
             captured_final_challenges.emplace_back(message.sender, *challenge);
+        } else if (challenge->purpose == AttestationPurpose::StorageUnlock) {
+            captured_storage_challenges.emplace_back(message.sender, *challenge);
         }
     } else if (const auto* plan = std::get_if<NextEpochPlanProof>(&message.body)) {
         captured_plans.push_back(*plan);
@@ -248,6 +261,13 @@ inline void MemoryMesh::pump() {
         queue.pop_front();
         if (offline.contains(item.from) || offline.contains(item.to)) {
             continue;
+        }
+        if (drop_if) {
+            const auto decoded = decode_security_message(item.bytes);
+            if (const auto* message = std::get_if<SecurityMessage>(&decoded);
+                message != nullptr && drop_if(item, *message)) {
+                continue;
+            }
         }
         if (!drop_next.empty()) {
             const auto decoded = decode_security_message(item.bytes);
@@ -437,6 +457,10 @@ struct DriverMeshBase : ::testing::Test {
                 .founding_member =
                     [&node](const NodeId& peer) {
                         return node.driver && node.driver->is_founding_member(peer);
+                    },
+                .storage_unlock_challenger =
+                    [&node](const NodeId& holder, const Digest& context) {
+                        return node.storage_gate && node.storage_gate(holder, context);
                     }},
             *node.runtime, *node.transport, node.events, *node.sealer, nullptr);
         if (&node == genesis_node) {
@@ -466,6 +490,9 @@ struct DriverMeshBase : ::testing::Test {
     /// Runs after build_node and restart_node rebuilt a node's driver, before
     /// it starts: a fixture attaches per-node services here.
     virtual void on_node_built(Node&) {}
+
+    /// Runs for every online node right after its driver tick in step().
+    virtual void on_tick(Node&) {}
 
     void preactivate(Node& observer, const Node& subject) {
         nexus_test::seed_svsm_activation(network, subject.id, subject.identity.public_key,
@@ -556,7 +583,10 @@ struct DriverMeshBase : ::testing::Test {
     void step(int count, const std::vector<Node*>& online) {
         for (int i = 0; i < count; ++i) {
             mesh.now_ms += 200;
-            for (Node* node : online) node->driver->tick(mesh.now_ms);
+            for (Node* node : online) {
+                node->driver->tick(mesh.now_ms);
+                on_tick(*node);
+            }
             mesh.pump();
         }
     }
