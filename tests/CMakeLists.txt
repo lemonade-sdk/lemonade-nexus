@@ -161,6 +161,7 @@ add_nexus_test(test_security_policy
 add_nexus_test(test_security_strong_id security/test_strong_id.cpp)
 add_nexus_test(test_secure_buffer      test_secure_buffer.cpp)
 add_nexus_test(test_frost_provider     test_frost_provider.cpp)
+add_nexus_test(test_storage_threshold  test_storage_threshold.cpp)
 add_nexus_test(test_security_consensus
     security/consensus/consensus_types.cpp
     security/consensus/quorum_certificate.cpp

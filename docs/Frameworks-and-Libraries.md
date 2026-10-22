@@ -12,7 +12,8 @@ instead of virtual dispatch: zero-overhead polymorphism, compile-time type
 safety, and inlinability, at the cost of more verbose templates.
 
 Rust builds the parts that need it: the BoringTun FFI wrapper, the virtual
-netstack (smoltcp), and the FROST integration (`crates/`).
+netstack (smoltcp), the FROST integration, and the threshold storage key
+library (`crates/`).
 
 ## Build System: CMake 3.25.1+ and Ninja
 
@@ -24,8 +25,9 @@ Dependencies use a **mix** of sourcing mechanisms, not all FetchContent:
   when no suitable system copy is found (or `-DOPENSSL_FORCE_BUNDLED=ON`).
 - **System packages (Linux)** — `libjson-c-dev`, `libcurl4-openssl-dev`,
   `uuid-dev` for the TPM2-TSS build.
-- **Cargo** — the three Rust crates, with `frost-ed25519 = 2.2.0` for
-  threshold signatures.
+- **Cargo** — the four Rust crates, with `frost-ed25519 = 2.2.0` for
+  threshold signatures, and `frost-ristretto255 = 2.2.0` and
+  `elastic-elgamal = 0.3.1` for the threshold storage key.
 
 The CMake library definitions under `cmake/libraries/` and the Cargo
 manifests under `crates/` are the source of truth for versions.
@@ -37,6 +39,8 @@ manifests under `crates/` are the source of truth for versions.
 | **libsodium** | 1.0.20 | Ed25519, X25519, XChaCha20-Poly1305, HKDF, randomness |
 | **OpenSSL** | 3.3.2 (system preferred) | TLS for HTTPS, ACME client, X.509 |
 | **frost-ed25519** (via `crates/frost-ffi`) | 2.2.0 | FROST threshold authority signatures |
+| **frost-ristretto255** (via `crates/storage-threshold`) | 2.2.0 | Storage key generation, share refresh, holder enrollment |
+| **elastic-elgamal** (via `crates/storage-threshold`) | 0.3.1 | DLEQ proofs for storage decryption partials |
 | **TPM2-TSS (FAPI)** | 4.1.3 (source build, Linux) | TPM access for the `nexus-attestd` helper |
 
 Application AEAD is XChaCha20-Poly1305-IETF only, in one versioned
