@@ -90,6 +90,8 @@ add_nexus_test(test_seip_naming       test_seip_naming.cpp)
 add_nexus_test(test_boringtun_wire_protocol  test_boringtun_wire_protocol.cpp)
 add_nexus_test(test_ip_router         test_ip_router.cpp)
 add_nexus_test(test_userspace_dataplane test_userspace_dataplane.cpp)
+add_nexus_test(test_forward_authz     test_forward_authz.cpp)
+target_link_libraries(test_forward_authz PRIVATE LemonadeNexusSDK)
 
 add_nexus_test(test_tls_resolution    test_tls_resolution.cpp)
 add_nexus_test(test_onboarding        test_onboarding.cpp)

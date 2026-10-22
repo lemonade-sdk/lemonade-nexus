@@ -38,6 +38,7 @@
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
+#include <LemonadeNexus/Boringtun/ForwardAuthorizer.hpp>
 #include <LemonadeNexus/Network/VirtualNetService.hpp>
 
 // CRTP request handlers
@@ -627,6 +628,18 @@ int main(int argc, char* argv[]) {
         auto x_sk = nexus::crypto::SodiumCryptoService::ed25519_sk_to_x25519(*root_privkey);
         mesh_server_private_key_b64 = nexus::crypto::to_base64(
             std::span<const uint8_t>(x_sk.data(), x_sk.size()));
+    }
+
+    // Forwarding between two client endpoints follows the permission tree: a
+    // client's server peer covers the whole plane, so without this policy any
+    // joined endpoint could reach any other through the server. Install it
+    // before the dataplane takes peers.
+    std::optional<nexus::boringtun::ForwardAuthorizer> forward_authorizer;
+    if (!tunnel_bind_ip.empty()) {
+        if (auto plane = nexus::boringtun::Cidr::parse(tunnel_bind_ip + "/10")) {
+            forward_authorizer.emplace(tree, boringtun_service.dataplane(), *plane);
+            forward_authorizer->start();
+        }
     }
 
     // Set up the boringtun interface with the server's tunnel IP
@@ -1268,6 +1281,7 @@ int main(int argc, char* argv[]) {
     if (acme_renewal_thread.joinable()) {
         acme_renewal_thread.join();
     }
+    if (forward_authorizer) forward_authorizer->stop();
     boringtun_service.stop();   // stops the dataplane: no more inbound packets
     vnet.stop();                // tears down the netstack + bridges
     if (private_http_server) {
