@@ -392,6 +392,10 @@ int main(int argc, char* argv[]) {
 
     // (server_public_ip already resolved before gossip.start() for DNS seed discovery)
 
+    // Every server answers the zone apex with its own public address, even
+    // one that holds no NS slot.
+    if (!server_public_ip.empty()) dns.set_apex_address(server_public_ip);
+
     // Configure NS identity for SOA/NS responses
     if (!ns_hostname.empty() && !server_public_ip.empty()) {
         dns.set_our_nameserver(ns_hostname, server_public_ip);

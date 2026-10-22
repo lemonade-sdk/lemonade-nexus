@@ -562,11 +562,17 @@ void DnsService::answer_txt_query(const ParsedQuery& q, const ResponseSink& send
 }
 
 void DnsService::answer_a_query(const ParsedQuery& q, const ResponseSink& send) {
-    // 0. Zone apex: return our own IP so getaddrinfo(base_domain) works
-    if (q.qname_lower == base_domain_lower_ && !our_ns_ip_.empty()) {
-        spdlog::debug("[{}] {} -> {} (zone apex)", name(), q.qname, our_ns_ip_);
-        send(build_response(q, our_ns_ip_, 300));
-        return;
+    // 0. Zone apex: return our own IP so getaddrinfo(base_domain) works. Every
+    // authoritative server answers it, including one that holds no NS slot:
+    // a resolver may ask any delegated server, and an NXDOMAIN for the apex is
+    // cached and breaks discovery until it expires.
+    if (q.qname_lower == base_domain_lower_) {
+        const std::string apex_ip = !apex_ip_.empty() ? apex_ip_ : our_ns_ip_;
+        if (!apex_ip.empty()) {
+            spdlog::debug("[{}] {} -> {} (zone apex)", name(), q.qname, apex_ip);
+            send(build_response(q, apex_ip, 300));
+            return;
+        }
     }
 
     // 0b. Tier+region wildcard: tier<N>.<region>.seip.<base_domain> -> multi-A.
@@ -1269,6 +1275,11 @@ std::optional<std::string> DnsService::nameserver_ip(const std::string& hostname
         if (ns.hostname == hostname) return ns.ip;
     }
     return std::nullopt;
+}
+
+void DnsService::set_apex_address(const std::string& ip) {
+    std::lock_guard<std::mutex> lock(zone_mutex_);
+    apex_ip_ = ip;
 }
 
 void DnsService::set_our_nameserver(const std::string& hostname, const std::string& ip) {

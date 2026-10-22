@@ -533,3 +533,23 @@ TEST_F(DnsTcpTest, PartialMessageProgressRefreshesIdleTimeout) {
     ASSERT_FALSE(ec);
     EXPECT_FALSE(read_framed(sock).empty());
 }
+
+// A server that holds no NS slot still answers the zone apex. Resolvers ask
+// any delegated server; an NXDOMAIN for the apex is cached and broke client
+// discovery for every lookup that landed on such a server.
+TEST_F(DnsTcpTest, TheZoneApexIsAnsweredWithoutANameserverSlot) {
+    const auto before = udp_query(make_query(kZone, 0x0A01));
+    ASSERT_GE(before.size(), 12u);
+    EXPECT_EQ(before[3] & 0x0F, 3);  // NXDOMAIN while no apex address is set
+
+    dns_->set_apex_address("192.0.2.7");
+    const auto reply = udp_query(make_query(kZone, 0x0A02));
+    ASSERT_GE(reply.size(), 16u);
+    EXPECT_EQ(reply[3] & 0x0F, 0);  // NOERROR
+    const std::size_t ancount =
+        (static_cast<std::size_t>(reply[6]) << 8) | static_cast<std::size_t>(reply[7]);
+    ASSERT_EQ(ancount, 1u);
+    // The answer's RDATA is the last four bytes of a single-A reply.
+    const std::vector<uint8_t> rdata(reply.end() - 4, reply.end());
+    EXPECT_EQ(rdata, (std::vector<uint8_t>{192, 0, 2, 7}));
+}
