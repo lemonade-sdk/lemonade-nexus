@@ -10,8 +10,11 @@ Status: **approved**. Phases 1 and 2 are implemented behind the experimental
 consensus and apply them only after commit. Tier 2 replication and the merge
 ceremony (Phase 3) are not implemented. See
 [Configuration](Configuration#experimental-tree-operations) for the behavior
-and limits. The design changes the trust model, so `AGENTS.md` requires review
-of each later phase and its migration plan before code.
+and limits. Phase 4, the `storage-threshold` library
+(`crates/storage-threshold`), is implemented and tested; the server does not
+call it yet, and its unaudited paths still need the external review in
+[B3](#b3-library). The design changes the trust model, so `AGENTS.md` requires
+review of each later phase and its migration plan before code.
 
 ## Table of Contents
 - [Summary](#summary)
@@ -307,7 +310,7 @@ wraps these libraries behind a C ABI like `frost-ffi`; panics never cross it.
 
 | Need | Library | Audit |
 |---|---|---|
-| Dealerless key generation over Ristretto255 | `frost-ristretto255` with the `internals` feature, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
+| Dealerless key generation over Ristretto255 | `frost-ristretto255`, with the `internals` feature of `frost-core`, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
 | Share refresh with the same holder set and threshold; removing holders | `frost-ristretto255` `refresh_dkg_*` | Not audited |
 | Enrolling a new holder at the same threshold | `frost-ristretto255` `repair_share_*` | Not audited |
 | Lagrange combination of partials | `frost-ristretto255` helpers | Audited with key generation |

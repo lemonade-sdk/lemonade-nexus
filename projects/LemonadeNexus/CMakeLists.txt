@@ -29,6 +29,7 @@ create_project(LemonadeNexus DEPENDENCIES
         boringtun-ffi
         virtual-netstack
         frost-ffi
+        storage-threshold
 )
 
 target_compile_definitions(LemonadeNexus PUBLIC
