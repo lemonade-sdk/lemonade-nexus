@@ -126,8 +126,20 @@ bool HotStuffService::extends_locked(const Proposal& proposal) const {
     }
 }
 
+const Proposal* HotStuffService::block(const Digest& proposal_digest) const {
+    const auto it = blocks_.find(proposal_digest);
+    return it == blocks_.end() ? nullptr : &it->second.proposal;
+}
+
+const BlockPayload* HotStuffService::block_payload(const Digest& proposal_digest) const {
+    const auto it = blocks_.find(proposal_digest);
+    if (it == blocks_.end() || !it->second.payload.has_value()) return nullptr;
+    return &*it->second.payload;
+}
+
 ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
-                                                 const QuorumCertificate& justify) {
+                                                 const QuorumCertificate& justify,
+                                                 const BlockPayload* payload) {
     ProposalResult result;
 
     // 1. Nothing is acted on before restart sync or after store corruption.
@@ -195,8 +207,8 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
     //     vote is withheld — but the block is tracked. A replica that refused
     //     to store a certified chain would partition itself by its own
     //     disagreement, and the transition still commits only if a quorum
-    //     independently derived it.
-    if (proposal.transitions_digest != Digest{}) {
+    //     independently derived it. A payload block is judged in 9b instead.
+    if (proposal.transitions_digest != Digest{} && payload == nullptr) {
         if (!config_.transition_validator ||
             !config_.transition_validator(proposal.transitions_digest)) {
             result.transition_refused = true;
@@ -238,8 +250,29 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
         return result;
     }
 
-    // 10. Accept into chain state.
-    blocks_[digest] = BlockRecord{proposal, justify, digest};
+    // 9b. A payload is what the header commits to, or it is not this block's
+    //     payload at all: bytes that miss the digest are not stored and earn
+    //     no vote. A matching payload earns a vote only when this node
+    //     independently agrees with it, judged now that the parent is known.
+    std::optional<BlockPayload> matched_payload;
+    if (payload != nullptr) {
+        if (block_payload_digest(*payload) != proposal.transitions_digest) {
+            result.transition_refused = true;
+        } else {
+            matched_payload = *payload;
+            if (!config_.payload_validator || !config_.payload_validator(proposal, *payload)) {
+                result.transition_refused = true;
+            }
+        }
+    }
+
+    // 10. Accept into chain state. A repeat delivery never drops a payload
+    //     that an earlier delivery of the same block stored.
+    if (const auto known = blocks_.find(digest);
+        !matched_payload.has_value() && known != blocks_.end()) {
+        matched_payload = known->second.payload;
+    }
+    blocks_[digest] = BlockRecord{proposal, justify, digest, std::move(matched_payload)};
     qc_by_block_[justify.proposal_digest] = justify;
     accepted_by_view_[proposal.view] = digest;
     advance_high_qc(justify);
@@ -556,7 +589,12 @@ std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
         !blocks_.contains(proposal.parent_digest)) {
         anchor_adopted_ = true;
     }
-    blocks_[digest] = BlockRecord{proposal, justify, digest};
+    // Sync carries headers only; a payload this node already holds stays.
+    std::optional<BlockPayload> kept_payload;
+    if (const auto known = blocks_.find(digest); known != blocks_.end()) {
+        kept_payload = known->second.payload;
+    }
+    blocks_[digest] = BlockRecord{proposal, justify, digest, std::move(kept_payload)};
     qc_by_block_[justify.proposal_digest] = justify;
     qc_by_block_[digest] = certifying;
     accepted_by_view_[proposal.view] = digest;

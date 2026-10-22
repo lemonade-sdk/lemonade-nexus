@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <cstring>
 #include <map>
+#include <unordered_set>
 
 namespace nexus::tree {
 
@@ -80,7 +82,6 @@ void add_join(security::CanonicalEncoder& enc, const JoinStatement& j) {
     add_bool(enc, j.is_inference);
     enc.add_string(j.link_group_id);
     enc.add_string(j.link_owner_pubkey);
-    enc.add_string(j.tunnel_ip);
 }
 
 /// The kind/source pairs an op may use.
@@ -91,6 +92,8 @@ bool source_allowed(TreeOpKind kind, TreeOpSource source) {
         case TreeOpKind::DeleteNode:
             return source == TreeOpSource::Session || source == TreeOpSource::Delta;
         case TreeOpKind::SetAssignment:
+        case TreeOpKind::EstablishRoot:
+        case TreeOpKind::SetEndpoint:
             return source == TreeOpSource::Session;
         case TreeOpKind::Join:
             return source == TreeOpSource::Device;
@@ -105,9 +108,36 @@ bool kind_known(TreeOpKind kind) {
         case TreeOpKind::SetAssignment:
         case TreeOpKind::DeleteNode:
         case TreeOpKind::Join:
+        case TreeOpKind::EstablishRoot:
+        case TreeOpKind::SetEndpoint:
             return true;
     }
     return false;
+}
+
+/// "host:port", "a.b.c.d:port", or "[v6]:port" characters only, bounded like
+/// the heartbeat route's check (253-character host, ":" and a 5-digit port).
+/// Empty clears the endpoint. The API applies the stricter pattern check
+/// first; this keeps a replica from storing arbitrary bytes.
+bool endpoint_text_valid(std::string_view endpoint) {
+    if (endpoint.empty()) return true;
+    if (endpoint.size() > 253 + 6) return false;
+    const auto colon = endpoint.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 >= endpoint.size()) {
+        return false;
+    }
+    for (char c : endpoint) {
+        const bool allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                             (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':' ||
+                             c == '[' || c == ']';
+        if (!allowed) return false;
+    }
+    unsigned port = 0;
+    const auto digits = endpoint.substr(colon + 1);
+    if (digits.size() > 5) return false;
+    auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), port);
+    return ec == std::errc{} && ptr == digits.data() + digits.size() && port >= 1 &&
+           port <= 65535;
 }
 
 // --- Key and signature parsing ----------------------------------------------
@@ -156,29 +186,57 @@ bool delta_signature_valid(crypto::SodiumCryptoService& crypto, const TreeDelta&
         *sig);
 }
 
-/// "a.b.c.d/32" inside the tunnel pool 10.64.0.0/10.
-bool tunnel_address_valid(std::string_view cidr) {
-    if (!cidr.ends_with("/32")) return false;
+constexpr uint32_t kTunnelBase = (10u << 24) | (64u << 16);  // 10.64.0.0
+constexpr uint32_t kTunnelMask = 0xFFC00000u;                // /10
+
+/// The offset inside 10.64.0.0/10 of a "a.b.c.d/32" address, or nullopt when
+/// the text is not such an address.
+std::optional<uint32_t> tunnel_offset(std::string_view cidr) {
+    if (!cidr.ends_with("/32")) return std::nullopt;
     const auto addr = cidr.substr(0, cidr.size() - 3);
     uint32_t value = 0;
     std::size_t pos = 0;
     for (int octet = 0; octet < 4; ++octet) {
         if (octet > 0) {
-            if (pos >= addr.size() || addr[pos] != '.') return false;
+            if (pos >= addr.size() || addr[pos] != '.') return std::nullopt;
             ++pos;
         }
         unsigned part = 0;
         const auto* begin = addr.data() + pos;
         const auto* end = addr.data() + addr.size();
         auto [ptr, ec] = std::from_chars(begin, end, part);
-        if (ec != std::errc{} || ptr == begin || part > 255 || (ptr - begin) > 3) return false;
+        if (ec != std::errc{} || ptr == begin || part > 255 || (ptr - begin) > 3) {
+            return std::nullopt;
+        }
         pos += static_cast<std::size_t>(ptr - begin);
         value = (value << 8) | part;
     }
-    if (pos != addr.size()) return false;
-    constexpr uint32_t kTunnelBase = (10u << 24) | (64u << 16);
-    constexpr uint32_t kTunnelMask = 0xFFC00000u;
-    return (value & kTunnelMask) == kTunnelBase;
+    if (pos != addr.size() || (value & kTunnelMask) != kTunnelBase) return std::nullopt;
+    return value - kTunnelBase;
+}
+
+std::string tunnel_address_text(uint32_t offset) {
+    const uint32_t v = kTunnelBase + offset;
+    return std::to_string(v >> 24) + "." + std::to_string((v >> 16) & 0xFF) + "." +
+           std::to_string((v >> 8) & 0xFF) + "." + std::to_string(v & 0xFF) + "/32";
+}
+
+/// First offset in the tree range not in `used`, probing upward from the
+/// node id's derived start and wrapping. Empty when the range is full.
+std::string first_free_tunnel_address(const std::unordered_set<uint32_t>& used,
+                                      std::string_view node_id) {
+    constexpr uint64_t span = uint64_t{kTreeTunnelLastOffset} - kTreeTunnelFirstOffset + 1;
+    security::CanonicalEncoder enc(kTreeTunnelDomain);
+    enc.add_string(node_id);
+    const auto digest = enc.digest();
+    uint64_t seed = 0;
+    for (int i = 0; i < 8; ++i) seed |= uint64_t{digest[static_cast<std::size_t>(i)]} << (8 * i);
+    const uint64_t start = seed % span;
+    for (uint64_t step = 0; step < span; ++step) {
+        const auto offset = static_cast<uint32_t>(kTreeTunnelFirstOffset + (start + step) % span);
+        if (!used.contains(offset)) return tunnel_address_text(offset);
+    }
+    return {};
 }
 
 TreeOpVerdict refuse(TreeOpRefusal refusal, std::string reason) {
@@ -246,6 +304,15 @@ public:
             if (n.id != own_id && n.endpoint_identifier == identifier) taken = true;
         });
         return taken;
+    }
+
+    /// The tunnel address a join assigns to `node_id` against this view.
+    [[nodiscard]] std::string free_tunnel_address(std::string_view node_id) const {
+        std::unordered_set<uint32_t> used;
+        for_each([&](const TreeNode& n) {
+            if (const auto offset = tunnel_offset(n.tunnel_ip)) used.insert(*offset);
+        });
+        return first_free_tunnel_address(used, node_id);
     }
 
     /// Ids of the live children of `parent_id`, sorted, so callers never depend
@@ -385,7 +452,10 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
         endpoint.net_mac      = js.net_mac;
         endpoint.region       = js.region;
         endpoint.is_inference = js.is_inference;
-        endpoint.tunnel_ip    = js.tunnel_ip;
+        endpoint.tunnel_ip    = overlay.free_tunnel_address(node_id);
+        if (endpoint.tunnel_ip.empty()) {
+            return refuse(TreeOpRefusal::Conflict, "tunnel address pool exhausted");
+        }
 
         if (!overlay.find(customer_id) ||
             overlay.identifier_taken(endpoint.endpoint_identifier, node_id) ||
@@ -429,18 +499,23 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
         return {};
     }
 
-    // Returning device: record the new tunnel address and a rotated mesh key.
-    // Best effort, like the direct path: a mesh key another node holds leaves
-    // the node unchanged (the API layer refuses such claims first).
-    if (!js.tunnel_ip.empty()) {
-        const std::string new_mesh = js.mesh_pubkey_present ? js.mesh_pubkey
-                                                            : existing->mesh_pubkey;
-        if ((existing->tunnel_ip != js.tunnel_ip || existing->mesh_pubkey != new_mesh) &&
-            !overlay.mesh_taken(new_mesh, node_id)) {
-            auto& updated = overlay.edit(node_id);
-            updated.tunnel_ip = js.tunnel_ip;
-            updated.mesh_pubkey = new_mesh;
+    // Returning device: it keeps its tunnel address (a node stored without one
+    // gets a derived address) and records a rotated mesh key. Best effort,
+    // like the direct path: a mesh key another node holds leaves the key
+    // unchanged (the API layer refuses such claims first).
+    std::string new_ip = existing->tunnel_ip;
+    if (new_ip.empty()) {
+        new_ip = overlay.free_tunnel_address(node_id);
+        if (new_ip.empty()) {
+            return refuse(TreeOpRefusal::Conflict, "tunnel address pool exhausted");
         }
+    }
+    std::string new_mesh = js.mesh_pubkey_present ? js.mesh_pubkey : existing->mesh_pubkey;
+    if (overlay.mesh_taken(new_mesh, node_id)) new_mesh = existing->mesh_pubkey;
+    if (existing->tunnel_ip != new_ip || existing->mesh_pubkey != new_mesh) {
+        auto& updated = overlay.edit(node_id);
+        updated.tunnel_ip = new_ip;
+        updated.mesh_pubkey = new_mesh;
     }
     return {};
 }
@@ -462,6 +537,12 @@ void CommittedOpIds::insert(const std::string& id, uint64_t signed_at) {
 
 void CommittedOpIds::prune_signed_before(uint64_t cutoff) {
     std::erase_if(ids_, [cutoff](const auto& kv) { return kv.second < cutoff; });
+}
+
+std::vector<std::pair<std::string, uint64_t>> CommittedOpIds::sorted() const {
+    std::vector<std::pair<std::string, uint64_t>> out(ids_.begin(), ids_.end());
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // --- Encoding, ids, signing --------------------------------------------------
@@ -493,6 +574,8 @@ security::CanonicalEncoder op_encoder(const TreeOp& op) {
             } else if (op.kind == TreeOpKind::SetAssignment) {
                 enc.add_string(op.body.assignment_principal);
                 add_strings(enc, op.body.assignment_permissions);
+            } else if (op.kind == TreeOpKind::SetEndpoint) {
+                enc.add_string(op.body.listen_endpoint);
             }
             break;
     }
@@ -500,6 +583,11 @@ security::CanonicalEncoder op_encoder(const TreeOp& op) {
 }
 
 }  // namespace
+
+void record_committed(CommittedOpIds& committed, const TreeOp& op) {
+    committed.insert(op_id_hex(op), op.signed_at);
+    if (const auto statement = statement_id_hex(op)) committed.insert(*statement, op.signed_at);
+}
 
 std::vector<uint8_t> encode_tree_op(const TreeOp& op) {
     return op_encoder(op).bytes();
@@ -667,9 +755,6 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             if (op.target != derive_join_node_id(crypto, js.device_pubkey)) {
                 return refuse(R::BadStatement, "join target is not the device's node id");
             }
-            if (!js.tunnel_ip.empty() && !tunnel_address_valid(js.tunnel_ip)) {
-                return refuse(R::Malformed, "join tunnel address is not a tunnel-pool /32");
-            }
             break;
         }
         case TreeOpSource::Session:
@@ -677,12 +762,18 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
                 body.node.id != op.target) {
                 return refuse(R::Malformed, "node record id differs from the op target");
             }
+            if (op.kind == TreeOpKind::EstablishRoot && op.target != "root") {
+                return refuse(R::Malformed, "the root op must target \"root\"");
+            }
+            if (op.kind == TreeOpKind::SetEndpoint && !endpoint_text_valid(body.listen_endpoint)) {
+                return refuse(R::Malformed, "listen endpoint is not host:port");
+            }
             break;
     }
 
     // 8. Target existence and base_version.
     const TreeNode* target = state.find(op.target);
-    if (op.kind == TreeOpKind::CreateNode) {
+    if (op.kind == TreeOpKind::CreateNode || op.kind == TreeOpKind::EstablishRoot) {
         if (target) return refuse(R::AlreadyExists, "node already exists");
         if (op.base_version != 0) return refuse(R::StaleBaseVersion, "create must use base version 0");
     } else if (op.kind == TreeOpKind::Join) {
@@ -770,6 +861,25 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             // submitter's admission policy (open registration or a link
             // token), not by a tree permission. plan_op checks placement.
             break;
+        case TreeOpKind::EstablishRoot: {
+            // Only the configured root management key, never a key the
+            // submitter chooses. Every replica checks the same policy key.
+            const auto& root_key = state.policy().root_key;
+            if (root_key.empty() || canonical_principal(op.principal).empty() ||
+                canonical_principal(op.principal) != canonical_principal(root_key) ||
+                !parse_ed25519_key(op.principal)) {
+                return refuse(R::Forbidden, "principal is not the configured root key");
+            }
+            break;
+        }
+        case TreeOpKind::SetEndpoint:
+            // The heartbeat route's ownership rule, in a form every replica
+            // can check: the principal is the node's own management key.
+            if (target->mgmt_pubkey.empty() ||
+                canonical_principal(target->mgmt_pubkey) != canonical_principal(op.principal)) {
+                return refuse(R::Forbidden, "only the node's own key sets its endpoint");
+            }
+            break;
     }
 
     // 10. The op must apply against this state.
@@ -851,10 +961,271 @@ TreeOpVerdict plan_op(const TreeOp& op, const TreeState::NodeMap& nodes,
             if (auto v = plan_join(op, overlay); !v.ok()) return v;
             break;
         }
+        case TreeOpKind::EstablishRoot: {
+            if (overlay.find(id)) return refuse(R::AlreadyExists, "node already exists");
+            overlay.put(make_root_node(op.principal));
+            break;
+        }
+        case TreeOpKind::SetEndpoint: {
+            if (!overlay.find(id)) return refuse(R::NotFound, "node not found");
+            overlay.edit(id).listen_endpoint = body.listen_endpoint;
+            break;
+        }
     }
 
     effect = overlay.effect();
     return {};
+}
+
+void apply_effect(TreeState::NodeMap& nodes, const TreeOpEffect& effect) {
+    for (const auto& node : effect.writes) nodes[node.id] = node;
+    for (const auto& id : effect.removals) nodes.erase(id);
+}
+
+TreeNode make_root_node(const std::string& root_key) {
+    TreeNode root;
+    root.id          = "root";
+    root.parent_id   = "";
+    root.type        = NodeType::Root;
+    root.hostname    = "root";
+    root.mgmt_pubkey = root_key;
+    root.assignments = {{.management_pubkey = root_key,
+                         .permissions = {"read", "write", "add_child", "delete_node",
+                                         "edit_node", "admin"}}};
+    return root;
+}
+
+std::string derive_tunnel_address(const TreeState::NodeMap& nodes, std::string_view node_id) {
+    std::unordered_set<uint32_t> used;
+    for (const auto& [id, node] : nodes) {
+        if (const auto offset = tunnel_offset(node.tunnel_ip)) used.insert(*offset);
+    }
+    return first_free_tunnel_address(used, node_id);
+}
+
+std::optional<crypto::Ed25519Signature> tree_op_signature_bytes(const TreeOp& op) {
+    return parse_signature(op.signature);
+}
+
+// --- Canonical decoding -------------------------------------------------------
+
+namespace {
+
+/// Reads the CanonicalEncoder layout back: each field is a little-endian u32
+/// length and that many bytes. Every read checks bounds; a failed read leaves
+/// the reader failed, and the caller discards the result.
+class CanonicalReader {
+public:
+    explicit CanonicalReader(std::span<const uint8_t> bytes) : bytes_(bytes) {}
+
+    bool field(std::span<const uint8_t>& out) {
+        if (failed_ || bytes_.size() - pos_ < 4) return fail();
+        uint32_t n = 0;
+        for (int i = 0; i < 4; ++i) n |= uint32_t{bytes_[pos_ + static_cast<std::size_t>(i)]} << (8 * i);
+        pos_ += 4;
+        if (bytes_.size() - pos_ < n) return fail();
+        out = bytes_.subspan(pos_, n);
+        pos_ += n;
+        return true;
+    }
+
+    bool string(std::string& out) {
+        std::span<const uint8_t> f;
+        if (!field(f)) return false;
+        out.assign(reinterpret_cast<const char*>(f.data()), f.size());
+        return true;
+    }
+
+    bool expect(std::string_view literal) {
+        std::string s;
+        return string(s) && (s == literal || fail());
+    }
+
+    template <typename T>
+    bool uint(T& out) {
+        std::span<const uint8_t> f;
+        if (!field(f) || f.size() != sizeof(T)) return fail();
+        uint64_t v = 0;
+        for (std::size_t i = 0; i < sizeof(T); ++i) v |= uint64_t{f[i]} << (8 * i);
+        out = static_cast<T>(v);
+        return true;
+    }
+
+    bool boolean(bool& out) {
+        uint16_t v = 0;
+        if (!uint(v) || v > 1) return fail();
+        out = v == 1;
+        return true;
+    }
+
+    template <std::size_t N>
+    bool fixed(std::array<uint8_t, N>& out) {
+        std::span<const uint8_t> f;
+        if (!field(f) || f.size() != N) return fail();
+        std::memcpy(out.data(), f.data(), N);
+        return true;
+    }
+
+    /// A u32 element count that cannot exceed the bytes left (each element
+    /// takes at least one 4-byte length prefix), so a hostile count never
+    /// drives a large allocation.
+    bool count(uint32_t& out) {
+        if (!uint(out)) return false;
+        return out <= (bytes_.size() - pos_) / 4 || fail();
+    }
+
+    bool strings(std::vector<std::string>& out) {
+        uint32_t n = 0;
+        if (!count(n)) return false;
+        out.resize(n);
+        for (auto& s : out) {
+            if (!string(s)) return false;
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool done() const { return !failed_ && pos_ == bytes_.size(); }
+
+private:
+    bool fail() {
+        failed_ = true;
+        return false;
+    }
+
+    std::span<const uint8_t> bytes_;
+    std::size_t pos_ = 0;
+    bool failed_ = false;
+};
+
+bool read_node(CanonicalReader& r, TreeNode& n) {
+    std::string type;
+    uint32_t assignments = 0;
+    if (!(r.string(n.id) && r.string(n.parent_id) && r.string(type) && r.string(n.hostname) &&
+          r.string(n.tunnel_ip) && r.string(n.private_subnet) &&
+          r.string(n.private_shared_addresses) && r.string(n.shared_domain) &&
+          r.string(n.mgmt_pubkey) && r.string(n.wrapped_mgmt_privkey) &&
+          r.string(n.mesh_pubkey) && r.string(n.endpoint_identifier) && r.string(n.cpu_id) &&
+          r.string(n.net_mac) && r.boolean(n.is_inference) && r.count(assignments))) {
+        return false;
+    }
+    // string_to_node_type throws on an unknown name; decoding never throws.
+    if (type == "root") {
+        n.type = NodeType::Root;
+    } else if (type == "customer") {
+        n.type = NodeType::Customer;
+    } else if (type == "endpoint") {
+        n.type = NodeType::Endpoint;
+    } else if (type == "relay") {
+        n.type = NodeType::Relay;
+    } else {
+        return false;
+    }
+    n.assignments.resize(assignments);
+    for (auto& a : n.assignments) {
+        if (!(r.string(a.management_pubkey) && r.strings(a.permissions))) return false;
+    }
+    uint32_t score_bits = 0;
+    if (!(r.string(n.signature) && r.string(n.listen_endpoint) && r.string(n.region) &&
+          r.uint(n.capacity_mbps) && r.uint(score_bits))) {
+        return false;
+    }
+    n.reputation_score = std::bit_cast<float>(score_bits);
+    return r.uint(n.expires_at) && r.uint(n.version);
+}
+
+bool read_delta(CanonicalReader& r, TreeDelta& d) {
+    return r.string(d.operation) && r.string(d.target_node_id) && read_node(r, d.node_data) &&
+           r.string(d.signer_pubkey) && r.string(d.signature) && r.uint(d.timestamp);
+}
+
+bool read_join(CanonicalReader& r, JoinStatement& j) {
+    return r.string(j.device_pubkey) && r.string(j.challenge) &&
+           r.string(j.challenge_signature) && r.boolean(j.hostname_present) &&
+           r.string(j.hostname) && r.boolean(j.mesh_pubkey_present) && r.string(j.mesh_pubkey) &&
+           r.string(j.cpu_id) && r.string(j.net_mac) && r.string(j.region) &&
+           r.boolean(j.is_inference) && r.string(j.link_group_id) &&
+           r.string(j.link_owner_pubkey);
+}
+
+}  // namespace
+
+std::optional<TreeOp> decode_tree_op(std::span<const uint8_t> encoding,
+                                     const crypto::Ed25519Signature& signature) {
+    if (encoding.size() > kMaxTreeOpEncodedBytes) return std::nullopt;
+    CanonicalReader r(encoding);
+    TreeOp op;
+    uint16_t kind = 0;
+    uint16_t source = 0;
+    if (!(r.expect(kTreeOpDomain) && r.uint(op.version) && r.fixed(op.network_id) &&
+          r.uint(kind) && r.string(op.target) && r.uint(op.base_version) &&
+          r.uint(op.signed_at) && r.fixed(op.nonce) && r.string(op.principal) &&
+          r.string(op.author) && r.uint(source))) {
+        return std::nullopt;
+    }
+    op.kind = static_cast<TreeOpKind>(kind);
+    op.body.source = static_cast<TreeOpSource>(source);
+    if (!kind_known(op.kind) || !source_allowed(op.kind, op.body.source)) return std::nullopt;
+    bool ok = true;
+    switch (op.body.source) {
+        case TreeOpSource::Delta:
+            ok = read_delta(r, op.body.delta);
+            break;
+        case TreeOpSource::Device:
+            ok = read_join(r, op.body.join);
+            break;
+        case TreeOpSource::Session:
+            if (op.kind == TreeOpKind::CreateNode || op.kind == TreeOpKind::UpdateFields) {
+                ok = read_node(r, op.body.node);
+            } else if (op.kind == TreeOpKind::SetAssignment) {
+                ok = r.string(op.body.assignment_principal) &&
+                     r.strings(op.body.assignment_permissions);
+            } else if (op.kind == TreeOpKind::SetEndpoint) {
+                ok = r.string(op.body.listen_endpoint);
+            }
+            break;
+    }
+    if (!ok || !r.done()) return std::nullopt;
+    // The layout above mirrors op_encoder; the exact re-encoding check makes
+    // the two impossible to drift apart silently.
+    if (encode_tree_op(op) != std::vector<uint8_t>(encoding.begin(), encoding.end())) {
+        return std::nullopt;
+    }
+    op.op_id = compute_op_id(op);
+    op.signature = crypto::to_base64(std::span<const uint8_t>(signature.data(), signature.size()));
+    return op;
+}
+
+std::vector<uint8_t> encode_tree_node(const TreeNode& node) {
+    security::CanonicalEncoder enc(kTreeNodeDomain);
+    add_node(enc, node);
+    return enc.bytes();
+}
+
+std::optional<TreeNode> decode_tree_node(std::span<const uint8_t> encoding) {
+    CanonicalReader r(encoding);
+    TreeNode node;
+    if (!r.expect(kTreeNodeDomain) || !read_node(r, node) || !r.done()) return std::nullopt;
+    if (encode_tree_node(node) != std::vector<uint8_t>(encoding.begin(), encoding.end())) {
+        return std::nullopt;
+    }
+    return node;
+}
+
+security::Digest compute_tree_digest(const TreeState::NodeMap& nodes) {
+    std::vector<std::pair<const std::string*, const TreeNode*>> ordered;
+    ordered.reserve(nodes.size());
+    for (const auto& [id, node] : nodes) ordered.emplace_back(&id, &node);
+    std::sort(ordered.begin(), ordered.end(),
+              [](const auto& a, const auto& b) { return *a.first < *b.first; });
+    security::CanonicalEncoder enc(kTreeDigestDomain);
+    enc.add_u64(ordered.size());
+    for (const auto& [id, node] : ordered) {
+        // The map key is the node identity, so it is part of the digest even
+        // when a record's own id field disagrees with it.
+        enc.add_string(*id);
+        enc.add_bytes(encode_tree_node(*node));
+    }
+    return enc.digest();
 }
 
 }  // namespace nexus::tree

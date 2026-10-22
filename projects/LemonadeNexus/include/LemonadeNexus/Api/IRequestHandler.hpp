@@ -2,12 +2,14 @@
 
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
+#include <LemonadeNexus/Tree/TreeOpPool.hpp>
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <concepts>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -75,10 +77,14 @@ struct ApiContext {
     std::string                       server_private_fqdn;  // private.<id>.<region>.seip.<domain>
     std::string                       server_public_ip;
     std::string                       tunnel_bind_ip;
-    /// Local tree-operation submitter (not owned). Required when
+    /// Tree-operation submitter (not owned). Required when
     /// config.tree_ops_enabled; the tree write routes then answer 500 without
     /// it instead of falling back to the direct write paths. Unused otherwise.
     tree::TreeOpSubmitter*            tree_ops{nullptr};
+    /// Answers GET /api/tree/op/{op_id} with a submitted op's status. Set with
+    /// a consensus submitter (TreeConsensus::status); unset, the route answers
+    /// 404 for every op id.
+    std::function<std::optional<tree::TreeOpOutcome>(const std::string&)> tree_op_status;
 };
 
 // ---------------------------------------------------------------------------

@@ -17,6 +17,7 @@
 // 18 and 19.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/Consensus/BlockPayload.hpp>
 #include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusStore.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
@@ -56,7 +57,16 @@ struct HotStuffConfig {
     ///
     /// Unset means no transition can be evaluated, so any non-empty digest is
     /// refused. An empty digest is an ordinary block and always passes.
+    /// Not consulted for a proposal that arrives with a payload.
     std::function<bool(const Digest& transitions_digest)> transition_validator;
+
+    /// Decides whether this node independently agrees with a block payload
+    /// (BlockPayload.hpp). Called only after the payload matched the
+    /// proposal's transitions digest and the proposal passed every header and
+    /// chain check, so the parent is in chain state. Unset refuses every
+    /// payload. Like transition_validator, a refusal withholds the vote and
+    /// the block still enters chain state.
+    std::function<bool(const Proposal& proposal, const BlockPayload& payload)> payload_validator;
 };
 
 struct ProposalResult {
@@ -92,8 +102,12 @@ public:
     // order or a zero quorum.
     HotStuffService(HotStuffConfig config, EpochVoteKey own_vote_key, IConsensusStore& store);
 
+    /// `payload` is the block payload the proposal message carried, or
+    /// nullptr. A payload that does not match `proposal.transitions_digest`
+    /// is not stored and withholds the vote (transition_refused).
     [[nodiscard]] ProposalResult receive_proposal(const Proposal& proposal,
-                                                  const QuorumCertificate& justify);
+                                                  const QuorumCertificate& justify,
+                                                  const BlockPayload* payload = nullptr);
 
     // monostate: counted, no certificate yet. A QC forms once per
     // (view, digest) at exactly config.quorum distinct voters.
@@ -136,6 +150,29 @@ public:
     /// verifies this instead of trusting the sender.
     [[nodiscard]] std::optional<CommitProof> commit_proof(const Digest& proposal_digest) const;
 
+    /// The header of a block in chain state, or nullptr. Committed blocks
+    /// stay in chain state; blocks pruned off the committed chain do not.
+    [[nodiscard]] const Proposal* block(const Digest& proposal_digest) const;
+
+    /// The payload a block in chain state arrived with, or nullptr when the
+    /// block is unknown or arrived without one (a stage block, an empty
+    /// block, or a block adopted through restart sync).
+    [[nodiscard]] const BlockPayload* block_payload(const Digest& proposal_digest) const;
+
+    /// The epoch's anchor digest: the parent of the epoch's first block.
+    [[nodiscard]] const Digest& genesis_digest() const { return config_.genesis_digest; }
+
+    /// Height of the last block this replica committed in this epoch.
+    [[nodiscard]] Height last_committed_height() const { return last_committed_height_; }
+
+    /// The epoch's frozen voting membership, sorted by node id.
+    [[nodiscard]] std::vector<NodeId> members() const {
+        std::vector<NodeId> out;
+        out.reserve(config_.vote_keys.size());
+        for (const auto& [node, key] : config_.vote_keys) out.push_back(node);
+        return out;
+    }
+
     [[nodiscard]] NodeId leader_of(View view) const {
         return config_.leader_order[view.underlying() % config_.leader_order.size()];
     }
@@ -151,6 +188,9 @@ private:
         // The QC the proposal shipped with. It certifies the parent.
         QuorumCertificate justify;
         Digest digest;
+        // The payload that matched the proposal's transitions digest, if one
+        // arrived with it.
+        std::optional<BlockPayload> payload;
     };
 
     [[nodiscard]] QuorumCertificate genesis_qc() const;

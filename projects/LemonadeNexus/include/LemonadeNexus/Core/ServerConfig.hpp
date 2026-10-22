@@ -120,9 +120,11 @@ struct ServerConfig {
     // User/device registration policy
     bool        open_registration{true};     // false: new identities need a device link token to join
 
-    // Experimental, Phase 1 of docs/Design-Tree-Consensus-and-Storage-Key.md:
-    // every tree write route builds a signed tree operation and applies it
-    // locally through validate_op + apply_op. Off: the direct write paths.
+    // Experimental, Phases 1 and 2 of docs/Design-Tree-Consensus-and-Storage-Key.md:
+    // every tree write builds a signed tree operation, Tier 1 orders it
+    // through consensus, and every Tier 1 server applies it after commit
+    // (TreeConsensus). Off: the direct write paths, and no tree block is
+    // proposed, voted for, or applied.
     bool        tree_ops_enabled{false};
 
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)

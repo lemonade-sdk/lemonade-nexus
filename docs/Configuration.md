@@ -160,36 +160,79 @@ Candidate-side:
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--tree-ops` | `SP_TREE_OPS` (any value) | `tree_ops_enabled` | off | Apply tree writes as signed tree operations (Phase 1, local only) |
+| `--tree-ops` | `SP_TREE_OPS` (any value) | `tree_ops_enabled` | off | Order tree writes through Tier 1 consensus and apply them after commit (Phase 2) |
 
-This setting is experimental. It implements Phase 1 of
+This setting is experimental. It implements Phases 1 and 2 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
-Keep it off in production.
+Keep it off in production. With the setting off, no tree operation is built,
+proposed, or applied, and the tree write paths are unchanged.
 
 With the setting on:
 
-- Every tree write route builds one signed tree operation (`TreeOp`) and
-  applies it through `validate_op` and `apply_op`. The routes are
+- Every tree write builds one signed tree operation (`TreeOp`). The routes are
   `POST /api/join`, `/api/tree/delta`, `/api/tree/node`,
-  `/api/tree/node/update/{id}`, `/api/tree/node/assignments/{id}`, and
-  `/api/tree/node/delete/{id}`. `POST /api/ipam/allocate` writes no tree node
-  and does not change.
+  `/api/tree/node/update/{id}`, `/api/tree/node/assignments/{id}`,
+  `/api/tree/node/delete/{id}`, and `/api/mesh/heartbeat` (a `SetEndpoint`
+  operation, sent only when the endpoint changed). The application root is an
+  `EstablishRoot` operation that names the configured `root_pubkey`.
+  `POST /api/ipam/allocate` writes no tree node and does not change.
 - The server signs each operation with its gossip identity key, with the
-  domain tag `lemonade-nexus/tree-op-signature:v1`. This signature identifies
-  the submitting server only. The principal's tree assignments still decide
-  whether the change is allowed.
-- Validation is deterministic. It uses the existing permission and content
-  rules, a `base_version` match, freshness against the supplied block time
-  (signed time at most 300 s older or 60 s newer), and replay against the
-  committed operation ids. In Phase 1 the block time is the local time.
+  domain tag `lemonade-nexus/tree-op-signature:v1`. Replicas trust a signature
+  only from a member of the block epoch's frozen Tier 1 set. The signature
+  identifies the submitting server only; the principal's tree assignments
+  still decide whether the change is allowed.
+- **Submission.** A Tier 1 server checks the operation against its committed
+  tree, adds it to its pending pool (at most 1,024 operations, 512 per
+  submitting server, 32 per principal), and forwards it to the other Tier 1
+  members with the `TreeOpSubmit` security message. A server outside Tier 1
+  answers tree writes with 503.
+- **Ordering.** When a Tier 1 server leads a view and no epoch-boundary stage
+  is pending, it proposes a batch from its pool: at most 128 operations and
+  48,000 bytes of operation encodings. The batch travels with the proposal;
+  the proposal's `transitions_digest` commits to it.
+- **Validation.** A replica votes for a batch only if every operation
+  validates in order against the tree of the block's parent (the committed
+  tree plus the uncommitted ancestors). The rules are the permission and
+  content rules, a `base_version` match, replay against the committed
+  operation ids, and freshness against the block time (signed time at most
+  300 s older or 60 s newer). The block time is binding: it must be later than
+  the parent's and than the previous tree block's, and within 60 s of the
+  replica's clock. The state root must match (see below).
+- **Commit, then apply.** A committed batch is written to the tree log
+  (`data/tree/log/<height>.json`, with its commit proof) before the tree
+  changes. The log height continues across epochs. A snapshot is written
+  every 1,000 heights. At startup the server verifies the log, and restores the
+  tree from the log when an apply was interrupted.
+- **Wait, then pending.** A write route waits up to 10 s for the commit. A
+  committed write answers with the status code and body of the direct path.
+  After 10 s the route answers `202` with `{"status": "pending", "op_id":
+  ...}`; the client polls `GET /api/tree/op/{op_id}` (`pending`, `committed`,
+  or `refused` with a reason). A pending join answers `202` without a tunnel
+  address; the client joins again after the commit. A heartbeat does not wait.
+- **Tunnel addresses.** The join operation's apply step derives the endpoint
+  address from the tree: the first free `/32` at or after a start offset
+  derived from the node id, inside `10.65.0.0`–`10.127.255.254`. A deleted
+  node's address is free again at once. IPAM keeps `10.64.0.0/16` for server
+  addresses and `/api/ipam/allocate`.
 - Each node that an operation writes gets `version` = previous version + 1
   (1 for a new node). Node JSON includes `version` only when it is not 0, so
   records written with the setting off keep their exact bytes.
   `canonical_node_json` and the tree hash never include `version`.
-- Status codes and response bodies are those of the direct write paths, with
-  these differences:
+- Committed operation ids are persisted (`data/tree/committed-ops.json`, and
+  the tree log under consensus), so replay stays refused after a restart.
+- **State root.** A tree block's `proposed_state_root` is
+  `H(previous_root ‖ ops_digest ‖ tree_digest)`, where `previous_root` is the
+  root of the previous tree block and `tree_digest` covers every node's
+  canonical encoding and version. The tree log is therefore a hash chain: a
+  server that missed a tree block cannot match the next one.
+- **Fail closed.** A server whose log does not verify, whose tree changed
+  outside the log, or that sees a committed block it cannot apply against its
+  own log halts tree operations: it applies, votes for, proposes, and accepts
+  no tree operation, and keeps serving its last committed tree.
+- Status codes and response bodies are otherwise those of the direct write
+  paths, with these differences:
   - A join, and any other write that changes several nodes, is all or
-    nothing. A refused join allocates no tunnel address.
+    nothing.
   - A delete through `/api/tree/delta` also removes the link grants that
     named the deleted key, as the direct delete route does.
   - No route deletes the root node.
@@ -197,44 +240,43 @@ With the setting on:
     identifier and one mesh key per node, as the direct routes do.
   - An operation larger than 48,000 bytes is refused.
   - A join without the Ed25519 challenge (`method` other than `ed25519`)
-    answers 500, because the operation needs the device's signed challenge.
+    answers 403, as with the setting off.
   - Without a configured submitter the write routes answer 500. They never
     fall back to the direct paths.
 
-Phase 1 limits:
+Limits:
 
-- **Local only.** There is no consensus ordering, tree log, or replication.
-  Two servers still apply different changes.
+- **Tier 1 only.** Only Tier 1 servers order and apply tree operations. Tier 2
+  servers neither receive committed blocks nor accept writes (Phase 3 adds log
+  replication). A Tier 2 server cannot forward a write, because replicas trust
+  operation signatures from the frozen Tier 1 set only.
+- **Same starting tree.** A new tree log starts from the server's current
+  tree. Replicas agree on state roots only if every Tier 1 server started from
+  the same tree, for example an empty one. Existing, divergent trees need the
+  merge ceremony (Phase 3, design A9).
+- **Missed blocks.** A server that missed a committed tree block (for example
+  through restart sync, which carries block headers only) halts tree
+  operations at the next tree block. Phase 3 replication repairs it.
+- **Tree changed outside the log.** Turning the setting off, writing the tree,
+  and turning it on again halts tree operations at startup. The server does
+  not overwrite either side.
 - **Server-filled base version.** Current clients send no base version, so
-  the server reads it from the current tree. When a concurrent write makes an
-  operation stale, the server rebuilds it from the new state, at most three
+  the server reads it from the committed tree. When a concurrent write makes
+  an operation stale, the server rebuilds it from the new state, at most three
   times. This keeps today's last-writer-wins behavior.
-- **Asserted principals.** Session routes (`/api/tree/node*`) carry no
-  signature by the principal; the submitting server asserts the principal.
-  The join device signature covers only the server challenge. The join
-  parameters, including the link-token group, are asserted by the submitting
-  server, and link-token validity is local state. A replica could verify
-  these operations only after clients sign operations themselves.
-- **Tunnel address not re-derived.** The join operation carries the address
-  that the submitting server's IPAM allocated. The apply step checks only
-  that it is a `/32` inside `10.64.0.0/10`. IPAM allocation is not a function
-  of the tree: `data/ipam/allocations.json` is per server and separate from
-  the tree; server tunnel addresses come from the same pool but are not tree
-  nodes; `/api/ipam/allocate` and the delete cascade change it outside any
-  operation; and the allocation cursor only moves forward, and restarts
-  after the highest remaining allocation, so reuse of a released address
-  depends on restart history. Deterministic derivation needs the tree to
-  record every pool reservation, including server addresses, and IPAM to
-  become a projection of the committed tree with a reuse rule defined on tree
-  state.
-- **Memory-only committed set.** Committed operation ids are not persisted.
-  A restart clears them, so the freshness window bounds replay, as it does
-  for the delta replay cache today.
-- **Other writers.** `POST /api/mesh/heartbeat` still writes
-  `listen_endpoint` directly, and root establishment still uses the bootstrap
-  path.
-- **No atomic multi-node persistence.** A storage failure can leave an
-  operation that writes several nodes partly persisted.
+- **Asserted principals.** Session routes (`/api/tree/node*`, the heartbeat)
+  carry no signature by the principal; the submitting Tier 1 server asserts
+  the principal. The join device signature covers only the server challenge.
+  The join parameters, including the link-token group, are asserted by the
+  submitting server, and link-token validity is local state.
+- **Root key from configuration.** Replicas accept an `EstablishRoot`
+  operation only for their own configured `root_pubkey`. Tier 1 servers with
+  different configured keys establish no root.
+- **Snapshot ids.** A snapshot's committed operation ids are not covered by
+  the state root. A snapshot whose ids were edited on disk is not detected.
+- **IPAM records.** Tree-derived addresses are not written to
+  `data/ipam/allocations.json`; the delete cascade's IPAM release finds no
+  record for them.
 - **Versions while on only.** The direct paths do not maintain `version`.
   After the setting is turned off, a delta update replaces the stored record,
   including its version.

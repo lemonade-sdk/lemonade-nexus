@@ -55,6 +55,7 @@ add_nexus_test(test_key_wrapping       test_key_wrapping.cpp)
 add_nexus_test(test_file_storage       test_file_storage.cpp)
 add_nexus_test(test_permission_tree    test_permission_tree.cpp)
 add_nexus_test(test_tree_ops           test_tree_ops.cpp)
+add_nexus_test(test_tree_consensus     test_tree_consensus.cpp)
 add_nexus_test(test_account_data       test_account_data.cpp)
 add_nexus_test(test_mesh_rekey         test_mesh_rekey.cpp)
 add_nexus_test(test_routing_identifier test_routing_identifier.cpp)
@@ -205,7 +206,8 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/multi_epoch.cpp
     security/lifecycle/population.cpp
     security/lifecycle/hostile_adoption.cpp
-    security/lifecycle/adversarial.cpp)
+    security/lifecycle/adversarial.cpp
+    security/lifecycle/tree_consensus_path.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority

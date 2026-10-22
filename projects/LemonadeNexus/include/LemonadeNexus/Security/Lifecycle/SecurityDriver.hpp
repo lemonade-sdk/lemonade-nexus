@@ -135,6 +135,7 @@ public:
     void on_authority_chain_request(const AuthorityChainRequest& request,
                                     const NodeId& from) override;
     void on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) override;
+    void on_tree_op_submit(const TreeOpSubmitMsg& message, const NodeId& from) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
@@ -161,6 +162,24 @@ public:
     /// one entry point consensus uses; it accepts a handoff or an eligibility
     /// commitment and nothing else.
     [[nodiscard]] bool accepts_transition(const Digest& transitions_digest) const;
+
+    /// Adds the handler for one block payload kind (BlockPayload.hpp). The
+    /// handler proposes that kind when this node leads and no stage is
+    /// pending, answers accepts_payload, and receives the kind's commits. Not
+    /// owning: the handler must outlive the driver or be registered again
+    /// after a rebuild. Set before start; io-thread only.
+    void register_payload_handler(IBlockPayloadHandler& handler);
+
+    /// Whether this node independently agrees with a block payload: the
+    /// registered handler for its kind decides. No handler, no vote. The
+    /// consensus payload_validator calls this.
+    [[nodiscard]] bool accepts_payload(const Proposal& proposal, const BlockPayload& payload) const;
+
+    /// Receives tree operations that current Tier 1 members forward
+    /// (SecurityRouter checked the membership). Unset drops them.
+    void set_tree_op_sink(std::function<void(const TreeOpSubmitMsg&, const NodeId&)> sink) {
+        tree_op_sink_ = std::move(sink);
+    }
 
     /// True when `node` is in the anchor-authenticated founding this driver
     /// accepted. Feeds the router's pre-epoch challenger gate so founders can
@@ -373,6 +392,11 @@ private:
     /// Outstanding participation challenges, one per candidate. Matched before
     /// the challenge is consumed, so a replayed answer cannot deny a live one.
     std::map<NodeId, ParticipationChallenge> pending_participation_;
+
+    /// Block payload handlers by kind; ordered, so the leader asks them in a
+    /// fixed order. Not owning.
+    std::map<BlockPayloadKind, IBlockPayloadHandler*> payload_handlers_;
+    std::function<void(const TreeOpSubmitMsg&, const NodeId&)> tree_op_sink_;
 };
 
 }  // namespace nexus::security
