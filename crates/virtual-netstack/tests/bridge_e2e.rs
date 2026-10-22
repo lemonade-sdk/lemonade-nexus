@@ -236,3 +236,17 @@ fn removing_egress_closes_only_its_loopback_listener() {
     assert_eq!(unsafe { ns_remove_tcp_egress(std::ptr::null_mut(), first.as_ptr(), 80) }, -1);
     unsafe { ns_destroy(stack) };
 }
+
+// A stack that cannot start must not hand back a handle. Before this check,
+// ns_create returned a non-null handle whose stack thread had already exited.
+#[test]
+fn create_returns_null_when_the_stack_cannot_start() {
+    // 67 is one byte below the IPv4 minimum MTU (RFC 791).
+    for mtu in [0u32, 20, 67] {
+        let stack = unsafe { ns_create(mtu, discard_packets, std::ptr::null_mut()) };
+        assert!(stack.is_null(), "ns_create({mtu}) returned a handle");
+    }
+    let stack = unsafe { ns_create(68, discard_packets, std::ptr::null_mut()) };
+    assert!(!stack.is_null());
+    unsafe { ns_destroy(stack) };
+}
