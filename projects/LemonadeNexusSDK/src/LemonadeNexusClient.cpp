@@ -102,6 +102,7 @@ struct LemonadeNexusClient::Impl {
     std::string  session_token;
     std::string  node_id;
     std::string  link_token;           // single-use device link token for the next join
+    bool         inference_node{false};  // join as Tier 3 (inference) instead of Tier 4
     std::vector<std::pair<uint16_t, std::string>> exposed_services;  // vport -> target
     std::string  server_seip_fqdn;     // e.g. "<id>.<region>.seip.lemonade-nexus.io" — public API after join
     std::string  server_private_fqdn;  // e.g. "private.<id>.<region>.seip.lemonade-nexus.io"
@@ -674,6 +675,11 @@ void LemonadeNexusClient::set_link_token(const std::string& token) {
     impl_->link_token = token;
 }
 
+void LemonadeNexusClient::set_inference_node(bool inference) {
+    std::lock_guard lock(impl_->mutex);
+    impl_->inference_node = inference;
+}
+
 Result<nlohmann::json> LemonadeNexusClient::create_link_token(uint32_t ttl_sec) {
     Result<nlohmann::json> result;
     json body = {{"ttl_sec", ttl_sec}};
@@ -729,6 +735,10 @@ std::vector<std::pair<uint16_t, std::string>> LemonadeNexusClient::exposed_servi
 
 uint16_t LemonadeNexusClient::open_egress(const std::string& dst_ip, uint16_t dst_port) {
     return impl_->meshplane.tcp_egress(dst_ip, dst_port);
+}
+
+void LemonadeNexusClient::close_egress(const std::string& dst_ip, uint16_t dst_port) {
+    impl_->meshplane.close_egress(dst_ip, dst_port);
 }
 
 // ---------------------------------------------------------------------------
@@ -1676,6 +1686,7 @@ Result<JoinResult> LemonadeNexusClient::join_network(const std::string& username
         if (!impl_->link_token.empty()) {
             join_body["link_token"] = impl_->link_token;
         }
+        join_body["is_inference"] = impl_->inference_node;
     }
 
     // Include auth credentials so /api/join can authenticate inline

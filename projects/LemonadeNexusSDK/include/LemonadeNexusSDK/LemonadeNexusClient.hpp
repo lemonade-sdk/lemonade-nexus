@@ -347,6 +347,12 @@ public:
     /// call (obtained out-of-band from an already-joined device).
     void set_link_token(const std::string& token);
 
+    /// Join as an inference node (Tier 3) instead of a client (Tier 4). Sent
+    /// with the next join_network; the server records it when it creates the
+    /// endpoint and derives the routing identifier from it ("infer-..." vs
+    /// "client-..."). Default false.
+    void set_inference_node(bool inference);
+
     /// Mint a device link token so another device can join this account's
     /// group (requires an established mesh session; calls the private API).
     /// Response JSON: {link_token, group_node_id, expires_at}.
@@ -363,6 +369,9 @@ public:
     /// Open (or reuse) a loopback bridge to a mesh peer's dst_ip:dst_port.
     /// Returns the bound 127.0.0.1 port, or 0 when the mesh is inactive.
     [[nodiscard]] uint16_t open_egress(const std::string& dst_ip, uint16_t dst_port);
+
+    /// Close the loopback bridge to dst_ip:dst_port and abort its connections.
+    void close_egress(const std::string& dst_ip, uint16_t dst_port);
 
 private:
     struct Impl;
