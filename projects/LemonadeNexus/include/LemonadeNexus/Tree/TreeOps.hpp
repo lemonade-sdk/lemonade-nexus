@@ -1,7 +1,7 @@
 #pragma once
 
 // Tree operations (design: docs/Design-Tree-Consensus-and-Storage-Key.md,
-// Part A, Phase 1).
+// Part A).
 //
 // A TreeOp is one signed change to the permission tree. validate_op decides
 // deterministically whether an op is acceptable against a given tree state;
@@ -10,9 +10,9 @@
 // committed op ids. Neither reads a clock or any local observation, so every
 // machine that holds the same inputs reaches the same result.
 //
-// Phase 1 applies ops locally only (PermissionTreeService::submit_local_op),
-// behind ServerConfig::tree_ops_enabled. Consensus ordering, the tree log, and
-// replication are later phases. In Phase 1 every op is wrapped and signed by
+// Behind ServerConfig::tree_ops_enabled, Tier 1 servers order ops through
+// consensus (TreeBatch.hpp, TreeChain.hpp, TreeLog.hpp) and apply an op only
+// after the block that carries it commits. Every op is wrapped and signed by
 // the server that received the request ("submitter"); the end-user authority
 // comes from the op's principal and, where one exists, the statement the
 // principal signed (a TreeDelta or a join challenge).
@@ -26,9 +26,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace nexus::crypto { class SodiumCryptoService; }
@@ -44,6 +46,12 @@ inline constexpr std::string_view kTreeOpDomain = "lemonade-nexus/tree-op:v1";
 inline constexpr std::string_view kTreeOpSignatureDomain = "lemonade-nexus/tree-op-signature:v1";
 /// Domain of a wrapped statement's replay id (delta or join challenge).
 inline constexpr std::string_view kTreeOpStatementDomain = "lemonade-nexus/tree-op-statement:v1";
+/// Domain of the node encoding (encode_tree_node).
+inline constexpr std::string_view kTreeNodeDomain = "lemonade-nexus/tree-node:v1";
+/// Domain of the whole-tree digest (compute_tree_digest).
+inline constexpr std::string_view kTreeDigestDomain = "lemonade-nexus/tree-digest:v1";
+/// Domain of the tunnel address start offset (derive_tunnel_address).
+inline constexpr std::string_view kTreeTunnelDomain = "lemonade-nexus/tree-tunnel-address:v1";
 
 /// Freshness, relative to the block time: an op is fresh when its signed time
 /// is at most kTreeOpMaxAgeSec older and at most kTreeOpMaxFutureSec newer
@@ -52,8 +60,9 @@ inline constexpr std::string_view kTreeOpStatementDomain = "lemonade-nexus/tree-
 inline constexpr uint64_t kTreeOpMaxAgeSec = 300;
 inline constexpr uint64_t kTreeOpMaxFutureSec = 60;
 
-/// Largest canonical op encoding validate_op accepts. Equal to the planned
-/// tree-batch cap (design A3), so any valid op fits in one consensus block.
+/// Largest canonical op encoding validate_op accepts. Equal to the tree-batch
+/// cap (design A3, constants::kMaxConsensusBlockBytes), so any valid op fits
+/// in one consensus block.
 inline constexpr std::size_t kMaxTreeOpEncodedBytes = 48000;
 
 /// What an op changes.
@@ -63,6 +72,12 @@ enum class TreeOpKind : uint16_t {
     SetAssignment = 3,  ///< set exactly the permissions one principal holds on the target
     DeleteNode    = 4,  ///< remove the target and the link grants that named its key
     Join          = 5,  ///< device join (POST /api/join), applied as one atomic step
+    /// Create the application root owned by the policy's root key. One-shot:
+    /// refused once a root exists. Target is "root"; the op carries no body.
+    EstablishRoot = 6,
+    /// Set the target's listen_endpoint (POST /api/mesh/heartbeat). Only the
+    /// target's own management key may set it.
+    SetEndpoint   = 7,
 };
 
 /// Where the principal's authority for an op comes from.
@@ -80,7 +95,9 @@ enum class TreeOpSource : uint16_t {
 
 /// The join request a submitter wraps in a Join op. The device signature
 /// covers only the challenge (the existing /api/join contract); the other
-/// fields are the submitter's request parameters.
+/// fields are the submitter's request parameters. The tunnel address is not
+/// part of the statement: plan_op derives it from the tree state
+/// (derive_tunnel_address), so every replica assigns the same address.
 struct JoinStatement {
     std::string device_pubkey;        ///< "ed25519:<base64>", the authenticated identity
     std::string challenge;            ///< base64 challenge the submitter issued
@@ -95,11 +112,6 @@ struct JoinStatement {
     bool        is_inference{false};
     std::string link_group_id;        ///< non-empty for a linked join (device-link token)
     std::string link_owner_pubkey;    ///< owner key from the link token
-    /// Tunnel address the submitter's IPAM allocated ("a.b.c.d/32" inside
-    /// 10.64.0.0/10). Empty means "no address change" (used for a dry run
-    /// before allocation). Not re-derived: see the Phase 1 limits in
-    /// docs/Configuration.md.
-    std::string tunnel_ip;
 };
 
 /// Kind-specific op content. Which fields are encoded, validated, and applied
@@ -111,6 +123,7 @@ struct TreeOpBody {
     std::string              assignment_principal;    ///< SetAssignment
     std::vector<std::string> assignment_permissions;  ///< SetAssignment
     JoinStatement            join;                    ///< Join
+    std::string              listen_endpoint;         ///< SetEndpoint ("host:port")
 };
 
 /// One signed change to the tree.
@@ -138,15 +151,24 @@ struct TreeOp {
     crypto::Hash256     op_id{};
     /// Base64 Ed25519 signature by `author` over the domain-separated op_id.
     std::string         signature;
-    /// Server that received the op. For routing only: unsigned, not in op_id.
+    /// Server that received the op. For routing only: unsigned, not in op_id,
+    /// and not carried on the consensus wire.
     std::string         submitted_by;
 };
 
-/// Who may sign ops for this tree, and which network the tree belongs to.
+/// Who may sign ops for this tree, which network the tree belongs to, and
+/// which key may establish its root.
 struct TreeOpPolicy {
     security::NetworkId      network_id{};
-    /// Submitter keys ("ed25519:<base64>"), compared by key bytes.
+    /// Submitter keys ("ed25519:<base64>"), compared by key bytes. Under
+    /// consensus this is the block epoch's frozen Tier 1 set, so every replica
+    /// evaluates the same set.
     std::vector<std::string> trusted_submitters;
+    /// The configured root management key ("ed25519:<base64>"). The only
+    /// principal an EstablishRoot op may name. Empty refuses EstablishRoot.
+    /// Like network_id it comes from configuration, so replicas with different
+    /// configured keys cannot agree on a root and none is established.
+    std::string              root_key;
 };
 
 /// Read-only view of a tree state that validate_op and plan_op evaluate.
@@ -178,14 +200,29 @@ public:
     /// Record `id` with the signed time of the op that committed it.
     void insert(const std::string& id, uint64_t signed_at);
     /// Drop ids whose op was signed before `cutoff`. Only safe for ids that
-    /// can no longer pass freshness, so the caller derives `cutoff` from the
-    /// block time minus the freshness window and a margin.
+    /// can no longer pass freshness, so the caller derives `cutoff` with
+    /// committed_id_cutoff from a block time that never decreases.
     void prune_signed_before(uint64_t cutoff);
     [[nodiscard]] std::size_t size() const { return ids_.size(); }
+    /// Every id with its signed time, sorted by id (persistence and digests).
+    [[nodiscard]] std::vector<std::pair<std::string, uint64_t>> sorted() const;
 
 private:
     std::unordered_map<std::string, uint64_t> ids_;
 };
+
+/// Committed ids stay this long past the freshness window. A wrapped
+/// statement (a join challenge, a delta) can be re-wrapped in a newer op, so
+/// its id must outlive the first op's freshness by a margin.
+inline constexpr uint64_t kCommittedIdMarginSec = 600;
+
+/// The prune cutoff for block time `block_time_sec`: ids signed before it can
+/// no longer pass freshness against this or any later block time. 0 (prune
+/// nothing) while the block time is inside the window.
+[[nodiscard]] constexpr uint64_t committed_id_cutoff(uint64_t block_time_sec) {
+    constexpr uint64_t window = kTreeOpMaxAgeSec + kCommittedIdMarginSec;
+    return block_time_sec > window ? block_time_sec - window : 0;
+}
 
 /// Why validate_op or apply refused an op. None means accepted.
 enum class TreeOpRefusal : uint8_t {
@@ -205,8 +242,11 @@ enum class TreeOpRefusal : uint8_t {
     Forbidden,           ///< principal lacks the required permission or admin rule
     Invalid,             ///< invalid assignment principal or permission name
     ContentRefused,      ///< delta content rules refuse the change
-    Conflict,            ///< endpoint identifier, mesh key, or join placement conflict
+    Conflict,            ///< identifier, mesh key, tunnel address, or join placement conflict
     StorageError,        ///< local persistence failed while applying
+    /// This server cannot order the op now: it is not a Tier 1 member, its
+    /// tree log is halted, or its pending pool is full. Nothing was queued.
+    Unavailable,
 };
 
 /// Outcome of validation or application. `reason` is a human-readable
@@ -241,6 +281,10 @@ struct TreeOpEffect {
 /// for the Session source.
 [[nodiscard]] std::optional<std::string> statement_id_hex(const TreeOp& op);
 
+/// Record the op id and, when the op wraps a statement, the statement id in
+/// `committed`, both with the op's signed time.
+void record_committed(CommittedOpIds& committed, const TreeOp& op);
+
 /// Set `op.author` to `key`'s public key, then `op.op_id`, then sign. Call
 /// after every other signed field is final.
 void sign_tree_op(crypto::SodiumCryptoService& crypto, TreeOp& op,
@@ -267,10 +311,66 @@ void sign_tree_op(crypto::SodiumCryptoService& crypto, TreeOp& op,
 /// The node writes `op` makes against `nodes`, without authentication or
 /// permission checks (validate_op performs those). Structural preconditions
 /// that the writes depend on (target present or absent, identifier and mesh
-/// key uniqueness, join placement) are checked here, so a refused plan leaves
-/// the tree unchanged. Every written node's version is its previous version
-/// plus one (1 for a new node). Deterministic.
+/// key uniqueness, join placement, a free tunnel address) are checked here, so
+/// a refused plan leaves the tree unchanged. Every written node's version is
+/// its previous version plus one (1 for a new node). Deterministic.
 [[nodiscard]] TreeOpVerdict plan_op(const TreeOp& op, const TreeState::NodeMap& nodes,
                                     TreeOpEffect& effect);
+
+/// Write `effect` (computed by plan_op against `nodes`) into `nodes`.
+void apply_effect(TreeState::NodeMap& nodes, const TreeOpEffect& effect);
+
+/// The application root record owned by `root_key` ("ed25519:<base64>"):
+/// id "root", no parent, type Root, hostname "root", and one assignment that
+/// gives the key every permission.
+[[nodiscard]] TreeNode make_root_node(const std::string& root_key);
+
+// --- Deterministic tunnel addresses ------------------------------------------
+//
+// With tree operations on, endpoint tunnel addresses come from the tree, not
+// from a per-server IPAM file. The tunnel pool is 10.64.0.0/10. Offsets below
+// kTreeTunnelFirstOffset (10.64.0.0/16) stay with IPAMService, which allocates
+// server addresses and /api/ipam/allocate requests sequentially from the
+// bottom of the pool. A join takes the first free /32 at or after a start
+// offset derived from the node id, probing upward and wrapping inside
+// [kTreeTunnelFirstOffset, kTreeTunnelLastOffset]. "Free" means that no tree
+// node holds the address, so a deleted node's address is free again at once on
+// every replica.
+
+inline constexpr uint32_t kTreeTunnelFirstOffset = 1u << 16;        // 10.65.0.0
+inline constexpr uint32_t kTreeTunnelLastOffset  = (1u << 22) - 2;  // 10.127.255.254
+
+/// The tunnel address ("a.b.c.d/32") a join assigns to `node_id` against
+/// `nodes`. Empty when every address in the range is taken. Deterministic.
+[[nodiscard]] std::string derive_tunnel_address(const TreeState::NodeMap& nodes,
+                                                std::string_view node_id);
+
+// --- Wire form and tree digest -----------------------------------------------
+
+/// Parse a canonical op encoding (encode_tree_op output) and a raw Ed25519
+/// signature back into an op, and set op_id from the encoding. nullopt unless
+/// the bytes are exactly one canonical encoding: a wrong domain, a field of
+/// the wrong width, an unknown kind or source, a kind/source pair that is not
+/// allowed, or trailing bytes all fail. Re-encoding the result gives the input
+/// bytes. Does not verify the signature; validate_op does.
+[[nodiscard]] std::optional<TreeOp> decode_tree_op(std::span<const uint8_t> encoding,
+                                                   const crypto::Ed25519Signature& signature);
+
+/// Raw bytes of the op's base64 signature. nullopt when it does not decode
+/// to 64 bytes.
+[[nodiscard]] std::optional<crypto::Ed25519Signature> tree_op_signature_bytes(const TreeOp& op);
+
+/// Canonical encoding of one node, including its version (domain
+/// kTreeNodeDomain). The unit of the tree digest and of tree snapshots.
+[[nodiscard]] std::vector<uint8_t> encode_tree_node(const TreeNode& node);
+
+/// Parse encode_tree_node output. nullopt unless the bytes are exactly one
+/// canonical node encoding.
+[[nodiscard]] std::optional<TreeNode> decode_tree_node(std::span<const uint8_t> encoding);
+
+/// Deterministic digest of a whole tree: the node count, then every node's
+/// canonical encoding (with its version) in node id order. Two trees have the
+/// same digest exactly when they hold the same nodes.
+[[nodiscard]] security::Digest compute_tree_digest(const TreeState::NodeMap& nodes);
 
 }  // namespace nexus::tree

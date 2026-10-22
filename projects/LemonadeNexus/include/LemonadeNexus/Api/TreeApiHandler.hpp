@@ -29,6 +29,17 @@ private:
     void cascade_node_cleanup(const std::string& node_id,
                               const std::optional<tree::TreeNode>& doomed);
 
+    // The dataplane and DNS steps of a join that wrote the node: drop the
+    // stale peer named by `rekey`, add the client peer for `tunnel_cidr`, and
+    // register the private EP record. Returns the registered FQDN (empty
+    // without DNS). With tree operations on, a join that commits after its
+    // request answered runs this when the commit arrives.
+    std::string finish_join_dataplane(const std::string& node_id,
+                                      const std::string& tunnel_cidr,
+                                      const std::string& client_mesh_pubkey,
+                                      bool remove_stale_peer,
+                                      const std::string& stale_peer_key);
+
     ApiContext& ctx_;
 };
 

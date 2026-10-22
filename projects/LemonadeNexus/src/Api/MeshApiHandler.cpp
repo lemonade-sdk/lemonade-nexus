@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
@@ -240,6 +241,60 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             spdlog::warn("[MeshAPI] Heartbeat ownership mismatch: caller={} node={}",
                           claims.user_id, hb_node_id);
             error_response(res, "insufficient permissions", 403);
+            return;
+        }
+
+        if (ctx_.config.tree_ops_enabled) {
+            // The endpoint write is a SetEndpoint tree operation. A heartbeat
+            // does not wait for the commit: it is periodic and best-effort,
+            // and an unchanged endpoint writes nothing at all.
+            if (!ctx_.tree_ops) {
+                spdlog::error("[MeshAPI] tree_ops_enabled is set but no tree-op submitter is wired");
+                error_response(res, "tree operations unavailable", 500);
+                return;
+            }
+            std::string status = "unchanged";
+            auto current = node_opt;
+            for (int attempt = 0; current && current->listen_endpoint != hb_endpoint; ++attempt) {
+                tree::TreeOp op;
+                op.kind = tree::TreeOpKind::SetEndpoint;
+                op.target = hb_node_id;
+                op.base_version = current->version;
+                op.principal = normalize_pubkey(claims.pubkey);
+                op.body.source = tree::TreeOpSource::Session;
+                op.body.listen_endpoint = hb_endpoint;
+                const auto admission = ctx_.tree_ops->submit_async(std::move(op));
+                if (admission.verdict.ok()) {
+                    status = admission.ticket->current().status == tree::TreeOpStatus::Committed
+                                 ? "committed"
+                                 : "pending";
+                    break;
+                }
+                using R = tree::TreeOpRefusal;
+                // A write that landed since the read: re-read and retry.
+                if (admission.verdict.refusal == R::StaleBaseVersion && attempt < 2) {
+                    current = ctx_.tree.get_node(hb_node_id);
+                    continue;
+                }
+                switch (admission.verdict.refusal) {
+                    case R::NotFound:    error_response(res, "node not found", 404); return;
+                    case R::Forbidden:   error_response(res, "insufficient permissions", 403); return;
+                    case R::Unavailable: error_response(res, admission.verdict.reason, 503); return;
+                    default:
+                        error_response(res, "failed to update node endpoint", 500);
+                        return;
+                }
+            }
+            if (!current) {
+                error_response(res, "node not found", 404);
+                return;
+            }
+            nlohmann::json j;
+            j["success"]  = true;
+            j["node_id"]  = hb_node_id;
+            j["endpoint"] = hb_endpoint;
+            j["status"]   = status;
+            json_response(res, j);
             return;
         }
 

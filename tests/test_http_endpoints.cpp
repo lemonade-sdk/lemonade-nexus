@@ -23,6 +23,7 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
@@ -1607,7 +1608,8 @@ TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
 //
 // test_http_endpoints_tree_ops builds this file with NEXUS_TEST_TREE_OPS, so
 // each case here and above also runs with ServerConfig::tree_ops_enabled.
-// Only the version counter may differ between the two builds.
+// Only the version counter and a joined endpoint's tunnel address (derived
+// from the tree instead of allocated by IPAM) may differ between the builds.
 
 TEST_F(HttpEndpointTest, NodeRoutesAnswerTheSameInBothModes) {
     auto cli = make_client();
@@ -1743,6 +1745,142 @@ TEST_F(HttpEndpointTest, TreeOpsWithoutSubmitterFailClosed) {
     ASSERT_NE(join_res, nullptr);
     EXPECT_EQ(join_res->status, 500);
     EXPECT_TRUE(tree->get_children("root").empty());
+}
+
+// The production heartbeat route (MeshApiHandler). With tree operations on,
+// a changed endpoint is a SetEndpoint operation that only the node's own key
+// may submit, and an unchanged endpoint writes nothing.
+TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
+    auto device_kp = crypto->ed25519_keygen();
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto node_id = json::parse(join_res->body).value("node_id", std::string{});
+    const auto version_before = tree->get_node(node_id)->version;
+
+    httplib::Server mesh_srv;
+    api::MeshApiHandler mesh(*test_api::current().ctx);
+    mesh.register_routes(mesh_srv, mesh_srv);
+    // An ephemeral port, so parallel test processes never collide.
+    const int bound = mesh_srv.bind_to_any_port("127.0.0.1");
+    ASSERT_GT(bound, 0);
+    const auto mesh_port = static_cast<uint16_t>(bound);
+    std::thread mesh_thread([&] { mesh_srv.listen_after_bind(); });
+    ASSERT_TRUE(wait_http_ready(mesh_port));
+    httplib::Client mesh_cli("127.0.0.1", mesh_port);
+
+    auto session = [&](const crypto::Ed25519Keypair& kp) {
+        const auto bare = crypto::to_base64(
+            std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+        auto now = std::chrono::system_clock::now();
+        const auto token = jwt::create()
+                               .set_issuer("lemonade-nexus")
+                               .set_subject(node_id)
+                               .set_issued_at(now)
+                               .set_expires_at(now + std::chrono::hours{1})
+                               .set_payload_claim("pubkey", jwt::claim(bare))
+                               .sign(jwt::algorithm::hs256{jwt_secret});
+        return httplib::Headers{{"Authorization", "Bearer " + token}};
+    };
+    const json body = {{"node_id", node_id}, {"endpoint", "203.0.113.9:51940"}};
+
+    auto res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), body.dump(),
+                             "application/json");
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    if (test_support::kTreeOpsBuild) {
+        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "committed");
+        EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
+
+        // The same endpoint again: no operation, no version change.
+        res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), body.dump(),
+                            "application/json");
+        ASSERT_NE(res, nullptr);
+        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
+        EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
+
+        // A session naming the node but holding another key is refused by the
+        // operation's ownership rule.
+        const auto other_kp = crypto->ed25519_keygen();
+        const json moved = {{"node_id", node_id}, {"endpoint", "203.0.113.10:51940"}};
+        res = mesh_cli.Post("/api/mesh/heartbeat", session(other_kp), moved.dump(),
+                            "application/json");
+        ASSERT_NE(res, nullptr);
+        EXPECT_EQ(res->status, 403);
+        EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    }
+    mesh_srv.stop();
+    mesh_thread.join();
+}
+
+// Under consensus a write that does not commit within the wait answers 202
+// with its op id, and the op's status is polled (design A2). A server that
+// cannot order tree operations answers 503. Nothing is applied before commit.
+TEST_F(HttpEndpointTest, AnUncommittedTreeWriteAnswersPendingWithItsOpId) {
+    auto cli = make_client();
+    tree::TreeOpPool pool;
+    const auto submitter_key = crypto->ed25519_keygen();
+    tree::TreeOpSubmitter ordered(
+        *tree, *crypto, security::NetworkId{}, submitter_key,
+        [&pool](tree::TreeOp op) {
+            tree::TreeOpAdmission admission;
+            admission.ticket = std::make_shared<tree::TreeOpTicket>(tree::op_id_hex(op));
+            (void)pool.add(std::move(op), admission.ticket);
+            return admission;
+        },
+        std::chrono::milliseconds(20));
+    test_api::current().config->tree_ops_enabled = true;
+    test_api::current().ctx->tree_ops = &ordered;
+    test_api::current().ctx->tree_op_status = [&pool](const std::string& id) {
+        return pool.status(id);
+    };
+
+    tree::TreeNode child;
+    child.id = "pending_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = root_pubkey_str;
+    auto res = post_auth_delta(cli, json(make_signed_delta("create_node", child.id, child)).dump());
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 202) << res->body;
+    const auto body = json::parse(res->body);
+    EXPECT_EQ(body.value("status", std::string{}), "pending");
+    const auto op_id = body.value("op_id", std::string{});
+    ASSERT_EQ(op_id.size(), 64u);
+    EXPECT_FALSE(tree->get_node(child.id).has_value());
+
+    const httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(root_pubkey_str)}};
+    auto poll = cli.Get("/api/tree/op/" + op_id, h);
+    ASSERT_NE(poll, nullptr);
+    ASSERT_EQ(poll->status, 200) << poll->body;
+    EXPECT_EQ(json::parse(poll->body).value("status", std::string{}), "pending");
+
+    pool.settle(op_id, {tree::TreeOpStatus::Committed, {}, 7});
+    poll = cli.Get("/api/tree/op/" + op_id, h);
+    ASSERT_NE(poll, nullptr);
+    EXPECT_EQ(json::parse(poll->body).value("status", std::string{}), "committed");
+    EXPECT_EQ(json::parse(poll->body).value("log_height", 0), 7);
+    poll = cli.Get("/api/tree/op/" + std::string(64, 'a'), h);
+    ASSERT_NE(poll, nullptr);
+    EXPECT_EQ(poll->status, 404);
+    poll = cli.Get("/api/tree/op/" + op_id);
+    ASSERT_NE(poll, nullptr);
+    EXPECT_EQ(poll->status, 401);
+
+    tree::TreeOpSubmitter unavailable(
+        *tree, *crypto, security::NetworkId{}, submitter_key,
+        [](tree::TreeOp) {
+            return tree::TreeOpAdmission{
+                {tree::TreeOpRefusal::Unavailable, "not a Tier 1 member"}, nullptr};
+        },
+        std::chrono::milliseconds(20));
+    test_api::current().ctx->tree_ops = &unavailable;
+    res = post_auth_delta(cli, json(make_signed_delta("create_node", child.id, child)).dump());
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 503);
+    test_api::current().ctx->tree_ops = nullptr;
+    test_api::current().ctx->tree_op_status = nullptr;
 }
 
 // A group admin administers the group's devices even without an entry on the

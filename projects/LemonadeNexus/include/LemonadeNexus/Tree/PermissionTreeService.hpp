@@ -86,28 +86,55 @@ public:
                                                   const std::vector<std::string>& permissions,
                                                   std::string& reason);
 
-    // --- Tree operations (Phase 1: applied locally, see TreeOps.hpp) ---
+    // --- Tree operations (see TreeOps.hpp) ---
 
     /// Validate `op` against the current tree, `policy`, and this service's
-    /// committed op ids at `block_time_sec`, without applying it. Thread-safe.
+    /// committed op ids at `block_time_sec`, without applying it. Under
+    /// consensus this is the submitting server's pre-check; the block's
+    /// validation decides. Thread-safe.
     [[nodiscard]] TreeOpVerdict validate_local_op(const TreeOp& op, const TreeOpPolicy& policy,
                                                   uint64_t block_time_sec) const;
 
     /// Validate `op` as validate_local_op does and, when it is accepted, apply
     /// it through apply_op, both under one lock so no other write intervenes.
-    /// `block_time_sec` is the local time in Phase 1. Thread-safe.
+    /// Local application without consensus: single-process tests and tools
+    /// only. The server never calls it; with tree operations on it applies ops
+    /// from committed blocks only (TreeConsensus). Thread-safe.
     [[nodiscard]] TreeOpVerdict submit_local_op(const TreeOp& op, const TreeOpPolicy& policy,
                                                 uint64_t block_time_sec);
 
     /// The one mutation path for tree operations: write the nodes plan_op
     /// computes (each with its incremented version), keep the identifier
-    /// index in sync, and record the op id and statement id as committed. An
-    /// op from a signed delta is also appended to the delta log and offered to
-    /// the retention sink, as do_apply_delta does. Precondition: the op passed
+    /// index in sync, and record the op id and statement id as committed
+    /// (persisted, so replay stays refused after a restart). An op from a
+    /// signed delta is also appended to the delta log and offered to the
+    /// retention sink, as do_apply_delta does. Precondition: the op passed
     /// validate_op against the current tree. A refused plan changes nothing.
     /// A storage failure can leave an op that writes several nodes partly
-    /// persisted (Phase 1 has no durable multi-node write). Thread-safe.
+    /// persisted; under consensus the tree log restores the committed state at
+    /// the next start (TreeConsensus). Thread-safe.
     [[nodiscard]] TreeOpVerdict apply_op(const TreeOp& op);
+
+    /// Apply the ops of one committed block in order, as apply_op does, under
+    /// one lock, then prune committed ids to `block_time_sec` and persist them
+    /// once. Stops at the first op that does not apply and returns its
+    /// verdict. Thread-safe.
+    [[nodiscard]] TreeOpVerdict apply_committed_ops(const std::vector<TreeOp>& ops,
+                                                    uint64_t block_time_sec);
+
+    /// A copy of every node, keyed by id. Thread-safe.
+    [[nodiscard]] rules::NodeMap nodes_snapshot() const;
+
+    /// compute_tree_digest of the current tree. Thread-safe.
+    [[nodiscard]] security::Digest tree_digest() const;
+
+    /// Replace the whole tree with `nodes` and the committed ids with
+    /// `committed`: persist every changed node, remove every stored node
+    /// `nodes` does not hold, and rebuild the identifier index. The tree log
+    /// uses it to restore committed state after an interrupted apply. False
+    /// when a write failed; the in-memory tree is `nodes` either way.
+    /// Thread-safe.
+    [[nodiscard]] bool replace_all(const rules::NodeMap& nodes, const CommittedOpIds& committed);
 
     // --- Delta statement authorization (shared with record acceptance) ---
 
@@ -215,7 +242,7 @@ private:
 
     // Reverse index: endpoint_identifier -> node_id. Kept in sync with nodes_ in
     // on_start / insert_join_node / update_node_direct / delete_node_direct /
-    // apply_op so resolve_by_identifier is O(1) and new colliding registrations
+    // apply_op / replace_all so resolve_by_identifier is O(1) and new colliding registrations
     // are rejected.
     std::unordered_map<std::string, std::string> identifier_index_;
 
@@ -223,7 +250,19 @@ private:
     std::unordered_map<std::string, uint64_t> recent_deltas_;
 
     // Op ids and statement ids applied through apply_op (tree operations).
+    // Persisted in tree/committed-ops.json after every apply.
     CommittedOpIds committed_ops_;
+    // The stored record exists but does not parse: the committed ids are
+    // unknown, so validate_local_op and submit_local_op refuse every op.
+    bool committed_ops_unreadable_ = false;
+
+    /// Write committed_ops_ to tree/committed-ops.json. Caller holds mutex_.
+    bool persist_committed_ops_locked() const;
+    /// persist_committed_ops_locked when `verdict` is ok; logs a failure.
+    /// Caller holds mutex_.
+    void persist_committed_ops_after(const TreeOpVerdict& verdict);
+    /// Load tree/committed-ops.json into committed_ops_. Caller holds mutex_.
+    void load_committed_ops_locked();
 };
 
 } // namespace nexus::tree

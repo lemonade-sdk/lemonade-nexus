@@ -5,9 +5,11 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 
 # Design: Tree Consensus and Threshold Storage Key
 
-Status: **approved**. Phase 1 is implemented behind the experimental
-`tree_ops_enabled` setting and applies tree operations locally only. See
-[Configuration](Configuration#experimental-tree-operations) for its behavior
+Status: **approved**. Phases 1 and 2 are implemented behind the experimental
+`tree_ops_enabled` setting: Tier 1 servers order tree operations through
+consensus and apply them only after commit. Tier 2 replication and the merge
+ceremony (Phase 3) are not implemented. See
+[Configuration](Configuration#experimental-tree-operations) for the behavior
 and limits. The design changes the trust model, so `AGENTS.md` requires review
 of each later phase and its migration plan before code.
 
@@ -154,6 +156,12 @@ TreeOp {
    After that it returns `202` with the `op_id`, the app shows the change as
    pending, and polls until it commits.
 
+Phase 2 implementation: replicas trust op signatures from the block epoch's
+frozen Tier 1 set only, so a Tier 2 server cannot sign an op a replica
+accepts. Until a finalized set of admitted submitters exists, a Tier 2 server
+answers tree writes with 503 instead of forwarding them. The poll route is
+`GET /api/tree/op/{op_id}`.
+
 ### A3. Consensus payload
 
 - A new `TreeBlock` carries an ordered batch of ops. `Proposal` gains
@@ -166,6 +174,18 @@ TreeOp {
   today.
 - Epoch-boundary stages keep priority. A block carries either a stage digest
   or a tree batch, never both, so the stage logic is unchanged.
+
+Phase 2 implementation: `Proposal` keeps its layout. A tree block's
+`transitions_digest` field carries `ops_digest` (the digest of the batch's
+canonical wire form, domain-separated from every stage digest), which enforces
+"never both" by construction. The batch follows the certificate in the
+`HotStuffProposal` message only, as a typed block payload
+(`BlockPayload.hpp`); commit proofs and sync replies carry the header. Blocks
+without a batch keep their proposal digest and wire bytes, so stored commit
+proofs and handoff links still decode. `kMaxConsensusBlockBytes` is now
+48,000. New payload kinds (for example Phase 5's `StorageHolderPlan` and
+`StorageKeyRotation`) add a `BlockPayloadKind` value and an
+`IBlockPayloadHandler`.
 
 ### A4. Deterministic validation
 
@@ -191,6 +211,13 @@ The checks are the current rules with the non-deterministic inputs removed:
 chain: `H(parent_root ‖ ops_digest ‖ tree_digest_after)`, where
 `tree_digest_after` is a deterministic digest of every node's canonical
 encoding and version. Replicas recompute it and vote only on a match.
+
+Phase 2 implementation: `parent_root` is the state root of the previous tree
+block in the chain (the tree log head, or the nearest uncommitted tree
+ancestor), and the proposal's `previous_state_root` carries it. The tree log
+is therefore a hash chain: a server that missed a tree block cannot match the
+next one, and halts instead of applying it. The first entry chains to a base
+root over the tree the log started from.
 
 ### A6. Commit, apply, and the tree log
 
