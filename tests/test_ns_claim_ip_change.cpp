@@ -578,3 +578,34 @@ TEST_F(NsClaimIpChangeTest, C5_AtMaxTimestampRenewalFailsClosed) {
     EXPECT_EQ(read_disk_slot0(a)["timestamp"], UINT64_MAX); // persisted unchanged
     EXPECT_EQ(read_disk_slot0(a)["server_ip"], IP_OLD);
 }
+
+// C6: a restarted server serves the NS records it held before the restart.
+// The holder's refresh re-sends the same claim with the same timestamp, which
+// the dedup above refuses, so registration cannot wait for a new message.
+TEST_F(NsClaimIpChangeTest, C6_LoadedSlotsAreServedInDnsAfterRestart) {
+    const std::string IP = "10.0.0.61";
+    const uint64_t ts = 1760000000;
+    const std::string ns1 = "ns1.lemonade-nexus.io";
+
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    const auto a_b64 = crypto::to_base64(a_kp.public_key);
+    const auto sig   = sign_b64(a_kp, pinned_preimage(1, a_b64, IP, ts));
+
+    auto& p = make_node(
+        "p",
+        [&](Node& n) {
+            attach_dns(n);
+            seed_ns_slot_state(*n.storage,
+                               {slot_entry(1, a_b64, IP, ts, sig, /*pinned=*/true)},
+                               /*our_slot=*/0);
+        },
+        [&](Node& n) {
+            n.gossip->set_root_pubkey(root_kp.public_key);
+            n.gossip->set_network_id(kTestNetworkHex);
+            n.gossip->set_dns(n.dns.get());
+        });
+
+    EXPECT_EQ(p.ns_holder(1), a_b64);
+    EXPECT_EQ(p.dns->nameserver_ip(ns1), IP);
+}

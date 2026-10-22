@@ -149,6 +149,12 @@ public:
     /// Set our own server's hostname and IP for the SOA MNAME field.
     void set_our_nameserver(const std::string& hostname, const std::string& ip);
 
+    /// The address this server answers for the zone apex A query. Set on every
+    /// server, including one that opts out of NS slots: resolvers may ask any
+    /// delegated server for the apex. Falls back to the nameserver address when
+    /// unset. Call before serving queries.
+    void set_apex_address(const std::string& ip);
+
     /// The glue IP registered for a nameserver hostname by add_nameserver,
     /// or nullopt when no nameserver is registered under that hostname.
     /// Read-only view over the NS table (public for testing).
@@ -348,6 +354,7 @@ private:
     std::vector<Nameserver>  nameservers_;
     std::string              our_ns_hostname_;
     std::string              our_ns_ip_;
+    std::string              apex_ip_;
 
     // SOA state
     std::string              soa_email_;          // e.g. "admin.domain.com"

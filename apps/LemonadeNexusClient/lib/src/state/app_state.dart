@@ -1111,11 +1111,16 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
+  static bool _sameJson(Object? a, Object? b) => jsonEncode(a) == jsonEncode(b);
+
   /// Refresh health status
   Future<void> refreshHealth() async {
     try {
       final h = await _sdk.health();
-      state = state.copyWith(healthStatus: h);
+      // Every replacement of `state` rebuilds its watchers; skip unchanged polls.
+      if (!_sameJson(state.healthStatus?.toJson(), h.toJson())) {
+        state = state.copyWith(healthStatus: h);
+      }
       // Runs every 5s — only worth a line when the server is NOT healthy.
       if (!state.isServerHealthy) {
         _log('refreshHealth: unhealthy (status=${h.status} service=${h.service})');
@@ -1171,13 +1176,20 @@ class AppNotifier extends StateNotifier<AppState> {
     try {
       final meshStatus = await _sdk.getMeshStatus();
       final meshPeers = await _sdk.getMeshPeers();
-      state = state.copyWith(
-        peerState: state.peerState.copyWith(
-          meshStatus: meshStatus,
-          meshPeers: meshPeers,
-          isMeshEnabled: meshStatus.isUp,
-        ),
-      );
+      final unchanged =
+          _sameJson(state.peerState.meshStatus?.toJson(), meshStatus.toJson()) &&
+              _sameJson(state.peerState.meshPeers.map((p) => p.toJson()).toList(),
+                  meshPeers.map((p) => p.toJson()).toList()) &&
+              state.peerState.isMeshEnabled == meshStatus.isUp;
+      if (!unchanged) {
+        state = state.copyWith(
+          peerState: state.peerState.copyWith(
+            meshStatus: meshStatus,
+            meshPeers: meshPeers,
+            isMeshEnabled: meshStatus.isUp,
+          ),
+        );
+      }
       if (!meshStatus.isUp) {
         _log('refreshMeshStatus: down (peers=${meshStatus.peerCount} '
             'online=${meshStatus.onlineCount})');
@@ -1525,7 +1537,8 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
-  /// Starts the periodic health probe that drives auto-reconnect.
+  /// Starts the periodic refresh: mesh status (local) and the health probe that
+  /// drives auto-reconnect.
   ///
   /// Runs for the notifier's lifetime and no-ops until the user is authed. When
   /// the connected server stops answering `/api/health`, it kicks off
@@ -1534,6 +1547,8 @@ class AppNotifier extends StateNotifier<AppState> {
     _healthTimer?.cancel();
     _healthTimer = Timer.periodic(_healthInterval, (_) async {
       if (!state.isAuthenticated || _isRecovering) return;
+      // The one periodic refresh for the app; views no longer run their own.
+      await refreshMeshStatus();
       await refreshHealth();
       if (state.isAuthenticated && !state.isServerHealthy) {
         await _recoverConnection();

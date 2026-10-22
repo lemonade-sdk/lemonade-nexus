@@ -535,6 +535,13 @@ private:
     /// Register an NS slot claim in the local DNS service (if available).
     void register_ns_slot_in_dns(const NsSlotClaimData& claim);
 
+    /// Register every held NS slot in the local DNS service. Runs after the
+    /// load at start and again when the DNS service or base domain is set, so
+    /// either startup order works. Slots loaded from disk at start
+    /// are otherwise never registered: the holder's re-broadcast carries the
+    /// same timestamp and is refused as a stale renewal.
+    void register_known_ns_slots();
+
     /// Sign an NS slot claim in place. Unpinned claims sign the legacy
     /// 5-field preimage (wire-identical to v0.9.3); pinned claims sign the
     /// 6-field preimage that includes "pinned".

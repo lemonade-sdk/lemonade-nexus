@@ -2,7 +2,6 @@
 /// @description Connection status and mesh stats, styled like the macOS app.
 library;
 
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -20,21 +19,13 @@ class DashboardView extends ConsumerStatefulWidget {
 }
 
 class _DashboardViewState extends ConsumerState<DashboardView> {
-  Timer? _refreshTimer;
-
   @override
   void initState() {
     super.initState();
-    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
-      final notifier = ref.read(appNotifierProvider.notifier);
-      await notifier.refreshMeshStatus();
-    });
-  }
-
-  @override
-  void dispose() {
-    _refreshTimer?.cancel();
-    super.dispose();
+    // AppNotifier refreshes mesh status every 5s; fetch once now so the view
+    // opens current.
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => ref.read(appNotifierProvider.notifier).refreshMeshStatus());
   }
 
   @override

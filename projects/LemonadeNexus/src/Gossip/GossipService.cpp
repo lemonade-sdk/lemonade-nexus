@@ -285,6 +285,7 @@ void GossipService::on_start() {
     // the mesh assigned them; the sync gate stays closed until live mesh
     // evidence opens it).
     load_ns_slots();
+    register_known_ns_slots();
 
     // Reconstruct the transfer pool index before any transfer state can move
     // (bounded; pool files are preserved on any failure).
@@ -3287,6 +3288,7 @@ void GossipService::handle_acl_delta(const asio::ip::udp::endpoint& sender,
 void GossipService::set_dns(network::DnsService* dns) {
     dns_ = dns;
     load_dns_replica();
+    register_known_ns_slots();
 }
 
 void GossipService::broadcast_dns_record_delta(const DnsRecordDelta& delta) {
@@ -4047,6 +4049,21 @@ void GossipService::set_our_region(const std::string& region) {
 
 void GossipService::set_dns_base_domain(const std::string& domain) {
     dns_base_domain_ = domain;
+    register_known_ns_slots();
+}
+
+void GossipService::register_known_ns_slots() {
+    if (!dns_ || dns_base_domain_.empty()) return;
+    std::vector<NsSlotClaimData> held;
+    {
+        std::lock_guard lock(mesh_state_mutex_);
+        for (const auto& s : ns_slots_) {
+            if (s.slot != 0 && !s.server_pubkey.empty() && !s.server_ip.empty()) {
+                held.push_back(s);
+            }
+        }
+    }
+    for (const auto& s : held) register_ns_slot_in_dns(s);
 }
 
 std::optional<uint8_t> GossipService::our_ns_slot() const {

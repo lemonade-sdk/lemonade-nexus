@@ -159,60 +159,48 @@ class DnsDiscoveryService {
     try {
       _dlog('[Discovery] Starting region-aware discovery for domain: $domain');
 
-      // Step 1: Bootstrap — resolve A records via DoH.
-      var bootstrapIPs = await _resolveBootstrapIPs();
-      _dlog('[Discovery] Step 1 — Bootstrap IPs: $bootstrapIPs');
+      // Region lookups go through DoH and need neither the zone apex nor the
+      // nameserver list, so they run first. A server that answers NXDOMAIN for
+      // the apex must not end discovery when every server answers the region.
 
-      // Fallback: if the base domain has no A record, resolve NS hostnames directly.
-      if (bootstrapIPs.isEmpty) {
-        _dlog('[Discovery] Step 1b — No A record, trying NS hostname resolution');
-        bootstrapIPs = await _resolveBootstrapIPs(hostname: 'ns1.$domain');
-        _dlog('[Discovery] Step 1b — NS fallback IPs: $bootstrapIPs');
-      }
-
-      if (bootstrapIPs.isEmpty) {
-        _dlog('[Discovery] No bootstrap IPs found — aborting');
-        lastMessage = 'No servers found for $domain';
-        return [];
-      }
-
-      // Step 2: Query NS records to discover all mesh servers.
-      final nsServers = await _resolveNSRecords(bootstrapIPs: bootstrapIPs);
-      _dlog('[Discovery] Step 2 — NS servers: '
-          '${nsServers.map((e) => '${e.hostname ?? '?'}@${e.ip}').toList()}');
-
-      // Step 3: Determine our region.
+      // Step 1: Determine our region.
       final ourRegion = await _determineOwnRegion();
-      _dlog('[Discovery] Step 3 — Our region: ${ourRegion ?? 'unknown'}');
+      _dlog('[Discovery] Step 1 — Our region: ${ourRegion ?? 'unknown'}');
 
-      // Step 4: Query SEIP records for our region first.
+      // Step 2: Query SEIP records for our region first.
       final servers = <DiscoveredServer>[];
       if (ourRegion != null) {
-        final regionServers =
-            await _querySEIPRegion(region: ourRegion, nameservers: nsServers);
+        final regionServers = await _querySEIPRegion(region: ourRegion);
         servers.addAll(regionServers);
-        _dlog("[Discovery] Step 4 — Region '$ourRegion' servers: "
+        _dlog("[Discovery] Step 2 — Region '$ourRegion' servers: "
             '${regionServers.length}');
       }
 
-      // Step 5: If no servers in our region, try all regions.
+      // Step 3: If no servers in our region, try all regions.
       if (servers.isEmpty) {
-        _dlog('[Discovery] Step 5 — No regional servers, querying all SEIP regions');
-        final allServers = await _queryAllSEIPServers(
-          nameservers: nsServers,
-          clientRegion: ourRegion,
-        );
+        _dlog('[Discovery] Step 3 — No regional servers, querying all SEIP regions');
+        final allServers = await _queryAllSEIPServers(clientRegion: ourRegion);
         servers.addAll(allServers);
-        _dlog('[Discovery] Step 5 — All-region servers: ${allServers.length}');
+        _dlog('[Discovery] Step 3 — All-region servers: ${allServers.length}');
       }
 
-      // Step 6: Fallback to legacy discovery (backward compat).
+      // Step 4: Fallback to legacy discovery (backward compat), which is the
+      // only step that needs the bootstrap address and nameserver list.
       if (servers.isEmpty) {
-        _dlog('[Discovery] Step 6 — Falling back to legacy discovery');
-        final legacy =
-            await _legacyDiscovery(nsServers: nsServers, bootstrapIPs: bootstrapIPs);
-        servers.addAll(legacy);
-        _dlog('[Discovery] Step 6 — Legacy servers: ${servers.length}');
+        var bootstrapIPs = await _resolveBootstrapIPs();
+        if (bootstrapIPs.isEmpty) {
+          bootstrapIPs = await _resolveBootstrapIPs(hostname: 'ns1.$domain');
+        }
+        _dlog('[Discovery] Step 4 — Bootstrap IPs: $bootstrapIPs');
+        if (bootstrapIPs.isNotEmpty) {
+          final nsServers = await _resolveNSRecords(bootstrapIPs: bootstrapIPs);
+          _dlog('[Discovery] Step 4 — NS servers: '
+              '${nsServers.map((e) => '${e.hostname ?? '?'}@${e.ip}').toList()}');
+          final legacy =
+              await _legacyDiscovery(nsServers: nsServers, bootstrapIPs: bootstrapIPs);
+          servers.addAll(legacy);
+        }
+        _dlog('[Discovery] Step 4 — Legacy servers: ${servers.length}');
       }
 
       // Step 7: Sort by score (latency + load penalty).
@@ -456,7 +444,6 @@ class DnsDiscoveryService {
   /// Queries A records for `<region>.seip.<domain>` and probes each server.
   Future<List<DiscoveredServer>> _querySEIPRegion({
     required String region,
-    required List<_NameserverEntry> nameservers,
   }) async {
     final qname = '$region.seip.$domain';
     _dlog('[Discovery] SEIP query: $qname');
@@ -486,7 +473,6 @@ class DnsDiscoveryService {
   // ---------------------------------------------------------------------------
 
   Future<List<DiscoveredServer>> _queryAllSEIPServers({
-    required List<_NameserverEntry> nameservers,
     required String? clientRegion,
   }) async {
     List<String> orderedRegions;
@@ -508,7 +494,7 @@ class DnsDiscoveryService {
 
     // Query all regions concurrently for speed.
     final perRegion = await Future.wait(orderedRegions.map(
-      (region) => _querySEIPRegion(region: region, nameservers: nameservers),
+      (region) => _querySEIPRegion(region: region),
     ));
     return perRegion.expand((e) => e).toList();
   }
