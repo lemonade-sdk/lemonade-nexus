@@ -1,7 +1,9 @@
 // nexus-attestd — the evidence-producing daemon.
 //
-// One job: a production AttestationChallenge in, a hardware-backed
-// AttestationEvidence out. It exists so that TPM access and the root-only IMA
+// Main job: a production AttestationChallenge in, a hardware-backed
+// AttestationEvidence out. It also runs the TPM operations the server may not
+// run itself: SVSM AK activation, and seal/unseal of a PCR-bound key for the
+// server's boot set. It exists so that TPM access and the root-only IMA
 // measurement log are held by ONE small binary instead of by the whole Nexus
 // server. Everything the daemon deliberately cannot do is spelled out in
 // AttestdGate.hpp and AttestdSocket.hpp; the short version is that it decides no

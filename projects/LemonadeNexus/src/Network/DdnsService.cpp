@@ -681,20 +681,10 @@ bool DdnsService::save_encrypted_credentials() {
     // and a fixed info string to derive a deterministic encryption key.
     // This way only this server instance can decrypt (needs same keypair).
 
-    // Read our gossip keypair
-    auto kp_env = storage_.read_file("identity", "keypair.json");
-    if (!kp_env) {
-        spdlog::warn("[{}] cannot save encrypted credentials: no identity keypair", name());
-        return false;
-    }
-
+    // The running gossip identity, not identity/keypair.json: once the boot
+    // set is sealed that file no longer exists.
     try {
-        auto kp_j = json::parse(kp_env->data);
-        auto priv_bytes = crypto::from_base64(kp_j.value("private_key", ""));
-        if (priv_bytes.size() != crypto::kEd25519PrivateKeySize) {
-            spdlog::warn("[{}] invalid identity keypair", name());
-            return false;
-        }
+        const auto& priv_bytes = gossip_.keypair().private_key;
 
         // Derive encryption key from private key via HKDF
         const std::string salt_str = "lemonade-nexus-ddns-at-rest";
@@ -746,18 +736,8 @@ bool DdnsService::load_encrypted_credentials() {
         return false;
     }
 
-    // Read our identity keypair
-    auto kp_env = storage_.read_file("identity", "keypair.json");
-    if (!kp_env) {
-        return false;
-    }
-
     try {
-        auto kp_j = json::parse(kp_env->data);
-        auto priv_bytes = crypto::from_base64(kp_j.value("private_key", ""));
-        if (priv_bytes.size() != crypto::kEd25519PrivateKeySize) {
-            return false;
-        }
+        const auto& priv_bytes = gossip_.keypair().private_key;
 
         // Re-derive the encryption key
         const std::string salt_str = "lemonade-nexus-ddns-at-rest";

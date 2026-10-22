@@ -8,6 +8,9 @@ Wants=network-online.target
 # otherwise its first execution is not measured and it can never be anchored.
 # Both are optional so a Tier 2 node without the attestation stack still starts:
 # a missing nexus-attestd costs Tier 1, it does not stop the mesh node.
+# Exception: once this host has sealed its gossip identity through
+# nexus-attestd (boot set, data/sealed/), the server waits about 30 s for the
+# daemon at startup and then exits rather than create a new identity.
 # NOTE: the nexus-ima-policy.service unit ships with the IMA measurement
 # component, which is not part of this repository yet. Once it lands, add it
 # back to the Wants=/After= lines below so the policy is loaded before first
@@ -27,8 +30,9 @@ ExecStart=/usr/bin/lemonade-nexus --config /var/lib/lemonade-nexus/lemonade-nexu
 WorkingDirectory=/var/lib/lemonade-nexus
 # The nexus-attestd socket is mode 0660 group 'nexus', and that group membership
 # IS its access control list. Without this the server cannot ask for platform
-# evidence and can never reach Tier 1. It grants nothing else: the group owns
-# one socket. postinst creates the group so this never blocks startup.
+# evidence, can never reach Tier 1, and cannot seal or unseal its boot set. It
+# grants nothing else: the group owns one socket. postinst creates the group so
+# this never blocks startup.
 SupplementaryGroups=nexus
 # Intentionally no systemd EnvironmentFile=: that would also expose inherited
 # manager/drop-in environment as a hidden config source. The explicit file is
