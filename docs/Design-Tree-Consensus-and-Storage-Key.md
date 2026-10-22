@@ -43,7 +43,8 @@ FROST, the epoch signing key, does not change.
 |---|---|
 | Storage key threshold | 65% of holders, rounded up |
 | Holders | Every server that passes SEV-SNP attestation, at most 50 |
-| Re-share | As soon as a holder is lost or added, and at least once per epoch when the set changed |
+| Re-share | Every epoch (share refresh), and right away when a holder is lost or added |
+| Key rotation | Storage secret daily (rewraps data keys); each server's data key monthly and after a suspected compromise (re-encrypts files) |
 | Recovery | No offline recovery key. Re-sharing restores full tolerance while at least the threshold stays online. |
 | Tree versions | Nodes hold their versions. The existing sync library (`nexus::sync`) replicates committed changes; consensus orders them. |
 | Saving a change | The API waits up to 10 s for the commit, then reports the change as pending |
@@ -312,8 +313,27 @@ review of audit status and maintenance. The crate exposes a C ABI like
   holders; honest holders contribute only to a finalized plan whose new
   holders all hold a fresh attestation.
 - Removed holders' old shares stop combining with the new ones.
-- Rotating `s` itself (a new `S`) is a separate, rare operation: it rewraps
-  every DEK, not the files.
+- Even when the holder set is unchanged, the holders refresh their shares
+  every epoch. A share copied before a refresh does not combine with shares
+  after it, so an attacker must collect 65% of the shares within one epoch.
+
+### B5a. Key rotation
+
+| Key | Rotates | What it costs |
+|---|---|---|
+| FROST epoch signing key | Every epoch (existing: each epoch runs a fresh DKG) | Nothing new |
+| Storage shares `s_i` | Every epoch (B5), same `S` | One re-share: about 5,000 small messages at 50 holders |
+| Storage secret `s` (new `S`) | Daily, and on demand | A fresh key generation among the holders. Each server rewraps its DEK to the new `S` through one threshold unlock. Files are not touched. |
+| Server data key (DEK) | Monthly, and on demand after a suspected compromise | The server re-encrypts its files under a new DEK in the background, then deletes the old ciphertext |
+
+- Rotation of `s` is finalized through consensus like a holder plan: a
+  `StorageKeyRotation` names the new `S`, its share commitments, and the
+  epoch it takes effect. The old `S` stays valid for unwrapping until every
+  server has rewrapped, with a bounded grace period (proposed: one epoch).
+- A server that misses a rotation unwraps with the old `S` during the grace
+  period, or rewraps through the holders of the new `S` afterwards.
+- Every rotation is logged with its epoch, so an operator can see when each
+  key last changed.
 
 ### B6. Sealing the boot set
 
@@ -396,10 +416,10 @@ This part does not change the trust model and can ship first.
 | 1 | `TreeOp`, node versions, deterministic validation, all write paths produce ops (applied locally, behind a flag). | — |
 | 2 | Tree batches in consensus, `TreeLog`, commit-then-apply on Tier 1. | 1 |
 | 3 | Log replication to Tier 2 and lagging servers with QC verification. Tree merge ceremony and switch-over (A9). | 2 |
-| 4 | `storage-threshold` crate: library review, key generation, re-share, DLEQ, threshold ECIES. | — |
-| 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose. | 2, 4 |
+| 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
+| 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. | — |
-| 7 | DEK file migration; plaintext removed. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 
@@ -417,8 +437,11 @@ Each phase adds tests for the valid path and these rejection cases:
 - **Storage key:** fewer than `t` partials, a partial with an invalid DLEQ
   proof, a partial for a different `R`, a requester without a passing
   attestation, a replayed unlock request, a re-share contributed by fewer
-  than `t_old` holders, a removed holder's share after re-share, cold start
-  with exactly `t` and with `t − 1` holders.
+  than `t_old` holders, a removed holder's share after re-share, a share from
+  before a refresh combined with shares after it, unlock with the old `S`
+  after its grace period, a server that missed a rotation catching up, an
+  interrupted DEK rotation resuming without data loss, cold start with
+  exactly `t` and with `t − 1` holders.
 - **Race fix:** round 2 arriving before round 1 on every DKG path completes
   without a stall.
 
