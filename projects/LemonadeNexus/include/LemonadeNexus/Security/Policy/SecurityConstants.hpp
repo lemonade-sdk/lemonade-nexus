@@ -134,6 +134,12 @@ inline constexpr uint32_t kMaxFinalAttestAttemptsPerPlan = kMaxTier1AttestAttemp
 inline constexpr uint64_t kBootstrapRetryMs = 15000;
 inline constexpr uint64_t kBootstrapRetryJitterMs = 5000;
 
+// Re-send cadence for an epoch-transition or adoption DKG in progress. Its
+// datagrams are mortal and a package can reach a peer before that peer's
+// session exists; re-sending lets every participant finish without waiting
+// for the stall window. Receivers treat duplicates as benign.
+inline constexpr uint64_t kDkgResendMs = 5000;
+
 // --- Mesh eligibility observations ------------------------------------------
 
 // Distinct attestations one observer must have verified before it counts

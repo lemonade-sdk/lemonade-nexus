@@ -68,6 +68,9 @@ struct MemoryMesh {
     // Unreachable nodes: nothing is delivered to or from them. Offline is a
     // transport fact, not a protocol one.
     std::set<NodeId> offline;
+    // Lossy transport: the next N messages of a kind are lost in transit,
+    // whoever sends them.
+    std::map<SecurityMessageKind, int> drop_next;
     void capture(std::span<const uint8_t> bytes);
     // Nodes whose transport certificate no longer verifies against the root.
     // The mesh knows this, not the platform, so it lives here. The per-observer
@@ -242,6 +245,16 @@ inline void MemoryMesh::pump() {
         queue.pop_front();
         if (offline.contains(item.from) || offline.contains(item.to)) {
             continue;
+        }
+        if (!drop_next.empty()) {
+            const auto decoded = decode_security_message(item.bytes);
+            if (const auto* message = std::get_if<SecurityMessage>(&decoded)) {
+                if (auto budget = drop_next.find(message->kind);
+                    budget != drop_next.end() && budget->second > 0) {
+                    --budget->second;
+                    continue;
+                }
+            }
         }
         capture(item.bytes);
         nodes.at(item.to)->deliver(item.from, item.bytes, now_ms);

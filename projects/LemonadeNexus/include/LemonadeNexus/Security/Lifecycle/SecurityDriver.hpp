@@ -188,6 +188,16 @@ private:
     /// and excludes the participants whose round-1 silence every member
     /// observed. Liveness recovery; nothing here activates anything.
     void maybe_fail_stalled_dkg(uint64_t now_ms);
+    /// Re-sends the own round-1 broadcast and produced round-2 packages on
+    /// kDkgResendMs: from the live session while it runs, then from the kept
+    /// outbox after this node's own session completed, because a peer may
+    /// still be missing a package. Stops at activation, at abandonment, or
+    /// after twice the stall window. The founding DKG's running session has
+    /// its own cadence in run_bootstrap_liveness.
+    void maybe_resend_dkg(uint64_t now_ms);
+    /// Takes the completed DKG result, keeping this node's own packages for
+    /// maybe_resend_dkg.
+    [[nodiscard]] std::optional<DkgResult> take_dkg_result_keeping_outbox();
     void maybe_propose(View view);
     void progress(uint64_t now_ms);
     void begin_sync(uint64_t now_ms);
@@ -264,6 +274,15 @@ private:
     // Founder-side bootstrap state.
     std::optional<GenesisFounding> founding_;
     std::optional<DkgResult> pending_dkg_;
+    /// This node's own packages from a completed DKG, re-sent until the epoch
+    /// it produced activates or the attempt is abandoned.
+    struct DkgOutbox {
+        EpochId epoch = 0;
+        std::optional<DkgMessage> round1;
+        std::vector<DkgMessage> round2;
+        uint64_t kept_ms = 0;
+    };
+    std::optional<DkgOutbox> dkg_outbox_;
     /// The founding eligibility state this node computed and signed. The
     /// bootstrap certificate must name exactly this value or it is refused.
     Digest founding_eligibility_digest_{};
@@ -273,6 +292,7 @@ private:
     Height founding_round_ = 0;
     uint64_t last_bootstrap_retry_ms_ = 0;
     uint64_t founding_dkg_started_ms_ = 0;
+    uint64_t last_dkg_resend_ms_ = 0;
     /// When each founding edge was last challenged; answers can outlive the
     /// cadence, so an edge is re-asked only after a grace period.
     std::map<NodeId, uint64_t> founding_challenge_ms_;

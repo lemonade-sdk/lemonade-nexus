@@ -294,9 +294,10 @@ TEST(DkgSession, PairwiseRulesHold) {
     Mesh mesh(5);
     mesh.run_round1();
 
-    // Before round 2 starts, no pairwise message is accepted.
+    // Before round 2 starts, an unbound package is still refused: early
+    // packages pass the same binding checks before they are held.
     DkgMessage early;
-    EXPECT_EQ(mesh.sessions[0]->receive_pairwise(early), DkgFailure::WrongPhase);
+    EXPECT_NE(mesh.sessions[0]->receive_pairwise(early), DkgFailure::None);
 
     std::vector<DkgMessage> pairwise;
     for (auto& session : mesh.sessions) {
@@ -339,3 +340,103 @@ TEST(DkgSession, FreshSessionGivesFreshKey) {
 }
 
 }  // namespace
+
+// A faster peer's round-2 package can arrive before this participant has
+// every round-1 broadcast. It is held and counts once round 1 completes,
+// instead of being dropped (the r17 founding split).
+TEST(DkgSession, EarlyRound2PackagesAreHeldUntilRound1Completes) {
+    Mesh mesh(5);
+    std::vector<DkgMessage> broadcasts;
+    for (auto& session : mesh.sessions) {
+        auto message = session->start();
+        ASSERT_TRUE(message.has_value());
+        broadcasts.push_back(*message);
+    }
+    // Sessions 1..4 see every broadcast; session 0 misses the last one.
+    for (std::size_t i = 1; i < mesh.sessions.size(); ++i) {
+        for (const auto& broadcast : broadcasts) {
+            (void)mesh.sessions[i]->receive_broadcast(broadcast);
+        }
+    }
+    for (std::size_t b = 0; b + 1 < broadcasts.size(); ++b) {
+        (void)mesh.sessions[0]->receive_broadcast(broadcasts[b]);
+    }
+    ASSERT_FALSE(mesh.sessions[0]->round1_complete());
+
+    // The others reach round 2 and send; session 0 holds its packages.
+    std::vector<DkgMessage> pairwise;
+    for (std::size_t i = 1; i < mesh.sessions.size(); ++i) {
+        auto messages = mesh.sessions[i]->round2_messages();
+        ASSERT_EQ(messages.size(), mesh.sessions.size() - 1);
+        pairwise.insert(pairwise.end(), messages.begin(), messages.end());
+    }
+    for (const auto& message : pairwise) {
+        if (message.recipient == node(1)) {
+            EXPECT_EQ(mesh.sessions[0]->receive_pairwise(message), DkgFailure::None);
+            EXPECT_EQ(mesh.sessions[0]->receive_pairwise(message), DkgFailure::DuplicateMessage);
+        }
+    }
+    EXPECT_EQ(mesh.sessions[0]->phase(), DkgPhase::Round1);
+    EXPECT_FALSE(mesh.sessions[0]->finish());
+
+    // The missing broadcast arrives: round 1 completes, the held packages
+    // count, and session 0 finishes without any re-send.
+    ASSERT_EQ(mesh.sessions[0]->receive_broadcast(broadcasts.back()), DkgFailure::None);
+    auto own = mesh.sessions[0]->round2_messages();
+    ASSERT_EQ(own.size(), mesh.sessions.size() - 1);
+    EXPECT_TRUE(mesh.sessions[0]->finish());
+
+    for (const auto& message : own) {
+        ASSERT_EQ(mesh.sessions[message.recipient.bytes[0] - 1]->receive_pairwise(message),
+                  DkgFailure::None);
+    }
+    for (const auto& message : pairwise) {
+        if (message.recipient != node(1)) {
+            ASSERT_EQ(mesh.sessions[message.recipient.bytes[0] - 1]->receive_pairwise(message),
+                      DkgFailure::None);
+        }
+    }
+    std::vector<DkgResult> results;
+    for (std::size_t i = 0; i < mesh.sessions.size(); ++i) {
+        if (i != 0) ASSERT_TRUE(mesh.sessions[i]->finish());
+        results.push_back(std::move(*mesh.sessions[i]->take_result()));
+    }
+    for (const auto& result : results) {
+        EXPECT_EQ(result.group_public_key, results[0].group_public_key);
+    }
+}
+
+// Holding an early package does not weaken the rules: a package for another
+// recipient is still refused, and two different early packages from one
+// sender fail the session and name the sender.
+TEST(DkgSession, EarlyRound2PackagesFollowThePairwiseRules) {
+    Mesh mesh(5);
+    std::vector<DkgMessage> broadcasts;
+    for (auto& session : mesh.sessions) {
+        broadcasts.push_back(*session->start());
+    }
+    for (std::size_t i = 1; i < mesh.sessions.size(); ++i) {
+        for (const auto& broadcast : broadcasts) {
+            (void)mesh.sessions[i]->receive_broadcast(broadcast);
+        }
+    }
+    auto from_two = mesh.sessions[1]->round2_messages();
+    const DkgMessage* to_one = nullptr;
+    const DkgMessage* to_three = nullptr;
+    for (const auto& message : from_two) {
+        if (message.recipient == node(1)) to_one = &message;
+        if (message.recipient == node(3)) to_three = &message;
+    }
+    ASSERT_NE(to_one, nullptr);
+    ASSERT_NE(to_three, nullptr);
+
+    EXPECT_EQ(mesh.sessions[0]->receive_pairwise(*to_three), DkgFailure::WrongRecipient);
+    ASSERT_EQ(mesh.sessions[0]->receive_pairwise(*to_one), DkgFailure::None);
+
+    DkgMessage forked = *to_one;
+    forked.payload.back() ^= 0x01;
+    EXPECT_EQ(mesh.sessions[0]->receive_pairwise(forked), DkgFailure::Equivocation);
+    EXPECT_EQ(mesh.sessions[0]->phase(), DkgPhase::Failed);
+    ASSERT_TRUE(mesh.sessions[0]->culprit().has_value());
+    EXPECT_EQ(*mesh.sessions[0]->culprit(), node(2));
+}
