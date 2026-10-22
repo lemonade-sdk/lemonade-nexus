@@ -262,9 +262,32 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                     customer_node.assignments = {{
                         .management_pubkey = norm_pubkey,
                         .permissions = {"read", "write", "add_child", "delete_node",
-                                        "edit_node"},
+                                        "edit_node", "admin"},
                     }};
                     ctx_.tree.insert_join_node(customer_node);
+                }
+            }
+
+            // The group creator administers the group: only an admin may change
+            // assignments, so an owner without it could not manage members.
+            // Groups created before that rule gain it on the owner's next join.
+            if (auto group = ctx_.tree.get_node(customer_id);
+                group && group->type == tree::NodeType::Customer &&
+                tree::canonical_principal(group->mgmt_pubkey) ==
+                    tree::canonical_principal(norm_pubkey)) {
+                auto upgraded = *group;
+                bool changed = false;
+                for (auto& a : upgraded.assignments) {
+                    if (tree::canonical_principal(a.management_pubkey) !=
+                        tree::canonical_principal(norm_pubkey)) continue;
+                    if (std::find(a.permissions.begin(), a.permissions.end(), "admin") ==
+                        a.permissions.end()) {
+                        a.permissions.push_back("admin");
+                        changed = true;
+                    }
+                }
+                if (changed && ctx_.tree.update_node_direct(customer_id, upgraded)) {
+                    spdlog::info("[Join] group owner now administers {}", customer_id);
                 }
             }
 

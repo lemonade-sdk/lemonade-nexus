@@ -658,3 +658,236 @@ TEST_F(PermissionTreeTest, MeshPubkeyBindsToExactlyOneNode) {
     back.mesh_pubkey = owner.mesh_pubkey;
     EXPECT_TRUE(tree_svc->update_node_direct("mesh_owner", back));
 }
+
+// --- Administration: who may change assignments ---
+
+namespace {
+
+/// A group under root administered by `owner`, with one endpoint whose own key
+/// holds the edit rights every joined device gets on itself.
+struct GroupFixture {
+    crypto::Ed25519Keypair owner_kp, device_kp;
+    std::string owner, device;
+};
+
+} // namespace
+
+class TreeAdministrationTest : public PermissionTreeTest {
+protected:
+    GroupFixture g;
+
+    std::string pub(const crypto::Ed25519Keypair& kp) {
+        return "ed25519:" + crypto::to_base64(kp.public_key);
+    }
+
+    void SetUp() override {
+        PermissionTreeTest::SetUp();
+        g.owner_kp = crypto_svc->ed25519_keygen();
+        g.device_kp = crypto_svc->ed25519_keygen();
+        g.owner = pub(g.owner_kp);
+        g.device = pub(g.device_kp);
+
+        tree::TreeNode owner_dev;
+        owner_dev.id = "owner-dev";
+        owner_dev.parent_id = "grp";
+        owner_dev.type = tree::NodeType::Endpoint;
+        owner_dev.mgmt_pubkey = g.owner;
+
+        tree::TreeNode grp;
+        grp.id = "grp";
+        grp.parent_id = "root";
+        grp.type = tree::NodeType::Customer;
+        grp.mgmt_pubkey = g.owner;
+        grp.assignments = {{g.owner, {"read", "write", "add_child", "delete_node",
+                                      "edit_node", "admin"}}};
+        ASSERT_TRUE(tree_svc->apply_delta(make_signed_delta("create_node", "grp", grp,
+                                                            root_keypair)));
+        ASSERT_TRUE(tree_svc->apply_delta(make_signed_delta("create_node", "owner-dev",
+                                                            owner_dev, g.owner_kp)));
+
+        tree::TreeNode dev;
+        dev.id = "dev";
+        dev.parent_id = "grp";
+        dev.type = tree::NodeType::Endpoint;
+        dev.mgmt_pubkey = g.device;
+        dev.assignments = {{g.device, {"read", "write", "edit_node"}},
+                           {g.owner, {"read", "write", "add_child", "delete_node",
+                                      "edit_node"}}};
+        ASSERT_TRUE(tree_svc->apply_delta(make_signed_delta("create_node", "dev", dev,
+                                                            g.owner_kp)));
+    }
+
+    void restart_tree() {
+        tree_svc->stop();
+        tree_svc = std::make_unique<tree::PermissionTreeService>(*storage_svc, *crypto_svc);
+        tree_svc->start();
+    }
+};
+
+// The overwrite this guards against: an edit_node holder renames its own record
+// onto "root", the server persists it under that id, and the next restart loads
+// the forged root with the device as admin.
+TEST_F(TreeAdministrationTest, UpdateCannotRenameANodeOntoAnotherNode) {
+    tree::TreeNode forged = *tree_svc->get_node("dev");
+    forged.id = "root";
+    forged.parent_id = "";
+    forged.type = tree::NodeType::Root;
+    forged.assignments = {{g.device, {"admin"}}};
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", forged,
+                                                         g.device_kp)));
+
+    restart_tree();
+    EXPECT_FALSE(tree_svc->check_permission(g.device, "root", acl::Permission::Admin));
+    EXPECT_TRUE(tree_svc->check_permission(root_pubkey_str, "root", acl::Permission::Admin));
+    EXPECT_EQ(tree_svc->get_node("dev")->parent_id, "grp");
+}
+
+TEST_F(TreeAdministrationTest, UpdateKeepsParentTypeAndManagementKey) {
+    auto base = *tree_svc->get_node("dev");
+
+    auto moved = base;
+    moved.parent_id = "root";
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", moved,
+                                                         g.device_kp)));
+    auto retyped = base;
+    retyped.type = tree::NodeType::Customer;
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", retyped,
+                                                         g.device_kp)));
+    auto rekeyed = base;
+    rekeyed.mgmt_pubkey = pub(crypto_svc->ed25519_keygen());
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", rekeyed,
+                                                         g.device_kp)));
+
+    // An ordinary field edit by the same holder still applies.
+    auto renamed = base;
+    renamed.hostname = "laptop";
+    EXPECT_TRUE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", renamed,
+                                                        g.device_kp)));
+    EXPECT_EQ(tree_svc->get_node("dev")->hostname, "laptop");
+}
+
+TEST_F(TreeAdministrationTest, EditNodeCannotChangeAssignments) {
+    const auto outsider = pub(crypto_svc->ed25519_keygen());
+    auto base = *tree_svc->get_node("dev");
+
+    auto self_grant = base;
+    self_grant.assignments[0].permissions.push_back("admin");
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_assignment", "dev",
+                                                         self_grant, g.device_kp)));
+    auto add_other = base;
+    add_other.assignments.push_back({outsider, {"read", "connect_private"}});
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", add_other,
+                                                         g.device_kp)));
+    auto drop_owner = base;
+    drop_owner.assignments.pop_back();
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_node", "dev", drop_owner,
+                                                         g.device_kp)));
+
+    EXPECT_FALSE(tree_svc->check_permission(g.device, "dev", acl::Permission::Admin));
+    EXPECT_FALSE(tree_svc->check_permission(outsider, "dev", acl::Permission::Read));
+    EXPECT_TRUE(tree_svc->check_permission(g.owner, "dev", acl::Permission::DeleteNode));
+}
+
+TEST_F(TreeAdministrationTest, GroupAdminPromotesOnlyJoinedMembers) {
+    auto grp = *tree_svc->get_node("grp");
+
+    // The device has joined the group, so its owner may promote it.
+    auto promote = grp;
+    promote.assignments.push_back({g.device, {"admin"}});
+    EXPECT_TRUE(tree_svc->apply_delta(make_signed_delta("update_assignment", "grp", promote,
+                                                        g.owner_kp)));
+    EXPECT_TRUE(tree_svc->check_permission(g.device, "grp", acl::Permission::Admin));
+
+    // A key that never joined cannot be named, even by an admin.
+    auto stranger = *tree_svc->get_node("grp");
+    stranger.assignments.push_back({pub(crypto_svc->ed25519_keygen()), {"read"}});
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_assignment", "grp",
+                                                         stranger, g.owner_kp)));
+
+    // A member of another group has joined, but not this group.
+    tree::TreeNode other_grp;
+    other_grp.id = "other";
+    other_grp.parent_id = "root";
+    other_grp.type = tree::NodeType::Customer;
+    const auto other_kp = crypto_svc->ed25519_keygen();
+    other_grp.mgmt_pubkey = pub(other_kp);
+    ASSERT_TRUE(tree_svc->apply_delta(make_signed_delta("create_node", "other", other_grp,
+                                                        root_keypair)));
+    auto cross = *tree_svc->get_node("grp");
+    cross.assignments.push_back({pub(other_kp), {"read"}});
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_assignment", "grp", cross,
+                                                         g.owner_kp)));
+}
+
+TEST_F(TreeAdministrationTest, AdminOfAGroupAdministersItsDevicesButNotOtherGroups) {
+    // The owner holds admin on the group, not on the device: the ancestor walk
+    // lets it change the device's assignments.
+    auto dev = *tree_svc->get_node("dev");
+    dev.assignments[0].permissions = {"read"};
+    EXPECT_TRUE(tree_svc->apply_delta(make_signed_delta("update_assignment", "dev", dev,
+                                                        g.owner_kp)));
+    EXPECT_FALSE(tree_svc->check_permission(g.device, "dev", acl::Permission::EditNode));
+
+    // Its admin does not reach above the group.
+    auto root = *tree_svc->get_node("root");
+    root.assignments.push_back({g.owner, {"admin"}});
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("update_assignment", "root", root,
+                                                         g.owner_kp)));
+}
+
+TEST_F(TreeAdministrationTest, CreateNamesOthersOnlyAsAnAdmin) {
+    // The device may add a child under itself (owner grants add_child first).
+    auto dev = *tree_svc->get_node("dev");
+    dev.assignments[0].permissions.push_back("add_child");
+    ASSERT_TRUE(tree_svc->apply_delta(make_signed_delta("update_assignment", "dev", dev,
+                                                        g.owner_kp)));
+
+    tree::TreeNode child;
+    child.id = "dev-child";
+    child.parent_id = "dev";
+    child.type = tree::NodeType::Endpoint;
+    child.assignments = {{g.device, {"read", "edit_node"}}};
+    EXPECT_TRUE(tree_svc->apply_delta(make_signed_delta("create_node", "dev-child", child,
+                                                        g.device_kp)));
+
+    // Granting the owner's key there is a grant by a non-admin: refused.
+    tree::TreeNode granting = child;
+    granting.id = "dev-child-2";
+    granting.assignments.push_back({g.owner, {"read"}});
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("create_node", "dev-child-2",
+                                                         granting, g.device_kp)));
+}
+
+TEST_F(TreeAdministrationTest, RootIsNeverCreatedOrDeletedByDelta) {
+    tree::TreeNode second_root;
+    second_root.id = "root2";
+    second_root.parent_id = "";
+    second_root.type = tree::NodeType::Root;
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("create_node", "root2", second_root,
+                                                         root_keypair)));
+
+    EXPECT_FALSE(tree_svc->apply_delta(make_signed_delta("delete_node", "root",
+                                                         *tree_svc->get_node("root"),
+                                                         root_keypair)));
+    EXPECT_TRUE(tree_svc->get_node("root").has_value());
+}
+
+// A node file whose record names a different node is refused on load instead
+// of replacing that node.
+TEST_F(TreeAdministrationTest, LoadRefusesAFileWhoseRecordNamesAnotherNode) {
+    tree::TreeNode forged = *tree_svc->get_node("dev");
+    forged.id = "root";
+    forged.parent_id = "";
+    forged.type = tree::NodeType::Root;
+    forged.assignments = {{g.device, {"admin"}}};
+    storage::SignedEnvelope env;
+    env.version = 1;
+    env.type = "tree_node";
+    env.data = nlohmann::json(forged).dump();
+    ASSERT_TRUE(storage_svc->write_node("dev", env));
+
+    restart_tree();
+    EXPECT_FALSE(tree_svc->check_permission(g.device, "root", acl::Permission::Admin));
+    EXPECT_TRUE(tree_svc->check_permission(root_pubkey_str, "root", acl::Permission::Admin));
+    EXPECT_FALSE(tree_svc->get_node("dev").has_value());
+}

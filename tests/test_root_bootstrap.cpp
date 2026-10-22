@@ -497,6 +497,37 @@ TEST_F(RootClaimHttpTest, AuthorizedJoinBehaviorUnchanged) {
     EXPECT_TRUE(root_matches(*tree->get_node("root")));
 }
 
+// Only an admin may change assignments, so the group creator administers its
+// group; a group created before that rule gains admin on the owner's next join.
+TEST_F(RootClaimHttpTest, GroupOwnerAdministersTheirGroup) {
+    seed_root(owner_kp);
+
+    auto res = join(stranger_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 200) << res->body;
+    auto customer = find_customer(stranger_kp);
+    ASSERT_TRUE(customer.has_value());
+    EXPECT_TRUE(tree->check_permission(prefixed_b64(stranger_kp), customer->id,
+                                       acl::Permission::Admin));
+
+    auto legacy = *customer;
+    legacy.assignments = {{.management_pubkey = prefixed_b64(stranger_kp),
+                           .permissions = {"read", "write", "add_child",
+                                           "delete_node", "edit_node"}}};
+    ASSERT_TRUE(tree->update_node_direct(customer->id, legacy));
+    ASSERT_FALSE(tree->check_permission(prefixed_b64(stranger_kp), customer->id,
+                                        acl::Permission::Admin));
+
+    res = join(stranger_kp);
+    ASSERT_TRUE(static_cast<bool>(res));
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_TRUE(tree->check_permission(prefixed_b64(stranger_kp), customer->id,
+                                       acl::Permission::Admin));
+    // The upgrade is scoped to the caller's own group.
+    EXPECT_FALSE(tree->check_permission(prefixed_b64(stranger_kp), "root",
+                                        acl::Permission::Admin));
+}
+
 // The closed-registration link-token exemption recognizes the owner of the
 // EXISTING root (pure validation of stored data) and no one else.
 TEST_F(RootClaimHttpTest, ClosedRegistrationExemptionUsesExistingOwnershipOnly) {
