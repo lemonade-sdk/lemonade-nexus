@@ -243,7 +243,13 @@ server that applies it:
 - **The root is fixed.** No delta creates a second root or deletes the root.
 
 The creator of a group holds `admin` on it, so the owner can promote a member
-device by giving its key `admin` on the group. Groups created before this
+device by giving its key `admin` on the group.
+
+Clients change assignments through `POST /api/tree/node/assignments/{id}`
+with `{"pubkey", "permissions"}`. The server sets exactly that list for the
+key, replacing its entry, and an empty list removes it. The same admin and
+joined rules apply. An admin cannot change its own entry on the node that
+grants its admin, so no admin locks itself out; another admin must do it. Groups created before this
 rule gain `admin` for their owner on the owner's next join.
 
 On load, a node file whose record names a different node is refused.

@@ -891,3 +891,54 @@ TEST_F(TreeAdministrationTest, LoadRefusesAFileWhoseRecordNamesAnotherNode) {
     EXPECT_TRUE(tree_svc->check_permission(root_pubkey_str, "root", acl::Permission::Admin));
     EXPECT_FALSE(tree_svc->get_node("dev").has_value());
 }
+
+TEST_F(TreeAdministrationTest, SetAssignmentReplacesTheEntryUnderTheSameRules) {
+    using Change = tree::PermissionTreeService::AssignmentChange;
+    std::string reason;
+
+    // Promote: one entry for the key, holding exactly what was set.
+    ASSERT_EQ(tree_svc->set_assignment("grp", g.owner, g.device, {"read", "admin"}, reason),
+              Change::Applied) << reason;
+    EXPECT_TRUE(tree_svc->check_permission(g.device, "grp", acl::Permission::Admin));
+    std::size_t entries = 0;
+    const auto grp_node = tree_svc->get_node("grp");
+    ASSERT_TRUE(grp_node.has_value());
+    for (const auto& a : grp_node->assignments) {
+        if (tree::canonical_principal(a.management_pubkey) ==
+            tree::canonical_principal(g.device)) ++entries;
+    }
+    EXPECT_EQ(entries, 1u);
+
+    // Demote by setting a smaller list, then remove with an empty one.
+    ASSERT_EQ(tree_svc->set_assignment("grp", g.owner, g.device, {"read"}, reason),
+              Change::Applied) << reason;
+    EXPECT_FALSE(tree_svc->check_permission(g.device, "grp", acl::Permission::Admin));
+    EXPECT_TRUE(tree_svc->check_permission(g.device, "grp", acl::Permission::Read));
+    ASSERT_EQ(tree_svc->set_assignment("grp", g.owner, g.device, {}, reason),
+              Change::Applied) << reason;
+    EXPECT_FALSE(tree_svc->check_permission(g.device, "grp", acl::Permission::Read));
+
+    // Refusals.
+    EXPECT_EQ(tree_svc->set_assignment("grp", g.device, g.device, {"admin"}, reason),
+              Change::Forbidden);  // not an admin
+    EXPECT_EQ(tree_svc->set_assignment("grp", g.owner, pub(crypto_svc->ed25519_keygen()),
+                                       {"read"}, reason),
+              Change::Forbidden);  // never joined
+    EXPECT_EQ(tree_svc->set_assignment("grp", g.owner, g.owner, {"read"}, reason),
+              Change::Forbidden);  // own entry on its admin node
+    EXPECT_EQ(tree_svc->set_assignment("grp", g.owner, g.device, {"superuser"}, reason),
+              Change::Invalid);
+    EXPECT_EQ(tree_svc->set_assignment("nope", g.owner, g.device, {"read"}, reason),
+              Change::NotFound);
+    EXPECT_TRUE(tree_svc->check_permission(g.owner, "grp", acl::Permission::Admin));
+
+    // A group admin sets node-level access on a device in its group.
+    ASSERT_EQ(tree_svc->set_assignment("dev", g.owner, g.owner, {"read", "connect_private"},
+                                       reason),
+              Change::Applied) << reason;
+    EXPECT_TRUE(tree_svc->check_permission(g.owner, "dev", acl::Permission::ConnectPrivate));
+
+    // The change survives a restart.
+    restart_tree();
+    EXPECT_TRUE(tree_svc->check_permission(g.owner, "dev", acl::Permission::ConnectPrivate));
+}

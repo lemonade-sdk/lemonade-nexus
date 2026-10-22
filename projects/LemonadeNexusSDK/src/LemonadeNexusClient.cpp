@@ -1785,65 +1785,40 @@ StatusResult LemonadeNexusClient::leave_network() {
 // Group membership management
 // ---------------------------------------------------------------------------
 
-Result<DeltaResult> LemonadeNexusClient::add_group_member(const std::string& node_id,
-                                                             const GroupMember& member) {
+// The server owns assignment changes: it applies the admin and joined-identity
+// rules and replaces the key's entry in place, so a promotion never leaves a
+// stale duplicate and no client-side copy of the node is written back.
+Result<DeltaResult> LemonadeNexusClient::set_member_permissions(
+        const std::string& node_id, const std::string& pubkey,
+        const std::vector<std::string>& permissions) {
     Result<DeltaResult> result;
 
-    // Step 1: Fetch current node to get existing assignments
-    auto node_result = get_tree_node(node_id);
-    if (!node_result) {
-        result.error = "failed to fetch node: " + node_result.error;
-        result.http_status = node_result.http_status;
+    const json body = {{"pubkey", pubkey}, {"permissions", permissions}};
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/tree/node/assignments/" + node_id, body,
+                                         status);
+    result.http_status = status;
+    if (!resp) {
+        result.error = "server unreachable";
         return result;
     }
 
-    // Step 2: Append the new member as an assignment
-    TreeNode updated = node_result.value;
-    Assignment new_assignment;
-    new_assignment.management_pubkey = member.management_pubkey;
-    new_assignment.permissions       = member.permissions;
-    updated.assignments.push_back(new_assignment);
+    result.value.success = resp->value("success", false);
+    result.value.node_id = resp->value("node_id", "");
+    result.value.error   = resp->value("error", "");
+    result.ok = result.value.success;
+    if (!result.ok) result.error = result.value.error;
+    return result;
+}
 
-    // Step 3: Submit update_assignment delta
-    TreeDelta delta;
-    delta.operation      = "update_assignment";
-    delta.target_node_id = node_id;
-    delta.node_data      = updated;
-
-    return submit_delta(delta);
+Result<DeltaResult> LemonadeNexusClient::add_group_member(const std::string& node_id,
+                                                             const GroupMember& member) {
+    return set_member_permissions(node_id, member.management_pubkey, member.permissions);
 }
 
 Result<DeltaResult> LemonadeNexusClient::remove_group_member(const std::string& node_id,
                                                                 const std::string& pubkey) {
-    Result<DeltaResult> result;
-
-    // Step 1: Fetch current node
-    auto node_result = get_tree_node(node_id);
-    if (!node_result) {
-        result.error = "failed to fetch node: " + node_result.error;
-        result.http_status = node_result.http_status;
-        return result;
-    }
-
-    // Step 2: Remove the assignment matching the pubkey
-    TreeNode updated = node_result.value;
-    auto& assignments = updated.assignments;
-    auto it = std::remove_if(assignments.begin(), assignments.end(),
-        [&pubkey](const Assignment& a) { return a.management_pubkey == pubkey; });
-
-    if (it == assignments.end()) {
-        result.error = "member not found in assignments";
-        return result;
-    }
-    assignments.erase(it, assignments.end());
-
-    // Step 3: Submit update_assignment delta
-    TreeDelta delta;
-    delta.operation      = "update_assignment";
-    delta.target_node_id = node_id;
-    delta.node_data      = updated;
-
-    return submit_delta(delta);
+    return set_member_permissions(node_id, pubkey, {});
 }
 
 Result<std::vector<GroupMember>> LemonadeNexusClient::get_group_members(const std::string& node_id) {

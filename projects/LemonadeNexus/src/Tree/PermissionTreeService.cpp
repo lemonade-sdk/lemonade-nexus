@@ -312,6 +312,64 @@ bool PermissionTreeService::grant_assignment(const std::string& node_id,
     return true;
 }
 
+PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
+        const std::string& node_id, std::string_view signer, std::string_view principal,
+        const std::vector<std::string>& permissions, std::string& reason) {
+    std::lock_guard lock(mutex_);
+
+    auto it = nodes_.find(node_id);
+    if (it == nodes_.end()) {
+        reason = "node not found";
+        return AssignmentChange::NotFound;
+    }
+    const auto principal_canon = canonical_principal(principal);
+    if (principal_canon.empty()) {
+        reason = "invalid principal";
+        return AssignmentChange::Invalid;
+    }
+    for (const auto& p : permissions) {
+        if (string_to_permission(p) == acl::Permission::None) {
+            reason = "unknown permission '" + p + "'";
+            return AssignmentChange::Invalid;
+        }
+    }
+
+    const auto anchor = admin_anchor_locked(node_id, signer);
+    if (!anchor) {
+        reason = "only an admin of this node or an ancestor may change assignments";
+        return AssignmentChange::Forbidden;
+    }
+    if (*anchor == node_id && canonical_principal(signer) == principal_canon) {
+        reason = "an admin cannot change its own entry on the node that grants it";
+        return AssignmentChange::Forbidden;
+    }
+    if (!permissions.empty() && !principal_joined_under_locked(*anchor, principal)) {
+        reason = "the identity has not joined this group";
+        return AssignmentChange::Forbidden;
+    }
+
+    TreeNode updated = it->second;
+    auto& list = updated.assignments;
+    list.erase(std::remove_if(list.begin(), list.end(), [&](const Assignment& a) {
+                   return canonical_principal(a.management_pubkey) == principal_canon;
+               }),
+               list.end());
+    if (!permissions.empty()) {
+        std::vector<std::string> perms = permissions;
+        std::sort(perms.begin(), perms.end());
+        perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
+        list.push_back({std::string(principal), std::move(perms)});
+    }
+    if (!persist_node(updated)) {
+        reason = "failed to persist node";
+        return AssignmentChange::StorageError;
+    }
+    it->second = std::move(updated);
+    spdlog::info("[{}] assignments on '{}' changed for '{}' by '{}'", name(), node_id,
+                 std::string(principal).substr(0, 24), std::string(signer).substr(0, 24));
+    return AssignmentChange::Applied;
+}
+
 // --- ITreeProvider ---
 
 acl::Permission PermissionTreeService::required_permission_for(std::string_view op) {
