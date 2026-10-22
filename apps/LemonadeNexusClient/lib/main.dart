@@ -70,10 +70,11 @@ class _AppShellState extends ConsumerState<AppShell> {
 
   @override
   Widget build(BuildContext context) {
-    final appState = ref.watch(appNotifierProvider);
+    final isAuthenticated =
+        ref.watch(appNotifierProvider.select((s) => s.isAuthenticated));
 
     // Show login view if not authenticated, otherwise show main navigation
-    if (!appState.isAuthenticated) {
+    if (!isAuthenticated) {
       return const LoginView();
     }
 

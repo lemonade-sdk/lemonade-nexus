@@ -23,7 +23,14 @@ class MainNavigation extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final appState = ref.watch(appNotifierProvider);
+    // Only the fields the shell shows: a whole-state watch rebuilt the window
+    // on every periodic refresh.
+    final view = ref.watch(appNotifierProvider.select((s) => _ShellView(
+          isAuthenticated: s.isAuthenticated,
+          isServerHealthy: s.isServerHealthy,
+          selectedSidebarItem: s.selectedSidebarItem,
+          username: s.username,
+        )));
     final scheme = Theme.of(context).colorScheme;
 
     return Scaffold(
@@ -35,9 +42,9 @@ class MainNavigation extends ConsumerWidget {
               color: scheme.surface,
               border: Border(right: BorderSide(color: scheme.outline, width: 0.5)),
             ),
-            child: _Sidebar(appState: appState),
+            child: _Sidebar(appState: view),
           ),
-          Expanded(child: _content(appState.selectedSidebarItem)),
+          Expanded(child: _content(view.selectedSidebarItem)),
         ],
       ),
     );
@@ -67,8 +74,34 @@ class MainNavigation extends ConsumerWidget {
   }
 }
 
+/// The slice of [AppState] the navigation shell renders.
+class _ShellView {
+  final bool isAuthenticated;
+  final bool isServerHealthy;
+  final SidebarItem selectedSidebarItem;
+  final String? username;
+  const _ShellView({
+    required this.isAuthenticated,
+    required this.isServerHealthy,
+    required this.selectedSidebarItem,
+    required this.username,
+  });
+
+  @override
+  bool operator ==(Object other) =>
+      other is _ShellView &&
+      other.isAuthenticated == isAuthenticated &&
+      other.isServerHealthy == isServerHealthy &&
+      other.selectedSidebarItem == selectedSidebarItem &&
+      other.username == username;
+
+  @override
+  int get hashCode =>
+      Object.hash(isAuthenticated, isServerHealthy, selectedSidebarItem, username);
+}
+
 class _Sidebar extends ConsumerWidget {
-  final AppState appState;
+  final _ShellView appState;
   const _Sidebar({required this.appState});
 
   @override

@@ -8,7 +8,6 @@
 /// - Bandwidth and latency display
 library;
 
-import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
@@ -29,25 +28,19 @@ class _PeersViewState extends ConsumerState<PeersView> {
   final _searchController = TextEditingController();
   String _searchQuery = '';
   MeshPeer? _selectedPeer;
-  Timer? _refreshTimer;
-
   @override
   void initState() {
     super.initState();
-    _startAutoRefresh();
+    // AppNotifier refreshes mesh status every 5s; fetch once now so the view
+    // opens current.
+    WidgetsBinding.instance.addPostFrameCallback(
+        (_) => ref.read(appNotifierProvider.notifier).refreshMeshStatus());
   }
 
   @override
   void dispose() {
     _searchController.dispose();
-    _refreshTimer?.cancel();
     super.dispose();
-  }
-
-  void _startAutoRefresh() {
-    _refreshTimer = Timer.periodic(const Duration(seconds: 5), (_) {
-      ref.read(appNotifierProvider.notifier).refreshMeshStatus();
-    });
   }
 
   List<MeshPeer> get _filteredPeers {

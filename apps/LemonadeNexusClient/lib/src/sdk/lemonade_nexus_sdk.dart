@@ -200,9 +200,13 @@ class LemonadeNexusSdk {
   /// tears down its boringtun dataplane (the tunnel), which is owned by value
   /// inside the C client.
   void _destroyClient() {
-    if (_client != null) {
-      _ffi.destroy(_client!);
-      _client = null;
+    final client = _client;
+    if (client == null) return;
+    _client = null;
+    if ((_inFlight[client.address] ?? 0) > 0) {
+      _destroyPending.add(client.address);
+    } else {
+      _ffi.destroy(client);
     }
   }
 
@@ -349,7 +353,7 @@ class LemonadeNexusSdk {
   Future<Map<String, dynamic>> createLinkToken({int ttlSec = 600}) async {
     _checkDisposed();
     _checkConnected();
-    final (error, json) = _ffi.linkTokenCreate(_client!, ttlSec);
+    final (error, json) = await _offThread((f, c) => f.linkTokenCreate(c, ttlSec));
     if (error != LnError.success || json == null) {
       String? reason;
       if (json != null) {
@@ -371,7 +375,7 @@ class LemonadeNexusSdk {
   Future<HealthResponse> health() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.health(_client!);
+    final json = await _offThread((f, c) => f.health(c));
     if (json == null) {
       throw SdkException(LnError.connect, message: 'Health check failed');
     }
@@ -386,7 +390,7 @@ class LemonadeNexusSdk {
   Future<AuthResponse> authPassword(String username, String password) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.authPassword(_client!, username, password);
+    final json = await _offThread((f, c) => f.authPassword(c, username, password));
     if (json == null) {
       throw SdkException(LnError.auth, message: 'Authentication failed');
     }
@@ -398,7 +402,7 @@ class LemonadeNexusSdk {
     _checkDisposed();
     _checkConnected();
     final json = jsonEncode(passkeyData);
-    final result = _ffi.authPasskey(_client!, json);
+    final result = await _offThread((f, c) => f.authPasskey(c, json));
     if (result == null) {
       throw SdkException(LnError.auth, message: 'Passkey authentication failed');
     }
@@ -411,7 +415,7 @@ class LemonadeNexusSdk {
   Future<String> getPasskeyChallenge(String userId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.authPasskeyChallenge(_client!, userId);
+    final json = await _offThread((f, c) => f.authPasskeyChallenge(c, userId));
     if (json == null) {
       throw SdkException(LnError.connect,
           message: 'Passkey challenge request failed');
@@ -427,7 +431,7 @@ class LemonadeNexusSdk {
   Future<AuthResponse> authToken(String token) async {
     _checkDisposed();
     _checkConnected();
-    final result = _ffi.authToken(_client!, token);
+    final result = await _offThread((f, c) => f.authToken(c, token));
     if (result == null) {
       throw SdkException(LnError.auth, message: 'Token authentication failed');
     }
@@ -455,13 +459,8 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final result = _ffi.registerPasskey(
-      _client!,
-      userId,
-      credentialId,
-      publicKeyX,
-      publicKeyY,
-    );
+    final result = await _offThread((f, c) =>
+        f.registerPasskey(c, userId, credentialId, publicKeyX, publicKeyY));
     if (result == null) {
       throw SdkException(LnError.auth, message: 'Failed to register passkey');
     }
@@ -476,7 +475,7 @@ class LemonadeNexusSdk {
   Future<TreeNode> getNode(String nodeId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.treeGetNode(_client!, nodeId);
+    final json = await _offThread((f, c) => f.treeGetNode(c, nodeId));
     if (json == null) {
       throw SdkException(LnError.notFound, message: 'Node not found: $nodeId');
     }
@@ -488,7 +487,7 @@ class LemonadeNexusSdk {
     _checkDisposed();
     _checkConnected();
     final json = jsonEncode(delta);
-    final result = _ffi.treeSubmitDelta(_client!, json);
+    final result = await _offThread((f, c) => f.treeSubmitDelta(c, json));
     if (result == null) {
       throw SdkException(LnError.internal, message: 'Failed to submit delta');
     }
@@ -502,7 +501,7 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.createChildNode(_client!, parentId, nodeType);
+    final json = await _offThread((f, c) => f.createChildNode(c, parentId, nodeType));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to create child node');
     }
@@ -517,7 +516,7 @@ class LemonadeNexusSdk {
     _checkDisposed();
     _checkConnected();
     final json = jsonEncode(updates);
-    final result = _ffi.updateNode(_client!, nodeId, json);
+    final result = await _offThread((f, c) => f.updateNode(c, nodeId, json));
     if (result == null) {
       throw SdkException(LnError.internal, message: 'Failed to update node');
     }
@@ -528,7 +527,7 @@ class LemonadeNexusSdk {
   Future<void> deleteNode(String nodeId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.deleteNode(_client!, nodeId);
+    final json = await _offThread((f, c) => f.deleteNode(c, nodeId));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to delete node');
     }
@@ -539,7 +538,7 @@ class LemonadeNexusSdk {
   Future<List<TreeNode>> getChildren(String parentId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.treeGetChildren(_client!, parentId);
+    final json = await _offThread((f, c) => f.treeGetChildren(c, parentId));
     if (json == null) {
       throw SdkException(LnError.notFound, message: 'Parent not found: $parentId');
     }
@@ -557,7 +556,7 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.ipamAllocate(_client!, nodeId, blockType);
+    final json = await _offThread((f, c) => f.ipamAllocate(c, nodeId, blockType));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to allocate IP');
     }
@@ -572,7 +571,7 @@ class LemonadeNexusSdk {
   Future<List<RelayInfo>> listRelays() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.relayList(_client!);
+    final json = await _offThread((f, c) => f.relayList(c));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to list relays');
     }
@@ -586,7 +585,7 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.relayTicket(_client!, peerId, relayId);
+    final json = await _offThread((f, c) => f.relayTicket(c, peerId, relayId));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get relay ticket');
     }
@@ -598,7 +597,7 @@ class LemonadeNexusSdk {
     _checkDisposed();
     _checkConnected();
     final json = jsonEncode(registrationData);
-    final result = _ffi.relayRegister(_client!, json);
+    final result = await _offThread((f, c) => f.relayRegister(c, json));
     if (result == null) {
       throw SdkException(LnError.internal, message: 'Failed to register relay');
     }
@@ -613,7 +612,7 @@ class LemonadeNexusSdk {
   Future<CertStatus> getCertStatus(String domain) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.certStatus(_client!, domain);
+    final json = await _offThread((f, c) => f.certStatus(c, domain));
     if (json == null) {
       throw SdkException(LnError.notFound, message: 'Cert not found for: $domain');
     }
@@ -624,7 +623,7 @@ class LemonadeNexusSdk {
   Future<Map<String, dynamic>> requestCert(String hostname) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.certRequest(_client!, hostname);
+    final json = await _offThread((f, c) => f.certRequest(c, hostname));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to request cert');
     }
@@ -655,7 +654,7 @@ class LemonadeNexusSdk {
     _checkDisposed();
     _checkConnected();
     final json = jsonEncode(permissions);
-    final result = _ffi.addGroupMember(_client!, nodeId, pubkey, json);
+    final result = await _offThread((f, c) => f.addGroupMember(c, nodeId, pubkey, json));
     if (result == null) {
       throw SdkException(LnError.internal, message: 'Failed to add group member');
     }
@@ -669,7 +668,7 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.removeGroupMember(_client!, nodeId, pubkey);
+    final json = await _offThread((f, c) => f.removeGroupMember(c, nodeId, pubkey));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to remove group member');
     }
@@ -680,7 +679,7 @@ class LemonadeNexusSdk {
   Future<List<GroupMember>> getGroupMembers(String nodeId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.getGroupMembers(_client!, nodeId);
+    final json = await _offThread((f, c) => f.getGroupMembers(c, nodeId));
     if (json == null) {
       throw SdkException(LnError.notFound, message: 'Group not found: $nodeId');
     }
@@ -691,7 +690,7 @@ class LemonadeNexusSdk {
   Future<GroupJoinResponse> joinGroup(String parentNodeId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.joinGroup(_client!, parentNodeId);
+    final json = await _offThread((f, c) => f.joinGroup(c, parentNodeId));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to join group');
     }
@@ -709,7 +708,7 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.joinNetwork(_client!, username, password);
+    final json = await _offThread((f, c) => f.joinNetwork(c, username, password));
     if (json == null) {
       throw SdkException(LnError.auth, message: 'Failed to join network');
     }
@@ -720,7 +719,7 @@ class LemonadeNexusSdk {
   Future<void> leaveNetwork() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.leaveNetwork(_client!);
+    final json = await _offThread((f, c) => f.leaveNetwork(c));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to leave network');
     }
@@ -786,7 +785,7 @@ class LemonadeNexusSdk {
   Future<void> enableMesh() async {
     _checkDisposed();
     _checkConnected();
-    final error = _ffi.meshEnable(_client!);
+    final error = await _offThread((f, c) => f.meshEnable(c));
     if (error != LnError.success) {
       throw SdkException(error, message: 'Failed to enable mesh');
     }
@@ -797,7 +796,7 @@ class LemonadeNexusSdk {
     _checkDisposed();
     _checkConnected();
     final json = jsonEncode(config);
-    final error = _ffi.meshEnableConfig(_client!, json);
+    final error = await _offThread((f, c) => f.meshEnableConfig(c, json));
     if (error != LnError.success) {
       throw SdkException(error, message: 'Failed to enable mesh with config');
     }
@@ -839,7 +838,7 @@ class LemonadeNexusSdk {
   Future<void> refreshMesh() async {
     _checkDisposed();
     _checkConnected();
-    final error = _ffi.meshRefresh(_client!);
+    final error = await _offThread((f, c) => f.meshRefresh(c));
     if (error != LnError.success) {
       throw SdkException(error, message: 'Failed to refresh mesh');
     }
@@ -853,7 +852,7 @@ class LemonadeNexusSdk {
   Future<ServiceStats> getStats() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.stats(_client!);
+    final json = await _offThread((f, c) => f.stats(c));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get stats');
     }
@@ -864,7 +863,7 @@ class LemonadeNexusSdk {
   Future<List<ServerInfo>> listServers() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.servers(_client!);
+    final json = await _offThread((f, c) => f.servers(c));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to list servers');
     }
@@ -879,7 +878,7 @@ class LemonadeNexusSdk {
   Future<DdnsStatus> getDdnsStatus() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.ddnsStatus(_client!);
+    final json = await _offThread((f, c) => f.ddnsStatus(c));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get DDNS status');
     }
@@ -894,7 +893,7 @@ class LemonadeNexusSdk {
   Future<List<AttestationManifest>> getAttestationManifests() async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.attestationManifests(_client!);
+    final json = await _offThread((f, c) => f.attestationManifests(c));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get manifests');
     }
@@ -952,7 +951,7 @@ class LemonadeNexusSdk {
   Future<Map<String, dynamic>> routingProfile({int page = 0, int pageSize = 200}) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.routingProfile(_client!, page: page, pageSize: pageSize);
+    final json = await _offThread((f, c) => f.routingProfile(c, page: page, pageSize: pageSize));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get routing profile');
     }
@@ -970,8 +969,8 @@ class LemonadeNexusSdk {
   }) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.routingRequest(_client!, identifier, connNonceB64,
-        clientMeshPubkey: clientMeshPubkey);
+    final json = await _offThread((f, c) => f.routingRequest(c, identifier, connNonceB64,
+        clientMeshPubkey: clientMeshPubkey));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Routing request failed');
     }
@@ -981,18 +980,43 @@ class LemonadeNexusSdk {
   /// Generic authenticated call to a private-mesh API route (e.g. /api/chats).
   /// [method] is "GET" or "POST"; [body] is sent as JSON for POST. Returns the
   /// raw response body decoded as a JSON object. Requires the mesh tunnel.
-  /// Run a private-API call on a worker isolate. These ride the mesh tunnel and
-  /// block for the full connect/read timeout when it is down; on the UI isolate
-  /// that freezes the app. The native side guards the client with a mutex.
-  Future<String?> _privateApiRaw(String method, String path, String body) {
+  /// Native calls that make network requests run on a worker isolate: on the
+  /// UI isolate each one would block frame rendering for the full round trip
+  /// (or the connect/read timeout when a server is down). The native client
+  /// guards its shared transport state, so concurrent calls are safe.
+  ///
+  /// The client handle stays alive until every call that uses it returns:
+  /// [_destroyClient] defers the native destroy while calls are in flight.
+  Future<T> _offThread<T>(
+      T Function(LemonadeNexusFfi f, ffi.Pointer<ffi.Void> c) call) async {
     final address = _client!.address;
     final libraryPath = _libraryPath;
-    return Isolate.run(() {
-      final bindings = LemonadeNexusFfi(libraryPath: libraryPath);
-      return bindings.privateApiCall(
-          ffi.Pointer<ffi.Void>.fromAddress(address), method, path, body);
-    });
+    _inFlight[address] = (_inFlight[address] ?? 0) + 1;
+    try {
+      return await Isolate.run(() => call(LemonadeNexusFfi(libraryPath: libraryPath),
+          ffi.Pointer<ffi.Void>.fromAddress(address)));
+    } finally {
+      final left = (_inFlight[address] ?? 1) - 1;
+      if (left > 0) {
+        _inFlight[address] = left;
+      } else {
+        _inFlight.remove(address);
+        if (_destroyPending.remove(address)) {
+          _ffi.destroy(ffi.Pointer<ffi.Void>.fromAddress(address));
+        }
+      }
+    }
   }
+
+  /// Background calls in flight per native client address, and clients whose
+  /// destroy waits for those calls to finish.
+  final Map<int, int> _inFlight = {};
+  final Set<int> _destroyPending = {};
+
+  /// Private-API calls ride the mesh tunnel; they run off the UI isolate like
+  /// every other network call (see [_offThread]).
+  Future<String?> _privateApiRaw(String method, String path, String body) =>
+      _offThread((f, c) => f.privateApiCall(c, method, path, body));
 
   Future<Map<String, dynamic>> privateApiCall(String method, String path,
       {Map<String, dynamic>? body}) async {
@@ -1024,7 +1048,7 @@ class LemonadeNexusSdk {
   Future<Map<String, dynamic>> routingConnectionStatus(String connectionId) async {
     _checkDisposed();
     _checkConnected();
-    final json = _ffi.routingConnectionStatus(_client!, connectionId);
+    final json = await _offThread((f, c) => f.routingConnectionStatus(c, connectionId));
     if (json == null) {
       throw SdkException(LnError.internal, message: 'Failed to get connection status');
     }
