@@ -2,6 +2,7 @@
 
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/Tree/ITreeProvider.hpp>
+#include <LemonadeNexus/Tree/TreeOps.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 
@@ -85,6 +86,29 @@ public:
                                                   const std::vector<std::string>& permissions,
                                                   std::string& reason);
 
+    // --- Tree operations (Phase 1: applied locally, see TreeOps.hpp) ---
+
+    /// Validate `op` against the current tree, `policy`, and this service's
+    /// committed op ids at `block_time_sec`, without applying it. Thread-safe.
+    [[nodiscard]] TreeOpVerdict validate_local_op(const TreeOp& op, const TreeOpPolicy& policy,
+                                                  uint64_t block_time_sec) const;
+
+    /// Validate `op` as validate_local_op does and, when it is accepted, apply
+    /// it through apply_op, both under one lock so no other write intervenes.
+    /// `block_time_sec` is the local time in Phase 1. Thread-safe.
+    [[nodiscard]] TreeOpVerdict submit_local_op(const TreeOp& op, const TreeOpPolicy& policy,
+                                                uint64_t block_time_sec);
+
+    /// The one mutation path for tree operations: write the nodes plan_op
+    /// computes (each with its incremented version), keep the identifier
+    /// index in sync, and record the op id and statement id as committed. An
+    /// op from a signed delta is also appended to the delta log and offered to
+    /// the retention sink, as do_apply_delta does. Precondition: the op passed
+    /// validate_op against the current tree. A refused plan changes nothing.
+    /// A storage failure can leave an op that writes several nodes partly
+    /// persisted (Phase 1 has no durable multi-node write). Thread-safe.
+    [[nodiscard]] TreeOpVerdict apply_op(const TreeOp& op);
+
     // --- Delta statement authorization (shared with record acceptance) ---
 
     /// Outcome of evaluating a delta statement against the current tree.
@@ -165,48 +189,19 @@ public:
     [[nodiscard]] std::vector<TreeNode> do_get_nodes_by_type(NodeType type) const;
 
 private:
-    /// True when another node already stores exactly this mesh public key. Caller
-    /// holds mutex_. The API layer additionally compares normalized keys; this
-    /// backstop keeps the one-key-one-node invariant for every caller.
-    [[nodiscard]] bool mesh_pubkey_taken_locked(const std::string& mesh_pubkey,
-                                                const std::string& own_id) const;
-
     /// Persist a tree node to storage wrapped in a SignedEnvelope.
     bool persist_node(const TreeNode& node);
 
     /// Remove a tree node from storage.
     bool remove_node(std::string_view node_id);
 
-    /// Map a permission string (from assignments) to an acl::Permission flag.
-    [[nodiscard]] static acl::Permission string_to_permission(std::string_view perm_str);
+    /// apply_op with mutex_ held.
+    [[nodiscard]] TreeOpVerdict apply_op_locked(const TreeOp& op);
 
-    /// Signer holds the required permission via an assignment on the node.
-    /// Caller holds mutex_.
-    [[nodiscard]] bool signer_has_permission_locked(const TreeNode& node,
-                                                    std::string_view signer_pubkey,
-                                                    acl::Permission required) const;
-
-    /// The nearest node, starting at `node_id` and walking up the parent
-    /// chain, on which the signer holds `admin`. nullopt when there is none.
-    /// This anchor bounds what the signer may administer: the anchor and its
-    /// subtree. Caller holds mutex_.
-    [[nodiscard]] std::optional<std::string> admin_anchor_locked(
-            std::string_view node_id, std::string_view signer_pubkey) const;
-
-    /// True when `principal` is the management key of a node at or beneath
-    /// `scope_id` — a joined identity, not an arbitrary key. Caller holds mutex_.
-    [[nodiscard]] bool principal_joined_under_locked(std::string_view scope_id,
-                                                     std::string_view principal) const;
-
-    /// Content rules a delta must satisfy beyond the operation permission:
-    /// an update keeps the node's identity (id, parent, type, management key,
-    /// endpoint identifier); only an admin of the node or an ancestor changes
-    /// assignments, and only for joined identities in that admin's subtree;
-    /// a create names no one but the signer unless the signer administers the
-    /// parent; the root is never created or deleted. Returns the refusal
-    /// reason, or nullopt when the delta is acceptable. Caller holds mutex_.
-    [[nodiscard]] std::optional<std::string> delta_content_refusal_locked(
-            const TreeDelta& delta) const;
+    /// Append an applied delta to the delta log and offer it to the retention
+    /// sink. Neither failure rolls back the applied mutation. Returns the log
+    /// sequence number (0 when the append failed). Caller holds mutex_.
+    uint64_t record_applied_delta_locked(const TreeDelta& delta);
 
     std::function<bool(const storage::FileStorageService::RetainedDelta&)> delta_retention_sink_;
 
@@ -219,12 +214,16 @@ private:
     std::unordered_map<std::string, TreeNode> nodes_;
 
     // Reverse index: endpoint_identifier -> node_id. Kept in sync with nodes_ in
-    // on_start / insert_join_node / update_node_direct / delete_node_direct so
-    // resolve_by_identifier is O(1) and new colliding registrations are rejected.
+    // on_start / insert_join_node / update_node_direct / delete_node_direct /
+    // apply_op so resolve_by_identifier is O(1) and new colliding registrations
+    // are rejected.
     std::unordered_map<std::string, std::string> identifier_index_;
 
     // Replay protection: SHA-256 hash of canonical delta → timestamp of receipt
     std::unordered_map<std::string, uint64_t> recent_deltas_;
+
+    // Op ids and statement ids applied through apply_op (tree operations).
+    CommittedOpIds committed_ops_;
 };
 
 } // namespace nexus::tree

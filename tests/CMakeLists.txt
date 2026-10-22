@@ -24,6 +24,28 @@ function(add_nexus_test TEST_NAME)
     gtest_discover_tests(${TEST_NAME} DISCOVERY_TIMEOUT 120)
 endfunction()
 
+# Flag-on build of an existing suite: the same source compiled with
+# NEXUS_TEST_TREE_OPS, so every case runs with ServerConfig::tree_ops_enabled.
+# CTest names get a ".TreeOps" suffix so both builds can be listed together.
+function(add_nexus_tree_ops_test TEST_NAME)
+    add_executable(${TEST_NAME} ${ARGN})
+    target_link_libraries(${TEST_NAME} PRIVATE
+        LemonadeNexus
+        GTest::gtest_main
+        GTest::gmock
+    )
+    target_compile_definitions(${TEST_NAME} PRIVATE
+        ASIO_STANDALONE
+        ASIO_NO_DEPRECATED
+        NEXUS_TEST_TREE_OPS=1
+    )
+    target_include_directories(${TEST_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(WIN32)
+        target_link_libraries(${TEST_NAME} PRIVATE ws2_32 mswsock iphlpapi)
+    endif()
+    gtest_discover_tests(${TEST_NAME} DISCOVERY_TIMEOUT 120 TEST_SUFFIX ".TreeOps")
+endfunction()
+
 # --- Unit tests ---
 add_nexus_test(test_version            test_version.cpp)
 add_nexus_test(test_acl_store          test_acl_store.cpp)
@@ -32,6 +54,7 @@ add_nexus_test(test_sodium_crypto      test_sodium_crypto.cpp)
 add_nexus_test(test_key_wrapping       test_key_wrapping.cpp)
 add_nexus_test(test_file_storage       test_file_storage.cpp)
 add_nexus_test(test_permission_tree    test_permission_tree.cpp)
+add_nexus_test(test_tree_ops           test_tree_ops.cpp)
 add_nexus_test(test_account_data       test_account_data.cpp)
 add_nexus_test(test_mesh_rekey         test_mesh_rekey.cpp)
 add_nexus_test(test_routing_identifier test_routing_identifier.cpp)
@@ -44,6 +67,7 @@ add_nexus_test(test_credential_unrevoke test_credential_unrevoke.cpp)
 add_nexus_test(test_passkey_challenge test_passkey_challenge.cpp)
 add_nexus_test(test_passkey_challenge_http test_passkey_challenge_http.cpp)
 add_nexus_test(test_root_bootstrap test_root_bootstrap.cpp)
+add_nexus_tree_ops_test(test_root_bootstrap_tree_ops test_root_bootstrap.cpp)
 add_nexus_test(test_api_authz_f34e test_api_authz_f34e.cpp)
 add_nexus_test(test_sdk_passkey_challenge test_sdk_passkey_challenge.cpp)
 target_link_libraries(test_sdk_passkey_challenge PRIVATE LemonadeNexusSDK)
@@ -280,6 +304,7 @@ add_sdk_test(test_sdk_capi_mesh       test_sdk_capi_mesh.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)
+add_nexus_tree_ops_test(test_http_endpoints_tree_ops test_http_endpoints.cpp)
 add_nexus_test(test_virtual_e2e        test_virtual_e2e.cpp)
 
 if(UNIX)

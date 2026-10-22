@@ -19,7 +19,10 @@ namespace nexus::core {
     class ServerAdmissionService;
 }
 namespace nexus::auth { class AuthService; }
-namespace nexus::tree { class PermissionTreeService; }
+namespace nexus::tree {
+    class PermissionTreeService;
+    class TreeOpSubmitter;
+}
 namespace nexus::ipam { class IPAMService; }
 namespace nexus::gossip { class GossipService; }
 namespace nexus::crypto {
@@ -72,6 +75,10 @@ struct ApiContext {
     std::string                       server_private_fqdn;  // private.<id>.<region>.seip.<domain>
     std::string                       server_public_ip;
     std::string                       tunnel_bind_ip;
+    /// Local tree-operation submitter (not owned). Required when
+    /// config.tree_ops_enabled; the tree write routes then answer 500 without
+    /// it instead of falling back to the direct write paths. Unused otherwise.
+    tree::TreeOpSubmitter*            tree_ops{nullptr};
 };
 
 // ---------------------------------------------------------------------------

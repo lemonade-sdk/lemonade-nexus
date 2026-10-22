@@ -13,6 +13,7 @@
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -771,6 +772,26 @@ int main(int argc, char* argv[]) {
     admission.start();
 
     // ========================================================================
+    // Experimental tree operations (Phase 1): local only, off by default
+    // ========================================================================
+    std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
+    if (config.tree_ops_enabled) {
+        const auto network_bytes = nexus::crypto::from_hex(security_mesh->network_id_hex);
+        nexus::security::NetworkId network_id{};
+        if (network_bytes.size() != network_id.size()) {
+            spdlog::error("Config: tree_ops_enabled needs the Genesis network id");
+            return 1;
+        }
+        std::copy(network_bytes.begin(), network_bytes.end(), network_id.begin());
+        // Ops are signed with this server's gossip identity under their own
+        // domain tag; the key never leaves GossipService.
+        tree_ops = std::make_unique<nexus::tree::TreeOpSubmitter>(
+            tree, crypto, network_id, gossip.keypair());
+        spdlog::warn("EXPERIMENTAL: tree operations enabled (Phase 1). Tree writes apply "
+                     "locally through validate_op/apply_op; they are not replicated.");
+    }
+
+    // ========================================================================
     // Register CRTP request handlers
     // ========================================================================
     nexus::api::ApiContext ctx{
@@ -797,6 +818,7 @@ int main(int argc, char* argv[]) {
         .server_private_fqdn = server_private_fqdn,
         .server_public_ip = server_public_ip,
         .tunnel_bind_ip   = tunnel_bind_ip,
+        .tree_ops         = tree_ops.get(),
     };
 
     nexus::api::PublicApiHandler public_api{ctx};

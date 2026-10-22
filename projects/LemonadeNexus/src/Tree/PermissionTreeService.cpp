@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
+#include <LemonadeNexus/Tree/TreeRules.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -130,7 +131,7 @@ bool PermissionTreeService::insert_join_node(const TreeNode& node) {
     // Same rule for the transport static: one key, one node. The API layer
     // refuses equivalence-aware claims first; this exact-match backstop holds
     // the invariant against any other caller.
-    if (mesh_pubkey_taken_locked(node.mesh_pubkey, node.id)) {
+    if (rules::mesh_pubkey_taken(nodes_, node.mesh_pubkey, node.id)) {
         spdlog::error("[{}] insert_join_node: mesh public key already bound to another "
                       "node — rejecting node '{}'",
                       name(), node.id);
@@ -164,7 +165,7 @@ bool PermissionTreeService::update_node_direct(const std::string& node_id,
         return false;
     }
 
-    if (mesh_pubkey_taken_locked(updated.mesh_pubkey, node_id)) {
+    if (rules::mesh_pubkey_taken(nodes_, updated.mesh_pubkey, node_id)) {
         spdlog::error("[{}] update_node_direct: mesh public key already bound to another "
                       "node — rejecting update of '{}'",
                       name(), node_id);
@@ -258,15 +259,6 @@ bool PermissionTreeService::delete_node_direct(const std::string& node_id) {
     return true;
 }
 
-bool PermissionTreeService::mesh_pubkey_taken_locked(const std::string& mesh_pubkey,
-                                                     const std::string& own_id) const {
-    if (mesh_pubkey.empty()) return false;
-    for (const auto& [id, node] : nodes_) {
-        if (id != own_id && node.mesh_pubkey == mesh_pubkey) return true;
-    }
-    return false;
-}
-
 bool PermissionTreeService::is_mgmt_pubkey_in_use(const std::string& mgmt_pubkey) const {
     if (mgmt_pubkey.empty()) return false;
     // Match on key bytes: this is the owner-protection guard on revocation, so a
@@ -315,7 +307,7 @@ bool PermissionTreeService::grant_assignment(const std::string& node_id,
 bool PermissionTreeService::administers(std::string_view signer,
                                         std::string_view node_id) const {
     std::lock_guard lock(mutex_);
-    return admin_anchor_locked(node_id, signer).has_value();
+    return rules::admin_anchor(nodes_, node_id, signer).has_value();
 }
 
 PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
@@ -323,49 +315,19 @@ PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
         const std::vector<std::string>& permissions, std::string& reason) {
     std::lock_guard lock(mutex_);
 
-    auto it = nodes_.find(node_id);
-    if (it == nodes_.end()) {
-        reason = "node not found";
-        return AssignmentChange::NotFound;
-    }
-    const auto principal_canon = canonical_principal(principal);
-    if (principal_canon.empty()) {
-        reason = "invalid principal";
-        return AssignmentChange::Invalid;
-    }
-    for (const auto& p : permissions) {
-        if (string_to_permission(p) == acl::Permission::None) {
-            reason = "unknown permission '" + p + "'";
-            return AssignmentChange::Invalid;
+    if (const auto ruling = rules::assignment_change_refusal(nodes_, node_id, signer,
+                                                             principal, permissions)) {
+        reason = ruling->reason;
+        switch (ruling->refusal) {
+            case rules::AssignmentRefusal::NotFound:  return AssignmentChange::NotFound;
+            case rules::AssignmentRefusal::Forbidden: return AssignmentChange::Forbidden;
+            case rules::AssignmentRefusal::Invalid:   return AssignmentChange::Invalid;
         }
     }
 
-    const auto anchor = admin_anchor_locked(node_id, signer);
-    if (!anchor) {
-        reason = "only an admin of this node or an ancestor may change assignments";
-        return AssignmentChange::Forbidden;
-    }
-    if (*anchor == node_id && canonical_principal(signer) == principal_canon) {
-        reason = "an admin cannot change its own entry on the node that grants it";
-        return AssignmentChange::Forbidden;
-    }
-    if (!permissions.empty() && !principal_joined_under_locked(*anchor, principal)) {
-        reason = "the identity has not joined this group";
-        return AssignmentChange::Forbidden;
-    }
-
+    auto it = nodes_.find(node_id);
     TreeNode updated = it->second;
-    auto& list = updated.assignments;
-    list.erase(std::remove_if(list.begin(), list.end(), [&](const Assignment& a) {
-                   return canonical_principal(a.management_pubkey) == principal_canon;
-               }),
-               list.end());
-    if (!permissions.empty()) {
-        std::vector<std::string> perms = permissions;
-        std::sort(perms.begin(), perms.end());
-        perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
-        list.push_back({std::string(principal), std::move(perms)});
-    }
+    rules::replace_assignment(updated.assignments, principal, permissions);
     if (!persist_node(updated)) {
         reason = "failed to persist node";
         return AssignmentChange::StorageError;
@@ -379,165 +341,7 @@ PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
 // --- ITreeProvider ---
 
 acl::Permission PermissionTreeService::required_permission_for(std::string_view op) {
-    if (op == "create_node") return acl::Permission::AddChild;
-    if (op == "update_node" || op == "allocate_ip" || op == "register_relay" ||
-        op == "update_assignment") return acl::Permission::EditNode;
-    if (op == "delete_node") return acl::Permission::DeleteNode;
-    return acl::Permission::None;
-}
-
-bool PermissionTreeService::signer_has_permission_locked(const TreeNode& node,
-                                                         std::string_view signer_pubkey,
-                                                         acl::Permission required) const {
-    // Same key-bytes match as check_permission, or reads and writes disagree
-    // on who a principal is.
-    const auto signer_canon = canonical_principal(signer_pubkey);
-    for (const auto& assignment : node.assignments) {
-        if (canonical_principal(assignment.management_pubkey) != signer_canon) continue;
-        for (const auto& perm_str : assignment.permissions) {
-            if (acl::has_permission(string_to_permission(perm_str), required)) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-std::optional<std::string> PermissionTreeService::admin_anchor_locked(
-        std::string_view node_id, std::string_view signer_pubkey) const {
-    std::unordered_set<std::string> visited;
-    std::string current(node_id);
-    while (!current.empty() && visited.insert(current).second) {
-        auto it = nodes_.find(current);
-        if (it == nodes_.end()) return std::nullopt;
-        if (signer_has_permission_locked(it->second, signer_pubkey,
-                                         acl::Permission::Admin)) {
-            return current;
-        }
-        current = it->second.parent_id;
-    }
-    return std::nullopt;
-}
-
-bool PermissionTreeService::principal_joined_under_locked(std::string_view scope_id,
-                                                          std::string_view principal) const {
-    const auto principal_canon = canonical_principal(principal);
-    if (principal_canon.empty()) return false;
-    for (const auto& [id, node] : nodes_) {
-        if (canonical_principal(node.mgmt_pubkey) != principal_canon) continue;
-        // Walk up from the candidate; a parent loop ends the walk unmatched.
-        std::unordered_set<std::string> visited;
-        std::string current = id;
-        while (!current.empty() && visited.insert(current).second) {
-            if (current == scope_id) return true;
-            auto it = nodes_.find(current);
-            if (it == nodes_.end()) break;
-            current = it->second.parent_id;
-        }
-    }
-    return false;
-}
-
-namespace {
-
-/// Principal -> sorted permission strings, keyed by key bytes so the two
-/// base64 spellings of one key are the same principal.
-std::unordered_map<std::string, std::vector<std::string>>
-assignment_map(const std::vector<Assignment>& assignments) {
-    std::unordered_map<std::string, std::vector<std::string>> out;
-    for (const auto& a : assignments) {
-        auto& perms = out[canonical_principal(a.management_pubkey)];
-        perms.insert(perms.end(), a.permissions.begin(), a.permissions.end());
-    }
-    for (auto& [_, perms] : out) {
-        std::sort(perms.begin(), perms.end());
-        perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
-    }
-    return out;
-}
-
-} // namespace
-
-std::optional<std::string> PermissionTreeService::delta_content_refusal_locked(
-        const TreeDelta& delta) const {
-    const auto& op = delta.operation;
-    const auto& data = delta.node_data;
-
-    if (op == "delete_node") {
-        auto it = nodes_.find(delta.target_node_id);
-        if (it != nodes_.end() && it->second.parent_id.empty()) {
-            return std::string{"the root node cannot be deleted"};
-        }
-        return std::nullopt;
-    }
-
-    if (op == "create_node") {
-        if (data.type == NodeType::Root || data.parent_id.empty()) {
-            return std::string{"a root node cannot be created"};
-        }
-        // A creator owns what it creates, and the new node's own management
-        // key joins with it. Naming anyone else is a grant, and grants belong
-        // to an administrator of the parent.
-        const auto signer_canon = canonical_principal(delta.signer_pubkey);
-        const auto own_canon = canonical_principal(data.mgmt_pubkey);
-        bool names_others = false;
-        for (const auto& a : data.assignments) {
-            const auto canon = canonical_principal(a.management_pubkey);
-            if (canon != signer_canon && canon != own_canon) {
-                names_others = true;
-                break;
-            }
-        }
-        if (!names_others) return std::nullopt;
-        const auto anchor = admin_anchor_locked(data.parent_id, delta.signer_pubkey);
-        if (!anchor) {
-            return std::string{"only an admin of the parent may assign other identities"};
-        }
-        for (const auto& a : data.assignments) {
-            const auto canon = canonical_principal(a.management_pubkey);
-            if (canon == signer_canon || canon == own_canon) continue;
-            if (!principal_joined_under_locked(*anchor, a.management_pubkey)) {
-                return std::string{"assignment names an identity that has not joined"};
-            }
-        }
-        return std::nullopt;
-    }
-
-    // Update operations replace the stored node. The replacement must be the
-    // same node: without this an edit_node holder could rename the record onto
-    // another node's id (overwriting that node on disk) or reparent itself
-    // into another group.
-    auto it = nodes_.find(delta.target_node_id);
-    if (it == nodes_.end()) return std::nullopt;  // reported by the apply step
-    const TreeNode& current = it->second;
-    if (data.id != current.id) return std::string{"node id cannot change"};
-    if (data.parent_id != current.parent_id) return std::string{"node parent cannot change"};
-    if (data.type != current.type) return std::string{"node type cannot change"};
-    if (canonical_principal(data.mgmt_pubkey) != canonical_principal(current.mgmt_pubkey)) {
-        return std::string{"node management key cannot change"};
-    }
-    if (data.endpoint_identifier != current.endpoint_identifier) {
-        return std::string{"endpoint identifier cannot change"};
-    }
-
-    const auto before = assignment_map(current.assignments);
-    const auto after = assignment_map(data.assignments);
-    if (before == after) return std::nullopt;
-
-    // Changing who holds what is administration: edit_node alone never
-    // grants it, so no holder can raise its own or anyone else's access.
-    const auto anchor = admin_anchor_locked(current.id, delta.signer_pubkey);
-    if (!anchor) {
-        return std::string{"only an admin of this node or an ancestor may change assignments"};
-    }
-    for (const auto& [principal, perms] : after) {
-        auto prev = before.find(principal);
-        if (prev != before.end() && prev->second == perms) continue;
-        if (!principal_joined_under_locked(*anchor, principal)) {
-            return std::string{"assignment names an identity that has not joined"};
-        }
-    }
-    return std::nullopt;
+    return rules::required_permission_for(op);
 }
 
 PermissionTreeService::DeltaAuthorization
@@ -562,7 +366,7 @@ PermissionTreeService::authorize_delta_statement(std::string_view operation,
     std::lock_guard lock(mutex_);
     auto it = nodes_.find(check_node_id);
     if (it == nodes_.end()) return DeltaAuthorization::ContextMissing;
-    return signer_has_permission_locked(it->second, signer_pubkey, required)
+    return rules::signer_has_permission(it->second, signer_pubkey, required)
                ? DeltaAuthorization::Authorized
                : DeltaAuthorization::Denied;
 }
@@ -619,7 +423,7 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
 
     // Verify signer has the required permission via assignments.
     const bool has_perm =
-        signer_has_permission_locked(check_it->second, delta.signer_pubkey, required);
+        rules::signer_has_permission(check_it->second, delta.signer_pubkey, required);
 
     if (!has_perm) {
         spdlog::warn("[{}] signer '{}' lacks permission for '{}' on node '{}'",
@@ -627,7 +431,7 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
         return false;
     }
 
-    if (const auto refusal = delta_content_refusal_locked(delta)) {
+    if (const auto refusal = rules::delta_content_refusal(nodes_, delta)) {
         spdlog::warn("[{}] refusing {} on '{}' from '{}': {}", name(), delta.operation,
                       delta.target_node_id, delta.signer_pubkey, *refusal);
         return false;
@@ -764,7 +568,15 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
         }
     }
 
-    // 5. Append delta to the storage log
+    // 5. Append delta to the storage log and retain it for record transfer.
+    const auto seq = record_applied_delta_locked(delta);
+
+    spdlog::info("[{}] applied delta: {} on '{}' (seq {})",
+                  name(), delta.operation, delta.target_node_id, seq);
+    return true;
+}
+
+uint64_t PermissionTreeService::record_applied_delta_locked(const TreeDelta& delta) {
     storage::SignedDelta signed_delta;
     signed_delta.operation      = delta.operation;
     signed_delta.target_node_id = delta.target_node_id;
@@ -781,11 +593,99 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
 
     // Record transfer only: retain the signed statement in the transfer pool.
     // A refusal never rolls back the applied local mutation.
-    retain_applied_delta(delta);
+    (void)retain_applied_delta(delta);
+    return seq;
+}
 
-    spdlog::info("[{}] applied delta: {} on '{}' (seq {})",
-                  name(), delta.operation, delta.target_node_id, seq);
-    return true;
+// --- Tree operations ---
+
+namespace {
+
+// Committed ids stay this long past the freshness window, so a local clock
+// that steps back by less than this cannot make a pruned op fresh again.
+constexpr uint64_t kCommittedIdMarginSec = 600;
+
+} // namespace
+
+TreeOpVerdict PermissionTreeService::validate_local_op(const TreeOp& op,
+                                                       const TreeOpPolicy& policy,
+                                                       uint64_t block_time_sec) const {
+    std::lock_guard lock(mutex_);
+    return validate_op(crypto_, op, TreeState(nodes_, policy), block_time_sec,
+                       committed_ops_);
+}
+
+TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
+                                                     const TreeOpPolicy& policy,
+                                                     uint64_t block_time_sec) {
+    std::lock_guard lock(mutex_);
+    auto verdict = validate_op(crypto_, op, TreeState(nodes_, policy), block_time_sec,
+                               committed_ops_);
+    if (!verdict.ok()) {
+        spdlog::warn("[{}] refusing tree op on '{}': {}", name(), op.target, verdict.reason);
+        return verdict;
+    }
+    const uint64_t window = kTreeOpMaxAgeSec + kCommittedIdMarginSec;
+    if (block_time_sec > window) committed_ops_.prune_signed_before(block_time_sec - window);
+    return apply_op_locked(op);
+}
+
+TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
+    std::lock_guard lock(mutex_);
+    return apply_op_locked(op);
+}
+
+TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op) {
+    TreeOpEffect effect;
+    if (auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
+        spdlog::warn("[{}] tree op on '{}' does not apply: {}", name(), op.target,
+                     verdict.reason);
+        return verdict;
+    }
+
+    // Persist writes before removals, so a failed write never leaves a node
+    // deleted for an op that did not complete.
+    for (const auto& node : effect.writes) {
+        if (!persist_node(node)) {
+            spdlog::error("[{}] tree op on '{}': failed to persist node '{}'", name(),
+                          op.target, node.id);
+            return TreeOpVerdict{TreeOpRefusal::StorageError, "failed to persist node"};
+        }
+        auto it = nodes_.find(node.id);
+        if (it != nodes_.end() && !it->second.endpoint_identifier.empty() &&
+            it->second.endpoint_identifier != node.endpoint_identifier) {
+            identifier_index_.erase(it->second.endpoint_identifier);
+        }
+        if (!node.endpoint_identifier.empty()) {
+            identifier_index_[node.endpoint_identifier] = node.id;
+        }
+        nodes_[node.id] = node;
+    }
+    for (const auto& id : effect.removals) {
+        auto it = nodes_.find(id);
+        if (it == nodes_.end()) continue;
+        if (!it->second.endpoint_identifier.empty()) {
+            identifier_index_.erase(it->second.endpoint_identifier);
+        }
+        nodes_.erase(it);
+        if (!remove_node(id)) {
+            spdlog::warn("[{}] tree op on '{}': storage delete failed for '{}'", name(),
+                         op.target, id);
+        }
+    }
+
+    committed_ops_.insert(op_id_hex(op), op.signed_at);
+    if (const auto statement = statement_id_hex(op)) {
+        committed_ops_.insert(*statement, op.signed_at);
+    }
+    if (op.body.source == TreeOpSource::Delta) {
+        (void)record_applied_delta_locked(op.body.delta);
+    }
+
+    spdlog::info("[{}] applied tree op {} on '{}' ({} written, {} removed)", name(),
+                 static_cast<unsigned>(op.kind), op.target, effect.writes.size(),
+                 effect.removals.size());
+    return {};
 }
 
 std::optional<TreeNode> PermissionTreeService::do_get_node(std::string_view node_id) const {
@@ -1032,7 +932,7 @@ bool PermissionTreeService::do_check_permission(std::string_view signer_pubkey,
     for (const auto& assignment : it->second.assignments) {
         if (canonical_principal(assignment.management_pubkey) == signer_canon) {
             for (const auto& perm_str : assignment.permissions) {
-                if (acl::has_permission(string_to_permission(perm_str), perm)) {
+                if (acl::has_permission(rules::permission_from_string(perm_str), perm)) {
                     return true;
                 }
             }
@@ -1110,24 +1010,6 @@ void PermissionTreeService::evict_replay_cache() {
             ++it;
         }
     }
-}
-
-acl::Permission PermissionTreeService::string_to_permission(std::string_view perm_str) {
-    if (perm_str == "read")            return acl::Permission::Read;
-    if (perm_str == "write")           return acl::Permission::Write;
-    if (perm_str == "add_child")       return acl::Permission::AddChild;
-    if (perm_str == "edit_node")       return acl::Permission::EditNode;
-    if (perm_str == "delete_node")     return acl::Permission::DeleteNode;
-    if (perm_str == "expand_subnet")   return acl::Permission::ExpandSubnet;
-    if (perm_str == "connect_private") return acl::Permission::ConnectPrivate;
-    if (perm_str == "connect_shared")  return acl::Permission::ConnectShared;
-    if (perm_str == "relay_forward")   return acl::Permission::RelayForward;
-    if (perm_str == "routing_coordinate") return acl::Permission::RoutingCoordinate;
-    if (perm_str == "stun_respond")    return acl::Permission::StunRespond;
-    if (perm_str == "relay_register")  return acl::Permission::RelayRegister;
-    if (perm_str == "allocate_ip")     return acl::Permission::AllocateIP;
-    if (perm_str == "admin")           return acl::Permission::Admin;
-    return acl::Permission::None;
 }
 
 } // namespace nexus::tree

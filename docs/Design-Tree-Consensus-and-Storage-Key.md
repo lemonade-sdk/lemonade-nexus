@@ -5,9 +5,11 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 
 # Design: Tree Consensus and Threshold Storage Key
 
-Status: **proposed**. Nothing in this document is implemented. It changes the
-trust model, so `AGENTS.md` requires review of this design and its migration
-plan before code.
+Status: **approved**. Phase 1 is implemented behind the experimental
+`tree_ops_enabled` setting and applies tree operations locally only. See
+[Configuration](Configuration#experimental-tree-operations) for its behavior
+and limits. The design changes the trust model, so `AGENTS.md` requires review
+of each later phase and its migration plan before code.
 
 ## Table of Contents
 - [Summary](#summary)

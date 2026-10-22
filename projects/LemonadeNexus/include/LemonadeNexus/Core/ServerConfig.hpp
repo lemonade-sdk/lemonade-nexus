@@ -120,6 +120,11 @@ struct ServerConfig {
     // User/device registration policy
     bool        open_registration{true};     // false: new identities need a device link token to join
 
+    // Experimental, Phase 1 of docs/Design-Tree-Consensus-and-Storage-Key.md:
+    // every tree write route builds a signed tree operation and applies it
+    // locally through validate_op + apply_op. Off: the direct write paths.
+    bool        tree_ops_enabled{false};
+
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
 
