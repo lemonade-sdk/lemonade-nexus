@@ -29,6 +29,7 @@
 
 #include <gtest/gtest.h>
 #include "test_http_ready.hpp"
+#include "support/tree_ops_mode.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <jwt-cpp/jwt.h>
@@ -101,7 +102,8 @@ inline void install(core::ServerConfig& cfg,
                     relay::RelayDiscoveryService& rd,
                     routing::RoutingCoordinationService& routing,
                     core::BinaryAttestationService& att,
-                    core::ServerAdmissionService& adm) {
+                    core::ServerAdmissionService& adm,
+                    tree::TreeOpSubmitter* tree_ops) {
     auto& s = current();
     if (s.ctx) return; // already installed this test
     s.config = new core::ServerConfig(cfg);
@@ -129,6 +131,7 @@ inline void install(core::ServerConfig& cfg,
         .server_private_fqdn = "",
         .server_public_ip = "",
         .tunnel_bind_ip   = "",
+        .tree_ops         = tree_ops,
     };
     s.handler = new api::TreeApiHandler(*s.ctx);
     s.routing_handler = new api::RoutingApiHandler(*s.ctx);
@@ -171,6 +174,7 @@ protected:
     std::unique_ptr<network::DnsService> dns;
     std::unique_ptr<acme::AcmeService> acme;
     core::ServerConfig config;
+    test_support::TreeOpsMode tree_ops_mode;
 
     crypto::Ed25519Keypair root_keypair;
     std::string root_pubkey_str;
@@ -249,10 +253,11 @@ protected:
             dns_io.run();
         });
 
+        auto* tree_ops = tree_ops_mode.enable(config, *tree, *crypto);
         test_api::install(config, *auth, *tree, *ipam, *gossip, *crypto,
                           *key_wrapping, *storage, *acme, *http, *ddns, *dns,
                           *relay, *relay_discovery, *routing, *attestation,
-                          *admission);
+                          *admission, tree_ops);
         register_routes();
         test_api::handler().register_routes(http->server(), http->server());
         test_api::routing_handler().register_routes(http->server(), http->server());
@@ -1594,4 +1599,140 @@ TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
     auto bad = post(owner_b64, owner_node, {{"pubkey", owner_b64}});
     ASSERT_NE(bad, nullptr);
     EXPECT_EQ(bad->status, 400);
+}
+
+// --- Tree write routes with and without tree operations ---
+//
+// test_http_endpoints_tree_ops builds this file with NEXUS_TEST_TREE_OPS, so
+// each case here and above also runs with ServerConfig::tree_ops_enabled.
+// Only the version counter may differ between the two builds.
+
+TEST_F(HttpEndpointTest, NodeRoutesAnswerTheSameInBothModes) {
+    auto cli = make_client();
+    // POST /api/tree/node names the node "node-" + the first 16 base64
+    // characters of the caller's key. A '/' there makes the node file path
+    // unwritable in both modes, so use a key without one.
+    crypto::Ed25519Keypair owner_kp;
+    std::string owner_b64;
+    do {
+        owner_kp = crypto->ed25519_keygen();
+        owner_b64 = crypto::to_base64(std::span<const uint8_t>(
+            owner_kp.public_key.data(), owner_kp.public_key.size()));
+    } while (owner_b64.substr(0, 16).find('/') != std::string::npos);
+    auto stranger_kp = crypto->ed25519_keygen();
+    const auto stranger_b64 = crypto::to_base64(std::span<const uint8_t>(
+        stranger_kp.public_key.data(), stranger_kp.public_key.size()));
+    auto join_res = join_node(owner_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto ep = json::parse(join_res->body).value("node_id", std::string{});
+    const auto group = tree->get_node(ep)->parent_id;
+    const httplib::Headers owner = {{"Authorization", "Bearer " + make_jwt(owner_b64)}};
+    const httplib::Headers stranger = {{"Authorization", "Bearer " + make_jwt(stranger_b64)}};
+
+    // Create under the owner's group; repeating it is idempotent.
+    const json create = {{"parent_id", group}, {"type", "endpoint"}, {"hostname", "laptop-2"}};
+    auto c1 = cli.Post("/api/tree/node", owner, create.dump(), "application/json");
+    ASSERT_NE(c1, nullptr);
+    ASSERT_EQ(c1->status, 200) << c1->body;
+    const auto created = json::parse(c1->body).value("node_id", std::string{});
+    EXPECT_EQ(created, "node-" + owner_b64.substr(0, 16));
+    ASSERT_TRUE(tree->get_node(created).has_value());
+    EXPECT_EQ(tree->get_node(created)->hostname, "laptop-2");
+    auto c2 = cli.Post("/api/tree/node", owner, create.dump(), "application/json");
+    ASSERT_NE(c2, nullptr);
+    EXPECT_EQ(c2->status, 200) << c2->body;
+    auto bad_type = cli.Post("/api/tree/node", owner,
+                             json{{"parent_id", group}, {"type", "planet"}}.dump(),
+                             "application/json");
+    ASSERT_NE(bad_type, nullptr);
+    EXPECT_EQ(bad_type->status, 400);
+    auto no_add_child = cli.Post("/api/tree/node", stranger, create.dump(), "application/json");
+    ASSERT_NE(no_add_child, nullptr);
+    EXPECT_EQ(no_add_child->status, 403);
+
+    // Update the owner's own endpoint.
+    auto u1 = cli.Post("/api/tree/node/update/" + ep, owner,
+                       json{{"hostname", "renamed"}, {"region", "eu-west"}}.dump(),
+                       "application/json");
+    ASSERT_NE(u1, nullptr);
+    ASSERT_EQ(u1->status, 200) << u1->body;
+    EXPECT_EQ(tree->get_node(ep)->hostname, "renamed");
+    EXPECT_EQ(tree->get_node(ep)->region, "eu-west");
+    auto u2 = cli.Post("/api/tree/node/update/" + ep, stranger,
+                       json{{"hostname", "hijacked"}}.dump(), "application/json");
+    ASSERT_NE(u2, nullptr);
+    EXPECT_EQ(u2->status, 403);
+    EXPECT_EQ(tree->get_node(ep)->hostname, "renamed");
+
+    // Assignment refusals keep their status codes and reasons.
+    auto bad_perm = cli.Post("/api/tree/node/assignments/" + ep, owner,
+                             json{{"pubkey", owner_b64}, {"permissions", {"fly"}}}.dump(),
+                             "application/json");
+    ASSERT_NE(bad_perm, nullptr);
+    EXPECT_EQ(bad_perm->status, 400);
+    EXPECT_EQ(json::parse(bad_perm->body).value("error", std::string{}),
+              "unknown permission 'fly'");
+    auto missing = cli.Post("/api/tree/node/assignments/no-such-node", owner,
+                            json{{"pubkey", owner_b64}, {"permissions", {"read"}}}.dump(),
+                            "application/json");
+    ASSERT_NE(missing, nullptr);
+    EXPECT_EQ(missing->status, 404);
+    EXPECT_EQ(json::parse(missing->body).value("error", std::string{}), "node not found");
+
+    // Delete the owner's endpoint; it is gone and cannot be deleted twice.
+    auto d1 = cli.Post("/api/tree/node/delete/" + ep, owner);
+    ASSERT_NE(d1, nullptr);
+    ASSERT_EQ(d1->status, 200) << d1->body;
+    EXPECT_FALSE(tree->get_node(ep).has_value());
+    EXPECT_FALSE(ipam->get_allocation(ep).has_value());
+    auto d2 = cli.Post("/api/tree/node/delete/" + ep, owner);
+    ASSERT_NE(d2, nullptr);
+    EXPECT_EQ(d2->status, 403);
+}
+
+TEST_F(HttpEndpointTest, NodeVersionsAdvanceOnlyWithTreeOperations) {
+    auto cli = make_client();
+    auto owner_kp = crypto->ed25519_keygen();
+    const auto owner_b64 = crypto::to_base64(std::span<const uint8_t>(
+        owner_kp.public_key.data(), owner_kp.public_key.size()));
+    auto join_res = join_node(owner_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto ep = json::parse(join_res->body).value("node_id", std::string{});
+    const httplib::Headers owner = {{"Authorization", "Bearer " + make_jwt(owner_b64)}};
+    auto u = cli.Post("/api/tree/node/update/" + ep, owner,
+                      json{{"hostname", "v2"}}.dump(), "application/json");
+    ASSERT_NE(u, nullptr);
+    ASSERT_EQ(u->status, 200) << u->body;
+
+    const auto stored = tree->get_node(ep);
+    ASSERT_TRUE(stored.has_value());
+    // Join wrote version 1 and the update version 2; the direct paths keep 0,
+    // and at 0 the stored JSON has no "version" field at all.
+    EXPECT_EQ(stored->version, test_support::kTreeOpsBuild ? 2u : 0u);
+    EXPECT_EQ(json(*stored).contains("version"), test_support::kTreeOpsBuild);
+}
+
+TEST_F(HttpEndpointTest, TreeOpsWithoutSubmitterFailClosed) {
+    // The flag on with no submitter wired must not fall back to direct writes.
+    auto cli = make_client();
+    test_api::current().config->tree_ops_enabled = true;
+    test_api::current().ctx->tree_ops = nullptr;
+
+    tree::TreeNode child;
+    child.id = "failclosed_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = root_pubkey_str;
+    auto res = post_auth_delta(cli, json(make_signed_delta("create_node", child.id, child)).dump());
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 500);
+    EXPECT_FALSE(tree->get_node(child.id).has_value());
+
+    auto device_kp = crypto->ed25519_keygen();
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    EXPECT_EQ(join_res->status, 500);
+    EXPECT_TRUE(tree->get_children("root").empty());
 }

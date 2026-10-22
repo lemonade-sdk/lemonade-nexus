@@ -68,6 +68,9 @@ void to_json(json& j, const TreeNode& n) {
         {"reputation_score",         n.reputation_score},
         {"expires_at",               n.expires_at},
     };
+    // Omitted at 0 so records written without tree operations keep their
+    // exact bytes (storage, wire bodies, and delta signatures over node_data).
+    if (n.version != 0) j["version"] = n.version;
 }
 
 void from_json(const json& j, TreeNode& n) {
@@ -96,6 +99,7 @@ void from_json(const json& j, TreeNode& n) {
     j.at("capacity_mbps").get_to(n.capacity_mbps);
     j.at("reputation_score").get_to(n.reputation_score);
     j.at("expires_at").get_to(n.expires_at);
+    if (j.contains("version")) j.at("version").get_to(n.version);
 }
 
 // --- TreeDelta ---
@@ -148,7 +152,9 @@ std::string canonical_node_json(const TreeNode& node) {
     j["capacity_mbps"]            = node.capacity_mbps;
     j["reputation_score"]         = node.reputation_score;
     j["expires_at"]               = node.expires_at;
-    // "signature" intentionally excluded for canonical form
+    // "signature" intentionally excluded for canonical form. "version" is
+    // excluded too: applying an operation increments it without a new parent
+    // signature, and existing signatures and tree hashes must stay valid.
     return j.dump();
 }
 

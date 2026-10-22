@@ -74,6 +74,16 @@ struct TreeNode {
     uint32_t                 capacity_mbps{0};
     float                    reputation_score{1.0f};
     uint64_t                 expires_at{0};              // Unix timestamp, 0 = no expiry
+
+    /// Count of tree operations applied to this node (see TreeOps.hpp). Each
+    /// applied operation that writes the node increments it; a new node starts
+    /// at 1. Only the tree-operation path maintains it. 0 means "no operation
+    /// applied yet" and is also the value of every record stored without the
+    /// field. JSON omits the field while it is 0, so records and wire bodies
+    /// written without tree operations are unchanged. Never part of
+    /// canonical_node_json: the parent signs the node content, not this
+    /// server-maintained counter.
+    uint64_t                 version{0};
 };
 
 /// A delta operation to apply to the tree.
@@ -100,7 +110,7 @@ void to_json(nlohmann::json& j, const TreeDelta& d);
 void from_json(const nlohmann::json& j, TreeDelta& d);
 
 /// Produce a canonical (deterministic) JSON string for signing.
-/// Excludes the "signature" field itself.
+/// Excludes the "signature" and "version" fields.
 [[nodiscard]] std::string canonical_node_json(const TreeNode& node);
 [[nodiscard]] std::string canonical_delta_json(const TreeDelta& delta);
 

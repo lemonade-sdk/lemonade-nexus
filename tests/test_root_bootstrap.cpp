@@ -31,6 +31,7 @@
 
 #include <gtest/gtest.h>
 #include "test_http_ready.hpp"
+#include "support/tree_ops_mode.hpp"
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
@@ -141,6 +142,7 @@ protected:
     std::unique_ptr<acme::AcmeService> acme;
 
     core::ServerConfig config;
+    test_support::TreeOpsMode tree_ops_mode;
     std::string jwt_secret;
     // Deliberately distinct keys: mesh trust anchor, pre-existing root owner,
     // and an unrelated stranger.
@@ -204,6 +206,7 @@ protected:
         ddns = std::make_unique<network::DdnsService>(io, *crypto, *storage, *attestation, *gossip);
         acme = std::make_unique<acme::AcmeService>(*storage);
 
+        auto* tree_ops = tree_ops_mode.enable(config, *tree, *crypto);
         join_holder().ctx = new api::ApiContext{
             .config           = config,
             .auth             = *auth,
@@ -228,6 +231,7 @@ protected:
             .server_private_fqdn = "",
             .server_public_ip = "",
             .tunnel_bind_ip   = "",
+            .tree_ops         = tree_ops,
         };
         join_holder().tree_handler = new api::TreeApiHandler(*join_holder().ctx);
         join_holder().tree_handler->register_routes(http->server(), http->server());
