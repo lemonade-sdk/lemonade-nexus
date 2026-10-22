@@ -1,6 +1,7 @@
 #pragma once
 
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Security/Sealing/SealedBlobStore.hpp>
 
 #include <optional>
 #include <string>
@@ -16,7 +17,10 @@ struct InitResult {
 };
 
 /// Create the data dir + identity/gossip keypairs if missing. Never regenerates
-/// existing keys. Returns nullopt on I/O failure.
+/// existing keys: a gossip identity that exists only as a sealed copy (see
+/// Core/BootSet.hpp) counts as existing. A new gossip key is written to
+/// identity/keypair.json; the server seals it on its next start. Returns
+/// nullopt on I/O failure.
 [[nodiscard]] std::optional<InitResult> ensure_initialized(const ServerConfig& config);
 
 /// Run any CLI-mode flag (--print-tpm-ak, --first-run, --enroll-server,
@@ -24,6 +28,9 @@ struct InitResult {
 /// --install-tree-merge) and the uninitialized-
 /// data-dir gate. Returns the process exit code when the invocation was a CLI
 /// mode (or the gate failed); nullopt when the normal server should start.
-[[nodiscard]] std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0);
+/// `seal_backend` unseals the gossip identity for a mode that signs with it
+/// after the boot set is sealed; empty when this build cannot seal.
+[[nodiscard]] std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0,
+                                              const security::SealBackend& seal_backend = {});
 
 } // namespace nexus::core

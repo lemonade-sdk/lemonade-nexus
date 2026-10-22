@@ -210,6 +210,14 @@ public:
     /// Access this server's Ed25519 identity keypair.
     [[nodiscard]] const crypto::Ed25519Keypair& keypair() const { return keypair_; }
 
+    /// Use this identity instead of reading identity/keypair.json at start.
+    /// The server sets it from the boot set (Core/BootSet.hpp), which owns the
+    /// key's storage and its sealed copy. Call before start().
+    void set_identity(const crypto::Ed25519Keypair& keypair) {
+        keypair_ = keypair;
+        identity_preset_ = true;
+    }
+
     // ISecurityTransport. Gossip is transport only for the security protocol:
     // the packet signature authenticates the sender, the byte bound applies,
     // and the bytes go to the sink unparsed. Nothing here decides security
@@ -637,6 +645,7 @@ private:
     storage::FileStorageService& storage_;
     crypto::SodiumCryptoService& crypto_;
     crypto::Ed25519Keypair       keypair_;
+    bool                         identity_preset_{false};
 
     mutable std::mutex      peers_mutex_;
     std::vector<GossipPeer> peers_;

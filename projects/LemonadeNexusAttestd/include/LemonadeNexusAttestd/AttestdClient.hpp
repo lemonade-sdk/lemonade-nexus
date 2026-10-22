@@ -6,9 +6,15 @@
 // of bounds. Outbound: a structured challenge — no nonce, no PCR selection, no
 // bytes to sign. Inbound: platform evidence and the digest it was bound to — no
 // signature, no vote key, no verdict.
+//
+// The same socket seals and unseals keys for the server's boot set
+// (attestd_seal_backend). That backend is the only production SealBackend. It
+// encrypts and decrypts the secret in this process, so the secret and the
+// blob's ciphertext never cross the socket.
 
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
+#include <LemonadeNexus/Security/Sealing/SealedBlobStore.hpp>
 #include <LemonadeNexusAttestd/AttestdCodec.hpp>
 #include <LemonadeNexusAttestd/AttestdFraming.hpp>
 #include <LemonadeNexusAttestd/AttestdGate.hpp>
@@ -43,6 +49,25 @@ struct AttestdActivationResult {
     std::vector<uint8_t> activated_secret;
 };
 
+/// AttestdFetchResult's shape plus the new sealed key on success.
+struct AttestdSealResult {
+    bool                      ok{false};
+    Refusal                   refusal{Refusal::None};
+    FrameError                transport{FrameError::None};
+    std::string               detail;
+    security::SealedKeyObject object;
+    crypto::SecureBuffer      key;
+};
+
+/// AttestdFetchResult's shape plus the unsealed key on success.
+struct AttestdUnsealResult {
+    bool                 ok{false};
+    Refusal              refusal{Refusal::None};
+    FrameError           transport{FrameError::None};
+    std::string          detail;
+    crypto::SecureBuffer key;
+};
+
 class AttestdClient {
 public:
     explicit AttestdClient(AttestdClientConfig config) : config_(std::move(config)) {}
@@ -60,6 +85,14 @@ public:
     /// frame or a Refusal.
     [[nodiscard]] AttestdActivationResult activate(const SvsmAkActivationRequest& request) const;
 
+    /// One connection, one seal request, one framed answer: a seal Result
+    /// frame or a Refusal.
+    [[nodiscard]] AttestdSealResult seal(const SealRequest& request) const;
+
+    /// One connection, one unseal request, one framed answer: an unseal
+    /// Result frame or a Refusal.
+    [[nodiscard]] AttestdUnsealResult unseal(const UnsealRequest& request) const;
+
 private:
     AttestdClientConfig config_;
 };
@@ -72,6 +105,12 @@ private:
 /// Read one framed activation answer — a single Result or Refusal frame —
 /// under the same local bounds as the evidence path.
 [[nodiscard]] AttestdActivationResult read_activation_response(int fd, int deadline_seconds);
+
+/// Read one framed seal answer — a single Result or Refusal frame.
+[[nodiscard]] AttestdSealResult read_seal_response(int fd, int deadline_seconds);
+
+/// Read one framed unseal answer — a single Result or Refusal frame.
+[[nodiscard]] AttestdUnsealResult read_unseal_response(int fd, int deadline_seconds);
 
 /// The request bytes for one challenge: the closed JSON grammar, newline
 /// terminated. Separate from the socket so a test can drive a server with it.
@@ -88,5 +127,19 @@ private:
 /// the verifier.
 [[nodiscard]] security::PlatformActivationSource attestd_activation_source(
     AttestdClientConfig config);
+
+/// The sealing seam, wired to the same daemon. Seal asks the daemon for a new
+/// sealed key and encrypts the plaintext under it here
+/// (security::make_sealed_blob); unseal sends only the blob's key object and
+/// decrypts here (security::open_sealed_blob). A blob that does not parse,
+/// names another domain, or fails its tag is Corrupt. Maps the daemon's answer
+/// onto security::SealStatus:
+///   transport fault                         -> Unreachable (the daemon may be starting)
+///   SealUnavailable, or MalformedRequest    -> Unavailable (no TPM, or an older daemon
+///                                              that does not know the operation)
+///   SealPolicyMismatch                      -> PolicyMismatch
+///   SealCorrupt                             -> Corrupt
+///   any other refusal                       -> Failed
+[[nodiscard]] security::SealBackend attestd_seal_backend(AttestdClientConfig config);
 
 }  // namespace nexus::attestd

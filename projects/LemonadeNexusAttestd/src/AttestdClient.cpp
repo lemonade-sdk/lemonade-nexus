@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 
 #include <nlohmann/json.hpp>
+#include <sodium.h>
 #include <spdlog/spdlog.h>
 
 #include <cerrno>
@@ -82,6 +83,129 @@ bool write_all(int fd, Clock::time_point expires, std::string_view data) {
         data.remove_prefix(static_cast<std::size_t>(n));
     }
     return true;
+}
+
+/// Read frames until the assembler finishes or fails. Single-frame answers
+/// (activation, seal, unseal) share this loop; the caller interprets the
+/// finished assembler.
+FrameError read_single_frame(int fd, int deadline_seconds, ResponseAssembler& assembler,
+                             std::string& detail) {
+    const auto expires = Clock::now() + std::chrono::seconds(deadline_seconds);
+    std::vector<uint8_t> payload;
+    const auto wipe_payload = [&payload] {
+        if (!payload.empty()) sodium_memzero(payload.data(), payload.size());
+    };
+    for (;;) {
+        uint8_t head[kFrameHeaderBytes];
+        if (!read_exact(fd, expires, head, sizeof(head))) {
+            detail = "the daemon stopped writing before the answer was complete";
+            wipe_payload();
+            return FrameError::Truncated;
+        }
+        const std::size_t length = (static_cast<std::size_t>(head[0]) << 24) |
+                                   (static_cast<std::size_t>(head[1]) << 16) |
+                                   (static_cast<std::size_t>(head[2]) << 8) |
+                                   static_cast<std::size_t>(head[3]);
+        if (length > kMaxLocalFrameBytes) {
+            detail = "frame declares " + std::to_string(length) + " bytes";
+            wipe_payload();
+            return FrameError::Oversized;
+        }
+        wipe_payload();
+        payload.resize(length);
+        if (length > 0 && !read_exact(fd, expires, payload.data(), length)) {
+            detail = "frame body did not arrive";
+            wipe_payload();
+            return FrameError::Truncated;
+        }
+        const auto kind = static_cast<FrameKind>(head[4]);
+        const std::string_view body(reinterpret_cast<const char*>(payload.data()), length);
+        if (assembler.offer(kind, body)) continue;
+        wipe_payload();
+        if (!assembler.done()) {
+            detail = std::string(frame_error_name(assembler.error()));
+            return assembler.error();
+        }
+        return FrameError::None;
+    }
+}
+
+/// Connect, send one request, half-close, and read one single-frame answer.
+FrameError exchange_single(const std::filesystem::path& socket_path, std::string_view request,
+                           ResponseAssembler& assembler, std::string& detail) {
+    const std::string path = socket_path.string();
+    ::sockaddr_un addr{};
+    if (path.size() + 1 > sizeof(addr.sun_path)) {
+        detail = "socket path is too long: " + path;
+        return FrameError::Malformed;
+    }
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        detail = std::string("socket(AF_UNIX): ") + std::strerror(errno);
+        return FrameError::Truncated;
+    }
+    addr.sun_family = AF_UNIX;
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+
+    FrameError result = FrameError::None;
+    if (::connect(fd, reinterpret_cast<const ::sockaddr*>(&addr), sizeof(addr)) != 0) {
+        detail = "connect(" + path + "): " + std::strerror(errno);
+        result = FrameError::Truncated;
+    } else {
+        const auto expires = Clock::now() + std::chrono::seconds(kLocalStreamDeadlineSeconds);
+        if (!write_all(fd, expires, request)) {
+            detail = "could not send the request";
+            result = FrameError::Truncated;
+        } else {
+            ::shutdown(fd, SHUT_WR);
+            result = read_single_frame(fd, kLocalStreamDeadlineSeconds, assembler, detail);
+        }
+    }
+    ::close(fd);
+    return result;
+}
+
+template <typename Result>
+Result single_frame_fault(FrameError e, std::string detail) {
+    Result r;
+    r.transport = e;
+    r.detail = std::move(detail);
+    return r;
+}
+
+AttestdSealResult seal_result_from(ResponseAssembler& assembler) {
+    AttestdSealResult result;
+    if (assembler.refusal() != Refusal::None) {
+        result.refusal = assembler.refusal();
+        result.detail = assembler.detail();
+        return result;
+    }
+    if (auto object = assembler.result_object(); object && assembler.has_result_key()) {
+        result.ok = true;
+        result.object = std::move(*object);
+        result.key = assembler.take_result_key();
+        return result;
+    }
+    result.transport = FrameError::Malformed;
+    result.detail = "the daemon answered with neither a sealed key nor a refusal";
+    return result;
+}
+
+AttestdUnsealResult unseal_result_from(ResponseAssembler& assembler) {
+    AttestdUnsealResult result;
+    if (assembler.refusal() != Refusal::None) {
+        result.refusal = assembler.refusal();
+        result.detail = assembler.detail();
+        return result;
+    }
+    if (!assembler.result_object() && assembler.has_result_key()) {
+        result.ok = true;
+        result.key = assembler.take_result_key();
+        return result;
+    }
+    result.transport = FrameError::Malformed;
+    result.detail = "the daemon answered with neither a key nor a refusal";
+    return result;
 }
 
 #endif  // !_WIN32
@@ -302,6 +426,44 @@ AttestdActivationResult AttestdClient::activate(const SvsmAkActivationRequest& r
     return result;
 }
 
+AttestdSealResult read_seal_response(int fd, int deadline_seconds) {
+    ResponseAssembler assembler;
+    std::string detail;
+    if (const auto e = read_single_frame(fd, deadline_seconds, assembler, detail);
+        e != FrameError::None) {
+        return single_frame_fault<AttestdSealResult>(e, std::move(detail));
+    }
+    return seal_result_from(assembler);
+}
+
+AttestdUnsealResult read_unseal_response(int fd, int deadline_seconds) {
+    ResponseAssembler assembler;
+    std::string detail;
+    if (const auto e = read_single_frame(fd, deadline_seconds, assembler, detail);
+        e != FrameError::None) {
+        return single_frame_fault<AttestdUnsealResult>(e, std::move(detail));
+    }
+    return unseal_result_from(assembler);
+}
+
+AttestdSealResult AttestdClient::seal(const SealRequest& request) const {
+    ResponseAssembler assembler;
+    std::string detail;
+    const auto e = exchange_single(config_.path, encode_seal_request(request), assembler, detail);
+    if (e != FrameError::None) return single_frame_fault<AttestdSealResult>(e, std::move(detail));
+    return seal_result_from(assembler);
+}
+
+AttestdUnsealResult AttestdClient::unseal(const UnsealRequest& request) const {
+    ResponseAssembler assembler;
+    std::string detail;
+    const auto e = exchange_single(config_.path, encode_unseal_request(request), assembler, detail);
+    if (e != FrameError::None) {
+        return single_frame_fault<AttestdUnsealResult>(e, std::move(detail));
+    }
+    return unseal_result_from(assembler);
+}
+
 #else  // _WIN32 — no unix domain socket transport
 
 AttestdFetchResult read_framed_response(int, int, PlatformEvidenceBundle&) {
@@ -315,6 +477,20 @@ AttestdFetchResult AttestdClient::fetch(const security::AttestationChallenge&,
 
 AttestdActivationResult AttestdClient::activate(const SvsmAkActivationRequest&) const {
     return activation_fault(FrameError::Truncated, "nexus-attestd has no transport on Windows");
+}
+
+AttestdSealResult AttestdClient::seal(const SealRequest&) const {
+    AttestdSealResult r;
+    r.transport = FrameError::Truncated;
+    r.detail = "nexus-attestd has no transport on Windows";
+    return r;
+}
+
+AttestdUnsealResult AttestdClient::unseal(const UnsealRequest&) const {
+    AttestdUnsealResult r;
+    r.transport = FrameError::Truncated;
+    r.detail = "nexus-attestd has no transport on Windows";
+    return r;
 }
 
 #endif
@@ -369,6 +545,99 @@ security::PlatformActivationSource attestd_activation_source(AttestdClientConfig
         if (failure) *failure = why + (result.detail.empty() ? "" : ": " + result.detail);
         return std::nullopt;
     };
+}
+
+}  // namespace nexus::attestd
+
+namespace nexus::attestd {
+
+namespace {
+
+template <typename Result>
+security::SealStatus seal_status_of(const Result& result) {
+    if (result.ok) return security::SealStatus::Ok;
+    if (result.refusal == Refusal::None) return security::SealStatus::Unreachable;
+    switch (result.refusal) {
+        case Refusal::SealUnavailable:
+        case Refusal::MalformedRequest:   return security::SealStatus::Unavailable;
+        case Refusal::SealPolicyMismatch: return security::SealStatus::PolicyMismatch;
+        case Refusal::SealCorrupt:        return security::SealStatus::Corrupt;
+        default:                          return security::SealStatus::Failed;
+    }
+}
+
+template <typename Result>
+std::string seal_detail_of(const Result& result) {
+    const auto why = result.refusal != Refusal::None
+                         ? std::string(refusal_name(result.refusal))
+                         : std::string(frame_error_name(result.transport));
+    return why + (result.detail.empty() ? "" : ": " + result.detail);
+}
+
+}  // namespace
+
+security::SealBackend attestd_seal_backend(AttestdClientConfig config) {
+    security::SealBackend backend;
+    backend.seal = [client = AttestdClient(config)](
+                       std::string_view domain, std::span<const uint8_t> plaintext,
+                       const std::optional<security::BootPcrValues>& target) {
+        security::SealReply reply;
+        if (plaintext.empty() || plaintext.size() > security::kMaxSealPlaintextBytes ||
+            !security::valid_seal_domain(domain)) {
+            reply.status = security::SealStatus::Failed;
+            reply.detail = "the domain or the plaintext size is outside the seal contract";
+            return reply;
+        }
+        SealRequest request;
+        request.domain = std::string(domain);
+        request.target = target;
+        auto result = client.seal(request);
+        reply.status = seal_status_of(result);
+        if (!result.ok) {
+            reply.detail = seal_detail_of(result);
+            return reply;
+        }
+        auto blob = security::make_sealed_blob(domain, result.object, result.key.span(),
+                                               plaintext);
+        result.key.clear();
+        if (!blob) {
+            reply.status = security::SealStatus::Failed;
+            reply.detail = "the daemon returned a sealed key this process cannot use";
+            return reply;
+        }
+        reply.blob = std::move(*blob);
+        return reply;
+    };
+    backend.unseal = [client = AttestdClient(std::move(config))](std::string_view domain,
+                                                                std::string_view text) {
+        security::UnsealReply reply;
+        const auto blob = security::decode_sealed_blob(text);
+        if (!blob || blob->domain != domain) {
+            reply.status = security::SealStatus::Corrupt;
+            reply.detail = blob ? "the blob was sealed for another domain"
+                                : "the blob is not a well-formed sealed blob";
+            return reply;
+        }
+        UnsealRequest request;
+        request.domain = std::string(domain);
+        request.object = {blob->pcr_digest, blob->tpm_public, blob->tpm_private};
+        auto result = client.unseal(request);
+        reply.status = seal_status_of(result);
+        if (!result.ok) {
+            reply.detail = seal_detail_of(result);
+            return reply;
+        }
+        auto plaintext = security::open_sealed_blob(*blob, result.key.span());
+        result.key.clear();
+        if (!plaintext) {
+            reply.status = security::SealStatus::Corrupt;
+            reply.detail = "the ciphertext does not authenticate under the unsealed key";
+            return reply;
+        }
+        reply.plaintext = std::move(*plaintext);
+        return reply;
+    };
+    return backend;
 }
 
 }  // namespace nexus::attestd

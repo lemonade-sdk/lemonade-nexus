@@ -71,6 +71,7 @@ include(libraries/sqlite3)
 include(libraries/boringtun)
 include(libraries/virtual-netstack)
 include(libraries/frost)
+include(libraries/storage-threshold)
 
 #-----------------------------------------------------------------------------
 # Projects

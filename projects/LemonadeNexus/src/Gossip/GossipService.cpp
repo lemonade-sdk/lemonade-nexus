@@ -240,10 +240,13 @@ void GossipService::set_network_id(const std::string& network_hex) {
 // ---------------------------------------------------------------------------
 
 void GossipService::on_start() {
-    // Generate or load our identity keypair
-    // Check if identity/keypair.json exists in storage
-    auto envelope = storage_.read_file("identity", "keypair.json");
-    if (envelope) {
+    // The server presets the identity from the boot set. Without a preset
+    // (tools and tests), load or create identity/keypair.json here.
+    auto envelope = identity_preset_ ? std::nullopt
+                                     : storage_.read_file("identity", "keypair.json");
+    if (identity_preset_) {
+        spdlog::info("[{}] using the boot-set identity keypair", name());
+    } else if (envelope) {
         try {
             auto j = json::parse(envelope->data);
             auto pub_bytes = crypto::from_base64(j.value("public_key", ""));

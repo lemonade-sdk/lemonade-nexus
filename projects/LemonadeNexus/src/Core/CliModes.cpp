@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Core/CliModes.hpp>
+#include <LemonadeNexus/Core/BootSet.hpp>
 
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
 #include <LemonadeNexus/Core/ApplicationRoot.hpp>
@@ -41,13 +42,8 @@ uint64_t now_unix() {
 
 /// Is the pubkey being enrolled this host's own gossip key?
 bool enrolling_self(storage::FileStorageService& storage, const std::string& pubkey_b64) {
-    auto kp_env = storage.read_file("identity", "keypair.json");
-    if (!kp_env) return false;
-    try {
-        return nlohmann::json::parse(kp_env->data).value("public_key", "") == pubkey_b64;
-    } catch (...) {
-        return false;
-    }
+    const auto own = gossip_public_key_b64(storage, storage.data_root());
+    return own && *own == pubkey_b64;
 }
 
 
@@ -564,14 +560,11 @@ std::optional<InitResult> ensure_initialized(const ServerConfig& config) {
     result.identity_pubkey_hex = crypto::to_hex(
         std::span<const uint8_t>(identity_pub->data(), identity_pub->size()));
 
-    // Gossip keypair (identity/keypair.json) — same file and format
-    // GossipService loads at startup. Its pubkey is what certificates bind
-    // to, so creating it here lets a server be enrolled before it ever runs.
-    if (auto kp_env = storage.read_file("identity", "keypair.json")) {
-        try {
-            auto kp_j = nlohmann::json::parse(kp_env->data);
-            result.gossip_pubkey_b64 = kp_j.value("public_key", "");
-        } catch (...) {}
+    // Gossip keypair (identity/keypair.json, or its sealed copy once the
+    // server has sealed it). Its pubkey is what certificates bind to, so
+    // creating it here lets a server be enrolled before it ever runs.
+    if (auto existing = gossip_public_key_b64(storage, config.data_root)) {
+        result.gossip_pubkey_b64 = *existing;
     }
     if (result.gossip_pubkey_b64.empty()) {
         auto kp = crypto.ed25519_keygen();
@@ -599,10 +592,11 @@ std::optional<InitResult> ensure_initialized(const ServerConfig& config) {
     return result;
 }
 
-std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0) {
+std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0,
+                                const security::SealBackend& seal_backend) {
     if (config.verify_platform)                   return run_verify_platform(config);
     if (config.first_run)                         return run_first_run(config);
-    if (config.onboard_server)                    return run_onboard_server(config);
+    if (config.onboard_server)                    return run_onboard_server(config, seal_backend);
     if (config.mint_admission_token)              return run_mint_admission_token(config);
     if (!config.enroll_server_pubkey.empty())     return run_enroll(config);
     if (!config.revoke_server_pubkey.empty())     return run_revoke(config);
