@@ -135,6 +135,19 @@ target_compile_definitions(test_evidence_chain PRIVATE
 add_nexus_test(test_nexus_attestd    test_nexus_attestd.cpp)
 target_link_libraries(test_nexus_attestd PRIVATE LemonadeNexusAttestdCore)
 
+# Sealed blobs and the boot-set migration, against a test double (no TPM).
+add_nexus_test(test_sealed_boot_set  test_sealed_boot_set.cpp)
+# The TPM seal path against swtpm. Skips unless NEXUS_TEST_TPM_TCTI names a
+# simulator; a simulator run is not hardware evidence. The cases share one
+# simulator and extend its PCR 8, so CTest runs them one at a time.
+add_executable(test_tpm_seal_simulator test_tpm_seal_simulator.cpp)
+target_link_libraries(test_tpm_seal_simulator PRIVATE
+    LemonadeNexus LemonadeNexusAttestdCore GTest::gtest_main GTest::gmock)
+target_compile_definitions(test_tpm_seal_simulator PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+target_include_directories(test_tpm_seal_simulator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+gtest_discover_tests(test_tpm_seal_simulator DISCOVERY_TIMEOUT 120
+    PROPERTIES RESOURCE_LOCK nexus_tpm_simulator)
+
 add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
 # Hostile packets at the real wire boundary: cert-gated sync, ServerHello
 # proof-of-possession, retired misbehavior proofs, and NS slot claim laundering.
@@ -162,6 +175,7 @@ add_nexus_test(test_security_policy
 add_nexus_test(test_security_strong_id security/test_strong_id.cpp)
 add_nexus_test(test_secure_buffer      test_secure_buffer.cpp)
 add_nexus_test(test_frost_provider     test_frost_provider.cpp)
+add_nexus_test(test_storage_threshold  test_storage_threshold.cpp)
 add_nexus_test(test_security_consensus
     security/consensus/consensus_types.cpp
     security/consensus/quorum_certificate.cpp

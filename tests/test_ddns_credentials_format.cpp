@@ -49,19 +49,10 @@ struct DdnsCredentialFormat : ::testing::Test {
         fs::remove_all(dir, ec);
     }
 
-    /// The identity DdnsService reads. Without it the loader bails before any
-    /// format check, which would make every assertion below vacuous.
-    void seed_identity() {
-        identity = crypto.ed25519_keygen();
-        nlohmann::json kp;
-        kp["public_key"] = crypto::to_base64(
-            std::span<const uint8_t>(identity.public_key.data(), identity.public_key.size()));
-        kp["private_key"] = crypto::to_base64(
-            std::span<const uint8_t>(identity.private_key.data(), identity.private_key.size()));
-        storage::SignedEnvelope env;
-        env.data = kp.dump();
-        ASSERT_TRUE(storage->write_file("identity", "keypair.json", env));
-    }
+    /// The identity DdnsService derives its at-rest key from: the running
+    /// gossip identity (identity/keypair.json is gone once the boot set is
+    /// sealed). Taking it here keeps the assertions below about the format.
+    void seed_identity() { identity = gossip->keypair(); }
 
     /// Exactly the key DdnsService derives for at-rest credentials.
     crypto::AeadKey at_rest_key() {

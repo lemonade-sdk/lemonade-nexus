@@ -97,12 +97,15 @@ observed on an unqualified host would make the profile decide nothing.
 ## The Evidence Helper: nexus-attestd
 
 `nexus-attestd` is a separate daemon (`/usr/bin/nexus-attestd`) that answers
-two questions over one local socket: produce this host's platform evidence for
-a challenge, and — for an SVSM candidate — run the one TPM operation the Nexus
-server may not run itself, the AK credential activation for enrollment. The
+over one local socket: produce this host's platform evidence for a challenge,
+and run the TPM operations the Nexus server may not run itself. These are the
+AK credential activation for SVSM enrollment, and the seal and unseal of a
+32-byte key bound to PCR 8 and 9, which protects the server's boot set (see
+[B6](Design-Tree-Consensus-and-Storage-Key#b6-sealing-the-boot-set)). The
 activation request carries the verifier's credential material as-is and returns
-the activated secret digest; the daemon never decides eligibility, persists
-nothing, and creates no persistent TPM handle.
+the activated secret digest. Seal and unseal never receive the server's secret
+or its ciphertext; the server encrypts with the key itself. The daemon never
+decides eligibility, persists nothing, and creates no persistent TPM handle.
 
 The unit file draws the privilege boundary explicitly:
 
@@ -144,7 +147,9 @@ For a server to produce evidence the implemented provider can verify:
   profile.
 - The `nexus-attestd` service running; the server unit requests it with
   `Wants=`/`After=`. A missing helper costs Tier 1, it does not stop the mesh
-  node.
+  node, except on a host whose gossip identity is fully sealed: that server
+  waits about 30 s for the helper and then stops rather than create a new
+  identity.
 - AMD revocation data: `scripts/nexus-refresh-amd-crl` fetches a product's KDS
   list and installs it atomically under
   `<data_root>/security/revocation`. A fetch failure keeps the existing
