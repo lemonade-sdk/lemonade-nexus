@@ -1,10 +1,13 @@
 // OriginReplica: origin-sequenced last-writer-wins replica, digest comparison,
-// catch-up planning and the bounded wire codec. Pure logic, no I/O.
+// catch-up planning and the bounded wire codec; and the entry chunk codec and
+// assembler. Pure logic, no I/O.
 
+#include <LemonadeNexus/Sync/EntryChunks.hpp>
 #include <LemonadeNexus/Sync/OriginReplica.hpp>
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -336,4 +339,101 @@ TEST(OriginReplicaWire, MalformedAndOversizedMessagesAreRefused) {
 
     auto dup_req = encode_catch_up("dns", {{"o1", 1}, {"o1", 2}});
     EXPECT_FALSE(decode_catch_up(dup_req).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// Entry chunks (the tree stream's transport for entries above one datagram)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<uint8_t> pattern(std::size_t size) {
+    std::vector<uint8_t> out(size);
+    for (std::size_t i = 0; i < size; ++i) out[i] = static_cast<uint8_t>(i * 31 + 7);
+    return out;
+}
+
+std::vector<EntryChunk> chunks_of(const std::vector<uint8_t>& entry, std::size_t chunk_bytes,
+                                  uint64_t seq = 9) {
+    std::vector<EntryChunk> out;
+    for (const auto& j : encode_entry_chunks("tree", seq, entry, chunk_bytes)) {
+        const auto c = decode_entry_chunk(nlohmann::json::from_msgpack(nlohmann::json::to_msgpack(j)),
+                                          1u << 20);
+        EXPECT_TRUE(c.has_value());
+        out.push_back(*c);
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(EntryChunks, AnEntryReassemblesInAnyOrder) {
+    const auto entry = pattern(10'000);
+    auto chunks = chunks_of(entry, 1'000);
+    ASSERT_EQ(chunks.size(), 10u);
+    std::reverse(chunks.begin(), chunks.end());
+    EntryAssembler assembler(1u << 20, 60'000);
+    std::optional<std::vector<uint8_t>> whole;
+    for (const auto& c : chunks) {
+        EXPECT_FALSE(whole.has_value());
+        whole = assembler.add("peer", c, 1);
+    }
+    ASSERT_TRUE(whole.has_value());
+    EXPECT_EQ(*whole, entry);
+    EXPECT_EQ(assembler.buffered_bytes(), 0u);
+}
+
+TEST(EntryChunks, MalformedChunksAreRefused) {
+    const auto entry = pattern(3'000);
+    auto j = encode_entry_chunks("tree", 1, entry, 1'000).front();
+    EXPECT_TRUE(decode_entry_chunk(j, 1u << 20).has_value());
+    EXPECT_FALSE(decode_entry_chunk(j, 100).has_value());  // declared size above the cap
+    auto bad = j;
+    bad["index"] = 3;  // index >= count
+    EXPECT_FALSE(decode_entry_chunk(bad, 1u << 20).has_value());
+    bad = j;
+    bad["count"] = kMaxEntryChunks + 1;
+    EXPECT_FALSE(decode_entry_chunk(bad, 1u << 20).has_value());
+    bad = j;
+    bad["v"] = 2;
+    EXPECT_FALSE(decode_entry_chunk(bad, 1u << 20).has_value());
+    EXPECT_TRUE(encode_entry_chunks("tree", 1, {}, 1'000).empty());
+}
+
+TEST(EntryChunks, ATamperedChunkNeverYieldsAnEntry) {
+    const auto entry = pattern(3'000);
+    auto chunks = chunks_of(entry, 1'000);
+    chunks[1].data[0] ^= 0x01;
+    EntryAssembler assembler(1u << 20, 60'000);
+    for (const auto& c : chunks) EXPECT_FALSE(assembler.add("peer", c, 1).has_value());
+    EXPECT_EQ(assembler.buffered_bytes(), 0u);
+}
+
+TEST(EntryChunks, ContradictingAndDuplicateChunksAreDropped) {
+    const auto entry = pattern(3'000);
+    auto chunks = chunks_of(entry, 1'000);
+    EntryAssembler assembler(1u << 20, 60'000);
+    EXPECT_FALSE(assembler.add("peer", chunks[0], 1).has_value());
+    EXPECT_FALSE(assembler.add("peer", chunks[0], 1).has_value());  // duplicate
+    EXPECT_EQ(assembler.buffered_bytes(), 1'000u);
+    auto other = chunks[1];
+    other.count = 4;  // contradicts the first chunk's count
+    EXPECT_FALSE(assembler.add("peer", other, 1).has_value());
+    EXPECT_EQ(assembler.buffered_bytes(), 0u);
+}
+
+TEST(EntryChunks, BufferedBytesStayWithinTheBudgetAndAge) {
+    EntryAssembler assembler(2'500, 1'000);
+    // Two partial entries from two senders fill the budget; a third drops
+    // the oldest instead of growing past it.
+    const auto a = chunks_of(pattern(3'000), 1'000, 1);
+    const auto b = chunks_of(pattern(3'001), 1'000, 2);
+    const auto c = chunks_of(pattern(3'002), 1'000, 3);
+    (void)assembler.add("x", a[0], 1);
+    (void)assembler.add("y", b[0], 2);
+    (void)assembler.add("z", c[0], 3);
+    EXPECT_LE(assembler.buffered_bytes(), 2'500u);
+    // Old partial entries expire.
+    (void)assembler.add("z", c[1], 5'000);
+    EXPECT_EQ(assembler.buffered_bytes(), 1'000u);
 }

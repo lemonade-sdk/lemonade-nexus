@@ -161,10 +161,13 @@ int main(int argc, char* argv[]) {
     // through gossip's bounded pool (transfer only, never re-applies them),
     // and gossip evaluates received records against the tree's existing
     // operation-derived permissions.
-    tree.set_delta_retention_sink(
-        [&gossip](const nexus::storage::FileStorageService::RetainedDelta& rec) {
-            return gossip.retain_local_delta(rec);
-        });
+    // In ops mode the committed tree log replaces this transfer.
+    if (!config.tree_ops_enabled) {
+        tree.set_delta_retention_sink(
+            [&gossip](const nexus::storage::FileStorageService::RetainedDelta& rec) {
+                return gossip.retain_local_delta(rec);
+            });
+    }
     gossip.set_tree(&tree);
 
     for (const auto& peer_endpoint : config.seed_peers) {
@@ -778,16 +781,21 @@ int main(int argc, char* argv[]) {
     admission.start();
 
     // ========================================================================
-    // Experimental tree operations (Phase 2): Tier 1 consensus, off by default
+    // Experimental tree operations (Phases 2 and 3), off by default:
+    //   --tree-log  read-only log: build and replicate it, writes stay direct
+    //   --tree-ops  ops: Tier 1 consensus orders writes, every server applies
+    //               the committed (or replicated) log
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
-    if (config.tree_ops_enabled) {
+    std::function<nlohmann::json()> tree_log_status;
+    if (config.tree_ops_enabled || config.tree_log_enabled) {
+        const bool ops_mode = config.tree_ops_enabled;
         const auto network_bytes = nexus::crypto::from_hex(security_mesh->network_id_hex);
         nexus::security::NetworkId network_id{};
         if (network_bytes.size() != network_id.size()) {
-            spdlog::error("Config: tree_ops_enabled needs the Genesis network id");
+            spdlog::error("Config: tree operations need the Genesis network id");
             return 1;
         }
         std::copy(network_bytes.begin(), network_bytes.end(), network_id.begin());
@@ -800,6 +808,8 @@ int main(int argc, char* argv[]) {
         tree_config.self = self;
         tree_config.network_id = network_id;
         tree_config.root_key = root_key;
+        tree_config.mode = ops_mode ? nexus::tree::TreeLogMode::Ops
+                                    : nexus::tree::TreeLogMode::ReadOnly;
         tree_config.wall_clock_ms = [] {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
@@ -816,41 +826,103 @@ int main(int argc, char* argv[]) {
         }
         auto* consensus = tree_consensus.get();
         auto* mesh = security_mesh->service.get();
-        // Ops are signed with this server's gossip identity under their own
-        // domain tag; the key never leaves GossipService.
-        tree_ops = std::make_unique<nexus::tree::TreeOpSubmitter>(
-            tree, crypto, network_id, gossip.keypair(),
-            [consensus](nexus::tree::TreeOp op) { return consensus->submit(std::move(op)); },
-            std::chrono::milliseconds(nexus::tree::kTreeOpCommitWaitMs));
-        tree_ops->set_root_key(root_key);
-        consensus->set_broadcast([mesh](nexus::security::TreeOpSubmitMsg message) {
-            mesh->broadcast_tree_op(std::move(message));
+
+        // Replication (design A7). Entries are verified against the driver's
+        // verified authority chain and the configured root key, on the
+        // security io thread; the sync stream only carries bytes.
+        consensus->set_authority_source([mesh](nexus::security::EpochId epoch) {
+            return mesh->authority_for_epoch(epoch);
         });
-        consensus->set_root_request([submitter = tree_ops.get(), root_key] {
-            nexus::tree::TreeOp op;
-            op.kind = nexus::tree::TreeOpKind::EstablishRoot;
-            op.target = "root";
-            op.principal = root_key;
-            op.body.source = nexus::tree::TreeOpSource::Session;
-            const auto admission = submitter->submit_async(std::move(op));
-            if (!admission.verdict.ok()) {
-                spdlog::warn("[tree] root operation not submitted: {}", admission.verdict.reason);
-            }
-        });
-        mesh->register_payload_handler(*consensus);
-        mesh->set_tree_op_sink([consensus](const nexus::security::TreeOpSubmitMsg& message,
-                                           const nexus::security::NodeId& from) {
-            consensus->receive_forwarded(message, from);
-        });
+        consensus->set_epoch_hint(
+            [mesh](nexus::security::EpochId epoch) { mesh->note_epoch_hint(epoch); });
+        consensus->set_appended_hook([&gossip](uint64_t height) { gossip.offer_tree_height(height); });
+        gossip.enable_tree_stream(
+            [consensus](uint64_t height) { return consensus->encoded_entry(height); },
+            [consensus, mesh](std::vector<uint8_t> bytes) {
+                mesh->post([consensus, bytes = std::move(bytes)] {
+                    const auto entry = nexus::tree::decode_replicated_entry(bytes);
+                    if (!entry) {
+                        spdlog::warn("[tree] dropped a malformed replicated tree log entry");
+                        return;
+                    }
+                    (void)consensus->receive_replicated(*entry);
+                });
+            });
+        for (uint64_t height = 1; height <= consensus->status_summary().height; ++height) {
+            gossip.offer_tree_height(height);
+        }
+        tree_log_status = [consensus, &gossip] {
+            const auto s = consensus->status_summary();
+            nlohmann::json out = gossip.tree_sync_status();
+            out["mode"] = s.mode == nexus::tree::TreeLogMode::Ops ? "ops" : "read-only";
+            out["healthy"] = s.healthy;
+            out["halt_reason"] = s.halt_reason;
+            out["height"] = s.height;
+            out["applied_height"] = s.applied_height;
+            out["state_root"] = nexus::crypto::to_base64(s.root);
+            out["behind"] = s.behind;
+            out["held_entries"] = s.held;
+            out["last_refusal"] = s.last_refusal;
+            return out;
+        };
+
+        if (ops_mode) {
+            // The committed log carries tree changes to every server, so the
+            // record transfer pool for tree records is retired.
+            gossip.retire_tree_transfer();
+            // Tree-derived tunnel addresses are recorded in the IPAM file.
+            const auto sync_ipam = [&tree, &ipam] {
+                std::map<std::string, std::string> assigned;
+                for (const auto& [id, node] : tree.nodes_snapshot()) {
+                    if (!node.tunnel_ip.empty()) assigned.emplace(id, node.tunnel_ip);
+                }
+                (void)ipam.sync_tree_tunnel_addresses(assigned);
+            };
+            sync_ipam();
+            consensus->set_applied_hook(sync_ipam);
+
+            // Ops are signed with this server's gossip identity under their own
+            // domain tag; the key never leaves GossipService.
+            tree_ops = std::make_unique<nexus::tree::TreeOpSubmitter>(
+                tree, crypto, network_id, gossip.keypair(),
+                [consensus](nexus::tree::TreeOp op) { return consensus->submit(std::move(op)); },
+                std::chrono::milliseconds(nexus::tree::kTreeOpCommitWaitMs));
+            tree_ops->set_root_key(root_key);
+            consensus->set_broadcast([mesh](nexus::security::TreeOpSubmitMsg message) {
+                mesh->broadcast_tree_op(std::move(message));
+            });
+            consensus->set_root_request([submitter = tree_ops.get(), root_key] {
+                nexus::tree::TreeOp op;
+                op.kind = nexus::tree::TreeOpKind::EstablishRoot;
+                op.target = "root";
+                op.principal = root_key;
+                op.body.source = nexus::tree::TreeOpSource::Session;
+                const auto admission = submitter->submit_async(std::move(op));
+                if (!admission.verdict.ok()) {
+                    spdlog::warn("[tree] root operation not submitted: {}",
+                                 admission.verdict.reason);
+                }
+            });
+            mesh->register_payload_handler(*consensus);
+            mesh->set_tree_op_sink([consensus](const nexus::security::TreeOpSubmitMsg& message,
+                                               const nexus::security::NodeId& from) {
+                consensus->receive_forwarded(message, from);
+            });
+            tree_op_status = [consensus](const std::string& op_id) {
+                return consensus->status(op_id);
+            };
+            spdlog::warn("EXPERIMENTAL: tree operations enabled (ops mode). Tier 1 orders tree "
+                         "writes through consensus; every server applies the committed log and "
+                         "Tier 2 and lagging servers catch up by replication. A server outside "
+                         "Tier 1 refuses tree writes.");
+        } else {
+            spdlog::warn("EXPERIMENTAL: tree log enabled (read-only mode). The tree log is built "
+                         "and replicated; tree writes keep the direct paths.");
+        }
         mesh->set_tick_hook([consensus, mesh] {
             consensus->set_members(mesh->current_members());
             consensus->maintain();
         });
-        tree_op_status = [consensus](const std::string& op_id) { return consensus->status(op_id); };
-        spdlog::warn("EXPERIMENTAL: tree operations enabled (Phase 2). Tier 1 orders tree "
-                     "writes through consensus and applies them after commit; Tier 2 "
-                     "replication is not implemented, so a server outside Tier 1 refuses "
-                     "tree writes.");
     }
 
     // ========================================================================
@@ -882,6 +954,7 @@ int main(int argc, char* argv[]) {
         .tunnel_bind_ip   = tunnel_bind_ip,
         .tree_ops         = tree_ops.get(),
         .tree_op_status   = tree_op_status,
+        .tree_log_status  = tree_log_status,
     };
 
     nexus::api::PublicApiHandler public_api{ctx};

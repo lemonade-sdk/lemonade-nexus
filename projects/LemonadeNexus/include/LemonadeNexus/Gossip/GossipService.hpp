@@ -8,6 +8,7 @@
 #include <LemonadeNexus/Security/Transport/SecurityTransport.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Sync/EntryChunks.hpp>
 #include <LemonadeNexus/Sync/OriginReplica.hpp>
 
 #include <asio.hpp>
@@ -142,9 +143,10 @@ public:
     /// Attach the in-process virtual netstack. Once our backbone IP is also
     /// set, gossip binds virtual UDP <backbone_ip>:<gossip port> and carries
     /// over the encrypted backbone: permission tree sync (Digest,
-    /// DeltaRequest, DeltaResponse) with every certified peer, catch-up sync
-    /// (SyncDigest, SyncRequest, catch-up DnsRecordSync) and
-    /// AccountEnvelopeSync. Without a backbone path to a peer, no tree
+    /// DeltaRequest, DeltaResponse; retired in tree ops mode) with every
+    /// certified peer, catch-up sync (SyncDigest, SyncRequest, catch-up
+    /// DnsRecordSync, TreeLogSync) and AccountEnvelopeSync. Without a backbone
+    /// path to a peer, no tree
     /// records move to or from it. Tier 1 servers serve catch-up to every
     /// certified server; Tier 2 servers catch up from Tier 1 and never feed
     /// records back. The netstack must outlive this service's start.
@@ -159,6 +161,9 @@ public:
     /// Account envelope replication state, in the same shape as
     /// dns_sync_status().
     [[nodiscard]] nlohmann::json account_sync_status() const;
+
+    /// Tree log replication state, in the same shape as dns_sync_status().
+    [[nodiscard]] nlohmann::json tree_sync_status() const;
 
     /// Set the "ip:port" this server is reachable at, carried in ServerHello so
     /// peers share it instead of the UDP source they happen to observe. Call
@@ -435,9 +440,18 @@ private:
     void handle_sync_request(const asio::ip::udp::endpoint& sender,
                              const std::string& sender_pubkey,
                              const uint8_t* payload, std::size_t payload_len, Via via);
+    /// Serve a tree stream catch-up request: committed log entries after
+    /// `since`, in height order, read from the log and sent as chunks.
+    void serve_tree_entries(const GossipPeer& peer, uint64_t since);
+    /// One chunk of a committed tree log entry (TreeLogSync). Accepted only on
+    /// the backbone from a certified Tier 1 peer; the assembled entry goes to
+    /// the tree entry sink, which verifies it.
+    void handle_tree_log_sync(const asio::ip::udp::endpoint& sender,
+                              const std::string& sender_pubkey,
+                              const uint8_t* payload, std::size_t payload_len, Via via);
 
-    /// Sends the digest of every sync stream (DNS, account envelopes), paged
-    /// to fit, over the backbone. Tier 1 sends to every certified peer with a
+    /// Sends the digest of every sync stream (DNS, account envelopes, and the
+    /// tree log when enabled), paged to fit, over the backbone. Tier 1 sends to every certified peer with a
     /// backbone path; Tier 2 sends to Tier 1 peers only, as status. No-op
     /// until the backbone transport is bound.
     void send_sync_digests();
@@ -764,6 +778,16 @@ private:
 
     // Account envelope replica and the store it feeds.
     std::unique_ptr<sync::OriginReplica>  account_replica_;
+
+    // Tree log stream (enable_tree_stream). The replica indexes committed
+    // heights only; entry bytes stay in the tree log and are read on demand.
+    std::unique_ptr<sync::OriginReplica>  tree_replica_;
+    std::function<std::optional<std::vector<uint8_t>>(uint64_t)> tree_entry_source_;
+    std::function<void(std::vector<uint8_t>)> tree_entry_sink_;
+    std::unique_ptr<sync::EntryAssembler> tree_assembler_;
+    // Ops mode: the record transfer pool (Digest, DeltaRequest,
+    // DeltaResponse) no longer carries tree changes; tree replication does.
+    std::atomic<bool>                     tree_transfer_retired_{false};
     uint64_t                              account_replica_saved_version_{0};
     bool                                  account_replica_loaded_{false};
     std::function<bool(const AccountEnvelopeRecord&)> account_envelope_sink_;
@@ -849,6 +873,24 @@ public:
     /// returns true only when it stored the envelope. It runs on the io
     /// thread. Restores the persisted replica once start() has also run.
     void set_account_envelope_sink(std::function<bool(const AccountEnvelopeRecord&)> sink);
+
+    /// Enable the "tree" sync stream (design A7). `source` returns the encoded
+    /// committed entry at a height, or nullopt when the log does not hold it;
+    /// it must be thread-safe. `sink` receives each assembled entry from a
+    /// Tier 1 peer on the io thread and must verify it before any use: the
+    /// stream only carries bytes, consensus evidence decides. Call before the
+    /// io context runs.
+    void enable_tree_stream(std::function<std::optional<std::vector<uint8_t>>(uint64_t)> source,
+                            std::function<void(std::vector<uint8_t>)> sink);
+
+    /// Record that the local tree log holds `height`, so digests offer it.
+    /// Heights are offered in order from 1. Thread-safe.
+    void offer_tree_height(uint64_t height);
+
+    /// Stop the record transfer pool for tree changes (ops mode): no transfer
+    /// digest is sent, and Digest, DeltaRequest, and DeltaResponse are
+    /// dropped. Call before the io context runs.
+    void retire_tree_transfer() { tree_transfer_retired_.store(true); }
 
     /// Replicate an envelope this server just stored for an authenticated
     /// device. Fills in the origin fields, signs the record, and sends it over

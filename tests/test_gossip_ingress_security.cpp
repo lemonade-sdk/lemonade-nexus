@@ -3169,3 +3169,147 @@ TEST_F(GossipIngressSecurityTest, DnsRemovalCarriesTheRemovalTime) {
     EXPECT_GE(sent->timestamp, before);
     EXPECT_EQ(sent->value, "10.1.1.1");
 }
+
+// Committed tree log entries replicate over the backbone on the "tree" sync
+// stream (design A7). Tier 1 serves them from its log, in height order and in
+// chunks when an entry exceeds one datagram; any certified server pulls them
+// from Tier 1 only. The stream only carries bytes: the receiver's sink
+// verifies each entry's consensus evidence (TreeConsensus).
+TEST_F(GossipIngressSecurityTest, TreeLogEntriesReplicateOverTheBackbone) {
+    auto root_kp = kc->ed25519_keygen();
+    auto a_kp    = kc->ed25519_keygen();
+    auto c_kp    = kc->ed25519_keygen();
+    const auto a_b64  = crypto::to_base64(a_kp.public_key);
+    const auto c_b64  = crypto::to_base64(c_kp.public_key);
+    const auto a_cert = issue_cert(a_b64, "srv-a", root_kp);
+    const auto c_cert = issue_cert(c_b64, "srv-c", root_kp);
+    const std::set<std::string> members{a_b64};  // C is Tier 2
+    const auto seed_own_cert = [](Node& n, const std::string& cert) {
+        storage::SignedEnvelope env;
+        env.type = "server_certificate";
+        env.data = cert;
+        ASSERT_TRUE(n.storage->write_file("identity", "server_cert.json", env));
+    };
+
+    // A's log: three entries, the second larger than several datagrams.
+    std::map<uint64_t, std::vector<uint8_t>> log_a;
+    for (uint64_t h = 1; h <= 3; ++h) {
+        std::vector<uint8_t> bytes(h == 2 ? 100'000 : 300);
+        randombytes_buf(bytes.data(), bytes.size());
+        log_a[h] = std::move(bytes);
+    }
+    std::vector<std::vector<uint8_t>> received_c;
+    std::vector<std::vector<uint8_t>> received_a;
+
+    const auto configure = [&](Node& n, std::map<uint64_t, std::vector<uint8_t>>* log,
+                               std::vector<std::vector<uint8_t>>* received) {
+        n.gossip->set_root_pubkey(root_kp.public_key);
+        n.gossip->set_network_id(kTestNetworkHex);
+        n.gossip->set_ipam(n.ipam.get());
+        n.gossip->set_tier1_membership_source(
+            [&members](const std::string& pk) { return members.count(pk) > 0; });
+        auto* g = n.gossip.get();
+        n.gossip->enable_tree_stream(
+            [log](uint64_t height) -> std::optional<std::vector<uint8_t>> {
+                if (log == nullptr) return std::nullopt;
+                const auto it = log->find(height);
+                if (it == log->end()) return std::nullopt;
+                return it->second;
+            },
+            [received, g](std::vector<uint8_t> bytes) {
+                // Production verifies and appends, then offers the height.
+                received->push_back(std::move(bytes));
+                g->offer_tree_height(received->size());
+            });
+    };
+
+    auto& a = make_node(
+        "a",
+        [&](Node& n) {
+            seed_keypair(*n.storage, a_kp);
+            seed_own_cert(n, a_cert);
+            attach_ipam(n);
+            seed_peers(*n.storage,
+                       nlohmann::json::array({peer_entry(c_b64, "127.0.0.1:10", c_cert)}));
+        },
+        [&](Node& n) { configure(n, &log_a, &received_a); });
+    for (uint64_t h = 1; h <= 3; ++h) a.gossip->offer_tree_height(h);
+    auto& c = make_node(
+        "c",
+        [&](Node& n) {
+            seed_keypair(*n.storage, c_kp);
+            seed_own_cert(n, c_cert);
+            attach_ipam(n);
+            seed_peers(*n.storage,
+                       nlohmann::json::array({peer_entry(a_b64, a.endpoint(), a_cert)}));
+        },
+        [&](Node& n) { configure(n, nullptr, &received_c); });
+    a.gossip->add_peer(c.endpoint(), c_b64);
+    pump_for(std::chrono::milliseconds(200));
+
+    // Refused: a tree chunk on the public socket, even from Tier 1.
+    const auto chunk = sync::encode_entry_chunks("tree", 1, log_a[1], 16 * 1024);
+    ASSERT_EQ(chunk.size(), 1u);
+    inject(build_packet(a_kp, gossip::GossipMsgType::TreeLogSync, msgpack_of(chunk[0])), c);
+    pump_for(std::chrono::milliseconds(200));
+    EXPECT_TRUE(received_c.empty());
+
+    network::VirtualNetService va, vc;
+    std::map<std::string, network::VirtualNetService*> by_ip{{"172.16.0.1", &va},
+                                                             {"172.16.0.3", &vc}};
+    const auto route = [&by_ip](std::span<const uint8_t> p) {
+        if (p.size() < 20) return;
+        const std::string dst = std::to_string(p[16]) + "." + std::to_string(p[17]) + "." +
+                                std::to_string(p[18]) + "." + std::to_string(p[19]);
+        if (auto it = by_ip.find(dst); it != by_ip.end()) it->second->deliver_inbound_ip_packet(p);
+    };
+    const auto mesh_key = [](uint8_t fill) {
+        std::array<uint8_t, crypto::kX25519PublicKeySize> k{};
+        k.fill(fill);
+        return crypto::to_base64(std::span<const uint8_t>(k.data(), k.size()));
+    };
+    struct Wire { Node* n; network::VirtualNetService* v; const char* ip; const char* id; uint8_t key; };
+    for (const auto& w : {Wire{&a, &va, "172.16.0.1", "node-a", 0xA1},
+                          Wire{&c, &vc, "172.16.0.3", "node-c", 0xC3}}) {
+        w.v->start();
+        w.v->set_outbound_sink(route);
+        ASSERT_TRUE(w.v->add_local_ip(std::string(w.ip) + "/22"));
+        w.n->gossip->set_our_mesh_pubkey(mesh_key(w.key));
+        w.n->gossip->set_our_backbone_claim(w.id, w.ip);
+        w.n->gossip->set_virtual_net(w.v);
+    }
+    const auto status_for = [](Node& n, const std::string& pk) {
+        const auto status = n.gossip->tree_sync_status();
+        for (const auto& p : status["peers"]) {
+            if (p["pubkey"] == pk) return p;
+        }
+        return nlohmann::json::object();
+    };
+    for (Node* n : {&a, &c}) gossip::GossipBallotTestAccess::run_gossip_tick(*n->gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return status_for(a, c_b64).value("mesh_key_known", false) &&
+               status_for(c, a_b64).value("mesh_key_known", false);
+    }));
+
+    // One digest round from A: C requests every height and receives the
+    // entries whole and in order, the large one reassembled from chunks.
+    gossip::GossipBallotTestAccess::send_sync_digests(*a.gossip);
+    ASSERT_TRUE(pump_until([&] { return received_c.size() == 3; }, std::chrono::seconds(5)));
+    for (uint64_t h = 1; h <= 3; ++h) EXPECT_EQ(received_c[h - 1], log_a[h]) << "height " << h;
+
+    // The next round finds C in sync, and C reports it to A. A pulls nothing
+    // from a Tier 2 server.
+    gossip::GossipBallotTestAccess::send_sync_digests(*a.gossip);
+    gossip::GossipBallotTestAccess::send_sync_digests(*c.gossip);
+    ASSERT_TRUE(pump_until([&] {
+        return status_for(c, a_b64).value("in_sync", false) &&
+               status_for(a, c_b64).value("in_sync", false);
+    }));
+    c.gossip->offer_tree_height(4);
+    gossip::GossipBallotTestAccess::send_sync_digests(*c.gossip);
+    pump_for(std::chrono::milliseconds(300));
+    EXPECT_TRUE(received_a.empty());
+    EXPECT_TRUE(a.gossip->tree_sync_status().value("enabled", false));
+
+    for (auto* v : {&va, &vc}) v->stop();
+}

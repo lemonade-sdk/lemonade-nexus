@@ -51,6 +51,12 @@ endif()
 add_executable(nexus-release-bundle tools/release_bundle_main.cpp)
 target_link_libraries(nexus-release-bundle PRIVATE LemonadeNexus)
 
+# Tree merge ceremony tooling (design A9): export, merge, finalize. Not
+# installed; the operator runs it during the one-time ceremony. No key
+# material is read or written.
+add_executable(nexus-tree-merge tools/tree_merge_main.cpp)
+target_link_libraries(nexus-tree-merge PRIVATE LemonadeNexus)
+
 # ── Install targets ──────────────────────────────────────────────────────────
 
 # Rename binary from LemonadeNexusApp → lemonade-nexus

@@ -93,6 +93,11 @@ struct ServerConfig {
     // Manifest CLI mode
     std::string add_manifest_path;  // path to a release manifest JSON to import
 
+    // Tree merge ceremony (design A9), root-side and server-side CLI modes.
+    std::string sign_tree_merge_preimage;   // --sign-tree-merge <preimage> <signature-out>
+    std::string sign_tree_merge_out;
+    std::string install_tree_merge_path;    // --install-tree-merge <commit.json>
+
     // Runtime-only: path the config was loaded from (not persisted to JSON).
     std::string config_path{"lemonade-nexus.json"};
     // Linux Tier-1 package contract. Process-inherited SP_* variables are
@@ -120,12 +125,18 @@ struct ServerConfig {
     // User/device registration policy
     bool        open_registration{true};     // false: new identities need a device link token to join
 
-    // Experimental, Phases 1 and 2 of docs/Design-Tree-Consensus-and-Storage-Key.md:
+    // Experimental, Phases 1 to 3 of docs/Design-Tree-Consensus-and-Storage-Key.md:
     // every tree write builds a signed tree operation, Tier 1 orders it
-    // through consensus, and every Tier 1 server applies it after commit
-    // (TreeConsensus). Off: the direct write paths, and no tree block is
-    // proposed, voted for, or applied.
+    // through consensus, every Tier 1 server applies it after commit, and
+    // Tier 2 and lagging servers apply the replicated log (TreeConsensus).
+    // Off: the direct write paths, and no tree block is proposed, voted for,
+    // applied, or replicated.
     bool        tree_ops_enabled{false};
+
+    // Experimental, design A9 release N: build and replicate the tree log in
+    // read-only mode while tree writes keep the direct paths. Ignored when
+    // tree_ops_enabled is set (ops mode runs the log too).
+    bool        tree_log_enabled{false};
 
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)
