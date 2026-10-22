@@ -322,6 +322,7 @@ add_sdk_test(test_boringtun_keys       test_boringtun_keys.cpp)
 add_sdk_test(test_group_key_envelope   test_group_key_envelope.cpp)
 add_sdk_test(test_sdk_tree_errors      test_sdk_tree_errors.cpp)
 add_sdk_test(test_sdk_capi_mesh       test_sdk_capi_mesh.cpp)
+add_sdk_test(test_sdk_identity       test_sdk_identity.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)

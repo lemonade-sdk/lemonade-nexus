@@ -196,6 +196,9 @@ class _MemberAccessDialogState extends ConsumerState<MemberAccessDialog> {
                       ),
                     const SizedBox(height: 16),
                     _heading('Who can reach this device'),
+                    _note(scheme,
+                        'See shows this device to the other device. Connect also adds it to that device\'s mesh peers.'),
+                    const SizedBox(height: 6),
                     if (_others.isEmpty)
                       _note(scheme, 'No other devices in this Cluster.')
                     else

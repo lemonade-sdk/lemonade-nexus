@@ -6,19 +6,25 @@
 // shared state, and it must reuse its HTTPS connection instead of paying a TCP
 // and TLS handshake on every call.
 
+#include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
 #include <gtest/gtest.h>
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include <sodium.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -198,4 +204,337 @@ TEST_F(SdkTransportTest, ConcurrentCallsAndTokenChangesStayConsistent) {
         for (const auto& t : tokens) whole = whole || v == "Bearer " + t;
         EXPECT_TRUE(whole) << "torn Authorization header: " << v;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Private API over the mesh.
+//
+// A stand-in server: the public API answers the join, and the private API is
+// reachable only through a BoringtunMesh that acts as the server's dataplane.
+// A second BoringtunMesh is another endpoint in the client's peer list. The
+// client runs its real join, private transport, orchestrator, and leave paths.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kNodeId   = "node-self";
+constexpr const char* kPeerId   = "node-peer";
+constexpr uint16_t    kPrivPort = 9101;
+
+/// The stand-in server's answer to one private request.
+enum class Reply { Ok, Reject, CutAfterHeaders };
+
+/// Send the status line and headers, then close the connection before the
+/// body. The client gets no response, although the server ran the request.
+void cut_after_headers(httplib::Response& res) {
+    res.set_chunked_content_provider("application/json",
+                                     [](size_t, httplib::DataSink&) { return false; });
+}
+
+template <typename Pred>
+bool wait_for(Pred pred, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return pred();
+}
+
+class SdkMeshPrivateApiTest : public ::testing::Test {
+protected:
+    fs::path dir;
+    std::unique_ptr<httplib::SSLServer> pub;
+    std::unique_ptr<httplib::SSLServer> priv;
+    std::thread pub_thread;
+    std::thread priv_thread;
+    int pub_port = 0;
+
+    lnsdk::BoringtunMesh server_mesh;  // the server's dataplane
+    lnsdk::BoringtunMesh peer_mesh;    // another endpoint in the client's peer list
+    std::pair<std::string, std::string> server_keys;
+    std::pair<std::string, std::string> peer_keys;
+
+    std::atomic<int>   peer_list_gets{0};
+    std::atomic<int>   delete_posts{0};
+    std::atomic<Reply> peer_list_reply{Reply::Ok};
+    std::atomic<Reply> delete_reply{Reply::Ok};
+
+    void SetUp() override {
+        ASSERT_GE(sodium_init(), 0);
+        dir = fs::temp_directory_path() /
+              ("nexus_sdk_mesh_" + std::to_string(::testing::UnitTest::GetInstance()->random_seed()) +
+               "_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+        fs::create_directories(dir);
+        const auto cert = dir / "cert.pem";
+        const auto key = dir / "key.pem";
+        ASSERT_TRUE(make_localhost_cert(cert, key));
+#ifdef _WIN32
+        (void)_putenv_s("SSL_CERT_FILE", cert.string().c_str());
+#else
+        ::setenv("SSL_CERT_FILE", cert.string().c_str(), 1);
+#endif
+
+        server_keys = lnsdk::BoringtunMesh::generate_keypair();
+        peer_keys   = lnsdk::BoringtunMesh::generate_keypair();
+        ASSERT_TRUE(server_mesh.start(mesh_config(server_keys, "10.64.0.1/32")));
+        ASSERT_TRUE(peer_mesh.start(mesh_config(peer_keys, "10.64.0.4/32")));
+
+        priv = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_TRUE(priv->is_valid());
+        priv->Get(std::string("/api/mesh/peers/") + kNodeId,
+                  [this](const httplib::Request&, httplib::Response& res) {
+            ++peer_list_gets;
+            if (peer_list_reply.load() == Reply::CutAfterHeaders) return cut_after_headers(res);
+            nlohmann::json peer = {
+                {"node_id", kPeerId},
+                {"mesh_pubkey", peer_keys.second},
+                {"tunnel_ip", "10.64.0.4/32"},
+                {"endpoint", "127.0.0.1:" + std::to_string(peer_mesh.bound_port())},
+                {"last_seen", 0},
+            };
+            nlohmann::json body;
+            body["peers"] = nlohmann::json::array({peer});
+            res.set_content(body.dump(), "application/json");
+        });
+        priv->Post(std::string("/api/tree/node/delete/") + kNodeId,
+                   [this](const httplib::Request&, httplib::Response& res) {
+            ++delete_posts;
+            switch (delete_reply.load()) {
+            case Reply::Ok:
+                res.set_content(R"({"success":true})", "application/json");
+                break;
+            case Reply::Reject:
+                res.status = 403;
+                res.set_content(R"({"success":false,"error":"denied"})", "application/json");
+                break;
+            case Reply::CutAfterHeaders:
+                cut_after_headers(res);
+                break;
+            }
+        });
+        priv->Post("/api/mesh/heartbeat", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"success":true})", "application/json");
+        });
+        const int priv_port = priv->bind_to_any_port("127.0.0.1");
+        ASSERT_GT(priv_port, 0);
+        priv_thread = std::thread([this] { priv->listen_after_bind(); });
+        priv->wait_until_ready();
+        ASSERT_TRUE(server_mesh.tcp_ingress(kPrivPort,
+                                            "tcp:127.0.0.1:" + std::to_string(priv_port)));
+
+        pub = std::make_unique<httplib::SSLServer>(cert.string().c_str(), key.string().c_str());
+        ASSERT_TRUE(pub->is_valid());
+        pub->Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content(R"({"status":"ok"})", "application/json");
+        });
+        pub->Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body, nullptr, false);
+            lnsdk::MeshPeer self;
+            self.mesh_pubkey = body.is_object() ? body.value("mesh_pubkey", "") : "";
+            self.tunnel_ip   = "10.64.0.3/32";
+            (void)server_mesh.sync_peers({self});
+            (void)peer_mesh.sync_peers({self});
+            nlohmann::json j;
+            j["token"]               = "session-token";
+            j["node_id"]             = kNodeId;
+            j["tunnel_ip"]           = "10.64.0.3/32";
+            j["server_tunnel_ip"]    = "10.64.0.1";
+            j["server_private_fqdn"] = "localhost";
+            j["private_api_port"]    = kPrivPort;
+            j["mesh_server_pubkey"]  = server_keys.second;
+            j["mesh_endpoint"]       = "127.0.0.1:" + std::to_string(server_mesh.bound_port());
+            j["tunnel_subnet"]       = "10.64.0.0/10";
+            res.set_content(j.dump(), "application/json");
+        });
+        pub_port = pub->bind_to_any_port("127.0.0.1");
+        ASSERT_GT(pub_port, 0);
+        pub_thread = std::thread([this] { pub->listen_after_bind(); });
+        pub->wait_until_ready();
+    }
+
+    void TearDown() override {
+        if (pub) pub->stop();
+        if (priv) priv->stop();
+        if (pub_thread.joinable()) pub_thread.join();
+        if (priv_thread.joinable()) priv_thread.join();
+        peer_mesh.stop();
+        server_mesh.stop();
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
+
+    static lnsdk::BoringtunConfig mesh_config(const std::pair<std::string, std::string>& keys,
+                                              const std::string& tunnel_ip) {
+        lnsdk::BoringtunConfig cfg;
+        cfg.private_key = keys.first;
+        cfg.public_key  = keys.second;
+        cfg.tunnel_ip   = tunnel_ip;
+        cfg.allowed_ips = {"10.64.0.0/10"};
+        return cfg;
+    }
+
+    bool default_trust_reaches_server() const {
+        httplib::Client probe("https://localhost:" + std::to_string(pub_port));
+        probe.set_connection_timeout(3);
+        auto res = probe.Get("/api/health");
+        return res && res->status == 200;
+    }
+
+    /// A client that has joined through the stand-in server.
+    std::unique_ptr<lnsdk::LemonadeNexusClient> joined_client() {
+        lnsdk::ServerConfig cfg;
+        cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
+        cfg.auto_discover = false;
+        auto client = std::make_unique<lnsdk::LemonadeNexusClient>(cfg);
+        client->set_session_token("session-token");
+        auto joined = client->join_network("user", "password");
+        EXPECT_TRUE(joined.ok) << joined.error;
+        EXPECT_TRUE(client->is_mesh_active());
+        return client;
+    }
+};
+
+}  // namespace
+
+#ifdef __linux__
+#define LN_REQUIRE_TEST_TRUST()                                                     \
+    if (!default_trust_reaches_server())                                            \
+    FAIL() << "default TLS trust cannot reach the test server; SSL_CERT_FILE is "   \
+              "deterministic on Linux"
+#else
+#define LN_REQUIRE_TEST_TRUST()                                                     \
+    if (!default_trust_reaches_server())                                            \
+    GTEST_SKIP() << "default TLS trust here ignores SSL_CERT_FILE (macOS keychain)"
+#endif
+
+// The node delete travels over the mesh, so leave_network must delete the node
+// before it stops the mesh.
+TEST_F(SdkMeshPrivateApiTest, LeaveDeletesTheNodeBeforeItStopsTheMesh) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    auto left = client->leave_network();
+    EXPECT_TRUE(left.ok) << left.error;
+    EXPECT_EQ(delete_posts.load(), 1);
+    EXPECT_FALSE(client->is_mesh_active());
+    EXPECT_TRUE(client->node_id().empty());
+}
+
+// A rejected delete leaves the node joined: the mesh stays up so the caller can
+// retry, and the error reaches the caller.
+TEST_F(SdkMeshPrivateApiTest, LeaveKeepsTheMeshUpWhenTheDeleteFails) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    delete_reply = Reply::Reject;
+    auto left = client->leave_network();
+    EXPECT_FALSE(left.ok);
+    EXPECT_EQ(left.http_status, 403);
+    EXPECT_EQ(delete_posts.load(), 1);
+    EXPECT_TRUE(client->is_mesh_active());
+    EXPECT_EQ(client->node_id(), kNodeId);
+}
+
+// The server can apply a POST and then lose the response. The client must not
+// send that POST a second time.
+TEST_F(SdkMeshPrivateApiTest, PostWithoutAResponseIsNotSentAgain) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    delete_reply = Reply::CutAfterHeaders;
+    auto deleted = client->delete_node(kNodeId);
+    EXPECT_FALSE(deleted.ok);
+    EXPECT_EQ(delete_posts.load(), 1);
+}
+
+// A GET has no side effect, so the client still retries it once.
+TEST_F(SdkMeshPrivateApiTest, GetWithoutAResponseIsRetriedOnce) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    peer_list_reply = Reply::CutAfterHeaders;
+    auto peers = client->fetch_mesh_peers(kNodeId);
+    EXPECT_FALSE(peers.ok);
+    EXPECT_EQ(peer_list_gets.load(), 2);
+}
+
+// refresh_mesh_peers must run a refresh now, not at the next interval.
+TEST_F(SdkMeshPrivateApiTest, RefreshNowFetchesPeersImmediately) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.peer_refresh_interval_sec = 3600;
+    cfg.heartbeat_interval_sec    = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return peer_list_gets.load() >= 1; }, std::chrono::seconds(10)));
+    const int before = peer_list_gets.load();
+    client->refresh_mesh_peers();
+    EXPECT_TRUE(wait_for([&] { return peer_list_gets.load() > before; }, std::chrono::seconds(3)))
+        << "refresh_mesh_peers did not wake the orchestrator";
+    client->disable_mesh();
+}
+
+// A mesh state callback runs on the orchestrator thread and may call back into
+// the client. leave_network stops the orchestrator; it must not hold the
+// client mutex while it waits for that thread, or the callback and the leave
+// wait on each other forever.
+TEST_F(SdkMeshPrivateApiTest, LeaveDoesNotDeadlockWithACallbackThatCallsTheClient) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    auto* raw = client.get();
+    std::atomic<bool> in_callback{false};
+    std::atomic<bool> callback_done{false};
+    client->set_mesh_callback([&, raw](const lnsdk::MeshTunnelStatus&) {
+        if (in_callback.exchange(true)) return;
+        // Hold the orchestrator thread here until the leave has deleted the
+        // node and is stopping the orchestrator, then call into the client.
+        (void)wait_for([&] { return delete_posts.load() > 0; }, std::chrono::seconds(20));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        (void)raw->get_mesh_peers();
+        (void)raw->mesh_status();
+        callback_done = true;
+    });
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return in_callback.load(); }, std::chrono::seconds(15)));
+
+    auto left = std::make_shared<std::promise<bool>>();
+    auto done = left->get_future();
+    std::thread leaver([left, raw] { left->set_value(raw->leave_network().ok); });
+    if (done.wait_for(std::chrono::seconds(20)) != std::future_status::ready) {
+        // The threads are deadlocked and cannot be joined; end the process so
+        // the run reports the failure instead of hanging.
+        ADD_FAILURE() << "leave_network deadlocked with the mesh state callback";
+        std::fprintf(stderr, "deadlock detected; exiting\n");
+        std::_Exit(1);
+    }
+    leaver.join();
+    EXPECT_TRUE(done.get());
+    EXPECT_TRUE(callback_done.load());
+    EXPECT_FALSE(client->is_mesh_active());
+}
+
+// The orchestrator takes a peer's handshake time from the dataplane entry with
+// the same mesh public key. The server lists tunnel_ip with a prefix and the
+// dataplane has no node_id, so neither of those fields can match.
+TEST_F(SdkMeshPrivateApiTest, HandshakeIsMatchedToItsPeerByMeshKey) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec = 3600;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return client->get_mesh_peers().size() == 1; },
+                         std::chrono::seconds(10)));
+
+    // Traffic toward the peer starts the Noise handshake with it.
+    const uint16_t egress = client->open_egress("10.64.0.4", 80);
+    ASSERT_GT(egress, 0);
+    httplib::Client poke("127.0.0.1", egress);
+    poke.set_connection_timeout(1);
+    poke.set_read_timeout(1);
+    (void)poke.Get("/");
+
+    EXPECT_TRUE(wait_for([&] {
+        auto peers = client->get_mesh_peers();
+        return peers.size() == 1 && peers[0].last_handshake > 0 && peers[0].is_online;
+    }, std::chrono::seconds(15))) << "the peer's handshake was not attributed to it";
+    client->disable_mesh();
 }
