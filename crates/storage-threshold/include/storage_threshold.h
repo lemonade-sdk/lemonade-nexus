@@ -6,8 +6,9 @@
 /// in sync if a crate version changes.
 ///
 /// Threshold storage key (design Part B). The storage secret s is shared
-/// among 5 to 50 holders with threshold t = ceil(0.65 * n) and is never
-/// assembled. A data key is wrapped to S = s*G with ECIES: this library
+/// among at most 50 holders with threshold t = ceil(0.65 * n) and is never
+/// assembled. The first key needs at least 5 holders; a rotation or a
+/// refresh needs at least 3, so the holders can re-share after losses. A data key is wrapped to S = s*G with ECIES: this library
 /// returns the ephemeral point R and the shared point r*S; the caller runs
 /// the KDF and AEAD. To unwrap, t holders each return s_i*R with a DLEQ proof,
 /// and storage_combine interpolates s*R.
@@ -52,12 +53,13 @@ extern "C" {
 #define STORAGE_ERR_SERIALIZATION      (-3)  ///< Byte encoding or decoding failed
 #define STORAGE_ERR_BELOW_THRESHOLD    (-4)  ///< Fewer than t distinct partials, helpers, or old holders
 #define STORAGE_ERR_THRESHOLD_CHANGE   (-5)  ///< The new holder count needs another t; rotate the key instead
-#define STORAGE_ERR_HOLDER_COUNT       (-6)  ///< Holder count outside 5..50
+#define STORAGE_ERR_HOLDER_COUNT       (-6)  ///< Holder count outside 5..50 (first key) or 3..50 (rotation, refresh, plan)
 #define STORAGE_ERR_PROOF              (-7)  ///< A partial failed DLEQ verification, or its holder is not in the plan
 #define STORAGE_ERR_SHARE_MISMATCH     (-8)  ///< The share does not belong to the plan (stale, removed, other key)
 #define STORAGE_ERR_PANIC              (-10) ///< Internal panic caught at the boundary
 
-#define STORAGE_MIN_HOLDERS   5
+#define STORAGE_MIN_HOLDERS   5   ///< First key
+#define STORAGE_MIN_RESHARE_HOLDERS 3   ///< Rotation, refresh, and any plan
 #define STORAGE_MAX_HOLDERS   50
 #define STORAGE_POINT_LEN     32
 #define STORAGE_PARTIAL_LEN   96  ///< s_i*R (32 bytes) followed by the DLEQ proof (64 bytes)
@@ -107,14 +109,22 @@ int32_t storage_threshold_for(uint16_t holder_count, uint16_t* out_threshold);
 
 /* --- Key generation (frost-ristretto255 DKG) ---------------------------- */
 
-/// Part 1 for one holder among holder_count (5..50) holders, t derived.
-/// Use this for the first key and for every key rotation.
+/// Part 1 of the first key for one holder among holder_count (5..50)
+/// holders, t derived.
 /// On success the caller owns *out_state (pass it to storage_dkg_part2 or
 /// free it) and *out_package (broadcast it, then storage_buffer_free).
 int32_t storage_dkg_part1(uint16_t identifier,
                           uint16_t holder_count,
                           StorageDkgRound1State** out_state,
                           StorageBuffer* out_package);
+
+/// Part 1 of a key rotation: as storage_dkg_part1, but for 3..50 holders.
+/// A rotation replaces an existing key, so it may keep fewer holders than
+/// the first key needs. Parts 2 and 3 are shared with the first key.
+int32_t storage_dkg_rotation_part1(uint16_t identifier,
+                                   uint16_t holder_count,
+                                   StorageDkgRound1State** out_state,
+                                   StorageBuffer* out_package);
 
 /// Part 2. CONSUMES state on every return path.
 /// @param round1 Round 1 package of every OTHER holder (identifier = sender)
@@ -259,7 +269,7 @@ int32_t storage_encapsulate(const uint8_t storage_public_key[32],
 
 /* --- Plans and shares ---------------------------------------------------- */
 
-/// Parse and fully check a plan: 5..50 holders, identifiers, and every
+/// Parse and fully check a plan: 3..50 holders, identifiers, and every
 /// commitment on one polynomial of degree t - 1 with constant term S.
 int32_t storage_plan_validate(const uint8_t* plan,
                               size_t plan_len,

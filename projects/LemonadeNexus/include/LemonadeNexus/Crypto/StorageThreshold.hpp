@@ -3,7 +3,7 @@
 // The threshold storage key boundary (design Part B, Phase 4).
 //
 // This is the only place that touches the storage-threshold crate. The
-// storage secret s is shared among 5 to 50 holders with threshold
+// storage secret s is shared among at most 50 holders with threshold
 // t = ceil(0.65 * n) and is never assembled. A server wraps its data key to
 // the storage public key S with ECIES; unwrapping needs t holders' partials
 // s_i*R, each with a DLEQ proof bound to the unlock request.
@@ -54,7 +54,8 @@ enum class StorageStatus : int8_t {
     BelowThreshold,
     /// The new holder count needs another threshold; rotate the key.
     ThresholdChange,
-    /// Holder count outside 5..50.
+    /// Holder count outside 5..50 (first key) or 3..50 (rotation, refresh,
+    /// plan).
     HolderCount,
     /// A partial failed DLEQ verification, or its holder is not in the plan.
     InvalidProof,
@@ -220,7 +221,11 @@ struct StorageWrappedDataKey {
 
 class StorageThreshold {
 public:
+    /// The fewest holders the first storage key can be created with.
     static constexpr uint16_t kMinHolders = 5;
+    /// The fewest holders a rotation or a refresh can keep after losses
+    /// (4 holders give t = 3, 3 holders give t = 2). No plan is smaller.
+    static constexpr uint16_t kMinReshareHolders = 3;
     static constexpr uint16_t kMaxHolders = 50;
     /// Upper bound on a wrapped data key and on a server identifier.
     static constexpr std::size_t kMaxDataKeySize = 256;
@@ -232,9 +237,14 @@ public:
 
     // --- Key generation: the first key and every rotation --------------------
 
-    /// Part 1 for one holder among holder_count (5..50) holders.
+    /// Part 1 of the first key, for one holder among holder_count (5..50)
+    /// holders.
     [[nodiscard]] static StorageResult<StorageDkgRound1> dkg_part1(StorageHolderId holder,
                                                                    uint16_t holder_count);
+    /// Part 1 of a key rotation, for one holder among holder_count (3..50)
+    /// holders. Parts 2 and 3 are the same as for the first key.
+    [[nodiscard]] static StorageResult<StorageDkgRound1> dkg_rotation_part1(
+        StorageHolderId holder, uint16_t holder_count);
     /// round1: every OTHER holder's package, keyed by sender. Consumes round1
     /// on every path.
     [[nodiscard]] static StorageResult<StorageDkgRound2> dkg_part2(
@@ -319,7 +329,7 @@ public:
 
     // --- Plans and shares -----------------------------------------------------
 
-    /// Full plan check: 5..50 holders, t derived, and every commitment on one
+    /// Full plan check: 3..50 holders, t derived, and every commitment on one
     /// polynomial of degree t - 1 with constant term S.
     [[nodiscard]] static StorageResult<StoragePlanInfo> validate_plan(std::span<const uint8_t> plan);
 

@@ -45,12 +45,15 @@ StoragePeerBytesMap without(const StoragePeerBytesMap& map, StorageHolderId skip
     return out;
 }
 
-Group run_dkg(const std::vector<StorageHolderId>& ids) {
+/// Key generation among `ids`: the first key, or a rotation when `rotation`
+/// is set (a rotation may keep 3 or 4 holders).
+Group run_dkg(const std::vector<StorageHolderId>& ids, bool rotation = false) {
     const auto n = static_cast<uint16_t>(ids.size());
     std::map<StorageHolderId, nexus::crypto::StorageDkgRound1> round1;
     StoragePeerBytesMap packages;
     for (const auto id : ids) {
-        auto result = StorageThreshold::dkg_part1(id, n);
+        auto result = rotation ? StorageThreshold::dkg_rotation_part1(id, n)
+                               : StorageThreshold::dkg_part1(id, n);
         EXPECT_TRUE(result.ok()) << "part1 for " << id;
         packages[id] = result.value->package();
         round1.emplace(id, std::move(*result.value));
@@ -208,8 +211,8 @@ protected:
 
     /// Unwrap with exactly t holders succeeds and with t - 1 fails. This is
     /// the library side of a cold start where only those holders are up.
-    void expect_exact_threshold(uint16_t n) {
-        const auto group = run_dkg(range(1, n));
+    void expect_exact_threshold(uint16_t n, bool rotation = false) {
+        const auto group = run_dkg(range(1, n), rotation);
         const auto t = *StorageThreshold::threshold_for(n);
         const auto wrapped = wrap(group);
         const auto ctx = context();
@@ -250,6 +253,46 @@ TEST(StorageThresholdParams, KeyGenerationRejectsOutOfRangeCounts) {
     }
     EXPECT_EQ(StorageThreshold::dkg_part1(1, 51).status, StorageStatus::HolderCount);
     EXPECT_EQ(StorageThreshold::dkg_part1(0, 5).status, StorageStatus::InvalidArgument);
+}
+
+TEST(StorageThresholdParams, RotationAndRefreshKeepAtLeastThreeHolders) {
+    EXPECT_EQ(StorageThreshold::kMinReshareHolders, 3);
+    for (uint16_t n = 0; n < StorageThreshold::kMinReshareHolders; ++n) {
+        EXPECT_EQ(StorageThreshold::dkg_rotation_part1(1, n).status, StorageStatus::HolderCount)
+            << n;
+    }
+    EXPECT_EQ(StorageThreshold::dkg_rotation_part1(1, 51).status, StorageStatus::HolderCount);
+    EXPECT_TRUE(StorageThreshold::dkg_rotation_part1(1, 3).ok());
+    EXPECT_TRUE(StorageThreshold::dkg_rotation_part1(1, 4).ok());
+    // The first key still needs five.
+    EXPECT_EQ(StorageThreshold::dkg_part1(1, 4).status, StorageStatus::HolderCount);
+}
+
+// After holder loss the key rotates at the new count: n = 4 gives t = 3 and
+// n = 3 gives t = 2. Exactly t holders unwrap; t - 1 do not.
+TEST_F(StorageThresholdTest, RotationToFourAndThreeHolders) {
+    for (const uint16_t n : {4, 3}) {
+        const auto group = run_dkg(range(1, n), true);
+        auto info = StorageThreshold::validate_plan(group.plan);
+        ASSERT_TRUE(info.ok()) << n;
+        EXPECT_EQ(info.value->holder_count, n);
+        EXPECT_EQ(info.value->threshold, n == 4 ? 3 : 2);
+        expect_exact_threshold(n, true);
+    }
+}
+
+// A 4-holder plan refreshes in place; shrinking it to 3 changes t and is
+// refused, so the caller rotates.
+TEST_F(StorageThresholdTest, FourHolderRefreshAndShrinkToThree) {
+    const auto group = run_dkg(range(1, 4), true);
+    auto refreshed = run_refresh(all_shares(group), group.plan, range(1, 4));
+    ASSERT_TRUE(refreshed.ok());
+    EXPECT_EQ(refreshed.value->storage_public_key, group.storage_public_key);
+    EXPECT_EQ(StorageThreshold::refresh_part1(group.shares.at(1), 3).status,
+              StorageStatus::ThresholdChange);
+    const auto three = run_dkg(range(1, 3), true);
+    EXPECT_EQ(StorageThreshold::refresh_part1(three.shares.at(1), 2).status,
+              StorageStatus::HolderCount);
 }
 
 TEST_F(StorageThresholdTest, KeyGenerationWrapAndUnwrap) {

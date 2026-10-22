@@ -7,7 +7,7 @@ use curve25519_dalek::traits::Identity;
 use rand_core::{OsRng, RngCore};
 
 use crate::keys::{self, PeerMessages, Share};
-use crate::params::{threshold_for, MAX_HOLDERS, MIN_HOLDERS};
+use crate::params::{threshold_for, MAX_HOLDERS, MIN_HOLDERS, MIN_RESHARE_HOLDERS};
 use crate::plan::{interpolate, Plan};
 use crate::unlock::{self, UnlockContext, PARTIAL_LEN};
 use crate::wrap::encapsulate;
@@ -26,11 +26,22 @@ fn view<'a>(map: &'a BTreeMap<HolderId, Vec<u8>>, skip: Option<HolderId>) -> Pee
 }
 
 fn run_dkg(ids: &[HolderId]) -> Group {
+    run_key_generation(ids, keys::dkg_part1)
+}
+
+/// A key rotation: a new key generation that may keep 3 or 4 holders.
+fn run_rotation(ids: &[HolderId]) -> Group {
+    run_key_generation(ids, keys::dkg_rotation_part1)
+}
+
+type Part1 = fn(HolderId, u16) -> Result<(keys::DkgRound1, Vec<u8>), StorageError>;
+
+fn run_key_generation(ids: &[HolderId], part1: Part1) -> Group {
     let n = ids.len() as u16;
     let mut round1 = BTreeMap::new();
     let mut packages = BTreeMap::new();
     for &id in ids {
-        let (state, package) = keys::dkg_part1(id, n).expect("part1");
+        let (state, package) = part1(id, n).expect("part1");
         round1.insert(id, state);
         packages.insert(id, package);
     }
@@ -474,10 +485,10 @@ fn threshold_change_requires_rotation() {
         Some(StorageError::ThresholdChange)
     );
     let five = run_dkg(&ids(1..=5));
-    // 5 to 4 holders is below the minimum plan size.
+    // 5 holders (t = 4) to 4 holders (t = 3).
     assert_eq!(
         keys::refresh_part1(&five.shares[&1], 4).err(),
-        Some(StorageError::HolderCount)
+        Some(StorageError::ThresholdChange)
     );
     assert_eq!(
         keys::refresh_part1(&five.shares[&1], MAX_HOLDERS + 1).err(),
@@ -706,6 +717,90 @@ fn malformed_share_and_plan_bytes() {
 
 // --- Holder-count sweep ------------------------------------------------------
 
+// --- Shrinking after holder loss (3 and 4 holders) --------------------------
+
+#[test]
+fn first_key_needs_five_holders() {
+    for n in [3u16, 4] {
+        assert_eq!(
+            keys::dkg_part1(1, n).err(),
+            Some(StorageError::HolderCount),
+            "n = {n}"
+        );
+    }
+}
+
+#[test]
+fn rotation_to_four_and_three_holders() {
+    // n = 4 gives t = 3; n = 3 gives t = 2.
+    for (n, t) in [(4u16, 3u16), (3, 2)] {
+        let group = run_rotation(&ids(1..=n));
+        assert_eq!(group.plan.holder_count(), n);
+        assert_eq!(group.plan.threshold(), t);
+        group.plan.validate().unwrap();
+        check_exact_threshold(&group, n);
+        // The shares survive the sealed-storage round trip at the small sizes.
+        let bytes = group.shares[&1].serialize().unwrap();
+        let restored = Share::deserialize(&bytes).unwrap();
+        restored.check_in_plan(&group.plan).unwrap();
+        let plan = Plan::deserialize(&group.plan.serialize().unwrap()).unwrap();
+        assert_eq!(plan.threshold(), t);
+    }
+}
+
+#[test]
+fn rotation_rejects_out_of_range_counts() {
+    for n in 0..MIN_RESHARE_HOLDERS {
+        assert_eq!(
+            keys::dkg_rotation_part1(1, n).err(),
+            Some(StorageError::HolderCount),
+            "n = {n}"
+        );
+    }
+    assert_eq!(
+        keys::dkg_rotation_part1(1, MAX_HOLDERS + 1).err(),
+        Some(StorageError::HolderCount)
+    );
+}
+
+#[test]
+fn refresh_at_four_and_three_holders() {
+    for n in [4u16, 3] {
+        let group = run_rotation(&ids(1..=n));
+        let refreshed = run_refresh(&all_shares(&group), &group.plan, &ids(1..=n)).unwrap();
+        assert_eq!(
+            refreshed.plan.storage_public_key(),
+            group.plan.storage_public_key()
+        );
+        check_exact_threshold(&refreshed, n);
+        // A pre-refresh share does not belong to the refreshed plan.
+        assert_eq!(
+            group.shares[&1].check_in_plan(&refreshed.plan),
+            Err(StorageError::ShareMismatch)
+        );
+    }
+}
+
+#[test]
+fn shrinking_changes_the_threshold_and_needs_rotation() {
+    // 4 holders (t = 3) to 3 holders (t = 2): rotate, never refresh.
+    let four = run_rotation(&ids(1..=4));
+    assert_eq!(
+        keys::refresh_part1(&four.shares[&1], 3).err(),
+        Some(StorageError::ThresholdChange)
+    );
+    // 3 holders to 2: no plan has 2 holders, although t would stay 2.
+    let three = run_rotation(&ids(1..=3));
+    assert_eq!(
+        keys::refresh_part1(&three.shares[&1], 2).err(),
+        Some(StorageError::HolderCount)
+    );
+    assert_eq!(
+        keys::dkg_rotation_part1(1, 2).err(),
+        Some(StorageError::HolderCount)
+    );
+}
+
 #[test]
 fn key_generation_rejects_out_of_range_counts() {
     for n in 0..MIN_HOLDERS {
@@ -771,10 +866,10 @@ fn check_exact_threshold(group: &Group, n: u16) {
     );
 }
 
-/// Every permitted holder count, with dealer shares.
+/// Every permitted plan size, with dealer shares.
 #[test]
 fn every_holder_count_exact_threshold() {
-    for n in MIN_HOLDERS..=MAX_HOLDERS {
+    for n in MIN_RESHARE_HOLDERS..=MAX_HOLDERS {
         check_exact_threshold(&dealer_group(n), n);
     }
 }
