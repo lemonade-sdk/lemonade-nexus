@@ -49,6 +49,11 @@ int ns_add_tcp_forward(NsHandle* handle, const char* vip, uint16_t vport,
 uint16_t ns_add_tcp_egress(NsHandle* handle, const char* dst_ip,
                            uint16_t dst_port, const char* src_ip);
 
+/// Close the egress listeners to `dst_ip:dst_port` and abort the virtual TCP
+/// connections already open to it. Returns 0, or -1 for a null handle, an
+/// invalid address, or a stopped stack.
+int ns_remove_tcp_egress(NsHandle* handle, const char* dst_ip, uint16_t dst_port);
+
 /// Callback invoked on the stack thread with each datagram received on a
 /// bound virtual UDP port. Addresses are IPv4 in host byte order
 /// (10.0.0.1 == 0x0A000001). `data` is valid only for the duration of the

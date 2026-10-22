@@ -54,6 +54,9 @@ pub enum Command {
         dst: IpEndpoint,
         src_ip: Ipv4Address,
     },
+    /// Close every egress listener to `dst` and abort the virtual TCP
+    /// connections already open to it.
+    RemoveTcpEgress(IpEndpoint),
     /// Bind virtual UDP `local`; each received datagram goes to `deliver`.
     UdpBind {
         local: IpEndpoint,
@@ -237,6 +240,34 @@ impl Stack {
                         },
                     );
                 }
+            }
+            Command::RemoveTcpEgress(dst) => {
+                let listeners: Vec<Token> = self
+                    .egress
+                    .iter()
+                    .filter_map(|(token, eg)| (eg.dst == dst).then_some(*token))
+                    .collect();
+                for token in listeners {
+                    if let Some(mut eg) = self.egress.remove(&token) {
+                        let _ = eg.listener.deregister(self.poll.registry());
+                    }
+                }
+                let connections: Vec<Token> = self
+                    .conns
+                    .iter()
+                    .filter_map(|(token, conn)| {
+                        (self.sockets.get::<tcp::Socket>(conn.tcp).remote_endpoint() == Some(dst))
+                            .then_some(*token)
+                    })
+                    .collect();
+                for token in connections {
+                    if let Some(mut conn) = self.conns.remove(&token) {
+                        self.sockets.get_mut::<tcp::Socket>(conn.tcp).abort();
+                        conn.bridge.deregister(self.poll.registry());
+                        self.sockets.remove(conn.tcp);
+                    }
+                }
+                log::info!("virtual-netstack: egress to {dst} removed");
             }
             Command::UdpBind { local, deliver } => {
                 if self.udp.iter().any(|b| b.local == local) {

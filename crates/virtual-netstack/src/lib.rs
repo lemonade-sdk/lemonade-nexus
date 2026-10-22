@@ -424,3 +424,35 @@ pub unsafe extern "C" fn ns_add_tcp_egress(
     let _ = handle.waker.wake();
     bound_port
 }
+
+/// Close the loopback egress listeners to `dst_ip:dst_port` and abort the
+/// virtual TCP connections open to it. Returns 0, or -1 for a null handle,
+/// an invalid address, or a stopped stack.
+///
+/// # Safety
+/// `handle` must come from `ns_create` and not yet be destroyed; `dst_ip`
+/// must be a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn ns_remove_tcp_egress(
+    handle: *mut NsHandle,
+    dst_ip: *const c_char,
+    dst_port: u16,
+) -> c_int {
+    let handle = match handle.as_ref() {
+        Some(h) => h,
+        None => return -1,
+    };
+    let addr = match cstr(dst_ip).and_then(parse_ipv4) {
+        Some(v) => v,
+        None => return -1,
+    };
+    let dst = IpEndpoint {
+        addr: addr.into(),
+        port: dst_port,
+    };
+    if handle.cmd_tx.send(Command::RemoveTcpEgress(dst)).is_err() {
+        return -1;
+    }
+    let _ = handle.waker.wake();
+    0
+}

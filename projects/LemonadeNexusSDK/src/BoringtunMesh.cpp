@@ -174,6 +174,14 @@ uint16_t BoringtunMesh::tcp_egress(const std::string& dst_ip, uint16_t dst_port)
     return local;
 }
 
+void BoringtunMesh::close_egress(const std::string& dst_ip, uint16_t dst_port) {
+    std::lock_guard lock(impl_->egress_mtx);
+    impl_->egress_cache.erase({dst_ip, dst_port});
+    if (!impl_->ns) return;
+    ns_remove_tcp_egress(impl_->ns, dst_ip.c_str(), dst_port);
+    spdlog::debug("[BoringtunMesh] egress to {}:{} closed", dst_ip, dst_port);
+}
+
 bool BoringtunMesh::tcp_ingress(uint16_t vport, const std::string& target) {
     if (!impl_->active.load() || !impl_->ns || impl_->tunnel_addr.empty()) return false;
     if (vport == 0 || target.empty()) return false;

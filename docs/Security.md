@@ -71,6 +71,18 @@ handoff.
 Clients use the mesh under their application permissions. They do not become
 members of the server authority committee.
 
+Endpoints, the devices that join a group, come in two roles. Neither holds any
+server or authority role:
+
+| Role | What establishes it | Capabilities |
+|---|---|---|
+| **Tier 3** | An endpoint that joins with `ln_set_inference_node(client, 1)` (the Lemonade server, for example). The server records `is_inference` when it creates the endpoint, and the routing identifier starts with `infer-`. | Serves inference to the group members its permissions allow. |
+| **Tier 4** | Any other endpoint (the default). Its routing identifier starts with `client-`. | Uses the group's inference nodes and other services under its permissions. |
+
+Which members may reach a Tier 3 node is decided by the permission tree, as for
+any endpoint. The role is set when the endpoint is created; a device that
+already joined keeps its role.
+
 ## Epoch Authority
 
 After Genesis, the current committee finalizes four transitions in order at
