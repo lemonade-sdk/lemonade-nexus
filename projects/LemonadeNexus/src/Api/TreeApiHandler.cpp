@@ -302,6 +302,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (!body_opt) return;
         auto& body = *body_opt;
 
+        // The joining device's key becomes its node's management key and every
+        // permission principal, so the join must prove the device holds it.
+        // Only the ed25519 method verifies body.pubkey against a challenge
+        // signature; with password, passkey, or token-link, body.pubkey is
+        // whatever the caller wrote.
+        if (body.value("method", std::string{}) != "ed25519") {
+            error_response(res,
+                "joining requires the ed25519 method: sign the server challenge "
+                "with the device key", 403);
+            return;
+        }
+
         auto auth_result = ctx_.auth.authenticate(body);
         if (!auth_result.authenticated) {
             error_response(res, "authentication failed", 401);
@@ -794,8 +806,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        // Generate node ID from pubkey
+        // Generate node ID from pubkey. Standard base64 can contain '/', which
+        // no node file name may hold, so use the URL-safe alphabet.
         auto pubkey_short = claims.pubkey.substr(0, std::min<size_t>(claims.pubkey.size(), 16));
+        for (auto& c : pubkey_short) {
+            if (c == '+') c = '-';
+            else if (c == '/') c = '_';
+        }
         node.id = "node-" + pubkey_short;
         if (hostname.empty()) {
             hostname = type_str + "-" + node.id.substr(0, 12);
