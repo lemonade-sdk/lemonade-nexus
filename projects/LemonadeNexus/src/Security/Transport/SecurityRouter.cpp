@@ -34,6 +34,14 @@ uint16_t code(Enum value) {
     return static_cast<uint16_t>(value);
 }
 
+bool storage_kind(SecurityMessageKind kind) {
+    return kind == SecurityMessageKind::StoragePlanProof ||
+           kind == SecurityMessageKind::StorageKeyPackage ||
+           kind == SecurityMessageKind::StorageUnlockRequest ||
+           kind == SecurityMessageKind::StorageUnlockPartial ||
+           kind == SecurityMessageKind::StoragePlanRequest;
+}
+
 }  // namespace
 
 SecurityRouter::SecurityRouter(SecurityRouterConfig config, SecurityRuntime& runtime,
@@ -125,6 +133,30 @@ bool SecurityRouter::challenger_is_member(const NodeId& from) const {
     return cur.tier1_members.contains(from);
 }
 
+bool SecurityRouter::storage_challenger(const NodeId& from, const Digest& context) const {
+    return config_.storage_unlock_challenger && config_.storage_unlock_challenger(from, context);
+}
+
+bool SecurityRouter::challenger_authorized(const AttestationChallenge& challenge,
+                                           const NodeId& from) const {
+    // A StorageUnlock challenge never rides on membership: it answers one
+    // request this node sent, so only that request can authorize it. A Tier 1
+    // member gets no unlock evidence it did not earn the same way.
+    if (challenge.purpose == AttestationPurpose::StorageUnlock) {
+        return challenge.context_digest != Digest{} &&
+               storage_challenger(from, challenge.context_digest);
+    }
+    if (challenger_is_member(from)) {
+        return true;
+    }
+    // A holder outside Tier 1 that has not enrolled this node's SVSM AK yet
+    // first asks for enrollment; the enrollment challenge carries the deferred
+    // unlock context.
+    return challenge.purpose == AttestationPurpose::PlatformEnrollment &&
+           challenge.context_digest != Digest{} &&
+           storage_challenger(from, challenge.context_digest);
+}
+
 bool SecurityRouter::within_challenge_budget(const NodeId& from, uint64_t now_ms) {
     auto it = challenge_budgets_.find(from);
     if (it == challenge_budgets_.end()) {
@@ -212,6 +244,12 @@ bool SecurityRouter::sender_bound(const SecurityMessage& message,
                 return body.node_id == authenticated_sender;
             } else if constexpr (std::is_same_v<T, CandidateStateReadyMsg>) {
                 return body.node == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, StorageKeyPackageMsg>) {
+                return body.sender == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, StorageUnlockRequestMsg>) {
+                return body.requester == authenticated_sender;
+            } else if constexpr (std::is_same_v<T, StorageUnlockPartialMsg>) {
+                return body.holder == authenticated_sender;
             } else {
                 return true;
             }
@@ -233,6 +271,13 @@ bool SecurityRouter::epoch_in_window(const SecurityMessage& message) const {
     const bool chain_kind = message.kind == SecurityMessageKind::AuthorityChainRequest ||
                             message.kind == SecurityMessageKind::AuthorityChainPage;
     if (chain_kind) {
+        return true;
+    }
+    // Storage-key traffic binds its epoch inside verified content (a commit
+    // proof, a session digest, an unlock context) and reaches holders outside
+    // Tier 1, which hold no epoch state here. The storage service checks every
+    // epoch against its own verified view; passing the window is delivery.
+    if (storage_kind(message.kind)) {
         return true;
     }
     // What a pending candidate exchanges before it holds epoch state. Each of
@@ -334,7 +379,13 @@ RouteResult SecurityRouter::receive(const NodeId& authenticated_sender,
                             message.kind == SecurityMessageKind::DkgBroadcast ||
                             message.kind == SecurityMessageKind::DkgPairwise ||
                             message.kind == SecurityMessageKind::DkgTranscriptAttest ||
-                            message.kind == SecurityMessageKind::BootstrapCertificate;
+                            message.kind == SecurityMessageKind::BootstrapCertificate ||
+                            // Storage-key re-sends and the record exchange
+                            // repeat byte-identical messages against loss; the
+                            // session rejects a second different package.
+                            message.kind == SecurityMessageKind::StoragePlanProof ||
+                            message.kind == SecurityMessageKind::StorageKeyPackage ||
+                            message.kind == SecurityMessageKind::StoragePlanRequest;
     if (!idempotent && !remember(envelope)) {
         return drop(DropReason::Duplicate);
     }
@@ -446,6 +497,13 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
             events_.on_tree_op_submit(std::get<TreeOpSubmitMsg>(message.body), message.sender);
             return delivered();
         }
+        case SecurityMessageKind::StoragePlanProof:
+        case SecurityMessageKind::StorageKeyPackage:
+        case SecurityMessageKind::StorageUnlockRequest:
+        case SecurityMessageKind::StorageUnlockPartial:
+        case SecurityMessageKind::StoragePlanRequest:
+            events_.on_storage_message(message);
+            return delivered();
     }
     return drop(DropReason::UnknownKind);
 }
@@ -688,10 +746,12 @@ RouteResult SecurityRouter::route_challenge(const AttestationChallenge& challeng
     if (evidence_producer_ == nullptr) {
         return drop(DropReason::NoService);
     }
-    if (from != runtime_.self() && !challenger_is_member(from)) {
+    if (from != runtime_.self() && !challenger_authorized(challenge, from)) {
         // Answering a challenge is expensive platform work. The requester is
         // authorized by phase — the pinned anchor pre-quorum, a current
-        // member once an epoch is active — never by its own signature.
+        // member once an epoch is active — never by its own signature. A
+        // storage-unlock challenge is authorized only by this node's own
+        // pending request to that holder.
         return drop(DropReason::NotMember);
     }
     if (!within_challenge_budget(from, now_ms)) {
@@ -759,7 +819,8 @@ RouteResult SecurityRouter::route_evidence(const AttestationEvidence& evidence) 
 
 RouteResult SecurityRouter::route_evidence_start(const AttestationEvidenceStart& start,
                                                  uint64_t now_ms) {
-    const auto challenge = runtime_.attestation().pending_challenge(start.evidence.node_id);
+    const auto challenge = runtime_.attestation().pending_challenge(start.evidence.node_id,
+                                                                    start.evidence.purpose);
     if (!challenge) return drop(DropReason::ServiceRejected,
                                 code(EvidenceTransferFailure::NoLiveChallenge));
     return settle_transfer(
@@ -785,7 +846,7 @@ RouteResult SecurityRouter::settle_transfer(EvidenceTransferResult result) {
 RouteResult SecurityRouter::route_activation_offer(const SvsmAkActivationOfferMessage& offer,
                                                    const NodeId& from) {
     if (offer.subject_node != runtime_.self() || offer.observer != from ||
-        !challenger_is_member(from))
+        !(challenger_is_member(from) || storage_challenger(from, Digest{})))
         return drop(DropReason::NotMember);
     if (evidence_producer_ == nullptr) return drop(DropReason::NoService);
     auto response = evidence_producer_->activate(offer);

@@ -12,7 +12,8 @@
 // Payload kinds are append-only. Each kind has one handler on the lifecycle
 // driver (IBlockPayloadHandler) that proposes, validates, and applies it. A
 // later kind (for example a storage holder plan) adds an enum value and a
-// handler; consensus code does not change.
+// handler; consensus code does not change. The storage key adds two kinds
+// (Security/Storage/StorageKeyService.hpp).
 
 #include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
@@ -30,6 +31,14 @@ class HotStuffService;
 enum class BlockPayloadKind : uint16_t {
     /// An ordered batch of tree operations (nexus::tree::TreeBatch wire form).
     TreeBatch = 1,
+    /// A storage holder record for the first key or a share refresh (design
+    /// B4, B5): a holder selection, or the finalized holder plan with S and
+    /// the share commitments (StorageRecords.hpp wire form).
+    StorageHolderPlan = 2,
+    /// A storage key rotation record (design B5a): the selection of a new key
+    /// generation, or the finalized rotation that names the new S, its share
+    /// commitments, and the effective epoch (StorageRecords.hpp wire form).
+    StorageKeyRotation = 3,
 };
 
 /// True for a kind this build knows. The codec refuses any other value.

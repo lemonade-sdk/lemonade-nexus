@@ -188,34 +188,9 @@ bool write_legacy(storage::FileStorageService& storage, const crypto::Ed25519Key
 }
 
 /// Overwrite the plaintext file, flush it to the device, then remove it. The
-/// overwrite is best effort: a journaling or copy-on-write file system, LVM
-/// snapshots, or SSD remapping can keep older blocks.
+/// overwrite is best effort (security::scrub_file).
 bool scrub_legacy(const fs::path& data_root) {
-    const auto path = legacy_path(data_root);
-    std::error_code ec;
-    const auto size = fs::file_size(path, ec);
-    if (!ec && size > 0) {
-#ifndef _WIN32
-        const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
-        if (fd >= 0) {
-            const std::vector<uint8_t> zeros(static_cast<std::size_t>(size), 0);
-            std::size_t at = 0;
-            while (at < zeros.size()) {
-                const ssize_t n = ::write(fd, zeros.data() + at, zeros.size() - at);
-                if (n <= 0) break;
-                at += static_cast<std::size_t>(n);
-            }
-            (void)::fsync(fd);
-            ::close(fd);
-        }
-#else
-        std::ofstream out(path, std::ios::binary | std::ios::in | std::ios::out);
-        const std::vector<char> zeros(static_cast<std::size_t>(size), 0);
-        out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
-#endif
-    }
-    fs::remove(path, ec);
-    return !fs::exists(path, ec);
+    return security::scrub_file(legacy_path(data_root));
 }
 
 crypto::SecureBuffer secret_of(const crypto::Ed25519Keypair& keypair) {

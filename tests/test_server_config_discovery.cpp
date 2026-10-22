@@ -81,3 +81,23 @@ TEST(ServerConfigJson, MeshInterfaceReadsCurrentName) {
     nexus::core::from_json(nlohmann::json{{"mesh_interface", "mesh0"}}, current);
     EXPECT_EQ(current.mesh_interface, "mesh0");
 }
+
+// The experimental storage key is off unless a setting turns it on.
+TEST(ServerConfigJson, StorageKeyIsOffByDefaultAndReadsItsJsonKey) {
+    nexus::core::ServerConfig config;
+    EXPECT_FALSE(config.storage_key_enabled);
+    nexus::core::from_json(nlohmann::json{{"storage_key_enabled", true}}, config);
+    EXPECT_TRUE(config.storage_key_enabled);
+}
+
+TEST_F(ConfigDiscovery, StorageKeyFlagTurnsTheStorageKeyOn) {
+    fs::current_path(dir);
+    EXPECT_FALSE(load_from_cwd().storage_key_enabled);
+    std::string a0 = "lemonade-nexus";
+    std::string a1 = "--root-pubkey";
+    std::string a2 = std::string(64, 'a');
+    std::string a3 = "--storage-key";
+    std::vector<char*> argv{a0.data(), a1.data(), a2.data(), a3.data()};
+    EXPECT_TRUE(nexus::core::load_config(static_cast<int>(argv.size()), argv.data())
+                    .storage_key_enabled);
+}

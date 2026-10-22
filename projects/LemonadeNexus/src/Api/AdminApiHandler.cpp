@@ -7,6 +7,7 @@
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
@@ -19,6 +20,53 @@ using nexus::auth::SessionClaims;
 
 void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                                          httplib::Server& priv) {
+    // GET /api/storage/status and POST /api/storage/rotate-data-key — files
+    // under the data key (Phase 7). Root admin only: a valid JWT alone is not
+    // enough. The rotation runs in the background; the request only records
+    // it (durably) for the next tick that can run it.
+    const auto storage_admin = [this](const SessionClaims& claims, httplib::Response& res) {
+        if (ctx_.storage_vault == nullptr) {
+            error_response(res, "storage files are not enabled", 404);
+            return false;
+        }
+        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), "root",
+                                         acl::Permission::Admin)) {
+            error_response(res, "admin authorization required", 403);
+            return false;
+        }
+        return true;
+    };
+    const auto storage_status = [this] {
+        const auto& vault = *ctx_.storage_vault;
+        return nlohmann::json{
+            {"mode", std::string(security::vault_mode_name(vault.mode()))},
+            {"phase", std::string(security::vault_phase_name(vault.phase()))},
+            {"files_ready", vault.files_ready()},
+            {"last_rotation_ms", vault.last_rotation_ms()},
+            {"rotation_requested", vault.rotation_requested()},
+        };
+    };
+    priv.Get("/api/storage/status", require_auth(ctx_.auth,
+        [storage_admin, storage_status](const httplib::Request&, httplib::Response& res,
+                                        const SessionClaims& claims) {
+        if (!storage_admin(claims, res)) return;
+        json_response(res, storage_status());
+    }));
+    priv.Post("/api/storage/rotate-data-key", require_auth(ctx_.auth,
+        [this, storage_admin, storage_status](const httplib::Request&, httplib::Response& res,
+                                              const SessionClaims& claims) {
+        if (!storage_admin(claims, res)) return;
+        if (!ctx_.storage_vault->request_rotation()) {
+            error_response(res, "the files are not migrated yet, or the request was not saved",
+                           409);
+            return;
+        }
+        spdlog::info("[storage] data key rotation requested by an administrator");
+        auto j = storage_status();
+        j["success"] = true;
+        json_response(res, j);
+    }));
+
     // POST /api/credentials/request — DDNS credential distribution
     priv.Post("/api/credentials/request", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {

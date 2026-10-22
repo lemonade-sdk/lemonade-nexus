@@ -3,7 +3,10 @@
 //! Every protocol step is one frost-ristretto255 call. This module adds the
 //! design rules around those calls:
 //!
-//! - Key generation needs `5 ≤ n ≤ 50` holders and uses `t = ceil(0.65 × n)`.
+//! - The first key needs `5 ≤ n ≤ 50` holders. A rotation (a new key
+//!   generation that replaces `S`) and a refresh need `3 ≤ n ≤ 50`, so the
+//!   holders can re-share after losses (design B4, B5). Every plan uses
+//!   `t = ceil(0.65 × n)`.
 //! - A refresh keeps `t` and `S`. It fails with
 //!   [`StorageError::ThresholdChange`] when the new holder count needs a
 //!   different `t`; the caller then rotates the key with a new key generation
@@ -31,7 +34,7 @@ use frost_ristretto255 as frost;
 use rand_core::OsRng;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::params::{is_plan_threshold, plan_threshold};
+use crate::params::{creation_threshold, is_plan_threshold, plan_threshold};
 use crate::plan::{holder_id, identifier, Plan};
 use crate::{HolderId, Result, StorageError};
 
@@ -147,10 +150,26 @@ impl Drop for DkgRound2 {
     }
 }
 
-/// Key generation part 1 for `holder` among `holder_count` holders.
-/// Returns the state and the round 1 package to broadcast.
+/// Key generation part 1 of the first storage key, for `holder` among
+/// `holder_count` holders (`5 ≤ holder_count ≤ 50`). Returns the state and
+/// the round 1 package to broadcast.
 pub fn dkg_part1(holder: HolderId, holder_count: u16) -> Result<(DkgRound1, Vec<u8>)> {
-    let threshold = plan_threshold(holder_count as usize)?;
+    dkg_part1_with(holder, holder_count, creation_threshold(holder_count as usize)?)
+}
+
+/// Key generation part 1 of a key rotation, for `holder` among
+/// `holder_count` holders (`3 ≤ holder_count ≤ 50`). A rotation replaces an
+/// existing key, so it may run with fewer holders than the first key after
+/// holders are lost. Parts 2 and 3 are the same as for the first key.
+pub fn dkg_rotation_part1(holder: HolderId, holder_count: u16) -> Result<(DkgRound1, Vec<u8>)> {
+    dkg_part1_with(holder, holder_count, plan_threshold(holder_count as usize)?)
+}
+
+fn dkg_part1_with(
+    holder: HolderId,
+    holder_count: u16,
+    threshold: u16,
+) -> Result<(DkgRound1, Vec<u8>)> {
     let (secret, package) = dkg::part1(identifier(holder)?, holder_count, threshold, OsRng)?;
     let state = DkgRound1 { secret };
     let bytes = package.serialize()?;

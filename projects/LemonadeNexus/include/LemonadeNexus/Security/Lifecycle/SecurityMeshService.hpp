@@ -18,6 +18,8 @@
 #include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
 #include <LemonadeNexus/Security/SecurityRuntime.hpp>
+#include <LemonadeNexus/Security/Storage/StorageKeyService.hpp>
+#include <LemonadeNexus/Security/Storage/StorageShareStore.hpp>
 #include <LemonadeNexus/Security/Transport/PairwiseSeal.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
 
@@ -63,6 +65,22 @@ struct SecurityMeshConfig {
     /// Fires when this node first holds finalized epoch authority (entry into
     /// Active, or genesis certificate issuance). io-thread context.
     std::function<void()> on_epoch_established;
+    /// ServerConfig::storage_key_enabled: run the threshold storage key
+    /// (StorageKeyService). Off: no storage handler, sink, or message exists.
+    bool storage_key_enabled = false;
+    /// How the storage share is sealed (B6, B7 step 1): the boot set's backend
+    /// (attestd_seal_backend in production). Empty means this host cannot
+    /// seal; the share then stays in the machine-bound file store.
+    SealBackend seal_backend;
+    /// The boot set's SealedBlobStore directory (Core/BootSet.hpp
+    /// kSealedDirectory under the data root).
+    std::filesystem::path sealed_directory;
+    /// Expected PCR 8/9 of the installed, verified release approval; staged
+    /// for the share like for the gossip identity. nullopt stages nothing.
+    std::optional<BootPcrValues> next_boot_chain;
+    /// Files encrypted under the data key (Phase 7), or nullptr. Not owning;
+    /// must outlive the service. Used only with storage_key_enabled.
+    StorageVault* vault = nullptr;
 };
 
 class SecurityMeshService : public core::IService<SecurityMeshService> {
@@ -72,6 +90,10 @@ public:
     SecurityMeshService(asio::io_context& io, const SecurityMeshConfig& config,
                         gossip::GossipService& transport,
                         crypto::KeyWrappingService* wrapping);
+    /// Detaches the vault from the data key service this object owns.
+    ~SecurityMeshService();
+    SecurityMeshService(const SecurityMeshService&) = delete;
+    SecurityMeshService& operator=(const SecurityMeshService&) = delete;
 
     void on_start();
     void on_stop();
@@ -136,6 +158,11 @@ public:
     /// Runs on the io thread after every driver tick. Call before the io
     /// context runs.
     void set_tick_hook(std::function<void()> hook) { tick_hook_ = std::move(hook); }
+
+    /// The storage key service, or nullptr when storage_key_enabled is off.
+    /// Its DataKeyService reads (state, data_key) are thread-safe; everything
+    /// else runs on the io thread.
+    [[nodiscard]] StorageKeyService* storage_key() { return storage_.get(); }
 
 private:
     // The router needs its events sink at construction and the driver needs
@@ -229,6 +256,9 @@ private:
         void on_tree_op_submit(const TreeOpSubmitMsg& m, const NodeId& n) override {
             if (target) target->on_tree_op_submit(m, n);
         }
+        void on_storage_message(const SecurityMessage& m) override {
+            if (target) target->on_storage_message(m);
+        }
     };
 
     [[nodiscard]] uint64_t now_ms() const;
@@ -249,6 +279,16 @@ private:
     SecurityRouter router_;
     PlatformEvidenceProducer producer_;
     SecurityDriver driver_;
+
+    // The threshold storage key, behind storage_key_enabled. Built after the
+    // driver it registers with; the router reaches it only through the
+    // address-captured challenge gate.
+    std::unique_ptr<crypto::SodiumCryptoService> storage_crypto_;
+    std::unique_ptr<SealedBlobStore> sealed_blobs_;
+    std::unique_ptr<FileStorageShareStore> file_share_store_;
+    std::unique_ptr<IStorageShareStore> share_store_;
+    std::unique_ptr<StorageKeyService> storage_;
+    StorageVault* vault_ = nullptr;
 
     asio::steady_timer timer_;
     std::chrono::steady_clock::time_point started_at_{};

@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
+
 #include <spdlog/spdlog.h>
 #include <sodium.h>
 
@@ -143,12 +145,23 @@ Ed25519Keypair KeyWrappingService::generate_and_store_identity(
         // Store wrapped private key as: "v2:" + nonce_hex + ":" + ciphertext_hex.
         // The "v2:" prefix marks the machine-bound binding (see WrapBinding::Machine).
         auto enc_path = identity_dir / "keypair.enc";
-        std::ofstream ofs(enc_path, std::ios::binary);
         // "v2:" marks the machine binding; the number after it is the crypto
         // format version, so the construction is named rather than guessed.
         auto nonce_hex = to_hex(std::span<const uint8_t>(
             wrapped.ciphertext.nonce.data(), wrapped.ciphertext.nonce.size()));
         auto ct_hex = to_hex(std::span<const uint8_t>(wrapped.ciphertext.ciphertext));
+        if (auto* vault = storage_.vault_for(enc_path)) {
+            // Phase 7: the file is also encrypted under the data key.
+            const std::string content = std::string(kEncV2Prefix) +
+                std::to_string(static_cast<unsigned>(wrapped.ciphertext.version)) + ":" +
+                nonce_hex + ":" + ct_hex;
+            if (!vault->write(enc_path, content)) {
+                spdlog::error("[{}] cannot write {} under the data key", name(),
+                              enc_path.string());
+            }
+            return keypair;
+        }
+        std::ofstream ofs(enc_path, std::ios::binary);
         ofs << kEncV2Prefix << static_cast<unsigned>(wrapped.ciphertext.version) << ":"
             << nonce_hex << ":" << ct_hex;
         ofs.close();
@@ -161,6 +174,14 @@ Ed25519Keypair KeyWrappingService::generate_and_store_identity(
     }
 
     return keypair;
+}
+
+bool KeyWrappingService::identity_present() const {
+    const auto enc_path = storage_.data_root() / "identity" / "keypair.enc";
+    auto staged = enc_path;
+    staged += security::kVaultStagedSuffix;
+    std::error_code ec;
+    return fs::exists(enc_path, ec) || fs::exists(staged, ec);
 }
 
 std::optional<Ed25519PublicKey> KeyWrappingService::load_identity_pubkey() const {
@@ -198,19 +219,33 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
     }
 
     auto enc_path = storage_.data_root() / "identity" / "keypair.enc";
-    if (!fs::exists(enc_path)) {
-        spdlog::warn("[{}] cannot unlock: no encrypted key found", name());
-        return std::nullopt;
-    }
-
-    std::ifstream ifs(enc_path);
-    if (!ifs) {
-        return std::nullopt;
-    }
-
+    auto* vault = storage_.vault_for(enc_path);
     std::string content;
-    std::getline(ifs, content);
-    ifs.close();
+    if (vault != nullptr) {
+        auto read = vault->read(enc_path);
+        if (read.status != security::VaultReadStatus::Ok) {
+            if (read.status == security::VaultReadStatus::Missing) {
+                spdlog::warn("[{}] cannot unlock: no encrypted key found", name());
+            } else {
+                spdlog::error("[{}] keypair.enc does not open under the data key", name());
+            }
+            return std::nullopt;
+        }
+        content = read.bytes.substr(0, read.bytes.find('\n'));
+        sodium_memzero(read.bytes.data(), read.bytes.size());
+    } else {
+        if (!fs::exists(enc_path)) {
+            spdlog::warn("[{}] cannot unlock: no encrypted key found", name());
+            return std::nullopt;
+        }
+
+        std::ifstream ifs(enc_path);
+        if (!ifs) {
+            return std::nullopt;
+        }
+        std::getline(ifs, content);
+        ifs.close();
+    }
 
     // A "v2:" prefix marks the machine-bound binding; its absence marks a legacy
     // (pre-hardening) blob that we transparently migrate to the machine binding.
@@ -271,7 +306,8 @@ std::optional<Ed25519PrivateKey> KeyWrappingService::unlock_identity(
 
     // Transparently migrate a legacy blob to the machine binding so a stolen
     // keypair.enc stops being usable on another host / without wrap_local.key.
-    if (binding == WrapBinding::Legacy) {
+    // Not under the data key: the migration writes the file directly.
+    if (binding == WrapBinding::Legacy && vault == nullptr) {
         migrate_legacy_identity(enc_path, *privkey, passphrase, *pubkey);
     }
     return privkey;

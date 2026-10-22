@@ -59,6 +59,8 @@ struct RecordingEvents : ISecurityEvents {
         sync_certificates.push_back(qc);
     }
     void on_vote_sent(const Vote& v, const NodeId& to) override { votes_sent.emplace_back(v, to); }
+    std::vector<SecurityMessage> storage_messages;
+    void on_storage_message(const SecurityMessage& m) override { storage_messages.push_back(m); }
 };
 
 struct Node;
@@ -131,6 +133,8 @@ struct Node {
     RecordingProducer producer;
     std::unique_ptr<SecurityRouter> router;
     std::vector<RouteResult> results;
+    /// The StorageUnlock challenge gate a storage service would answer.
+    std::function<bool(const NodeId&, const Digest&)> storage_gate;
 
     RouteResult deliver(const NodeId& from, std::span<const uint8_t> bytes, uint64_t now) {
         results.push_back(router->receive(from, bytes, now));
@@ -222,6 +226,10 @@ struct RouterMesh : ::testing::Test {
             SecurityRouterConfig router_config;
             router_config.network_id = network;
             router_config.genesis_anchor_id = anchor_id;
+            router_config.storage_unlock_challenger =
+                [raw = node.get()](const NodeId& holder, const Digest& context) {
+                    return raw->storage_gate && raw->storage_gate(holder, context);
+                };
             node->router = std::make_unique<SecurityRouter>(
                 router_config, *node->runtime, *node->transport, node->events,
                 *node->sealer, &node->producer);
@@ -634,6 +642,95 @@ TEST_F(RouterMesh, RemoteNonMemberChallengeIsDroppedBeforeProduction) {
         a->deliver(founders[1]->id, encode_security_message(member_envelope), mesh.now_ms);
     EXPECT_EQ(member_result.dropped, DropReason::NoService);
     EXPECT_EQ(a->producer.calls, 1);
+}
+
+TEST_F(RouterMesh, StorageUnlockChallengeNeedsThisNodesPendingRequest) {
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+    Digest context{};
+    context.fill(0x5A);
+    const auto storage_challenge = [&](AttestationPurpose purpose, const Digest& bound) {
+        auto challenge = gate_passing_challenge(network, a->id);
+        challenge.purpose = purpose;
+        challenge.context_digest = bound;
+        return challenge;
+    };
+    const auto from = [&](Node* sender, const AttestationChallenge& challenge) {
+        return a->deliver(sender->id,
+                          encode_security_message(sender->router->compose(
+                              SecurityMessageKind::AttestationChallenge, challenge, 1)),
+                          mesh.now_ms);
+    };
+
+    // A holder outside Tier 1 with no request from this node: refused before
+    // any production.
+    EXPECT_EQ(from(outsider, storage_challenge(AttestationPurpose::StorageUnlock, context)).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(a->producer.calls, 0);
+
+    // With a pending request to that holder bound to this context, the gate
+    // opens (the fake producer then answers nothing: NoService).
+    a->storage_gate = [&](const NodeId& holder, const Digest& bound) {
+        return holder == outsider->id && (bound == context || bound == Digest{});
+    };
+    EXPECT_EQ(from(outsider, storage_challenge(AttestationPurpose::StorageUnlock, context)).dropped,
+              DropReason::NoService);
+    EXPECT_EQ(a->producer.calls, 1);
+
+    // Another context, an unbound one, or another purpose stays closed.
+    Digest other{};
+    other.fill(0x11);
+    EXPECT_EQ(from(outsider, storage_challenge(AttestationPurpose::StorageUnlock, other)).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(
+        from(outsider, storage_challenge(AttestationPurpose::StorageUnlock, Digest{})).dropped,
+        DropReason::NotMember);
+    EXPECT_EQ(from(outsider, storage_challenge(AttestationPurpose::Eligibility, Digest{})).dropped,
+              DropReason::NotMember);
+    EXPECT_EQ(a->producer.calls, 1);
+
+    // The SVSM enrollment that precedes an unlock attestation carries the
+    // same context and passes the same gate.
+    EXPECT_EQ(
+        from(outsider, storage_challenge(AttestationPurpose::PlatformEnrollment, context)).dropped,
+        DropReason::NoService);
+    EXPECT_EQ(a->producer.calls, 2);
+
+    // Membership alone does not open the StorageUnlock purpose: a Tier 1
+    // member earns unlock evidence only through a request too.
+    EXPECT_EQ(
+        from(founders[1], storage_challenge(AttestationPurpose::StorageUnlock, context)).dropped,
+        DropReason::NotMember);
+    EXPECT_EQ(a->producer.calls, 2);
+}
+
+TEST_F(RouterMesh, StorageMessagesReachTheStorageSinkBoundToTheirSender) {
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+    StorageKeyPackageMsg package;
+    package.session.fill(0x01);
+    package.sender = outsider->id;
+    package.payload = {1, 2, 3};
+    // The storage service checks epochs itself, so a far epoch is delivered.
+    auto envelope = outsider->router->compose(SecurityMessageKind::StorageKeyPackage, package, 9);
+    EXPECT_TRUE(a->deliver(outsider->id, encode_security_message(envelope), mesh.now_ms).delivered);
+    ASSERT_EQ(a->events.storage_messages.size(), 1u);
+    // A package naming another sender than the authenticated one is refused.
+    package.sender = founders[1]->id;
+    envelope = outsider->router->compose(SecurityMessageKind::StorageKeyPackage, package, 9);
+    EXPECT_EQ(a->deliver(outsider->id, encode_security_message(envelope), mesh.now_ms).dropped,
+              DropReason::SenderMismatch);
+    StorageUnlockRequestMsg request;
+    request.requester = founders[1]->id;
+    envelope = outsider->router->compose(SecurityMessageKind::StorageUnlockRequest, request, 1);
+    EXPECT_EQ(a->deliver(outsider->id, encode_security_message(envelope), mesh.now_ms).dropped,
+              DropReason::SenderMismatch);
+    StorageUnlockPartialMsg partial;
+    partial.holder = founders[1]->id;
+    envelope = outsider->router->compose(SecurityMessageKind::StorageUnlockPartial, partial, 1);
+    EXPECT_EQ(a->deliver(outsider->id, encode_security_message(envelope), mesh.now_ms).dropped,
+              DropReason::SenderMismatch);
+    EXPECT_EQ(a->events.storage_messages.size(), 1u);
 }
 
 TEST_F(RouterMesh, TreeOpsAreAcceptedOnlyFromCurrentTier1Members) {

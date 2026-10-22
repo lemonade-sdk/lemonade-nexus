@@ -1,6 +1,9 @@
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Security/Attestation/AmdRevocationCache.hpp>
+
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 
@@ -83,6 +86,13 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
                   .founding_member =
                       [this](const NodeId& node) {
                           return driver_.is_founding_member(node);
+                      },
+                  // Address-only capture as above: the storage service, when
+                  // enabled, is built after the router.
+                  .storage_unlock_challenger =
+                      [this](const NodeId& holder, const Digest& context) {
+                          return storage_ != nullptr &&
+                                 storage_->expects_unlock_challenge(holder, context);
                       }},
               runtime_, transport_, events_, sealer_, &producer_),
       producer_(EvidenceProducerSources{
@@ -110,6 +120,55 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
     events_.target = &driver_;
     if (config.on_epoch_established)
         driver_.set_epoch_established_callback(config.on_epoch_established);
+    if (config.storage_key_enabled) {
+        storage_crypto_ = std::make_unique<crypto::SodiumCryptoService>();
+        storage_crypto_->start();
+        const auto storage_directory = config.data_root / "security" / "storage";
+        file_share_store_ = std::make_unique<FileStorageShareStore>(
+            storage_directory / "sealed", storage_crypto_.get(), wrapping,
+            config.identity.public_key);
+        if (config.seal_backend.available() && !config.sealed_directory.empty()) {
+            // The share joins the gossip identity in the sealed boot set. A
+            // share kept in the file store before this host could seal moves
+            // across on first use.
+            sealed_blobs_ =
+                std::make_unique<SealedBlobStore>(config.sealed_directory, config.seal_backend);
+            sealed_blobs_->set_next_boot_chain(config.next_boot_chain);
+            share_store_ = std::make_unique<SealedStorageShareStore>(*sealed_blobs_,
+                                                                     file_share_store_.get());
+        } else {
+            spdlog::warn("[storage] this host cannot seal; the storage share stays in the "
+                         "machine-bound file store");
+            share_store_ = std::make_unique<FileStorageShareStore>(
+                storage_directory / "sealed", storage_crypto_.get(), wrapping,
+                config.identity.public_key);
+        }
+        storage_ = std::make_unique<StorageKeyService>(
+            StorageKeyServiceConfig{
+                .self = self_id(config),
+                .identity = config.identity,
+                .network_id = mesh_network_id(config),
+                .directory = storage_directory,
+                .wall_clock_ms =
+                    [] {
+                        return static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+                    }},
+            driver_, router_, runtime_, sealer_, *share_store_, *storage_crypto_);
+        storage_->attach();
+        if (config.vault != nullptr) {
+            vault_ = config.vault;
+            vault_->attach(&storage_->data_keys());
+        }
+    }
+}
+
+SecurityMeshService::~SecurityMeshService() {
+    if (vault_ != nullptr) {
+        vault_->attach(nullptr);
+    }
 }
 
 uint64_t SecurityMeshService::now_ms() const {
@@ -135,6 +194,11 @@ void SecurityMeshService::on_start() {
     transport_.set_peer_certified_callback(
         [this](const NodeId& peer) { driver_.on_peer(peer, now_ms()); });
 
+    if (storage_ != nullptr) {
+        // A storage service whose durable state does not load stays inert;
+        // the rest of the mesh runs.
+        (void)storage_->start(now_ms());
+    }
     driver_.start(now_ms());
     refresh_members();
     arm_timer();
@@ -165,6 +229,17 @@ void SecurityMeshService::arm_timer() {
             return;
         }
         driver_.tick(now_ms());
+        if (storage_ != nullptr) {
+            storage_->tick(now_ms());
+        }
+        if (vault_ != nullptr) {
+            // Rotation follows the local wall clock (B5a): per server, not
+            // consensus.
+            vault_->tick(static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count()));
+        }
         refresh_members();
         if (tick_hook_) tick_hook_();
         arm_timer();

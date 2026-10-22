@@ -494,10 +494,9 @@ void SecurityDriver::maybe_resend_dkg(uint64_t now_ms) {
     if (!live && !dkg_outbox_.has_value()) {
         return;
     }
-    if (now_ms - last_dkg_resend_ms_ < constants::kDkgResendMs) {
+    if (!dkg_resend_.due(now_ms)) {
         return;
     }
-    last_dkg_resend_ms_ = now_ms;
     const EpochId epoch = live ? dkg->target_epoch() : dkg_outbox_->epoch;
     const auto round1 = live ? dkg->own_round1() : dkg_outbox_->round1;
     const auto& round2 = live ? dkg->round2_cached() : dkg_outbox_->round2;
@@ -1253,6 +1252,14 @@ bool SecurityDriver::eligibility_verdict_ok(const AttestationVerdict& verdict) c
 
 void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
                                             const AttestationEvidence& evidence) {
+    if (verdict.purpose == AttestationPurpose::StorageUnlock) {
+        // Unlock evidence answers one storage request. It confers no
+        // eligibility and no readiness, so it never reaches either path.
+        if (storage_verdict_sink_) {
+            storage_verdict_sink_(verdict);
+        }
+        return;
+    }
     if (phase_ == DriverPhase::GenesisCollecting && genesis_ != nullptr &&
         !genesis_->finalized()) {
         if (!eligibility_verdict_ok(verdict)) {
@@ -1844,6 +1851,12 @@ void SecurityDriver::on_tree_op_submit(const TreeOpSubmitMsg& message, const Nod
     }
 }
 
+void SecurityDriver::on_storage_message(const SecurityMessage& message) {
+    if (storage_sink_) {
+        storage_sink_(message);
+    }
+}
+
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
     progress(now_ms_);
     for (const auto& commit : commits) {
@@ -1885,6 +1898,11 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
                                    .height = commit.height,
                                    .state_root = commit.proposed_state_root,
                                    .next_epoch = epochs->current().id + 1});
+            if (on_eligibility_finalized_) {
+                if (const auto pool = eligibility_.frozen_pool(epochs->current().id + 1)) {
+                    on_eligibility_finalized_(*eligibility_.finalized(), *pool);
+                }
+            }
             continue;
         }
         const Digest plan = pending_plan_digest();

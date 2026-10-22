@@ -13,14 +13,21 @@ replicate the log in read-only mode for the merge ceremony. See
 [Configuration](Configuration#experimental-tree-operations) for the behavior
 and limits, and [Tree Merge Ceremony](Tree-Merge-Ceremony) for the
 migration runbook. Phase 4, the `storage-threshold` library
-(`crates/storage-threshold`), is implemented and tested; the server does not
-call it yet, and its unaudited paths still need the external review in
-[B3](#b3-library). Phase 6 is implemented: `nexus-attestd` seals and unseals,
-and the gossip identity key moves to a sealed copy through a one-way migration
-(see [B6](#b6-sealing-the-boot-set) for the binding, the migration, the
-upgrade path, and the limits). The design changes the trust model, so
-`AGENTS.md` requires review of each later phase and its migration plan before
-code.
+(`crates/storage-threshold`), is implemented and tested. Phase 5 (holder
+plans and key rotations in consensus, the unlock protocol, the `StorageUnlock`
+attestation purpose, per-epoch share refresh, and daily rotation) is
+implemented behind the experimental `storage_key_enabled` setting; see
+[B11](#b11-phase-5-implementation) and
+[Configuration](Configuration#experimental-threshold-storage-key). The
+setting must stay off in production until the external review of the
+unaudited library paths in [B3](#b3-library) is done. Phase 6 is implemented:
+`nexus-attestd` seals and unseals, and the gossip identity key moves to a
+sealed copy through a one-way migration (see [B6](#b6-sealing-the-boot-set)
+for the binding, the migration, the upgrade path, and the limits). Phase 7 is
+implemented in part behind `storage_files_enabled`, default off (see
+[B12](#b12-phase-7-implementation)); it has the same review gate. The design
+changes the trust model, so `AGENTS.md` requires review of each later phase
+and its migration plan before code.
 
 ## Table of Contents
 - [Summary](#summary)
@@ -391,7 +398,8 @@ rotates the key when the threshold must change.
   the next-epoch plan: the holder list, the threshold, `S`, and each holder's
   public share commitment.
 - **Threshold:** `t = ceil(0.65 × n)`, with at least 5 holders before the
-  storage key is created.
+  storage key is created. After holders are lost, re-sharing continues while
+  at least 3 holders remain (see [Open Decisions](#open-decisions)).
 
 ### B5. Re-sharing
 
@@ -517,8 +525,8 @@ Limits:
   remapping can keep old blocks.
 - On the root server the gossip identity is also the Genesis key, and it is
   sealed the same way.
-- The node identity (`keypair.enc`), vote keys, and `wrap_local.key` keep the
-  machine-bound wrapping until Phase 7 (B9).
+- The vote keys and `wrap_local.key` keep the machine-bound wrapping (B12).
+  With Phase 7 on, `keypair.enc` is also encrypted under the DEK.
 
 ### B7. Unlock at startup
 
@@ -567,6 +575,90 @@ snapshots, and account data. `wrap_local.key` is retired.
    plaintext.
 3. A server that cannot reach `t` holders keeps its old files and retries.
 
+### B11. Phase 5 implementation
+
+Behind `storage_key_enabled` (`Security/Storage/`):
+
+- **Records.** Two block payload kinds carry storage records:
+  `StorageHolderPlan` (first key and share refresh) and `StorageKeyRotation`.
+  A record is a *selection* (holders, `t`, operation) or a *final plan* (`S`,
+  the share commitments, and every selected holder's identity signature over
+  the exact plan bytes). Records chain by sequence and previous digest. A
+  replica votes for a selection only when its own derivation gives the same
+  bytes, and for a final plan only when every check in
+  `check_storage_final` passes. Servers outside Tier 1 receive each record
+  with its commit proof (`StoragePlanProof`) and verify the proof against the
+  committing epoch's vote keys.
+- **Selection.** At each epoch boundary the holders come from the finalized
+  eligibility pool, ranked by `H(checkpoint_seed ‖ node_id)` with the
+  finalized state root as the seed, at most 50. With no key and at least 5
+  holders, the key is created. With a key, the shares refresh when the new
+  holders are a subset of the current ones, `t` is unchanged, and no rotation
+  is due; otherwise the key rotates. A rotation is due when block time is 24 h
+  past the block time that created `S`. New holders join through a rotation;
+  the crate's share repair is not used yet.
+- **Holder loss.** A session that has no final plan 120 s of block time after
+  its selection may be replaced: by the next boundary's selection, or by a
+  retry without the holders whose round-1 package the replica never observed
+  (at most 3 attempts). Below 3 holders nothing is selected and the last plan
+  stays.
+- **Sessions.** Round 1 is broadcast; each round-2 package is sealed to its
+  recipient with the network, the session (selection digest), and both holder
+  identifiers bound inside the seal. Early round-2 packages are held and own
+  packages are re-sent every 5 s (Part C, `RoundRelay.hpp`, shared with the
+  FROST DKG). A holder seals its new share before it signs its confirmation.
+- **Unlock.** A holder answers a `StorageUnlockRequest` only for the current
+  plan, or the retiring plan through the epoch after the rotation's effective
+  epoch, after a passing `StorageUnlock` attestation bound to that request.
+  Budgets: one pending request per requester, 8 per requester per epoch, 64
+  pending in all; a replayed request digest is refused. The partial is sealed
+  to the requester with the request digest bound inside the seal.
+- **Data key.** `DataKeyService` creates the DEK, wraps it to `S`, proves the
+  unwrap through the holders, unlocks at startup, and rewraps after a
+  rotation. No file is encrypted yet (Phase 7).
+- **Share storage.** On a host that can seal, shares are kept by
+  `SealedStorageShareStore` in the boot set's `SealedBlobStore` under the
+  domain `storage-share`, with the same backend and upgrade staging as the
+  gossip identity. A host that cannot seal keeps `FileStorageShareStore` under
+  today's machine-bound wrapping (the B6 limit).
+
+### B12. Phase 7 implementation
+
+Behind `storage_files_enabled`, which needs `storage_key_enabled`
+(`Security/Storage/StorageVault.hpp`):
+
+- **Format.** A covered file is replaced in place by
+  `"LNXVAULT" | 0x01 | key id (16) | nonce (24) | ciphertext`. The cipher is
+  `EncryptedBlob` version 1 (XChaCha20-Poly1305) under
+  `HKDF(DEK, "LEMONADE-NEXUS-STORAGE-V1", "lemonade-nexus-storage-file-key-v1")`.
+  The associated data is `aead_aad("storage-file-at-rest", {domain, relative
+  path, key id})`. The key id is a second HKDF output of the DEK.
+- **Covered.** `identity/keypair.enc`, `identity/jwt_secret.hex`,
+  `identity/ddns_credentials.enc`, `account/replica.json`, `tree/nodes`,
+  `tree/deltas`, and `tree/log`. `FileStorageService`, `KeyWrappingService`,
+  `resolve_jwt_secret`, and `TreeLog` route these paths through the vault.
+- **Not covered yet.** TLS and ACME keys (loaded by path by the HTTP server),
+  ACL rows (SQLite, keyed from the gossip identity), vote keys, and
+  `wrap_local.key`. The vote keys and the file share store are read before
+  the unlock, and they depend on `wrap_local.key`; moving any of them under
+  the DEK would stop a cold start (B8). `wrap_local.key` is not retired.
+- **Migration (B10).** `plaintext`, then `migrating` (stage
+  `<file>.vault-new`, request a new unlock round trip, verify every staged
+  copy against the plaintext), then `encrypted` (overwrite and replace). The
+  plaintext is authoritative until `encrypted` is durable. A missing or
+  damaged state file with encrypted files present loads as `encrypted`.
+- **Startup.** With `encrypted` recorded, `main` runs the io context (gossip,
+  attestation, the security mesh, holder duties) until the DEK is in memory,
+  then starts the tree, the node identity, and everything after them. Startup
+  with the flag off stops when the state file records encryption.
+- **DEK rotation (B5a).** Every 30 days on the local clock, or on
+  `POST /api/storage/rotate-data-key` (root administrator).
+  `DataKeyService::begin_replacement` wraps a new DEK to the current S in
+  `data-key.next.json` and proves it through the holders; the vault stages
+  and verifies every file under it; `commit_replacement` replaces
+  `data-key.json`, which is the switch point; the staged files then replace
+  the old ciphertext.
+
 ## Part C: Key-Generation Race Fix
 
 The first r17 founding split because round-2 messages that arrive before round
@@ -592,7 +684,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented in part** (B12): TLS/ACME keys, ACL rows, and vote keys are not covered yet. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 
@@ -627,4 +719,10 @@ Decided: libraries for `storage-threshold` (B3), with an external review of
 the unaudited paths before Phase 5; a threshold change rotates the key
 instead of re-sharing to a new threshold (B5); no offline recovery key (B8); nodes hold per-node versions and the
 sync library replicates (A7); the API waits up to 10 s, then reports pending
-(A2).
+(A2); holder counts (B4, B5, B10): the storage key is created only with at
+least 5 eligible, attested holders; after holders are lost, Tier 1 refreshes
+or rotates promptly while at least 3 holders remain (a refresh when `t` stays
+the same, otherwise a rotation at the new count: 4 holders give `t = 3`, 3
+holders give `t = 2`); below 3 holders the last plan stays and no rotation
+runs; holders are added back through rotation; the crate permits 3 to 50
+holders for a refresh or rotation and 5 to 50 for the first key.

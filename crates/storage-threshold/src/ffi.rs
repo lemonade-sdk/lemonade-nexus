@@ -29,7 +29,8 @@ pub const STORAGE_ERR_SERIALIZATION: i32 = -3;
 pub const STORAGE_ERR_BELOW_THRESHOLD: i32 = -4;
 /// The new holder count needs another threshold. Rotate the key.
 pub const STORAGE_ERR_THRESHOLD_CHANGE: i32 = -5;
-/// Holder count outside 5..=50.
+/// Holder count outside the permitted range: 5..=50 for the first key,
+/// 3..=50 for a rotation, a refresh, or a plan.
 pub const STORAGE_ERR_HOLDER_COUNT: i32 = -6;
 /// A partial failed verification, or its holder is not in the plan.
 pub const STORAGE_ERR_PROOF: i32 = -7;
@@ -181,7 +182,7 @@ pub unsafe extern "C" fn storage_threshold_for(holder_count: u16, out_threshold:
 
 // --- Key generation ---------------------------------------------------------
 
-/// Key generation part 1.
+/// Key generation part 1 of the first storage key (5 to 50 holders).
 ///
 /// # Safety
 /// Out pointers must be valid and writable.
@@ -196,6 +197,28 @@ pub unsafe extern "C" fn storage_dkg_part1(
         non_null(out_state)?;
         non_null(out_package)?;
         let (state, package) = keys::dkg_part1(identifier, holder_count)?;
+        *out_state = Box::into_raw(Box::new(state));
+        *out_package = StorageBuffer::from_vec(package);
+        Ok(())
+    })
+}
+
+/// Key generation part 1 of a key rotation: like `storage_dkg_part1`, but
+/// permits 3 to 50 holders.
+///
+/// # Safety
+/// Out pointers must be valid and writable.
+#[no_mangle]
+pub unsafe extern "C" fn storage_dkg_rotation_part1(
+    identifier: u16,
+    holder_count: u16,
+    out_state: *mut *mut StorageDkgRound1State,
+    out_package: *mut StorageBuffer,
+) -> i32 {
+    guard(|| {
+        non_null(out_state)?;
+        non_null(out_package)?;
+        let (state, package) = keys::dkg_rotation_part1(identifier, holder_count)?;
         *out_state = Box::into_raw(Box::new(state));
         *out_package = StorageBuffer::from_vec(package);
         Ok(())
@@ -1010,6 +1033,23 @@ mod tests {
                 STORAGE_ERR_INVALID_ARGUMENT
             );
             assert!(state.is_null() && buf.data.is_null());
+            // A rotation may run with 3 or 4 holders; never with 2 or 51.
+            assert_eq!(
+                storage_dkg_rotation_part1(1, 2, &mut state, &mut buf),
+                STORAGE_ERR_HOLDER_COUNT
+            );
+            assert_eq!(
+                storage_dkg_rotation_part1(1, 51, &mut state, &mut buf),
+                STORAGE_ERR_HOLDER_COUNT
+            );
+            assert!(state.is_null() && buf.data.is_null());
+            assert_eq!(
+                storage_dkg_rotation_part1(1, 3, &mut state, &mut buf),
+                STORAGE_OK
+            );
+            storage_buffer_free(&mut buf);
+            storage_dkg_round1_state_free(state);
+            state = null_mut();
 
             // Duplicate and zero identifiers in a peer list.
             assert_eq!(storage_dkg_part1(1, 5, &mut state, &mut buf), STORAGE_OK);

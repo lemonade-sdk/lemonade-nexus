@@ -282,6 +282,17 @@ StorageResult<StorageDkgRound1> StorageThreshold::dkg_part1(StorageHolderId hold
     return success(StorageDkgRound1(state, take_buffer(package)));
 }
 
+StorageResult<StorageDkgRound1> StorageThreshold::dkg_rotation_part1(StorageHolderId holder,
+                                                                     uint16_t holder_count) {
+    ::StorageDkgRound1State* state = nullptr;
+    StorageBuffer package{};
+    const int32_t code = storage_dkg_rotation_part1(holder, holder_count, &state, &package);
+    if (code != STORAGE_OK) {
+        return failure<StorageDkgRound1>(status_from(code));
+    }
+    return success(StorageDkgRound1(state, take_buffer(package)));
+}
+
 StorageResult<StorageDkgRound2> StorageThreshold::dkg_part2(
     StorageDkgRound1&& round1, const StoragePeerBytesMap& round1_packages) {
     ::StorageDkgRound1State* state = round1.release();

@@ -91,8 +91,9 @@ AttestationChallenge AttestationService::make_challenge(
             challenge.ima_checkpoint_paths = checkpoint->required_paths;
         }
     }
-    // A new challenge replaces any unanswered one: only the latest is live.
-    pending_[node] = challenge;
+    // A new challenge replaces any unanswered one in its lane: only the latest
+    // is live.
+    pending_[{node, lane_of(purpose)}] = challenge;
     return challenge;
 }
 
@@ -103,7 +104,9 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     // A final challenge with no bound context would recreate the reusable
     // attestation this binding exists to remove; an eligibility challenge with
     // a caller-chosen context would let the caller relabel one.
-    if (purpose == AttestationPurpose::FinalEpochReadiness && context == Digest{}) {
+    if ((purpose == AttestationPurpose::FinalEpochReadiness ||
+         purpose == AttestationPurpose::StorageUnlock) &&
+        context == Digest{}) {
         return std::nullopt;
     }
     if (purpose == AttestationPurpose::Eligibility && context != Digest{}) {
@@ -117,6 +120,15 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
         ++used;
         while (final_attempts_.size() > 4 * constants::kMaxActiveTier1) {
             final_attempts_.erase(final_attempts_.begin());
+        }
+    } else if (purpose == AttestationPurpose::StorageUnlock) {
+        auto& used = storage_attempts_[{epoch, node}];
+        if (used >= constants::kStorageUnlocksPerRequesterPerEpoch) {
+            return std::nullopt;
+        }
+        ++used;
+        while (storage_attempts_.size() > 4 * constants::kStorageMaxPendingUnlocks) {
+            storage_attempts_.erase(storage_attempts_.begin());
         }
     } else {
         auto& used = attempts_[{epoch, node}];
@@ -154,7 +166,7 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
     rejected.policy_digest = policy_digest_;
     rejected.failure = AttestationFailure::ChallengeMismatch;
 
-    const auto pending = pending_.find(evidence.node_id);
+    const auto pending = pending_.find({evidence.node_id, lane_of(evidence.purpose)});
     if (pending == pending_.end()) {
         return rejected;
     }
@@ -255,7 +267,7 @@ AttestationService::receive_enrollment_evidence(const AttestationEvidence& evide
         return std::nullopt;
     };
     if (refusal) *refusal = EnrollmentRefusal::None;
-    const auto it = pending_.find(evidence.node_id);
+    const auto it = pending_.find({evidence.node_id, ChallengeLane::Mesh});
     if (it == pending_.end() || it->second.purpose != AttestationPurpose::PlatformEnrollment ||
         evidence.challenge_digest != challenge_digest(it->second) ||
         evidence.purpose != AttestationPurpose::PlatformEnrollment ||
@@ -364,8 +376,8 @@ std::optional<AttestationChallenge> AttestationService::receive_activation_respo
 }
 
 std::optional<AttestationChallenge> AttestationService::pending_challenge(
-    const NodeId& node) const {
-    const auto it = pending_.find(node);
+    const NodeId& node, AttestationPurpose purpose) const {
+    const auto it = pending_.find({node, lane_of(purpose)});
     return it == pending_.end() ? std::nullopt
                                 : std::optional<AttestationChallenge>{it->second};
 }

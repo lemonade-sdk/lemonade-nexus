@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
+
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
@@ -73,6 +75,7 @@ bool FileStorageService::do_write_node(std::string_view node_id, const SignedEnv
     std::lock_guard lock(mutex_);
     try {
         const auto path = node_path(node_id);
+        if (auto* vault = vault_for(path)) return vault->write(path, envelope_to_json(envelope));
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs) return false;
         ofs << envelope_to_json(envelope);
@@ -87,6 +90,11 @@ std::optional<SignedEnvelope> FileStorageService::do_read_node(std::string_view 
     std::lock_guard lock(mutex_);
     try {
         const auto path = node_path(node_id);
+        if (auto* vault = vault_for(path)) {
+            const auto read = vault->read(path);
+            if (read.status != security::VaultReadStatus::Ok) return std::nullopt;
+            return json_to_envelope(read.bytes);
+        }
         if (!fs::exists(path)) return std::nullopt;
 
         std::ifstream ifs(path);
@@ -104,7 +112,9 @@ std::optional<SignedEnvelope> FileStorageService::do_read_node(std::string_view 
 bool FileStorageService::do_delete_node(std::string_view node_id) {
     std::lock_guard lock(mutex_);
     try {
-        return fs::remove(node_path(node_id));
+        const auto path = node_path(node_id);
+        if (auto* vault = vault_for(path)) return vault->remove(path);
+        return fs::remove(path);
     } catch (const std::exception& e) {
         spdlog::error("[{}] delete_node '{}' failed: {}", name(), node_id, e.what());
         return false;
@@ -136,6 +146,14 @@ uint64_t FileStorageService::do_append_delta(const SignedDelta& delta) {
 
     try {
         const auto path = delta_path(seq);
+        if (auto* vault = vault_for(path)) {
+            if (!vault->write(path, delta_to_json(stamped))) {
+                spdlog::error("[{}] failed to write delta {}", name(), seq);
+                return 0;
+            }
+            ++next_delta_seq_;
+            return seq;
+        }
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs) {
             spdlog::error("[{}] failed to write delta {}", name(), seq);
@@ -159,6 +177,11 @@ std::optional<SignedDelta> FileStorageService::do_read_delta(uint64_t seq) const
     std::lock_guard lock(mutex_);
     try {
         const auto path = delta_path(seq);
+        if (auto* vault = vault_for(path)) {
+            const auto read = vault->read(path);
+            if (read.status != security::VaultReadStatus::Ok) return std::nullopt;
+            return json_to_delta(read.bytes);
+        }
         if (!fs::exists(path)) return std::nullopt;
 
         std::ifstream ifs(path);
@@ -183,6 +206,12 @@ std::vector<SignedDelta> FileStorageService::do_read_deltas_since(uint64_t seq) 
     std::vector<SignedDelta> deltas;
     for (uint64_t s = seq + 1; s < next_delta_seq_; ++s) {
         const auto path = delta_path(s);
+        if (auto* vault = vault_for(path)) {
+            const auto read = vault->read(path);
+            if (read.status != security::VaultReadStatus::Ok) continue;
+            if (auto d = json_to_delta(read.bytes)) deltas.push_back(std::move(*d));
+            continue;
+        }
         if (!fs::exists(path)) continue;
 
         std::ifstream ifs(path);
@@ -205,6 +234,7 @@ bool FileStorageService::do_write_file(std::string_view category, std::string_vi
     std::lock_guard lock(mutex_);
     try {
         const auto path = file_path(category, file_name);
+        if (auto* vault = vault_for(path)) return vault->write(path, envelope_to_json(envelope));
         fs::create_directories(path.parent_path());
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs) return false;
@@ -226,6 +256,11 @@ std::optional<SignedEnvelope> FileStorageService::do_read_file(std::string_view 
     std::lock_guard lock(mutex_);
     try {
         const auto path = file_path(category, file_name);
+        if (auto* vault = vault_for(path)) {
+            const auto read = vault->read(path);
+            if (read.status != security::VaultReadStatus::Ok) return std::nullopt;
+            return json_to_envelope(read.bytes);
+        }
         if (!fs::exists(path)) return std::nullopt;
 
         std::ifstream ifs(path);
@@ -243,7 +278,9 @@ std::optional<SignedEnvelope> FileStorageService::do_read_file(std::string_view 
 bool FileStorageService::do_delete_file(std::string_view category, std::string_view file_name) {
     std::lock_guard lock(mutex_);
     try {
-        return fs::remove(file_path(category, file_name));
+        const auto path = file_path(category, file_name);
+        if (auto* vault = vault_for(path)) return vault->remove(path);
+        return fs::remove(path);
     } catch (const std::exception& e) {
         spdlog::error("[{}] delete_file '{}/{}' failed: {}", name(), category, file_name, e.what());
         return false;
@@ -284,6 +321,13 @@ void FileStorageService::do_ensure_directories() {
     for (const auto& dir : dirs) {
         fs::create_directories(dir);
     }
+}
+
+// --- Files under the data key ---
+
+security::StorageVault* FileStorageService::vault_for(const fs::path& path) const {
+    if (vault_ == nullptr || !vault_->covers(path)) return nullptr;
+    return vault_;
 }
 
 // --- Path safety ---

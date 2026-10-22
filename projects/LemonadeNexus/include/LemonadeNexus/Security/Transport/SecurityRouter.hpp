@@ -44,7 +44,9 @@ enum class DropReason : uint16_t {
     Duplicate,
     NoService,
     /// A remote challenger that is not a Tier 1 member of the current epoch:
-    /// its evidence could never reach a verifier that counts it.
+    /// its evidence could never reach a verifier that counts it. For a
+    /// StorageUnlock challenge: a challenger this node has no pending unlock
+    /// request to.
     NotMember,
     /// A challenger answered more challenges than the per-challenger budget
     /// allows inside one window.
@@ -121,6 +123,11 @@ public:
     /// pool. The router checked only the sender's membership; the op itself is
     /// unverified bytes until the pool's owner validates it.
     virtual void on_tree_op_submit(const TreeOpSubmitMsg&, const NodeId&) {}
+    /// Storage-key traffic (kinds StoragePlanProof to StoragePlanRequest). The
+    /// router bound the body's sender to the transport identity and checked
+    /// the network; the storage service checks the epoch, the session or plan,
+    /// and every proof itself.
+    virtual void on_storage_message(const SecurityMessage&) {}
 };
 
 struct SecurityRouterConfig {
@@ -134,6 +141,14 @@ struct SecurityRouterConfig {
     /// set, so founders can challenge one another before any epoch exists.
     /// The list is accepted only from the anchor; unset admits only the anchor.
     std::function<bool(const NodeId&)> founding_member;
+    /// Answers whether `holder` may make this node attest for a storage unlock:
+    /// true only while this node has a pending unlock request to that holder
+    /// whose attestation context is `context`. An all-zero context asks
+    /// whether any request to that holder is pending (an SVSM activation
+    /// offer carries no context). This is the only path by which a holder
+    /// outside Tier 1 can challenge, and only for the StorageUnlock purpose
+    /// (or the enrollment that precedes it). Unset admits no such challenger.
+    std::function<bool(const NodeId& holder, const Digest& context)> storage_unlock_challenger;
 };
 
 class SecurityRouter {
@@ -178,6 +193,12 @@ private:
     /// the current lifecycle phase: the pinned anchor while no epoch is
     /// active, a current Tier 1 member once one is.
     [[nodiscard]] bool challenger_is_member(const NodeId& from) const;
+    /// The challenge gate: membership by phase for every purpose except
+    /// StorageUnlock, which only this node's pending unlock request to `from`
+    /// authorizes.
+    [[nodiscard]] bool challenger_authorized(const AttestationChallenge& challenge,
+                                             const NodeId& from) const;
+    [[nodiscard]] bool storage_challenger(const NodeId& from, const Digest& context) const;
     [[nodiscard]] bool within_challenge_budget(const NodeId& from, uint64_t now_ms);
 
     [[nodiscard]] bool remember(std::span<const uint8_t> envelope);

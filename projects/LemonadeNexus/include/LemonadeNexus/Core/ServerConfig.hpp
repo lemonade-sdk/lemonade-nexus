@@ -137,6 +137,23 @@ struct ServerConfig {
     // read-only mode while tree writes keep the direct paths. Ignored when
     // tree_ops_enabled is set (ops mode runs the log too).
     bool        tree_log_enabled{false};
+    // Experimental, Phase 5 of docs/Design-Tree-Consensus-and-Storage-Key.md:
+    // the threshold storage key. Tier 1 finalizes storage holder plans and key
+    // rotations through consensus, holders run the key sessions and answer
+    // attested unlock requests, and this server keeps a data key wrapped to
+    // the storage key (files are encrypted only with storage_files_enabled),
+    // and the holder's share is sealed when the host can seal. Off: no storage record is
+    // proposed or voted for, and no storage message is sent or answered. The
+    // storage-threshold crate paths are not externally reviewed; keep this
+    // off in production until that review is done.
+    bool        storage_key_enabled{false};
+
+    // Experimental, Phase 7: encrypt this server's files under its data key
+    // (StorageVault), migrate the plaintext after an unlock round trip
+    // through the holders, and rotate the data key monthly. Requires
+    // storage_key_enabled. Off: files stay as they are. Once the migration
+    // completed, startup refuses to run with this off.
+    bool        storage_files_enabled{false};
 
     // Private API (dual-server mode — auto-enabled once tunnel IP is allocated)
     uint16_t    private_http_port{9101};     // Private API port (VPN-only)

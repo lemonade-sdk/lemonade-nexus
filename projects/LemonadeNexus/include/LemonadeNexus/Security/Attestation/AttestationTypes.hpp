@@ -37,6 +37,13 @@ enum class AttestationPurpose : uint16_t {
     /// and proposed AK so an authorized observer can issue MakeCredential.
     /// It grants no eligibility and is never accepted as a Tier-1 verdict.
     PlatformEnrollment = 3,
+    /// The attestation a storage-key holder requires before it answers one
+    /// unlock request (design B7). The context binds the network, the epoch,
+    /// the holder plan, and the request digest (which carries the request
+    /// nonce), so the evidence answers exactly one request. A holder outside
+    /// Tier 1 may challenge for this purpose only. It grants no eligibility
+    /// and is never accepted as a Tier 1 verdict.
+    StorageUnlock = 4,
 };
 
 /// The canonical context for an ordinary eligibility attestation.
@@ -49,6 +56,14 @@ enum class AttestationPurpose : uint16_t {
 [[nodiscard]] Digest final_readiness_attestation_context(
     const NetworkId& network_id, EpochId next_epoch, const Digest& plan_digest, uint32_t attempt,
     const Digest& selected_set_digest, const NodeId& node, IncarnationId incarnation);
+
+/// The canonical context for one storage unlock request. `request_digest` is
+/// storage_unlock_request_digest() of the request, which binds the requester,
+/// the ephemeral point, and the request nonce.
+[[nodiscard]] Digest storage_unlock_attestation_context(const NetworkId& network_id,
+                                                        EpochId epoch,
+                                                        const Digest& plan_digest,
+                                                        const Digest& request_digest);
 
 /// The challenge the current Tier 1 set issues for one attestation attempt.
 struct AttestationChallenge {
@@ -223,8 +238,8 @@ enum class AttestationFailure : uint16_t {
     /// Same purpose, different bound context: another plan, attempt, or
     /// selected set. Old evidence cannot answer a new context.
     ContextMismatch,
-    /// A final-readiness challenge with no context bound. Never issued; a
-    /// hostile one proves nothing.
+    /// A final-readiness or storage-unlock challenge with no context bound.
+    /// Never issued; a hostile one proves nothing.
     ContextUnbound,
     ActivationRequired,
     CheckpointRequired,

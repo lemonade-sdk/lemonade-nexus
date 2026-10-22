@@ -210,7 +210,8 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/population.cpp
     security/lifecycle/hostile_adoption.cpp
     security/lifecycle/adversarial.cpp
-    security/lifecycle/tree_consensus_path.cpp)
+    security/lifecycle/tree_consensus_path.cpp
+    security/lifecycle/storage_key_path.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
@@ -218,7 +219,12 @@ add_nexus_test(test_security_authority
     security/authority/nonce_commitment.cpp
     security/authority/dkg_session.cpp
     security/authority/signing.cpp
-    security/authority/mesh_credential.cpp)
+    security/authority/mesh_credential.cpp
+    security/authority/round_relay.cpp)
+add_nexus_test(test_security_storage
+    security/storage/records.cpp
+    security/storage/share_store.cpp
+    security/storage/vault.cpp)
 add_nexus_test(test_security_eligibility
     security/eligibility/ledger.cpp
     security/eligibility/store.cpp

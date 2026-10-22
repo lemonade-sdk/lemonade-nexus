@@ -233,8 +233,10 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     // 8. The bundle must answer the purpose and context the challenge bound.
     //    Both are inside the challenge digest, so step 9 would catch them —
     //    but a wrong purpose or a wrong plan context each deserves its own
-    //    diagnosis, not "replay". An unbound final challenge proves nothing.
-    if (challenge.purpose == AttestationPurpose::FinalEpochReadiness &&
+    //    diagnosis, not "replay". An unbound final or storage-unlock
+    //    challenge proves nothing.
+    if ((challenge.purpose == AttestationPurpose::FinalEpochReadiness ||
+         challenge.purpose == AttestationPurpose::StorageUnlock) &&
         challenge.context_digest == Digest{}) {
         return fail(AttestationFailure::ContextUnbound);
     }

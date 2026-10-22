@@ -32,6 +32,7 @@ namespace nexus::crypto {
     class KeyWrappingService;
 }
 namespace nexus::storage { class FileStorageService; }
+namespace nexus::security { class StorageVault; }
 namespace nexus::acme { class AcmeService; }
 namespace nexus::network {
     class HttpServer;
@@ -89,6 +90,10 @@ struct ApiContext {
     /// state. Set when the tree log runs (read-only or ops mode); unset, the
     /// route answers 404.
     std::function<nlohmann::json()>   tree_log_status;
+    /// Files under the data key (Phase 7), or nullptr when
+    /// storage_files_enabled is off. Not owned. The admin storage routes
+    /// answer 404 without it.
+    security::StorageVault*           storage_vault{nullptr};
 };
 
 // ---------------------------------------------------------------------------

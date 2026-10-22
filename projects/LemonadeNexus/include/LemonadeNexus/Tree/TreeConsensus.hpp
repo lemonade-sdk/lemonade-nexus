@@ -130,6 +130,9 @@ struct TreeConsensusConfig {
     /// block time and the voter's block-time bound (design A4).
     std::function<uint64_t()> wall_clock_ms;
     TreeOpPoolLimits pool_limits{};
+    /// Phase 7: the tree log is read and written through this vault. Not
+    /// owning; nullptr keeps plain files.
+    security::StorageVault* vault = nullptr;
     TreeLogMode mode = TreeLogMode::Ops;
 };
 

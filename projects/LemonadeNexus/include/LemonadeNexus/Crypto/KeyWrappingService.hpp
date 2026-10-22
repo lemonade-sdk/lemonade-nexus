@@ -77,7 +77,13 @@ public:
     /// Load the server's identity public key from disk.
     [[nodiscard]] std::optional<Ed25519PublicKey> load_identity_pubkey() const;
 
-    /// Unlock the server's identity private key from disk.
+    /// True when identity/keypair.enc (or its staged copy under the data key)
+    /// exists, readable or not. A caller must not generate a new identity over
+    /// a file that only failed to open.
+    [[nodiscard]] bool identity_present() const;
+
+    /// Unlock the server's identity private key from disk. With a storage
+    /// vault on the FileStorageService, keypair.enc is read through it.
     [[nodiscard]] std::optional<Ed25519PrivateKey> unlock_identity(
             std::span<const uint8_t> passphrase);
 

@@ -5,10 +5,14 @@ use crate::{Result, StorageError};
 /// The most holders a plan can have.
 pub const MAX_HOLDERS: u16 = 50;
 
-/// The fewest holders a plan can have. Key generation needs at least this
-/// many holders (B4, B10). A refresh keeps `t`, and `t = ceil(0.65 × n)`
-/// with `t ≥ 4` needs `n ≥ 5`, so no permitted refresh goes below it.
+/// The fewest holders a new storage key can be created with (B4, B10).
 pub const MIN_HOLDERS: u16 = 5;
+
+/// The fewest holders a re-share can keep. After holders are lost, Tier 1
+/// refreshes the shares or rotates the key while at least this many holders
+/// remain (4 holders give `t = 3`, 3 holders give `t = 2`). Below this count
+/// the last plan stays in place. A plan with fewer holders cannot exist.
+pub const MIN_RESHARE_HOLDERS: u16 = 3;
 
 /// Threshold percentage of holders.
 pub const THRESHOLD_PERCENT: u32 = 65;
@@ -25,13 +29,25 @@ pub const fn threshold_for(holder_count: u16) -> Option<u16> {
     Some((THRESHOLD_PERCENT * n).div_ceil(100) as u16)
 }
 
-/// The threshold of a plan with `holder_count` holders.
+/// The threshold of a plan with `holder_count` holders: the plan of a refresh,
+/// a rotation, or the first key.
 ///
 /// Fails with [`StorageError::HolderCount`] outside
-/// `MIN_HOLDERS..=MAX_HOLDERS`.
+/// `MIN_RESHARE_HOLDERS..=MAX_HOLDERS`.
 pub fn plan_threshold(holder_count: usize) -> Result<u16> {
+    threshold_in(holder_count, MIN_RESHARE_HOLDERS)
+}
+
+/// The threshold of the first storage key with `holder_count` holders.
+///
+/// Fails with [`StorageError::HolderCount`] outside `MIN_HOLDERS..=MAX_HOLDERS`.
+pub fn creation_threshold(holder_count: usize) -> Result<u16> {
+    threshold_in(holder_count, MIN_HOLDERS)
+}
+
+fn threshold_in(holder_count: usize, minimum: u16) -> Result<u16> {
     let n = u16::try_from(holder_count).map_err(|_| StorageError::HolderCount)?;
-    if !(MIN_HOLDERS..=MAX_HOLDERS).contains(&n) {
+    if !(minimum..=MAX_HOLDERS).contains(&n) {
         return Err(StorageError::HolderCount);
     }
     threshold_for(n).ok_or(StorageError::HolderCount)
@@ -39,7 +55,7 @@ pub fn plan_threshold(holder_count: usize) -> Result<u16> {
 
 /// Whether `t` is the threshold of some permitted plan size.
 pub fn is_plan_threshold(t: u16) -> bool {
-    (MIN_HOLDERS..=MAX_HOLDERS).any(|n| threshold_for(n) == Some(t))
+    (MIN_RESHARE_HOLDERS..=MAX_HOLDERS).any(|n| threshold_for(n) == Some(t))
 }
 
 #[cfg(test)]
@@ -48,7 +64,7 @@ mod tests {
 
     #[test]
     fn design_table() {
-        for (n, t) in [(5, 4), (7, 5), (10, 7), (20, 13), (31, 21), (50, 33)] {
+        for (n, t) in [(3, 2), (4, 3), (5, 4), (7, 5), (10, 7), (20, 13), (31, 21), (50, 33)] {
             assert_eq!(threshold_for(n), Some(t), "n = {n}");
         }
     }
@@ -69,22 +85,48 @@ mod tests {
 
     #[test]
     fn plan_bounds() {
-        for n in 0..MIN_HOLDERS as usize {
+        for n in 0..MIN_RESHARE_HOLDERS as usize {
             assert_eq!(plan_threshold(n), Err(StorageError::HolderCount));
         }
-        assert_eq!(plan_threshold(51), Err(StorageError::HolderCount));
-        assert_eq!(plan_threshold(70000), Err(StorageError::HolderCount));
+        assert_eq!(plan_threshold(3), Ok(2));
+        assert_eq!(plan_threshold(4), Ok(3));
         assert_eq!(plan_threshold(5), Ok(4));
         assert_eq!(plan_threshold(50), Ok(33));
+        assert_eq!(plan_threshold(51), Err(StorageError::HolderCount));
+        assert_eq!(plan_threshold(70000), Err(StorageError::HolderCount));
+    }
+
+    #[test]
+    fn creation_bounds() {
+        for n in 0..MIN_HOLDERS as usize {
+            assert_eq!(creation_threshold(n), Err(StorageError::HolderCount), "n = {n}");
+        }
+        assert_eq!(creation_threshold(5), Ok(4));
+        assert_eq!(creation_threshold(50), Ok(33));
+        assert_eq!(creation_threshold(51), Err(StorageError::HolderCount));
+    }
+
+    #[test]
+    fn plan_thresholds() {
+        // t = 2 (n = 3) is the smallest plan threshold; t = 1 is never one.
+        assert!(!is_plan_threshold(1));
+        assert!(is_plan_threshold(2));
+        assert!(is_plan_threshold(3));
+        assert!(is_plan_threshold(33));
+        assert!(!is_plan_threshold(34));
     }
 
     #[test]
     fn refresh_never_drops_below_minimum() {
-        // Every n that shares a threshold with a permitted plan is permitted.
-        for n in MIN_HOLDERS..=MAX_HOLDERS {
+        // n = 2 shares t = 2 with n = 3, so only the holder-count bound keeps a
+        // refresh of a 3-holder plan from going to 2 holders. Above that, no
+        // smaller count shares a threshold with a permitted plan.
+        assert_eq!(threshold_for(2), threshold_for(3));
+        assert_eq!(plan_threshold(2), Err(StorageError::HolderCount));
+        for n in (MIN_RESHARE_HOLDERS + 1)..=MAX_HOLDERS {
             let t = threshold_for(n).unwrap();
-            for m in 1..MIN_HOLDERS {
-                assert_ne!(threshold_for(m), Some(t));
+            for m in 1..MIN_RESHARE_HOLDERS {
+                assert_ne!(threshold_for(m), Some(t), "n = {n}, m = {m}");
             }
         }
     }

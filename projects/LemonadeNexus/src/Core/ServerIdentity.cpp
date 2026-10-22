@@ -7,8 +7,10 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Relay/GeoRegion.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
 #include <httplib.h>
+#include <sodium.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
@@ -38,12 +40,35 @@ namespace nexus::core {
 std::string resolve_jwt_secret(
     const ServerConfig& config,
     const std::filesystem::path& data_root,
-    crypto::SodiumCryptoService& crypto)
+    crypto::SodiumCryptoService& crypto,
+    security::StorageVault* vault)
 {
     std::string jwt_secret_hex = config.jwt_secret;
     if (!jwt_secret_hex.empty()) return jwt_secret_hex;
 
     const auto jwt_path = data_root / "identity" / "jwt_secret.hex";
+    if (vault != nullptr && vault->covers(jwt_path)) {
+        auto read = vault->read(jwt_path);
+        if (read.status == security::VaultReadStatus::Ok) {
+            jwt_secret_hex = read.bytes.substr(0, read.bytes.find('\n'));
+            sodium_memzero(read.bytes.data(), read.bytes.size());
+            return jwt_secret_hex;
+        }
+        if (read.status != security::VaultReadStatus::Missing) {
+            spdlog::error("{} does not open under the data key", jwt_path.string());
+            return {};
+        }
+        std::array<uint8_t, 32> jwt_secret_bytes{};
+        crypto.random_bytes(std::span<uint8_t>(jwt_secret_bytes));
+        jwt_secret_hex = crypto::to_hex(std::span<const uint8_t>(jwt_secret_bytes));
+        sodium_memzero(jwt_secret_bytes.data(), jwt_secret_bytes.size());
+        if (!vault->write(jwt_path, jwt_secret_hex)) {
+            spdlog::error("Cannot persist the JWT secret under the data key");
+            return {};
+        }
+        spdlog::info("Generated and persisted JWT secret to {}", jwt_path.string());
+        return jwt_secret_hex;
+    }
     if (std::filesystem::exists(jwt_path)) {
         std::ifstream f(jwt_path);
         std::getline(f, jwt_secret_hex);
