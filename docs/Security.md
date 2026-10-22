@@ -257,6 +257,10 @@ server that applies it:
 The creator of a group holds `admin` on it, so the owner can promote a member
 device by giving its key `admin` on the group.
 
+An admin of a group also administers the group's devices without an entry on
+each one: it reads a device's full assignment list and removes the device. No
+caller removes the root node through the API.
+
 Clients change assignments through `POST /api/tree/node/assignments/{id}`
 with `{"pubkey", "permissions"}`. The server sets exactly that list for the
 key, replacing its entry, and an empty list removes it. The same admin and

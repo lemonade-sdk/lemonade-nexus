@@ -312,6 +312,12 @@ bool PermissionTreeService::grant_assignment(const std::string& node_id,
     return true;
 }
 
+bool PermissionTreeService::administers(std::string_view signer,
+                                        std::string_view node_id) const {
+    std::lock_guard lock(mutex_);
+    return admin_anchor_locked(node_id, signer).has_value();
+}
+
 PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
         const std::string& node_id, std::string_view signer, std::string_view principal,
         const std::vector<std::string>& permissions, std::string& reason) {
