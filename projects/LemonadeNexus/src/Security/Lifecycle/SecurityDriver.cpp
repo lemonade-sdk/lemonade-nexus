@@ -1754,21 +1754,84 @@ void SecurityDriver::maybe_propose(View view) {
     if (transitions == Digest{}) transitions = pending_readiness_digest();
     if (transitions == Digest{}) transitions = pending_plan_digest();
     if (transitions == Digest{}) transitions = pending_eligibility_digest();
-    // The transition is inside the state root, so finalizing the block
-    // finalizes the eligibility state it names.
-    CanonicalEncoder root("lemonade-nexus/state-root:v1");
-    root.add_bytes(last_committed_root_);
-    root.add_bytes(transitions);
-    auto made = consensus->make_proposal(last_committed_root_, root.digest(), transitions);
-    if (!std::holds_alternative<Proposal>(made)) {
+    // Stages keep priority: a payload block is proposed only when no stage is
+    // pending, so a block never carries both.
+    std::optional<ProposedPayload> payload;
+    if (transitions == Digest{}) {
+        for (const auto& [kind, handler] : payload_handlers_) {
+            payload = handler->propose(*consensus);
+            if (payload.has_value()) break;
+        }
+    }
+    const auto make = [&](const std::optional<ProposedPayload>& carried)
+        -> std::optional<ProposalMessage> {
+        Digest previous = last_committed_root_;
+        Digest proposed{};
+        Digest digest = transitions;
+        if (carried.has_value()) {
+            // The payload's handler defines its roots (a tree batch commits to
+            // the tree state, design A5).
+            digest = block_payload_digest(carried->payload);
+            previous = carried->previous_state_root;
+            proposed = carried->proposed_state_root;
+        } else {
+            // The transition is inside the state root, so finalizing the block
+            // finalizes the eligibility state it names.
+            CanonicalEncoder root("lemonade-nexus/state-root:v1");
+            root.add_bytes(last_committed_root_);
+            root.add_bytes(transitions);
+            proposed = root.digest();
+        }
+        auto made = consensus->make_proposal(previous, proposed, digest);
+        if (!std::holds_alternative<Proposal>(made)) {
+            return std::nullopt;
+        }
+        ProposalMessage message{std::get<Proposal>(made), consensus->state().high_qc,
+                                std::nullopt};
+        if (carried.has_value()) {
+            message.proposal.timestamp_hint = carried->timestamp_hint;
+            message.payload = carried->payload;
+        }
+        return message;
+    };
+    const EpochId epoch = current_epoch().value_or(0);
+    auto message = make(payload);
+    if (message.has_value() && payload.has_value() &&
+        encode_security_message(
+            router_.compose(SecurityMessageKind::HotStuffProposal, *message, epoch))
+            .empty()) {
+        // A payload that does not fit the envelope would reach only this
+        // node. Propose an ordinary block instead; the payload waits.
+        spdlog::warn("[security] block payload does not fit a proposal message; "
+                     "proposing without it");
+        message = make(std::nullopt);
+    }
+    if (!message.has_value()) {
         return;
     }
     last_proposed_view_ = view;
-    const EpochId epoch = current_epoch().value_or(0);
-    ProposalMessage message{std::get<Proposal>(made), consensus->state().high_qc};
-    auto envelope = router_.compose(SecurityMessageKind::HotStuffProposal, message, epoch);
+    auto envelope = router_.compose(SecurityMessageKind::HotStuffProposal, *message, epoch);
     (void)router_.broadcast(envelope);
     (void)router_.deliver_local(std::move(envelope), now_ms_);
+}
+
+void SecurityDriver::register_payload_handler(IBlockPayloadHandler& handler) {
+    payload_handlers_[handler.kind()] = &handler;
+}
+
+bool SecurityDriver::accepts_payload(const Proposal& proposal, const BlockPayload& payload) const {
+    const auto handler = payload_handlers_.find(payload.kind);
+    const HotStuffService* consensus = runtime_.consensus();
+    if (handler == payload_handlers_.end() || consensus == nullptr) {
+        return false;
+    }
+    return handler->second->validate(*consensus, proposal, payload);
+}
+
+void SecurityDriver::on_tree_op_submit(const TreeOpSubmitMsg& message, const NodeId& from) {
+    if (tree_op_sink_) {
+        tree_op_sink_(message, from);
+    }
 }
 
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
@@ -1779,6 +1842,24 @@ void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
         last_committed_height_ = commit.height;
         if (commit.transitions_digest == Digest{}) {
             continue;
+        }
+        // A payload block goes to its kind's handler, in commit order. Its
+        // digest is domain-separated from every stage digest, so it can never
+        // be mistaken for one.
+        if (const HotStuffService* consensus = runtime_.consensus()) {
+            if (const BlockPayload* payload = consensus->block_payload(commit.proposal_digest)) {
+                const auto handler = payload_handlers_.find(payload->kind);
+                const Proposal* proposal = consensus->block(commit.proposal_digest);
+                if (handler != payload_handlers_.end() && proposal != nullptr) {
+                    CommittedPayload committed;
+                    committed.commit = commit;
+                    committed.proposal = *proposal;
+                    committed.payload = payload;
+                    committed.proof = consensus->commit_proof(commit.proposal_digest);
+                    handler->second->on_committed(committed);
+                }
+                continue;
+            }
         }
         EpochManager* epochs = runtime_.epochs();
         if (epochs == nullptr) {
@@ -2043,6 +2124,9 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     last_proposed_view_ = 0;
     last_committed_root_ = Digest{};
     last_committed_height_ = 0;
+    for (const auto& [kind, handler] : payload_handlers_) {
+        handler->on_consensus_reset();
+    }
     announce_epoch(checkpoint, dkg_digest);
 }
 

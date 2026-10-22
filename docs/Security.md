@@ -83,6 +83,15 @@ Which members may reach a Tier 3 node is decided by the permission tree, as for
 any endpoint. The role is set when the endpoint is created; a device that
 already joined keeps its role.
 
+Two device permissions control reachability. `read` lets a member see a
+device in the tree. `connect_private` or `connect_shared` lets a member
+connect to it. The mesh peer list (`GET /api/mesh/peers/{node_id}`) and the
+routing layer use the same rule: a device in the member's group is listed or
+resolved only when the member holds a connect permission on that device
+itself. `admin` includes both connect permissions. A grant on the group does
+not count, because permissions are not inherited. Relays in the group are
+listed with `read`.
+
 A client's server peer covers the whole tunnel plane, so the server's
 dataplane sees traffic that one endpoint sends to another. The server forwards
 it only when the source endpoint's key may connect to the destination
@@ -197,8 +206,10 @@ The boundary that matters here:
   identity, the epoch, and the network.
 - `nexus-attestd` runs under a separate service identity with scoped TPM/IMA
   access and filesystem restrictions. It collects evidence without holding
-  the server's Nexus identity key, consensus vote key, or FROST share. The
-  server itself has no TPM access.
+  the server's Nexus identity key, consensus vote key, or FROST share. It
+  seals and unseals a PCR-bound key for the server's boot set but never
+  receives the key material that key protects. The server itself has no TPM
+  access.
 - Confidential computing protects against a **hostile host or hypervisor**.
   It is not a claim that privileged root inside the guest cannot inspect
   guest processes.

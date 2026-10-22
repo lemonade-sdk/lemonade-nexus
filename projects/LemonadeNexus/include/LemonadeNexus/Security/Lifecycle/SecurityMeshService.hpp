@@ -95,6 +95,34 @@ public:
     }
     [[nodiscard]] SecurityRuntime& runtime() { return runtime_; }
 
+    /// A copy of the current Tier 1 membership snapshot (see
+    /// is_current_member). Thread-safe.
+    [[nodiscard]] std::vector<NodeId> current_members() const {
+        std::lock_guard lock(members_mutex_);
+        return current_members_;
+    }
+
+    /// Registers a block payload handler with the driver
+    /// (SecurityDriver::register_payload_handler). Not owning. Call before the
+    /// io context runs.
+    void register_payload_handler(IBlockPayloadHandler& handler) {
+        driver_.register_payload_handler(handler);
+    }
+
+    /// Where tree operations forwarded by Tier 1 members go (io thread).
+    void set_tree_op_sink(std::function<void(const TreeOpSubmitMsg&, const NodeId&)> sink) {
+        driver_.set_tree_op_sink(std::move(sink));
+    }
+
+    /// Forwards a tree operation to every peer; the receivers' routers accept
+    /// it only from current Tier 1 members. Thread-safe: the send runs on the
+    /// io thread.
+    void broadcast_tree_op(TreeOpSubmitMsg message);
+
+    /// Runs on the io thread after every driver tick. Call before the io
+    /// context runs.
+    void set_tick_hook(std::function<void()> hook) { tick_hook_ = std::move(hook); }
+
 private:
     // The router needs its events sink at construction and the driver needs
     // the router. The proxy breaks the cycle.
@@ -184,6 +212,9 @@ private:
         void on_authority_chain_page(const AuthorityChainPage& p, const NodeId& n) override {
             if (target) target->on_authority_chain_page(p, n);
         }
+        void on_tree_op_submit(const TreeOpSubmitMsg& m, const NodeId& n) override {
+            if (target) target->on_tree_op_submit(m, n);
+        }
     };
 
     [[nodiscard]] uint64_t now_ms() const;
@@ -213,6 +244,8 @@ private:
     /// by refresh_members(), read by is_current_member() from any thread.
     mutable std::mutex members_mutex_;
     std::vector<NodeId> current_members_;
+
+    std::function<void()> tick_hook_;
 
     /// Copy the live membership into the snapshot. io thread only.
     void refresh_members();

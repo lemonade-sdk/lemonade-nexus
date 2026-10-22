@@ -67,12 +67,14 @@ void apply_optional_field(const nlohmann::json& body, const char* key, T& dst) {
     if (body.contains(key)) dst = body[key].get<T>();
 }
 
-// --- Tree operations (ServerConfig::tree_ops_enabled, Phase 1) ---
+// --- Tree operations (ServerConfig::tree_ops_enabled) ---
 //
-// With the flag on, every tree write below builds a TreeOp and applies it
-// through TreeOpSubmitter (validate_op + apply_op). Request checks that run
-// before a write, HTTP status codes, and response bodies stay those of the
-// direct paths.
+// With the flag on, every tree write below builds a TreeOp and submits it
+// through TreeOpSubmitter. On the server the op goes through Tier 1 consensus:
+// the route waits up to kTreeOpCommitWaitMs for the commit and then answers
+// 202 with the op id (answer_unfinished). Request checks that run before a
+// write, and the status codes and bodies of a committed write, stay those of
+// the direct paths.
 
 /// The configured submitter, or nullptr after answering 500. The flag never
 /// falls back to the direct write paths.
@@ -84,29 +86,55 @@ tree::TreeOpSubmitter* tree_op_submitter(ApiContext& ctx, httplib::Response& res
     return ctx.tree_ops;
 }
 
-/// Phase 1 clients send no base version, so a route reads it from the current
+/// Answer a submission that did not finish: 202 with the op id when the op is
+/// queued but not yet committed, 503 when this server cannot order tree
+/// operations (not Tier 1, halted, or a full pool). Returns true when it
+/// answered.
+bool answer_unfinished(httplib::Response& res, const tree::TreeOpSubmission& s) {
+    if (s.pending) {
+        json_response(res, {{"success", true}, {"status", "pending"}, {"op_id", s.op_id}}, 202);
+        return true;
+    }
+    if (s.verdict.refusal == tree::TreeOpRefusal::Unavailable) {
+        error_response(res, s.verdict.reason, 503);
+        return true;
+    }
+    return false;
+}
+
+/// Run `fn` when the pending op behind `s` commits. Work a committed write
+/// does after the tree changes (a delete's cascade, a join's dataplane steps)
+/// must still happen when the commit arrives after the request answered.
+void after_commit(const tree::TreeOpSubmission& s, std::function<void()> fn) {
+    if (!s.ticket) return;
+    s.ticket->on_settled([fn = std::move(fn)](const tree::TreeOpOutcome& outcome) {
+        if (outcome.status == tree::TreeOpStatus::Committed) fn();
+    });
+}
+
+/// Current clients send no base version, so a route reads it from the current
 /// tree when it builds the op. A concurrent write between that read and the
-/// apply makes the op stale; rebuilding it from the new state keeps the direct
-/// paths' last-writer-wins behavior. Bounded, so a busy node cannot hold a
-/// request in a loop.
+/// commit makes the op stale; rebuilding it from the new state keeps the
+/// direct paths' last-writer-wins behavior. Bounded, so a busy node cannot
+/// hold a request in a loop.
 constexpr int kStaleBaseAttempts = 3;
 
 /// Submit `build()`, rebuilding and resubmitting while the result is
 /// StaleBaseVersion, at most kStaleBaseAttempts times in total.
 template <typename Build>
-tree::TreeOpVerdict submit_rebased(tree::TreeOpSubmitter& submitter, Build&& build) {
-    tree::TreeOpVerdict verdict;
+tree::TreeOpSubmission submit_rebased(tree::TreeOpSubmitter& submitter, Build&& build) {
+    tree::TreeOpSubmission s;
     for (int attempt = 0; attempt < kStaleBaseAttempts; ++attempt) {
-        verdict = submitter.submit(build());
-        if (verdict.refusal != tree::TreeOpRefusal::StaleBaseVersion) break;
+        s = submitter.submit(build());
+        if (s.pending || s.verdict.refusal != tree::TreeOpRefusal::StaleBaseVersion) break;
     }
-    return verdict;
+    return s;
 }
 
-/// Wrap a client-signed delta in a TreeOp and submit it. Returns whether the
-/// op was applied; the delta route answers every refusal the same way.
-bool submit_delta_op(tree::TreeOpSubmitter& submitter, tree::PermissionTreeService& tree,
-                     const tree::TreeDelta& delta) {
+/// Wrap a client-signed delta in a TreeOp and submit it.
+tree::TreeOpSubmission submit_delta_op(tree::TreeOpSubmitter& submitter,
+                                       tree::PermissionTreeService& tree,
+                                       const tree::TreeDelta& delta) {
     tree::TreeOp op;
     if (delta.operation == "create_node") {
         op.kind = tree::TreeOpKind::CreateNode;
@@ -118,10 +146,12 @@ bool submit_delta_op(tree::TreeOpSubmitter& submitter, tree::PermissionTreeServi
                acl::Permission::EditNode) {
         op.kind = tree::TreeOpKind::UpdateFields;
         op.target = delta.target_node_id;
-    } else {
-        return false;
     }
-    if (op.target.empty()) return false;
+    if (op.target.empty()) {
+        tree::TreeOpSubmission refused;
+        refused.verdict = {tree::TreeOpRefusal::Malformed, "delta does not map to a tree op"};
+        return refused;
+    }
     // The delta's own signed time is the op's signed time. A zero timestamp
     // leaves the op unequal to its delta, so validate_op refuses it.
     op.signed_at = delta.timestamp;
@@ -134,42 +164,50 @@ bool submit_delta_op(tree::TreeOpSubmitter& submitter, tree::PermissionTreeServi
             op.base_version = current ? current->version : 0;
         }
         return op;
-    }).ok();
+    });
 }
 
+/// Outcome of the tree part of a join with tree operations on.
+struct JoinOpResult {
+    enum class State { Answered, Committed, Pending } state = State::Answered;
+    tree::TreeOpSubmission submission;
+    std::string tunnel_ip;      ///< the committed node's address (Committed)
+    api::MeshRekeyPlan rekey;   ///< dataplane changes the join implies
+};
+
 /// The tree part of POST /api/join with tree operations on: the direct path's
-/// placement checks, then one Join op. The op is validated before the IPAM
-/// allocation, so a refused join allocates no address, and submitted with the
-/// allocated address after it. Fills `alloc` and `rekey` for the dataplane
-/// steps (an empty `alloc` means allocation failed). Returns false after
-/// writing an error response.
-bool join_via_tree_op(ApiContext& ctx, httplib::Response& res, const nlohmann::json& body,
-                      const std::string& node_id, const std::string& norm_pubkey,
-                      const std::optional<auth::LinkTokenRecord>& link,
-                      const std::string& cpu_id, const std::string& net_mac,
-                      const std::string& node_region, bool is_inference, bool is_root_owner,
-                      ipam::Allocation& alloc, api::MeshRekeyPlan& rekey) {
+/// placement checks, then one Join op. The op's apply step derives the tunnel
+/// address from the tree (tree::derive_tunnel_address), so every replica
+/// assigns the same address and no IPAM allocation runs. Answered means an
+/// error response was written.
+JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
+                              const nlohmann::json& body, const std::string& node_id,
+                              const std::string& norm_pubkey,
+                              const std::optional<auth::LinkTokenRecord>& link,
+                              const std::string& cpu_id, const std::string& net_mac,
+                              const std::string& node_region, bool is_inference,
+                              bool is_root_owner) {
+    JoinOpResult result;
     auto* submitter = tree_op_submitter(ctx, res);
-    if (!submitter) return false;
+    if (!submitter) return result;
 
     const auto existing = ctx.tree.get_node(node_id);
     if (!existing) {
         if (link) {
             if (!ctx.tree.get_node(link->group_node_id)) {
                 error_response(res, "link token group no longer exists", 409);
-                return false;
+                return result;
             }
         } else if (!ctx.config.open_registration && !is_root_owner &&
                    !ctx.tree.get_node("customer-" + node_id)) {
             error_response(res, "registration closed — link token required", 403);
-            return false;
+            return result;
         }
     }
 
     tree::TreeOp op;
     op.kind = tree::TreeOpKind::Join;
     op.target = node_id;
-    op.base_version = existing ? existing->version : 0;
     op.principal = norm_pubkey;
     op.body.source = tree::TreeOpSource::Device;
     auto& js = op.body.join;
@@ -199,6 +237,9 @@ bool join_via_tree_op(ApiContext& ctx, httplib::Response& res, const nlohmann::j
                     "application root not established — root initialization is unavailable",
                     409);
                 break;
+            case tree::TreeOpRefusal::Unavailable:
+                error_response(res, v.reason, 503);
+                break;
             default:
                 spdlog::warn("[Join] tree op for {} refused: {}", node_id, v.reason);
                 error_response(res, "tree operation refused", 500);
@@ -206,38 +247,57 @@ bool join_via_tree_op(ApiContext& ctx, httplib::Response& res, const nlohmann::j
         }
     };
 
-    // A stale base version here only means another write landed meanwhile;
-    // the submission below re-reads it.
-    if (const auto v = submitter->dry_run(op);
-        !v.ok() && v.refusal != tree::TreeOpRefusal::StaleBaseVersion) {
-        answer_refusal(v);
-        return false;
-    }
+    // Same re-key decision as the direct path, made from the stored node
+    // before the op (a new node "stores" the key this join carries).
+    auto plan_rekey = [&](const std::optional<tree::TreeNode>& before,
+                          const std::string& new_ip) {
+        const std::string prev_ip = before ? before->tunnel_ip : std::string{};
+        const std::string prev_mesh = before ? before->mesh_pubkey : js.mesh_pubkey;
+        const std::string new_mesh = js.mesh_pubkey_present ? js.mesh_pubkey : prev_mesh;
+        return api::plan_mesh_rekey(prev_ip, new_ip, prev_mesh, new_mesh);
+    };
 
-    alloc = ctx.ipam.allocate_tunnel_ip(node_id);
-    if (alloc.base_network.empty()) return true;
-    js.tunnel_ip = alloc.base_network;
+    // A returning device whose join changes nothing needs no op.
+    if (existing && !existing->tunnel_ip.empty()) {
+        op.base_version = existing->version;
+        tree::TreeOpEffect effect;
+        if (tree::plan_op(op, ctx.tree.nodes_snapshot(), effect).ok() &&
+            effect.writes.empty() && effect.removals.empty()) {
+            result.state = JoinOpResult::State::Committed;
+            result.tunnel_ip = existing->tunnel_ip;
+            result.rekey = plan_rekey(existing, existing->tunnel_ip);
+            return result;
+        }
+    }
 
     for (int attempt = 0;; ++attempt) {
         // A concurrent join of the same device may have written the node
         // since the last read; the op then applies as a returning-device join.
         const auto current = attempt == 0 ? existing : ctx.tree.get_node(node_id);
         op.base_version = current ? current->version : 0;
-        // Same re-key decision as the direct path, made from the stored node
-        // before the op (a new node "stores" the key this join carries).
-        const std::string prev_ip = current ? current->tunnel_ip : std::string{};
-        const std::string prev_mesh = current ? current->mesh_pubkey : js.mesh_pubkey;
-        const std::string new_mesh = js.mesh_pubkey_present ? js.mesh_pubkey : prev_mesh;
-
-        const auto v = submitter->submit(op);
-        if (v.ok()) {
-            rekey = api::plan_mesh_rekey(prev_ip, alloc.base_network, prev_mesh, new_mesh);
-            return true;
+        auto s = submitter->submit(op);
+        if (s.pending) {
+            result.state = JoinOpResult::State::Pending;
+            result.submission = std::move(s);
+            result.rekey = plan_rekey(current, {});
+            return result;
         }
-        if (v.refusal != tree::TreeOpRefusal::StaleBaseVersion ||
+        if (s.verdict.ok()) {
+            const auto after = ctx.tree.get_node(node_id);
+            if (!after || after->tunnel_ip.empty()) {
+                error_response(res, "IP allocation failed", 409);
+                return result;
+            }
+            result.state = JoinOpResult::State::Committed;
+            result.tunnel_ip = after->tunnel_ip;
+            result.rekey = plan_rekey(current, after->tunnel_ip);
+            result.submission = std::move(s);
+            return result;
+        }
+        if (s.verdict.refusal != tree::TreeOpRefusal::StaleBaseVersion ||
             attempt + 1 >= kStaleBaseAttempts) {
-            answer_refusal(v);
-            return false;
+            answer_refusal(s.verdict);
+            return result;
         }
     }
 }
@@ -286,6 +346,45 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
                          node_id);
         }
     }
+}
+
+std::string TreeApiHandler::finish_join_dataplane(const std::string& node_id,
+                                                  const std::string& tunnel_cidr,
+                                                  const std::string& client_mesh_pubkey,
+                                                  bool remove_stale_peer,
+                                                  const std::string& stale_peer_key) {
+    // Add the client as a mesh peer on the server interface.
+    if (ctx_.boringtun && !client_mesh_pubkey.empty() && !tunnel_cidr.empty()) {
+        auto peer_mesh_key = api::normalize_mesh_pubkey(client_mesh_pubkey);
+
+        // Re-join with a rotated key: drop the stale peer first, or its
+        // allowed_ips route shadows the new key and return traffic is
+        // encrypted to a dead handshake.
+        if (remove_stale_peer && ctx_.boringtun->remove_peer(stale_peer_key)) {
+            spdlog::info("[Join] removed stale mesh peer {} for node {}",
+                         stale_peer_key.substr(0, 12), node_id);
+        }
+
+        if (ctx_.boringtun->add_peer(peer_mesh_key, tunnel_cidr, "")) {
+            spdlog::info("[Join] added mesh peer {} allowed_ips={}",
+                         peer_mesh_key.substr(0, 12), tunnel_cidr);
+        } else {
+            spdlog::warn("[Join] failed to add mesh peer for node {}", node_id);
+        }
+    }
+
+    // Register private DNS for this client: private.<node_id>.ep.<domain> -> tunnel IP
+    std::string client_tunnel_ip_bare = tunnel_cidr;
+    if (auto slash = client_tunnel_ip_bare.find('/'); slash != std::string::npos) {
+        client_tunnel_ip_bare = client_tunnel_ip_bare.substr(0, slash);
+    }
+    std::string client_private_fqdn;
+    if (ctx_.dns && !client_tunnel_ip_bare.empty()) {
+        client_private_fqdn = client_ep_fqdn(node_id, ctx_.config.dns_base_domain);
+        ctx_.dns->set_record(client_private_fqdn, "A", client_tunnel_ip_bare, 300);
+        spdlog::info("[Join] registered DNS: {} -> {}", client_private_fqdn, client_tunnel_ip_bare);
+    }
+    return client_private_fqdn;
 }
 
 void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& priv) {
@@ -551,11 +650,35 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         ipam::Allocation alloc;
         api::MeshRekeyPlan rekey;
         if (ctx_.config.tree_ops_enabled) {
-            if (!join_via_tree_op(ctx_, res, body, node_id, norm_pubkey, link, cpu_id,
-                                  net_mac, node_region, is_inference, is_root_owner, alloc,
-                                  rekey)) {
+            auto joined = join_via_tree_op(ctx_, res, body, node_id, norm_pubkey, link, cpu_id,
+                                           net_mac, node_region, is_inference, is_root_owner);
+            if (joined.state == JoinOpResult::State::Answered) return;
+            if (joined.state == JoinOpResult::State::Pending) {
+                // The tunnel address exists only once the join commits; the
+                // client joins again to learn it (a returning-device join).
+                // The dataplane and DNS steps run when the commit arrives.
+                after_commit(joined.submission,
+                             [this, node_id, mesh = body.value("mesh_pubkey", std::string{}),
+                              rekey = joined.rekey] {
+                                 const auto node = ctx_.tree.get_node(node_id);
+                                 if (node && !node->tunnel_ip.empty()) {
+                                     (void)finish_join_dataplane(node_id, node->tunnel_ip, mesh,
+                                                                 rekey.remove_stale_peer,
+                                                                 rekey.stale_peer_key);
+                                 }
+                             });
+                json_response(res,
+                              {{"success", true},
+                               {"status", "pending"},
+                               {"op_id", joined.submission.op_id},
+                               {"node_id", node_id}},
+                              202);
                 return;
             }
+            alloc.block_type = ipam::BlockType::Tunnel;
+            alloc.base_network = joined.tunnel_ip;
+            alloc.customer_node_id = node_id;
+            rekey = joined.rekey;
         } else {
             // Allocate tunnel IP (returns existing if already allocated for this node)
             alloc = ctx_.ipam.allocate_tunnel_ip(node_id);
@@ -596,44 +719,16 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                         ? "10.64.0.1"
                                         : ctx_.tunnel_bind_ip;
 
-        // Add the client as a mesh peer on the server interface.
-        auto client_mesh_pubkey = body.value("mesh_pubkey", std::string{});
-        if (ctx_.boringtun && !client_mesh_pubkey.empty() && !alloc.base_network.empty()) {
-            auto peer_mesh_key = api::normalize_mesh_pubkey(client_mesh_pubkey);
-
-            // Re-join with a rotated key: drop the stale peer first, or its
-            // allowed_ips route shadows the new key and return traffic is
-            // encrypted to a dead handshake.
-            if (rekey.remove_stale_peer &&
-                ctx_.boringtun->remove_peer(rekey.stale_peer_key)) {
-                spdlog::info("[Join] removed stale mesh peer {} for node {}",
-                             rekey.stale_peer_key.substr(0, 12), node_id);
-            }
-
-            if (ctx_.boringtun->add_peer(peer_mesh_key, alloc.base_network, "")) {
-                spdlog::info("[Join] added mesh peer {} allowed_ips={}",
-                             peer_mesh_key.substr(0, 12), alloc.base_network);
-            } else {
-                spdlog::warn("[Join] failed to add mesh peer for node {}", node_id);
-            }
-        }
+        // Add the client as a mesh peer and register its private DNS name.
+        const std::string client_private_fqdn =
+            finish_join_dataplane(node_id, alloc.base_network,
+                                  body.value("mesh_pubkey", std::string{}),
+                                  rekey.remove_stale_peer, rekey.stale_peer_key);
 
         // Build the mesh endpoint: public_ip:udp_port
         std::string mesh_endpoint;
         if (!ctx_.server_public_ip.empty()) {
             mesh_endpoint = ctx_.server_public_ip + ":" + std::to_string(ctx_.config.udp_port);
-        }
-
-        // Register private DNS for this client: private.<node_id>.ep.<domain> -> tunnel IP
-        std::string client_tunnel_ip_bare = alloc.base_network;
-        if (auto slash = client_tunnel_ip_bare.find('/'); slash != std::string::npos) {
-            client_tunnel_ip_bare = client_tunnel_ip_bare.substr(0, slash);
-        }
-        std::string client_private_fqdn;
-        if (ctx_.dns && !client_tunnel_ip_bare.empty()) {
-            client_private_fqdn = client_ep_fqdn(node_id, ctx_.config.dns_base_domain);
-            ctx_.dns->set_record(client_private_fqdn, "A", client_tunnel_ip_bare, 300);
-            spdlog::info("[Join] registered DNS: {} -> {}", client_private_fqdn, client_tunnel_ip_bare);
         }
 
         nlohmann::json resp = {
@@ -731,7 +826,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (ctx_.config.tree_ops_enabled) {
             auto* submitter = tree_op_submitter(ctx_, res);
             if (!submitter) return;
-            ok = submit_delta_op(*submitter, ctx_.tree, delta);
+            const auto s = submit_delta_op(*submitter, ctx_.tree, delta);
+            if (s.pending && doomed) {
+                after_commit(s, [this, id = delta.target_node_id, doomed] {
+                    cascade_node_cleanup(id, doomed);
+                });
+            }
+            if (answer_unfinished(res, s)) return;
+            ok = s.verdict.ok();
         } else {
             ok = ctx_.tree.apply_delta(delta);
         }
@@ -828,7 +930,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             op.principal = caller_pubkey;
             op.body.source = tree::TreeOpSource::Session;
             op.body.node = node;
-            const auto v = submitter->submit(std::move(op));
+            const auto s = submitter->submit(std::move(op));
+            if (answer_unfinished(res, s)) return;
+            const auto& v = s.verdict;
             // The direct path treats an existing node as success; keep that.
             if (!v.ok() && v.refusal != tree::TreeOpRefusal::AlreadyExists) {
                 error_response(res, "node creation failed", 409);
@@ -909,7 +1013,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             if (!submitter) return;
             // A retry (stale base version) re-reads the node and re-applies
             // the request to it, as the direct path's last write would.
-            tree::TreeOpVerdict v;
+            tree::TreeOpSubmission s;
             auto current = existing;
             for (int attempt = 0; attempt < kStaleBaseAttempts; ++attempt) {
                 if (attempt > 0) {
@@ -929,13 +1033,15 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 op.body.source = tree::TreeOpSource::Session;
                 op.body.node = updated;
                 op.body.node.id = node_id;
-                v = submitter->submit(std::move(op));
-                if (v.refusal != tree::TreeOpRefusal::StaleBaseVersion) break;
+                s = submitter->submit(std::move(op));
+                if (s.pending || s.verdict.refusal != tree::TreeOpRefusal::StaleBaseVersion) break;
             }
             if (!current) {
                 error_response(res, "node not found", 404);
                 return;
             }
+            if (answer_unfinished(res, s)) return;
+            const auto& v = s.verdict;
             if (v.refusal == tree::TreeOpRefusal::NotFound) {
                 error_response(res, "node not found", 404);
                 return;
@@ -993,11 +1099,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             op.body.source = tree::TreeOpSource::Session;
             op.body.assignment_principal = normalize_pubkey(principal);
             op.body.assignment_permissions = permissions;
-            const auto v = submit_rebased(*submitter, [&] {
+            const auto s = submit_rebased(*submitter, [&] {
                 const auto current = ctx_.tree.get_node(node_id);
                 op.base_version = current ? current->version : 0;
                 return op;
             });
+            if (answer_unfinished(res, s)) return;
+            const auto& v = s.verdict;
             using R = tree::TreeOpRefusal;
             switch (v.refusal) {
                 case R::None:
@@ -1063,13 +1171,17 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             op.target = node_id;
             op.principal = normalize_pubkey(claims.pubkey);
             op.body.source = tree::TreeOpSource::Session;
-            const auto v = submit_rebased(*submitter, [&] {
+            const auto s = submit_rebased(*submitter, [&] {
                 // The cascade below uses the record the op actually deleted.
                 doomed = ctx_.tree.get_node(node_id);
                 op.base_version = doomed ? doomed->version : 0;
                 return op;
             });
-            if (!v.ok()) {
+            if (s.pending) {
+                after_commit(s, [this, node_id, doomed] { cascade_node_cleanup(node_id, doomed); });
+            }
+            if (answer_unfinished(res, s)) return;
+            if (!s.verdict.ok()) {
                 error_response(res, "node not found or delete failed", 404);
                 return;
             }
@@ -1083,6 +1195,37 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);
         json_response(res, resp);
+    }));
+
+    // ========================================================================
+    // GET /api/tree/op/{op_id} (PRIVATE, auth required)
+    // Status of a tree operation this server accepted: pending, committed, or
+    // refused. A client that got 202 from a write polls here (design A2).
+    // The answer carries no op content, only its state.
+    // ========================================================================
+    priv.Get(R"(/api/tree/op/([0-9a-f]{64}))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res, const SessionClaims&) {
+        const auto op_id = req.matches[1].str();
+        const auto outcome = ctx_.tree_op_status ? ctx_.tree_op_status(op_id) : std::nullopt;
+        if (!outcome) {
+            error_response(res, "unknown tree operation", 404);
+            return;
+        }
+        nlohmann::json j = {{"op_id", op_id}};
+        switch (outcome->status) {
+            case tree::TreeOpStatus::Pending:
+                j["status"] = "pending";
+                break;
+            case tree::TreeOpStatus::Committed:
+                j["status"] = "committed";
+                j["log_height"] = outcome->log_height;
+                break;
+            case tree::TreeOpStatus::Refused:
+                j["status"] = "refused";
+                j["reason"] = outcome->verdict.reason;
+                break;
+        }
+        json_response(res, j);
     }));
 
     // ========================================================================

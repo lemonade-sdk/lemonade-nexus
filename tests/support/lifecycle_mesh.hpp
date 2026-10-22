@@ -190,6 +190,9 @@ struct EventsProxy : ISecurityEvents {
     void on_authority_chain_page(const AuthorityChainPage& p, const NodeId& n) override {
         if (target) target->on_authority_chain_page(p, n);
     }
+    void on_tree_op_submit(const TreeOpSubmitMsg& m, const NodeId& n) override {
+        if (target) target->on_tree_op_submit(m, n);
+    }
 };
 
 struct Node {
@@ -418,6 +421,10 @@ struct DriverMeshBase : ::testing::Test {
         runtime_config.transition_validator = [&node](const Digest& transitions_digest) {
             return node.driver && node.driver->accepts_transition(transitions_digest);
         };
+        runtime_config.payload_validator = [&node](const Proposal& proposal,
+                                                   const BlockPayload& payload) {
+            return node.driver && node.driver->accepts_payload(proposal, payload);
+        };
         node.runtime = std::make_unique<SecurityRuntime>(runtime_config);
         node.sealer = std::make_unique<PairwiseSealer>(node.identity.private_key);
         node.transport = std::make_unique<MemoryTransport>(mesh, node.id);
@@ -453,7 +460,12 @@ struct DriverMeshBase : ::testing::Test {
                                                        *node.router, *node.store,
                                                        node.genesis.get());
         node.events.target = node.driver.get();
+        on_node_built(node);
     }
+
+    /// Runs after build_node and restart_node rebuilt a node's driver, before
+    /// it starts: a fixture attaches per-node services here.
+    virtual void on_node_built(Node&) {}
 
     void preactivate(Node& observer, const Node& subject) {
         nexus_test::seed_svsm_activation(network, subject.id, subject.identity.public_key,

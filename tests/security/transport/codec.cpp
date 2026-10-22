@@ -220,6 +220,18 @@ std::vector<SecurityMessage> all_kinds() {
     sync_response.chain.push_back(proposal_message());
     messages.push_back(envelope(SecurityMessageKind::SyncResponse, sync_response));
 
+    // A payload block: the payload follows the certificate.
+    ProposalMessage with_payload = proposal_message();
+    with_payload.payload = BlockPayload{BlockPayloadKind::TreeBatch,
+                                        std::vector<uint8_t>(300, 0x6B)};
+    with_payload.proposal.transitions_digest = block_payload_digest(*with_payload.payload);
+    messages.push_back(envelope(SecurityMessageKind::HotStuffProposal, with_payload));
+
+    TreeOpSubmitMsg op;
+    op.encoded_op = std::vector<uint8_t>(200, 0x4C);
+    op.signature = signature(0x97);
+    messages.push_back(envelope(SecurityMessageKind::TreeOpSubmit, op));
+
     return messages;
 }
 
@@ -420,6 +432,46 @@ TEST(SecurityCodec, ChallengeCheckpointHashMustBe64Chars) {
     bytes[bytes.size() - 64 - 4] = 63;  // the hash's own length prefix
     bytes.pop_back();
     EXPECT_EQ(std::get<CodecError>(decode_security_message(bytes)), CodecError::BadValue);
+}
+
+TEST(SecurityCodec, APayloadFreeProposalKeepsItsBytes) {
+    // The payload is an addition: a proposal without one encodes exactly as
+    // before, and the same proposal with one is a strict extension.
+    const auto plain = encode_security_message(
+        envelope(SecurityMessageKind::HotStuffProposal, proposal_message()));
+    ProposalMessage carried = proposal_message();
+    carried.payload = BlockPayload{BlockPayloadKind::TreeBatch, std::vector<uint8_t>(8, 0x01)};
+    const auto extended =
+        encode_security_message(envelope(SecurityMessageKind::HotStuffProposal, carried));
+    ASSERT_FALSE(plain.empty());
+    ASSERT_GT(extended.size(), plain.size());
+    const auto decoded = decode_security_message(plain);
+    ASSERT_TRUE(std::holds_alternative<SecurityMessage>(decoded));
+    EXPECT_FALSE(std::get<ProposalMessage>(std::get<SecurityMessage>(decoded).body).payload);
+}
+
+TEST(SecurityCodec, UnknownPayloadKindsAndEmptyOpsAreRejected) {
+    ProposalMessage carried = proposal_message();
+    carried.payload = BlockPayload{static_cast<BlockPayloadKind>(99), {1, 2, 3}};
+    EXPECT_TRUE(
+        encode_security_message(envelope(SecurityMessageKind::HotStuffProposal, carried)).empty());
+
+    // A known kind encoded, then its kind field rewritten on the wire.
+    carried.payload->kind = BlockPayloadKind::TreeBatch;
+    auto bytes =
+        encode_security_message(envelope(SecurityMessageKind::HotStuffProposal, carried));
+    ASSERT_FALSE(bytes.empty());
+    // The kind is the u16 right before the payload's u32 length and 3 bytes.
+    bytes[bytes.size() - 3 - 4 - 2] = 99;
+    const auto decoded = decode_security_message(bytes);
+    ASSERT_TRUE(std::holds_alternative<CodecError>(decoded));
+    EXPECT_EQ(std::get<CodecError>(decoded), CodecError::BadValue);
+
+    TreeOpSubmitMsg empty;
+    const auto empty_bytes =
+        encode_security_message(envelope(SecurityMessageKind::TreeOpSubmit, empty));
+    ASSERT_FALSE(empty_bytes.empty());
+    EXPECT_TRUE(std::holds_alternative<CodecError>(decode_security_message(empty_bytes)));
 }
 
 TEST(SecurityCodec, SingleByteCorruptionNeverCrashesAndNeverSilentlyReinterprets) {

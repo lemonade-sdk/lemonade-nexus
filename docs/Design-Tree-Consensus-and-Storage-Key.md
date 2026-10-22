@@ -5,11 +5,20 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 
 # Design: Tree Consensus and Threshold Storage Key
 
-Status: **approved**. Phase 1 is implemented behind the experimental
-`tree_ops_enabled` setting and applies tree operations locally only. See
-[Configuration](Configuration#experimental-tree-operations) for its behavior
-and limits. The design changes the trust model, so `AGENTS.md` requires review
-of each later phase and its migration plan before code.
+Status: **approved**. Phases 1 and 2 are implemented behind the experimental
+`tree_ops_enabled` setting: Tier 1 servers order tree operations through
+consensus and apply them only after commit. Tier 2 replication and the merge
+ceremony (Phase 3) are not implemented. See
+[Configuration](Configuration#experimental-tree-operations) for the behavior
+and limits. Phase 4, the `storage-threshold` library
+(`crates/storage-threshold`), is implemented and tested; the server does not
+call it yet, and its unaudited paths still need the external review in
+[B3](#b3-library). Phase 6 is implemented: `nexus-attestd` seals and unseals,
+and the gossip identity key moves to a sealed copy through a one-way migration
+(see [B6](#b6-sealing-the-boot-set) for the binding, the migration, the
+upgrade path, and the limits). The design changes the trust model, so
+`AGENTS.md` requires review of each later phase and its migration plan before
+code.
 
 ## Table of Contents
 - [Summary](#summary)
@@ -154,6 +163,12 @@ TreeOp {
    After that it returns `202` with the `op_id`, the app shows the change as
    pending, and polls until it commits.
 
+Phase 2 implementation: replicas trust op signatures from the block epoch's
+frozen Tier 1 set only, so a Tier 2 server cannot sign an op a replica
+accepts. Until a finalized set of admitted submitters exists, a Tier 2 server
+answers tree writes with 503 instead of forwarding them. The poll route is
+`GET /api/tree/op/{op_id}`.
+
 ### A3. Consensus payload
 
 - A new `TreeBlock` carries an ordered batch of ops. `Proposal` gains
@@ -166,6 +181,18 @@ TreeOp {
   today.
 - Epoch-boundary stages keep priority. A block carries either a stage digest
   or a tree batch, never both, so the stage logic is unchanged.
+
+Phase 2 implementation: `Proposal` keeps its layout. A tree block's
+`transitions_digest` field carries `ops_digest` (the digest of the batch's
+canonical wire form, domain-separated from every stage digest), which enforces
+"never both" by construction. The batch follows the certificate in the
+`HotStuffProposal` message only, as a typed block payload
+(`BlockPayload.hpp`); commit proofs and sync replies carry the header. Blocks
+without a batch keep their proposal digest and wire bytes, so stored commit
+proofs and handoff links still decode. `kMaxConsensusBlockBytes` is now
+48,000. New payload kinds (for example Phase 5's `StorageHolderPlan` and
+`StorageKeyRotation`) add a `BlockPayloadKind` value and an
+`IBlockPayloadHandler`.
 
 ### A4. Deterministic validation
 
@@ -191,6 +218,13 @@ The checks are the current rules with the non-deterministic inputs removed:
 chain: `H(parent_root ‖ ops_digest ‖ tree_digest_after)`, where
 `tree_digest_after` is a deterministic digest of every node's canonical
 encoding and version. Replicas recompute it and vote only on a match.
+
+Phase 2 implementation: `parent_root` is the state root of the previous tree
+block in the chain (the tree log head, or the nearest uncommitted tree
+ancestor), and the proposal's `previous_state_root` carries it. The tree log
+is therefore a hash chain: a server that missed a tree block cannot match the
+next one, and halts instead of applying it. The first entry chains to a base
+root over the tree the log started from.
 
 ### A6. Commit, apply, and the tree log
 
@@ -280,7 +314,7 @@ wraps these libraries behind a C ABI like `frost-ffi`; panics never cross it.
 
 | Need | Library | Audit |
 |---|---|---|
-| Dealerless key generation over Ristretto255 | `frost-ristretto255` with the `internals` feature, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
+| Dealerless key generation over Ristretto255 | `frost-ristretto255`, with the `internals` feature of `frost-core`, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
 | Share refresh with the same holder set and threshold; removing holders | `frost-ristretto255` `refresh_dkg_*` | Not audited |
 | Enrolling a new holder at the same threshold | `frost-ristretto255` `repair_share_*` | Not audited |
 | Lagrange combination of partials | `frost-ristretto255` helpers | Audited with key generation |
@@ -356,18 +390,90 @@ rotates the key when the threshold must change.
 A server must authenticate and hold its own share before it can unlock
 anything, so these two items cannot depend on the DEK:
 
-- `nexus-attestd` gains `Seal` and `Unseal` operations. It seals a blob to the
-  SVSM vTPM under a policy bound to the approved release's PCRs and returns
-  the sealed blob to the server, which stores it. `nexus-attestd` still never
-  reads the server's data directory.
+- `nexus-attestd` gains `Seal` and `Unseal` operations. It seals to the SVSM
+  vTPM under a policy bound to the approved release's PCRs and returns the
+  result to the server, which stores it. `nexus-attestd` still never reads the
+  server's data directory.
 - The gossip identity key and the server's storage share are stored sealed.
-- **Before B6 ships,** the boot set keeps today's machine-bound wrapping, and
-  `keypair.json` moves to mode 600 and the same wrapping. This is a documented
-  limit, not the target.
+
+**Implemented (Phase 6).**
+
+| Item | Value |
+|---|---|
+| Policy | `TPM2_PolicyPCR` over the SHA-256 bank of PCR 8 and 9 (`kSvsmBootPcrs`), the two values a qualified release approval pins. PCR 10 is not bound: it advances with the IMA log. |
+| Seal parent | ECC P-256 storage primary in the owner hierarchy, unique field `LEMONADE-NEXUS-SEAL-PARENT-V1`. Recreated per call. No persistent handle, no NV index. Not the EK, not the quote AK. |
+| Sealed object | Keyed-hash object holding a random 32-byte key. No `USERWITHAUTH`; `ADMINWITHPOLICY`. Sessions are salted to the parent, so the key is encrypted to and from the TPM. |
+| Secret encryption | XChaCha20-Poly1305 in the server process, under the sealed key. Associated data: purpose `sealed-blob`, the sealing domain, the PCR digest, and the TPM public area. |
+| Domains | One per secret role: `gossip-identity` today; `storage-share` for Phase 5. |
+| Files | `data/sealed/<domain>.sealed` (running boot chain), `data/sealed/<domain>.next.sealed` (staged for an approved next boot chain), `data/sealed/gossip-identity.state.json` (migration state and the public key). |
+
+The daemon creates and unseals only the 32-byte key. The server encrypts and
+decrypts the secret itself (`SealedBlobStore` with `attestd_seal_backend`), so
+neither the secret nor its ciphertext crosses the socket, and a compromised
+daemon does not obtain the server's keys.
+
+Migration of the gossip identity (`identity/keypair.json`):
+
+1. **Legacy file.** A host that cannot seal (no attestd client in the build, no
+   TPM, or an older daemon) keeps `keypair.json` at mode 600. This is today's
+   protection and the documented limit for certificate-only (Tier 2) hosts.
+2. **Sealed, pending.** The server seals the key, unseals the sealed copy, and
+   compares it with the file. Only then does it record the pending state and
+   the kernel boot id. `keypair.json` stays.
+3. **Sealed.** When the sealed copy unseals in a later boot (another boot id),
+   the server records the sealed state, then overwrites and removes
+   `keypair.json`. The two-boot rule protects against a vTPM that does not keep
+   its owner seed across reboots.
+
+While `keypair.json` exists it is the fallback when the sealed copy does not
+unseal, and the server seals it again. After step 3 the server never creates a
+new identity in place of a sealed one:
+
+| Restart case | Result |
+|---|---|
+| Sealed copy present, PCR 8/9 match | Unseals; the same key. |
+| PCR 8/9 changed, approved chain staged | The staged copy unseals, is sealed again to the running PCRs, and the staged file is removed. |
+| PCR 8/9 changed, nothing staged | Startup stops with `policy_mismatch`. Files stay unchanged. Recovery: boot the previous boot entry. |
+| Blob corrupt, from another TPM, or the vTPM owner seed changed | Startup stops with `corrupt`. Recovery: restore `data/sealed/` from a backup of this host. |
+| Blob missing | Startup stops. Recovery: restore the file, or remove the state file to start with a new identity, which needs new enrollment. |
+| Daemon unreachable | Retries for about 30 s, then stops. |
+
+The same rules apply before step 3, except that `keypair.json` is used instead
+of stopping.
+
+Upgrade path. PCR 8 records the GRUB commands and the kernel command line; PCR
+9 records the files GRUB reads (kernel, initramfs, GRUB configuration). The
+server binary is measured into PCR 10 by IMA, not into PCR 8 or 9. On the
+Tier 1 mesh, releases r11 to r21 all pin the same PCR 8 and 9, so a
+binary-only release changes nothing that the seal binds. A release that
+changes the boot chain installs an approval with new expected PCR 8 and 9. At
+its next start on the old boot chain, the server verifies that approval
+against Genesis and seals each boot-set secret a second time, to the expected
+values (`<domain>.next.sealed`). After the reboot the staged copy unseals and
+becomes the current copy. The current copy is replaced only after the new one
+is durable, so booting back into the old chain still works until then. No step
+needs Genesis or a new enrollment.
+
+Limits:
+
+- Simulator-tested only (swtpm). Not yet verified on the SEV-SNP SVSM vTPM: in
+  particular whether that vTPM keeps its owner seed across reboots. If it does
+  not, the migration stays in the pending state and `keypair.json` stays.
+- A boot-chain change that no approval staged (a pending approval, a manual
+  command-line edit) stops a fully migrated server until the previous boot
+  entry boots.
+- Overwriting `keypair.json` is best effort: journaling, snapshots, and SSD
+  remapping can keep old blocks.
+- On the root server the gossip identity is also the Genesis key, and it is
+  sealed the same way.
+- The node identity (`keypair.enc`), vote keys, and `wrap_local.key` keep the
+  machine-bound wrapping until Phase 7 (B9).
 
 ### B7. Unlock at startup
 
-1. The server unseals its boot set.
+1. The server unseals its boot set (Phase 6, `Core/BootSet.hpp`). The share
+   goes into the same `SealedBlobStore` under the `storage-share` domain and
+   gets the same upgrade staging.
 2. It requests partials from the holders with a new security message,
    `StorageUnlockRequest {network, epoch, R, nonce}`.
 3. Each holder challenges the requester with a new attestation purpose,
@@ -434,7 +540,7 @@ This part does not change the trust model and can ship first.
 | 3 | Log replication to Tier 2 and lagging servers with QC verification. Tree merge ceremony and switch-over (A9). | 2 |
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
-| 6 | `nexus-attestd` Seal and Unseal; boot set sealed. | — |
+| 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
 | 7 | DEK file migration; plaintext removed; monthly DEK rotation. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.

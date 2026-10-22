@@ -136,7 +136,102 @@ template <std::size_t N>
     return true;
 }
 
+[[nodiscard]] bool proposal_from_json_into(const json& object, Proposal& out) {
+    if (!object.is_object()) return false;
+    if (has_unknown_key(object, {"security_ruleset", "consensus_ruleset", "network_id", "epoch",
+                                 "height", "view", "leader", "parent_digest",
+                                 "justify_qc_digest", "previous_state_root",
+                                 "proposed_state_root", "transitions_digest",
+                                 "timestamp_hint"})) {
+        return false;
+    }
+    Proposal p{};
+    const bool ok = read_u16(object, "security_ruleset", p.security_ruleset) &&
+                    read_u16(object, "consensus_ruleset", p.consensus_ruleset) &&
+                    read_b64(object, "network_id", p.network_id) &&
+                    read_u64(object, "epoch", p.epoch) && read_u64(object, "height", p.height) &&
+                    read_u64(object, "view", p.view) &&
+                    read_b64(object, "leader", p.leader.bytes) &&
+                    read_b64(object, "parent_digest", p.parent_digest) &&
+                    read_b64(object, "justify_qc_digest", p.justify_qc_digest) &&
+                    read_b64(object, "previous_state_root", p.previous_state_root) &&
+                    read_b64(object, "proposed_state_root", p.proposed_state_root) &&
+                    read_b64(object, "transitions_digest", p.transitions_digest) &&
+                    read_u64(object, "timestamp_hint", p.timestamp_hint);
+    if (ok) out = p;
+    return ok;
+}
+
 }  // namespace
+
+json quorum_certificate_to_json(const QuorumCertificate& certificate) {
+    return qc_to_json(certificate);
+}
+
+std::optional<QuorumCertificate> quorum_certificate_from_json(const json& object) {
+    QuorumCertificate certificate{};
+    if (!qc_from_json(object, certificate)) return std::nullopt;
+    return certificate;
+}
+
+json proposal_to_json(const Proposal& p) {
+    return json{{"security_ruleset", p.security_ruleset},
+                {"consensus_ruleset", p.consensus_ruleset},
+                {"network_id", b64(p.network_id)},
+                {"epoch", p.epoch.underlying()},
+                {"height", p.height.underlying()},
+                {"view", p.view.underlying()},
+                {"leader", b64(p.leader.span())},
+                {"parent_digest", b64(p.parent_digest)},
+                {"justify_qc_digest", b64(p.justify_qc_digest)},
+                {"previous_state_root", b64(p.previous_state_root)},
+                {"proposed_state_root", b64(p.proposed_state_root)},
+                {"transitions_digest", b64(p.transitions_digest)},
+                {"timestamp_hint", p.timestamp_hint}};
+}
+
+std::optional<Proposal> proposal_from_json(const json& object) {
+    Proposal p{};
+    if (!proposal_from_json_into(object, p)) return std::nullopt;
+    return p;
+}
+
+json commit_proof_to_json(const CommitProof& proof) {
+    json chain = json::array();
+    for (const auto& block : proof.chain) {
+        chain.push_back(json{{"proposal", proposal_to_json(block.proposal)},
+                             {"justify", qc_to_json(block.justify)}});
+    }
+    return json{{"chain", std::move(chain)}, {"certifying", qc_to_json(proof.certifying)}};
+}
+
+std::optional<CommitProof> commit_proof_from_json(const json& object) {
+    if (!object.is_object() || has_unknown_key(object, {"chain", "certifying"})) {
+        return std::nullopt;
+    }
+    const auto chain = object.find("chain");
+    const auto certifying = object.find("certifying");
+    // A commit proof is exactly three blocks (CommitProof.hpp).
+    if (chain == object.end() || !chain->is_array() || chain->size() != 3 ||
+        certifying == object.end()) {
+        return std::nullopt;
+    }
+    CommitProof proof;
+    for (const auto& entry : *chain) {
+        if (!entry.is_object() || has_unknown_key(entry, {"proposal", "justify"}) ||
+            !entry.contains("proposal") || !entry.contains("justify")) {
+            return std::nullopt;
+        }
+        CommittedBlock block;
+        if (!proposal_from_json_into(entry["proposal"], block.proposal) ||
+            !qc_from_json(entry["justify"], block.justify)) {
+            return std::nullopt;
+        }
+        proof.chain.push_back(std::move(block));
+    }
+    if (!qc_from_json(*certifying, proof.certifying)) return std::nullopt;
+    return proof;
+}
 
 json hotstuff_state_to_json(const HotStuffState& state) {
     // The record binds its own payload: a byte changed at rest loads as

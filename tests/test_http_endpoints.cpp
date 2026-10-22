@@ -23,7 +23,9 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 
@@ -39,6 +41,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <thread>
 #include <asio.hpp>
@@ -1607,7 +1610,8 @@ TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
 //
 // test_http_endpoints_tree_ops builds this file with NEXUS_TEST_TREE_OPS, so
 // each case here and above also runs with ServerConfig::tree_ops_enabled.
-// Only the version counter may differ between the two builds.
+// Only the version counter and a joined endpoint's tunnel address (derived
+// from the tree instead of allocated by IPAM) may differ between the builds.
 
 TEST_F(HttpEndpointTest, NodeRoutesAnswerTheSameInBothModes) {
     auto cli = make_client();
@@ -1743,6 +1747,142 @@ TEST_F(HttpEndpointTest, TreeOpsWithoutSubmitterFailClosed) {
     ASSERT_NE(join_res, nullptr);
     EXPECT_EQ(join_res->status, 500);
     EXPECT_TRUE(tree->get_children("root").empty());
+}
+
+// The production heartbeat route (MeshApiHandler). With tree operations on,
+// a changed endpoint is a SetEndpoint operation that only the node's own key
+// may submit, and an unchanged endpoint writes nothing.
+TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
+    auto device_kp = crypto->ed25519_keygen();
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto node_id = json::parse(join_res->body).value("node_id", std::string{});
+    const auto version_before = tree->get_node(node_id)->version;
+
+    httplib::Server mesh_srv;
+    api::MeshApiHandler mesh(*test_api::current().ctx);
+    mesh.register_routes(mesh_srv, mesh_srv);
+    // An ephemeral port, so parallel test processes never collide.
+    const int bound = mesh_srv.bind_to_any_port("127.0.0.1");
+    ASSERT_GT(bound, 0);
+    const auto mesh_port = static_cast<uint16_t>(bound);
+    std::thread mesh_thread([&] { mesh_srv.listen_after_bind(); });
+    ASSERT_TRUE(wait_http_ready(mesh_port));
+    httplib::Client mesh_cli("127.0.0.1", mesh_port);
+
+    auto session = [&](const crypto::Ed25519Keypair& kp) {
+        const auto bare = crypto::to_base64(
+            std::span<const uint8_t>(kp.public_key.data(), kp.public_key.size()));
+        auto now = std::chrono::system_clock::now();
+        const auto token = jwt::create()
+                               .set_issuer("lemonade-nexus")
+                               .set_subject(node_id)
+                               .set_issued_at(now)
+                               .set_expires_at(now + std::chrono::hours{1})
+                               .set_payload_claim("pubkey", jwt::claim(bare))
+                               .sign(jwt::algorithm::hs256{jwt_secret});
+        return httplib::Headers{{"Authorization", "Bearer " + token}};
+    };
+    const json body = {{"node_id", node_id}, {"endpoint", "203.0.113.9:51940"}};
+
+    auto res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), body.dump(),
+                             "application/json");
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    if (test_support::kTreeOpsBuild) {
+        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "committed");
+        EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
+
+        // The same endpoint again: no operation, no version change.
+        res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), body.dump(),
+                            "application/json");
+        ASSERT_NE(res, nullptr);
+        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
+        EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
+
+        // A session naming the node but holding another key is refused by the
+        // operation's ownership rule.
+        const auto other_kp = crypto->ed25519_keygen();
+        const json moved = {{"node_id", node_id}, {"endpoint", "203.0.113.10:51940"}};
+        res = mesh_cli.Post("/api/mesh/heartbeat", session(other_kp), moved.dump(),
+                            "application/json");
+        ASSERT_NE(res, nullptr);
+        EXPECT_EQ(res->status, 403);
+        EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    }
+    mesh_srv.stop();
+    mesh_thread.join();
+}
+
+// Under consensus a write that does not commit within the wait answers 202
+// with its op id, and the op's status is polled (design A2). A server that
+// cannot order tree operations answers 503. Nothing is applied before commit.
+TEST_F(HttpEndpointTest, AnUncommittedTreeWriteAnswersPendingWithItsOpId) {
+    auto cli = make_client();
+    tree::TreeOpPool pool;
+    const auto submitter_key = crypto->ed25519_keygen();
+    tree::TreeOpSubmitter ordered(
+        *tree, *crypto, security::NetworkId{}, submitter_key,
+        [&pool](tree::TreeOp op) {
+            tree::TreeOpAdmission admission;
+            admission.ticket = std::make_shared<tree::TreeOpTicket>(tree::op_id_hex(op));
+            (void)pool.add(std::move(op), admission.ticket);
+            return admission;
+        },
+        std::chrono::milliseconds(20));
+    test_api::current().config->tree_ops_enabled = true;
+    test_api::current().ctx->tree_ops = &ordered;
+    test_api::current().ctx->tree_op_status = [&pool](const std::string& id) {
+        return pool.status(id);
+    };
+
+    tree::TreeNode child;
+    child.id = "pending_child";
+    child.parent_id = "root";
+    child.type = tree::NodeType::Customer;
+    child.mgmt_pubkey = root_pubkey_str;
+    auto res = post_auth_delta(cli, json(make_signed_delta("create_node", child.id, child)).dump());
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 202) << res->body;
+    const auto body = json::parse(res->body);
+    EXPECT_EQ(body.value("status", std::string{}), "pending");
+    const auto op_id = body.value("op_id", std::string{});
+    ASSERT_EQ(op_id.size(), 64u);
+    EXPECT_FALSE(tree->get_node(child.id).has_value());
+
+    const httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(root_pubkey_str)}};
+    auto poll = cli.Get("/api/tree/op/" + op_id, h);
+    ASSERT_NE(poll, nullptr);
+    ASSERT_EQ(poll->status, 200) << poll->body;
+    EXPECT_EQ(json::parse(poll->body).value("status", std::string{}), "pending");
+
+    pool.settle(op_id, {tree::TreeOpStatus::Committed, {}, 7});
+    poll = cli.Get("/api/tree/op/" + op_id, h);
+    ASSERT_NE(poll, nullptr);
+    EXPECT_EQ(json::parse(poll->body).value("status", std::string{}), "committed");
+    EXPECT_EQ(json::parse(poll->body).value("log_height", 0), 7);
+    poll = cli.Get("/api/tree/op/" + std::string(64, 'a'), h);
+    ASSERT_NE(poll, nullptr);
+    EXPECT_EQ(poll->status, 404);
+    poll = cli.Get("/api/tree/op/" + op_id);
+    ASSERT_NE(poll, nullptr);
+    EXPECT_EQ(poll->status, 401);
+
+    tree::TreeOpSubmitter unavailable(
+        *tree, *crypto, security::NetworkId{}, submitter_key,
+        [](tree::TreeOp) {
+            return tree::TreeOpAdmission{
+                {tree::TreeOpRefusal::Unavailable, "not a Tier 1 member"}, nullptr};
+        },
+        std::chrono::milliseconds(20));
+    test_api::current().ctx->tree_ops = &unavailable;
+    res = post_auth_delta(cli, json(make_signed_delta("create_node", child.id, child)).dump());
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 503);
+    test_api::current().ctx->tree_ops = nullptr;
+    test_api::current().ctx->tree_op_status = nullptr;
 }
 
 // A group admin administers the group's devices even without an entry on the
@@ -1912,4 +2052,136 @@ TEST_F(HttpEndpointTest, JoinRefusesMethodsThatDoNotProveTheDeviceKey) {
     auto ok = join_node(victim);
     ASSERT_NE(ok, nullptr);
     EXPECT_EQ(ok->status, 200) << ok->body;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/mesh/peers through the real MeshApiHandler.
+//
+// The client adds every listed peer to its dataplane, so the list must hold
+// only peers the requester may connect to: ConnectPrivate or ConnectShared on
+// the peer node, as in PermissionTreeService::resolve_authorized. Read alone
+// must not list an endpoint. The routes in register_routes() above are a
+// stand-in, so this fixture serves the real handler on its own server.
+// ---------------------------------------------------------------------------
+class MeshPeersConnectTest : public HttpEndpointTest {
+protected:
+    httplib::Server mesh_srv;
+    std::thread mesh_thread;
+    int mesh_port = 0;
+    std::unique_ptr<api::MeshApiHandler> mesh_handler;
+    std::string caller;  // the requesting device's principal
+
+    void SetUp() override {
+        HttpEndpointTest::SetUp();
+        if (HasFatalFailure()) return;
+        mesh_handler = std::make_unique<api::MeshApiHandler>(*test_api::current().ctx);
+        mesh_handler->register_routes(mesh_srv, mesh_srv);
+        mesh_port = mesh_srv.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(mesh_port, 0);
+        mesh_thread = std::thread([this] { mesh_srv.listen_after_bind(); });
+        mesh_srv.wait_until_ready();
+
+        caller = principal();
+        add("mc_group", "root", tree::NodeType::Customer, {});
+        add("mc_self", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
+    }
+
+    void TearDown() override {
+        mesh_srv.stop();
+        if (mesh_thread.joinable()) mesh_thread.join();
+        mesh_handler.reset();
+        HttpEndpointTest::TearDown();
+    }
+
+    std::string principal() {
+        return "ed25519:" + crypto::to_base64(crypto->ed25519_keygen().public_key);
+    }
+
+    void add(const std::string& id, const std::string& parent, tree::NodeType type,
+             std::vector<tree::Assignment> assignments) {
+        tree::TreeNode n;
+        n.id = id;
+        n.parent_id = parent;
+        n.type = type;
+        n.mgmt_pubkey = root_pubkey_str;
+        n.assignments = std::move(assignments);
+        if (type == tree::NodeType::Endpoint || type == tree::NodeType::Relay) {
+            n.mesh_pubkey = "mesh-" + id;
+            n.tunnel_ip = "10.64.9." + std::to_string(tree->get_children(parent).size() + 2) + "/32";
+        }
+        ASSERT_TRUE(tree->insert_join_node(n)) << id;
+    }
+
+    /// Node ids in the requester's peer list, and the full response body.
+    std::set<std::string> listed(json* body_out = nullptr) {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(caller)}};
+        auto res = cli.Get("/api/mesh/peers/mc_self", h);
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        auto body = json::parse(res->body);
+        std::set<std::string> ids;
+        for (const auto& p : body["peers"]) ids.insert(p["node_id"].get<std::string>());
+        if (body_out) *body_out = body;
+        return ids;
+    }
+
+    uint32_t status_peer_count() {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(caller)}};
+        auto res = cli.Get("/api/mesh/status/mc_self", h);
+        EXPECT_NE(res, nullptr);
+        if (!res) return 0;
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body)["peer_count"].get<uint32_t>();
+    }
+};
+
+TEST_F(MeshPeersConnectTest, ReadOnlyEndpointIsNotListed) {
+    add("mc_seen", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
+    const auto ids = listed();
+    EXPECT_FALSE(ids.count("mc_seen")) << "Read alone put a peer in the dataplane list";
+    EXPECT_EQ(status_peer_count(), 0u);
+}
+
+TEST_F(MeshPeersConnectTest, ConnectGrantIsListed) {
+    add("mc_private", "mc_group", tree::NodeType::Endpoint,
+        {{caller, {"read", "connect_private"}}});
+    add("mc_shared", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_shared"}}});
+    add("mc_other_key", "mc_group", tree::NodeType::Endpoint,
+        {{principal(), {"read", "connect_private"}}});
+    const auto ids = listed();
+    EXPECT_TRUE(ids.count("mc_private"));
+    EXPECT_TRUE(ids.count("mc_shared"));
+    EXPECT_FALSE(ids.count("mc_other_key")) << "a grant to another principal counted";
+    EXPECT_EQ(status_peer_count(), 2u);
+}
+
+// An admin grant holds every permission bit, so it lists the node it is on.
+// Permissions are not inherited: admin on the group does not list a device in
+// that group on which the caller holds only Read.
+TEST_F(MeshPeersConnectTest, GroupAdminNeedsAGrantOnEachDevice) {
+    auto group = tree->get_node("mc_group");
+    ASSERT_TRUE(group.has_value());
+    group->assignments = {{caller, {"admin"}}};
+    ASSERT_TRUE(tree->update_node_direct("mc_group", *group));
+    add("mc_admin_dev", "mc_group", tree::NodeType::Endpoint, {{caller, {"admin"}}});
+    add("mc_read_dev", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
+    const auto ids = listed();
+    EXPECT_TRUE(ids.count("mc_admin_dev"));
+    EXPECT_FALSE(ids.count("mc_read_dev"));
+}
+
+// Infrastructure entries keep their rules: the server peer is always present,
+// and a relay in scope is listed with Read.
+TEST_F(MeshPeersConnectTest, ServerPeerAndRelayAreUnchanged) {
+    add("mc_relay", "mc_group", tree::NodeType::Relay, {{caller, {"read"}}});
+    json body;
+    const auto ids = listed(&body);
+    EXPECT_TRUE(ids.count("mc_relay"));
+    ASSERT_TRUE(body.contains("server_peer"));
+    EXPECT_EQ(body["server_peer"]["node_id"], "server");
+    EXPECT_EQ(body["server_peer"]["is_server"], true);
+    EXPECT_EQ(status_peer_count(), 1u);
 }

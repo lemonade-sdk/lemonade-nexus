@@ -1,5 +1,7 @@
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
 
+#include <LemonadeNexus/Core/BootSet.hpp>
+
 #include <LemonadeNexus/Core/CliModes.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
 #include <LemonadeNexus/Core/NetUtil.hpp>
@@ -118,10 +120,29 @@ struct GossipKeys {
     bool ok{false};
 };
 
-GossipKeys load_gossip_keys(const std::string& data_root) {
+GossipKeys load_gossip_keys(const std::string& data_root,
+                            const security::SealBackend& seal_backend) {
     GossipKeys k;
     std::ifstream f(std::filesystem::path(data_root) / "identity" / "keypair.json");
-    if (!f) return k;
+    if (!f) {
+        // Sealed boot set: the plaintext file is gone, so unseal through the
+        // same loader the server uses. Never creates a key here.
+        storage::FileStorageService storage{std::filesystem::path(data_root)};
+        BootSetConfig boot;
+        boot.data_root = data_root;
+        boot.backend = seal_backend;
+        boot.create_if_absent = false;
+        std::string error;
+        const auto identity = load_gossip_identity(storage, boot, error);
+        if (!identity) {
+            if (!error.empty()) spdlog::error("Onboard: {}", error);
+            return k;
+        }
+        k.pub_b64 = crypto::to_base64(identity->keypair.public_key);
+        k.priv = identity->keypair.private_key;
+        k.ok = true;
+        return k;
+    }
     try {
         auto env = json::parse(f);
         auto data = env.contains("data") && env["data"].is_object()
@@ -296,7 +317,7 @@ std::string check_root_confirmation(const std::string& pinned_hex,
            "--root-pubkey; refusing (possible MITM or wrong mesh)";
 }
 
-int run_onboard_server(ServerConfig& config) {
+int run_onboard_server(ServerConfig& config, const security::SealBackend& seal_backend) {
     // Trust must be pre-anchored: the response may confirm the root key,
     // never establish it.
     if (auto err = validate_pinned_root(config.root_pubkey); !err.empty()) {
@@ -307,7 +328,7 @@ int run_onboard_server(ServerConfig& config) {
     auto init = ensure_initialized(config);
     if (!init) return 1;
 
-    auto keys = load_gossip_keys(config.data_root);
+    auto keys = load_gossip_keys(config.data_root, seal_backend);
     if (!keys.ok) {
         spdlog::error("Onboard: could not load gossip keypair from {}/identity/keypair.json",
                       config.data_root);

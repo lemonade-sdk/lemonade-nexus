@@ -1,4 +1,6 @@
+#include <LemonadeNexus/Core/BootSet.hpp>
 #include <LemonadeNexus/Core/CliModes.hpp>
+#include <LemonadeNexus/Core/GenesisAnchor.hpp>
 #include <LemonadeNexus/Core/Coordinator.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
@@ -13,6 +15,7 @@
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeConsensus.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -31,6 +34,7 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
+#include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
@@ -82,9 +86,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // The boot set (gossip identity) is sealed through nexus-attestd. Builds
+    // without the attestd client have no sealing and keep identity/keypair.json.
+    nexus::security::SealBackend seal_backend;
+#ifdef LEMONADE_HAVE_ATTESTD_CLIENT
+    seal_backend = nexus::attestd::attestd_seal_backend(nexus::attestd::AttestdClientConfig{});
+#endif
+
     // --- CLI modes (--first-run, --enroll-server, ...) and the
     // uninitialized-data-dir gate live in Core/CliModes.cpp.
-    if (auto rc = nexus::core::run_cli_mode(config, argv[0])) {
+    if (auto rc = nexus::core::run_cli_mode(config, argv[0], seal_backend)) {
         return *rc;
     }
 
@@ -146,7 +157,32 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Gossip (depends on storage + crypto, uses io_context)
     // ========================================================================
+    // The gossip identity comes from the boot set: unsealed through
+    // nexus-attestd when sealed, otherwise identity/keypair.json, which is
+    // sealed here when this host can. A sealed identity that does not unseal
+    // stops startup; a new identity is never created in its place.
+    nexus::core::BootSetConfig boot_set;
+    boot_set.data_root = data_root;
+    boot_set.backend = seal_backend;
+    if (const auto anchor = nexus::core::load_genesis_anchor(config.genesis_pubkey);
+        anchor && anchor->release) {
+        // Expected PCR 8/9 of the installed, verified approval: staged so a
+        // boot-chain upgrade still unseals after its reboot.
+        boot_set.next_boot_chain =
+            nexus::security::boot_pcrs_from_approval(anchor->release->approval);
+    }
+    std::string boot_set_error;
+    const auto gossip_identity =
+        nexus::core::load_gossip_identity(storage, boot_set, boot_set_error);
+    if (!gossip_identity) {
+        spdlog::error("Boot set: {}", boot_set_error);
+        return 1;
+    }
+    spdlog::info("Gossip identity protection: {}",
+                 nexus::core::gossip_identity_protection_name(gossip_identity->protection));
+
     nexus::gossip::GossipService gossip{coordinator.io_context(), gossip_port, storage, crypto};
+    gossip.set_identity(gossip_identity->keypair);
     if (!config.root_pubkey.empty()) {
         auto root_pk_bytes = nexus::crypto::from_hex(config.root_pubkey);
         if (root_pk_bytes.size() == nexus::crypto::kEd25519PublicKeySize) {
@@ -243,7 +279,12 @@ int main(int argc, char* argv[]) {
         coordinator.io_context(), config, gossip, key_wrapping,
         std::move(platform_source), std::move(activation_source), mesh_error,
         [&tree, &config] {
-            nexus::core::ensure_application_root(tree, config.root_pubkey);
+            // With tree operations on, the root is an EstablishRoot op that
+            // Tier 1 commits (TreeConsensus::set_root_request below); a direct
+            // write here would bypass consensus.
+            if (!config.tree_ops_enabled) {
+                nexus::core::ensure_application_root(tree, config.root_pubkey);
+            }
         });
     if (!security_mesh) {
         spdlog::error("Config: {}", mesh_error);
@@ -785,9 +826,11 @@ int main(int argc, char* argv[]) {
     admission.start();
 
     // ========================================================================
-    // Experimental tree operations (Phase 1): local only, off by default
+    // Experimental tree operations (Phase 2): Tier 1 consensus, off by default
     // ========================================================================
+    std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
+    std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     if (config.tree_ops_enabled) {
         const auto network_bytes = nexus::crypto::from_hex(security_mesh->network_id_hex);
         nexus::security::NetworkId network_id{};
@@ -796,12 +839,66 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::copy(network_bytes.begin(), network_bytes.end(), network_id.begin());
+        nexus::security::NodeId self{};
+        self.bytes = gossip.keypair().public_key;
+        const std::string root_key =
+            nexus::core::root_principal_from_hex(config.root_pubkey).value_or("");
+
+        nexus::tree::TreeConsensusConfig tree_config;
+        tree_config.self = self;
+        tree_config.network_id = network_id;
+        tree_config.root_key = root_key;
+        tree_config.wall_clock_ms = [] {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count());
+        };
+        tree_consensus = std::make_unique<nexus::tree::TreeConsensus>(
+            std::move(tree_config), tree, crypto,
+            std::filesystem::path(data_root) / "tree" / "log");
+        if (!tree_consensus->start()) {
+            // Fail closed: the server runs and serves its last committed tree,
+            // but applies, votes for, and accepts no tree operation.
+            spdlog::error("EXPERIMENTAL tree operations halted at startup: {}",
+                          tree_consensus->halt_reason());
+        }
+        auto* consensus = tree_consensus.get();
+        auto* mesh = security_mesh->service.get();
         // Ops are signed with this server's gossip identity under their own
         // domain tag; the key never leaves GossipService.
         tree_ops = std::make_unique<nexus::tree::TreeOpSubmitter>(
-            tree, crypto, network_id, gossip.keypair());
-        spdlog::warn("EXPERIMENTAL: tree operations enabled (Phase 1). Tree writes apply "
-                     "locally through validate_op/apply_op; they are not replicated.");
+            tree, crypto, network_id, gossip.keypair(),
+            [consensus](nexus::tree::TreeOp op) { return consensus->submit(std::move(op)); },
+            std::chrono::milliseconds(nexus::tree::kTreeOpCommitWaitMs));
+        tree_ops->set_root_key(root_key);
+        consensus->set_broadcast([mesh](nexus::security::TreeOpSubmitMsg message) {
+            mesh->broadcast_tree_op(std::move(message));
+        });
+        consensus->set_root_request([submitter = tree_ops.get(), root_key] {
+            nexus::tree::TreeOp op;
+            op.kind = nexus::tree::TreeOpKind::EstablishRoot;
+            op.target = "root";
+            op.principal = root_key;
+            op.body.source = nexus::tree::TreeOpSource::Session;
+            const auto admission = submitter->submit_async(std::move(op));
+            if (!admission.verdict.ok()) {
+                spdlog::warn("[tree] root operation not submitted: {}", admission.verdict.reason);
+            }
+        });
+        mesh->register_payload_handler(*consensus);
+        mesh->set_tree_op_sink([consensus](const nexus::security::TreeOpSubmitMsg& message,
+                                           const nexus::security::NodeId& from) {
+            consensus->receive_forwarded(message, from);
+        });
+        mesh->set_tick_hook([consensus, mesh] {
+            consensus->set_members(mesh->current_members());
+            consensus->maintain();
+        });
+        tree_op_status = [consensus](const std::string& op_id) { return consensus->status(op_id); };
+        spdlog::warn("EXPERIMENTAL: tree operations enabled (Phase 2). Tier 1 orders tree "
+                     "writes through consensus and applies them after commit; Tier 2 "
+                     "replication is not implemented, so a server outside Tier 1 refuses "
+                     "tree writes.");
     }
 
     // ========================================================================
@@ -832,6 +929,7 @@ int main(int argc, char* argv[]) {
         .server_public_ip = server_public_ip,
         .tunnel_bind_ip   = tunnel_bind_ip,
         .tree_ops         = tree_ops.get(),
+        .tree_op_status   = tree_op_status,
     };
 
     nexus::api::PublicApiHandler public_api{ctx};

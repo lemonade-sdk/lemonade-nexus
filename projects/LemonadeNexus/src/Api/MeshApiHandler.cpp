@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
@@ -39,6 +40,20 @@ std::unordered_map<std::string, uint64_t> build_mesh_handshake_map(
     return m;
 }
 } // anonymous namespace
+
+bool mesh_peer_listed(const tree::PermissionTreeService& tree,
+                      std::string_view caller_pubkey,
+                      const tree::TreeNode& peer) {
+    switch (peer.type) {
+        case tree::NodeType::Endpoint:
+            return tree.check_permission(caller_pubkey, peer.id, acl::Permission::ConnectPrivate) ||
+                   tree.check_permission(caller_pubkey, peer.id, acl::Permission::ConnectShared);
+        case tree::NodeType::Relay:
+            return tree.check_permission(caller_pubkey, peer.id, acl::Permission::Read);
+        default:
+            return false;
+    }
+}
 
 namespace {
 /// Validate that a mesh heartbeat endpoint string is a well-formed ip:port
@@ -81,8 +96,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     // GET /api/mesh/peers/:node_id (PRIVATE, auth required)
     //
-    // Returns the server peer plus every endpoint BELOW the caller in the access
-    // chain (its parent group's subtree), filtered per-node by Read permission.
+    // Returns the server peer plus the endpoints and relays in the caller's
+    // parent-group subtree that mesh_peer_listed admits. Read on the requesting
+    // node lets the caller ask; each listed endpoint needs a connect grant.
     // ========================================================================
     priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -135,12 +151,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         for (const auto& sibling : reachable) {
             if (sibling.id == node_id) continue;  // skip self
             if (sibling.type != tree::NodeType::Endpoint) continue;  // only endpoints
-
-            // Check that we have Read permission on the sibling
-            if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
-                                             acl::Permission::Read)) {
-                continue;  // skip nodes we can't see
-            }
+            if (!mesh_peer_listed(ctx_.tree, caller_pubkey, sibling)) continue;
 
             // Determine online status from the last Noise handshake.
             auto sip = strip_cidr(sibling.tunnel_ip);
@@ -168,10 +179,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         // Also include Relay-type nodes in scope as potential relay endpoints
         for (const auto& sibling : reachable) {
             if (sibling.type != tree::NodeType::Relay) continue;
-            if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
-                                             acl::Permission::Read)) {
-                continue;
-            }
+            if (!mesh_peer_listed(ctx_.tree, caller_pubkey, sibling)) continue;
 
             nlohmann::json peer;
             peer["node_id"]        = sibling.id;
@@ -243,6 +251,60 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
+        if (ctx_.config.tree_ops_enabled) {
+            // The endpoint write is a SetEndpoint tree operation. A heartbeat
+            // does not wait for the commit: it is periodic and best-effort,
+            // and an unchanged endpoint writes nothing at all.
+            if (!ctx_.tree_ops) {
+                spdlog::error("[MeshAPI] tree_ops_enabled is set but no tree-op submitter is wired");
+                error_response(res, "tree operations unavailable", 500);
+                return;
+            }
+            std::string status = "unchanged";
+            auto current = node_opt;
+            for (int attempt = 0; current && current->listen_endpoint != hb_endpoint; ++attempt) {
+                tree::TreeOp op;
+                op.kind = tree::TreeOpKind::SetEndpoint;
+                op.target = hb_node_id;
+                op.base_version = current->version;
+                op.principal = normalize_pubkey(claims.pubkey);
+                op.body.source = tree::TreeOpSource::Session;
+                op.body.listen_endpoint = hb_endpoint;
+                const auto admission = ctx_.tree_ops->submit_async(std::move(op));
+                if (admission.verdict.ok()) {
+                    status = admission.ticket->current().status == tree::TreeOpStatus::Committed
+                                 ? "committed"
+                                 : "pending";
+                    break;
+                }
+                using R = tree::TreeOpRefusal;
+                // A write that landed since the read: re-read and retry.
+                if (admission.verdict.refusal == R::StaleBaseVersion && attempt < 2) {
+                    current = ctx_.tree.get_node(hb_node_id);
+                    continue;
+                }
+                switch (admission.verdict.refusal) {
+                    case R::NotFound:    error_response(res, "node not found", 404); return;
+                    case R::Forbidden:   error_response(res, "insufficient permissions", 403); return;
+                    case R::Unavailable: error_response(res, admission.verdict.reason, 503); return;
+                    default:
+                        error_response(res, "failed to update node endpoint", 500);
+                        return;
+                }
+            }
+            if (!current) {
+                error_response(res, "node not found", 404);
+                return;
+            }
+            nlohmann::json j;
+            j["success"]  = true;
+            j["node_id"]  = hb_node_id;
+            j["endpoint"] = hb_endpoint;
+            j["status"]   = status;
+            json_response(res, j);
+            return;
+        }
+
         // Atomically update only the listen_endpoint field (avoids TOCTOU race)
         if (!ctx_.tree.update_node_endpoint(hb_node_id, hb_endpoint)) {
             error_response(res, "failed to update node endpoint", 500);
@@ -300,11 +362,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             auto now = epoch_seconds();
             for (const auto& s : reachable) {
                 if (s.id == node_id) continue;
-                if (s.type != tree::NodeType::Endpoint &&
-                    s.type != tree::NodeType::Relay) continue;
-                // Only count nodes the caller is allowed to see.
-                if (!ctx_.tree.check_permission(caller_pubkey, s.id,
-                                                 acl::Permission::Read)) continue;
+                // Count the same peers that GET /api/mesh/peers lists.
+                if (!mesh_peer_listed(ctx_.tree, caller_pubkey, s)) continue;
                 ++peer_count;
                 if (s.type == tree::NodeType::Relay) {
                     ++online_count;  // relays always considered online

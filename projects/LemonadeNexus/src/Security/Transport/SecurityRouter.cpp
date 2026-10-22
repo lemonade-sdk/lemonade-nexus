@@ -435,6 +435,17 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
             events_.on_authority_chain_page(std::get<AuthorityChainPage>(message.body),
                                             message.sender);
             return delivered();
+        case SecurityMessageKind::TreeOpSubmit: {
+            // Only current Tier 1 members order tree operations, so only they
+            // feed each other's pools. A non-member's op could never be
+            // proposed by a node that accepted it here.
+            const EpochManager* epochs = runtime_.epochs();
+            if (epochs == nullptr || !epochs->current().tier1_members.contains(message.sender)) {
+                return drop(DropReason::NotMember);
+            }
+            events_.on_tree_op_submit(std::get<TreeOpSubmitMsg>(message.body), message.sender);
+            return delivered();
+        }
     }
     return drop(DropReason::UnknownKind);
 }
@@ -514,7 +525,9 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
     if (consensus == nullptr) {
         return drop(DropReason::NoService);
     }
-    const ProposalResult result = consensus->receive_proposal(message.proposal, message.justify);
+    const ProposalResult result = consensus->receive_proposal(
+        message.proposal, message.justify,
+        message.payload.has_value() ? &*message.payload : nullptr);
     if (result.rejected.has_value()) {
         return drop(DropReason::ServiceRejected, code(*result.rejected));
     }

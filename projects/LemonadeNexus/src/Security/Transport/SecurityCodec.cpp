@@ -256,6 +256,31 @@ bool encode_proposal(Writer& w, const ProposalMessage& m) {
     return encode_certificate(w, m.justify);
 }
 
+// The HotStuffProposal body: the proposal and certificate, then the payload
+// when the block carries one. Nothing follows a payload-free proposal, so
+// such a message keeps its earlier bytes.
+bool encode_proposal_message(Writer& w, const ProposalMessage& m) {
+    if (!encode_proposal(w, m)) {
+        return false;
+    }
+    if (!m.payload.has_value()) {
+        return true;
+    }
+    if (!block_payload_kind_known(static_cast<uint16_t>(m.payload->kind))) {
+        return false;
+    }
+    w.u16(static_cast<uint16_t>(m.payload->kind));
+    return w.bytes(m.payload->body, constants::kMaxBlockPayloadBytes);
+}
+
+bool encode_tree_op_submit(Writer& w, const TreeOpSubmitMsg& m) {
+    if (!w.bytes(m.encoded_op, constants::kMaxConsensusBlockBytes)) {
+        return false;
+    }
+    w.fixed(m.signature);
+    return true;
+}
+
 bool encode_vote(Writer& w, const Vote& v) {
     w.u16(v.consensus_ruleset);
     w.fixed(v.network_id);
@@ -767,6 +792,34 @@ bool decode_proposal(Reader& r, ProposalMessage& m) {
            decode_certificate(r, m.justify);
 }
 
+bool decode_proposal_message(Reader& r, ProposalMessage& m) {
+    if (!decode_proposal(r, m)) {
+        return false;
+    }
+    if (r.remaining() == 0) {
+        return true;
+    }
+    uint16_t kind = 0;
+    if (!r.u16(kind)) {
+        return false;
+    }
+    if (!block_payload_kind_known(kind)) {
+        return r.fail(CodecError::BadValue);
+    }
+    BlockPayload payload;
+    payload.kind = static_cast<BlockPayloadKind>(kind);
+    if (!r.bytes(payload.body, constants::kMaxBlockPayloadBytes)) {
+        return false;
+    }
+    m.payload = std::move(payload);
+    return true;
+}
+
+bool decode_tree_op_submit(Reader& r, TreeOpSubmitMsg& m) {
+    return r.bytes(m.encoded_op, constants::kMaxConsensusBlockBytes) && !m.encoded_op.empty() &&
+           r.fixed(m.signature);
+}
+
 bool decode_vote(Reader& r, Vote& v) {
     return r.u16(v.consensus_ruleset) && r.fixed(v.network_id) && r.u64(v.epoch) &&
            r.u64(v.height) && r.u64(v.view) && r.fixed(v.proposal_digest) &&
@@ -1128,7 +1181,13 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
         }
         case SecurityMessageKind::HotStuffProposal: {
             ProposalMessage m;
-            if (!decode_proposal(r, m)) return false;
+            if (!decode_proposal_message(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
+        case SecurityMessageKind::TreeOpSubmit: {
+            TreeOpSubmitMsg m;
+            if (!decode_tree_op_submit(r, m)) return false;
             body = std::move(m);
             return true;
         }
@@ -1290,7 +1349,7 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::SvsmAkActivationResponse);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::TreeOpSubmit);
 }
 
 }  // namespace
@@ -1371,6 +1430,8 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::AttestationEvidenceEnd;
             } else if constexpr (std::is_same_v<T, SvsmAkActivationOfferMessage>) {
                 return SecurityMessageKind::SvsmAkActivationOffer;
+            } else if constexpr (std::is_same_v<T, TreeOpSubmitMsg>) {
+                return SecurityMessageKind::TreeOpSubmit;
             } else {
                 return SecurityMessageKind::SvsmAkActivationResponse;
             }
@@ -1393,7 +1454,9 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
             } else if constexpr (std::is_same_v<T, AttestationEvidence>) {
                 return encode_evidence(body, value);
             } else if constexpr (std::is_same_v<T, ProposalMessage>) {
-                return encode_proposal(body, value);
+                return encode_proposal_message(body, value);
+            } else if constexpr (std::is_same_v<T, TreeOpSubmitMsg>) {
+                return encode_tree_op_submit(body, value);
             } else if constexpr (std::is_same_v<T, Vote>) {
                 return encode_vote(body, value);
             } else if constexpr (std::is_same_v<T, TimeoutVote>) {

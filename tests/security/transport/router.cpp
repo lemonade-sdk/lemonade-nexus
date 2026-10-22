@@ -636,6 +636,25 @@ TEST_F(RouterMesh, RemoteNonMemberChallengeIsDroppedBeforeProduction) {
     EXPECT_EQ(a->producer.calls, 1);
 }
 
+TEST_F(RouterMesh, TreeOpsAreAcceptedOnlyFromCurrentTier1Members) {
+    bootstrap_epoch_one();
+    Node* a = founders[0];
+    TreeOpSubmitMsg op;
+    op.encoded_op = std::vector<uint8_t>(64, 0x11);
+    op.signature.fill(0x22);
+
+    // Only current members order tree operations, so only they feed pools.
+    const auto from_outsider =
+        outsider->router->compose(SecurityMessageKind::TreeOpSubmit, op, 1);
+    EXPECT_EQ(a->deliver(outsider->id, encode_security_message(from_outsider), mesh.now_ms)
+                  .dropped,
+              DropReason::NotMember);
+    const auto from_member =
+        founders[1]->router->compose(SecurityMessageKind::TreeOpSubmit, op, 1);
+    EXPECT_TRUE(a->deliver(founders[1]->id, encode_security_message(from_member), mesh.now_ms)
+                    .delivered);
+}
+
 TEST_F(RouterMesh, ChallengeProductionIsBoundedPerChallenger) {
     bootstrap_epoch_one();
     Node* a = founders[0];

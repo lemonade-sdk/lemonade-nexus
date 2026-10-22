@@ -55,6 +55,7 @@ add_nexus_test(test_key_wrapping       test_key_wrapping.cpp)
 add_nexus_test(test_file_storage       test_file_storage.cpp)
 add_nexus_test(test_permission_tree    test_permission_tree.cpp)
 add_nexus_test(test_tree_ops           test_tree_ops.cpp)
+add_nexus_test(test_tree_consensus     test_tree_consensus.cpp)
 add_nexus_test(test_account_data       test_account_data.cpp)
 add_nexus_test(test_mesh_rekey         test_mesh_rekey.cpp)
 add_nexus_test(test_routing_identifier test_routing_identifier.cpp)
@@ -136,6 +137,19 @@ target_compile_definitions(test_evidence_chain PRIVATE
 add_nexus_test(test_nexus_attestd    test_nexus_attestd.cpp)
 target_link_libraries(test_nexus_attestd PRIVATE LemonadeNexusAttestdCore)
 
+# Sealed blobs and the boot-set migration, against a test double (no TPM).
+add_nexus_test(test_sealed_boot_set  test_sealed_boot_set.cpp)
+# The TPM seal path against swtpm. Skips unless NEXUS_TEST_TPM_TCTI names a
+# simulator; a simulator run is not hardware evidence. The cases share one
+# simulator and extend its PCR 8, so CTest runs them one at a time.
+add_executable(test_tpm_seal_simulator test_tpm_seal_simulator.cpp)
+target_link_libraries(test_tpm_seal_simulator PRIVATE
+    LemonadeNexus LemonadeNexusAttestdCore GTest::gtest_main GTest::gmock)
+target_compile_definitions(test_tpm_seal_simulator PRIVATE ASIO_STANDALONE ASIO_NO_DEPRECATED)
+target_include_directories(test_tpm_seal_simulator PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+gtest_discover_tests(test_tpm_seal_simulator DISCOVERY_TIMEOUT 120
+    PROPERTIES RESOURCE_LOCK nexus_tpm_simulator)
+
 add_nexus_test(test_legacy_removal    test_legacy_removal.cpp)
 # Hostile packets at the real wire boundary: cert-gated sync, ServerHello
 # proof-of-possession, retired misbehavior proofs, and NS slot claim laundering.
@@ -163,6 +177,7 @@ add_nexus_test(test_security_policy
 add_nexus_test(test_security_strong_id security/test_strong_id.cpp)
 add_nexus_test(test_secure_buffer      test_secure_buffer.cpp)
 add_nexus_test(test_frost_provider     test_frost_provider.cpp)
+add_nexus_test(test_storage_threshold  test_storage_threshold.cpp)
 add_nexus_test(test_security_consensus
     security/consensus/consensus_types.cpp
     security/consensus/quorum_certificate.cpp
@@ -193,7 +208,8 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/multi_epoch.cpp
     security/lifecycle/population.cpp
     security/lifecycle/hostile_adoption.cpp
-    security/lifecycle/adversarial.cpp)
+    security/lifecycle/adversarial.cpp
+    security/lifecycle/tree_consensus_path.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority
@@ -303,6 +319,7 @@ add_sdk_test(test_boringtun_keys       test_boringtun_keys.cpp)
 add_sdk_test(test_group_key_envelope   test_group_key_envelope.cpp)
 add_sdk_test(test_sdk_tree_errors      test_sdk_tree_errors.cpp)
 add_sdk_test(test_sdk_capi_mesh       test_sdk_capi_mesh.cpp)
+add_sdk_test(test_sdk_identity       test_sdk_identity.cpp)
 
 # --- Integration tests ---
 add_nexus_test(test_http_endpoints     test_http_endpoints.cpp)

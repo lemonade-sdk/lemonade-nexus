@@ -166,7 +166,7 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
-    spdlog::info("  --tree-ops                 Experimental: apply tree writes as signed tree operations (Phase 1, local only)");
+    spdlog::info("  --tree-ops                 Experimental: order tree writes through Tier 1 consensus (Phase 2)");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
     spdlog::info("  --help, -h                 Show this help");
 }

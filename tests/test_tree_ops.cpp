@@ -216,7 +216,7 @@ protected:
     }
 
     /// A Join op for `device`, with a fresh challenge the device signed.
-    TreeOp join_op(const crypto::Ed25519Keypair& device, const std::string& tunnel_ip,
+    TreeOp join_op(const crypto::Ed25519Keypair& device,
                    const std::string& link_group = {}, const std::string& link_owner = {},
                    const std::string& mesh_pubkey = {}) {
         std::array<uint8_t, 32> challenge{};
@@ -240,7 +240,6 @@ protected:
         js.mesh_pubkey = mesh_pubkey;
         js.link_group_id = link_group;
         js.link_owner_pubkey = link_owner;
-        js.tunnel_ip = tunnel_ip;
         return op;
     }
 
@@ -300,7 +299,7 @@ TEST_F(TreeOpsTest, UpdateFieldsFromDeltaApplies) {
 TEST_F(TreeOpsTest, SetAssignmentApplies) {
     ASSERT_TRUE(submit(seal(create_op(customer("acme", root_pk), root_pk))).ok());
     auto device = crypto_svc->ed25519_keygen();
-    ASSERT_TRUE(submit(seal(join_op(device, "10.64.0.20/32", "acme", root_pk))).ok());
+    ASSERT_TRUE(submit(seal(join_op(device, "acme", root_pk))).ok());
     const auto before = version_of("acme");
 
     auto v = submit(seal(assign_op("acme", root_pk, principal_of(device),
@@ -315,8 +314,8 @@ TEST_F(TreeOpsTest, DeleteNodeRemovesNodeAndSweepsLinkGrants) {
     ASSERT_TRUE(submit(seal(create_op(customer("acme", root_pk), root_pk))).ok());
     auto dev1 = crypto_svc->ed25519_keygen();
     auto dev2 = crypto_svc->ed25519_keygen();
-    ASSERT_TRUE(submit(seal(join_op(dev1, "10.64.0.20/32", "acme", root_pk))).ok());
-    ASSERT_TRUE(submit(seal(join_op(dev2, "10.64.0.21/32", "acme", root_pk))).ok());
+    ASSERT_TRUE(submit(seal(join_op(dev1, "acme", root_pk))).ok());
+    ASSERT_TRUE(submit(seal(join_op(dev2, "acme", root_pk))).ok());
     const auto id1 = tree::derive_join_node_id(*crypto_svc, principal_of(dev1));
     const auto id2 = tree::derive_join_node_id(*crypto_svc, principal_of(dev2));
     ASSERT_TRUE(tree_svc->check_permission(principal_of(dev2), id1, acl::Permission::Read));
@@ -374,8 +373,10 @@ TEST_F(TreeOpsTest, GroupAdminRemovesDevicesThroughTheApiOnly) {
 
 TEST_F(TreeOpsTest, JoinCreatesGroupAndEndpoint) {
     auto device = crypto_svc->ed25519_keygen();
-    auto op = join_op(device, "10.64.0.30/32");
+    auto op = join_op(device);
     const auto node_id = op.target;
+    // The address is a function of the tree before the join.
+    const auto expected_ip = tree::derive_tunnel_address(tree_svc->nodes_snapshot(), node_id);
     auto v = submit(seal(op));
     ASSERT_TRUE(v.ok()) << v.reason;
 
@@ -388,7 +389,8 @@ TEST_F(TreeOpsTest, JoinCreatesGroupAndEndpoint) {
     ASSERT_TRUE(ep.has_value());
     EXPECT_EQ(ep->version, 1u);
     EXPECT_EQ(ep->parent_id, group->id);
-    EXPECT_EQ(ep->tunnel_ip, "10.64.0.30/32");
+    EXPECT_EQ(ep->tunnel_ip, expected_ip);
+    EXPECT_FALSE(expected_ip.empty());
     EXPECT_EQ(ep->hostname, "endpoint-" + node_id.substr(0, 8));
     // Re-derived in the apply step, not taken from the submitter.
     EXPECT_EQ(ep->endpoint_identifier,
@@ -401,7 +403,7 @@ TEST_F(TreeOpsTest, LinkedJoinGrantsSiblingsInSortedOrder) {
     std::vector<crypto::Ed25519Keypair> devices;
     for (int i = 0; i < 4; ++i) {
         devices.push_back(crypto_svc->ed25519_keygen());
-        auto v = submit(seal(join_op(devices.back(), "10.64.0." + std::to_string(40 + i) + "/32",
+        auto v = submit(seal(join_op(devices.back(),
                                      "acme", root_pk)));
         ASSERT_TRUE(v.ok()) << v.reason;
     }
@@ -424,17 +426,17 @@ TEST_F(TreeOpsTest, LinkedJoinGrantsSiblingsInSortedOrder) {
 
 TEST_F(TreeOpsTest, ReturningJoinRecordsAddressAndRotatedKey) {
     auto device = crypto_svc->ed25519_keygen();
-    ASSERT_TRUE(submit(seal(join_op(device, "10.64.0.50/32", {}, {}, "meshA"))).ok());
+    ASSERT_TRUE(submit(seal(join_op(device, {}, {}, "meshA"))).ok());
     const auto node_id = tree::derive_join_node_id(*crypto_svc, principal_of(device));
     ASSERT_EQ(version_of(node_id), 1u);
 
     // Same address, rotated key: the node is rewritten once.
-    ASSERT_TRUE(submit(seal(join_op(device, "10.64.0.50/32", {}, {}, "meshB"))).ok());
+    ASSERT_TRUE(submit(seal(join_op(device, {}, {}, "meshB"))).ok());
     EXPECT_EQ(tree_svc->get_node(node_id)->mesh_pubkey, "meshB");
     EXPECT_EQ(version_of(node_id), 2u);
 
     // Nothing changed: no write, no version increment.
-    ASSERT_TRUE(submit(seal(join_op(device, "10.64.0.50/32", {}, {}, "meshB"))).ok());
+    ASSERT_TRUE(submit(seal(join_op(device, {}, {}, "meshB"))).ok());
     EXPECT_EQ(version_of(node_id), 2u);
 }
 
@@ -515,8 +517,8 @@ TEST_F(TreeOpsTest, BadSignaturesAreRefused) {
 
     // A join whose challenge signature is not the device's.
     auto device = crypto_svc->ed25519_keygen();
-    auto join = join_op(device, "10.64.0.60/32");
-    auto other = join_op(stranger_kp, "10.64.0.60/32");
+    auto join = join_op(device);
+    auto other = join_op(stranger_kp);
     join.body.join.challenge_signature = other.body.join.challenge_signature;
     EXPECT_EQ(submit(seal(join)).refusal, TreeOpRefusal::BadStatement);
 
@@ -649,10 +651,10 @@ TEST_F(TreeOpsTest, SameOpSequenceGivesIdenticalTrees) {
     };
     both(seal(create_op(customer("acme", root_pk), root_pk)));
     for (std::size_t i = 0; i < devices.size(); ++i) {
-        both(seal(join_op(devices[i], "10.64.1." + std::to_string(i + 10) + "/32", "acme",
+        both(seal(join_op(devices[i], "acme",
                           root_pk)));
     }
-    both(seal(join_op(stranger_kp, "10.64.2.10/32")));
+    both(seal(join_op(stranger_kp)));
     both(seal(assign_op("acme", root_pk, principal_of(devices[0]), {"edit_node", "read"})));
     auto renamed = *tree_svc->get_node("acme");
     renamed.hostname = "acme-2";
@@ -724,11 +726,15 @@ TEST_F(TreeOpsTest, SubmitterGivesEachRequestItsOwnOpId) {
     // The local submitter signs with the wall clock as block time. Two
     // requests with identical content in the same second are distinct ops.
     tree::TreeOpSubmitter submitter(*tree_svc, *crypto_svc, network, server_kp);
-    ASSERT_TRUE(submitter.submit(create_op(customer("acme", root_pk), root_pk)).ok());
+    ASSERT_TRUE(submitter.submit(create_op(customer("acme", root_pk), root_pk)).verdict.ok());
     auto node = *tree_svc->get_node("acme");
     node.hostname = "same";
-    ASSERT_TRUE(submitter.submit(update_op(node, root_pk, 1)).ok());
-    ASSERT_TRUE(submitter.submit(update_op(node, root_pk, 2)).ok());
+    const auto first = submitter.submit(update_op(node, root_pk, 1));
+    const auto second = submitter.submit(update_op(node, root_pk, 2));
+    ASSERT_TRUE(first.verdict.ok());
+    ASSERT_TRUE(second.verdict.ok());
+    EXPECT_NE(first.op_id, second.op_id);
+    EXPECT_FALSE(first.pending);
     EXPECT_EQ(version_of("acme"), 3u);
     // A dry run validates without applying.
     EXPECT_TRUE(submitter.dry_run(update_op(node, root_pk, 3)).ok());

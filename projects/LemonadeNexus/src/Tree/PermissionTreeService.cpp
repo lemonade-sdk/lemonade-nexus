@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
+#include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Tree/TreeRules.hpp>
 
 #include <spdlog/spdlog.h>
@@ -8,6 +9,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <unordered_set>
 
 namespace nexus::tree {
@@ -64,6 +68,8 @@ void PermissionTreeService::on_start() {
             identifier_index_[node.endpoint_identifier] = id;
         }
     }
+
+    load_committed_ops_locked();
 
     spdlog::info("[{}] loaded {} nodes from storage ({} with endpoint identifiers)",
                   name(), nodes_.size(), identifier_index_.size());
@@ -599,18 +605,13 @@ uint64_t PermissionTreeService::record_applied_delta_locked(const TreeDelta& del
 
 // --- Tree operations ---
 
-namespace {
-
-// Committed ids stay this long past the freshness window, so a local clock
-// that steps back by less than this cannot make a pruned op fresh again.
-constexpr uint64_t kCommittedIdMarginSec = 600;
-
-} // namespace
-
 TreeOpVerdict PermissionTreeService::validate_local_op(const TreeOp& op,
                                                        const TreeOpPolicy& policy,
                                                        uint64_t block_time_sec) const {
     std::lock_guard lock(mutex_);
+    if (committed_ops_unreadable_) {
+        return TreeOpVerdict{TreeOpRefusal::StorageError, "committed op ids are unreadable"};
+    }
     return validate_op(crypto_, op, TreeState(nodes_, policy), block_time_sec,
                        committed_ops_);
 }
@@ -619,20 +620,48 @@ TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
                                                      const TreeOpPolicy& policy,
                                                      uint64_t block_time_sec) {
     std::lock_guard lock(mutex_);
+    if (committed_ops_unreadable_) {
+        return TreeOpVerdict{TreeOpRefusal::StorageError, "committed op ids are unreadable"};
+    }
     auto verdict = validate_op(crypto_, op, TreeState(nodes_, policy), block_time_sec,
                                committed_ops_);
     if (!verdict.ok()) {
         spdlog::warn("[{}] refusing tree op on '{}': {}", name(), op.target, verdict.reason);
         return verdict;
     }
-    const uint64_t window = kTreeOpMaxAgeSec + kCommittedIdMarginSec;
-    if (block_time_sec > window) committed_ops_.prune_signed_before(block_time_sec - window);
-    return apply_op_locked(op);
+    committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
+    verdict = apply_op_locked(op);
+    persist_committed_ops_after(verdict);
+    return verdict;
 }
 
 TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
     std::lock_guard lock(mutex_);
-    return apply_op_locked(op);
+    auto verdict = apply_op_locked(op);
+    persist_committed_ops_after(verdict);
+    return verdict;
+}
+
+TreeOpVerdict PermissionTreeService::apply_committed_ops(const std::vector<TreeOp>& ops,
+                                                         uint64_t block_time_sec) {
+    std::lock_guard lock(mutex_);
+    TreeOpVerdict verdict;
+    for (const auto& op : ops) {
+        verdict = apply_op_locked(op);
+        if (!verdict.ok()) break;
+    }
+    committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
+    persist_committed_ops_after(TreeOpVerdict{});
+    return verdict;
+}
+
+void PermissionTreeService::persist_committed_ops_after(const TreeOpVerdict& verdict) {
+    // Under consensus this file only mirrors the tree log, which is the
+    // authority; for local application it is what keeps replay refused
+    // after a restart.
+    if (verdict.ok() && !persist_committed_ops_locked()) {
+        spdlog::warn("[{}] failed to persist committed op ids", name());
+    }
 }
 
 TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op) {
@@ -674,10 +703,7 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op) {
         }
     }
 
-    committed_ops_.insert(op_id_hex(op), op.signed_at);
-    if (const auto statement = statement_id_hex(op)) {
-        committed_ops_.insert(*statement, op.signed_at);
-    }
+    record_committed(committed_ops_, op);
     if (op.body.source == TreeOpSource::Delta) {
         (void)record_applied_delta_locked(op.body.delta);
     }
@@ -686,6 +712,92 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op) {
                  static_cast<unsigned>(op.kind), op.target, effect.writes.size(),
                  effect.removals.size());
     return {};
+}
+
+rules::NodeMap PermissionTreeService::nodes_snapshot() const {
+    std::lock_guard lock(mutex_);
+    return nodes_;
+}
+
+security::Digest PermissionTreeService::tree_digest() const {
+    std::lock_guard lock(mutex_);
+    return compute_tree_digest(nodes_);
+}
+
+bool PermissionTreeService::replace_all(const rules::NodeMap& nodes,
+                                        const CommittedOpIds& committed) {
+    std::lock_guard lock(mutex_);
+    committed_ops_ = committed;
+    committed_ops_unreadable_ = false;
+    bool ok = persist_committed_ops_locked();
+    for (const auto& [id, node] : nodes) {
+        const auto current = nodes_.find(id);
+        if (current != nodes_.end() && encode_tree_node(current->second) == encode_tree_node(node)) {
+            continue;
+        }
+        if (!persist_node(node)) {
+            spdlog::error("[{}] replace_all: failed to persist node '{}'", name(), id);
+            ok = false;
+        }
+    }
+    for (const auto& [id, node] : nodes_) {
+        if (!nodes.contains(id) && !remove_node(id)) {
+            spdlog::error("[{}] replace_all: failed to remove node '{}'", name(), id);
+            ok = false;
+        }
+    }
+    nodes_ = nodes;
+    identifier_index_.clear();
+    for (const auto& [id, node] : nodes_) {
+        if (!node.endpoint_identifier.empty()) identifier_index_[node.endpoint_identifier] = id;
+    }
+    return ok;
+}
+
+namespace {
+
+std::filesystem::path committed_ops_path(const storage::FileStorageService& storage) {
+    return storage.data_root() / "tree" / "committed-ops.json";
+}
+
+}  // namespace
+
+bool PermissionTreeService::persist_committed_ops_locked() const {
+    json ids = json::array();
+    for (const auto& [id, signed_at] : committed_ops_.sorted()) {
+        ids.push_back(json::array({id, signed_at}));
+    }
+    const json doc{{"format", 1}, {"ids", std::move(ids)}};
+    return security::write_durable(committed_ops_path(storage_), doc.dump());
+}
+
+void PermissionTreeService::load_committed_ops_locked() {
+    std::ifstream in(committed_ops_path(storage_), std::ios::binary);
+    if (!in) return;  // nothing committed yet
+    std::ostringstream text;
+    text << in.rdbuf();
+    const auto doc = json::parse(text.str(), nullptr, false);
+    const bool shaped = !doc.is_discarded() && doc.is_object() && doc.value("format", 0) == 1 &&
+                        doc.contains("ids") && doc["ids"].is_array();
+    if (!shaped) {
+        // Fail closed for replay: an unreadable record means the ids are
+        // unknown, and local application must not proceed as if none were
+        // committed.
+        spdlog::error("[{}] committed op id record is malformed; refusing tree operations",
+                      name());
+        committed_ops_unreadable_ = true;
+        return;
+    }
+    for (const auto& item : doc["ids"]) {
+        if (!item.is_array() || item.size() != 2 || !item[0].is_string() ||
+            !item[1].is_number_unsigned()) {
+            spdlog::error("[{}] committed op id record holds a malformed entry; refusing tree "
+                          "operations", name());
+            committed_ops_unreadable_ = true;
+            return;
+        }
+        committed_ops_.insert(item[0].get<std::string>(), item[1].get<uint64_t>());
+    }
 }
 
 std::optional<TreeNode> PermissionTreeService::do_get_node(std::string_view node_id) const {

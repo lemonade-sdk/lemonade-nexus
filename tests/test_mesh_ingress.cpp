@@ -12,9 +12,11 @@
 #include <httplib.h>
 #include <sodium.h>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -99,4 +101,44 @@ TEST(MeshIngress, IngressRejectedWhenInactive) {
     EXPECT_FALSE(idle.tcp_ingress(8080, "tcp:127.0.0.1:80"));
     EXPECT_EQ(idle.bound_port(), 0);
     EXPECT_EQ(idle.tcp_egress("10.64.0.1", 9101), 0);
+}
+
+// stop() destroys the netstack while egress and ingress calls run on other
+// threads. Each of those calls must observe either the live netstack or none,
+// never a freed one. A use-after-free here crashes intermittently in a normal
+// build; ThreadSanitizer or AddressSanitizer reports it on every run.
+TEST(MeshIngress, StopRacesEgressAndIngressSafely) {
+    ASSERT_GE(sodium_init(), 0);
+    auto keys = lnsdk::BoringtunMesh::generate_keypair();
+    lnsdk::BoringtunConfig cfg;
+    cfg.private_key = keys.first;
+    cfg.public_key  = keys.second;
+    cfg.tunnel_ip   = "10.64.0.9/32";
+    cfg.allowed_ips = {"10.64.0.0/10"};
+
+    lnsdk::BoringtunMesh mesh;
+    std::atomic<bool> done{false};
+    std::vector<std::thread> workers;
+    for (int w = 0; w < 4; ++w) {
+        workers.emplace_back([&mesh, &done, w] {
+            uint16_t port = 1;
+            while (!done.load()) {
+                const std::string dst = "10.64.1." + std::to_string(w + 1);
+                (void)mesh.tcp_egress(dst, port);
+                (void)mesh.tcp_ingress(static_cast<uint16_t>(9000 + w), "tcp:127.0.0.1:1");
+                mesh.close_egress(dst, port);
+                (void)mesh.mesh_status();
+                port = static_cast<uint16_t>(port % 200 + 1);
+            }
+        });
+    }
+    for (int i = 0; i < 40; ++i) {
+        EXPECT_TRUE(mesh.start(cfg));
+        std::this_thread::sleep_for(2ms);
+        mesh.stop();
+    }
+    done = true;
+    for (auto& t : workers) t.join();
+    EXPECT_FALSE(mesh.is_active());
+    EXPECT_EQ(mesh.tcp_egress("10.64.0.1", 9101), 0);
 }

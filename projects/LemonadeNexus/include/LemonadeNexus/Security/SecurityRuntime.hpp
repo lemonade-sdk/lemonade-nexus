@@ -43,6 +43,10 @@ struct SecurityRuntimeConfig {
     /// quorum only from nodes that independently agree. Unset refuses every
     /// non-empty transition.
     std::function<bool(const Digest& transitions_digest)> transition_validator;
+
+    /// Passed to every epoch's consensus service: answers whether this node
+    /// independently agrees with a block payload. Unset refuses every payload.
+    std::function<bool(const Proposal& proposal, const BlockPayload& payload)> payload_validator;
 };
 
 class SecurityRuntime {
