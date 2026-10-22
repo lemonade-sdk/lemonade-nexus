@@ -11,7 +11,9 @@
 #include <array>
 #include <cstdint>
 #include <exception>
+#include <iterator>
 #include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -223,6 +225,179 @@ std::string encode_activation_request(const SvsmAkActivationRequest& request) {
     return j.dump() + "\n";
 }
 
+// --- seal / unseal ----------------------------------------------------------
+
+namespace {
+
+constexpr std::string_view kSealKeys[] = {"version", "type", "domain", "target"};
+constexpr std::string_view kUnsealKeys[] = {"version",    "type",       "domain",
+                                            "pcr_digest", "tpm_public", "tpm_private"};
+constexpr std::string_view kSealResultKeys[] = {"version",    "type",        "pcr_digest",
+                                                "tpm_public", "tpm_private", "key"};
+constexpr std::string_view kUnsealResultKeys[] = {"version", "type", "key"};
+
+/// The exact key set, checked before any field is read.
+[[nodiscard]] bool has_exact_keys(const json& j, std::span<const std::string_view> keys) {
+    if (!j.is_object() || j.size() != keys.size()) return false;
+    return std::all_of(keys.begin(), keys.end(),
+                       [&j](std::string_view key) { return j.contains(std::string(key)); });
+}
+
+[[nodiscard]] bool has_version_and_type(const json& j, std::string_view type) {
+    return j["version"].is_number_integer() && j["version"].get<int>() == kAttestdWireVersion &&
+           j["type"].is_string() && j["type"].get<std::string>() == type;
+}
+
+[[nodiscard]] bool lower_hex(const std::string& text, std::size_t length) {
+    return text.size() == length && std::all_of(text.begin(), text.end(), [](char c) {
+               return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+           });
+}
+
+/// Lowercase hex only, so one value has one spelling on the wire.
+template <std::size_t N>
+[[nodiscard]] bool read_lower_hex(const json& value, std::array<uint8_t, N>& out) {
+    return value.is_string() && lower_hex(value.get_ref<const std::string&>(), 2 * N) &&
+           read_hex(value, out);
+}
+
+/// Non-empty base64 within `maximum` bytes.
+[[nodiscard]] bool read_b64(const json& value, std::size_t maximum, std::vector<uint8_t>& out) {
+    if (!value.is_string() || value.get_ref<const std::string&>().empty()) return false;
+    try {
+        auto bytes = crypto::from_base64(value.get<std::string>());
+        if (bytes.empty() || bytes.size() > maximum) return false;
+        out = std::move(bytes);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+/// Overwrite a string's characters in place before it is released.
+void wipe(std::string& text) {
+    if (!text.empty()) sodium_memzero(text.data(), text.size());
+}
+
+/// A kSealKeyBytes key from a base64 field, into guarded memory. The encoded
+/// field is wiped either way.
+[[nodiscard]] bool take_key(json& value, crypto::SecureBuffer& out) {
+    if (!value.is_string()) return false;
+    auto& encoded = value.get_ref<std::string&>();
+    std::vector<uint8_t> bytes;
+    try {
+        bytes = crypto::from_base64(encoded);
+    } catch (const std::exception&) {
+        bytes.clear();
+    }
+    wipe(encoded);
+    const bool sized = bytes.size() == security::kSealKeyBytes;
+    if (sized) out = crypto::SecureBuffer(bytes);
+    if (!bytes.empty()) sodium_memzero(bytes.data(), bytes.size());
+    return sized;
+}
+
+[[nodiscard]] bool emit_wiped(json& j, const FrameSink& sink) {
+    std::string payload = j.dump();
+    wipe(j["key"].get_ref<std::string&>());
+    std::string frame = encode_frame(FrameKind::Result, payload);
+    wipe(payload);
+    const bool sent = !frame.empty() && sink(frame);
+    wipe(frame);
+    return sent;
+}
+
+}  // namespace
+
+std::optional<SealRequest> decode_seal_request(std::string_view text) {
+    if (text.empty() || text.size() > kMaxRequestBytes) return std::nullopt;
+    const json j = json::parse(text, nullptr, false);
+    if (j.is_discarded() || !has_exact_keys(j, kSealKeys) ||
+        !has_version_and_type(j, kSealRequestType) || !j["domain"].is_string() ||
+        !security::valid_seal_domain(j["domain"].get<std::string>())) {
+        return std::nullopt;
+    }
+    SealRequest request;
+    request.domain = j["domain"].get<std::string>();
+    const json& target = j["target"];
+    if (target.is_string()) {
+        if (target.get<std::string>() != "current") return std::nullopt;
+        return request;
+    }
+    constexpr std::string_view kTargetKeys[] = {"pcr8", "pcr9"};
+    static_assert(std::size(kTargetKeys) == security::kSealPcrCount);
+    if (!has_exact_keys(target, kTargetKeys)) return std::nullopt;
+    security::BootPcrValues values{};
+    if (!read_lower_hex(target["pcr8"], values[0]) || !read_lower_hex(target["pcr9"], values[1])) {
+        return std::nullopt;
+    }
+    request.target = values;
+    return request;
+}
+
+std::string encode_seal_request(const SealRequest& request) {
+    json j;
+    j["version"] = kAttestdWireVersion;
+    j["type"] = std::string(kSealRequestType);
+    j["domain"] = request.domain;
+    if (request.target) {
+        j["target"] = {{"pcr8", hex_of((*request.target)[0])},
+                       {"pcr9", hex_of((*request.target)[1])}};
+    } else {
+        j["target"] = "current";
+    }
+    return j.dump() + "\n";
+}
+
+std::optional<UnsealRequest> decode_unseal_request(std::string_view text) {
+    if (text.empty() || text.size() > kMaxRequestBytes) return std::nullopt;
+    const json j = json::parse(text, nullptr, false);
+    if (j.is_discarded() || !has_exact_keys(j, kUnsealKeys) ||
+        !has_version_and_type(j, kUnsealRequestType) || !j["domain"].is_string() ||
+        !security::valid_seal_domain(j["domain"].get<std::string>())) {
+        return std::nullopt;
+    }
+    UnsealRequest request;
+    request.domain = j["domain"].get<std::string>();
+    if (!read_lower_hex(j["pcr_digest"], request.object.pcr_digest) ||
+        !read_b64(j["tpm_public"], security::kMaxTpmObjectBytes, request.object.tpm_public) ||
+        !read_b64(j["tpm_private"], security::kMaxTpmObjectBytes, request.object.tpm_private)) {
+        return std::nullopt;
+    }
+    return request;
+}
+
+std::string encode_unseal_request(const UnsealRequest& request) {
+    json j;
+    j["version"] = kAttestdWireVersion;
+    j["type"] = std::string(kUnsealRequestType);
+    j["domain"] = request.domain;
+    j["pcr_digest"] = hex_of(request.object.pcr_digest);
+    j["tpm_public"] = crypto::to_base64(request.object.tpm_public);
+    j["tpm_private"] = crypto::to_base64(request.object.tpm_private);
+    return j.dump() + "\n";
+}
+
+bool emit_seal_result(const security::SealedKeyObject& object, std::span<const uint8_t> key,
+                      const FrameSink& sink) {
+    json j;
+    j["version"] = kAttestdWireVersion;
+    j["type"] = std::string(kSealResultType);
+    j["pcr_digest"] = hex_of(object.pcr_digest);
+    j["tpm_public"] = crypto::to_base64(object.tpm_public);
+    j["tpm_private"] = crypto::to_base64(object.tpm_private);
+    j["key"] = crypto::to_base64(key);
+    return emit_wiped(j, sink);
+}
+
+bool emit_unseal_result(std::span<const uint8_t> key, const FrameSink& sink) {
+    json j;
+    j["version"] = kAttestdWireVersion;
+    j["type"] = std::string(kUnsealResultType);
+    j["key"] = crypto::to_base64(key);
+    return emit_wiped(j, sink);
+}
+
 bool emit_bundle(const PlatformEvidenceBundle& bundle, const FrameSink& sink) {
     const std::string evidence = security::encode_platform_evidence(bundle.platform);
 
@@ -309,7 +484,7 @@ bool ResponseAssembler::offer(FrameKind kind, std::string_view payload) {
                 return fail(FrameError::Malformed);
             }
             refusal_ = static_cast<Refusal>(j["code"].get<uint16_t>());
-            if (refusal_name(refusal_) == "Unknown") return fail(FrameError::Malformed);
+            if (refusal_name(refusal_) == "unknown") return fail(FrameError::Malformed);
             if (j.contains("detail") && j["detail"].is_string()) {
                 detail_ = j["detail"].get<std::string>();
             }
@@ -377,10 +552,36 @@ bool ResponseAssembler::offer(FrameKind kind, std::string_view payload) {
                 j["version"].get<int>() != kAttestdWireVersion) {
                 return fail(FrameError::Malformed);
             }
-            if (!j.contains("type") || !j["type"].is_string() ||
-                j["type"].get<std::string>() != kActivationResultType) {
-                return fail(FrameError::Malformed);
+            if (!j.contains("type") || !j["type"].is_string()) return fail(FrameError::Malformed);
+            const std::string type = j["type"].get<std::string>();
+            if (type == kSealResultType) {
+                security::SealedKeyObject object;
+                const bool shaped =
+                    has_exact_keys(j, kSealResultKeys) &&
+                    read_lower_hex(j["pcr_digest"], object.pcr_digest) &&
+                    read_b64(j["tpm_public"], security::kMaxTpmObjectBytes, object.tpm_public) &&
+                    read_b64(j["tpm_private"], security::kMaxTpmObjectBytes, object.tpm_private);
+                crypto::SecureBuffer key;
+                const bool keyed = j.contains("key") && take_key(j["key"], key);
+                if (!shaped || !keyed) return fail(FrameError::Malformed);
+                result_type_ = type;
+                result_object_ = std::move(object);
+                result_key_ = std::move(key);
+                done_ = true;
+                return false;  // over, carrying a sealed key
             }
+            if (type == kUnsealResultType) {
+                crypto::SecureBuffer key;
+                const bool keyed = j.contains("key") && take_key(j["key"], key);
+                if (!has_exact_keys(j, kUnsealResultKeys) || !keyed) {
+                    return fail(FrameError::Malformed);
+                }
+                result_type_ = type;
+                result_key_ = std::move(key);
+                done_ = true;
+                return false;  // over, carrying an unsealed key
+            }
+            if (type != kActivationResultType) return fail(FrameError::Malformed);
             if (!j.contains("activated_secret") || !j["activated_secret"].is_string() ||
                 j["activated_secret"].get<std::string>().size() != 2 * security::kDigestSize) {
                 return fail(FrameError::Malformed);
@@ -395,6 +596,24 @@ bool ResponseAssembler::offer(FrameKind kind, std::string_view payload) {
         }
     }
     return fail(FrameError::Malformed);
+}
+
+std::optional<security::SealedKeyObject> ResponseAssembler::result_object() const {
+    if (!done_ || error_ != FrameError::None || result_type_ != kSealResultType) {
+        return std::nullopt;
+    }
+    return result_object_;
+}
+
+bool ResponseAssembler::has_result_key() const {
+    return done_ && error_ == FrameError::None &&
+           (result_type_ == kSealResultType || result_type_ == kUnsealResultType) &&
+           !result_key_.empty();
+}
+
+crypto::SecureBuffer ResponseAssembler::take_result_key() {
+    if (!has_result_key()) return {};
+    return std::move(result_key_);
 }
 
 std::optional<std::vector<uint8_t>> ResponseAssembler::result_secret() const {

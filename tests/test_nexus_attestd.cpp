@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -758,9 +759,11 @@ TEST(AttestdFraming, TheRequestSurfaceIsStillOneChallengeAndNothingElse) {
 // absence is asserted on the type, not on a code path that might be missed.
 TEST(AttestdBoundary, NothingInTheDaemonConfigCanCarryKeyMaterial) {
     // Structured binding, so a new field breaks the BUILD rather than slipping
-    // past a runtime check. Both members are named here; neither can hold a key.
+    // past a runtime check. Every member is named here; none can hold a key.
+    // tcti names a TPM transport (a device path or a simulator address); the
+    // plaintext a seal request carries arrives per request, never as config.
     AttestdConfig config;
-    auto& [cache_dir, allow_network, svsm_report_object, guest_report_object] = config;
+    auto& [cache_dir, allow_network, svsm_report_object, guest_report_object, tcti] = config;
     cache_dir = "/var/lib/nexus-attestd/cache";
     allow_network = false;
     svsm_report_object = "/sys/kernel/config/tsm/report/nexus-attestd-svsm";
@@ -770,7 +773,9 @@ TEST(AttestdBoundary, NothingInTheDaemonConfigCanCarryKeyMaterial) {
     static_assert(std::is_same_v<decltype(allow_network), bool>);
     static_assert(std::is_same_v<decltype(svsm_report_object), std::filesystem::path>);
     static_assert(std::is_same_v<decltype(guest_report_object), std::filesystem::path>);
+    static_assert(std::is_same_v<decltype(tcti), std::string>);
     EXPECT_EQ(config.cache_dir, "/var/lib/nexus-attestd/cache");
+    EXPECT_EQ(tcti, "device:/dev/tpmrm0");
 }
 
 TEST(AttestdBoundary, NoResponseEverCarriesAuthority) {
@@ -1268,4 +1273,411 @@ TEST_F(AttestdServiceTest, AMalformedActivationRequestIsMalformedNotActivated) {
     const auto document = json::parse(one_frame(service, smuggled.dump()).second, nullptr, false);
     ASSERT_FALSE(document.is_discarded());
     EXPECT_EQ(document["refusal"], "malformed_request");
+}
+
+// ---------------------------------------------------------------------------
+// Seal and unseal: closed grammar, typed refusals, and the client mapping
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using nexus::attestd::SealRequest;
+using nexus::attestd::UnsealRequest;
+using nexus::security::SealStatus;
+
+nexus::security::SealedKeyObject sample_object() {
+    nexus::security::SealedKeyObject object;
+    object.pcr_digest = patterned<32>(0x61);
+    object.tpm_public = {0, 4, 1, 2, 3, 4};
+    object.tpm_private = {0, 2, 5, 6};
+    return object;
+}
+
+std::vector<uint8_t> sample_key() { return std::vector<uint8_t>(32, 0x6B); }
+
+json seal_json(const SealRequest& request) {
+    return json::parse(nexus::attestd::encode_seal_request(request));
+}
+
+json unseal_json(const UnsealRequest& request) {
+    return json::parse(nexus::attestd::encode_unseal_request(request));
+}
+
+std::string wire_of(const std::function<bool(const nexus::attestd::FrameSink&)>& emit) {
+    std::string wire;
+    EXPECT_TRUE(emit([&wire](std::string_view f) {
+        wire.append(f);
+        return true;
+    }));
+    return wire;
+}
+
+std::string refusal_wire(Refusal refusal) {
+    return wire_of([refusal](const nexus::attestd::FrameSink& sink) {
+        return nexus::attestd::emit_refusal(refusal, sink);
+    });
+}
+
+std::string seal_result_wire(const nexus::security::SealedKeyObject& object,
+                             const std::vector<uint8_t>& key) {
+    return wire_of([&](const nexus::attestd::FrameSink& sink) {
+        return nexus::attestd::emit_seal_result(object, key, sink);
+    });
+}
+
+std::string unseal_result_wire(const std::vector<uint8_t>& key) {
+    return wire_of([&](const nexus::attestd::FrameSink& sink) {
+        return nexus::attestd::emit_unseal_result(key, sink);
+    });
+}
+
+}  // namespace
+
+TEST(AttestdSealGrammar, RoundTripsTheCurrentAndARequestedBinding) {
+    const auto current =
+        nexus::attestd::decode_seal_request(seal_json({"gossip-identity", std::nullopt}).dump());
+    ASSERT_TRUE(current.has_value());
+    EXPECT_EQ(current->domain, "gossip-identity");
+    EXPECT_FALSE(current->target.has_value());
+
+    nexus::security::BootPcrValues target{};
+    target[0].fill(0xAB);
+    target[1].fill(0xCD);
+    const auto requested =
+        nexus::attestd::decode_seal_request(seal_json({"storage-share", target}).dump());
+    ASSERT_TRUE(requested.has_value());
+    ASSERT_TRUE(requested->target.has_value());
+    EXPECT_EQ(*requested->target, target);
+}
+
+TEST(AttestdSealGrammar, RefusesEveryDeviation) {
+    const json good = seal_json({"gossip-identity", std::nullopt});
+    auto refuse = [](const json& j, const char* what) {
+        EXPECT_FALSE(nexus::attestd::decode_seal_request(j.dump()).has_value()) << what;
+    };
+    // No secret, no PCR selection, no path, no parent: none of these exist.
+    for (const char* key :
+         {"plaintext", "pcr_selection", "pcrs", "qualifying_data", "path", "parent"}) {
+        auto j = good;
+        j[key] = "whatever";
+        refuse(j, key);
+    }
+    {
+        auto j = good;
+        j.erase("target");
+        refuse(j, "missing target");
+    }
+    {
+        auto j = good;
+        j["target"] = "next";
+        refuse(j, "unknown target word");
+    }
+    {
+        auto j = good;
+        j["target"] = {{"pcr8", std::string(64, 'a')}, {"pcr9", std::string(64, 'b')},
+                       {"pcr10", std::string(64, 'c')}};
+        refuse(j, "a third PCR");
+    }
+    {
+        auto j = good;
+        j["target"] = {{"pcr8", std::string(64, 'A')}, {"pcr9", std::string(64, 'b')}};
+        refuse(j, "uppercase hex");
+    }
+    {
+        auto j = good;
+        j["target"] = {{"pcr8", std::string(62, 'a')}, {"pcr9", std::string(64, 'b')}};
+        refuse(j, "short value");
+    }
+    {
+        auto j = good;
+        j["domain"] = "../identity";
+        refuse(j, "bad domain");
+    }
+    {
+        auto j = good;
+        j["version"] = nexus::attestd::kAttestdWireVersion + 1;
+        refuse(j, "wrong version");
+    }
+    {
+        auto j = good;
+        j["type"] = std::string(nexus::attestd::kUnsealRequestType);
+        refuse(j, "wrong type");
+    }
+}
+
+TEST(AttestdSealGrammar, TheUnsealGrammarCarriesTheKeyObjectAndNothingElse) {
+    const UnsealRequest request{"gossip-identity", sample_object()};
+    const json good = unseal_json(request);
+    const auto decoded = nexus::attestd::decode_unseal_request(good.dump());
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->object.pcr_digest, request.object.pcr_digest);
+    EXPECT_EQ(decoded->object.tpm_public, request.object.tpm_public);
+    EXPECT_EQ(decoded->object.tpm_private, request.object.tpm_private);
+
+    auto refuse = [](const json& j, const char* what) {
+        EXPECT_FALSE(nexus::attestd::decode_unseal_request(j.dump()).has_value()) << what;
+    };
+    for (const char* key : {"ciphertext", "nonce", "blob", "target"}) {
+        auto j = good;
+        j[key] = "AAAA";
+        refuse(j, key);
+    }
+    {
+        auto j = good;
+        j["tpm_public"] = "";
+        refuse(j, "empty object");
+    }
+    {
+        auto j = good;
+        j["tpm_private"] = nexus::crypto::to_base64(
+            std::vector<uint8_t>(nexus::security::kMaxTpmObjectBytes + 1, 1));
+        refuse(j, "oversized object");
+    }
+    {
+        auto j = good;
+        j["pcr_digest"] = std::string(64, 'F');
+        refuse(j, "uppercase digest");
+    }
+    {
+        auto j = good;
+        j["domain"] = "Gossip";
+        refuse(j, "bad domain");
+    }
+}
+
+TEST_F(AttestdServiceTest, SealWithoutATpmIsRefusedUnavailable) {
+    auto cfg = config();
+    cfg.tcti = "device:/nonexistent/nexus-test-tpmrm0";  // never a real TPM in a unit test
+    AttestdService service{cfg};
+    const auto frame = one_frame(service, seal_json({"gossip-identity", std::nullopt}).dump());
+    ASSERT_EQ(frame.first, FrameKind::Refusal);
+    EXPECT_EQ(json::parse(frame.second)["refusal"], "seal_unavailable");
+}
+
+TEST_F(AttestdServiceTest, UnsealIsRefusedTypedWithoutATpm) {
+    auto cfg = config();
+    cfg.tcti = "device:/nonexistent/nexus-test-tpmrm0";
+    AttestdService service{cfg};
+    const auto frame = one_frame(service, unseal_json({"gossip-identity", sample_object()}).dump());
+    ASSERT_EQ(frame.first, FrameKind::Refusal);
+    const std::string refusal = json::parse(frame.second)["refusal"];
+    // The object parses as JSON but is no TPM object a seal produces: a TPM
+    // build refuses it as corrupt before touching the TPM; other builds have
+    // no TPM at all.
+    EXPECT_EQ(refusal, AttestdService::platform_available() ? "seal_corrupt" : "seal_unavailable");
+}
+
+TEST(AttestdSealResult, TheAssemblerAcceptsEachResultOnlyInItsOwnShape) {
+    const auto object = sample_object();
+    const auto key = sample_key();
+    auto frames = split_frames(seal_result_wire(object, key));
+    ASSERT_EQ(frames.size(), 1u);
+    nexus::attestd::ResponseAssembler seal_reader;
+    EXPECT_FALSE(seal_reader.offer(frames[0].first, frames[0].second));
+    EXPECT_TRUE(seal_reader.done());
+    const auto got = seal_reader.result_object();
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->pcr_digest, object.pcr_digest);
+    EXPECT_EQ(got->tpm_public, object.tpm_public);
+    EXPECT_FALSE(seal_reader.result_secret().has_value()) << "not an activation result";
+    ASSERT_TRUE(seal_reader.has_result_key());
+    const auto taken = seal_reader.take_result_key();
+    EXPECT_EQ(std::vector<uint8_t>(taken.span().begin(), taken.span().end()), key);
+    EXPECT_FALSE(seal_reader.has_result_key()) << "moved out once";
+
+    frames = split_frames(unseal_result_wire(key));
+    ASSERT_EQ(frames.size(), 1u);
+    nexus::attestd::ResponseAssembler unseal_reader;
+    EXPECT_FALSE(unseal_reader.offer(frames[0].first, frames[0].second));
+    EXPECT_FALSE(unseal_reader.result_object().has_value());
+    EXPECT_TRUE(unseal_reader.has_result_key());
+
+    auto malformed = [](const json& j, const char* what) {
+        nexus::attestd::ResponseAssembler reader;
+        EXPECT_FALSE(reader.offer(FrameKind::Result, j.dump())) << what;
+        EXPECT_EQ(reader.error(), nexus::attestd::FrameError::Malformed) << what;
+    };
+    const json seal_good = json::parse(split_frames(seal_result_wire(object, key))[0].second);
+    {
+        auto j = seal_good;
+        j.erase("key");
+        malformed(j, "seal result without a key");
+    }
+    {
+        auto j = seal_good;
+        j["key"] = nexus::crypto::to_base64(std::vector<uint8_t>(31, 1));
+        malformed(j, "short key");
+    }
+    {
+        auto j = seal_good;
+        j["plaintext"] = "AAAA";
+        malformed(j, "extra key");
+    }
+    const json unseal_good = json::parse(split_frames(unseal_result_wire(key))[0].second);
+    {
+        auto j = unseal_good;
+        j["tpm_public"] = "AAAA";
+        malformed(j, "unseal result with an object");
+    }
+}
+
+TEST(AttestdSealResult, AnUnknownRefusalCodeIsMalformed) {
+    json refusal;
+    refusal["version"] = nexus::attestd::kAttestdWireVersion;
+    refusal["type"] = std::string(nexus::attestd::kRefusalType);
+    refusal["code"] = 999;
+    nexus::attestd::ResponseAssembler reader;
+    EXPECT_FALSE(reader.offer(FrameKind::Refusal, refusal.dump()));
+    EXPECT_FALSE(reader.done());
+    EXPECT_EQ(reader.error(), nexus::attestd::FrameError::Malformed);
+}
+
+TEST_F(FakeAttestdSocket, TheSealBackendEncryptsLocallyAndSendsNoSecret) {
+    const auto object = sample_object();
+    const auto key = sample_key();
+    std::string request;
+    start_server_thread(&request, seal_result_wire(object, key));
+    const auto backend = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_});
+    nexus::security::BootPcrValues target{};
+    target[0].fill(0x01);
+    target[1].fill(0x02);
+    const std::vector<uint8_t> secret(40, 0x33);
+    const auto reply = backend.seal("gossip-identity", secret, target);
+    join_server();
+
+    ASSERT_EQ(reply.status, SealStatus::Ok) << reply.detail;
+    const auto blob = nexus::security::decode_sealed_blob(reply.blob);
+    ASSERT_TRUE(blob.has_value());
+    EXPECT_EQ(blob->domain, "gossip-identity");
+    EXPECT_EQ(blob->pcr_digest, object.pcr_digest);
+    EXPECT_EQ(blob->tpm_public, object.tpm_public);
+    const auto opened = nexus::security::open_sealed_blob(*blob, key);
+    ASSERT_TRUE(opened.has_value());
+    EXPECT_EQ(std::vector<uint8_t>(opened->span().begin(), opened->span().end()), secret);
+
+    ASSERT_FALSE(request.empty());
+    const auto decoded =
+        nexus::attestd::decode_seal_request(std::string_view(request).substr(0, request.size() - 1));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->domain, "gossip-identity");
+    ASSERT_TRUE(decoded->target.has_value());
+    EXPECT_EQ(*decoded->target, target);
+    EXPECT_EQ(request.find(nexus::crypto::to_base64(secret)), std::string::npos)
+        << "the secret must never cross the socket";
+}
+
+TEST_F(FakeAttestdSocket, TheUnsealBackendSendsOnlyTheKeyObject) {
+    const auto object = sample_object();
+    const auto key = sample_key();
+    const std::vector<uint8_t> secret(64, 0x44);
+    const auto text = nexus::security::make_sealed_blob("gossip-identity", object, key, secret);
+    ASSERT_TRUE(text.has_value());
+    const auto blob = nexus::security::decode_sealed_blob(*text);
+    ASSERT_TRUE(blob.has_value());
+
+    std::string request;
+    start_server_thread(&request, unseal_result_wire(key));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .unseal("gossip-identity", *text);
+    join_server();
+    ASSERT_EQ(reply.status, SealStatus::Ok) << reply.detail;
+    EXPECT_EQ(std::vector<uint8_t>(reply.plaintext.span().begin(), reply.plaintext.span().end()),
+              secret);
+    const auto decoded = nexus::attestd::decode_unseal_request(
+        std::string_view(request).substr(0, request.size() - 1));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->object.tpm_private, object.tpm_private);
+    EXPECT_EQ(request.find(nexus::crypto::to_base64(blob->ciphertext)), std::string::npos)
+        << "the ciphertext must never cross the socket";
+}
+
+TEST_F(FakeAttestdSocket, AWrongKeyFromTheDaemonIsCorrupt) {
+    const auto object = sample_object();
+    const auto text =
+        nexus::security::make_sealed_blob("gossip-identity", object, sample_key(),
+                                          std::vector<uint8_t>(16, 1));
+    ASSERT_TRUE(text.has_value());
+    std::string request;
+    start_server_thread(&request, unseal_result_wire(std::vector<uint8_t>(32, 0x01)));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .unseal("gossip-identity", *text);
+    join_server();
+    EXPECT_EQ(reply.status, SealStatus::Corrupt);
+    EXPECT_TRUE(reply.plaintext.empty());
+}
+
+TEST_F(FakeAttestdSocket, TheBackendMapsAPolicyMismatch) {
+    const auto text = nexus::security::make_sealed_blob("gossip-identity", sample_object(),
+                                                        sample_key(), std::vector<uint8_t>(8, 1));
+    ASSERT_TRUE(text.has_value());
+    std::string request;
+    start_server_thread(&request, refusal_wire(Refusal::SealPolicyMismatch));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .unseal("gossip-identity", *text);
+    join_server();
+    EXPECT_EQ(reply.status, SealStatus::PolicyMismatch);
+    EXPECT_TRUE(reply.plaintext.empty());
+}
+
+TEST_F(FakeAttestdSocket, TheBackendMapsACorruptObject) {
+    const auto text = nexus::security::make_sealed_blob("gossip-identity", sample_object(),
+                                                        sample_key(), std::vector<uint8_t>(8, 1));
+    ASSERT_TRUE(text.has_value());
+    std::string request;
+    start_server_thread(&request, refusal_wire(Refusal::SealCorrupt));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .unseal("gossip-identity", *text);
+    join_server();
+    EXPECT_EQ(reply.status, SealStatus::Corrupt);
+}
+
+TEST_F(FakeAttestdSocket, AnOlderDaemonMeansSealingIsUnavailable) {
+    // A daemon that predates seal refuses the request type as malformed.
+    std::string request;
+    start_server_thread(&request, refusal_wire(Refusal::MalformedRequest));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .seal("gossip-identity", std::vector<uint8_t>(8, 1), std::nullopt);
+    join_server();
+    EXPECT_EQ(reply.status, SealStatus::Unavailable);
+}
+
+TEST_F(FakeAttestdSocket, ANoTpmRefusalMeansSealingIsUnavailable) {
+    std::string request;
+    start_server_thread(&request, refusal_wire(Refusal::SealUnavailable));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .seal("gossip-identity", std::vector<uint8_t>(8, 1), std::nullopt);
+    join_server();
+    EXPECT_EQ(reply.status, SealStatus::Unavailable);
+}
+
+TEST_F(FakeAttestdSocket, AnUnsealResultIsNotASealResult) {
+    std::string request;
+    start_server_thread(&request, unseal_result_wire(sample_key()));
+    const auto reply = nexus::attestd::attestd_seal_backend(AttestdClientConfig{socket_path_})
+                           .seal("gossip-identity", std::vector<uint8_t>(8, 1), std::nullopt);
+    join_server();
+    EXPECT_NE(reply.status, SealStatus::Ok);
+    EXPECT_TRUE(reply.blob.empty());
+}
+
+TEST(AttestdSealBackend, ABlobForAnotherDomainNeverReachesTheDaemon) {
+    const auto text = nexus::security::make_sealed_blob("storage-share", sample_object(),
+                                                        sample_key(), std::vector<uint8_t>(8, 1));
+    ASSERT_TRUE(text.has_value());
+    // No daemon listens here: Corrupt, not Unreachable, proves no connection.
+    const auto backend = nexus::attestd::attestd_seal_backend(
+        AttestdClientConfig{fs::temp_directory_path() / "nexus-no-such-attestd.sock"});
+    EXPECT_EQ(backend.unseal("gossip-identity", *text).status, SealStatus::Corrupt);
+    EXPECT_EQ(backend.unseal("gossip-identity", "not a blob").status, SealStatus::Corrupt);
+}
+
+TEST(AttestdSealBackend, AnAbsentDaemonIsUnreachable) {
+    const auto text = nexus::security::make_sealed_blob("gossip-identity", sample_object(),
+                                                        sample_key(), std::vector<uint8_t>(8, 1));
+    ASSERT_TRUE(text.has_value());
+    const auto backend = nexus::attestd::attestd_seal_backend(
+        AttestdClientConfig{fs::temp_directory_path() / "nexus-no-such-attestd.sock"});
+    EXPECT_EQ(backend.seal("gossip-identity", std::vector<uint8_t>(8, 1), std::nullopt).status,
+              SealStatus::Unreachable);
+    EXPECT_EQ(backend.unseal("gossip-identity", *text).status, SealStatus::Unreachable);
 }

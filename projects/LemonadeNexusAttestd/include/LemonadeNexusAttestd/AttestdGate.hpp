@@ -90,6 +90,22 @@ enum class Refusal : uint16_t {
     /// The TPM ran the activation and refused (public-area mismatch, policy
     /// failure, TPM2_RC error). The detail string is diagnostic only.
     ActivationFailed,
+
+    /// The seal or unseal request is well-formed, but this daemon cannot run
+    /// it: the build has no TPM stack, or no TPM is reachable.
+    SealUnavailable,
+
+    /// The TPM failed while sealing or unsealing for a reason other than the
+    /// two below. Retrying may help.
+    SealFailed,
+
+    /// PCR 8/9 differ from the values the blob is sealed to. The expected
+    /// cause is a changed boot chain.
+    SealPolicyMismatch,
+
+    /// The blob does not parse, does not load into this TPM, names another
+    /// sealing domain, or does not authenticate.
+    SealCorrupt,
 };
 
 [[nodiscard]] std::string_view refusal_name(Refusal r);

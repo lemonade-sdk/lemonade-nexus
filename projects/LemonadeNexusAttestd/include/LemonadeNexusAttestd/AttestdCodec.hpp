@@ -15,8 +15,10 @@
 // refusal rather than something quietly ignored, so a future caller cannot smuggle
 // one past an older daemon.
 
+#include <LemonadeNexus/Crypto/SecureBuffer.hpp>
 #include <LemonadeNexus/Security/Attestation/AttestationTypes.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
 #include <LemonadeNexusAttestd/AttestdFraming.hpp>
 #include <LemonadeNexusAttestd/AttestdGate.hpp>
 
@@ -28,9 +30,12 @@
 
 namespace nexus::attestd {
 
-/// Wire format version. Bumped when the grammar below changes; a request
-/// carrying anything else is malformed. Owned by SecurityConstants.hpp so the
-/// release-approval verifier checks the same number this codec speaks.
+/// Wire format version. Bumped when the grammar of an existing request or
+/// response changes; a request carrying anything else is malformed. A new
+/// request type is additive: an older daemon refuses it as MalformedRequest,
+/// and every existing form keeps its exact grammar. Owned by
+/// SecurityConstants.hpp so the release-approval verifier checks the same
+/// number this codec speaks.
 inline constexpr int kAttestdWireVersion = security::constants::kAttestdWireVersion;
 
 inline constexpr std::string_view kRequestType = "attestation_challenge";
@@ -38,6 +43,10 @@ inline constexpr std::string_view kActivationRequestType = "svsm_ak_activation_o
 inline constexpr std::string_view kBundleType = "platform_evidence_bundle";
 inline constexpr std::string_view kRefusalType = "attestation_refusal";
 inline constexpr std::string_view kActivationResultType = "svsm_ak_activation_result";
+inline constexpr std::string_view kSealRequestType = "sealed_key_seal";
+inline constexpr std::string_view kUnsealRequestType = "sealed_key_unseal";
+inline constexpr std::string_view kSealResultType = "sealed_key_seal_result";
+inline constexpr std::string_view kUnsealResultType = "sealed_key_unseal_result";
 
 /// Largest request the daemon will read off the socket. A challenge carries up
 /// to kMaxSummarisedPaths checkpoint paths of up to 4 KiB each; this covers
@@ -73,6 +82,40 @@ inline constexpr std::size_t kMaxActivationFieldBytes = 4096;
 /// The one-connection request bytes for an activation, newline terminated.
 [[nodiscard]] std::string encode_activation_request(const SvsmAkActivationRequest& request);
 
+/// One seal request: create a random key sealed to PCR 8 and 9 of this host's
+/// TPM. The request carries no secret; the server encrypts its secret under the
+/// returned key (security::make_sealed_blob). The PCR selection is fixed
+/// (security::kSvsmBootPcrs); a request can choose only the values.
+struct SealRequest {
+    /// A valid sealing domain (security::valid_seal_domain). It names the
+    /// secret role in the daemon's log and changes nothing in the TPM object.
+    std::string domain;
+    /// nullopt: bind the PCR values the TPM holds now. A value: bind these
+    /// values instead (the expected PCRs of a verified release approval).
+    std::optional<security::BootPcrValues> target;
+};
+
+/// One unseal request: a sealed key object a seal returned. Never the blob's
+/// ciphertext.
+struct UnsealRequest {
+    std::string domain;
+    security::SealedKeyObject object;
+};
+
+/// Closed grammar: {version, type, domain, target}. `target` is the string
+/// "current" or an object with exactly "pcr8" and "pcr9" (64 lowercase hex
+/// each). Any deviation is nullopt.
+[[nodiscard]] std::optional<SealRequest> decode_seal_request(std::string_view json);
+
+/// Request bytes, newline terminated.
+[[nodiscard]] std::string encode_seal_request(const SealRequest& request);
+
+/// Closed grammar: {version, type, domain, pcr_digest, tpm_public,
+/// tpm_private}. Hex digest, base64 objects within security::kMaxTpmObjectBytes.
+[[nodiscard]] std::optional<UnsealRequest> decode_unseal_request(std::string_view json);
+
+[[nodiscard]] std::string encode_unseal_request(const UnsealRequest& request);
+
 /// Takes one complete frame's bytes. False stops the emitter where it stands.
 using FrameSink = std::function<bool(std::string_view frame)>;
 
@@ -91,6 +134,15 @@ using FrameSink = std::function<bool(std::string_view frame)>;
 /// no End — so there is no reassembly state to get wrong.
 [[nodiscard]] bool emit_activation_result(const std::vector<uint8_t>& activated_secret,
                                            const FrameSink& sink);
+
+/// One Result frame: the sealed key object and the key it holds. The frame
+/// buffer is wiped after the sink returns.
+[[nodiscard]] bool emit_seal_result(const security::SealedKeyObject& object,
+                                    std::span<const uint8_t> key, const FrameSink& sink);
+
+/// One Result frame: the unsealed key. The frame buffer is wiped after the
+/// sink returns.
+[[nodiscard]] bool emit_unseal_result(std::span<const uint8_t> key, const FrameSink& sink);
 
 /// Reassembles a framed response under the local bounds, with no transport of
 /// its own, so every bound is testable without a socket.
@@ -118,6 +170,14 @@ public:
     /// nullopt when the stream was anything else.
     [[nodiscard]] std::optional<std::vector<uint8_t>> result_secret() const;
 
+    /// The sealed key object, when the stream was a single seal Result frame.
+    [[nodiscard]] std::optional<security::SealedKeyObject> result_object() const;
+
+    /// True when the stream was a single seal or unseal Result frame. The key
+    /// is moved out once by take_result_key().
+    [[nodiscard]] bool has_result_key() const;
+    [[nodiscard]] crypto::SecureBuffer take_result_key();
+
     /// Bytes accepted so far, frame headers included.
     [[nodiscard]] std::size_t accepted() const { return accepted_; }
 
@@ -136,6 +196,9 @@ private:
     Refusal          refusal_{Refusal::None};
     std::string      detail_;
     std::vector<uint8_t> result_secret_;
+    std::string      result_type_;
+    security::SealedKeyObject result_object_;
+    crypto::SecureBuffer result_key_;
 };
 
 }  // namespace nexus::attestd

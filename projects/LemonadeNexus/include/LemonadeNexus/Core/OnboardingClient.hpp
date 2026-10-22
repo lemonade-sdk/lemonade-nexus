@@ -1,5 +1,7 @@
 #pragma once
 
+#include <LemonadeNexus/Security/Sealing/SealedBlobStore.hpp>
+
 #include <string>
 #include <vector>
 
@@ -15,7 +17,11 @@ struct ServerConfig;
 /// the operator to apply. Requires a preconfigured root pubkey (--root-pubkey);
 /// the response may confirm it but never establishes it. Returns a process exit
 /// code.
-[[nodiscard]] int run_onboard_server(ServerConfig& config);
+///
+/// `seal_backend` unseals the gossip identity when identity/keypair.json is
+/// gone because the boot set is sealed; empty when this build cannot seal.
+[[nodiscard]] int run_onboard_server(ServerConfig& config,
+                                     const security::SealBackend& seal_backend = {});
 
 /// "" when `pinned_hex` is a usable root anchor (32-byte hex), else an
 /// actionable error. Onboarding must not run without a pinned root.

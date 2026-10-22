@@ -182,8 +182,10 @@ The boundary that matters here:
   identity, the epoch, and the network.
 - `nexus-attestd` runs under a separate service identity with scoped TPM/IMA
   access and filesystem restrictions. It collects evidence without holding
-  the server's Nexus identity key, consensus vote key, or FROST share. The
-  server itself has no TPM access.
+  the server's Nexus identity key, consensus vote key, or FROST share. It
+  seals and unseals a PCR-bound key for the server's boot set but never
+  receives the key material that key protects. The server itself has no TPM
+  access.
 - Confidential computing protects against a **hostile host or hypervisor**.
   It is not a claim that privileged root inside the guest cannot inspect
   guest processes.

@@ -55,8 +55,9 @@ bool endorsement_discovery_failed(std::string_view detail) {
 
 AttestdService::AttestdService(AttestdConfig config) : config_(std::move(config)) {}
 
-// The one secret this daemon ever holds is the transient activation secret;
-// handle_request wipes it once the result frame is emitted.
+// The daemon holds secrets only transiently: the activation secret and the key
+// of one seal or unseal. handle_request wipes each once the result frame is
+// emitted.
 AttestdService::~AttestdService() = default;
 
 bool AttestdService::platform_available() {
@@ -71,12 +72,9 @@ Refusal AttestdService::answer_activation(const SvsmAkActivationRequest& request
                                           std::vector<uint8_t>& activated_secret,
                                           std::string* detail) {
 #if defined(__linux__) && defined(LEMONADE_HAVE_TPM_FAPI)
-    // The unit's DeviceAllow grants /dev/tpmrm0 only; the TSS default
-    // device:/dev/tpm0 would be refused.
-    static constexpr const char* kTctiConfig = "device:/dev/tpmrm0";
     auto secret = security::activate_svsm_ak_credential(
         request.ek_public, request.ak_public, request.credential_blob,
-        request.encrypted_secret, detail, kTctiConfig);
+        request.encrypted_secret, detail, config_.tcti.c_str());
     if (!secret) {
         // ActivationUnavailable is reserved for builds with no TPM stack.
         if (detail && detail->empty()) *detail = "the TPM path refused the activation";
@@ -92,6 +90,45 @@ Refusal AttestdService::answer_activation(const SvsmAkActivationRequest& request
     if (detail) *detail = "this build has no TPM stack";
     return Refusal::ActivationUnavailable;
 #endif
+}
+
+namespace {
+
+Refusal seal_refusal(security::TpmSealError error) {
+    switch (error) {
+        case security::TpmSealError::None:           return Refusal::None;
+        case security::TpmSealError::Unavailable:    return Refusal::SealUnavailable;
+        case security::TpmSealError::PolicyMismatch: return Refusal::SealPolicyMismatch;
+        case security::TpmSealError::Corrupt:        return Refusal::SealCorrupt;
+        case security::TpmSealError::TpmFailure:     return Refusal::SealFailed;
+    }
+    return Refusal::SealFailed;
+}
+
+}  // namespace
+
+Refusal AttestdService::answer_seal(const SealRequest& request, security::SealedKey& sealed,
+                                    std::string* detail) {
+    security::TpmSealStatus status;
+    auto created = security::tpm_seal_key(request.target, status, config_.tcti.c_str());
+    if (!created) {
+        if (detail) *detail = status.detail;
+        return seal_refusal(status.error);
+    }
+    sealed = std::move(*created);
+    return Refusal::None;
+}
+
+Refusal AttestdService::answer_unseal(const UnsealRequest& request, crypto::SecureBuffer& key,
+                                      std::string* detail) {
+    security::TpmSealStatus status;
+    auto opened = security::tpm_unseal_key(request.object, status, config_.tcti.c_str());
+    if (!opened) {
+        if (detail) *detail = status.detail;
+        return seal_refusal(status.error);
+    }
+    key = std::move(*opened);
+    return Refusal::None;
 }
 
 Refusal AttestdService::answer(const security::AttestationChallenge& challenge,
@@ -247,6 +284,36 @@ void AttestdService::handle_request(std::string_view request, const FrameSink& s
             (void)emit_activation_result(secret, sink);
             // The secret leaves this process only in that frame; wipe our copy.
             if (!secret.empty()) sodium_memzero(secret.data(), secret.size());
+            return;
+        }
+        if (const auto seal = decode_seal_request(request)) {
+            security::SealedKey sealed;
+            std::string detail;
+            const Refusal refusal = answer_seal(*seal, sealed, &detail);
+            if (refusal != Refusal::None) {
+                spdlog::warn("[attestd] refused seal domain={}: {}{}{}", seal->domain,
+                             refusal_name(refusal), detail.empty() ? "" : " — ", detail);
+                (void)emit_refusal(refusal, sink, detail);
+                return;
+            }
+            // Domain and binding only: never the key.
+            spdlog::info("[attestd] sealed a key domain={} binding={}", seal->domain,
+                         seal->target ? "requested" : "current");
+            (void)emit_seal_result(sealed.object, sealed.key.span(), sink);
+            return;
+        }
+        if (const auto unseal = decode_unseal_request(request)) {
+            crypto::SecureBuffer key;
+            std::string detail;
+            const Refusal refusal = answer_unseal(*unseal, key, &detail);
+            if (refusal != Refusal::None) {
+                spdlog::warn("[attestd] refused unseal domain={}: {}{}{}", unseal->domain,
+                             refusal_name(refusal), detail.empty() ? "" : " — ", detail);
+                (void)emit_refusal(refusal, sink, detail);
+                return;
+            }
+            spdlog::info("[attestd] unsealed a key domain={}", unseal->domain);
+            (void)emit_unseal_result(key.span(), sink);
             return;
         }
         spdlog::warn("[attestd] refused: {}", refusal_name(Refusal::MalformedRequest));

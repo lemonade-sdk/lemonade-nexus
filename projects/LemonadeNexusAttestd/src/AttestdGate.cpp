@@ -24,6 +24,10 @@ std::string_view refusal_name(Refusal r) {
         case Refusal::EvidenceOversized:      return "evidence_oversized";
         case Refusal::ActivationUnavailable:  return "activation_unavailable";
         case Refusal::ActivationFailed:       return "activation_failed";
+        case Refusal::SealUnavailable:        return "seal_unavailable";
+        case Refusal::SealFailed:             return "seal_failed";
+        case Refusal::SealPolicyMismatch:     return "seal_policy_mismatch";
+        case Refusal::SealCorrupt:            return "seal_corrupt";
     }
     return "unknown";
 }
@@ -57,6 +61,15 @@ std::string_view refusal_reason(Refusal r) {
             return "this daemon cannot run credential activation: no TPM stack or no reachable TPM";
         case Refusal::ActivationFailed:
             return "the TPM ran the credential activation and refused it";
+        case Refusal::SealUnavailable:
+            return "this daemon cannot seal or unseal: no TPM stack or no reachable TPM";
+        case Refusal::SealFailed:
+            return "the TPM failed while sealing or unsealing";
+        case Refusal::SealPolicyMismatch:
+            return "PCR 8/9 differ from the values the blob is sealed to";
+        case Refusal::SealCorrupt:
+            return "the sealed blob is damaged, belongs to another TPM or domain, or does not "
+                   "authenticate";
     }
     return "unknown";
 }
