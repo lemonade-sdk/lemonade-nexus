@@ -191,7 +191,12 @@ inline constexpr uint32_t kTimeoutResetAfterCommittedBlocks = 3;
 
 // --- Consensus resource limits (applied before expensive work) --------------
 
-inline constexpr std::size_t kMaxConsensusBlockBytes = 256 * 1024;
+// A block payload (BlockPayload.hpp) carries at most kMaxTransitionsPerBlock
+// entries whose canonical encodings total at most kMaxConsensusBlockBytes, so
+// the proposal message that carries it stays inside kMaxSecurityMessageBytes
+// together with the proposal header, the justify certificate at the largest
+// population, and the payload framing. A larger backlog uses more blocks.
+inline constexpr std::size_t kMaxConsensusBlockBytes = 48000;
 inline constexpr std::size_t kMaxTransitionsPerBlock = 128;
 inline constexpr uint64_t kMaxFutureViewDistance = 64;
 inline constexpr std::size_t kMaxPendingProposals = 128;
@@ -202,9 +207,20 @@ inline constexpr std::size_t kMaxQcSignatures = kMaxActiveTier1;
 // v2 added the bounded evidence-transfer state machine and the SVSM AK
 // activation messages; v3 the release-approval commitment in GenesisFounding
 // and the bootstrap certificate.
+//
+// The optional block payload at the end of a proposal and the TreeOpSubmit
+// message are additions, not layout changes: a message without them keeps its
+// v3 bytes, and only a node with tree operations on sends them.
 inline constexpr uint8_t kSecurityWireVersion = 3;
 inline constexpr std::size_t kMaxSecurityMessageBytes = 60000;
 inline constexpr std::size_t kMaxPlatformEvidenceWireBytes = 56 * 1024;
+
+// Wire bound of one block payload body: the entry bytes plus, per entry, a
+// u32 length and a 64-byte signature, plus a u16 count. The envelope limit
+// still applies to the whole proposal message.
+inline constexpr std::size_t kMaxBlockPayloadBytes =
+    kMaxConsensusBlockBytes + kMaxTransitionsPerBlock * (4 + 64) + 2;
+static_assert(kMaxBlockPayloadBytes < kMaxSecurityMessageBytes);
 
 // The collector IPC wire version. Authoritative here so the release-approval
 // verifier and the attestd codec cannot drift; AttestdCodec.hpp aliases it.

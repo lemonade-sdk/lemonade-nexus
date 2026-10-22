@@ -60,6 +60,12 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
           .transition_validator =
               [this](const Digest& transitions_digest) {
                   return driver_.accepts_transition(transitions_digest);
+              },
+          // Same deferral: a payload is judged by its kind's handler, and
+          // with no handler registered no payload earns this node's vote.
+          .payload_validator =
+              [this](const Proposal& proposal, const BlockPayload& payload) {
+                  return driver_.accepts_payload(proposal, payload);
               }}),
       sealer_(config.identity.private_key),
       store_(config.data_root / "security", wrapping),
@@ -160,7 +166,19 @@ void SecurityMeshService::arm_timer() {
         }
         driver_.tick(now_ms());
         refresh_members();
+        if (tick_hook_) tick_hook_();
         arm_timer();
+    });
+}
+
+void SecurityMeshService::broadcast_tree_op(TreeOpSubmitMsg message) {
+    asio::post(timer_.get_executor(), [this, message = std::move(message)]() mutable {
+        if (!running_) {
+            return;
+        }
+        const EpochId epoch = driver_.current_epoch().value_or(0);
+        (void)router_.broadcast(
+            router_.compose(SecurityMessageKind::TreeOpSubmit, std::move(message), epoch));
     });
 }
 

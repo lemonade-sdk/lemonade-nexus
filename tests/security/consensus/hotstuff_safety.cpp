@@ -488,4 +488,105 @@ TEST_F(HotStuffTransitions, ARecognisedTransitionIsVotedFor) {
     ASSERT_TRUE(result.vote.has_value());
 }
 
+// --- Block payloads ------------------------------------------------------------
+//
+// A payload commits through the proposal's transitions digest. The bytes earn
+// a vote only when they are what the header commits to and the payload's
+// handler independently agrees; otherwise the vote is withheld and the block
+// is still tracked, exactly like an unrecognised transition.
+
+using nexus::security::BlockPayload;
+using nexus::security::BlockPayloadKind;
+using nexus::security::block_payload_digest;
+
+class HotStuffPayloads : public ::testing::Test {
+protected:
+    void make_service(std::function<bool(const Proposal&, const BlockPayload&)> validator) {
+        auto config = harness.config_for(1);
+        // A payload block never consults the stage validator.
+        config.transition_validator = [](const Digest&) { return false; };
+        config.payload_validator = std::move(validator);
+        service.emplace(std::move(config), clone_key(harness.keys[1]), store);
+    }
+
+    /// The first block of the epoch, committing to `payload`.
+    [[nodiscard]] Block payload_block(const BlockPayload& payload) const {
+        auto block = harness.make_block(1, 1, test_genesis(), harness.genesis_qc(), 0x30);
+        block.proposal.transitions_digest = block_payload_digest(payload);
+        block.digest = nexus::security::proposal_digest(block.proposal);
+        return block;
+    }
+
+    static BlockPayload payload(uint8_t seed) {
+        return BlockPayload{BlockPayloadKind::TreeBatch, std::vector<uint8_t>(16, seed)};
+    }
+
+    Harness harness{4};
+    RecordingStore store;
+    std::optional<HotStuffService> service;
+};
+
+TEST_F(HotStuffPayloads, AnAcceptedPayloadEarnsTheVoteAndIsStored) {
+    int calls = 0;
+    make_service([&calls](const Proposal&, const BlockPayload&) {
+        ++calls;
+        return true;
+    });
+    const auto p = payload(0x01);
+    const auto block = payload_block(p);
+    const auto result = service->receive_proposal(block.proposal, block.justify, &p);
+    ASSERT_FALSE(result.rejected.has_value());
+    EXPECT_TRUE(result.vote.has_value());
+    EXPECT_EQ(calls, 1);
+    ASSERT_NE(service->block_payload(block.digest), nullptr);
+    EXPECT_EQ(service->block_payload(block.digest)->body, p.body);
+    ASSERT_NE(service->block(block.digest), nullptr);
+}
+
+TEST_F(HotStuffPayloads, ARefusedPayloadWithholdsTheVoteButTracksTheBlock) {
+    make_service([](const Proposal&, const BlockPayload&) { return false; });
+    const auto p = payload(0x02);
+    const auto block = payload_block(p);
+    const auto result = service->receive_proposal(block.proposal, block.justify, &p);
+    EXPECT_FALSE(result.rejected.has_value());
+    EXPECT_TRUE(result.transition_refused);
+    EXPECT_FALSE(result.vote.has_value());
+    EXPECT_NE(service->block(block.digest), nullptr);
+}
+
+TEST_F(HotStuffPayloads, AReplicaWithNoPayloadValidatorRefusesEveryPayload) {
+    make_service(nullptr);
+    const auto p = payload(0x03);
+    const auto block = payload_block(p);
+    const auto result = service->receive_proposal(block.proposal, block.justify, &p);
+    EXPECT_TRUE(result.transition_refused);
+    EXPECT_FALSE(result.vote.has_value());
+}
+
+TEST_F(HotStuffPayloads, BytesThatMissTheDigestAreNeitherJudgedNorStored) {
+    int calls = 0;
+    make_service([&calls](const Proposal&, const BlockPayload&) {
+        ++calls;
+        return true;
+    });
+    const auto block = payload_block(payload(0x04));
+    const auto other = payload(0x05);
+    const auto result = service->receive_proposal(block.proposal, block.justify, &other);
+    EXPECT_TRUE(result.transition_refused);
+    EXPECT_FALSE(result.vote.has_value());
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(service->block_payload(block.digest), nullptr);
+}
+
+TEST_F(HotStuffPayloads, ARepeatDeliveryWithoutThePayloadKeepsIt) {
+    make_service([](const Proposal&, const BlockPayload&) { return true; });
+    const auto p = payload(0x06);
+    const auto block = payload_block(p);
+    ASSERT_TRUE(service->receive_proposal(block.proposal, block.justify, &p).vote.has_value());
+    const auto again = service->receive_proposal(block.proposal, block.justify);
+    EXPECT_FALSE(again.vote.has_value());  // vote once per view
+    ASSERT_NE(service->block_payload(block.digest), nullptr);
+    EXPECT_EQ(service->block_payload(block.digest)->body, p.body);
+}
+
 }  // namespace

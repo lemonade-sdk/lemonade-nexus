@@ -117,6 +117,10 @@ public:
     /// trusted anchor, link by link.
     virtual void on_authority_chain_request(const AuthorityChainRequest&, const NodeId&) {}
     virtual void on_authority_chain_page(const AuthorityChainPage&, const NodeId&) {}
+    /// A tree operation from a current Tier 1 member, for this node's pending
+    /// pool. The router checked only the sender's membership; the op itself is
+    /// unverified bytes until the pool's owner validates it.
+    virtual void on_tree_op_submit(const TreeOpSubmitMsg&, const NodeId&) {}
 };
 
 struct SecurityRouterConfig {

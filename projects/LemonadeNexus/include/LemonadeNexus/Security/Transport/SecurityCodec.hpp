@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Security/Attestation/SvsmAkEnrollment.hpp>
 #include <LemonadeNexus/Security/Authority/AuthorityService.hpp>
 #include <LemonadeNexus/Security/Authority/DkgSession.hpp>
+#include <LemonadeNexus/Security/Consensus/BlockPayload.hpp>
 #include <LemonadeNexus/Security/Consensus/CommitProof.hpp>
 #include <LemonadeNexus/Security/Consensus/ConsensusTypes.hpp>
 #include <LemonadeNexus/Security/Eligibility/EligibilityObservation.hpp>
@@ -25,6 +26,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <variant>
 #include <vector>
@@ -62,6 +64,7 @@ enum class SecurityMessageKind : uint16_t {
     AttestationEvidenceEnd = 28,
     SvsmAkActivationOffer = 29,
     SvsmAkActivationResponse = 30,
+    TreeOpSubmit = 31,
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -77,6 +80,20 @@ struct SyncResponse;  // defined after ProposalMessage
 struct ProposalMessage {
     Proposal proposal;
     QuorumCertificate justify;
+    /// The block payload (BlockPayload.hpp), present only on a payload block
+    /// and only in the HotStuffProposal message: it follows the certificate as
+    /// a u16 kind and a length-prefixed body. Commit proofs and sync replies
+    /// carry proposals without it.
+    std::optional<BlockPayload> payload;
+};
+
+/// One signed tree operation on its way to the Tier 1 pending pools (design
+/// A2): its canonical encoding (nexus::tree::encode_tree_op) and the raw
+/// submitter signature. Delivery grants nothing; the receiver decodes the op
+/// and validates it on its own content.
+struct TreeOpSubmitMsg {
+    std::vector<uint8_t> encoded_op;
+    crypto::Ed25519Signature signature{};
 };
 
 struct SyncResponse {
@@ -190,7 +207,8 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   AttestationEvidenceChunk,
                                   AttestationEvidenceEnd,
                                   SvsmAkActivationOfferMessage,
-                                  SvsmAkActivationResponseMessage>;
+                                  SvsmAkActivationResponseMessage,
+                                  TreeOpSubmitMsg>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;
