@@ -43,7 +43,10 @@ FROST, the epoch signing key, does not change.
 |---|---|
 | Storage key threshold | 65% of holders, rounded up |
 | Holders | Every server that passes SEV-SNP attestation, at most 50 |
-| Re-share | Once per epoch, only when the holder set changed |
+| Re-share | As soon as a holder is lost or added, and at least once per epoch when the set changed |
+| Recovery | No offline recovery key. Re-sharing restores full tolerance while at least the threshold stays online. |
+| Tree versions | Nodes hold their versions. The existing sync library (`nexus::sync`) replicates committed changes; consensus orders them. |
+| Saving a change | The API waits up to 10 s for the commit, then reports the change as pending |
 | Re-share authority | Needs 65% of the current holders, not only a consensus quorum |
 | FROST and consensus | Unchanged in role, threshold, and storage |
 | Endpoint tiers | Tier 3 = inference node, Tier 4 = client (see [Security](Security#server-roles)) |
@@ -144,9 +147,9 @@ TreeOp {
    to Tier 1 the same way.
 2. Each Tier 1 server keeps a bounded pending pool, keyed by `op_id`, with
    per-author limits.
-3. The API answers when the op commits or is refused, with a timeout
-   (proposed: 10 s). On timeout it returns `202` with the `op_id`, which the
-   client can poll.
+3. The API answers when the op commits or is refused, waiting up to 10 s.
+   After that it returns `202` with the `op_id`, the app shows the change as
+   pending, and polls until it commits.
 
 ### A3. Consensus payload
 
@@ -201,10 +204,14 @@ encoding and version. Replicas recompute it and vote only on a match.
 
 ### A7. Tier 2 and lagging servers
 
-- Any server catches up by requesting log entries from a height over the
-  backbone. It verifies each block's QC against the epoch's vote keys and
-  follows the authority chain across epochs. It applies only verified
-  entries.
+- Replication reuses the existing sync library (`nexus::sync`, already used
+  for DNS and account envelopes): a new `"tree"` stream whose entries are
+  committed log blocks keyed by height, with the same digest and catch-up
+  exchange over the backbone. Consensus fixes the order; the sync library
+  only carries it, so last-writer-wins never decides a permission change.
+- A receiving server verifies each block's QC against the epoch's vote keys
+  and follows the authority chain across epochs. It applies only verified
+  entries, in height order.
 - Tier 2 servers never vote. They apply the same verified log, so they serve
   the same tree.
 - A server that cannot verify an entry stops applying and keeps serving the
@@ -293,9 +300,13 @@ review of audit status and maintenance. The crate exposes a C ABI like
 
 ### B5. Re-sharing
 
-- At an epoch boundary where the holder set changed, the old holders run a
-  proactive re-share to the new set. `S` stays the same, so no file is
-  re-encrypted.
+- When a holder is lost (its attestation lapses or it stays unreachable past
+  a timeout) or a new holder is added, Tier 1 finalizes an updated
+  `StorageHolderPlan` and the remaining holders re-share to the new set right
+  away, without waiting for the epoch boundary. `S` stays the same, so no file
+  is re-encrypted. Prompt re-sharing restores full tolerance after each loss:
+  at 5 holders, one loss is survivable, and after the re-share to 4 the next
+  loss is survivable again once a fifth holder joins.
 - A re-share needs at least `t_old` old holders to contribute. The
   consensus quorum (about 67% of Tier 1) alone cannot move the key to new
   holders; honest holders contribute only to a finalized plan whose new
@@ -343,8 +354,9 @@ like attestation budgets.
   answer before they unlock their own files.
 - After a full outage, the network unlocks once `t` holders are up and
   attested. Below `t`, no server unlocks. That is the cost of the threshold.
-- Recovery when too few holders survive is an
-  [open decision](#open-decisions).
+- There is no offline recovery key. Prompt re-sharing (B5) keeps the holder
+  set healthy; the key is lost only if more holders than the tolerance drop
+  at the same time, before a re-share runs.
 
 ### B9. What the DEK encrypts
 
@@ -412,14 +424,11 @@ Each phase adds tests for the valid path and these rejection cases:
 
 ## Open Decisions
 
-1. **Recovery below the threshold.** If fewer than 65% of holders can ever
-   return, the files are lost. Options: accept it, or split an offline
-   recovery key among named admins in a ceremony.
-2. **Conflict granularity.** Per-node `base_version` (simple, more retries)
-   or per-principal versions for assignments (fewer conflicts).
-3. **Client wait.** Answer after commit with a 10 s timeout, or always return
-   `202` and let clients poll.
-4. **Genesis and root management keys.** Move both offline, like the release
-   key, before Phase 7, since the root server is a Tier 2 server and holds
-   the network's most powerful keys.
-5. **Library choice** for `storage-threshold` (B3).
+1. **Library choice** for `storage-threshold` (B3): to be reviewed before
+   Phase 4.
+2. **Genesis and root management keys** stay on the root server for now.
+   Revisit before Phase 7.
+
+Decided: no offline recovery key (B8); nodes hold per-node versions and the
+sync library replicates (A7); the API waits up to 10 s, then reports pending
+(A2).
