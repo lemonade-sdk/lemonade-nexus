@@ -40,6 +40,20 @@ std::unordered_map<std::string, uint64_t> build_mesh_handshake_map(
 }
 } // anonymous namespace
 
+bool mesh_peer_listed(const tree::PermissionTreeService& tree,
+                      std::string_view caller_pubkey,
+                      const tree::TreeNode& peer) {
+    switch (peer.type) {
+        case tree::NodeType::Endpoint:
+            return tree.check_permission(caller_pubkey, peer.id, acl::Permission::ConnectPrivate) ||
+                   tree.check_permission(caller_pubkey, peer.id, acl::Permission::ConnectShared);
+        case tree::NodeType::Relay:
+            return tree.check_permission(caller_pubkey, peer.id, acl::Permission::Read);
+        default:
+            return false;
+    }
+}
+
 namespace {
 /// Validate that a mesh heartbeat endpoint string is a well-formed ip:port
 /// or hostname:port.  Empty strings are allowed (clears the endpoint).
@@ -81,8 +95,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     // GET /api/mesh/peers/:node_id (PRIVATE, auth required)
     //
-    // Returns the server peer plus every endpoint BELOW the caller in the access
-    // chain (its parent group's subtree), filtered per-node by Read permission.
+    // Returns the server peer plus the endpoints and relays in the caller's
+    // parent-group subtree that mesh_peer_listed admits. Read on the requesting
+    // node lets the caller ask; each listed endpoint needs a connect grant.
     // ========================================================================
     priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -135,12 +150,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         for (const auto& sibling : reachable) {
             if (sibling.id == node_id) continue;  // skip self
             if (sibling.type != tree::NodeType::Endpoint) continue;  // only endpoints
-
-            // Check that we have Read permission on the sibling
-            if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
-                                             acl::Permission::Read)) {
-                continue;  // skip nodes we can't see
-            }
+            if (!mesh_peer_listed(ctx_.tree, caller_pubkey, sibling)) continue;
 
             // Determine online status from the last Noise handshake.
             auto sip = strip_cidr(sibling.tunnel_ip);
@@ -168,10 +178,7 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         // Also include Relay-type nodes in scope as potential relay endpoints
         for (const auto& sibling : reachable) {
             if (sibling.type != tree::NodeType::Relay) continue;
-            if (!ctx_.tree.check_permission(caller_pubkey, sibling.id,
-                                             acl::Permission::Read)) {
-                continue;
-            }
+            if (!mesh_peer_listed(ctx_.tree, caller_pubkey, sibling)) continue;
 
             nlohmann::json peer;
             peer["node_id"]        = sibling.id;
@@ -300,11 +307,8 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             auto now = epoch_seconds();
             for (const auto& s : reachable) {
                 if (s.id == node_id) continue;
-                if (s.type != tree::NodeType::Endpoint &&
-                    s.type != tree::NodeType::Relay) continue;
-                // Only count nodes the caller is allowed to see.
-                if (!ctx_.tree.check_permission(caller_pubkey, s.id,
-                                                 acl::Permission::Read)) continue;
+                // Count the same peers that GET /api/mesh/peers lists.
+                if (!mesh_peer_listed(ctx_.tree, caller_pubkey, s)) continue;
                 ++peer_count;
                 if (s.type == tree::NodeType::Relay) {
                     ++online_count;  // relays always considered online

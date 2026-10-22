@@ -83,6 +83,15 @@ Which members may reach a Tier 3 node is decided by the permission tree, as for
 any endpoint. The role is set when the endpoint is created; a device that
 already joined keeps its role.
 
+Two device permissions control reachability. `read` lets a member see a
+device in the tree. `connect_private` or `connect_shared` lets a member
+connect to it. The mesh peer list (`GET /api/mesh/peers/{node_id}`) and the
+routing layer use the same rule: a device in the member's group is listed or
+resolved only when the member holds a connect permission on that device
+itself. `admin` includes both connect permissions. A grant on the group does
+not count, because permissions are not inherited. Relays in the group are
+listed with `read`. See Current Limitations for the server forwarding gap.
+
 ## Epoch Authority
 
 After Genesis, the current committee finalizes four transitions in order at
@@ -317,6 +326,13 @@ These are implementation limits, not settings an operator can disable:
 5. **IMA checkpoint/resume acceptance is not implemented.** The bounded
    evidence path must satisfy the current complete verification
    requirements.
+6. **The server mesh dataplane forwards between any two peers.** The
+   connect rule decides which peers a client adds to its dataplane. The
+   server's userspace dataplane still forwards a packet from one client to
+   any other client whose tunnel IP it routes, without a permission check
+   (`UserspaceDataplane::route_decrypted`). A client that sends traffic for
+   another device's tunnel IP through the server peer can reach that device
+   without a connect permission.
 
 ## Retired Mechanisms
 

@@ -24,6 +24,7 @@
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
+#include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 
@@ -39,6 +40,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <thread>
 #include <asio.hpp>
@@ -1912,4 +1914,136 @@ TEST_F(HttpEndpointTest, JoinRefusesMethodsThatDoNotProveTheDeviceKey) {
     auto ok = join_node(victim);
     ASSERT_NE(ok, nullptr);
     EXPECT_EQ(ok->status, 200) << ok->body;
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/mesh/peers through the real MeshApiHandler.
+//
+// The client adds every listed peer to its dataplane, so the list must hold
+// only peers the requester may connect to: ConnectPrivate or ConnectShared on
+// the peer node, as in PermissionTreeService::resolve_authorized. Read alone
+// must not list an endpoint. The routes in register_routes() above are a
+// stand-in, so this fixture serves the real handler on its own server.
+// ---------------------------------------------------------------------------
+class MeshPeersConnectTest : public HttpEndpointTest {
+protected:
+    httplib::Server mesh_srv;
+    std::thread mesh_thread;
+    int mesh_port = 0;
+    std::unique_ptr<api::MeshApiHandler> mesh_handler;
+    std::string caller;  // the requesting device's principal
+
+    void SetUp() override {
+        HttpEndpointTest::SetUp();
+        if (HasFatalFailure()) return;
+        mesh_handler = std::make_unique<api::MeshApiHandler>(*test_api::current().ctx);
+        mesh_handler->register_routes(mesh_srv, mesh_srv);
+        mesh_port = mesh_srv.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(mesh_port, 0);
+        mesh_thread = std::thread([this] { mesh_srv.listen_after_bind(); });
+        mesh_srv.wait_until_ready();
+
+        caller = principal();
+        add("mc_group", "root", tree::NodeType::Customer, {});
+        add("mc_self", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
+    }
+
+    void TearDown() override {
+        mesh_srv.stop();
+        if (mesh_thread.joinable()) mesh_thread.join();
+        mesh_handler.reset();
+        HttpEndpointTest::TearDown();
+    }
+
+    std::string principal() {
+        return "ed25519:" + crypto::to_base64(crypto->ed25519_keygen().public_key);
+    }
+
+    void add(const std::string& id, const std::string& parent, tree::NodeType type,
+             std::vector<tree::Assignment> assignments) {
+        tree::TreeNode n;
+        n.id = id;
+        n.parent_id = parent;
+        n.type = type;
+        n.mgmt_pubkey = root_pubkey_str;
+        n.assignments = std::move(assignments);
+        if (type == tree::NodeType::Endpoint || type == tree::NodeType::Relay) {
+            n.mesh_pubkey = "mesh-" + id;
+            n.tunnel_ip = "10.64.9." + std::to_string(tree->get_children(parent).size() + 2) + "/32";
+        }
+        ASSERT_TRUE(tree->insert_join_node(n)) << id;
+    }
+
+    /// Node ids in the requester's peer list, and the full response body.
+    std::set<std::string> listed(json* body_out = nullptr) {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(caller)}};
+        auto res = cli.Get("/api/mesh/peers/mc_self", h);
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        auto body = json::parse(res->body);
+        std::set<std::string> ids;
+        for (const auto& p : body["peers"]) ids.insert(p["node_id"].get<std::string>());
+        if (body_out) *body_out = body;
+        return ids;
+    }
+
+    uint32_t status_peer_count() {
+        httplib::Client cli("127.0.0.1", mesh_port);
+        httplib::Headers h = {{"Authorization", "Bearer " + make_jwt(caller)}};
+        auto res = cli.Get("/api/mesh/status/mc_self", h);
+        EXPECT_NE(res, nullptr);
+        if (!res) return 0;
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body)["peer_count"].get<uint32_t>();
+    }
+};
+
+TEST_F(MeshPeersConnectTest, ReadOnlyEndpointIsNotListed) {
+    add("mc_seen", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
+    const auto ids = listed();
+    EXPECT_FALSE(ids.count("mc_seen")) << "Read alone put a peer in the dataplane list";
+    EXPECT_EQ(status_peer_count(), 0u);
+}
+
+TEST_F(MeshPeersConnectTest, ConnectGrantIsListed) {
+    add("mc_private", "mc_group", tree::NodeType::Endpoint,
+        {{caller, {"read", "connect_private"}}});
+    add("mc_shared", "mc_group", tree::NodeType::Endpoint, {{caller, {"connect_shared"}}});
+    add("mc_other_key", "mc_group", tree::NodeType::Endpoint,
+        {{principal(), {"read", "connect_private"}}});
+    const auto ids = listed();
+    EXPECT_TRUE(ids.count("mc_private"));
+    EXPECT_TRUE(ids.count("mc_shared"));
+    EXPECT_FALSE(ids.count("mc_other_key")) << "a grant to another principal counted";
+    EXPECT_EQ(status_peer_count(), 2u);
+}
+
+// An admin grant holds every permission bit, so it lists the node it is on.
+// Permissions are not inherited: admin on the group does not list a device in
+// that group on which the caller holds only Read.
+TEST_F(MeshPeersConnectTest, GroupAdminNeedsAGrantOnEachDevice) {
+    auto group = tree->get_node("mc_group");
+    ASSERT_TRUE(group.has_value());
+    group->assignments = {{caller, {"admin"}}};
+    ASSERT_TRUE(tree->update_node_direct("mc_group", *group));
+    add("mc_admin_dev", "mc_group", tree::NodeType::Endpoint, {{caller, {"admin"}}});
+    add("mc_read_dev", "mc_group", tree::NodeType::Endpoint, {{caller, {"read"}}});
+    const auto ids = listed();
+    EXPECT_TRUE(ids.count("mc_admin_dev"));
+    EXPECT_FALSE(ids.count("mc_read_dev"));
+}
+
+// Infrastructure entries keep their rules: the server peer is always present,
+// and a relay in scope is listed with Read.
+TEST_F(MeshPeersConnectTest, ServerPeerAndRelayAreUnchanged) {
+    add("mc_relay", "mc_group", tree::NodeType::Relay, {{caller, {"read"}}});
+    json body;
+    const auto ids = listed(&body);
+    EXPECT_TRUE(ids.count("mc_relay"));
+    ASSERT_TRUE(body.contains("server_peer"));
+    EXPECT_EQ(body["server_peer"]["node_id"], "server");
+    EXPECT_EQ(body["server_peer"]["is_server"], true);
+    EXPECT_EQ(status_peer_count(), 1u);
 }
