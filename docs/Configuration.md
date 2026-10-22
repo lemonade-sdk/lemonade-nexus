@@ -14,6 +14,7 @@ title: Configuration Reference
 - [TLS / ACME](#tls--acme)
 - [DDNS](#ddns)
 - [Onboarding](#onboarding)
+- [Experimental: Tree Operations](#experimental-tree-operations)
 - [JSON Config Example](#json-config-example)
 - [Retired and Inert Settings](#retired-and-inert-settings)
 
@@ -154,6 +155,89 @@ Candidate-side:
 | `--onboard-id <label>` | | Requested DNS label for the new server |
 | `--onboard-timeout <sec>` | | Give up waiting for admission after this (default 900) |
 | `--onboard-token <tok>` | `SP_ONBOARD_TOKEN` | Single-use enrollment token for immediate admission |
+
+## Experimental: Tree Operations
+
+| CLI Flag | Env Var | JSON Key | Default | Description |
+|----------|---------|----------|---------|-------------|
+| `--tree-ops` | `SP_TREE_OPS` (any value) | `tree_ops_enabled` | off | Apply tree writes as signed tree operations (Phase 1, local only) |
+
+This setting is experimental. It implements Phase 1 of
+[Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
+Keep it off in production.
+
+With the setting on:
+
+- Every tree write route builds one signed tree operation (`TreeOp`) and
+  applies it through `validate_op` and `apply_op`. The routes are
+  `POST /api/join`, `/api/tree/delta`, `/api/tree/node`,
+  `/api/tree/node/update/{id}`, `/api/tree/node/assignments/{id}`, and
+  `/api/tree/node/delete/{id}`. `POST /api/ipam/allocate` writes no tree node
+  and does not change.
+- The server signs each operation with its gossip identity key, with the
+  domain tag `lemonade-nexus/tree-op-signature:v1`. This signature identifies
+  the submitting server only. The principal's tree assignments still decide
+  whether the change is allowed.
+- Validation is deterministic. It uses the existing permission and content
+  rules, a `base_version` match, freshness against the supplied block time
+  (signed time at most 300 s older or 60 s newer), and replay against the
+  committed operation ids. In Phase 1 the block time is the local time.
+- Each node that an operation writes gets `version` = previous version + 1
+  (1 for a new node). Node JSON includes `version` only when it is not 0, so
+  records written with the setting off keep their exact bytes.
+  `canonical_node_json` and the tree hash never include `version`.
+- Status codes and response bodies are those of the direct write paths, with
+  these differences:
+  - A join, and any other write that changes several nodes, is all or
+    nothing. A refused join allocates no tunnel address.
+  - A delete through `/api/tree/delta` also removes the link grants that
+    named the deleted key, as the direct delete route does.
+  - No route deletes the root node.
+  - A create or update through `/api/tree/delta` also enforces one endpoint
+    identifier and one mesh key per node, as the direct routes do.
+  - An operation larger than 48,000 bytes is refused.
+  - A join without the Ed25519 challenge (`method` other than `ed25519`)
+    answers 500, because the operation needs the device's signed challenge.
+  - Without a configured submitter the write routes answer 500. They never
+    fall back to the direct paths.
+
+Phase 1 limits:
+
+- **Local only.** There is no consensus ordering, tree log, or replication.
+  Two servers still apply different changes.
+- **Server-filled base version.** Current clients send no base version, so
+  the server reads it from the current tree. When a concurrent write makes an
+  operation stale, the server rebuilds it from the new state, at most three
+  times. This keeps today's last-writer-wins behavior.
+- **Asserted principals.** Session routes (`/api/tree/node*`) carry no
+  signature by the principal; the submitting server asserts the principal.
+  The join device signature covers only the server challenge. The join
+  parameters, including the link-token group, are asserted by the submitting
+  server, and link-token validity is local state. A replica could verify
+  these operations only after clients sign operations themselves.
+- **Tunnel address not re-derived.** The join operation carries the address
+  that the submitting server's IPAM allocated. The apply step checks only
+  that it is a `/32` inside `10.64.0.0/10`. IPAM allocation is not a function
+  of the tree: `data/ipam/allocations.json` is per server and separate from
+  the tree; server tunnel addresses come from the same pool but are not tree
+  nodes; `/api/ipam/allocate` and the delete cascade change it outside any
+  operation; and the allocation cursor only moves forward, and restarts
+  after the highest remaining allocation, so reuse of a released address
+  depends on restart history. Deterministic derivation needs the tree to
+  record every pool reservation, including server addresses, and IPAM to
+  become a projection of the committed tree with a reuse rule defined on tree
+  state.
+- **Memory-only committed set.** Committed operation ids are not persisted.
+  A restart clears them, so the freshness window bounds replay, as it does
+  for the delta replay cache today.
+- **Other writers.** `POST /api/mesh/heartbeat` still writes
+  `listen_endpoint` directly, and root establishment still uses the bootstrap
+  path.
+- **No atomic multi-node persistence.** A storage failure can leave an
+  operation that writes several nodes partly persisted.
+- **Versions while on only.** The direct paths do not maintain `version`.
+  After the setting is turned off, a delta update replaces the stored record,
+  including its version.
 
 ## JSON Config Example
 
