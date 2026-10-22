@@ -159,8 +159,9 @@ cmake --build build --target LemonadeNexusSDKShared --parallel
 ```
 
 For Rust-only changes, run the relevant crate's checks from its manifest path
-(`crates/boringtun-ffi`, `crates/virtual-netstack`, `crates/frost-ffi`) and
-preserve the lockfile.
+(`crates/boringtun-ffi`, `crates/virtual-netstack`, `crates/frost-ffi`,
+`crates/storage-threshold`) with `cargo test --locked`, and preserve the
+lockfile.
 
 ## Dependencies
 
@@ -184,4 +185,5 @@ source of truth for versions.
 | BoringTun | Rust crate via Corrosion (`crates/boringtun-ffi`) | Userspace WireGuard |
 | virtual netstack | Rust crate (`crates/virtual-netstack`) | Userspace TCP/IP (smoltcp) |
 | FROST | Rust crate (`crates/frost-ffi`, `frost-ed25519 = 2.2.0`) | Threshold authority signatures |
+| Storage threshold | Rust crate (`crates/storage-threshold`, `frost-ristretto255 = 2.2.0`, `elastic-elgamal = 0.3.1`) | Threshold storage key (library only; not yet used by the server) |
 | json-c, libcurl, UUID | System packages (Linux) | TPM2-TSS build dependencies |

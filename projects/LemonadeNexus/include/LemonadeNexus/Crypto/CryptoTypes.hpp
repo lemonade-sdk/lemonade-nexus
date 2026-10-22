@@ -114,6 +114,7 @@ inline constexpr std::string_view kCertBundle = "cert-bundle";
 inline constexpr std::string_view kKeyWrapping = "key-wrapping";
 inline constexpr std::string_view kChildKey = "child-key";
 inline constexpr std::string_view kDelegationWrappingKey = "delegation-wrapping-key";
+inline constexpr std::string_view kStorageDataKey = "storage-data-key";
 }  // namespace aead_purpose
 
 // --- HKDF ---
