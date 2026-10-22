@@ -9,6 +9,9 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
+
+#include <chrono>
 
 #include <spdlog/spdlog.h>
 
@@ -82,6 +85,18 @@ std::optional<SecurityMeshStartup> start_security_mesh(
             security::release_approval_digest_hex(release->approval);
     }
     return startup;
+}
+
+bool wait_for_storage_unlock(asio::io_context& io, const security::StorageVault& vault,
+                             const std::function<bool()>& stop) {
+    // Pacing only; the unlock itself retries with its own backoff.
+    constexpr auto kSlice = std::chrono::milliseconds(100);
+    while (!vault.files_ready() && !(stop && stop())) {
+        if (io.stopped()) io.restart();
+        (void)io.run_for(kSlice);
+    }
+    if (io.stopped()) io.restart();
+    return vault.files_ready();
 }
 
 }  // namespace nexus::core

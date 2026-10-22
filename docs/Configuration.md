@@ -332,6 +332,7 @@ Limits:
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
 | `--storage-key` | `SP_STORAGE_KEY` (any value) | `storage_key_enabled` | off | Run the threshold storage key and keep a data key wrapped to it (Phase 5) |
+| `--storage-files` | `SP_STORAGE_FILES` (any value) | `storage_files_enabled` | off | Encrypt this server's files under the data key and rotate the data key monthly (Phase 7). Needs `--storage-key` |
 
 This setting is experimental. It implements Phase 5 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key)
@@ -372,22 +373,26 @@ With the setting on:
   to the storage public key, and proves the unwrap through the holders. After
   a rotation it rewraps the key from memory. A key wrapped to the previous
   storage key still unlocks through the epoch after the rotation's effective
-  epoch, then never. No file is encrypted yet (Phase 7).
+  epoch, then never. Files are encrypted only with `--storage-files` (below).
+- **Share storage.** When the host can seal (nexus-attestd with Seal and
+  Unseal), the holder's shares are sealed beside the gossip identity under the
+  domain `storage-share`: `data/sealed/storage-share.sealed`, with the same
+  upgrade staging (`storage-share.next.sealed`). A host that cannot seal keeps
+  `data/security/storage/sealed/storage-share.share` (mode 600, under the
+  machine-bound wrapping of the epoch vote keys). A share found in that file
+  on a host that can now seal moves into the sealed store after the sealed
+  copy unseals to the same bytes. A sealed share that reports Missing,
+  PolicyMismatch, or Corrupt is never replaced by the file copy.
 - **Files.** `data/security/storage/records.json` (the live records and their
-  proofs), `data/security/storage/data-key.json` (the wrapped data key), and
-  `data/security/storage/sealed/storage-share.share` (this holder's shares,
-  mode 600, under the machine-bound wrapping of the epoch vote keys).
+  proofs) and `data/security/storage/data-key.json` (the wrapped data key).
 - **nexus-attestd.** The daemon must know the `StorageUnlock` purpose (value
   4). An older daemon refuses the challenge, so the holder's attestation fails
   closed and the requester stays locked.
 
 Limits:
 
-- **No file encryption.** This phase only provides the data key. Phase 7
-  migrates files.
-- **Shares are not sealed yet.** Until Phase 6 (vTPM sealing through
-  nexus-attestd) is merged, shares use the machine-bound file wrapping (design
-  B6 limit).
+- **Hosts without sealing.** Shares stay in the machine-bound file wrapping
+  (design B6 limit).
 - **Holder loss is found by sessions.** A holder that goes away is replaced
   when a session runs: at the next epoch boundary, at the daily rotation, or
   after a session timeout. A holder that sends round 1 and then withholds its
@@ -476,3 +481,67 @@ The following settings no longer do anything and are not recognized:
 These inert settings are listed so that older runbooks and environment files
 can be read correctly; remove them from your configuration when you touch
 it.
+
+### Files under the data key (Phase 7)
+
+`--storage-files` needs `--storage-key`. It implements Phase 7 of the design
+(sections B9, B10, B5a). **Keep it off in production** for the same reason as
+`--storage-key`: the external review of the storage-threshold library paths is
+not done. With it off, files stay as they are.
+
+Covered files, under the data root: `identity/keypair.enc`,
+`identity/jwt_secret.hex`, `identity/ddns_credentials.enc`,
+`account/replica.json`, `tree/nodes/*.json`, `tree/deltas/*.json`, and
+`tree/log/*.json`. Each file is replaced in place by an encrypted object
+(XChaCha20-Poly1305 under a key derived from the data key; the associated data
+binds the purpose `storage-file-at-rest`, the file's domain, its relative
+path, and the data key id). The state is in
+`data/security/storage/vault-state.json`.
+
+Migration runbook:
+
+1. Start the server with `--storage-key --storage-files`. The files stay
+   plaintext until the data key exists and one unlock through the holders has
+   proved it.
+2. The server encrypts each covered file to `<file>.vault-new`, asks the
+   holders for a new unlock round trip, then decrypts every staged file and
+   compares it with the plaintext. Only then does it record `encrypted`,
+   overwrite each plaintext (best effort), and replace it with the staged
+   copy. The log line `migration complete; plaintext removed` marks the end.
+3. A server that cannot reach `t` holders keeps its plaintext and retries. A
+   crash at any step resumes from the state file without data loss.
+4. After the migration, each start waits for the data key before it starts
+   the services that read covered files (tree, node identity, auth, DDNS,
+   account data, HTTP API). Gossip, attestation, and holder duties run while
+   it waits. With fewer than `t` holders the server serves nothing that needs
+   the files. Startup with `--storage-files` off stops with an error once the
+   files are encrypted; it never reads them as plaintext.
+
+Rotation runbook:
+
+- The data key rotates 30 days after the last migration or rotation, on the
+  server's local clock. It is per server, not a consensus rule.
+- On demand (for example after a suspected compromise), a root administrator
+  calls `POST /api/storage/rotate-data-key` on the private API.
+  `GET /api/storage/status` reports the mode, phase, and last rotation time.
+- The server creates a new data key, wraps it to the current storage public
+  key in `data-key.next.json`, proves the unwrap through the holders,
+  re-encrypts every file to `<file>.vault-new`, and verifies each. The
+  replacement of `data-key.json` is the switch point. Before it, an
+  interrupted rotation is discarded and starts again; after it, the staged
+  files replace the old ciphertext.
+
+Limits:
+
+- Not covered yet: the TLS and ACME private keys (the HTTP server loads them
+  by path), the ACL rows (SQLite, keyed from the gossip identity), the epoch
+  vote keys, and `wrap_local.key`. The vote keys and the file share store are
+  read before the unlock, so moving them, or the local secret they depend on,
+  under the data key would stop a cold start; `wrap_local.key` therefore stays.
+- CLI modes do not unlock the data key. After the migration, CLI modes that
+  read the node identity or the tree log (`--enroll-server`, release signing,
+  tree merge tools) fail closed.
+- The gossip record transfer pool (`tree/retained_deltas`) stays plaintext.
+- Rollback of a file to an older ciphertext under the same data key is not
+  detected.
+- Overwriting plaintext is best effort, as in Phase 6.

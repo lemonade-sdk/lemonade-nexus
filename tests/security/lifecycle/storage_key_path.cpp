@@ -16,6 +16,10 @@
 #include <LemonadeNexus/Security/Storage/DataKeyService.hpp>
 #include <LemonadeNexus/Security/Storage/StorageKeyService.hpp>
 #include <LemonadeNexus/Security/Storage/StorageShareStore.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
+
+#include <fstream>
+#include <iterator>
 
 #include <functional>
 
@@ -38,6 +42,7 @@ struct StorageStack {
 class StorageKeyPath : public RotatingMeshBase {
 protected:
     void TearDown() override {
+        vaults.clear();
         for (auto& [id, stack] : stacks) {
             stack.service.reset();
         }
@@ -55,12 +60,16 @@ protected:
         if (auto it = stacks.find(node.id); it != stacks.end() && it->second.service) {
             it->second.service->tick(mesh.now_ms);
         }
+        if (auto it = vaults.find(node.id); it != vaults.end()) {
+            it->second->tick(kWallBase + mesh.now_ms + wall_offset_ms);
+        }
     }
 
     /// (Re)builds a node's storage service from its directories, as a process
     /// restart of the storage side would: the data key leaves memory.
     void build_storage(Node& node) {
         auto& stack = stacks[node.id];
+        if (auto it = vaults.find(node.id); it != vaults.end()) it->second->attach(nullptr);
         stack.service.reset();
         stack.shares = std::make_unique<FileStorageShareStore>(
             node.dir / "storage" / "sealed", node.crypto.get(), node.wrapping.get(),
@@ -80,6 +89,47 @@ protected:
             return service->expects_unlock_challenge(holder, context);
         };
         EXPECT_TRUE(stack.service->start(mesh.now_ms));
+        if (auto it = vaults.find(node.id); it != vaults.end()) {
+            it->second->attach(&stack.service->data_keys());
+        }
+    }
+
+    /// The node's file vault (Phase 7) over <dir>/files, rebuilt from disk
+    /// like a process restart. `seed` writes plaintext files first.
+    StorageVault& build_vault(Node& node, bool seed) {
+        const auto root = node.dir / "files";
+        if (seed) {
+            for (const auto& [rel, text] : vault_files) {
+                std::filesystem::create_directories((root / rel).parent_path());
+                std::ofstream(root / rel, std::ios::binary | std::ios::trunc) << text;
+            }
+        }
+        auto& vault = vaults[node.id];
+        vault.reset();
+        vault = std::make_unique<StorageVault>(root, node.dir / "storage", *node.crypto);
+        vault->load();
+        vault->attach(&storage(&node).data_keys());
+        return *vault;
+    }
+
+    static std::string raw_file(const std::filesystem::path& path) {
+        std::ifstream in(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    }
+
+    void expect_vault_files(Node& node) {
+        for (const auto& [rel, text] : vault_files) {
+            const auto read = vaults.at(node.id)->read(node.dir / "files" / rel);
+            ASSERT_EQ(read.status, VaultReadStatus::Ok) << rel;
+            EXPECT_EQ(read.bytes, text) << rel;
+            EXPECT_TRUE(raw_file(node.dir / "files" / rel).starts_with("LNXVAULT")) << rel;
+        }
+    }
+
+    bool vault_done(Node& node) {
+        const auto& vault = *vaults.at(node.id);
+        return vault.mode() == VaultMode::Encrypted && vault.phase() == VaultPhase::Idle &&
+               !vault.rotation_requested();
     }
 
     StorageKeyService& storage(const Node* node) { return *stacks.at(node->id).service; }
@@ -285,6 +335,13 @@ protected:
     /// The current Tier 1 members (after create_key, the epoch-2 set).
     std::vector<Node*> members;
     std::map<NodeId, StorageStack> stacks;
+    std::map<NodeId, std::unique_ptr<StorageVault>> vaults;
+    const std::map<std::string, std::string> vault_files = {
+        {"identity/keypair.enc", "v2:1:0011:2233"},
+        {"identity/jwt_secret.hex", "abcdef0123456789"},
+        {"tree/nodes/root.json", "{\"id\":\"root\"}"},
+        {"tree/log/1.json", "{\"height\":1}"},
+    };
     std::vector<StorageUnlockRequestMsg> captured_requests;
     std::set<NodeId> refuse_attestation;
     uint64_t wall_offset_ms = 0;
@@ -903,6 +960,65 @@ TEST_F(StorageKeyPath, AServerOutsideTier1AcceptsOnlyAProvedRecord) {
     deliver(proof);
     EXPECT_EQ(storage(fresh).chain().current_digest, current);
     EXPECT_TRUE(storage(fresh).current_verified());
+}
+
+// --- Files under the data key (Phase 7, B9, B10, B5a) --------------------------------
+
+TEST_F(StorageKeyPath, FilesMigrateAfterAHolderRoundTripAndColdStartNeedsTHolders) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    ASSERT_EQ(current_plan().threshold, 4);
+    Node* server = founders[0];
+    build_vault(*server, /*seed=*/true);
+    ASSERT_TRUE(run_storage_until([&] { return vault_done(*server); }));
+    expect_vault_files(*server);
+
+    // Restart with exactly t holders: services that need the files wait for
+    // the unlock, then read them.
+    mesh.offline.insert(founders[4]->id);
+    build_storage(*server);
+    auto& vault = build_vault(*server, /*seed=*/false);
+    EXPECT_FALSE(vault.files_ready());
+    EXPECT_EQ(vault.read(server->dir / "files/tree/nodes/root.json").status,
+              VaultReadStatus::Locked);
+    ASSERT_TRUE(run_storage_until([&] { return vault.files_ready(); }));
+    expect_vault_files(*server);
+
+    // Restart with t - 1 holders: the data key never arrives, nothing is
+    // readable, and no plaintext is accepted in its place.
+    mesh.offline.insert(founders[3]->id);
+    build_storage(*server);
+    auto& locked = build_vault(*server, /*seed=*/false);
+    for (int i = 0; i < 600; ++i) storage_step();
+    EXPECT_FALSE(locked.files_ready());
+    EXPECT_EQ(locked.read(server->dir / "files/identity/jwt_secret.hex").status,
+              VaultReadStatus::Locked);
+    EXPECT_FALSE(locked.write(server->dir / "files/identity/jwt_secret.hex", "replaced"));
+}
+
+TEST_F(StorageKeyPath, DataKeyRotationRewrapsThroughTheHoldersAndSurvivesARestart) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* server = founders[1];
+    auto& vault = build_vault(*server, /*seed=*/true);
+    ASSERT_TRUE(run_storage_until([&] { return vault_done(*server); }));
+    const auto first = data_key_bytes(server);
+    ASSERT_EQ(first.size(), 32u);
+
+    ASSERT_TRUE(vault.request_rotation());
+    ASSERT_TRUE(run_storage_until([&] { return vault_done(*server); }));
+    const auto second = data_key_bytes(server);
+    EXPECT_NE(second, first);
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), current_plan().storage_public_key);
+    EXPECT_FALSE(std::filesystem::exists(server->dir / "storage" / "data-key.next.json"));
+    expect_vault_files(*server);
+
+    // After a restart the holders return the new key, and it opens the files.
+    build_storage(*server);
+    auto& restarted = build_vault(*server, /*seed=*/false);
+    ASSERT_TRUE(run_storage_until([&] { return restarted.files_ready(); }));
+    EXPECT_EQ(data_key_bytes(server), second);
+    expect_vault_files(*server);
 }
 
 }  // namespace

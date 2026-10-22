@@ -142,6 +142,9 @@ struct StorageVaultOptions {
     uint64_t rotation_interval_ms = 30ULL * 24 * 3600 * 1000;
 };
 
+[[nodiscard]] std::string_view vault_mode_name(VaultMode mode);
+[[nodiscard]] std::string_view vault_phase_name(VaultPhase phase);
+
 /// The suffix of a staged file.
 inline constexpr std::string_view kVaultStagedSuffix = ".vault-new";
 
@@ -154,6 +157,11 @@ public:
                  crypto::SodiumCryptoService& crypto,
                  std::vector<VaultCoverage> coverage = default_coverage(),
                  StorageVaultOptions options = {});
+
+    /// The mode recorded in <state_directory>/vault-state.json without a vault:
+    /// nullopt when no state file exists, Encrypted when it is damaged.
+    [[nodiscard]] static std::optional<VaultMode> recorded_mode(
+        const std::filesystem::path& state_directory);
 
     /// The B9 file set this phase covers.
     [[nodiscard]] static std::vector<VaultCoverage> default_coverage();

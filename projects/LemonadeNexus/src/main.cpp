@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeConsensus.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
@@ -136,21 +137,59 @@ int main(int argc, char* argv[]) {
     // The old TEE/trust services are gone: attestation, eligibility, and
     // Tier 1 authority live in the mesh security system.
 
+    // Phase 7: files under the data key. The vault's state decides whether
+    // the services that read those files wait for the unlock (below).
+    const auto vault_state_directory = data_root / "security" / "storage";
+    std::unique_ptr<nexus::security::StorageVault> storage_vault;
+    if (config.storage_files_enabled) {
+        storage_vault = std::make_unique<nexus::security::StorageVault>(
+            data_root, vault_state_directory, crypto);
+        storage_vault->load();
+        storage.set_vault(storage_vault.get());
+    } else if (const auto recorded =
+                   nexus::security::StorageVault::recorded_mode(vault_state_directory);
+               recorded && *recorded != nexus::security::VaultMode::Plaintext) {
+        // Never read encrypted files as plaintext, and never replace them.
+        spdlog::error("Files under {} are encrypted under the data key; start with "
+                      "--storage-key --storage-files",
+                      data_root.string());
+        return 1;
+    }
+    // Services that read files under the data key start only once it is in
+    // memory. Gossip, attestation, and holder duties start without it (B8).
+    const bool defer_file_services = storage_vault && !storage_vault->files_ready();
+
     nexus::tree::PermissionTreeService tree{storage, crypto};
-    tree.start();
+    bool tree_started = !defer_file_services;
+    bool root_pending = false;
+    if (tree_started) tree.start();
 
     nexus::ipam::IPAMService ipam{storage};
     ipam.start();
 
-
-    // Load or auto-generate server identity keypair
-    auto root_privkey = key_wrapping.unlock_identity({});
-    auto root_pubkey = key_wrapping.load_identity_pubkey();
-    if (!root_privkey || !root_pubkey) {
-        spdlog::info("No identity keypair found — generating one for this server");
-        auto generated = key_wrapping.generate_and_store_identity({});
-        root_privkey = generated.private_key;
-        root_pubkey  = generated.public_key;
+    // Load or auto-generate server identity keypair. Under the data key, a
+    // file that exists but does not open stops startup instead of being
+    // replaced.
+    std::optional<nexus::crypto::Ed25519PrivateKey> root_privkey;
+    std::optional<nexus::crypto::Ed25519PublicKey> root_pubkey;
+    const auto load_node_identity = [&]() -> bool {
+        root_privkey = key_wrapping.unlock_identity({});
+        root_pubkey = key_wrapping.load_identity_pubkey();
+        if (!root_privkey || !root_pubkey) {
+            if (storage_vault && key_wrapping.identity_present()) {
+                spdlog::error("identity/keypair.enc exists and does not open under the data "
+                              "key; refusing to replace it");
+                return false;
+            }
+            spdlog::info("No identity keypair found — generating one for this server");
+            auto generated = key_wrapping.generate_and_store_identity({});
+            root_privkey = generated.private_key;
+            root_pubkey  = generated.public_key;
+        }
+        return true;
+    };
+    if (!defer_file_services && !load_node_identity()) {
+        return 1;
     }
 
 
@@ -281,17 +320,54 @@ int main(int argc, char* argv[]) {
     auto security_mesh = nexus::core::start_security_mesh(
         coordinator.io_context(), config, gossip, key_wrapping,
         std::move(platform_source), std::move(activation_source), mesh_error,
-        [&tree, &config] {
+        [&tree, &config, &tree_started, &root_pending] {
             // With tree operations on, the root is an EstablishRoot op that
             // Tier 1 commits (TreeConsensus::set_root_request below); a direct
             // write here would bypass consensus.
             if (!config.tree_ops_enabled) {
+                // While the tree waits for the data key its cache is empty; a
+                // root written now could replace the stored one.
+                if (!tree_started) {
+                    root_pending = true;
+                    return;
+                }
                 nexus::core::ensure_application_root(tree, config.root_pubkey);
             }
-        });
+        },
+        nexus::core::SecurityMeshStorageInputs{.seal_backend = seal_backend,
+                                               .vault = storage_vault.get()});
     if (!security_mesh) {
         spdlog::error("Config: {}", mesh_error);
         return 1;
+    }
+    if (defer_file_services) {
+        // Fail closed: the files are encrypted, so nothing that reads them
+        // starts before t holders return the data key. There is no plaintext
+        // fallback.
+        spdlog::info("Waiting for the data key: files are encrypted and the services that "
+                     "read them start after the unlock");
+        std::atomic<bool> stop_requested{false};
+        asio::signal_set unlock_signals{coordinator.io_context(), SIGINT, SIGTERM};
+        unlock_signals.async_wait(
+            [&stop_requested](const asio::error_code& ec, int) {
+                if (!ec) stop_requested = true;
+            });
+        const bool unlocked = nexus::core::wait_for_storage_unlock(
+            coordinator.io_context(), *storage_vault, [&] { return stop_requested.load(); });
+        unlock_signals.cancel();
+        if (!unlocked) {
+            spdlog::info("Stopped before the data key unlocked");
+            return 0;
+        }
+        spdlog::info("Data key unlocked; starting the services that read encrypted files");
+        tree.start();
+        tree_started = true;
+        if (root_pending) {
+            nexus::core::ensure_application_root(tree, config.root_pubkey);
+        }
+        if (!load_node_identity()) {
+            return 1;
+        }
     }
     // Legacy manifest consumers reuse the Genesis-delegated release authority;
     // config and environment never select this key.
@@ -552,7 +628,12 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Auth + ACL
     // ========================================================================
-    auto jwt_secret_hex = nexus::core::resolve_jwt_secret(config, data_root, crypto);
+    auto jwt_secret_hex =
+        nexus::core::resolve_jwt_secret(config, data_root, crypto, storage_vault.get());
+    if (jwt_secret_hex.empty()) {
+        spdlog::error("The JWT secret is not available; refusing to replace it");
+        return 1;
+    }
 
     nexus::auth::AuthService auth_service{storage, crypto,
                                            config.rp_id, jwt_secret_hex};
@@ -858,6 +939,7 @@ int main(int argc, char* argv[]) {
         tree_config.root_key = root_key;
         tree_config.mode = ops_mode ? nexus::tree::TreeLogMode::Ops
                                     : nexus::tree::TreeLogMode::ReadOnly;
+        tree_config.vault = storage_vault.get();
         tree_config.wall_clock_ms = [] {
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                              std::chrono::system_clock::now().time_since_epoch())
@@ -976,8 +1058,17 @@ int main(int argc, char* argv[]) {
     if (config.storage_key_enabled) {
         spdlog::warn("EXPERIMENTAL: threshold storage key enabled (Phase 5). Tier 1 finalizes "
                      "storage holder plans and daily key rotations; this server keeps a data key "
-                     "wrapped to the storage key but encrypts no file yet. The storage-threshold "
-                     "library paths are not externally reviewed: keep this off in production.");
+                     "wrapped to the storage key. The storage-threshold library paths are not "
+                     "externally reviewed: keep this off in production.");
+    }
+    if (storage_vault) {
+        spdlog::warn("EXPERIMENTAL: files under the data key (Phase 7), mode {}. The node "
+                     "identity, JWT secret, DDNS credentials, account replica, and tree files "
+                     "are encrypted after an unlock round trip through the holders; the data key "
+                     "rotates monthly.",
+                     storage_vault->mode() == nexus::security::VaultMode::Encrypted
+                         ? "encrypted"
+                         : "migrating from plaintext");
     }
 
     // ========================================================================
@@ -1010,6 +1101,7 @@ int main(int argc, char* argv[]) {
         .tree_ops         = tree_ops.get(),
         .tree_op_status   = tree_op_status,
         .tree_log_status  = tree_log_status,
+        .storage_vault    = storage_vault.get(),
     };
 
     nexus::api::PublicApiHandler public_api{ctx};

@@ -223,7 +223,8 @@ add_nexus_test(test_security_authority
     security/authority/round_relay.cpp)
 add_nexus_test(test_security_storage
     security/storage/records.cpp
-    security/storage/share_store.cpp)
+    security/storage/share_store.cpp
+    security/storage/vault.cpp)
 add_nexus_test(test_security_eligibility
     security/eligibility/ledger.cpp
     security/eligibility/store.cpp

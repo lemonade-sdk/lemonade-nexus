@@ -52,4 +52,14 @@ struct SecurityMeshStorageInputs {
     std::function<void()> on_epoch_established = {},
     const SecurityMeshStorageInputs& storage = {});
 
+/// Runs `io` until `vault` reports files_ready() (the data key is in memory)
+/// or `stop()` returns true, and returns files_ready(). Only the handlers
+/// already on `io` run meanwhile: gossip, attestation, the security mesh, and
+/// holder duties (B8). Nothing that needs the files is constructed yet, so
+/// nothing is served. Call before Coordinator::run(); `io` is restarted
+/// before return so it can run again.
+[[nodiscard]] bool wait_for_storage_unlock(asio::io_context& io,
+                                           const security::StorageVault& vault,
+                                           const std::function<bool()>& stop);
+
 }  // namespace nexus::core

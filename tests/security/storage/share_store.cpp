@@ -1,6 +1,8 @@
-// The storage share store (design B6 seam until Phase 6 sealing lands): the
-// file-backed store with and without the machine-bound wrapping, and the
-// share bundle encoding.
+// The storage share store (design B6): the sealed adapter over SealedBlobStore
+// (with FakeSealer, not a TPM), the file-backed store with and without the
+// machine-bound wrapping, and the share bundle encoding.
+
+#include "support/fake_sealer.hpp"
 
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
@@ -116,6 +118,63 @@ TEST(ShareBundle, EncodingIsExactAndBounded) {
     EXPECT_FALSE(decode_share_bundle(bytes).has_value());
     bytes[0] ^= 0x01;
     EXPECT_FALSE(decode_share_bundle(bytes).has_value());
+}
+
+// --- Sealed adapter (B6, B7 step 1) ----------------------------------------------
+
+TEST_F(ShareStoreTest, SealedAdapterRoundTripsUnderTheStorageShareDomain) {
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    SealedStorageShareStore store(blobs);
+    const auto value = secret();
+    ASSERT_EQ(store.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+    EXPECT_TRUE(fs::exists(blobs.current_path(kStorageShareDomain)));
+    const auto back = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(back.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(std::vector<uint8_t>(back.plaintext.data(), back.plaintext.data() + back.plaintext.size()),
+              value);
+    EXPECT_TRUE(store.remove(kStorageShareDomain));
+    EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::Missing);
+}
+
+TEST_F(ShareStoreTest, SealedAdapterFailsClosedOnMissingAndPolicyMismatch) {
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    SealedStorageShareStore store(blobs);
+    // Missing: nothing sealed; no plaintext is invented.
+    const auto missing = store.unseal(kStorageShareDomain);
+    EXPECT_EQ(missing.status, ShareStoreStatus::Missing);
+    EXPECT_TRUE(missing.plaintext.empty());
+    // PolicyMismatch: the boot chain changed and nothing was staged.
+    ASSERT_EQ(store.seal(kStorageShareDomain, secret()), ShareStoreStatus::Ok);
+    sealer.pcrs = seal_test::pcrs_of(0x33, 0x44);
+    const auto mismatch = store.unseal(kStorageShareDomain);
+    EXPECT_EQ(mismatch.status, ShareStoreStatus::PolicyMismatch);
+    EXPECT_TRUE(mismatch.plaintext.empty());
+    EXPECT_TRUE(fs::exists(blobs.current_path(kStorageShareDomain)));
+    // Unreachable daemon: reported, not treated as Missing.
+    sealer.reachable = false;
+    EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::Unreachable);
+}
+
+TEST_F(ShareStoreTest, SealedAdapterMovesALegacyFileShareOnlyAfterItUnseals) {
+    FileStorageShareStore legacy(root / "sealed", &crypto, wrapping.get(), identity.public_key);
+    const auto value = secret();
+    ASSERT_EQ(legacy.seal(kStorageShareDomain, value), ShareStoreStatus::Ok);
+    seal_test::FakeSealer sealer;
+    SealedBlobStore blobs(root / "boot-sealed", sealer.backend());
+    SealedStorageShareStore store(blobs, &legacy);
+    const auto first = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(first.status, ShareStoreStatus::Ok);
+    EXPECT_FALSE(fs::exists(legacy.path_of(kStorageShareDomain)));
+    const auto second = store.unseal(kStorageShareDomain);
+    ASSERT_EQ(second.status, ShareStoreStatus::Ok);
+    EXPECT_EQ(std::vector<uint8_t>(second.plaintext.data(),
+                                   second.plaintext.data() + second.plaintext.size()),
+              value);
+    // A policy mismatch on the sealed copy never falls back to a file copy.
+    sealer.pcrs = seal_test::pcrs_of(0x55, 0x66);
+    EXPECT_EQ(store.unseal(kStorageShareDomain).status, ShareStoreStatus::PolicyMismatch);
 }
 
 }  // namespace

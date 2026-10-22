@@ -50,7 +50,25 @@ void wipe(std::string& text) {
     text.clear();
 }
 
-std::string_view mode_name(VaultMode mode) {
+std::optional<VaultMode> parse_mode(std::string_view text) {
+    for (auto m : {VaultMode::Plaintext, VaultMode::Migrating, VaultMode::Encrypted}) {
+        if (vault_mode_name(m) == text) return m;
+    }
+    return std::nullopt;
+}
+
+std::optional<VaultPhase> parse_phase(std::string_view text) {
+    for (auto p : {VaultPhase::Idle, VaultPhase::Staging, VaultPhase::Verifying,
+                   VaultPhase::Promoting, VaultPhase::RotateStaging,
+                   VaultPhase::RotateVerifying}) {
+        if (vault_phase_name(p) == text) return p;
+    }
+    return std::nullopt;
+}
+
+}  // namespace
+
+std::string_view vault_mode_name(VaultMode mode) {
     switch (mode) {
         case VaultMode::Plaintext: return "plaintext";
         case VaultMode::Migrating: return "migrating";
@@ -59,7 +77,7 @@ std::string_view mode_name(VaultMode mode) {
     return "encrypted";
 }
 
-std::string_view phase_name(VaultPhase phase) {
+std::string_view vault_phase_name(VaultPhase phase) {
     switch (phase) {
         case VaultPhase::Idle: return "idle";
         case VaultPhase::Staging: return "staging";
@@ -70,24 +88,6 @@ std::string_view phase_name(VaultPhase phase) {
     }
     return "idle";
 }
-
-std::optional<VaultMode> parse_mode(std::string_view text) {
-    for (auto m : {VaultMode::Plaintext, VaultMode::Migrating, VaultMode::Encrypted}) {
-        if (mode_name(m) == text) return m;
-    }
-    return std::nullopt;
-}
-
-std::optional<VaultPhase> parse_phase(std::string_view text) {
-    for (auto p : {VaultPhase::Idle, VaultPhase::Staging, VaultPhase::Verifying,
-                   VaultPhase::Promoting, VaultPhase::RotateStaging,
-                   VaultPhase::RotateVerifying}) {
-        if (phase_name(p) == text) return p;
-    }
-    return std::nullopt;
-}
-
-}  // namespace
 
 StorageVault::StorageVault(fs::path data_root, fs::path state_directory,
                            crypto::SodiumCryptoService& crypto,
@@ -259,11 +259,23 @@ std::optional<std::string> StorageVault::seal_for(const fs::path& path,
 
 // --- State ---------------------------------------------------------------------------
 
+std::optional<VaultMode> StorageVault::recorded_mode(const fs::path& state_directory) {
+    const auto path = state_directory / kStateFile;
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return std::nullopt;
+    const auto text = read_whole(path);
+    const json j = text ? json::parse(*text, nullptr, false) : json();
+    if (!j.is_object() || !j.contains("mode") || !j["mode"].is_string()) {
+        return VaultMode::Encrypted;  // damaged: fail closed
+    }
+    return parse_mode(j["mode"].get<std::string>()).value_or(VaultMode::Encrypted);
+}
+
 bool StorageVault::save_state() {
     json j;
     j["format"] = kStateFormat;
-    j["mode"] = mode_name(mode_);
-    j["phase"] = phase_name(phase_);
+    j["mode"] = vault_mode_name(mode_);
+    j["phase"] = vault_phase_name(phase_);
     j["key_id"] = crypto::to_hex(std::span<const uint8_t>(target_key_id_));
     j["last_rotation_ms"] = last_rotation_ms_;
     j["rotation_requested"] = rotation_requested_;
@@ -331,7 +343,7 @@ void StorageVault::load() {
         phase_ = VaultPhase::Idle;
         (void)save_state();
     }
-    spdlog::info("[storage-vault] mode {}, phase {}", mode_name(mode_), phase_name(phase_));
+    spdlog::info("[storage-vault] mode {}, phase {}", vault_mode_name(mode_), vault_phase_name(phase_));
 }
 
 void StorageVault::attach(DataKeySource* source) {

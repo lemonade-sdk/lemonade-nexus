@@ -23,7 +23,9 @@ setting must stay off in production until the external review of the
 unaudited library paths in [B3](#b3-library) is done. Phase 6 is implemented:
 `nexus-attestd` seals and unseals, and the gossip identity key moves to a
 sealed copy through a one-way migration (see [B6](#b6-sealing-the-boot-set)
-for the binding, the migration, the upgrade path, and the limits). The design
+for the binding, the migration, the upgrade path, and the limits). Phase 7 is
+implemented in part behind `storage_files_enabled`, default off (see
+[B12](#b12-phase-7-implementation)); it has the same review gate. The design
 changes the trust model, so `AGENTS.md` requires review of each later phase
 and its migration plan before code.
 
@@ -523,8 +525,8 @@ Limits:
   remapping can keep old blocks.
 - On the root server the gossip identity is also the Genesis key, and it is
   sealed the same way.
-- The node identity (`keypair.enc`), vote keys, and `wrap_local.key` keep the
-  machine-bound wrapping until Phase 7 (B9).
+- The vote keys and `wrap_local.key` keep the machine-bound wrapping (B12).
+  With Phase 7 on, `keypair.enc` is also encrypted under the DEK.
 
 ### B7. Unlock at startup
 
@@ -614,10 +616,48 @@ Behind `storage_key_enabled` (`Security/Storage/`):
 - **Data key.** `DataKeyService` creates the DEK, wraps it to `S`, proves the
   unwrap through the holders, unlocks at startup, and rewraps after a
   rotation. No file is encrypted yet (Phase 7).
-- **Share storage.** Until Phase 6 is merged, shares are kept by
-  `FileStorageShareStore` under today's machine-bound wrapping (the B6
-  limit); `IStorageShareStore` maps one-to-one onto `SealedBlobStore` with the
-  domain `storage-share`.
+- **Share storage.** On a host that can seal, shares are kept by
+  `SealedStorageShareStore` in the boot set's `SealedBlobStore` under the
+  domain `storage-share`, with the same backend and upgrade staging as the
+  gossip identity. A host that cannot seal keeps `FileStorageShareStore` under
+  today's machine-bound wrapping (the B6 limit).
+
+### B12. Phase 7 implementation
+
+Behind `storage_files_enabled`, which needs `storage_key_enabled`
+(`Security/Storage/StorageVault.hpp`):
+
+- **Format.** A covered file is replaced in place by
+  `"LNXVAULT" | 0x01 | key id (16) | nonce (24) | ciphertext`. The cipher is
+  `EncryptedBlob` version 1 (XChaCha20-Poly1305) under
+  `HKDF(DEK, "LEMONADE-NEXUS-STORAGE-V1", "lemonade-nexus-storage-file-key-v1")`.
+  The associated data is `aead_aad("storage-file-at-rest", {domain, relative
+  path, key id})`. The key id is a second HKDF output of the DEK.
+- **Covered.** `identity/keypair.enc`, `identity/jwt_secret.hex`,
+  `identity/ddns_credentials.enc`, `account/replica.json`, `tree/nodes`,
+  `tree/deltas`, and `tree/log`. `FileStorageService`, `KeyWrappingService`,
+  `resolve_jwt_secret`, and `TreeLog` route these paths through the vault.
+- **Not covered yet.** TLS and ACME keys (loaded by path by the HTTP server),
+  ACL rows (SQLite, keyed from the gossip identity), vote keys, and
+  `wrap_local.key`. The vote keys and the file share store are read before
+  the unlock, and they depend on `wrap_local.key`; moving any of them under
+  the DEK would stop a cold start (B8). `wrap_local.key` is not retired.
+- **Migration (B10).** `plaintext`, then `migrating` (stage
+  `<file>.vault-new`, request a new unlock round trip, verify every staged
+  copy against the plaintext), then `encrypted` (overwrite and replace). The
+  plaintext is authoritative until `encrypted` is durable. A missing or
+  damaged state file with encrypted files present loads as `encrypted`.
+- **Startup.** With `encrypted` recorded, `main` runs the io context (gossip,
+  attestation, the security mesh, holder duties) until the DEK is in memory,
+  then starts the tree, the node identity, and everything after them. Startup
+  with the flag off stops when the state file records encryption.
+- **DEK rotation (B5a).** Every 30 days on the local clock, or on
+  `POST /api/storage/rotate-data-key` (root administrator).
+  `DataKeyService::begin_replacement` wraps a new DEK to the current S in
+  `data-key.next.json` and proves it through the holders; the vault stages
+  and verifies every file under it; `commit_replacement` replaces
+  `data-key.json`, which is the switch point; the staged files then replace
+  the old ciphertext.
 
 ## Part C: Key-Generation Race Fix
 
@@ -644,7 +684,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented in part** (B12): TLS/ACME keys, ACL rows, and vote keys are not covered yet. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 
