@@ -8,11 +8,15 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 Status: **approved**. Phase 1 is implemented behind the experimental
 `tree_ops_enabled` setting and applies tree operations locally only. See
 [Configuration](Configuration#experimental-tree-operations) for its behavior
-and limits. Phase 6 is implemented: `nexus-attestd` seals and unseals, and the
-gossip identity key moves to a sealed copy through a one-way migration (see
-[B6](#b6-sealing-the-boot-set) for the binding, the migration, the upgrade
-path, and the limits). The design changes the trust model, so `AGENTS.md` requires review
-of each later phase and its migration plan before code.
+and limits. Phase 4, the `storage-threshold` library
+(`crates/storage-threshold`), is implemented and tested; the server does not
+call it yet, and its unaudited paths still need the external review in
+[B3](#b3-library). Phase 6 is implemented: `nexus-attestd` seals and unseals,
+and the gossip identity key moves to a sealed copy through a one-way migration
+(see [B6](#b6-sealing-the-boot-set) for the binding, the migration, the
+upgrade path, and the limits). The design changes the trust model, so
+`AGENTS.md` requires review of each later phase and its migration plan before
+code.
 
 ## Table of Contents
 - [Summary](#summary)
@@ -283,7 +287,7 @@ wraps these libraries behind a C ABI like `frost-ffi`; panics never cross it.
 
 | Need | Library | Audit |
 |---|---|---|
-| Dealerless key generation over Ristretto255 | `frost-ristretto255` with the `internals` feature, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
+| Dealerless key generation over Ristretto255 | `frost-ristretto255`, with the `internals` feature of `frost-core`, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
 | Share refresh with the same holder set and threshold; removing holders | `frost-ristretto255` `refresh_dkg_*` | Not audited |
 | Enrolling a new holder at the same threshold | `frost-ristretto255` `repair_share_*` | Not audited |
 | Lagrange combination of partials | `frost-ristretto255` helpers | Audited with key generation |
