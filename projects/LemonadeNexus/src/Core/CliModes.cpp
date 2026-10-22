@@ -2,6 +2,7 @@
 #include <LemonadeNexus/Core/BootSet.hpp>
 
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
+#include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
 #include <LemonadeNexus/Core/GenesisAnchor.hpp>
 #include <LemonadeNexus/Core/OnboardingClient.hpp>
@@ -13,6 +14,8 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+#include <LemonadeNexus/Tree/TreeLog.hpp>
+#include <LemonadeNexus/Tree/TreeMerge.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -23,6 +26,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <span>
 #include <system_error>
 
@@ -389,6 +393,143 @@ int run_add_manifest(const ServerConfig& config) {
     return 0;
 }
 
+std::optional<std::string> read_text_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return std::nullopt;
+    std::ostringstream text;
+    text << in.rdbuf();
+    return text.str();
+}
+
+/// The network id the configured Genesis anchor derives, or nullopt.
+std::optional<security::NetworkId> configured_network_id(const ServerConfig& config) {
+    if (config.genesis_pubkey.empty()) return std::nullopt;
+    std::vector<uint8_t> bytes;
+    try {
+        bytes = crypto::from_base64(crypto::canonical_key_b64(config.genesis_pubkey));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+    if (bytes.size() != crypto::kEd25519PublicKeySize) return std::nullopt;
+    crypto::Ed25519PublicKey genesis{};
+    std::memcpy(genesis.data(), bytes.data(), bytes.size());
+    return security::derive_network_id(genesis, security::constants::kSecurityRulesetVersion,
+                                       security::constants::kConsensusRulesetVersion);
+}
+
+int run_sign_tree_merge(const ServerConfig& config) {
+    // The root management key signs the merged tree offline (design A9). The
+    // command signs only a canonical merge preimage for this network, so the
+    // key cannot be pointed at other bytes through this path.
+    const auto network_id = configured_network_id(config);
+    if (config.root_pubkey.empty() || !network_id) {
+        spdlog::error("Cannot sign: root_pubkey and genesis_pubkey must be configured");
+        return 1;
+    }
+    const auto preimage = read_text_file(config.sign_tree_merge_preimage);
+    if (!preimage) {
+        spdlog::error("Cannot sign: cannot read {}", config.sign_tree_merge_preimage);
+        return 1;
+    }
+    const auto doc = nlohmann::json::parse(*preimage, nullptr, false);
+    if (doc.is_discarded() || !doc.is_object() || doc.dump() != *preimage ||
+        doc.value("type", "") != tree::kTreeMergePreimageType || !doc.contains("height") ||
+        !doc["height"].is_number_unsigned() || doc["height"].get<uint64_t>() != 1) {
+        spdlog::error("Cannot sign: {} is not a canonical tree merge preimage",
+                      config.sign_tree_merge_preimage);
+        return 1;
+    }
+    if (doc.value("network_id", "") != crypto::to_hex(*network_id)) {
+        spdlog::error("Cannot sign: the preimage names another network");
+        return 1;
+    }
+
+    crypto::SodiumCryptoService sign_crypto;
+    sign_crypto.start();
+    storage::FileStorageService sign_storage{std::filesystem::path(config.data_root)};
+    sign_storage.start();
+    crypto::KeyWrappingService sign_kw{sign_crypto, sign_storage};
+    sign_kw.start();
+    auto privkey = sign_kw.unlock_identity({});
+    auto pubkey = sign_kw.load_identity_pubkey();
+    if (!privkey || !pubkey) {
+        spdlog::error("Cannot sign: root identity not available in {}", config.data_root);
+        return 1;
+    }
+    std::vector<uint8_t> want;
+    try { want = crypto::from_hex(config.root_pubkey); } catch (...) {}
+    if (std::vector<uint8_t>(pubkey->begin(), pubkey->end()) != want) {
+        spdlog::error("Cannot sign: this server's identity is not the configured root key "
+                      "(root_pubkey); only the root-key holder signs the tree merge");
+        return 1;
+    }
+    const std::span<const uint8_t> message(reinterpret_cast<const uint8_t*>(preimage->data()),
+                                           preimage->size());
+    const auto signature = crypto::to_base64(sign_crypto.ed25519_sign(*privkey, message));
+    std::ofstream out(config.sign_tree_merge_out, std::ios::binary | std::ios::trunc);
+    out << signature;
+    if (!out) {
+        spdlog::error("Cannot write {}", config.sign_tree_merge_out);
+        return 1;
+    }
+    std::printf("Signed tree merge: %llu nodes, tree digest %s, state root %s\n",
+                static_cast<unsigned long long>(doc.value("node_count", uint64_t{0})),
+                doc.value("tree_digest", "").c_str(), doc.value("state_root", "").c_str());
+    std::printf("Signature written to %s\n", config.sign_tree_merge_out.c_str());
+    return 0;
+}
+
+int run_install_tree_merge(const ServerConfig& config) {
+    // Run with the server stopped: the tree log belongs to the running
+    // process. Every server verifies the commit against its own configured
+    // anchors here and again when it arrives by replication.
+    const auto network_id = configured_network_id(config);
+    const auto root_key = root_principal_from_hex(config.root_pubkey);
+    if (!network_id || !root_key) {
+        spdlog::error("Cannot install: root_pubkey and genesis_pubkey must be configured");
+        return 1;
+    }
+    const auto text = read_text_file(config.install_tree_merge_path);
+    const auto doc = text ? nlohmann::json::parse(*text, nullptr, false) : nlohmann::json();
+    const auto entry = text && !doc.is_discarded() ? tree::tree_log_entry_from_json(doc)
+                                                   : std::nullopt;
+    if (!entry) {
+        spdlog::error("Cannot install: {} is not a tree log entry", config.install_tree_merge_path);
+        return 1;
+    }
+    crypto::SodiumCryptoService install_crypto;
+    install_crypto.start();
+    if (const auto refusal =
+            tree::verify_merge_signature(install_crypto, *entry, *network_id, *root_key)) {
+        spdlog::error("Cannot install: {}", *refusal);
+        return 1;
+    }
+    tree::TreeLog log(std::filesystem::path(config.data_root) / "tree" / "log");
+    if (log.open(tree::rules::NodeMap{}) != tree::TreeLog::OpenResult::Ok) {
+        spdlog::error("Cannot install: the tree log in {} does not open", config.data_root);
+        return 1;
+    }
+    if (log.height() != 0) {
+        spdlog::error("Cannot install: the tree log already holds height {}", log.height());
+        return 1;
+    }
+    if (log.state().root != tree::empty_base_root()) {
+        spdlog::error("Cannot install: the tree log does not start from the empty tree. Move "
+                      "{}/tree/log aside and run this command again.", config.data_root);
+        return 1;
+    }
+    auto next = log.state();
+    const auto result = tree::replay_entry(next, *entry);
+    if (!result.verdict.ok() || !log.append(*entry, std::move(next))) {
+        spdlog::error("Cannot install: {}", result.verdict.ok() ? "the tree log write failed"
+                                                                : result.verdict.reason);
+        return 1;
+    }
+    std::printf("Installed the tree merge commit as tree log height 1 (state root %s)\n",
+                crypto::to_base64(entry->state_root).c_str());
+    return 0;
+}
+
 } // namespace
 
 std::optional<InitResult> ensure_initialized(const ServerConfig& config) {
@@ -460,6 +601,8 @@ std::optional<int> run_cli_mode(ServerConfig& config, const char* argv0,
     if (!config.enroll_server_pubkey.empty())     return run_enroll(config);
     if (!config.revoke_server_pubkey.empty())     return run_revoke(config);
     if (!config.add_manifest_path.empty())        return run_add_manifest(config);
+    if (!config.sign_tree_merge_preimage.empty()) return run_sign_tree_merge(config);
+    if (!config.install_tree_merge_path.empty())  return run_install_tree_merge(config);
 
     // --- Refuse to start without an initialized data directory ---
     // A fresh box with no seed peers would otherwise silently bootstrap itself

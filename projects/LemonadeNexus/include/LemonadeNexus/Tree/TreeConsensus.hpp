@@ -16,11 +16,32 @@
 // kTreeBlockClockSkewMs of this node's clock, and the state roots must match.
 //
 // Commit then apply (A6): on_committed() appends the block to the TreeLog and
-// only then applies its ops to the PermissionTreeService. Any disagreement
-// between the committed block and this node's log (a missed block, a root
-// mismatch, a write failure) halts the handler: it stops applying, voting,
-// and proposing tree blocks, and keeps serving the last committed tree. It
-// never applies a block it cannot verify against its own log.
+// only then applies its ops to the PermissionTreeService.
+//
+// Replication (A7): receive_replicated() takes committed entries that peers
+// deliver over the "tree" sync stream. It verifies each entry's evidence (the
+// commit proof under the block epoch's verified vote keys, or the merge
+// signature under the configured root management key), then applies it only
+// when it is the next height and chains to this log. A server that missed a
+// block (on_committed sees a block that does not follow its log) does not
+// halt: it is "behind", applies nothing out of order, and catches up through
+// replication; the next committed block that chains resumes it.
+//
+// Fail closed: an entry whose evidence does not verify, or that does not
+// chain to this log, is refused and not applied, and nothing after it applies
+// until a verified entry for that height arrives. (The log height is not
+// covered by the commit proof, so an unchained entry may be a renumbered
+// genuine one; a server whose log base differs from the mesh's refuses every
+// entry and reports it in its status.) A log that does not verify at start,
+// a certified entry that chains but does not replay to its roots, or a write
+// failure halts the handler: it stops applying, voting, and proposing tree
+// blocks, and keeps serving the last committed tree.
+//
+// Modes: in Ops mode the committed log drives the persistent tree. In
+// ReadOnly mode (design A9, release N) the log starts from the empty tree,
+// takes only replicated entries (the merge commit, then committed blocks),
+// and never changes the persistent tree, which keeps its local write paths.
+// A ReadOnly handler never proposes, votes, or accepts a submission.
 //
 // Threads: submit(), status(), healthy(), and set_members() may run on any
 // thread. Everything else runs on the security io thread.
@@ -31,11 +52,13 @@
 #include <LemonadeNexus/Tree/TreeChain.hpp>
 #include <LemonadeNexus/Tree/TreeLog.hpp>
 #include <LemonadeNexus/Tree/TreeOpPool.hpp>
+#include <LemonadeNexus/Tree/TreeReplication.hpp>
 
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -56,6 +79,47 @@ inline constexpr uint64_t kTreeOpCommitWaitMs = 10'000;
 /// payload framing.
 inline constexpr std::size_t kTreeBatchWireBudget = 54'000;
 
+/// How the tree log relates to the persistent tree.
+enum class TreeLogMode : uint8_t {
+    /// Tree writes are ops; the committed log drives the persistent tree.
+    Ops,
+    /// The log is built and replicated, but the persistent tree keeps its
+    /// local write paths (design A9, release N).
+    ReadOnly,
+};
+
+/// Most replicated entries held for a later height (a gap, or an epoch whose
+/// authority is not verified yet). They are verified when their turn comes.
+inline constexpr std::size_t kMaxReplicaHeldEntries = 64;
+/// Most bytes of entry content held for later heights.
+inline constexpr std::size_t kMaxReplicaHeldBytes = 8u * 1024u * 1024u;
+
+/// What receive_replicated() did with an entry.
+enum class ReplicaResult : uint8_t {
+    Applied,       ///< verified and applied (with any held entries it unblocked)
+    Duplicate,     ///< this log already holds the height; nothing changed
+    Gap,           ///< a later height; held, not applied
+    UnknownEpoch,  ///< the epoch's authority is not verified here yet; held
+    Refused,       ///< the evidence does not verify; dropped, not applied
+    Halted,        ///< the handler is halted, or this entry halted it
+};
+
+/// A thread-safe summary of the tree log for status reports.
+struct TreeLogStatus {
+    TreeLogMode mode = TreeLogMode::Ops;
+    bool healthy = false;
+    std::string halt_reason;
+    uint64_t height = 0;
+    uint64_t applied_height = 0;
+    security::Digest root{};
+    /// A committed block did not follow this log; waiting for replication.
+    bool behind = false;
+    /// Replicated entries held for a later height.
+    std::size_t held = 0;
+    /// The last refused replicated entry, or empty.
+    std::string last_refusal;
+};
+
 struct TreeConsensusConfig {
     /// This server's node id (its gossip identity key).
     security::NodeId self{};
@@ -69,6 +133,7 @@ struct TreeConsensusConfig {
     /// Phase 7: the tree log is read and written through this vault. Not
     /// owning; nullptr keeps plain files.
     security::StorageVault* vault = nullptr;
+    TreeLogMode mode = TreeLogMode::Ops;
 };
 
 class TreeConsensus final : public security::IBlockPayloadHandler {
@@ -77,10 +142,12 @@ public:
     TreeConsensus(TreeConsensusConfig config, PermissionTreeService& tree,
                   crypto::SodiumCryptoService& crypto, std::filesystem::path log_directory);
 
-    /// Open the tree log and reconcile it with the persistent tree: equal
-    /// digests are clean; a tree behind an unapplied log tail is restored from
-    /// the log; any other difference halts (the tree changed outside the
-    /// log). Call once, before consensus delivers blocks. False when halted.
+    /// Open the tree log. In Ops mode, reconcile it with the persistent tree:
+    /// equal digests are clean; a tree behind an unapplied log tail is restored
+    /// from the log; any other difference halts (the tree changed outside the
+    /// log). A new Ops log starts from the current tree. A ReadOnly log starts
+    /// from the empty tree and is not reconciled. Call once, before consensus
+    /// delivers blocks. False when halted.
     [[nodiscard]] bool start();
 
     /// False once halted; halt_reason() says why. Thread-safe.
@@ -124,8 +191,39 @@ public:
     /// EstablishRoot op. io thread.
     void set_root_request(std::function<void()> request) { root_request_ = std::move(request); }
 
-    /// The committed log (tests and Phase 3 replication). io thread.
+    /// The committed log (tests). io thread.
     [[nodiscard]] const TreeLog& log() const { return log_; }
+
+    // --- Replication (design A7) ---
+
+    /// Where the verified epoch authorities come from (the driver's verified
+    /// chain). Unset, every consensus entry is UnknownEpoch. io thread.
+    void set_authority_source(EpochAuthorityLookup lookup) { authority_ = std::move(lookup); }
+
+    /// Told the epoch an entry names when its authority is not verified yet,
+    /// so the owner can ask for the authority chain. io thread.
+    void set_epoch_hint(std::function<void(security::EpochId)> hint) {
+        epoch_hint_ = std::move(hint);
+    }
+
+    /// Called after each entry is durably appended, with its height (the sync
+    /// stream offers it to peers). io thread.
+    void set_appended_hook(std::function<void(uint64_t)> hook) { appended_hook_ = std::move(hook); }
+
+    /// Called after the persistent tree followed the log (Ops mode only). io
+    /// thread.
+    void set_applied_hook(std::function<void()> hook) { applied_hook_ = std::move(hook); }
+
+    /// Verify and apply one replicated entry (see the file comment). io thread.
+    [[nodiscard]] ReplicaResult receive_replicated(const TreeLogEntry& entry);
+
+    /// The encoded entry at `height` (encode_replicated_entry) for serving a
+    /// peer, or nullopt when this log does not hold it. Reads the entry file
+    /// only. Thread-safe.
+    [[nodiscard]] std::optional<std::vector<uint8_t>> encoded_entry(uint64_t height) const;
+
+    /// A summary for status reports. Thread-safe.
+    [[nodiscard]] TreeLogStatus status_summary() const;
 
     /// The policy a block in an epoch with `members` is validated under.
     [[nodiscard]] TreeOpPolicy policy_for(const std::vector<security::NodeId>& members) const;
@@ -150,6 +248,19 @@ private:
         const security::HotStuffService& consensus, const security::Digest& block_digest) const;
     void halt(const std::string& reason);
     void revalidate_pool();
+    /// Append `entry` (whose replay produced `next` and `result`) and, in Ops
+    /// mode, apply it to the persistent tree. False when halted.
+    bool commit_entry(const TreeLogEntry& entry, TreeChainState next,
+                      const TreeBlockResult& result);
+    /// Verify and apply the entry for height log_.height() + 1.
+    [[nodiscard]] ReplicaResult apply_next(const TreeLogEntry& entry);
+    /// Hold an entry for a later height, within kMaxReplicaHeldEntries and
+    /// kMaxReplicaHeldBytes.
+    void hold(const TreeLogEntry& entry);
+    /// Apply held entries while the next height is held and verifies.
+    void drain_held();
+    void refresh_status();
+    void note_refusal(const std::string& reason);
     [[nodiscard]] bool is_member(const security::NodeId& node) const;
 
     TreeConsensusConfig config_;
@@ -159,11 +270,19 @@ private:
     TreeOpPool pool_;
     std::function<void(security::TreeOpSubmitMsg)> broadcast_;
     std::function<void()> root_request_;
+    EpochAuthorityLookup authority_;
+    std::function<void(security::EpochId)> epoch_hint_;
+    std::function<void(uint64_t)> appended_hook_;
+    std::function<void()> applied_hook_;
+    /// Replicated entries for later heights, by height. io thread.
+    std::map<uint64_t, TreeLogEntry> held_;
 
-    mutable std::mutex mutex_;  // guards halted_, halt_reason_, members_
+    mutable std::mutex mutex_;  // guards halted_, halt_reason_, members_, status_
     bool halted_ = true;        // until start() succeeds
     std::string halt_reason_ = "not started";
     std::vector<security::NodeId> members_;
+    TreeLogStatus status_;
+    bool behind_ = false;  // io thread; mirrored into status_
 
     uint64_t last_maintain_ms_ = 0;
     uint64_t last_root_request_ms_ = 0;

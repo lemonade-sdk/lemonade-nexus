@@ -101,6 +101,7 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
     if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
     if (j.contains("tree_ops_enabled"))           j.at("tree_ops_enabled").get_to(c.tree_ops_enabled);
+    if (j.contains("tree_log_enabled"))           j.at("tree_log_enabled").get_to(c.tree_log_enabled);
     if (j.contains("storage_key_enabled"))        j.at("storage_key_enabled").get_to(c.storage_key_enabled);
     if (j.contains("storage_files_enabled"))      j.at("storage_files_enabled").get_to(c.storage_files_enabled);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
@@ -168,7 +169,10 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
-    spdlog::info("  --tree-ops                 Experimental: order tree writes through Tier 1 consensus (Phase 2)");
+    spdlog::info("  --tree-ops                 Experimental: order tree writes through Tier 1 consensus and replicate the tree log");
+    spdlog::info("  --tree-log                 Experimental: build and replicate the tree log read-only; tree writes stay direct");
+    spdlog::info("  --sign-tree-merge <preimage> <out>  Root holder: sign a tree merge preimage and exit");
+    spdlog::info("  --install-tree-merge <commit.json>  Verify a signed tree merge commit and write it as tree log height 1, then exit");
     spdlog::info("  --storage-key              Experimental: threshold storage key and data key (Phase 5; not for production)");
     spdlog::info("  --storage-files            Experimental: encrypt files under the data key, monthly rotation (Phase 7; needs --storage-key)");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
@@ -344,6 +348,13 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.open_registration = false;
         } else if (std::strcmp(argv[i], "--tree-ops") == 0) {
             config.tree_ops_enabled = true;
+        } else if (std::strcmp(argv[i], "--tree-log") == 0) {
+            config.tree_log_enabled = true;
+        } else if (std::strcmp(argv[i], "--sign-tree-merge") == 0 && i + 2 < argc) {
+            config.sign_tree_merge_preimage = argv[++i];
+            config.sign_tree_merge_out      = argv[++i];
+        } else if (std::strcmp(argv[i], "--install-tree-merge") == 0 && i + 1 < argc) {
+            config.install_tree_merge_path = argv[++i];
         } else if (std::strcmp(argv[i], "--storage-key") == 0) {
             config.storage_key_enabled = true;
         } else if (std::strcmp(argv[i], "--storage-files") == 0) {
@@ -422,6 +433,7 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
     if (std::getenv("SP_CLOSED_REGISTRATION"))           config.open_registration     = false;
     if (std::getenv("SP_TREE_OPS"))                      config.tree_ops_enabled      = true;
+    if (std::getenv("SP_TREE_LOG"))                      config.tree_log_enabled      = true;
     if (std::getenv("SP_STORAGE_KEY"))                   config.storage_key_enabled   = true;
     if (std::getenv("SP_STORAGE_FILES"))                 config.storage_files_enabled = true;
 
@@ -508,7 +520,9 @@ bool validate_config(const ServerConfig& config) {
     const bool cli_mode = config.first_run || config.verify_platform ||
                           config.onboard_server ||
                           config.mint_admission_token || !config.enroll_server_pubkey.empty() ||
-                          !config.revoke_server_pubkey.empty() || !config.add_manifest_path.empty();
+                          !config.revoke_server_pubkey.empty() || !config.add_manifest_path.empty() ||
+                          !config.sign_tree_merge_preimage.empty() ||
+                          !config.install_tree_merge_path.empty();
 
     if (!cli_mode) {
         if (config.root_pubkey.empty()) {

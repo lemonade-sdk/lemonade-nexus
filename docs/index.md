@@ -23,7 +23,8 @@ A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, crypto
 
 ### Security
 - [Security](Security) — Roles, epoch authority, Genesis, trust chain, threat assumptions, limitations
-- [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key) — Proposed: tree changes through Tier 1 consensus, and a 65% threshold storage key
+- [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key) — Approved; Phases 1 to 3 experimental: tree changes through Tier 1 consensus, and a 65% threshold storage key
+- [Tree Merge Ceremony](Tree-Merge-Ceremony) — Experimental runbook: merge every server's tree into tree log height 1, then switch to tree operations
 - [Attestation](Attestation) — Providers, evidence path, `nexus-attestd`, profile requirements, fail-closed diagnostics
 
 ### Reference

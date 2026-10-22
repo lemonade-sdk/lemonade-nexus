@@ -5,12 +5,14 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 
 # Design: Tree Consensus and Threshold Storage Key
 
-Status: **approved**. Phases 1 and 2 are implemented behind the experimental
-`tree_ops_enabled` setting: Tier 1 servers order tree operations through
-consensus and apply them only after commit. Tier 2 replication and the merge
-ceremony (Phase 3) are not implemented. See
+Status: **approved**. Phases 1 to 3 are implemented behind experimental
+settings: with `tree_ops_enabled`, Tier 1 servers order tree operations
+through consensus and apply them only after commit, and Tier 2 and lagging
+servers apply the replicated log; with `tree_log_enabled`, servers build and
+replicate the log in read-only mode for the merge ceremony. See
 [Configuration](Configuration#experimental-tree-operations) for the behavior
-and limits. Phase 4, the `storage-threshold` library
+and limits, and [Tree Merge Ceremony](Tree-Merge-Ceremony) for the
+migration runbook. Phase 4, the `storage-threshold` library
 (`crates/storage-threshold`), is implemented and tested. Phase 5 (holder
 plans and key rotations in consensus, the unlock protocol, the `StorageUnlock`
 attestation purpose, per-epoch share refresh, and daily rotation) is
@@ -174,6 +176,12 @@ accepts. Until a finalized set of admitted submitters exists, a Tier 2 server
 answers tree writes with 503 instead of forwarding them. The poll route is
 `GET /api/tree/op/{op_id}`.
 
+Phase 3 keeps the 503. Finalized state names only the Tier 1 set (and, at a
+boundary, the eligible candidates for selection). Root-signed admission
+certificates are identity, not authority, so they cannot become a list of
+trusted submitters, and a Tier 1 server that signed a Tier 2 server's request
+would assert a session it did not authenticate.
+
 ### A3. Consensus payload
 
 - A new `TreeBlock` carries an ordered batch of ops. `Proposal` gains
@@ -226,7 +234,12 @@ encoding and version. Replicas recompute it and vote only on a match.
 
 Phase 2 implementation: `parent_root` is the state root of the previous tree
 block in the chain (the tree log head, or the nearest uncommitted tree
-ancestor), and the proposal's `previous_state_root` carries it. The tree log
+ancestor), and the proposal's `previous_state_root` carries it. Phase 3 adds
+the committed op ids to the root:
+`H(parent_root ‖ ops_digest ‖ tree_digest_after ‖ committed_digest_after)`
+(domain `lemonade-nexus/tree-state-root:v2`, tree log format 2), so a
+snapshot's ids are bound by a certified root and an edited snapshot is not
+used. The tree log
 is therefore a hash chain: a server that missed a tree block cannot match the
 next one, and halts instead of applying it. The first entry chains to a base
 root over the tree the log started from.
@@ -259,6 +272,30 @@ root over the tree the log started from.
 - A server that cannot verify an entry stops applying and keeps serving the
   last verified state. It never applies unverified data.
 
+Phase 3 implementation:
+
+- The `"tree"` stream indexes committed heights under one origin
+  (`tree-log`) in an `OriginReplica`; the entry bytes stay in the tree log and
+  are read on demand. Catch-up sends entries in height order, at most 16 per
+  request, as 16 KiB `TreeLogSync` chunks that the receiver reassembles within
+  a 32 MiB budget. Only Tier 1 serves; only backbone traffic from certified
+  peers is accepted.
+- A receiver verifies the commit proof (`verify_commit_proof`) under the vote
+  keys and quorum of the epoch the entry's header names. It takes them from
+  `SecurityDriver::authority_for_epoch`, which holds every epoch authority the
+  driver verified from the pinned Genesis certificate and the finalized
+  handoffs. An epoch it has not verified yet is held and hinted to the chain
+  walker; it is never applied on a peer's word.
+- The log height is not inside the proof. An entry is applied only when it
+  chains to the log head (`previous_root`); an entry that does not chain is
+  refused, not acted on, because a peer can renumber a genuine entry. A
+  server whose log base differs from the mesh's therefore refuses every entry
+  and reports it in `GET /api/tree/sync`.
+- A Tier 1 server that sees a committed block that does not follow its log is
+  "behind": it applies nothing out of order, catches up through replication,
+  and resumes with the next committed block that chains.
+- In ops mode the gossip record transfer pool no longer carries tree records.
+
 ### A8. Effect on clients
 
 - Peer lists, permissions, and the tree become identical on every server.
@@ -279,6 +316,20 @@ Today each server's tree differs.
 3. The merged tree is committed as **height 1**, signed by the root
    management key offline, and verified by every server.
 4. Release N+1 switches every write path to ops. Local-only writes end.
+
+Phase 3 implementation: release N is `tree_log_enabled` (read-only mode: the
+log starts from the empty tree and never changes the live tree); release N+1
+is `tree_ops_enabled`. Both default to off, so deploying the build changes
+nothing until an operator runs the ceremony. The merge commit is a tree log
+entry of kind `merge` at height 1: its body is the canonical encoding of the
+merged nodes, its root chains to the empty base, and the root management key
+signs a canonical JSON preimage that names the network, height, block time,
+roots, and node count. A log accepts it only on top of the empty base, so it
+is one-shot. `nexus-tree-merge` exports, merges (listing conflicts), and
+finalizes; `lemonade-nexus --sign-tree-merge` signs on the root server and
+`--install-tree-merge` installs the commit on a stopped server. At the switch
+to ops mode, a server's live tree is behind the committed log and is replaced
+by it. See [Tree Merge Ceremony](Tree-Merge-Ceremony).
 
 ## Part B: Threshold Storage Key
 

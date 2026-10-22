@@ -141,6 +141,20 @@ public:
     /// io thread.
     void broadcast_tree_op(TreeOpSubmitMsg message);
 
+    /// The verified authority of `epoch` (SecurityDriver::authority_for_epoch).
+    /// io thread.
+    [[nodiscard]] std::optional<VerifiedEpochAuthority> authority_for_epoch(EpochId epoch) const {
+        return driver_.authority_for_epoch(epoch);
+    }
+
+    /// An unauthenticated epoch hint (SecurityDriver::note_epoch_hint). io
+    /// thread.
+    void note_epoch_hint(EpochId epoch) { driver_.note_epoch_hint(epoch); }
+
+    /// Runs `work` on the io thread, unless the service has stopped.
+    /// Thread-safe.
+    void post(std::function<void()> work);
+
     /// Runs on the io thread after every driver tick. Call before the io
     /// context runs.
     void set_tick_hook(std::function<void()> hook) { tick_hook_ = std::move(hook); }

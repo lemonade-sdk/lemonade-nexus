@@ -5,6 +5,7 @@
 #include <LemonadeNexus/Security/Consensus/HotStuffState.hpp>
 #include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
+#include <LemonadeNexus/Tree/TreeMerge.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -89,6 +90,7 @@ security::Digest batch_digest(const std::vector<uint8_t>& batch) {
 
 json tree_log_entry_to_json(const TreeLogEntry& entry) {
     return json{{"format", kTreeLogFormatVersion},
+                {"kind", entry.kind == TreeLogEntryKind::Merge ? "merge" : "batch"},
                 {"height", entry.height},
                 {"block_time_ms", entry.block_time_ms},
                 {"batch", b64(entry.batch)},
@@ -102,6 +104,15 @@ json tree_log_entry_to_json(const TreeLogEntry& entry) {
 std::optional<TreeLogEntry> tree_log_entry_from_json(const json& doc) {
     if (!doc.is_object() || !format_ok(doc)) return std::nullopt;
     TreeLogEntry entry;
+    const auto kind = doc.find("kind");
+    if (kind == doc.end() || !kind->is_string()) return std::nullopt;
+    if (*kind == "batch") {
+        entry.kind = TreeLogEntryKind::Batch;
+    } else if (*kind == "merge") {
+        entry.kind = TreeLogEntryKind::Merge;
+    } else {
+        return std::nullopt;
+    }
     const auto batch = doc.contains("batch") ? unb64(doc["batch"]) : std::nullopt;
     if (!batch || !read_u64(doc, "height", entry.height) ||
         !read_u64(doc, "block_time_ms", entry.block_time_ms) ||
@@ -115,6 +126,73 @@ std::optional<TreeLogEntry> tree_log_entry_from_json(const json& doc) {
     entry.batch = *batch;
     entry.commit = doc["commit"];
     return entry;
+}
+
+security::Digest empty_base_root() {
+    return base_state_root(compute_tree_digest(rules::NodeMap{}));
+}
+
+TreeBlockResult replay_entry(TreeChainState& state, const TreeLogEntry& entry) {
+    TreeBlockResult out;
+    const auto refuse = [&out](std::string reason) {
+        out.verdict = {TreeOpRefusal::Malformed, std::move(reason)};
+        out.effects.clear();
+        return out;
+    };
+    if (entry.previous_root != state.root) {
+        return refuse("the entry does not chain to the previous state root");
+    }
+    if (entry.kind == TreeLogEntryKind::Merge) {
+        // One-shot: the merge commit replaces the empty base at height 1 and
+        // nothing else.
+        if (entry.height != 1 || state.root != empty_base_root() || !state.nodes.empty() ||
+            state.committed.size() != 0 || state.last_block_time_ms != 0) {
+            return refuse("a merge entry is valid only at height 1 on top of the empty base");
+        }
+        if (merge_body_digest(entry.batch) != entry.ops_digest) {
+            return refuse("the merge body does not match its digest");
+        }
+        auto nodes = decode_merge_body(entry.batch);
+        if (!nodes) return refuse("the merge body does not decode");
+        if (entry.block_time_ms == 0) return refuse("the merge entry has no block time");
+        TreeChainState next;
+        next.nodes = std::move(*nodes);
+        next.last_block_time_ms = entry.block_time_ms;
+        out.tree_digest = compute_tree_digest(next.nodes);
+        out.root = chain_state_root(state.root, entry.ops_digest, next);
+        if (out.tree_digest != entry.tree_digest || out.root != entry.state_root) {
+            return refuse("the merge entry does not produce its recorded roots");
+        }
+        next.root = out.root;
+        state = std::move(next);
+        return out;
+    }
+
+    if (batch_digest(entry.batch) != entry.ops_digest) {
+        return refuse("the batch does not match its ops digest");
+    }
+    const auto batch = decode_tree_batch(entry.batch);
+    if (!batch) return refuse("the batch is malformed");
+    // The certified header, when recorded, must state the same block: its
+    // time, ops digest, and roots. This binds the block time, which the state
+    // root does not cover, to a quorum-certified record.
+    if (const auto it = entry.commit.find("proposal"); it != entry.commit.end()) {
+        const auto header = security::proposal_from_json(*it);
+        if (!header || header->timestamp_hint != entry.block_time_ms ||
+            header->transitions_digest != entry.ops_digest ||
+            header->previous_state_root != entry.previous_root ||
+            header->proposed_state_root != entry.state_root) {
+            return refuse("the entry contradicts its certified header");
+        }
+    }
+    TreeChainState next = state;
+    out = apply_certified_batch(next, *batch, entry.block_time_ms, entry.ops_digest);
+    if (!out.verdict.ok()) return out;
+    if (out.tree_digest != entry.tree_digest || out.root != entry.state_root) {
+        return refuse("the entry does not replay to its recorded state");
+    }
+    state = std::move(next);
+    return out;
 }
 
 TreeLog::TreeLog(fs::path directory) : directory_(std::move(directory)) {}
@@ -255,11 +333,15 @@ TreeLog::OpenResult TreeLog::open(const rules::NodeMap& base_nodes) {
         base = read_snapshot(*it);
         if (base && *it > 0) {
             // Cross-check against the entry the snapshot follows: the same
-            // tree digest, root, and block time, or the snapshot is not used.
+            // tree digest, root, and block time, and a root recomputed from
+            // the snapshot's own nodes and committed ids, or the snapshot is
+            // not used.
             const auto entry = read_entry(*it);
             if (!entry || entry->state_root != base->root ||
                 entry->tree_digest != compute_tree_digest(base->nodes) ||
-                entry->block_time_ms != base->last_block_time_ms) {
+                entry->block_time_ms != base->last_block_time_ms ||
+                chain_state_root(entry->previous_root, entry->ops_digest, *base) !=
+                    base->root) {
                 base.reset();
             }
         }
@@ -283,34 +365,13 @@ TreeLog::OpenResult TreeLog::open(const rules::NodeMap& base_nodes) {
             return OpenResult::Corrupt;
         }
         const auto entry = read_entry(h);
-        if (!entry || entry->height != h || entry->previous_root != state_.root ||
-            batch_digest(entry->batch) != entry->ops_digest) {
-            spdlog::error("[TreeLog] entry {} does not chain to the log", h);
+        if (!entry || entry->height != h) {
+            spdlog::error("[TreeLog] entry {} is unreadable or has another format", h);
             return OpenResult::Corrupt;
         }
-        const auto batch = decode_tree_batch(entry->batch);
-        if (!batch) {
-            spdlog::error("[TreeLog] entry {} holds a malformed batch", h);
-            return OpenResult::Corrupt;
-        }
-        // The certified header, when recorded, must state the same block:
-        // its time, ops digest, and roots. This binds the block time, which
-        // the state root does not cover, to a quorum-certified record.
-        if (const auto it = entry->commit.find("proposal"); it != entry->commit.end()) {
-            const auto header = security::proposal_from_json(*it);
-            if (!header || header->timestamp_hint != entry->block_time_ms ||
-                header->transitions_digest != entry->ops_digest ||
-                header->previous_state_root != entry->previous_root ||
-                header->proposed_state_root != entry->state_root) {
-                spdlog::error("[TreeLog] entry {} contradicts its certified header", h);
-                return OpenResult::Corrupt;
-            }
-        }
-        const auto result =
-            apply_certified_batch(state_, *batch, entry->block_time_ms, entry->ops_digest);
-        if (!result.verdict.ok() || result.tree_digest != entry->tree_digest ||
-            result.root != entry->state_root) {
-            spdlog::error("[TreeLog] entry {} does not replay to its recorded state", h);
+        const auto result = replay_entry(state_, *entry);
+        if (!result.verdict.ok()) {
+            spdlog::error("[TreeLog] entry {}: {}", h, result.verdict.reason);
             return OpenResult::Corrupt;
         }
         height_ = h;
@@ -328,7 +389,8 @@ TreeLog::OpenResult TreeLog::open(const rules::NodeMap& base_nodes) {
 
 bool TreeLog::append(const TreeLogEntry& entry, TreeChainState next) {
     if (entry.height != height_ + 1 || entry.previous_root != state_.root ||
-        next.root != entry.state_root) {
+        next.root != entry.state_root ||
+        (entry.kind == TreeLogEntryKind::Merge && entry.height != 1)) {
         return false;
     }
     if (!write_doc(entry_path(entry.height), tree_log_entry_to_json(entry).dump())) {

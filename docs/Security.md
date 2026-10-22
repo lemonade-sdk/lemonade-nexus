@@ -90,7 +90,22 @@ routing layer use the same rule: a device in the member's group is listed or
 resolved only when the member holds a connect permission on that device
 itself. `admin` includes both connect permissions. A grant on the group does
 not count, because permissions are not inherited. Relays in the group are
-listed with `read`. See Current Limitations for the server forwarding gap.
+listed with `read`.
+
+A client's server peer covers the whole tunnel plane, so the server's
+dataplane sees traffic that one endpoint sends to another. The server forwards
+it only when the source endpoint's key may connect to the destination
+endpoint: the destination is in the source's group, and the source key holds
+`connect_private`, `connect_shared`, or `admin` on the destination device
+itself. This is the rule the routing layer applies. Replies return without a
+grant in the other direction: a TCP segment that is not a bare SYN, and ICMP
+echo replies and errors. A device that may only be reached cannot open a TCP
+connection back, and a UDP reply needs a grant in its own direction. Relays
+and addresses outside the tunnel plane, such as backbone servers, are not
+restricted by this rule. An address in the plane that is not an endpoint or
+relay in the tree is dropped. The server rebuilds the rule off the packet path
+when the tree changes; a revoked grant stops forwarding within about one
+second.
 
 ## Epoch Authority
 
@@ -328,13 +343,6 @@ These are implementation limits, not settings an operator can disable:
 5. **IMA checkpoint/resume acceptance is not implemented.** The bounded
    evidence path must satisfy the current complete verification
    requirements.
-6. **The server mesh dataplane forwards between any two peers.** The
-   connect rule decides which peers a client adds to its dataplane. The
-   server's userspace dataplane still forwards a packet from one client to
-   any other client whose tunnel IP it routes, without a permission check
-   (`UserspaceDataplane::route_decrypted`). A client that sends traffic for
-   another device's tunnel IP through the server peer can reach that device
-   without a connect permission.
 
 ## Retired Mechanisms
 

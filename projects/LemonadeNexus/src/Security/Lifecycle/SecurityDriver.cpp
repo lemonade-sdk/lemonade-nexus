@@ -169,7 +169,14 @@ std::optional<EpochId> SecurityDriver::current_epoch() const {
 
 // --- Lifecycle ---------------------------------------------------------------
 
+std::optional<VerifiedEpochAuthority> SecurityDriver::authority_for_epoch(EpochId epoch) const {
+    const auto it = authority_history_.find(epoch);
+    if (it == authority_history_.end()) return std::nullopt;
+    return it->second;
+}
+
 void SecurityDriver::install_authority(VerifiedEpochAuthority authority) {
+    authority_history_[authority.epoch] = authority;
     authority_ = std::move(authority);
     (void)store_.store_authority_anchor(*authority_);
     if (genesis_node() && genesis_ != nullptr) {
@@ -304,6 +311,9 @@ void SecurityDriver::start(uint64_t now_ms) {
         }
     }
 
+    for (const auto& verified : authenticated) {
+        authority_history_[verified.epoch] = verified;
+    }
     if (!authenticated.empty()) {
         authority_ = authenticated.back();
     }

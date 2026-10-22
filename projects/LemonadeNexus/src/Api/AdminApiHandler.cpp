@@ -70,6 +70,17 @@ void AdminApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         json_response(res, ctx_.gossip.account_sync_status());
     }));
 
+    // GET /api/tree/sync — tree log state (mode, height, state root, halt
+    // reason, last refused entry) and its replication status per peer
+    priv.Get("/api/tree/sync", require_auth(ctx_.auth,
+        [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {
+        if (!ctx_.tree_log_status) {
+            error_response(res, "the tree log is not enabled on this server", 404);
+            return;
+        }
+        json_response(res, ctx_.tree_log_status());
+    }));
+
     // POST /api/ddns/update — Force DDNS update
     priv.Post("/api/ddns/update", require_auth(ctx_.auth,
         [this](const httplib::Request&, httplib::Response& res, const SessionClaims&) {

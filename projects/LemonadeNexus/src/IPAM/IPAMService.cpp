@@ -1,9 +1,11 @@
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
+#include <LemonadeNexus/Tree/TreeOps.hpp>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <stdexcept>
+#include <tuple>
 
 namespace nexus::ipam {
 
@@ -27,6 +29,14 @@ constexpr uint32_t kSharedSize    = ~kSharedMask + 1;                   // 262,1
 constexpr uint32_t kBackboneBase  = (172u << 24) | (16u << 16);         // 172.16.0.0
 constexpr uint32_t kBackboneMask  = 0xFFFFFC00u;                        // /22
 constexpr uint32_t kBackboneSize  = ~kBackboneMask + 1;                 // 1,024 addresses
+
+/// The first tunnel address tree operations assign (10.65.0.0).
+constexpr uint32_t kTreeTunnelFirst = kTunnelBase + tree::kTreeTunnelFirstOffset;
+
+/// True for a tunnel record in the range the tree assigns.
+bool is_tree_tunnel_ip(uint32_t ip) {
+    return ip >= kTreeTunnelFirst && ip < kTunnelBase + kTunnelSize;
+}
 
 /// Return the current Unix timestamp.
 uint64_t now_unix() {
@@ -354,9 +364,10 @@ void IPAMService::load_allocations() {
         }
     }
 
-    // Rebuild cursor positions by scanning existing allocations
+    // Rebuild cursor positions by scanning existing allocations. Tree-range
+    // records belong to the tree and never move the sequential cursor.
     for (const auto& [node_id, aset] : allocations_) {
-        if (aset.tunnel) {
+        if (aset.tunnel && !is_tree_tunnel_ip(parse_cidr(aset.tunnel->base_network).first)) {
             auto [ip, prefix] = parse_cidr(aset.tunnel->base_network);
             uint32_t offset = ip - kTunnelBase + 1;
             // Never go below 10 — .0-.9 reserved for system use
@@ -518,6 +529,7 @@ uint32_t IPAMService::sweep_expired_tunnel_leases() {
 
     for (const auto& [nid, aset] : allocations_) {
         if (!aset.tunnel) continue;
+        if (is_tree_tunnel_ip(parse_cidr(aset.tunnel->base_network).first)) continue;
         if (aset.tunnel->last_seen > 0 &&
             (now - aset.tunnel->last_seen) > timeout) {
             to_release.push_back(nid);
@@ -545,6 +557,49 @@ uint32_t IPAMService::sweep_expired_tunnel_leases() {
                       name(), released, timeout / 3600);
     }
     return released;
+}
+
+std::size_t IPAMService::sync_tree_tunnel_addresses(
+    const std::map<std::string, std::string>& assigned) {
+    std::lock_guard lock(mutex_);
+    std::size_t changed = 0;
+    for (const auto& [node_id, cidr] : assigned) {
+        uint32_t ip = 0;
+        uint8_t prefix = 0;
+        try {
+            std::tie(ip, prefix) = parse_cidr(cidr);
+        } catch (const std::exception&) {
+            continue;  // not an address record IPAM can hold
+        }
+        if (prefix != 32 || !is_tree_tunnel_ip(ip)) continue;
+        auto& aset = allocations_[node_id];
+        if (aset.tunnel && aset.tunnel->base_network == cidr) continue;
+        Allocation alloc;
+        alloc.block_type = BlockType::Tunnel;
+        alloc.base_network = cidr;
+        alloc.customer_node_id = node_id;
+        alloc.allocated_at = now_unix();
+        alloc.last_seen = 0;
+        aset.tunnel = alloc;
+        ++changed;
+    }
+    for (auto it = allocations_.begin(); it != allocations_.end();) {
+        auto& aset = it->second;
+        if (aset.tunnel && is_tree_tunnel_ip(parse_cidr(aset.tunnel->base_network).first)) {
+            const auto held = assigned.find(it->first);
+            if (held == assigned.end() || held->second != aset.tunnel->base_network) {
+                aset.tunnel.reset();
+                ++changed;
+            }
+        }
+        if (!aset.tunnel && !aset.private_subnet && !aset.shared_block && !aset.backbone) {
+            it = allocations_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (changed > 0) save_allocations();
+    return changed;
 }
 
 void IPAMService::update_tunnel_last_seen(std::string_view node_id) {
