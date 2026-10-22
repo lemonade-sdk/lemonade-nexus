@@ -210,6 +210,12 @@ void SecurityMeshService::arm_timer() {
     });
 }
 
+void SecurityMeshService::post(std::function<void()> work) {
+    asio::post(timer_.get_executor(), [this, work = std::move(work)]() {
+        if (running_) work();
+    });
+}
+
 void SecurityMeshService::broadcast_tree_op(TreeOpSubmitMsg message) {
     asio::post(timer_.get_executor(), [this, message = std::move(message)]() mutable {
         if (!running_) {

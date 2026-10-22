@@ -83,6 +83,30 @@ Which members may reach a Tier 3 node is decided by the permission tree, as for
 any endpoint. The role is set when the endpoint is created; a device that
 already joined keeps its role.
 
+Two device permissions control reachability. `read` lets a member see a
+device in the tree. `connect_private` or `connect_shared` lets a member
+connect to it. The mesh peer list (`GET /api/mesh/peers/{node_id}`) and the
+routing layer use the same rule: a device in the member's group is listed or
+resolved only when the member holds a connect permission on that device
+itself. `admin` includes both connect permissions. A grant on the group does
+not count, because permissions are not inherited. Relays in the group are
+listed with `read`.
+
+A client's server peer covers the whole tunnel plane, so the server's
+dataplane sees traffic that one endpoint sends to another. The server forwards
+it only when the source endpoint's key may connect to the destination
+endpoint: the destination is in the source's group, and the source key holds
+`connect_private`, `connect_shared`, or `admin` on the destination device
+itself. This is the rule the routing layer applies. Replies return without a
+grant in the other direction: a TCP segment that is not a bare SYN, and ICMP
+echo replies and errors. A device that may only be reached cannot open a TCP
+connection back, and a UDP reply needs a grant in its own direction. Relays
+and addresses outside the tunnel plane, such as backbone servers, are not
+restricted by this rule. An address in the plane that is not an endpoint or
+relay in the tree is dropped. The server rebuilds the rule off the packet path
+when the tree changes; a revoked grant stops forwarding within about one
+second.
+
 ## Epoch Authority
 
 After Genesis, the current committee finalizes four transitions in order at

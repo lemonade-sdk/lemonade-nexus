@@ -104,6 +104,19 @@ public:
         return authority_.has_value() ? &*authority_ : nullptr;
     }
 
+    /// The verified authority of `epoch`, or nullopt when this node has not
+    /// verified it. Every value comes from the authenticated chain: the
+    /// Genesis certificate for Epoch 1 and one verified finalized handoff per
+    /// later epoch, rebuilt from the durable chain at start. Replication
+    /// verifies a committed tree block's proof against the block epoch's
+    /// frozen vote keys with this. A read, never a grant. io thread.
+    [[nodiscard]] std::optional<VerifiedEpochAuthority> authority_for_epoch(EpochId epoch) const;
+
+    /// Unauthenticated evidence that the mesh reached `epoch` (for example a
+    /// replicated tree block that names it). A hint and nothing more: it can
+    /// prompt an authority chain request, never an answer. io thread.
+    void note_epoch_hint(EpochId epoch) { chain_hint_epoch_ = std::max(chain_hint_epoch_, epoch); }
+
     // --- ISecurityEvents ---
     void on_vote_sent(const Vote&, const NodeId&) override {}
     void on_certificate(const QuorumCertificate& certificate) override;
@@ -404,6 +417,9 @@ private:
     /// per epoch after that. Grants nothing; it is what everything else is
     /// verified against.
     std::optional<VerifiedEpochAuthority> authority_;
+    /// Every epoch authority this node verified, by epoch: the authenticated
+    /// chain from start() plus each authority installed since. Grants nothing.
+    std::map<EpochId, VerifiedEpochAuthority> authority_history_;
     /// The highest epoch any announcement or plan has named. A hint that can
     /// prompt a chain request; it never becomes state by itself.
     EpochId chain_hint_epoch_ = 0;

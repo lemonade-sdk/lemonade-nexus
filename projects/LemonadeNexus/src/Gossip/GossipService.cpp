@@ -62,6 +62,23 @@ constexpr auto kTombstoneRetention       = std::chrono::hours(24 * 30);
 constexpr std::size_t kSyncMaxEntriesPerRequest = 256;
 constexpr std::string_view kDnsSyncStream = "dns";
 constexpr std::string_view kAccountSyncStream = "account";
+// Committed tree log blocks, keyed by height under one shared origin:
+// consensus fixes their order, the stream only carries it (design A7).
+constexpr std::string_view kTreeSyncStream = "tree";
+constexpr std::string_view kTreeSyncOrigin = "tree-log";
+// One index entry per committed height. At this cap newer heights are not
+// offered; the warning names it.
+constexpr std::size_t kTreeReplicaMaxEntries = std::size_t{1} << 20;
+// Tree entries sent per catch-up request, and their byte budget. Entries go
+// out in height order, so the requester applies them as they arrive.
+constexpr std::size_t kTreeSyncMaxEntriesPerRequest = 16;
+constexpr std::size_t kTreeSyncMaxBytesPerRequest = 2u * 1024u * 1024u;
+// Chunk data bytes: one chunk is one datagram on the backbone.
+constexpr std::size_t kTreeChunkBytes = 16 * 1024;
+// Largest entry accepted, and the reassembly budget across all senders.
+constexpr std::size_t kTreeMaxEntryBytes = 16u * 1024u * 1024u;
+constexpr std::size_t kTreeAssemblyBudget = 32u * 1024u * 1024u;
+constexpr uint64_t kTreeAssemblyMaxAgeMs = 60'000;
 
 // Strip an optional "ed25519:" prefix to the bare base64 certificate form
 // used by the revocation list.
@@ -1156,7 +1173,8 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
         header.msg_type == GossipMsgType::DeltaResponse ||
         header.msg_type == GossipMsgType::SyncDigest ||
         header.msg_type == GossipMsgType::SyncRequest ||
-        header.msg_type == GossipMsgType::AccountEnvelopeSync;
+        header.msg_type == GossipMsgType::AccountEnvelopeSync ||
+        header.msg_type == GossipMsgType::TreeLogSync;
     if (via == Via::Public && backbone_only) {
         if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
                                std::chrono::steady_clock::now())) {
@@ -1225,6 +1243,9 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
         case GossipMsgType::AccountEnvelopeSync:
             handle_account_envelope_sync(from, sender_pubkey_b64, payload, payload_len, via);
             break;
+        case GossipMsgType::TreeLogSync:
+            handle_tree_log_sync(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
                           name(), static_cast<uint8_t>(header.msg_type),
@@ -1242,6 +1263,7 @@ void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
                                             const uint8_t* payload,
                                             std::size_t payload_len,
                                             const std::string& signer_pubkey, Via via) {
+    if (tree_transfer_retired_.load()) return;  // tree replication carries tree changes
     // Transport authorization before any transfer state is allocated: an
     // uncertified digest, or one off the signer's backbone address,
     // allocates nothing and triggers no request.
@@ -1279,6 +1301,7 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
                                            const uint8_t* payload,
                                            std::size_t payload_len,
                                            const std::string& signer_pubkey, Via via) {
+    if (tree_transfer_retired_.load()) return;  // tree replication carries tree changes
     // Data-returning path: same transport gate as digest and response.
     if (!backbone_sender_verified(sender, signer_pubkey, via, "DeltaRequest")) return;
 
@@ -1416,6 +1439,7 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
                                             const std::string& sender_pubkey,
                                             const uint8_t* payload,
                                             std::size_t payload_len, Via via) {
+    if (tree_transfer_retired_.load()) return;  // tree replication carries tree changes
     // Fail-closed gate, no tokens: state-mutating gossip ingress requires the
     // packet signer to be an enrolled peer with a root-signed certificate,
     // sending from its own backbone address. Gossip is Tier-2 transport and
@@ -1913,8 +1937,9 @@ void GossipService::on_gossip_tick() {
         }
     }
 
-    // Send digest outside of the lock to avoid holding it during I/O
-    do_send_digest(chosen);
+    // Send digest outside of the lock to avoid holding it during I/O. In ops
+    // mode the transfer pool is retired and sends nothing.
+    if (!tree_transfer_retired_.load()) do_send_digest(chosen);
 }
 
 // ---------------------------------------------------------------------------
@@ -3626,6 +3651,7 @@ std::vector<GossipPeer> GossipService::backbone_targets(bool tier1_only) const {
 sync::OriginReplica* GossipService::replica_for_stream(std::string_view stream) const {
     if (stream == kDnsSyncStream) return dns_replica_.get();
     if (stream == kAccountSyncStream) return account_replica_.get();
+    if (stream == kTreeSyncStream) return tree_replica_.get();
     return nullptr;
 }
 
@@ -3645,7 +3671,7 @@ void GossipService::send_sync_digests() {
     const std::size_t budget = network::VirtualNetService::max_udp_payload() -
                                kGossipHeaderSize - kGossipSignatureSize;
     const uint64_t round = ++sync_digest_round_;
-    for (const auto stream : {kDnsSyncStream, kAccountSyncStream}) {
+    for (const auto stream : {kDnsSyncStream, kAccountSyncStream, kTreeSyncStream}) {
         const auto* replica = replica_for_stream(stream);
         if (!replica) continue;
         const auto pages = sync::encode_digest_pages(stream, replica->digest(), round, budget);
@@ -3739,6 +3765,12 @@ void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
         const auto peer = find_peer_by_pubkey(sender_pubkey);
         if (!peer) return;
         sync_request_served_[rate_key] = now;
+        if (stream == kTreeSyncStream) {
+            for (const auto& req : decoded->second) {
+                if (req.origin == kTreeSyncOrigin) serve_tree_entries(*peer, req.since);
+            }
+            return;
+        }
         const auto entry_type = entry_type_for_stream(stream);
 
         // Entries are replayed with their origin signatures intact; the
@@ -3991,6 +4023,89 @@ nlohmann::json GossipService::dns_sync_status() const {
 
 nlohmann::json GossipService::account_sync_status() const {
     return sync_status(account_replica_.get());
+}
+
+nlohmann::json GossipService::tree_sync_status() const {
+    auto out = sync_status(tree_replica_.get());
+    out["enabled"] = tree_replica_ != nullptr;
+    out["transfer_pool_retired"] = tree_transfer_retired_.load();
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Tree log replication (backbone only, served by Tier 1)
+// ---------------------------------------------------------------------------
+
+void GossipService::enable_tree_stream(
+    std::function<std::optional<std::vector<uint8_t>>(uint64_t)> source,
+    std::function<void(std::vector<uint8_t>)> sink) {
+    tree_replica_ = std::make_unique<sync::OriginReplica>(std::string(kTreeSyncOrigin),
+                                                          kTreeReplicaMaxEntries);
+    tree_entry_source_ = std::move(source);
+    tree_entry_sink_ = std::move(sink);
+    tree_assembler_ =
+        std::make_unique<sync::EntryAssembler>(kTreeAssemblyBudget, kTreeAssemblyMaxAgeMs);
+}
+
+void GossipService::offer_tree_height(uint64_t height) {
+    if (!tree_replica_ || height == 0) return;
+    // The payload stays empty: entries are read from the tree log on demand,
+    // so the index costs a few dozen bytes per height.
+    const auto result = tree_replica_->offer(
+        {"h:" + std::to_string(height), std::string(kTreeSyncOrigin), height, height, false, {}});
+    if (result == sync::OfferResult::Full) {
+        spdlog::warn("[{}] tree sync index is full at {} heights; height {} is not offered",
+                     name(), kTreeReplicaMaxEntries, height);
+    }
+}
+
+void GossipService::serve_tree_entries(const GossipPeer& peer, uint64_t since) {
+    if (!tree_entry_source_) return;
+    std::size_t sent = 0;
+    std::size_t bytes = 0;
+    for (uint64_t height = since + 1; sent < kTreeSyncMaxEntriesPerRequest; ++height) {
+        const auto entry = tree_entry_source_(height);
+        if (!entry) break;  // past the head of this server's log
+        const auto chunks =
+            sync::encode_entry_chunks(kTreeSyncStream, height, *entry, kTreeChunkBytes);
+        if (chunks.empty()) {
+            spdlog::warn("[{}] tree log entry {} is too large to serve", name(), height);
+            break;
+        }
+        for (const auto& chunk : chunks) {
+            const auto packed = json::to_msgpack(chunk);
+            (void)send_backbone_packet(peer, GossipMsgType::TreeLogSync,
+                                       std::vector<uint8_t>(packed.begin(), packed.end()));
+        }
+        ++sent;
+        bytes += entry->size();
+        if (bytes >= kTreeSyncMaxBytesPerRequest) break;
+    }
+    spdlog::debug("[{}] served {} tree log entr{} after height {} to {}", name(), sent,
+                  sent == 1 ? "y" : "ies", since, peer.pubkey.substr(0, 12));
+}
+
+void GossipService::handle_tree_log_sync(const asio::ip::udp::endpoint& sender,
+                                         const std::string& sender_pubkey,
+                                         const uint8_t* payload, std::size_t payload_len,
+                                         Via via) {
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "TreeLogSync")) return;
+    // Entries are pulled only from Tier 1, as every catch-up stream is. The
+    // entry's own commit proof is what the receiver trusts, not the sender.
+    if (!is_tier1(sender_pubkey)) {
+        deny_sync(sender, sender_pubkey, "TreeLogSync", "tree entries are served by Tier 1 only");
+        return;
+    }
+    if (!tree_assembler_ || !tree_entry_sink_) return;
+    const auto doc = json::from_msgpack(payload, payload + payload_len, true, false);
+    const auto chunk = sync::decode_entry_chunk(doc, kTreeMaxEntryBytes);
+    if (!chunk || chunk->stream != kTreeSyncStream) {
+        spdlog::warn("[{}] malformed TreeLogSync from {}", name(), sender.address().to_string());
+        return;
+    }
+    if (auto entry = tree_assembler_->add(sender_pubkey, *chunk, steady_ms())) {
+        tree_entry_sink_(std::move(*entry));
+    }
 }
 
 nlohmann::json GossipService::sync_status(const sync::OriginReplica* replica) const {

@@ -761,7 +761,7 @@ TEST_F(TreeConsensusCommitTest, AnInterruptedApplyIsRestoredFromTheLog) {
         nodes.erase("beta");
         return nodes;
     }(), tc->log().state().committed));
-    nlohmann::json applied{{"format", 1}, {"height", 1}};
+    nlohmann::json applied{{"format", tree::kTreeLogFormatVersion}, {"height", 1}};
     std::ofstream(dir / "data" / "tree" / "log" / "applied.json") << applied.dump();
     close_tree();
 
@@ -785,11 +785,12 @@ TEST_F(TreeConsensusCommitTest, ATamperedLogEntryHalts) {
     EXPECT_FALSE(tc->healthy());
 }
 
-TEST_F(TreeConsensusCommitTest, AMissedBlockHaltsInsteadOfApplying) {
+TEST_F(TreeConsensusCommitTest, AMissedBlockWaitsForReplicationInsteadOfApplying) {
     commit_two_blocks();
     const auto digest = tree_svc->tree_digest();
     // A committed tree block whose previous root is not this log's head: the
-    // block before it never reached this server.
+    // block before it never reached this server. It is not applied, and the
+    // handler does not halt: replication brings the missing block.
     auto other = mirror;
     other.root = filled(0x13);
     const auto gap = tree_block(&blocks[4], 6,
@@ -799,9 +800,20 @@ TEST_F(TreeConsensusCommitTest, AMissedBlockHaltsInsteadOfApplying) {
     committed.proposal = gap.proposal;
     committed.payload = &*gap.payload;
     tc->on_committed(committed);
-    EXPECT_FALSE(tc->healthy());
+    EXPECT_TRUE(tc->healthy()) << tc->halt_reason();
+    EXPECT_TRUE(tc->status_summary().behind);
     EXPECT_EQ(tree_svc->tree_digest(), digest);
     EXPECT_EQ(tc->log().height(), 2u);
+}
+
+TEST_F(TreeConsensusTest, TheStateRootCoversTheCommittedIds) {
+    // Two states that differ only in their committed op ids have different
+    // roots, so a snapshot's ids are bound by the certified root.
+    tree::TreeChainState a = base_state();
+    tree::TreeChainState b = base_state();
+    b.committed.insert(std::string(64, 'a'), kNowSec);
+    EXPECT_NE(tree::chain_state_root(filled(1), filled(2), a),
+              tree::chain_state_root(filled(1), filled(2), b));
 }
 
 // =========================================================================
@@ -1065,4 +1077,344 @@ TEST_F(TreeConsensusTest, LocallyCommittedIdsSurviveARestart) {
     open_tree();
     EXPECT_EQ(tree_svc->validate_local_op(seal(root_op()), policy, kNowSec).refusal,
               TreeOpRefusal::StorageError);
+}
+
+// =========================================================================
+// Replication (design A7)
+// =========================================================================
+
+/// A second server that receives the source's log through replication.
+struct ReplicaServer {
+    fs::path dir;
+    std::unique_ptr<storage::FileStorageService> storage;
+    std::unique_ptr<tree::PermissionTreeService> tree;
+    std::unique_ptr<tree::TreeConsensus> tc;
+};
+
+class TreeReplicationTest : public TreeConsensusCommitTest {
+protected:
+    void SetUp() override {
+        TreeConsensusCommitTest::SetUp();
+        authority.network_id = network;
+        authority.epoch = kEpoch;
+        authority.members = members;
+        authority.vote_keys = vote_pubs;
+        authority.consensus_quorum = sec::constants::consensus_quorum(members.size());
+        lookup = [this](sec::EpochId epoch) -> std::optional<sec::VerifiedEpochAuthority> {
+            if (!authority_known || epoch != authority.epoch) return std::nullopt;
+            return authority;
+        };
+    }
+
+    void TearDown() override {
+        for (auto& r : replicas) close_replica(*r);
+        replicas.clear();
+        TreeConsensusCommitTest::TearDown();
+    }
+
+    ReplicaServer& make_replica(const std::string& name,
+                                tree::TreeLogMode mode = tree::TreeLogMode::Ops,
+                                const std::function<void(tree::PermissionTreeService&)>& seed = {}) {
+        auto r = std::make_unique<ReplicaServer>();
+        r->dir = dir / name;
+        open_replica(*r, mode, seed);
+        replicas.push_back(std::move(r));
+        return *replicas.back();
+    }
+
+    void open_replica(ReplicaServer& r, tree::TreeLogMode mode,
+                      const std::function<void(tree::PermissionTreeService&)>& seed = {}) {
+        r.storage = std::make_unique<storage::FileStorageService>(r.dir / "data");
+        r.storage->start();
+        r.tree = std::make_unique<tree::PermissionTreeService>(*r.storage, *crypto_svc);
+        r.tree->start();
+        if (seed) seed(*r.tree);
+        tree::TreeConsensusConfig config;
+        config.self = members[3];
+        config.network_id = network;
+        config.root_key = root_key;
+        config.wall_clock_ms = [this] { return now_ms; };
+        config.mode = mode;
+        r.tc = std::make_unique<tree::TreeConsensus>(std::move(config), *r.tree, *crypto_svc,
+                                                     r.dir / "data" / "tree" / "log");
+        r.tc->set_authority_source(lookup);
+        ASSERT_TRUE(r.tc->start()) << r.tc->halt_reason();
+    }
+
+    static void close_replica(ReplicaServer& r) {
+        r.tc.reset();
+        if (r.tree) r.tree->stop();
+        r.tree.reset();
+        if (r.storage) r.storage->stop();
+        r.storage.reset();
+    }
+
+    /// The source's entry at `height`, through the wire form a peer sends.
+    tree::TreeLogEntry wire_entry(uint64_t height) const {
+        const auto bytes = tc->encoded_entry(height);
+        EXPECT_TRUE(bytes.has_value()) << "height " << height;
+        const auto entry = tree::decode_replicated_entry(*bytes);
+        EXPECT_TRUE(entry.has_value());
+        return *entry;
+    }
+
+    sec::VerifiedEpochAuthority authority;
+    bool authority_known = true;
+    tree::EpochAuthorityLookup lookup;
+    std::vector<std::unique_ptr<ReplicaServer>> replicas;
+};
+
+TEST_F(TreeReplicationTest, AReplicaAppliesTheSameLogToTheSameDigest) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
+    // It serves the same tree: same nodes, same digest, same log root.
+    EXPECT_EQ(r.tc->log().height(), 2u);
+    EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
+    EXPECT_EQ(r.tree->tree_digest(), tree_svc->tree_digest());
+    ASSERT_TRUE(r.tree->get_node("beta").has_value());
+    EXPECT_EQ(r.tree->get_node("acme")->version, tree_svc->get_node("acme")->version);
+    EXPECT_EQ(r.tc->log().applied_height(), 2u);
+    // Replay stays refused on the replica: the committed ids came with the log.
+    EXPECT_TRUE(r.tc->log().state().committed.contains(tree::op_id_hex(acme)));
+    // The replica serves the entries it holds to the next server.
+    EXPECT_TRUE(r.tc->encoded_entry(2).has_value());
+    EXPECT_FALSE(r.tc->encoded_entry(3).has_value());
+    // A second copy changes nothing.
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Duplicate);
+}
+
+TEST_F(TreeReplicationTest, ARestartedReplicaReplaysItsLog) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    ASSERT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    ASSERT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
+    const auto digest = r.tree->tree_digest();
+    close_replica(r);
+    open_replica(r, tree::TreeLogMode::Ops);
+    EXPECT_EQ(r.tc->log().height(), 2u);
+    EXPECT_EQ(r.tree->tree_digest(), digest);
+    EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
+}
+
+TEST_F(TreeReplicationTest, AGapOrOutOfOrderEntryIsNotApplied) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    // Height 2 before height 1: held, not applied.
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Gap);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    EXPECT_TRUE(r.tree->nodes_snapshot().empty());
+    EXPECT_EQ(r.tc->status_summary().held, 1u);
+    // Height 0 is never an entry.
+    auto zero = wire_entry(1);
+    zero.height = 0;
+    EXPECT_EQ(r.tc->receive_replicated(zero), tree::ReplicaResult::Refused);
+    // An entry renumbered to fill the gap does not chain.
+    auto renumbered = wire_entry(2);
+    renumbered.height = 1;
+    EXPECT_NE(r.tc->receive_replicated(renumbered), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+}
+
+TEST_F(TreeReplicationTest, AHeldEntryAppliesOnceTheGapFills) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    ASSERT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Gap);
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->log().height(), 2u);
+    EXPECT_EQ(r.tc->status_summary().held, 0u);
+    EXPECT_EQ(r.tree->tree_digest(), tree_svc->tree_digest());
+}
+
+TEST_F(TreeReplicationTest, AForgedQcIsRefused) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    auto forged = wire_entry(1);
+    auto& signature = forged.commit["proof"]["certifying"]["signers"][0]["signature"];
+    auto bytes = crypto::from_base64(signature.get<std::string>());
+    bytes[0] ^= 0x01;
+    signature = crypto::to_base64(bytes);
+    EXPECT_EQ(r.tc->receive_replicated(forged), tree::ReplicaResult::Refused);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    EXPECT_TRUE(r.tree->nodes_snapshot().empty());
+    EXPECT_TRUE(r.tc->healthy());
+    EXPECT_FALSE(r.tc->status_summary().last_refusal.empty());
+
+    // A QC signed by keys outside the epoch is refused too.
+    sec::QuorumCertificate outsider = *sec::quorum_certificate_from_json(
+        wire_entry(1).commit["proof"]["certifying"]);
+    for (auto& signer : outsider.signers) {
+        const auto key = sec::make_epoch_vote_key(kEpoch, signer.node_id);
+        signer.signature = sec::sign_digest(
+            key, sec::vote_signing_digest(sec::constants::kConsensusRulesetVersion, network,
+                                          kEpoch, outsider.height, outsider.view,
+                                          outsider.proposal_digest, signer.node_id));
+    }
+    auto foreign = wire_entry(1);
+    foreign.commit["proof"]["certifying"] = sec::quorum_certificate_to_json(outsider);
+    EXPECT_EQ(r.tc->receive_replicated(foreign), tree::ReplicaResult::Refused);
+
+    // Without a proof, nothing is applied.
+    auto bare = wire_entry(1);
+    bare.commit.erase("proof");
+    EXPECT_EQ(r.tc->receive_replicated(bare), tree::ReplicaResult::Refused);
+
+    // The genuine entry still applies afterwards.
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+}
+
+TEST_F(TreeReplicationTest, AWrongEpochQcIsRefused) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    // The entry claims a later epoch than its certificates name.
+    auto relabelled = wire_entry(1);
+    relabelled.commit["epoch"] = kEpoch.underlying() + 1;
+    EXPECT_EQ(r.tc->receive_replicated(relabelled), tree::ReplicaResult::Refused);
+
+    // The replica's verified authority for this epoch holds other vote keys
+    // (for example the next epoch's): the proof does not verify under them.
+    std::map<sec::NodeId, crypto::Ed25519PublicKey> next_keys;
+    for (const auto& node : members) {
+        next_keys[node] = sec::make_epoch_vote_key(sec::EpochId(kEpoch.underlying() + 1), node).public_key;
+    }
+    authority.vote_keys = next_keys;
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Refused);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    authority.vote_keys = vote_pubs;
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+}
+
+TEST_F(TreeReplicationTest, ATamperedBatchIsRefused) {
+    commit_two_blocks();
+    auto& r = make_replica("tier2");
+    auto tampered = wire_entry(1);
+    tampered.batch.back() ^= 0x01;
+    EXPECT_EQ(r.tc->receive_replicated(tampered), tree::ReplicaResult::Refused);
+    // Recomputing the ops digest does not help: the certified header names
+    // the original one.
+    sec::BlockPayload payload;
+    payload.kind = sec::BlockPayloadKind::TreeBatch;
+    payload.body = tampered.batch;
+    tampered.ops_digest = sec::block_payload_digest(payload);
+    EXPECT_EQ(r.tc->receive_replicated(tampered), tree::ReplicaResult::Refused);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    EXPECT_TRUE(r.tree->nodes_snapshot().empty());
+}
+
+TEST_F(TreeReplicationTest, AnUnverifiedEpochIsHeldUntilTheChainReachesIt) {
+    commit_two_blocks();
+    authority_known = false;
+    auto& r = make_replica("tier2");
+    std::vector<sec::EpochId> hints;
+    r.tc->set_epoch_hint([&](sec::EpochId epoch) { hints.push_back(epoch); });
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::UnknownEpoch);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    ASSERT_EQ(hints.size(), 1u);
+    EXPECT_EQ(hints[0], kEpoch);
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Gap);
+    // The authority chain reaches the epoch; upkeep applies what was held.
+    authority_known = true;
+    r.tc->maintain();
+    EXPECT_EQ(r.tc->log().height(), 2u);
+    EXPECT_EQ(r.tree->tree_digest(), tree_svc->tree_digest());
+}
+
+TEST_F(TreeReplicationTest, ALaggingServerCatchesUpAndResumesFromCommits) {
+    commit_two_blocks();
+    auto& r = make_replica("lagging");
+    // The second block commits while the first never reached this server.
+    sec::CommittedPayload committed;
+    committed.proposal = blocks[1].proposal;
+    committed.payload = &*blocks[1].payload;
+    committed.proof = service->commit_proof(blocks[1].digest);
+    committed.commit.epoch = kEpoch;
+    r.tc->on_committed(committed);
+    EXPECT_TRUE(r.tc->healthy());
+    EXPECT_TRUE(r.tc->status_summary().behind);
+    EXPECT_EQ(r.tc->log().height(), 0u);
+
+    // Replication brings the first block; the next commit then chains.
+    ASSERT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    r.tc->on_committed(committed);
+    EXPECT_FALSE(r.tc->status_summary().behind);
+    EXPECT_EQ(r.tc->log().height(), 2u);
+    EXPECT_EQ(r.tree->tree_digest(), tree_svc->tree_digest());
+    // Its own copy of block 2 carries the proof, so peers can verify it.
+    const auto own = r.tc->log().read_entry(2);
+    ASSERT_TRUE(own.has_value());
+    EXPECT_TRUE(own->commit.contains("proof"));
+}
+
+TEST_F(TreeReplicationTest, ACertifiedEntryThatDoesNotChainIsNotApplied) {
+    commit_two_blocks();
+    // This server's log started from another tree, so the mesh's first entry
+    // can never apply to it. It refuses the entry and keeps its own state.
+    auto& r = make_replica("divergent", tree::TreeLogMode::Ops,
+                           [this](tree::PermissionTreeService& t) {
+                               ASSERT_TRUE(t.bootstrap_root(tree::make_root_node(root_key)));
+                           });
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Refused);
+    EXPECT_TRUE(r.tc->healthy());
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    EXPECT_NE(r.tc->status_summary().last_refusal.find("does not chain"), std::string::npos);
+    EXPECT_TRUE(r.tree->get_node("root").has_value());  // the last state stays served
+}
+
+TEST_F(TreeReplicationTest, AReadOnlyLogLeavesTheTreeToItsLocalWrites) {
+    commit_two_blocks();
+    auto& r = make_replica("readonly", tree::TreeLogMode::ReadOnly,
+                           [this](tree::PermissionTreeService& t) {
+                               ASSERT_TRUE(t.bootstrap_root(tree::make_root_node(root_key)));
+                           });
+    const auto local = r.tree->tree_digest();
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
+    EXPECT_EQ(r.tree->tree_digest(), local);
+    EXPECT_EQ(r.tc->log().applied_height(), 0u);
+    EXPECT_EQ(r.tc->submit(seal(root_op())).verdict.refusal, TreeOpRefusal::Unavailable);
+}
+
+TEST_F(TreeReplicationTest, ASnapshotWithEditedCommittedIdsIsNotUsed) {
+    // Build a log past the first snapshot height directly through TreeLog.
+    close_tree();
+    const auto log_dir = dir / "snapshot-log";
+    tree::TreeLog log(log_dir);
+    ASSERT_EQ(log.open({}), tree::TreeLog::OpenResult::Ok);
+    tree::TreeChainState state = log.state();
+    for (uint64_t h = 1; h <= tree::kTreeLogSnapshotInterval; ++h) {
+        TreeOp op = h == 1 ? seal(root_op())
+                           : seal(create_op(customer("c" + std::to_string(h), root_key), root_key));
+        TreeBatch batch{{op}};
+        tree::TreeLogEntry entry;
+        entry.height = h;
+        entry.block_time_ms = now_ms + h;
+        entry.batch = *tree::encode_tree_batch(batch);
+        entry.ops_digest = sec::block_payload_digest(payload_of(batch));
+        entry.previous_root = state.root;
+        auto next = state;
+        const auto result =
+            tree::apply_certified_batch(next, batch, entry.block_time_ms, entry.ops_digest);
+        ASSERT_TRUE(result.verdict.ok()) << result.verdict.reason;
+        entry.tree_digest = result.tree_digest;
+        entry.state_root = result.root;
+        ASSERT_TRUE(log.append(entry, next));
+        state = std::move(next);
+    }
+    const auto snapshot = log_dir / ("snapshot-" + std::to_string(tree::kTreeLogSnapshotInterval) +
+                                     ".json");
+    ASSERT_TRUE(fs::exists(snapshot));
+    auto doc = nlohmann::json::parse(std::ifstream(snapshot));
+    ASSERT_FALSE(doc["committed"].empty());
+    doc["committed"].erase(doc["committed"].begin());
+    std::ofstream(snapshot) << doc.dump();
+
+    // The edited snapshot is not used: the log replays from the base instead
+    // and keeps every committed id.
+    tree::TreeLog reopened(log_dir);
+    ASSERT_EQ(reopened.open({}), tree::TreeLog::OpenResult::Ok);
+    EXPECT_EQ(reopened.height(), tree::kTreeLogSnapshotInterval);
+    EXPECT_EQ(reopened.state().committed.size(), state.committed.size());
+    EXPECT_EQ(reopened.state().root, state.root);
 }

@@ -9,11 +9,14 @@
 // block time comes from the block header, never from a local clock.
 //
 // State roots form a hash chain over the tree log:
-//   root(n) = H(kTreeStateRootDomain, root(n-1), ops_digest(n), tree_digest(n))
-// where tree_digest(n) is compute_tree_digest of the tree after block n, and
-// root(0) is base_state_root(tree_digest(0)). A replica that missed a tree
-// block cannot match the next block's previous root, so it never applies a
-// later block on top of a gap.
+//   root(n) = H(kTreeStateRootDomain, root(n-1), ops_digest(n), tree_digest(n),
+//               committed_digest(n))
+// where tree_digest(n) is compute_tree_digest of the tree after block n,
+// committed_digest(n) is compute_committed_digest of the committed op ids
+// after block n, and root(0) is base_state_root(tree_digest(0)). A replica
+// that missed a tree block cannot match the next block's previous root, so it
+// never applies a later block on top of a gap. The root covers the committed
+// ids, so a snapshot's ids are checked against a certified root too.
 
 #include <LemonadeNexus/Security/Policy/SecurityTypes.hpp>
 #include <LemonadeNexus/Tree/TreeBatch.hpp>
@@ -29,8 +32,9 @@ namespace nexus::crypto { class SodiumCryptoService; }
 
 namespace nexus::tree {
 
-inline constexpr std::string_view kTreeStateRootDomain = "lemonade-nexus/tree-state-root:v1";
+inline constexpr std::string_view kTreeStateRootDomain = "lemonade-nexus/tree-state-root:v2";
 inline constexpr std::string_view kTreeBaseRootDomain = "lemonade-nexus/tree-base-root:v1";
+inline constexpr std::string_view kTreeCommittedIdsDomain = "lemonade-nexus/tree-committed-ids:v1";
 
 /// Most a tree block time may differ from a replica's own clock, in either
 /// direction, before the replica withholds its vote (design A4).
@@ -48,10 +52,22 @@ struct TreeChainState {
     security::Digest root{};
 };
 
-/// root(n) from root(n-1), the block's ops digest, and the tree digest after it.
+/// Deterministic digest of a committed op id set: the count, then every id
+/// with its signed time, in id order.
+[[nodiscard]] security::Digest compute_committed_digest(const CommittedOpIds& committed);
+
+/// root(n) from root(n-1), the block's ops digest, the tree digest after it,
+/// and the committed id digest after it.
 [[nodiscard]] security::Digest tree_state_root(const security::Digest& previous_root,
                                                const security::Digest& ops_digest,
-                                               const security::Digest& tree_digest);
+                                               const security::Digest& tree_digest,
+                                               const security::Digest& committed_digest);
+
+/// The state root of `state` after a block with `ops_digest` on top of
+/// `previous_root`: tree_state_root over its tree and committed ids.
+[[nodiscard]] security::Digest chain_state_root(const security::Digest& previous_root,
+                                                const security::Digest& ops_digest,
+                                                const TreeChainState& state);
 
 /// root(0) for a log that starts from a tree with digest `tree_digest`.
 [[nodiscard]] security::Digest base_state_root(const security::Digest& tree_digest);

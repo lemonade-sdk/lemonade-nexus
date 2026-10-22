@@ -24,7 +24,8 @@ struct InitResult {
 [[nodiscard]] std::optional<InitResult> ensure_initialized(const ServerConfig& config);
 
 /// Run any CLI-mode flag (--print-tpm-ak, --first-run, --enroll-server,
-/// --revoke-server, --add-manifest, --onboard-server) and the uninitialized-
+/// --revoke-server, --add-manifest, --onboard-server, --sign-tree-merge,
+/// --install-tree-merge) and the uninitialized-
 /// data-dir gate. Returns the process exit code when the invocation was a CLI
 /// mode (or the gate failed); nullopt when the normal server should start.
 /// `seal_backend` unseals the gossip identity for a mode that signs with it
