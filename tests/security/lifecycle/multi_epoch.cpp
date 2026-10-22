@@ -316,6 +316,80 @@ TEST_F(MultiEpochMesh, AReadyCandidateThatRefusesTheDkgIsReplaced) {
     EXPECT_EQ(members.front()->driver->current_epoch(), 3u);
 }
 
+// Lost key-generation datagrams at an epoch boundary are re-sent, so the
+// ceremony completes in the first attempt instead of stalling until the
+// compiled window replaces it. Before the re-send cadence, only the founding
+// DKG re-sent; a transition DKG lost its round-2 packages for good.
+TEST_F(MultiEpochMesh, LostTransitionDkgPackagesAreResentWithoutAStall) {
+    bootstrap();
+    run_until_committed(1);
+    introduce_reserves();
+
+    const std::vector<Node*> members(founders.begin(), founders.end());
+    std::vector<Node*> pool = members;
+    pool.push_back(reserves[0]);
+    observe(members, pool, 1);
+    run_to_plan(members);
+    const auto selected = selected_nodes(*members.front());
+    ASSERT_FALSE(selected.empty());
+    wait_for_keys(members, selected, 2);
+
+    // Lose a burst of the ceremony's traffic in both rounds.
+    mesh.drop_next[SecurityMessageKind::DkgBroadcast] = 6;
+    mesh.drop_next[SecurityMessageKind::DkgPairwise] = 10;
+
+    // Every participant ticks, the promoted reserve included, as every
+    // production server does: its own re-send cadence must run too.
+    std::vector<Node*> participants = members;
+    for (Node* node : selected) {
+        if (std::find(participants.begin(), participants.end(), node) == participants.end()) {
+            participants.push_back(node);
+        }
+    }
+    const uint64_t started_ms = mesh.now_ms;
+    bool activated = false;
+    for (int i = 0; i < 2500 && !activated; ++i) {
+        step(1, participants);
+        answer_final_challenges();
+        activated = std::all_of(selected.begin(), selected.end(), [](Node* n) {
+            return n->driver->current_epoch() == 2u;
+        });
+    }
+    ASSERT_TRUE(activated) << "epoch 2 did not activate";
+    EXPECT_EQ(mesh.drop_next[SecurityMessageKind::DkgBroadcast], 0) << "nothing was lost";
+    EXPECT_EQ(mesh.drop_next[SecurityMessageKind::DkgPairwise], 0) << "nothing was lost";
+    EXPECT_LT(mesh.now_ms - started_ms, constants::kDkgStallSeconds * 1000)
+        << "the ceremony waited out the stall window";
+    EXPECT_EQ(latest_plan().attempt, 0u) << "a replacement attempt ran";
+}
+
+// The founding ceremony survives lost key-generation packages too. A founder
+// that finished used to fall silent at once, so a slower founder missing one
+// of its packages waited out the stall window and the founding split (seen
+// on r17). Finished founders keep re-sending until Epoch 1 activates.
+TEST_F(MultiEpochMesh, LostFoundingDkgPackagesAreResentWithoutAStall) {
+    collect_founding();
+    mesh.drop_next[SecurityMessageKind::DkgBroadcast] = 4;
+    mesh.drop_next[SecurityMessageKind::DkgPairwise] = 8;
+    run_founding_eligibility();
+
+    std::vector<Node*> online = founders;
+    online.push_back(genesis_node);
+    const uint64_t started_ms = mesh.now_ms;
+    bool active = false;
+    for (int i = 0; i < 1400 && !active; ++i) {
+        step(1, online);
+        active = std::all_of(founders.begin(), founders.end(), [](Node* n) {
+            return n->driver->phase() == DriverPhase::Active && n->driver->current_epoch() == 1u;
+        });
+    }
+    ASSERT_TRUE(active) << "Epoch 1 did not activate";
+    EXPECT_EQ(mesh.drop_next[SecurityMessageKind::DkgBroadcast], 0) << "nothing was lost";
+    EXPECT_EQ(mesh.drop_next[SecurityMessageKind::DkgPairwise], 0) << "nothing was lost";
+    EXPECT_LT(mesh.now_ms - started_ms, constants::kDkgStallSeconds * 1000)
+        << "the founding waited out the stall window";
+}
+
 // A boundary that outlives the final-attestation freshness window renews the
 // exchange instead of deadlocking: the members re-challenge exactly the
 // nodes whose proof aged out, the answers arrive through the ordinary

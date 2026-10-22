@@ -625,6 +625,13 @@ RouteResult SecurityRouter::route_dkg(DkgMessage& message) {
         for (const auto& package : pairwise) {
             (void)send_sealed_dkg(package);
         }
+        // Round-2 packages held while this node was still in round 1 count
+        // now; they may already complete the session.
+        if (dkg->finish()) {
+            events_.on_dkg_complete(message.target_epoch);
+        } else if (dkg->phase() == DkgPhase::Failed) {
+            events_.on_dkg_failed(dkg->failure(), dkg->culprit());
+        }
     }
     return delivered();
 }

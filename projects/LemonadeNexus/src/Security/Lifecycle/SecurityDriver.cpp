@@ -416,6 +416,7 @@ void SecurityDriver::tick(uint64_t now_ms) {
 
     maybe_request_chain();
     run_bootstrap_liveness(now_ms);
+    maybe_resend_dkg(now_ms);
 
     if (phase_ == DriverPhase::PendingNextEpoch && adoption_.has_value() &&
         !adoption_->state_synced &&
@@ -468,6 +469,42 @@ void SecurityDriver::tick(uint64_t now_ms) {
         maybe_renew_final_attestation();
         run_epoch_cadence(now_ms);
     }
+}
+
+void SecurityDriver::maybe_resend_dkg(uint64_t now_ms) {
+    DkgSession* dkg = runtime_.authority().dkg();
+    const bool live = dkg != nullptr && dkg->phase() != DkgPhase::Failed;
+    if (live && phase_ == DriverPhase::FoundingDkg) {
+        return;  // run_bootstrap_liveness re-emits the running founding session
+    }
+    if (!live && dkg_outbox_.has_value() &&
+        now_ms - dkg_outbox_->kept_ms >= constants::kDkgStallSeconds * 2000) {
+        dkg_outbox_.reset();  // nothing activated in time; stop talking
+    }
+    if (!live && !dkg_outbox_.has_value()) {
+        return;
+    }
+    if (now_ms - last_dkg_resend_ms_ < constants::kDkgResendMs) {
+        return;
+    }
+    last_dkg_resend_ms_ = now_ms;
+    const EpochId epoch = live ? dkg->target_epoch() : dkg_outbox_->epoch;
+    const auto round1 = live ? dkg->own_round1() : dkg_outbox_->round1;
+    const auto& round2 = live ? dkg->round2_cached() : dkg_outbox_->round2;
+    if (round1.has_value()) {
+        (void)router_.broadcast(router_.compose(SecurityMessageKind::DkgBroadcast, *round1, epoch));
+    }
+    for (const auto& package : round2) {
+        (void)router_.send_sealed_dkg(package);
+    }
+}
+
+std::optional<DkgResult> SecurityDriver::take_dkg_result_keeping_outbox() {
+    if (DkgSession* dkg = runtime_.authority().dkg(); dkg != nullptr && dkg->complete()) {
+        dkg_outbox_ = DkgOutbox{dkg->target_epoch(), dkg->own_round1(), dkg->round2_cached(),
+                                now_ms_};
+    }
+    return runtime_.authority().take_dkg_result();
 }
 
 void SecurityDriver::maybe_fail_stalled_dkg(uint64_t now_ms) {
@@ -891,7 +928,7 @@ void SecurityDriver::start_founding_dkg() {
 }
 
 void SecurityDriver::on_dkg_complete(EpochId target) {
-    pending_dkg_ = runtime_.authority().take_dkg_result();
+    pending_dkg_ = take_dkg_result_keeping_outbox();
     if (!pending_dkg_.has_value()) {
         return;
     }
@@ -1145,6 +1182,7 @@ void SecurityDriver::on_bootstrap_certificate(const BootstrapCertificate& certif
         set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
         return;
     }
+    dkg_outbox_.reset();
     set_phase(DriverPhase::Active, "epoch 1 adopted and active");
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;
@@ -1945,6 +1983,7 @@ void SecurityDriver::broadcast_proof(SecurityMessageKind kind, SecurityBody body
 
 void SecurityDriver::abandon_boundary(const char* reason) {
     spdlog::info("[security] boundary abandoned: {}", reason);
+    dkg_outbox_.reset();
     plan_.reset();
     readiness_.reset();
     dkg_authorized_ms_ = 0;
@@ -1964,6 +2003,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
     if (transition == nullptr) {
         return;
     }
+    dkg_outbox_.reset();
     const EpochId old_epoch = epochs->current().id;
     const EpochId to_epoch = transition->to_epoch;
     const Digest dkg_digest = transition->dkg_transcript_digest;
@@ -2413,7 +2453,7 @@ void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message)
     // arriving before the ceremony finished proves an epoch this node cannot
     // serve yet.
     if (!pending_dkg_.has_value()) {
-        pending_dkg_ = runtime_.authority().take_dkg_result();
+        pending_dkg_ = take_dkg_result_keeping_outbox();
     }
     if (!pending_dkg_.has_value()) {
         return;
@@ -2458,6 +2498,7 @@ void SecurityDriver::on_epoch_handoff_proof(const EpochHandoffProofMsg& message)
         set_phase(DriverPhase::Failed, "durable eligibility state is corrupt");
         return;
     }
+    dkg_outbox_.reset();
     set_phase(DriverPhase::Active, "finalized handoff verified; the new epoch role begins");
     epoch_started_ms_ = now_ms_;
     last_progress_ms_ = now_ms_;

@@ -141,13 +141,19 @@ public:
     [[nodiscard]] std::optional<DkgMessage> own_round1() const;
     [[nodiscard]] const std::vector<DkgMessage>& round2_cached() const { return round2_cache_; }
 
-    /// Accepts one round-2 package addressed to this participant.
+    /// Accepts one round-2 package addressed to this participant. A package
+    /// that arrives while this participant is still in round 1 (or not yet
+    /// started) passes the same binding checks and is held, one per sender,
+    /// until round 1 completes: a faster peer's round 2 must not be lost to
+    /// arrival order. Two different packages from one sender are
+    /// equivocation in either case.
     [[nodiscard]] DkgFailure receive_pairwise(const DkgMessage& message);
 
     /// Runs FROST part 3 once every round-2 package is present.
     [[nodiscard]] bool finish();
 
     [[nodiscard]] bool complete() const { return phase_ == DkgPhase::Complete; }
+    [[nodiscard]] EpochId target_epoch() const { return config_.target_epoch; }
     [[nodiscard]] DkgPhase phase() const { return phase_; }
     [[nodiscard]] DkgFailure failure() const { return failure_; }
 
@@ -185,6 +191,9 @@ private:
 
     std::map<NodeId, std::vector<uint8_t>> round1_payloads_;
     std::map<NodeId, std::vector<uint8_t>> round2_payloads_;
+    // Round-2 packages received before round 1 completed; merged into
+    // round2_payloads_ when this participant enters round 2.
+    std::map<NodeId, std::vector<uint8_t>> early_round2_;
 
     std::optional<DkgResult> result_;
 };

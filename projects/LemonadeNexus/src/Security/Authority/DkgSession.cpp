@@ -203,6 +203,9 @@ std::vector<DkgMessage> DkgSession::round2_messages() {
     }
     round2_ = std::move(*round2.value);
     phase_ = DkgPhase::Round2;
+    // Packages that arrived early were checked on receipt; they count now.
+    round2_payloads_.merge(early_round2_);
+    early_round2_.clear();
 
     std::vector<DkgMessage> messages;
     for (const auto& [recipient_index, payload] : round2_.packages_for_recipients()) {
@@ -221,7 +224,8 @@ std::optional<DkgMessage> DkgSession::own_round1() const {
 }
 
 DkgFailure DkgSession::receive_pairwise(const DkgMessage& message) {
-    if (phase_ != DkgPhase::Round2) {
+    const bool early = phase_ == DkgPhase::Created || phase_ == DkgPhase::Round1;
+    if (!early && phase_ != DkgPhase::Round2) {
         return DkgFailure::WrongPhase;
     }
     if (const auto failure = check_binding(message, DkgRound::Round2Pairwise);
@@ -234,15 +238,16 @@ DkgFailure DkgSession::receive_pairwise(const DkgMessage& message) {
     if (message.sender == config_.self) {
         return DkgFailure::UnknownSender;
     }
-    const auto existing = round2_payloads_.find(message.sender);
-    if (existing != round2_payloads_.end()) {
+    auto& held = early ? early_round2_ : round2_payloads_;
+    const auto existing = held.find(message.sender);
+    if (existing != held.end()) {
         if (existing->second == message.payload) {
             return DkgFailure::DuplicateMessage;
         }
         fail(DkgFailure::Equivocation, message.sender);
         return DkgFailure::Equivocation;
     }
-    round2_payloads_[message.sender] = message.payload;
+    held[message.sender] = message.payload;
     return DkgFailure::None;
 }
 
