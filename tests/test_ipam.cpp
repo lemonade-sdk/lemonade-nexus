@@ -183,3 +183,36 @@ TEST_F(IPAMTest, AllocationsSurviveRestart) {
 TEST_F(IPAMTest, ServiceName) {
     EXPECT_EQ(ipam->service_name(), "IPAMService");
 }
+
+// --- Tree-derived tunnel addresses (tree operations on) ---
+
+TEST_F(IPAMTest, TreeAddressesAreRecordedAndFollowTheTree) {
+    const auto server = ipam->allocate_tunnel_ip("server-a");  // IPAM's own range
+    EXPECT_EQ(ipam->sync_tree_tunnel_addresses({{"d1", "10.65.0.7/32"},
+                                                {"d2", "10.70.1.2/32"},
+                                                {"legacy", "10.64.0.99/32"}}),
+              2u);  // the IPAM-range address is not the tree's to record
+    ASSERT_TRUE(ipam->get_allocation("d1").has_value());
+    EXPECT_EQ(ipam->get_allocation("d1")->tunnel->base_network, "10.65.0.7/32");
+    EXPECT_FALSE(ipam->get_allocation("legacy").has_value());
+    EXPECT_TRUE(ipam->check_conflict("10.65.0.7/32"));
+
+    // Nothing changed: nothing is written.
+    EXPECT_EQ(ipam->sync_tree_tunnel_addresses({{"d1", "10.65.0.7/32"}, {"d2", "10.70.1.2/32"}}),
+              0u);
+    // d2 left the tree and d1 moved: the records follow, and IPAM's own
+    // allocations stay.
+    EXPECT_EQ(ipam->sync_tree_tunnel_addresses({{"d1", "10.65.0.8/32"}}), 2u);
+    EXPECT_FALSE(ipam->get_allocation("d2").has_value());
+    EXPECT_EQ(ipam->get_allocation("d1")->tunnel->base_network, "10.65.0.8/32");
+    EXPECT_EQ(ipam->get_allocation("server-a")->tunnel->base_network, server.base_network);
+
+    // After a restart the records come back, and the sequential cursor stays
+    // in IPAM's range instead of jumping past the tree's addresses.
+    ipam->stop();
+    ipam = std::make_unique<ipam::IPAMService>(*storage);
+    ipam->start();
+    EXPECT_EQ(ipam->get_allocation("d1")->tunnel->base_network, "10.65.0.8/32");
+    const auto next = ipam->allocate_tunnel_ip("server-b");
+    EXPECT_EQ(next.base_network.rfind("10.64.", 0), 0u) << next.base_network;
+}

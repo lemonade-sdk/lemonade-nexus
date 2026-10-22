@@ -85,6 +85,10 @@ struct ApiContext {
     /// a consensus submitter (TreeConsensus::status); unset, the route answers
     /// 404 for every op id.
     std::function<std::optional<tree::TreeOpOutcome>(const std::string&)> tree_op_status;
+    /// Answers GET /api/tree/sync with the tree log and its replication
+    /// state. Set when the tree log runs (read-only or ops mode); unset, the
+    /// route answers 404.
+    std::function<nlohmann::json()>   tree_log_status;
 };
 
 // ---------------------------------------------------------------------------

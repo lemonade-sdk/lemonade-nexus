@@ -36,20 +36,41 @@ void finish_block(TreeChainState& next, uint64_t block_time_ms,
     next.committed.prune_signed_before(committed_id_cutoff(block_time_ms / 1000));
     next.last_block_time_ms = block_time_ms;
     out.tree_digest = compute_tree_digest(next.nodes);
-    out.root = tree_state_root(next.root, ops_digest, out.tree_digest);
+    out.root = tree_state_root(next.root, ops_digest, out.tree_digest,
+                               compute_committed_digest(next.committed));
     next.root = out.root;
 }
 
 }  // namespace
 
+security::Digest compute_committed_digest(const CommittedOpIds& committed) {
+    const auto sorted = committed.sorted();
+    security::CanonicalEncoder enc(kTreeCommittedIdsDomain);
+    enc.add_u64(sorted.size());
+    for (const auto& [id, signed_at] : sorted) {
+        enc.add_string(id);
+        enc.add_u64(signed_at);
+    }
+    return enc.digest();
+}
+
 security::Digest tree_state_root(const security::Digest& previous_root,
                                  const security::Digest& ops_digest,
-                                 const security::Digest& tree_digest) {
+                                 const security::Digest& tree_digest,
+                                 const security::Digest& committed_digest) {
     security::CanonicalEncoder enc(kTreeStateRootDomain);
     enc.add_bytes(previous_root);
     enc.add_bytes(ops_digest);
     enc.add_bytes(tree_digest);
+    enc.add_bytes(committed_digest);
     return enc.digest();
+}
+
+security::Digest chain_state_root(const security::Digest& previous_root,
+                                  const security::Digest& ops_digest,
+                                  const TreeChainState& state) {
+    return tree_state_root(previous_root, ops_digest, compute_tree_digest(state.nodes),
+                           compute_committed_digest(state.committed));
 }
 
 security::Digest base_state_root(const security::Digest& tree_digest) {

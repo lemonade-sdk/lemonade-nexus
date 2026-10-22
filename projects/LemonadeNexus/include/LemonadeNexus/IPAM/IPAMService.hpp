@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -76,6 +77,19 @@ public:
 
     /// Update last_seen for a tunnel client (call on heartbeat/join).
     void update_tunnel_last_seen(std::string_view node_id);
+
+    // --- Tree-derived tunnel addresses (tree operations on) ---
+
+    /// Make the tunnel records in the tree's range (10.65.0.0 and above, see
+    /// tree::kTreeTunnelFirstOffset) equal `assigned` (node id -> "a.b.c.d/32"
+    /// as the tree holds it): add or update a record for each, and remove
+    /// every tree-range record whose node no longer holds that address. The
+    /// tree decides these addresses; the records let IPAM report them and
+    /// refuse a conflicting block. Records below the tree range are not
+    /// touched. Tree-range records never expire through the lease sweep and
+    /// never move the sequential cursor. Persists only when something
+    /// changed. Returns the number of records added, updated, or removed.
+    std::size_t sync_tree_tunnel_addresses(const std::map<std::string, std::string>& assigned);
 
     /// Set callback for allocation changes (gossip broadcast).
     using BackboneCallback = std::function<void(const BackboneAllocationDelta&)>;

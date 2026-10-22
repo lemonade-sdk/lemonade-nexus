@@ -160,14 +160,19 @@ Candidate-side:
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--tree-ops` | `SP_TREE_OPS` (any value) | `tree_ops_enabled` | off | Order tree writes through Tier 1 consensus and apply them after commit (Phase 2) |
+| `--tree-ops` | `SP_TREE_OPS` (any value) | `tree_ops_enabled` | off | Ops mode: order tree writes through Tier 1 consensus, apply them after commit, and replicate the tree log |
+| `--tree-log` | `SP_TREE_LOG` (any value) | `tree_log_enabled` | off | Read-only mode: build and replicate the tree log; tree writes keep the direct paths. Ignored when `tree_ops_enabled` is set |
 
-This setting is experimental. It implements Phases 1 and 2 of
+These settings are experimental. They implement Phases 1 to 3 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
-Keep it off in production. With the setting off, no tree operation is built,
-proposed, or applied, and the tree write paths are unchanged.
+Keep them off in production. With both off (the default), no tree operation
+is built, proposed, applied, or replicated, the tree write paths are
+unchanged, and the gossip record transfer pool runs as before. Read-only mode
+is the first release of the migration; the
+[Tree Merge Ceremony](Tree-Merge-Ceremony) runbook moves a mesh from
+read-only mode to ops mode.
 
-With the setting on:
+With ops mode on:
 
 - Every tree write builds one signed tree operation (`TreeOp`). The routes are
   `POST /api/join`, `/api/tree/delta`, `/api/tree/node`,
@@ -221,14 +226,53 @@ With the setting on:
 - Committed operation ids are persisted (`data/tree/committed-ops.json`, and
   the tree log under consensus), so replay stays refused after a restart.
 - **State root.** A tree block's `proposed_state_root` is
-  `H(previous_root ‖ ops_digest ‖ tree_digest)`, where `previous_root` is the
-  root of the previous tree block and `tree_digest` covers every node's
-  canonical encoding and version. The tree log is therefore a hash chain: a
-  server that missed a tree block cannot match the next one.
+  `H(previous_root ‖ ops_digest ‖ tree_digest ‖ committed_digest)`, where
+  `previous_root` is the root of the previous tree block, `tree_digest` covers
+  every node's canonical encoding and version, and `committed_digest` covers
+  the committed operation ids. The tree log is therefore a hash chain: a
+  server that missed a tree block cannot match the next one. Tree log format
+  2 uses this root; a format 1 log (from an earlier build) does not open, and
+  the server halts tree operations until the log is moved aside.
+- **Replication.** Every server runs the `"tree"` sync stream over the
+  backbone, with the same digest and catch-up exchange as DNS records and
+  account envelopes. Entries are committed log blocks keyed by height. Tier 1
+  servers serve them; any certified server pulls them from Tier 1 only. An
+  entry larger than one datagram travels as 16 KiB chunks. Consensus fixes
+  the order; the stream only carries it.
+- **Verification.** A receiving server applies an entry only when it is the
+  next height, its commit proof verifies under the frozen vote keys and
+  quorum of the epoch the entry names, and it chains to the server's own log
+  (`previous_root`). The server takes each epoch's vote keys from its own
+  verified authority chain (the Genesis certificate, then every finalized
+  handoff), so it follows the chain across epochs. An entry from an epoch the
+  server has not verified yet is held (at most 64 entries) until the chain
+  reaches it. An entry that does not verify or does not chain is refused and
+  logged, and nothing after it applies.
+- **Tier 2 servers** apply the same log and serve the same tree. They never
+  vote.
+- **Lagging servers.** A Tier 1 server that missed a tree block does not
+  halt. It applies nothing out of order, catches up through replication, and
+  resumes with the next committed block.
+- **Transfer pool.** In ops mode the gossip record transfer pool no longer
+  carries tree records (`Digest`, `DeltaRequest`, and `DeltaResponse` are
+  dropped), because the committed log does.
+- **IPAM records.** Each committed block updates the tunnel records in
+  `data/ipam/allocations.json` for tree-derived addresses (`10.65.0.0` and
+  above). These records never expire through the lease sweep and never move
+  IPAM's sequential cursor.
+- **Status.** `GET /api/tree/sync` (private API, authenticated) reports the
+  mode, log height, state root, health and halt reason, whether the server is
+  behind, held entries, the last refused entry, and per-peer sync status.
 - **Fail closed.** A server whose log does not verify, whose tree changed
-  outside the log, or that sees a committed block it cannot apply against its
-  own log halts tree operations: it applies, votes for, proposes, and accepts
-  no tree operation, and keeps serving its last committed tree.
+  outside the log, or whose state disagrees with a certified entry that chains
+  to its log halts tree operations: it applies, votes for, proposes, and
+  accepts no tree operation, and keeps serving its last committed tree.
+
+With read-only mode on, the server builds the tree log from the empty tree,
+runs the `"tree"` stream, verifies and appends replicated entries (the merge
+commit, then committed blocks), and never changes the live tree. It proposes,
+votes for, and accepts no tree operation. Tree writes use the direct paths,
+and the record transfer pool keeps running.
 - Status codes and response bodies are otherwise those of the direct write
   paths, with these differences:
   - A join, and any other write that changes several nodes, is all or
@@ -246,17 +290,23 @@ With the setting on:
 
 Limits:
 
-- **Tier 1 only.** Only Tier 1 servers order and apply tree operations. Tier 2
-  servers neither receive committed blocks nor accept writes (Phase 3 adds log
-  replication). A Tier 2 server cannot forward a write, because replicas trust
-  operation signatures from the frozen Tier 1 set only.
-- **Same starting tree.** A new tree log starts from the server's current
-  tree. Replicas agree on state roots only if every Tier 1 server started from
-  the same tree, for example an empty one. Existing, divergent trees need the
-  merge ceremony (Phase 3, design A9).
-- **Missed blocks.** A server that missed a committed tree block (for example
-  through restart sync, which carries block headers only) halts tree
-  operations at the next tree block. Phase 3 replication repairs it.
+- **Writes on Tier 1 only.** A Tier 2 server answers tree writes with 503. It
+  cannot forward a write: replicas trust operation signatures from the frozen
+  Tier 1 set only, and no finalized list of admitted submitters exists. A
+  root-signed admission certificate is identity, not authority.
+- **Same starting tree.** A new ops-mode tree log starts from the server's
+  current tree. Servers agree on state roots only if every server started from
+  the same tree: an empty one, or the merge commit. A server whose log base
+  differs refuses every replicated entry (the status names it). Existing,
+  divergent trees need the [Tree Merge Ceremony](Tree-Merge-Ceremony).
+- **Unproved commits.** A block that committed while the three blocks behind
+  its commit were no longer held is logged without a commit proof. Peers
+  refuse that copy and take the entry from another Tier 1 server.
+- **Height is not certified.** The log height is not inside the commit proof.
+  A replicated entry is applied only when it chains to the log head, so a
+  renumbered entry is refused, not applied.
+- **Replication index.** The sync stream indexes at most 1,048,576 heights;
+  later heights are not offered.
 - **Tree changed outside the log.** Turning the setting off, writing the tree,
   and turning it on again halts tree operations at startup. The server does
   not overwrite either side.
@@ -272,11 +322,6 @@ Limits:
 - **Root key from configuration.** Replicas accept an `EstablishRoot`
   operation only for their own configured `root_pubkey`. Tier 1 servers with
   different configured keys establish no root.
-- **Snapshot ids.** A snapshot's committed operation ids are not covered by
-  the state root. A snapshot whose ids were edited on disk is not detected.
-- **IPAM records.** Tree-derived addresses are not written to
-  `data/ipam/allocations.json`; the delete cascade's IPAM release finds no
-  record for them.
 - **Versions while on only.** The direct paths do not maintain `version`.
   After the setting is turned off, a delta update replaces the stored record,
   including its version.
@@ -322,6 +367,8 @@ These flags select a one-shot command instead of running the daemon:
 | `--enroll-tpm-ak <b64>` | With enrollment: pin the server's platform binding key (base64 DER SPKI) in its certificate. |
 | `--enroll-tpm-ek-cert <path>` | With enrollment: attach the server's TPM EK certificate (PEM) for audit/validation. |
 | `--add-manifest <path>` | Load a signed release manifest from a local file and exit. |
+| `--sign-tree-merge <preimage> <out>` | Root-side: sign a canonical tree merge preimage for this network with the root management key, write the base64 signature to `<out>`, and exit. See [Tree Merge Ceremony](Tree-Merge-Ceremony). |
+| `--install-tree-merge <commit.json>` | Verify a signed tree merge commit against the configured `root_pubkey` and network, write it as tree log height 1, and exit. Run with the service stopped. |
 | `--github-releases-url <url>` | Override the GitHub releases URL for manifest fetching (env: `SP_GITHUB_RELEASES_URL`). |
 | `--manifest-fetch-interval <sec>` | Manifest fetch interval (env: `SP_MANIFEST_FETCH_INTERVAL`). |
 | `--minimum-version <ver>` | Minimum client version gate (env: `SP_MINIMUM_VERSION`). |
