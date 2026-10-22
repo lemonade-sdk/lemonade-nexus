@@ -17,6 +17,7 @@ against, and what it does not yet protect.
 - [Attestation and Key Boundaries](#attestation-and-key-boundaries)
 - [Threat Assumptions](#threat-assumptions)
 - [Transport and Message Security](#transport-and-message-security)
+- [Permission Tree Administration](#permission-tree-administration)
 - [Application Authority Gaps](#application-authority-gaps)
 - [Current Limitations](#current-limitations)
 - [Retired Mechanisms](#retired-mechanisms)
@@ -216,6 +217,36 @@ What it does not defend:
 Rate limiting is per-client (default 120 requests/minute, burst 20). Security
 messages have per-peer budgets and deduplication windows compiled into the
 router.
+
+## Permission Tree Administration
+
+Each tree node carries assignments: a management key and the permissions it
+holds on that node. Permissions are not inherited, with one exception for
+administration (below). A signed tree delta must pass these rules on the
+server that applies it:
+
+- **The operation permission.** `create_node` needs `add_child` on the
+  parent. `update_node` and `update_assignment` need `edit_node` on the node.
+  `delete_node` needs `delete_node` on the node.
+- **An update keeps the node's identity.** The `id`, `parent_id`, `type`,
+  management key, and endpoint identifier cannot change. A record that
+  renames itself onto another node, or moves into another group, is refused.
+- **Only an admin changes assignments.** The signer must hold `admin` on the
+  node or on one of its ancestors. That nearest admin node is the signer's
+  scope. `edit_node` alone never changes who holds what.
+- **Only joined identities are granted.** Each added or changed assignment
+  must name a key that is the management key of a node inside the signer's
+  scope. A key that never joined, or joined a different group, is refused.
+- **A create names no one else unless the signer is an admin.** The new
+  node may name its creator and its own management key. Any other key needs
+  an admin of the parent and the joined rule above.
+- **The root is fixed.** No delta creates a second root or deletes the root.
+
+The creator of a group holds `admin` on it, so the owner can promote a member
+device by giving its key `admin` on the group. Groups created before this
+rule gain `admin` for their owner on the owner's next join.
+
+On load, a node file whose record names a different node is refused.
 
 ## Application Authority Gaps
 

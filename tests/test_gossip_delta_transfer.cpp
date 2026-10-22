@@ -2529,8 +2529,16 @@ TEST_F(DeltaTransferTest, DeniedInCurrentTreeIsRetryableAndSucceedsAfterGrant) {
     EXPECT_EQ(gossip::GossipBallotTestAccess::cursor_of(*cv.gossip, fwd_b64), 0u);
 
     // The valid permission context becomes available: the admin author
-    // grants pk2 on the root through the production local path.
+    // grants pk2 on the root through the production local path. Only a
+    // joined identity can be granted, so pk2 joins first.
     {
+        tree::TreeNode joined;
+        joined.id = "pk2-device";
+        joined.parent_id = "root";
+        joined.type = tree::NodeType::Endpoint;
+        joined.mgmt_pubkey = pk2;
+        ASSERT_TRUE(cv.tree->apply_delta(signed_delta("create_node", "pk2-device", joined)));
+
         tree::TreeNode rn;
         rn.id = "root";
         rn.parent_id = "";

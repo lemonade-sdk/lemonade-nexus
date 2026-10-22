@@ -164,6 +164,28 @@ private:
                                                     std::string_view signer_pubkey,
                                                     acl::Permission required) const;
 
+    /// The nearest node, starting at `node_id` and walking up the parent
+    /// chain, on which the signer holds `admin`. nullopt when there is none.
+    /// This anchor bounds what the signer may administer: the anchor and its
+    /// subtree. Caller holds mutex_.
+    [[nodiscard]] std::optional<std::string> admin_anchor_locked(
+            std::string_view node_id, std::string_view signer_pubkey) const;
+
+    /// True when `principal` is the management key of a node at or beneath
+    /// `scope_id` — a joined identity, not an arbitrary key. Caller holds mutex_.
+    [[nodiscard]] bool principal_joined_under_locked(std::string_view scope_id,
+                                                     std::string_view principal) const;
+
+    /// Content rules a delta must satisfy beyond the operation permission:
+    /// an update keeps the node's identity (id, parent, type, management key,
+    /// endpoint identifier); only an admin of the node or an ancestor changes
+    /// assignments, and only for joined identities in that admin's subtree;
+    /// a create names no one but the signer unless the signer administers the
+    /// parent; the root is never created or deleted. Returns the refusal
+    /// reason, or nullopt when the delta is acceptable. Caller holds mutex_.
+    [[nodiscard]] std::optional<std::string> delta_content_refusal_locked(
+            const TreeDelta& delta) const;
+
     std::function<bool(const storage::FileStorageService::RetainedDelta&)> delta_retention_sink_;
 
     /// Evict stale entries from the replay cache.
