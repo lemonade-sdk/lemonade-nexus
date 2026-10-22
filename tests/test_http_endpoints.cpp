@@ -33,6 +33,8 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <jwt-cpp/jwt.h>
+#include <openssl/evp.h>
+#include <openssl/bn.h>
 
 #include <chrono>
 #include <cstdio>
@@ -1609,16 +1611,22 @@ TEST_F(HttpEndpointTest, AssignmentEndpointAppliesTheAdminRules) {
 
 TEST_F(HttpEndpointTest, NodeRoutesAnswerTheSameInBothModes) {
     auto cli = make_client();
-    // POST /api/tree/node names the node "node-" + the first 16 base64
-    // characters of the caller's key. A '/' there makes the node file path
-    // unwritable in both modes, so use a key without one.
+    // POST /api/tree/node names the node "node-" + the first 16 characters of
+    // the caller's key in the URL-safe base64 alphabet. Pick a key whose
+    // standard spelling has a '/' there: that once made the node file
+    // unwritable and the route answer 409.
     crypto::Ed25519Keypair owner_kp;
     std::string owner_b64;
     do {
         owner_kp = crypto->ed25519_keygen();
         owner_b64 = crypto::to_base64(std::span<const uint8_t>(
             owner_kp.public_key.data(), owner_kp.public_key.size()));
-    } while (owner_b64.substr(0, 16).find('/') != std::string::npos);
+    } while (owner_b64.substr(0, 16).find('/') == std::string::npos);
+    std::string owner_id_part = owner_b64.substr(0, 16);
+    for (auto& c : owner_id_part) {
+        if (c == '+') c = '-';
+        else if (c == '/') c = '_';
+    }
     auto stranger_kp = crypto->ed25519_keygen();
     const auto stranger_b64 = crypto::to_base64(std::span<const uint8_t>(
         stranger_kp.public_key.data(), stranger_kp.public_key.size()));
@@ -1636,7 +1644,7 @@ TEST_F(HttpEndpointTest, NodeRoutesAnswerTheSameInBothModes) {
     ASSERT_NE(c1, nullptr);
     ASSERT_EQ(c1->status, 200) << c1->body;
     const auto created = json::parse(c1->body).value("node_id", std::string{});
-    EXPECT_EQ(created, "node-" + owner_b64.substr(0, 16));
+    EXPECT_EQ(created, "node-" + owner_id_part);
     ASSERT_TRUE(tree->get_node(created).has_value());
     EXPECT_EQ(tree->get_node(created)->hostname, "laptop-2");
     auto c2 = cli.Post("/api/tree/node", owner, create.dump(), "application/json");
@@ -1789,4 +1797,119 @@ TEST_F(HttpEndpointTest, GroupAdminReadsAndRemovesTheGroupsDevices) {
     ASSERT_NE(root_delete, nullptr);
     EXPECT_EQ(root_delete->status, 403);
     EXPECT_TRUE(tree->get_node("root").has_value());
+}
+
+namespace join_proof {
+
+// A real WebAuthn assertion, so the join below authenticates with a valid
+// passkey and only the device-key proof is missing.
+EVP_PKEY* p256_key() {
+    EVP_PKEY* pkey = nullptr;
+    EVP_PKEY_CTX* pctx = EVP_PKEY_CTX_new_from_name(nullptr, "EC", nullptr);
+    EVP_PKEY_keygen_init(pctx);
+    char group[] = "P-256";
+    OSSL_PARAM params[] = {OSSL_PARAM_construct_utf8_string("group", group, 0),
+                           OSSL_PARAM_construct_end()};
+    EVP_PKEY_CTX_set_params(pctx, params);
+    EVP_PKEY_keygen(pctx, &pkey);
+    EVP_PKEY_CTX_free(pctx);
+    return pkey;
+}
+
+std::string hex_coordinate(EVP_PKEY* pkey, const char* name) {
+    BIGNUM* bn = nullptr;
+    EVP_PKEY_get_bn_param(pkey, name, &bn);
+    std::vector<uint8_t> out(32, 0);
+    BN_bn2binpad(bn, out.data(), 32);
+    BN_free(bn);
+    return crypto::to_hex(std::span<const uint8_t>(out));
+}
+
+std::string b64url(const std::vector<uint8_t>& bytes) {
+    std::string out = crypto::to_base64(std::span<const uint8_t>(bytes));
+    for (auto& ch : out) {
+        if (ch == '+') ch = '-';
+        else if (ch == '/') ch = '_';
+    }
+    out.erase(std::remove(out.begin(), out.end(), '='), out.end());
+    return out;
+}
+
+json passkey_assertion(crypto::SodiumCryptoService& c, const std::string& rp_id,
+                       EVP_PKEY* pkey, const std::string& credential_id,
+                       const std::string& challenge) {
+    auto sha = [&](std::string_view in) {
+        auto h = c.sha256(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(in.data()), in.size()));
+        return std::vector<uint8_t>(h.begin(), h.end());
+    };
+    std::vector<uint8_t> auth_data = sha(rp_id);
+    auth_data.insert(auth_data.end(), {0x01, 0, 0, 0, 1});
+    const std::string cdj =
+        json{{"type", "webauthn.get"}, {"origin", rp_id}, {"challenge", challenge}}.dump();
+    std::vector<uint8_t> signed_data = auth_data;
+    const auto cdj_hash = sha(cdj);
+    signed_data.insert(signed_data.end(), cdj_hash.begin(), cdj_hash.end());
+    size_t sig_len = 0;
+    EVP_MD_CTX* mctx = EVP_MD_CTX_new();
+    EVP_DigestSignInit(mctx, nullptr, EVP_sha256(), nullptr, pkey);
+    EVP_DigestSign(mctx, nullptr, &sig_len, signed_data.data(), signed_data.size());
+    std::vector<uint8_t> sig(sig_len);
+    EVP_DigestSign(mctx, sig.data(), &sig_len, signed_data.data(), signed_data.size());
+    EVP_MD_CTX_free(mctx);
+    sig.resize(sig_len);
+    return {{"method", "passkey"},
+            {"assertion",
+             {{"credential_id", credential_id},
+              {"authenticator_data", b64url(auth_data)},
+              {"client_data_json", b64url({cdj.begin(), cdj.end()})},
+              {"signature", b64url(sig)}}}};
+}
+
+}  // namespace join_proof
+
+// The joining device's key becomes its management key and every permission
+// principal, so a join must prove possession. Only the ed25519 method verifies
+// body.pubkey. A valid passkey login could otherwise join under someone
+// else's device key, taking their identity in the tree.
+TEST_F(HttpEndpointTest, JoinRefusesMethodsThatDoNotProveTheDeviceKey) {
+    auto victim = crypto->ed25519_keygen();
+    const auto victim_b64 = crypto::to_base64(
+        std::span<const uint8_t>(victim.public_key.data(), victim.public_key.size()));
+
+    // Mallory holds a genuine passkey account.
+    auto* pkey = join_proof::p256_key();
+    const std::string mallory = "mallory";
+    ASSERT_TRUE(auth->register_passkey(json{{"user_id", mallory},
+                                            {"credential_id", "cred_mallory"},
+                                            {"public_key_x", join_proof::hex_coordinate(pkey, "qx")},
+                                            {"public_key_y", join_proof::hex_coordinate(pkey, "qy")}})
+                    .authenticated);
+    const auto challenge = auth->issue_passkey_challenge(mallory);
+    ASSERT_TRUE(challenge.has_value());
+    json body = join_proof::passkey_assertion(*crypto, "lemonade-nexus.local", pkey,
+                                              "cred_mallory",
+                                              challenge->at("challenge").get<std::string>());
+    EVP_PKEY_free(pkey);
+
+    body["pubkey"] = victim_b64;
+    body["public_key"] = "ed25519:" + victim_b64;
+    auto res = make_client().Post("/api/join", body.dump(), "application/json");
+    ASSERT_NE(res, nullptr);
+    EXPECT_EQ(res->status, 403) << res->body;
+    for (const char* method : {"password", "token-link", ""}) {
+        json other = {{"pubkey", victim_b64}, {"public_key", "ed25519:" + victim_b64},
+                      {"username", "someone"}, {"password", "anything"}};
+        if (*method) other["method"] = method;
+        auto r = make_client().Post("/api/join", other.dump(), "application/json");
+        ASSERT_NE(r, nullptr);
+        EXPECT_EQ(r->status, 403) << method << ": " << r->body;
+    }
+    for (const auto& child : tree->get_children("root")) {
+        EXPECT_NE(child.mgmt_pubkey, "ed25519:" + victim_b64);
+    }
+    // The ed25519 path still joins.
+    auto ok = join_node(victim);
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(ok->status, 200) << ok->body;
 }
