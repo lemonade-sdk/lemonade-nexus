@@ -338,6 +338,40 @@ TEST_F(TreeOpsTest, DeleteNodeFromDeltaApplies) {
     EXPECT_FALSE(tree_svc->get_node("acme").has_value());
 }
 
+// A group admin removes a device it holds no entry on through the API (a
+// session op), as with tree operations off. A signed delta keeps the stricter
+// rule: delete_node on the node itself.
+TEST_F(TreeOpsTest, GroupAdminRemovesDevicesThroughTheApiOnly) {
+    auto owner = crypto_svc->ed25519_keygen();
+    auto device = crypto_svc->ed25519_keygen();
+    const auto owner_pk = principal_of(owner);
+    ASSERT_TRUE(submit(seal(create_op(customer("acme", owner_pk), root_pk))).ok());
+    tree::TreeNode node;
+    node.id = "acme-dev";
+    node.parent_id = "acme";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = principal_of(device);
+    node.assignments = {{principal_of(device), {"read", "edit_node"}}};
+    ASSERT_TRUE(submit(seal(create_op(node, owner_pk))).ok());
+    ASSERT_FALSE(tree_svc->check_permission(owner_pk, "acme-dev", acl::Permission::DeleteNode));
+
+    auto d = signed_delta("delete_node", "acme-dev", tree::TreeNode{}, owner, kBlock + 1);
+    EXPECT_EQ(submit(seal(delta_op(d), d.timestamp), kBlock + 1).refusal,
+              TreeOpRefusal::Forbidden);
+    EXPECT_TRUE(tree_svc->get_node("acme-dev").has_value());
+
+    auto v = submit(seal(delete_op("acme-dev", owner_pk)), kBlock + 2);
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_FALSE(tree_svc->get_node("acme-dev").has_value());
+
+    // The device itself administers nothing above its node.
+    auto other = node;
+    other.id = "acme-dev-2";
+    ASSERT_TRUE(submit(seal(create_op(other, owner_pk)), kBlock + 3).ok());
+    EXPECT_EQ(submit(seal(delete_op("acme-dev-2", principal_of(device))), kBlock + 4).refusal,
+              TreeOpRefusal::Forbidden);
+}
+
 TEST_F(TreeOpsTest, JoinCreatesGroupAndEndpoint) {
     auto device = crypto_svc->ed25519_keygen();
     auto op = join_op(device, "10.64.0.30/32");

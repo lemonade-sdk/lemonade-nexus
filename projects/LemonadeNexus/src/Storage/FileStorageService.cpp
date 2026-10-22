@@ -29,6 +29,19 @@ FileStorageService::FileStorageService(fs::path data_root)
 void FileStorageService::on_start() {
     do_ensure_directories();
 
+    // Identity files hold private keys and secrets. Older releases wrote some
+    // of them readable by every local account (keypair.json at 0644); close
+    // that on every start, whatever wrote them.
+    const auto identity_dir = data_root_ / "identity";
+    if (fs::exists(identity_dir)) {
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(identity_dir, ec)) {
+            if (!entry.is_regular_file(ec)) continue;
+            fs::permissions(entry.path(), fs::perms::group_all | fs::perms::others_all,
+                            fs::perm_options::remove, ec);
+        }
+    }
+
     // Scan existing deltas to find next sequence number
     const auto deltas_dir = data_root_ / "tree" / "deltas";
     uint64_t max_seq = 0;
@@ -196,7 +209,12 @@ bool FileStorageService::do_write_file(std::string_view category, std::string_vi
         std::ofstream ofs(path, std::ios::trunc);
         if (!ofs) return false;
         ofs << envelope_to_json(envelope);
-        return ofs.good();
+        ofs.close();
+        // Stored files can carry keys and secrets: owner read/write only.
+        std::error_code ec;
+        fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, ec);
+        return !ofs.fail() && !ec;
     } catch (const std::exception& e) {
         spdlog::error("[{}] write_file '{}/{}' failed: {}", name(), category, file_name, e.what());
         return false;

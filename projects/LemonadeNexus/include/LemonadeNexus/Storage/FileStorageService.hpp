@@ -167,7 +167,9 @@ public:
     [[nodiscard]] uint64_t do_latest_delta_seq() const;
     [[nodiscard]] std::vector<SignedDelta> do_read_deltas_since(uint64_t seq) const;
 
-    // IStorageProvider — generic file storage
+    // IStorageProvider — generic file storage. Files are written owner
+    // read/write only; on start, files under identity/ lose any group or other
+    // access an older release left on them.
     [[nodiscard]] bool do_write_file(std::string_view category, std::string_view name,
                                       const SignedEnvelope& envelope);
     [[nodiscard]] std::optional<SignedEnvelope> do_read_file(std::string_view category,

@@ -276,17 +276,24 @@ every server's files. Instead:
 ### B3. Library
 
 No custom cryptography (`AGENTS.md`). A new Rust crate, `storage-threshold`,
-wraps an audited implementation of:
+wraps these libraries behind a C ABI like `frost-ffi`; panics never cross it.
 
-- Feldman verifiable secret sharing and Pedersen-style dealerless key
-  generation over Ristretto255;
-- proactive re-sharing (new shares for a new holder set, same `S`);
-- DLEQ proofs.
+| Need | Library | Audit |
+|---|---|---|
+| Dealerless key generation over Ristretto255 | `frost-ristretto255` with the `internals` feature, pinned to the same version as `frost-ed25519` (2.2.0) | NCC Group, 2023-10-23 (v0.6.0) |
+| Share refresh with the same holder set and threshold; removing holders | `frost-ristretto255` `refresh_dkg_*` | Not audited |
+| Enrolling a new holder at the same threshold | `frost-ristretto255` `repair_share_*` | Not audited |
+| Lagrange combination of partials | `frost-ristretto255` helpers | Audited with key generation |
+| DLEQ (Chaum-Pedersen) proof for each partial | `elastic-elgamal` 0.3.1 `LogEqualityProof` | Not audited |
 
-Candidates: `vsss-rs` with `curve25519-dalek`, or the ZF FROST crates'
-secret-sharing primitives used outside their signing API. Selection needs a
-review of audit status and maintenance. The crate exposes a C ABI like
-`frost-ffi`; panics never cross it.
+Both libraries use `curve25519-dalek` 4.1.3, so the lockfile stays on one
+curve implementation. Written in this repository: the C ABI wrapper, the
+partial and proof wrapper (about 60 lines), the combiner (about 30 lines),
+and key derivation and encryption in C++ with the existing primitives. The
+unaudited library paths get an external review before Phase 5 ships.
+
+No audited library changes the threshold while keeping `S`. B5 therefore
+rotates the key when the threshold must change.
 
 ### B4. Holder set
 
@@ -305,11 +312,18 @@ review of audit status and maintenance. The crate exposes a C ABI like
 
 - When a holder is lost (its attestation lapses or it stays unreachable past
   a timeout) or a new holder is added, Tier 1 finalizes an updated
-  `StorageHolderPlan` and the remaining holders re-share to the new set right
-  away, without waiting for the epoch boundary. `S` stays the same, so no file
-  is re-encrypted. Prompt re-sharing restores full tolerance after each loss:
-  at 5 holders, one loss is survivable, and after the re-share to 4 the next
-  loss is survivable again once a fifth holder joins.
+  `StorageHolderPlan` right away, without waiting for the epoch boundary.
+  Prompt action restores full tolerance after each loss: at 5 holders, one
+  loss is survivable, and after the change the next loss is survivable again
+  once the set is back to strength.
+- **If the threshold stays the same** (65% of the new holder count rounds to
+  the same `t`), the holders refresh their shares for the new set and keep
+  `S`: removed holders drop out of the refresh, and a new holder is enrolled
+  through share repair. No file and no data key changes.
+- **If the threshold changes,** the holders run a key rotation (B5a) instead:
+  a fresh key generation among the new set at the new threshold, a new `S`,
+  and each server rewraps its data key. Files are not touched. This is the
+  same operation as the daily rotation, started early.
 - A re-share needs at least `t_old` old holders to contribute. The
   consensus quorum (about 67% of Tier 1) alone cannot move the key to new
   holders; honest holders contribute only to a finalized plan whose new
@@ -449,11 +463,11 @@ Each phase adds tests for the valid path and these rejection cases:
 
 ## Open Decisions
 
-1. **Library choice** for `storage-threshold` (B3): to be reviewed before
-   Phase 4.
-2. **Genesis and root management keys** stay on the root server for now.
+1. **Genesis and root management keys** stay on the root server for now.
    Revisit before Phase 7.
 
-Decided: no offline recovery key (B8); nodes hold per-node versions and the
+Decided: libraries for `storage-threshold` (B3), with an external review of
+the unaudited paths before Phase 5; a threshold change rotates the key
+instead of re-sharing to a new threshold (B5); no offline recovery key (B8); nodes hold per-node versions and the
 sync library replicates (A7); the API waits up to 10 s, then reports pending
 (A2).

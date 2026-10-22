@@ -654,9 +654,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
         auto caller_pubkey = normalize_pubkey(claims.pubkey);
-        // Gate the read on an explicit Read grant scoped to this node.
-        if (!ctx_.tree.check_permission(caller_pubkey, node_id,
-                                         acl::Permission::Read)) {
+        // Gate the read on an explicit Read grant scoped to this node, or on
+        // administering it (admin on the node or an ancestor group).
+        const bool administers = ctx_.tree.administers(caller_pubkey, node_id);
+        if (!administers && !ctx_.tree.check_permission(caller_pubkey, node_id,
+                                                        acl::Permission::Read)) {
             error_response(res, "no read permission", 403);
             return;
         }
@@ -667,8 +669,8 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
         // Management readers get the full ACL (needed for read-modify-write
         // group edits); everyone else sees only their own assignment.
-        bool full_acl = ctx_.tree.check_permission(caller_pubkey, node_id,
-                                                    acl::Permission::EditNode);
+        bool full_acl = administers || ctx_.tree.check_permission(caller_pubkey, node_id,
+                                                                  acl::Permission::EditNode);
         json_response(res, redact_node_for_caller(*node, caller_pubkey, full_acl));
     }));
 
@@ -746,8 +748,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
         nlohmann::json j = nlohmann::json::array();
         for (const auto& child : ctx_.tree.get_children(parent_id)) {
-            bool full_acl = ctx_.tree.check_permission(caller_pubkey, child.id,
-                                                        acl::Permission::EditNode);
+            bool full_acl = ctx_.tree.administers(caller_pubkey, child.id) ||
+                            ctx_.tree.check_permission(caller_pubkey, child.id,
+                                                       acl::Permission::EditNode);
             j.push_back(redact_node_for_caller(child, caller_pubkey, full_acl));
         }
         json_response(res, j);
@@ -1018,9 +1021,16 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                const SessionClaims& claims) {
         auto node_id = req.matches[1].str();
 
-        // Check DeleteNode permission (normalize pubkey format)
-        if (!ctx_.tree.check_permission(normalize_pubkey(claims.pubkey), node_id,
-                                         acl::Permission::DeleteNode)) {
+        // DeleteNode on the node itself, or an admin of the node or an ancestor
+        // group (a group admin removes the group's devices). The root is never
+        // removed through the API.
+        const auto caller = normalize_pubkey(claims.pubkey);
+        if (auto target = ctx_.tree.get_node(node_id); target && target->parent_id.empty()) {
+            error_response(res, "the root node cannot be deleted", 403);
+            return;
+        }
+        if (!ctx_.tree.check_permission(caller, node_id, acl::Permission::DeleteNode) &&
+            !ctx_.tree.administers(caller, node_id)) {
             error_response(res, "no delete_node permission", 403);
             return;
         }

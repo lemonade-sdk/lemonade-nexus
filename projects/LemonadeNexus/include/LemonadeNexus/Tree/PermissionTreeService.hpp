@@ -64,6 +64,12 @@ public:
     /// Used after Ed25519 key registration to give new keys add_child on root.
     bool grant_assignment(const std::string& node_id, const Assignment& assignment);
 
+    /// True when `signer` holds `admin` on `node_id` or on one of its
+    /// ancestors: an admin of a group administers the group's devices (reads
+    /// their full assignment lists, removes them). Permissions are otherwise
+    /// not inherited.
+    [[nodiscard]] bool administers(std::string_view signer, std::string_view node_id) const;
+
     /// Outcome of an administrative assignment change.
     enum class AssignmentChange { Applied, NotFound, Forbidden, Invalid, StorageError };
 

@@ -617,3 +617,31 @@ TEST_F(FileStorageTest, RetainedDeltaJsonRoundTrip) {
     EXPECT_FALSE(FileStorageService::RetainedDelta::from_json(
         R"({"operation":"update_node"})").has_value());
 }
+
+#ifndef _WIN32
+// Stored files can hold private keys and secrets, so they are owner-only.
+TEST_F(FileStorageTest, StoredFilesAreOwnerOnly) {
+    ASSERT_TRUE(storage->write_file("identity", "keypair.json", make_envelope("k", "{}")));
+    const auto perms = fs::status(temp_dir / "identity" / "keypair.json").permissions();
+    EXPECT_EQ(perms & (fs::perms::group_all | fs::perms::others_all), fs::perms::none);
+    EXPECT_NE(perms & fs::perms::owner_read, fs::perms::none);
+}
+
+// An older release left keypair.json readable by every local account. A start
+// removes group and other access from every identity file, whatever wrote it.
+TEST_F(FileStorageTest, StartClosesWorldReadableIdentityFiles) {
+    const auto path = temp_dir / "identity" / "keypair.json";
+    {
+        std::ofstream out(path);
+        out << "{}";
+    }
+    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write |
+                              fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace);
+    storage->stop();
+    storage = std::make_unique<FileStorageService>(temp_dir);
+    storage->start();
+    const auto perms = fs::status(path).permissions();
+    EXPECT_EQ(perms & (fs::perms::group_all | fs::perms::others_all), fs::perms::none);
+}
+#endif

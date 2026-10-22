@@ -734,7 +734,13 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             break;
         }
         case TreeOpKind::DeleteNode: {
-            if (!rules::signer_has_permission(*target, op.principal,
+            // A group admin removes the group's devices through the API, as
+            // with tree operations off. A signed delta keeps the stricter
+            // delta rule: delete_node on the node itself.
+            const bool admin_removal = body.source != TreeOpSource::Delta &&
+                                       rules::admin_anchor(nodes, op.target, op.principal);
+            if (!admin_removal &&
+                !rules::signer_has_permission(*target, op.principal,
                                               acl::Permission::DeleteNode)) {
                 return refuse(R::Forbidden, "no delete_node permission");
             }
