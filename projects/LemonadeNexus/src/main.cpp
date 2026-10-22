@@ -1,4 +1,6 @@
+#include <LemonadeNexus/Core/BootSet.hpp>
 #include <LemonadeNexus/Core/CliModes.hpp>
+#include <LemonadeNexus/Core/GenesisAnchor.hpp>
 #include <LemonadeNexus/Core/Coordinator.hpp>
 #include <LemonadeNexus/Core/HostnameGenerator.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
@@ -31,6 +33,7 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
+#include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
@@ -81,9 +84,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // The boot set (gossip identity) is sealed through nexus-attestd. Builds
+    // without the attestd client have no sealing and keep identity/keypair.json.
+    nexus::security::SealBackend seal_backend;
+#ifdef LEMONADE_HAVE_ATTESTD_CLIENT
+    seal_backend = nexus::attestd::attestd_seal_backend(nexus::attestd::AttestdClientConfig{});
+#endif
+
     // --- CLI modes (--first-run, --enroll-server, ...) and the
     // uninitialized-data-dir gate live in Core/CliModes.cpp.
-    if (auto rc = nexus::core::run_cli_mode(config, argv[0])) {
+    if (auto rc = nexus::core::run_cli_mode(config, argv[0], seal_backend)) {
         return *rc;
     }
 
@@ -145,7 +155,32 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Gossip (depends on storage + crypto, uses io_context)
     // ========================================================================
+    // The gossip identity comes from the boot set: unsealed through
+    // nexus-attestd when sealed, otherwise identity/keypair.json, which is
+    // sealed here when this host can. A sealed identity that does not unseal
+    // stops startup; a new identity is never created in its place.
+    nexus::core::BootSetConfig boot_set;
+    boot_set.data_root = data_root;
+    boot_set.backend = seal_backend;
+    if (const auto anchor = nexus::core::load_genesis_anchor(config.genesis_pubkey);
+        anchor && anchor->release) {
+        // Expected PCR 8/9 of the installed, verified approval: staged so a
+        // boot-chain upgrade still unseals after its reboot.
+        boot_set.next_boot_chain =
+            nexus::security::boot_pcrs_from_approval(anchor->release->approval);
+    }
+    std::string boot_set_error;
+    const auto gossip_identity =
+        nexus::core::load_gossip_identity(storage, boot_set, boot_set_error);
+    if (!gossip_identity) {
+        spdlog::error("Boot set: {}", boot_set_error);
+        return 1;
+    }
+    spdlog::info("Gossip identity protection: {}",
+                 nexus::core::gossip_identity_protection_name(gossip_identity->protection));
+
     nexus::gossip::GossipService gossip{coordinator.io_context(), gossip_port, storage, crypto};
+    gossip.set_identity(gossip_identity->keypair);
     if (!config.root_pubkey.empty()) {
         auto root_pk_bytes = nexus::crypto::from_hex(config.root_pubkey);
         if (root_pk_bytes.size() == nexus::crypto::kEd25519PublicKeySize) {

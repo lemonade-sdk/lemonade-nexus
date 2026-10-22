@@ -26,9 +26,11 @@ RestartSec=5
 #
 # This unit is the reason the component exists. The Nexus server must NOT have
 # TPM or IMA access; this daemon has exactly that and nothing else, and answers
-# its two questions over one socket: platform evidence, and the one TPM
-# operation the server may not run itself (SVSM AK credential activation).
-# Everything granted below is listed with why.
+# over one socket: platform evidence, and the TPM operations the server may not
+# run itself (SVSM AK credential activation, and sealing or unsealing the
+# server's boot set to PCR 8/9). A sealed blob goes back to the server, which
+# stores it; the daemon writes nothing for it and still cannot read the
+# server's data directory. Everything granted below is listed with why.
 #
 # Dedicated identity. Not root, and not the server's account: a compromise of
 # the mesh server must not inherit TPM access, and a compromise of this daemon
