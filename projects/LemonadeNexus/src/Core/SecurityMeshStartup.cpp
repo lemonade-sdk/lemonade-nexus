@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
 
+#include <LemonadeNexus/Core/BootSet.hpp>
 #include <LemonadeNexus/Core/GenesisAnchor.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
@@ -18,7 +19,7 @@ std::optional<SecurityMeshStartup> start_security_mesh(
         gossip::GossipService& gossip, crypto::KeyWrappingService& key_wrapping,
         security::PlatformEvidenceSource platform_source,
         security::PlatformActivationSource activation_source, std::string& error,
-        std::function<void()> on_epoch_established) {
+        std::function<void()> on_epoch_established, const SecurityMeshStorageInputs& storage) {
     const auto anchor = load_genesis_anchor(config.genesis_pubkey);
     if (!anchor) {
         error = "genesis_pubkey is not a base64 Ed25519 public key";
@@ -57,6 +58,17 @@ std::optional<SecurityMeshStartup> start_security_mesh(
     mesh_config.activation_source = std::move(activation_source);
     mesh_config.on_epoch_established = std::move(on_epoch_established);
     mesh_config.storage_key_enabled = config.storage_key_enabled;
+    if (config.storage_key_enabled) {
+        // The share is sealed beside the gossip identity, with the same
+        // backend, directory, and upgrade staging (B7 step 1).
+        mesh_config.seal_backend = storage.seal_backend;
+        mesh_config.sealed_directory =
+            std::filesystem::path(config.data_root) / kSealedDirectory;
+        if (release) {
+            mesh_config.next_boot_chain = security::boot_pcrs_from_approval(release->approval);
+        }
+        mesh_config.vault = storage.vault;
+    }
     auto startup = std::make_optional<SecurityMeshStartup>();
     startup->service =
         std::make_unique<security::SecurityMeshService>(io, mesh_config, gossip,

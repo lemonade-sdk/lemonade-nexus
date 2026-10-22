@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 #include <sodium.h>
+#include <spdlog/spdlog.h>
 
 #include <cstring>
 #include <fstream>
@@ -277,6 +278,61 @@ std::optional<StorageShareBundle> decode_share_bundle(std::span<const uint8_t> b
         return std::nullopt;
     }
     return bundle;
+}
+
+// --- Sealed store -------------------------------------------------------------------
+
+ShareStoreStatus share_store_status(SealStatus status) {
+    switch (status) {
+        case SealStatus::Ok: return ShareStoreStatus::Ok;
+        case SealStatus::Missing: return ShareStoreStatus::Missing;
+        case SealStatus::Unavailable: return ShareStoreStatus::Unavailable;
+        case SealStatus::Unreachable: return ShareStoreStatus::Unreachable;
+        case SealStatus::PolicyMismatch: return ShareStoreStatus::PolicyMismatch;
+        case SealStatus::Corrupt: return ShareStoreStatus::Corrupt;
+        case SealStatus::Failed: return ShareStoreStatus::Failed;
+    }
+    return ShareStoreStatus::Failed;
+}
+
+SealedStorageShareStore::SealedStorageShareStore(SealedBlobStore& sealed,
+                                                 FileStorageShareStore* legacy)
+    : sealed_(sealed), legacy_(legacy) {}
+
+ShareStoreStatus SealedStorageShareStore::seal(std::string_view domain,
+                                               std::span<const uint8_t> plaintext) {
+    return share_store_status(sealed_.seal(domain, plaintext).status);
+}
+
+ShareUnsealResult SealedStorageShareStore::unseal(std::string_view domain) {
+    auto reply = sealed_.unseal(domain);
+    if (reply.status == SealStatus::Missing && legacy_ != nullptr) {
+        auto legacy = legacy_->unseal(domain);
+        if (legacy.status != ShareStoreStatus::Ok) {
+            return {legacy.status, {}};
+        }
+        // Move the share into the sealed store. The legacy copy goes only
+        // after the sealed copy unseals to the same bytes.
+        if (sealed_.seal(domain, legacy.plaintext.span()).status != SealStatus::Ok) {
+            spdlog::warn("[storage] the legacy share could not be sealed; using the file copy");
+            return legacy;
+        }
+        auto check = sealed_.unseal(domain);
+        if (check.status == SealStatus::Ok && check.plaintext.size() == legacy.plaintext.size() &&
+            sodium_memcmp(check.plaintext.data(), legacy.plaintext.data(),
+                          legacy.plaintext.size()) == 0) {
+            (void)legacy_->remove(domain);
+            spdlog::info("[storage] the storage share moved into the sealed store");
+        }
+        return legacy;
+    }
+    return {share_store_status(reply.status), std::move(reply.plaintext)};
+}
+
+bool SealedStorageShareStore::remove(std::string_view domain) {
+    const bool sealed_gone = sealed_.remove(domain);
+    const bool legacy_gone = legacy_ == nullptr || legacy_->remove(domain);
+    return sealed_gone && legacy_gone;
 }
 
 }  // namespace nexus::security

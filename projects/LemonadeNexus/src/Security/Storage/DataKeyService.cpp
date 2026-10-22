@@ -34,7 +34,9 @@ std::string short_hex(std::span<const uint8_t> bytes) {
 }  // namespace
 
 DataKeyService::DataKeyService(StorageKeyService& service)
-    : service_(service), path_(service.config().directory / "data-key.json") {}
+    : service_(service),
+      path_(service.config().directory / "data-key.json"),
+      next_path_(service.config().directory / "data-key.next.json") {}
 
 DataKeyState DataKeyService::state() const {
     std::lock_guard lock(mutex_);
@@ -91,7 +93,7 @@ std::vector<uint8_t> DataKeyService::server_id() const {
     return {self.begin(), self.end()};
 }
 
-bool DataKeyService::store(const crypto::StorageWrappedDataKey& wrapped) {
+std::string DataKeyService::encode_wrapped(const crypto::StorageWrappedDataKey& wrapped) {
     json j;
     j["format"] = kFileFormat;
     j["storage_public_key"] = crypto::to_base64(wrapped.storage_public_key);
@@ -99,41 +101,29 @@ bool DataKeyService::store(const crypto::StorageWrappedDataKey& wrapped) {
     j["version"] = static_cast<unsigned>(wrapped.ciphertext.version);
     j["nonce"] = crypto::to_base64(wrapped.ciphertext.nonce);
     j["ciphertext"] = crypto::to_base64(wrapped.ciphertext.ciphertext);
-    std::error_code ec;
-    std::filesystem::create_directories(path_.parent_path(), ec);
-    if (!write_durable(path_, j.dump())) {
-        return false;
-    }
-    std::lock_guard lock(mutex_);
-    wrapped_ = wrapped;
-    return true;
+    return j.dump();
 }
 
-bool DataKeyService::load() {
-    std::ifstream in(path_, std::ios::binary);
-    if (!in) {
-        return true;  // none stored yet
-    }
-    std::ostringstream buffer;
-    buffer << in.rdbuf();
-    const json j = json::parse(buffer.str(), nullptr, false);
+std::optional<crypto::StorageWrappedDataKey> DataKeyService::decode_wrapped(
+        const std::string& text) {
+    const json j = json::parse(text, nullptr, false);
     if (!j.is_object() || !j.contains("format") || j["format"] != kFileFormat) {
-        return false;
+        return std::nullopt;
     }
     for (const char* field : {"storage_public_key", "ephemeral_point", "nonce", "ciphertext"}) {
         if (!j.contains(field) || !j[field].is_string()) {
-            return false;
+            return std::nullopt;
         }
     }
     if (!j.contains("version") || j["version"] != crypto::kEncryptedBlobVersion) {
-        return false;
+        return std::nullopt;
     }
     crypto::StorageWrappedDataKey wrapped;
     const auto key = crypto::from_base64(j["storage_public_key"].get<std::string>());
     const auto point = crypto::from_base64(j["ephemeral_point"].get<std::string>());
     if (key.size() != wrapped.storage_public_key.size() ||
         point.size() != wrapped.ephemeral_point.size()) {
-        return false;
+        return std::nullopt;
     }
     std::copy(key.begin(), key.end(), wrapped.storage_public_key.begin());
     std::copy(point.begin(), point.end(), wrapped.ephemeral_point.begin());
@@ -142,11 +132,148 @@ bool DataKeyService::load() {
     wrapped.ciphertext.ciphertext = crypto::from_base64(j["ciphertext"].get<std::string>());
     if (wrapped.ciphertext.nonce.size() != crypto::kAeadNonceSize ||
         wrapped.ciphertext.ciphertext.empty()) {
+        return std::nullopt;
+    }
+    return wrapped;
+}
+
+bool DataKeyService::store(const crypto::StorageWrappedDataKey& wrapped) {
+    std::error_code ec;
+    std::filesystem::create_directories(path_.parent_path(), ec);
+    if (!write_durable(path_, encode_wrapped(wrapped))) {
         return false;
     }
     std::lock_guard lock(mutex_);
-    wrapped_ = std::move(wrapped);
+    wrapped_ = wrapped;
     return true;
+}
+
+bool DataKeyService::load() {
+    std::error_code ec;
+    if (std::filesystem::exists(next_path_, ec)) {
+        // A replacement that was never committed. The current wrapped key and
+        // the files under it still stand.
+        spdlog::info("[storage] discarding an uncommitted replacement data key");
+        std::filesystem::remove(next_path_, ec);
+    }
+    std::ifstream in(path_, std::ios::binary);
+    if (!in) {
+        return true;  // none stored yet
+    }
+    std::ostringstream buffer;
+    buffer << in.rdbuf();
+    auto wrapped = decode_wrapped(buffer.str());
+    if (!wrapped.has_value()) {
+        return false;
+    }
+    std::lock_guard lock(mutex_);
+    wrapped_ = std::move(*wrapped);
+    return true;
+}
+
+void DataKeyService::request_verification() {
+    {
+        std::lock_guard lock(mutex_);
+        verified_ = false;
+    }
+    // A round trip already in flight started before this request; it does not
+    // count.
+    if (attempt_.has_value() && attempt_->target == Target::Current && attempt_->verify_only) {
+        attempt_.reset();
+    }
+    next_attempt_ms_ = now_ms_;
+}
+
+bool DataKeyService::begin_replacement() {
+    const auto& chain = service_.chain();
+    if (!chain.current.has_value() || !service_.current_verified()) {
+        return false;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        if (!dek_.has_value() || next_dek_.has_value()) {
+            return false;
+        }
+    }
+    crypto::SecureBuffer dek(kDataKeyBytes);
+    randombytes_buf(dek.data(), dek.size());
+    auto wrapped = crypto::StorageThreshold::wrap_data_key(
+        service_.crypto(), chain.current->storage_public_key, dek.span(), server_id());
+    std::error_code ec;
+    std::filesystem::create_directories(next_path_.parent_path(), ec);
+    if (!wrapped.ok() || !write_durable(next_path_, encode_wrapped(*wrapped.value))) {
+        spdlog::warn("[storage] the replacement data key could not be wrapped and stored");
+        return false;
+    }
+    {
+        std::lock_guard lock(mutex_);
+        next_dek_ = std::move(dek);
+        next_wrapped_ = *wrapped.value;
+        next_verified_ = false;
+    }
+    next_attempt_ms_ = now_ms_;
+    spdlog::info("[storage] replacement data key created and wrapped to S {}",
+                 short_hex(chain.current->storage_public_key));
+    return true;
+}
+
+std::optional<crypto::SecureBuffer> DataKeyService::replacement_key() const {
+    std::lock_guard lock(mutex_);
+    if (!next_dek_.has_value()) {
+        return std::nullopt;
+    }
+    return crypto::SecureBuffer(next_dek_->span());
+}
+
+bool DataKeyService::replacement_verified() const {
+    std::lock_guard lock(mutex_);
+    return next_dek_.has_value() && next_verified_;
+}
+
+bool DataKeyService::commit_replacement() {
+    std::optional<crypto::StorageWrappedDataKey> next;
+    {
+        std::lock_guard lock(mutex_);
+        if (!next_dek_.has_value() || !next_wrapped_.has_value() || !next_verified_) {
+            return false;
+        }
+        next = next_wrapped_;
+    }
+    // The durable replacement of data-key.json is the switch point. A crash
+    // after it leaves data-key.next.json with the same key; load() removes it.
+    if (!write_durable(path_, encode_wrapped(*next))) {
+        return false;
+    }
+    std::error_code ec;
+    std::filesystem::remove(next_path_, ec);
+    {
+        std::lock_guard lock(mutex_);
+        dek_ = std::move(next_dek_);
+        wrapped_ = std::move(next_wrapped_);
+        verified_ = true;
+        next_dek_.reset();
+        next_wrapped_.reset();
+        next_verified_ = false;
+    }
+    if (attempt_.has_value() && attempt_->target == Target::Replacement) {
+        attempt_.reset();
+    }
+    spdlog::info("[storage] replacement data key committed");
+    return true;
+}
+
+void DataKeyService::abort_replacement() {
+    std::error_code ec;
+    std::filesystem::remove(next_path_, ec);
+    {
+        std::lock_guard lock(mutex_);
+        next_dek_.reset();
+        next_wrapped_.reset();
+        next_verified_ = false;
+    }
+    if (attempt_.has_value() && attempt_->target == Target::Replacement) {
+        attempt_.reset();
+    }
 }
 
 void DataKeyService::on_chain_changed() {
@@ -215,6 +342,24 @@ void DataKeyService::tick(uint64_t now_ms) {
         if (!unlock_verified() && !attempt_.has_value() && now_ms >= next_attempt_ms_ &&
             wrapped->storage_public_key == chain.current->storage_public_key) {
             start_attempt(*chain.current, chain.current_digest, true, now_ms);
+            return;
+        }
+        std::optional<crypto::StorageWrappedDataKey> next;
+        bool next_verified = false;
+        {
+            std::lock_guard lock(mutex_);
+            next = next_wrapped_;
+            next_verified = next_verified_;
+        }
+        if (next.has_value()) {
+            if (next->storage_public_key != chain.current->storage_public_key) {
+                // S rotated under the pending replacement; the vault restarts it.
+                abort_replacement();
+            } else if (!next_verified && unlock_verified() && !attempt_.has_value() &&
+                       now_ms >= next_attempt_ms_) {
+                start_attempt(*chain.current, chain.current_digest, true, now_ms,
+                              Target::Replacement);
+            }
         }
         return;
     }
@@ -300,7 +445,7 @@ bool DataKeyService::rewrap() {
 }
 
 void DataKeyService::start_attempt(const StorageFinalPlan& plan, const Digest& plan_digest,
-                                   bool verify_only, uint64_t now_ms) {
+                                   bool verify_only, uint64_t now_ms, Target target) {
     const EpochId epoch = service_.current_epoch();
     if (epoch == EpochId{}) {
         return;
@@ -308,12 +453,14 @@ void DataKeyService::start_attempt(const StorageFinalPlan& plan, const Digest& p
     std::optional<crypto::StorageWrappedDataKey> wrapped;
     {
         std::lock_guard lock(mutex_);
-        wrapped = wrapped_;
+        wrapped = target == Target::Replacement ? next_wrapped_ : wrapped_;
     }
     if (!wrapped.has_value()) {
         return;
     }
     Attempt attempt;
+    attempt.target = target;
+    attempt.wrapped = *wrapped;
     attempt.plan_digest = plan_digest;
     attempt.plan = plan;
     attempt.verify_only = verify_only;
@@ -364,20 +511,13 @@ void DataKeyService::on_partial(const StorageUnlockPartialMsg& partial) {
     if (!opened.has_value() || opened->size() != crypto::kStoragePartialSize) {
         return;
     }
-    std::optional<crypto::StorageWrappedDataKey> wrapped;
-    {
-        std::lock_guard lock(mutex_);
-        wrapped = wrapped_;
-    }
-    if (!wrapped.has_value()) {
-        return;
-    }
+    const auto& wrapped = attempt_->wrapped;
     // Each partial is checked as it arrives: a bad DLEQ proof, a partial for
     // another R, or one from a share outside this plan never counts.
     const auto context =
         StorageKeyService::unlock_context(service_.config().network_id, attempt_->request);
     if (crypto::StorageThreshold::verify_partial(attempt_->plan.key_plan, context,
-                                                 wrapped->ephemeral_point, partial.holder_id,
+                                                 wrapped.ephemeral_point, partial.holder_id,
                                                  *opened) != crypto::StorageStatus::Ok) {
         spdlog::debug("[storage] a partial from holder {} failed verification",
                       partial.holder_id);
@@ -391,17 +531,13 @@ void DataKeyService::finish_attempt() {
     if (!attempt_.has_value() || attempt_->partials.size() < attempt_->plan.threshold) {
         return;
     }
-    std::optional<crypto::StorageWrappedDataKey> wrapped;
-    {
-        std::lock_guard lock(mutex_);
-        wrapped = wrapped_;
-    }
     const auto context =
         StorageKeyService::unlock_context(service_.config().network_id, attempt_->request);
     auto unwrapped = crypto::StorageThreshold::unwrap_data_key(
-        service_.crypto(), *wrapped, attempt_->plan.key_plan, context, attempt_->partials,
-        server_id());
+        service_.crypto(), attempt_->wrapped, attempt_->plan.key_plan, context,
+        attempt_->partials, server_id());
     const bool verify_only = attempt_->verify_only;
+    const Target target = attempt_->target;
     attempt_.reset();
     if (!unwrapped.ok()) {
         spdlog::warn("[storage] unwrapping the data key failed (status {})",
@@ -413,7 +549,12 @@ void DataKeyService::finish_attempt() {
     bool matches = true;
     {
         std::lock_guard lock(mutex_);
-        if (verify_only && dek_.has_value()) {
+        if (target == Target::Replacement) {
+            matches = next_dek_.has_value() && next_dek_->size() == unwrapped.value->size() &&
+                      sodium_memcmp(next_dek_->data(), unwrapped.value->data(),
+                                    next_dek_->size()) == 0;
+            next_verified_ = matches;
+        } else if (verify_only && dek_.has_value()) {
             matches = dek_->size() == unwrapped.value->size() &&
                       sodium_memcmp(dek_->data(), unwrapped.value->data(), dek_->size()) == 0;
             verified_ = matches;

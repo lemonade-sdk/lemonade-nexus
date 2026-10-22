@@ -11,6 +11,7 @@ namespace nexus::crypto { class SodiumCryptoService; }
 namespace nexus::storage { class FileStorageService; }
 namespace nexus::ipam { class IPAMService; }
 namespace nexus::gossip { class GossipService; }
+namespace nexus::security { class StorageVault; }
 
 namespace nexus::core {
 
@@ -22,10 +23,14 @@ struct TlsResolution {
 };
 
 /// Resolve JWT secret: config value > persisted file > auto-generate and persist.
+/// With `vault` (Phase 7, not owning), identity/jwt_secret.hex is read and
+/// written through it; a file that exists but does not open returns an empty
+/// string, and the caller must stop instead of replacing the secret.
 [[nodiscard]] std::string resolve_jwt_secret(
     const ServerConfig& config,
     const std::filesystem::path& data_root,
-    crypto::SodiumCryptoService& crypto);
+    crypto::SodiumCryptoService& crypto,
+    security::StorageVault* vault = nullptr);
 
 /// Read the server_node_id from the stored server certificate.
 [[nodiscard]] std::string resolve_server_node_id(

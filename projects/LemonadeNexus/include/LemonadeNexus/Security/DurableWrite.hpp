@@ -31,4 +31,18 @@ namespace nexus::security {
 [[nodiscard]] bool write_durable_preserving(const std::filesystem::path& final_path,
                                             std::string_view payload);
 
+/// Atomically replace `final_path` with `source_path` (same directory), then
+/// make the directory entry durable. False on any failure; `final_path` then
+/// holds either its previous content or the source content.
+[[nodiscard]] bool rename_durable(const std::filesystem::path& source_path,
+                                  const std::filesystem::path& final_path);
+
+/// Overwrite the content of `path` with zeros and flush it to the device. Best
+/// effort: a journaling or copy-on-write file system, LVM snapshots, or SSD
+/// remapping can keep older blocks. A missing file is not an error.
+void overwrite_contents(const std::filesystem::path& path);
+
+/// overwrite_contents(), then remove the file. True when the file is gone.
+[[nodiscard]] bool scrub_file(const std::filesystem::path& path);
+
 }  // namespace nexus::security

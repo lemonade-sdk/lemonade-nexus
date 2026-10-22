@@ -8,6 +8,8 @@
 #include <optional>
 #include <string>
 
+namespace nexus::security { class StorageVault; }
+
 namespace nexus::storage {
 
 /// File-based storage service. All state is stored as signed JSON files.
@@ -150,6 +152,18 @@ public:
 public:
     explicit FileStorageService(std::filesystem::path data_root);
 
+    /// Phase 7: files the vault covers (StorageVault::covers) are read,
+    /// written, and removed through it; the vault decrypts, encrypts, or
+    /// refuses. Not owning; nullptr (the default) keeps every path as before.
+    /// Set before any service reads a covered file. Not thread-safe against
+    /// concurrent file calls.
+    void set_vault(security::StorageVault* vault) { vault_ = vault; }
+
+    /// The vault when one is set and covers `path`; nullptr otherwise. Callers
+    /// outside this class with their own file I/O route covered files through
+    /// it.
+    [[nodiscard]] security::StorageVault* vault_for(const std::filesystem::path& path) const;
+
     // IService
     void on_start();
     void on_stop();
@@ -211,6 +225,7 @@ private:
     std::filesystem::path pool_dir_;
     mutable std::mutex    mutex_;
     uint64_t              next_delta_seq_{1};
+    security::StorageVault* vault_{nullptr};
 
     // Test seams.
     std::size_t test_fail_next_pool_dirsync_{0};

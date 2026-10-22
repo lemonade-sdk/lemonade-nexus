@@ -4,6 +4,7 @@
 #include <LemonadeNexus/Security/Consensus/BlockPayload.hpp>
 #include <LemonadeNexus/Security/Consensus/HotStuffState.hpp>
 #include <LemonadeNexus/Security/DurableWrite.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -118,6 +119,22 @@ std::optional<TreeLogEntry> tree_log_entry_from_json(const json& doc) {
 
 TreeLog::TreeLog(fs::path directory) : directory_(std::move(directory)) {}
 
+std::optional<json> TreeLog::read_doc(const fs::path& path) const {
+    if (vault_ != nullptr && vault_->covers(path)) {
+        const auto read = vault_->read(path);
+        if (read.status != security::VaultReadStatus::Ok) return std::nullopt;
+        auto doc = json::parse(read.bytes, nullptr, false);
+        if (doc.is_discarded() || !doc.is_object()) return std::nullopt;
+        return doc;
+    }
+    return read_json_file(path);
+}
+
+bool TreeLog::write_doc(const fs::path& path, const std::string& text) const {
+    if (vault_ != nullptr && vault_->covers(path)) return vault_->write(path, text);
+    return security::write_durable(path, text);
+}
+
 fs::path TreeLog::entry_path(uint64_t height) const {
     return directory_ / (std::to_string(height) + ".json");
 }
@@ -146,11 +163,11 @@ bool TreeLog::write_snapshot(uint64_t height, const TreeChainState& state) const
                    {"root", b64(state.root)},
                    {"nodes", std::move(nodes)},
                    {"committed", std::move(committed)}};
-    return security::write_durable(snapshot_path(height), doc.dump());
+    return write_doc(snapshot_path(height), doc.dump());
 }
 
 std::optional<TreeChainState> TreeLog::read_snapshot(uint64_t height) const {
-    const auto doc = read_json_file(snapshot_path(height));
+    const auto doc = read_doc(snapshot_path(height));
     uint64_t stored_height = 0;
     if (!doc || !format_ok(*doc) || !read_u64(*doc, "height", stored_height) ||
         stored_height != height) {
@@ -300,7 +317,7 @@ TreeLog::OpenResult TreeLog::open(const rules::NodeMap& base_nodes) {
     }
 
     applied_height_ = 0;
-    if (const auto applied = read_json_file(directory_ / kAppliedFile)) {
+    if (const auto applied = read_doc(directory_ / kAppliedFile)) {
         uint64_t value = 0;
         if (format_ok(*applied) && read_u64(*applied, "height", value)) applied_height_ = value;
     }
@@ -314,7 +331,7 @@ bool TreeLog::append(const TreeLogEntry& entry, TreeChainState next) {
         next.root != entry.state_root) {
         return false;
     }
-    if (!security::write_durable(entry_path(entry.height), tree_log_entry_to_json(entry).dump())) {
+    if (!write_doc(entry_path(entry.height), tree_log_entry_to_json(entry).dump())) {
         spdlog::error("[TreeLog] cannot write entry {}", entry.height);
         return false;
     }
@@ -330,13 +347,13 @@ bool TreeLog::append(const TreeLogEntry& entry, TreeChainState next) {
 
 bool TreeLog::mark_applied(uint64_t height) {
     const json doc{{"format", kTreeLogFormatVersion}, {"height", height}};
-    if (!security::write_durable(directory_ / kAppliedFile, doc.dump())) return false;
+    if (!write_doc(directory_ / kAppliedFile, doc.dump())) return false;
     applied_height_ = height;
     return true;
 }
 
 std::optional<TreeLogEntry> TreeLog::read_entry(uint64_t height) const {
-    const auto doc = read_json_file(entry_path(height));
+    const auto doc = read_doc(entry_path(height));
     if (!doc) return std::nullopt;
     return tree_log_entry_from_json(*doc);
 }

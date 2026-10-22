@@ -117,6 +117,7 @@ inline constexpr std::string_view kDelegationWrappingKey = "delegation-wrapping-
 inline constexpr std::string_view kSealedBlob = "sealed-blob";
 inline constexpr std::string_view kStorageDataKey = "storage-data-key";
 inline constexpr std::string_view kStorageShareAtRest = "storage-share-at-rest";
+inline constexpr std::string_view kStorageFileAtRest = "storage-file-at-rest";
 }  // namespace aead_purpose
 
 // --- HKDF ---

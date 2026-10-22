@@ -31,7 +31,9 @@ TreeConsensus::TreeConsensus(TreeConsensusConfig config, PermissionTreeService& 
       tree_(tree),
       crypto_(crypto),
       log_(std::move(log_directory)),
-      pool_(config_.pool_limits) {}
+      pool_(config_.pool_limits) {
+    log_.set_vault(config_.vault);
+}
 
 bool TreeConsensus::start() {
     const auto current = tree_.nodes_snapshot();

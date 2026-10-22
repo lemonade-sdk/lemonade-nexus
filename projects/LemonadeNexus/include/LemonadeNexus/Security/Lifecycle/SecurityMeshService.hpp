@@ -68,6 +68,19 @@ struct SecurityMeshConfig {
     /// ServerConfig::storage_key_enabled: run the threshold storage key
     /// (StorageKeyService). Off: no storage handler, sink, or message exists.
     bool storage_key_enabled = false;
+    /// How the storage share is sealed (B6, B7 step 1): the boot set's backend
+    /// (attestd_seal_backend in production). Empty means this host cannot
+    /// seal; the share then stays in the machine-bound file store.
+    SealBackend seal_backend;
+    /// The boot set's SealedBlobStore directory (Core/BootSet.hpp
+    /// kSealedDirectory under the data root).
+    std::filesystem::path sealed_directory;
+    /// Expected PCR 8/9 of the installed, verified release approval; staged
+    /// for the share like for the gossip identity. nullopt stages nothing.
+    std::optional<BootPcrValues> next_boot_chain;
+    /// Files encrypted under the data key (Phase 7), or nullptr. Not owning;
+    /// must outlive the service. Used only with storage_key_enabled.
+    StorageVault* vault = nullptr;
 };
 
 class SecurityMeshService : public core::IService<SecurityMeshService> {
@@ -77,6 +90,10 @@ public:
     SecurityMeshService(asio::io_context& io, const SecurityMeshConfig& config,
                         gossip::GossipService& transport,
                         crypto::KeyWrappingService* wrapping);
+    /// Detaches the vault from the data key service this object owns.
+    ~SecurityMeshService();
+    SecurityMeshService(const SecurityMeshService&) = delete;
+    SecurityMeshService& operator=(const SecurityMeshService&) = delete;
 
     void on_start();
     void on_stop();
@@ -253,8 +270,11 @@ private:
     // driver it registers with; the router reaches it only through the
     // address-captured challenge gate.
     std::unique_ptr<crypto::SodiumCryptoService> storage_crypto_;
-    std::unique_ptr<FileStorageShareStore> share_store_;
+    std::unique_ptr<SealedBlobStore> sealed_blobs_;
+    std::unique_ptr<FileStorageShareStore> file_share_store_;
+    std::unique_ptr<IStorageShareStore> share_store_;
     std::unique_ptr<StorageKeyService> storage_;
+    StorageVault* vault_ = nullptr;
 
     asio::steady_timer timer_;
     std::chrono::steady_clock::time_point started_at_{};

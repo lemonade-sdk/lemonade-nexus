@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+namespace nexus::security { class StorageVault; }
+
 namespace nexus::tree {
 
 /// Format version of every tree log file. open() refuses any other value.
@@ -89,13 +91,21 @@ public:
 
     [[nodiscard]] const std::filesystem::path& directory() const { return directory_; }
 
+    /// Phase 7: entries, snapshots, and the applied marker are read and
+    /// written through `vault` when it covers them. Not owning; set before
+    /// open().
+    void set_vault(security::StorageVault* vault) { vault_ = vault; }
+
 private:
+    [[nodiscard]] std::optional<nlohmann::json> read_doc(const std::filesystem::path& path) const;
+    [[nodiscard]] bool write_doc(const std::filesystem::path& path, const std::string& text) const;
     [[nodiscard]] std::filesystem::path entry_path(uint64_t height) const;
     [[nodiscard]] std::filesystem::path snapshot_path(uint64_t height) const;
     [[nodiscard]] bool write_snapshot(uint64_t height, const TreeChainState& state) const;
     [[nodiscard]] std::optional<TreeChainState> read_snapshot(uint64_t height) const;
 
     std::filesystem::path directory_;
+    security::StorageVault* vault_ = nullptr;
     TreeChainState        state_;
     uint64_t              height_ = 0;
     uint64_t              applied_height_ = 0;

@@ -1,6 +1,8 @@
 #include <LemonadeNexus/Security/DurableWrite.hpp>
 
 #include <cstddef>
+#include <fstream>
+#include <vector>
 #include <system_error>
 
 #ifdef _WIN32
@@ -141,6 +143,51 @@ bool write_durable(const fs::path& final_path, std::string_view payload) {
 
 bool write_durable_preserving(const fs::path& final_path, std::string_view payload) {
     return write_durable_impl(final_path, payload, /*preserve_metadata=*/true);
+}
+
+bool rename_durable(const fs::path& source_path, const fs::path& final_path) {
+    std::error_code ec;
+    fs::rename(source_path, final_path, ec);
+    if (ec) return false;
+#ifdef _WIN32
+    return true;
+#else
+    const int dir_fd = ::open(final_path.parent_path().c_str(), O_RDONLY);
+    if (dir_fd < 0) return false;
+    const bool directory_synced = ::fsync(dir_fd) == 0;
+    ::close(dir_fd);
+    return directory_synced;
+#endif
+}
+
+void overwrite_contents(const fs::path& path) {
+    std::error_code ec;
+    const auto size = fs::file_size(path, ec);
+    if (ec || size == 0) return;
+#ifndef _WIN32
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    const std::vector<uint8_t> zeros(static_cast<std::size_t>(size), 0);
+    std::size_t at = 0;
+    while (at < zeros.size()) {
+        const ssize_t n = ::write(fd, zeros.data() + at, zeros.size() - at);
+        if (n <= 0) break;
+        at += static_cast<std::size_t>(n);
+    }
+    (void)::fsync(fd);
+    ::close(fd);
+#else
+    std::ofstream out(path, std::ios::binary | std::ios::in | std::ios::out);
+    const std::vector<char> zeros(static_cast<std::size_t>(size), 0);
+    out.write(zeros.data(), static_cast<std::streamsize>(zeros.size()));
+#endif
+}
+
+bool scrub_file(const fs::path& path) {
+    overwrite_contents(path);
+    std::error_code ec;
+    fs::remove(path, ec);
+    return !fs::exists(path, ec);
 }
 
 }  // namespace nexus::security
