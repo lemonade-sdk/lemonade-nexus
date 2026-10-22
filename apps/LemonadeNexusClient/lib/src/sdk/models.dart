@@ -556,6 +556,16 @@ class ServerInfo {
   final bool available;
   final double? latencyMs;
 
+  /// The server's gossip endpoint as it announces it ("host:port").
+  final String endpoint;
+
+  /// The server's Ed25519 identity key (base64), when announced.
+  final String pubkey;
+
+  /// When the queried server last heard from this one (Unix seconds; 0 =
+  /// unknown or the queried server itself).
+  final int lastSeen;
+
   ServerInfo({
     required this.id,
     required this.host,
@@ -563,6 +573,9 @@ class ServerInfo {
     required this.region,
     required this.available,
     this.latencyMs,
+    this.endpoint = '',
+    this.pubkey = '',
+    this.lastSeen = 0,
   });
 
   /// Parses an entry from the SDK's `ln_servers` output.
@@ -586,6 +599,9 @@ class ServerInfo {
       region: (json['region'] ?? '').toString(),
       available: (json['healthy'] ?? json['available'] ?? false) as bool,
       latencyMs: (json['latency_ms'] as num?)?.toDouble(),
+      endpoint: endpoint,
+      pubkey: (json['pubkey'] ?? '').toString(),
+      lastSeen: ((json['last_seen'] ?? json['lastSeen']) as num?)?.toInt() ?? 0,
     );
   }
 

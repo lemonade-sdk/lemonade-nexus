@@ -834,6 +834,22 @@ class AppNotifier extends StateNotifier<AppState> {
     return provisioned;
   }
 
+  /// Create a fresh account key when no device holds one, and seal it to this
+  /// device. Only safe when the server holds no envelope for any device in the
+  /// Cluster: the caller checks that, because replacing a key another device
+  /// still holds would split the Cluster between two keys.
+  Future<void> createAccountKey() async {
+    final active = state.activeCluster;
+    if (active == null) throw StateError('no active Cluster');
+    if (active.groupKeyB64?.isNotEmpty == true) {
+      throw StateError('this device already holds the account key');
+    }
+    final groupKey = _sdk.generateGroupKey();
+    await _provisionGroupKeyTo(_sdk.identityPubkey ?? '', groupKey);
+    await _saveActiveCluster(active.copyWith(groupKeyB64: groupKey));
+    addActivity(ActivityLevel.success, 'Created a new account key');
+  }
+
   /// Fetch + unwrap this device's group-key envelope, persisting it to the
   /// keyring on success. Returns null if no owner has provisioned us yet.
   Future<String?> fetchGroupKey() async {
@@ -1222,6 +1238,20 @@ class AppNotifier extends StateNotifier<AppState> {
       _log('listClusterDevices: pending lookup failed -> $e');
     }
 
+    // Group admins, by key. A non-admin caller only sees its own entry, which
+    // still answers whether this device is an admin.
+    final adminKeys = <String>{};
+    try {
+      for (final a in await nodeAssignments(groupId)) {
+        final perms = (a['permissions'] as List?)?.map((p) => p.toString()) ?? const [];
+        if (perms.contains('admin')) {
+          adminKeys.add(canonicalPrincipal(a['management_pubkey']?.toString() ?? ''));
+        }
+      }
+    } catch (e) {
+      _log('listClusterDevices: group assignments lookup failed -> $e');
+    }
+
     final devices = <ClusterDevice>[];
     for (final node in children) {
       if ((node['node_type'] ?? node['type'])?.toString().toLowerCase() !=
@@ -1230,15 +1260,42 @@ class AppNotifier extends StateNotifier<AppState> {
       }
       final id = node['id']?.toString() ?? '';
       if (id.isEmpty) continue;
+      final mgmt = node['mgmt_pubkey']?.toString() ?? '';
       devices.add(ClusterDevice(
         nodeId: id,
         hostname: (node['hostname'] ?? node['data']?['hostname'])?.toString() ?? id,
         tunnelIp: (node['tunnel_ip'] ?? node['data']?['tunnel_ip'])?.toString(),
         needsKey: waiting.contains(id),
         isThisDevice: id == state.userId,
+        mgmtPubkey: mgmt,
+        isAdmin: mgmt.isNotEmpty && adminKeys.contains(canonicalPrincipal(mgmt)),
       ));
     }
     return devices;
+  }
+
+  /// A node's assignments: every entry when this device can edit the node,
+  /// otherwise only this device's own entry.
+  Future<List<Map<String, dynamic>>> nodeAssignments(String nodeId) async {
+    final node = await callPrivateApi('GET', '/api/tree/node/$nodeId');
+    if (node.containsKey('error')) throw Exception(node['error']);
+    return ((node['assignments'] as List?) ?? const [])
+        .map((a) => Map<String, dynamic>.from(a as Map))
+        .toList();
+  }
+
+  /// Set exactly [permissions] for [pubkey] on [nodeId]; an empty list removes
+  /// the entry. The server allows this only for an admin of the node or its
+  /// group, and only for devices that joined that group. Throws with the
+  /// server's reason when refused.
+  Future<void> setMemberPermissions(
+      String nodeId, String pubkey, List<String> permissions) async {
+    final resp = await callPrivateApi('POST', '/api/tree/node/assignments/$nodeId',
+        body: {'pubkey': pubkey, 'permissions': permissions});
+    if (resp['success'] != true) {
+      throw Exception(resp['error'] ?? 'the server refused the change');
+    }
+    addActivity(ActivityLevel.info, 'Updated access on $nodeId');
   }
 
   /// Remove a device from the active Cluster (owner-only; revokes its key).

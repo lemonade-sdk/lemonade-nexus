@@ -15,6 +15,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/cluster_keyring.dart';
 import 'invite_member_dialog.dart';
+import 'member_access_dialog.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 
@@ -361,6 +362,12 @@ class _AccountViewState extends ConsumerState<AccountView> {
     // the key, and never for our own row.
     final weHoldKey = ref.read(appNotifierProvider).activeCluster?.hasGroupKey ?? false;
     final anyPending = _devices.any((d) => d.needsKey && !d.isThisDevice);
+    // No device holds an envelope and this one has no key: the key was never
+    // stored anywhere, so an admin may start a new one without splitting it.
+    final keyLost = !weHoldKey &&
+        _devices.isNotEmpty &&
+        _devices.every((d) => d.needsKey) &&
+        _devices.any((d) => d.isThisDevice && d.isAdmin);
     return AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -373,6 +380,12 @@ class _AccountViewState extends ConsumerState<AccountView> {
               Text('${_devices.length}',
                   style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant)),
               const Spacer(),
+              if (keyLost)
+                TextButton.icon(
+                  onPressed: _isBusyDevices ? null : _createAccountKey,
+                  icon: const Icon(Icons.add_moderator_outlined, size: 16),
+                  label: const Text('Create account key'),
+                ),
               if (anyPending && weHoldKey)
                 TextButton.icon(
                   onPressed: _isBusyDevices ? null : _shareKeyWithAll,
@@ -403,13 +416,16 @@ class _AccountViewState extends ConsumerState<AccountView> {
             Text('No devices listed yet.',
                 style: TextStyle(fontSize: 12, color: scheme.onSurfaceVariant))
           else
-            for (final device in _devices) _deviceRow(context, device, weHoldKey),
+            for (final device in _devices)
+              _deviceRow(context, device, weHoldKey,
+                  iAmAdmin: _devices.any((d) => d.isThisDevice && d.isAdmin)),
         ],
       ),
     );
   }
 
-  Widget _deviceRow(BuildContext context, ClusterDevice device, bool weHoldKey) {
+  Widget _deviceRow(BuildContext context, ClusterDevice device, bool weHoldKey,
+      {required bool iAmAdmin}) {
     final scheme = Theme.of(context).colorScheme;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 6),
@@ -437,6 +453,10 @@ class _AccountViewState extends ConsumerState<AccountView> {
                     if (device.isThisDevice) ...[
                       const SizedBox(width: 6),
                       const LemonBadge(text: 'THIS DEVICE'),
+                    ],
+                    if (device.isAdmin) ...[
+                      const SizedBox(width: 6),
+                      const LemonBadge(text: 'ADMIN', color: AppTheme.lemonYellowDark),
                     ],
                     if (device.needsKey) ...[
                       const SizedBox(width: 6),
@@ -469,6 +489,13 @@ class _AccountViewState extends ConsumerState<AccountView> {
               icon: const Icon(Icons.key, size: 16),
               onPressed: _isBusyDevices ? null : _shareKeyWithAll,
             ),
+          if (iAmAdmin && device.mgmtPubkey.isNotEmpty)
+            IconButton(
+              tooltip: 'Manage access',
+              visualDensity: VisualDensity.compact,
+              icon: const Icon(Icons.admin_panel_settings_outlined, size: 16),
+              onPressed: _isBusyDevices ? null : () => _manageAccess(device),
+            ),
           if (!device.isThisDevice)
             IconButton(
               tooltip: 'Remove device',
@@ -480,6 +507,54 @@ class _AccountViewState extends ConsumerState<AccountView> {
         ],
       ),
     );
+  }
+
+  Future<void> _createAccountKey() async {
+    final scheme = Theme.of(context).colorScheme;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: scheme.surface,
+        shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: BorderSide(color: scheme.outline)),
+        title: const Text('Create account key'),
+        content: Text(
+          'No device in this Cluster holds the account key, and the servers have '
+          'no copy of it. Create a new one on this device? You can then share it '
+          'with the other devices.',
+          style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel')),
+          ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Create')),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() => _isBusyDevices = true);
+    try {
+      await ref.read(appNotifierProvider.notifier).createAccountKey();
+      _toast('Created the account key on this device');
+    } catch (e) {
+      _toast('Could not create the account key: $e', error: true);
+    } finally {
+      if (mounted) setState(() => _isBusyDevices = false);
+    }
+    await _load();
+  }
+
+  Future<void> _manageAccess(ClusterDevice device) async {
+    final saved =
+        await showMemberAccessDialog(context, device: device, devices: _devices);
+    if (saved == true) {
+      _toast('Access updated for ${device.hostname}');
+      await _load();
+    }
   }
 
   /// Seal the account key to every device still waiting for it.
