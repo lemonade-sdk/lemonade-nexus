@@ -16,16 +16,17 @@ migration runbook. Phase 4, the `storage-threshold` library
 (`crates/storage-threshold`), is implemented and tested. Phase 5 (holder
 plans and key rotations in consensus, the unlock protocol, the `StorageUnlock`
 attestation purpose, per-epoch share refresh, and daily rotation) is
-implemented behind the experimental `storage_key_enabled` setting; see
+implemented and always on, with no setting to turn it off; see
 [B11](#b11-phase-5-implementation) and
-[Configuration](Configuration#experimental-threshold-storage-key). The
-setting must stay off in production until the external review of the
-unaudited library paths in [B3](#b3-library) is done. Phase 6 is implemented:
+[Configuration](Configuration#threshold-storage-key). The external review of
+the unaudited library paths in [B3](#b3-library) was not commissioned: that
+gate was waived on 2026-10-22, not satisfied. Phase 6 is implemented:
 `nexus-attestd` seals and unseals, and the gossip identity key moves to a
 sealed copy through a one-way migration (see [B6](#b6-sealing-the-boot-set)
 for the binding, the migration, the upgrade path, and the limits). Phase 7 is
-implemented in part behind `storage_files_enabled`, default off (see
-[B12](#b12-phase-7-implementation)); it has the same review gate. The design
+implemented and always on (see
+[B12](#b12-phase-7-implementation)); it had the same review gate, also
+waived. The design
 changes the trust model, so `AGENTS.md` requires review of each later phase
 and its migration plan before code.
 
@@ -577,7 +578,7 @@ snapshots, and account data. `wrap_local.key` is retired.
 
 ### B11. Phase 5 implementation
 
-Behind `storage_key_enabled` (`Security/Storage/`):
+Always on, no setting (`Security/Storage/`):
 
 - **Records.** Two block payload kinds carry storage records:
   `StorageHolderPlan` (first key and share refresh) and `StorageKeyRotation`.
@@ -624,8 +625,7 @@ Behind `storage_key_enabled` (`Security/Storage/`):
 
 ### B12. Phase 7 implementation
 
-Behind `storage_files_enabled`, which needs `storage_key_enabled`
-(`Security/Storage/StorageVault.hpp`):
+Always on, no setting (`Security/Storage/StorageVault.hpp`):
 
 - **Format.** A covered file is replaced in place by
   `"LNXVAULT" | 0x01 | key id (16) | nonce (24) | ciphertext`. The cipher is

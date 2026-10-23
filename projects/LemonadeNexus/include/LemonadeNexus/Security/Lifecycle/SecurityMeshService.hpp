@@ -65,9 +65,6 @@ struct SecurityMeshConfig {
     /// Fires when this node first holds finalized epoch authority (entry into
     /// Active, or genesis certificate issuance). io-thread context.
     std::function<void()> on_epoch_established;
-    /// ServerConfig::storage_key_enabled: run the threshold storage key
-    /// (StorageKeyService). Off: no storage handler, sink, or message exists.
-    bool storage_key_enabled = false;
     /// How the storage share is sealed (B6, B7 step 1): the boot set's backend
     /// (attestd_seal_backend in production). Empty means this host cannot
     /// seal; the share then stays in the machine-bound file store.
@@ -79,7 +76,7 @@ struct SecurityMeshConfig {
     /// for the share like for the gossip identity. nullopt stages nothing.
     std::optional<BootPcrValues> next_boot_chain;
     /// Files encrypted under the data key (Phase 7), or nullptr. Not owning;
-    /// must outlive the service. Used only with storage_key_enabled.
+    /// must outlive the service.
     StorageVault* vault = nullptr;
 };
 
@@ -159,9 +156,9 @@ public:
     /// context runs.
     void set_tick_hook(std::function<void()> hook) { tick_hook_ = std::move(hook); }
 
-    /// The storage key service, or nullptr when storage_key_enabled is off.
-    /// Its DataKeyService reads (state, data_key) are thread-safe; everything
-    /// else runs on the io thread.
+    /// The storage key service. Always built: the threshold storage key is not
+    /// optional. Its DataKeyService reads (state, data_key) are thread-safe;
+    /// everything else runs on the io thread.
     [[nodiscard]] StorageKeyService* storage_key() { return storage_.get(); }
 
 private:
@@ -280,9 +277,8 @@ private:
     PlatformEvidenceProducer producer_;
     SecurityDriver driver_;
 
-    // The threshold storage key, behind storage_key_enabled. Built after the
-    // driver it registers with; the router reaches it only through the
-    // address-captured challenge gate.
+    // The threshold storage key. Built after the driver it registers with;
+    // the router reaches it only through the address-captured challenge gate.
     std::unique_ptr<crypto::SodiumCryptoService> storage_crypto_;
     std::unique_ptr<SealedBlobStore> sealed_blobs_;
     std::unique_ptr<FileStorageShareStore> file_share_store_;

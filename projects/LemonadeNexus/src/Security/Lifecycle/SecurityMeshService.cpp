@@ -120,48 +120,48 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
     events_.target = &driver_;
     if (config.on_epoch_established)
         driver_.set_epoch_established_callback(config.on_epoch_established);
-    if (config.storage_key_enabled) {
-        storage_crypto_ = std::make_unique<crypto::SodiumCryptoService>();
-        storage_crypto_->start();
-        const auto storage_directory = config.data_root / "security" / "storage";
-        file_share_store_ = std::make_unique<FileStorageShareStore>(
+    // The threshold storage key is unconditional: every server runs the holder
+    // duties and answers attested unlock requests, with or without a data key.
+    storage_crypto_ = std::make_unique<crypto::SodiumCryptoService>();
+    storage_crypto_->start();
+    const auto storage_directory = config.data_root / "security" / "storage";
+    file_share_store_ = std::make_unique<FileStorageShareStore>(
+        storage_directory / "sealed", storage_crypto_.get(), wrapping,
+        config.identity.public_key);
+    if (config.seal_backend.available() && !config.sealed_directory.empty()) {
+        // The share joins the gossip identity in the sealed boot set. A share
+        // kept in the file store before this host could seal moves across on
+        // first use.
+        sealed_blobs_ =
+            std::make_unique<SealedBlobStore>(config.sealed_directory, config.seal_backend);
+        sealed_blobs_->set_next_boot_chain(config.next_boot_chain);
+        share_store_ = std::make_unique<SealedStorageShareStore>(*sealed_blobs_,
+                                                                 file_share_store_.get());
+    } else {
+        spdlog::warn("[storage] this host cannot seal; the storage share stays in the "
+                     "machine-bound file store");
+        share_store_ = std::make_unique<FileStorageShareStore>(
             storage_directory / "sealed", storage_crypto_.get(), wrapping,
             config.identity.public_key);
-        if (config.seal_backend.available() && !config.sealed_directory.empty()) {
-            // The share joins the gossip identity in the sealed boot set. A
-            // share kept in the file store before this host could seal moves
-            // across on first use.
-            sealed_blobs_ =
-                std::make_unique<SealedBlobStore>(config.sealed_directory, config.seal_backend);
-            sealed_blobs_->set_next_boot_chain(config.next_boot_chain);
-            share_store_ = std::make_unique<SealedStorageShareStore>(*sealed_blobs_,
-                                                                     file_share_store_.get());
-        } else {
-            spdlog::warn("[storage] this host cannot seal; the storage share stays in the "
-                         "machine-bound file store");
-            share_store_ = std::make_unique<FileStorageShareStore>(
-                storage_directory / "sealed", storage_crypto_.get(), wrapping,
-                config.identity.public_key);
-        }
-        storage_ = std::make_unique<StorageKeyService>(
-            StorageKeyServiceConfig{
-                .self = self_id(config),
-                .identity = config.identity,
-                .network_id = mesh_network_id(config),
-                .directory = storage_directory,
-                .wall_clock_ms =
-                    [] {
-                        return static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch())
-                                .count());
-                    }},
-            driver_, router_, runtime_, sealer_, *share_store_, *storage_crypto_);
-        storage_->attach();
-        if (config.vault != nullptr) {
-            vault_ = config.vault;
-            vault_->attach(&storage_->data_keys());
-        }
+    }
+    storage_ = std::make_unique<StorageKeyService>(
+        StorageKeyServiceConfig{
+            .self = self_id(config),
+            .identity = config.identity,
+            .network_id = mesh_network_id(config),
+            .directory = storage_directory,
+            .wall_clock_ms =
+                [] {
+                    return static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count());
+                }},
+        driver_, router_, runtime_, sealer_, *share_store_, *storage_crypto_);
+    storage_->attach();
+    if (config.vault != nullptr) {
+        vault_ = config.vault;
+        vault_->attach(&storage_->data_keys());
     }
 }
 
