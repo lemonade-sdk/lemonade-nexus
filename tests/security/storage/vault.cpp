@@ -219,6 +219,65 @@ TEST_F(StorageVaultTest, MigrationEncryptsEveryCoveredFileAfterAFreshRoundTrip) 
     EXPECT_EQ(vault->read(data / "tree/nodes/gamma.json").bytes, "{\"id\":\"gamma\"}");
 }
 
+// Phase 7b: the ACME account key and every issued cert private key are covered
+// by the default storage coverage, so they are DEK-encrypted at rest. The
+// public fullchain and the metadata file stay plaintext (they are not secret).
+TEST_F(StorageVaultTest, CoverageCoversAcmeKeysNotPublicCerts) {
+    build();
+    EXPECT_TRUE(vault->covers(data / "certs" / "account.key"));
+    EXPECT_TRUE(vault->covers(data / "certs" / "server-abc.eu-west.seip.lemonade-nexus.io" / "privkey.pem"));
+    EXPECT_TRUE(vault->covers(data / "certs" / "private.server-abc.eu-west.seip.lemonade-nexus.io" / "privkey.pem"));
+    // Public, non-secret files are not covered.
+    EXPECT_FALSE(vault->covers(data / "certs" / "server-abc.eu-west.seip.lemonade-nexus.io" / "fullchain.pem"));
+    EXPECT_FALSE(vault->covers(data / "certs" / "server-abc.eu-west.seip.lemonade-nexus.io" / "meta.json"));
+}
+
+// A symlink anywhere in a covered directory makes the scan incomplete, and an
+// incomplete scan must not be treated as a complete empty one. A symlinked
+// privkey.pem must not be staged, promoted, or reported as migrated: the
+// plaintext it points at has to stay on disk and the vault must refuse the
+// scan. A symlink defeats no permissions, so this holds for a root test run
+// too. (A symlink is never trusted vault content: followed, it could loop the
+// walk; ignored, it could hide or impersonate a real file.)
+TEST_F(StorageVaultTest, SymlinkInCoveredDirectoryKeepsThePlaintextAndBlocksMigration) {
+    write_raw(data / "certs/account.key", "acme-account-secret");
+    const auto fqdn = data / "certs" / "server-abc.example";
+    fs::create_directories(fqdn);
+    fs::create_directories(data / "certs" / "outside");
+    write_raw(data / "certs" / "outside" / "real-key.pem", "target-key");
+    ASSERT_EQ(::symlink("../outside/real-key.pem",
+                        (fqdn / "privkey.pem").c_str()),
+              0);
+
+    build(64);
+    // The scan fails: a symlink in a covered directory means the list is
+    // incomplete or unsafe, so enumerate() returns empty.
+    const auto files = vault->test_enumerate_relative();
+    EXPECT_TRUE(files.empty());
+
+    keys.unlock();
+    tick(40);
+    // Migration must not have finished: a private key file is still unscannable.
+    EXPECT_NE(vault->mode(), VaultMode::Encrypted);
+    EXPECT_FALSE(done());
+    // The symlinked file was never staged; the plaintext it points at is
+    // untouched, and no plaintext anywhere was promoted to ciphertext in its
+    // place of a staged copy.
+    EXPECT_FALSE(fs::exists(fqdn / "privkey.pem.vault-new"));
+    EXPECT_EQ(read_raw(fqdn / "privkey.pem"), "target-key");  // via the symlink
+    EXPECT_EQ(read_raw(data / "certs" / "outside" / "real-key.pem"), "target-key");
+    EXPECT_FALSE(encrypted(read_raw(data / "certs" / "account.key")));
+    for (const auto& [rel, text] : originals) EXPECT_EQ(read_raw(data / rel), text);
+
+    // Remove the symlink: the scan is clean again and migration completes.
+    fs::remove(fqdn / "privkey.pem");
+    ASSERT_TRUE(run_to_done());
+    expect_encrypted_contents();
+    EXPECT_TRUE(encrypted(read_raw(data / "certs" / "account.key")));
+    EXPECT_EQ(vault->read(data / "certs" / "account.key").bytes,
+              "acme-account-secret");
+}
+
 TEST_F(StorageVaultTest, WithoutTHoldersThePlaintextStaysAndMigrationRetries) {
     // Locked: never starts.
     build();

@@ -60,6 +60,7 @@
 #include <filesystem>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -166,6 +167,14 @@ public:
     /// The B9 file set this phase covers.
     [[nodiscard]] static std::vector<VaultCoverage> default_coverage();
 
+    /// The covered files now on disk, or an empty list when the scan failed.
+    /// The scan walks each coverage directory recursively and refuses to stop
+    /// at an unreadable or symlinking entry: a partial list must never be
+    /// reported as a complete one, so every caller treats an empty result with
+    /// a file expected as "retry later", not "nothing to do".
+    /// Test-only; io thread.
+    [[nodiscard]] std::vector<std::string> test_enumerate_relative() const;
+
     /// Reads the state file and finishes interrupted replacements that need no
     /// key. A missing state file while a covered file holds the header, or a
     /// damaged state file, loads as Encrypted (fail closed). Call once before
@@ -231,6 +240,7 @@ private:
     [[nodiscard]] bool write_locked(const Covered& file, std::string_view bytes);
     [[nodiscard]] bool stage_one(const Covered& file, std::span<const uint8_t> source_key,
                                  std::span<const uint8_t> target_key);
+    [[nodiscard]] bool verify_scan_complete(const std::set<std::string>& original_files) const;
     [[nodiscard]] bool verify_all(std::span<const uint8_t> source_key,
                                   std::span<const uint8_t> target_key);
     void promote_all(const KeyId& target);
@@ -258,6 +268,8 @@ private:
     bool rotation_requested_ = false;
     std::vector<Covered> pending_;
     bool pending_loaded_ = false;
+    std::set<std::string> staged_originals_;
+    mutable bool last_scan_ok_ = true;
 };
 
 }  // namespace nexus::security
