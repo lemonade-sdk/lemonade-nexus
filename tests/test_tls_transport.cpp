@@ -75,7 +75,8 @@ TEST(TlsTransport, VerifiedByFqdnWhileConnectingToLoopback) {
     ASSERT_TRUE(make_self_signed(fqdn, cert, key));
 
     const uint16_t port = static_cast<uint16_t>(18000 + (getpid() % 1000));
-    network::HttpServer srv(port, "127.0.0.1", cert.string(), key.string());
+    network::HttpServer srv(port, "127.0.0.1");
+    ASSERT_TRUE(srv.enable_tls_from_paths(cert.string(), key.string()));
     ASSERT_TRUE(srv.is_tls());
     srv.server().Get("/ping", [](const httplib::Request&, httplib::Response& r) {
         r.set_content("pong", "text/plain");
@@ -118,6 +119,73 @@ TEST(TlsTransport, VerifiedByFqdnWhileConnectingToLoopback) {
         cli.set_connection_timeout(3);
         EXPECT_FALSE(cli.Get("/ping"));
     }
+
+    srv.stop();
+    fs::remove_all(tmp);
+}
+
+// ===========================================================================
+// Phase 7b: in-memory-key TLS. The key is a vault-covered file decrypted into
+// memory; enable_tls_inmemory_key loads it with the cert still read by path.
+// Fail closed: an empty (still-locked) key withholds the listener.
+// ===========================================================================
+
+namespace {
+std::string read_file(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    std::ostringstream ss; ss << f.rdbuf();
+    return ss.str();
+}
+}
+
+TEST(TlsInMemoryKey, FailClosedWhenKeyEmpty) {
+    auto tmp = fs::temp_directory_path() / ("nexus_tls_imem_locked_" + std::to_string(getpid()));
+    fs::create_directories(tmp);
+    const auto cert = tmp / "cert.pem";
+    const auto key  = tmp / "key.pem";
+    const std::string fqdn = "locked.eu-west.seip.lemonade-nexus.io";
+    ASSERT_TRUE(make_self_signed(fqdn, cert, key));
+
+    // A vault-covered key while the DEK is locked yields no in-memory bytes.
+    // The cert is still on disk (public, not secret) but the listener must be
+    // withheld rather than serving plaintext.
+    network::HttpServer srv(static_cast<uint16_t>(18200 + (getpid() % 1000)), "127.0.0.1");
+    EXPECT_FALSE(srv.enable_tls_inmemory_key(cert.string(), /*key_pem=*/"", key.string()));
+    EXPECT_FALSE(srv.is_tls());
+    srv.stop();
+    fs::remove_all(tmp);
+}
+
+TEST(TlsInMemoryKey, ServesTlsFromInMemoryKey) {
+    auto tmp = fs::temp_directory_path() / ("nexus_tls_imem_" + std::to_string(getpid()));
+    fs::create_directories(tmp);
+    const auto cert = tmp / "cert.pem";
+    const auto key  = tmp / "key.pem";
+    const std::string fqdn = "imem.eu-west.seip.lemonade-nexus.io";
+    ASSERT_TRUE(make_self_signed(fqdn, cert, key));
+    const std::string key_pem = read_file(key);  // decrypted in memory
+    ASSERT_FALSE(key_pem.empty());
+
+    const uint16_t port = static_cast<uint16_t>(18250 + (getpid() % 1000));
+    network::HttpServer srv(port, "127.0.0.1");
+    ASSERT_TRUE(srv.enable_tls_inmemory_key(cert.string(), key_pem, key.string()));
+    ASSERT_TRUE(srv.is_tls());
+    srv.server().Get("/ping", [](const httplib::Request&, httplib::Response& r) {
+        r.set_content("pong", "text/plain");
+    });
+    srv.start();
+    std::this_thread::sleep_for(300ms);
+
+    // Connect by the cert FQDN, verify against the on-disk cert as CA, land on
+    // loopback. Proves the in-memory key produced a working TLS context.
+    httplib::SSLClient cli(fqdn, port);
+    cli.set_hostname_addr_map({{fqdn, "127.0.0.1"}});
+    cli.set_ca_cert_path(cert.string());
+    cli.set_connection_timeout(3);
+    auto res = cli.Get("/ping");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->body, "pong");
 
     srv.stop();
     fs::remove_all(tmp);

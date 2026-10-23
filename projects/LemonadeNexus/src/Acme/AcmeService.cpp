@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Network/DnsService.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -208,6 +209,41 @@ bool AcmeService::write_raw_file(const std::filesystem::path& path,
     }
 }
 
+void AcmeService::set_vault(security::StorageVault* vault) {
+    vault_ = vault;
+}
+
+std::string AcmeService::read_secret_file(const std::filesystem::path& path) const {
+    if (vault_ != nullptr) {
+        // Phase 7: the key is a vault file. Read it through the DEK. Fail closed
+        // — a locked or unreadable key returns empty, so the caller treats it as
+        // absent and never parses or logs the ciphertext.
+        const auto read = vault_->read(path);
+        if (read.status != security::VaultReadStatus::Ok) {
+            spdlog::warn("[{}] {} not readable through the storage vault (status={}); "
+                         "treating as absent", name(), path.string(),
+                         static_cast<int>(read.status));
+            return {};
+        }
+        return read.bytes;
+    }
+    return read_raw_file(path);
+}
+
+bool AcmeService::write_secret_file(const std::filesystem::path& path,
+                                     const std::string& content) const {
+    if (vault_ != nullptr) {
+        // DEK-encrypt at rest. The vault rejects the write while locked.
+        if (!vault_->write(path, content)) {
+            spdlog::warn("[{}] could not write {} through the storage vault; the "
+                         "data key may still be locked", name(), path.string());
+            return false;
+        }
+        return true;
+    }
+    return write_raw_file(path, content);
+}
+
 uint64_t AcmeService::parse_cert_expiry(const std::string& pem) {
     BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
     if (!bio) return 0;
@@ -333,9 +369,12 @@ bool AcmeService::ensure_account_key() {
         spdlog::info("[{}] loading existing account key from {}",
                       name(), account_key_path_.string());
 
-        auto pem = read_raw_file(account_key_path_);
+        // Phase 7: the account key is a vault file; read it through the DEK
+        // (fail closed when locked or unreadable).
+        auto pem = read_secret_file(account_key_path_);
         if (pem.empty()) {
-            spdlog::error("[{}] account key file is empty", name());
+            spdlog::error("[{}] account key is unavailable (vault-locked or empty)",
+                          name());
             return false;
         }
 
@@ -410,17 +449,20 @@ bool AcmeService::ensure_account_key() {
     std::string pem(pem_data, static_cast<std::size_t>(pem_len));
     BIO_free(bio);
 
-    if (!write_raw_file(account_key_path_, pem)) {
+    if (!write_secret_file(account_key_path_, pem)) {
         spdlog::error("[{}] failed to write account key to {}",
                        name(), account_key_path_.string());
         EVP_PKEY_free(key);
         return false;
     }
 
-    // Set restrictive permissions on the key file
-    fs::permissions(account_key_path_,
-                     fs::perms::owner_read | fs::perms::owner_write,
-                     fs::perm_options::replace);
+    // Set restrictive permissions on the key file (no-op while vault-covered:
+    // the vault file is written with 0600 by write_durable).
+    if (vault_ == nullptr) {
+        fs::permissions(account_key_path_,
+                         fs::perms::owner_read | fs::perms::owner_write,
+                         fs::perm_options::replace);
+    }
 
     account_key_ = key;
     spdlog::info("[{}] account key saved to {}", name(), account_key_path_.string());
@@ -1551,16 +1593,19 @@ AcmeResult AcmeService::do_request_certificate(const std::string& domain) {
         return result;
     }
 
-    if (!write_raw_file(privkey_path, cert_privkey_pem)) {
+    if (!write_secret_file(privkey_path, cert_privkey_pem)) {
         result.error_message = "Failed to write privkey.pem";
         spdlog::error("[{}] {}", name(), result.error_message);
         return result;
     }
 
-    // Set restrictive permissions on the private key
-    fs::permissions(privkey_path,
-                     fs::perms::owner_read | fs::perms::owner_write,
-                     fs::perm_options::replace);
+    // Set restrictive permissions on the private key (no-op while vault-covered:
+    // the vault file is written with 0600 by write_durable).
+    if (vault_ == nullptr) {
+        fs::permissions(privkey_path,
+                         fs::perms::owner_read | fs::perms::owner_write,
+                         fs::perm_options::replace);
+    }
 
     // Step 12: Write meta.json with expiry
     auto expiry = parse_cert_expiry(fullchain_pem);

@@ -16,9 +16,19 @@ namespace nexus::security { class StorageVault; }
 namespace nexus::core {
 
 /// Result of TLS certificate resolution.
+///
+/// `key_bytes` carries the private key in memory whenever a storage vault covers
+/// it (Phase 7): the listener uses the in-memory key and never opens the on-disk
+/// file, which is DEK ciphertext and unreadable while the DEK is locked. When the
+/// vault does not cover the key, `key_bytes` is empty and the listener loads
+/// `key_path` from disk. `valid` stays false while a covered key cannot be
+/// decrypted, so callers fail closed (no HTTP listener, pending API) instead of
+/// serving or exposing plaintext.
 struct TlsResolution {
     std::string cert_path;
     std::string key_path;
+    std::string key_bytes;
+    bool valid{false};
     bool needs_acme_background{false};
 };
 
@@ -124,13 +134,19 @@ void resolve_server_region(
     ipam::IPAMService& ipam,
     gossip::GossipService& gossip);
 
-/// Resolve the TLS certificate paths for `server_fqdn`. The cert is always
+/// Resolve the TLS certificate for `server_fqdn`. The cert is always
 /// ACME-issued (public CA on the SEIP FQDN); this returns the cert on disk for
 /// THIS FQDN, or needs_acme_background=true when it must still be requested.
 /// Each listener resolves its OWN FQDN independently — the private listener
 /// (private.<seip>) never receives the public cert.
+///
+/// When `vault` is non-null and covers the private key, the key is read through
+/// the vault and returned in `key_bytes` (never the raw on-disk file). A covered
+/// key that cannot be decrypted yet keeps `valid` false, so the caller fails
+/// closed. Without a vault the key path is returned as before.
 [[nodiscard]] TlsResolution resolve_tls_cert(
     const std::filesystem::path& data_root,
-    const std::string& server_fqdn);
+    const std::string& server_fqdn,
+    const security::StorageVault* vault = nullptr);
 
 } // namespace nexus::core

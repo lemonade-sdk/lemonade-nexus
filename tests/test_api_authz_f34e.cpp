@@ -232,8 +232,8 @@ protected:
         side_cert = temp_dir / "side_cert.pem";
         side_key  = temp_dir / "side_key.pem";
         if (!make_self_signed("side.test.local", side_cert, side_key)) return 0;
-        tls_http = std::make_unique<network::HttpServer>(
-            port, "127.0.0.1", side_cert.string(), side_key.string());
+        tls_http = std::make_unique<network::HttpServer>(port, "127.0.0.1");
+        if (!tls_http->enable_tls_from_paths(side_cert.string(), side_key.string())) return 0;
         if (!tls_http->is_tls()) return 0;
 
         tls_ctx = new api::ApiContext{
@@ -443,7 +443,7 @@ TEST_F(ApiAuthzF34eTest, InternalRenewalReloadMechanismServesNewCertificate) {
     }
 
     // Refusal paths of the retained mechanism: no TLS mode, bad paths.
-    network::HttpServer plain(port + 3, "127.0.0.1", "", "");
+    network::HttpServer plain(port + 3, "127.0.0.1");
     EXPECT_FALSE(plain.reload_tls_certs());
     EXPECT_FALSE(tls_http->reload_tls_certs("/nonexistent/cert.pem",
                                             "/nonexistent/key.pem"));
