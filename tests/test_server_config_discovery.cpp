@@ -82,22 +82,15 @@ TEST(ServerConfigJson, MeshInterfaceReadsCurrentName) {
     EXPECT_EQ(current.mesh_interface, "mesh0");
 }
 
-// The experimental storage key is off unless a setting turns it on.
-TEST(ServerConfigJson, StorageKeyIsOffByDefaultAndReadsItsJsonKey) {
+// The storage key and file encryption are not configurable settings: the old
+// `storage_key_enabled` / `storage_files_enabled` JSON keys were removed. A
+// stale config that still names one is ignored, not an error.
+TEST(ServerConfigJson, StaleStorageFlagJsonKeysAreIgnored) {
     nexus::core::ServerConfig config;
-    EXPECT_FALSE(config.storage_key_enabled);
-    nexus::core::from_json(nlohmann::json{{"storage_key_enabled", true}}, config);
-    EXPECT_TRUE(config.storage_key_enabled);
-}
-
-TEST_F(ConfigDiscovery, StorageKeyFlagTurnsTheStorageKeyOn) {
-    fs::current_path(dir);
-    EXPECT_FALSE(load_from_cwd().storage_key_enabled);
-    std::string a0 = "lemonade-nexus";
-    std::string a1 = "--root-pubkey";
-    std::string a2 = std::string(64, 'a');
-    std::string a3 = "--storage-key";
-    std::vector<char*> argv{a0.data(), a1.data(), a2.data(), a3.data()};
-    EXPECT_TRUE(nexus::core::load_config(static_cast<int>(argv.size()), argv.data())
-                    .storage_key_enabled);
+    nexus::core::from_json(
+        nlohmann::json{{"storage_key_enabled", true}, {"storage_files_enabled", true}},
+        config);
+    EXPECT_FALSE(config.tree_ops_enabled);
+    EXPECT_FALSE(config.tree_log_enabled);
+    EXPECT_FALSE(config.ddns_enabled);
 }

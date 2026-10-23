@@ -5,9 +5,9 @@ Check this list before the next release. Nothing below is a blocker unless marke
 
 ## Decisions already made
 
-- **Storage encryption goes default-on.** `storage_key_enabled` and `storage_files_enabled` are to be
-  removed, not defaulted on behind a flag. Owner position: these are not optional, so they do not get
-  flags. Done deciding; treat as accepted.
+- **Storage encryption goes default-on.** `storage_key_enabled` and `storage_files_enabled` were
+  removed rather than defaulted on behind a flag. Owner position: these are not optional, so they do
+  not get flags. Done deciding; treat as accepted. Implemented 2026-10-23.
 - **Fail closed**, per the TLS decision. No plaintext fallback after migration completes.
 - **B3 external review not commissioned** (owner decision, 2026-10-22). The gate in
   `Design-Tree-Consensus-and-Storage-Key.md` line 22 is therefore **waived, not satisfied**. Recorded
@@ -36,8 +36,10 @@ Still open, needs an owner call:
   unrecoverable, by design. Rollback to the `c382d2d` binary after a completed migration is not
   supported. This is a product decision about the upgrade path, not a security question. It needs a
   decision before release, plus a backup requirement for `data/security/storage/` and `data/sealed/`.
-- Whether stale `SP_STORAGE_KEY` / `SP_STORAGE_FILES` keys in existing config files are rejected or
-  ignored. The Tier 1 environment-file contract changes either way, so it affects the next deploy.
+- Resolved: stale `SP_STORAGE_KEY` / `SP_STORAGE_FILES` keys, the JSON keys, and the
+  `--storage-key` / `--storage-files` options are **ignored**, not rejected. The config parser is a
+  `strcmp` chain with no unknown-option branch, so a unit file that still names them starts normally
+  and runs with encryption on. The Tier 1 environment-file contract changes accordingly.
 - What the status endpoint shows in the pre-key state.
 - Whether the file share store stays the accepted at-rest protection for Tier 2 shares on macOS and
   Linux dev hosts.

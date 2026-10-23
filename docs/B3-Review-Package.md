@@ -1,11 +1,14 @@
 # B3 External-Review Package — Threshold Storage Key
 
 **Status:** preparation artifact only. This document and the internal analysis
-in it do **not** constitute external review. `storage_key_enabled` and
-`storage_files_enabled` stay **off** until a real external review of the
-unaudited library paths is commissioned, performed by an independent vendor,
-and its findings are resolved. `AGENTS.md` forbids treating internal analysis,
-simulated tests, or a passing `ctest` as that evidence.
+in it do **not** constitute external review. The `storage_key_enabled` and
+`storage_files_enabled` flags have since been removed, so storage encryption
+now runs on every node with no way to turn it off. The review gate described
+here was **waived by the owner on 2026-10-22; it was not satisfied.** No
+external review of the unaudited library paths has been commissioned or
+performed, and `AGENTS.md` forbids treating internal analysis, simulated
+tests, or a passing `ctest` as that evidence. Read the sections below as
+unreviewed analysis of code that is now always compiled in.
 
 **Repo checkout:** branch `storage-dek-phase7`.
 
@@ -354,20 +357,20 @@ CTest case have overlapping coverage, but the CTest case does not run
 every unit test in `tests.rs`. If a regression is introduced in a crate
 test that the CTest case does not exercise, CI will not catch it.
 
-## 7. Feature-flag status
+## 7. Feature-flag status (superseded)
 
-`storage_key_enabled` and `storage_files_enabled` are both
-**default-off** in
-`projects/LemonadeNexus/include/LemonadeNexus/Core/ServerConfig.hpp:149,156`
-(`bool storage_key_enabled{false};` and
-`bool storage_files_enabled{false};`). They can be turned on via
-`ServerConfig` JSON or the `SP_STORAGE_KEY` / `SP_STORAGE_FILES`
-environment variables
-(`projects/LemonadeNexus/src/Core/ServerConfig.cpp:437-438`). `main.cpp`
-logs an "EXPERIMENTAL" warning when `storage_key_enabled` is on
-(`projects/LemonadeNexus/src/main.cpp:1058-1059`). **Do not enable either
-flag in production until the external review is complete and its findings
-are resolved.**
+The flags described below no longer exist. `storage_key_enabled` and
+`storage_files_enabled` were removed from `ServerConfig`, together with the
+`--storage-key` and `--storage-files` options, the `SP_STORAGE_KEY` and
+`SP_STORAGE_FILES` environment variables, their JSON keys, the
+`storage_files_enabled requires storage_key_enabled` validation, and the
+"EXPERIMENTAL" warning.
+
+There is no supported way to run a node with storage encryption off. Unknown
+flags and stale JSON keys are ignored by the config parser, so a unit file or
+environment file that still names them starts normally and runs with storage
+encryption on. The review gate that used to hold this behind a flag was
+waived; see the status note at the top of this document.
 
 ## 8. Reproducible build and test commands
 

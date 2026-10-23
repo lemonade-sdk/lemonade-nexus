@@ -29,12 +29,13 @@ struct SecurityMeshStartup {
     std::string release_approval_digest_hex;
 };
 
-/// Storage inputs of the mesh. Used only with storage_key_enabled.
+/// Storage inputs of the mesh. The threshold storage key always runs; the
+/// vault is nullptr when this server keeps no files under a data key.
 struct SecurityMeshStorageInputs {
     /// The boot set's seal backend; empty when this build or host cannot seal.
     security::SealBackend seal_backend;
-    /// Files under the data key (storage_files_enabled), or nullptr. Not
-    /// owning; must outlive the returned service.
+    /// Files under the data key (Phase 7), or nullptr. Not owning; must
+    /// outlive the returned service.
     security::StorageVault* vault = nullptr;
 };
 
