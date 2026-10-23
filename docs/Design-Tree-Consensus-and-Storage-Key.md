@@ -637,11 +637,21 @@ Behind `storage_files_enabled`, which needs `storage_key_enabled`
   `identity/ddns_credentials.enc`, `account/replica.json`, `tree/nodes`,
   `tree/deltas`, and `tree/log`. `FileStorageService`, `KeyWrappingService`,
   `resolve_jwt_secret`, and `TreeLog` route these paths through the vault.
-- **Not covered yet.** TLS and ACME keys (loaded by path by the HTTP server),
-  ACL rows (SQLite, keyed from the gossip identity), vote keys, and
-  `wrap_local.key`. The vote keys and the file share store are read before
-  the unlock, and they depend on `wrap_local.key`; moving any of them under
-  the DEK would stop a cold start (B8). `wrap_local.key` is not retired.
+- **Not covered (plaintext private keys at rest).** TLS and ACME keys:
+  `certs/<fqdn>/privkey.pem` and `certs/account.key`. `resolve_tls_cert`
+  resolves them by path and `HttpServer` opens them by path, so covering them
+  needs an in-memory key path, plus a decision on listener start order: the
+  listener does not wait for the unlock today.
+- **No secret at rest, so not coverage gaps.** Vote keys: `VoteKey.cpp`
+  generates the Ed25519 keypair into guarded memory each epoch and never
+  writes the private key, and `vote-key-<epoch>.json` and the epoch file carry
+  public keys and digests only. ACL rows: `acl.db` already stores `perms_enc`
+  under XChaCha20-Poly1305, keyed from the gossip identity
+  (`ACLService::set_signing_keypair`). Moving ACL rows to a DEK-derived key is
+  a re-keying choice, not a plaintext gap, and a live SQLite file does not fit
+  the whole-file vault container.
+- `wrap_local.key` is not retired. The file share store reads it before the
+  unlock, so moving it under the DEK would stop a cold start (B8).
 - **Migration (B10).** `plaintext`, then `migrating` (stage
   `<file>.vault-new`, request a new unlock round trip, verify every staged
   copy against the plaintext), then `encrypted` (overwrite and replace). The
@@ -684,7 +694,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented in part** (B12): TLS/ACME keys, ACL rows, and vote keys are not covered yet. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented in part** (B12): TLS/ACME private keys are not covered. Vote keys keep no private key at rest and ACL rows are already encrypted under a separate key, so neither is a coverage gap. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 
