@@ -2,34 +2,37 @@
 #
 # nexus-release-ingest
 #
-# The ingestion half of the release ceremony: verify that candidate artifacts
-# really came from this repository's release workflow before any approval is
-# signed. Provenance verification lives in operator tooling, never in the
-# node. A PASS is one required input to the separately authorized signing
-# act; this tool signs nothing, touches no key material, deploys nothing, and
-# never trusts a repository or workflow named by the artifact itself.
+# Operator check: verify that release artifacts came from this repository's
+# release workflow on main. nexus-updater runs the same check on each server
+# before it stages a release (with a pinned Sigstore trusted root, offline);
+# this tool lets an operator repeat it with gh. It signs nothing, touches no
+# key material, deploys nothing, and never trusts a repository or workflow
+# named by the artifact itself.
+#
+# release.yml runs only by workflow_dispatch from main, so the signer
+# identity is the workflow file at refs/heads/main, not at the tag.
 #
 # Usage:
 #   nexus-release-ingest --repo lemonade-sdk/lemonade-nexus \
-#       --workflow release.yml --tag v0.9.7 <artifact> [<artifact>...]
+#       [--workflow release.yml] [--ref refs/heads/main] <artifact> [<artifact>...]
 #
 # Requires: gh (authenticated), sha256sum.
 
 set -euo pipefail
 
-REPO="" WORKFLOW="release.yml" TAG=""
+REPO="" WORKFLOW="release.yml" REF="refs/heads/main"
 ARTIFACTS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --repo)     REPO="$2"; shift 2 ;;
         --workflow) WORKFLOW="$2"; shift 2 ;;
-        --tag)      TAG="$2"; shift 2 ;;
+        --ref)      REF="$2"; shift 2 ;;
         -*)         echo "nexus-release-ingest: unknown option $1" >&2; exit 2 ;;
         *)          ARTIFACTS+=("$1"); shift ;;
     esac
 done
-if [ -z "$REPO" ] || [ -z "$TAG" ] || [ "${#ARTIFACTS[@]}" -eq 0 ]; then
-    echo "usage: nexus-release-ingest --repo <owner/repo> [--workflow <file>] --tag <vX.Y.Z> <artifact>..." >&2
+if [ -z "$REPO" ] || [ "${#ARTIFACTS[@]}" -eq 0 ]; then
+    echo "usage: nexus-release-ingest --repo <owner/repo> [--workflow <file>] [--ref <ref>] <artifact>..." >&2
     exit 2
 fi
 
@@ -39,11 +42,11 @@ status=0
 for artifact in "${ARTIFACTS[@]}"; do
     [ -f "$artifact" ] || { echo "MISSING  $artifact" >&2; status=1; continue; }
     sha="$(sha256sum "$artifact" | awk '{print $1}')"
-    # The signer identity must be this repo's release workflow on the tag ref;
-    # a generic repository build or arbitrary ref is not an official release.
+    # The signer identity must be this repo's release workflow on the release
+    # ref; a generic repository build or another ref is not an official release.
     if gh attestation verify "$artifact" \
             --repo "$REPO" \
-            --signer-workflow "${REPO}/.github/workflows/${WORKFLOW}@refs/tags/${TAG}" \
+            --signer-workflow "${REPO}/.github/workflows/${WORKFLOW}@${REF}" \
             >/dev/null 2>&1; then
         echo "PASS     $sha  $artifact"
     else

@@ -20,7 +20,12 @@ struct ReleaseArtifact {
     /// Installed path, exactly as the kernel records it in the IMA log.
     std::string installed_path;
     /// Local file whose bytes are hashed. Missing or unreadable fails closed.
+    /// Empty when `sha256` gives the digests instead.
     std::filesystem::path file;
+    /// Reviewed digests (64 lowercase hex) for a file the build does not
+    /// produce, such as a fleet system library from release/fleet-profile.json.
+    /// Used only when `file` is empty.
+    std::vector<std::string> sha256;
 };
 
 struct ReleaseBundleSpec {
@@ -42,10 +47,19 @@ struct ReleaseBundleSpec {
     std::vector<std::string> svsm_launch_measurements;
     /// Both required executables plus the audited dependency closure.
     std::vector<ReleaseArtifact> artifacts;
+    /// The previous release's approval, for the one-release overlap window
+    /// (design Phase 2). Its signature must verify under signer_pubkey_b64.
+    /// Its digests are appended after the new digest of every path the new
+    /// release still lists; a path the new release drops is not carried over.
+    std::optional<ReleaseApprovalV1> previous;
 };
 
 /// Fills the compiled template with digests of the actual files. Fail-closed:
 /// any invalid spec yields nullopt and a reason in `error`.
+///
+/// Order of each path's digests: the new release's digest first, then the
+/// previous release's. nexus-updater relies on the first entry being the
+/// newest build.
 [[nodiscard]] std::optional<ReleaseApprovalV1> generate_release_approval(
     const ReleaseBundleSpec& spec, std::string& error);
 

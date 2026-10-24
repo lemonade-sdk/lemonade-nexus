@@ -174,4 +174,44 @@ TEST_F(GeneratorFixture, EachInvalidSpecIsRefusedWithAReason) {
     }
 }
 
+TEST_F(GeneratorFixture, ReviewedDigestsStandInForFilesTheBuildDoesNotProduce) {
+    spec.artifacts[2] = {"/usr/lib/x86_64-linux-gnu/libc.so.6", {}, {std::string(64, 'c')}};
+    std::string error;
+    const auto approval = generate_release_approval(spec, error);
+    ASSERT_TRUE(approval.has_value()) << error;
+    EXPECT_EQ(approval->approved_paths[2].sha256, std::vector<std::string>{std::string(64, 'c')});
+
+    spec.artifacts[2] = {"/usr/lib/x86_64-linux-gnu/libc.so.6", {}, {"NOT-HEX"}};
+    EXPECT_FALSE(generate_release_approval(spec, error).has_value());
+    spec.artifacts[2] = {"/usr/lib/x86_64-linux-gnu/libc.so.6", {}, {}};
+    EXPECT_FALSE(generate_release_approval(spec, error).has_value());
+}
+
+TEST_F(GeneratorFixture, CarriesThePreviousReleaseDigestsAfterTheNewOnes) {
+    std::string error;
+    auto previous = generate_release_approval(spec, error);
+    ASSERT_TRUE(previous.has_value()) << error;
+    previous->approved_paths.push_back({"/usr/bin/retired-tool", {std::string(64, 'e')}});
+    const auto preimage = canonical_release_approval_json(*previous);
+    std::array<unsigned char, crypto_sign_BYTES> sig{};
+    crypto_sign_detached(sig.data(), nullptr,
+                         reinterpret_cast<const unsigned char*>(preimage.data()), preimage.size(),
+                         authority_sk.data());
+    previous->signature_b64 = crypto::to_base64(sig);
+
+    spec.artifacts[0] = {"/usr/bin/lemonade-nexus", write_artifact("app2", "app bytes v2")};
+    spec.previous = *previous;
+    const auto next = generate_release_approval(spec, error);
+    ASSERT_TRUE(next.has_value()) << error;
+    EXPECT_EQ(next->approved_paths[0].sha256,
+              (std::vector<std::string>{hex_sha256("app bytes v2"), hex_sha256("app bytes")}));
+    // Unchanged files are not listed twice; dropped paths are not carried over.
+    EXPECT_EQ(next->approved_paths[1].sha256.size(), 1u);
+    EXPECT_EQ(next->approved_paths.size(), 3u);
+
+    // A previous approval the release key did not sign contributes nothing.
+    spec.previous->signature_b64 = crypto::to_base64(std::array<unsigned char, 64>{});
+    EXPECT_FALSE(generate_release_approval(spec, error).has_value());
+}
+
 }  // namespace

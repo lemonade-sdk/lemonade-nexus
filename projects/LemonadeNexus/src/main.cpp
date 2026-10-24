@@ -32,6 +32,7 @@
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
+#include <LemonadeNexus/Core/UpdateControlWiring.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
@@ -330,6 +331,40 @@ int main(int argc, char* argv[]) {
     if (!security_mesh) {
         spdlog::error("Config: {}", mesh_error);
         return 1;
+    }
+
+    // Update control socket for nexus-updater (status, upgrade turn, boot-chain
+    // staging). It starts before the data-key wait so the updater can watch an
+    // unlock. The turn gate refuses until consensus turns exist (Phase 5).
+    std::atomic<nexus::tree::TreeConsensus*> tree_for_update_status{nullptr};
+    nexus::update::RefusingTurnGate upgrade_turn_gate;
+    nexus::update::UpdateControlSocket update_control;
+    if (const auto anchor = nexus::core::load_genesis_anchor(config.genesis_pubkey)) {
+        nexus::core::UpdateStatusSources sources;
+        sources.mesh = security_mesh->service.get();
+        sources.self.bytes = gossip.keypair().public_key;
+        sources.vault = storage_vault.get();
+        sources.tree = &tree_for_update_status;
+        if (anchor->release) {
+            sources.release_id = anchor->release->approval.release_id;
+            sources.approval_digest_hex = security_mesh->release_approval_digest_hex;
+        }
+        nexus::core::BootChainStagingInputs staging;
+        staging.genesis_public_key = anchor->genesis_public_key;
+        staging.network_id = anchor->network_id;
+        staging.sealed_directory =
+            std::filesystem::path(data_root) / std::string(nexus::core::kSealedDirectory);
+        staging.backend = seal_backend;
+        std::string update_control_error;
+        if (!update_control.start(
+                std::string(nexus::update::kUpdateControlSocketPath),
+                nexus::core::make_update_control_handlers(std::move(sources), std::move(staging),
+                                                          upgrade_turn_gate),
+                update_control_error)) {
+            spdlog::warn("Update control socket unavailable ({}); nexus-updater cannot "
+                         "read this server's status",
+                         update_control_error);
+        }
     }
     if (defer_file_services) {
         // Fail closed: the files are encrypted, so nothing that reads them
@@ -937,6 +972,12 @@ int main(int argc, char* argv[]) {
     //               the committed (or replicated) log
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
+    // Destroyed before tree_consensus on every exit path: the control socket
+    // thread reads the tree log status.
+    struct StopUpdateControl {
+        nexus::update::UpdateControlSocket& socket;
+        ~StopUpdateControl() { socket.stop(); }
+    } stop_update_control{update_control};
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     std::function<nlohmann::json()> tree_log_status;
@@ -969,6 +1010,7 @@ int main(int argc, char* argv[]) {
         tree_consensus = std::make_unique<nexus::tree::TreeConsensus>(
             std::move(tree_config), tree, crypto,
             std::filesystem::path(data_root) / "tree" / "log");
+        tree_for_update_status.store(tree_consensus.get());
         if (!tree_consensus->start()) {
             // Fail closed: the server runs and serves its last committed tree,
             // but applies, votes for, and accepts no tree operation.
@@ -1386,6 +1428,8 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Shutdown (reverse order)
     // ========================================================================
+    // The control socket reads the services below; stop it first.
+    update_control.stop();
     acme_retry_stop.store(true);
     if (acme_retry_thread.joinable()) {
         acme_retry_thread.join();

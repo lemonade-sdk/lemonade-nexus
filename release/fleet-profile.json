@@ -1,0 +1,85 @@
+{
+  "format_version": 1,
+  "_doc": [
+    "Reviewed release inputs that CI cannot measure. Change them only in a reviewed pull request.",
+    "Seeded from release r21 (v0.9.8-tier1-svsm-epoch1-r21): its nexus-release-bundle spec and output.",
+    "expected_pcrs: PCR 8/9 of the boot chain that release/os-packages.lock pins, measured on the reference VM (scripts/nexus-measure-boot-chain).",
+    "system_libraries: SHA-256 of each fleet system library (ceremony/fleet-libs). They change only together with release/os-packages.lock.",
+    "authority_genesis_signature: the public Genesis signature over the release authority (network_id, release_signer). Ed25519 is deterministic, so it stays the same while those two values do.",
+    "This file holds no private key."
+  ],
+  "network_id": "7ed6818e840cd3b8d5b590b660d64b969fcc12c102566909d6c390cdd1817c77",
+  "release_signer": "mbNVEcbQrck7kK51bhrj1qCMJVZLaojWJeT3p3guKVg=",
+  "authority_genesis_signature": "yLUWsmHvVWAiP4nTC/NSngRRML1DD0ggDrsZ83AevT8NgbdJzaWyJQO+/+2OjTAxMgf0eiN6BovRwAMGPa61Bg==",
+  "qualification_state": "LIVE_BOOT_APPROVED",
+  "expected_pcrs": [
+    {
+      "index": 8,
+      "sha256": "bcfa91360974e3dac6cfc46593239a6dfb641b2db0fe25470707f2a8671d8aca"
+    },
+    {
+      "index": 9,
+      "sha256": "6372d2bc8f0bbd7443050bf868a6b7b51c6a33214f03e9f056ab494717e5edfc"
+    }
+  ],
+  "svsm_launch_measurements": [
+    "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821c6e84c2490814e22a2b5ba860a37208d1d9a",
+    "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e79313e3df3f88b9798a7eb53ab1b3ff59a54"
+  ],
+  "system_libraries": [
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libc.so.6",
+      "sha256": [
+        "85e64f97e348786a8fb4d9f3d52fec289e2fb86bba20f0731dfe61990525e0f7"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+      "sha256": [
+        "5385f0436ac2e284ba8c5fb1488874057c29c04be72dea32add832694f381e28"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
+      "sha256": [
+        "9d339ecb409578d6a5d587e6c537a8f9589b8a13fefba30d167433a4b5758bee"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libm.so.6",
+      "sha256": [
+        "1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libssl.so.3",
+      "sha256": [
+        "63b47f444efa588e291e9b650a5ba2ab02f856356f2d50f13a2e477db9119e09"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.35",
+      "sha256": [
+        "5bb0d21308f123b6ad46c6f35b42cedfcb8d6d439a53aa3dae04d880aaffdde3"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libz.so.1.3.1",
+      "sha256": [
+        "47b61967895b30e8c0c6818dd633ffeb87711cf637c688f981896f0dd84ce23b"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/libzstd.so.1.5.7",
+      "sha256": [
+        "060eeb79531d435306665fd78329d8a9dd579f95876c5960bb67937825362a80"
+      ]
+    },
+    {
+      "path": "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+      "sha256": [
+        "bda779ea9e9ad234f60315477d7cfd0bdde861cd8ddd9df8cdaf62f18c4cec14"
+      ]
+    }
+  ]
+}
