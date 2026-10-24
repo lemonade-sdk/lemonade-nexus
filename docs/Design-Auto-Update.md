@@ -71,6 +71,8 @@ Phase 0. Update this document with their answers before code starts.
    feed `network_id` unchanged; a ruleset change is a separate,
    consensus-finalized transition, never a side effect of an update. This is
    a trust-model change, so it needs explicit review and a migration test.
+   Owner approval: 2026-10-24, on the condition that it stays secure (fail
+   closed, signer pinned by Genesis, monotonic release number, no downgrade).
 2. **Holder margin.** With 5 holders, `t = 4`. One server down is exactly
    survivable. Confirm that unlock and consensus continue while one Tier 1
    server restarts.
@@ -175,6 +177,12 @@ plaintext files. The first auto-update release is installed once by the
 procedure from the storage review: back up the security and sealed state,
 install one server at a time, confirm migration and unlock before the next,
 and never re-found. Every release after that uses Phases 1-5.
+
+## Tier 2 and the tree
+
+Tier 2 servers never write the tree, in any mode. A tree write or a new join
+that reaches a Tier 2 server gets a redirect listing verified Tier 1 API
+endpoints, and the SDK retries there. Tier 2 never forwards or proxies an op.
 
 ## Tests
 
