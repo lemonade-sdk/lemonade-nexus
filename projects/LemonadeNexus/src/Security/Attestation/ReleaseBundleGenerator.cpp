@@ -101,6 +101,21 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "no artifacts given";
         return std::nullopt;
     }
+    if (spec.previous) {
+        // Only digests the same release key approved are carried over.
+        const auto signature = crypto::from_base64(spec.previous->signature_b64);
+        const auto signer = crypto::from_base64(spec.signer_pubkey_b64);
+        const auto preimage = canonical_release_approval_json(*spec.previous);
+        if (spec.previous->signer_pubkey_b64 != spec.signer_pubkey_b64 ||
+            spec.previous->network_id_hex != spec.network_id_hex ||
+            signature.size() != crypto_sign_BYTES || signer.size() != crypto_sign_PUBLICKEYBYTES ||
+            crypto_sign_verify_detached(signature.data(),
+                                        reinterpret_cast<const unsigned char*>(preimage.data()),
+                                        preimage.size(), signer.data()) != 0) {
+            error = "the previous approval is not signed by this release key for this network";
+            return std::nullopt;
+        }
+    }
     if (spec.artifacts.size() > constants::kMaxSummarisedPaths) {
         error = "more artifacts than the summarised-path protocol bound";
         return std::nullopt;
@@ -132,12 +147,41 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
             error = "duplicate artifact path: " + artifact.installed_path;
             return std::nullopt;
         }
-        const auto digest = sha256_of_file(artifact.file);
-        if (!digest.has_value()) {
-            error = "cannot read artifact file: " + artifact.file.string();
-            return std::nullopt;
+        std::vector<std::string> digests;
+        if (!artifact.file.empty()) {
+            const auto digest = sha256_of_file(artifact.file);
+            if (!digest.has_value()) {
+                error = "cannot read artifact file: " + artifact.file.string();
+                return std::nullopt;
+            }
+            digests.push_back(*digest);
+        } else {
+            if (artifact.sha256.empty()) {
+                error = "artifact has neither a file nor digests: " + artifact.installed_path;
+                return std::nullopt;
+            }
+            for (const auto& digest : artifact.sha256) {
+                if (!valid_hex(digest, 64)) {
+                    error = "artifact digest is not 64 lowercase hex: " + artifact.installed_path;
+                    return std::nullopt;
+                }
+                if (std::find(digests.begin(), digests.end(), digest) == digests.end()) {
+                    digests.push_back(digest);
+                }
+            }
         }
-        approval.approved_paths.push_back({artifact.installed_path, {*digest}});
+        if (spec.previous) {
+            for (const auto& previous : spec.previous->approved_paths) {
+                if (previous.path != artifact.installed_path) continue;
+                for (const auto& digest : previous.sha256) {
+                    if (valid_hex(digest, 64) &&
+                        std::find(digests.begin(), digests.end(), digest) == digests.end()) {
+                        digests.push_back(digest);
+                    }
+                }
+            }
+        }
+        approval.approved_paths.push_back({artifact.installed_path, std::move(digests)});
         have_nexus |= artifact.installed_path == "/usr/bin/lemonade-nexus";
         have_collector |= artifact.installed_path == approval.evidence_collector_path;
     }

@@ -25,6 +25,15 @@ on:
       - '.github/workflows/flutter-clients.yml'
   release:
     types: [published]
+  # release.yml calls this workflow to build the clients for a release. It
+  # passes an empty release_tag and attaches the artifacts itself.
+  workflow_call:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to attach the built apps to (empty: build only)'
+        required: false
+        default: ''
+        type: string
   workflow_dispatch:
     inputs:
       release_tag:

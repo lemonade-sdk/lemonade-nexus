@@ -21,7 +21,11 @@
 //     "expected_pcrs": [{"index": 8, "sha256": "..."}, {"index": 9, "sha256": "..."}],
 //     "svsm_launch_measurements": ["<96-hex>", ...],   // optional; one per approved
 //                                                      // VM shape, else the compiled set
-//     "artifacts": [{"path": "/usr/bin/lemonade-nexus", "file": "build/bin/lemonade-nexus"}, ...]
+//     "artifacts": [{"path": "/usr/bin/lemonade-nexus", "file": "build/bin/lemonade-nexus"},
+//                   {"path": "/usr/lib/x86_64-linux-gnu/libc.so.6", "sha256": ["<64-hex>"]}, ...],
+//                                                      // "sha256" for reviewed digests of
+//                                                      // files the build does not produce
+//     "previous_approval": "<path to the previous signed bundle>"   // optional overlap
 //   }
 //
 // No key material is read or written; signatures stay empty.
@@ -33,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 using nexus::security::ReleaseBundleSpec;
@@ -96,8 +101,26 @@ int main(int argc, char** argv) {
             spec.svsm_launch_measurements.push_back(measurement.get<std::string>());
         }
         for (const auto& artifact : spec_json.at("artifacts")) {
-            spec.artifacts.push_back({artifact.at("path").get<std::string>(),
-                                      artifact.at("file").get<std::string>()});
+            nexus::security::ReleaseArtifact entry;
+            entry.installed_path = artifact.at("path").get<std::string>();
+            if (artifact.contains("file")) {
+                entry.file = artifact.at("file").get<std::string>();
+            } else {
+                entry.sha256 = artifact.at("sha256").get<std::vector<std::string>>();
+            }
+            spec.artifacts.push_back(std::move(entry));
+        }
+        if (spec_json.contains("previous_approval")) {
+            const auto path = spec_json.at("previous_approval").get<std::string>();
+            std::ifstream previous_stream(path, std::ios::binary);
+            if (!previous_stream) return fail("cannot read previous approval: " + path);
+            const std::string text{std::istreambuf_iterator<char>(previous_stream),
+                                   std::istreambuf_iterator<char>()};
+            std::string parse_error;
+            const auto previous =
+                nexus::security::parse_release_approval_bundle(text, parse_error);
+            if (!previous) return fail("previous approval does not parse: " + parse_error);
+            spec.previous = previous->approval;
         }
     } catch (const std::exception& e) {
         return fail(std::string("spec field error: ") + e.what());

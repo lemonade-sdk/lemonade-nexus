@@ -951,6 +951,12 @@ int main(int argc, char* argv[]) {
     //               the committed (or replicated) log
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
+    // Destroyed before tree_consensus on every exit path: the control socket
+    // thread reads the tree log status.
+    struct StopUpdateControl {
+        nexus::update::UpdateControlSocket& socket;
+        ~StopUpdateControl() { socket.stop(); }
+    } stop_update_control{update_control};
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     std::function<nlohmann::json()> tree_log_status;
@@ -983,6 +989,7 @@ int main(int argc, char* argv[]) {
         tree_consensus = std::make_unique<nexus::tree::TreeConsensus>(
             std::move(tree_config), tree, crypto,
             std::filesystem::path(data_root) / "tree" / "log");
+        tree_for_update_status.store(tree_consensus.get());
         if (!tree_consensus->start()) {
             // Fail closed: the server runs and serves its last committed tree,
             // but applies, votes for, and accepts no tree operation.
@@ -1400,6 +1407,8 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Shutdown (reverse order)
     // ========================================================================
+    // The control socket reads the services below; stop it first.
+    update_control.stop();
     acme_retry_stop.store(true);
     if (acme_retry_thread.joinable()) {
         acme_retry_thread.join();

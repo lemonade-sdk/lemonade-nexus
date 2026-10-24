@@ -138,6 +138,21 @@ target_compile_definitions(test_evidence_chain PRIVATE
 add_nexus_test(test_nexus_attestd    test_nexus_attestd.cpp)
 target_link_libraries(test_nexus_attestd PRIVATE LemonadeNexusAttestdCore)
 
+# nexus-updater: release verification, Sigstore provenance (a real public
+# bundle as the fixture), the file swap, the health gate, and whole update
+# cycles against fake GitHub responses and a fake server socket.
+if(TARGET LemonadeNexusUpdaterCore)
+    add_nexus_test(test_nexus_updater test_nexus_updater.cpp)
+    target_link_libraries(test_nexus_updater PRIVATE LemonadeNexusUpdaterCore)
+    target_compile_definitions(test_nexus_updater PRIVATE
+        NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+        NEXUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
+
+# The server side of the updater interface: control codec and socket, the
+# refusing turn gate, and boot-chain staging (FakeSealer; no TPM).
+add_nexus_test(test_update_control test_update_control.cpp)
+
 # Sealed blobs and the boot-set migration, against a test double (no TPM).
 add_nexus_test(test_sealed_boot_set  test_sealed_boot_set.cpp)
 # The TPM seal path against swtpm. Skips unless NEXUS_TEST_TPM_TCTI names a

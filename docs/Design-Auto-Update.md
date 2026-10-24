@@ -8,6 +8,38 @@ Status: **draft plan; Phases 0.1, 2, 3, and 5 implemented, not
 hardware-qualified.** Two open reviews (tree side and storage side) feed
 Phase 0. See [Implementation status](#implementation-status).
 
+## Implementation status
+
+| Part | State | Where |
+|---|---|---|
+| Phase 1: release workflow | Implemented, not run yet | `.github/workflows/release.yml`, `scripts/nexus-release-tool`, `scripts/nexus-release-sign`, [Releasing](Releasing) |
+| Phase 0 gate 3: fleet profile | Implemented; seeded from r21 | `release/fleet-profile.json` |
+| Phase 4: updater | Implemented and unit tested; the turn gate is a stub that refuses | `projects/LemonadeNexusUpdater/`, `packaging/systemd/nexus-updater.*` |
+| OS updates and reboot | Implemented and unit tested; the package lock lists no packages yet | `release/os-packages.lock`, `Core/BootChainStaging` |
+| Phases 0 (gates 1, 2), 2, 3, 5, 6 | Not implemented | — |
+
+Decisions made during implementation:
+
+- **Release number in the signed approval.** The approval's `release_id` is
+  the tag, so the release number is derived from signed data without a new
+  approval field. Phase 2 may add an explicit field.
+- **Signed manifest.** The approval cannot carry the file-to-path mapping or
+  the OS package lock. The release key also signs `manifest.json`, with the
+  domain prefix `lemonade-nexus/release-manifest/v1\n`.
+- **Updater language.** A C++ project, so it uses the server's own approval
+  verification (`verify_release_approval_bundle`) and canonical encoding
+  instead of a second implementation.
+- **Provenance.** Offline verification of the Sigstore bundle published next
+  to each asset, against a trusted root pinned in the package. No Sigstore
+  service is contacted. Only Rekor v1 entries with an inclusion promise are
+  accepted.
+- **Turn interface.** A local unix socket owned by the server
+  (`Update/UpdateControl.hpp`): `status`, `may_restart`, `report`, and
+  `stage_boot_chain`. Phase 5 replaces `RefusingTurnGate`.
+- **PCR measurement.** A GitHub-hosted runner cannot boot the fleet guest. The
+  PCRs come from the reviewed profile; an optional job on a reference-VM
+  runner compares them (`scripts/nexus-measure-boot-chain`).
+
 ## Goal
 
 - An operator runs **one** GitHub Actions workflow. It builds every artifact,

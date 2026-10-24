@@ -40,6 +40,8 @@ A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, crypto
 - [Client SDK](Client-SDK) — SDK overview and linking
 - [Frameworks and Libraries](Frameworks-and-Libraries) — Tech stack and dependencies
 - [Building](Building) — Build instructions and platform status
+- [Releasing](Releasing) — The release workflow, required repository settings, and the server updater
+- [Design: In-Place Auto-Update](Design-Auto-Update) — Draft plan; Phases 1 and 4 implemented: one release workflow and in-place server updates
 
 ## Quick Links
 
