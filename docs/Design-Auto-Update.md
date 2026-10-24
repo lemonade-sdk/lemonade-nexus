@@ -183,7 +183,9 @@ and never re-found. Every release after that uses Phases 1-5.
 Tier 2 servers are pure proxies of data and connections that are already
 encrypted end to end. They have no tree role: they do not read, write,
 redirect, or forward tree requests, and they do not terminate or vouch for a
-client session. Tier 2 servers do not serve the tree API. Clients send every
+client session. Tier 2 servers do not store, replicate, or serve the tree at all; the Phase 3
+replication to Tier 2 is removed. A server that leaves Tier 1 deletes its tree
+copy after its last epoch ends. Clients send every
 tree read and write directly to a Tier 1 server. The SDK selects Tier 1 servers
 from the finalized epoch membership and verifies that list; it never asks a
 Tier 2 server for tree data.
