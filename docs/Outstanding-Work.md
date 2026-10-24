@@ -33,9 +33,11 @@ Both keep dev boxes and CI working, which was the reason the flag existed.
 Still open, needs an owner call:
 
 - **One-way upgrade.** A node whose vault state says `encrypted` but whose `data-key.json` is gone is
-  unrecoverable, by design. Rollback to the `c382d2d` binary after a completed migration is not
-  supported. This is a product decision about the upgrade path, not a security question. It needs a
-  decision before release, plus a backup requirement for `data/security/storage/` and `data/sealed/`.
+  unrecoverable, by design. Such a node now refuses to start and names the files to restore
+  (`records.json`, `data-key.json`); it no longer prunes its share or creates a new data key. Rollback
+  to the `c382d2d` binary after a completed migration is not supported. This is a product decision
+  about the upgrade path, not a security question. It needs a decision before release, plus a backup
+  requirement for `data/security/storage/` and `data/sealed/`.
 - Resolved: stale `SP_STORAGE_KEY` / `SP_STORAGE_FILES` keys, the JSON keys, and the
   `--storage-key` / `--storage-files` options are **ignored**, not rejected. The config parser is a
   `strcmp` chain with no unknown-option branch, so a unit file that still names them starts normally
@@ -51,9 +53,10 @@ at lines 144-158, drive deferred file services off `files_ready()`),
 `test_server_config_discovery.cpp`, `security/lifecycle/storage_key_path.cpp`, and three docs.
 
 Test infrastructure that does not exist yet: a `main.cpp` startup test for the fresh and
-pre-seeded-encrypted paths; a 1-4 holder mesh fixture proving the pre-key state and the key appearing at
-the fifth holder without a restart; and a mixed-version test of an already-encrypted data directory
-coming up on a default-on binary.
+pre-seeded-encrypted paths (only the production startup function, `start_security_mesh`, is tested
+for an encrypted vault with lost storage state and for a plaintext vault); a 1-4 holder mesh fixture
+proving the pre-key state and the key appearing at the fifth holder without a restart; and a
+mixed-version test of an already-encrypted data directory coming up on a default-on binary.
 
 ## 2. Tier 2 to Tier 1 promotion
 
@@ -64,10 +67,14 @@ write Tier 1 membership. There isn't one today; that is the property worth keepi
 
 Missing pieces:
 
-- **Storage share does not follow promotion.** A promoted node joins Tier 1 but gets no share. The C++
-  `StorageOperation` enum has no `Repair`, and nothing calls `repair_share_*`. Blocked on missing
-  session and consensus wiring, not on crypto. 5 to 6 holders keeps threshold 4, so the
-  rotate-on-threshold-change rule does not fire.
+- **Storage holders follow eligibility, not promotion.** Holders come from the finalized eligibility
+  pool, Tier 1 and Tier 2 alike (B4), so promotion by itself adds no holder, and 5 eligible servers still
+  give 5 holders (`t = 4`) and a Tier 1 of 5. A new eligible server becomes a holder at the next
+  boundary through a `Rotate` (new `S`, every server rewraps), even when `t` stays the same:
+  `reshare()` in `StorageRecords.cpp` refreshes only when the new holders are a subset of the current
+  ones. The C++ `StorageOperation` enum has no `Repair`, and nothing calls `repair_share_*`; adding
+  it would turn that rotation into a refresh. Blocked on missing session and consensus wiring, not on
+  crypto.
 - **"Stable enough" has no data source.** Only attestation continuity and mesh participation are
   consensus-verifiable today. A multi-epoch stability streak needs new instrumentation. Rate-limiter
   stats and tree-log lag are locally observable only, so they are spoofable and must not drive authority.
@@ -106,6 +113,18 @@ Check before you start:
 - Whether the node you are about to take down is one of the holders the others still need.
 - That you have the two backups, and that you have tested reading them back.
 
+Upgrading to the release with wrap claims (B5a, B7): an upgraded holder answers an unlock only for an
+`R` that a finalized wrap claim of the requester names, and a claim finalizes only when a consensus
+quorum of Tier 1 runs that release. With 5 holders and a quorum of 4, the third upgraded node can stay
+locked until the fourth is upgraded too: its holder duties and consensus votes run while it waits, and
+it unlocks once the quorum finalizes the claims. Plan for that window instead of waiting on the third
+node's unlock.
+
+A node whose files are encrypted refuses to start when `records.json` or `data-key.json` is missing,
+when `records.json` holds no finalized plan, or when its records belong to another epoch chain (a
+re-found). The log names the files to restore. Restore them from this node's backup above, not from
+another node.
+
 Rollback: not supported after a migration completes. This is the one-way part — a node whose vault state
 says `encrypted` but has lost its data key cannot be brought back by reinstalling the old binary.
 Bring the node up on a test data directory first, or on one production node that you are prepared to
@@ -129,9 +148,8 @@ section 2.
 - **Verification done, no action needed.** Full-suite run of this code: macOS 1944 passed / 0 failed /
   28 skipped; Linux 1976 passed / 2 failed / 4 skipped. The 2 failures are the root artifacts below.
   First completed run; PR #70 merged without one.
-- `cargo test` does not run in CI. `crates/storage-threshold` has 35 tests covering DLEQ rejection,
-  sub-quorum refresh, and stale-share combination. They passed locally in 8 seconds. Nothing runs them
-  automatically, so that result goes stale on the next crate edit.
+- `cargo test --locked` for `crates/storage-threshold` (35 tests covering DLEQ rejection, sub-quorum
+  refresh, and stale-share combination) runs in the native Linux and macOS CI jobs.
 - `FileStorageTest.UnreadableRecordFileIsIoErrorNotAbsent` and
   `UnscannablePoolDirectoryIsAnErrorNotAnEmptyPool` fail when run as root. Both use `chmod 0` to
   simulate unreadable input, and root bypasses permission checks. Test-design artifact, not a defect.

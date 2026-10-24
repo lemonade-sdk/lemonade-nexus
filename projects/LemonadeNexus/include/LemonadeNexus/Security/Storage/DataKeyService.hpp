@@ -8,23 +8,33 @@
 //   StorageThreshold::wrap_data_key, and writes the wrapped key to
 //   <directory>/data-key.json. It then runs one unlock through the holders to
 //   prove the wrapped key opens (unlock_verified()); Phase 7 deletes no
-//   plaintext before that proof (B10).
+//   plaintext before that proof (B10). It never creates a DEK while the files
+//   are encrypted: a lost data-key.json is restored, not replaced.
+// - Wrap claims (B5a, B7): the service keeps a signed claim of its wrapped
+//   keys (S and R) finalized in the storage chain: the committed wrap, and the
+//   staged wrap while one exists. Holders serve s_i*R only for an R the
+//   requester's latest finalized claim names, so no unlock round trip starts
+//   before that claim is finalized.
 // - Startup: the DEK is not on disk in the clear. The service sends a
 //   StorageUnlockRequest to every holder of the plan whose S the wrapped key
 //   names, collects t verified partials, and unwraps the DEK into guarded
 //   memory. With fewer it retries with backoff and stays locked: nothing that
 //   needs the DEK may run (fail closed).
 // - Rotation: when the current plan's S differs from the S the wrapped key
-//   names and the DEK is in memory, rewrap() wraps it to the new S. A server
-//   that restarted inside the grace period first unlocks under the retiring
-//   plan, then rewraps. After the grace period a key wrapped to the retired S
-//   cannot unlock (state Retired).
+//   names and the DEK is in memory, rewrap() stages the DEK wrapped to the new
+//   S in data-key.next.json, claims it, and proves through the new plan's
+//   holders that it unwraps. Only then does it replace data-key.json (the
+//   switch point) and claim the new wrap alone, which is this server's
+//   acknowledgement of the rotation. A server that restarted before the swap
+//   unlocks under the retiring plan and stages again. The retiring plan stays
+//   live until every server's claim moved off its S, up to a hard cap; after
+//   the cap a key wrapped to the retired S cannot unlock (state Retired).
 //
 // - Replacement (B5a, monthly DEK rotation): begin_replacement() creates a new
 //   DEK, wraps it to the current S, and stores it in data-key.next.json beside
-//   the current wrapped key; an unlock round trip proves it unwraps. Only
-//   commit_replacement() makes it current. A next file found at startup was
-//   never committed and is removed.
+//   the current wrapped key; once claimed, an unlock round trip proves it
+//   unwraps. Only commit_replacement() makes it current. A next file found at
+//   startup was never committed and is removed.
 //
 // StorageVault (Phase 7) encrypts the server's files under this key.
 
@@ -55,7 +65,9 @@ enum class DataKeyState : uint8_t {
     Locked,
     /// The DEK is in memory.
     Unlocked,
-    /// The wrapped DEK names an S whose grace period ended. It cannot unlock.
+    /// The wrapped DEK names the retiring S after the retiring plan ended:
+    /// every server claimed a rewrap, or the hard cap passed. It cannot
+    /// unlock.
     Retired,
 };
 
@@ -90,10 +102,17 @@ public:
     /// Thread-safe.
     [[nodiscard]] std::optional<StoragePointBytes> wrapped_to() const;
 
-    /// Wraps the in-memory DEK to the current S and replaces the stored
-    /// wrapped key. False when the DEK is not in memory, the current plan is
-    /// not verified in this run, or the write fails. io thread.
+    /// Stages the in-memory DEK wrapped to the current S in
+    /// data-key.next.json. The stored wrapped key is replaced only after an
+    /// unlock through the current plan's holders reproduces the DEK from the
+    /// staged wrap. False when the DEK is not in memory, the current plan is
+    /// not verified in this run, the stored key already names the current S,
+    /// or the write fails. io thread.
     bool rewrap();
+
+    /// The S the staged wrap (data-key.next.json) names, or nullopt when none
+    /// is staged. Thread-safe.
+    [[nodiscard]] std::optional<StoragePointBytes> staged_to() const;
 
     /// Called on the io thread on every state change.
     void set_state_callback(std::function<void(DataKeyState)> callback);
@@ -138,6 +157,10 @@ private:
 
     void set_state(DataKeyState next);
     void create(uint64_t now_ms);
+    [[nodiscard]] bool commit_staged();
+    void discard_staged();
+    void maintain_claim(uint64_t now_ms);
+    [[nodiscard]] bool claimed(const crypto::StorageWrappedDataKey& wrapped) const;
     void start_attempt(const StorageFinalPlan& plan, const Digest& plan_digest, bool verify_only,
                        uint64_t now_ms, Target target = Target::Current);
     void finish_attempt();
@@ -161,6 +184,15 @@ private:
     std::optional<crypto::SecureBuffer> next_dek_;
     std::optional<crypto::StorageWrappedDataKey> next_wrapped_;
     bool next_verified_ = false;
+    /// The staged wrap holds the same DEK under a new S (a rewrap) and is
+    /// committed as soon as it verifies; otherwise it is a replacement the
+    /// vault commits.
+    bool next_rewrap_ = false;
+
+    /// The last claim this server signed and when it was last sent.
+    std::optional<StorageWrapClaim> claim_;
+    uint64_t claim_sent_ms_ = 0;
+    bool create_refused_ = false;
 
     bool loaded_ = false;
     std::optional<Attempt> attempt_;
