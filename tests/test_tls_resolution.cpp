@@ -57,3 +57,21 @@ TEST(TlsResolution, NoCertOnDiskRequestsBackground) {
     EXPECT_TRUE(r.cert_path.empty());
     EXPECT_TRUE(r.needs_acme_background);
 }
+
+// Phase 7b: with no vault, the key stays a path and no in-memory bytes are
+// returned. The on-disk plaintext key is used directly.
+TEST(TlsResolution, NoVaultKeepsKeyOnDisk) {
+    auto root = fs::temp_directory_path() / ("nexus_tlsres_novault_" + std::to_string(getpid()));
+    fs::remove_all(root);
+    const std::string fqdn = "server-novault.eu-west.seip.lemonade-nexus.io";
+    write_cert(root / "certs" / fqdn, "PLAIN");
+
+    auto r = core::resolve_tls_cert(root, fqdn, /*vault=*/nullptr);
+    EXPECT_TRUE(r.valid);
+    EXPECT_TRUE(r.key_bytes.empty());
+    EXPECT_FALSE(r.key_path.empty());
+    // No vault: the on-disk plaintext key path is used directly.
+    EXPECT_NE(r.key_path.find("privkey.pem"), std::string::npos);
+
+    fs::remove_all(root);
+}

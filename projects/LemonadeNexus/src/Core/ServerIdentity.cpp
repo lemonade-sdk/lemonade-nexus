@@ -336,6 +336,18 @@ bool read_dns_name(const uint8_t* origin, const uint8_t* end, const uint8_t*& p,
     }
 }
 
+/// True when `pem` holds a PEM private-key block (generic, RSA, EC, ED25519,
+/// PKCS8 or DSA). Used to confirm a vault read returned a usable key rather
+/// than a cert, header, or truncated block.
+bool pem_has_key_block(const std::string& pem) {
+    return pem.find("BEGIN PRIVATE KEY") != std::string::npos ||
+           pem.find("BEGIN RSA PRIVATE KEY") != std::string::npos ||
+           pem.find("BEGIN EC PRIVATE KEY") != std::string::npos ||
+           pem.find("BEGIN ED25519 PRIVATE KEY") != std::string::npos ||
+           pem.find("BEGIN DSA PRIVATE KEY") != std::string::npos ||
+           pem.find("BEGIN ENCRYPTED PRIVATE KEY") != std::string::npos;
+}
+
 }  // namespace
 
 std::vector<std::string> parse_dns_txt_records(const std::vector<uint8_t>& message) {
@@ -602,7 +614,8 @@ std::string resolve_tunnel_ip(
 
 TlsResolution resolve_tls_cert(
     const std::filesystem::path& data_root,
-    const std::string& server_fqdn)
+    const std::string& server_fqdn,
+    const security::StorageVault* vault)
 {
     TlsResolution result;
 
@@ -618,6 +631,25 @@ TlsResolution resolve_tls_cert(
             result.cert_path = acme_cert_file.string();
             result.key_path  = acme_key_file.string();
             spdlog::info("Auto-TLS: using existing ACME cert for {}", server_fqdn);
+
+            if (vault != nullptr) {
+                // Phase 7: the private key is vault-covered. Read it through the
+                // vault and hand it to the listener in memory; never open the
+                // on-disk file (DEK ciphertext, unreadable while locked). Fail
+                // closed: no valid key, so the listener does not start.
+                const auto key = vault->read(acme_key_file);
+                if (key.status == security::VaultReadStatus::Ok &&
+                    pem_has_key_block(key.bytes)) {
+                    result.key_bytes = key.bytes;
+                    result.valid = true;
+                } else {
+                    spdlog::warn("Auto-TLS: TLS key for {} not yet readable through the "
+                                 "storage vault (status={}); HTTPS deferred until the data "
+                                 "key unlocks", server_fqdn, static_cast<int>(key.status));
+                }
+            } else {
+                result.valid = true;
+            }
         } else {
             result.needs_acme_background = true;
             spdlog::info("Auto-TLS: no cert on disk for {} -- will request in background",

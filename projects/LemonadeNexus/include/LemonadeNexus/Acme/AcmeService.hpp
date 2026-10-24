@@ -22,6 +22,7 @@
 #include <vector>
 
 namespace nexus::network { class DnsService; }
+namespace nexus::security { class StorageVault; }
 
 namespace nexus::acme {
 
@@ -49,6 +50,13 @@ public:
     AcmeService(storage::FileStorageService& storage,
                 AcmeProviderConfig provider_config = AcmeProviderConfig::letsencrypt(),
                 std::string dns_provider = "local");
+
+    /// Route ACME private-key files through the storage vault (Phase 7). When
+    /// set, `certs/account.key` and `certs/<fqdn>/privkey.pem` are read and
+    /// written through the vault (so they are DEK-encrypted at rest), instead
+    /// of as plaintext files. Fail closed: a covered key that cannot be
+    /// decrypted yet is treated as absent. Must be called before on_start().
+    void set_vault(security::StorageVault* vault);
 
     /// Set the local DNS service for DNS-01 challenge management.
     /// When set and dns_provider is "local", ACME challenges are served
@@ -213,6 +221,18 @@ private:
     /// Read a raw file from disk and return its contents.
     [[nodiscard]] std::string read_raw_file(const std::filesystem::path& path) const;
 
+    /// Read a file through the storage vault when one is set (fail closed:
+    /// empty string when the DEK is locked or the read fails), else read the
+    /// plaintext file directly. Private keys must be read this way so an
+    /// encrypted key is never parsed or logged.
+    [[nodiscard]] std::string read_secret_file(const std::filesystem::path& path) const;
+
+    /// Write `content` through the storage vault when one is set (so it is
+    /// DEK-encrypted at rest), else write it as a plaintext file. Returns false
+    /// on a failed write. Never exposes secret material through `storage_`.
+    bool write_secret_file(const std::filesystem::path& path,
+                           const std::string& content) const;
+
     /// Write raw content to a file, creating directories as needed.
     bool write_raw_file(const std::filesystem::path& path,
                          const std::string& content) const;
@@ -238,6 +258,9 @@ private:
 
     // Local authoritative DNS service (nullptr = use Cloudflare fallback)
     network::DnsService*         dns_service_{nullptr};
+
+    // Storage vault for DEK-encrypted private keys (nullptr = plaintext files).
+    security::StorageVault*      vault_{nullptr};
 
     // ACME directory endpoints (populated by get_directory)
     std::string new_nonce_url_;

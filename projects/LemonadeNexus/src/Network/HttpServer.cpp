@@ -6,6 +6,8 @@
 #include <openssl/x509.h>
 
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <utility>
 
 namespace nexus::network {
@@ -21,35 +23,62 @@ HttpServer::HttpServer(uint16_t port, std::string bind_address)
 {
 }
 
-HttpServer::HttpServer(uint16_t port, std::string bind_address,
-                       const std::string& tls_cert_path,
-                       const std::string& tls_key_path)
-    : port_{port}
-    , bind_address_{std::move(bind_address)}
-{
-    if (!tls_cert_path.empty() && !tls_key_path.empty()) {
-        auto ssl_server = try_create_ssl_server(tls_cert_path, tls_key_path);
-        if (ssl_server) {
-            server_ = std::move(ssl_server);
-            tls_cert_path_ = tls_cert_path;
-            tls_key_path_ = tls_key_path;
-            is_tls_ = true;
-            spdlog::info("HttpServer: TLS enabled (cert={}, key={})",
-                          tls_cert_path, tls_key_path);
-        } else {
-            // TLS was requested but the cert/key won't load. Do NOT serve
-            // plaintext in their place — keep a server object so routes can be
-            // registered, but leave is_tls_ false so the caller withholds the
-            // listener until a valid cert is available (or upgrade_to_tls).
-            spdlog::error("HttpServer: TLS cert/key provided but failed to load — "
-                          "server will not listen until a valid cert is available");
-            server_ = std::make_unique<httplib::Server>();
-        }
-    } else {
-        // No cert yet (e.g. ACME still pending). The object exists for route
-        // registration; the caller gates start() on is_tls().
-        server_ = std::make_unique<httplib::Server>();
+bool HttpServer::enable_tls_inmemory_key(const std::string& tls_cert_path,
+                                          const std::string& key_pem,
+                                          const std::string& key_path) {
+    std::lock_guard lock(mutex_);
+    if (is_tls_) {
+        spdlog::warn("HttpServer: enable_tls_inmemory_key called but already TLS");
+        return false;
     }
+    if (key_pem.empty()) {
+        spdlog::warn("HttpServer: in-memory TLS key empty — staying plain (key path={})",
+                     key_path);
+        return false;
+    }
+    // Read the public cert from its path (not secret, not vault-covered).
+    if (!std::filesystem::exists(tls_cert_path)) {
+        spdlog::warn("HttpServer: cert {} not found for in-memory-key TLS",
+                     tls_cert_path);
+        return false;
+    }
+
+    auto ssl = try_create_ssl_server_inmemory_key(tls_cert_path, key_pem);
+    if (!ssl) {
+        spdlog::error("HttpServer: in-memory-key TLS cert/key failed to load");
+        return false;
+    }
+    server_ = std::move(ssl);
+    tls_cert_path_ = tls_cert_path;
+    tls_key_path_  = key_path;
+    is_tls_ = true;
+    spdlog::info("HttpServer: enabled HTTPS with in-memory key (cert={}, key path={})",
+                 tls_cert_path, key_path);
+    return true;
+}
+
+bool HttpServer::enable_tls_from_paths(const std::string& tls_cert_path,
+                                        const std::string& tls_key_path) {
+    std::lock_guard lock(mutex_);
+    if (is_tls_) {
+        spdlog::warn("HttpServer: enable_tls_from_paths called but already TLS");
+        return false;
+    }
+    if (tls_cert_path.empty() || tls_key_path.empty()) {
+        return false;
+    }
+    auto ssl = try_create_ssl_server(tls_cert_path, tls_key_path);
+    if (!ssl) {
+        spdlog::error("HttpServer: TLS cert/key at {} / {} failed to load",
+                       tls_cert_path, tls_key_path);
+        return false;
+    }
+    server_ = std::move(ssl);
+    tls_cert_path_ = tls_cert_path;
+    tls_key_path_  = tls_key_path;
+    is_tls_ = true;
+    spdlog::info("HttpServer: enabled HTTPS (cert={}, key={})", tls_cert_path, tls_key_path);
+    return true;
 }
 
 HttpServer::~HttpServer() = default;
@@ -186,6 +215,52 @@ std::unique_ptr<httplib::SSLServer> HttpServer::try_create_ssl_server(
         spdlog::error("HttpServer: SSLServer creation exception: {}", e.what());
         return nullptr;
     }
+}
+
+std::unique_ptr<httplib::SSLServer> HttpServer::try_create_ssl_server_inmemory_key(
+    const std::string& cert_path, const std::string& key_pem)
+{
+    // httplib has no direct in-memory key constructor. Use the
+    // setup_ssl_ctx_callback ctor: load the public cert chain from its path
+    // file (the chain is public, not secret) and the private key from an
+    // in-memory BIO. This keeps the key on the memory path only — it is never
+    // opened from disk by the listener.
+    BIO* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+    if (!key_bio) return nullptr;
+    EVP_PKEY* key = PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr);
+    BIO_free(key_bio);
+    if (!key) {
+        spdlog::error("HttpServer: in-memory TLS key could not be parsed");
+        return nullptr;
+    }
+
+    std::unique_ptr<httplib::SSLServer> srv;
+    try {
+        std::function<bool(SSL_CTX&)> setup =
+            [cert_path, key](SSL_CTX& ctx) -> bool {
+                if (SSL_CTX_use_certificate_chain_file(&ctx, cert_path.c_str()) != 1) {
+                    return false;
+                }
+                if (SSL_CTX_use_PrivateKey(&ctx, key) != 1) {
+                    return false;
+                }
+                return true;
+            };
+        srv = std::make_unique<httplib::SSLServer>(std::move(setup));
+        if (!srv->is_valid()) {
+            EVP_PKEY_free(key);
+            spdlog::error("HttpServer: in-memory SSLServer creation failed (cert={} key in-memory)",
+                          cert_path);
+            return nullptr;
+        }
+    } catch (const std::exception& e) {
+        EVP_PKEY_free(key);
+        spdlog::error("HttpServer: in-memory SSLServer exception: {}", e.what());
+        return nullptr;
+    }
+    // The callback copies the key into the SSL_CTX; release our copy.
+    EVP_PKEY_free(key);
+    return srv;
 }
 
 HttpServer::CertKeyPair HttpServer::load_cert_key(

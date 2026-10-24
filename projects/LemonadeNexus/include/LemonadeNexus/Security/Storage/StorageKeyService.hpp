@@ -2,8 +2,9 @@
 
 // The threshold storage key on one server (design Part B, Phase 5).
 //
-// One service per server, on the security io thread, behind
-// ServerConfig::storage_key_enabled. It owns four jobs:
+// One service per server, on the security io thread. It is unconditional: the
+// threshold storage key and the holder duties run on every server. It owns
+// four jobs:
 //
 // 1. Holder records in consensus (B4, B5, B5a). Two block payload handlers
 //    (StorageHolderPlan, StorageKeyRotation) propose and check the storage

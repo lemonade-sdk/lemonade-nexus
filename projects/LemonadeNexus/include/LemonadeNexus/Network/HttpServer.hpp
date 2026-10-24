@@ -30,11 +30,20 @@ public:
     /// Construct a plain HTTP server.
     explicit HttpServer(uint16_t port, std::string bind_address = "0.0.0.0");
 
-    /// Construct an HTTPS server with TLS certificate and key file paths.
-    /// Falls back to plain HTTP if the cert/key files don't exist or fail to load.
-    HttpServer(uint16_t port, std::string bind_address,
-               const std::string& tls_cert_path,
-               const std::string& tls_key_path);
+    /// Upgrade this (plain) HTTP server to HTTPS from cert/key file paths.
+    /// No-op (returns false) when already TLS or the cert/key won't load.
+    /// After a successful upgrade the caller must re-register routes and
+    /// (re)start the server.
+    bool enable_tls_from_paths(const std::string& tls_cert_path, const std::string& tls_key_path);
+
+    /// Upgrade this (plain) HTTP server to HTTPS from a cert file path plus an
+    /// in-memory PEM private key (Phase 7). Used when the private key is a
+    /// vault-covered file decrypted into memory. No-op (returns false) when the
+    /// server is already TLS or the key is empty (e.g. still vault-locked). The
+    /// public cert is opened from its path. After a successful upgrade the
+    /// caller must re-register routes and (re)start the server.
+    bool enable_tls_inmemory_key(const std::string& tls_cert_path, const std::string& key_pem,
+                                 const std::string& key_path);
 
     ~HttpServer();
 
@@ -88,6 +97,12 @@ private:
     /// Try to create an SSLServer from cert/key paths. Returns nullptr on failure.
     static std::unique_ptr<httplib::SSLServer> try_create_ssl_server(
         const std::string& cert_path, const std::string& key_path);
+
+    /// Try to create an SSLServer from a cert file path (public, opened from
+    /// disk) plus an in-memory PEM private key (vault-covered, decrypted into
+    /// memory). Returns nullptr on failure.
+    static std::unique_ptr<httplib::SSLServer> try_create_ssl_server_inmemory_key(
+        const std::string& cert_path, const std::string& key_pem);
 
     /// Load X509 cert and EVP_PKEY from PEM files for hot-reload.
     /// Returns {cert, key} pair; both are nullptr on failure. Caller must free.

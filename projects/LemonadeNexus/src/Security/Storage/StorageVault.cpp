@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 
@@ -109,6 +110,13 @@ std::vector<VaultCoverage> StorageVault::default_coverage() {
         {"tree-node", "tree/nodes", "", ".json"},
         {"tree-delta", "tree/deltas", "", ".json"},
         {"tree-log", "tree/log", "", ".json"},
+        // Phase 7b: TLS and ACME private keys are secret material at rest.
+        // Cover the TLS private key in every FQDN directory (certs/<fqdn>/
+        // privkey.pem) and the ACME account key (certs/account.key). The public
+        // cert (fullchain.pem) and meta.json stay plaintext: they are not secret,
+        // and the TLS listener still opens the cert by path.
+        {"tls-key", "certs", "privkey.pem", ""},
+        {"acme-account-key", "certs", "account.key", ""},
     };
 }
 
@@ -123,7 +131,16 @@ std::optional<StorageVault::Covered> StorageVault::classify(const fs::path& path
     const std::string directory = relative.parent_path().generic_string();
     const std::string name = relative.filename().string();
     for (const auto& c : coverage_) {
-        if (c.directory != directory) continue;
+        // The file sits in `c.directory` or in any subdirectory beneath it
+        // (recursive coverage). Nested FQDN cert directories (certs/<fqdn>/)
+        // hold privkey.pem one level below the declared `certs` directory.
+        const bool in_dir = directory == c.directory ||
+            (c.directory.empty()
+                 ? false
+                 : (directory.size() > c.directory.size() &&
+                    directory.starts_with(c.directory) &&
+                    directory[c.directory.size()] == '/'));
+        if (!in_dir) continue;
         const bool match = !c.name.empty() ? name == c.name
                                            : (!c.suffix.empty() && name.size() > c.suffix.size() &&
                                               name.ends_with(c.suffix));
@@ -142,23 +159,83 @@ fs::path StorageVault::staged_path(const fs::path& path) {
     return staged;
 }
 
+std::vector<std::string> StorageVault::test_enumerate_relative() const {
+    std::vector<std::string> out;
+    for (const auto& file : enumerate()) out.push_back(file.relative);
+    return out;
+}
+
 std::vector<StorageVault::Covered> StorageVault::enumerate() const {
+    last_scan_ok_ = true;
     std::map<std::string, Covered> found;
+
+    // Manual recursive walk that refuses to follow symlinks. The standard
+    // recursive_directory_iterator follows symlinks to directories and can
+    // loop; a manual walk lets us reject every symlink and non-regular entry
+    // before descending, so a partial or unsafe list is never reported as
+    // complete.
+    std::function<bool(const fs::path&)> walk =
+        [&](const fs::path& dir) -> bool {
+        std::error_code ec;
+        auto it = fs::directory_iterator(dir, ec);
+        if (ec) {
+            spdlog::error("[storage-vault] cannot scan {}", dir.string());
+            return false;
+        }
+        while (it != fs::directory_iterator()) {
+            const auto sstatus = it->symlink_status(ec);
+            if (ec) {
+                spdlog::error("[storage-vault] cannot stat {}: {}",
+                               it->path().string(), ec.message());
+                return false;
+            }
+            if (fs::is_symlink(sstatus)) {
+                spdlog::error("[storage-vault] symlink in covered directory: "
+                               "{}", it->path().string());
+                return false;
+            }
+            const bool is_regular = fs::is_regular_file(sstatus);
+            const bool is_dir = fs::is_directory(sstatus);
+            if (!is_regular && !is_dir) {
+                spdlog::error("[storage-vault] non-regular entry in covered "
+                               "directory: {}", it->path().string());
+                return false;
+            }
+            if (is_dir) {
+                if (!walk(it->path())) return false;
+            } else {
+                // A staged copy ("<file>.vault-new") whose original is gone
+                // still counts: after a rotation commit it is the only current
+                // copy. Classify the path with the staged suffix stripped so
+                // the original name matches; the AAD uses the original
+                // relative path.
+                std::string name = it->path().filename().string();
+                fs::path orig = it->path();
+                if (name.ends_with(kVaultStagedSuffix)) {
+                    orig = orig.parent_path() /
+                           name.substr(0, name.size() - kVaultStagedSuffix.size());
+                }
+                if (auto file = classify(orig)) {
+                    found.emplace(file->relative, std::move(*file));
+                }
+            }
+            it.increment(ec);
+            if (ec) {
+                spdlog::error("[storage-vault] scan of {} failed: {}",
+                               dir.string(), ec.message());
+                return false;
+            }
+        }
+        return true;
+    };
+
     for (const auto& c : coverage_) {
         const auto dir = data_root_ / c.directory;
         std::error_code ec;
         if (!fs::is_directory(dir, ec)) continue;
-        for (const auto& entry : fs::directory_iterator(dir, ec)) {
-            if (!entry.is_regular_file(ec)) continue;
-            std::string name = entry.path().filename().string();
-            // A staged copy whose original is gone still counts: after a
-            // rotation commit it is the only current copy.
-            if (name.ends_with(kVaultStagedSuffix)) {
-                name.resize(name.size() - kVaultStagedSuffix.size());
-            }
-            if (auto file = classify(dir / name)) {
-                found.emplace(file->relative, std::move(*file));
-            }
+        if (!walk(dir)) {
+            last_scan_ok_ = false;
+            return {};
         }
     }
     std::vector<Covered> out;
@@ -521,6 +598,23 @@ bool StorageVault::stage_one(const Covered& file, std::span<const uint8_t> sourc
     return ok;
 }
 
+bool StorageVault::verify_scan_complete(const std::set<std::string>& original_files) const {
+    for (const auto& file : enumerate()) {
+        if (original_files.find(file.relative) == original_files.end()) {
+            // A covered file that was not in the original scan: it appeared
+            // after the scan, so the list must be repeated.
+            spdlog::warn("[storage-vault] covered file {} appeared after the scan; "
+                         "the scan must be repeated", file.relative);
+            return false;
+        }
+    }
+    if (!last_scan_ok_) {
+        spdlog::warn("[storage-vault] scan failed; the scan must be repeated");
+        return false;
+    }
+    return true;
+}
+
 bool StorageVault::verify_all(std::span<const uint8_t> source_key,
                               std::span<const uint8_t> target_key) {
     for (const auto& file : enumerate()) {
@@ -557,6 +651,8 @@ bool StorageVault::verify_all(std::span<const uint8_t> source_key,
 }
 
 void StorageVault::promote_all(const KeyId& target) {
+    // The staged copies were all verified before this ran; a scan failure here
+    // never drops one.
     for (const auto& file : enumerate()) {
         const auto staged = staged_path(file.path);
         std::error_code ec;
@@ -602,6 +698,7 @@ void StorageVault::finish(uint64_t wall_ms) {
     rotation_requested_ = false;
     pending_.clear();
     pending_loaded_ = false;
+    staged_originals_.clear();
     (void)save_state();
 }
 
@@ -641,10 +738,21 @@ void StorageVault::tick_migration(uint64_t wall_ms) {
                              pending_.back().relative);
                 return;
             }
+            staged_originals_.insert(pending_.back().relative);
             pending_.pop_back();
             ++done;
         }
         if (!pending_.empty()) return;
+        // A covered file that appeared after the scan, or a scan that could
+        // not be repeated cleanly, must not be skipped: rescan and stage
+        // before verifying.
+        if (!verify_scan_complete(staged_originals_)) {
+            phase_ = VaultPhase::Staging;
+            pending_loaded_ = false;
+            staged_originals_.clear();
+            (void)save_state();
+            return;
+        }
         phase_ = VaultPhase::Verifying;
         if (!save_state()) return;
         // B10 step 2: a fresh round trip through the holders before any
@@ -749,10 +857,20 @@ void StorageVault::tick_rotation(uint64_t wall_ms) {
                              pending_.back().relative);
                 return;
             }
+            staged_originals_.insert(pending_.back().relative);
             pending_.pop_back();
             ++done;
         }
         if (!pending_.empty()) return;
+        // A covered file that appeared after the scan, or a scan that could
+        // not be repeated cleanly, must not be skipped: rescan and re-stage
+        // before verifying.
+        if (!verify_scan_complete(staged_originals_)) {
+            pending_loaded_ = false;
+            staged_originals_.clear();
+            (void)save_state();
+            return;
+        }
         phase_ = VaultPhase::RotateVerifying;
         (void)save_state();
         return;

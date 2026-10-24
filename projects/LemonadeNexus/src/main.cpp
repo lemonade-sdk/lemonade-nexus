@@ -137,27 +137,18 @@ int main(int argc, char* argv[]) {
     // The old TEE/trust services are gone: attestation, eligibility, and
     // Tier 1 authority live in the mesh security system.
 
-    // Phase 7: files under the data key. The vault's state decides whether
-    // the services that read those files wait for the unlock (below).
+    // Phase 7: files under the data key. The vault always exists; its state
+    // decides whether the services that read those files wait for the unlock
+    // (below). A vault that cannot unlock serves no storage-dependent reads
+    // or writes — never plaintext as a substitute.
     const auto vault_state_directory = data_root / "security" / "storage";
-    std::unique_ptr<nexus::security::StorageVault> storage_vault;
-    if (config.storage_files_enabled) {
-        storage_vault = std::make_unique<nexus::security::StorageVault>(
-            data_root, vault_state_directory, crypto);
-        storage_vault->load();
-        storage.set_vault(storage_vault.get());
-    } else if (const auto recorded =
-                   nexus::security::StorageVault::recorded_mode(vault_state_directory);
-               recorded && *recorded != nexus::security::VaultMode::Plaintext) {
-        // Never read encrypted files as plaintext, and never replace them.
-        spdlog::error("Files under {} are encrypted under the data key; start with "
-                      "--storage-key --storage-files",
-                      data_root.string());
-        return 1;
-    }
+    std::unique_ptr<nexus::security::StorageVault> storage_vault =
+        std::make_unique<nexus::security::StorageVault>(data_root, vault_state_directory, crypto);
+    storage_vault->load();
+    storage.set_vault(storage_vault.get());
     // Services that read files under the data key start only once it is in
     // memory. Gossip, attestation, and holder duties start without it (B8).
-    const bool defer_file_services = storage_vault && !storage_vault->files_ready();
+    const bool defer_file_services = !storage_vault->files_ready();
 
     nexus::tree::PermissionTreeService tree{storage, crypto};
     bool tree_started = !defer_file_services;
@@ -176,7 +167,7 @@ int main(int argc, char* argv[]) {
         root_privkey = key_wrapping.unlock_identity({});
         root_pubkey = key_wrapping.load_identity_pubkey();
         if (!root_privkey || !root_pubkey) {
-            if (storage_vault && key_wrapping.identity_present()) {
+            if (key_wrapping.identity_present()) {
                 spdlog::error("identity/keypair.enc exists and does not open under the data "
                               "key; refusing to replace it");
                 return false;
@@ -458,6 +449,11 @@ int main(int argc, char* argv[]) {
         acme_config = nexus::acme::AcmeProviderConfig::letsencrypt();
     }
     nexus::acme::AcmeService acme{storage, std::move(acme_config), config.dns_provider};
+    // Phase 7: route the ACME account key and issued cert keys through the
+    // storage vault (DEK-encrypted at rest). When files were locked at startup,
+    // the unlock gate above already returned before reaching here, so the data
+    // key is in memory and ACME may start and read/write keys through the vault.
+    acme.set_vault(storage_vault.get());
     acme.start();
 
     // ========================================================================
@@ -683,7 +679,7 @@ int main(int argc, char* argv[]) {
     // no public IP). The background ACME thread and renewal use the same target.
     const std::string public_cert_fqdn =
         !server_seip_fqdn.empty() ? server_seip_fqdn : server_fqdn;
-    auto tls = nexus::core::resolve_tls_cert(data_root, public_cert_fqdn);
+    auto tls = nexus::core::resolve_tls_cert(data_root, public_cert_fqdn, storage_vault.get());
 
     // ========================================================================
     // boringtun interface — server-side tunnel endpoint
@@ -824,8 +820,24 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // HTTP Control Plane -- Dual-server architecture
     // ========================================================================
-    nexus::network::HttpServer http_server{http_port, "0.0.0.0",
-                                            tls.cert_path, tls.key_path};
+    // When the TLS key is vault-covered (Phase 7) the key arrives in memory; the
+    // cert is still opened by path. Fail closed: while the DEK is locked the key
+    // cannot be read, tls.valid stays false, and the HTTPS listener is withheld
+    // (no plaintext interim) until the background ACME/upgrade path brings it up.
+    nexus::network::HttpServer http_server{http_port, "0.0.0.0"};
+    if (tls.cert_path.empty()) {
+        // No cert on disk yet — ACME background path will issue it and upgrade.
+    } else if (!tls.key_bytes.empty()) {
+        // Key is vault-covered and decrypted: enable HTTPS from the in-memory key.
+        if (!http_server.enable_tls_inmemory_key(tls.cert_path, tls.key_bytes, tls.key_path)) {
+            spdlog::warn("Public API: HTTPS withheld — in-memory TLS key could not be enabled");
+        }
+    } else {
+        // Plaintext key on disk (pre-key state).
+        if (!http_server.enable_tls_from_paths(tls.cert_path, tls.key_path)) {
+            spdlog::warn("Public API: HTTPS withheld — TLS cert/key could not be enabled");
+        }
+    }
 
     std::unique_ptr<nexus::network::HttpServer> private_http_server;
     bool private_needs_acme = false;   // request + upgrade the private cert in the background
@@ -834,11 +846,13 @@ int main(int argc, char* argv[]) {
         // cert is the one issued for server_private_fqdn (never the public SEIP
         // cert).
         std::string priv_cert_path, priv_key_path;
+        std::string priv_key_bytes;   // in-memory key when vault-covered
         if (!server_private_fqdn.empty()) {
-            auto priv_tls = nexus::core::resolve_tls_cert(data_root, server_private_fqdn);
+            auto priv_tls = nexus::core::resolve_tls_cert(data_root, server_private_fqdn, storage_vault.get());
             if (!priv_tls.cert_path.empty() && !priv_tls.key_path.empty()) {
                 priv_cert_path = priv_tls.cert_path;
                 priv_key_path  = priv_tls.key_path;
+                priv_key_bytes = priv_tls.key_bytes;
                 spdlog::info("Private API: using TLS cert for {}", server_private_fqdn);
             } else if (priv_tls.needs_acme_background) {
                 // The private API is withheld until its cert issues; the unified
@@ -850,13 +864,20 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        auto priv_srv = std::make_unique<nexus::network::HttpServer>(
+            config.private_http_port, tunnel_bind_ip);
         if (!priv_cert_path.empty()) {
-            private_http_server = std::make_unique<nexus::network::HttpServer>(
-                config.private_http_port, tunnel_bind_ip, priv_cert_path, priv_key_path);
-        } else {
-            private_http_server = std::make_unique<nexus::network::HttpServer>(
-                config.private_http_port, tunnel_bind_ip);
+            if (!priv_key_bytes.empty()) {
+                if (!priv_srv->enable_tls_inmemory_key(priv_cert_path, priv_key_bytes, priv_key_path)) {
+                    spdlog::warn("Private API: HTTPS withheld — in-memory TLS key could not be enabled");
+                }
+            } else {
+                if (!priv_srv->enable_tls_from_paths(priv_cert_path, priv_key_path)) {
+                    spdlog::warn("Private API: HTTPS withheld — TLS cert/key could not be enabled");
+                }
+            }
         }
+        private_http_server = std::move(priv_srv);
 
         // The private API has no kernel tunnel address to bind anymore. Bind it
         // to loopback and let the in-process netstack pipe virtual TCP from the
@@ -1055,21 +1076,14 @@ int main(int argc, char* argv[]) {
         });
     }
 
-    if (config.storage_key_enabled) {
-        spdlog::warn("EXPERIMENTAL: threshold storage key enabled (Phase 5). Tier 1 finalizes "
-                     "storage holder plans and daily key rotations; this server keeps a data key "
-                     "wrapped to the storage key. The storage-threshold library paths are not "
-                     "externally reviewed: keep this off in production.");
-    }
-    if (storage_vault) {
-        spdlog::warn("EXPERIMENTAL: files under the data key (Phase 7), mode {}. The node "
-                     "identity, JWT secret, DDNS credentials, account replica, and tree files "
-                     "are encrypted after an unlock round trip through the holders; the data key "
-                     "rotates monthly.",
-                     storage_vault->mode() == nexus::security::VaultMode::Encrypted
-                         ? "encrypted"
-                         : "migrating from plaintext");
-    }
+    spdlog::warn("Storage key (Phase 5) and files under the data key (Phase 7) run on every "
+                 "server: Tier 1 finalizes storage holder plans and key rotations, this server "
+                 "keeps a data key wrapped to the storage key, and its identity, JWT secret, "
+                 "DDNS credentials, account replica, and tree files are encrypted after an unlock "
+                 "round trip through the holders. Mode: {}.",
+                 storage_vault->mode() == nexus::security::VaultMode::Encrypted
+                     ? "encrypted"
+                     : "plaintext, pre-key or migrating");
 
     // ========================================================================
     // Register CRTP request handlers
