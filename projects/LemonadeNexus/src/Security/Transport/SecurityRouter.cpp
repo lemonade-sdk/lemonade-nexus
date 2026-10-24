@@ -504,6 +504,9 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
         case SecurityMessageKind::StoragePlanRequest:
             events_.on_storage_message(message);
             return delivered();
+        case SecurityMessageKind::Upgrade:
+            events_.on_upgrade_message(message);
+            return delivered();
     }
     return drop(DropReason::UnknownKind);
 }

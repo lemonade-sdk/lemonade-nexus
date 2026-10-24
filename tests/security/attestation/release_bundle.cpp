@@ -52,6 +52,7 @@ struct GeneratorFixture : ::testing::Test {
                                     constants::kConsensusRulesetVersion);
         spec.release_id = "release-bundle-test";
         spec.nexus_version = "0.9.7";
+        spec.release_number = 2026102401;
         spec.final_patched_tree = std::string(40, '2');
         spec.network_id_hex = crypto::to_hex(network);
         spec.signer_pubkey_b64 = crypto::to_base64(authority_pk);

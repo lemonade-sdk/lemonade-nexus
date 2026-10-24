@@ -72,7 +72,7 @@ json approval_preimage(const ReleaseApprovalV1& approval) {
     for (const auto& [index, digest] : approval.expected_pcrs) {
         pcrs.push_back({{"index", index}, {"sha256", digest}});
     }
-    return {
+    json preimage = {
         {"format_version", approval.format_version},
         {"release_id", approval.release_id},
         {"nexus_version", approval.nexus_version},
@@ -102,6 +102,14 @@ json approval_preimage(const ReleaseApprovalV1& approval) {
         {"qualification_state", approval.qualification_state},
         {"signer_pubkey", approval.signer_pubkey_b64},
     };
+    // Format 2 has no such fields; adding them would change its digest, which
+    // a stored bootstrap certificate commits.
+    if (approval.format_version >= kReleaseApprovalFormatVersion) {
+        preimage["release_number"] = approval.release_number;
+        preimage["previous_release_paths"] =
+            approved_paths_json(approval.previous_release_paths);
+    }
+    return preimage;
 }
 
 using detail::valid_hex;
@@ -149,6 +157,10 @@ bool compiled_release_fields_match(const ReleaseApprovalV1& a, std::string& erro
     if (a.format_version != kReleaseApprovalFormatVersion || a.release_id.empty() ||
         a.nexus_version.empty() || a.final_patched_tree.size() != 40) {
         error = "release identity is incomplete or has an unsupported format";
+        return false;
+    }
+    if (a.release_number == 0 || a.release_number > kMaxReleaseNumber) {
+        error = "release number is outside the valid range";
         return false;
     }
     if (a.source_commit != kExpectedSourceCommit ||
@@ -211,6 +223,18 @@ ReleaseApprovalBundleV1 parse_bundle(const json& root) {
     a.starting_patched_tree = j.at("starting_patched_tree").get<std::string>();
     a.final_patched_tree = j.at("final_patched_tree").get<std::string>();
     a.network_id_hex = j.at("network_id").get<std::string>();
+    // Fields outside a format's preimage are unsigned there, so they are
+    // refused rather than read.
+    if (a.format_version >= kReleaseApprovalFormatVersion) {
+        a.release_number = j.at("release_number").get<uint64_t>();
+        for (const auto& path : j.at("previous_release_paths")) {
+            a.previous_release_paths.push_back(
+                {path.at("path").get<std::string>(),
+                 path.at("sha256").get<std::vector<std::string>>()});
+        }
+    } else if (j.contains("release_number") || j.contains("previous_release_paths")) {
+        throw std::invalid_argument("format 2 approval carries format 3 fields");
+    }
     a.security_wire_version = j.at("security_wire_version").get<uint16_t>();
     a.security_ruleset = j.at("security_ruleset").get<SecurityRulesetVersion>();
     a.consensus_ruleset = j.at("consensus_ruleset").get<ConsensusRulesetVersion>();
@@ -294,11 +318,28 @@ ReleaseApprovalV1 release_approval_template() {
     return a;
 }
 
-bool verify_release_approval_bundle(const ReleaseApprovalBundleV1& bundle,
-                                    const crypto::Ed25519PublicKey& genesis_public_key,
-                                    const NetworkId& expected_network_id,
-                                    std::string& error) {
+std::string release_approval_bundle_json(const ReleaseApprovalBundleV1& bundle) {
+    auto authority_json =
+        json::parse(canonical_release_authority_json(bundle.authority));
+    authority_json["genesis_signature"] = bundle.authority.genesis_signature_b64;
+    auto approval_json = json::parse(canonical_release_approval_json(bundle.approval));
+    approval_json["signature"] = bundle.approval.signature_b64;
+    json root;
+    root["authority"] = std::move(authority_json);
+    root["approval"] = std::move(approval_json);
+    return root.dump();
+}
+
+bool verify_release_approval_signatures(const ReleaseApprovalBundleV1& bundle,
+                                        const crypto::Ed25519PublicKey& genesis_public_key,
+                                        const NetworkId& expected_network_id,
+                                        std::string& error) {
     error.clear();
+    if (bundle.approval.format_version != kReleaseApprovalFormatV2 &&
+        bundle.approval.format_version != kReleaseApprovalFormatVersion) {
+        error = "release approval has an unsupported format";
+        return false;
+    }
     const auto expected_network_hex = crypto::to_hex(expected_network_id);
     if (bundle.authority.format_version != kReleaseAuthorityFormatVersion ||
         bundle.authority.network_id_hex != expected_network_hex) {
@@ -328,6 +369,18 @@ bool verify_release_approval_bundle(const ReleaseApprovalBundleV1& bundle,
         error = "release approval signature is invalid";
         return false;
     }
+    return true;
+}
+
+bool verify_release_approval_bundle(const ReleaseApprovalBundleV1& bundle,
+                                    const crypto::Ed25519PublicKey& genesis_public_key,
+                                    const NetworkId& expected_network_id,
+                                    std::string& error) {
+    if (!verify_release_approval_signatures(bundle, genesis_public_key, expected_network_id,
+                                            error)) {
+        return false;
+    }
+    const auto& a = bundle.approval;
     if (!compiled_release_fields_match(a, error)) return false;
 
     std::set<std::string> paths;
@@ -348,6 +401,16 @@ bool verify_release_approval_bundle(const ReleaseApprovalBundleV1& bundle,
         a.evidence_collector_path != "/usr/bin/nexus-attestd") {
         error = "release approval omits a required executable or collector binding";
         return false;
+    }
+    std::set<std::string> previous;
+    for (const auto& prior : a.previous_release_paths) {
+        if (!paths.contains(prior.path) || !previous.insert(prior.path).second ||
+            prior.sha256.empty() ||
+            std::any_of(prior.sha256.begin(), prior.sha256.end(),
+                        [](const auto& hash) { return !valid_sha256(hash); })) {
+            error = "previous release paths name an unapproved, duplicate, or unhashed path";
+            return false;
+        }
     }
     if (a.qualification_state == "PENDING_LIVE_QUALIFICATION") {
         if (!a.expected_pcrs.empty()) {
@@ -404,6 +467,17 @@ LinuxAttestationProfile profile_from_release_approval(const ReleaseApprovalV1& a
     profile.snp.min_tcb = approval.min_tcb;
     profile.snp.expected_measurements_hex = approval.svsm_launch_measurements_hex;
     profile.approved_paths = approval.approved_paths;
+    for (auto& path : profile.approved_paths) {
+        const auto prior = std::find_if(
+            approval.previous_release_paths.begin(), approval.previous_release_paths.end(),
+            [&path](const ApprovedPath& candidate) { return candidate.path == path.path; });
+        if (prior == approval.previous_release_paths.end()) continue;
+        for (const auto& hash : prior->sha256) {
+            if (std::find(path.sha256.begin(), path.sha256.end(), hash) == path.sha256.end()) {
+                path.sha256.push_back(hash);
+            }
+        }
+    }
     profile.evidence_collector_path = approval.evidence_collector_path;
     profile.expected_pcrs = approval.expected_pcrs;
     return profile;

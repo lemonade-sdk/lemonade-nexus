@@ -26,6 +26,11 @@ struct ReleaseArtifact {
 struct ReleaseBundleSpec {
     std::string release_id;
     std::string nexus_version;
+    /// Monotonic release number (YYYYMMDD * 100 + N); 1..kMaxReleaseNumber.
+    uint64_t release_number = 0;
+    /// The previous release's hashes for the same paths (normally that
+    /// release's own approved_paths). Every path must also be an artifact path.
+    std::vector<ApprovedPath> previous_release_paths;
     /// Git tree hash of the exact built source; computed by the caller
     /// (`git rev-parse 'HEAD^{tree}'`), never hand-typed.
     std::string final_patched_tree;

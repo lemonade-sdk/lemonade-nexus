@@ -6,13 +6,14 @@
     "genesis_signature": ""
   },
   "approval": {
-    "format_version": 2,
+    "format_version": 3,
     "release_id": "lemonade-nexus-0.9.7-current-head-svsm-tier1",
     "nexus_version": "0.9.7",
     "source_commit": "dd80e7f99d104e6be71ee9c30e32d39ea911bec8",
     "starting_patched_tree": "148bcf279cd18a7c46295fcd76db022ed5451422",
     "final_patched_tree": "EXTERNAL_FINAL_TREE_REQUIRED",
     "network_id": "OPERATOR_NETWORK_ID_REQUIRED",
+    "release_number": 2026102401,
     "security_wire_version": 3,
     "security_ruleset": 1,
     "consensus_ruleset": 1,
@@ -41,6 +42,7 @@
       "microcode": 0
     },
     "approved_paths": [],
+    "previous_release_paths": [],
     "evidence_collector_path": "/usr/bin/nexus-attestd",
     "expected_pcrs": [],
     "qualification_state": "PENDING_LIVE_QUALIFICATION",

@@ -32,6 +32,7 @@
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
+#include <LemonadeNexus/Core/UpgradeControl.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
@@ -331,6 +332,19 @@ int main(int argc, char* argv[]) {
         spdlog::error("Config: {}", mesh_error);
         return 1;
     }
+#if defined(LEMONADE_HAVE_UPGRADE_CONTROL)
+    // The turn gate and health report for nexus-updater: root peers only.
+    // Without the socket the updater waits; nothing else depends on it.
+    auto upgrade_control = std::make_unique<nexus::core::UpgradeControlServer>(
+        coordinator.io_context(), nexus::core::UpgradeControlConfig{},
+        [mesh = security_mesh->service.get()](std::function<void()> work) {
+            mesh->post(std::move(work));
+        },
+        *security_mesh->service->upgrade());
+    if (std::string control_error; !upgrade_control->start(control_error)) {
+        spdlog::warn("Upgrade control socket unavailable: {}", control_error);
+    }
+#endif
     if (defer_file_services) {
         // Fail closed: the files are encrypted, so nothing that reads them
         // starts before t holders return the data key. There is no plaintext
@@ -1409,6 +1423,9 @@ int main(int argc, char* argv[]) {
     relay_discovery.stop();
     relay.stop();
     stun.stop();
+#if defined(LEMONADE_HAVE_UPGRADE_CONTROL)
+    upgrade_control->stop();
+#endif
     if (security_mesh) {
         security_mesh->service->stop();  // uses gossip as transport: stop it first
     }

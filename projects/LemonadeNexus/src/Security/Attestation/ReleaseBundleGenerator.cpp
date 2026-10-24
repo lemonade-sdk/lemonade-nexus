@@ -45,6 +45,10 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "release_id and nexus_version are required";
         return std::nullopt;
     }
+    if (spec.release_number == 0 || spec.release_number > kMaxReleaseNumber) {
+        error = "release_number must be YYYYMMDD * 100 + N";
+        return std::nullopt;
+    }
     if (!valid_hex(spec.final_patched_tree, 40)) {
         error = "final_patched_tree must be the 40-hex git tree of the built source";
         return std::nullopt;
@@ -105,6 +109,7 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
     ReleaseApprovalV1 approval = release_approval_template();
     approval.release_id = spec.release_id;
     approval.nexus_version = spec.nexus_version;
+    approval.release_number = spec.release_number;
     approval.final_patched_tree = spec.final_patched_tree;
     approval.network_id_hex = spec.network_id_hex;
     approval.signer_pubkey_b64 = spec.signer_pubkey_b64;
@@ -140,6 +145,18 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "artifacts must include /usr/bin/lemonade-nexus and the evidence collector";
         return std::nullopt;
     }
+    std::set<std::string> previous;
+    for (const auto& prior : spec.previous_release_paths) {
+        if (!seen.contains(prior.path) || !previous.insert(prior.path).second ||
+            prior.sha256.empty() ||
+            std::any_of(prior.sha256.begin(), prior.sha256.end(),
+                        [](const std::string& hash) { return !valid_hex(hash, 64); })) {
+            error = "previous release path is not an artifact path, is duplicated, or has an "
+                    "invalid hash: " + prior.path;
+            return std::nullopt;
+        }
+    }
+    approval.previous_release_paths = spec.previous_release_paths;
     return approval;
 }
 

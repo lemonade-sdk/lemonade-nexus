@@ -128,6 +128,10 @@ public:
     /// the network; the storage service checks the epoch, the session or plan,
     /// and every proof itself.
     virtual void on_storage_message(const SecurityMessage&) {}
+    /// Release adoption and upgrade-turn traffic (kind Upgrade). The router
+    /// bound the sender and checked the network; the upgrade service checks
+    /// every signature, record, and proof itself.
+    virtual void on_upgrade_message(const SecurityMessage&) {}
 };
 
 struct SecurityRouterConfig {

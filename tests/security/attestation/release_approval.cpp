@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
 
 #include <LemonadeNexus/Security/Attestation/AttestationProfileId.hpp>
+#include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Attestation/Providers/SnpSvsmVtpmProvider.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
@@ -43,6 +44,7 @@ struct SignedFixture {
         auto& a = bundle.approval;
         a.release_id = "release-test";
         a.nexus_version = "0.9.7";
+        a.release_number = 2026102401;
         a.source_commit = "dd80e7f99d104e6be71ee9c30e32d39ea911bec8";
         a.starting_patched_tree = "148bcf279cd18a7c46295fcd76db022ed5451422";
         a.final_patched_tree = "1111111111111111111111111111111111111111";
@@ -235,7 +237,91 @@ TEST(ReleaseApproval, TheSingleMeasurementFormatVersionIsRetired) {
     fixture.resign();
     EXPECT_FALSE(verify_release_approval_bundle(
         fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release approval has an unsupported format");
+}
+
+TEST(ReleaseApproval, FormatTwoVerifiesItsSignaturesButIsNotAcceptedForAttestation) {
+    // Format 3 added the release number. A format-2 approval (the r21 line)
+    // still has checkable signatures, which identify a founding approval's
+    // signer, but it never passes the full verifier.
+    SignedFixture fixture;
+    std::string error;
+    fixture.bundle.approval.format_version = kReleaseApprovalFormatV2;
+    fixture.bundle.approval.release_number = 0;
+    fixture.resign();
+    EXPECT_TRUE(verify_release_approval_signatures(fixture.bundle, fixture.genesis_pk,
+                                                   fixture.network, error))
+        << error;
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
     EXPECT_EQ(error, "release identity is incomplete or has an unsupported format");
+}
+
+TEST(ReleaseApproval, AReleaseNumberIsRequiredAndBounded) {
+    SignedFixture fixture;
+    std::string error;
+    fixture.bundle.approval.release_number = 0;
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release number is outside the valid range");
+    fixture.bundle.approval.release_number = kMaxReleaseNumber + 1;
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+}
+
+TEST(ReleaseApproval, PreviousReleaseHashesWidenTheProfileButNotTheReleaseOwnPaths) {
+    SignedFixture fixture;
+    std::string error;
+    const std::string previous(64, 'a');
+    fixture.bundle.approval.previous_release_paths = {
+        {"/usr/bin/lemonade-nexus", {previous}}};
+    fixture.resign();
+    ASSERT_TRUE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error))
+        << error;
+    const auto profile = profile_from_release_approval(fixture.bundle.approval);
+    EXPECT_TRUE(path_approved(profile, "/usr/bin/lemonade-nexus", std::string(64, '1')));
+    EXPECT_TRUE(path_approved(profile, "/usr/bin/lemonade-nexus", previous));
+    EXPECT_FALSE(path_approved(profile, "/usr/bin/lemonade-nexus", std::string(64, 'b')));
+    // The release's own paths stay exactly this release's hashes.
+    EXPECT_EQ(fixture.bundle.approval.approved_paths.front().sha256.size(), 1u);
+
+    // A previous path that this release does not approve is refused.
+    fixture.bundle.approval.previous_release_paths = {{"/usr/bin/other", {previous}}};
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error,
+              "previous release paths name an unapproved, duplicate, or unhashed path");
+}
+
+TEST(ReleaseApproval, FormatTwoJsonCarryingFormatThreeFieldsIsRefused) {
+    // Those fields are outside the format-2 preimage, so they would be
+    // unsigned there.
+    SignedFixture fixture;
+    fixture.bundle.approval.format_version = kReleaseApprovalFormatV2;
+    fixture.resign();
+    auto text = release_approval_bundle_json(fixture.bundle);
+    const auto at = text.find("\"format_version\":2");
+    ASSERT_NE(at, std::string::npos);
+    text.insert(text.find('{', text.find("\"approval\"")) + 1, "\"release_number\":7,");
+    std::string error;
+    EXPECT_FALSE(parse_release_approval_bundle(text, error).has_value());
+}
+
+TEST(ReleaseApproval, TheBundleJsonRoundTripsWithItsSignatures) {
+    SignedFixture fixture;
+    std::string error;
+    const auto parsed =
+        parse_release_approval_bundle(release_approval_bundle_json(fixture.bundle), error);
+    ASSERT_TRUE(parsed.has_value()) << error;
+    EXPECT_TRUE(verify_release_approval_bundle(*parsed, fixture.genesis_pk, fixture.network,
+                                               error))
+        << error;
+    EXPECT_EQ(release_approval_digest(parsed->approval),
+              release_approval_digest(fixture.bundle.approval));
 }
 
 TEST(ReleaseApproval, MeasurementOutsideTheApprovedSetIsRejectedEvenResigned) {

@@ -20,7 +20,15 @@ namespace nexus::security {
 inline constexpr uint32_t kReleaseAuthorityFormatVersion = 1;
 /// Version 2: svsm_launch_measurements is a set, one entry per approved VM
 /// shape. A version-1 verifier must refuse the new form, never half-read it.
-inline constexpr uint32_t kReleaseApprovalFormatVersion = 2;
+inline constexpr uint32_t kReleaseApprovalFormatV2 = 2;
+/// Version 3: the approval carries a monotonic release_number and the
+/// previous release's executable hashes (previous_release_paths), so a newer
+/// approval can supersede an older one in place (Design-Auto-Update Phase 2).
+/// A version-2 verifier refuses this form.
+inline constexpr uint32_t kReleaseApprovalFormatVersion = 3;
+/// Upper bound of a release number: the tag date as YYYYMMDD times 100 plus
+/// the release of that day (vYYYY.MM.DD.N).
+inline constexpr uint64_t kMaxReleaseNumber = 9999123199ULL;
 inline constexpr std::string_view kReleaseApprovalPath =
     "/usr/lib/lemonade-nexus/release/release-approval.json";
 
@@ -47,6 +55,10 @@ struct ReleaseApprovalV1 {
     std::string starting_patched_tree;
     std::string final_patched_tree;
     std::string network_id_hex;
+    /// Format 3: the monotonic release number (YYYYMMDD * 100 + N). A server
+    /// accepts a newer approval only with a strictly greater number than every
+    /// approval it accepted before. Zero in a format-2 approval.
+    uint64_t release_number{};
 
     uint16_t security_wire_version{};
     SecurityRulesetVersion security_ruleset{};
@@ -65,7 +77,15 @@ struct ReleaseApprovalV1 {
     /// measurement passes only on an exact match with a member.
     std::vector<std::string> svsm_launch_measurements_hex;
     TcbVersion min_tcb{};
+    /// The hashes of THIS release, one entry per required path. A witness
+    /// treats a server as running this release only when every measured hash
+    /// is listed here.
     std::vector<ApprovedPath> approved_paths;
+    /// Format 3: the previous release's hashes for the same paths. Attestation
+    /// also accepts these, so servers on release N and N+1 attest each other
+    /// during a rollout. Every path must also appear in approved_paths. Empty
+    /// approves no previous release.
+    std::vector<ApprovedPath> previous_release_paths;
     std::string evidence_collector_path;
 
     // Empty while qualification is pending. A qualified approval contains
@@ -96,9 +116,25 @@ struct ReleaseApprovalBundleV1 {
 /// empty for the generator to fill, so template and verifier cannot drift.
 [[nodiscard]] ReleaseApprovalV1 release_approval_template();
 
+/// The complete signed bundle as JSON, in the form parse_release_approval_bundle
+/// reads. Used to persist and forward an accepted approval byte-exactly in
+/// meaning (the signatures cover the canonical preimages, not this layout).
+[[nodiscard]] std::string release_approval_bundle_json(const ReleaseApprovalBundleV1& bundle);
+
+/// Checks only the Genesis delegation, the network, the signer binding, and
+/// the release signature, for format 2 or 3. It does NOT check the compiled
+/// release line. Use it only to identify the release signer of an approval
+/// whose digest a Genesis-signed bootstrap certificate already commits (the
+/// founding approval); never to accept an approval for attestation.
+[[nodiscard]] bool verify_release_approval_signatures(
+    const ReleaseApprovalBundleV1& bundle,
+    const crypto::Ed25519PublicKey& genesis_public_key,
+    const NetworkId& expected_network_id,
+    std::string& error);
+
 // Verifies Genesis delegation first, then the release signature, then every
 // compiled protocol/release invariant. Hashes are not exposed to callers until
-// all three checks succeed.
+// all three checks succeed. Requires format 3.
 [[nodiscard]] bool verify_release_approval_bundle(
     const ReleaseApprovalBundleV1& bundle,
     const crypto::Ed25519PublicKey& genesis_public_key,
@@ -116,6 +152,8 @@ struct ReleaseApprovalBundleV1 {
 
 // Converts only an already verified approval. Pending PCR8/PCR9 deliberately
 // leave the profile incomplete, keeping production Tier-1 admission disabled.
+// Each approved path accepts the hashes of this release and of the previous
+// release (previous_release_paths).
 [[nodiscard]] LinuxAttestationProfile profile_from_release_approval(
     const ReleaseApprovalV1& approval);
 

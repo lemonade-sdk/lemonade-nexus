@@ -211,7 +211,18 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/hostile_adoption.cpp
     security/lifecycle/adversarial.cpp
     security/lifecycle/tree_consensus_path.cpp
-    security/lifecycle/storage_key_path.cpp)
+    security/lifecycle/storage_key_path.cpp
+    security/lifecycle/upgrade_path.cpp)
+# Release adoption (Design-Auto-Update Phase 2) and the ruleset pin that keeps
+# network_id stable across releases.
+add_nexus_test(test_security_release
+    security/release/release_chain.cpp
+    security/release/ruleset_pin.cpp)
+# Upgrade turns (Design-Auto-Update Phase 5): the record rules and the local
+# control interface for nexus-updater.
+add_nexus_test(test_security_upgrade
+    security/upgrade/upgrade_progress.cpp
+    security/upgrade/upgrade_control.cpp)
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority

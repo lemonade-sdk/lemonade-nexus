@@ -39,6 +39,10 @@ enum class BlockPayloadKind : uint16_t {
     /// generation, or the finalized rotation that names the new S, its share
     /// commitments, and the effective epoch (StorageRecords.hpp wire form).
     StorageKeyRotation = 3,
+    /// One upgrade-turn record (Design-Auto-Update Phase 5): a rollout
+    /// start, a turn, an upgraded report, or a halt
+    /// (Security/Upgrade/UpgradeProgress.hpp wire form).
+    UpgradeProgress = 4,
 };
 
 /// True for a kind this build knows. The codec refuses any other value.
