@@ -180,9 +180,13 @@ and never re-found. Every release after that uses Phases 1-5.
 
 ## Tier 2 and the tree
 
-Tier 2 servers never write the tree, in any mode. A tree write or a new join
-that reaches a Tier 2 server gets a redirect listing verified Tier 1 API
-endpoints, and the SDK retries there. Tier 2 never forwards or proxies an op.
+Tier 2 servers are pure proxies of data and connections that are already
+encrypted end to end. They never write the tree, in any mode, and never
+terminate or vouch for a client session. A tree write or a new join that
+reaches a Tier 2 server is either passed through as an opaque, end-to-end
+encrypted connection to a verified Tier 1 server, or answered with a redirect
+listing verified Tier 1 API endpoints so the SDK retries there. Tier 2 never
+reads, forwards, or re-signs an op.
 
 ## Tests
 
