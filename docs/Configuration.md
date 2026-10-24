@@ -324,11 +324,12 @@ Limits:
   cannot forward a write: replicas trust operation signatures from the frozen
   Tier 1 set only, and no finalized list of admitted submitters exists. A
   root-signed admission certificate is identity, not authority.
-- **Same starting tree.** A new ops-mode tree log starts from the server's
-  current tree. Servers agree on state roots only if every server started from
-  the same tree: an empty one, or the merge commit. A server whose log base
-  differs refuses every replicated entry (the status names it). Existing,
-  divergent trees need the [Tree Merge Ceremony](Tree-Merge-Ceremony).
+- **Same starting tree.** Servers agree on state roots only if every server
+  started from the same tree: an empty one, or the merge commit. A new
+  ops-mode tree log therefore starts only from an empty tree (see **Start**).
+  A server whose log base differs, for example a log an earlier build started
+  from a populated tree, refuses every replicated entry (the status names it).
+  Existing, divergent trees need the [Tree Merge Ceremony](Tree-Merge-Ceremony).
 - **Unproved commits.** A block that committed while the three blocks behind
   its commit were no longer held is logged without a commit proof. Peers
   refuse that copy and take the entry from another Tier 1 server.
