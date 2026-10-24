@@ -181,12 +181,12 @@ and never re-found. Every release after that uses Phases 1-5.
 ## Tier 2 and the tree
 
 Tier 2 servers are pure proxies of data and connections that are already
-encrypted end to end. They never write the tree, in any mode, and never
-terminate or vouch for a client session. A tree write or a new join that
-reaches a Tier 2 server is either passed through as an opaque, end-to-end
-encrypted connection to a verified Tier 1 server, or answered with a redirect
-listing verified Tier 1 API endpoints so the SDK retries there. Tier 2 never
-reads, forwards, or re-signs an op.
+encrypted end to end. They have no tree role: they do not read, write,
+redirect, or forward tree requests, and they do not terminate or vouch for a
+client session. Tier 2 servers do not serve the tree API. Clients send every
+tree read and write directly to a Tier 1 server. The SDK selects Tier 1 servers
+from the finalized epoch membership and verifies that list; it never asks a
+Tier 2 server for tree data.
 
 ## Tests
 
