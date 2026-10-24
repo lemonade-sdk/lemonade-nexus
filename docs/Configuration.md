@@ -327,20 +327,24 @@ Limits:
   After the setting is turned off, a delta update replaces the stored record,
   including its version.
 
-## Experimental: Threshold Storage Key
+## Threshold Storage Key
 
-| CLI Flag | Env Var | JSON Key | Default | Description |
-|----------|---------|----------|---------|-------------|
-| `--storage-key` | `SP_STORAGE_KEY` (any value) | `storage_key_enabled` | off | Run the threshold storage key and keep a data key wrapped to it (Phase 5) |
-| `--storage-files` | `SP_STORAGE_FILES` (any value) | `storage_files_enabled` | off | Encrypt this server's files under the data key and rotate the data key monthly (Phase 7). Needs `--storage-key` |
+Storage encryption is always on. There is no CLI flag, environment variable,
+or JSON key for it. `--storage-key`, `--storage-files`, `SP_STORAGE_KEY`,
+`SP_STORAGE_FILES`, and the `storage_key_enabled` and `storage_files_enabled`
+JSON keys were removed. A unit file or config that still names them starts
+normally and ignores them.
 
-This setting is experimental. It implements Phase 5 of
-[Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key)
-(section B11). **Keep it off in production.** The `storage-threshold` crate
-uses library paths that no external review covers yet (design B3); the
-setting stays off in production until that review is done. With the setting
-off, no storage record is proposed, voted for, or applied, no storage message
-is sent or answered, and nothing below happens.
+A node with fewer than five storage holders never creates a data key. It
+starts and runs normally with its files unchanged. This is the pre-key state,
+not an error and not a reduced-security mode. `/api/storage/status` reports
+the vault mode and phase; it does not report the holder count.
+
+**The B3 external review of the `storage-threshold` library paths was not
+commissioned.** The flag was removed with that gate waived, not satisfied. The
+design cites an audit of `frost` v0.6.0, while the lockfile ships
+`frost-core` and `frost-ristretto255` 2.2.0, which that audit does not cover.
+CI runs no `cargo test` step.
 
 With the setting on:
 
@@ -373,7 +377,8 @@ With the setting on:
   to the storage public key, and proves the unwrap through the holders. After
   a rotation it rewraps the key from memory. A key wrapped to the previous
   storage key still unlocks through the epoch after the rotation's effective
-  epoch, then never. Files are encrypted only with `--storage-files` (below).
+  epoch, then never. Covered files are encrypted whenever a data key exists
+(below).
 - **Share storage.** When the host can seal (nexus-attestd with Seal and
   Unseal), the holder's shares are sealed beside the gossip identity under the
   domain `storage-share`: `data/sealed/storage-share.sealed`, with the same
@@ -484,10 +489,15 @@ it.
 
 ### Files under the data key (Phase 7)
 
-`--storage-files` needs `--storage-key`. It implements Phase 7 of the design
-(sections B9, B10, B5a). **Keep it off in production** for the same reason as
-`--storage-key`: the external review of the storage-threshold library paths is
-not done. With it off, files stay as they are.
+It implements Phase 7 of the design (sections B9, B10, B5a) and runs on every
+node. There is no way to turn it off.
+
+Migration is one-way. Once the vault records `encrypted`, a node that cannot
+reassemble the data key serves nothing that reads covered files, with no
+plaintext fallback and no timeout. Back up `data/security/storage/` and
+`data/sealed/` before upgrading a node. If those are lost after the migration
+the data key cannot be recovered, and reinstalling an older binary does not
+return the node to service.
 
 Covered files, under the data root: `identity/keypair.enc`,
 `identity/jwt_secret.hex`, `identity/ddns_credentials.enc`,
@@ -500,9 +510,9 @@ path, and the data key id). The state is in
 
 Migration runbook:
 
-1. Start the server with `--storage-key --storage-files`. The files stay
-   plaintext until the data key exists and one unlock through the holders has
-   proved it.
+1. Start the server. Files stay plaintext until the data key exists and one
+   unlock through the holders has proved it, which needs at least five
+   holders.
 2. The server encrypts each covered file to `<file>.vault-new`, asks the
    holders for a new unlock round trip, then decrypts every staged file and
    compares it with the plaintext. Only then does it record `encrypted`,
@@ -513,9 +523,9 @@ Migration runbook:
 4. After the migration, each start waits for the data key before it starts
    the services that read covered files (tree, node identity, auth, DDNS,
    account data, HTTP API). Gossip, attestation, and holder duties run while
-   it waits. With fewer than `t` holders the server serves nothing that needs
-   the files. Startup with `--storage-files` off stops with an error once the
-   files are encrypted; it never reads them as plaintext.
+   it waits, so a locked node still answers peer unlock requests using its own
+   share. With fewer than `t` holders reachable the server serves nothing that
+   needs the files and keeps waiting. It never reads them as plaintext.
 
 Rotation runbook:
 

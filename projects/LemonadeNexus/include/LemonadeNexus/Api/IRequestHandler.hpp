@@ -90,9 +90,9 @@ struct ApiContext {
     /// state. Set when the tree log runs (read-only or ops mode); unset, the
     /// route answers 404.
     std::function<nlohmann::json()>   tree_log_status;
-    /// Files under the data key (Phase 7), or nullptr when
-    /// storage_files_enabled is off. Not owned. The admin storage routes
-    /// answer 404 without it.
+    /// Files under the data key (Phase 7), or nullptr. Not owned. The admin
+    /// storage routes answer 404 without it. In the assembled server it is
+    /// always set; nullptr is the state for handlers built without a vault.
     security::StorageVault*           storage_vault{nullptr};
 };
 

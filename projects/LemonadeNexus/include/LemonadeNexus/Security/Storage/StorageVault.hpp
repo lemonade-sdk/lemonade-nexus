@@ -1,7 +1,7 @@
 #pragma once
 
 // Files encrypted under this server's data key (DEK), design B9, B10, and the
-// monthly DEK rotation of B5a. Phase 7, behind ServerConfig::storage_files_enabled.
+// monthly DEK rotation of B5a. Phase 7; the vault always exists.
 //
 // Format. A covered file is replaced in place by one encrypted object:
 //
