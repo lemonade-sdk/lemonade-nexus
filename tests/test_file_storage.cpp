@@ -303,6 +303,19 @@ TEST_F(FileStorageTest, PoolGenerationRoundTripAndRefusal) {
     EXPECT_EQ(*storage->read_pool_generation(meta), "gen-1");  // unchanged
 }
 
+TEST_F(FileStorageTest, AtomicEnvelopeReplacesTheExistingFileAndRejectsTraversal) {
+    const auto first = make_envelope("account_avatar", R"({"revision":1})");
+    const auto second = make_envelope("account_avatar", R"({"revision":2})");
+    ASSERT_TRUE(storage->write_file_atomic("avatar-group", "device.json", first));
+    ASSERT_TRUE(storage->write_file_atomic("avatar-group", "device.json", second));
+    ASSERT_TRUE(storage->read_file("avatar-group", "device.json"));
+    EXPECT_EQ(storage->read_file("avatar-group", "device.json")->data, second.data);
+    EXPECT_FALSE(storage->write_file_atomic("../outside", "device.json", first));
+    EXPECT_FALSE(storage->write_file_atomic("avatar-group", "../device.json", first));
+    EXPECT_EQ(storage->read_file("avatar-group", "device.json")->data, second.data);
+    EXPECT_EQ(storage->list_files("avatar-group").size(), 1u);
+}
+
 TEST_F(FileStorageTest, PoolRecordWriteReadRoundTripAndBoundedRead) {
     const auto text = R"({"position":1,"operation":"create_node"})";
     ASSERT_EQ(storage->write_pool_record(kHash, text),
@@ -474,6 +487,9 @@ TEST_F(FileStorageTest, RecordGrowthBetweenInspectionAndReadIsAnIoError) {
 // An existing record file that cannot be read is an I/O error, never
 // absence: the identifier is still occupied by evidence.
 TEST_F(FileStorageTest, UnreadableRecordFileIsIoErrorNotAbsent) {
+#ifdef _WIN32
+    GTEST_SKIP() << "This case requires POSIX file permission modes; Windows uses ACLs.";
+#else
     ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
               FileStorageService::PoolWrite::Ok);
     const auto path = storage->pool_dir() / (kHash + ".json");
@@ -486,6 +502,7 @@ TEST_F(FileStorageTest, UnreadableRecordFileIsIoErrorNotAbsent) {
         << "an unreadable existing file must not be reported as absent";
     EXPECT_FALSE(text.has_value());
     EXPECT_TRUE(storage->pool_record_exists(kHash));
+#endif
 }
 
 TEST_F(FileStorageTest, PoolRecordStateDistinguishesIoErrorFromAbsence) {
@@ -508,8 +525,9 @@ TEST_F(FileStorageTest, BrokenSymlinkMakesTheInventoryIncomplete) {
     ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
               FileStorageService::PoolWrite::Ok);
     const std::string other = kHash.substr(1) + "0";
-    ::symlink((temp_dir / "missing-target").c_str(),
-              (storage->pool_dir() / (other + ".json")).c_str());
+    std::error_code symlink_error;
+    fs::create_symlink(temp_dir / "missing-target", storage->pool_dir() / (other + ".json"), symlink_error);
+    if (symlink_error) GTEST_SKIP() << "Symlink creation is unavailable: " << symlink_error.message();
 
     EXPECT_EQ(storage->pool_record_state(other),
               FileStorageService::PoolFileState::Present)
@@ -523,7 +541,7 @@ TEST_F(FileStorageTest, BrokenSymlinkMakesTheInventoryIncomplete) {
         << "an entry whose size cannot be determined must fail the scan";
     EXPECT_FALSE(listing.truncated);
 
-    ::remove((storage->pool_dir() / (other + ".json")).c_str());
+    fs::remove(storage->pool_dir() / (other + ".json"));
     const auto clean = storage->list_pool_entries();
     EXPECT_FALSE(clean.error);
     EXPECT_EQ(clean.entries.size(), 1u);
@@ -532,6 +550,9 @@ TEST_F(FileStorageTest, BrokenSymlinkMakesTheInventoryIncomplete) {
 // A directory that cannot be opened is a scan error, never a complete
 // empty pool.
 TEST_F(FileStorageTest, UnscannablePoolDirectoryIsAnErrorNotAnEmptyPool) {
+#ifdef _WIN32
+    GTEST_SKIP() << "This case requires POSIX directory permission modes; Windows uses ACLs.";
+#else
     ASSERT_EQ(storage->write_pool_record(kHash, "{}"),
               FileStorageService::PoolWrite::Ok);
     ASSERT_EQ(::chmod(storage->pool_dir().c_str(), 0), 0);
@@ -540,6 +561,7 @@ TEST_F(FileStorageTest, UnscannablePoolDirectoryIsAnErrorNotAnEmptyPool) {
     EXPECT_TRUE(blocked.error)
         << "a failed scan must not be presented as an empty pool";
     EXPECT_EQ(blocked.entries.size(), 0u);
+#endif
 }
 
 // The pool directory is derived from the constructor argument. A moved-from

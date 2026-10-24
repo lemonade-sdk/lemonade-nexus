@@ -37,6 +37,7 @@ enum class GossipMsgType : uint8_t {
     SyncRequest           = 0x18,  // "send me these origins' entries after seq N" (backbone only)
     AccountEnvelopeSync   = 0x19,  // "account group-key envelope stored" (backbone only, Tier 1 origin)
     TreeLogSync           = 0x1A,  // "one chunk of a committed tree log entry" (backbone only, from Tier 1)
+    AccountAvatarSync     = 0x1B,  // device-signed profile metadata chunks (backbone only)
 };
 
 // Compile-time pin on the retired range: a new enumerator inside [0x07, 0x10]
@@ -63,7 +64,8 @@ static_assert(detail::outside_retired_range(GossipMsgType::Digest) &&
               detail::outside_retired_range(GossipMsgType::SyncDigest) &&
               detail::outside_retired_range(GossipMsgType::SyncRequest) &&
               detail::outside_retired_range(GossipMsgType::AccountEnvelopeSync) &&
-              detail::outside_retired_range(GossipMsgType::TreeLogSync),
+              detail::outside_retired_range(GossipMsgType::TreeLogSync) &&
+              detail::outside_retired_range(GossipMsgType::AccountAvatarSync),
               "gossip wire values 0x07-0x10 are retired and reserved forever");
 
 #pragma pack(push, 1)

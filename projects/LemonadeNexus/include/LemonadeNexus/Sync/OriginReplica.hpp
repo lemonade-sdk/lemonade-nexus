@@ -35,7 +35,7 @@ struct ReplicaEntry {
     std::string          key;        ///< unique per stream, e.g. "A:host.example"
     std::string          origin;     ///< author identity (base64 Ed25519 public key)
     uint64_t             seq{0};     ///< origin-assigned, strictly increasing per origin; 0 = legacy (untracked)
-    uint64_t             timestamp{0}; ///< author's clock in seconds; primary order key
+    uint64_t             timestamp{0}; ///< primary version: author seconds or the stream's logical revision
     bool                 tombstone{false}; ///< true when the entry records a removal
     std::vector<uint8_t> payload;
 };
@@ -45,7 +45,7 @@ struct ReplicaEntry {
 struct OriginSummary {
     uint64_t max_seq{0};
     uint64_t count{0};
-    uint64_t hash{0};   ///< XOR of per-entry XXH3 hashes over (key, seq, tombstone)
+    uint64_t hash{0};   ///< XOR of XXH3(key, seq, tombstone), plus payload in payload-tie streams
 
     bool operator==(const OriginSummary&) const = default;
 };
@@ -92,7 +92,7 @@ enum class OfferResult {
 ///
 /// Each origin numbers its own changes (next_local_seq), similar to a log
 /// sequence number. The replica keeps only the newest entry per key,
-/// tombstones included, ordered by (timestamp, seq). Peers exchange
+/// tombstones included, ordered by (timestamp, seq), then payload when opted in. Peers exchange
 /// digests, and plan_catch_up names the origins and ranges to request.
 ///
 /// The replica does no I/O and no cryptography. Callers verify and authorize
@@ -106,8 +106,12 @@ public:
     ///                      like any other origin's
     /// @param max_entries   cap on stored keys; offers of new keys beyond it
     ///                      return OfferResult::Full
+    /// @param payload_ties  opt in to lexicographic payload ordering for equal
+    ///                      versions and include payload bytes in the digest.
+    ///                      Only streams that define this rule may enable it.
     explicit OriginReplica(std::string local_origin,
-                           std::size_t max_entries = kDefaultMaxReplicaEntries);
+                           std::size_t max_entries = kDefaultMaxReplicaEntries,
+                           bool payload_ties = false);
 
     [[nodiscard]] const std::string& local_origin() const { return local_origin_; }
 
@@ -199,6 +203,7 @@ private:
 
     const std::string local_origin_;
     const std::size_t max_entries_;
+    const bool payload_ties_;
 
     mutable std::mutex mutex_;
     uint64_t last_local_seq_{0};

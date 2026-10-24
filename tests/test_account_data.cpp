@@ -4,6 +4,8 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
+#include <LemonadeNexusSDK/lemonade_nexus.h>
+#include <LemonadeNexusSDK/AccountAvatarClient.hpp>
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -118,7 +120,147 @@ protected:
     std::string a_pub() const { return b64(a_kp.public_key); }
     std::string b_pub() const { return b64(b_kp.public_key); }
     std::string c_pub() const { return b64(c_kp.public_key); }
+
+    json avatar(const crypto::Ed25519Keypair& key, const std::string& group,
+                uint64_t revision, const std::string& image) {
+        auto* identity = ln_identity_from_seed(key.private_key.data(), 32);
+        EXPECT_NE(identity, nullptr);
+        char* output = nullptr;
+        EXPECT_EQ(ln_account_avatar_sign(identity, group.c_str(), image.c_str(), revision, &output), LN_OK);
+        auto result = output ? json::parse(output) : json();
+        ln_free(output);
+        ln_identity_destroy(identity);
+        return result;
+    }
 };
+
+namespace {
+const std::string pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a6XcAAAAASUVORK5CYII=";
+}
+
+TEST_F(AccountDataTest, AvatarReferencesSharedAcrossDevicesAndIsolatedAcrossAccounts) {
+    auto record = avatar(a_kp, "customer-g1", 1, pixel);
+    ASSERT_EQ(store->put_avatar("endpointA", a_pub(), record, record.dump().size()).status, 200);
+    EXPECT_EQ(store->get_avatar("endpointB", b_pub()).body["record"]["image_hash"], lnsdk::avatar_image_hash(pixel));
+    EXPECT_FALSE(store->get_avatar("endpointB", b_pub()).body["can_write"].get<bool>());
+    EXPECT_FALSE(record.contains("image"));
+    EXPECT_EQ(record["type"], "nexus.account_avatar.ref.v2");
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(temp_dir)) {
+        if (!entry.is_regular_file()) continue;
+        std::ifstream input(entry.path(), std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(input)), {});
+        EXPECT_EQ(bytes.find(pixel), std::string::npos) << entry.path();
+        EXPECT_EQ(bytes.find("data:image/png"), std::string::npos) << entry.path();
+    }
+    EXPECT_TRUE(store->get_avatar("endpointC", c_pub()).body["record"].is_null());
+    EXPECT_EQ(store->get_avatar("endpointA", c_pub()).status, 404);
+    auto forged = avatar(c_kp, "customer-g1", 2, pixel);
+    EXPECT_EQ(store->put_avatar("endpointC", c_pub(), forged, forged.dump().size()).status, 404);
+    EXPECT_FALSE(store->apply_replicated_avatar(*account::avatar_from_wire(forged)));
+    auto readonly = avatar(b_kp, "customer-g1", 2, pixel);
+    EXPECT_EQ(store->put_avatar("endpointB", b_pub(), readonly, readonly.dump().size()).status, 404);
+    EXPECT_FALSE(store->apply_replicated_avatar(*account::avatar_from_wire(readonly)));
+}
+
+TEST_F(AccountDataTest, AvatarReplaceRemoveReplayAndRestart) {
+    auto record = avatar(a_kp, "customer-g1", 1, pixel);
+    ASSERT_EQ(store->put_avatar("endpointA", a_pub(), record, record.dump().size()).status, 200);
+    auto replaced = avatar(a_kp, "customer-g1", 2, pixel);
+    ASSERT_EQ(store->put_avatar("endpointA", a_pub(), replaced, replaced.dump().size()).status, 200);
+    EXPECT_EQ(store->put_avatar("endpointA", a_pub(), record, record.dump().size()).status, 409);
+    auto removed = avatar(a_kp, "customer-g1", 3, "");
+    ASSERT_EQ(store->put_avatar("endpointA", a_pub(), removed, removed.dump().size()).status, 200);
+    EXPECT_FALSE(store->apply_replicated_avatar(*account::avatar_from_wire(record)));
+    EXPECT_EQ(store->get_avatar("endpointB", b_pub()).body["record"]["image_hash"], "");
+    store = std::make_unique<account::AccountDataStore>(*crypto_svc, *tree, *storage);
+    EXPECT_EQ(store->get_avatar("endpointA", a_pub()).body["revision"], 3);
+    EXPECT_EQ(store->get_avatar("endpointA", a_pub()).body["record"]["image_hash"], "");
+    auto restored = avatar(a_kp, "customer-g1", 4, pixel);
+    EXPECT_EQ(store->put_avatar("endpointA", a_pub(), restored, restored.dump().size()).status, 200);
+    EXPECT_EQ(store->get_avatar("endpointB", b_pub()).body["record"]["image_hash"], lnsdk::avatar_image_hash(pixel));
+}
+
+TEST_F(AccountDataTest, AvatarDirectoryRequiresReadAndDirectionalConnectionRights) {
+    auto find = [](const json& reply, const std::string& node) {
+        for (const auto& device : reply.at("devices")) if (device["node_id"] == node) return device;
+        return json();
+    };
+    const auto before = find(store->get_avatar("endpointA", a_pub()).body, "endpointB");
+    ASSERT_TRUE(before.is_object());
+    EXPECT_FALSE(before["can_fetch_from_me"].get<bool>());
+    EXPECT_FALSE(before["can_serve_me"].get<bool>());
+    write_node("endpointA", "customer-g1", tree::NodeType::Endpoint, prefixed(a_kp.public_key),
+        {{prefixed(a_kp.public_key), {"read", "write", "edit_node"}},
+         {prefixed(b_kp.public_key), {"connect_private"}}});
+    tree->stop(); tree->start();
+    const auto allowed = find(store->get_avatar("endpointA", a_pub()).body, "endpointB");
+    EXPECT_TRUE(allowed["can_fetch_from_me"].get<bool>());
+    EXPECT_FALSE(allowed["can_serve_me"].get<bool>());
+    EXPECT_TRUE(find(store->get_avatar("endpointB", b_pub()).body, "endpointA")["can_serve_me"].get<bool>());
+    write_node("customer-g1", "root", tree::NodeType::Customer, prefixed(a_kp.public_key),
+        {{prefixed(a_kp.public_key), {"read", "write"}}});
+    tree->stop(); tree->start();
+    EXPECT_TRUE(find(store->get_avatar("endpointA", a_pub()).body, "endpointB").is_null());
+}
+
+TEST_F(AccountDataTest, AvatarRejectsTamperWrongDomainBoundsAndImagePayloads) {
+    auto record = avatar(a_kp, "customer-g1", 1, pixel);
+    auto tampered = record;
+    tampered["revision"] = 2;
+    EXPECT_EQ(store->put_avatar("endpointA", a_pub(), tampered, tampered.dump().size()).status, 400);
+    tampered = record; tampered["type"] = "nexus.account_envelope.v1";
+    EXPECT_FALSE(account::avatar_from_wire(tampered));
+    auto invalid = record;
+    invalid["image"] = pixel;
+    EXPECT_EQ(store->put_avatar("endpointA", a_pub(), invalid, invalid.dump().size()).status, 400);
+    invalid = record; invalid["image_hash"] = std::string(65, 'a');
+    EXPECT_FALSE(account::avatar_from_wire(invalid));
+    tampered = record; tampered["revision"] = -1;
+    EXPECT_FALSE(account::avatar_from_wire(tampered));
+    tampered = record; tampered["revision"] = account::kMaxAvatarRevision + 1;
+    EXPECT_FALSE(account::avatar_from_wire(tampered));
+    EXPECT_EQ(store->put_avatar("endpointA", a_pub(), record, account::kMaxAvatarRecordBytes + 1).status, 413);
+    char* output = reinterpret_cast<char*>(1);
+    EXPECT_EQ(ln_account_avatar_sign(nullptr, "customer-g1", "", 1, &output), LN_ERR_NULL_ARG);
+    EXPECT_EQ(output, nullptr);
+}
+
+TEST_F(AccountDataTest, AvatarReplicaConvergesForEqualRevisionAndRetainsDeletion) {
+    auto image = *account::avatar_from_wire(avatar(a_kp, "customer-g1", 1, pixel));
+    auto removal = *account::avatar_from_wire(avatar(a_kp, "customer-g1", 1, ""));
+    storage::FileStorageService other_storage(temp_dir / "peer"); other_storage.start();
+    account::AccountDataStore other(*crypto_svc, *tree, other_storage);
+    ASSERT_TRUE(store->apply_replicated_avatar(image));
+    EXPECT_FALSE(store->apply_replicated_avatar(removal));
+    ASSERT_TRUE(other.apply_replicated_avatar(removal));
+    ASSERT_TRUE(other.apply_replicated_avatar(image));
+    EXPECT_EQ(store->get_avatar("endpointA", a_pub()).body, other.get_avatar("endpointA", a_pub()).body);
+    auto deletion = *account::avatar_from_wire(avatar(a_kp, "customer-g1", 2, ""));
+    ASSERT_TRUE(other.apply_replicated_avatar(deletion));
+    EXPECT_FALSE(other.apply_replicated_avatar(image));
+    EXPECT_EQ(other.get_avatar("endpointB", b_pub()).body["record"]["image_hash"], "");
+    other_storage.stop();
+}
+
+TEST_F(AccountDataTest, AvatarConcurrentDeviceWritersConvergeAndShareReplacements) {
+    write_node("customer-g1", "root", tree::NodeType::Customer, prefixed(a_kp.public_key),
+               {{prefixed(a_kp.public_key), {"read", "write"}}, {prefixed(b_kp.public_key), {"read", "write"}}});
+    tree->stop(); tree->start();
+    auto first = *account::avatar_from_wire(avatar(a_kp, "customer-g1", 1, pixel));
+    auto second = *account::avatar_from_wire(avatar(b_kp, "customer-g1", 1, ""));
+    storage::FileStorageService peer_storage(temp_dir / "peer"); peer_storage.start();
+    account::AccountDataStore peer(*crypto_svc, *tree, peer_storage);
+    ASSERT_TRUE(store->apply_replicated_avatar(first));
+    ASSERT_TRUE(store->apply_replicated_avatar(second));
+    ASSERT_TRUE(peer.apply_replicated_avatar(second));
+    ASSERT_TRUE(peer.apply_replicated_avatar(first));
+    EXPECT_EQ(store->get_avatar("endpointA", a_pub()).body, peer.get_avatar("endpointA", a_pub()).body);
+    const auto replacement = avatar(b_kp, "customer-g1", 2, pixel);
+    ASSERT_EQ(store->put_avatar("endpointB", b_pub(), replacement, replacement.dump().size()).status, 200);
+    EXPECT_EQ(store->get_avatar("endpointA", a_pub()).body["record"]["image_hash"], lnsdk::avatar_image_hash(pixel));
+    peer_storage.stop();
+}
+
 
 // --- Free helpers ---
 

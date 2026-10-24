@@ -2949,6 +2949,7 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
     auto a_kp    = kc->ed25519_keygen();
     auto b_kp    = kc->ed25519_keygen();
     auto c_kp    = kc->ed25519_keygen();
+    auto device_kp = kc->ed25519_keygen();
     const auto a_b64  = crypto::to_base64(a_kp.public_key);
     const auto b_b64  = crypto::to_base64(b_kp.public_key);
     const auto c_b64  = crypto::to_base64(c_kp.public_key);
@@ -2966,6 +2967,7 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
     struct Sink {
         std::map<std::string, gossip::AccountEnvelopeRecord> stored;  // by recipient
         bool accept = true;
+        std::optional<account::AccountAvatarRecord> avatar;
     };
     std::map<std::string, Sink> sinks;
     const auto configure = [&](Node& n, Sink& sink) {
@@ -2976,6 +2978,13 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
         n.gossip->set_account_envelope_sink([&sink](const gossip::AccountEnvelopeRecord& r) {
             if (!sink.accept) return false;
             sink.stored[r.recipient_pubkey] = r;
+            return true;
+        });
+        n.gossip->set_account_avatar_sink([&sink, &device_kp](const account::AccountAvatarRecord& r) {
+            if (!sink.accept || r.group_id != "customer-g1" ||
+                r.author_pubkey != crypto::to_base64(device_kp.public_key)) return false;
+            if (sink.avatar && account::avatar_newer(*sink.avatar, r)) return false;
+            sink.avatar = r;
             return true;
         });
     };
@@ -3125,14 +3134,85 @@ TEST_F(GossipIngressSecurityTest, AccountEnvelopesReplicateOverTheBackbone) {
     EXPECT_FALSE(holds("a", "dev7"));
     EXPECT_FALSE(holds("b", "dev4"));
 
+    const std::string image(64, 'a');
+    const auto avatar = [&](uint64_t revision, std::string data) {
+        account::AccountAvatarRecord r{"customer-g1", crypto::to_base64(device_kp.public_key), revision, std::move(data), ""};
+        r.signature = sign_b64(device_kp, account::avatar_canonical(r));
+        return r;
+    };
+    const auto avatar_revision = [&](const std::string& tag) { return sinks[tag].avatar ? sinks[tag].avatar->revision : 0; };
+    a.gossip->broadcast_account_avatar(avatar(1, image));
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("b") == 1 && avatar_revision("c") == 1; }));
+
+    // A Tier 2 server transports device authority; infrastructure streams above
+    // still refuse its writes. Delayed peers catch up from the profile stream.
+    c.gossip->broadcast_account_avatar(avatar(2, ""));
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("a") == 2 && avatar_revision("b") == 2; }));
+    EXPECT_TRUE(sinks["b"].avatar->image_hash.empty());
+    c.gossip->broadcast_account_avatar(avatar(1, image));
+    pump_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(avatar_revision("a"), 2u);
+    sinks["b"].accept = false;
+    c.gossip->broadcast_account_avatar(avatar(3, image));
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("a") == 3; }));
+    EXPECT_EQ(avatar_revision("b"), 2u);
+    sinks["b"].accept = true;
+    gossip::GossipBallotTestAccess::send_sync_digests(*a.gossip);
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("b") == 3; }, std::chrono::seconds(5)));
+
+    by_ip.erase("172.16.0.1"); by_ip.erase("172.16.0.2");
+    c.gossip->broadcast_account_avatar(avatar(4, ""));
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("c") == 4; }));
+    by_ip["172.16.0.1"] = &va; by_ip["172.16.0.2"] = &vb;
+    gossip::GossipBallotTestAccess::send_sync_digests(*c.gossip);
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("a") == 4 && avatar_revision("b") == 4; }, std::chrono::seconds(5)));
+
+    auto bad_avatar = avatar(5, image);
+    bad_avatar.image_hash.clear();
+    const auto bad_wire = account::avatar_wire(bad_avatar).dump();
+    const std::vector<uint8_t> bad_bytes(bad_wire.begin(), bad_wire.end());
+    for (const auto& chunk : sync::encode_entry_chunks(account::kAvatarSyncStream, 5, bad_bytes, 32)) {
+        const auto packet = build_packet(a_kp, gossip::GossipMsgType::AccountAvatarSync, msgpack_of(chunk));
+        ASSERT_TRUE(va.send_udp("172.16.0.1", a_port, "172.16.0.2", b_port, packet));
+    }
+    pump_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(avatar_revision("b"), 4u);
+    const auto valid_wire = account::avatar_wire(avatar(6, image)).dump();
+    const std::vector<uint8_t> valid_bytes(valid_wire.begin(), valid_wire.end());
+    for (const auto& chunk : sync::encode_entry_chunks(account::kAvatarSyncStream, 6, valid_bytes, 32)) {
+        inject(build_packet(a_kp, gossip::GossipMsgType::AccountAvatarSync, msgpack_of(chunk)), b);
+    }
+    pump_for(std::chrono::milliseconds(100));
+    EXPECT_EQ(avatar_revision("b"), 4u);
+    for (const auto& chunk : sync::encode_entry_chunks(account::kAvatarSyncStream, 6, valid_bytes, 32)) {
+        const auto packet = build_packet(a_kp, gossip::GossipMsgType::AccountAvatarSync, msgpack_of(chunk));
+        ASSERT_TRUE(va.send_udp("172.16.0.1", a_port, "172.16.0.2", b_port, packet));
+    }
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("b") == 6; }));
+    c.gossip->broadcast_account_avatar(avatar(7, ""));
+    ASSERT_TRUE(pump_until([&] { return avatar_revision("a") == 7 && avatar_revision("b") == 7; }));
+
     // B restarts and restores every envelope from disk, re-verified, with no
     // peer contact.
     sinks["b"].stored.clear();
+    sinks["b"].avatar.reset();
     restart_node(b, [&](Node& n) { configure(n, sinks["b"]); });
     EXPECT_TRUE(holds("b", "dev1"));
     EXPECT_TRUE(holds("b", "dev3"));
     EXPECT_TRUE(holds("b", "dev6"));
     EXPECT_FALSE(holds("b", "dev5"));
+    EXPECT_EQ(avatar_revision("b"), 7u);
+    EXPECT_TRUE(sinks["b"].avatar->image_hash.empty());
+    const auto references = b.storage->read_file("avatar_refs", "replica.json");
+    ASSERT_TRUE(references);
+    const auto snapshot = nlohmann::json::parse(references->data);
+    for (const auto& encoded : snapshot.at("entries")) {
+        const auto bytes = crypto::from_base64(encoded.get<std::string>());
+        const auto reference = nlohmann::json::parse(bytes.begin(), bytes.end());
+        EXPECT_FALSE(reference.contains("image"));
+        EXPECT_TRUE(reference.contains("image_hash"));
+        EXPECT_LE(bytes.size(), account::kMaxAvatarRecordBytes);
+    }
 
     // A restores the envelopes it originated (its own certificate verifies them).
     sinks["a"].stored.clear();

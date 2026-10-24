@@ -1,11 +1,13 @@
 #pragma once
 
 #include <LemonadeNexus/Gossip/GossipTypes.hpp>
+#include <LemonadeNexus/Account/AccountAvatar.hpp>
 
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -24,9 +26,8 @@ struct Result {
     nlohmann::json body;
 };
 
-/// Zero-knowledge, per-account store for opaque client-encrypted data over the
-/// private mesh API. The server never decrypts anything; it only enforces WHO
-/// may read/write and persists opaque blobs.
+/// Per-account data over the private mesh API. Chats and key envelopes remain
+/// opaque client-encrypted data. Profile image references are signed metadata. Image bytes stay on devices.
 ///
 /// Ownership is structural: the on-disk category is derived from the caller's
 /// OWN Customer group (its Endpoint node's parent), never from client input, so
@@ -86,6 +87,23 @@ public:
     /// true when the envelope was written.
     [[nodiscard]] bool apply_replicated_envelope(const gossip::AccountEnvelopeRecord& record);
 
+    /// Read the caller's own signed image reference and permitted peer directory.
+    /// A missing reference is null. Requires an Endpoint in a Customer group and Read.
+    [[nodiscard]] Result get_avatar(const std::string& caller_node,
+                                    const std::string& caller_pubkey) const;
+    /// Replace or remove the own-account image reference with a device-signed record.
+    /// Requires Read and Write; rejects a stale logical revision with 409.
+    [[nodiscard]] Result put_avatar(const std::string& caller_node,
+                                    const std::string& caller_pubkey,
+                                    const nlohmann::json& body, std::size_t body_size);
+    /// Set before serving requests. Called after a local avatar write, outside
+    /// the store lock; the publisher must preserve the device signature.
+    void set_avatar_publisher(std::function<void(AccountAvatarRecord)> publisher);
+    /// Verify device signature, current group membership and Write before
+    /// applying a replicated record. Retains removals for replay protection.
+    /// Thread safe; accepts duplicates but rejects older records.
+    [[nodiscard]] bool apply_replicated_avatar(const AccountAvatarRecord& record);
+
 private:
     // Caller's owning Customer group (Endpoint node's parent); nullopt if the
     // caller has no node or is topless (root).
@@ -104,11 +122,16 @@ private:
     [[nodiscard]] std::string keyenv_category(const std::string& group) const; // "keyenv-"+hash
     // Stable, spelling-independent hash of a device pubkey (canonicalized).
     [[nodiscard]] std::string principal_hash(const std::string& pubkey) const;
+    [[nodiscard]] bool avatar_authorized(const AccountAvatarRecord& record) const;
+    [[nodiscard]] std::optional<AccountAvatarRecord> read_avatar(const std::string& group) const;
+    [[nodiscard]] bool write_avatar(const AccountAvatarRecord& record);
 
     crypto::SodiumCryptoService&  crypto_;
     tree::PermissionTreeService&  tree_;
     storage::FileStorageService&  storage_;
     EnvelopePublisher             publisher_;
+    std::function<void(AccountAvatarRecord)> avatar_publisher_;
+    mutable std::mutex avatar_mutex_;
 };
 
 /// True if `s` is 1..64 lowercase hex chars (a server-generated chat id). Used

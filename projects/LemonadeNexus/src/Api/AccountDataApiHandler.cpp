@@ -21,6 +21,12 @@ AccountDataApiHandler::AccountDataApiHandler(ApiContext& ctx)
         [store = store_](const gossip::AccountEnvelopeRecord& r) {
             return store->apply_replicated_envelope(r);
         });
+    store_->set_avatar_publisher([&g = ctx_.gossip](account::AccountAvatarRecord record) {
+        g.broadcast_account_avatar(std::move(record));
+    });
+    ctx_.gossip.set_account_avatar_sink([store = store_](const account::AccountAvatarRecord& record) {
+        return store->apply_replicated_avatar(record);
+    });
 }
 
 // Thin HTTP translator over account::AccountDataStore. All authorization and
@@ -36,6 +42,20 @@ void AccountDataApiHandler::do_register_routes(httplib::Server& /*pub*/,
     auto reply = [](httplib::Response& res, const account::Result& r) {
         json_response(res, r.body, r.status);
     };
+
+    priv.Get("/api/account/avatar", require_auth(ctx_.auth,
+        [store, reply](const httplib::Request&, httplib::Response& res, const SessionClaims& claims) {
+        reply(res, store->get_avatar(claims.user_id, claims.pubkey));
+    }));
+    priv.Post("/api/account/avatar", require_auth(ctx_.auth,
+        [store, reply](const httplib::Request& req, httplib::Response& res, const SessionClaims& claims) {
+        if (req.body.size() > account::kMaxAvatarRecordBytes) {
+            json_response(res, {{"error", "profile image too large"}}, 413);
+            return;
+        }
+        auto body = parse_body(req, res);
+        if (body) reply(res, store->put_avatar(claims.user_id, claims.pubkey, *body, req.body.size()));
+    }));
 
     // --- Encrypted chat blobs ---
 

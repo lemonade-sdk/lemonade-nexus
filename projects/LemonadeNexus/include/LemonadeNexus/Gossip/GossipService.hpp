@@ -1,5 +1,7 @@
 #pragma once
 
+#include <LemonadeNexus/Account/AccountAvatar.hpp>
+
 #include <LemonadeNexus/ACL/ACLService.hpp>
 #include <LemonadeNexus/Core/IService.hpp>
 #include <LemonadeNexus/Gossip/IGossipProvider.hpp>
@@ -496,6 +498,14 @@ private:
     void save_account_replica();
     void load_account_replica();
 
+    void handle_account_avatar_sync(const asio::ip::udp::endpoint& sender,
+                                     const std::string& sender_pubkey,
+                                     const uint8_t* payload, std::size_t payload_len, Via via);
+    void send_avatar_entry(const GossipPeer& peer, const sync::ReplicaEntry& entry);
+    bool apply_account_avatar(const account::AccountAvatarRecord& record);
+    void save_avatar_replica();
+    void load_avatar_replica();
+
     /// Sign and persist a replica snapshot as <category>/replica.json.
     bool save_replica_file(const sync::OriginReplica& replica, const std::string& category,
                            const std::string& type);
@@ -787,6 +797,11 @@ private:
 
     // Account envelope replica and the store it feeds.
     std::unique_ptr<sync::OriginReplica>  account_replica_;
+    std::unique_ptr<sync::OriginReplica> avatar_replica_;
+    std::unique_ptr<sync::EntryAssembler> avatar_assembler_;
+    uint64_t avatar_replica_saved_version_{0};
+    bool avatar_replica_loaded_{false};
+    std::function<bool(const account::AccountAvatarRecord&)> account_avatar_sink_;
 
     // Tree log stream (enable_tree_stream). The replica indexes committed
     // heights only; entry bytes stay in the tree log and are read on demand.
@@ -907,6 +922,14 @@ public:
     /// a Tier 2 server keeps the envelope local. Thread-safe: the send runs on
     /// the io thread.
     void broadcast_account_envelope(AccountEnvelopeRecord record);
+
+    /// Device-signed account metadata has no server-tier authority. The sink
+    /// must verify its signature and current account ACL on every boundary.
+    /// Install before the gossip io thread starts, or while it is stopped.
+    void set_account_avatar_sink(std::function<bool(const account::AccountAvatarRecord&)> sink);
+    /// Queue an already accepted account record for backbone replication.
+    /// Safe from request threads; sends and replica persistence run on io.
+    void broadcast_account_avatar(account::AccountAvatarRecord record);
 
     /// Pin the NS slot this server claims (1-9); 0 = auto (lowest free). Set
     /// when the operator's ns<N> identity matches registrar glue for that name.

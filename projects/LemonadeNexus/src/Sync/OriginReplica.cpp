@@ -14,7 +14,7 @@ namespace {
 
 // Stable across builds and platforms: replicas on different binaries must
 // compute equal hashes for equal entries, which rules out std::hash.
-uint64_t entry_hash(const ReplicaEntry& e) {
+uint64_t entry_hash(const ReplicaEntry& e, bool payload_ties) {
     std::string buf;
     buf.reserve(e.key.size() + 10);
     buf.append(e.key);
@@ -23,6 +23,7 @@ uint64_t entry_hash(const ReplicaEntry& e) {
         buf.push_back(static_cast<char>((e.seq >> (8 * i)) & 0xFF));
     }
     buf.push_back(e.tombstone ? '\1' : '\0');
+    if (payload_ties) buf.append(reinterpret_cast<const char*>(e.payload.data()), e.payload.size());
     return XXH3_64bits(buf.data(), buf.size());
 }
 
@@ -62,8 +63,8 @@ bool valid_origin(const nlohmann::json& v, std::string& out) {
 
 }  // namespace
 
-OriginReplica::OriginReplica(std::string local_origin, std::size_t max_entries)
-    : local_origin_(std::move(local_origin)), max_entries_(max_entries) {}
+OriginReplica::OriginReplica(std::string local_origin, std::size_t max_entries, bool payload_ties)
+    : local_origin_(std::move(local_origin)), max_entries_(max_entries), payload_ties_(payload_ties) {}
 
 uint64_t OriginReplica::next_local_seq(uint64_t now_ms) {
     std::lock_guard lock(mutex_);
@@ -91,7 +92,9 @@ OfferResult OriginReplica::offer(ReplicaEntry entry) {
         ++version_;
         return OfferResult::Stored;
     }
-    if (!newer(entry.timestamp, entry.seq, it->second.timestamp, it->second.seq)) {
+    const bool payload_wins = payload_ties_ && entry.timestamp == it->second.timestamp &&
+                              entry.seq == it->second.seq && entry.payload > it->second.payload;
+    if (!newer(entry.timestamp, entry.seq, it->second.timestamp, it->second.seq) && !payload_wins) {
         return OfferResult::Stale;
     }
     it->second = std::move(entry);
@@ -111,7 +114,7 @@ Digest OriginReplica::digest_locked() const {
         auto& s = d[e.origin];
         s.max_seq = std::max(s.max_seq, e.seq);
         ++s.count;
-        s.hash ^= entry_hash(e);
+        s.hash ^= entry_hash(e, payload_ties_);
     }
     return d;
 }

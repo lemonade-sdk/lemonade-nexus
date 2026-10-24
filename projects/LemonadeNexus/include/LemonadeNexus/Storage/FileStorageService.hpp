@@ -186,6 +186,12 @@ public:
     // access an older release left on them.
     [[nodiscard]] bool do_write_file(std::string_view category, std::string_view name,
                                       const SignedEnvelope& envelope);
+    /// Replace an envelope with a synchronized temporary file and atomic rename.
+    /// Preserves the old file on failures before rename. False also includes an
+    /// uncertain directory-sync result after rename. Routes covered paths through
+    /// the configured storage vault. Thread safe; path components are validated.
+    [[nodiscard]] bool write_file_atomic(std::string_view category, std::string_view name,
+                                         const SignedEnvelope& envelope);
     [[nodiscard]] std::optional<SignedEnvelope> do_read_file(std::string_view category,
                                                               std::string_view name) const;
     [[nodiscard]] bool do_delete_file(std::string_view category, std::string_view name);

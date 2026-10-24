@@ -292,6 +292,9 @@ void GossipService::on_start() {
     dns_replica_ = std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
     account_replica_ =
         std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
+    avatar_replica_ = std::make_unique<sync::OriginReplica>(
+        crypto::to_base64(keypair_.public_key), 4096, true);
+    avatar_assembler_ = std::make_unique<sync::EntryAssembler>(8 * account::kMaxAvatarRecordBytes, 30000);
 
     // Load known peers
     load_peers();
@@ -300,6 +303,7 @@ void GossipService::on_start() {
     // follows load_peers. Runs here or in set_dns, whichever comes last.
     load_dns_replica();
     load_account_replica();
+    load_avatar_replica();
 
     // Load persisted NS slot state (restarting nodes must remember the slots
     // the mesh assigned them; the sync gate stays closed until live mesh
@@ -382,6 +386,7 @@ void GossipService::on_stop() {
     gossip_timer_.cancel();
     save_dns_replica();
     save_account_replica();
+    save_avatar_replica();
 
     asio::error_code ec;
     socket_.close(ec);
@@ -1174,6 +1179,7 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
         header.msg_type == GossipMsgType::SyncDigest ||
         header.msg_type == GossipMsgType::SyncRequest ||
         header.msg_type == GossipMsgType::AccountEnvelopeSync ||
+        header.msg_type == GossipMsgType::AccountAvatarSync ||
         header.msg_type == GossipMsgType::TreeLogSync;
     if (via == Via::Public && backbone_only) {
         if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
@@ -1242,6 +1248,9 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
             break;
         case GossipMsgType::AccountEnvelopeSync:
             handle_account_envelope_sync(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
+        case GossipMsgType::AccountAvatarSync:
+            handle_account_avatar_sync(from, sender_pubkey_b64, payload, payload_len, via);
             break;
         case GossipMsgType::TreeLogSync:
             handle_tree_log_sync(from, sender_pubkey_b64, payload, payload_len, via);
@@ -1911,6 +1920,7 @@ void GossipService::on_gossip_tick() {
             last_dns_replica_save_ = now;
             save_dns_replica();
             save_account_replica();
+            save_avatar_replica();
         }
     }
 
@@ -3539,7 +3549,7 @@ bool GossipService::save_replica_file(const sync::OriginReplica& replica,
         chrono::system_clock::to_time_t(chrono::system_clock::now()));
     const std::vector<uint8_t> data_bytes(envelope.data.begin(), envelope.data.end());
     envelope.signature = crypto::to_base64(crypto_.ed25519_sign(keypair_.private_key, data_bytes));
-    return storage_.write_file(category, "replica.json", envelope);
+    return storage_.write_file_atomic(category, "replica.json", envelope);
 }
 
 void GossipService::load_dns_replica() {
@@ -3649,6 +3659,7 @@ std::vector<GossipPeer> GossipService::backbone_targets(bool tier1_only) const {
 }
 
 sync::OriginReplica* GossipService::replica_for_stream(std::string_view stream) const {
+    if (stream == account::kAvatarSyncStream) return avatar_replica_.get();
     if (stream == kDnsSyncStream) return dns_replica_.get();
     if (stream == kAccountSyncStream) return account_replica_.get();
     if (stream == kTreeSyncStream) return tree_replica_.get();
@@ -3671,7 +3682,7 @@ void GossipService::send_sync_digests() {
     const std::size_t budget = network::VirtualNetService::max_udp_payload() -
                                kGossipHeaderSize - kGossipSignatureSize;
     const uint64_t round = ++sync_digest_round_;
-    for (const auto stream : {kDnsSyncStream, kAccountSyncStream, kTreeSyncStream}) {
+    for (const auto stream : {kDnsSyncStream, kAccountSyncStream, kTreeSyncStream, account::kAvatarSyncStream}) {
         const auto* replica = replica_for_stream(stream);
         if (!replica) continue;
         const auto pages = sync::encode_digest_pages(stream, replica->digest(), round, budget);
@@ -3723,7 +3734,7 @@ void GossipService::handle_sync_digest(const asio::ip::udp::endpoint& sender,
         }
 
         // Records are pulled only from Tier 1. A Tier 2 digest is status.
-        if (!sender_tier1) return;
+        if (!sender_tier1 && page->stream != account::kAvatarSyncStream) return;
         const auto requests = replica->plan_catch_up(page->origins);
         const auto peer = find_peer_by_pubkey(sender_pubkey);
         if (requests.empty() || !peer) return;
@@ -3740,12 +3751,6 @@ void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
                                         const std::string& sender_pubkey,
                                         const uint8_t* payload, std::size_t payload_len, Via via) {
     if (!backbone_sender_verified(sender, sender_pubkey, via, "SyncRequest")) return;
-    // Any certified server may catch up, but only from Tier 1.
-    if (!self_is_tier1()) {
-        deny_sync(sender, sender_pubkey, "SyncRequest", "only Tier 1 serves catch-up");
-        return;
-    }
-
     try {
         const auto decoded = sync::decode_catch_up(json::from_msgpack(payload, payload + payload_len));
         if (!decoded) {
@@ -3753,6 +3758,12 @@ void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
             return;
         }
         const auto& stream = decoded->first;
+        // Profile authority is the device signature plus the account ACL.
+        // Existing infrastructure streams retain their Tier 1 serving rule.
+        if (!self_is_tier1() && stream != account::kAvatarSyncStream) {
+            deny_sync(sender, sender_pubkey, "SyncRequest", "only Tier 1 serves catch-up");
+            return;
+        }
         const auto* replica = replica_for_stream(stream);
         if (!replica) return;
 
@@ -3780,6 +3791,12 @@ void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
             if (sent >= kSyncMaxEntriesPerRequest) break;
             for (const auto& e : replica->entries_since(req.origin, req.since,
                                                         kSyncMaxEntriesPerRequest - sent)) {
+                if (stream == account::kAvatarSyncStream) {
+                    send_avatar_entry(*peer, e);
+                    ++sent;
+                    if (sent >= 8) return;
+                    continue;
+                }
                 auto j = json::from_msgpack(e.payload);
                 j["catch_up"] = true;
                 const auto bytes = json::to_msgpack(j);

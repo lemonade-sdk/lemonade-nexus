@@ -10,6 +10,9 @@
 #include <sstream>
 
 #ifdef _WIN32
+#  include <fcntl.h>
+#  include <io.h>
+#  include <sys/stat.h>
 #  include <windows.h>
 #else
 #  include <fcntl.h>
@@ -52,7 +55,7 @@ void FileStorageService::on_start() {
             if (entry.path().extension() == ".json") {
                 try {
                     const auto seq = std::stoull(entry.path().stem().string());
-                    max_seq = std::max(max_seq, static_cast<uint64_t>(seq));
+                    max_seq = (std::max)(max_seq, static_cast<uint64_t>(seq));
                 } catch (...) {
                     // skip non-numeric filenames
                 }
@@ -251,6 +254,20 @@ bool FileStorageService::do_write_file(std::string_view category, std::string_vi
     }
 }
 
+bool FileStorageService::write_file_atomic(std::string_view category, std::string_view file_name,
+                                           const SignedEnvelope& envelope) {
+    std::lock_guard lock(mutex_);
+    try {
+        const auto path = file_path(category, file_name);
+        const auto text = envelope_to_json(envelope);
+        if (auto* vault = vault_for(path)) return vault->write(path, text);
+        return atomic_write_synced(path, text) == AtomicWrite::Ok;
+    } catch (const std::exception& e) {
+        spdlog::error("[{}] atomic write '{}/{}' failed: {}", name(), category, file_name, e.what());
+        return false;
+    }
+}
+
 std::optional<SignedEnvelope> FileStorageService::do_read_file(std::string_view category,
                                                                 std::string_view file_name) const {
     std::lock_guard lock(mutex_);
@@ -410,7 +427,11 @@ FileStorageService::AtomicWrite FileStorageService::atomic_write_synced(
     fs::create_directories(path.parent_path());
     fs::path tmp = path;
     tmp += ".tmp";
+#ifdef _WIN32
+    int fd = ::_wopen(tmp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, _S_IREAD | _S_IWRITE);
+#else
     int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+#endif
     if (fd < 0) return AtomicWrite::Failed;
     bool ok = false;
     {
@@ -418,11 +439,9 @@ FileStorageService::AtomicWrite FileStorageService::atomic_write_synced(
         std::size_t remaining = text.size();
         while (remaining > 0) {
 #ifdef _WIN32
-            const auto n = static_cast<std::size_t>(::WriteFile(
-                reinterpret_cast<HANDLE>(_get_osfhandle(fd)), p, static_cast<DWORD>(remaining),
-                nullptr, nullptr));
-            if (n == 0) break;
-            p += n; remaining -= n;
+            const auto n = ::_write(fd, p, static_cast<unsigned int>((std::min)(remaining, std::size_t{1} << 30)));
+            if (n <= 0) break;
+            p += n; remaining -= static_cast<std::size_t>(n);
 #else
             const auto n = ::write(fd, p, remaining);
             if (n <= 0) break;
@@ -432,14 +451,24 @@ FileStorageService::AtomicWrite FileStorageService::atomic_write_synced(
         ok = remaining == 0;
     }
     if (ok) ok = synchronize_file(fd);
+#ifdef _WIN32
+    ::_close(fd);
+#else
     ::close(fd);
+#endif
     if (!ok) {
         std::error_code ec;
         fs::remove(tmp, ec);
         return AtomicWrite::Failed;
     }
     std::error_code ec;
+#ifdef _WIN32
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+    }
+#else
     fs::rename(tmp, path, ec);
+#endif
     if (ec) {
         fs::remove(tmp, ec);
         return AtomicWrite::Failed;

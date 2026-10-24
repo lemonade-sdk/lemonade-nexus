@@ -40,6 +40,26 @@ TEST(OriginReplica, LocalSequenceIsStrictlyIncreasingAndFollowsTheClock) {
     EXPECT_EQ(r.next_local_seq(5000), 5000u);  // clock moved on
 }
 
+TEST(OriginReplica, ProfilePayloadTiesConvergeWithoutChangingExistingStreams) {
+    auto first = entry("avatar", "device", 1, 1);
+    auto second = first;
+    first.payload = {'a'};
+    second.payload = {'b'};
+    OriginReplica a("a", 10, true), b("b", 10, true), legacy("old");
+    EXPECT_EQ(a.offer(first), OfferResult::Stored);
+    EXPECT_EQ(b.offer(second), OfferResult::Stored);
+    EXPECT_NE(a.digest(), b.digest());
+    catch_up(a, b);
+    catch_up(b, a);
+    EXPECT_EQ(a.digest(), b.digest());
+    EXPECT_EQ(a.snapshot().front().payload, second.payload);
+    EXPECT_EQ(legacy.offer(first), OfferResult::Stored);
+    EXPECT_EQ(legacy.offer(second), OfferResult::Stale);
+    auto removed = first; removed.seq = removed.timestamp = 2; removed.tombstone = true;
+    EXPECT_EQ(a.offer(removed), OfferResult::Stored);
+    EXPECT_EQ(a.offer(second), OfferResult::Stale);
+}
+
 TEST(OriginReplica, NewestByTimestampThenSequenceWins) {
     OriginReplica r("me");
     EXPECT_EQ(r.offer(entry("A:x", "o1", 10, 100)), OfferResult::Stored);
