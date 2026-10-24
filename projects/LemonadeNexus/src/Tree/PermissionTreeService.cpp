@@ -619,40 +619,70 @@ TreeOpVerdict PermissionTreeService::validate_local_op(const TreeOp& op,
 TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
                                                      const TreeOpPolicy& policy,
                                                      uint64_t block_time_sec) {
-    std::lock_guard lock(mutex_);
-    if (committed_ops_unreadable_) {
-        return TreeOpVerdict{TreeOpRefusal::StorageError, "committed op ids are unreadable"};
+    std::vector<TreeNode> removed;
+    TreeOpVerdict verdict;
+    {
+        std::lock_guard lock(mutex_);
+        if (committed_ops_unreadable_) {
+            return TreeOpVerdict{TreeOpRefusal::StorageError, "committed op ids are unreadable"};
+        }
+        verdict = validate_op(crypto_, op, TreeState(nodes_, policy), block_time_sec,
+                              committed_ops_);
+        if (!verdict.ok()) {
+            spdlog::warn("[{}] refusing tree op on '{}': {}", name(), op.target, verdict.reason);
+            return verdict;
+        }
+        committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
+        verdict = apply_op_locked(op, removed);
+        persist_committed_ops_after(verdict);
     }
-    auto verdict = validate_op(crypto_, op, TreeState(nodes_, policy), block_time_sec,
-                               committed_ops_);
-    if (!verdict.ok()) {
-        spdlog::warn("[{}] refusing tree op on '{}': {}", name(), op.target, verdict.reason);
-        return verdict;
-    }
-    committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
-    verdict = apply_op_locked(op);
-    persist_committed_ops_after(verdict);
+    notify_removed(removed);
     return verdict;
 }
 
 TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
-    std::lock_guard lock(mutex_);
-    auto verdict = apply_op_locked(op);
-    persist_committed_ops_after(verdict);
+    std::vector<TreeNode> removed;
+    TreeOpVerdict verdict;
+    {
+        std::lock_guard lock(mutex_);
+        verdict = apply_op_locked(op, removed);
+        persist_committed_ops_after(verdict);
+    }
+    notify_removed(removed);
     return verdict;
 }
 
 TreeOpVerdict PermissionTreeService::apply_committed_ops(const std::vector<TreeOp>& ops,
                                                          uint64_t block_time_sec) {
-    std::lock_guard lock(mutex_);
+    std::vector<TreeNode> removed;
     TreeOpVerdict verdict;
-    for (const auto& op : ops) {
-        verdict = apply_op_locked(op);
-        if (!verdict.ok()) break;
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& op : ops) {
+            verdict = apply_op_locked(op, removed);
+            if (!verdict.ok()) break;
+        }
+        committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
+        persist_committed_ops_after(TreeOpVerdict{});
     }
-    committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
-    persist_committed_ops_after(TreeOpVerdict{});
+    notify_removed(removed);
     return verdict;
+}
+
+void PermissionTreeService::set_removed_nodes_hook(
+        std::function<void(const std::vector<TreeNode>&)> hook) {
+    std::lock_guard lock(removed_hook_mtx_);
+    removed_hook_ = std::move(hook);
+}
+
+void PermissionTreeService::notify_removed(const std::vector<TreeNode>& removed) const {
+    if (removed.empty()) return;
+    std::function<void(const std::vector<TreeNode>&)> hook;
+    {
+        std::lock_guard lock(removed_hook_mtx_);
+        hook = removed_hook_;
+    }
+    if (hook) hook(removed);
 }
 
 void PermissionTreeService::persist_committed_ops_after(const TreeOpVerdict& verdict) {
@@ -664,7 +694,8 @@ void PermissionTreeService::persist_committed_ops_after(const TreeOpVerdict& ver
     }
 }
 
-TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op) {
+TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
+                                                     std::vector<TreeNode>& removed) {
     TreeOpEffect effect;
     if (auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
         spdlog::warn("[{}] tree op on '{}' does not apply: {}", name(), op.target,
@@ -696,6 +727,7 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op) {
         if (!it->second.endpoint_identifier.empty()) {
             identifier_index_.erase(it->second.endpoint_identifier);
         }
+        removed.push_back(std::move(it->second));
         nodes_.erase(it);
         if (!remove_node(id)) {
             spdlog::warn("[{}] tree op on '{}': storage delete failed for '{}'", name(),

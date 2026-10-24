@@ -91,6 +91,13 @@ public:
     /// trusted; the caller must not apply or validate tree blocks.
     [[nodiscard]] OpenResult open(const rules::NodeMap& base_nodes);
 
+    /// True when the directory holds an entry or a snapshot file, so open()
+    /// would load an existing log instead of starting a new one. It checks
+    /// file names only and creates nothing. A directory that cannot be listed
+    /// counts as holding a log, so a caller that refuses to start a new log
+    /// lets open() report the fault instead.
+    [[nodiscard]] bool exists() const;
+
     /// The committed tree state at the log head.
     [[nodiscard]] const TreeChainState& state() const { return state_; }
     [[nodiscard]] uint64_t height() const { return height_; }

@@ -1,10 +1,13 @@
 #include <LemonadeNexus/Boringtun/ForwardAuthorizer.hpp>
 
 #include <LemonadeNexus/ACL/Permission.hpp>
+#include <LemonadeNexus/Api/MeshRekey.hpp>
+#include <LemonadeNexus/Tree/TreeRules.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -34,41 +37,83 @@ bool may_connect(const tree::PermissionTreeService& tree, const tree::TreeNode& 
 } // namespace
 
 std::shared_ptr<const ForwardPolicy> build_forward_policy(
-    const tree::PermissionTreeService& tree, const Cidr& governed) {
+    const tree::PermissionTreeService& tree, const Cidr& governed, const PlanePeers& peers) {
     auto policy = std::make_shared<ForwardPolicy>();
     policy->governed = governed;
 
-    for (const auto& relay : tree.get_nodes_by_type(tree::NodeType::Relay)) {
-        if (auto addr = plane_address(relay, governed)) policy->open.insert(*addr);
-    }
-
+    // A node's tunnel_ip is only a claim. An address belongs to a node only
+    // when the dataplane peer the server installed for that address has the
+    // node's mesh key; the dataplane already binds the address to that key,
+    // so a node that names another device's address gains nothing from it.
     struct Located {
         tree::TreeNode node;
         uint32_t       addr;
     };
-    std::vector<Located> endpoints;
-    for (auto& node : tree.get_nodes_by_type(tree::NodeType::Endpoint)) {
-        if (auto addr = plane_address(node, governed)) endpoints.push_back({std::move(node), *addr});
+    std::vector<Located> located;
+    std::unordered_map<uint32_t, int> claims;
+    for (const auto type : {tree::NodeType::Endpoint, tree::NodeType::Relay}) {
+        for (auto& node : tree.get_nodes_by_type(type)) {
+            const auto addr = plane_address(node, governed);
+            if (!addr || node.mesh_pubkey.empty()) continue;
+            const auto peer = peers.find(*addr);
+            if (peer == peers.end() || api::normalize_mesh_pubkey(node.mesh_pubkey) != peer->second) {
+                continue;
+            }
+            ++claims[*addr];
+            located.push_back({std::move(node), *addr});
+        }
+    }
+    // Two nodes that both match one peer (two spellings of one key) make the
+    // owner ambiguous: the address gets no rule, so its traffic is dropped.
+    std::erase_if(located, [&](const Located& l) {
+        if (claims[l.addr] == 1) return false;
+        spdlog::warn("[ForwardAuthorizer] {} nodes claim one tunnel address and its peer key; "
+                     "forwarding for it is denied",
+                     claims[l.addr]);
+        return true;
+    });
+
+    // A relay forwards for the whole plane, so it is open only when a root
+    // admin placed it: its management key must administer the tree root (the
+    // rule that lets a writer create a relay at all).
+    std::vector<const Located*> endpoints;
+    std::optional<tree::rules::NodeMap> nodes;
+    for (const auto& l : located) {
+        if (l.node.type == tree::NodeType::Endpoint) {
+            endpoints.push_back(&l);
+            continue;
+        }
+        if (l.node.mgmt_pubkey.empty()) continue;
+        if (!nodes) nodes = tree.nodes_snapshot();
+        if (tree::rules::administers_root(*nodes, l.node.id, l.node.mgmt_pubkey)) {
+            policy->open.insert(l.addr);
+        }
     }
 
     // A grant names a principal on the target node, so the candidate sources
     // for a target are the endpoints whose management key appears in the
     // target's assignments. may_connect then applies the full rule.
     std::unordered_map<std::string, std::vector<const Located*>> by_principal;
-    for (const auto& e : endpoints) {
-        if (!e.node.mgmt_pubkey.empty())
-            by_principal[tree::canonical_principal(e.node.mgmt_pubkey)].push_back(&e);
+    for (const Located* e : endpoints) {
+        if (!e->node.mgmt_pubkey.empty())
+            by_principal[tree::canonical_principal(e->node.mgmt_pubkey)].push_back(e);
     }
-    for (const auto& target : endpoints) {
-        for (const auto& assignment : target.node.assignments) {
+    for (const Located* target : endpoints) {
+        for (const auto& assignment : target->node.assignments) {
             auto it = by_principal.find(tree::canonical_principal(assignment.management_pubkey));
             if (it == by_principal.end()) continue;
             for (const Located* source : it->second) {
-                if (may_connect(tree, source->node, target.node))
-                    policy->allowed.insert(ForwardPolicy::key(source->addr, target.addr));
+                if (may_connect(tree, source->node, target->node))
+                    policy->allowed.insert(ForwardPolicy::key(source->addr, target->addr));
             }
         }
     }
+    return policy;
+}
+
+std::shared_ptr<const ForwardPolicy> deny_forward_policy() {
+    auto policy = std::make_shared<ForwardPolicy>();
+    policy->governed = *Cidr::parse("0.0.0.0/0");
     return policy;
 }
 
@@ -100,15 +145,19 @@ void ForwardAuthorizer::stop() {
 
 bool ForwardAuthorizer::refresh(bool force) {
     std::lock_guard lock(refresh_mtx_);
-    // Hash before the build: a change during the build gives a new hash, and
-    // the next poll rebuilds.
+    // Read both inputs' versions before the build: a change during the build
+    // gives a new version, and the next poll rebuilds.
     const auto hash = tree_.get_tree_hash();
-    if (!force && built_hash_ && *built_hash_ == hash) return false;
-    auto policy = build_forward_policy(tree_, governed_);
+    const auto generation = dataplane_.routes_generation();
+    if (!force && built_hash_ && *built_hash_ == hash && built_generation_ == generation) {
+        return false;
+    }
+    auto policy = build_forward_policy(tree_, governed_, dataplane_.primary_address_peers());
     spdlog::debug("[ForwardAuthorizer] policy rebuilt: {} allowed pairs, {} relays",
                   policy->allowed.size(), policy->open.size());
     dataplane_.set_forward_policy(std::move(policy));
     built_hash_ = hash;
+    built_generation_ = generation;
     return true;
 }
 

@@ -54,6 +54,18 @@ bool TreeConsensus::start() {
         return true;
     }
     const auto current = tree_.nodes_snapshot();
+    // A new log takes the live tree as its base. Servers whose trees differ
+    // would then hold logs with different bases and refuse every vote, and a
+    // populated base forecloses the merge ceremony, whose commit is valid only
+    // as height 1 on the empty base. Start a new log only from an empty tree;
+    // a populated tree needs the ceremony's log first.
+    if (!log_.exists() && !current.empty()) {
+        halt("ops mode found no tree log and a populated tree (" +
+             std::to_string(current.size()) +
+             " nodes). Run the tree merge ceremony and install its commit "
+             "(docs/Tree-Merge-Ceremony.md), or start from an empty tree");
+        return false;
+    }
     if (log_.open(current) != TreeLog::OpenResult::Ok) {
         halt("the tree log is corrupt");
         return false;

@@ -27,6 +27,30 @@ uint64_t now_epoch_sec() {
             std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
+/// Write `record` to `path`, replacing any file there.
+bool write_record(const std::filesystem::path& path, const LinkTokenRecord& record) {
+    json j = {
+        {"owner_user_id", record.owner_user_id},
+        {"owner_pubkey",  record.owner_pubkey},
+        {"group_node_id", record.group_node_id},
+        {"created_at",    record.created_at},
+        {"expires_at",    record.expires_at},
+    };
+    try {
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream ofs(path, std::ios::trunc);
+        if (!ofs) {
+            spdlog::error("[token-link] Failed to open token file: {}", path.string());
+            return false;
+        }
+        ofs << j.dump(2);
+        return ofs.good();
+    } catch (const std::exception& e) {
+        spdlog::error("[token-link] Exception writing token file: {}", e.what());
+        return false;
+    }
+}
+
 } // namespace
 
 TokenLinkAuthProvider::TokenLinkAuthProvider(storage::FileStorageService& storage,
@@ -68,28 +92,7 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
         .expires_at    = now + static_cast<uint64_t>(ttl.count()),
     };
 
-    json j = {
-        {"owner_user_id", record.owner_user_id},
-        {"owner_pubkey",  record.owner_pubkey},
-        {"group_node_id", record.group_node_id},
-        {"created_at",    record.created_at},
-        {"expires_at",    record.expires_at},
-    };
-
-    auto path = token_path(token);
-    try {
-        std::filesystem::create_directories(path.parent_path());
-        std::ofstream ofs(path, std::ios::trunc);
-        if (!ofs) {
-            spdlog::error("[token-link] Failed to open token file: {}", path.string());
-            return std::nullopt;
-        }
-        ofs << j.dump(2);
-        if (!ofs.good()) return std::nullopt;
-    } catch (const std::exception& e) {
-        spdlog::error("[token-link] Exception writing token file: {}", e.what());
-        return std::nullopt;
-    }
+    if (!write_record(token_path(token), record)) return std::nullopt;
 
     spdlog::info("[token-link] Minted link token for group {} (owner {}, ttl {}s)",
                  group_node_id, owner_user_id, ttl.count());
@@ -142,6 +145,19 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view t
 
     spdlog::info("[token-link] Consumed link token for group {}", record->group_node_id);
     return record;
+}
+
+bool TokenLinkAuthProvider::refund(std::string_view token, const LinkTokenRecord& record) {
+    if (token.empty() || record.owner_user_id.empty() || record.group_node_id.empty() ||
+        record.expires_at <= now_epoch_sec()) {
+        return false;
+    }
+    const auto path = token_path(token);
+    std::error_code ec;
+    if (std::filesystem::exists(path, ec) || ec) return false;
+    if (!write_record(path, record)) return false;
+    spdlog::info("[token-link] Restored unused link token for group {}", record.group_node_id);
+    return true;
 }
 
 std::filesystem::path TokenLinkAuthProvider::token_path(std::string_view token) const {

@@ -18,6 +18,32 @@ using json = nlohmann::json;
 namespace {
 constexpr const char* kTier1Json = "/var/lib/lemonade-nexus/lemonade-nexus.json";
 constexpr const char* kTier1Env = "/etc/lemonade-nexus/lemonade-nexus.env";
+
+/// Read the boolean environment variable `name` into `target`. An unset
+/// variable leaves `target` unchanged. A value parse_bool_flag rejects is
+/// logged and sets `target` to `on_invalid`.
+void read_env_bool(const char* name, bool& target, bool on_invalid) {
+    const char* value = std::getenv(name);
+    if (!value) return;
+    if (const auto parsed = parse_bool_flag(value)) {
+        target = *parsed;
+        return;
+    }
+    spdlog::error("Config: {}='{}' is not a boolean (use 1/0, true/false, yes/no, on/off); "
+                  "using {}",
+                  name, value, on_invalid ? "true" : "false");
+    target = on_invalid;
+}
+}
+
+std::optional<bool> parse_bool_flag(std::string_view text) {
+    std::string lower(text);
+    for (auto& c : lower) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") return true;
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off") return false;
+    return std::nullopt;
 }
 
 bool load_tier1_environment_file(ServerConfig& config, const std::string& path,
@@ -407,14 +433,11 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_DNS_PORT"))         config.dns_port        = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_PUBLIC_DNS_PORT"))  config.public_dns_port = static_cast<uint16_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_DNS_BASE_DOMAIN"))  config.dns_base_domain = v;
-    if (const char* v = std::getenv("SP_DNS_SEED_DISCOVERY")) {
-        std::string s = v;
-        config.dns_seed_discovery = !(s == "0" || s == "false" || s == "no");
-    }
+    read_env_bool("SP_DNS_SEED_DISCOVERY", config.dns_seed_discovery, config.dns_seed_discovery);
     if (const char* v = std::getenv("SP_DNS_NS_HOSTNAME")) config.dns_ns_hostname = v;
     if (const char* v = std::getenv("SP_DDNS_DOMAIN"))    config.ddns_domain   = v;
     if (const char* v = std::getenv("SP_DDNS_PASSWORD"))  config.ddns_password = v;
-    if (std::getenv("SP_DDNS_ENABLED"))                   config.ddns_enabled  = true;
+    read_env_bool("SP_DDNS_ENABLED", config.ddns_enabled, false);
     if (const char* v = std::getenv("SP_GITHUB_RELEASES_URL"))  config.github_releases_url       = v;
     if (const char* v = std::getenv("SP_MANIFEST_FETCH_INTERVAL")) config.manifest_fetch_interval_sec = static_cast<uint32_t>(std::atoi(v));
     if (const char* v = std::getenv("SP_MINIMUM_VERSION"))      config.minimum_version           = v;
@@ -423,9 +446,14 @@ ServerConfig load_config(int argc, char* argv[]) {
     if (const char* v = std::getenv("SP_SERVER_HOSTNAME"))    config.server_hostname       = v;
     if (const char* v = std::getenv("SP_ACME_EAB_KID"))       config.acme_eab_kid          = v;
     if (const char* v = std::getenv("SP_ACME_EAB_HMAC_KEY"))  config.acme_eab_hmac_key     = v;
-    if (std::getenv("SP_CLOSED_REGISTRATION"))           config.open_registration     = false;
-    if (std::getenv("SP_TREE_OPS"))                      config.tree_ops_enabled      = true;
-    if (std::getenv("SP_TREE_LOG"))                      config.tree_log_enabled      = true;
+    {
+        // An unreadable value closes registration: the safer reading.
+        bool closed = !config.open_registration;
+        read_env_bool("SP_CLOSED_REGISTRATION", closed, true);
+        config.open_registration = !closed;
+    }
+    read_env_bool("SP_TREE_OPS", config.tree_ops_enabled, false);
+    read_env_bool("SP_TREE_LOG", config.tree_log_enabled, false);
 
     if (const char* v = std::getenv("SP_SEED_PEERS")) {
         // Comma-separated list

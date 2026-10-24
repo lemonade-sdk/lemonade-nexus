@@ -4,6 +4,7 @@
 
 #include <sodium.h>
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -261,6 +262,54 @@ TEST_F(UserspaceDataplaneTest, RemovePeerMidTrafficStopsDelivery) {
         std::this_thread::sleep_for(10ms);
     }
     EXPECT_FALSE(server.inbox.contains("after-removal"));
+
+    alice.dataplane.stop();
+    server.dataplane.stop();
+}
+
+// add_peer replaces a peer's allowed IPs while receive workers read them for
+// the source check and snapshot_peers copies them. Both reads take the table
+// lock. A ThreadSanitizer build reports a race here if either read does not;
+// a normal build checks that traffic and the control plane keep working while
+// the routes change.
+TEST_F(UserspaceDataplaneTest, AllowedIpsChangeDuringTrafficIsSafe) {
+    Node server, alice;
+    ASSERT_TRUE(server.start());
+    ASSERT_TRUE(alice.start());
+
+    server.dataplane.add_local_ip(ip(10, 64, 0, 1));
+    ASSERT_TRUE(server.dataplane.add_peer(alice.keys.pub_b64, "10.64.0.2/32", ""));
+    ASSERT_TRUE(alice.dataplane.add_peer(server.keys.pub_b64, "10.64.0.0/10",
+                                         server.loopback_endpoint()));
+    auto hello = make_ipv4(ip(10, 64, 0, 2), ip(10, 64, 0, 1), "churn-hello");
+    ASSERT_TRUE(send_until_received(alice.dataplane, server.inbox, hello, "churn-hello"));
+
+    std::atomic<bool> stop{false};
+    std::thread churn([&] {
+        for (int i = 0; !stop.load(); ++i) {
+            (void)server.dataplane.add_peer(
+                alice.keys.pub_b64, i % 2 ? "10.64.0.2/32" : "10.64.0.2/32,10.128.0.0/30", "");
+        }
+    });
+    std::thread snapshots([&] {
+        while (!stop.load()) (void)server.dataplane.snapshot_peers();
+    });
+    std::thread sender([&] {
+        auto pkt = make_ipv4(ip(10, 64, 0, 2), ip(10, 64, 0, 1), "churn-traffic");
+        while (!stop.load()) {
+            (void)alice.dataplane.send_outbound_ip_packet(pkt);
+            std::this_thread::sleep_for(1ms);
+        }
+    });
+    std::this_thread::sleep_for(1500ms);
+    stop = true;
+    churn.join();
+    snapshots.join();
+    sender.join();
+
+    EXPECT_TRUE(server.inbox.contains("churn-traffic"));
+    auto after = make_ipv4(ip(10, 64, 0, 2), ip(10, 64, 0, 1), "after-churn");
+    EXPECT_TRUE(send_until_received(alice.dataplane, server.inbox, after, "after-churn"));
 
     alice.dataplane.stop();
     server.dataplane.stop();

@@ -285,6 +285,20 @@ std::optional<TreeChainState> TreeLog::read_snapshot(uint64_t height) const {
     return state;
 }
 
+bool TreeLog::exists() const {
+    std::error_code ec;
+    if (!fs::exists(directory_, ec)) return static_cast<bool>(ec);
+    for (const auto& item : fs::directory_iterator(directory_, ec)) {
+        if (!item.is_regular_file() || item.path().extension() != ".json") continue;
+        const std::string stem = item.path().stem().string();
+        const std::string_view height = stem.starts_with(kSnapshotPrefix)
+                                            ? std::string_view(stem).substr(kSnapshotPrefix.size())
+                                            : std::string_view(stem);
+        if (height_of(height)) return true;
+    }
+    return static_cast<bool>(ec);
+}
+
 TreeLog::OpenResult TreeLog::open(const rules::NodeMap& base_nodes) {
     std::error_code ec;
     fs::create_directories(directory_, ec);

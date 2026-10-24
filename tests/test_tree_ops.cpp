@@ -783,3 +783,110 @@ TEST_F(TreeOpsTest, DirectPathsDoNotAdvanceVersions) {
     nlohmann::json j = *tree_svc->get_node("acme");
     EXPECT_FALSE(j.contains("version"));
 }
+
+// =========================================================================
+// Server-assigned addresses and the relay type
+// =========================================================================
+
+// A joined device holds add_child and edit_node on its endpoint and owns its
+// group. Tunnel addresses, private subnets, and relays act on the whole plane,
+// so the device sets none of them; only a root admin does. Each refusal is
+// checked on the session path and the signed-delta path.
+TEST_F(TreeOpsTest, OnlyARootAdminSetsAddressesOrCreatesRelays) {
+    const auto device_kp = crypto_svc->ed25519_keygen();
+    const auto device = principal_of(device_kp);
+    auto join = join_op(device_kp);
+    const auto endpoint_id = join.target;
+    ASSERT_TRUE(submit(seal(join)).ok());
+    const auto endpoint = *tree_svc->get_node(endpoint_id);
+    ASSERT_FALSE(endpoint.tunnel_ip.empty());
+
+    auto child = [&](const std::string& id) {
+        tree::TreeNode n;
+        n.id = id;
+        n.parent_id = endpoint_id;
+        n.type = tree::NodeType::Endpoint;
+        n.mgmt_pubkey = device;
+        n.assignments = {{device, {"read", "connect_private", "admin"}}};
+        return n;
+    };
+    uint64_t t = kBlock;
+    auto refused = [&](const TreeOp& op, uint64_t signed_at) {
+        const auto v = submit(seal(op, signed_at));
+        EXPECT_EQ(v.refusal, TreeOpRefusal::ContentRefused) << v.reason;
+        return v.reason;
+    };
+
+    // A child that carries another device's address, a subnet, or the relay type.
+    auto victim_address = child("c-address");
+    victim_address.tunnel_ip = "10.65.0.9/32";
+    EXPECT_EQ(refused(create_op(victim_address, device), ++t),
+              "only a root admin may create a relay or set node addresses");
+    auto subnet = child("c-subnet");
+    subnet.private_subnet = "10.128.0.0/30";
+    refused(create_op(subnet, device), ++t);
+    auto relay = child("c-relay");
+    relay.type = tree::NodeType::Relay;
+    refused(create_op(relay, device), ++t);
+    for (const auto& node : {victim_address, subnet, relay}) {
+        const auto d = signed_delta("create_node", node.id, node, device_kp, ++t);
+        refused(delta_op(d), d.timestamp);
+        EXPECT_FALSE(tree_svc->get_node(node.id).has_value());
+    }
+
+    // A plain child is allowed, and admin on it does not move its address.
+    ASSERT_TRUE(submit(seal(create_op(child("c-plain"), device), ++t)).ok());
+    auto moved = *tree_svc->get_node("c-plain");
+    moved.tunnel_ip = "10.65.0.9/32";
+    EXPECT_EQ(refused(update_op(moved, device, version_of("c-plain")), ++t),
+              "only a root admin may change node addresses");
+
+    // edit_node on its own endpoint, and admin of its group, do not move the
+    // endpoint's address or set its subnet.
+    auto own = endpoint;
+    own.tunnel_ip = "10.65.0.9/32";
+    refused(update_op(own, device, version_of(endpoint_id)), ++t);
+    auto own_subnet = endpoint;
+    own_subnet.private_subnet = "10.128.0.0/24";
+    refused(update_op(own_subnet, device, version_of(endpoint_id)), ++t);
+    const auto d = signed_delta("update_node", endpoint_id, own, device_kp, ++t);
+    refused(delta_op(d), d.timestamp);
+    EXPECT_EQ(tree_svc->get_node(endpoint_id)->tunnel_ip, endpoint.tunnel_ip);
+
+    // The root admin may create a relay with an address.
+    tree::TreeNode root_relay;
+    root_relay.id = "relay-1";
+    root_relay.parent_id = "root";
+    root_relay.type = tree::NodeType::Relay;
+    root_relay.mgmt_pubkey = root_pk;
+    root_relay.tunnel_ip = "10.64.0.7/32";
+    EXPECT_TRUE(submit(seal(create_op(root_relay, root_pk), ++t)).ok());
+}
+
+// =========================================================================
+// Removed-nodes hook
+// =========================================================================
+
+// A replica applies a delete that another server took. The hook runs on the
+// replica with the record as it was before the delete, so each server can
+// clean up its own state for the node. A restore through replace_all is not a
+// delete and does not call it.
+TEST_F(TreeOpsTest, ApplyingACommittedDeleteReportsTheRemovedNode) {
+    ASSERT_TRUE(submit(seal(create_op(customer("acme", root_pk), root_pk))).ok());
+    const auto before = *tree_svc->get_node("acme");
+    std::vector<tree::TreeNode> reported;
+    tree_svc->set_removed_nodes_hook([&](const std::vector<tree::TreeNode>& removed) {
+        // The hook runs without the tree lock held, so it may read the tree.
+        EXPECT_FALSE(tree_svc->get_node("acme").has_value());
+        reported.insert(reported.end(), removed.begin(), removed.end());
+    });
+
+    ASSERT_TRUE(tree_svc->apply_committed_ops({seal(delete_op("acme", root_pk))}, kBlock).ok());
+    ASSERT_EQ(reported.size(), 1u);
+    EXPECT_EQ(nlohmann::json(reported[0]).dump(), nlohmann::json(before).dump());
+
+    reported.clear();
+    ASSERT_TRUE(tree_svc->replace_all({}, tree::CommittedOpIds{}));
+    EXPECT_TRUE(reported.empty());
+    tree_svc->set_removed_nodes_hook({});
+}
