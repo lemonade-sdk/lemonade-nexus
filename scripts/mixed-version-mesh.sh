@@ -17,10 +17,9 @@
 # both binaries reach Active, that verdicts pass across versions, that an
 # epoch activates, and that every node unlocks its data key.
 #
-# Baseline: the first gated release is the bootstrap release (Design-Auto-Update
-# Phase 6). It must interoperate with the fleet's r21 line, which is not a
-# GitHub release asset; pass an r21-line build as OLD_BIN for that run. From
-# the bootstrap release on, the previous date-tagged release is the baseline.
+# Baseline: the previous date-tagged release. The first date-tagged release is
+# the bootstrap release (Design-Auto-Update Phase 6). Every server installs it
+# by hand on a fresh founding, so it has no baseline and no mixed-version run.
 #
 # Usage:
 #   scripts/mixed-version-mesh.sh
@@ -60,8 +59,8 @@ if [ -z "${OLD_BIN:-}" ]; then
         --json tagName --jq '.[].tagName' |
         grep -E '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]?)?$' | sort -V | tail -n 1)}"
     [ -n "$tag" ] || {
-        say "no date-tagged release in $REPO: the next release is the bootstrap release;"
-        say "set OLD_BIN to an r21-line build (see the header)"
+        say "no date-tagged release in $REPO: the next release is the bootstrap release,"
+        say "which has no baseline (see the header); set OLD_BIN to test another build"
         exit 2
     }
     say "downloading $OLD_ASSET from $REPO $tag"

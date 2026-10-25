@@ -154,6 +154,11 @@ public:
     void set_release_adopted_callback(std::function<void(const ReleaseApprovalBundleV1&)> cb) {
         on_release_adopted_ = std::move(cb);
     }
+    /// Fires when a finalized Start record puts the accepted release below
+    /// the network floor (ReleaseChain::raise_floor), at start or later. The
+    /// release chain then holds no usable approval; the owner replaces the
+    /// attestation profile so that it fails closed.
+    void set_release_floor_callback(std::function<void()> cb) { on_release_floor_ = std::move(cb); }
 
 private:
     class PayloadAdapter;
@@ -195,6 +200,8 @@ private:
     void broadcast_approval();
     void send_approval(const NodeId& peer);
     void adopted();
+    /// Raises the release chain's floor to the finalized rollout release.
+    void raise_release_floor();
     /// Applies a finalized record and keeps it with its proof. False when it
     /// does not extend the state.
     bool accept_record(const UpgradeRecord& record, std::optional<CommitProof> proof,
@@ -215,6 +222,7 @@ private:
     ReleaseChain* chain_;
     std::unique_ptr<PayloadAdapter> handler_;
     std::function<void(const ReleaseApprovalBundleV1&)> on_release_adopted_;
+    std::function<void()> on_release_floor_;
 
     bool healthy_ = true;
     uint64_t now_ms_ = 0;

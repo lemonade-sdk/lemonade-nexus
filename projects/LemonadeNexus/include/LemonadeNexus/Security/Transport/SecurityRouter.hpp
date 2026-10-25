@@ -235,7 +235,8 @@ private:
     RouteResult route_activation_response(const SvsmAkActivationResponseMessage& response);
     RouteResult route_announcement(const EpochAnnouncement& announcement, const NodeId& from);
     RouteResult route_sync_request(const SyncRequest& request, const NodeId& from);
-    RouteResult route_sync_response(const SyncResponse& response, const NodeId& from);
+    RouteResult route_sync_response(const SyncResponse& response, const NodeId& from,
+                                    uint64_t now_ms);
 
     struct PeerBudget {
         uint64_t window_start_ms = 0;
@@ -262,6 +263,13 @@ private:
 
     std::map<NodeId, PeerBudget> budgets_;
     std::map<NodeId, ChallengeBudget> challenge_budgets_;
+    // Paging catch-up (route_sync_response): the last page asked of each peer
+    // and when, so one peer is not asked for the same page in a loop.
+    struct PageRequest {
+        Height after_height{};
+        uint64_t sent_ms = 0;
+    };
+    std::map<NodeId, PageRequest> page_requests_;
     std::vector<Digest> seen_ring_;
     std::set<Digest> seen_;
     std::size_t seen_next_ = 0;

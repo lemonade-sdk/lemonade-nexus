@@ -251,6 +251,81 @@ TEST_F(HotStuffRestart, FreshEpochStartsSynced) {
     EXPECT_TRUE(fs::exists(safety_file()));
 }
 
+// A running replica that missed more blocks than one sync reply carries
+// cannot link the tip: it holds blocks, so it takes no sync anchor. It
+// fetches the certified chain in bounded pages above its committed height
+// (SyncRequest::after_height). Adoption casts no vote; the held proposal
+// votes once it links, under the normal rules.
+TEST_F(HotStuffRestart, ARunningReplicaFarBehindCatchesUpPageByPage) {
+    const auto chain = harness.build_chain(30);
+    RecordingStore ahead_store;
+    HotStuffService ahead(harness.config_for(1), clone_key(harness.keys[1]), ahead_store);
+    for (const auto& block : chain) {
+        ASSERT_FALSE(ahead.receive_proposal(block.proposal, block.justify).rejected.has_value());
+    }
+    ASSERT_GT(ahead.last_committed_height(), Height{3 * constants::kMaxSyncChainBlocks});
+
+    RecordingStore store;
+    HotStuffService lagging(harness.config_for(0), clone_key(harness.keys[0]), store);
+    for (std::size_t i = 0; i < 4; ++i) {
+        ASSERT_TRUE(lagging.receive_proposal(chain[i].proposal, chain[i].justify).vote.has_value());
+    }
+    // The network moved on: the view-31 proposal on the certified b29 names a
+    // parent this replica does not hold.
+    const Block next = harness.make_block(30, 31, chain[28].digest,
+                                          harness.qc_for(chain[28].proposal), 0x7c);
+    EXPECT_EQ(lagging.receive_proposal(next.proposal, next.justify).rejected,
+              ConsensusFailure::MissingParent);
+    ASSERT_TRUE(lagging.holds_orphan());
+
+    // The plain reply, the uncommitted chain, does not link.
+    std::vector<ConsensusCommit> commits;
+    const auto tip = ahead.uncommitted_chain();
+    ASSERT_FALSE(tip.empty());
+    const QuorumCertificate tip_certifying =
+        tip.size() > 1 ? tip[1].second : ahead.state().high_qc;
+    EXPECT_EQ(lagging.adopt_certified_block(tip[0].first, tip[0].second, tip_certifying, commits),
+              ConsensusFailure::MissingParent);
+
+    // Nothing to page from a replica that is not ahead.
+    EXPECT_FALSE(lagging.certified_page_after(lagging.last_committed_height()).has_value());
+
+    // A page block with a certificate over another block is refused.
+    auto page = ahead.certified_page_after(lagging.last_committed_height());
+    ASSERT_TRUE(page.has_value());
+    ASSERT_GT(page->chain.front().first.height, Height{1});
+    EXPECT_EQ(lagging.adopt_certified_block(page->chain[0].first, page->chain[0].second,
+                                            harness.qc_for(chain[0].proposal), commits),
+              ConsensusFailure::JustifyInvalid);
+
+    std::optional<nexus::security::OrphanProposal> held;
+    int pages = 0;
+    while (!(held = lagging.take_linkable_orphan()).has_value() && pages < 10) {
+        page = ahead.certified_page_after(lagging.last_committed_height());
+        ASSERT_TRUE(page.has_value()) << "page " << pages;
+        ASSERT_LE(page->chain.size(), constants::kMaxSyncChainBlocks);
+        for (std::size_t k = 0; k < page->chain.size(); ++k) {
+            const QuorumCertificate& certifying =
+                k + 1 < page->chain.size() ? page->chain[k + 1].second : page->certifying;
+            ASSERT_FALSE(lagging
+                             .adopt_certified_block(page->chain[k].first, page->chain[k].second,
+                                                    certifying, commits)
+                             .has_value())
+                << "page " << pages << " block " << k;
+        }
+        ++pages;
+    }
+    ASSERT_TRUE(held.has_value()) << "the held proposal never linked";
+    EXPECT_GE(pages, 3);
+    EXPECT_EQ(lagging.state().last_voted_view, 4u) << "adoption must not vote";
+    EXPECT_GE(lagging.last_committed_height(), Height{27});
+
+    const auto judged = lagging.receive_proposal(held->proposal, held->justify);
+    EXPECT_FALSE(judged.rejected.has_value());
+    ASSERT_TRUE(judged.vote.has_value());
+    EXPECT_EQ(judged.vote->view, 31u);
+}
+
 TEST_F(HotStuffRestart, RecordingStoreSeedsRestartAndCorruptPaths) {
     RecordingStore store;
     store.seed_state = HotStuffState{};

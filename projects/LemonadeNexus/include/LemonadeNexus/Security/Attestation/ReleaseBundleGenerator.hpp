@@ -68,7 +68,22 @@ struct ReleaseBundleSpec {
     /// every path the new release still lists; a path the new release drops
     /// is not carried over. approved_paths keeps only this release's hashes.
     std::optional<ReleaseApprovalV1> previous;
+    /// The rollout of `previous` halted (a finalized Halt record). Servers
+    /// then run either the halted release or the release before it, so
+    /// previous_release_paths carries both (release_overlap_paths). The
+    /// release workflow sets this only from a verified rollout proof, and
+    /// nexus-rollout-check refuses an approval whose overlap does not match
+    /// the proven rollout state. Requires `previous`.
+    bool previous_halted = false;
 };
+
+/// The previous_release_paths that follow `previous`, one entry per path of
+/// previous.approved_paths. After a completed rollout: that release's own
+/// hashes. After a halted rollout: its own hashes, then the hashes of its
+/// previous_release_paths for the same path (the release before it),
+/// without duplicates. The caller drops paths the new release does not list.
+[[nodiscard]] std::vector<ApprovedPath> release_overlap_paths(const ReleaseApprovalV1& previous,
+                                                              bool previous_halted);
 
 /// Fills the compiled template with digests of the actual files. Fail-closed:
 /// any invalid spec yields nullopt and a reason in `error`.

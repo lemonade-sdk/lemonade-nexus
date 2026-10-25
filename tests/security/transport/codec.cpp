@@ -215,6 +215,7 @@ std::vector<SecurityMessage> all_kinds() {
     messages.push_back(envelope(SecurityMessageKind::BootstrapCertificate, bootstrap));
 
     messages.push_back(envelope(SecurityMessageKind::SyncRequest, SyncRequest{7}));
+    messages.push_back(envelope(SecurityMessageKind::SyncRequest, SyncRequest{7, Height{41}}));
     SyncResponse sync_response;
     sync_response.high_qc = certificate(4);
     sync_response.chain.push_back(proposal_message());
@@ -516,6 +517,29 @@ TEST(SecurityCodec, SyncChainIsBounded) {
         response.chain.push_back(proposal_message());
     }
     EXPECT_TRUE(encode_security_message(envelope(SecurityMessageKind::SyncResponse, response)).empty());
+}
+
+// The paging field is an optional trailing u64: a request without it keeps the
+// earlier layout byte for byte, so a release that predates paging still
+// decodes every restart sync request.
+TEST(SecurityCodec, SyncRequestPagingIsAnOptionalTrailingField) {
+    const auto plain = encode_security_message(envelope(SecurityMessageKind::SyncRequest, SyncRequest{7}));
+    const auto paged =
+        encode_security_message(envelope(SecurityMessageKind::SyncRequest, SyncRequest{7, Height{41}}));
+    ASSERT_FALSE(plain.empty());
+    ASSERT_EQ(paged.size(), plain.size() + 8);
+
+    auto decoded = decode_security_message(plain);
+    ASSERT_TRUE(std::holds_alternative<SecurityMessage>(decoded));
+    const auto& request = std::get<SyncRequest>(std::get<SecurityMessage>(decoded).body);
+    EXPECT_EQ(request.epoch, 7u);
+    EXPECT_FALSE(request.after_height.has_value());
+
+    decoded = decode_security_message(paged);
+    ASSERT_TRUE(std::holds_alternative<SecurityMessage>(decoded));
+    const auto& page = std::get<SyncRequest>(std::get<SecurityMessage>(decoded).body);
+    ASSERT_TRUE(page.after_height.has_value());
+    EXPECT_EQ(*page.after_height, 41u);
 }
 
 TEST(SecurityCodec, FoundingMemberCountIsBounded) {

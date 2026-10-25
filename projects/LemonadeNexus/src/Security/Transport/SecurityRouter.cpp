@@ -461,7 +461,8 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
         case SecurityMessageKind::SyncRequest:
             return route_sync_request(std::get<SyncRequest>(message.body), message.sender);
         case SecurityMessageKind::SyncResponse:
-            return route_sync_response(std::get<SyncResponse>(message.body), message.sender);
+            return route_sync_response(std::get<SyncResponse>(message.body), message.sender,
+                                       now_ms);
         case SecurityMessageKind::EligibilityObservation:
             events_.on_eligibility_observation(
                 std::get<EligibilityObservation>(message.body));
@@ -530,15 +531,26 @@ RouteResult SecurityRouter::route_sync_request(const SyncRequest& request, const
         return drop(DropReason::NoService);
     }
     SyncResponse response;
-    response.high_qc = consensus->state().high_qc;
-    for (auto& [proposal, justify] : consensus->uncommitted_chain()) {
-        response.chain.push_back(ProposalMessage{std::move(proposal), std::move(justify)});
+    auto page = request.after_height.has_value()
+                    ? consensus->certified_page_after(*request.after_height)
+                    : std::nullopt;
+    if (page.has_value()) {
+        response.high_qc = std::move(page->certifying);
+        for (auto& [proposal, justify] : page->chain) {
+            response.chain.push_back(ProposalMessage{std::move(proposal), std::move(justify)});
+        }
+    } else {
+        response.high_qc = consensus->state().high_qc;
+        for (auto& [proposal, justify] : consensus->uncommitted_chain()) {
+            response.chain.push_back(ProposalMessage{std::move(proposal), std::move(justify)});
+        }
     }
     (void)send(from, compose(SecurityMessageKind::SyncResponse, response, request.epoch));
     return delivered();
 }
 
-RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, const NodeId& from) {
+RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, const NodeId& from,
+                                                uint64_t now_ms) {
     const EpochManager* epochs = runtime_.epochs();
     if (epochs == nullptr) {
         // A pending candidate holds no epoch state to validate against; the
@@ -566,6 +578,7 @@ RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, co
     // service validates every certificate before adoption.
     HotStuffService* consensus = runtime_.consensus();
     std::optional<OrphanProposal> orphan;
+    std::optional<SyncRequest> next_page;
     if (consensus != nullptr && !response.chain.empty()) {
         for (std::size_t i = 0; i + 1 < response.chain.size(); ++i) {
             if (response.chain[i + 1].justify.proposal_digest !=
@@ -578,20 +591,46 @@ RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, co
             qc.proposal_digest != proposal_digest(response.chain.back().proposal)) {
             return drop(DropReason::ServiceRejected, code(ConsensusFailure::JustifyInvalid));
         }
+        const Height committed_before = consensus->last_committed_height();
+        bool gap = false;
         std::vector<ConsensusCommit> commits;
         for (std::size_t i = 0; i < response.chain.size(); ++i) {
             const QuorumCertificate& certifying =
                 i + 1 < response.chain.size() ? response.chain[i + 1].justify : qc;
-            (void)consensus->adopt_certified_block(response.chain[i].proposal,
-                                                   response.chain[i].justify, certifying,
-                                                   commits);
+            const auto failure = consensus->adopt_certified_block(
+                response.chain[i].proposal, response.chain[i].justify, certifying, commits);
+            gap = gap || (i == 0 && failure == ConsensusFailure::MissingParent);
         }
         // Taken before the commits fire: a committed handoff destroys this
         // service instance.
         orphan = consensus->take_linkable_orphan();
+        // A running replica that fell further behind than this reply cannot
+        // link it: the first block names a parent it does not hold, and new
+        // proposals stay orphaned. It asks the sender for the certified chain
+        // above its own committed height, one bounded page at a time, until
+        // the held proposal links. Each page is validated like any sync reply
+        // and adopted without a vote; the held proposal is then judged in
+        // full by receive_proposal (vote-once, store-before-vote). A restarted
+        // replica is not synced yet and anchors instead.
+        const Height committed = consensus->last_committed_height();
+        if (consensus->synced() && consensus->holds_orphan() &&
+            (gap || committed > committed_before)) {
+            auto& asked = page_requests_[from];
+            if (asked.sent_ms == 0 || asked.after_height != committed ||
+                now_ms - asked.sent_ms >= constants::kSyncPageRetryMs) {
+                asked = PageRequest{committed, now_ms == 0 ? 1 : now_ms};
+                next_page = SyncRequest{current.id, committed};
+            }
+            while (page_requests_.size() > constants::kSecurityTrackedPeers) {
+                page_requests_.erase(page_requests_.begin());
+            }
+        }
         if (!commits.empty()) {
             events_.on_commits(commits);
         }
+    }
+    if (next_page.has_value()) {
+        (void)send(from, compose(SecurityMessageKind::SyncRequest, *next_page, next_page->epoch));
     }
     events_.on_sync_certificate(qc, from);
     if (orphan.has_value()) {

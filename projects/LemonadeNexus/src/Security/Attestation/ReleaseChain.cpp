@@ -76,8 +76,29 @@ ReleaseChain::ReleaseChain(std::filesystem::path directory,
       genesis_public_key_(genesis_public_key),
       network_id_(network_id) {}
 
+const std::optional<ReleaseApprovalBundleV1>& ReleaseChain::current() const {
+    static const std::optional<ReleaseApprovalBundleV1> kNone;
+    return below_floor() ? kNone : current_;
+}
+
 Digest ReleaseChain::current_digest() const {
-    return current_ ? release_approval_digest(current_->approval) : Digest{};
+    const auto& held = current();
+    return held ? release_approval_digest(held->approval) : Digest{};
+}
+
+bool ReleaseChain::below_floor() const {
+    return floor_ != 0 && (!record_ || record_->highest_release_number < floor_);
+}
+
+bool ReleaseChain::raise_floor(uint64_t finalized_release_number) {
+    if (finalized_release_number <= floor_) return false;
+    floor_ = finalized_release_number;
+    if (below_floor()) {
+        spdlog::warn("[release] finalized state shows release {}, above the accepted release "
+                     "{}; the accepted approval is not used until a newer one is adopted",
+                     floor_, highest_release_number());
+    }
+    return true;
 }
 
 bool ReleaseChain::persist(const ReleaseChainRecord& record) {
@@ -178,7 +199,8 @@ ReleaseOfferResult ReleaseChain::offer(const ReleaseApprovalBundleV1& bundle) {
     if (!signer_matches(bundle, record_->release_signing_pubkey_b64)) {
         return ReleaseOfferResult::WrongSigner;
     }
-    if (current_ && release_approval_digest(bundle.approval) == current_digest()) {
+    if (current_ && release_approval_digest(bundle.approval) ==
+                        release_approval_digest(current_->approval)) {
         return ReleaseOfferResult::Current;
     }
     if (bundle.approval.release_number <= record_->highest_release_number) {

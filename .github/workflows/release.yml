@@ -7,7 +7,8 @@ name: Release
 #                   and the previous date-tagged release
 #   server          fleet server binaries in a pinned Ubuntu 24.04 / GCC 13.3
 #                   container; the rollout guard; the unsigned approval from
-#                   release/fleet-profile.json and the previous approval
+#                   release/fleet-profile.json and the previous approval (none
+#                   for the bootstrap release)
 #   mixed-version   the previous release's server next to the new one
 #                   (mixed-version.yml; skipped for the bootstrap release)
 #   native, distro  macOS and other Linux distribution builds and packages
@@ -59,6 +60,7 @@ jobs:
       release_number: ${{ steps.version.outputs.release_number }}
       previous_tag: ${{ steps.previous.outputs.tag }}
       previous_is_first: ${{ steps.previous.outputs.is_first }}
+      bootstrap: ${{ steps.previous.outputs.bootstrap }}
     steps:
       - name: Refuse any ref except main
         if: github.ref != 'refs/heads/main'
@@ -85,8 +87,9 @@ jobs:
 
       # The previous release is the newest published date-tagged release. The
       # vX.Y.Z-alpha releases predate the approval chain and are never one.
-      # Without a date-tagged release this is the bootstrap release
-      # (Design-Auto-Update Phase 6).
+      # The bootstrap release (Design-Auto-Update Phase 6) is detected, never
+      # selected by hand: no earlier date tag or date-tagged release, and no
+      # release/bootstrap-complete. It has no previous release.
       - name: Find the previous release
         id: previous
         env:
@@ -95,7 +98,9 @@ jobs:
         run: |
           gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 200 \
             --json tagName --jq '.[].tagName' > published-tags
-          python3 scripts/nexus-release-tool previous --tags published-tags --before "$NEW_TAG" >> "$GITHUB_OUTPUT"
+          python3 scripts/nexus-release-tool previous --tags published-tags \
+            --all-tags existing-tags --bootstrap-marker release/bootstrap-complete \
+            --before "$NEW_TAG" >> "$GITHUB_OUTPUT"
           prev=$(grep '^tag=' "$GITHUB_OUTPUT" | tail -n 1 | cut -d= -f2)
           echo "Previous release: ${prev:-none (bootstrap release)}"
 
@@ -112,6 +117,7 @@ jobs:
       TAG: ${{ needs.prepare.outputs.tag }}
       PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
       PREVIOUS_IS_FIRST: ${{ needs.prepare.outputs.previous_is_first }}
+      BOOTSTRAP: ${{ needs.prepare.outputs.bootstrap }}
     steps:
       - name: Install the pinned toolchain
         run: |
@@ -165,19 +171,48 @@ jobs:
           cp build/projects/LemonadeNexusUpdater/nexus-updater out/nexus-updater-linux-x86_64
           (cd out && sha256sum -- *)
 
-      # Each approval lists one previous release. Publishing while the
-      # previous rollout is open would drop the servers still on the release
-      # before it out of attestation, so the guard requires Tier 1 finalized
-      # state: a rollout proof (GET /api/upgrade/rollout-proof from any server
-      # in ROLLOUT_PROOF_URLS) that verifies from the Genesis key behind the
-      # profile's network id and shows the previous rollout complete. The
-      # servers are not trusted for it. See docs/Releasing.md.
-      - name: Refuse to publish while a rollout is open
+      # The previous approval: its hashes become previous_release_paths, so
+      # servers on both releases attest each other. A missing previous
+      # approval fails the release; it never falls back to an approval without
+      # the overlap. The bootstrap release has no previous release.
+      - name: Fetch the previous release's approval and package lock
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p previous
+          if [ "$BOOTSTRAP" = "true" ]; then
+            echo "::notice::Bootstrap release: there is no previous release"
+            exit 0
+          fi
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "::error::no previous release, and this is not the bootstrap release"
+            exit 1
+          fi
+          curl -fsSL -o previous/release-approval.json \
+            "https://github.com/${GH_REPO}/releases/download/${PREVIOUS_TAG}/release-approval.json"
+          curl -fsSL -o previous/os-packages.lock \
+            "https://github.com/${GH_REPO}/releases/download/${PREVIOUS_TAG}/os-packages.lock"
+          ls -l previous
+
+      # Each approval lists the previous release's hashes. Publishing while
+      # the previous rollout is open would drop the servers still on the
+      # release before it out of attestation, so the guard requires Tier 1
+      # finalized state: a rollout proof (GET /api/upgrade/rollout-proof from
+      # any server in ROLLOUT_PROOF_URLS) that verifies from the Genesis key
+      # behind the profile's network id. The rollout must be complete, or
+      # halted: after a halt, servers run the halted release or the release
+      # before it, and the new approval must list both (checked again after
+      # the approval is built). The servers are not trusted for the proof.
+      # See docs/Releasing.md.
+      - name: Check the previous rollout
+        id: rollout
         env:
           ROLLOUT_PROOF_URLS: ${{ vars.ROLLOUT_PROOF_URLS }}
         run: |
-          if [ -z "$PREVIOUS_TAG" ]; then
+          mkdir -p rollout
+          if [ "$BOOTSTRAP" = "true" ]; then
             echo "::notice::Bootstrap release: no previous rollout to check"
+            echo "state=bootstrap" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$PREVIOUS_IS_FIRST" = "true" ]; then
@@ -188,6 +223,7 @@ jobs:
               exit 1
             fi
             echo "::notice::The bootstrap release $PREVIOUS_TAG is recorded as complete"
+            echo "state=complete" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ -z "$ROLLOUT_PROOF_URLS" ]; then
@@ -197,57 +233,70 @@ jobs:
           network=$(python3 -c 'import json; print(json.load(open("release/fleet-profile.json"))["network_id"])')
           number=$(python3 scripts/nexus-release-tool release-number --tag "$PREVIOUS_TAG")
           for url in $ROLLOUT_PROOF_URLS; do
-            rm -f rollout-proof.json
+            rm -f rollout/rollout-proof.json rollout/state
             if ! curl -fsS --proto '=https' --max-time 30 --max-filesize 8388608 \
-                -o rollout-proof.json "$url"; then
+                -o rollout/rollout-proof.json "$url"; then
               echo "::warning::no rollout proof from $url"
               continue
             fi
             if build/projects/LemonadeNexus/nexus-rollout-check --network-id "$network" \
-                --release "$number" --proof rollout-proof.json; then
+                --release "$number" --proof rollout/rollout-proof.json \
+                --previous-approval previous/release-approval.json --print-state > rollout/state; then
+              state=$(sed -n 's/^rollout=//p' rollout/state)
+              case "$state" in
+                complete|halted) ;;
+                *) echo "::error::unexpected rollout state '$state'"; exit 1 ;;
+              esac
+              if [ "$state" = "halted" ]; then
+                echo "::warning::The rollout of $PREVIOUS_TAG halted; this release must list the hashes of $PREVIOUS_TAG and of the release before it"
+              fi
+              echo "state=$state" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           done
-          echo "::error::no server proved the rollout of $PREVIOUS_TAG complete; refusing to publish"
+          rm -f rollout/rollout-proof.json
+          echo "::error::no server proved the rollout of $PREVIOUS_TAG complete or halted; refusing to publish"
           exit 1
 
-      # The previous approval: its hashes become previous_release_paths, so
-      # servers on both releases attest each other. A missing previous
-      # approval fails the release; it never falls back to an approval without
-      # the overlap.
-      - name: Fetch the previous release's approval and package lock
-        env:
-          GH_REPO: ${{ github.repository }}
-        run: |
-          mkdir -p previous
-          if [ -n "$PREVIOUS_TAG" ]; then
-            curl -fsSL -o previous/release-approval.json \
-              "https://github.com/${GH_REPO}/releases/download/${PREVIOUS_TAG}/release-approval.json"
-            curl -fsSL -o previous/os-packages.lock \
-              "https://github.com/${GH_REPO}/releases/download/${PREVIOUS_TAG}/os-packages.lock"
-          elif [ -f release/r21-release-approval.json ]; then
-            echo "::notice::Bootstrap release: the previous approval is the r21 approval"
-            cp release/r21-release-approval.json previous/release-approval.json
-          else
-            echo "::error::the bootstrap release needs the r21 approval at release/r21-release-approval.json (Design-Auto-Update Phase 6)"
-            exit 1
-          fi
-          ls -l previous
-
       - name: Generate the unsigned approval
+        env:
+          ROLLOUT_STATE: ${{ steps.rollout.outputs.state }}
         run: |
           python3 scripts/nexus-release-tool spec \
             --profile release/fleet-profile.json --tag "$TAG" \
             --tree "$(git rev-parse 'HEAD^{tree}')" \
             --nexus out/lemonade-nexus-linux-x86_64 --attestd out/nexus-attestd-linux-x86_64 \
             --out approval-spec.json
+          previous_args=()
+          case "$ROLLOUT_STATE" in
+            bootstrap) ;;
+            complete) previous_args=(--previous-approval previous/release-approval.json) ;;
+            halted) previous_args=(--previous-approval previous/release-approval.json --previous-halted) ;;
+            *) echo "::error::unknown rollout state '$ROLLOUT_STATE'"; exit 1 ;;
+          esac
           mkdir -p approval
           build/projects/LemonadeNexus/nexus-release-bundle --spec approval-spec.json \
-            --previous-approval previous/release-approval.json \
+            "${previous_args[@]}" \
             --out approval/release-approval.unsigned.json \
             --approval-preimage approval/approval.preimage
           cp approval-spec.json approval/
           cp -r previous approval/previous
+
+      # The approval must carry exactly the overlap the proven rollout state
+      # requires: the previous release after a completed rollout, the halted
+      # release and the release before it after a halt.
+      - name: Check the approval against the previous rollout
+        run: |
+          if [ ! -f rollout/rollout-proof.json ]; then
+            echo "::notice::No rollout proof (bootstrap release, or the release after it)"
+            exit 0
+          fi
+          network=$(python3 -c 'import json; print(json.load(open("release/fleet-profile.json"))["network_id"])')
+          number=$(python3 scripts/nexus-release-tool release-number --tag "$PREVIOUS_TAG")
+          build/projects/LemonadeNexus/nexus-rollout-check --network-id "$network" \
+            --release "$number" --proof rollout/rollout-proof.json \
+            --previous-approval previous/release-approval.json \
+            --approval approval/release-approval.unsigned.json
 
       - name: Attest build provenance
         id: attest
@@ -285,12 +334,11 @@ jobs:
 
   # =========================================================================
   # Phase 3 gate: the previous release's server next to this commit's. The
-  # bootstrap release has no date-tagged predecessor; its baseline is the
-  # fleet's r21 line, which is not a release asset, so that run is manual
-  # (scripts/mixed-version-mesh.sh with OLD_BIN, docs/Releasing.md).
+  # bootstrap release has no previous release, so the gate is skipped; every
+  # server installs it by hand on a fresh founding (docs/Releasing.md).
   mixed-version:
     needs: prepare
-    if: needs.prepare.outputs.previous_tag != ''
+    if: needs.prepare.outputs.bootstrap != 'true' && needs.prepare.outputs.previous_tag != ''
     uses: ./.github/workflows/mixed-version.yml
     with:
       previous_tag: ${{ needs.prepare.outputs.previous_tag }}

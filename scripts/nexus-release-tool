@@ -2,7 +2,8 @@
 """Release workflow helpers. None of them reads or writes key material.
 
   next-tag     Pick the date tag and release number for today.
-  previous     Pick the previous release: the newest date-tagged release.
+  previous     Pick the previous release: the newest date-tagged release, or
+               detect the bootstrap release when none exists.
   release-number  Print the release number of a tag.
   spec         Write the nexus-release-bundle spec from release/fleet-profile.json.
   boot-chain   Decide whether the OS package lock changes the boot chain, and
@@ -125,20 +126,37 @@ def cmd_previous(args):
     """The newest published date-tagged release, and whether it is the first.
 
     The vX.Y.Z-alpha releases predate the release workflow and the approval
-    chain; they are never a previous release. When no date-tagged release
-    exists, the next release is the bootstrap release (Design-Auto-Update
-    Phase 6) and its previous approval is the fleet's r21 approval.
+    chain; they are never a previous release.
+
+    The bootstrap release (Design-Auto-Update Phase 6) is detected, never
+    switched on: it is the release with no earlier date-tagged release and no
+    bootstrap marker (release/bootstrap-complete). It has no previous release.
+    A date tag without a published release, or a marker without any
+    date-tagged release, is a contradiction and fails.
     """
     with open(args.tags, encoding="utf-8") as f:
         tags = [line.strip() for line in f if TAG_RE.match(line.strip())]
     numbered = sorted((release_number(t), t) for t in tags)
-    if args.before:
-        limit = release_number(args.before)
+    limit = release_number(args.before) if args.before else None
+    if limit is not None:
         numbered = [(n, t) for n, t in numbered if n < limit]
+    bootstrap = not numbered
+    if bootstrap:
+        if args.all_tags:
+            with open(args.all_tags, encoding="utf-8") as f:
+                stray = sorted(t for t in (line.strip() for line in f)
+                               if TAG_RE.match(t) and (limit is None or release_number(t) < limit))
+            if stray:
+                fail(f"date tag {stray[-1]} exists without a published release; "
+                     "this is not the bootstrap release")
+        if os.path.exists(args.bootstrap_marker):
+            fail(f"{args.bootstrap_marker} exists but no date-tagged release is published; "
+                 "this is not the bootstrap release")
     tag = numbered[-1][1] if numbered else ""
     print(f"tag={tag}")
     print(f"release_number={numbered[-1][0] if numbered else ''}")
     print(f"is_first={'true' if len(numbered) == 1 else 'false'}")
+    print(f"bootstrap={'true' if bootstrap else 'false'}")
 
 
 def cmd_release_number(args):
@@ -280,6 +298,9 @@ def main():
     p = sub.add_parser("previous")
     p.add_argument("--tags", required=True, help="file with one published tag per line")
     p.add_argument("--before", help="only releases older than this tag")
+    p.add_argument("--all-tags", help="file with every v* tag of the repository, one per line")
+    p.add_argument("--bootstrap-marker", default="release/bootstrap-complete",
+                   help="the reviewed file that records the bootstrap release as installed")
     p.set_defaults(func=cmd_previous)
 
     p = sub.add_parser("release-number")
