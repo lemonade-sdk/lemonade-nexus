@@ -53,6 +53,9 @@ enum class DropReason : uint16_t {
     BudgetExceeded,
     SealFailure,
     ServiceRejected,
+    /// The envelope names another security wire version. A peer on a release
+    /// with another wire, not a malformed message (Wire-Compatibility.md).
+    WireVersionMismatch,
 };
 
 struct RouteResult {

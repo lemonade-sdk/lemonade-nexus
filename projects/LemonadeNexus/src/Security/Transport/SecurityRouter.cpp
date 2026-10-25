@@ -24,6 +24,8 @@ DropReason from_codec(CodecError error) {
             return DropReason::Oversized;
         case CodecError::UnknownKind:
             return DropReason::UnknownKind;
+        case CodecError::BadVersion:
+            return DropReason::WireVersionMismatch;
         default:
             return DropReason::Malformed;
     }

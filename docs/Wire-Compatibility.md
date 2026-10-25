@@ -35,10 +35,11 @@ release may change and what it must keep.
      security wire version differs from its own.
    - `kAttestdWireVersion` and the attestation profile ruleset, for the same
      reason.
-   - The compiled kernel, IMA policy, and SVSM launch identity in
-     `ReleaseApproval.cpp`. A release N verifier refuses an approval that
-     names different values. Changing them needs the fleet-profile work in
-     Design-Auto-Update Phase 0.3 first.
+
+   The kernel, IMA policy, and SVSM launch identity are not on this list.
+   Since Design-Auto-Update Phase 0.3 the signed approval carries them (from
+   `release/fleet-profile.json`) and a release N verifier checks them against
+   that approval only, so N+1 may change them.
 5. **Storage formats change only with a reader for the previous format.** A
    release reads every durable record that release N writes: epoch state,
    consensus state, attestation state, storage records, the release chain
@@ -46,6 +47,27 @@ release may change and what it must keep.
 6. **Approvals overlap by one release.** The approval of N+1 lists the
    hashes of N in `previous_release_paths`, so N and N+1 attest each other.
    N-1 stops passing attestation once a server adopts N+1.
+
+## Baseline
+
+The rule starts with the bootstrap release, the first date-tagged release
+(Design-Auto-Update Phase 6). Its baseline is the fleet's r21 line: the r21
+release carries the release approval with an SVSM launch measurement set and
+a bootstrap certificate that commits the approval digest. Both arrived after
+security wire version 3 (commit `e9748c6`), so r21 runs version 3, like this
+line. This is inferred from the r21 approval format; the r21 binary is not a
+release asset and no mixed-version run against it is recorded.
+
+The `vX.Y.Z-alpha` GitHub releases are not a baseline. `v0.9.7-alpha` sends
+security wire version 1. A current server refuses every such envelope at the
+version byte (`decode_security_message` returns `BadVersion`), and its
+message layouts also differ (attestation challenge and evidence fields, the
+bootstrap certificate). A mixed-version run against that release therefore
+reports dropped messages from every old node. The router records these drops
+as `WireVersionMismatch` (16), not `Malformed`, and the gate script reports
+the old binary as an invalid baseline. The commit r21 started from
+(`dd80e7f`) is also wire version 1; the r21 build added the version 3 work on
+top of it, so that commit alone is not r21 either.
 
 ## A new block payload kind
 
@@ -66,7 +88,9 @@ sends a status only when it runs a release that knows the kind.
   `network_id` derivation.
 - `scripts/mixed-version-mesh.sh` and the `Mixed-version gate` workflow run
   the previous release's server binary next to the new binary in one
-  multi-process mesh. On a host without SEV-SNP the run proves wire
+  multi-process mesh. `release.yml` calls the workflow with the previous
+  date-tagged release; for the bootstrap release the run uses an r21-line
+  build as `OLD_BIN` by hand. On a host without SEV-SNP the run proves wire
   compatibility only: both binaries decode each other's traffic, and the mesh
   refuses to found on unproven hardware. Founding, epoch transition, storage
   unlock, and cross attestation across binaries need an SEV-SNP host; the

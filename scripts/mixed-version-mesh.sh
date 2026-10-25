@@ -17,12 +17,19 @@
 # both binaries reach Active, that verdicts pass across versions, that an
 # epoch activates, and that every node unlocks its data key.
 #
+# Baseline: the first gated release is the bootstrap release (Design-Auto-Update
+# Phase 6). It must interoperate with the fleet's r21 line, which is not a
+# GitHub release asset; pass an r21-line build as OLD_BIN for that run. From
+# the bootstrap release on, the previous date-tagged release is the baseline.
+#
 # Usage:
 #   scripts/mixed-version-mesh.sh
 # Env:
 #   BIN        new server binary (default: build/projects/LemonadeNexus/lemonade-nexus)
 #   OLD_BIN    previous server binary; when unset it is downloaded
-#   OLD_TAG    release tag to download (default: the newest release)
+#   OLD_TAG    release tag to download (default: the newest date-tagged release,
+#              vYYYY.MM.DD[.N]; the older vX.Y.Z-alpha tags use another security
+#              wire version and are not a baseline)
 #   OLD_ASSET  asset name pattern (default: lemonade-nexus-*-linux-x86_64)
 #   REPO       GitHub repository (default: lemonade-sdk/lemonade-nexus)
 #   WORK       working directory (default: /tmp/nexus-mixed-mesh)
@@ -49,8 +56,14 @@ if [ -z "${OLD_BIN:-}" ]; then
     download="$WORK/previous-release"
     rm -rf "$download"
     mkdir -p "$download"
-    tag="${OLD_TAG:-$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName')}"
-    [ -n "$tag" ] || { say "no previous release found in $REPO"; exit 2; }
+    tag="${OLD_TAG:-$(gh release list --repo "$REPO" --exclude-drafts --limit 100 \
+        --json tagName --jq '.[].tagName' |
+        grep -E '^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[1-9][0-9]?)?$' | sort -V | tail -n 1)}"
+    [ -n "$tag" ] || {
+        say "no date-tagged release in $REPO: the next release is the bootstrap release;"
+        say "set OLD_BIN to an r21-line build (see the header)"
+        exit 2
+    }
     say "downloading $OLD_ASSET from $REPO $tag"
     gh release download "$tag" --repo "$REPO" --pattern "$OLD_ASSET" --dir "$download" \
         || { say "download failed"; exit 2; }
@@ -61,19 +74,25 @@ fi
 say "new: $BIN"
 say "old: $OLD_BIN"
 
-# Drop reasons in SecurityRouter's DropReason: Malformed = 2, UnknownKind = 3.
+# Drop reasons in SecurityRouter's DropReason: Malformed = 2, UnknownKind = 3,
+# WireVersionMismatch = 16. Only the per-drop debug lines are counted; the
+# rate-limited info lines repeat them.
 check_new_nodes_decode_old() {
     local pass_dir="$1" old_nodes="$2"
     for i in 0 1 2 3 4; do
         case " $old_nodes " in *" $i "*) continue ;; esac
-        local bad
-        bad=$(grep -cE 'route drop reason=(2|3) ' "$pass_dir/n$i.log" || true)
+        local bad skew
+        bad=$(grep -cE '\[debug\].*route drop reason=(2|3) ' "$pass_dir/n$i.log" || true)
         [ "$bad" -eq 0 ] || fail "new-binary node n$i dropped $bad message(s) as malformed or unknown"
+        skew=$(grep -cE '\[debug\].*route drop reason=16 ' "$pass_dir/n$i.log" || true)
+        [ "$skew" -eq 0 ] || fail "new-binary node n$i dropped $skew message(s) of another security \
+wire version: the old binary is not a valid baseline (docs/Wire-Compatibility.md)"
     done
     for i in $old_nodes; do
         local unknown
-        unknown=$(grep -cE 'route drop reason=3 ' "$pass_dir/n$i.log" || true)
-        say "old-binary node n$i ignored $unknown message(s) of a newer kind (allowed: additions)"
+        unknown=$(grep -cE '\[debug\].*route drop reason=3 ' "$pass_dir/n$i.log" || true)
+        say "old-binary node n$i ignored $unknown message(s) of a newer kind (allowed: additions;" \
+            "a binary older than this drop log reports 0)"
     done
 }
 
