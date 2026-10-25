@@ -165,6 +165,11 @@ public:
     /// Returns the number removed.
     std::size_t prune_tombstones(uint64_t cutoff_timestamp);
 
+    /// Drop every entry, tombstone or not, whose timestamp is older than
+    /// `cutoff_timestamp`. For a stream whose entries carry their expiry as
+    /// the timestamp (link tokens). Returns the number removed.
+    std::size_t prune_expired(uint64_t cutoff_timestamp);
+
     /// Status of every peer that sent a digest, compared with the current
     /// local state.
     [[nodiscard]] std::map<std::string, PeerSyncStatus> peer_status() const;

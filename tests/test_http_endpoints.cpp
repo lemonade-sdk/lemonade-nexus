@@ -2714,6 +2714,8 @@ TEST_F(InviteHttpTest, MovingADeviceKeepsItsAddressAndNeedsBothRights) {
     const auto device = join(invite_token(alice));
     const auto bob = join();
     const auto ip_before = tree->get_node(device.node_id)->tunnel_ip;
+    ASSERT_TRUE(peers(alice).count(device.node_id));
+    ASSERT_TRUE(peers(device).count(alice.node_id));
 
     auto refused = post(bob, "/api/tree/node/move/" + device.node_id, {{"parent_id", bob.group}});
     ASSERT_NE(refused, nullptr);
@@ -2728,7 +2730,49 @@ TEST_F(InviteHttpTest, MovingADeviceKeepsItsAddressAndNeedsBothRights) {
     const auto after = tree->get_node(device.node_id);
     EXPECT_EQ(after->parent_id, sub);
     EXPECT_EQ(after->tunnel_ip, ip_before);
-    // The moved device left its old group's scope: alice's device no longer
-    // reaches it until a grant in the new group allows it.
-    EXPECT_FALSE(peers(alice).count(device.node_id));
+    // The moved device's own grants stay with it: alice's key holds a connect
+    // grant on it, and the subgroup is inside alice's group. The device's
+    // grant on alice's device needed the old group's scope, so it stops
+    // applying.
+    EXPECT_TRUE(peers(alice).count(device.node_id));
+    EXPECT_FALSE(peers(device).count(alice.node_id));
+}
+
+// A group owner's first device and a device linked later into the same group
+// list each other. The owner's key already holds an entry on the linked
+// device (the owner keeps control of it), so the connect grant completes that
+// entry instead of being skipped.
+TEST_F(InviteHttpTest, ALinkedDeviceAndTheOwnersFirstDeviceListEachOther) {
+    const auto alice = join();
+    const auto device = join(invite_token(alice));
+    ASSERT_EQ(device.group, alice.group);
+
+    EXPECT_TRUE(peers(alice).count(device.node_id)) << "the owner's device misses the new device";
+    EXPECT_TRUE(peers(device).count(alice.node_id));
+
+    // The owner's entry keeps its control permissions and gains the grant.
+    const auto node = tree->get_node(device.node_id);
+    ASSERT_TRUE(node.has_value());
+    std::vector<std::string> owner_perms;
+    for (const auto& a : node->assignments) {
+        if (tree::canonical_principal(a.management_pubkey) ==
+            tree::canonical_principal("ed25519:" + alice.b64)) {
+            owner_perms.insert(owner_perms.end(), a.permissions.begin(), a.permissions.end());
+        }
+    }
+    for (const char* p : {"read", "write", "add_child", "delete_node", "edit_node",
+                          "connect_private"}) {
+        EXPECT_NE(std::find(owner_perms.begin(), owner_perms.end(), p), owner_perms.end()) << p;
+    }
+
+    // A third device sees both, and both see it. A device in another group
+    // sees none of them.
+    const auto third = join(invite_token(alice));
+    EXPECT_TRUE(peers(third).count(alice.node_id));
+    EXPECT_TRUE(peers(third).count(device.node_id));
+    EXPECT_TRUE(peers(alice).count(third.node_id));
+    EXPECT_TRUE(peers(device).count(third.node_id));
+    const auto bob = join();
+    EXPECT_FALSE(peers(bob).count(device.node_id));
+    EXPECT_FALSE(peers(device).count(bob.node_id));
 }

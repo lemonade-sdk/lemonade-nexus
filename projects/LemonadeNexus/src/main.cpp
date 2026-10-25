@@ -689,6 +689,23 @@ int main(int argc, char* argv[]) {
                                            config.rp_id, jwt_secret_hex};
     auth_service.start();
 
+    // Link tokens (invites) replicate between Tier 1 servers over the
+    // backbone, so any Tier 1 server redeems them. Events are signed with the
+    // gossip identity under their own domain and name a token only by its
+    // hash; no server stores or sends the token. Without tree operations a
+    // redemption waits for a concurrent redemption on another server to
+    // arrive before it is used; with them, consensus orders the redemption.
+    auth_service.set_link_token_replication(
+        [&gossip](nexus::auth::LinkTokenEvent& e) { return gossip.sign_link_token_event(e); },
+        [&gossip](const nexus::auth::LinkTokenEvent& e) {
+            return gossip.broadcast_link_token_event(e);
+        },
+        config.tree_ops_enabled ? std::chrono::milliseconds{0}
+                                : nexus::auth::TokenLinkAuthProvider::kDefaultSettleWindow);
+    gossip.set_link_token_sink([&auth_service](const nexus::auth::LinkTokenEvent& e) {
+        return auth_service.apply_replicated_link_token(e);
+    });
+
     auto acl_db_path = std::filesystem::path{config.data_root} / "acl.db";
     nexus::acl::AclStore acl_store{acl_db_path};
     nexus::acl::ACLService acl_service{acl_store, crypto};
@@ -1201,7 +1218,13 @@ int main(int argc, char* argv[]) {
                 // Tree-range tunnel records are a copy of tree data.
                 if (sync_ipam) (void)ipam.sync_tree_tunnel_addresses({});
             },
-        .purge = [&] { (void)storage.purge_tree_files(); },
+        .purge =
+            [&] {
+                (void)storage.purge_tree_files();
+                // Invites are tree state: a server outside Tier 1 keeps none.
+                auth_service.purge_link_tokens();
+                gossip.purge_link_tokens();
+            },
     }};
     const auto update_tree_role = [&tree_role, mesh, self_node, vault = storage_vault.get()] {
         const auto snapshot = mesh->membership();

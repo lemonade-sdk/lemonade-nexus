@@ -193,7 +193,11 @@ With ops mode on:
   `MoveNode` are new operation kinds, and a member leaving its own entry is a
   new `SetAssignment` allowance: a Tier 1 server without them refuses such
   blocks, so upgrade every Tier 1 server before ops-mode clients use invites
-  into other groups or moves. The application root is an
+  into other groups or moves. In the same way, a `Join` with a link token and
+  an `AcceptInvite` now carry a link extension (the invite's signed grant,
+  which makes the redemption single use on every replica) that an earlier
+  release cannot decode: upgrade every Tier 1 server before ops-mode clients
+  redeem invites. The application root is an
   `EstablishRoot` operation that names the configured `root_pubkey`.
   `POST /api/ipam/allocate` writes no tree node. It refuses a `tunnel` block
   with `409`, because the join operation assigns tunnel addresses; `private`

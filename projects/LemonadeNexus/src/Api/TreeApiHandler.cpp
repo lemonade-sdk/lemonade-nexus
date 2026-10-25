@@ -242,6 +242,15 @@ bool link_owner_may_place(const tree::PermissionTreeService& tree,
                                              link.owner_pubkey, acl::Permission::AddChild);
 }
 
+/// The signed grant a tree operation carries for `link`, so that every
+/// replica checks the invite and refuses a second redemption of it. nullopt
+/// for a token that has no signed grant (minted without replication, or by
+/// an earlier release); such an op keeps the earlier rules.
+std::optional<auth::LinkTokenEvent> signed_grant(const auth::LinkTokenRecord& link) {
+    if (!link.grant || link.grant->signature.empty()) return std::nullopt;
+    return link.grant;
+}
+
 /// HTTP status for a refused tree operation in the membership and move routes.
 int status_for_refusal(tree::TreeOpRefusal refusal) {
     using R = tree::TreeOpRefusal;
@@ -304,6 +313,8 @@ MembershipOutcome accept_membership(ApiContext& ctx, const std::string& invitee,
     op.body.source = tree::TreeOpSource::Session;
     op.body.inviter = link.owner_pubkey;
     op.body.invite_permissions = link.permissions;
+    op.body.link_extension = true;
+    op.body.invite_grant = signed_grant(link);
     auto s = submit_rebased(*ctx.tree_ops, [&] {
         const auto current = ctx.tree.get_node(op.target);
         op.base_version = current ? current->version : 0;
@@ -389,6 +400,8 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
     if (!existing && link) {
         js.link_group_id = link->group_node_id;
         js.link_owner_pubkey = link->owner_pubkey;
+        op.body.link_extension = true;
+        op.body.invite_grant = signed_grant(*link);
     }
 
     auto answer_refusal = [&](const tree::TreeOpVerdict& v) {
@@ -857,22 +870,27 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 if (link) {
                     link_claim->keep();
                     // Pairwise grants so devices in the group can list and dial
-                    // each other (peer reads and connects check the sibling node)
+                    // each other (peer reads and connects check the sibling
+                    // node). A sibling's key can already hold an entry on the
+                    // new device (the group owner's always does), so the grant
+                    // completes that entry instead of skipping it; the same
+                    // rule as the Join operation.
+                    const auto grant_peer = [this](const std::string& id,
+                                                   const std::string& principal) {
+                        auto node = ctx_.tree.get_node(id);
+                        if (node && tree::rules::grant_link_peer_access(*node, principal)) {
+                            (void)ctx_.tree.update_node_direct(id, *node);
+                        }
+                    };
                     for (const auto& sibling : ctx_.tree.get_children(customer_id)) {
                         if (sibling.type != tree::NodeType::Endpoint ||
                             sibling.id == node_id) {
                             continue;
                         }
                         if (!sibling.mgmt_pubkey.empty()) {
-                            ctx_.tree.grant_assignment(node_id, {
-                                .management_pubkey = sibling.mgmt_pubkey,
-                                .permissions       = {"read", "connect_private"},
-                            });
+                            grant_peer(node_id, sibling.mgmt_pubkey);
                         }
-                        ctx_.tree.grant_assignment(sibling.id, {
-                            .management_pubkey = norm_pubkey,
-                            .permissions       = {"read", "connect_private"},
-                        });
+                        grant_peer(sibling.id, norm_pubkey);
                     }
                     // Let the device read its group node
                     ctx_.tree.grant_assignment(customer_id, {

@@ -109,6 +109,17 @@ struct AssignmentRuling {
 void replace_assignment(std::vector<Assignment>& assignments, std::string_view principal,
                         const std::vector<std::string>& permissions);
 
+/// True when `principal` lacks `read` or `connect_private` on `node`
+/// (signer_has_permission, so `admin` covers both).
+[[nodiscard]] bool link_peer_access_missing(const TreeNode& node, std::string_view principal);
+
+/// The pairwise grant between devices of one group after a linked join: make
+/// `principal` hold `read` and `connect_private` on `node`. The missing names
+/// are appended to the first entry whose key matches by bytes, or a new entry
+/// {read, connect_private} is appended. Never removes or reduces a
+/// permission. Returns true when `node` changed. Deterministic.
+bool grant_link_peer_access(TreeNode& node, std::string_view principal);
+
 /// True when `signer` holds `perm` through its entry on `node_id`, or holds
 /// `admin` on the node or an ancestor (admin_anchor). This is the authority
 /// an inviter or a mover needs on a node.

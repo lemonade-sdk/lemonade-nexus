@@ -237,6 +237,16 @@ TEST_F(StorageVaultTest, CoverageCoversAcmeKeysNotPublicCerts) {
     EXPECT_FALSE(vault->covers(data / "certs" / "server-abc.eu-west.seip.lemonade-nexus.io" / "meta.json"));
 }
 
+// Link token (invite) state is encrypted at rest: the provider's ledger and
+// the gossip replica file. A plaintext token file from an earlier release is
+// not covered, so the provider still reads it during the upgrade window.
+TEST_F(StorageVaultTest, CoverageCoversLinkTokenState) {
+    build();
+    EXPECT_TRUE(vault->covers(data / "link_tokens" / "ledger.json"));
+    EXPECT_TRUE(vault->covers(data / "link_replica" / "replica.json"));
+    EXPECT_FALSE(vault->covers(data / "link_tokens" / (std::string(64, 'a') + ".json")));
+}
+
 // A symlink anywhere in a covered directory makes the scan incomplete, and an
 // incomplete scan must not be treated as a complete empty one. A symlinked
 // privkey.pem must not be staged, promoted, or reported as migrated: the

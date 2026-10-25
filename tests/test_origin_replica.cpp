@@ -198,6 +198,23 @@ TEST(OriginReplica, TombstonesExpireByAgeOnly) {
     EXPECT_EQ(r.version(), unchanged);
 }
 
+// A stream whose entries carry their expiry as the timestamp (link tokens)
+// drops live entries and tombstones alike once they expire.
+TEST(OriginReplica, PruneExpiredDropsEveryEntryPastTheCutoff) {
+    OriginReplica r("me");
+    (void)r.offer(entry("lt:a:m", "o1", 1, 100));
+    (void)r.offer(entry("lt:a:s", "o2", 2, 100, /*tombstone=*/true));
+    (void)r.offer(entry("lt:b:m", "o1", 3, 500));
+    const auto before = r.version();
+    EXPECT_EQ(r.prune_expired(200), 2u);
+    EXPECT_NE(r.version(), before);
+    EXPECT_EQ(r.size(), 1u);
+    EXPECT_TRUE(r.holds_newer("lt:b:m", 0, 0));
+    const auto unchanged = r.version();
+    EXPECT_EQ(r.prune_expired(200), 0u);
+    EXPECT_EQ(r.version(), unchanged);
+}
+
 TEST(OriginReplica, SnapshotRestoresAnEqualReplica) {
     OriginReplica a("a");
     (void)a.offer(entry("A:x", "o1", 10, 100));

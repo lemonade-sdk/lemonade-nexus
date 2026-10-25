@@ -281,6 +281,27 @@ void replace_assignment(std::vector<Assignment>& list, std::string_view principa
     }
 }
 
+bool link_peer_access_missing(const TreeNode& node, std::string_view principal) {
+    return !signer_has_permission(node, principal, acl::Permission::Read) ||
+           !signer_has_permission(node, principal, acl::Permission::ConnectPrivate);
+}
+
+bool grant_link_peer_access(TreeNode& node, std::string_view principal) {
+    if (!link_peer_access_missing(node, principal)) return false;
+    const auto canon = canonical_principal(principal);
+    for (auto& a : node.assignments) {
+        if (canonical_principal(a.management_pubkey) != canon) continue;
+        for (const char* p : {"read", "connect_private"}) {
+            if (std::find(a.permissions.begin(), a.permissions.end(), p) == a.permissions.end()) {
+                a.permissions.emplace_back(p);
+            }
+        }
+        return true;
+    }
+    node.assignments.push_back({std::string(principal), {"read", "connect_private"}});
+    return true;
+}
+
 bool holds_or_administers(const NodeMap& nodes, std::string_view node_id,
                           std::string_view signer, acl::Permission perm) {
     auto it = nodes.find(std::string(node_id));

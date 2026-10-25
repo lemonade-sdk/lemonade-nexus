@@ -62,6 +62,11 @@ constexpr auto kTombstoneRetention       = std::chrono::hours(24 * 30);
 constexpr std::size_t kSyncMaxEntriesPerRequest = 256;
 constexpr std::string_view kDnsSyncStream = "dns";
 constexpr std::string_view kAccountSyncStream = "account";
+// Link token events: Tier 1 to Tier 1 only, never to or from Tier 2.
+constexpr std::string_view kLinkSyncStream = "link";
+// Replica entries per token: its mint plus the spends and refunds of each
+// generation.
+constexpr std::size_t kLinkReplicaMaxEntries = auth::kLinkTokenMaxTokens * 4;
 // Committed tree log blocks, keyed by height under one shared origin:
 // consensus fixes their order, the stream only carries it (design A7).
 constexpr std::string_view kTreeSyncStream = "tree";
@@ -292,6 +297,8 @@ void GossipService::on_start() {
     dns_replica_ = std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
     account_replica_ =
         std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key));
+    link_replica_ = std::make_unique<sync::OriginReplica>(crypto::to_base64(keypair_.public_key),
+                                                          kLinkReplicaMaxEntries);
 
     // Load known peers
     load_peers();
@@ -300,6 +307,7 @@ void GossipService::on_start() {
     // follows load_peers. Runs here or in set_dns, whichever comes last.
     load_dns_replica();
     load_account_replica();
+    load_link_replica();
 
     // Load persisted NS slot state (restarting nodes must remember the slots
     // the mesh assigned them; the sync gate stays closed until live mesh
@@ -383,6 +391,7 @@ void GossipService::on_stop() {
     gossip_timer_.cancel();
     save_dns_replica();
     save_account_replica();
+    save_link_replica();
 
     asio::error_code ec;
     socket_.close(ec);
@@ -1176,7 +1185,8 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
         header.msg_type == GossipMsgType::SyncDigest ||
         header.msg_type == GossipMsgType::SyncRequest ||
         header.msg_type == GossipMsgType::AccountEnvelopeSync ||
-        header.msg_type == GossipMsgType::TreeLogSync;
+        header.msg_type == GossipMsgType::TreeLogSync ||
+        header.msg_type == GossipMsgType::LinkTokenSync;
     if (via == Via::Public && backbone_only) {
         if (denial_log_allowed("public-backbone-only:" + sender_pubkey_b64,
                                std::chrono::steady_clock::now())) {
@@ -1247,6 +1257,9 @@ void GossipService::process_datagram(const uint8_t* data, std::size_t bytes_rece
             break;
         case GossipMsgType::TreeLogSync:
             handle_tree_log_sync(from, sender_pubkey_b64, payload, payload_len, via);
+            break;
+        case GossipMsgType::LinkTokenSync:
+            handle_link_token_sync(from, sender_pubkey_b64, payload, payload_len, via);
             break;
         default:
             spdlog::warn("[{}] unknown message type 0x{:02X} from {}:{}",
@@ -1908,11 +1921,16 @@ void GossipService::on_gossip_tick() {
                     spdlog::info("[{}] expired {} DNS removal marker(s)", name(), n);
                 }
             }
+            // Link token entries carry the token's expiry as their timestamp.
+            if (link_replica_ && now_s > auth::kLinkTokenRetentionSec) {
+                (void)link_replica_->prune_expired(now_s - auth::kLinkTokenRetentionSec);
+            }
         }
         if (now - last_dns_replica_save_ >= kDnsReplicaSaveInterval) {
             last_dns_replica_save_ = now;
             save_dns_replica();
             save_account_replica();
+            save_link_replica();
         }
     }
 
@@ -3655,28 +3673,40 @@ sync::OriginReplica* GossipService::replica_for_stream(std::string_view stream) 
     if (stream == kDnsSyncStream) return dns_replica_.get();
     if (stream == kAccountSyncStream) return account_replica_.get();
     if (stream == kTreeSyncStream) return tree_replica_.get();
+    if (stream == kLinkSyncStream) return link_replica_.get();
     return nullptr;
 }
 
 GossipMsgType GossipService::entry_type_for_stream(std::string_view stream) const {
-    return stream == kAccountSyncStream ? GossipMsgType::AccountEnvelopeSync
-                                        : GossipMsgType::DnsRecordSync;
+    if (stream == kAccountSyncStream) return GossipMsgType::AccountEnvelopeSync;
+    if (stream == kLinkSyncStream) return GossipMsgType::LinkTokenSync;
+    return GossipMsgType::DnsRecordSync;
 }
 
 void GossipService::send_sync_digests() {
     if (!backbone_bound_.load()) return;
     // Tier 1 offers its state to every server; Tier 2 reports its state to
     // Tier 1 only, for status (Tier 1 never pulls from Tier 2).
-    const auto targets = backbone_targets(!self_is_tier1());
+    const bool self_tier1 = self_is_tier1();
+    const auto targets = backbone_targets(!self_tier1);
     if (targets.empty()) return;
+    // Link tokens move between Tier 1 servers only.
+    std::vector<GossipPeer> tier1_targets;
+    for (const auto& p : targets) {
+        if (is_tier1(p.pubkey)) tier1_targets.push_back(p);
+    }
 
     // Each page must fit one gossip packet in one virtual UDP datagram.
     const std::size_t budget = network::VirtualNetService::max_udp_payload() -
                                kGossipHeaderSize - kGossipSignatureSize;
     const uint64_t round = ++sync_digest_round_;
-    for (const auto stream : {kDnsSyncStream, kAccountSyncStream, kTreeSyncStream}) {
+    for (const auto stream :
+         {kDnsSyncStream, kAccountSyncStream, kTreeSyncStream, kLinkSyncStream}) {
         const auto* replica = replica_for_stream(stream);
         if (!replica) continue;
+        const bool link = stream == kLinkSyncStream;
+        if (link && !self_tier1) continue;
+        const auto& stream_targets = link ? tier1_targets : targets;
         const auto pages = sync::encode_digest_pages(stream, replica->digest(), round, budget);
         if (pages.empty()) {
             spdlog::warn("[{}] {} digest does not fit {} pages; not sent", name(), stream,
@@ -3686,7 +3716,7 @@ void GossipService::send_sync_digests() {
         for (const auto& page : pages) {
             const auto packed = json::to_msgpack(page);
             const std::vector<uint8_t> payload(packed.begin(), packed.end());
-            for (const auto& p : targets) {
+            for (const auto& p : stream_targets) {
                 (void)send_backbone_packet(p, GossipMsgType::SyncDigest, payload);
             }
         }
@@ -3710,6 +3740,8 @@ void GossipService::handle_sync_digest(const asio::ip::udp::endpoint& sender,
         }
         auto* replica = replica_for_stream(page->stream);
         if (!replica) return;
+        // Link tokens move between Tier 1 servers only.
+        if (page->stream == kLinkSyncStream && (!sender_tier1 || !self_is_tier1())) return;
 
         if (replica->record_peer_digest_page(sender_pubkey, *page, unix_ms())) {
             const auto status = replica->peer_status()[sender_pubkey];
@@ -3758,6 +3790,11 @@ void GossipService::handle_sync_request(const asio::ip::udp::endpoint& sender,
         const auto& stream = decoded->first;
         const auto* replica = replica_for_stream(stream);
         if (!replica) return;
+        if (stream == kLinkSyncStream && !is_tier1(sender_pubkey)) {
+            deny_sync(sender, sender_pubkey, "SyncRequest",
+                      "link tokens are served to Tier 1 only");
+            return;
+        }
 
         const auto now = std::chrono::steady_clock::now();
         const auto rate_key = stream + "|" + sender_pubkey;
@@ -4018,6 +4055,185 @@ void GossipService::load_account_replica() {
     account_replica_saved_version_ = account_replica_->version();
     spdlog::info("[{}] restored {} account envelope(s) from disk ({} refused)", name(),
                  restored, refused);
+}
+
+// ---------------------------------------------------------------------------
+// Link token replication (backbone only, Tier 1 to Tier 1)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string link_token_canonical(const auth::LinkTokenEvent& e) {
+    const auto bytes = auth::link_token_event_signing_bytes(e);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+}  // namespace
+
+void GossipService::set_link_token_sink(std::function<bool(const auth::LinkTokenEvent&)> sink) {
+    link_token_sink_ = std::move(sink);
+    load_link_replica();
+}
+
+bool GossipService::sign_link_token_event(auth::LinkTokenEvent& event) {
+    if (!link_replica_ || expected_network_id_.empty()) return false;
+    event.network_id    = expected_network_id_;
+    event.origin_pubkey = crypto::to_base64(keypair_.public_key);
+    event.origin_seq    = link_replica_->next_local_seq(unix_ms());
+    const auto canonical = link_token_canonical(event);
+    event.signature = crypto::to_base64(crypto_.ed25519_sign(
+        keypair_.private_key,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(canonical.data()),
+                                 canonical.size())));
+    return true;
+}
+
+std::size_t GossipService::broadcast_link_token_event(const auth::LinkTokenEvent& event) {
+    if (!link_replica_ || event.signature.empty()) return 0;
+    // Only Tier 1 holds link tokens; a server outside Tier 1 cannot mint or
+    // redeem one (the tree routes are refused there), and keeps nothing.
+    if (!self_is_tier1()) {
+        spdlog::debug("[{}] not Tier 1; link token event stays local", name());
+        return 0;
+    }
+    const auto packed = json::to_msgpack(auth::link_token_event_to_wire(event));
+    std::vector<uint8_t> payload(packed.begin(), packed.end());
+    // The entry timestamp is the token's expiry, so prune_expired drops the
+    // token's entries together.
+    (void)link_replica_->offer({auth::link_token_event_key(event), event.origin_pubkey,
+                                event.origin_seq, event.expires_at, false, payload});
+
+    auto targets = backbone_targets(true);
+    const std::size_t count = targets.size();
+    // Called from HTTP threads; the socket and peer sends belong to the io
+    // thread. Peers that miss this catch up from the next digest.
+    asio::post(socket_.get_executor(), [this, alive = backbone_alive_,
+                                        targets = std::move(targets),
+                                        payload = std::move(payload)] {
+        if (!alive->load()) return;
+        for (const auto& p : targets) {
+            (void)send_backbone_packet(p, GossipMsgType::LinkTokenSync, payload);
+        }
+    });
+    return count;
+}
+
+void GossipService::handle_link_token_sync(const asio::ip::udp::endpoint& sender,
+                                           const std::string& sender_pubkey,
+                                           const uint8_t* payload, std::size_t payload_len,
+                                           Via via) {
+    if (!link_replica_ || !link_token_sink_) return;
+    if (!backbone_sender_verified(sender, sender_pubkey, via, "LinkTokenSync")) return;
+    if (!is_tier1(sender_pubkey)) {
+        deny_sync(sender, sender_pubkey, "LinkTokenSync", "sender is not a current Tier 1 member");
+        return;
+    }
+    if (!self_is_tier1()) {
+        deny_sync(sender, sender_pubkey, "LinkTokenSync",
+                  "this server is not Tier 1 and holds no link tokens");
+        return;
+    }
+    try {
+        const auto event = auth::link_token_event_from_wire(
+            json::from_msgpack(payload, payload + payload_len));
+        if (!event) {
+            spdlog::warn("[{}] malformed LinkTokenSync from {}", name(),
+                         sender.address().to_string());
+            return;
+        }
+        if (const auto error = link_token_origin_error(*event)) {
+            deny_sync(sender, sender_pubkey, "LinkTokenSync", *error);
+            return;
+        }
+        (void)apply_link_token_event(*event);
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] failed to process LinkTokenSync from {}: {}", name(),
+                     sender.address().to_string(), e.what());
+    }
+}
+
+std::optional<std::string> GossipService::link_token_origin_error(
+    const auth::LinkTokenEvent& event) const {
+    if (const auto shape = auth::link_token_event_shape_error(event)) return *shape;
+    if (expected_network_id_.empty() || event.network_id != expected_network_id_) {
+        return "event belongs to another network";
+    }
+    // The origin must still be a certified server. It was Tier 1 when its
+    // event first reached a Tier 1 server; the event outlives later
+    // membership changes only until the token's retention ends.
+    const auto canonical = link_token_canonical(event);
+    const bool self_authored = event.origin_pubkey == crypto::to_base64(keypair_.public_key);
+    const bool verified =
+        self_authored
+            ? own_certificate_valid() &&
+                  author_signature_valid(canonical, event.origin_pubkey, event.signature)
+            : delta_origin_verified(canonical, event.origin_pubkey, event.signature);
+    if (!verified) return "origin signature invalid or origin not a certified server";
+    return std::nullopt;
+}
+
+bool GossipService::apply_link_token_event(const auth::LinkTokenEvent& event) {
+    if (!link_token_sink_(event)) return false;
+    const auto packed = json::to_msgpack(auth::link_token_event_to_wire(event));
+    (void)link_replica_->offer({auth::link_token_event_key(event), event.origin_pubkey,
+                                event.origin_seq, event.expires_at, false,
+                                std::vector<uint8_t>(packed.begin(), packed.end())});
+    return true;
+}
+
+void GossipService::save_link_replica() {
+    if (!link_replica_) return;
+    const auto version = link_replica_->version();
+    if (version == link_replica_saved_version_) return;
+    if (save_replica_file(*link_replica_, "link_replica", "link_token_replica")) {
+        link_replica_saved_version_ = version;
+    } else {
+        spdlog::warn("[{}] failed to save the link token replica", name());
+    }
+}
+
+void GossipService::load_link_replica() {
+    if (!link_replica_ || !link_token_sink_ || link_replica_loaded_) return;
+    link_replica_loaded_ = true;
+    const auto envelope = storage_.read_file("link_replica", "replica.json");
+    if (!envelope) return;
+
+    // Each event is re-verified exactly as on receipt, so the file's own
+    // signature is not what grants authority. Expired tokens are dropped.
+    std::size_t restored = 0, refused = 0;
+    try {
+        const auto j = json::parse(envelope->data);
+        for (const auto& item : j.value("entries", json::array())) {
+            if (!item.is_string()) { ++refused; continue; }
+            const auto event = auth::link_token_event_from_wire(
+                json::from_msgpack(crypto::from_base64(item.get<std::string>())));
+            if (!event || link_token_origin_error(*event)) {
+                ++refused;
+                continue;
+            }
+            if (apply_link_token_event(*event)) {
+                ++restored;
+            } else {
+                ++refused;
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[{}] link token replica file unreadable: {}", name(), e.what());
+        return;
+    }
+    link_replica_saved_version_ = link_replica_->version();
+    spdlog::info("[{}] restored {} link token event(s) from disk ({} refused or expired)",
+                 name(), restored, refused);
+}
+
+void GossipService::purge_link_tokens() {
+    if (!link_replica_) return;
+    link_replica_->clear();
+    (void)storage_.delete_file("link_replica", "replica.json");
+}
+
+nlohmann::json GossipService::link_sync_status() const {
+    return sync_status(link_replica_.get());
 }
 
 nlohmann::json GossipService::dns_sync_status() const {

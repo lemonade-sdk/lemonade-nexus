@@ -74,6 +74,26 @@ the old binary as an invalid baseline.
   paged request as trailing bytes. A replica that is far behind then cannot
   page from that peer; it asks the next leader whose proposal it cannot link.
   Nothing else depends on paging.
+- **Link token replication.** Gossip type `LinkTokenSync` (0x1B) and the
+  catch-up stream `link` are new. A release from before them drops a
+  `LinkTokenSync` datagram on the backbone as an unknown type, and ignores a
+  `link` digest page or catch-up request as an unknown stream, so it neither
+  stores nor answers link token events. Nothing an earlier release sends
+  changes. During a rollout a token minted on an earlier release is redeemed
+  only on that server (as before), and a token minted on N+1 is redeemed on
+  any N+1 Tier 1 server. N+1 still reads the plaintext per-token files
+  (`link_tokens/<sha256>.json`) an earlier release wrote. The new files
+  (`link_tokens/ledger.json`, `link_replica/replica.json`) are storage-vault
+  files; an earlier release does not read them.
+- **Tree op link extension.** With tree operations on, a `Join` with a link
+  token and an `AcceptInvite` from N+1 append a link extension to the
+  canonical op encoding. An op without it encodes exactly as before, and N+1
+  applies such an op with the earlier rules, so ops from N stay valid and give
+  the same tree on N and N+1. A release from before the extension refuses an
+  op that carries it (trailing bytes), so it cannot vote for a block with
+  one. With tree operations on, upgrade every Tier 1 server before clients
+  redeem invites. Tree operations are off by default; the direct-write mode
+  needs no such step.
 
 ## A new block payload kind
 
