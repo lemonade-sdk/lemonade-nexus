@@ -13,6 +13,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -40,9 +42,19 @@ std::vector<MeshPortMember> group_members() {
 }
 
 uint16_t free_port() {
-    httplib::Server probe;
-    const int port = probe.bind_to_any_port("127.0.0.1");
-    return static_cast<uint16_t>(port);
+    const auto sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    socklen_t length = sizeof(address);
+    uint16_t port = 0;
+    if (::bind(sock, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+        ::getsockname(sock, reinterpret_cast<sockaddr*>(&address), &length) == 0) {
+        port = ntohs(address.sin_port);
+    }
+    httplib::detail::close_socket(sock);
+    return port;
 }
 
 /// A running httplib server on a loopback port, stopped on destruction.
@@ -183,7 +195,7 @@ protected:
             return ip == "10.64.0.3" && vport == lnsdk::kMeshPortPeerServicePort ? peer_port : 0;
         };
         b.close_egress = [this](const std::string&, uint16_t) { ++closed_egress; };
-        b.request_certificate = std::move(cert);
+        b.ensure_certificate = std::move(cert);
         return b;
     }
 
@@ -197,7 +209,8 @@ protected:
         port->refresh_now();
     }
 
-    httplib::Result chat(httplib::Client& client, const std::string& model, bool stream = false,
+    template <typename HttpClient>
+    httplib::Result chat(HttpClient& client, const std::string& model, bool stream = false,
                          const httplib::Headers& headers = {}) {
         return client.Post("/api/v1/chat/completions", headers, json{{"model", model}, {"stream", stream}}.dump(),
                            "application/json");
@@ -496,30 +509,56 @@ TEST_F(MeshPortTest, RejectsCertificatesItCannotServe) {
     EXPECT_EQ(port->status()["scheme"], "http");
 }
 
-TEST_F(MeshPortTest, RequestsTheCertificateThroughTheBackend) {
+TEST_F(MeshPortTest, ProvisionsTheCertificateOncePerStart) {
     std::atomic<int> requests{0};
-    std::mutex hostname_mutex;
-    std::string hostname;
+    std::mutex dir_mutex;
+    std::string seen_dir;
     MeshPort::Options options;
     options.refresh_interval = std::chrono::hours(1);
-    port = std::make_unique<MeshPort>(backend([&](const std::string& name) -> std::optional<lnsdk::MeshPortCertificate> {
+    port = std::make_unique<MeshPort>(backend([&](const std::string& dir) -> std::optional<lnsdk::MeshPortCertificate> {
         ++requests;
-        std::lock_guard lock(hostname_mutex);
-        hostname = name;
+        std::lock_guard lock(dir_mutex);
+        seen_dir = dir;
         return wildcard(21);
     }), options);
     number = free_port();
     ASSERT_EQ(port->start(number, ""), MeshPortStartResult::Ok);
     port->refresh_now();
-    EXPECT_GE(requests.load(), 1);
+    EXPECT_EQ(requests.load(), 0) << "no certificate directory, no request";
+    EXPECT_EQ(port->status()["tls"]["error"], "No certificate directory is set");
+    port->set_certificate_dir("/certs/group");
+    port->refresh_now();
+    EXPECT_EQ(requests.load(), 1);
     {
-        std::lock_guard lock(hostname_mutex);
-        EXPECT_EQ(hostname, "My Laptop");
+        std::lock_guard lock(dir_mutex);
+        EXPECT_EQ(seen_dir, "/certs/group");
     }
     EXPECT_EQ(port->status()["tls"]["state"], "active");
-    const int before = requests.load();
     port->refresh_now();
-    EXPECT_EQ(requests.load(), before) << "a valid certificate is not requested again";
+    EXPECT_EQ(requests.load(), 1) << "the SDK renewer, not the port, schedules later requests";
+}
+
+TEST_F(MeshPortTest, RenewalEventReloadsTheCertificate) {
+    start();
+    const auto dir = std::filesystem::temp_directory_path() / ("mesh-port-test-" + std::to_string(number));
+    std::filesystem::create_directories(dir);
+    const auto write = [&](const lnsdk::MeshPortCertificate& cert) {
+        std::ofstream(dir / "fullchain.pem", std::ios::binary) << cert.fullchain_pem;
+        std::ofstream(dir / "privkey.pem", std::ios::binary) << cert.privkey_pem;
+    };
+    const auto fullchain = (dir / "fullchain.pem").string();
+    const auto key = (dir / "privkey.pem").string();
+    port->set_certificate_dir(dir.string());
+    write(wildcard(31));
+    port->certificate_renewed("laptop", "*.team.lo.example", fullchain, key);
+    EXPECT_EQ(port->status()["scheme"], "http") << "events for another target are ignored";
+    port->certificate_renewed("*", "*.team.lo.example", "/elsewhere/fullchain.pem", "/elsewhere/privkey.pem");
+    EXPECT_EQ(port->status()["scheme"], "http") << "events for another directory are ignored";
+    port->certificate_renewed("*", "*.team.lo.example", fullchain, key);
+    EXPECT_EQ(port->status()["scheme"], "https");
+    EXPECT_EQ(port->status()["tls"]["state"], "active");
+    EXPECT_GT(port->status()["tls"]["expires_at"].get<uint64_t>(), 0u);
+    std::filesystem::remove_all(dir);
 }
 
 TEST_F(MeshPortTest, SingleOwner) {
@@ -581,6 +620,7 @@ json status_of(ln_client_t* client) {
 TEST(MeshPortCApi, ArgumentsAndLifecycle) {
     EXPECT_EQ(ln_mesh_port_start(nullptr, 0, nullptr), LN_ERR_NULL_ARG);
     EXPECT_EQ(ln_mesh_port_stop(nullptr), LN_ERR_NULL_ARG);
+    EXPECT_EQ(ln_mesh_port_set_cert_dir(nullptr, "/tmp"), LN_ERR_NULL_ARG);
     EXPECT_EQ(ln_mesh_port_set_selection(nullptr, "auto", nullptr), LN_ERR_NULL_ARG);
     char* out = nullptr;
     EXPECT_EQ(ln_mesh_port_status(nullptr, &out), LN_ERR_NULL_ARG);

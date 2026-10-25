@@ -143,11 +143,20 @@ struct MeshPortBackend {
     std::function<uint16_t(const std::string& tunnel_ip, uint16_t port)> open_egress;
     /// Closes the loopback bridge to a mesh peer. May be empty.
     std::function<void(const std::string& tunnel_ip, uint16_t port)> close_egress;
-    /// Requests and decrypts the device certificate for `hostname`. Called only on the
-    /// refresh thread. Returns nullopt on failure. May be empty: the port then stays on
-    /// plain HTTP until install_certificate() is called.
-    std::function<std::optional<MeshPortCertificate>(const std::string& hostname)> request_certificate;
+    /// Makes the group loopback certificate in `cert_dir` current and reads it.
+    /// Production code calls LemonadeNexusClient::renew_certificate_if_needed() with
+    /// kGroupLoopbackCertTarget, which also registers the certificate for background
+    /// renewal; later renewals arrive through MeshPort::certificate_renewed(). Called
+    /// only on the refresh thread, once per start or directory change. Returns nullopt
+    /// on failure. May be empty: the port then stays on plain HTTP until a certificate
+    /// arrives through certificate_renewed() or install_certificate().
+    std::function<std::optional<MeshPortCertificate>(const std::string& cert_dir)> ensure_certificate;
 };
+
+/// Reads "fullchain.pem" and "privkey.pem" at the given paths. Returns nullopt when
+/// a file cannot be read or is larger than 1 MiB.
+[[nodiscard]] std::optional<MeshPortCertificate> read_certificate_files(
+    const std::string& domain, const std::string& fullchain_path, const std::string& privkey_path);
 
 /// Builds a backend over `client`. The client must outlive every MeshPort that uses
 /// the backend.
@@ -164,9 +173,10 @@ enum class MeshPortStartResult {
 
 /// Loopback listener that serves group devices by name.
 ///
-/// The listener binds 127.0.0.1 only. It serves plain HTTP until a group wildcard
-/// device certificate is available, then TLS. A renewed certificate is reloaded in
-/// place for new connections. A request to another device's
+/// The listener binds 127.0.0.1 only. It serves plain HTTP until the group loopback
+/// certificate ("*.<group-label>.lo.<base>") is available, then TLS. The SDK
+/// certificate renewer keeps that certificate current; certificate_renewed()
+/// reloads it in place for new connections. A request to another device's
 /// "<device>.<group>.lo.<base>" name is forwarded over mesh egress to that device's
 /// lemond on mesh port 13305. A request to this device's name or a loopback name is
 /// forwarded to the current selection: the local service, the auto router or one
@@ -180,7 +190,7 @@ enum class MeshPortStartResult {
 class MeshPort {
 public:
     struct Options {
-        /// Interval between member list refreshes and certificate checks.
+        /// Interval between member list refreshes.
         std::chrono::milliseconds refresh_interval{std::chrono::seconds(10)};
         /// How long cached model lists stay fresh for the auto router.
         std::chrono::milliseconds models_ttl{std::chrono::seconds(5)};
@@ -225,7 +235,20 @@ public:
     /// state for every other input. Requires a running port.
     bool install_certificate(const MeshPortCertificate& certificate);
 
-    /// Runs one member refresh and certificate check now, on the calling thread.
+    /// Sets the directory of the group loopback certificate ("" for none). The
+    /// refresh thread then provisions the certificate through
+    /// MeshPortBackend::ensure_certificate. Without a directory the port stays on
+    /// plain HTTP.
+    void set_certificate_dir(const std::string& cert_dir);
+
+    /// Reloads the certificate after a renewal of the group loopback target
+    /// (kGroupLoopbackCertTarget). Events for other targets, or for another
+    /// directory than the one set, are ignored. Safe to call from any thread.
+    void certificate_renewed(const std::string& target, const std::string& domain,
+                             const std::string& fullchain_path, const std::string& privkey_path);
+
+    /// Runs one member refresh, and the certificate provisioning when it is pending,
+    /// now on the calling thread.
     void refresh_now();
 
 private:
@@ -274,9 +297,9 @@ private:
     std::string tls_state_{"waiting"};
     std::string tls_domain_;
     std::string tls_error_;
-    uint64_t certificate_expires_at_{0};
-    std::chrono::steady_clock::time_point certificate_attempt_{};
-    bool certificate_attempted_{false};
+    uint64_t certificate_expires_at_{0};  // Not After of the installed certificate
+    std::string cert_dir_;
+    bool certificate_pending_{false};     // provision cert_dir_ on the next refresh
     std::string error_;
     // The selection target ("", "local", "auto" or a node ID) and its peer key. The
     // key lives only in memory and is cleared whenever the target is set.
@@ -288,6 +311,7 @@ private:
     std::mutex wake_mutex_;
     std::condition_variable wake_;
     bool stopping_{false};
+    bool refresh_requested_{false};
     std::thread refresh_thread_;
 
     struct CachedModels {

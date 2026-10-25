@@ -1,4 +1,5 @@
 #include <LemonadeNexusSDK/MeshPort.hpp>
+#include <LemonadeNexusSDK/CertRenewal.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
 #include <httplib.h>
@@ -12,6 +13,8 @@
 #include <algorithm>
 #include <cctype>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <random>
 
 #ifndef _WIN32
@@ -564,17 +567,38 @@ MeshPortBackend make_mesh_port_backend(LemonadeNexusClient& client) {
         }
         return members;
     };
-    backend.request_certificate = [&client](const std::string& hostname) -> std::optional<MeshPortCertificate> {
-        const auto issued = client.request_certificate(hostname);
-        if (!issued.ok) return std::nullopt;
-        auto decrypted = client.decrypt_certificate(issued.value);
-        if (!decrypted.ok) return std::nullopt;
-        MeshPortCertificate certificate{decrypted.value.domain, decrypted.value.fullchain_pem,
-                                        decrypted.value.privkey_pem, decrypted.value.expires_at};
-        sodium_memzero(decrypted.value.privkey_pem.data(), decrypted.value.privkey_pem.size());
-        return certificate;
+    backend.ensure_certificate = [&client](const std::string& cert_dir) -> std::optional<MeshPortCertificate> {
+        const auto result = client.renew_certificate_if_needed(std::string(kGroupLoopbackCertTarget), cert_dir);
+        if (result.status == CertRenewalStatus::Failed) {
+            spdlog::info("[MeshPort] group loopback certificate not available: {}", result.error);
+            return std::nullopt;
+        }
+        return read_certificate_files(result.domain, result.fullchain_path, result.privkey_path);
     };
     return backend;
+}
+
+std::optional<MeshPortCertificate> read_certificate_files(const std::string& domain,
+                                                          const std::string& fullchain_path,
+                                                          const std::string& privkey_path) {
+    constexpr std::uintmax_t kFileLimit = 1u * 1024u * 1024u;
+    const auto read = [&](const std::string& path) -> std::optional<std::string> {
+        std::error_code error;
+        const auto size = std::filesystem::file_size(path, error);
+        if (error || size > kFileLimit) return std::nullopt;
+        std::ifstream input(path, std::ios::binary);
+        if (!input) return std::nullopt;
+        std::string text(static_cast<size_t>(size), '\0');
+        if (!input.read(text.data(), static_cast<std::streamsize>(text.size()))) return std::nullopt;
+        return text;
+    };
+    auto fullchain = read(fullchain_path);
+    auto key = read(privkey_path);
+    if (!fullchain || !key) {
+        if (key) sodium_memzero(key->data(), key->size());
+        return std::nullopt;
+    }
+    return MeshPortCertificate{domain, std::move(*fullchain), std::move(*key), 0};
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +811,7 @@ MeshPortStartResult MeshPort::start(uint16_t port, const std::string& local_serv
         tls_domain_.clear();
         tls_error_.clear();
         certificate_expires_at_ = 0;
-        certificate_attempted_ = false;
+        certificate_pending_ = !cert_dir_.empty();
         error_.clear();
         selection_target_.clear();
         selection_key_.clear();
@@ -843,7 +867,9 @@ void MeshPort::refresh_loop() {
     while (true) {
         refresh_now();
         std::unique_lock lock(wake_mutex_);
-        if (wake_.wait_for(lock, options_.refresh_interval, [this] { return stopping_; })) return;
+        wake_.wait_for(lock, options_.refresh_interval, [this] { return stopping_ || refresh_requested_; });
+        if (stopping_) return;
+        refresh_requested_ = false;
     }
 }
 
@@ -890,28 +916,56 @@ void MeshPort::refresh_members() {
     }
 }
 
+// Runs once per start or directory change. The SDK certificate renewer owns the
+// schedule after that: a failed first attempt is retried in the background, and
+// each renewal reaches certificate_renewed().
 void MeshPort::check_certificate() {
-    if (!backend_.request_certificate) return;
-    std::string hostname;
+    std::string dir;
     {
         std::lock_guard lock(state_mutex_);
-        if (!running_) return;
-        const auto self = backend_.self_node_id ? backend_.self_node_id() : std::string();
-        if (const auto* member = find_member(members_, self)) hostname = member->device_name;
-        if (hostname.empty()) return;
-        const auto now = std::chrono::steady_clock::now();
-        const bool installed = certificate_expires_at_ != 0;
-        const bool due = !installed || epoch_seconds() > static_cast<int64_t>(certificate_expires_at_) - 7 * 24 * 3600;
-        const auto retry = (!installed && tls_state_ == "waiting") ? std::chrono::steady_clock::duration(std::chrono::minutes(10))
-                                                                   : std::chrono::steady_clock::duration(std::chrono::hours(1));
-        if (!due || (certificate_attempted_ && now - certificate_attempt_ < retry)) return;
-        certificate_attempted_ = true;
-        certificate_attempt_ = now;
+        if (!running_ || !certificate_pending_) return;
+        certificate_pending_ = false;
+        dir = cert_dir_;
     }
-    auto certificate = backend_.request_certificate(hostname);
+    if (dir.empty() || !backend_.ensure_certificate) return;
+    auto certificate = backend_.ensure_certificate(dir);
     if (!certificate) {
         std::lock_guard lock(state_mutex_);
-        tls_error_ = "The device certificate request failed";
+        tls_error_ = "The group loopback certificate is not available yet";
+        return;
+    }
+    install_certificate(*certificate);
+    sodium_memzero(certificate->privkey_pem.data(), certificate->privkey_pem.size());
+}
+
+void MeshPort::set_certificate_dir(const std::string& cert_dir) {
+    {
+        std::lock_guard lock(state_mutex_);
+        if (cert_dir == cert_dir_) return;
+        cert_dir_ = cert_dir;
+        certificate_pending_ = !cert_dir.empty();
+    }
+    {
+        std::lock_guard lock(wake_mutex_);
+        refresh_requested_ = true;
+    }
+    wake_.notify_all();
+}
+
+void MeshPort::certificate_renewed(const std::string& target, const std::string& domain,
+                                   const std::string& fullchain_path, const std::string& privkey_path) {
+    if (target != kGroupLoopbackCertTarget) return;
+    {
+        std::lock_guard lock(state_mutex_);
+        if (!running_ || cert_dir_.empty()) return;
+        std::error_code ignored;
+        const auto dir = std::filesystem::weakly_canonical(cert_dir_, ignored);
+        if (std::filesystem::weakly_canonical(std::filesystem::path(fullchain_path).parent_path(), ignored) != dir) return;
+    }
+    auto certificate = read_certificate_files(domain, fullchain_path, privkey_path);
+    if (!certificate) {
+        std::lock_guard lock(state_mutex_);
+        tls_error_ = "The renewed certificate files cannot be read";
         return;
     }
     install_certificate(*certificate);
@@ -967,7 +1021,7 @@ bool MeshPort::install_certificate(const MeshPortCertificate& certificate) {
     tls_state_ = "active";
     tls_domain_ = lower(certificate.domain);
     tls_error_.clear();
-    // Renewal follows the certificate's own expiry; a declared expiry can only shorten it.
+    // Report the certificate's own expiry; a declared expiry can only shorten it.
     auto expires = static_cast<uint64_t>(std::max<int64_t>(material->not_after, 1));
     if (certificate.expires_at != 0) expires = std::min(expires, certificate.expires_at);
     certificate_expires_at_ = expires;
@@ -1019,7 +1073,9 @@ nlohmann::json MeshPort::status() const {
         {"selection", {{"target", selection_target_.empty() ? json(nullptr) : json(selection_target_)},
                        {"peer_key_set", !selection_key_.empty()}}},
         {"tls", {{"state", running_ ? tls_state_ : std::string("off")}, {"domain", tls_domain_},
-                 {"expires_at", certificate_expires_at_}, {"error", tls_error_}}},
+                 {"expires_at", certificate_expires_at_},
+                 {"error", tls_error_.empty() && cert_dir_.empty() && running_
+                               ? std::string("No certificate directory is set") : tls_error_}}},
         {"urls", running_ ? mesh_port::device_urls(members_, self, local_domain_, port_, tls) : json::array()},
         {"devices", devices},
     };

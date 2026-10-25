@@ -562,11 +562,16 @@ int ln_mesh_is_active(ln_client_t* client);
 /** Start the mesh port: a listener on 127.0.0.1:port that serves group devices
  *  by name. It never binds another address.
  *
- *  The listener serves plain HTTP until the device certificate is available.
- *  It then serves TLS with the group wildcard certificate "*.<group>.lo.<base>"
- *  from ln_cert_request, and reloads a renewed certificate in place. The port
- *  does not use a certificate that is not a group wildcard. It then stays on
- *  plain HTTP, and ln_mesh_port_status reports the reason.
+ *  The listener serves plain HTTP until the group loopback certificate
+ *  "*.<group-label>.lo.<base>" is available, then TLS. The certificate lives in
+ *  the directory set with ln_mesh_port_set_cert_dir. On start, the port runs
+ *  the ln_cert_renew_if_needed flow for LN_CERT_GROUP_LOOPBACK in that
+ *  directory on a background thread. The SDK then renews the certificate in the
+ *  background while the mesh is enabled, and the port reloads each renewed
+ *  certificate in place for new connections. The port does not use a
+ *  certificate that is not a group wildcard under ".lo.", that does not cover
+ *  its own name, or whose key does not match. It then stays on plain HTTP, and
+ *  ln_mesh_port_status reports the reason.
  *
  *  Routing uses the TLS server name and the Host header. They must name the
  *  same host, otherwise the answer is 421.
@@ -605,6 +610,17 @@ int ln_mesh_is_active(ln_client_t* client);
  *  Thread-safe. ln_destroy stops the port. */
 ln_error_t ln_mesh_port_start(ln_client_t* client, uint16_t port,
                               const char* local_service_url);
+
+/** Set the directory of the mesh port's group loopback certificate, or NULL or
+ *  "" for none. The directory holds fullchain.pem and privkey.pem (mode 0600),
+ *  as written by ln_cert_renew_if_needed. Use a directory that only this user
+ *  can read. Without a directory the port serves plain HTTP only. The setting
+ *  stays across ln_mesh_port_stop and ln_mesh_port_start. When the port runs,
+ *  a new directory is provisioned at once on the port's background thread. The
+ *  string is copied. Returns LN_OK, or LN_ERR_NULL_ARG for a NULL client.
+ *  Thread-safe. The mesh port receives renewal events in addition to the
+ *  callback set with ln_set_cert_renewed_callback; that callback is unchanged. */
+ln_error_t ln_mesh_port_set_cert_dir(ln_client_t* client, const char* cert_dir);
 
 /** Stop the mesh port, abort its open requests, and clear the selection and its
  *  peer key. Blocks until the listener stops. Returns LN_OK, also when the port

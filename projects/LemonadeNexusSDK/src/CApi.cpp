@@ -38,7 +38,23 @@ struct ln_client_s {
     std::mutex mesh_port_mutex;
     // Declared after `client` so it is destroyed, and stopped, first.
     std::unique_ptr<lnsdk::MeshPort> mesh_port;
-    explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {}
+    // The application's renewal callback. The client has one renewal callback,
+    // so on_cert_renewed() delivers each event to the mesh port and to this.
+    std::mutex cert_callback_mutex;
+    ln_cert_renewed_fn cert_callback{nullptr};
+    void* cert_callback_user{nullptr};
+
+    explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {
+        client.set_cert_renewed_callback([this](const lnsdk::CertRenewedEvent& event) { on_cert_renewed(event); });
+    }
+    ~ln_client_s() {
+        // Waits for a running callback, so none runs during member destruction.
+        client.set_cert_renewed_callback({});
+    }
+    ln_client_s(const ln_client_s&) = delete;
+    ln_client_s& operator=(const ln_client_s&) = delete;
+
+    void on_cert_renewed(const lnsdk::CertRenewedEvent& event);
 };
 
 struct ln_identity_s {
@@ -562,28 +578,41 @@ ln_error_t ln_set_cert_renewed_callback(ln_client_t* client,
                                         void* user) {
     if (!client) return LN_ERR_NULL_ARG;
     try {
-        if (!fn) {
-            client->client.set_cert_renewed_callback({});
-            return LN_OK;
-        }
-        client->client.set_cert_renewed_callback(
-            [fn, user](const lnsdk::CertRenewedEvent& event) {
-                try {
-                    json j;
-                    j["target"]         = event.target;
-                    j["domain"]         = event.domain;
-                    j["fullchain_path"] = event.fullchain_path;
-                    j["privkey_path"]   = event.privkey_path;
-                    j["expires_at"]     = event.expires_at;
-                    const auto text = j.dump();
-                    fn(text.c_str(), user);
-                } catch (...) {
-                    spdlog::warn("[CApi] certificate renewed event not delivered");
-                }
-            });
+        // on_cert_renewed() calls the callback under this lock, so the old
+        // callback is not running when the lock is held here.
+        std::lock_guard lock(client->cert_callback_mutex);
+        client->cert_callback = fn;
+        client->cert_callback_user = fn ? user : nullptr;
         return LN_OK;
     } catch (...) {
         return LN_ERR_INTERNAL;
+    }
+}
+
+void ln_client_s::on_cert_renewed(const lnsdk::CertRenewedEvent& event) {
+    lnsdk::MeshPort* port = nullptr;
+    {
+        std::lock_guard lock(mesh_port_mutex);
+        port = mesh_port.get();
+    }
+    try {
+        if (port) port->certificate_renewed(event.target, event.domain, event.fullchain_path, event.privkey_path);
+    } catch (...) {
+        spdlog::warn("[CApi] mesh port did not reload the renewed certificate");
+    }
+    std::lock_guard lock(cert_callback_mutex);
+    if (!cert_callback) return;
+    try {
+        json j;
+        j["target"]         = event.target;
+        j["domain"]         = event.domain;
+        j["fullchain_path"] = event.fullchain_path;
+        j["privkey_path"]   = event.privkey_path;
+        j["expires_at"]     = event.expires_at;
+        const auto text = j.dump();
+        cert_callback(text.c_str(), cert_callback_user);
+    } catch (...) {
+        spdlog::warn("[CApi] certificate renewed event not delivered");
     }
 }
 
@@ -1330,6 +1359,16 @@ ln_error_t ln_mesh_port_start(ln_client_t* client, uint16_t port, const char* lo
             case lnsdk::MeshPortStartResult::BindFailed:      return LN_ERR_INTERNAL;
         }
         return LN_ERR_INTERNAL;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
+ln_error_t ln_mesh_port_set_cert_dir(ln_client_t* client, const char* cert_dir) {
+    if (!client) return LN_ERR_NULL_ARG;
+    try {
+        ln_mesh_port(client, true)->set_certificate_dir(cert_dir ? cert_dir : "");
+        return LN_OK;
     } catch (...) {
         return LN_ERR_INTERNAL;
     }
