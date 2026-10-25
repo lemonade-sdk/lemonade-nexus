@@ -18,7 +18,7 @@ on:
       asset:
         description: Server binary asset name pattern
         required: false
-        default: "lemonade-nexus-*-linux-x86_64"
+        default: "lemonade-nexus-linux-x86_64"
       hardware:
         description: Empty for the wire checks, "snp" on an SEV-SNP runner
         required: false
@@ -36,7 +36,7 @@ on:
       asset:
         type: string
         required: false
-        default: "lemonade-nexus-*-linux-x86_64"
+        default: "lemonade-nexus-linux-x86_64"
       hardware:
         type: string
         required: false
