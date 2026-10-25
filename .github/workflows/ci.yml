@@ -50,23 +50,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
 
-      - name: Cache vcpkg binaries (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v5
-        with:
-          path: vcpkg-binary-cache
-          key: vcpkg-openssl-${{ matrix.os }}-${{ github.run_id }}
-          restore-keys: |
-            vcpkg-openssl-${{ matrix.os }}-
-
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
+      # macOS and Windows link the pinned static OpenSSL archive that CMake
+      # downloads (cmake/libraries/openssl.cmake); they install no OpenSSL.
+      - name: Install Ninja (Windows)
+        if: runner.os == 'Windows' && !matrix.vs_generator
         shell: pwsh
-        run: |
-          if (-not "${{ matrix.vs_generator }}") { choco install ninja -y }
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\vcpkg-binary-cache" | Out-Null
-          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg-binary-cache"
-          vcpkg install openssl:x64-windows-static
+        run: choco install ninja -y
 
       # VS generator skips vcvars — MSBuild finds the toolchain itself,
       # matching how Lemonade's parent configure invokes the sub-build
@@ -85,50 +74,41 @@ jobs:
           Remove-Item -Recurse -Force "build" -ErrorAction SilentlyContinue
           New-Item -ItemType Junction -Path "build" -Target "D:\build"
 
-      # On macOS, build OpenSSL from source (static) instead of using Homebrew
-      # so the resulting binaries have no Homebrew dylib dependencies.
       - name: Configure CMake (Unix)
         if: runner.os != 'Windows'
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=ON \
-            -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+            -DBUILD_TESTING=ON
 
       - name: Configure CMake (Windows, Ninja)
         if: runner.os == 'Windows' && !matrix.vs_generator
         shell: pwsh
         run: |
-          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
           cmake -B build `
             -G Ninja `
             "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
-            -DBUILD_TESTING=ON `
-            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
-            -DOPENSSL_USE_STATIC_LIBS=ON
+            -DBUILD_TESTING=ON
 
       - name: Configure CMake (Windows, Visual Studio)
         if: matrix.vs_generator
         shell: pwsh
         run: |
-          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
           cmake --preset windows `
-            -DBUILD_TESTING=ON `
-            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
-            -DOPENSSL_USE_STATIC_LIBS=ON
+            -DBUILD_TESTING=ON
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      - name: Verify no Homebrew linkage (macOS)
+      - name: Verify no Homebrew or OpenSSL linkage (macOS)
         if: runner.os == 'macOS'
         run: |
           status=0
           while IFS= read -r bin; do
-            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/' || true)
+            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/|libssl|libcrypto' || true)
             if [ -n "$deps" ]; then
-              echo "::error::$bin links against Homebrew/local libraries:"
+              echo "::error::$bin links against Homebrew/local or OpenSSL shared libraries:"
               echo "$deps"
               status=1
             fi

@@ -14,8 +14,10 @@ if(NEXUS_VERSION_OVERRIDE)
     set(NEXUS_VERSION "${NEXUS_VERSION_OVERRIDE}")
 else()
     if(Git_FOUND)
+        # Only release tags (v*). Other tags, such as deps-openssl-<version>,
+        # are not Nexus versions.
         execute_process(
-            COMMAND ${GIT_EXECUTABLE} describe --tags --always --dirty
+            COMMAND ${GIT_EXECUTABLE} describe --tags --match "v[0-9]*" --always --dirty
             WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
             OUTPUT_VARIABLE NEXUS_VERSION
             OUTPUT_STRIP_TRAILING_WHITESPACE

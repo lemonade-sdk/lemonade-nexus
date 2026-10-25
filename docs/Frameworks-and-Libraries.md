@@ -21,13 +21,13 @@ Dependencies use a **mix** of sourcing mechanisms, not all FetchContent:
 
 - **FetchContent** — most C/C++ libraries (libsodium, asio, httplib,
   nlohmann/json, spdlog, jwt-cpp, magic_enum, xxHash, SQLite amalgamation).
-- **Source builds** — TPM2-TSS 4.1.3 (Linux) and, on macOS and Windows,
-  OpenSSL 3.3.2 when no suitable system copy is found (or
-  `-DOPENSSL_FORCE_BUNDLED=ON`) until the pinned archive below is set.
+- **Source builds** — TPM2-TSS 4.1.3 (Linux).
 - **Pinned static OpenSSL** — on Linux, the static libraries of Ubuntu 24.04
-  `libssl-dev` (exactly 3.0.13); on macOS and Windows, a static OpenSSL 3.5.9
-  archive from the `deps-openssl-3.5.9` release, checked by SHA-256
-  (`cmake/libraries/openssl.cmake`, `LEMONADE_NEXUS_STATIC_DEPS`).
+  `libssl-dev` (exactly 3.0.13); on macOS arm64 and Windows x64, a static
+  OpenSSL 3.5.9 archive from the `deps-openssl-3.5.9` release, checked by
+  SHA-256 (`cmake/libraries/openssl.cmake`, `LEMONADE_NEXUS_STATIC_DEPS`). The
+  build does not compile OpenSSL. With `LEMONADE_NEXUS_STATIC_DEPS=OFF`, the
+  build uses the system OpenSSL.
 - **System packages (Linux)** — `libjson-c-dev`, `libcurl4-openssl-dev`,
   `uuid-dev` for the TPM2-TSS build.
 - **Cargo** — the four Rust crates, with `frost-ed25519 = 2.2.0` for

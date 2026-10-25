@@ -272,7 +272,7 @@ The normal Linux build compiles TPM2-TSS from source and needs the system json-c
 
 ### Other platforms
 
-macOS builds use the same CMake targets. For distributable macOS binaries, configure with `-DOPENSSL_FORCE_BUNDLED=ON` as in CI. Windows build and packaging definitions exist, but Windows entries are disabled in the reviewed native and Flutter CI matrices; their presence is not current build qualification.
+macOS builds use the same CMake targets. On macOS arm64 and Windows x64, CMake downloads a pinned static OpenSSL archive, checks its SHA-256, and links it; the build does not use Homebrew or vcpkg OpenSSL. Windows build and packaging definitions exist, but the Windows entries are disabled in the native CI matrix; CI builds only the Windows SDK DLL and Flutter client. This is not current Windows server build qualification.
 
 Use [Building](docs/Building.md) and the [client guide](apps/LemonadeNexusClient/README.md) as navigation starting points, and check their examples against the current build files during the documentation refresh. Native platform support and Tier 1 attestation support are separate questions.
 

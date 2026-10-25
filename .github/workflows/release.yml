@@ -380,19 +380,18 @@ jobs:
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
-            -DGIT_TAG_OVERRIDE="$TAG" \
-            -DOPENSSL_FORCE_BUNDLED=ON
+            -DGIT_TAG_OVERRIDE="$TAG"
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      - name: Verify no Homebrew linkage
+      - name: Verify no Homebrew or OpenSSL linkage
         run: |
           status=0
           while IFS= read -r bin; do
-            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/' || true)
+            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/|libssl|libcrypto' || true)
             if [ -n "$deps" ]; then
-              echo "::error::$bin links against Homebrew/local libraries:"
+              echo "::error::$bin links against Homebrew/local or OpenSSL shared libraries:"
               echo "$deps"
               status=1
             fi
@@ -548,8 +547,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
             -DBUILD_SDK_SHARED=ON \
-            -DGIT_TAG_OVERRIDE="$TAG" \
-            -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+            -DGIT_TAG_OVERRIDE="$TAG"
           cmake --build build --target LemonadeNexusSDKShared --parallel
           mkdir -p out
           cp "build/projects/LemonadeNexusSDK/${{ matrix.library }}" \
@@ -562,6 +560,16 @@ jobs:
           so="build/projects/LemonadeNexusSDK/${{ matrix.library }}"
           readelf -d "$so" | grep NEEDED
           if readelf -d "$so" | grep NEEDED | grep -E 'libssl|libcrypto|libz\.|libzstd|libsodium'; then
+            echo "::error::the SDK library links a shared library that it must embed"
+            exit 1
+          fi
+
+      - name: Check the SDK library's shared libraries (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          lib="build/projects/LemonadeNexusSDK/${{ matrix.library }}"
+          otool -L "$lib"
+          if otool -L "$lib" | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/|libssl|libcrypto|libsodium'; then
             echo "::error::the SDK library links a shared library that it must embed"
             exit 1
           fi

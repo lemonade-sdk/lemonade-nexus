@@ -46,12 +46,19 @@ statically. glibc stays a shared dependency. The attestation profile pins the
 hash of each shared library the server loads, so an OS update of OpenSSL,
 zlib, zstd, or the C++ runtime cannot change what attestation measures (see
 [Releasing](Releasing#embedded-libraries)). On another distribution, or for a
-distribution package, configure with `-DLEMONADE_NEXUS_STATIC_DEPS=OFF`.
+distribution package, configure with `-DLEMONADE_NEXUS_STATIC_DEPS=OFF`. The
+build then uses the system OpenSSL.
+
+On macOS arm64 and Windows x64, `LEMONADE_NEXUS_STATIC_DEPS=ON` downloads a
+pinned static OpenSSL archive, checks its SHA-256, and links it. The build
+does not compile OpenSSL and does not use Homebrew or vcpkg. See
+[Embedded libraries](Releasing#embedded-libraries).
 
 Dependencies are **not** all fetched automatically. They use a mix of CMake
-FetchContent (most C/C++ libraries), source builds (TPM2-TSS, OpenSSL as a
-fallback), system packages (json-c, libcurl, UUID), and Cargo (the Rust
-crates). See [Dependencies](#dependencies) and the
+FetchContent (most C/C++ libraries), a pinned OpenSSL archive (macOS and
+Windows), source builds (TPM2-TSS), system packages (json-c, libcurl, UUID,
+and OpenSSL on Linux), and Cargo (the Rust crates). See
+[Dependencies](#dependencies) and the
 [CMake library definitions](https://github.com/lemonade-sdk/lemonade-nexus/tree/main/cmake/libraries)
 for the actual sourcing and versions.
 
@@ -96,22 +103,27 @@ cmake -S . -B build -G Ninja \
 cmake --build build --parallel
 ```
 
-For distributable binaries, configure with `-DOPENSSL_FORCE_BUNDLED=ON` (as
-CI does) so OpenSSL is statically bundled instead of linking Homebrew's copy.
+The configure step downloads the pinned static OpenSSL archive for macOS arm64
+and links it, so the binaries do not load a Homebrew or system OpenSSL. The
+archive holds arm64 code only: a universal or x86_64 build
+(`CMAKE_OSX_ARCHITECTURES`) needs `-DLEMONADE_NEXUS_STATIC_DEPS=OFF` and a
+system OpenSSL.
 
 macOS builds run in CI on every push.
 
 ## Windows Status
 
-Windows build and packaging definitions exist in the tree (MSVC + vcpkg
-OpenSSL in CI, NSIS/ZIP in CPack, a Windows durable-write path in the security
-stores), but the Windows jobs are **disabled in the current CI matrices**:
+Windows build and packaging definitions exist in the tree (MSVC with the
+pinned static OpenSSL archive for Windows x64, NSIS/ZIP in CPack, a Windows
+durable-write path in the security stores). CI coverage is partial:
 
-- The native `ci.yml` matrix comments out both `windows-2022` entries.
-- The Flutter client workflow sets the Windows job `if: false`.
+- The native `ci.yml` matrix comments out both `windows-2022` entries, so CI
+  does not build or test the Windows server.
+- The Flutter client workflow builds the Windows SDK DLL and the client app,
+  and runs `flutter analyze` and `flutter test`.
 
-Their presence is not current build qualification. Treat Windows as
-unsupported until those jobs are re-enabled and passing.
+Treat the Windows server as unsupported until the native jobs are re-enabled
+and passing.
 
 ## Flutter Client App
 
@@ -121,10 +133,10 @@ the C SDK over FFI. Build the SDK **shared** library first, then run Flutter.
 ### macOS
 
 ```bash
-# 1. Build the SDK dylib from the repo root. OPENSSL_FORCE_BUNDLED=ON statically
-#    bundles OpenSSL so the dylib is self-contained — without it the dylib links
-#    Homebrew's OpenSSL and the app fails at runtime. This matches the CI build.
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DOPENSSL_FORCE_BUNDLED=ON
+# 1. Build the SDK dylib from the repo root. The pinned static OpenSSL archive
+#    is linked in, so the dylib loads no Homebrew or system OpenSSL. This
+#    matches the CI build.
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --target LemonadeNexusSDKShared --parallel
 
 # 2. Run / build the app — the Xcode "Embed Lemonade Nexus SDK" build phase
@@ -142,9 +154,8 @@ Set `LN_DEBUG=1` to surface verbose SDK and mesh diagnostics in the console.
 
 See the [Windows packaging guide](../apps/LemonadeNexusClient/windows/packaging/PACKAGING.md).
 The SDK DLL must be staged next to the runner before `flutter build windows`.
-Windows CI is currently disabled; validate locally.
 
-CI builds and sanity-checks the macOS client on every push — see
+CI builds and sanity-checks the macOS and Windows clients — see
 [`.github/workflows/flutter-clients.yml`](../.github/workflows/flutter-clients.yml).
 
 ## Running Tests
@@ -181,7 +192,7 @@ source of truth for versions.
 | Component | Sourcing | Purpose |
 |-----------|----------|---------|
 | libsodium | FetchContent (1.0.20) | Ed25519, X25519, AEAD, HKDF, random |
-| OpenSSL | Linux: Ubuntu 24.04 `libssl-dev` 3.0.13, linked statically; macOS/Windows: pinned static archive (3.5.9), or system package / source build (3.3.2) until it is pinned | TLS, ACME client |
+| OpenSSL | Linux: Ubuntu 24.04 `libssl-dev` 3.0.13, linked statically; macOS arm64 / Windows x64: pinned static archive (3.5.9), checked by SHA-256; `LEMONADE_NEXUS_STATIC_DEPS=OFF`: system package | TLS, ACME client |
 | TPM2-TSS (FAPI) | Source build (4.1.3), Linux | TPM access for the evidence helper |
 | asio | FetchContent (1.34.2) | Async I/O (UDP, timers) |
 | cpp-httplib | FetchContent (0.18.3) | HTTP/HTTPS server and client |

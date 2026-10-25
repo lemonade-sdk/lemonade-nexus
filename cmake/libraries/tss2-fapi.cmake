@@ -4,11 +4,11 @@ cmake_minimum_required(VERSION 3.25.1)
 # tss2-fapi — TPM2 Software Stack, Feature API (libtss2-fapi)
 # =============================================================================
 # Provides <tss2/tss2_fapi.h>. Built from source via ExternalProject_Add
-# (autotools), mirroring the OpenSSL pattern in libraries/openssl.cmake.
+# (autotools).
 #
 # FAPI is a Linux-only component and is built STATICALLY here. Its transitive
 # dependencies are sourced as follows:
-#   • OpenSSL  — the copy this repo builds from source (OpenSSL::Crypto)
+#   • OpenSSL  — the copy that libraries/openssl.cmake selects (OpenSSL::Crypto)
 #   • json-c   — system package, via pkg-config   (Debian: libjson-c-dev)
 #   • libcurl  — system package, via pkg-config   (Debian: libcurl4-openssl-dev)
 #   • libuuid  — system package, via pkg-config   (Debian: uuid-dev)
@@ -59,9 +59,8 @@ pkg_check_modules(CURL  IMPORTED_TARGET REQUIRED libcurl)
 pkg_check_modules(UUID  IMPORTED_TARGET REQUIRED uuid)
 
 # OpenSSL is included before this module (see top-level CMakeLists.txt) and
-# provides OpenSSL::Crypto. When built from source, OPENSSL_ROOT_DIR points at
-# its install prefix; prepend its pkgconfig dir so tpm2-tss's ./configure finds
-# our libcrypto rather than a system one.
+# provides OpenSSL::Crypto. When OPENSSL_ROOT_DIR is set, prepend its pkgconfig
+# dir so tpm2-tss's ./configure finds that libcrypto rather than another one.
 set(_TSS2_PKGCONFIG_PATH "$ENV{PKG_CONFIG_PATH}")
 set(_TSS2_CPPFLAGS "$ENV{CPPFLAGS}")
 # TPM2-TSS bakes __FILE__ into its diagnostic strings; remap both trees so the
@@ -146,11 +145,6 @@ ExternalProject_Add(tss2_external
     LOG_INSTALL       TRUE
     LOG_OUTPUT_ON_FAILURE TRUE
 )
-
-# Build OpenSSL first if it's also built from source.
-if(TARGET openssl_external)
-    add_dependencies(tss2_external openssl_external)
-endif()
 
 # Include dir must exist at configure time so CMake doesn't complain about
 # INTERFACE_INCLUDE_DIRECTORIES referencing a non-existent path.
