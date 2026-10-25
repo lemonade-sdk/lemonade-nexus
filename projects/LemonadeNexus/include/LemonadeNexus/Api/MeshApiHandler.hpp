@@ -23,6 +23,10 @@ namespace nexus::api {
 /// The caller must already limit `peer` to the requester's parent-group
 /// subtree and exclude the requester's own node. `caller_pubkey` must be
 /// normalized. Returns false for every other node type. Thread-safe.
+///
+/// GET /api/mesh/peers lists endpoints with tree::rules::endpoint_may_connect,
+/// which applies this per-node rule inside the parent-group subtree and also
+/// admits the endpoints an invite membership covers. Relays use this function.
 [[nodiscard]] bool mesh_peer_listed(const tree::PermissionTreeService& tree,
                                     std::string_view caller_pubkey,
                                     const tree::TreeNode& peer);

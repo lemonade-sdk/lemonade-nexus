@@ -197,6 +197,52 @@ typedef _LnLinkTokenCreateDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
+// Invites, memberships, and moves
+typedef _LnInviteCreate = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> targetNodeId,
+  ffi.Pointer<ffi.Char> permissionsJson,
+  ffi.Uint32 ttlSec,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnInviteCreateDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> targetNodeId,
+  ffi.Pointer<ffi.Char> permissionsJson,
+  int ttlSec,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnStringJson = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> arg,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnStringJsonDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> arg,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnClientJson = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnClientJsonDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnMoveNode = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> nodeId,
+  ffi.Pointer<ffi.Char> newParentId,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnMoveNodeDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> nodeId,
+  ffi.Pointer<ffi.Char> newParentId,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
 // Health
 typedef _LnHealth = ffi.Int32 Function(
   LnClientHandle client,
@@ -806,6 +852,16 @@ class LemonadeNexusFfi {
           'ln_discover_genesis_key');
   late final _lnLinkTokenCreate = _lib.lookupFunction<_LnLinkTokenCreate,
       _LnLinkTokenCreateDart>('ln_link_token_create');
+  late final _lnInviteCreate =
+      _lib.lookupFunction<_LnInviteCreate, _LnInviteCreateDart>('ln_invite_create');
+  late final _lnInviteAccept =
+      _lib.lookupFunction<_LnStringJson, _LnStringJsonDart>('ln_invite_accept');
+  late final _lnMembershipsList =
+      _lib.lookupFunction<_LnClientJson, _LnClientJsonDart>('ln_memberships_list');
+  late final _lnMembershipLeave =
+      _lib.lookupFunction<_LnStringJson, _LnStringJsonDart>('ln_membership_leave');
+  late final _lnMoveNode =
+      _lib.lookupFunction<_LnMoveNode, _LnMoveNodeDart>('ln_move_node');
 
   // Health
   late final _lnHealth =
@@ -949,6 +1005,11 @@ class LemonadeNexusFfi {
   static const List<String> requiredSymbols = [
     'ln_set_link_token',
     'ln_link_token_create',
+    'ln_invite_create',
+    'ln_invite_accept',
+    'ln_memberships_list',
+    'ln_membership_leave',
+    'ln_move_node',
     'ln_private_api_call',
     'ln_group_key_generate',
     'ln_group_key_wrap',
@@ -1195,6 +1256,73 @@ class LemonadeNexusFfi {
       return (LnError.fromCode(result), json);
     } finally {
       calloc.free(outJson);
+    }
+  }
+
+  /// Runs a C call that writes a caller-owned JSON string to its last
+  /// argument, and returns the code with the JSON (freed with ln_free).
+  (LnError, String?) _jsonOut(int Function(ffi.Pointer<ffi.Pointer<ffi.Char>> out) call) {
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = call(outJson);
+      final json = outJson.value == ffi.nullptr ? null : toStringAndFree(outJson.value);
+      return (LnError.fromCode(result), json);
+    } finally {
+      calloc.free(outJson);
+    }
+  }
+
+  /// Mint an invite into [targetNodeId] (null: this account's own group) with
+  /// [permissionsJson] (null: the server default). See ln_invite_create.
+  (LnError, String?) inviteCreate(
+      LnClientHandle client, String? targetNodeId, String? permissionsJson, int ttlSec) {
+    final target = targetNodeId == null
+        ? ffi.nullptr.cast<ffi.Char>()
+        : targetNodeId.toNativeUtf8().cast<ffi.Char>();
+    final perms = permissionsJson == null
+        ? ffi.nullptr.cast<ffi.Char>()
+        : permissionsJson.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return _jsonOut((out) => _lnInviteCreate(client, target, perms, ttlSec, out));
+    } finally {
+      if (target != ffi.nullptr) malloc.free(target);
+      if (perms != ffi.nullptr) malloc.free(perms);
+    }
+  }
+
+  /// Accept an invite as an account that already joined. See ln_invite_accept.
+  (LnError, String?) inviteAccept(LnClientHandle client, String linkToken) {
+    final token = linkToken.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return _jsonOut((out) => _lnInviteAccept(client, token, out));
+    } finally {
+      malloc.free(token);
+    }
+  }
+
+  /// The groups this identity belongs to. See ln_memberships_list.
+  (LnError, String?) membershipsList(LnClientHandle client) =>
+      _jsonOut((out) => _lnMembershipsList(client, out));
+
+  /// Leave a group entered through an invite. See ln_membership_leave.
+  (LnError, String?) membershipLeave(LnClientHandle client, String groupNodeId) {
+    final group = groupNodeId.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return _jsonOut((out) => _lnMembershipLeave(client, group, out));
+    } finally {
+      malloc.free(group);
+    }
+  }
+
+  /// Move a device or subgroup under another group. See ln_move_node.
+  (LnError, String?) moveNode(LnClientHandle client, String nodeId, String newParentId) {
+    final node = nodeId.toNativeUtf8().cast<ffi.Char>();
+    final parent = newParentId.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return _jsonOut((out) => _lnMoveNode(client, node, parent, out));
+    } finally {
+      malloc.free(node);
+      malloc.free(parent);
     }
   }
 

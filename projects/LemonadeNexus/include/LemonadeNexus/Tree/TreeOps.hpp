@@ -78,6 +78,15 @@ enum class TreeOpKind : uint16_t {
     /// Set the target's listen_endpoint (POST /api/mesh/heartbeat). Only the
     /// target's own management key may set it.
     SetEndpoint   = 7,
+    /// Make the principal (the invitee, session-authenticated) a member of the
+    /// target group with the invite's permissions (POST /api/link/accept, or
+    /// POST /api/join by an existing device with a link token). The submitter
+    /// consumed the link token; every replica checks the inviter's current
+    /// authority on the target (rules::invite_acceptance_refusal).
+    AcceptInvite  = 8,
+    /// Move the target (a device or a subgroup) under body.new_parent_id
+    /// (POST /api/tree/node/move/{id}); rules::move_refusal decides.
+    MoveNode      = 9,
 };
 
 /// Where the principal's authority for an op comes from.
@@ -124,6 +133,9 @@ struct TreeOpBody {
     std::vector<std::string> assignment_permissions;  ///< SetAssignment
     JoinStatement            join;                    ///< Join
     std::string              listen_endpoint;         ///< SetEndpoint ("host:port")
+    std::string              inviter;                 ///< AcceptInvite: link token owner key
+    std::vector<std::string> invite_permissions;      ///< AcceptInvite: permissions granted
+    std::string              new_parent_id;           ///< MoveNode
 };
 
 /// One signed change to the tree.

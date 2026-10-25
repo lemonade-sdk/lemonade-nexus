@@ -896,8 +896,33 @@ class AppNotifier extends StateNotifier<AppState> {
   // ---- device linking + group-key provisioning ------------------------------
 
   /// Mint an invitation code for another device. Owner-only; needs the mesh.
-  Future<Map<String, dynamic>> createDeviceInvite({int ttlSec = 600}) =>
-      _sdk.createLinkToken(ttlSec: ttlSec);
+  Future<Map<String, dynamic>> createDeviceInvite(
+          {int ttlSec = 600, String? targetNodeId}) =>
+      _sdk.createInvite(targetNodeId: targetNodeId, ttlSec: ttlSec);
+
+  /// Join another network: accept an invite code with this account's
+  /// identity. Nothing this account owns moves; it becomes a member of the
+  /// invite's group. Throws SdkException with the server's reason.
+  Future<Map<String, dynamic>> acceptInvite(String code) async {
+    final result = await _sdk.acceptInvite(code.trim());
+    addActivity(ActivityLevel.info, 'Joined network ${result['node_id'] ?? ''}');
+    return result;
+  }
+
+  /// The groups this identity belongs to (home groups and invite memberships).
+  Future<List<Map<String, dynamic>>> listMemberships() => _sdk.listMemberships();
+
+  /// Leave a group entered through an invite.
+  Future<void> leaveMembership(String groupNodeId) async {
+    await _sdk.leaveMembership(groupNodeId);
+    addActivity(ActivityLevel.info, 'Left network $groupNodeId');
+  }
+
+  /// Move a device or a subgroup under another group.
+  Future<void> moveNode(String nodeId, String newParentId) async {
+    await _sdk.moveNode(nodeId, newParentId);
+    addActivity(ActivityLevel.info, 'Moved $nodeId to $newParentId');
+  }
 
   /// Devices in the active Cluster that have no group-key envelope yet.
   Future<List<Map<String, dynamic>>> pendingDevices() async {

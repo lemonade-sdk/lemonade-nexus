@@ -8,9 +8,11 @@
 /// any joined endpoint could reach any other endpoint through the server.
 /// The policy allows forwarding from endpoint A to endpoint B only when A's
 /// management key may connect to B under the rule of
-/// PermissionTreeService::resolve_authorized: B is inside A's parent-group
-/// subtree, and A's key holds ConnectPrivate or ConnectShared on B itself
-/// (`admin` includes both). Replies from B to A pass under the reply rule of
+/// PermissionTreeService::resolve_authorized (tree::rules::endpoint_may_connect):
+/// B is inside A's parent-group subtree and A's key holds ConnectPrivate or
+/// ConnectShared on B itself (`admin` includes both), or an invite membership
+/// covers the pair (A's key holds a connect entry on a group above B, or B's
+/// key holds one on a group above A). Replies from B to A pass under the reply rule of
 /// ForwardPolicy. Addresses outside the tunnel plane keep the open rule, and so
 /// does a Relay node whose management key administers the tree root.
 ///

@@ -51,8 +51,10 @@ std::optional<std::pair<std::string, LinkTokenRecord>>
 AuthService::mint_link_token(const std::string& owner_user_id,
                              const std::string& owner_pubkey,
                              const std::string& group_node_id,
-                             std::chrono::seconds ttl) {
-    return token_link_provider_.mint(owner_user_id, owner_pubkey, group_node_id, ttl);
+                             std::chrono::seconds ttl,
+                             std::vector<std::string> permissions) {
+    return token_link_provider_.mint(owner_user_id, owner_pubkey, group_node_id, ttl,
+                                     std::move(permissions));
 }
 
 std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view token) {

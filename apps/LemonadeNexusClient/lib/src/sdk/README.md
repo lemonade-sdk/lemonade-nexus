@@ -56,6 +56,8 @@ function count here.
 - **Sessions/devices:** `ln_set_session_token`, `ln_get_session_token`,
   `ln_set_node_id`, `ln_get_node_id`, `ln_set_link_token`,
   `ln_link_token_create`
+- **Invites, memberships, moves:** `ln_invite_create`, `ln_invite_accept`,
+  `ln_memberships_list`, `ln_membership_leave`, `ln_move_node`
 - **Private API / misc:** `ln_private_api_call`, `ln_ddns_status`,
   `ln_attestation_manifests`, group-key envelopes (`ln_group_key_generate`,
   `ln_group_key_wrap`, `ln_group_key_unwrap`)

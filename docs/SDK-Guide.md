@@ -13,6 +13,7 @@ title: SDK Guide
 - [Identity Management](#identity-management)
 - [Authentication](#authentication)
 - [Joining the Network](#joining-the-network)
+- [Invites and Other Networks](#invites-and-other-networks)
 - [Tree Operations](#tree-operations)
 - [Mesh P2P and Local Services](#mesh-p2p-and-local-services)
 - [Error Handling](#error-handling)
@@ -220,6 +221,42 @@ Join is composite — one call does everything:
 
 After joining, private API calls (tree, IPAM, mesh, routing, certs) route
 over the mesh to the server's private API.
+
+## Invites and Other Networks
+
+An invite is a single-use code for one group. One call creates it: without a
+target it is for your own top-level group, with a target it is for that group
+(a subgroup, or another user's group where you hold `add_child`).
+
+```cpp
+auto own = client.create_link_token(600);                       // own group
+auto sub = client.create_link_token(600, "group-id",            // chosen group
+                                    {"read", "connect_private"});
+// sub.value["link_token"] is the code to share.
+```
+
+| C++ | C | Purpose |
+|-----|---|---------|
+| `create_link_token(ttl, target, perms)` | `ln_invite_create(client, target_or_NULL, perms_json_or_NULL, ttl, &json)` | Create an invite |
+| `accept_invite(code)` | `ln_invite_accept(client, code, &json)` | Join another network with an existing account |
+| `list_memberships()` | `ln_memberships_list(client, &json)` | Groups this identity belongs to |
+| `leave_membership(group)` | `ln_membership_leave(client, group, &json)` | Leave a group joined by invite |
+| `move_node(node, parent)` | `ln_move_node(client, node, parent, &json)` | Move a device or subgroup |
+
+- A **new device** uses the code with `set_link_token(code)` before
+  `join_network`; it is placed under the invite's group.
+- An **existing account** uses `accept_invite(code)`. It keeps its own network
+  and becomes a member of the invite's group. Its device can then reach that
+  group's devices, and they can reach it, as the invite's permissions allow.
+  The inviter never sees the member's other devices.
+- An invite never grants `admin`, `edit_node`, or `delete_node`, and never
+  grants more than the inviter holds. The server checks the inviter's
+  authority again when the code is used.
+- Every C function writes a caller-owned JSON string to `out_json` (also on
+  most failures, with an `"error"` field). Release it with `ln_free()`. Input
+  strings are not retained.
+
+See [Security](Security#invites-and-group-membership) for the full rules.
 
 ## Tree Operations
 

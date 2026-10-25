@@ -959,9 +959,13 @@ void LemonadeNexusClient::set_inference_node(bool inference) {
     impl_->inference_node = inference;
 }
 
-Result<nlohmann::json> LemonadeNexusClient::create_link_token(uint32_t ttl_sec) {
+Result<nlohmann::json> LemonadeNexusClient::create_link_token(
+        uint32_t ttl_sec, const std::string& target_node_id,
+        const std::vector<std::string>& permissions) {
     Result<nlohmann::json> result;
     json body = {{"ttl_sec", ttl_sec}};
+    if (!target_node_id.empty()) body["target_node_id"] = target_node_id;
+    if (!permissions.empty()) body["permissions"] = permissions;
     int status = 0;
     auto resp = impl_->private_http_post("/api/link/token", body, status);
     result.http_status = status;
@@ -978,6 +982,77 @@ Result<nlohmann::json> LemonadeNexusClient::create_link_token(uint32_t ttl_sec) 
     result.ok    = true;
     result.value = *resp;
     return result;
+}
+
+namespace {
+
+/// A private-API JSON answer as a Result: ok for 200 and for 202 (a tree
+/// operation that has not committed yet), else the server's "error".
+Result<nlohmann::json> json_result(const std::optional<json>& resp, int status,
+                                   const char* what) {
+    Result<nlohmann::json> result;
+    result.http_status = status;
+    if (!resp) {
+        result.error = std::string(what) + " failed (server unreachable)";
+        return result;
+    }
+    if (status != 200 && status != 202) {
+        result.error = resp->value("error", std::string(what) + " failed");
+        result.value = *resp;
+        return result;
+    }
+    result.ok = true;
+    result.value = *resp;
+    return result;
+}
+
+}  // namespace
+
+Result<nlohmann::json> LemonadeNexusClient::accept_invite(const std::string& link_token) {
+    if (link_token.empty()) {
+        Result<nlohmann::json> result;
+        result.error = "link token required";
+        return result;
+    }
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/link/accept", json{{"link_token", link_token}},
+                                         status);
+    return json_result(resp, status, "invite acceptance");
+}
+
+Result<nlohmann::json> LemonadeNexusClient::list_memberships() {
+    int status = 0;
+    auto resp = impl_->private_http_get("/api/tree/memberships", status);
+    return json_result(resp, status, "membership list");
+}
+
+Result<DeltaResult> LemonadeNexusClient::leave_membership(const std::string& group_node_id) {
+    std::string own_key;
+    {
+        std::lock_guard lock(impl_->mutex);
+        if (impl_->identity.is_valid()) own_key = impl_->identity.pubkey_string();
+    }
+    if (own_key.empty()) {
+        Result<DeltaResult> result;
+        result.error = "no identity";
+        return result;
+    }
+    // Removing this identity's own entry is the leave; the server allows it
+    // without admin only for a group entered through an invite.
+    return set_member_permissions(group_node_id, own_key, {});
+}
+
+Result<nlohmann::json> LemonadeNexusClient::move_node(const std::string& node_id,
+                                                      const std::string& new_parent_id) {
+    if (node_id.empty() || new_parent_id.empty()) {
+        Result<nlohmann::json> result;
+        result.error = "node_id and new_parent_id required";
+        return result;
+    }
+    int status = 0;
+    auto resp = impl_->private_http_post("/api/tree/node/move/" + node_id,
+                                         json{{"parent_id", new_parent_id}}, status);
+    return json_result(resp, status, "move");
 }
 
 StatusResult LemonadeNexusClient::expose_service(uint16_t vport, const std::string& target) {

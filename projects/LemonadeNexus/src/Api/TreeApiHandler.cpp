@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
 #include <algorithm>
 #include <cctype>
+#include <map>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
 #include <LemonadeNexus/Acme/AcmeService.hpp>
@@ -232,6 +233,108 @@ private:
     bool                  decided_ = false;
 };
 
+/// True when the link token's owner still holds add_child on (or administers)
+/// the target, so the invite may still place a new device there. A token
+/// whose owner lost that authority after minting places nothing.
+bool link_owner_may_place(const tree::PermissionTreeService& tree,
+                          const auth::LinkTokenRecord& link) {
+    return tree::rules::holds_or_administers(tree.nodes_snapshot(), link.group_node_id,
+                                             link.owner_pubkey, acl::Permission::AddChild);
+}
+
+/// HTTP status for a refused tree operation in the membership and move routes.
+int status_for_refusal(tree::TreeOpRefusal refusal) {
+    using R = tree::TreeOpRefusal;
+    switch (refusal) {
+        case R::NotFound:         return 404;
+        case R::Forbidden:        return 403;
+        case R::Invalid:          return 400;
+        case R::Conflict:         return 409;
+        case R::StaleBaseVersion: return 409;
+        case R::Unavailable:      return 503;
+        default:                  return 500;
+    }
+}
+
+/// HTTP status for a refused direct-write assignment, invite, or move.
+int status_for_change(tree::PermissionTreeService::AssignmentChange change) {
+    using Change = tree::PermissionTreeService::AssignmentChange;
+    switch (change) {
+        case Change::Applied:      return 200;
+        case Change::NotFound:     return 404;
+        case Change::Forbidden:    return 403;
+        case Change::Invalid:      return 400;
+        case Change::Conflict:     return 409;
+        case Change::StorageError: return 500;
+    }
+    return 500;
+}
+
+/// Outcome of accepting an invite as a member.
+struct MembershipOutcome {
+    int                                   status = 500;  ///< 200 applied, 202 pending, else refused
+    std::string                           error;
+    std::optional<tree::TreeOpSubmission> submission;   ///< set when the op is pending
+};
+
+/// Make `invitee` a member of the invite's target with the invite's
+/// permissions: a direct write, or an AcceptInvite tree operation. Both apply
+/// rules::invite_acceptance_refusal, so the inviter's current authority on
+/// the target bounds the grant. The invitee's own nodes never move.
+MembershipOutcome accept_membership(ApiContext& ctx, const std::string& invitee,
+                                    const auth::LinkTokenRecord& link) {
+    MembershipOutcome out;
+    if (!ctx.config.tree_ops_enabled) {
+        std::string reason;
+        const auto change = ctx.tree.accept_invite(link.group_node_id, invitee, link.owner_pubkey,
+                                                   link.permissions, reason);
+        out.status = status_for_change(change);
+        out.error = std::move(reason);
+        return out;
+    }
+    if (!ctx.tree_ops) {
+        spdlog::error("[TreeApi] tree_ops_enabled is set but no tree-op submitter is wired");
+        out.error = "tree operations unavailable";
+        return out;
+    }
+    tree::TreeOp op;
+    op.kind = tree::TreeOpKind::AcceptInvite;
+    op.target = link.group_node_id;
+    op.principal = invitee;
+    op.body.source = tree::TreeOpSource::Session;
+    op.body.inviter = link.owner_pubkey;
+    op.body.invite_permissions = link.permissions;
+    auto s = submit_rebased(*ctx.tree_ops, [&] {
+        const auto current = ctx.tree.get_node(op.target);
+        op.base_version = current ? current->version : 0;
+        return op;
+    });
+    if (s.pending) {
+        out.status = 202;
+        out.submission = std::move(s);
+        return out;
+    }
+    out.status = s.verdict.ok() ? 200 : status_for_refusal(s.verdict.refusal);
+    out.error = s.verdict.reason;
+    return out;
+}
+
+/// The response body part that reports a membership outcome.
+nlohmann::json membership_json(const MembershipOutcome& outcome,
+                               const auth::LinkTokenRecord& link) {
+    nlohmann::json j = {{"node_id", link.group_node_id}, {"permissions", link.permissions}};
+    if (outcome.status == 200) {
+        j["status"] = "member";
+    } else if (outcome.status == 202 && outcome.submission) {
+        j["status"] = "pending";
+        j["op_id"] = outcome.submission->op_id;
+    } else {
+        j["status"] = "refused";
+        j["error"] = outcome.error;
+    }
+    return j;
+}
+
 /// The tree part of POST /api/join with tree operations on: the direct path's
 /// placement checks, then one Join op. The op's apply step derives the tunnel
 /// address from the tree (tree::derive_tunnel_address), so every replica
@@ -253,6 +356,10 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
         if (link) {
             if (!ctx.tree.get_node(link->group_node_id)) {
                 error_response(res, "link token group no longer exists", 409);
+                return result;
+            }
+            if (!link_owner_may_place(ctx.tree, *link)) {
+                error_response(res, "the invite is no longer valid", 403);
                 return result;
             }
         } else if (!ctx.config.open_registration && !is_root_owner &&
@@ -574,10 +681,11 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             }
         }
 
-        // Optional device-link token (single use, minted via POST /api/link/token):
-        // places the new endpoint under the token owner's Customer group.
-        // Consuming it first stops two concurrent joins from both using it;
-        // link_claim restores it unless this join places a device with it.
+        // Optional link token (single use, minted via POST /api/link/token):
+        // places a new endpoint under the token's target group, or makes an
+        // existing device's identity a member of that group. Consuming it first
+        // stops two concurrent joins from both using it; link_claim restores
+        // it unless this join uses it.
         auto link_token = body.value("link_token", std::string{});
         std::optional<auth::LinkTokenRecord> link;
         std::optional<LinkTokenClaim> link_claim;
@@ -621,6 +729,22 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             tree::canonical_principal(existing_root->mgmt_pubkey) ==
             tree::canonical_principal(norm_pubkey);
 
+        // A device that already joined does not move: its link token is an
+        // invite to become a member of the token's group. The join below then
+        // runs as a returning-device join without the token. A refused
+        // membership does not fail the join, and link_claim restores the token.
+        std::optional<nlohmann::json> membership;
+        if (link && ctx_.tree.get_node(node_id)) {
+            const auto outcome = accept_membership(ctx_, norm_pubkey, *link);
+            membership = membership_json(outcome, *link);
+            if (outcome.status == 200) {
+                link_claim->keep();
+            } else if (outcome.status == 202 && outcome.submission) {
+                link_claim->settle_with(*outcome.submission);
+            }
+            link.reset();
+        }
+
         if (!ctx_.config.tree_ops_enabled && node_id != "root") {
             std::string customer_id;
             auto existing_endpoint = ctx_.tree.get_node(node_id);
@@ -630,10 +754,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 // must not be reparented into a fresh group of its own).
                 customer_id = existing_endpoint->parent_id;
             } else if (link) {
-                // Linked join — place the device under the token owner's group.
+                // Linked join — place the device under the token's target group.
                 customer_id = link->group_node_id;
                 if (!ctx_.tree.get_node(customer_id)) {
                     error_response(res, "link token group no longer exists", 409);
+                    return;
+                }
+                if (!link_owner_may_place(ctx_.tree, *link)) {
+                    error_response(res, "the invite is no longer valid", 403);
                     return;
                 }
             } else {
@@ -784,12 +912,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                                                                  rekey.stale_peer_key);
                                  }
                              });
-                json_response(res,
-                              {{"success", true},
-                               {"status", "pending"},
-                               {"op_id", joined.submission.op_id},
-                               {"node_id", node_id}},
-                              202);
+                nlohmann::json pending = {{"success", true},
+                                          {"status", "pending"},
+                                          {"op_id", joined.submission.op_id},
+                                          {"node_id", node_id}};
+                if (membership) pending["membership"] = *membership;
+                json_response(res, pending, 202);
                 return;
             }
             alloc.block_type = ipam::BlockType::Tunnel;
@@ -865,6 +993,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             {"mesh_endpoint",      mesh_endpoint},
             {"dns_servers",      nlohmann::json::array({server_tunnel})},
         };
+        if (membership) resp["membership"] = *membership;
         spdlog::info("[Join] node={} tunnel_ip={} mesh_endpoint={} private_fqdn={}",
                       node_id, alloc.base_network, mesh_endpoint, client_private_fqdn);
         json_response(res, resp);
@@ -1239,6 +1368,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 case R::NotFound:         error_response(res, v.reason, 404); return;
                 case R::Forbidden:        error_response(res, v.reason, 403); return;
                 case R::Invalid:          error_response(res, v.reason, 400); return;
+                case R::Conflict:         error_response(res, v.reason, 409); return;
                 case R::StaleBaseVersion: error_response(res, v.reason, 409); return;
                 case R::StorageError:     error_response(res, v.reason, 500); return;
                 default:
@@ -1258,8 +1388,167 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             case Change::NotFound:     error_response(res, reason, 404); return;
             case Change::Forbidden:    error_response(res, reason, 403); return;
             case Change::Invalid:      error_response(res, reason, 400); return;
+            case Change::Conflict:     error_response(res, reason, 409); return;
             case Change::StorageError: error_response(res, reason, 500); return;
         }
+    }));
+
+    // ========================================================================
+    // POST /api/link/accept (PRIVATE, auth required)
+    // Body: {"link_token": "lnk_..."}. The session's identity, which has
+    // already joined, becomes a member of the token's target group with the
+    // token's permissions. Nothing the identity owns moves. A new device uses
+    // the token in POST /api/join instead. The token is spent only when the
+    // membership is applied (or its tree operation commits).
+    // ========================================================================
+    priv.Post("/api/link/accept", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        const auto token = body_opt->value("link_token", std::string{});
+        if (token.empty()) {
+            error_response(res, "link_token required");
+            return;
+        }
+        const auto invitee = normalize_pubkey(claims.pubkey);
+        // Only an identity that owns a node accepts as a member; its devices
+        // are the ones the membership covers.
+        if (!ctx_.tree.is_mgmt_pubkey_in_use(invitee)) {
+            error_response(res,
+                "this identity has not joined; a new device joins with the token "
+                "through /api/join", 409);
+            return;
+        }
+        auto link = ctx_.auth.consume_link_token(token);
+        if (!link) {
+            error_response(res, "invalid or expired link token", 403);
+            return;
+        }
+        LinkTokenClaim claim(ctx_.auth, token, *link);
+        const auto outcome = accept_membership(ctx_, invitee, *link);
+        auto j = membership_json(outcome, *link);
+        if (outcome.status == 200) {
+            claim.keep();
+            j["success"] = true;
+            json_response(res, j);
+            return;
+        }
+        if (outcome.status == 202 && outcome.submission) {
+            claim.settle_with(*outcome.submission);
+            j["success"] = true;
+            json_response(res, j, 202);
+            return;
+        }
+        error_response(res, outcome.error.empty() ? "invite refused" : outcome.error,
+                       outcome.status);
+    }));
+
+    // ========================================================================
+    // GET /api/tree/memberships (PRIVATE, auth required)
+    // The groups the session's identity belongs to: "home" groups (the
+    // parent group of each device it owns, and groups it owns) and "member"
+    // groups (groups it entered through an invite, or where an admin gave it
+    // an entry without it having joined there). Each entry carries the
+    // identity's own permissions on the group, never other principals.
+    // ========================================================================
+    priv.Get("/api/tree/memberships", require_auth(ctx_.auth,
+        [this](const httplib::Request&, httplib::Response& res, const SessionClaims& claims) {
+        const auto caller = normalize_pubkey(claims.pubkey);
+        const auto caller_canon = tree::canonical_principal(caller);
+        const auto nodes = ctx_.tree.nodes_snapshot();
+
+        auto own_permissions = [&](const tree::TreeNode& n) {
+            std::vector<std::string> perms;
+            for (const auto& a : n.assignments) {
+                if (tree::canonical_principal(a.management_pubkey) != caller_canon) continue;
+                perms.insert(perms.end(), a.permissions.begin(), a.permissions.end());
+            }
+            std::sort(perms.begin(), perms.end());
+            perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
+            return perms;
+        };
+
+        std::map<std::string, std::string> role_of;  // group id -> role, sorted
+        for (const auto& [id, n] : nodes) {
+            if (tree::canonical_principal(n.mgmt_pubkey) != caller_canon) continue;
+            if (n.type == tree::NodeType::Customer) {
+                role_of[id] = "home";
+            } else if (n.type == tree::NodeType::Endpoint) {
+                auto parent = nodes.find(n.parent_id);
+                if (parent != nodes.end() && parent->second.type == tree::NodeType::Customer) {
+                    role_of[parent->first] = "home";
+                }
+            }
+        }
+        for (const auto& [id, n] : nodes) {
+            if (n.type != tree::NodeType::Customer || role_of.contains(id)) continue;
+            if (own_permissions(n).empty()) continue;
+            role_of[id] = tree::rules::principal_joined_under(nodes, id, caller) ? "home"
+                                                                                 : "member";
+        }
+
+        nlohmann::json list = nlohmann::json::array();
+        for (const auto& [id, role] : role_of) {
+            const auto& n = nodes.at(id);
+            list.push_back({{"node_id", id},
+                            {"hostname", n.hostname},
+                            {"parent_id", n.parent_id},
+                            {"owner_pubkey", n.mgmt_pubkey},
+                            {"role", role},
+                            {"permissions", own_permissions(n)}});
+        }
+        json_response(res, {{"memberships", std::move(list)}});
+    }));
+
+    // ========================================================================
+    // POST /api/tree/node/move/{id} (PRIVATE, auth required)
+    // Body: {"parent_id": "<group>"}. Moves a device or a subgroup under
+    // another group. rules::move_refusal decides; the node keeps its id,
+    // tunnel address, and own assignments, and the move adds no grant.
+    // ========================================================================
+    priv.Post(R"(/api/tree/node/move/(.+))", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto node_id = req.matches[1].str();
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        const auto new_parent = body_opt->value("parent_id", std::string{});
+        if (new_parent.empty()) {
+            error_response(res, "parent_id required");
+            return;
+        }
+        const auto caller = normalize_pubkey(claims.pubkey);
+
+        if (ctx_.config.tree_ops_enabled) {
+            auto* submitter = tree_op_submitter(ctx_, res);
+            if (!submitter) return;
+            tree::TreeOp op;
+            op.kind = tree::TreeOpKind::MoveNode;
+            op.target = node_id;
+            op.principal = caller;
+            op.body.source = tree::TreeOpSource::Session;
+            op.body.new_parent_id = new_parent;
+            const auto s = submit_rebased(*submitter, [&] {
+                const auto current = ctx_.tree.get_node(node_id);
+                op.base_version = current ? current->version : 0;
+                return op;
+            });
+            if (answer_unfinished(res, s)) return;
+            if (!s.verdict.ok()) {
+                error_response(res, s.verdict.reason, status_for_refusal(s.verdict.refusal));
+                return;
+            }
+        } else {
+            std::string reason;
+            const auto change = ctx_.tree.move_node(node_id, new_parent, caller, reason);
+            if (change != tree::PermissionTreeService::AssignmentChange::Applied) {
+                error_response(res, reason, status_for_change(change));
+                return;
+            }
+        }
+        spdlog::info("[TreeApi] moved node '{}' under '{}'", node_id, new_parent);
+        json_response(res, {{"success", true}, {"node_id", node_id}, {"parent_id", new_parent}});
     }));
 
     // ========================================================================

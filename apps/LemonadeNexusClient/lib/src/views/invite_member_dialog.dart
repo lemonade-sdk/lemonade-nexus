@@ -1,7 +1,8 @@
 /// @title Invite Member dialog
 /// @description Mints a single-use invitation code (POST /api/link/token over
 /// the private mesh API) so another person or device can join this Cluster's
-/// group. Shows the code with copy, a live expiry countdown and regeneration.
+/// group, or a chosen group when the dialog is opened from a group's context
+/// menu. Shows the code with copy, a live expiry countdown and regeneration.
 /// When this device cannot mint codes yet it says why instead of failing
 /// silently.
 library;
@@ -15,15 +16,22 @@ import '../sdk/lemonade_nexus_sdk.dart';
 import '../state/providers.dart';
 import '../../theme/app_theme.dart';
 
-Future<void> showInviteMemberDialog(BuildContext context) {
+/// Show the invite dialog. Without [targetNodeId] the invite targets this
+/// account's own top-level group; with it, the invite targets that group
+/// ([targetLabel] names it in the title).
+Future<void> showInviteMemberDialog(BuildContext context,
+    {String? targetNodeId, String? targetLabel}) {
   return showDialog<void>(
     context: context,
-    builder: (_) => const InviteMemberDialog(),
+    builder: (_) =>
+        InviteMemberDialog(targetNodeId: targetNodeId, targetLabel: targetLabel),
   );
 }
 
 class InviteMemberDialog extends ConsumerStatefulWidget {
-  const InviteMemberDialog({super.key});
+  final String? targetNodeId;
+  final String? targetLabel;
+  const InviteMemberDialog({super.key, this.targetNodeId, this.targetLabel});
 
   @override
   ConsumerState<InviteMemberDialog> createState() => _InviteMemberDialogState();
@@ -76,7 +84,7 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
     try {
       final invite = await ref
           .read(appNotifierProvider.notifier)
-          .createDeviceInvite(ttlSec: _ttlSec);
+          .createDeviceInvite(ttlSec: _ttlSec, targetNodeId: widget.targetNodeId);
       final code = invite['link_token']?.toString() ?? '';
       if (code.isEmpty) {
         throw SdkException(LnError.internal,
@@ -132,11 +140,18 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
       shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(12),
           side: BorderSide(color: scheme.outline)),
-      title: const Row(
+      title: Row(
         children: [
-          Icon(Icons.person_add_alt_1, color: AppTheme.lemonYellowDark, size: 20),
-          SizedBox(width: 8),
-          Text('Invite member'),
+          const Icon(Icons.person_add_alt_1, color: AppTheme.lemonYellowDark, size: 20),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              widget.targetNodeId == null
+                  ? 'Invite member'
+                  : 'Invite user to ${widget.targetLabel ?? widget.targetNodeId}',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
         ],
       ),
       content: SizedBox(
@@ -149,9 +164,11 @@ class _InviteMemberDialogState extends ConsumerState<InviteMemberDialog> {
               _notice(context, Icons.info_outline, blocker, scheme.onSurfaceVariant)
             else ...[
               Text(
-                'Share this code with the person you are inviting. On their '
+                'Share this code with the person you are inviting. On a new '
                 'device they choose "Have an invitation code?" on the sign-in '
-                'screen and enter it. The code works once.',
+                'screen and enter it. A person who already has a network '
+                'enters it in "Join another network" and keeps their own '
+                'network. The code works once.',
                 style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
               ),
               const SizedBox(height: 16),

@@ -397,6 +397,7 @@ server that applies it:
 - **An update keeps the node's identity.** The `id`, `parent_id`, `type`,
   management key, and endpoint identifier cannot change. A record that
   renames itself onto another node, or moves into another group, is refused.
+  A node changes groups only through the move route (see "Moves" below).
 - **Only an admin changes assignments.** The signer must hold `admin` on the
   node or on one of its ancestors. That nearest admin node is the signer's
   scope. `edit_node` alone never changes who holds what.
@@ -423,6 +424,82 @@ grants its admin, so no admin locks itself out; another admin must do it. Groups
 rule gain `admin` for their owner on the owner's next join.
 
 On load, a node file whose record names a different node is refused.
+
+### Invites and group membership
+
+An invite is a single-use link token for a target group
+(`POST /api/link/token`, optional `target_node_id` and `permissions`). Without
+a target, the target is the caller's own group. The rules
+(`tree::rules::invite_refusal`) are:
+
+- **The target is a group.** An invite never targets a device or the root.
+- **The inviter has authority on the target.** The inviter holds `add_child`
+  on the target or administers it (`admin` on the target or an ancestor).
+- **An invite never grants more than the inviter holds.** Each permission is
+  one of `read`, `write`, `add_child`, `connect_private`, and
+  `connect_shared`, and the inviter holds it on the target or administers the
+  target. `admin`, `edit_node`, and `delete_node` are never granted by an
+  invite, so neither side gains control over the other's group. Without
+  `permissions`, the invite carries `read` and `connect_private`, reduced to
+  what the inviter holds.
+
+A new device uses the token in `POST /api/join` and is placed under the
+target, as before. An identity that already joined uses the token in
+`POST /api/link/accept` (or `POST /api/join` from its existing device). It
+becomes a **member**: the server sets exactly the invite's permissions as the
+identity's entry on the target (`AcceptInvite`). Nothing the member owns
+moves, and no other node changes. At acceptance the server checks the rules
+again against the current tree (`tree::rules::invite_acceptance_refusal`):
+an inviter that lost its authority voids the invite, and an identity that
+already joined inside the target, or administers it, is refused. A refused
+acceptance does not spend the token. Tokens stay single use, expire after at
+most one hour, are stored hashed, and are valid only on the server that
+minted them.
+
+**Membership reach.** A literal `connect_private` or `connect_shared` entry
+for key K on a group G is a membership. It lets each device whose management
+key is K connect to every device beneath G, and lets every device beneath G
+connect to those devices (`tree::rules::endpoint_may_connect`). It covers no
+other device: the member's other devices (other keys) and the rest of its
+network stay invisible to G, and the member sees nothing of the inviter's
+other groups. An `admin` entry is not a membership and gives no connect
+reach. The mesh peer list, the routing chokepoint (`resolve_authorized`), and
+the dataplane forwarding policy (`ForwardAuthorizer`) apply this one rule.
+
+**Leaving.** An admin of the group removes a member through
+`POST /api/tree/node/assignments/{id}` with an empty list. A member removes
+its own entry the same way without admin, but only on a group it has not
+joined and only when that entry holds no `admin`
+(`tree::rules::assignment_change_refusal`). Removing the entry removes all
+membership reach at once.
+
+Limit: an admin can remove a member but cannot change a member's
+permissions in place, because the joined-identity rule above refuses a key
+that did not join inside the group. Send a new invite instead.
+
+### Moves
+
+`POST /api/tree/node/move/{id}` with `{"parent_id"}` moves a device or a
+subgroup under another group (`MoveNode`, `tree::rules::move_refusal`):
+
+- The node is an Endpoint or a Customer group. The root and every top-level
+  group (a group directly under the root) never move, so no one moves another
+  user's network out from under its owner.
+- The new parent is a group, differs from the current parent, and is not the
+  node or one of its descendants.
+- For a device, the signer holds `delete_node` on it or administers it. For a
+  subgroup, the signer administers it: `delete_node` alone cannot take over a
+  subtree.
+- The signer holds `add_child` on the new parent or administers it.
+
+A move keeps the node's id, tunnel address, endpoint identifier, and own
+assignments. It clears the node's parent signature, which no longer covers
+the record. It grants nothing: access in the new group comes from that
+group's rules (its admins administer the node; its memberships cover it).
+Connect grants that depended on the old group's scope stop applying. When a
+moved device's key owns no other node, the entries that its old group and old
+sibling devices held for that key (the link-join grants) are removed, as a
+delete removes them.
 
 ## Application Authority Gaps
 

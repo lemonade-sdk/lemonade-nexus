@@ -6,6 +6,7 @@
 #include <LemonadeNexus/Auth/TokenLinkAuthProvider.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
+#include <LemonadeNexus/Tree/TreeRules.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
 namespace nexus::api {
@@ -108,16 +109,22 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
     // No public key-registration endpoint: identities are auto-registered on a
     // successful challenge-response in /api/auth (proof of possession required).
 
-    // POST /api/link/token (PRIVATE, auth required) — mint a single-use device
-    // link token; the joining device passes it to /api/join to be placed under
-    // the caller's Customer group.
+    // POST /api/link/token (PRIVATE, auth required) — mint a single-use link
+    // token (an invite) for a target group. Body (all optional):
+    //   {"ttl_sec": N, "target_node_id": "<group>", "permissions": [...]}
+    // Without target_node_id the target is the caller's own group. A new
+    // device passes the token to /api/join to be placed under the target; an
+    // identity that already joined passes it to /api/link/accept (or
+    // /api/join) to become a member of the target with the permissions.
+    // Without permissions the invite carries
+    // tree::rules::kDefaultInvitePermissions that the caller holds.
     priv.Post("/api/link/token", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
                const SessionClaims& claims) {
         nlohmann::json body = nlohmann::json::object();
         if (!req.body.empty()) {
             body = nlohmann::json::parse(req.body, nullptr, false);
-            if (body.is_discarded()) {
+            if (body.is_discarded() || !body.is_object()) {
                 error_response(res, "invalid JSON body");
                 return;
             }
@@ -125,42 +132,88 @@ void AuthApiHandler::do_register_routes(httplib::Server& pub,
 
         auto caller_pubkey = normalize_pubkey(claims.pubkey);
 
-        // Resolve the caller's Customer group: parent of their endpoint node,
-        // falling back to the group derived from their user id.
         std::string group_id;
-        if (auto node = ctx_.tree.get_node(claims.user_id)) {
-            if (auto parent = ctx_.tree.get_node(node->parent_id);
-                parent && parent->type == tree::NodeType::Customer) {
-                group_id = parent->id;
+        if (body.contains("target_node_id")) {
+            if (!body["target_node_id"].is_string()) {
+                error_response(res, "target_node_id must be a string");
+                return;
             }
-        }
-        if (group_id.empty() && ctx_.tree.get_node("customer-" + claims.user_id)) {
-            group_id = "customer-" + claims.user_id;
+            group_id = body["target_node_id"].get<std::string>();
         }
         if (group_id.empty()) {
-            error_response(res, "no customer group for caller — join first", 409);
-            return;
+            // Resolve the caller's Customer group: parent of their endpoint
+            // node, falling back to the group derived from their user id.
+            if (auto node = ctx_.tree.get_node(claims.user_id)) {
+                if (auto parent = ctx_.tree.get_node(node->parent_id);
+                    parent && parent->type == tree::NodeType::Customer) {
+                    group_id = parent->id;
+                }
+            }
+            if (group_id.empty() && ctx_.tree.get_node("customer-" + claims.user_id)) {
+                group_id = "customer-" + claims.user_id;
+            }
+            if (group_id.empty()) {
+                error_response(res, "no customer group for caller — join first", 409);
+                return;
+            }
+            if (!ctx_.tree.check_permission(caller_pubkey, group_id,
+                                            acl::Permission::AddChild)) {
+                error_response(res, "add_child permission required on " + group_id, 403);
+                return;
+            }
         }
 
-        if (!ctx_.tree.check_permission(caller_pubkey, group_id,
-                                        acl::Permission::AddChild)) {
-            error_response(res, "add_child permission required on " + group_id, 403);
+        const auto nodes = ctx_.tree.nodes_snapshot();
+        std::vector<std::string> permissions;
+        if (body.contains("permissions")) {
+            if (!body["permissions"].is_array()) {
+                error_response(res, "permissions must be an array of strings");
+                return;
+            }
+            for (const auto& p : body["permissions"]) {
+                if (!p.is_string()) {
+                    error_response(res, "permissions must be an array of strings");
+                    return;
+                }
+                permissions.push_back(p.get<std::string>());
+            }
+        } else {
+            for (const auto p : tree::rules::kDefaultInvitePermissions) {
+                if (tree::rules::holds_or_administers(nodes, group_id, caller_pubkey,
+                                                      tree::rules::permission_from_string(p))) {
+                    permissions.emplace_back(p);
+                }
+            }
+        }
+
+        // The inviter's own authority on the target bounds the invite.
+        if (const auto ruling =
+                tree::rules::invite_refusal(nodes, group_id, caller_pubkey, permissions)) {
+            using R = tree::rules::AssignmentRefusal;
+            const int status = ruling->refusal == R::NotFound    ? 404
+                               : ruling->refusal == R::Forbidden ? 403
+                               : ruling->refusal == R::Conflict  ? 409
+                                                                 : 400;
+            error_response(res, ruling->reason, status);
             return;
         }
 
         auto ttl_sec = body.value("ttl_sec",
             static_cast<uint64_t>(auth::TokenLinkAuthProvider::kDefaultTtl.count()));
         auto minted = ctx_.auth.mint_link_token(
-            claims.user_id, caller_pubkey, group_id, std::chrono::seconds{ttl_sec});
+            claims.user_id, caller_pubkey, group_id, std::chrono::seconds{ttl_sec},
+            permissions);
         if (!minted) {
             error_response(res, "failed to mint link token", 500);
             return;
         }
 
         nlohmann::json j = {
-            {"link_token",    minted->first},
-            {"group_node_id", minted->second.group_node_id},
-            {"expires_at",    minted->second.expires_at},
+            {"link_token",     minted->first},
+            {"group_node_id",  minted->second.group_node_id},
+            {"target_node_id", minted->second.group_node_id},
+            {"permissions",    minted->second.permissions},
+            {"expires_at",     minted->second.expires_at},
         };
         json_response(res, j);
     }));

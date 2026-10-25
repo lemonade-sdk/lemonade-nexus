@@ -141,6 +141,7 @@ TreeOp {
   network_id     binds the op to this network
   op_id          SHA-256 of the canonical encoding without signatures
   kind           create_node | update_fields | set_assignment | delete_node | join
+                 | establish_root | set_endpoint | accept_invite | move_node
   target         node id
   base_version   the target node's version the author saw
   body           kind-specific fields
@@ -163,6 +164,13 @@ TreeOp {
   server key. Every replica verifies both signatures and re-derives the node
   id, tunnel address, and endpoint identifier deterministically. Address
   allocation therefore moves into the op's deterministic apply step.
+- `accept_invite` (kind 8) makes a session-authenticated identity a member
+  of a group. The submitter consumed the link token; every replica checks the
+  inviter's current authority and the permission bounds
+  (`rules::invite_acceptance_refusal`). `move_node` (kind 9) moves a device or
+  subgroup under another group (`rules::move_refusal`). Both are appended
+  values; no existing kind is renumbered. See [Security](Security) for the
+  rules.
 - Every write path in `TreeApiHandler` produces an op. The local-only methods
   (`insert_join_node`, `update_node_direct`, `grant_assignment`,
   `delete_node_direct`) stop being called from request handlers.

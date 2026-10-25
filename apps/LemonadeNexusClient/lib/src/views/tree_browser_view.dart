@@ -14,10 +14,13 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
+import '../state/cluster_keyring.dart' show canonicalPrincipal;
+import '../sdk/lemonade_nexus_sdk.dart' show SdkException;
 import '../sdk/models.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 import 'invite_member_dialog.dart';
+import 'networks_dialog.dart';
 
 class TreeBrowserView extends ConsumerStatefulWidget {
   const TreeBrowserView({super.key});
@@ -127,6 +130,15 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
                       ),
                       onPressed: () => showInviteMemberDialog(context),
                     ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      tooltip: 'Join another network',
+                      icon: const Icon(Icons.hub_outlined, size: 20),
+                      onPressed: () async {
+                        await showNetworksDialog(context);
+                        if (mounted) _loadTree();
+                      },
+                    ),
                   ],
                 ),
               ),
@@ -182,6 +194,11 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
       ),
       child: InkWell(
         onTap: () => setState(() => _selectedNode = node),
+        onSecondaryTapDown: (details) => _showNodeMenu(node, details.globalPosition),
+        onLongPress: () {
+          final box = context.findRenderObject() as RenderBox?;
+          _showNodeMenu(node, box?.localToGlobal(Offset.zero) ?? Offset.zero);
+        },
         child: Row(
           children: [
             Icon(
@@ -421,6 +438,144 @@ class _TreeBrowserViewState extends ConsumerState<TreeBrowserView> {
         );
       },
     );
+  }
+
+  /// This account's own permissions on [node] (the tree returns this
+  /// account's entry even when it hides the others).
+  Set<String> _ownPermissions(TreeNode node) {
+    final own = ref.read(appNotifierProvider).publicKeyBase64;
+    if (own == null || own.isEmpty) return {};
+    final canon = canonicalPrincipal(own);
+    return {
+      for (final a in node.assignments ?? const <NodeAssignment>[])
+        if (canonicalPrincipal(a.managementPubkey) == canon) ...a.permissions,
+    };
+  }
+
+  /// True when this account holds admin on [node] or a loaded ancestor.
+  bool _administers(TreeNode node) {
+    final byId = {for (final n in _localTreeNodes) n.id: n};
+    final seen = <String>{};
+    TreeNode? current = node;
+    while (current != null && seen.add(current.id)) {
+      if (_ownPermissions(current).contains('admin')) return true;
+      current = byId[current.parentId];
+    }
+    return false;
+  }
+
+  /// The server makes the final decision; these only decide which menu
+  /// entries are enabled.
+  bool _canInviteInto(TreeNode node) =>
+      node.nodeType == 'customer' &&
+      (_ownPermissions(node).contains('add_child') || _administers(node));
+
+  bool _canMove(TreeNode node) {
+    if (node.nodeType == 'endpoint') {
+      return _ownPermissions(node).contains('delete_node') || _administers(node);
+    }
+    if (node.nodeType == 'customer') {
+      final parent = _localTreeNodes.where((n) => n.id == node.parentId);
+      final topLevel = parent.isEmpty || parent.first.nodeType == 'root';
+      return !topLevel && _administers(node);
+    }
+    return false;
+  }
+
+  Future<void> _showNodeMenu(TreeNode node, Offset position) async {
+    final name = node.data['hostname']?.toString() ?? node.hostname ?? node.id;
+    final choice = await showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx, position.dy),
+      items: [
+        if (node.nodeType == 'customer')
+          PopupMenuItem(
+            value: 'invite',
+            enabled: _canInviteInto(node),
+            child: const ListTile(
+              dense: true,
+              leading: Icon(Icons.person_add_alt_1, size: 18),
+              title: Text('Invite user to group'),
+            ),
+          ),
+        if (node.nodeType == 'customer' || node.nodeType == 'endpoint')
+          PopupMenuItem(
+            value: 'move',
+            enabled: _canMove(node),
+            child: const ListTile(
+              dense: true,
+              leading: Icon(Icons.drive_file_move_outline, size: 18),
+              title: Text('Move to group…'),
+            ),
+          ),
+      ],
+    );
+    if (!mounted || choice == null) return;
+    if (choice == 'invite') {
+      await showInviteMemberDialog(context, targetNodeId: node.id, targetLabel: name);
+    } else if (choice == 'move') {
+      await _showMoveDialog(node);
+    }
+  }
+
+  /// Groups [node] may move under: every loaded group except its current
+  /// parent, itself, and its descendants. The server checks the rights.
+  List<TreeNode> _moveTargets(TreeNode node) {
+    final byId = {for (final n in _localTreeNodes) n.id: n};
+    bool under(TreeNode candidate) {
+      final seen = <String>{};
+      TreeNode? current = candidate;
+      while (current != null && seen.add(current.id)) {
+        if (current.id == node.id) return true;
+        current = byId[current.parentId];
+      }
+      return false;
+    }
+
+    return _localTreeNodes
+        .where((n) => n.nodeType == 'customer' && n.id != node.parentId && !under(n))
+        .toList();
+  }
+
+  Future<void> _showMoveDialog(TreeNode node) async {
+    final targets = _moveTargets(node);
+    final target = await showDialog<TreeNode>(
+      context: context,
+      builder: (context) {
+        final scheme = Theme.of(context).colorScheme;
+        return SimpleDialog(
+          backgroundColor: scheme.surface,
+          title: Text('Move "${node.data['hostname'] ?? node.id}" to group'),
+          children: targets.isEmpty
+              ? [
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Text('No other group is available.',
+                        style: TextStyle(color: scheme.onSurfaceVariant)),
+                  ),
+                ]
+              : [
+                  for (final t in targets)
+                    SimpleDialogOption(
+                      onPressed: () => Navigator.pop(context, t),
+                      child: Text(t.data['hostname']?.toString() ?? t.hostname ?? t.id),
+                    ),
+                ],
+        );
+      },
+    );
+    if (!mounted || target == null) return;
+    try {
+      await ref.read(appNotifierProvider.notifier).moveNode(node.id, target.id);
+      await _loadTree();
+    } catch (e) {
+      if (!mounted) return;
+      final reason = e is SdkException ? (e.message ?? e.toString()) : e.toString();
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Could not move the node: $reason'),
+        backgroundColor: AppTheme.errorColor,
+      ));
+    }
   }
 
   void _confirmDeleteNode(TreeNode node) {
