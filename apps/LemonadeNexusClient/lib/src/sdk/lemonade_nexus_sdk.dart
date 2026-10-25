@@ -13,7 +13,10 @@ import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'ffi_bindings.dart';
+import 'mesh_port.dart';
 import 'models.dart';
+
+export 'mesh_port.dart';
 
 /// Exception thrown when an SDK operation fails.
 class SdkException implements Exception {
@@ -891,6 +894,57 @@ class LemonadeNexusSdk {
     if (error != LnError.success) {
       throw SdkException(error, message: 'Failed to refresh mesh');
     }
+  }
+
+  // =========================================================================
+  // Mesh port (loopback listener that serves group devices by name)
+  // =========================================================================
+
+  /// Starts the mesh port on 127.0.0.1:[port] with the group loopback
+  /// certificate in [certDir]. Throws [SdkException] with [LnError.portInUse]
+  /// when another process (for example lemond) already owns the port.
+  Future<void> startMeshPort({
+    int port = 13306,
+    String? localServiceUrl,
+    String? certDir,
+  }) async {
+    _checkDisposed();
+    _checkConnected();
+    final error = await _offThread((f, c) {
+      final dirError = f.meshPortSetCertDir(c, certDir);
+      if (dirError != LnError.success) return dirError;
+      return f.meshPortStart(c, port, localServiceUrl);
+    });
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'Failed to start the mesh port');
+    }
+  }
+
+  /// Stops the mesh port. Does nothing when no client exists.
+  Future<void> stopMeshPort() async {
+    if (_isDisposed || _client == null) return;
+    await _offThread((f, c) => f.meshPortStop(c));
+  }
+
+  /// Sets the mesh port selection: "local", "auto", a node ID, or null.
+  Future<void> setMeshPortSelection(String? target, {String? peerKey}) async {
+    _checkDisposed();
+    _checkConnected();
+    final error = await _offThread((f, c) => f.meshPortSetSelection(c, target, peerKey));
+    if (error != LnError.success) {
+      throw SdkException(error, message: 'Failed to set the mesh port selection');
+    }
+  }
+
+  /// Reads the mesh port status.
+  Future<MeshPortStatus> getMeshPortStatus() async {
+    _checkDisposed();
+    _checkConnected();
+    final json = await _offThread((f, c) => f.meshPortStatus(c));
+    if (json == null) {
+      throw SdkException(LnError.internal, message: 'Failed to read the mesh port status');
+    }
+    return _parseJson(json, MeshPortStatus.fromJson);
   }
 
   // =========================================================================

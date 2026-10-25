@@ -43,6 +43,9 @@ function count here.
 - **Mesh:** `ln_mesh_enable`, `ln_mesh_enable_config`, `ln_mesh_disable`,
   `ln_mesh_status`, `ln_mesh_peers`, `ln_mesh_refresh`,
   `ln_mesh_expose_service`, `ln_mesh_open_egress`, `ln_generate_keypair`
+- **Mesh port (127.0.0.1:13306):** `ln_mesh_port_set_cert_dir`,
+  `ln_mesh_port_start`, `ln_mesh_port_stop`, `ln_mesh_port_set_selection`,
+  `ln_mesh_port_status`
 - **Routing (connect-by-identifier):** `ln_routing_profile`,
   `ln_routing_request`, `ln_routing_connection_status`
 - **Sessions/devices:** `ln_set_session_token`, `ln_get_session_token`,
@@ -92,7 +95,7 @@ authentication is a deprecated stub that always fails.
 The C ABI returns `ln_error_t`: `LN_OK` (0), `LN_ERR_NULL_ARG` (-1),
 `LN_ERR_CONNECT` (-2), `LN_ERR_AUTH` (-3), `LN_ERR_NOT_FOUND` (-4),
 `LN_ERR_REJECTED` (-5), `LN_ERR_NO_IDENTITY` (-6), `LN_ERR_PARSE` (-7),
-`LN_ERR_UNSUPPORTED` (-8), `LN_ERR_INTERNAL` (-99).
+`LN_ERR_UNSUPPORTED` (-8), `LN_ERR_PORT_IN_USE` (-9), `LN_ERR_INTERNAL` (-99).
 
 Dart methods throw `SdkException` (carrying the error code) or
 `JsonParseException`.

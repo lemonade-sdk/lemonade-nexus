@@ -12,6 +12,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../sdk/sdk.dart';
+import '../platform/app_paths.dart';
 import '../platform/settings_store.dart';
 import '../platform/secure_store.dart';
 import '../services/dns_discovery.dart';
@@ -212,6 +213,7 @@ enum SidebarItem {
   dashboard,
   account,
   peers,
+  meshPort,
   network,
   endpoints,
   servers,
@@ -227,6 +229,8 @@ extension SidebarItemExtension on SidebarItem {
         return 'Dashboard';
       case SidebarItem.peers:
         return 'Peers';
+      case SidebarItem.meshPort:
+        return 'Mesh Port';
       case SidebarItem.network:
         return 'Network';
       case SidebarItem.endpoints:
@@ -250,6 +254,8 @@ extension SidebarItemExtension on SidebarItem {
         return Icons.dashboard;
       case SidebarItem.peers:
         return Icons.people;
+      case SidebarItem.meshPort:
+        return Icons.lan;
       case SidebarItem.network:
         return Icons.network_check;
       case SidebarItem.endpoints:
@@ -299,6 +305,9 @@ class AppState {
   /// localId of the Cluster currently connected (null when none).
   final String? activeClusterId;
 
+  /// The loopback mesh port that serves group devices by name.
+  final MeshPortStatus meshPortStatus;
+
   const AppState({
     this.connectionStatus = ConnectionStatus.disconnected,
     this.authState = AuthState.initial,
@@ -324,6 +333,7 @@ class AppState {
     this.connectedSince,
     this.clusters = const [],
     this.activeClusterId,
+    this.meshPortStatus = MeshPortStatus.stopped,
   });
 
   AppState copyWith({
@@ -351,6 +361,7 @@ class AppState {
     DateTime? connectedSince,
     List<ClusterEntry>? clusters,
     String? activeClusterId,
+    MeshPortStatus? meshPortStatus,
     // copyWith can't null a field via the ?? pattern; sign-out needs to.
     bool clearActiveCluster = false,
   }) {
@@ -380,6 +391,7 @@ class AppState {
       clusters: clusters ?? this.clusters,
       activeClusterId:
           clearActiveCluster ? null : (activeClusterId ?? this.activeClusterId),
+      meshPortStatus: meshPortStatus ?? this.meshPortStatus,
     );
   }
 
@@ -587,6 +599,7 @@ class AppNotifier extends StateNotifier<AppState> {
   /// reusable for a later reconnect/re-login; [clearIdentity] drops the Ed25519
   /// identity too, which logout wants so the next session starts clean.
   Future<void> disconnectFromServer({bool clearIdentity = false}) async {
+    await stopMeshPort();
     try {
       _sdk.disconnect(clearIdentity: clearIdentity);
     } catch (e) {
@@ -1482,6 +1495,7 @@ class AppNotifier extends StateNotifier<AppState> {
       _log('enableMesh: meshUp=${m?.isUp} peers=${m?.peerCount} '
           'online=${m?.onlineCount} meshIp=${m?.tunnelIp}');
       addActivity(ActivityLevel.success, 'Mesh enabled');
+      await startMeshPort();
     } catch (e) {
       state = state.copyWith(errorMessage: 'Failed to enable mesh: $e');
       addActivity(ActivityLevel.error, 'Failed to enable mesh: $e');
@@ -1491,11 +1505,73 @@ class AppNotifier extends StateNotifier<AppState> {
     }
   }
 
+  // =========================================================================
+  // Mesh port
+  // =========================================================================
+
+  /// Starts the loopback mesh port through the SDK. The group loopback
+  /// certificate lives in the app support directory. When lemond on this
+  /// machine already owns the port, the app shows that and does not retry.
+  Future<void> startMeshPort() async {
+    try {
+      final support = await AppPaths.supportDir();
+      await _sdk.startMeshPort(certDir: '${support.path}/certs/group-loopback');
+      addActivity(ActivityLevel.info, 'Mesh port started');
+    } on SdkException catch (e) {
+      final message = e.error == LnError.portInUse
+          ? 'Port 13306 is in use by another process, for example lemond'
+          : 'Cannot start the mesh port: ${e.error.name}';
+      state = state.copyWith(meshPortStatus: MeshPortStatus(error: message));
+      addActivity(ActivityLevel.warning, message);
+      return;
+    } catch (e) {
+      _log('startMeshPort: FAILED -> $e');
+      return;
+    }
+    await refreshMeshPortStatus();
+  }
+
+  /// Stops the mesh port. Safe to call when it is not running.
+  Future<void> stopMeshPort() async {
+    try {
+      await _sdk.stopMeshPort();
+    } catch (e) {
+      _log('stopMeshPort: FAILED -> $e');
+    }
+    state = state.copyWith(meshPortStatus: MeshPortStatus.stopped);
+  }
+
+  /// Reads the mesh port status. Keeps a start error visible while the port
+  /// is not running.
+  Future<void> refreshMeshPortStatus() async {
+    if (!state.isConnected) return;
+    if (!state.meshPortStatus.running && state.meshPortStatus.error.isNotEmpty) return;
+    try {
+      final status = await _sdk.getMeshPortStatus();
+      state = state.copyWith(meshPortStatus: status);
+    } catch (e) {
+      _log('refreshMeshPortStatus: FAILED -> $e');
+    }
+  }
+
+  /// Sets the mesh port selection: "auto", a node ID, or null to clear it.
+  Future<void> setMeshPortSelection(String? target) async {
+    try {
+      await _sdk.setMeshPortSelection(target);
+    } on SdkException catch (e) {
+      state = state.copyWith(errorMessage: 'Cannot select that device: ${e.error.name}');
+    } catch (e) {
+      _log('setMeshPortSelection: FAILED -> $e');
+    }
+    await refreshMeshPortStatus();
+  }
+
   /// Disable P2P mesh networking.
   Future<void> disableMesh() async {
     state = state.copyWith(isLoading: true);
     _log('disableMesh: start');
     try {
+      await stopMeshPort();
       await _sdk.disableMesh();
       await refreshMeshStatus();
       _log('disableMesh: ln_mesh_disable OK -> meshUp=${state.meshStatus?.isUp}');
@@ -1619,6 +1695,7 @@ class AppNotifier extends StateNotifier<AppState> {
       if (!state.isAuthenticated || _isRecovering) return;
       // The one periodic refresh for the app; views no longer run their own.
       await refreshMeshStatus();
+      await refreshMeshPortStatus();
       await refreshHealth();
       if (state.isAuthenticated && !state.isServerHealthy) {
         await _recoverConnection();
@@ -1663,6 +1740,7 @@ class AppNotifier extends StateNotifier<AppState> {
     state = state.copyWith(connectionStatus: ConnectionStatus.connecting);
     try {
       // Drop the dead client + tunnel, but keep the identity for the re-join.
+      await stopMeshPort();
       _sdk.disconnect();
       // DNS/SEIP discovery health-probes as it goes, so dead servers are skipped
       // and connectToServer brings up a fresh client on a reachable one.

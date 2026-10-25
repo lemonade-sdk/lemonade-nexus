@@ -19,6 +19,9 @@ enum LnError {
   notFound(-4),
   rejected(-5),
   noIdentity(-6),
+  parse(-7),
+  unsupported(-8),
+  portInUse(-9),
   internal(-99);
 
   final int code;
@@ -696,6 +699,50 @@ typedef _LnRoutingConnectionStatusDart = int Function(
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
 
+// Mesh port
+typedef _LnMeshPortStart = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Uint16 port,
+  ffi.Pointer<ffi.Char> localServiceUrl,
+);
+typedef _LnMeshPortStartDart = int Function(
+  LnClientHandle client,
+  int port,
+  ffi.Pointer<ffi.Char> localServiceUrl,
+);
+
+typedef _LnMeshPortStop = ffi.Int32 Function(LnClientHandle client);
+typedef _LnMeshPortStopDart = int Function(LnClientHandle client);
+
+typedef _LnMeshPortSetCertDir = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> certDir,
+);
+typedef _LnMeshPortSetCertDirDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> certDir,
+);
+
+typedef _LnMeshPortSetSelection = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> target,
+  ffi.Pointer<ffi.Char> peerKey,
+);
+typedef _LnMeshPortSetSelectionDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> target,
+  ffi.Pointer<ffi.Char> peerKey,
+);
+
+typedef _LnMeshPortStatus = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnMeshPortStatusDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
 /// Low-level FFI bindings to the Lemonade Nexus C SDK.
 ///
 /// This class provides direct access to all C SDK functions via FFI.
@@ -873,6 +920,16 @@ class LemonadeNexusFfi {
   late final _lnRoutingConnectionStatus = _lib.lookupFunction<
           _LnRoutingConnectionStatus,
           _LnRoutingConnectionStatusDart>('ln_routing_connection_status');
+  late final _lnMeshPortStart =
+      _lib.lookupFunction<_LnMeshPortStart, _LnMeshPortStartDart>('ln_mesh_port_start');
+  late final _lnMeshPortStop =
+      _lib.lookupFunction<_LnMeshPortStop, _LnMeshPortStopDart>('ln_mesh_port_stop');
+  late final _lnMeshPortSetCertDir = _lib.lookupFunction<_LnMeshPortSetCertDir,
+      _LnMeshPortSetCertDirDart>('ln_mesh_port_set_cert_dir');
+  late final _lnMeshPortSetSelection = _lib.lookupFunction<_LnMeshPortSetSelection,
+      _LnMeshPortSetSelectionDart>('ln_mesh_port_set_selection');
+  late final _lnMeshPortStatus =
+      _lib.lookupFunction<_LnMeshPortStatus, _LnMeshPortStatusDart>('ln_mesh_port_status');
 
   /// Recently-added C ABI symbols. The native library is built separately from
   /// the Dart layer, so these are what a stale build is missing.
@@ -883,6 +940,11 @@ class LemonadeNexusFfi {
     'ln_group_key_generate',
     'ln_group_key_wrap',
     'ln_group_key_unwrap',
+    'ln_mesh_port_start',
+    'ln_mesh_port_stop',
+    'ln_mesh_port_set_cert_dir',
+    'ln_mesh_port_set_selection',
+    'ln_mesh_port_status',
     'ln_set_genesis_key',
     'ln_tier1_refresh',
     'ln_tier1_membership',
@@ -1866,6 +1928,59 @@ class LemonadeNexusFfi {
       malloc.free(identifierPtr);
       malloc.free(noncePtr);
       malloc.free(meshPubkeyPtr);
+      calloc.free(outJson);
+    }
+  }
+
+  /// Starts the loopback mesh port (see ln_mesh_port_start). [port] 0 selects
+  /// 13306. [localServiceUrl] null means no local service.
+  LnError meshPortStart(LnClientHandle client, int port, String? localServiceUrl) {
+    final urlPtr = localServiceUrl == null
+        ? ffi.nullptr
+        : localServiceUrl.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return LnError.fromCode(_lnMeshPortStart(client, port, urlPtr));
+    } finally {
+      if (urlPtr != ffi.nullptr) malloc.free(urlPtr);
+    }
+  }
+
+  LnError meshPortStop(LnClientHandle client) =>
+      LnError.fromCode(_lnMeshPortStop(client));
+
+  /// Sets the group loopback certificate directory; null clears it.
+  LnError meshPortSetCertDir(LnClientHandle client, String? certDir) {
+    final dirPtr = certDir == null ? ffi.nullptr : certDir.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return LnError.fromCode(_lnMeshPortSetCertDir(client, dirPtr));
+    } finally {
+      if (dirPtr != ffi.nullptr) malloc.free(dirPtr);
+    }
+  }
+
+  /// Sets the selection: "local", "auto", a node ID, or null to clear it.
+  LnError meshPortSetSelection(LnClientHandle client, String? target, String? peerKey) {
+    final targetPtr = target == null ? ffi.nullptr : target.toNativeUtf8().cast<ffi.Char>();
+    final keyPtr = peerKey == null ? ffi.nullptr : peerKey.toNativeUtf8().cast<ffi.Char>();
+    try {
+      return LnError.fromCode(_lnMeshPortSetSelection(client, targetPtr, keyPtr));
+    } finally {
+      if (targetPtr != ffi.nullptr) malloc.free(targetPtr);
+      if (keyPtr != ffi.nullptr) malloc.free(keyPtr);
+    }
+  }
+
+  /// Mesh port status JSON, or null on error.
+  String? meshPortStatus(LnClientHandle client) {
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnMeshPortStatus(client, outJson);
+      if (result == 0) {
+        return toStringAndFree(outJson.value);
+      }
+      freeString(outJson.value);
+      return null;
+    } finally {
       calloc.free(outJson);
     }
   }
