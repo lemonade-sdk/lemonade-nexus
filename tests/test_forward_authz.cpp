@@ -345,6 +345,44 @@ TEST_F(ForwardAuthzTest, CrossGroupGrantIsDropped) {
     EXPECT_TRUE(blocked("a", "x", kTcpSyn, "a-syn-to-x"));
 }
 
+// An accepted invite is a connect entry for the member's key on the target
+// group. The member's device and the group's devices reach each other; the
+// member's other devices (other keys) and the rest of its network do not.
+TEST_F(ForwardAuthzTest, AnInviteMembershipReachesOnlyTheMembersDevice) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("b", "group-2", tree::NodeType::Endpoint, "10.64.0.3");
+    add_node("b2", "group-2", tree::NodeType::Endpoint, "10.64.0.4");
+    grant("b2", "b", {"read", "connect_private"});
+    grant("group-1", "b", {"connect_private", "read"});
+    authorizer->start();
+
+    EXPECT_TRUE(allowed("10.64.0.3", "10.64.0.2"));
+    EXPECT_TRUE(allowed("10.64.0.2", "10.64.0.3"));
+    EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.4"));
+    EXPECT_FALSE(allowed("10.64.0.4", "10.64.0.2"));
+    EXPECT_TRUE(reaches("b", "a", kTcpSyn, "member-to-group"));
+    EXPECT_TRUE(reaches("a", "b", kTcpSyn, "group-to-member"));
+    EXPECT_TRUE(blocked("a", "b2", kTcpSyn, "group-to-other-device"));
+
+    // Removing the membership entry removes the reach.
+    auto group = tree_svc->get_node("group-1");
+    ASSERT_TRUE(group.has_value());
+    group->assignments.clear();
+    ASSERT_TRUE(tree_svc->update_node_direct("group-1", *group));
+    EXPECT_FALSE(allowed("10.64.0.3", "10.64.0.2"));
+    EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.3"));
+}
+
+// An admin entry on a group is not a membership: it opens no device.
+TEST_F(ForwardAuthzTest, AGroupAdminEntryOpensNoDevice) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("x", "group-2", tree::NodeType::Endpoint, "10.64.0.5");
+    grant("group-2", "a", {"admin"});
+    authorizer->start();
+    EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.5"));
+    EXPECT_FALSE(allowed("10.64.0.5", "10.64.0.2"));
+}
+
 // Linked devices get read + connect_private on each other at join.
 TEST_F(ForwardAuthzTest, LinkedDevicesReachEachOther) {
     add_node("laptop", "group-1", tree::NodeType::Endpoint, "10.64.0.2");

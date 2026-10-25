@@ -438,6 +438,59 @@ class LemonadeNexusSdk {
     return _parseJson<Map<String, dynamic>>(json, (m) => m);
   }
 
+  /// Mint an invite into [targetNodeId], or into this account's own
+  /// top-level group when it is null. [permissions] null lets the server
+  /// choose the default. Returns `{link_token, group_node_id, target_node_id,
+  /// permissions, expires_at}`. Requires the mesh up.
+  Future<Map<String, dynamic>> createInvite(
+      {String? targetNodeId, List<String>? permissions, int ttlSec = 600}) async {
+    _checkDisposed();
+    _checkConnected();
+    final permsJson = permissions == null ? null : jsonEncode(permissions);
+    final (error, json) =
+        await _offThread((f, c) => f.inviteCreate(c, targetNodeId, permsJson, ttlSec));
+    return _tier1Result(error, json, 'Failed to create the invite');
+  }
+
+  /// Accept an invite as an account that already joined: this identity
+  /// becomes a member of the invite's group. Nothing it owns moves. Returns
+  /// `{success, node_id, permissions, status}`.
+  Future<Map<String, dynamic>> acceptInvite(String linkToken) async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.inviteAccept(c, linkToken));
+    return _tier1Result(error, json, 'The invite was not accepted');
+  }
+
+  /// The groups this identity belongs to: `{memberships: [{node_id,
+  /// hostname, parent_id, owner_pubkey, role, permissions}]}`.
+  Future<List<Map<String, dynamic>>> listMemberships() async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.membershipsList(c));
+    final body = _tier1Result(error, json, 'Failed to list networks');
+    return [
+      for (final m in (body['memberships'] as List? ?? const []))
+        Map<String, dynamic>.from(m as Map),
+    ];
+  }
+
+  /// Leave a group entered through an invite.
+  Future<void> leaveMembership(String groupNodeId) async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.membershipLeave(c, groupNodeId));
+    _tier1Result(error, json, 'Failed to leave the network');
+  }
+
+  /// Move a device or a subgroup under another group.
+  Future<Map<String, dynamic>> moveNode(String nodeId, String newParentId) async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.moveNode(c, nodeId, newParentId));
+    return _tier1Result(error, json, 'Failed to move the node');
+  }
+
   // =========================================================================
   // Health
   // =========================================================================

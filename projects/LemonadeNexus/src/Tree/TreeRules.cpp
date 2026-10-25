@@ -238,6 +238,18 @@ std::optional<AssignmentRuling> assignment_change_refusal(
         }
     }
 
+    // A member leaves a group it entered through an invite. Its own entry is
+    // the whole membership, so removing it needs no admin. A home entry (the
+    // principal joined inside the group) or an admin entry stays with the
+    // admin rules below, so no one locks a group out of its own management.
+    const TreeNode& node = nodes.at(std::string(node_id));
+    if (permissions.empty() && canonical_principal(signer) == principal_canon &&
+        node.type == NodeType::Customer &&
+        !signer_has_permission(node, signer, acl::Permission::Admin) &&
+        !principal_joined_under(nodes, node_id, principal)) {
+        return std::nullopt;
+    }
+
     const auto anchor = admin_anchor(nodes, node_id, signer);
     if (!anchor) {
         return AssignmentRuling{AssignmentRefusal::Forbidden,
@@ -267,6 +279,183 @@ void replace_assignment(std::vector<Assignment>& list, std::string_view principa
         perms.erase(std::unique(perms.begin(), perms.end()), perms.end());
         list.push_back({std::string(principal), std::move(perms)});
     }
+}
+
+bool holds_or_administers(const NodeMap& nodes, std::string_view node_id,
+                          std::string_view signer, acl::Permission perm) {
+    auto it = nodes.find(std::string(node_id));
+    if (it == nodes.end()) return false;
+    return signer_has_permission(it->second, signer, perm) ||
+           admin_anchor(nodes, node_id, signer).has_value();
+}
+
+namespace {
+
+/// True when `node_id` is `ancestor_id` or lies beneath it. A parent loop or
+/// a missing node ends the walk unmatched.
+bool at_or_under(const NodeMap& nodes, std::string_view node_id, std::string_view ancestor_id) {
+    std::unordered_set<std::string> visited;
+    std::string current(node_id);
+    while (!current.empty() && visited.insert(current).second) {
+        if (current == ancestor_id) return true;
+        auto it = nodes.find(current);
+        if (it == nodes.end()) return false;
+        current = it->second.parent_id;
+    }
+    return false;
+}
+
+bool invite_permission_allowed(std::string_view perm) {
+    return std::find(kInvitePermissions.begin(), kInvitePermissions.end(), perm) !=
+           kInvitePermissions.end();
+}
+
+/// True when `principal`'s entry on `node` names a connect permission
+/// literally. `admin` implies every bit but is not a membership grant.
+bool holds_literal_connect(const TreeNode& node, std::string_view principal) {
+    const auto canon = canonical_principal(principal);
+    if (canon.empty()) return false;
+    for (const auto& a : node.assignments) {
+        if (canonical_principal(a.management_pubkey) != canon) continue;
+        for (const auto& p : a.permissions) {
+            if (p == "connect_private" || p == "connect_shared") return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+std::optional<AssignmentRuling> invite_refusal(const NodeMap& nodes, std::string_view target_id,
+                                               std::string_view inviter,
+                                               const std::vector<std::string>& permissions) {
+    auto it = nodes.find(std::string(target_id));
+    if (it == nodes.end()) {
+        return AssignmentRuling{AssignmentRefusal::NotFound, "invite target not found"};
+    }
+    if (it->second.type != NodeType::Customer) {
+        return AssignmentRuling{AssignmentRefusal::Invalid, "an invite targets a group"};
+    }
+    if (canonical_principal(inviter).empty()) {
+        return AssignmentRuling{AssignmentRefusal::Invalid, "invalid inviter"};
+    }
+    for (const auto& p : permissions) {
+        if (!invite_permission_allowed(p)) {
+            return AssignmentRuling{AssignmentRefusal::Invalid,
+                                    "an invite cannot grant '" + p + "'"};
+        }
+    }
+    if (!holds_or_administers(nodes, target_id, inviter, acl::Permission::AddChild)) {
+        return AssignmentRuling{AssignmentRefusal::Forbidden,
+                                "the inviter needs add_child on the invite target"};
+    }
+    for (const auto& p : permissions) {
+        if (!holds_or_administers(nodes, target_id, inviter, permission_from_string(p))) {
+            return AssignmentRuling{AssignmentRefusal::Forbidden,
+                                    "the inviter does not hold '" + p + "' on the invite target"};
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<AssignmentRuling> invite_acceptance_refusal(
+        const NodeMap& nodes, std::string_view target_id, std::string_view invitee,
+        std::string_view inviter, const std::vector<std::string>& permissions) {
+    if (auto ruling = invite_refusal(nodes, target_id, inviter, permissions)) return ruling;
+    if (std::find(permissions.begin(), permissions.end(), "read") == permissions.end()) {
+        return AssignmentRuling{AssignmentRefusal::Invalid,
+                                "the invite grants no membership (read is missing)"};
+    }
+    if (canonical_principal(invitee).empty() || !invitee.starts_with("ed25519:")) {
+        return AssignmentRuling{AssignmentRefusal::Invalid, "invalid invitee"};
+    }
+    if (principal_joined_under(nodes, target_id, invitee) ||
+        admin_anchor(nodes, target_id, invitee)) {
+        return AssignmentRuling{AssignmentRefusal::Conflict,
+                                "the identity already belongs to this group"};
+    }
+    return std::nullopt;
+}
+
+bool membership_reaches(const NodeMap& nodes, std::string_view member, const TreeNode& node) {
+    std::unordered_set<std::string> visited{node.id};
+    std::string current = node.parent_id;
+    while (!current.empty() && visited.insert(current).second) {
+        auto it = nodes.find(current);
+        if (it == nodes.end()) return false;
+        if (it->second.type == NodeType::Customer && holds_literal_connect(it->second, member)) {
+            return true;
+        }
+        current = it->second.parent_id;
+    }
+    return false;
+}
+
+bool endpoint_may_connect(const NodeMap& nodes, std::string_view principal, const TreeNode& from,
+                          const TreeNode& to) {
+    if (from.id == to.id || from.parent_id.empty()) return false;
+    if (to.id != from.parent_id && at_or_under(nodes, to.id, from.parent_id) &&
+        (signer_has_permission(to, principal, acl::Permission::ConnectPrivate) ||
+         signer_has_permission(to, principal, acl::Permission::ConnectShared))) {
+        return true;
+    }
+    const auto principal_canon = canonical_principal(principal);
+    if (principal_canon.empty() || principal_canon != canonical_principal(from.mgmt_pubkey)) {
+        return false;
+    }
+    return membership_reaches(nodes, principal, to) ||
+           (!to.mgmt_pubkey.empty() && membership_reaches(nodes, to.mgmt_pubkey, from));
+}
+
+std::optional<AssignmentRuling> move_refusal(const NodeMap& nodes, std::string_view node_id,
+                                             std::string_view new_parent_id,
+                                             std::string_view signer) {
+    auto node_it = nodes.find(std::string(node_id));
+    if (node_it == nodes.end()) {
+        return AssignmentRuling{AssignmentRefusal::NotFound, "node not found"};
+    }
+    auto parent_it = nodes.find(std::string(new_parent_id));
+    if (parent_it == nodes.end()) {
+        return AssignmentRuling{AssignmentRefusal::NotFound, "new parent not found"};
+    }
+    const TreeNode& node = node_it->second;
+    if (node.parent_id.empty() || node.type == NodeType::Root) {
+        return AssignmentRuling{AssignmentRefusal::Forbidden, "the root node cannot move"};
+    }
+    if (node.type != NodeType::Endpoint && node.type != NodeType::Customer) {
+        return AssignmentRuling{AssignmentRefusal::Invalid, "only devices and groups move"};
+    }
+    if (node.type == NodeType::Customer) {
+        auto current_parent = nodes.find(node.parent_id);
+        if (current_parent == nodes.end() || current_parent->second.type == NodeType::Root) {
+            return AssignmentRuling{AssignmentRefusal::Forbidden, "a top-level group cannot move"};
+        }
+    }
+    if (parent_it->second.type != NodeType::Customer) {
+        return AssignmentRuling{AssignmentRefusal::Invalid, "a node moves only under a group"};
+    }
+    if (node.parent_id == new_parent_id) {
+        return AssignmentRuling{AssignmentRefusal::Conflict, "the node is already under that group"};
+    }
+    if (at_or_under(nodes, new_parent_id, node_id)) {
+        return AssignmentRuling{AssignmentRefusal::Invalid,
+                                "a node cannot move under itself or its descendants"};
+    }
+    const bool may_remove =
+        node.type == NodeType::Endpoint
+            ? holds_or_administers(nodes, node_id, signer, acl::Permission::DeleteNode)
+            : admin_anchor(nodes, node_id, signer).has_value();
+    if (!may_remove) {
+        return AssignmentRuling{AssignmentRefusal::Forbidden,
+                                node.type == NodeType::Endpoint
+                                    ? "moving a device needs delete_node on it or admin above it"
+                                    : "moving a group needs admin on it or above it"};
+    }
+    if (!holds_or_administers(nodes, new_parent_id, signer, acl::Permission::AddChild)) {
+        return AssignmentRuling{AssignmentRefusal::Forbidden,
+                                "moving needs add_child on the new parent"};
+    }
+    return std::nullopt;
 }
 
 }  // namespace nexus::tree::rules

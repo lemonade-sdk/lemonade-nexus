@@ -347,11 +347,7 @@ PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
     if (const auto ruling = rules::assignment_change_refusal(nodes_, node_id, signer,
                                                              principal, permissions)) {
         reason = ruling->reason;
-        switch (ruling->refusal) {
-            case rules::AssignmentRefusal::NotFound:  return AssignmentChange::NotFound;
-            case rules::AssignmentRefusal::Forbidden: return AssignmentChange::Forbidden;
-            case rules::AssignmentRefusal::Invalid:   return AssignmentChange::Invalid;
-        }
+        return change_for(ruling->refusal);
     }
 
     auto it = nodes_.find(node_id);
@@ -365,6 +361,91 @@ PermissionTreeService::AssignmentChange PermissionTreeService::set_assignment(
     spdlog::info("[{}] assignments on '{}' changed for '{}' by '{}'", name(), node_id,
                  std::string(principal).substr(0, 24), std::string(signer).substr(0, 24));
     return AssignmentChange::Applied;
+}
+
+PermissionTreeService::AssignmentChange PermissionTreeService::change_for(
+        rules::AssignmentRefusal refusal) {
+    switch (refusal) {
+        case rules::AssignmentRefusal::NotFound:  return AssignmentChange::NotFound;
+        case rules::AssignmentRefusal::Forbidden: return AssignmentChange::Forbidden;
+        case rules::AssignmentRefusal::Invalid:   return AssignmentChange::Invalid;
+        case rules::AssignmentRefusal::Conflict:  return AssignmentChange::Conflict;
+    }
+    return AssignmentChange::Invalid;
+}
+
+PermissionTreeService::AssignmentChange PermissionTreeService::apply_planned_direct_locked(
+        const TreeOp& op, std::string& reason) {
+    TreeOpEffect effect;
+    if (const auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
+        reason = verdict.reason;
+        return verdict.refusal == TreeOpRefusal::NotFound ? AssignmentChange::NotFound
+                                                          : AssignmentChange::Invalid;
+    }
+    // The direct paths do not maintain versions (TreeNode::version), so each
+    // written node keeps the version it had.
+    for (auto node : effect.writes) {
+        if (auto it = nodes_.find(node.id); it != nodes_.end()) node.version = it->second.version;
+        if (!persist_node(node)) {
+            reason = "failed to persist node";
+            return AssignmentChange::StorageError;
+        }
+        nodes_[node.id] = std::move(node);
+    }
+    return AssignmentChange::Applied;
+}
+
+PermissionTreeService::AssignmentChange PermissionTreeService::accept_invite(
+        const std::string& target_id, std::string_view invitee, std::string_view inviter,
+        const std::vector<std::string>& permissions, std::string& reason) {
+    std::lock_guard lock(mutex_);
+    if (const auto ruling = rules::invite_acceptance_refusal(nodes_, target_id, invitee, inviter,
+                                                             permissions)) {
+        reason = ruling->reason;
+        return change_for(ruling->refusal);
+    }
+    TreeOp op;
+    op.kind = TreeOpKind::AcceptInvite;
+    op.target = target_id;
+    op.principal = std::string(invitee);
+    op.body.inviter = std::string(inviter);
+    op.body.invite_permissions = permissions;
+    const auto change = apply_planned_direct_locked(op, reason);
+    if (change == AssignmentChange::Applied) {
+        spdlog::info("[{}] '{}' joined group '{}' by invite of '{}'", name(),
+                     std::string(invitee).substr(0, 24), target_id,
+                     std::string(inviter).substr(0, 24));
+    }
+    return change;
+}
+
+PermissionTreeService::AssignmentChange PermissionTreeService::move_node(
+        const std::string& node_id, const std::string& new_parent_id, std::string_view signer,
+        std::string& reason) {
+    std::lock_guard lock(mutex_);
+    if (const auto ruling = rules::move_refusal(nodes_, node_id, new_parent_id, signer)) {
+        reason = ruling->reason;
+        return change_for(ruling->refusal);
+    }
+    TreeOp op;
+    op.kind = TreeOpKind::MoveNode;
+    op.target = node_id;
+    op.principal = std::string(signer);
+    op.body.new_parent_id = new_parent_id;
+    const auto change = apply_planned_direct_locked(op, reason);
+    if (change == AssignmentChange::Applied) {
+        spdlog::info("[{}] moved node '{}' under '{}'", name(), node_id, new_parent_id);
+    }
+    return change;
+}
+
+bool PermissionTreeService::may_connect(std::string_view principal, std::string_view from_node_id,
+                                        std::string_view to_node_id) const {
+    std::lock_guard lock(mutex_);
+    auto from = nodes_.find(std::string(from_node_id));
+    auto to = nodes_.find(std::string(to_node_id));
+    if (from == nodes_.end() || to == nodes_.end()) return false;
+    return rules::endpoint_may_connect(nodes_, principal, from->second, to->second);
 }
 
 // --- ITreeProvider ---
@@ -964,19 +1045,11 @@ std::optional<TreeNode> PermissionTreeService::resolve_authorized(
     if (!target) return std::nullopt;
     if (!validate_identifier_binding(*target)) return std::nullopt;
 
-    auto caller = do_get_node(caller_node_id);
-    if (!caller) return std::nullopt;
-    if (caller->parent_id.empty()) return std::nullopt;   // root owns no group
-    if (target->id == caller_node_id) return std::nullopt; // no self-connect
-
-    // Scope: target must be within the caller's parent-group subtree.
-    if (!is_descendant_of(target->id, caller->parent_id)) return std::nullopt;
-
-    // Per-node ACL — permissions are not inherited.
-    if (!do_check_permission(caller_pubkey, target->id, acl::Permission::ConnectPrivate) &&
-        !do_check_permission(caller_pubkey, target->id, acl::Permission::ConnectShared)) {
-        return std::nullopt;
-    }
+    // Scope and grant: the target is in the caller's parent-group subtree
+    // with a connect grant on the target itself, or an invite membership
+    // covers the pair (rules::endpoint_may_connect). The rule refuses a
+    // caller without a parent (the root owns no group) and a self-connect.
+    if (!may_connect(caller_pubkey, caller_node_id, target->id)) return std::nullopt;
     return target;
 }
 

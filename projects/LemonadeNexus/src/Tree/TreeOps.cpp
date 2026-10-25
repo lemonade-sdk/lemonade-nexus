@@ -94,6 +94,8 @@ bool source_allowed(TreeOpKind kind, TreeOpSource source) {
         case TreeOpKind::SetAssignment:
         case TreeOpKind::EstablishRoot:
         case TreeOpKind::SetEndpoint:
+        case TreeOpKind::AcceptInvite:
+        case TreeOpKind::MoveNode:
             return source == TreeOpSource::Session;
         case TreeOpKind::Join:
             return source == TreeOpSource::Device;
@@ -110,6 +112,8 @@ bool kind_known(TreeOpKind kind) {
         case TreeOpKind::Join:
         case TreeOpKind::EstablishRoot:
         case TreeOpKind::SetEndpoint:
+        case TreeOpKind::AcceptInvite:
+        case TreeOpKind::MoveNode:
             return true;
     }
     return false;
@@ -520,6 +524,69 @@ TreeOpVerdict plan_join(const TreeOp& op, Overlay& overlay) {
     return {};
 }
 
+/// Move the target under body.new_parent_id. The node keeps its id, its
+/// addresses, and its own assignments. Its parent signature no longer covers
+/// the new record, so the move clears it. A device key that owns no other
+/// node loses the entries its old group and old sibling devices held for it
+/// (the link-join grants), as a delete would remove them. A move adds no
+/// grant: access in the new group comes from the new group's rules.
+TreeOpVerdict plan_move(const TreeOp& op, Overlay& overlay) {
+    const std::string& id = op.target;
+    const TreeNode* moving = overlay.find(id);
+    if (!moving) return refuse(TreeOpRefusal::NotFound, "node not found");
+    if (!overlay.find(op.body.new_parent_id)) {
+        return refuse(TreeOpRefusal::NotFound, "new parent not found");
+    }
+    const std::string old_parent = moving->parent_id;
+    const std::string key_canon = canonical_principal(moving->mgmt_pubkey);
+    const bool is_device = moving->type == NodeType::Endpoint;
+    {
+        auto& moved = overlay.edit(id);
+        moved.parent_id = op.body.new_parent_id;
+        moved.signature.clear();
+    }
+    if (!is_device || key_canon.empty()) return {};
+
+    bool key_owns_other = false;
+    overlay.for_each([&](const TreeNode& n) {
+        if (n.id != id && canonical_principal(n.mgmt_pubkey) == key_canon) key_owns_other = true;
+    });
+    if (key_owns_other) return {};
+
+    std::vector<std::string> scope = overlay.child_ids(old_parent);
+    if (!old_parent.empty()) scope.push_back(old_parent);
+    std::sort(scope.begin(), scope.end());
+    for (const auto& sid : scope) {
+        if (sid == id) continue;
+        const TreeNode* n = overlay.find(sid);
+        if (!n) continue;
+        const bool names_key =
+            std::any_of(n->assignments.begin(), n->assignments.end(), [&](const Assignment& a) {
+                return canonical_principal(a.management_pubkey) == key_canon;
+            });
+        if (!names_key) continue;
+        std::erase_if(overlay.edit(sid).assignments, [&](const Assignment& a) {
+            return canonical_principal(a.management_pubkey) == key_canon;
+        });
+    }
+    return {};
+}
+
+/// The op verdict for a refused assignment, invite, or move rule.
+TreeOpVerdict ruling_verdict(const rules::AssignmentRuling& ruling) {
+    switch (ruling.refusal) {
+        case rules::AssignmentRefusal::NotFound:
+            return refuse(TreeOpRefusal::NotFound, ruling.reason);
+        case rules::AssignmentRefusal::Forbidden:
+            return refuse(TreeOpRefusal::Forbidden, ruling.reason);
+        case rules::AssignmentRefusal::Invalid:
+            return refuse(TreeOpRefusal::Invalid, ruling.reason);
+        case rules::AssignmentRefusal::Conflict:
+            return refuse(TreeOpRefusal::Conflict, ruling.reason);
+    }
+    return refuse(TreeOpRefusal::Invalid, ruling.reason);
+}
+
 }  // namespace
 
 // --- TreeState / CommittedOpIds ---------------------------------------------
@@ -576,6 +643,11 @@ security::CanonicalEncoder op_encoder(const TreeOp& op) {
                 add_strings(enc, op.body.assignment_permissions);
             } else if (op.kind == TreeOpKind::SetEndpoint) {
                 enc.add_string(op.body.listen_endpoint);
+            } else if (op.kind == TreeOpKind::AcceptInvite) {
+                enc.add_string(op.body.inviter);
+                add_strings(enc, op.body.invite_permissions);
+            } else if (op.kind == TreeOpKind::MoveNode) {
+                enc.add_string(op.body.new_parent_id);
             }
             break;
     }
@@ -845,14 +917,24 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             if (auto ruling = rules::assignment_change_refusal(
                     nodes, op.target, op.principal, body.assignment_principal,
                     body.assignment_permissions)) {
-                switch (ruling->refusal) {
-                    case rules::AssignmentRefusal::NotFound:
-                        return refuse(R::NotFound, ruling->reason);
-                    case rules::AssignmentRefusal::Forbidden:
-                        return refuse(R::Forbidden, ruling->reason);
-                    case rules::AssignmentRefusal::Invalid:
-                        return refuse(R::Invalid, ruling->reason);
-                }
+                return ruling_verdict(*ruling);
+            }
+            break;
+        }
+        case TreeOpKind::AcceptInvite: {
+            // The submitter consumed the link token. Every replica still
+            // checks, against the committed tree, that the inviter may grant
+            // these permissions on the target now.
+            if (auto ruling = rules::invite_acceptance_refusal(
+                    nodes, op.target, op.principal, body.inviter, body.invite_permissions)) {
+                return ruling_verdict(*ruling);
+            }
+            break;
+        }
+        case TreeOpKind::MoveNode: {
+            if (auto ruling = rules::move_refusal(nodes, op.target, body.new_parent_id,
+                                                  op.principal)) {
+                return ruling_verdict(*ruling);
             }
             break;
         }
@@ -969,6 +1051,16 @@ TreeOpVerdict plan_op(const TreeOp& op, const TreeState::NodeMap& nodes,
         case TreeOpKind::SetEndpoint: {
             if (!overlay.find(id)) return refuse(R::NotFound, "node not found");
             overlay.edit(id).listen_endpoint = body.listen_endpoint;
+            break;
+        }
+        case TreeOpKind::AcceptInvite: {
+            if (!overlay.find(id)) return refuse(R::NotFound, "node not found");
+            rules::replace_assignment(overlay.edit(id).assignments, op.principal,
+                                      body.invite_permissions);
+            break;
+        }
+        case TreeOpKind::MoveNode: {
+            if (auto v = plan_move(op, overlay); !v.ok()) return v;
             break;
         }
     }
@@ -1181,6 +1273,10 @@ std::optional<TreeOp> decode_tree_op(std::span<const uint8_t> encoding,
                      r.strings(op.body.assignment_permissions);
             } else if (op.kind == TreeOpKind::SetEndpoint) {
                 ok = r.string(op.body.listen_endpoint);
+            } else if (op.kind == TreeOpKind::AcceptInvite) {
+                ok = r.string(op.body.inviter) && r.strings(op.body.invite_permissions);
+            } else if (op.kind == TreeOpKind::MoveNode) {
+                ok = r.string(op.body.new_parent_id);
             }
             break;
     }

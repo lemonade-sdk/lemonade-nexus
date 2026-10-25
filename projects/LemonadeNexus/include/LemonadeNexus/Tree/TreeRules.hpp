@@ -11,6 +11,7 @@
 #include <LemonadeNexus/ACL/Permission.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -75,8 +76,10 @@ using NodeMap = std::unordered_map<std::string, TreeNode>;
 [[nodiscard]] std::optional<std::string> delta_content_refusal(const NodeMap& nodes,
                                                                const TreeDelta& delta);
 
-/// Why an administrative assignment change is refused.
-enum class AssignmentRefusal { NotFound, Forbidden, Invalid };
+/// Why an administrative assignment change, an invite, or a move is refused.
+/// Conflict: the change contradicts the current placement (for example, the
+/// invitee already belongs to the group).
+enum class AssignmentRefusal { NotFound, Forbidden, Invalid, Conflict };
 
 /// A refused assignment change and the reason text returned to the caller.
 struct AssignmentRuling {
@@ -91,6 +94,11 @@ struct AssignmentRuling {
 /// given any permission has joined inside that admin's subtree. nullopt when
 /// the change is allowed. The checks run in this order, so the first failing
 /// rule decides the reason.
+///
+/// One change needs no admin: a principal removes its own entry (empty
+/// `permissions`, `signer` equals `principal`) from a group (Customer node)
+/// that it has not joined, when that entry does not hold `admin`. This is how
+/// a member leaves a group it entered through an invite.
 [[nodiscard]] std::optional<AssignmentRuling> assignment_change_refusal(
         const NodeMap& nodes, std::string_view node_id, std::string_view signer,
         std::string_view principal, const std::vector<std::string>& permissions);
@@ -100,5 +108,86 @@ struct AssignmentRuling {
 /// empty list removes the principal. The new entry keeps the given spelling.
 void replace_assignment(std::vector<Assignment>& assignments, std::string_view principal,
                         const std::vector<std::string>& permissions);
+
+/// True when `signer` holds `perm` through its entry on `node_id`, or holds
+/// `admin` on the node or an ancestor (admin_anchor). This is the authority
+/// an inviter or a mover needs on a node.
+[[nodiscard]] bool holds_or_administers(const NodeMap& nodes, std::string_view node_id,
+                                        std::string_view signer, acl::Permission perm);
+
+// --- Invites (link tokens that target a group) ------------------------------
+
+/// The permission names an invite may grant. `admin`, `edit_node`, and
+/// `delete_node` are never granted by an invite, so an invite cannot give
+/// control over the inviter's group.
+inline constexpr std::array<std::string_view, 5> kInvitePermissions = {
+    "read", "write", "add_child", "connect_private", "connect_shared"};
+
+/// The permissions an invite carries when the inviter names none, reduced to
+/// those the inviter holds (see the link token route).
+inline constexpr std::array<std::string_view, 2> kDefaultInvitePermissions = {
+    "read", "connect_private"};
+
+/// The rules for an invite into `target_id` minted by `inviter` with
+/// `permissions`: the target exists and is a group (Customer node); the
+/// inviter holds add_child on it or administers it (holds_or_administers);
+/// every permission name is in kInvitePermissions; and the inviter holds
+/// each permission on the target or administers it, so an invite never grants
+/// more than the inviter holds. An empty list is allowed: such an invite can
+/// place a new device but cannot make a member. nullopt when the invite is
+/// allowed.
+[[nodiscard]] std::optional<AssignmentRuling> invite_refusal(
+        const NodeMap& nodes, std::string_view target_id, std::string_view inviter,
+        const std::vector<std::string>& permissions);
+
+/// The rules for `invitee` accepting an invite into `target_id`: the
+/// invite_refusal rules, evaluated against the current tree (an inviter that
+/// lost its permission voids the invite); the permissions include `read`; the
+/// invitee is a valid principal; and the invitee neither joined inside the
+/// target (principal_joined_under) nor administers it, because a member entry
+/// would replace that home entry. nullopt when accepting is allowed.
+/// Accepting sets exactly `permissions` as the invitee's entry on the target
+/// (replace_assignment) and changes no other node.
+[[nodiscard]] std::optional<AssignmentRuling> invite_acceptance_refusal(
+        const NodeMap& nodes, std::string_view target_id, std::string_view invitee,
+        std::string_view inviter, const std::vector<std::string>& permissions);
+
+// --- Group membership reach --------------------------------------------------
+
+/// True when `member` holds a literal `connect_private` or `connect_shared`
+/// entry on a group (Customer node) that is a strict ancestor of `node`. An
+/// `admin` entry does not count, so a root or group admin gets no connect
+/// reach from this rule. This is the connect reach an accepted invite gives.
+[[nodiscard]] bool membership_reaches(const NodeMap& nodes, std::string_view member,
+                                      const TreeNode& node);
+
+/// The connect rule for endpoint `from`, acting as `principal`, to node `to`.
+/// It allows the connection when either:
+///  - home scope: `to` is beneath `from`'s parent group and `principal` holds
+///    ConnectPrivate or ConnectShared on `to` itself (`admin` includes both); or
+///  - membership: `principal` is `from`'s own management key, and either
+///    membership_reaches(principal, to) (a member's device reaches the
+///    group's devices) or membership_reaches(to.mgmt_pubkey, from) (the
+///    group's devices reach a member's device).
+/// Never true for a node to itself or for a `from` without a parent.
+[[nodiscard]] bool endpoint_may_connect(const NodeMap& nodes, std::string_view principal,
+                                        const TreeNode& from, const TreeNode& to);
+
+// --- Moves -------------------------------------------------------------------
+
+/// The rules for moving `node_id` under `new_parent_id` by `signer`: the node
+/// and the new parent exist; the node is an Endpoint or a Customer group; a
+/// top-level group (a Customer node whose parent is a Root node) never moves,
+/// so no one moves another user's network out from under its owner; the new
+/// parent is a Customer group, differs from the current parent, and is not the
+/// node or one of its descendants; for an Endpoint the signer holds
+/// delete_node on it or administers it, and for a group the signer administers
+/// it (delete_node alone cannot take over a subtree); and the signer holds
+/// add_child on the new parent or administers it. nullopt when the move is
+/// allowed.
+[[nodiscard]] std::optional<AssignmentRuling> move_refusal(const NodeMap& nodes,
+                                                           std::string_view node_id,
+                                                           std::string_view new_parent_id,
+                                                           std::string_view signer);
 
 }  // namespace nexus::tree::rules

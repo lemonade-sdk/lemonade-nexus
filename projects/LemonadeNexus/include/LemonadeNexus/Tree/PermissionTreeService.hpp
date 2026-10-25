@@ -81,8 +81,9 @@ public:
     /// not inherited.
     [[nodiscard]] bool administers(std::string_view signer, std::string_view node_id) const;
 
-    /// Outcome of an administrative assignment change.
-    enum class AssignmentChange { Applied, NotFound, Forbidden, Invalid, StorageError };
+    /// Outcome of an administrative assignment change, an invite acceptance,
+    /// or a move.
+    enum class AssignmentChange { Applied, NotFound, Forbidden, Invalid, Conflict, StorageError };
 
     /// Set exactly the permissions `principal` holds on `node_id`, replacing
     /// any entries it had (an empty list removes it). The same rules as an
@@ -90,12 +91,41 @@ public:
     /// ancestor, and a principal given any permission must have joined inside
     /// that admin's subtree. A signer cannot change its own entry on the node
     /// that grants its admin, so no admin locks itself out. Unknown
-    /// permission names are Invalid. `reason` receives the refusal text.
+    /// permission names are Invalid. A member may remove its own entry from a
+    /// group it entered through an invite (see rules::assignment_change_refusal).
+    /// `reason` receives the refusal text.
     [[nodiscard]] AssignmentChange set_assignment(const std::string& node_id,
                                                   std::string_view signer,
                                                   std::string_view principal,
                                                   const std::vector<std::string>& permissions,
                                                   std::string& reason);
+
+    /// Direct-write form of the AcceptInvite tree operation: make `invitee` a
+    /// member of `target_id` with exactly `permissions`, as invited by
+    /// `inviter`. The caller has consumed the link token; this checks
+    /// rules::invite_acceptance_refusal against the current tree and then
+    /// applies the same plan as the tree operation. No other node changes.
+    /// `reason` receives the refusal text. Thread-safe.
+    [[nodiscard]] AssignmentChange accept_invite(const std::string& target_id,
+                                                 std::string_view invitee,
+                                                 std::string_view inviter,
+                                                 const std::vector<std::string>& permissions,
+                                                 std::string& reason);
+
+    /// Direct-write form of the MoveNode tree operation: move `node_id` under
+    /// `new_parent_id` for `signer`, after rules::move_refusal, with the same
+    /// plan as the tree operation (the node keeps its id, addresses, and own
+    /// assignments; see plan_op). `reason` receives the refusal text.
+    /// Thread-safe.
+    [[nodiscard]] AssignmentChange move_node(const std::string& node_id,
+                                             const std::string& new_parent_id,
+                                             std::string_view signer, std::string& reason);
+
+    /// The connect rule (rules::endpoint_may_connect) for endpoint
+    /// `from_node_id`, acting as `principal`, to `to_node_id`. False when
+    /// either node is missing. Thread-safe.
+    [[nodiscard]] bool may_connect(std::string_view principal, std::string_view from_node_id,
+                                   std::string_view to_node_id) const;
 
     // --- Tree operations (see TreeOps.hpp) ---
 
@@ -211,9 +241,11 @@ public:
                                         std::string_view ancestor_id) const;
 
     /// Routing-layer authorization chokepoint. Returns the target node only if
-    /// the identifier resolves, its binding validates, the target is within the
-    /// caller's parent-group subtree, and the caller holds ConnectPrivate or
-    /// ConnectShared on it; nullopt otherwise. caller_pubkey must be normalized.
+    /// the identifier resolves, its binding validates, and the connect rule
+    /// (may_connect) allows the caller's node to reach it: the target is in the
+    /// caller's parent-group subtree with a ConnectPrivate or ConnectShared
+    /// grant on it, or a group membership from an accepted invite covers the
+    /// pair. nullopt otherwise. caller_pubkey must be normalized.
     [[nodiscard]] std::optional<TreeNode> resolve_authorized(
             std::string_view caller_pubkey,
             std::string_view caller_node_id,
@@ -241,6 +273,16 @@ private:
 
     /// Remove a tree node from storage.
     bool remove_node(std::string_view node_id);
+
+    /// The AssignmentChange for a refused rule.
+    [[nodiscard]] static AssignmentChange change_for(rules::AssignmentRefusal refusal);
+
+    /// Plan `op` with plan_op and persist its writes without consensus,
+    /// keeping each node's version (the direct paths do not maintain it).
+    /// The caller holds mutex_ and has already checked the op's rules. Only
+    /// for ops whose plan writes nodes and removes none.
+    [[nodiscard]] AssignmentChange apply_planned_direct_locked(const TreeOp& op,
+                                                               std::string& reason);
 
     /// apply_op with mutex_ held. Appends each node the op removes, as it was
     /// before the op, to `removed`.

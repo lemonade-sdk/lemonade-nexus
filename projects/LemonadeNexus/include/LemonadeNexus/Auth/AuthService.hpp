@@ -64,10 +64,13 @@ public:
     /// key was not revoked. Admin authorization is enforced by the API layer.
     bool unrevoke_ed25519(const std::string& pubkey_b64);
 
-    /// Mint a single-use device-link token bound to the owner's Customer group.
+    /// Mint a single-use link token (invite) bound to `group_node_id` that
+    /// carries `permissions` for an accepting member (see
+    /// TokenLinkAuthProvider::mint). The caller authorizes the invite.
     [[nodiscard]] std::optional<std::pair<std::string, LinkTokenRecord>>
     mint_link_token(const std::string& owner_user_id, const std::string& owner_pubkey,
-                    const std::string& group_node_id, std::chrono::seconds ttl);
+                    const std::string& group_node_id, std::chrono::seconds ttl,
+                    std::vector<std::string> permissions = {});
 
     /// Verify and burn a device-link token (single use).
     [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token);

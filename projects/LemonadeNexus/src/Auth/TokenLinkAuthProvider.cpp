@@ -2,6 +2,7 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
+#include <LemonadeNexus/Tree/TreeRules.hpp>
 
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -35,6 +36,7 @@ bool write_record(const std::filesystem::path& path, const LinkTokenRecord& reco
         {"group_node_id", record.group_node_id},
         {"created_at",    record.created_at},
         {"expires_at",    record.expires_at},
+        {"permissions",   record.permissions},
     };
     try {
         std::filesystem::create_directories(path.parent_path());
@@ -75,7 +77,8 @@ std::optional<std::pair<std::string, LinkTokenRecord>>
 TokenLinkAuthProvider::mint(const std::string& owner_user_id,
                             const std::string& owner_pubkey,
                             const std::string& group_node_id,
-                            std::chrono::seconds ttl) {
+                            std::chrono::seconds ttl,
+                            std::vector<std::string> permissions) {
     if (owner_user_id.empty() || group_node_id.empty()) return std::nullopt;
     ttl = std::clamp(ttl, std::chrono::seconds{60}, kMaxTtl);
 
@@ -90,6 +93,7 @@ TokenLinkAuthProvider::mint(const std::string& owner_user_id,
         .group_node_id = group_node_id,
         .created_at    = now,
         .expires_at    = now + static_cast<uint64_t>(ttl.count()),
+        .permissions   = std::move(permissions),
     };
 
     if (!write_record(token_path(token), record)) return std::nullopt;
@@ -120,6 +124,20 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::verify(std::string_view to
         .created_at    = j.value("created_at", uint64_t{0}),
         .expires_at    = j.value("expires_at", uint64_t{0}),
     };
+    if (!j.contains("permissions")) {
+        // Minted before invites carried permissions. Acceptance re-checks the
+        // inviter's authority for these, so the default grants nothing extra.
+        for (const auto p : tree::rules::kDefaultInvitePermissions) {
+            record.permissions.emplace_back(p);
+        }
+    } else if (j["permissions"].is_array()) {
+        for (const auto& p : j["permissions"]) {
+            if (!p.is_string()) return std::nullopt;
+            record.permissions.push_back(p.get<std::string>());
+        }
+    } else {
+        return std::nullopt;
+    }
 
     if (record.expires_at <= now_epoch_sec()) {
         std::error_code ec;

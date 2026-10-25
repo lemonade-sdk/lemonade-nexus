@@ -23,6 +23,7 @@
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Api/IRequestHandler.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <LemonadeNexus/Api/AuthApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
@@ -2386,4 +2387,348 @@ TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
     cfg.tree_ops_enabled = original;
     srv.stop();
     server_thread.join();
+}
+
+// --- Invites into a chosen group, joining another network, and moves ---
+//
+// Serves the production tree, auth (link token), and mesh routes on their own
+// server; the base fixture shadows some of them with stand-ins. In the
+// tree-operation build every write below goes through a tree operation.
+class InviteHttpTest : public HttpEndpointTest {
+protected:
+    httplib::Server srv;
+    std::thread srv_thread;
+    int port = 0;
+    std::unique_ptr<api::AuthApiHandler> auth_handler;
+    std::unique_ptr<api::MeshApiHandler> mesh_handler;
+
+    /// One joined identity: its key, node id, and group.
+    struct Member {
+        crypto::Ed25519Keypair kp;
+        std::string b64;
+        std::string node_id;
+        std::string group;
+    };
+
+    void SetUp() override {
+        HttpEndpointTest::SetUp();
+        if (HasFatalFailure()) return;
+        auth_handler = std::make_unique<api::AuthApiHandler>(*test_api::current().ctx);
+        mesh_handler = std::make_unique<api::MeshApiHandler>(*test_api::current().ctx);
+        test_api::handler().register_routes(srv, srv);
+        auth_handler->register_routes(srv, srv);
+        mesh_handler->register_routes(srv, srv);
+        port = srv.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(port, 0);
+        srv_thread = std::thread([this] { srv.listen_after_bind(); });
+        srv.wait_until_ready();
+    }
+
+    void TearDown() override {
+        srv.stop();
+        if (srv_thread.joinable()) srv_thread.join();
+        mesh_handler.reset();
+        auth_handler.reset();
+        HttpEndpointTest::TearDown();
+    }
+
+    /// Join a new device, optionally with a link token.
+    Member join(const std::string& link_token = {}) {
+        Member m;
+        m.kp = crypto->ed25519_keygen();
+        m.b64 = crypto::to_base64(
+            std::span<const uint8_t>(m.kp.public_key.data(), m.kp.public_key.size()));
+        auto res = join_node(m.kp, link_token);
+        EXPECT_NE(res, nullptr);
+        if (!res) return m;
+        EXPECT_EQ(res->status, 200) << res->body;
+        m.node_id = json::parse(res->body).value("node_id", std::string{});
+        if (auto n = tree->get_node(m.node_id)) m.group = n->parent_id;
+        return m;
+    }
+
+    /// A session for `m`: subject is its node id, pubkey its identity.
+    httplib::Headers session(const Member& m) {
+        auto now = std::chrono::system_clock::now();
+        const auto jwt = jwt::create()
+                             .set_issuer("lemonade-nexus")
+                             .set_subject(m.node_id)
+                             .set_issued_at(now)
+                             .set_expires_at(now + std::chrono::hours{1})
+                             .set_payload_claim("pubkey", jwt::claim(m.b64))
+                             .sign(jwt::algorithm::hs256{jwt_secret});
+        return {{"Authorization", "Bearer " + jwt}};
+    }
+
+    httplib::Result post(const Member& m, const std::string& path, const json& body) {
+        httplib::Client cli("127.0.0.1", port);
+        return cli.Post(path, session(m), body.dump(), "application/json");
+    }
+
+    httplib::Result get(const Member& m, const std::string& path) {
+        httplib::Client cli("127.0.0.1", port);
+        return cli.Get(path, session(m));
+    }
+
+    /// Mint an invite as `m`; returns the response.
+    httplib::Result invite(const Member& m, const json& body = json::object()) {
+        return post(m, "/api/link/token", body);
+    }
+
+    std::string invite_token(const Member& m, const json& body = json::object()) {
+        auto res = invite(m, body);
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body).value("link_token", std::string{});
+    }
+
+    /// Node ids in `m`'s mesh peer list.
+    std::set<std::string> peers(const Member& m) {
+        auto res = get(m, "/api/mesh/peers/" + m.node_id);
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        std::set<std::string> ids;
+        const auto body = json::parse(res->body);
+        for (const auto& p : body["peers"]) {
+            ids.insert(p["node_id"].get<std::string>());
+        }
+        return ids;
+    }
+
+    /// Create a subgroup under `m`'s group as `m`; returns its id.
+    std::string subgroup(const Member& m) {
+        auto res = post(m, "/api/tree/node", {{"parent_id", m.group}, {"type", "customer"}});
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body).value("node_id", std::string{});
+    }
+};
+
+TEST_F(InviteHttpTest, AnInviteTargetsTheChosenGroupOrTheOwnGroup) {
+    const auto alice = join();
+    const auto sub = subgroup(alice);
+    ASSERT_FALSE(sub.empty());
+
+    auto own = invite(alice);
+    ASSERT_NE(own, nullptr);
+    ASSERT_EQ(own->status, 200) << own->body;
+    const auto own_body = json::parse(own->body);
+    EXPECT_EQ(own_body["target_node_id"], alice.group);
+    EXPECT_EQ(own_body["permissions"], json::array({"read", "connect_private"}));
+
+    const auto token = invite_token(alice, {{"target_node_id", sub}});
+    const auto device = join(token);
+    EXPECT_EQ(device.group, sub) << "a new device lands under the chosen group";
+}
+
+TEST_F(InviteHttpTest, AnInviteIsBoundedByTheInvitersAuthority) {
+    const auto alice = join();
+    const auto bob = join();
+    auto status_of = [&](const Member& m, const json& body) {
+        auto res = invite(m, body);
+        return res ? res->status : -1;
+    };
+    EXPECT_EQ(status_of(bob, {{"target_node_id", alice.group}}), 403);
+    EXPECT_EQ(status_of(alice, {{"permissions", {"read", "admin"}}}), 400);
+    EXPECT_EQ(status_of(alice, {{"permissions", {"read", "delete_node"}}}), 400);
+    EXPECT_EQ(status_of(alice, {{"target_node_id", alice.node_id}}), 400) << "not a group";
+    EXPECT_EQ(status_of(alice, {{"target_node_id", "no-such-group"}}), 404);
+    EXPECT_EQ(status_of(alice, {{"target_node_id", "root"}}), 400);
+}
+
+TEST_F(InviteHttpTest, AnExistingUserJoinsAnotherNetworkWithoutMoving) {
+    const auto alice = join();
+    const auto alice2 = join(invite_token(alice));  // alice's second device
+    const auto bob = join();
+    const auto bob2 = join(invite_token(bob));      // bob's second device
+    ASSERT_EQ(alice2.group, alice.group);
+    ASSERT_EQ(bob2.group, bob.group);
+    const auto bob_before = json(*tree->get_node(bob.node_id)).dump();
+
+    const auto token = invite_token(alice);
+    auto res = post(bob, "/api/link/accept", {{"link_token", token}});
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_EQ(json::parse(res->body)["status"], "member");
+
+    // Nothing of bob's network moved or changed.
+    EXPECT_EQ(json(*tree->get_node(bob.node_id)).dump(), bob_before);
+    EXPECT_EQ(tree->get_node(bob.group)->parent_id, "root");
+
+    // Bob's device sees alice's devices; bob's home network is unchanged.
+    const auto bob_peers = peers(bob);
+    EXPECT_TRUE(bob_peers.count(alice.node_id));
+    EXPECT_TRUE(bob_peers.count(alice2.node_id));
+    EXPECT_TRUE(peers(bob2).count(bob.node_id));
+    // Alice's devices see bob's device, never bob's other device.
+    const auto alice_peers = peers(alice);
+    EXPECT_TRUE(alice_peers.count(bob.node_id));
+    EXPECT_FALSE(alice_peers.count(bob2.node_id)) << "the membership leaked bob's network";
+    EXPECT_TRUE(peers(alice2).count(bob.node_id));
+    // Bob's other device is not a member.
+    EXPECT_FALSE(peers(bob2).count(alice.node_id));
+    // Bob reads alice's group but administers nothing there.
+    EXPECT_EQ(get(bob, "/api/tree/node/" + alice.group)->status, 200);
+    EXPECT_EQ(post(bob, "/api/tree/node/delete/" + alice2.node_id, json::object())->status, 403);
+}
+
+TEST_F(InviteHttpTest, AMemberOfASubgroupSeesOnlyThatSubgroup) {
+    const auto alice = join();
+    const auto sub = subgroup(alice);
+    const auto sub_device = join(invite_token(alice, {{"target_node_id", sub}}));
+    const auto bob = join();
+    auto res = post(bob, "/api/link/accept",
+                    {{"link_token", invite_token(alice, {{"target_node_id", sub}})}});
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    const auto bob_peers = peers(bob);
+    EXPECT_TRUE(bob_peers.count(sub_device.node_id));
+    EXPECT_FALSE(bob_peers.count(alice.node_id));
+    EXPECT_EQ(get(bob, "/api/tree/node/" + alice.group)->status, 403);
+}
+
+TEST_F(InviteHttpTest, JoiningWithAnInviteAsAnExistingDeviceMakesAMember) {
+    const auto alice = join();
+    const auto bob = join();
+    auto res = join_node(bob.kp, invite_token(alice));
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    const auto body = json::parse(res->body);
+    EXPECT_EQ(body["node_id"], bob.node_id);
+    ASSERT_TRUE(body.contains("membership")) << res->body;
+    EXPECT_EQ(body["membership"]["status"], "member");
+    EXPECT_EQ(body["membership"]["node_id"], alice.group);
+    EXPECT_EQ(tree->get_node(bob.node_id)->parent_id, bob.group) << "the device did not move";
+    EXPECT_TRUE(peers(bob).count(alice.node_id));
+}
+
+TEST_F(InviteHttpTest, AnInviteIsSingleUseAndARefusalDoesNotSpendIt) {
+    const auto alice = join();
+    const auto alice2 = join(invite_token(alice));
+    const auto bob = join();
+    const auto carol = join();
+    const auto token = invite_token(alice);
+
+    // Alice's own device already belongs: refused, and the token survives.
+    auto home = post(alice2, "/api/link/accept", {{"link_token", token}});
+    ASSERT_NE(home, nullptr);
+    EXPECT_EQ(home->status, 409) << home->body;
+
+    ASSERT_EQ(post(bob, "/api/link/accept", {{"link_token", token}})->status, 200);
+    auto reused = post(carol, "/api/link/accept", {{"link_token", token}});
+    ASSERT_NE(reused, nullptr);
+    EXPECT_EQ(reused->status, 403) << reused->body;
+    EXPECT_FALSE(peers(carol).count(alice.node_id));
+
+    // An identity that never joined cannot accept.
+    Member stranger;
+    stranger.kp = crypto->ed25519_keygen();
+    stranger.b64 = crypto::to_base64(std::span<const uint8_t>(stranger.kp.public_key.data(),
+                                                              stranger.kp.public_key.size()));
+    stranger.node_id = "nobody";
+    EXPECT_EQ(post(stranger, "/api/link/accept", {{"link_token", invite_token(alice)}})->status,
+              409);
+}
+
+TEST_F(InviteHttpTest, TheOwnerRemovesAMemberAndAMemberLeaves) {
+    const auto alice = join();
+    const auto alice2 = join(invite_token(alice));
+    const auto bob = join();
+    const auto bob_pk = "ed25519:" + bob.b64;
+    ASSERT_EQ(post(bob, "/api/link/accept", {{"link_token", invite_token(alice)}})->status, 200);
+
+    // A member cannot remove another principal.
+    EXPECT_EQ(post(bob, "/api/tree/node/assignments/" + alice.group,
+                   {{"pubkey", "ed25519:" + alice2.b64}, {"permissions", json::array()}})
+                  ->status,
+              403);
+    // The owner removes the member.
+    auto removed = post(alice, "/api/tree/node/assignments/" + alice.group,
+                        {{"pubkey", bob_pk}, {"permissions", json::array()}});
+    ASSERT_NE(removed, nullptr);
+    ASSERT_EQ(removed->status, 200) << removed->body;
+    EXPECT_FALSE(peers(bob).count(alice.node_id));
+    EXPECT_FALSE(peers(alice).count(bob.node_id));
+
+    // Invited again, the member leaves on its own.
+    ASSERT_EQ(post(bob, "/api/link/accept", {{"link_token", invite_token(alice)}})->status, 200);
+    ASSERT_TRUE(peers(bob).count(alice.node_id));
+    auto left = post(bob, "/api/tree/node/assignments/" + alice.group,
+                     {{"pubkey", bob_pk}, {"permissions", json::array()}});
+    ASSERT_NE(left, nullptr);
+    ASSERT_EQ(left->status, 200) << left->body;
+    EXPECT_FALSE(peers(bob).count(alice.node_id));
+}
+
+TEST_F(InviteHttpTest, MembershipsListHomeAndMemberGroups) {
+    const auto alice = join();
+    const auto bob = join();
+    ASSERT_EQ(post(bob, "/api/link/accept", {{"link_token", invite_token(alice)}})->status, 200);
+    auto res = get(bob, "/api/tree/memberships");
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    std::map<std::string, json> by_id;
+    const auto body = json::parse(res->body);
+    for (const auto& m : body["memberships"]) {
+        by_id[m["node_id"].get<std::string>()] = m;
+    }
+    ASSERT_TRUE(by_id.count(bob.group)) << res->body;
+    ASSERT_TRUE(by_id.count(alice.group)) << res->body;
+    EXPECT_EQ(by_id[bob.group]["role"], "home");
+    EXPECT_EQ(by_id[alice.group]["role"], "member");
+    EXPECT_EQ(by_id[alice.group]["permissions"], json::array({"connect_private", "read"}));
+    EXPECT_FALSE(by_id[alice.group].contains("assignments"));
+}
+
+TEST_F(InviteHttpTest, AnInviteFromAMemberEndsWithItsAuthority) {
+    const auto alice = join();
+    const auto bob = join();
+    const auto carol = join();
+    ASSERT_EQ(post(bob, "/api/link/accept",
+                   {{"link_token",
+                     invite_token(alice, {{"permissions", {"read", "add_child"}}})}})
+                  ->status,
+              200);
+    // Bob holds add_child and read, so he may invite with read only.
+    auto too_much = invite(bob, {{"target_node_id", alice.group},
+                                 {"permissions", {"read", "connect_private"}}});
+    ASSERT_NE(too_much, nullptr);
+    EXPECT_EQ(too_much->status, 403) << too_much->body;
+    const auto token = invite_token(bob, {{"target_node_id", alice.group}});
+
+    ASSERT_EQ(post(alice, "/api/tree/node/assignments/" + alice.group,
+                   {{"pubkey", "ed25519:" + bob.b64}, {"permissions", json::array()}})
+                  ->status,
+              200);
+    auto refused = post(carol, "/api/link/accept", {{"link_token", token}});
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 403) << refused->body;
+}
+
+TEST_F(InviteHttpTest, MovingADeviceKeepsItsAddressAndNeedsBothRights) {
+    const auto alice = join();
+    const auto sub = subgroup(alice);
+    const auto device = join(invite_token(alice));
+    const auto bob = join();
+    const auto ip_before = tree->get_node(device.node_id)->tunnel_ip;
+
+    auto refused = post(bob, "/api/tree/node/move/" + device.node_id, {{"parent_id", bob.group}});
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 403) << refused->body;
+    auto top = post(alice, "/api/tree/node/move/" + alice.group, {{"parent_id", sub}});
+    ASSERT_NE(top, nullptr);
+    EXPECT_EQ(top->status, 403) << top->body;
+
+    auto moved = post(alice, "/api/tree/node/move/" + device.node_id, {{"parent_id", sub}});
+    ASSERT_NE(moved, nullptr);
+    ASSERT_EQ(moved->status, 200) << moved->body;
+    const auto after = tree->get_node(device.node_id);
+    EXPECT_EQ(after->parent_id, sub);
+    EXPECT_EQ(after->tunnel_ip, ip_before);
+    // The moved device left its old group's scope: alice's device no longer
+    // reaches it until a grant in the new group allows it.
+    EXPECT_FALSE(peers(alice).count(device.node_id));
 }

@@ -890,3 +890,348 @@ TEST_F(TreeOpsTest, ApplyingACommittedDeleteReportsTheRemovedNode) {
     EXPECT_TRUE(reported.empty());
     tree_svc->set_removed_nodes_hook({});
 }
+
+// =========================================================================
+// Invites into a chosen group (AcceptInvite) and moves (MoveNode)
+// =========================================================================
+
+/// Two networks: "alpha" (owner A, subgroups "alpha-sub1" and "alpha-sub2",
+/// devices "alpha-dev" with key A and "alpha-dev2" with key A2) and "beta"
+/// (owner B, devices "beta-dev" with key B and "beta-dev2" with key B2).
+class TreeMembershipTest : public TreeOpsTest {
+protected:
+    crypto::Ed25519Keypair a_kp, a2_kp, b_kp, b2_kp;
+    std::string pa, pa2, pb, pb2;
+    uint64_t clock = kBlock;
+
+    void SetUp() override {
+        TreeOpsTest::SetUp();
+        a_kp = crypto_svc->ed25519_keygen();
+        a2_kp = crypto_svc->ed25519_keygen();
+        b_kp = crypto_svc->ed25519_keygen();
+        b2_kp = crypto_svc->ed25519_keygen();
+        pa = principal_of(a_kp);
+        pa2 = principal_of(a2_kp);
+        pb = principal_of(b_kp);
+        pb2 = principal_of(b2_kp);
+        build(*tree_svc);
+    }
+
+    /// Seal with a strictly increasing signed time, so equal content never
+    /// collides on op id.
+    TreeOp next(TreeOp op) { return seal(std::move(op), ++clock); }
+
+    tree::TreeOpVerdict run(const TreeOp& op, tree::PermissionTreeService* svc = nullptr) {
+        return submit(op, clock, svc);
+    }
+
+    static tree::TreeNode node(const std::string& id, const std::string& parent,
+                               tree::NodeType type, const std::string& key,
+                               std::vector<tree::Assignment> assignments) {
+        tree::TreeNode n;
+        n.id = id;
+        n.parent_id = parent;
+        n.type = type;
+        n.mgmt_pubkey = key;
+        n.assignments = std::move(assignments);
+        return n;
+    }
+
+    void build(tree::PermissionTreeService& svc) {
+        using tree::NodeType;
+        // Each node is created by the admin of its parent, in an order where
+        // every identity an assignment names has already joined.
+        const std::vector<std::pair<tree::TreeNode, std::string>> nodes = {
+            {node("alpha", "root", NodeType::Customer, pa, {{pa, {"admin"}}}), root_pk},
+            {node("alpha-sub1", "alpha", NodeType::Customer, pa, {{pa, {"add_child", "read"}}}),
+             pa},
+            {node("alpha-sub2", "alpha", NodeType::Customer, pa, {{pa, {"add_child", "read"}}}),
+             pa},
+            {node("alpha-dev2", "alpha", NodeType::Endpoint, pa2,
+                  {{pa2, {"edit_node", "read", "write"}}, {pa, {"connect_private", "read"}}}),
+             pa},
+            {node("alpha-dev", "alpha", NodeType::Endpoint, pa,
+                  {{pa, {"add_child", "delete_node", "edit_node", "read", "write"}},
+                   {pa2, {"connect_private", "read"}}}),
+             pa},
+            {node("beta", "root", NodeType::Customer, pb, {{pb, {"admin"}}}), root_pk},
+            {node("beta-dev2", "beta", NodeType::Endpoint, pb2,
+                  {{pb2, {"edit_node", "read", "write"}}, {pb, {"connect_private", "read"}}}),
+             pb},
+            {node("beta-dev", "beta", NodeType::Endpoint, pb,
+                  {{pb, {"add_child", "delete_node", "edit_node", "read", "write"}},
+                   {pb2, {"connect_private", "read"}}}),
+             pb},
+        };
+        for (const auto& [n, signer] : nodes) {
+            auto v = submit(seal(create_op(n, signer), kBlock), kBlock, &svc);
+            ASSERT_TRUE(v.ok()) << n.id << ": " << v.reason;
+        }
+    }
+
+    TreeOp accept_op(const std::string& target, const std::string& invitee,
+                     const std::string& inviter, std::vector<std::string> perms) {
+        TreeOp op;
+        op.kind = TreeOpKind::AcceptInvite;
+        op.target = target;
+        op.base_version = version_of(target);
+        op.principal = invitee;
+        op.body.source = TreeOpSource::Session;
+        op.body.inviter = inviter;
+        op.body.invite_permissions = std::move(perms);
+        return op;
+    }
+
+    TreeOp move_op(const std::string& target, const std::string& new_parent,
+                   const std::string& signer) {
+        TreeOp op;
+        op.kind = TreeOpKind::MoveNode;
+        op.target = target;
+        op.base_version = version_of(target);
+        op.principal = signer;
+        op.body.source = TreeOpSource::Session;
+        op.body.new_parent_id = new_parent;
+        return op;
+    }
+
+    bool connects(const std::string& principal, const std::string& from, const std::string& to) {
+        return tree_svc->may_connect(principal, from, to);
+    }
+};
+
+TEST_F(TreeMembershipTest, AcceptInviteMakesAMemberWithoutMovingAnything) {
+    const auto beta_before = nlohmann::json(*tree_svc->get_node("beta")).dump();
+    const auto beta_dev_before = nlohmann::json(*tree_svc->get_node("beta-dev")).dump();
+
+    auto v = run(next(accept_op("alpha", pb, pa, {"read", "connect_private"})));
+    ASSERT_TRUE(v.ok()) << v.reason;
+
+    const auto alpha = *tree_svc->get_node("alpha");
+    EXPECT_TRUE(tree::rules::signer_has_permission(alpha, pb, acl::Permission::Read));
+    EXPECT_FALSE(tree::rules::signer_has_permission(alpha, pb, acl::Permission::Admin));
+    // Nothing of the invitee's own network changed or moved.
+    EXPECT_EQ(nlohmann::json(*tree_svc->get_node("beta")).dump(), beta_before);
+    EXPECT_EQ(nlohmann::json(*tree_svc->get_node("beta-dev")).dump(), beta_dev_before);
+    // Neither side gains control over the other's group.
+    EXPECT_FALSE(tree_svc->check_permission(pa, "beta", acl::Permission::Read));
+    EXPECT_FALSE(tree_svc->administers(pa, "beta-dev"));
+    EXPECT_FALSE(tree_svc->administers(pb, "alpha-dev"));
+}
+
+TEST_F(TreeMembershipTest, AcceptInviteRefusesWhatTheInviterCannotGrant) {
+    auto refusal = [&](const TreeOp& op) { return run(next(op)).refusal; };
+    // An inviter with no authority on the target.
+    EXPECT_EQ(refusal(accept_op("alpha", pb, principal_of(stranger_kp), {"read"})),
+              TreeOpRefusal::Forbidden);
+    // Escalation: admin, delete_node, and edit_node are never granted.
+    EXPECT_EQ(refusal(accept_op("alpha", pb, pa, {"read", "admin"})), TreeOpRefusal::Invalid);
+    EXPECT_EQ(refusal(accept_op("alpha", pb, pa, {"read", "delete_node"})),
+              TreeOpRefusal::Invalid);
+    EXPECT_EQ(refusal(accept_op("alpha", pb, pa, {"read", "edit_node"})),
+              TreeOpRefusal::Invalid);
+    // A member that holds read and add_child cannot pass on connect.
+    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"add_child", "read"}))).ok());
+    EXPECT_EQ(refusal(accept_op("alpha", pb2, pb, {"connect_private", "read"})),
+              TreeOpRefusal::Forbidden);
+    // An inviter that lost its authority voids the invite.
+    ASSERT_TRUE(run(next(assign_op("alpha", pa, pb, {}))).ok());
+    EXPECT_EQ(refusal(accept_op("alpha", pb2, pb, {"read"})), TreeOpRefusal::Forbidden);
+}
+
+TEST_F(TreeMembershipTest, AcceptInviteRefusesBadTargetsAndHomeMembers) {
+    auto refusal = [&](const TreeOp& op) { return run(next(op)).refusal; };
+    EXPECT_EQ(refusal(accept_op("alpha-dev", pb, pa, {"read"})), TreeOpRefusal::Invalid);
+    EXPECT_EQ(refusal(accept_op("alpha", pb, pa, {"connect_private"})), TreeOpRefusal::Invalid)
+        << "a membership needs read";
+    EXPECT_EQ(refusal(accept_op("alpha", pa2, pa, {"read"})), TreeOpRefusal::Conflict)
+        << "a device joined inside the group keeps its home entry";
+    EXPECT_EQ(refusal(accept_op("alpha-sub1", pa, pa, {"read"})), TreeOpRefusal::Conflict)
+        << "an admin above the group is not made a member";
+
+    const auto op = next(accept_op("alpha", pb, pa, {"read"}));
+    ASSERT_TRUE(run(op).ok());
+    EXPECT_EQ(run(op).refusal, TreeOpRefusal::Replayed);
+}
+
+TEST_F(TreeMembershipTest, MembershipReachCoversOnlyTheMembersDevices) {
+    EXPECT_FALSE(connects(pb, "beta-dev", "alpha-dev"));
+    EXPECT_FALSE(connects(pa, "alpha-dev", "beta-dev"));
+
+    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
+    // B's device reaches alpha's devices, and alpha's devices reach it back.
+    EXPECT_TRUE(connects(pb, "beta-dev", "alpha-dev"));
+    EXPECT_TRUE(connects(pb, "beta-dev", "alpha-dev2"));
+    EXPECT_TRUE(connects(pa, "alpha-dev", "beta-dev"));
+    EXPECT_TRUE(connects(pa2, "alpha-dev2", "beta-dev"));
+    // B's other device has its own key: the membership does not cover it in
+    // either direction, so alpha sees nothing else of B's network.
+    EXPECT_FALSE(connects(pb2, "beta-dev2", "alpha-dev"));
+    EXPECT_FALSE(connects(pa, "alpha-dev", "beta-dev2"));
+    // A key acting through a node it does not own gets no membership reach.
+    EXPECT_FALSE(connects(pb, "beta-dev2", "alpha-dev"));
+    // An admin entry is not a membership: the root admin reaches nothing.
+    EXPECT_FALSE(tree::rules::membership_reaches(tree_svc->nodes_snapshot(), root_pk,
+                                                 *tree_svc->get_node("alpha-dev")));
+}
+
+TEST_F(TreeMembershipTest, MemberInASubgroupReachesOnlyThatSubgroup) {
+    const auto sub_dev =
+        node("sub1-dev", "alpha-sub1", tree::NodeType::Endpoint, pa2, {{pa2, {"read"}}});
+    ASSERT_TRUE(run(next(create_op(sub_dev, pa))).ok());
+    ASSERT_TRUE(run(next(accept_op("alpha-sub1", pb, pa, {"connect_private", "read"}))).ok());
+    EXPECT_TRUE(connects(pb, "beta-dev", "sub1-dev"));
+    EXPECT_FALSE(connects(pb, "beta-dev", "alpha-dev"));
+    EXPECT_FALSE(tree_svc->check_permission(pb, "alpha", acl::Permission::Read));
+}
+
+TEST_F(TreeMembershipTest, MemberLeavesAndAdminRemovesMembers) {
+    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
+    ASSERT_TRUE(run(next(accept_op("alpha", pb2, pa, {"connect_private", "read"}))).ok());
+
+    // A member cannot remove another member.
+    EXPECT_EQ(run(next(assign_op("alpha", pb, pb2, {}))).refusal, TreeOpRefusal::Forbidden);
+    // A member leaves by removing its own entry.
+    ASSERT_TRUE(run(next(assign_op("alpha", pb, pb, {}))).ok());
+    EXPECT_FALSE(connects(pb, "beta-dev", "alpha-dev"));
+    EXPECT_FALSE(connects(pa, "alpha-dev", "beta-dev"));
+    // The group admin removes the other member.
+    ASSERT_TRUE(run(next(assign_op("alpha", pa, pb2, {}))).ok());
+    EXPECT_FALSE(connects(pb2, "beta-dev2", "alpha-dev"));
+
+    // A device joined inside the group cannot drop its home entry this way,
+    // and an admin cannot remove its own anchor entry.
+    ASSERT_TRUE(run(next(assign_op("alpha", pa, pa2, {"read"}))).ok());
+    EXPECT_EQ(run(next(assign_op("alpha", pa2, pa2, {}))).refusal, TreeOpRefusal::Forbidden);
+    EXPECT_EQ(run(next(assign_op("alpha", pa, pa, {}))).refusal, TreeOpRefusal::Forbidden);
+}
+
+TEST_F(TreeMembershipTest, MoveDeviceKeepsIdentityAndDropsOldLinkGrants) {
+    auto dev1 = crypto_svc->ed25519_keygen();
+    auto dev2 = crypto_svc->ed25519_keygen();
+    ASSERT_TRUE(run(next(join_op(dev1, "alpha-sub1", pa))).ok());
+    ASSERT_TRUE(run(next(join_op(dev2, "alpha-sub1", pa))).ok());
+    const auto id1 = tree::derive_join_node_id(*crypto_svc, principal_of(dev1));
+    const auto id2 = tree::derive_join_node_id(*crypto_svc, principal_of(dev2));
+    const auto before = *tree_svc->get_node(id2);
+    ASSERT_TRUE(tree_svc->check_permission(principal_of(dev2), id1, acl::Permission::Read));
+    ASSERT_TRUE(connects(principal_of(dev1), id1, id2));
+
+    auto v = run(next(move_op(id2, "alpha-sub2", pa)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    const auto after = *tree_svc->get_node(id2);
+    EXPECT_EQ(after.parent_id, "alpha-sub2");
+    EXPECT_EQ(after.tunnel_ip, before.tunnel_ip);
+    EXPECT_FALSE(after.tunnel_ip.empty());
+    EXPECT_EQ(after.endpoint_identifier, before.endpoint_identifier);
+    EXPECT_EQ(nlohmann::json(after.assignments).dump(), nlohmann::json(before.assignments).dump())
+        << "own assignments stay";
+    // The old group and the old sibling no longer name the moved key.
+    EXPECT_FALSE(tree_svc->check_permission(principal_of(dev2), id1, acl::Permission::Read));
+    EXPECT_FALSE(
+        tree_svc->check_permission(principal_of(dev2), "alpha-sub1", acl::Permission::Read));
+    // Out of the old group's scope, the old sibling no longer connects.
+    EXPECT_FALSE(connects(principal_of(dev1), id1, id2));
+    // The move granted the moved key nothing in the new group.
+    EXPECT_FALSE(
+        tree_svc->check_permission(principal_of(dev2), "alpha-sub2", acl::Permission::Read));
+}
+
+TEST_F(TreeMembershipTest, MoveSubgroupCarriesItsSubtree) {
+    const auto sub_dev =
+        node("sub1-dev", "alpha-sub1", tree::NodeType::Endpoint, pa2, {{pa2, {"read"}}});
+    ASSERT_TRUE(run(next(create_op(sub_dev, pa))).ok());
+    auto v = run(next(move_op("alpha-sub1", "alpha-sub2", pa)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_EQ(tree_svc->get_node("alpha-sub1")->parent_id, "alpha-sub2");
+    EXPECT_EQ(tree_svc->get_node("sub1-dev")->parent_id, "alpha-sub1");
+    EXPECT_TRUE(tree_svc->is_descendant_of("sub1-dev", "alpha-sub2"));
+}
+
+TEST_F(TreeMembershipTest, MoveRefusesWithoutAuthorityOrIntoACycle) {
+    auto refusal = [&](const std::string& target, const std::string& parent,
+                       const std::string& signer) {
+        return run(next(move_op(target, parent, signer))).refusal;
+    };
+    // No delete_node or admin on the device.
+    EXPECT_EQ(refusal("alpha-dev", "alpha-sub1", pb), TreeOpRefusal::Forbidden);
+    // Rights on the device but no add_child on the destination.
+    EXPECT_EQ(refusal("beta-dev", "alpha-sub1", pb), TreeOpRefusal::Forbidden);
+    // A group under itself or under its descendant.
+    ASSERT_TRUE(run(next(move_op("alpha-sub2", "alpha-sub1", pa))).ok());
+    EXPECT_EQ(refusal("alpha-sub1", "alpha-sub2", pa), TreeOpRefusal::Invalid);
+    EXPECT_EQ(refusal("alpha-sub1", "alpha-sub1", pa), TreeOpRefusal::Invalid);
+    // The root and top-level groups never move, even for the root admin.
+    EXPECT_EQ(refusal("root", "alpha", root_pk), TreeOpRefusal::Forbidden);
+    EXPECT_EQ(refusal("beta", "alpha", root_pk), TreeOpRefusal::Forbidden);
+    // Only under a group, and only to a new parent.
+    EXPECT_EQ(refusal("alpha-dev2", "alpha-dev", pa), TreeOpRefusal::Invalid);
+    EXPECT_EQ(refusal("alpha-dev2", "alpha", pa), TreeOpRefusal::Conflict);
+}
+
+TEST_F(TreeMembershipTest, DeleteRightAloneDoesNotTakeOverASubgroup) {
+    // B is a member of alpha with add_child, and holds delete_node on
+    // alpha-sub1. Moving the subgroup into B's own network would hand B admin
+    // over alpha's devices: refused.
+    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"add_child", "read"}))).ok());
+    auto sub = *tree_svc->get_node("alpha-sub1");
+    sub.assignments.push_back({pb, {"delete_node"}});
+    ASSERT_TRUE(tree_svc->update_node_direct("alpha-sub1", sub));
+    EXPECT_EQ(run(next(move_op("alpha-sub1", "beta", pb))).refusal, TreeOpRefusal::Forbidden);
+    // B may move its own device into alpha, where it holds add_child. The
+    // device gains no reach to alpha's devices by that.
+    ASSERT_TRUE(run(next(move_op("beta-dev2", "alpha", pb))).ok());
+    EXPECT_FALSE(connects(pb2, "beta-dev2", "alpha-dev"));
+}
+
+TEST_F(TreeMembershipTest, NewOpKindsRoundTripAndApplyIdentically) {
+    auto storage_b = make_storage("b2");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+
+    auto both = [&](const TreeOp& op) {
+        const auto sig = tree::tree_op_signature_bytes(op);
+        ASSERT_TRUE(sig.has_value());
+        const auto decoded = tree::decode_tree_op(tree::encode_tree_op(op), *sig);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(tree::op_id_hex(*decoded), tree::op_id_hex(op));
+        auto va = run(op);
+        auto vb = run(*decoded, &tree_b);
+        ASSERT_EQ(va.refusal, vb.refusal) << va.reason << " / " << vb.reason;
+        ASSERT_TRUE(va.ok()) << va.reason;
+    };
+    both(next(accept_op("alpha", pb, pa, {"connect_private", "read"})));
+    both(next(move_op("alpha-dev2", "alpha-sub1", pa)));
+    both(next(move_op("alpha-sub1", "alpha-sub2", pa)));
+    EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
+    tree_b.stop();
+    storage_b->stop();
+}
+
+TEST_F(TreeMembershipTest, DirectPathsApplyTheSamePlanAsTreeOps) {
+    auto storage_b = make_storage("b3");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+
+    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
+    ASSERT_TRUE(run(next(move_op("alpha-dev2", "alpha-sub1", pa))).ok());
+    std::string reason;
+    using Change = tree::PermissionTreeService::AssignmentChange;
+    EXPECT_EQ(tree_b.accept_invite("alpha", pb, pa, {"connect_private", "read"}, reason),
+              Change::Applied)
+        << reason;
+    EXPECT_EQ(tree_b.move_node("alpha-dev2", "alpha-sub1", pa, reason), Change::Applied) << reason;
+    for (const auto* id : {"alpha", "alpha-dev", "alpha-dev2", "alpha-sub1"}) {
+        auto a = *tree_svc->get_node(id);
+        auto b = *tree_b.get_node(id);
+        a.version = 0;
+        b.version = 0;
+        EXPECT_EQ(nlohmann::json(a).dump(), nlohmann::json(b).dump()) << id;
+    }
+    // The direct paths refuse what the ops refuse.
+    EXPECT_EQ(tree_b.accept_invite("alpha", pb2, pa, {"admin", "read"}, reason), Change::Invalid);
+    EXPECT_EQ(tree_b.move_node("beta", "alpha", root_pk, reason), Change::Forbidden);
+    tree_b.stop();
+    storage_b->stop();
+}

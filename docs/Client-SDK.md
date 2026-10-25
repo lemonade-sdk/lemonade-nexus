@@ -187,7 +187,7 @@ always uses a relay.
 | Ed25519 challenge-response | Primary. Requires an identity (`set_identity` / `ln_set_identity`). Auto-registers new pubkeys on first use. |
 | Passkey / WebAuthn | Backup. Challenge bound to the user; assertion verified server-side. |
 | Password | **Deprecated.** The server stub always fails; the SDK keeps the functions for compatibility. |
-| Token link | One-time device-link tokens for adding devices to an account group. |
+| Token link | One-time invite codes for a group: a new device joins under the group; an existing account becomes a member of it (`ln_invite_create`, `ln_invite_accept`). See [SDK Guide](SDK-Guide#invites-and-other-networks). |
 
 ## Linking
 

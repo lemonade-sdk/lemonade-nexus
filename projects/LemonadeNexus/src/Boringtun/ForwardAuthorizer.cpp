@@ -7,9 +7,11 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace nexus::boringtun {
@@ -24,14 +26,12 @@ std::optional<uint32_t> plane_address(const tree::TreeNode& node, const Cidr& go
     return cidr->network;
 }
 
-/// The connect rule of PermissionTreeService::resolve_authorized, applied to
-/// the endpoint `from` (its management key is the principal) and `to`.
-bool may_connect(const tree::PermissionTreeService& tree, const tree::TreeNode& from,
+/// The connect rule of PermissionTreeService::resolve_authorized
+/// (rules::endpoint_may_connect), applied to the endpoint `from` (its
+/// management key is the principal) and `to`.
+bool may_connect(const tree::rules::NodeMap& nodes, const tree::TreeNode& from,
                  const tree::TreeNode& to) {
-    if (from.id == to.id || from.parent_id.empty()) return false;
-    if (!tree.is_descendant_of(to.id, from.parent_id)) return false;
-    return tree.check_permission(from.mgmt_pubkey, to.id, acl::Permission::ConnectPrivate) ||
-           tree.check_permission(from.mgmt_pubkey, to.id, acl::Permission::ConnectShared);
+    return tree::rules::endpoint_may_connect(nodes, from.mgmt_pubkey, from, to);
 }
 
 } // namespace
@@ -76,19 +76,23 @@ std::shared_ptr<const ForwardPolicy> build_forward_policy(
     // A relay forwards for the whole plane, so it is open only when a root
     // admin placed it: its management key must administer the tree root (the
     // rule that lets a writer create a relay at all).
+    const auto nodes = tree.nodes_snapshot();
     std::vector<const Located*> endpoints;
-    std::optional<tree::rules::NodeMap> nodes;
     for (const auto& l : located) {
         if (l.node.type == tree::NodeType::Endpoint) {
             endpoints.push_back(&l);
             continue;
         }
         if (l.node.mgmt_pubkey.empty()) continue;
-        if (!nodes) nodes = tree.nodes_snapshot();
-        if (tree::rules::administers_root(*nodes, l.node.id, l.node.mgmt_pubkey)) {
+        if (tree::rules::administers_root(nodes, l.node.id, l.node.mgmt_pubkey)) {
             policy->open.insert(l.addr);
         }
     }
+
+    auto allow_if_permitted = [&](const Located* source, const Located* target) {
+        if (may_connect(nodes, source->node, target->node))
+            policy->allowed.insert(ForwardPolicy::key(source->addr, target->addr));
+    };
 
     // A grant names a principal on the target node, so the candidate sources
     // for a target are the endpoints whose management key appears in the
@@ -102,9 +106,40 @@ std::shared_ptr<const ForwardPolicy> build_forward_policy(
         for (const auto& assignment : target->node.assignments) {
             auto it = by_principal.find(tree::canonical_principal(assignment.management_pubkey));
             if (it == by_principal.end()) continue;
-            for (const Located* source : it->second) {
-                if (may_connect(tree, source->node, target->node))
-                    policy->allowed.insert(ForwardPolicy::key(source->addr, target->addr));
+            for (const Located* source : it->second) allow_if_permitted(source, target);
+        }
+    }
+
+    // An invite membership is a connect entry on a group, not on each device,
+    // so its pairs are the member's devices and the devices beneath that
+    // group, in both directions. may_connect applies the full rule.
+    std::unordered_map<std::string, std::vector<const Located*>> under_group;
+    for (const Located* e : endpoints) {
+        std::unordered_set<std::string> visited{e->node.id};
+        std::string current = e->node.parent_id;
+        while (!current.empty() && visited.insert(current).second) {
+            auto it = nodes.find(current);
+            if (it == nodes.end()) break;
+            if (it->second.type == tree::NodeType::Customer) under_group[current].push_back(e);
+            current = it->second.parent_id;
+        }
+    }
+    for (const auto& [group_id, devices] : under_group) {
+        const auto& group = nodes.at(group_id);
+        for (const auto& assignment : group.assignments) {
+            const bool connect_entry =
+                std::any_of(assignment.permissions.begin(), assignment.permissions.end(),
+                            [](const std::string& p) {
+                                return p == "connect_private" || p == "connect_shared";
+                            });
+            if (!connect_entry) continue;
+            auto members = by_principal.find(tree::canonical_principal(assignment.management_pubkey));
+            if (members == by_principal.end()) continue;
+            for (const Located* member : members->second) {
+                for (const Located* device : devices) {
+                    allow_if_permitted(member, device);
+                    allow_if_permitted(device, member);
+                }
             }
         }
     }

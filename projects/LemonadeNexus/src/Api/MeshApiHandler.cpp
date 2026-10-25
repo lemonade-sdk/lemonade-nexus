@@ -4,14 +4,17 @@
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
+#include <LemonadeNexus/Tree/TreeRules.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Boringtun/BoringtunService.hpp>
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <regex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nexus::api {
 
@@ -54,6 +57,38 @@ bool mesh_peer_listed(const tree::PermissionTreeService& tree,
             return false;
     }
 }
+
+namespace {
+
+/// The endpoints that `from`, acting as `caller_pubkey`, may connect to
+/// (tree::rules::endpoint_may_connect): first those in `home_scope` (the
+/// parent-group subtree, in its order), then those outside it that an invite
+/// membership covers, sorted by node id.
+std::vector<tree::TreeNode> connectable_endpoints(const tree::PermissionTreeService& tree,
+                                                  std::string_view caller_pubkey,
+                                                  const tree::TreeNode& from,
+                                                  const std::vector<tree::TreeNode>& home_scope) {
+    const auto nodes = tree.nodes_snapshot();
+    std::vector<tree::TreeNode> out;
+    std::unordered_set<std::string> seen;
+    for (const auto& n : home_scope) {
+        if (n.type != tree::NodeType::Endpoint) continue;
+        seen.insert(n.id);
+        if (tree::rules::endpoint_may_connect(nodes, caller_pubkey, from, n)) out.push_back(n);
+    }
+    std::vector<tree::TreeNode> members;
+    for (const auto& [id, n] : nodes) {
+        if (n.type != tree::NodeType::Endpoint || seen.contains(id)) continue;
+        if (tree::rules::endpoint_may_connect(nodes, caller_pubkey, from, n)) members.push_back(n);
+    }
+    std::sort(members.begin(), members.end(),
+              [](const tree::TreeNode& a, const tree::TreeNode& b) { return a.id < b.id; });
+    out.insert(out.end(), std::make_move_iterator(members.begin()),
+               std::make_move_iterator(members.end()));
+    return out;
+}
+
+}  // namespace
 
 namespace {
 /// Validate that a mesh heartbeat endpoint string is a well-formed ip:port
@@ -111,9 +146,10 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     // ========================================================================
     // GET /api/mesh/peers/:node_id (PRIVATE, auth required)
     //
-    // Returns the server peer plus the endpoints and relays in the caller's
-    // parent-group subtree that mesh_peer_listed admits. Read on the requesting
-    // node lets the caller ask; each listed endpoint needs a connect grant.
+    // Returns the server peer, the endpoints the requesting node may connect
+    // to (tree::rules::endpoint_may_connect: a connect grant in the parent-group
+    // subtree, or an invite membership), and the relays in that subtree that
+    // mesh_peer_listed admits. Read on the requesting node lets the caller ask.
     // ========================================================================
     priv.Get(R"(/api/mesh/peers/([a-zA-Z0-9_-]+))", require_auth(ctx_.auth,
         [this](const httplib::Request& req, httplib::Response& res,
@@ -154,19 +190,18 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        // Descendants of the caller's parent group; ACL-filtered per node below.
+        // Descendants of the caller's parent group (relays below), and the
+        // endpoints the connect rule admits, including invite memberships.
         auto reachable = ctx_.tree.collect_subtree(node.parent_id);
+        const auto endpoints = connectable_endpoints(ctx_.tree, caller_pubkey, node, reachable);
 
         // Use Noise handshake activity to determine peer liveness.
         auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
         auto now = epoch_seconds();
 
-        // Build peer list: all Endpoint-type nodes in scope except the caller
+        // Build peer list: every endpoint the caller's node may connect to
         nlohmann::json peers = nlohmann::json::array();
-        for (const auto& sibling : reachable) {
-            if (sibling.id == node_id) continue;  // skip self
-            if (sibling.type != tree::NodeType::Endpoint) continue;  // only endpoints
-            if (!mesh_peer_listed(ctx_.tree, caller_pubkey, sibling)) continue;
+        for (const auto& sibling : endpoints) {
 
             // Determine online status from the last Noise handshake.
             auto sip = strip_cidr(sibling.tunnel_ip);
@@ -386,24 +421,23 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         uint32_t online_count = 0;
 
         if (!node.parent_id.empty()) {
+            // Count the same peers that GET /api/mesh/peers lists.
             auto reachable = ctx_.tree.collect_subtree(node.parent_id);
             auto mesh_handshakes = build_mesh_handshake_map(ctx_.boringtun);
             auto now = epoch_seconds();
+            for (const auto& s : connectable_endpoints(ctx_.tree, caller_pubkey, node, reachable)) {
+                ++peer_count;
+                auto sip = strip_cidr(s.tunnel_ip);
+                auto it = mesh_handshakes.find(sip);
+                if (it != mesh_handshakes.end() && (now - it->second) < kStaleThresholdSec) {
+                    ++online_count;
+                }
+            }
             for (const auto& s : reachable) {
-                if (s.id == node_id) continue;
-                // Count the same peers that GET /api/mesh/peers lists.
+                if (s.type != tree::NodeType::Relay) continue;
                 if (!mesh_peer_listed(ctx_.tree, caller_pubkey, s)) continue;
                 ++peer_count;
-                if (s.type == tree::NodeType::Relay) {
-                    ++online_count;  // relays always considered online
-                } else {
-                    auto sip = strip_cidr(s.tunnel_ip);
-                    auto it = mesh_handshakes.find(sip);
-                    if (it != mesh_handshakes.end() &&
-                        (now - it->second) < kStaleThresholdSec) {
-                        ++online_count;
-                    }
-                }
+                ++online_count;  // relays always considered online
             }
         }
 
