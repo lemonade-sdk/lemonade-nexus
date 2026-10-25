@@ -17,9 +17,13 @@ Check this list before the next release. Nothing below is a blocker unless marke
 - **Tier 2 servers hold no tree** (owner decision, 2026-10-24). Only current Tier 1 members load, serve,
   and keep the permission tree; clients send every tree read and write to a Tier 1 server they verify
   from the Genesis key. Any relay, Tier 1 or Tier 2, verifies relay tickets against
-  its verified Tier 1 membership. Follow-ups: the relay protocol has no handler for its `Allocate`
-  message, and tree-derived DNS names are answered by Tier 1 nameservers only. See `Security.md`,
-  current limitations 6 to 8.
+  its verified Tier 1 membership and its own relay id.
+- **Relays work end to end** (owner approval, 2026-10-25). The relay handles the wire `Allocate`
+  message and pairs two peers by a rendezvous only they can derive; the SDK falls back to a relay
+  for peers it cannot reach directly. Follow-ups: relay fallback is not tested across real NAT
+  devices or under load, the SDK has no STUN probe or hole punching for mesh peers, and
+  tree-derived DNS names are answered by Tier 1 nameservers only. See `Security.md`, current
+  limitations 6 to 8.
 
 ## 1. Remove the two storage flags
 

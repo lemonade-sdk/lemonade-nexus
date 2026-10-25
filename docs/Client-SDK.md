@@ -77,6 +77,33 @@ refuses an older membership. A client with no stored epoch can be held at an
 old epoch only if every server it reaches withholds the newer handoffs and
 every member it reaches signs the older epoch.
 
+## Relay Fallback
+
+When mesh networking is on (`enable_mesh` / `ln_mesh_enable`), the SDK moves
+a peer onto a relay when the dataplane cannot reach it directly:
+
+- The peer has no direct endpoint in the server's peer list, or its direct
+  endpoint gave no handshake within 20 seconds.
+- Both peers choose the same relay on their own. The candidates are the
+  verified Tier 1 servers (relay port `9103`) and the relays that
+  `GET /api/relay/list` returns. A relay's id is its base64 node identity key.
+- Each peer requests a relay ticket for its own session from its verified
+  Tier 1 server (`POST /api/relay/ticket`) and sends the relay an `Allocate`
+  request. The relay pairs the two requests by a rendezvous that only the two
+  peers can derive (see [Security](Security#relay-sessions)).
+- After the relay pairs them, the peer's BoringTun traffic goes through the
+  relay. The relay carries only ciphertext.
+
+A relay that refuses, does not answer, or gives no handshake is skipped for
+five minutes, and the peer is retried with backoff. Set `prefer_direct` to
+`false` in the mesh config to relay every peer.
+
+`ln_mesh_status` and `ln_mesh_peers` report a relayed peer with an empty
+`endpoint` and its relay address (`ip:port`) in `relay_endpoint`.
+
+The SDK has no STUN probe or hole punching for mesh peers yet, so a peer that
+publishes no direct endpoint always uses a relay.
+
 ## Authentication Status
 
 | Method | Status |

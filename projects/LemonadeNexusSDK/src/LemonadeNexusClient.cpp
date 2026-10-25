@@ -1673,6 +1673,11 @@ Result<RelayTicket> LemonadeNexusClient::request_relay_ticket(const std::string&
         result.error = "server unreachable";
         return result;
     }
+    if (status != 200 || !resp->is_object()) {
+        result.error = resp->is_object() ? resp->value("error", "relay ticket refused")
+                                         : "relay ticket refused";
+        return result;
+    }
 
     result.value.peer_id       = resp->value("peer_id", "");
     result.value.relay_id      = resp->value("relay_id", "");

@@ -226,8 +226,15 @@ Client A (NAT)          Server (coordinator)          Client B (NAT)
 ```
 
 Path selection is `DirectP2P` when both sides offered a usable candidate;
-otherwise the coordinator issues a relay ticket (UDP `9103`). STUN (`3478`)
-supplies reflexive candidates.
+otherwise it selects `Relay`. The routing coordinator does not allocate a
+relay session for a routing-layer connection: its directive carries an empty
+`relay_endpoint`. STUN (`3478`) supplies reflexive candidates.
+
+Mesh dataplane peers use the SDK relay fallback instead (UDP `9103`): each
+peer requests its own relay ticket from its verified Tier 1 server, and the
+relay pairs the two peers' `Allocate` requests. See
+[Client SDK](Client-SDK#relay-fallback) and
+[Security](Security#relay-sessions).
 
 ## SDK Client
 

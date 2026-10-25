@@ -7,12 +7,45 @@
 #include <chrono>
 #include <utility>
 
+namespace {
+
+/// The canonical relay port (README): every server relays on it.
+constexpr uint16_t kRelayPort = 9103;
+
+/// Split "host:port". Without exactly one colon, the whole text is the host
+/// and the port is kRelayPort.
+std::pair<std::string, uint16_t> split_endpoint(const std::string& endpoint) {
+    std::string host = endpoint;
+    uint16_t port = kRelayPort;
+    const auto colon = endpoint.rfind(':');
+    if (colon != std::string::npos && endpoint.find(':') == colon) {
+        host = endpoint.substr(0, colon);
+        try {
+            const int parsed = std::stoi(endpoint.substr(colon + 1));
+            if (parsed > 0 && parsed <= 65535) port = static_cast<uint16_t>(parsed);
+        } catch (...) {
+        }
+    }
+    return {host, port};
+}
+
+}  // namespace
+
 namespace lnsdk {
 
 MeshOrchestrator::MeshOrchestrator(LemonadeNexusClient& client,
                                    BoringtunMesh& mesh,
                                    const std::string& node_id)
-    : client_(client), mesh_(mesh), node_id_(node_id) {}
+    : client_(client), mesh_(mesh), node_id_(node_id) {
+    relay_fallback_ = std::make_unique<RelayFallback>(
+        mesh_,
+        // The ticket names this device's own session, and only the session's
+        // verified Tier 1 server issues it (private API).
+        [this](const std::string& relay_id) {
+            return client_.request_relay_ticket(node_id_, relay_id);
+        },
+        [this] { return relay_candidates(); });
+}
 
 MeshOrchestrator::~MeshOrchestrator() {
     stop();
@@ -43,6 +76,9 @@ void MeshOrchestrator::stop() {
     // A renewal in progress finishes its request (bounded by the HTTP
     // timeouts); its callback must not run after stop() returns.
     if (cert_thread_.joinable()) cert_thread_.join();
+
+    // The loop thread has ended, so the relay fallback has no other user.
+    relay_fallback_->stop();
 
     // Remove all mesh peers from the dataplane
     {
@@ -115,8 +151,9 @@ void MeshOrchestrator::run_loop() {
             next_heartbeat = now + std::chrono::seconds(cfg.heartbeat_interval_sec);
         }
 
-        // Monitor
+        // Monitor, then move unreachable peers onto a relay
         if (now >= next_monitor) {
+            do_relay_maintenance();
             do_monitor();
             next_monitor = now + std::chrono::seconds(5); // 5s monitor interval
         }
@@ -205,6 +242,39 @@ void MeshOrchestrator::do_heartbeat() {
     }
 }
 
+std::vector<RelayCandidate> MeshOrchestrator::relay_candidates() {
+    std::vector<RelayCandidate> out;
+    // Verified Tier 1 servers: their relay id is their node identity.
+    for (const auto& server : client_.tier1_membership().servers) {
+        out.push_back({server.node_id, server.host, kRelayPort});
+    }
+    // Relays the session's server lists. Tier 2 relays appear here.
+    auto listed = client_.list_relays();
+    if (listed) {
+        for (const auto& relay : listed.value) {
+            if (!relay.supports_relay || relay.relay_id.empty() || relay.endpoint.empty()) continue;
+            auto [host, port] = split_endpoint(relay.endpoint);
+            out.push_back({relay.relay_id, host, port});
+        }
+    }
+    return out;
+}
+
+void MeshOrchestrator::do_relay_maintenance() {
+    std::vector<MeshPeer> peers;
+    bool prefer_direct = true;
+    {
+        std::lock_guard lock(mutex_);
+        peers = known_peers_;
+        prefer_direct = config_.prefer_direct;
+    }
+    try {
+        relay_fallback_->maintain(peers, prefer_direct);
+    } catch (const std::exception& e) {
+        spdlog::warn("[MeshOrchestrator] relay fallback pass failed: {}", e.what());
+    }
+}
+
 void MeshOrchestrator::do_monitor() {
     auto ms = mesh_.mesh_status();
 
@@ -226,6 +296,8 @@ void MeshOrchestrator::do_monitor() {
                     if (tp.last_handshake > peer.last_handshake) {
                         peer.last_handshake = tp.last_handshake;
                     }
+                    // A relayed peer reports the relay it goes through.
+                    if (!tp.relay_endpoint.empty()) peer.relay_endpoint = tp.relay_endpoint;
                     break;
                 }
             }

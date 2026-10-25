@@ -454,9 +454,10 @@ ln_error_t ln_relay_ticket(ln_client_t* client,
     j["epoch"]         = result.value.epoch;
     j["issuer"]        = result.value.issuer;
     j["signature"]     = result.value.signature;
+    if (!result.ok) j["error"] = result.error;
 
     *out_json = strdup_json(j);
-    return result.ok ? LN_OK : LN_ERR_CONNECT;
+    return result.ok ? LN_OK : ln_map_error(result.http_status);
 }
 
 ln_error_t ln_relay_register(ln_client_t* client,

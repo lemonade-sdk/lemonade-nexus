@@ -3,6 +3,7 @@
 
 #include <LemonadeNexus/Boringtun/IpRouter.hpp>
 #include <LemonadeNexus/Boringtun/UserspaceDataplane.hpp>
+#include <LemonadeNexus/Relay/RelayWire.hpp>
 
 #include <virtual_netstack.h>
 #include <sodium.h>
@@ -94,7 +95,31 @@ struct BoringtunMesh::Impl {
     NsHandle*                                             ns{nullptr};
     std::string                                           tunnel_addr;  // our virtual IP (no prefix), egress source
     std::map<std::pair<std::string, uint16_t>, uint16_t>  egress_cache;
+
+    // Peers whose traffic goes through a relay: pubkey -> {local shim
+    // endpoint, relay endpoint}. Bounded by the peer set; guarded by relay_mtx.
+    struct RelayPath {
+        std::string local_endpoint;
+        std::string relay_endpoint;
+    };
+    mutable std::mutex                  relay_mtx;
+    std::map<std::string, RelayPath>    relay_paths;
 };
+
+namespace {
+
+std::optional<std::array<uint8_t, 32>> decode_key32(const std::string& b64) {
+    std::array<uint8_t, 32> raw{};
+    size_t len = 0;
+    if (sodium_base642bin(raw.data(), raw.size(), b64.c_str(), b64.size(), nullptr, &len,
+                          nullptr, sodium_base64_VARIANT_ORIGINAL) != 0 ||
+        len != raw.size()) {
+        return std::nullopt;
+    }
+    return raw;
+}
+
+}  // namespace
 
 BoringtunMesh::BoringtunMesh() : impl_(std::make_unique<Impl>()) {}
 
@@ -181,6 +206,10 @@ bool BoringtunMesh::start(const BoringtunConfig& config) {
 
 void BoringtunMesh::stop() {
     if (!impl_->active.exchange(false)) return;
+    {
+        std::lock_guard lock(impl_->relay_mtx);
+        impl_->relay_paths.clear();
+    }
     impl_->dp.stop();  // stop feeding the netstack before tearing it down
     NsHandle* ns = nullptr;
     {
@@ -258,11 +287,20 @@ StatusResult BoringtunMesh::sync_peers(const std::vector<MeshPeer>& desired) {
     const auto allowed_list =
         peer_allowed_ips(desired, impl_->started_cfg.allowed_ips, own_tunnel_ip);
 
+    std::map<std::string, Impl::RelayPath> relayed;
+    {
+        std::lock_guard lock(impl_->relay_mtx);
+        relayed = impl_->relay_paths;
+    }
+
     std::unordered_set<std::string> want;
     for (std::size_t i = 0; i < desired.size(); ++i) {
         const auto& p = desired[i];
         if (p.mesh_pubkey.empty()) continue;
-        const std::string endpoint = p.endpoint.empty() ? p.relay_endpoint : p.endpoint;
+        const auto relay = relayed.find(p.mesh_pubkey);
+        const std::string endpoint = relay != relayed.end() ? relay->second.local_endpoint
+                                     : p.endpoint.empty()   ? p.relay_endpoint
+                                                            : p.endpoint;
         const std::string& allowed = allowed_list[i];
         if (allowed.empty()) continue;
         want.insert(p.mesh_pubkey);
@@ -274,6 +312,11 @@ StatusResult BoringtunMesh::sync_peers(const std::vector<MeshPeer>& desired) {
     for (const auto& peer : impl_->dp.snapshot_peers()) {
         if (peer.public_key == impl_->server_pubkey) continue;
         if (!want.count(peer.public_key)) (void)impl_->dp.remove_peer(peer.public_key);
+    }
+    {
+        std::lock_guard lock(impl_->relay_mtx);
+        std::erase_if(impl_->relay_paths,
+                      [&want](const auto& entry) { return !want.count(entry.first); });
     }
 
     result.ok = true;
@@ -357,6 +400,62 @@ std::vector<std::string> BoringtunMesh::peer_allowed_ips(
     return out;
 }
 
+std::string BoringtunMesh::public_key() const {
+    return impl_->active.load() ? impl_->started_cfg.public_key : std::string{};
+}
+
+std::optional<std::array<uint8_t, 64>> BoringtunMesh::relay_rendezvous(
+    const std::string& peer_pubkey, const std::string& relay_id, uint64_t window) const {
+    if (!impl_->active.load()) return std::nullopt;
+    const auto own_pk = decode_key32(impl_->started_cfg.public_key);
+    const auto peer_pk = decode_key32(peer_pubkey);
+    auto own_sk = decode_key32(impl_->started_cfg.private_key);
+    if (!own_pk || !peer_pk || !own_sk) {
+        if (own_sk) sodium_memzero(own_sk->data(), own_sk->size());
+        return std::nullopt;
+    }
+    std::array<uint8_t, 32> shared{};
+    const bool ok = crypto_scalarmult(shared.data(), own_sk->data(), peer_pk->data()) == 0;
+    sodium_memzero(own_sk->data(), own_sk->size());
+    std::optional<nexus::relay::RelayRendezvous> material;
+    if (ok) {
+        material = nexus::relay::derive_relay_rendezvous(std::span<const uint8_t, 32>(shared),
+                                                         *own_pk, *peer_pk, relay_id, window);
+    }
+    sodium_memzero(shared.data(), shared.size());
+    if (!material) return std::nullopt;
+
+    std::array<uint8_t, 64> out{};
+    std::copy(material->id.begin(), material->id.end(), out.begin());
+    std::copy(material->own_proof.begin(), material->own_proof.end(), out.begin() + 16);
+    std::copy(material->peer_commitment.begin(), material->peer_commitment.end(),
+              out.begin() + 32);
+    sodium_memzero(material->own_proof.data(), material->own_proof.size());
+    return out;
+}
+
+bool BoringtunMesh::set_peer_relay(const std::string& pubkey, const std::string& local_endpoint,
+                                   const std::string& relay_endpoint) {
+    if (!impl_->active.load() || pubkey == impl_->server_pubkey) return false;
+    {
+        std::lock_guard lock(impl_->relay_mtx);
+        impl_->relay_paths[pubkey] = Impl::RelayPath{local_endpoint, relay_endpoint};
+    }
+    if (!impl_->dp.update_endpoint(pubkey, local_endpoint)) {
+        std::lock_guard lock(impl_->relay_mtx);
+        impl_->relay_paths.erase(pubkey);
+        return false;
+    }
+    spdlog::info("[BoringtunMesh] peer {}... now goes through relay {}",
+                 pubkey.substr(0, std::min<size_t>(8, pubkey.size())), relay_endpoint);
+    return true;
+}
+
+void BoringtunMesh::clear_peer_relay(const std::string& pubkey) {
+    std::lock_guard lock(impl_->relay_mtx);
+    impl_->relay_paths.erase(pubkey);
+}
+
 StatusResult BoringtunMesh::remove_peer(const std::string& pubkey) {
     StatusResult result;
     if (!impl_->active.load()) {
@@ -376,12 +475,23 @@ MeshTunnelStatus BoringtunMesh::mesh_status() const {
     }
     if (!ms.is_up) return ms;
 
+    std::map<std::string, Impl::RelayPath> relayed;
+    {
+        std::lock_guard lock(impl_->relay_mtx);
+        relayed = impl_->relay_paths;
+    }
+
     for (const auto& peer : impl_->dp.snapshot_peers()) {
         if (peer.public_key == impl_->server_pubkey) continue;
         MeshPeer mp;
         mp.mesh_pubkey   = peer.public_key;
         mp.tunnel_ip     = addr_part(peer.allowed_ips);  // first cidr's address
-        mp.endpoint      = peer.endpoint;
+        if (const auto relay = relayed.find(peer.public_key); relay != relayed.end()) {
+            // The dataplane endpoint is the local relay shim; report the relay.
+            mp.relay_endpoint = relay->second.relay_endpoint;
+        } else {
+            mp.endpoint = peer.endpoint;
+        }
         mp.last_handshake = static_cast<int64_t>(peer.last_handshake);
         mp.rx_bytes      = peer.rx_bytes;
         mp.tx_bytes      = peer.tx_bytes;
