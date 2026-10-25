@@ -15,6 +15,11 @@
 /// backoff. A relay that refused, never answered, or went silent is skipped
 /// for a cooldown period, so both sides move to the next relay.
 ///
+/// With `prefer_direct`, HolePuncher keeps probing a relayed peer's listed
+/// endpoint. When the peer answers there with an authenticated handshake, the
+/// dataplane moves the peer to that address, and the next pass closes the
+/// relay channel without counting a failure.
+///
 /// Not thread-safe except relayed_peers(): call maintain() and stop() from
 /// one thread (the mesh orchestrator's).
 
@@ -127,6 +132,10 @@ private:
     bool open_channel(PeerState& state, const MeshPeer& peer, const RelayCandidate& relay);
     /// Close the peer's channel, undo its relay path, and schedule a retry.
     void abandon(const std::string& pubkey, PeerState& state, bool blame_relay);
+    /// Close the peer's channel because its traffic moved to a direct path,
+    /// keep that path, and do not count a failure.
+    void promote_direct(const std::string& pubkey, PeerState& state,
+                        const std::string& listed_endpoint);
     void schedule_retry(PeerState& state);
     std::vector<RelayCandidate> usable_candidates(Clock::time_point now);
 

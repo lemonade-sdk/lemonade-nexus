@@ -78,6 +78,26 @@ void RelayFallback::abandon(const std::string& pubkey, PeerState& state, bool bl
     schedule_retry(state);
 }
 
+void RelayFallback::promote_direct(const std::string& pubkey, PeerState& state,
+                                   const std::string& listed_endpoint) {
+    if (state.channel) {
+        state.channel->close();
+        state.channel.reset();
+    }
+    // The dataplane already sends to the direct address. Keep it there, and
+    // keep the handshake that proved it: no abandon time, no backoff.
+    mesh_.clear_peer_relay(pubkey, listed_endpoint);
+    state.applied = false;
+    state.failures = 0;
+    state.next_attempt = {};
+    {
+        std::lock_guard lock(relayed_mtx_);
+        relayed_.erase(pubkey);
+    }
+    spdlog::info("[RelayFallback] peer {} answered on a direct path; relay closed",
+                 short_key(pubkey));
+}
+
 std::vector<RelayCandidate> RelayFallback::usable_candidates(Clock::time_point now) {
     if (candidate_cache_.empty() || now - candidates_at_ > timing_.candidate_ttl) {
         candidate_cache_ = candidates_ ? candidates_() : std::vector<RelayCandidate>{};
@@ -143,7 +163,13 @@ void RelayFallback::maintain(const std::vector<MeshPeer>& peers, bool prefer_dir
     }
 
     std::map<std::string, int64_t> handshakes;
-    for (const auto& p : mesh_.mesh_status().peers) handshakes[p.mesh_pubkey] = p.last_handshake;
+    // Peers with a relay path whose traffic now comes from another address
+    // (mesh_status reports it as a direct endpoint).
+    std::set<std::string> moved_off_relay;
+    for (const auto& p : mesh_.mesh_status().peers) {
+        handshakes[p.mesh_pubkey] = p.last_handshake;
+        if (!p.endpoint.empty() && p.relay_endpoint.empty()) moved_off_relay.insert(p.mesh_pubkey);
+    }
 
     // Forget peers the server no longer lists.
     std::set<std::string> listed;
@@ -194,7 +220,14 @@ void RelayFallback::maintain(const std::vector<MeshPeer>& peers, bool prefer_dir
                         // The relay must carry a handshake soon after pairing
                         // and keep it fresh.
                         const bool since_pair = handshake >= state.paired_unix;
-                        if (!since_pair && now - state.paired_at > timing_.handshake_grace) {
+                        const bool fresh =
+                            since_pair && now_unix - handshake <= timing_.handshake_fresh_sec;
+                        if (prefer_direct && fresh && !peer.endpoint.empty() &&
+                            moved_off_relay.contains(pubkey)) {
+                            // A punched direct path answered with an
+                            // authenticated handshake: it replaces the relay.
+                            promote_direct(pubkey, state, peer.endpoint);
+                        } else if (!since_pair && now - state.paired_at > timing_.handshake_grace) {
                             spdlog::warn("[RelayFallback] no handshake with peer {} through relay",
                                          short_key(pubkey));
                             abandon(pubkey, state, true);

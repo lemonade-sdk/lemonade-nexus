@@ -10,6 +10,8 @@
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Network/StunService.hpp>
 #include <LemonadeNexus/Security/Epoch/Tier1Membership.hpp>
 #include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
 
@@ -263,6 +265,13 @@ protected:
     std::atomic<int>   delete_posts{0};
     std::atomic<Reply> peer_list_reply{Reply::Ok};
     std::atomic<Reply> delete_reply{Reply::Ok};
+    std::mutex               heartbeat_mtx;
+    std::vector<std::string> heartbeat_endpoints;  // the "endpoint" of each heartbeat
+
+    std::vector<std::string> heartbeats() {
+        std::lock_guard lock(heartbeat_mtx);
+        return heartbeat_endpoints;
+    }
 
     // The stand-in server is the one Tier 1 member of a four-member epoch:
     // the client verifies it before it sends a tree request.
@@ -322,7 +331,14 @@ protected:
                 break;
             }
         });
-        priv->Post("/api/mesh/heartbeat", [](const httplib::Request&, httplib::Response& res) {
+        priv->Post("/api/mesh/heartbeat", [this](const httplib::Request& req,
+                                                 httplib::Response& res) {
+            const auto body = nlohmann::json::parse(req.body, nullptr, false);
+            {
+                std::lock_guard lock(heartbeat_mtx);
+                heartbeat_endpoints.push_back(
+                    body.is_object() ? body.value("endpoint", std::string{"<none>"}) : "<bad>");
+            }
             res.set_content(R"({"success":true})", "application/json");
         });
         const int priv_port = priv->bind_to_any_port("127.0.0.1");
@@ -580,4 +596,65 @@ TEST_F(SdkMeshPrivateApiTest, HandshakeIsMatchedToItsPeerByMeshKey) {
         return peers.size() == 1 && peers[0].last_handshake > 0 && peers[0].is_online;
     }, std::chrono::seconds(15))) << "the peer's handshake was not attributed to it";
     client->disable_mesh();
+}
+
+// The orchestrator learns its reflexive address from the session server's
+// STUN service (the canonical port 3478 on the server's host) and publishes
+// it with the heartbeat. The address is the mapping the server's own
+// dataplane sees, because the query leaves from the dataplane socket.
+TEST_F(SdkMeshPrivateApiTest, HeartbeatPublishesTheReflexiveEndpoint) {
+    LN_REQUIRE_TEST_TRUST();
+    asio::io_context io;
+    nexus::crypto::SodiumCryptoService crypto;
+    crypto.start();
+    std::unique_ptr<nexus::network::StunService> stun;
+    try {
+        stun = std::make_unique<nexus::network::StunService>(io, 3478, crypto, "test-stun");
+    } catch (const std::exception&) {
+        crypto.stop();
+        GTEST_SKIP() << "UDP port 3478 is in use on this host";
+    }
+    stun->start();
+    auto guard = asio::make_work_guard(io);
+    std::thread io_thread([&io] { io.run(); });
+
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec    = 1;
+    cfg.stun_refresh_interval_sec = 60;
+    client->enable_mesh(cfg);
+
+    std::string seen_by_server;
+    EXPECT_TRUE(wait_for([&] {
+        for (const auto& p : server_mesh.mesh_status().peers) {
+            if (!p.endpoint.empty()) seen_by_server = p.endpoint;
+        }
+        if (seen_by_server.empty()) return false;
+        for (const auto& endpoint : heartbeats()) {
+            if (endpoint == seen_by_server) return true;
+        }
+        return false;
+    }, std::chrono::seconds(15))) << "no heartbeat carried the reflexive endpoint "
+                                  << seen_by_server;
+
+    client->disable_mesh();
+    stun->stop();
+    guard.reset();
+    io.stop();
+    io_thread.join();
+    crypto.stop();
+}
+
+// Without a reflexive address (STUN refresh off) the heartbeat carries an
+// empty endpoint, which the server treats as liveness only.
+TEST_F(SdkMeshPrivateApiTest, HeartbeatWithoutStunSendsAnEmptyEndpoint) {
+    LN_REQUIRE_TEST_TRUST();
+    auto client = joined_client();
+    lnsdk::MeshConfig cfg;
+    cfg.heartbeat_interval_sec    = 1;
+    cfg.stun_refresh_interval_sec = 0;
+    client->enable_mesh(cfg);
+    ASSERT_TRUE(wait_for([&] { return heartbeats().size() >= 2; }, std::chrono::seconds(10)));
+    client->disable_mesh();
+    for (const auto& endpoint : heartbeats()) EXPECT_EQ(endpoint, "");
 }

@@ -41,9 +41,10 @@ Notes:
 - **`53` is only for nodes that serve public authoritative DNS.** Map both
   UDP and TCP; a UDP-only authoritative server fails truncated responses.
   Do not expose public DNS from a node that does not serve it.
-- `9100/tcp` and `51940/udp` must accept any source — clients connect from
-  unknown IPs. Gossip (`9102`), STUN (`3478`), and relay (`9103`) can be
-  restricted to known mesh server IPs.
+- `9100/tcp`, `51940/udp`, `3478/udp`, and `9103/udp` must accept any
+  source — clients connect from unknown IPs. Clients query STUN (`3478`) to
+  learn the address that peers punch toward, and fall back to the relay
+  (`9103`). Gossip (`9102`) can be restricted to known mesh server IPs.
 - Mapping port `53` to `5335` does not replace the rest of your firewall
   policy.
 

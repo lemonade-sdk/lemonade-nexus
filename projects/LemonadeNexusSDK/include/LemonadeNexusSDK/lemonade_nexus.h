@@ -375,7 +375,13 @@ ln_error_t ln_mesh_enable(ln_client_t* client);
 
 /** Enable mesh networking with custom config (JSON string).
  *  Config JSON keys: peer_refresh_interval_sec, heartbeat_interval_sec,
- *  stun_refresh_interval_sec, prefer_direct, auto_connect. */
+ *  stun_refresh_interval_sec, prefer_direct, auto_connect.
+ *  stun_refresh_interval_sec (default 60) sets how often the client learns
+ *  its reflexive address from the server's STUN service and publishes it for
+ *  hole punching; 0 turns this off. prefer_direct (default true) keeps
+ *  probing a relayed peer's direct endpoint and moves the peer back to a
+ *  direct path when a probe gets an authenticated handshake; false keeps
+ *  every peer on a relay when one is available. */
 ln_error_t ln_mesh_enable_config(ln_client_t* client, const char* config_json);
 
 /** Disable mesh networking and remove all mesh peers from the tunnel. */

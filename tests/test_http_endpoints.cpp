@@ -1793,8 +1793,38 @@ TEST_F(HttpEndpointTest, HeartbeatEndpointWritesFollowTheTreeOperationRules) {
     ASSERT_NE(res, nullptr);
     ASSERT_EQ(res->status, 200) << res->body;
     EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    const auto version_after_write = tree->get_node(node_id)->version;
+    const auto first_status = json::parse(res->body).value("status", std::string{});
+
+    // A heartbeat without an endpoint (the client has no STUN answer yet) is
+    // liveness only: the stored endpoint stays and nothing is written.
+    for (const json& empty : {json{{"node_id", node_id}, {"endpoint", ""}},
+                              json{{"node_id", node_id}}}) {
+        res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), empty.dump(),
+                            "application/json");
+        ASSERT_NE(res, nullptr);
+        ASSERT_EQ(res->status, 200) << res->body;
+        EXPECT_EQ(json::parse(res->body).value("endpoint", std::string{}), "203.0.113.9:51940");
+        EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+        EXPECT_EQ(tree->get_node(node_id)->version, version_after_write);
+        if (test_support::kTreeOpsBuild) {
+            EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "unchanged");
+        }
+    }
+
+    // An IPv4 endpoint that is not a unicast address is refused.
+    for (const char* bogus : {"999.1.1.1:51940", "0.0.0.0:51940", "224.0.0.1:51940",
+                              "255.255.255.255:51940"}) {
+        const json bad = {{"node_id", node_id}, {"endpoint", bogus}};
+        res = mesh_cli.Post("/api/mesh/heartbeat", session(device_kp), bad.dump(),
+                            "application/json");
+        ASSERT_NE(res, nullptr);
+        EXPECT_EQ(res->status, 400) << bogus;
+        EXPECT_EQ(tree->get_node(node_id)->listen_endpoint, "203.0.113.9:51940");
+    }
+
     if (test_support::kTreeOpsBuild) {
-        EXPECT_EQ(json::parse(res->body).value("status", std::string{}), "committed");
+        EXPECT_EQ(first_status, "committed");
         EXPECT_EQ(tree->get_node(node_id)->version, version_before + 1);
 
         // The same endpoint again: no operation, no version change.

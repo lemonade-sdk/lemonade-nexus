@@ -20,10 +20,13 @@ Check this list before the next release. Nothing below is a blocker unless marke
   its verified Tier 1 membership and its own relay id.
 - **Relays work end to end** (owner approval, 2026-10-25). The relay handles the wire `Allocate`
   message and pairs two peers by a rendezvous only they can derive; the SDK falls back to a relay
-  for peers it cannot reach directly. Follow-ups: relay fallback is not tested across real NAT
-  devices or under load, the SDK has no STUN probe or hole punching for mesh peers, and
-  tree-derived DNS names are answered by Tier 1 nameservers only. See `Security.md`, current
-  limitations 6 to 8.
+  for peers it cannot reach directly.
+- **Mesh hole punching** (owner approval, 2026-10-25). The SDK learns its reflexive address with a
+  STUN query from the dataplane socket, publishes it with the heartbeat, and punches direct paths
+  to peers at their listed endpoints; a relayed peer moves back to a direct path when a punch
+  succeeds. Follow-ups: relay fallback and hole punching are not tested across real NAT devices
+  or under load; there are no LAN candidates and no symmetric-NAT detection; and tree-derived DNS
+  names are answered by Tier 1 nameservers only. See `Security.md`, current limitations 6 to 8.
 
 ## 1. Remove the two storage flags
 

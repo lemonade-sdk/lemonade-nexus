@@ -113,10 +113,45 @@ refuses an older membership. A client with no stored epoch can be held at an
 old epoch only if every server it reaches withholds the newer handoffs and
 every member it reaches signs the older epoch.
 
+## Direct Paths (Hole Punching)
+
+When mesh networking is on (`enable_mesh` / `ln_mesh_enable`), the SDK tries a
+direct path to every peer before it uses a relay:
+
+- Every `stun_refresh_interval_sec` (default 60), the SDK sends a STUN Binding
+  request from the BoringTun dataplane socket to the session server's STUN
+  service (UDP `3478` on the host of the server's mesh endpoint). The answer
+  is the NAT mapping that the mesh traffic uses. Set the interval to `0` to
+  turn this off.
+- STUN answers are not authenticated. The SDK accepts an answer only from the
+  queried address, with its own transaction id, and with a valid IPv4
+  `XOR-MAPPED-ADDRESS`. It publishes the address only when the STUN server
+  could have observed it: a public address from any server, a private address
+  only from a private or loopback server, and a loopback address only from a
+  loopback server.
+- The heartbeat (`POST /api/mesh/heartbeat`) publishes the address. The
+  server stores it as the node's endpoint. A heartbeat with an empty endpoint
+  (no STUN answer yet) keeps the stored endpoint.
+- Peers receive the endpoint in the verified Tier 1 server's peer list
+  (`GET /api/mesh/peers`). The SDK ignores a listed endpoint that is not a
+  dotted IPv4 unicast address. It accepts a loopback endpoint only when the
+  session server is also on loopback.
+- The SDK then sends probes: BoringTun handshake initiations from the
+  dataplane socket to the peer's listed endpoint. It sends a burst of five
+  probes one second apart, then two probes at each pair slot (every 15
+  seconds). A pair slot is a wall-clock time that both peers compute from
+  their two public keys, so both sides probe at about the same moment. A
+  probe changes no state. Only a valid handshake answer moves the peer to the
+  probed address.
+- A peer with a fresh handshake on its direct path gets no probes. At most 16
+  probes go out in one pass.
+
+`ln_mesh_status` and `ln_mesh_peers` report a direct peer's address in
+`endpoint`.
+
 ## Relay Fallback
 
-When mesh networking is on (`enable_mesh` / `ln_mesh_enable`), the SDK moves
-a peer onto a relay when the dataplane cannot reach it directly:
+The SDK moves a peer onto a relay when the dataplane cannot reach it directly:
 
 - The peer has no direct endpoint in the server's peer list, or its direct
   endpoint gave no handshake within 20 seconds.
@@ -134,11 +169,16 @@ A relay that refuses, does not answer, or gives no handshake is skipped for
 five minutes, and the peer is retried with backoff. Set `prefer_direct` to
 `false` in the mesh config to relay every peer.
 
+With `prefer_direct` (the default), the SDK keeps probing a relayed peer's
+listed endpoint, two probes at each pair slot (every 60 seconds). When the
+peer answers there with a valid handshake, the peer moves to the direct path
+and the SDK closes the relay session. This does not count as a relay failure.
+
 `ln_mesh_status` and `ln_mesh_peers` report a relayed peer with an empty
 `endpoint` and its relay address (`ip:port`) in `relay_endpoint`.
 
-The SDK has no STUN probe or hole punching for mesh peers yet, so a peer that
-publishes no direct endpoint always uses a relay.
+A peer that publishes no direct endpoint (no STUN answer, or STUN turned off)
+always uses a relay.
 
 ## Authentication Status
 

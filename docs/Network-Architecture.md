@@ -230,11 +230,24 @@ otherwise it selects `Relay`. The routing coordinator does not allocate a
 relay session for a routing-layer connection: its directive carries an empty
 `relay_endpoint`. STUN (`3478`) supplies reflexive candidates.
 
-Mesh dataplane peers use the SDK relay fallback instead (UDP `9103`): each
-peer requests its own relay ticket from its verified Tier 1 server, and the
-relay pairs the two peers' `Allocate` requests. See
-[Client SDK](Client-SDK#relay-fallback) and
-[Security](Security#relay-sessions).
+Mesh dataplane peers do not use the routing coordinator. Each SDK client
+learns its reflexive address with a STUN query sent from its BoringTun
+dataplane socket to the session server (`3478`), and publishes it with the
+mesh heartbeat. Authorized peers receive it in `GET /api/mesh/peers` from
+their verified Tier 1 server and send BoringTun handshake initiations to it
+from their own dataplane socket. Both sides probe at the same wall-clock slot,
+which each side computes from the two public keys, so no signaling message is
+needed. A probe changes no state; only a valid handshake answer moves the peer
+to the probed address.
+
+When no direct handshake arrives within 20 seconds, the SDK relay fallback
+takes over (UDP `9103`): each peer requests its own relay ticket from its
+verified Tier 1 server, and the relay pairs the two peers' `Allocate`
+requests. A relayed peer keeps getting upgrade probes and moves back to the
+direct path when one succeeds. See
+[Client SDK](Client-SDK#direct-paths-hole-punching),
+[Client SDK](Client-SDK#relay-fallback), and
+[Security](Security#direct-paths).
 
 ## SDK Client
 
@@ -247,8 +260,9 @@ relay pairs the two peers' `Allocate` requests. See
 - Private-API calls ride an egress bridge: the netstack binds an ephemeral
   `127.0.0.1` listener and bridges accepted connections to a virtual TCP
   stream toward the server's `<tunnel_ip>:9101`.
-- A background orchestrator refreshes peers, sends heartbeats, and tracks
-  liveness.
+- A background orchestrator refreshes peers, learns and publishes the
+  reflexive address (STUN), sends heartbeats, punches direct paths, falls back
+  to relays, and tracks liveness.
 - **Local service publishing is now exposed:** `expose_service(vport, target)`
   publishes a local service to mesh peers (the daemon bridges
   `our-mesh-IP:vport` to, e.g., `tcp:127.0.0.1:PORT`), and
