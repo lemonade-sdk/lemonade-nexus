@@ -21,6 +21,7 @@
 #include <LemonadeNexus/IPAM/IPAMService.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Relay/RelayService.hpp>
+#include <LemonadeNexus/Relay/RelayTicketAuth.hpp>
 #include <LemonadeNexus/Relay/RelayDiscoveryService.hpp>
 #include <LemonadeNexus/Routing/RoutingCoordinationService.hpp>
 #include <LemonadeNexus/Core/BinaryAttestation.hpp>
@@ -43,6 +44,7 @@
 #include <openssl/x509v3.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -103,7 +105,18 @@ protected:
     core::ServerConfig config;
     crypto::Ed25519Keypair root_keypair;
     crypto::Ed25519Keypair mesh_keypair;
+    crypto::Ed25519Keypair server_identity;  // the node identity a relay ticket is signed with
     std::string jwt_secret;
+
+    // Whether this server is a current Tier 1 member (it issues relay
+    // tickets only then), and the network and epoch it serves.
+    static inline std::atomic<bool> is_tier1{true};
+    static constexpr uint64_t kEpoch = 3;
+    static security::NetworkId network() {
+        security::NetworkId id{};
+        id.fill(0x5A);
+        return id;
+    }
 
     void SetUp() override {
         test_port_ = static_cast<uint16_t>(19500 + (getpid() % 10000));
@@ -139,6 +152,9 @@ protected:
         relay = std::make_unique<relay::RelayService>(io, 0, *crypto);
         relay_discovery = std::make_unique<relay::RelayDiscoveryService>(*storage);
         gossip = std::make_unique<gossip::GossipService>(io, 0, *storage, *crypto);
+        server_identity = crypto->ed25519_keygen();
+        gossip->set_identity(server_identity);
+        is_tier1 = true;
         routing = std::make_unique<routing::RoutingCoordinationService>(*crypto, *gossip);
         attestation = std::make_unique<core::BinaryAttestationService>(*crypto, *storage);
         admission = std::make_unique<core::ServerAdmissionService>(
@@ -170,6 +186,13 @@ protected:
             .server_private_fqdn = "",
             .server_public_ip = "",
             .tunnel_bind_ip   = "",
+            .tier1_identity   = []() -> std::optional<api::Tier1Identity> {
+                if (!is_tier1) return std::nullopt;
+                api::Tier1Identity id;
+                id.network_id = network();
+                id.epoch = kEpoch;
+                return id;
+            },
         };
         holder().auth_handler = new api::AuthApiHandler(*holder().ctx);
         holder().auth_handler->register_routes(http->server(), http->server());
@@ -501,6 +524,48 @@ TEST_F(ApiAuthzF34eTest, RelayTicketForOwnIdentitySucceeds) {
     EXPECT_EQ(j.value("relay_id", ""), "relay-1");
     EXPECT_GT(j.value("expires_at", 0), j.value("issued_at", 0));
     EXPECT_FALSE(j.value("session_nonce", std::string{}).empty());
+
+    // Any relay verifies the issued ticket against the Tier 1 membership.
+    relay::RelayTicket ticket;
+    ticket.peer_id = j.value("peer_id", "");
+    ticket.relay_id = j.value("relay_id", "");
+    const auto nonce = crypto::from_base64(j.value("session_nonce", std::string{}));
+    ASSERT_EQ(nonce.size(), ticket.session_nonce.size());
+    std::copy(nonce.begin(), nonce.end(), ticket.session_nonce.begin());
+    ticket.issued_at = j.value("issued_at", uint64_t{0});
+    ticket.expires_at = j.value("expires_at", uint64_t{0});
+    const auto net = crypto::from_hex(j.value("network_id", std::string{}));
+    ASSERT_EQ(net.size(), ticket.network_id.size());
+    std::copy(net.begin(), net.end(), ticket.network_id.begin());
+    ticket.epoch = j.value("epoch", uint64_t{0});
+    const auto issuer = crypto::from_base64(j.value("issuer", std::string{}));
+    ASSERT_EQ(issuer.size(), ticket.issuer.size());
+    std::copy(issuer.begin(), issuer.end(), ticket.issuer.begin());
+    const auto sig = crypto::from_base64(j.value("signature", std::string{}));
+    ASSERT_EQ(sig.size(), ticket.signature.size());
+    std::copy(sig.begin(), sig.end(), ticket.signature.begin());
+    EXPECT_EQ(ticket.issuer, server_identity.public_key);
+    EXPECT_LE(ticket.expires_at - ticket.issued_at, relay::kRelayTicketMaxLifetimeSec);
+    security::NodeId member;
+    member.bytes = server_identity.public_key;
+    const relay::RelayTicketAuthority authority{network(), kEpoch, {member}};
+    EXPECT_EQ(relay::check_relay_ticket(ticket, authority, ticket.issued_at),
+              relay::RelayTicketCheck::Valid);
+}
+
+TEST_F(ApiAuthzF34eTest, OnlyATier1ServerIssuesRelayTickets) {
+    auto login = login_ed25519(root_keypair);
+    ASSERT_TRUE(login.has_value());
+    is_tier1 = false;
+    httplib::Headers headers{{"Authorization", "Bearer " + login->first}};
+    auto cli = make_client();
+    auto res = cli.Post("/api/relay/ticket", headers,
+                        json{{"peer_id", login->second},
+                             {"relay_id", "relay-1"}}.dump(),
+                        "application/json");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 421);
+    EXPECT_FALSE(json::parse(res->body).contains("signature"));
 }
 
 // ── /api/relay/register ─────────────────────────────────────────────────────
