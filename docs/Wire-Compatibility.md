@@ -64,7 +64,7 @@ version byte (`decode_security_message` returns `BadVersion`), and its
 message layouts also differ (attestation challenge and evidence fields, the
 bootstrap certificate). A mixed-version run against that release therefore
 reports dropped messages from every old node. The router records these drops
-as `WireVersionMismatch` (16), not `Malformed`, and the gate script reports
+as `WireVersionMismatch` (14), not `Malformed`, and the gate script reports
 the old binary as an invalid baseline. The commit r21 started from
 (`dd80e7f`) is also wire version 1; the r21 build added the version 3 work on
 top of it, so that commit alone is not r21 either.

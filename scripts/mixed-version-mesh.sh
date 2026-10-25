@@ -75,7 +75,7 @@ say "new: $BIN"
 say "old: $OLD_BIN"
 
 # Drop reasons in SecurityRouter's DropReason: Malformed = 2, UnknownKind = 3,
-# WireVersionMismatch = 16. Only the per-drop debug lines are counted; the
+# WireVersionMismatch = 14. Only the per-drop debug lines are counted; the
 # rate-limited info lines repeat them.
 check_new_nodes_decode_old() {
     local pass_dir="$1" old_nodes="$2"
@@ -84,7 +84,7 @@ check_new_nodes_decode_old() {
         local bad skew
         bad=$(grep -cE '\[debug\].*route drop reason=(2|3) ' "$pass_dir/n$i.log" || true)
         [ "$bad" -eq 0 ] || fail "new-binary node n$i dropped $bad message(s) as malformed or unknown"
-        skew=$(grep -cE '\[debug\].*route drop reason=16 ' "$pass_dir/n$i.log" || true)
+        skew=$(grep -cE '\[debug\].*route drop reason=14 ' "$pass_dir/n$i.log" || true)
         [ "$skew" -eq 0 ] || fail "new-binary node n$i dropped $skew message(s) of another security \
 wire version: the old binary is not a valid baseline (docs/Wire-Compatibility.md)"
     done

@@ -18,6 +18,11 @@ RouteResult delivered() {
     return result;
 }
 
+// The mixed-version gate greps the number; a value inserted before it would
+// silently repeat 14.
+static_assert(static_cast<uint16_t>(DropReason::ServiceRejected) + 1 ==
+              static_cast<uint16_t>(DropReason::WireVersionMismatch));
+
 DropReason from_codec(CodecError error) {
     switch (error) {
         case CodecError::Oversized:

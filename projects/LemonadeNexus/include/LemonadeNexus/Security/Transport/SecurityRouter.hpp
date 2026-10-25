@@ -55,7 +55,8 @@ enum class DropReason : uint16_t {
     ServiceRejected,
     /// The envelope names another security wire version. A peer on a release
     /// with another wire, not a malformed message (Wire-Compatibility.md).
-    WireVersionMismatch,
+    /// scripts/mixed-version-mesh.sh matches this number.
+    WireVersionMismatch = 14,
 };
 
 struct RouteResult {
