@@ -102,6 +102,12 @@ after it signs an endpoint proof for the host and port the client reached
 (see [Client SDK](Client-SDK#tier-1-servers)). A server never vouches for a
 session it did not issue.
 
+A client with no stored Genesis key can discover it on first connect from
+`GET /api/onboard/info`. The SDK pins the key only when at least 3 hosts in the
+network DNS domain report the same key and network id over verified HTTPS.
+This is trust on first use: it rests on domain ownership and host agreement,
+not on a signature. After the key is pinned, discovery never replaces it.
+
 ### Relay tickets
 
 A Tier 1 server issues a relay ticket (`POST /api/relay/ticket`) only for the

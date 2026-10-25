@@ -50,6 +50,42 @@ key (`genesis_pubkey` in the server config) before the first tree call:
 - C++: `client.set_genesis_key(genesis_b64, min_epoch)`
 - C: `ln_set_genesis_key(client, genesis_b64, min_epoch)`
 
+A client that has no stored key can discover it on first connect:
+
+- C++: `client.discover_genesis_key(hosts)`
+- C: `ln_discover_genesis_key(client, hosts_json, &json)`
+
+Discovery runs only when no key is pinned. It asks each candidate server for
+`GET /api/onboard/info` over verified HTTPS: the hosts the caller passes (for
+example, servers found through DNS discovery), the configured servers, and the
+servers they list in `/api/servers`. It asks at most 16 distinct hosts. Each
+server reports its configured `genesis_pubkey` and the `network_id` that
+derives from it. The SDK pins the key only when all of these are true:
+
+1. Every server that reports a key reports the same key, network id, and DNS
+   base domain.
+2. The network id derives from the key under the compiled ruleset versions.
+3. At least 3 distinct agreeing hosts are inside that DNS domain.
+
+A disagreement, a malformed key, a network id that does not derive from the
+key, or no DNS domain fails closed with `LN_ERR_REJECTED`. Fewer than 3
+agreeing hosts fails closed with `LN_ERR_CONNECT`. A network with fewer than 3
+reachable servers needs an explicit `set_genesis_key`. On success the key is
+pinned as with `set_genesis_key`, and the call returns
+`{"genesis_pubkey","network_id","dns_base_domain","hosts"}`. Store the key and
+pin it with `set_genesis_key` on later runs.
+
+Discovery never replaces a pinned key, even one pinned while it runs. A key
+change is always an explicit `set_genesis_key` call.
+
+**Trust limit:** discovery is trust on first use. The key is not signed by
+anything the client already trusts. Trust rests on verified-HTTPS ownership of
+the network's DNS domain and on agreement of several servers. An attacker who
+can obtain certificates for at least 3 names in that domain, or who controls
+every server the client reaches, can supply a false key on first connect.
+After the key is pinned, the Tier 1 verification below does not depend on DNS
+or on the servers' honesty.
+
 The SDK then:
 
 1. Walks the authority chain from the key (`GET /api/tier1/authority` on any

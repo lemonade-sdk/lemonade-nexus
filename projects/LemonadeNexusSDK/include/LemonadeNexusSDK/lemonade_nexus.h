@@ -603,6 +603,41 @@ ln_error_t ln_tier1_refresh(ln_client_t* client, char** out_json);
  *  must ln_free() *out_json. Thread-safe. */
 ln_error_t ln_tier1_membership(ln_client_t* client, char** out_json);
 
+/** First-connect discovery of the network's Genesis key, for a client with no
+ *  pinned key. It never replaces a pinned key; changing the key stays an
+ *  explicit ln_set_genesis_key call.
+ *
+ *  The client asks each candidate server for GET /api/onboard/info over
+ *  verified HTTPS: the servers in hosts_json first, then the configured
+ *  server and the servers it lists in /api/servers. At most 16 distinct hosts
+ *  are asked. Every server that reports a key must report the same key,
+ *  network id, and DNS domain; the network id must derive from the key; and at
+ *  least 3 distinct agreeing hosts must sit inside that DNS domain. Anything
+ *  else fails closed and pins nothing.
+ *
+ *  Trust limit: this is trust on first use. It rests on verified-HTTPS
+ *  ownership of the network's DNS domain and on agreement of several servers,
+ *  not on a signature. The application must store the returned key and pin it
+ *  with ln_set_genesis_key on later runs.
+ *
+ *  @param hosts_json  NULL, or a JSON array of extra candidate servers, for
+ *                     example servers found through DNS discovery:
+ *                     [{"host":"<certificate fqdn>","port":9100},...]. "port"
+ *                     is optional (default 9100). Not retained after the call.
+ *  @param out_json    Receives, on LN_OK,
+ *                     {"genesis_pubkey":"<base64>","network_id":"<hex>",
+ *                      "dns_base_domain":"<domain>","hosts":["<fqdn>",...]}
+ *                     and on failure {"error":"..."}. The caller must ln_free()
+ *                     *out_json in both cases. It stays NULL only for
+ *                     LN_ERR_NULL_ARG and LN_ERR_INTERNAL.
+ *  @return LN_OK and the key is pinned; LN_ERR_REJECTED when a key is already
+ *          pinned, hosts_json is malformed, a server sent a malformed key or a
+ *          network id that does not derive from its key, or servers disagree;
+ *          LN_ERR_CONNECT when fewer than 3 agreeing servers answered.
+ *  Blocks on network I/O. Thread-safe. */
+ln_error_t ln_discover_genesis_key(ln_client_t* client, const char* hosts_json,
+                                   char** out_json);
+
 /* ------------------------------------------------------------------ */
 /* Mesh port                                                           */
 /* ------------------------------------------------------------------ */

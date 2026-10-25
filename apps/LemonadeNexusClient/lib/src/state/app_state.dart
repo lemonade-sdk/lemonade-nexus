@@ -120,7 +120,8 @@ class Settings {
   final bool darkModeEnabled;
 
   /// The network's Genesis public key (base64). The SDK verifies Tier 1
-  /// servers from it; without it no tree request is sent.
+  /// servers from it; without it no tree request is sent. When empty at
+  /// connect, the app discovers it once and saves it here.
   final String genesisKey;
 
   /// The highest Tier 1 epoch this app verified. The SDK refuses an older
@@ -515,7 +516,11 @@ class AppNotifier extends StateNotifier<AppState> {
       } else {
         await _sdk.connect(host, port);
       }
-      _applyGenesisKey();
+      if (state.settings.genesisKey.trim().isEmpty) {
+        await _discoverGenesisKey();
+      } else {
+        _applyGenesisKey();
+      }
       state = state.copyWith(
         settings: state.settings.copyWith(
           serverHost: host,
@@ -558,6 +563,41 @@ class AppNotifier extends StateNotifier<AppState> {
     } catch (e) {
       _log('connectToServer: network key refused -> $e');
       addActivity(ActivityLevel.error, 'The network key is not valid: $e');
+    }
+  }
+
+  /// First connect with no network key: the SDK finds the key on several
+  /// servers of the network and pins it, then this saves it. It is trust on
+  /// first use: it rests on verified-HTTPS ownership of the network domain
+  /// and on agreement of at least 3 servers. The saved key is never replaced
+  /// automatically; the Settings field stays the manual override.
+  Future<void> _discoverGenesisKey() async {
+    try {
+      var servers = state.discoveredServers;
+      if (servers.isEmpty && state.settings.autoDiscoveryEnabled) {
+        final service = DnsDiscoveryService();
+        try {
+          servers = await service.discoverServers();
+        } finally {
+          service.close();
+        }
+      }
+      final hosts = [
+        for (final s in servers)
+          if ((s.connectHost ?? s.hostname) != null)
+            (host: (s.connectHost ?? s.hostname)!, port: s.port),
+      ];
+      final found = await _sdk.discoverGenesisKey(hosts: hosts);
+      final key = (found['genesis_pubkey'] as String?) ?? '';
+      final agreeing = (found['hosts'] as List?)?.length ?? 0;
+      _log('connectToServer: network key found on $agreeing servers');
+      await setGenesisKey(key);
+      addActivity(ActivityLevel.success,
+          'Found the network key on $agreeing servers and saved it');
+    } catch (e) {
+      _log('connectToServer: network key discovery failed -> $e');
+      addActivity(ActivityLevel.error,
+          'The network key was not found: $e. Set it in Settings.');
     }
   }
 
