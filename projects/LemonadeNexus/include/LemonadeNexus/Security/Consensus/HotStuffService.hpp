@@ -85,6 +85,14 @@ struct ProposalResult {
     bool transition_refused = false;
 };
 
+/// A proposal refused only because its parent block is unknown. It is held
+/// so it can be judged again, in full, once catch-up delivers the parent.
+struct OrphanProposal {
+    Proposal proposal;
+    QuorumCertificate justify;
+    std::optional<BlockPayload> payload;
+};
+
 // Two signed messages from one node for one (epoch, view).
 struct EquivocationRecord {
     NodeId node;
@@ -140,6 +148,18 @@ public:
     [[nodiscard]] std::optional<ConsensusFailure> adopt_certified_block(
         const Proposal& proposal, const QuorumCertificate& justify,
         const QuorumCertificate& certifying, std::vector<ConsensusCommit>& commits_out);
+
+    /// Returns the held orphan proposal when its parent is now in chain state,
+    /// and releases it. Returns nothing while the parent is still unknown.
+    ///
+    /// receive_proposal() holds one orphan: the highest-view proposal it
+    /// refused with MissingParent after every header, justify, view and
+    /// leader check passed. The caller feeds the returned proposal back
+    /// through receive_proposal(), which judges it again from the start, so
+    /// holding it grants nothing. Without this, a replica that missed one
+    /// block stays one block behind: each later proposal names the block it
+    /// refused before.
+    [[nodiscard]] std::optional<OrphanProposal> take_linkable_orphan();
 
     /// The chain above the last committed block, oldest first, each with its
     /// justify. The last entry is the block the high certificate certifies.
@@ -226,6 +246,9 @@ private:
     std::set<std::tuple<View, Height, Digest>> formed_qcs_;
     std::map<View, std::map<NodeId, TimeoutVote>> timeouts_by_view_;
     std::set<View> formed_tcs_;
+
+    // At most one proposal waits for its parent; see take_linkable_orphan().
+    std::optional<OrphanProposal> orphan_;
 
     // One parentless adoption is allowed after a restart: the sync anchor.
     // Its quorum certificate proves the content; everything above it links.
