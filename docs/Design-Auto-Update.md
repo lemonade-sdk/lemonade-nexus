@@ -305,12 +305,12 @@ Details that the phases above leave open:
 
 Known limits found during the implementation:
 
-- **HotStuff restart catch-up defect (pre-existing).** On the memory mesh, a
-  full restart of three Tier 1 members in a row leaves a restarted member
-  that never commits again, and sometimes stalls the chain, in about a third
-  to a half of runs. It reproduces on the base commit with plain restarts and
-  no upgrade code. In-place updates of Tier 1 servers depend on restart
-  catch-up, so this blocks production use of Phase 5 until it is fixed.
+- **HotStuff restart catch-up (fixed).** A restarted Tier 1 member that came
+  back one block behind refused every later proposal for a missing parent and
+  never asked for it. PR #80 fixed this: the member requests the parent from
+  the proposer and replays the held proposal.
+  `DriverMesh.SequentialRestartsKeepEveryMemberCommitting` covers sequential
+  restarts.
 - **Release record rollback.** A party that can write the security directory
   can replace or delete the release record. Finalized consensus state is the
   anchor (`ReleaseChain::raise_floor`). A rollout starts with a finalized

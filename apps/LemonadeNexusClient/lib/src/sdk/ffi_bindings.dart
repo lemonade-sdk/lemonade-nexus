@@ -166,6 +166,16 @@ typedef _LnTier1JsonDart = int Function(
   LnClientHandle client,
   ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
 );
+typedef _LnDiscoverGenesisKey = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> hostsJson,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnDiscoverGenesisKeyDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> hostsJson,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
 
 // Device linking
 typedef _LnSetLinkToken = ffi.Int32 Function(
@@ -791,6 +801,9 @@ class LemonadeNexusFfi {
       _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_refresh');
   late final _lnTier1Membership =
       _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_membership');
+  late final _lnDiscoverGenesisKey =
+      _lib.lookupFunction<_LnDiscoverGenesisKey, _LnDiscoverGenesisKeyDart>(
+          'ln_discover_genesis_key');
   late final _lnLinkTokenCreate = _lib.lookupFunction<_LnLinkTokenCreate,
       _LnLinkTokenCreateDart>('ln_link_token_create');
 
@@ -948,6 +961,7 @@ class LemonadeNexusFfi {
     'ln_set_genesis_key',
     'ln_tier1_refresh',
     'ln_tier1_membership',
+    'ln_discover_genesis_key',
   ];
 
   /// Required symbols absent from the loaded native library (empty when the
@@ -1129,6 +1143,26 @@ class LemonadeNexusFfi {
   /// The last verified Tier 1 membership, without network I/O.
   (LnError, String?) tier1Membership(LnClientHandle client) =>
       _tier1Json(client, _lnTier1Membership);
+
+  /// First-connect discovery of the network key, only when none is pinned.
+  /// [hostsJson] is null or a JSON array of `{"host", "port"}` candidates.
+  /// Returns the error code and the JSON: {genesis_pubkey, network_id,
+  /// dns_base_domain, hosts} on success, {error} on failure.
+  (LnError, String?) discoverGenesisKey(LnClientHandle client, String? hostsJson) {
+    final hosts = hostsJson == null
+        ? ffi.nullptr.cast<ffi.Char>()
+        : hostsJson.toNativeUtf8().cast<ffi.Char>();
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = _lnDiscoverGenesisKey(client, hosts, outJson);
+      final json =
+          outJson.value == ffi.nullptr ? null : toStringAndFree(outJson.value);
+      return (LnError.fromCode(result), json);
+    } finally {
+      calloc.free(outJson);
+      if (hosts != ffi.nullptr) malloc.free(hosts);
+    }
+  }
 
   (LnError, String?) _tier1Json(LnClientHandle client, _LnTier1JsonDart call) {
     final outJson = calloc<ffi.Pointer<ffi.Char>>();

@@ -289,10 +289,9 @@ every OS change comes through a release.
 
 ## Limits
 
-- **Upgrade turns are not production-ready.** The turn gate answers from
-  finalized UpgradeProgress records (Phase 5). A pre-existing HotStuff
-  restart catch-up defect on the memory mesh blocks production use for Tier 1
-  servers until it is fixed (Design-Auto-Update, Known limits).
+- **Upgrade turns have no hardware qualification yet.** The turn gate answers
+  from finalized UpgradeProgress records (Phase 5). The tests inject the
+  `UpgradeHealth` attestation verdicts; no rollout has run on the fleet.
 - **A fix after a halt.** A second halt in a row adds the first fix's hashes
   to the next fix, so the overlap grows by one release for each consecutive
   halt until a rollout completes. The approval holds one PCR 8/9 pair, so a
@@ -301,9 +300,9 @@ every OS change comes through a release.
 - **PCR measurement.** A GitHub-hosted runner cannot boot the fleet's SEV-SNP
   guest. PCR 8/9 come from the reviewed profile, and the optional reference VM
   job only compares them. The workflow never computes PCR values.
-- **No pinned packages yet.** `release/os-packages.lock` lists no packages:
-  the fleet's package versions are not in this repository. Releases change no
-  OS package and never reboot until the lock is seeded from the reference VM.
+- **OS package lock.** `release/os-packages.lock` was captured on the
+  reference VM. A lock change that touches a `boot` package needs new PCR 8/9
+  in `release/fleet-profile.json`, measured on the reference VM.
 - **GRUB.** A boot-chain update requires `GRUB_DEFAULT=saved`. Whether GRUB's
   measurement of `grubenv` and of the previous entry gives the old PCR 8/9 is
   not verified on the reference VM. After a server has started on the new

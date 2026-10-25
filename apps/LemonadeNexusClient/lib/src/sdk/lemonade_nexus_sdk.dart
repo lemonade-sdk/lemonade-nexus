@@ -360,6 +360,25 @@ class LemonadeNexusSdk {
     }
   }
 
+  /// First-connect discovery of the network key, for a client with no pinned
+  /// key. The SDK asks [hosts] (certificate FQDN and HTTP port, for example
+  /// from DNS discovery), the connected server, and the servers it lists. It
+  /// pins the key only when at least 3 servers inside the network DNS domain
+  /// report the same key and network id. It never replaces a pinned key.
+  /// Returns {genesis_pubkey, network_id, dns_base_domain, hosts}. Store
+  /// `genesis_pubkey` and pin it with [setGenesisKey] on later runs.
+  Future<Map<String, dynamic>> discoverGenesisKey(
+      {List<({String host, int port})> hosts = const []}) async {
+    _checkDisposed();
+    _checkConnected();
+    final hostsJson = jsonEncode([
+      for (final h in hosts) {'host': h.host, 'port': h.port},
+    ]);
+    final (error, json) =
+        await _offThread((f, c) => f.discoverGenesisKey(c, hostsJson));
+    return _tier1Result(error, json, 'The network key was not found');
+  }
+
   /// Verify the Tier 1 membership now. Returns {epoch, members, servers}.
   Future<Map<String, dynamic>> refreshTier1() async {
     _checkDisposed();

@@ -55,6 +55,16 @@ bool verify_poll_sig(crypto::SodiumCryptoService& crypto,
     return crypto.ed25519_verify(pubkey, std::span<const uint8_t>(msg), signature);
 }
 
+/// The configured Genesis public key in canonical form, or nullopt when the
+/// config holds no base64 Ed25519 public key.
+std::optional<crypto::Ed25519PublicKey> configured_genesis_key(const std::string& configured) {
+    const auto bytes = crypto::from_base64(crypto::canonical_key_b64(configured));
+    if (bytes.size() != crypto::kEd25519PublicKeySize) return std::nullopt;
+    crypto::Ed25519PublicKey key{};
+    std::memcpy(key.data(), bytes.data(), bytes.size());
+    return key;
+}
+
 } // namespace
 
 std::optional<core::ApprovedOnboardingBundle> OnboardApiHandler::approved_bundle(
@@ -73,13 +83,10 @@ std::optional<core::ApprovedOnboardingBundle> OnboardApiHandler::approved_bundle
     // The configured Genesis anchor must derive exactly the network id the
     // stored certificate names: a locally inconsistent config or admission
     // store must not be served to the candidate as a valid join.
-    const auto genesis_bytes =
-        crypto::from_base64(crypto::canonical_key_b64(ctx_.config.genesis_pubkey));
-    if (genesis_bytes.size() != crypto::kEd25519PublicKeySize) return std::nullopt;
-    crypto::Ed25519PublicKey genesis_pk{};
-    std::memcpy(genesis_pk.data(), genesis_bytes.data(), genesis_bytes.size());
+    const auto genesis_pk = configured_genesis_key(ctx_.config.genesis_pubkey);
+    if (!genesis_pk) return std::nullopt;
     const auto derived = security::derive_network_id(
-        genesis_pk, security::constants::kSecurityRulesetVersion,
+        *genesis_pk, security::constants::kSecurityRulesetVersion,
         security::constants::kConsensusRulesetVersion);
     std::vector<uint8_t> cert_network;
     try {
@@ -91,8 +98,7 @@ std::optional<core::ApprovedOnboardingBundle> OnboardApiHandler::approved_bundle
         std::memcmp(cert_network.data(), derived.data(), derived.size()) != 0) {
         return std::nullopt;
     }
-    bundle.genesis_pubkey = crypto::to_base64(
-        std::span<const uint8_t>(genesis_bytes.data(), genesis_bytes.size()));
+    bundle.genesis_pubkey = crypto::to_base64(*genesis_pk);
 
     // Root anchor as hex, sourced from the configured trust anchor — NOT from
     // whichever local identity handled the request. This is what the candidate
@@ -153,6 +159,14 @@ void OnboardApiHandler::do_register_routes(httplib::Server& pub, httplib::Server
         response.accepts_onboarding = admission.accepts_onboarding();
         response.dns_base_domain = ctx_.config.dns_base_domain;
         response.server_fqdn = ctx_.server_fqdn;
+        // First-connect clients compare these values across several servers
+        // before they pin the key (see Tier1Directory::discover_genesis_key).
+        if (const auto genesis_pk = configured_genesis_key(ctx_.config.genesis_pubkey)) {
+            response.genesis_pubkey = crypto::to_base64(*genesis_pk);
+            response.network_id = crypto::to_hex(security::derive_network_id(
+                *genesis_pk, security::constants::kSecurityRulesetVersion,
+                security::constants::kConsensusRulesetVersion));
+        }
         json_response(res, response.toJson());
     });
 

@@ -330,15 +330,24 @@ using OnboardingDto = onboarding_json::Serializable<Derived>;
 
 struct OnboardingInfoResponse : OnboardingDto<OnboardingInfoResponse> {
     // Drift guard: number of data members.
-    static constexpr std::size_t kFieldCount = 3;
+    static constexpr std::size_t kFieldCount = 5;
     bool accepts_onboarding{false};
     std::string dns_base_domain;
     std::string server_fqdn;
+    /// The configured Genesis public key, canonical standard base64. Absent
+    /// when the server config holds no valid key. Unsigned: a client must not
+    /// trust it from one server alone.
+    std::optional<std::string> genesis_pubkey;
+    /// Lowercase hex of the network id that `genesis_pubkey` derives under
+    /// the compiled ruleset versions. Present only with `genesis_pubkey`.
+    std::optional<std::string> network_id;
 
     static constexpr auto jsonFields() {
         return std::tuple{NEXUS_ONBOARDING_FIELD(OnboardingInfoResponse, accepts_onboarding),
                           NEXUS_ONBOARDING_FIELD(OnboardingInfoResponse, dns_base_domain),
-                          NEXUS_ONBOARDING_FIELD(OnboardingInfoResponse, server_fqdn)};
+                          NEXUS_ONBOARDING_FIELD(OnboardingInfoResponse, server_fqdn),
+                          NEXUS_ONBOARDING_FIELD(OnboardingInfoResponse, genesis_pubkey),
+                          NEXUS_ONBOARDING_FIELD(OnboardingInfoResponse, network_id)};
     }
 };
 

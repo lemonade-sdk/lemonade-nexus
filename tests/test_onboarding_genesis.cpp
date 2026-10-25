@@ -576,6 +576,49 @@ TEST_F(GenesisAnchorOnboarding, TamperedAdmissionStoreIsNotServedAsApprovedBundl
     EXPECT_FALSE(is_bundle);
 }
 
+// /api/onboard/info carries the configured Genesis key in canonical form and
+// the network id it derives, so a first-connect client can compare them across
+// servers. A config without a valid key publishes neither field.
+TEST_F(GenesisAnchorOnboarding, InfoCarriesTheGenesisKeyAndNetworkId) {
+    const auto& genesis = gossip->keypair().public_key;
+    httplib::SSLClient client("localhost", tls_port);
+    client.set_ca_cert_path(ca_pem.string());
+    const auto info = [&client]() {
+        auto res = client.Get("/api/onboard/info");
+        EXPECT_TRUE(res);
+        if (!res) return core::OnboardingInfoResponse{};
+        EXPECT_EQ(res->status, 200);
+        auto decoded =
+            core::OnboardingInfoResponse::fromJson(nlohmann::json::parse(res->body, nullptr, false));
+        EXPECT_TRUE(decoded) << decoded.error;
+        return decoded ? *decoded.value : core::OnboardingInfoResponse{};
+    };
+
+    auto served = info();
+    ASSERT_TRUE(served.genesis_pubkey.has_value());
+    ASSERT_TRUE(served.network_id.has_value());
+    EXPECT_EQ(*served.genesis_pubkey, b64_array(genesis));
+    EXPECT_EQ(*served.network_id, derived_network_hex(genesis));
+
+    // A url-safe, prefixed spelling of the same key is served canonically.
+    config.genesis_pubkey = "ed25519:" + crypto::canonical_key_b64(b64_array(genesis));
+    std::replace(config.genesis_pubkey.begin(), config.genesis_pubkey.end(), '+', '-');
+    std::replace(config.genesis_pubkey.begin(), config.genesis_pubkey.end(), '/', '_');
+    std::erase(config.genesis_pubkey, '=');
+    served = info();
+    ASSERT_TRUE(served.genesis_pubkey.has_value());
+    EXPECT_EQ(*served.genesis_pubkey, b64_array(genesis));
+    EXPECT_EQ(*served.network_id, derived_network_hex(genesis));
+
+    for (const std::string& bad :
+         std::vector<std::string>{"", "not base64!", b64(std::vector<uint8_t>(16, 7))}) {
+        config.genesis_pubkey = bad;
+        served = info();
+        EXPECT_FALSE(served.genesis_pubkey.has_value()) << "config key: " << bad;
+        EXPECT_FALSE(served.network_id.has_value()) << "config key: " << bad;
+    }
+}
+
 // A pre-existing config that does not parse as a JSON object only earns a
 // warning: onboarding never writes the config, so the run still completes and
 // the bytes stay untouched.

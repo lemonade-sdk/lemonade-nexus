@@ -1834,7 +1834,10 @@ TEST(OnboardingDtoDriftGuard, AllDtosMatchTheirDeclaredFieldCounts) {
     info.accepts_onboarding = true;
     info.dns_base_domain = "example.internal";
     info.server_fqdn = "node.example.internal";
-    check_onboarding_dto(info, {"accepts_onboarding", "dns_base_domain", "server_fqdn"});
+    info.genesis_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 9));
+    info.network_id = kTestNetworkHex;
+    check_onboarding_dto(info, {"accepts_onboarding", "dns_base_domain", "server_fqdn",
+                                "genesis_pubkey", "network_id"});
 
     core::ChallengeRequest challenge_req;
     challenge_req.candidate_pubkey = b64(std::vector<uint8_t>(crypto::kEd25519PublicKeySize, 1));
