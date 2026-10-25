@@ -32,6 +32,7 @@ std::string_view relay_ticket_check_name(RelayTicketCheck check) {
     switch (check) {
         case RelayTicketCheck::Valid: return "valid";
         case RelayTicketCheck::NoAuthority: return "no verified Tier 1 membership";
+        case RelayTicketCheck::WrongRelay: return "ticket for another relay";
         case RelayTicketCheck::WrongNetwork: return "ticket for another network";
         case RelayTicketCheck::WrongEpoch: return "ticket for another epoch";
         case RelayTicketCheck::NotMember: return "issuer is not a Tier 1 member";
@@ -45,8 +46,9 @@ std::string_view relay_ticket_check_name(RelayTicketCheck check) {
 
 RelayTicketCheck check_relay_ticket(const RelayTicket& ticket,
                                     const std::optional<RelayTicketAuthority>& authority,
-                                    uint64_t now_sec) {
+                                    std::string_view relay_id, uint64_t now_sec) {
     if (!authority) return RelayTicketCheck::NoAuthority;
+    if (relay_id.empty() || ticket.relay_id != relay_id) return RelayTicketCheck::WrongRelay;
     if (ticket.network_id != authority->network_id) return RelayTicketCheck::WrongNetwork;
     if (ticket.epoch != authority->epoch.underlying()) return RelayTicketCheck::WrongEpoch;
     security::NodeId issuer;

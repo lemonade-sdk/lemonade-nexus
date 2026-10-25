@@ -153,6 +153,7 @@ protected:
         self.bytes = member.public_key;
         authority.members.push_back(self);
         r = std::make_unique<relay::RelayService>(io, 0, *c);
+        r->set_relay_id("relay-1");
         r->set_ticket_authority([this]() -> std::optional<relay::RelayTicketAuthority> {
             if (!authority_known) return std::nullopt;
             return authority;
@@ -247,6 +248,12 @@ TEST_F(RelayBindTest, EveryBadTicketIsRefused) {
     // From a server outside the verified membership.
     EXPECT_EQ(r->check_ticket(make_ticket(&outsider)), relay::RelayTicketCheck::NotMember);
 
+    // For another relay, signed by a real member.
+    auto other_relay = make_ticket();
+    other_relay.relay_id = "relay-2";
+    relay::sign_relay_ticket(other_relay, member);
+    EXPECT_EQ(r->check_ticket(other_relay), relay::RelayTicketCheck::WrongRelay);
+
     // For another epoch, or another network, signed by a real member.
     auto old_epoch = make_ticket();
     old_epoch.epoch = 6;
@@ -267,7 +274,8 @@ TEST_F(RelayBindTest, EveryBadTicketIsRefused) {
     EXPECT_EQ(r->check_ticket(make_ticket()), relay::RelayTicketCheck::NoAuthority);
 
     // None of the refused tickets allocated a session.
-    for (const auto& t : {forged, stolen, expired, overlong, future, old_epoch, foreign}) {
+    for (const auto& t :
+         {forged, stolen, expired, overlong, future, old_epoch, foreign, other_relay}) {
         EXPECT_FALSE(refusal(t).empty());
     }
 }

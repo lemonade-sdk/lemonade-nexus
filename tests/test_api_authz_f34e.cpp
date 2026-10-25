@@ -549,7 +549,22 @@ TEST_F(ApiAuthzF34eTest, RelayTicketForOwnIdentitySucceeds) {
     security::NodeId member;
     member.bytes = server_identity.public_key;
     const relay::RelayTicketAuthority authority{network(), kEpoch, {member}};
-    EXPECT_EQ(relay::check_relay_ticket(ticket, authority, ticket.issued_at),
+    EXPECT_EQ(relay::check_relay_ticket(ticket, authority, "relay-1", ticket.issued_at),
+              relay::RelayTicketCheck::Valid);
+    // The ticket names one relay; another relay refuses it.
+    EXPECT_EQ(relay::check_relay_ticket(ticket, authority, "relay-2", ticket.issued_at),
+              relay::RelayTicketCheck::WrongRelay);
+
+    // The response body is the JSON form a client carries in its Allocate
+    // request, and the relay's codec reads it to the same ticket.
+    const auto wire = relay::relay_ticket_from_json(res->body);
+    ASSERT_TRUE(wire.has_value());
+    EXPECT_EQ(wire->peer_id, ticket.peer_id);
+    EXPECT_EQ(wire->session_nonce, ticket.session_nonce);
+    EXPECT_EQ(wire->network_id, ticket.network_id);
+    EXPECT_EQ(wire->issuer, ticket.issuer);
+    EXPECT_EQ(wire->signature, ticket.signature);
+    EXPECT_EQ(relay::check_relay_ticket(*wire, authority, "relay-1", ticket.issued_at),
               relay::RelayTicketCheck::Valid);
 }
 

@@ -469,8 +469,11 @@ int main(int argc, char* argv[]) {
 
     // Every server relays, Tier 1 and Tier 2 alike. A ticket is valid when a
     // current Tier 1 member signed it, by the membership the security mesh
-    // verified from the authority chain; the relay needs no tree.
+    // verified from the authority chain; the relay needs no tree. The ticket
+    // must also name this relay, by its base64 node identity key.
     nexus::relay::RelayService relay{coordinator.io_context(), relay_port, crypto};
+    relay.set_relay_id(nexus::crypto::to_base64(
+        std::span<const uint8_t>(gossip.keypair().public_key)));
     relay.set_ticket_authority(
         [mesh = security_mesh->service.get()]() -> std::optional<nexus::relay::RelayTicketAuthority> {
             const auto snapshot = mesh->membership();

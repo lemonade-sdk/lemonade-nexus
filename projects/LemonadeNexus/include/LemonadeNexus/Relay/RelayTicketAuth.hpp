@@ -8,8 +8,11 @@
 /// the epoch the issuer is a member of. A relay verifies it against the Tier 1
 /// membership its security mesh verified from the pinned Genesis key through
 /// the authority chain (SecurityDriver, AuthorityChain.hpp). The relay needs no
-/// tree and no session state: only that membership, the signature, the expiry,
-/// and its own replay set.
+/// tree and no session state: only that membership, its own relay id, the
+/// signature, the expiry, and its own replay set.
+///
+/// A relay's id is its base64 node identity key. A ticket that names another
+/// relay is refused, so a ticket for one relay cannot allocate on another.
 ///
 /// A ticket from an epoch other than the relay's current one is refused, so a
 /// ticket issued just before an epoch change must be requested again.
@@ -54,6 +57,8 @@ enum class RelayTicketCheck : uint8_t {
     /// The relay holds no verified membership (before Epoch 1, or not yet
     /// verified): every ticket is refused.
     NoAuthority,
+    /// The ticket names another relay, or this relay has no relay id.
+    WrongRelay,
     WrongNetwork,
     WrongEpoch,
     /// The issuer is not in the verified membership.
@@ -66,10 +71,11 @@ enum class RelayTicketCheck : uint8_t {
 
 [[nodiscard]] std::string_view relay_ticket_check_name(RelayTicketCheck check);
 
-/// Checks a ticket against the verified membership at `now_sec` (Unix
+/// Checks a ticket against the verified membership and the checking relay's
+/// own id (`relay_id`, empty refuses every ticket) at `now_sec` (Unix
 /// seconds). Replay is the relay's job (one allocation per issuer and nonce).
 [[nodiscard]] RelayTicketCheck check_relay_ticket(
     const RelayTicket& ticket, const std::optional<RelayTicketAuthority>& authority,
-    uint64_t now_sec);
+    std::string_view relay_id, uint64_t now_sec);
 
 }  // namespace nexus::relay

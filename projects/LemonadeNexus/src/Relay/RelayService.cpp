@@ -9,20 +9,6 @@
 
 namespace nexus::relay {
 
-// ---------------------------------------------------------------------------
-// Construction
-// ---------------------------------------------------------------------------
-
-RelayService::RelayService(asio::io_context& io,
-                           uint16_t port,
-                           crypto::SodiumCryptoService& crypto)
-    : io_(io)
-    , socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v6(), port))
-    , port_(port)
-    , crypto_(crypto)
-{
-}
-
 namespace {
 
 uint64_t unix_now() {
@@ -31,7 +17,63 @@ uint64_t unix_now() {
                                      .count());
 }
 
+int64_t steady_ms(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(t.time_since_epoch()).count();
+}
+
+/// Replay key of a ticket: one allocation per issuer and session nonce.
+std::string ticket_key(const RelayTicket& ticket) {
+    return crypto::to_hex(std::span<const uint8_t>(ticket.issuer)) + ":" +
+           crypto::to_hex(std::span<const uint8_t>(ticket.session_nonce));
+}
+
+bool equal_ct(const RelayCommitment& a, const RelayCommitment& b) {
+    return sodium_memcmp(a.data(), b.data(), a.size()) == 0;
+}
+
+asio::ip::udp::socket open_dual_stack(asio::io_context& io, uint16_t port) {
+    asio::ip::udp::socket socket(io);
+    socket.open(asio::ip::udp::v6());
+    // The client dataplane is IPv4, so the relay must accept IPv4 senders
+    // even where the host defaults IPv6 sockets to IPv6 only.
+    asio::error_code ec;
+    socket.set_option(asio::ip::v6_only(false), ec);
+    socket.bind(asio::ip::udp::endpoint(asio::ip::udp::v6(), port));
+    return socket;
+}
+
+network::RateLimitConfig limiter_config(const RelayLimits& limits) {
+    return network::RateLimitConfig{limits.allocate_per_minute, limits.allocate_burst};
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Construction
+// ---------------------------------------------------------------------------
+
+RelayService::RelayService(asio::io_context& io,
+                           uint16_t port,
+                           crypto::SodiumCryptoService& crypto)
+    : io_(io)
+    , socket_(open_dual_stack(io, port))
+    , port_(port)
+    , crypto_(crypto)
+    , allocate_limiter_(std::make_unique<network::RateLimiter>(limiter_config(limits_)))
+{
+}
+
+void RelayService::set_limits(const RelayLimits& limits) {
+    std::lock_guard lock(mutex_);
+    limits_ = limits;
+    allocate_limiter_ = std::make_unique<network::RateLimiter>(limiter_config(limits_));
+}
+
+uint16_t RelayService::local_port() const {
+    asio::error_code ec;
+    const auto endpoint = socket_.local_endpoint(ec);
+    return ec ? 0 : endpoint.port();
+}
 
 // ---------------------------------------------------------------------------
 // IService
@@ -39,7 +81,10 @@ uint64_t unix_now() {
 
 void RelayService::on_start() {
     crypto_.random_bytes(std::span<uint8_t>(bind_secret_));
-    spdlog::info("[{}] listening on UDP port {}", name(), port_);
+    if (relay_id_.empty()) {
+        spdlog::warn("[{}] no relay id is set: every ticket is refused", name());
+    }
+    spdlog::info("[{}] listening on UDP port {}", name(), local_port());
     start_receive();
     start_ttl_timer();
 }
@@ -56,7 +101,41 @@ void RelayService::on_stop() {
     std::lock_guard lock(mutex_);
     const auto session_count = sessions_.size();
     sessions_.clear();
+    pending_.clear();
+    holder_sessions_.clear();
     spdlog::info("[{}] cleared {} sessions", name(), session_count);
+}
+
+// ---------------------------------------------------------------------------
+// Session bookkeeping
+// ---------------------------------------------------------------------------
+
+bool RelayService::holder_has_room_locked(const std::string& holder) const {
+    const auto it = holder_sessions_.find(holder);
+    return it == holder_sessions_.end() || it->second < limits_.max_sessions_per_holder;
+}
+
+void RelayService::add_holder_locked(const std::string& holder) {
+    if (!holder.empty()) ++holder_sessions_[holder];
+}
+
+RelayService::SessionMap::iterator RelayService::erase_session_locked(SessionMap::iterator it) {
+    const auto& session = *it->second;
+    for (const auto* holder : {&session.holder_a, &session.holder_b}) {
+        if (holder->empty()) continue;
+        auto count = holder_sessions_.find(*holder);
+        if (count != holder_sessions_.end() && --count->second == 0) {
+            holder_sessions_.erase(count);
+        }
+    }
+    if (session.has_rendezvous) {
+        const auto key = crypto::to_hex(std::span<const uint8_t>(session.rendezvous));
+        auto pending = pending_.find(key);
+        if (pending != pending_.end() && pending->second == session.session_id) {
+            pending_.erase(pending);
+        }
+    }
+    return sessions_.erase(it);
 }
 
 // ---------------------------------------------------------------------------
@@ -76,33 +155,164 @@ RelayAllocation RelayService::do_allocate(const RelayTicket& ticket) {
         return result;
     }
 
-    // Reject replay: one allocation per issuer and session nonce.
-    const std::string nonce_key =
-        crypto::to_hex(std::span<const uint8_t>(ticket.issuer)) + ":" +
-        crypto::to_hex(std::span<const uint8_t>(ticket.session_nonce));
-
-    // Create a new session
+    const auto now = std::chrono::steady_clock::now();
     auto session = std::make_shared<RelaySession>();
     session->session_id = generate_session_id();
-    session->created_at = std::chrono::steady_clock::now();
-    session->ttl_seconds = 300;
+    session->created_at = now;
+    session->last_activity_ms.store(steady_ms(now));
+    session->holder_a = ticket.peer_id;
+
+    std::lock_guard lock(mutex_);
+    session->ttl_seconds = limits_.idle_timeout_sec;
+    if (seen_tickets_.contains(ticket_key(ticket))) {
+        result.error_message = "ticket already used";
+        spdlog::warn("[{}] allocation denied: replayed ticket nonce", name());
+        return result;
+    }
+    if (sessions_.size() >= limits_.max_sessions ||
+        seen_tickets_.size() >= limits_.max_seen_tickets ||
+        !holder_has_room_locked(ticket.peer_id)) {
+        result.error_message = "relay capacity exceeded";
+        spdlog::warn("[{}] allocation denied: {}", name(), result.error_message);
+        return result;
+    }
+    seen_tickets_.emplace(ticket_key(ticket), SeenTicket{ticket.expires_at, session->session_id, {}});
+    add_holder_locked(ticket.peer_id);
 
     result.session_id = session->session_id;
     result.relay_endpoint = "[::]:" + std::to_string(port_);
     result.ttl_seconds = session->ttl_seconds;
+    sessions_.emplace(session->session_id, std::move(session));
+    spdlog::info("[{}] allocated session for peer={}", name(), ticket.peer_id);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Wire allocation (rendezvous)
+// ---------------------------------------------------------------------------
+
+RelayRendezvousResult RelayService::allocate_rendezvous(const RelayAllocateRequest& request,
+                                                        const asio::ip::udp::endpoint& remote) {
+    RelayRendezvousResult result;
+    const auto refuse = [&result](RelayErrorCode code, std::string message) {
+        result.error = code;
+        result.error_message = std::move(message);
+        return result;
+    };
 
     {
+        // The limiter object is replaced only by set_limits, under the lock.
         std::lock_guard lock(mutex_);
-        if (!seen_tickets_.emplace(nonce_key, ticket.expires_at).second) {
-            result.session_id = {};
-            result.error_message = "ticket already used";
-            spdlog::warn("[{}] allocation denied: replayed ticket nonce", name());
-            return result;
+        if (!allocate_limiter_->allow("allocate")) {
+            return refuse(RelayErrorCode::RateLimited, "allocate rate limit reached");
         }
-        sessions_.emplace(session->session_id, std::move(session));
     }
 
-    spdlog::info("[{}] allocated session for peer={}", name(), ticket.peer_id);
+    const auto check = check_ticket(request.ticket);
+    if (check != RelayTicketCheck::Valid) {
+        return refuse(RelayErrorCode::TicketRefused,
+                      "ticket refused: " + std::string(relay_ticket_check_name(check)));
+    }
+
+    const auto& holder = request.ticket.peer_id;
+    const auto key = ticket_key(request.ticket);
+    const auto own_commitment = relay_proof_commitment(request.proof);
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard lock(mutex_);
+
+    if (auto seen = seen_tickets_.find(key); seen != seen_tickets_.end()) {
+        // A retransmission from the endpoint that sent the ticket learns its
+        // session again. Anyone else replaying it is refused.
+        auto it = sessions_.find(seen->second.session_id);
+        if (seen->second.remote == remote && it != sessions_.end()) {
+            result.session_id = it->first;
+            result.paired = it->second->peer_a_bound && it->second->peer_b_bound;
+            return result;
+        }
+        return refuse(RelayErrorCode::TicketReplayed, "ticket already used");
+    }
+    if (seen_tickets_.size() >= limits_.max_seen_tickets) {
+        return refuse(RelayErrorCode::CapacityExceeded, "replay set full");
+    }
+
+    const auto rendezvous_key = crypto::to_hex(std::span<const uint8_t>(request.rendezvous));
+    const auto pending = pending_.find(rendezvous_key);
+
+    if (pending == pending_.end()) {
+        if (sessions_.size() >= limits_.max_sessions) {
+            return refuse(RelayErrorCode::CapacityExceeded, "session limit reached");
+        }
+        if (!holder_has_room_locked(holder)) {
+            return refuse(RelayErrorCode::CapacityExceeded, "holder session limit reached");
+        }
+        auto session = std::make_shared<RelaySession>();
+        session->session_id = generate_session_id();
+        session->created_at = now;
+        session->last_activity_ms.store(steady_ms(now));
+        session->ttl_seconds = limits_.idle_timeout_sec;
+        session->peer_a_endpoint = remote;
+        session->peer_a_bound = true;
+        session->holder_a = holder;
+        session->has_rendezvous = true;
+        session->rendezvous = request.rendezvous;
+        session->a_commitment = own_commitment;
+        session->b_expected = request.peer_commitment;
+
+        result.session_id = session->session_id;
+        seen_tickets_.emplace(key, SeenTicket{request.ticket.expires_at, session->session_id, remote});
+        add_holder_locked(holder);
+        pending_.emplace(rendezvous_key, session->session_id);
+        sessions_.emplace(session->session_id, std::move(session));
+        spdlog::debug("[{}] session waiting for its second side (holder={})", name(), holder);
+        return result;
+    }
+
+    auto it = sessions_.find(pending->second);
+    if (it == sessions_.end()) {
+        pending_.erase(pending);
+        return refuse(RelayErrorCode::RendezvousBusy, "rendezvous state lost; retry");
+    }
+    auto& session = *it->second;
+
+    if (equal_ct(own_commitment, session.a_commitment)) {
+        // The waiting side again, with a fresh ticket. Only its own holder at
+        // its own endpoint may repeat; anyone who merely saw its request may not.
+        if (holder != session.holder_a || remote != session.peer_a_endpoint) {
+            return refuse(RelayErrorCode::RendezvousBusy, "rendezvous slot is taken");
+        }
+        seen_tickets_.emplace(key, SeenTicket{request.ticket.expires_at, session.session_id, remote});
+        session.last_activity_ms.store(steady_ms(now));
+        result.session_id = session.session_id;
+        return result;
+    }
+
+    if (!equal_ct(own_commitment, session.b_expected) ||
+        !equal_ct(request.peer_commitment, session.a_commitment)) {
+        return refuse(RelayErrorCode::ProofMismatch, "rendezvous proof does not match");
+    }
+    if (holder == session.holder_a) {
+        return refuse(RelayErrorCode::RendezvousBusy, "both sides name the same ticket holder");
+    }
+    if (remote == session.peer_a_endpoint) {
+        return refuse(RelayErrorCode::RendezvousBusy, "both sides use the same endpoint");
+    }
+    if (!holder_has_room_locked(holder)) {
+        return refuse(RelayErrorCode::CapacityExceeded, "holder session limit reached");
+    }
+
+    session.peer_b_endpoint = remote;
+    session.peer_b_bound = true;
+    session.holder_b = holder;
+    session.last_activity_ms.store(steady_ms(now));
+    seen_tickets_.emplace(key, SeenTicket{request.ticket.expires_at, session.session_id, remote});
+    add_holder_locked(holder);
+    pending_.erase(pending);
+
+    result.session_id = session.session_id;
+    result.paired = true;
+    result.notify = session.peer_a_endpoint;
+    spdlog::info("[{}] relay session paired ({} live)", name(), sessions_.size());
     return result;
 }
 
@@ -163,6 +373,7 @@ RelayBindResult RelayService::do_bind(const SessionId& session_id,
         return result;
     }
 
+    session.last_activity_ms.store(steady_ms(std::chrono::steady_clock::now()));
     result.success = true;
     return result;
 }
@@ -175,6 +386,9 @@ bool RelayService::do_forward(const SessionId& session_id,
                                std::span<const uint8_t> data,
                                const asio::ip::udp::endpoint& from) {
     std::shared_ptr<RelaySession> session;
+    asio::ip::udp::endpoint dest;
+    bool sender_bound = false;
+    bool fully_bound = false;
     {
         std::lock_guard lock(mutex_);
         auto it = sessions_.find(session_id);
@@ -183,23 +397,32 @@ bool RelayService::do_forward(const SessionId& session_id,
             return false;
         }
         session = it->second;
+        fully_bound = session->peer_a_bound && session->peer_b_bound;
+        // Forward only between the two endpoints the session bound.
+        if (fully_bound && from == session->peer_a_endpoint) {
+            dest = session->peer_b_endpoint;
+            sender_bound = true;
+        } else if (fully_bound && from == session->peer_b_endpoint) {
+            dest = session->peer_a_endpoint;
+            sender_bound = true;
+        }
     }
 
-    if (!session->peer_a_bound || !session->peer_b_bound) {
+    if (!fully_bound) {
         session->packets_dropped.fetch_add(1, std::memory_order_relaxed);
         spdlog::debug("[{}] forward: session not fully bound", name());
         return false;
     }
-
-    // Determine the destination: forward to the other peer
-    asio::ip::udp::endpoint dest;
-    if (from == session->peer_a_endpoint) {
-        dest = session->peer_b_endpoint;
-    } else if (from == session->peer_b_endpoint) {
-        dest = session->peer_a_endpoint;
-    } else {
+    if (!sender_bound) {
         session->packets_dropped.fetch_add(1, std::memory_order_relaxed);
-        spdlog::warn("[{}] forward: sender not bound to session", name());
+        spdlog::debug("[{}] forward: sender not bound to session", name());
+        return false;
+    }
+    // The receiver tells relay control messages from forwarded data by the
+    // relay magic, so a peer may not forward bytes that look like control.
+    // A BoringTun datagram never starts with it.
+    if (data.size() >= 2 && data[0] == 0x52 && data[1] == 0x4C) {
+        session->packets_dropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -207,10 +430,12 @@ bool RelayService::do_forward(const SessionId& session_id,
     socket_.send_to(asio::buffer(data.data(), data.size()), dest, 0, ec);
     if (ec) {
         session->packets_dropped.fetch_add(1, std::memory_order_relaxed);
-        spdlog::warn("[{}] forward send_to error: {}", name(), ec.message());
+        spdlog::debug("[{}] forward send_to error: {}", name(), ec.message());
         return false;
     }
 
+    session->last_activity_ms.store(steady_ms(std::chrono::steady_clock::now()),
+                                    std::memory_order_relaxed);
     session->bytes_forwarded.fetch_add(data.size(), std::memory_order_relaxed);
     session->packets_forwarded.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -222,8 +447,9 @@ bool RelayService::do_forward(const SessionId& session_id,
 
 void RelayService::do_teardown(const SessionId& session_id) {
     std::lock_guard lock(mutex_);
-    auto erased = sessions_.erase(session_id);
-    if (erased > 0) {
+    auto it = sessions_.find(session_id);
+    if (it != sessions_.end()) {
+        erase_session_locked(it);
         spdlog::info("[{}] session torn down", name());
     } else {
         spdlog::debug("[{}] teardown: session not found", name());
@@ -241,7 +467,7 @@ bool RelayService::do_verify_ticket(const RelayTicket& ticket) const {
 RelayTicketCheck RelayService::check_ticket(const RelayTicket& ticket) const {
     return check_relay_ticket(
         ticket, ticket_authority_ ? ticket_authority_() : std::optional<RelayTicketAuthority>{},
-        unix_now());
+        relay_id_, unix_now());
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +488,23 @@ std::optional<RelaySessionStats> RelayService::get_session_stats(const SessionId
     stats.packets_forwarded = s.packets_forwarded.load(std::memory_order_relaxed);
     stats.packets_dropped = s.packets_dropped.load(std::memory_order_relaxed);
     return stats;
+}
+
+std::size_t RelayService::session_count() const {
+    std::lock_guard lock(mutex_);
+    return sessions_.size();
+}
+
+bool RelayService::touch_if_bound(const SessionId& session_id,
+                                  const asio::ip::udp::endpoint& from) {
+    std::lock_guard lock(mutex_);
+    auto it = sessions_.find(session_id);
+    if (it == sessions_.end()) return false;
+    auto& session = *it->second;
+    const bool bound = (session.peer_a_bound && from == session.peer_a_endpoint) ||
+                       (session.peer_b_bound && from == session.peer_b_endpoint);
+    if (bound) session.last_activity_ms.store(steady_ms(std::chrono::steady_clock::now()));
+    return bound;
 }
 
 // ---------------------------------------------------------------------------
@@ -294,20 +537,18 @@ void RelayService::handle_receive(std::size_t bytes_received,
         return;
     }
 
-    // Read the first two bytes to determine protocol
-    uint16_t magic = 0;
-    std::memcpy(&magic, recv_buf_.data(), sizeof(magic));
+    // The relay magic is little-endian on the wire: 0x52 0x4C.
+    const uint16_t magic = static_cast<uint16_t>(recv_buf_[0] | (recv_buf_[1] << 8));
 
     if (magic == kRelayMagic) {
         handle_relay_packet(
             std::span<const uint8_t>(recv_buf_.data(), bytes_received), remote);
-    } else if (magic == 0x0001) {
-        // STUN Binding Request -- log and ignore (handled by a co-located StunProvider)
-        spdlog::debug("[{}] received STUN packet from {} ({} bytes)",
-                      name(), remote.address().to_string(), bytes_received);
+    } else if (magic == 0x0100) {
+        // STUN Binding Request (type 0x0001 in network byte order) -- ignored
+        // here (handled by a co-located StunProvider)
+        spdlog::debug("[{}] received STUN packet ({} bytes)", name(), bytes_received);
     } else {
-        spdlog::debug("[{}] unknown protocol magic 0x{:04X} from {}",
-                      name(), magic, remote.address().to_string());
+        spdlog::debug("[{}] unknown protocol magic 0x{:04X}", name(), magic);
     }
 }
 
@@ -315,77 +556,103 @@ void RelayService::handle_receive(std::size_t bytes_received,
 // Relay protocol handler
 // ---------------------------------------------------------------------------
 
+void RelayService::send_reply(RelayMsgType type, const SessionId& session, uint32_t sequence,
+                              std::span<const uint8_t> payload,
+                              const asio::ip::udp::endpoint& to) {
+    const auto datagram = make_relay_datagram(type, session, sequence, payload);
+    asio::error_code ec;
+    socket_.send_to(asio::buffer(datagram), to, 0, ec);
+    if (ec) {
+        spdlog::debug("[{}] reply send_to error: {}", name(), ec.message());
+    }
+}
+
+void RelayService::send_error(RelayErrorCode code, const SessionId& session, uint32_t sequence,
+                              const asio::ip::udp::endpoint& to) {
+    const uint8_t payload[1] = {static_cast<uint8_t>(code)};
+    send_reply(RelayMsgType::Error, session, sequence, payload, to);
+}
+
+void RelayService::handle_allocate(const RelayPacketHeader& header,
+                                   std::span<const uint8_t> payload,
+                                   const asio::ip::udp::endpoint& remote) {
+    const auto request = decode_relay_allocate(payload);
+    if (!request) {
+        send_error(RelayErrorCode::Malformed, header.session_id, header.sequence_number, remote);
+        return;
+    }
+    const auto result = allocate_rendezvous(*request, remote);
+    if (result.error) {
+        spdlog::debug("[{}] allocate refused: {}", name(), result.error_message);
+        send_error(*result.error, header.session_id, header.sequence_number, remote);
+        return;
+    }
+
+    uint32_t idle_timeout = 0;
+    {
+        std::lock_guard lock(mutex_);
+        idle_timeout = limits_.idle_timeout_sec;
+    }
+    const auto reply = encode_relay_allocated(RelayAllocatedReply{
+        result.paired ? RelayAllocationState::Paired : RelayAllocationState::Waiting,
+        idle_timeout});
+    send_reply(RelayMsgType::Allocated, result.session_id, header.sequence_number, reply, remote);
+    if (result.notify) {
+        send_reply(RelayMsgType::Bound, result.session_id, 0, {}, *result.notify);
+    }
+}
+
 void RelayService::handle_relay_packet(std::span<const uint8_t> data,
                                         const asio::ip::udp::endpoint& remote) {
-    if (data.size() < kRelayHeaderSize) {
-        spdlog::warn("[{}] relay packet too short ({} bytes)", name(), data.size());
+    const auto parsed = decode_relay_header(data);
+    if (!parsed) {
+        spdlog::debug("[{}] malformed relay packet ({} bytes)", name(), data.size());
         return;
     }
-
-    RelayPacketHeader header;
-    std::memcpy(&header, data.data(), sizeof(header));
-
-    if (header.version != kRelayVersion) {
-        spdlog::warn("[{}] unsupported relay version {}", name(), header.version);
-        return;
-    }
-
-    const auto payload = data.subspan(kRelayHeaderSize);
-    if (payload.size() < header.payload_length) {
-        spdlog::warn("[{}] payload truncated: expected {} got {}",
-                     name(), header.payload_length, payload.size());
-        return;
-    }
+    const auto& header = *parsed;
+    const auto payload = data.subspan(kRelayHeaderSize, header.payload_length);
 
     switch (header.msg_type) {
+        case RelayMsgType::Allocate:
+            handle_allocate(header, payload, remote);
+            break;
+
         case RelayMsgType::Bind: {
             // Bind payload carries the 16-byte bind token.
             std::span<const uint8_t> token;
             if (payload.size() >= 16) token = payload.subspan(0, 16);
-            auto result = do_bind(header.session_id, remote, token);
-            // Build a Bound response
-            RelayPacketHeader resp_header{};
-            resp_header.magic = kRelayMagic;
-            resp_header.version = kRelayVersion;
-            resp_header.msg_type = result.success ? RelayMsgType::Bound : RelayMsgType::Error;
-            resp_header.session_id = header.session_id;
-            resp_header.sequence_number = header.sequence_number;
-            resp_header.payload_length = 0;
-
-            asio::error_code ec;
-            socket_.send_to(
-                asio::buffer(&resp_header, sizeof(resp_header)), remote, 0, ec);
-            if (ec) {
-                spdlog::warn("[{}] failed to send Bound response: {}", name(), ec.message());
+            const auto result = do_bind(header.session_id, remote, token);
+            if (result.success) {
+                send_reply(RelayMsgType::Bound, header.session_id, header.sequence_number, {},
+                           remote);
+            } else {
+                send_error(RelayErrorCode::BindFailed, header.session_id,
+                           header.sequence_number, remote);
             }
             break;
         }
 
-        case RelayMsgType::Data: {
-            auto fwd_payload = payload.subspan(0, header.payload_length);
-            (void)do_forward(header.session_id, fwd_payload, remote);
+        case RelayMsgType::Data:
+            (void)do_forward(header.session_id, payload, remote);
             break;
-        }
 
-        case RelayMsgType::Heartbeat: {
-            // Echo back a HeartbeatAck
-            RelayPacketHeader ack{};
-            ack.magic = kRelayMagic;
-            ack.version = kRelayVersion;
-            ack.msg_type = RelayMsgType::HeartbeatAck;
-            ack.session_id = header.session_id;
-            ack.sequence_number = header.sequence_number;
-            ack.payload_length = 0;
-
-            asio::error_code ec;
-            socket_.send_to(asio::buffer(&ack, sizeof(ack)), remote, 0, ec);
+        case RelayMsgType::Heartbeat:
+            // Only a bound endpoint keeps a session alive or learns it exists.
+            if (touch_if_bound(header.session_id, remote)) {
+                send_reply(RelayMsgType::HeartbeatAck, header.session_id,
+                           header.sequence_number, {}, remote);
+            } else {
+                send_error(RelayErrorCode::SessionUnknown, header.session_id,
+                           header.sequence_number, remote);
+            }
             break;
-        }
 
-        case RelayMsgType::Teardown: {
-            do_teardown(header.session_id);
+        case RelayMsgType::Teardown:
+            // Only a bound endpoint may end its own session.
+            if (touch_if_bound(header.session_id, remote)) {
+                do_teardown(header.session_id);
+            }
             break;
-        }
 
         default:
             spdlog::debug("[{}] unhandled relay msg_type 0x{:02X}",
@@ -399,25 +666,31 @@ void RelayService::handle_relay_packet(std::span<const uint8_t> data,
 // ---------------------------------------------------------------------------
 
 void RelayService::start_ttl_timer() {
-    ttl_timer_.expires_after(std::chrono::seconds(30));
+    ttl_timer_.expires_after(std::chrono::seconds(5));
     ttl_timer_.async_wait([this](const asio::error_code& ec) {
         if (ec) return; // cancelled or error
-        purge_expired_sessions();
+        (void)expire_sessions(std::chrono::steady_clock::now());
         start_ttl_timer(); // reschedule
     });
 }
 
-void RelayService::purge_expired_sessions() {
-    const auto now = std::chrono::steady_clock::now();
+std::size_t RelayService::expire_sessions(std::chrono::steady_clock::time_point now) {
+    using std::chrono::seconds;
+    const int64_t now_ms = steady_ms(now);
     std::lock_guard lock(mutex_);
 
     std::size_t purged = 0;
-    for (auto it = sessions_.begin(); it != sessions_.end(); ) {
+    for (auto it = sessions_.begin(); it != sessions_.end();) {
         const auto& session = *it->second;
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            now - session.created_at).count();
-        if (elapsed > session.ttl_seconds) {
-            it = sessions_.erase(it);
+        const auto age = now - session.created_at;
+        const bool paired = session.peer_a_bound && session.peer_b_bound;
+        const int64_t idle_ms = now_ms - session.last_activity_ms.load();
+        const bool expired =
+            (!paired && age > seconds(limits_.pending_timeout_sec)) ||
+            (paired && idle_ms > static_cast<int64_t>(limits_.idle_timeout_sec) * 1000) ||
+            age > seconds(limits_.max_lifetime_sec);
+        if (expired) {
+            it = erase_session_locked(it);
             ++purged;
         } else {
             ++it;
@@ -425,15 +698,17 @@ void RelayService::purge_expired_sessions() {
     }
 
     if (purged > 0) {
-        spdlog::info("[{}] purged {} expired sessions ({} remaining)",
+        spdlog::info("[{}] expired {} sessions ({} remaining)",
                      name(), purged, sessions_.size());
     }
 
     // A replay entry outlives its ticket by the clock skew allowance.
     const auto unix = unix_now();
     for (auto it = seen_tickets_.begin(); it != seen_tickets_.end();) {
-        it = it->second + kRelayTicketClockSkewSec < unix ? seen_tickets_.erase(it) : ++it;
+        it = it->second.expires_at + kRelayTicketClockSkewSec < unix ? seen_tickets_.erase(it)
+                                                                     : ++it;
     }
+    return purged;
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +720,5 @@ SessionId RelayService::generate_session_id() {
     crypto_.random_bytes(std::span<uint8_t>(id));
     return id;
 }
-
 
 } // namespace nexus::relay
