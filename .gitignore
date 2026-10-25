@@ -30,6 +30,9 @@ venv/
 *.env
 !.env.example
 
+# Identity files from scripts/live-e2e-setup (private keys)
+live-e2e-secrets/
+
 # OS
 .DS_Store
 Thumbs.db
