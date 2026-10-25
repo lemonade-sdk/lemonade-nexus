@@ -1273,6 +1273,14 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     std::atomic<bool> acme_retry_stop{false};
 
+    // Load the key of an issued certificate through AcmeService, which reads
+    // it through the storage vault (the key file on disk may be DEK
+    // ciphertext). Empty when the key is not readable yet.
+    auto issued_key_pem = [&](const std::string& fqdn) -> std::string {
+        auto bundle = acme.get_certificate(fqdn);
+        return bundle ? std::move(bundle->privkey_pem) : std::string{};
+    };
+
     // Obtain a cert for `fqdn` and bring `srv` up over HTTPS in place (hot-reload
     // if already TLS, else swap the listener to an SSLServer and re-register its
     // routes). Loops with backoff until issuance or shutdown; never serves
@@ -1295,8 +1303,10 @@ int main(int argc, char* argv[]) {
             if (result.success) {
                 spdlog::info("Auto-TLS: ACME certificate issued for {} (cert={}, key={})",
                               fqdn, result.cert_path, result.key_path);
+                const auto key_pem = issued_key_pem(fqdn);
                 if (srv.is_tls()) {
-                    if (srv.reload_tls_certs(result.cert_path, result.key_path))
+                    if (srv.reload_tls_certs_inmemory_key(result.cert_path, key_pem,
+                                                          result.key_path))
                         spdlog::info("Auto-TLS: reloaded TLS cert for {} (no restart)", fqdn);
                     else
                         spdlog::warn("Auto-TLS: failed to hot-reload TLS cert for {}", fqdn);
@@ -1304,7 +1314,7 @@ int main(int argc, char* argv[]) {
                 }
                 spdlog::info("Auto-TLS: activating HTTPS for {} ({}) in place...", fqdn, label);
                 srv.stop();
-                if (srv.upgrade_to_tls(result.cert_path, result.key_path)) {
+                if (srv.enable_tls_inmemory_key(result.cert_path, key_pem, result.key_path)) {
                     if (is_private) register_private_routes(); else reregister_public_routes();
                     srv.start();
                     spdlog::info("Auto-TLS: HTTPS active for {} ({}) — other services unaffected",
@@ -1353,18 +1363,21 @@ int main(int argc, char* argv[]) {
     }
 
     // ========================================================================
-    // Background ACME renewal -- check daily, renew when cert expires within 30 days
+    // Background ACME renewal -- check daily. The server's own certs renew
+    // when they expire within 30 days; the device and group loopback certs
+    // this server issued renew when less than one third of their lifetime
+    // remains (nexus::api::device_certificates_due).
     // ========================================================================
     std::atomic<bool> acme_renewal_stop{false};
     std::thread acme_renewal_thread;
     const bool have_private_fqdn = private_http_server && !server_private_fqdn.empty();
-    if (!public_cert_fqdn.empty() || have_private_fqdn) {
+    if (!public_cert_fqdn.empty() || have_private_fqdn || !config.dns_base_domain.empty()) {
         acme_renewal_thread = std::thread([&]() {
             constexpr auto initial_delay = std::chrono::hours(1);
             constexpr auto check_interval = std::chrono::hours(24);
 
-            spdlog::info("Auto-TLS: certificate renewal monitor started (public + private, "
-                         "checking daily)");
+            spdlog::info("Auto-TLS: certificate renewal monitor started (public + private + "
+                         "device, checking daily)");
 
             for (auto elapsed = std::chrono::seconds(0);
                  elapsed < initial_delay && !acme_renewal_stop.load();
@@ -1381,7 +1394,8 @@ int main(int argc, char* argv[]) {
                 if (r.success && !r.cert_path.empty()) {
                     spdlog::info("Auto-TLS: renewal check complete for {} (cert={})",
                                   fqdn, r.cert_path);
-                    (void)srv.reload_tls_certs(r.cert_path, r.key_path);
+                    (void)srv.reload_tls_certs_inmemory_key(r.cert_path, issued_key_pem(fqdn),
+                                                            r.key_path);
                 } else if (!r.success) {
                     spdlog::warn("Auto-TLS: renewal failed for {}: {}", fqdn, r.error_message);
                 }
@@ -1390,6 +1404,20 @@ int main(int argc, char* argv[]) {
             while (!acme_renewal_stop.load()) {
                 renew_one(http_server, public_cert_fqdn);
                 if (private_http_server) renew_one(*private_http_server, server_private_fqdn);
+
+                // Devices receive a renewed certificate through their next
+                // /api/certs/issue call (the SDK checks expiry and asks).
+                for (const auto& domain : nexus::api::device_certificates_due(
+                         acme, tree, config.dns_base_domain, nexus::api::epoch_seconds())) {
+                    if (acme_renewal_stop.load()) break;
+                    auto r = acme.request_certificate(domain);
+                    if (r.success) {
+                        spdlog::info("Auto-TLS: renewed device certificate {}", domain);
+                    } else {
+                        spdlog::warn("Auto-TLS: device certificate renewal failed for {}: {}",
+                                     domain, r.error_message);
+                    }
+                }
 
                 for (auto elapsed = std::chrono::seconds(0);
                      elapsed < check_interval && !acme_renewal_stop.load();

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <LemonadeNexusSDK/CertRenewal.hpp>
 #include <LemonadeNexusSDK/Error.hpp>
 #include <LemonadeNexusSDK/Identity.hpp>
 #include <LemonadeNexusSDK/LatencyMonitor.hpp>
@@ -149,6 +150,41 @@ public:
     /// @param bundle The encrypted bundle from request_certificate()
     /// @return Decrypted certificate (fullchain PEM + private key PEM)
     [[nodiscard]] Result<DecryptedCert> decrypt_certificate(const IssuedCertBundle& bundle);
+
+    /// POST /api/certs/issue with scope "group_loopback" — request the
+    /// wildcard certificate "*.<group-label>.lo.<base_domain>" of this
+    /// device's group. Every device of the group receives the same key. The
+    /// server requires a session of a joined endpoint of the group.
+    /// @return Encrypted certificate bundle (call decrypt_certificate to use)
+    [[nodiscard]] Result<IssuedCertBundle> request_group_loopback_certificate();
+
+    /// Callback type for certificate renewals.
+    using CertRenewedCallback = CertRenewer::RenewedCallback;
+
+    /// Set the callback that runs once after each certificate renewal, when
+    /// both files are replaced (empty clears it). It runs on the thread that
+    /// renewed: the mesh orchestrator's renewal thread, or the caller of
+    /// renew_certificate_if_needed(). When this returns, the previous callback
+    /// is not running and is not called again. Do not call this method from
+    /// the callback.
+    void set_cert_renewed_callback(CertRenewedCallback cb);
+
+    /// Keep the certificate of `target` in `cert_dir` current: request and
+    /// decrypt a new one when the stored one is missing or less than one third
+    /// of its lifetime remains, then replace `fullchain.pem` and `privkey.pem`
+    /// (mode 0600) through temporary files. `target` is a node hostname or
+    /// kGroupLoopbackCertTarget. The target is then also renewed in the
+    /// background while the mesh is enabled. Blocks on the network when due.
+    CertRenewalResult renew_certificate_if_needed(const std::string& target,
+                                                  const std::string& cert_dir);
+
+    /// True when a certificate registered with renew_certificate_if_needed()
+    /// is due and outside its backoff delay. Reads only local files.
+    [[nodiscard]] bool certificate_renewal_pending() const;
+
+    /// Renew the registered certificates that are due and outside their
+    /// backoff delay. Used by MeshOrchestrator; blocks on the network.
+    void renew_managed_certificates();
 
     // -----------------------------------------------------------------
     // High-level composite operations
@@ -377,6 +413,13 @@ public:
     void close_egress(const std::string& dst_ip, uint16_t dst_port);
 
 private:
+    /// POST /api/certs/issue with this identity's key and `fields` added to
+    /// the request body.
+    [[nodiscard]] Result<IssuedCertBundle> issue_certificate(const nlohmann::json& fields);
+
+    /// Request and decrypt one certificate for a renewal target.
+    [[nodiscard]] Result<DecryptedCert> fetch_certificate(const std::string& target);
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

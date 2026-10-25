@@ -63,11 +63,34 @@ using DnsRecordCallback = std::function<void(const std::string& delta_id,
 ///   _config.<id>.<region>.seip.<base_domain>     -> Server config TXT (SEIP)
 ///   _config.<hostname>.<base_domain>             -> TXT record with port config
 ///   _acme-challenge.<domain>                     -> ACME DNS-01 TXT challenge
+///   <device>.<group-label>.lo.<base_domain>      -> 127.0.0.1 (group loopback name)
 inline constexpr std::size_t kDnsTcpMaxMessageBytes = 65535;
 inline constexpr std::size_t kDnsMinMessageBytes = 12;
 inline constexpr int kDnsTcpMaxSessions = 64;
 inline constexpr int kDnsTcpIdleTimeoutSeconds = 10;
 inline constexpr std::size_t kDnsTcpMaxQueuedResponses = 16;
+
+/// The fixed address of every group loopback name.
+inline constexpr std::string_view kGroupLoopbackAddress = "127.0.0.1";
+
+/// The DNS label of a Customer group in its loopback names
+/// ("<device>.<label>.lo.<base_domain>"): "g" followed by 20 lowercase hex
+/// characters of a domain-separated SHA-256 of the group id. The label is
+/// derived from the immutable group id, not from the group's hostname, so a
+/// rename does not change it and another group cannot claim it by name.
+/// Deterministic: every server derives the same label from the same tree.
+[[nodiscard]] std::string group_loopback_label(std::string_view group_id);
+
+/// The wildcard certificate name of a group: "*.<label>.lo.<base_domain>",
+/// with the base domain lowercased. Empty when `base_domain` is empty.
+[[nodiscard]] std::string group_loopback_wildcard(std::string_view group_id,
+                                                  std::string_view base_domain);
+
+/// The ids of the Customer groups in `tree` whose loopback label is `label`,
+/// sorted. More than one id is a label collision: callers must then refuse
+/// the label (no DNS answer, no certificate).
+[[nodiscard]] std::vector<std::string> groups_with_loopback_label(
+    const tree::PermissionTreeService& tree, std::string_view label);
 
 /// A received DNS query, parsed exactly once. Carries everything the response
 /// builders used to re-extract by re-parsing the raw query bytes (the query id,
@@ -190,6 +213,13 @@ public:
 
     /// Resolve a relay hostname under the "relays" subdomain.
     [[nodiscard]] std::optional<DnsRecord> resolve_relay_subdomain(
+        const std::string& prefix);
+
+    /// Resolve a group loopback name. `prefix` is the lowercased name without
+    /// ".lo.<base_domain>" and must be exactly "<device>.<group-label>", where
+    /// <device> is one DNS label and <group-label> belongs to exactly one
+    /// Customer group. Answers kGroupLoopbackAddress; nullopt otherwise.
+    [[nodiscard]] std::optional<DnsRecord> resolve_group_loopback(
         const std::string& prefix);
 
     /// Port configuration for TXT record publishing.

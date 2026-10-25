@@ -1,7 +1,9 @@
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
 #include <algorithm>
+#include <cctype>
 
 #include <LemonadeNexus/Api/MeshRekey.hpp>
+#include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Auth/AuthService.hpp>
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
@@ -417,6 +419,36 @@ void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
         if (ctx_.dns->remove_record(client_ep_fqdn(node_id, ctx_.config.dns_base_domain), "A")) {
             spdlog::info("[TreeApi] removed private EP DNS record for deleted node '{}'",
                          node_id);
+        }
+    }
+    // 5. Remove the stored certificate that this server issued for the node,
+    //    so the next owner of the name gets a new key. The group loopback
+    //    names stop resolving with the group itself (DnsService reads the
+    //    tree). A device certificate stays while another endpoint still uses
+    //    the hostname.
+    const auto& base_domain = ctx_.config.dns_base_domain;
+    if (!base_domain.empty()) {
+        if (doomed->type == tree::NodeType::Customer) {
+            const auto wildcard = network::group_loopback_wildcard(doomed->id, base_domain);
+            if (!wildcard.empty()) (void)ctx_.acme.remove_certificate(wildcard);
+        } else if (doomed->type == tree::NodeType::Endpoint && !doomed->hostname.empty()) {
+            const auto lower = [](std::string s) {
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                return s;
+            };
+            const auto hostname = lower(doomed->hostname);
+            bool still_used = false;
+            for (const auto& node : ctx_.tree.get_nodes_by_type(tree::NodeType::Endpoint)) {
+                if (node.id != node_id && lower(node.hostname) == hostname) {
+                    still_used = true;
+                    break;
+                }
+            }
+            if (!still_used) {
+                (void)ctx_.acme.remove_certificate(doomed->hostname + ".capi." + base_domain);
+            }
         }
     }
 }

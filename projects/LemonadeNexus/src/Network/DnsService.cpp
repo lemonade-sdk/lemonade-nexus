@@ -7,6 +7,8 @@
 #include <ares.h>
 #include <ares_dns_record.h>
 
+#include <openssl/evp.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -702,6 +704,17 @@ std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
     // e.g. "my-laptop.ep.lemonade-nexus.io" -> "my-laptop.ep"
     std::string prefix = std::string(strip_suffix(query, suffix));
 
+    // Group loopback names: <device>.<group-label>.lo. The name is reserved:
+    // it never falls through to the tree hostname search below.
+    {
+        const std::string lo_tag = ".lo";
+        if (prefix.size() > lo_tag.size() && ends_with(prefix, lo_tag)) {
+            auto result = resolve_group_loopback(std::string(strip_suffix(prefix, lo_tag)));
+            if (result) result->name = fqdn;
+            return result;
+        }
+    }
+
     // Check for SEIP subdomain: <id>.<region>.seip
     // This handles: server1.us-west.seip.lemonade-nexus.io -> specific server A record
     {
@@ -799,6 +812,87 @@ std::optional<DnsRecord> DnsService::do_resolve(const std::string& fqdn) {
     }
 
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Group loopback names
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// True for one DNS label of 1-63 lowercase letters, digits, and hyphens that
+/// does not start or end with a hyphen.
+[[nodiscard]] bool is_dns_label(std::string_view label) {
+    if (label.empty() || label.size() > 63) return false;
+    if (label.front() == '-' || label.back() == '-') return false;
+    return std::all_of(label.begin(), label.end(), [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+    });
+}
+
+} // namespace
+
+std::string group_loopback_label(std::string_view group_id) {
+    // Domain separation: this digest is a name, not any other use of the id.
+    static constexpr std::string_view kDomain = "lemonade-nexus/group-loopback-label/v1";
+    std::string input;
+    input.reserve(kDomain.size() + 1 + group_id.size());
+    input.append(kDomain);
+    input.push_back('\0');
+    input.append(group_id);
+
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    if (EVP_Digest(input.data(), input.size(), digest, &digest_len, EVP_sha256(), nullptr) != 1 ||
+        digest_len < 10) {
+        return {};
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string label = "g";
+    for (unsigned int i = 0; i < 10; ++i) {
+        label.push_back(kHex[digest[i] >> 4]);
+        label.push_back(kHex[digest[i] & 0x0f]);
+    }
+    return label;
+}
+
+std::string group_loopback_wildcard(std::string_view group_id, std::string_view base_domain) {
+    const auto label = group_loopback_label(group_id);
+    if (label.empty() || base_domain.empty()) return {};
+    return "*." + label + ".lo." + to_lower(base_domain);
+}
+
+std::vector<std::string> groups_with_loopback_label(const tree::PermissionTreeService& tree,
+                                                    std::string_view label) {
+    std::vector<std::string> ids;
+    if (label.empty()) return ids;
+    for (const auto& group : tree.get_nodes_by_type(tree::NodeType::Customer)) {
+        if (group_loopback_label(group.id) == label) ids.push_back(group.id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+std::optional<DnsRecord> DnsService::resolve_group_loopback(const std::string& prefix) {
+    const auto dot = prefix.find('.');
+    if (dot == std::string::npos) return std::nullopt;
+    const std::string_view device(prefix.data(), dot);
+    const std::string_view label = std::string_view(prefix).substr(dot + 1);
+    if (!is_dns_label(device) || !is_dns_label(label)) return std::nullopt;
+
+    const auto groups = groups_with_loopback_label(tree_, label);
+    if (groups.size() != 1) {
+        if (groups.size() > 1) {
+            spdlog::warn("[{}] group loopback label {} matches {} groups; not answered",
+                         name(), label, groups.size());
+        }
+        return std::nullopt;
+    }
+
+    DnsRecord rec;
+    rec.ipv4_address = std::string(kGroupLoopbackAddress);
+    rec.ttl = 300;
+    return rec;
 }
 
 // ---------------------------------------------------------------------------

@@ -85,6 +85,43 @@ public:
     [[nodiscard]] bool do_remove_dns_txt_record(const std::string& fqdn);
     [[nodiscard]] std::optional<CertBundle> do_get_certificate(const std::string& domain);
 
+    /// The directory name under data/certs/ that holds `domain`. A wildcard
+    /// name "*.<rest>" maps to "_wildcard.<rest>"; every other name maps to
+    /// itself. No valid domain contains "_", so the two forms cannot collide.
+    /// The caller validates `domain` with is_valid_domain() first.
+    [[nodiscard]] static std::string certificate_directory_name(const std::string& domain);
+
+    /// The domains of the complete certificates stored under data/certs/
+    /// (fullchain.pem and privkey.pem both present), sorted. Wildcard
+    /// directories are reported as "*.<rest>". Invalid directory names are
+    /// skipped. Does not wait for an ACME order in progress.
+    [[nodiscard]] std::vector<std::string> stored_certificate_domains();
+
+    /// Delete the stored certificate, key, and metadata for `domain`. The key
+    /// is removed through the storage vault when one is set. Returns true when
+    /// nothing remains (also when nothing was stored). Does not wait for an
+    /// ACME order in progress: an order that completes later stores its
+    /// certificate again.
+    bool remove_certificate(const std::string& domain);
+
+    /// True when `domain` is a DNS name of letters, digits, and hyphens, with
+    /// an optional leading "*." wildcard label. Rejects path separators.
+    [[nodiscard]] static bool is_valid_domain(const std::string& domain);
+
+    /// The DNS-01 TXT record name for one authorization of an order for
+    /// `domain`: "_acme-challenge.<identifier>". RFC 8555 section 7.1.3: the
+    /// identifier of a wildcard authorization is the base name without "*.".
+    /// Uses the authorization's identifier value, else `domain` without a
+    /// leading "*.". Empty when the result is not a valid domain.
+    [[nodiscard]] static std::string challenge_record_name(
+        const nlohmann::json& authorization, const std::string& domain);
+
+    /// Test-only: create_csr() for `domain`.
+    [[nodiscard]] std::vector<uint8_t> test_create_csr(const std::string& domain,
+                                                       std::string& out_privkey) {
+        return create_csr(domain, out_privkey);
+    }
+
 private:
     // -----------------------------------------------------------------------
     // ACME protocol helpers
@@ -136,6 +173,8 @@ private:
         int delay_secs = 2);
 
     /// Generate an ECDSA P-256 key and create a DER-encoded CSR for the domain.
+    /// The CSR carries `domain` as its CN and as its one DNS SAN; a wildcard
+    /// name ("*.<rest>") is used unchanged.
     /// @param domain       The domain name for the CSR
     /// @param out_privkey  Receives the PEM-encoded private key
     /// @return             DER-encoded CSR bytes, or empty on failure
@@ -179,9 +218,6 @@ private:
     bool remove_local_dns_txt(const std::string& fqdn);
 
     // Cloudflare DNS API fallback
-
-    /// Validate a domain string contains only safe characters.
-    [[nodiscard]] static bool is_valid_domain(const std::string& domain);
 
     /// Extract the base domain from an FQDN for zone lookup.
     /// e.g. "_acme-challenge.sub.example.com" -> "example.com"
@@ -240,6 +276,10 @@ private:
     /// Parse the expiry (Not After) from a PEM certificate chain.
     /// Returns Unix timestamp, or 0 on failure.
     [[nodiscard]] static uint64_t parse_cert_expiry(const std::string& pem);
+
+    /// Parse the Not Before time from a PEM certificate chain.
+    /// Returns Unix timestamp, or 0 on failure.
+    [[nodiscard]] static uint64_t parse_cert_not_before(const std::string& pem);
 
     /// Extract the path component from a full URL.
     [[nodiscard]] static std::string url_path(const std::string& url);

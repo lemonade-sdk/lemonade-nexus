@@ -3,6 +3,10 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
+
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include <filesystem>
 #include <fstream>
@@ -265,4 +269,109 @@ TEST_F(AcmeTest, DISABLED_ZeroSSLRenewCertificate) {
     auto result = svc.renew_certificate("test.example.com");
     EXPECT_FALSE(result.success);
     svc.stop();
+}
+
+// ===========================================================================
+// Renewal rule, wildcard names, and stored certificates (offline)
+// ===========================================================================
+
+TEST(AcmeRenewalRule, DueWhenLessThanOneThirdOfTheLifetimeRemains) {
+    constexpr uint64_t kDay = 24 * 3600;
+    const uint64_t nb = 1'000'000;
+    const uint64_t na = nb + 90 * kDay;
+    EXPECT_FALSE(acme::certificate_renewal_due(nb, na, nb));
+    EXPECT_FALSE(acme::certificate_renewal_due(nb, na, nb + 60 * kDay));
+    EXPECT_TRUE(acme::certificate_renewal_due(nb, na, nb + 60 * kDay + 1));
+    EXPECT_TRUE(acme::certificate_renewal_due(nb, na, na));
+    // An unknown or invalid period is due: it is never kept unchecked.
+    EXPECT_TRUE(acme::certificate_renewal_due(0, na, nb));
+    EXPECT_TRUE(acme::certificate_renewal_due(na, nb, nb));
+}
+
+TEST(AcmeWildcard, DomainValidationAndDirectoryName) {
+    EXPECT_TRUE(acme::AcmeService::is_valid_domain("*.g0123.lo.example.test"));
+    EXPECT_TRUE(acme::AcmeService::is_valid_domain("laptop.capi.example.test"));
+    EXPECT_FALSE(acme::AcmeService::is_valid_domain("*"));
+    EXPECT_FALSE(acme::AcmeService::is_valid_domain("*."));
+    EXPECT_FALSE(acme::AcmeService::is_valid_domain("a.*.example.test"));
+    EXPECT_FALSE(acme::AcmeService::is_valid_domain("*.*.example.test"));
+    EXPECT_FALSE(acme::AcmeService::is_valid_domain("../etc"));
+    EXPECT_FALSE(acme::AcmeService::is_valid_domain("_wildcard.example.test"));
+    EXPECT_EQ(acme::AcmeService::certificate_directory_name("*.g0123.lo.example.test"),
+              "_wildcard.g0123.lo.example.test");
+    EXPECT_EQ(acme::AcmeService::certificate_directory_name("laptop.capi.example.test"),
+              "laptop.capi.example.test");
+}
+
+TEST(AcmeWildcard, ChallengeRecordNameUsesTheAuthorizationIdentifier) {
+    const auto wildcard_auth = nlohmann::json::parse(
+        R"({"identifier":{"type":"dns","value":"g0123.lo.example.test"},"wildcard":true})");
+    EXPECT_EQ(acme::AcmeService::challenge_record_name(wildcard_auth, "*.g0123.lo.example.test"),
+              "_acme-challenge.g0123.lo.example.test");
+    // Without an identifier the base name is the domain without "*.".
+    EXPECT_EQ(acme::AcmeService::challenge_record_name(nlohmann::json::object(),
+                                                        "*.g0123.lo.example.test"),
+              "_acme-challenge.g0123.lo.example.test");
+    EXPECT_EQ(acme::AcmeService::challenge_record_name(nlohmann::json::object(),
+                                                        "laptop.capi.example.test"),
+              "_acme-challenge.laptop.capi.example.test");
+    // A malformed identifier is refused, never used as a record name.
+    const auto bad = nlohmann::json::parse(R"({"identifier":{"value":"*.x.example.test"}})");
+    EXPECT_EQ(acme::AcmeService::challenge_record_name(bad, "*.x.example.test"), "");
+}
+
+TEST_F(AcmeTest, WildcardCsrCarriesTheWildcardName) {
+    acme::AcmeService svc{*storage, acme::AcmeProviderConfig::letsencrypt_staging()};
+    std::string key_pem;
+    const auto der = svc.test_create_csr("*.g0123.lo.example.test", key_pem);
+    ASSERT_FALSE(der.empty());
+    EXPECT_NE(key_pem.find("PRIVATE KEY"), std::string::npos);
+
+    const unsigned char* p = der.data();
+    X509_REQ* req = d2i_X509_REQ(nullptr, &p, static_cast<long>(der.size()));
+    ASSERT_NE(req, nullptr);
+    STACK_OF(X509_EXTENSION)* exts = X509_REQ_get_extensions(req);
+    ASSERT_NE(exts, nullptr);
+    std::vector<std::string> names;
+    for (int i = 0; i < sk_X509_EXTENSION_num(exts); ++i) {
+        X509_EXTENSION* ext = sk_X509_EXTENSION_value(exts, i);
+        if (OBJ_obj2nid(X509_EXTENSION_get_object(ext)) != NID_subject_alt_name) continue;
+        auto* gens = static_cast<GENERAL_NAMES*>(X509V3_EXT_d2i(ext));
+        for (int j = 0; gens && j < sk_GENERAL_NAME_num(gens); ++j) {
+            const GENERAL_NAME* gen = sk_GENERAL_NAME_value(gens, j);
+            if (gen->type != GEN_DNS) continue;
+            names.emplace_back(reinterpret_cast<const char*>(ASN1_STRING_get0_data(gen->d.dNSName)),
+                               static_cast<std::size_t>(ASN1_STRING_length(gen->d.dNSName)));
+        }
+        GENERAL_NAMES_free(gens);
+    }
+    sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
+    X509_REQ_free(req);
+    EXPECT_EQ(names, std::vector<std::string>{"*.g0123.lo.example.test"});
+}
+
+TEST_F(AcmeTest, StoredWildcardCertificateIsListedReadAndRemoved) {
+    const std::string wildcard = "*.g0123.lo.example.test";
+    const auto dir = temp_dir / "certs" / "_wildcard.g0123.lo.example.test";
+    fs::create_directories(dir);
+    std::ofstream(dir / "fullchain.pem") << "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----\n";
+    std::ofstream(dir / "privkey.pem") << "wildcard-key";
+    // An incomplete directory and one with an invalid name are not listed.
+    fs::create_directories(temp_dir / "certs" / "half.example.test");
+    std::ofstream(temp_dir / "certs" / "half.example.test" / "fullchain.pem") << "x";
+    fs::create_directories(temp_dir / "certs" / "bad_name");
+    std::ofstream(temp_dir / "certs" / "bad_name" / "fullchain.pem") << "x";
+    std::ofstream(temp_dir / "certs" / "bad_name" / "privkey.pem") << "x";
+
+    acme::AcmeService svc{*storage, acme::AcmeProviderConfig::letsencrypt_staging()};
+    EXPECT_EQ(svc.stored_certificate_domains(), std::vector<std::string>{wildcard});
+    const auto bundle = svc.get_certificate(wildcard);
+    ASSERT_TRUE(bundle.has_value());
+    EXPECT_EQ(bundle->privkey_pem, "wildcard-key");
+    EXPECT_FALSE(svc.get_certificate("../../etc").has_value());
+
+    EXPECT_TRUE(svc.remove_certificate(wildcard));
+    EXPECT_FALSE(fs::exists(dir));
+    EXPECT_TRUE(svc.stored_certificate_domains().empty());
+    EXPECT_TRUE(svc.remove_certificate(wildcard));  // nothing left: still true
 }
