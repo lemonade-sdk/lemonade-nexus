@@ -426,11 +426,17 @@ int main(int argc, char* argv[]) {
     nexus::network::StunService stun{coordinator.io_context(), stun_port, crypto, "lemonade-nexus-central"};
     stun.start();
 
-    nexus::crypto::Ed25519PublicKey central_pubkey{};
-    if (auto pk = key_wrapping.load_identity_pubkey()) {
-        central_pubkey = *pk;
-    }
-    nexus::relay::RelayService relay{coordinator.io_context(), relay_port, crypto, central_pubkey};
+    // Every server relays, Tier 1 and Tier 2 alike. A ticket is valid when a
+    // current Tier 1 member signed it, by the membership the security mesh
+    // verified from the authority chain; the relay needs no tree.
+    nexus::relay::RelayService relay{coordinator.io_context(), relay_port, crypto};
+    relay.set_ticket_authority(
+        [mesh = security_mesh->service.get()]() -> std::optional<nexus::relay::RelayTicketAuthority> {
+            const auto snapshot = mesh->membership();
+            if (!snapshot.known) return std::nullopt;
+            return nexus::relay::RelayTicketAuthority{mesh->network_id(), snapshot.epoch,
+                                                      snapshot.members};
+        });
     relay.start();
 
     nexus::relay::RelayDiscoveryService relay_discovery{storage};

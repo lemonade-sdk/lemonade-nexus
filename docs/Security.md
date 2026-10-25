@@ -102,6 +102,22 @@ after it signs an endpoint proof for the host and port the client reached
 (see [Client SDK](Client-SDK#tier-1-servers)). A server never vouches for a
 session it did not issue.
 
+### Relay tickets
+
+A Tier 1 server issues a relay ticket (`POST /api/relay/ticket`) only for the
+caller's own session. It signs the ticket with its node identity key, the key
+the finalized membership names, under `lemonade-nexus/relay-ticket:v2`. The
+ticket names the network, the issuer's epoch, the session, the relay, a fresh
+nonce, and an expiry at most 120 seconds after issue. Any relay accepts it
+only when the issuer is a member of the Tier 1 membership the relay verified
+from the authority chain, the network and epoch match, the signature
+verifies, and it has not expired (`Relay/RelayTicketAuth.hpp`). Each issuer
+and nonce allocates one session; the relay keeps that record until the ticket
+expires. The relay needs no tree and no session state, so a Tier 2 relay
+carries ciphertext for any session a Tier 1 server authorized. A ticket from
+the previous epoch is refused after an epoch change and must be requested
+again.
+
 Endpoints, the devices that join a group, come in two roles. Neither holds any
 server or authority role:
 
@@ -382,10 +398,10 @@ These are implementation limits, not settings an operator can disable:
 6. **No tree without Tier 1.** Only Tier 1 members hold the tree. Before Epoch
    1 activates, and while no server qualifies for Tier 1 (item 1), no server
    serves a tree route or a client session, and no client can join.
-7. **Relay tickets come from the session server.** A relay accepts only
-   tickets its own server signed, and only Tier 1 servers issue sessions, so a
-   Tier 2 relay accepts no ticket today. Tier 2 relaying needs relay tickets
-   that a Tier 2 relay verifies against the verified Tier 1 membership.
+7. **Relay allocation has no wire message.** Any relay, Tier 1 or Tier 2,
+   accepts a relay ticket that a current Tier 1 member signed (see
+   [Relay tickets](#relay-tickets)), but the relay protocol has no handler for
+   its `Allocate` message, so a session is allocated only in process.
 8. **Tree-derived DNS names are Tier 1 answers.** A nameserver that is not a
    Tier 1 member has no tree and does not answer endpoint host names.
 

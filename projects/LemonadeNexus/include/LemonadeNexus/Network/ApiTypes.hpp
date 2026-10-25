@@ -235,6 +235,9 @@ struct RelayTicketResponse {
     std::string session_nonce;
     uint64_t    issued_at{0};
     uint64_t    expires_at{0};
+    std::string network_id;  // hex
+    uint64_t    epoch{0};
+    std::string issuer;      // base64 node identity key
     std::string signature;
 };
 
@@ -245,6 +248,9 @@ inline void to_json(nlohmann::json& j, const RelayTicketResponse& r) {
         {"session_nonce", r.session_nonce},
         {"issued_at",     r.issued_at},
         {"expires_at",    r.expires_at},
+        {"network_id",    r.network_id},
+        {"epoch",         r.epoch},
+        {"issuer",        r.issuer},
         {"signature",     r.signature},
     };
 }
@@ -255,6 +261,9 @@ inline void from_json(const nlohmann::json& j, RelayTicketResponse& r) {
     r.session_nonce = j.value("session_nonce", "");
     r.issued_at     = j.value("issued_at", uint64_t{0});
     r.expires_at    = j.value("expires_at", uint64_t{0});
+    r.network_id    = j.value("network_id", "");
+    r.epoch         = j.value("epoch", uint64_t{0});
+    r.issuer        = j.value("issuer", "");
     r.signature     = j.value("signature", "");
 }
 

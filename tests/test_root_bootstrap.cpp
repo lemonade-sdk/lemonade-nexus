@@ -196,7 +196,7 @@ protected:
         config.open_registration = true;
 
         crypto::Ed25519Keypair server_kp = crypto->ed25519_keygen();
-        relay = std::make_unique<relay::RelayService>(io, 0, *crypto, server_kp.public_key);
+        relay = std::make_unique<relay::RelayService>(io, 0, *crypto);
         relay_discovery = std::make_unique<relay::RelayDiscoveryService>(*storage);
         gossip = std::make_unique<gossip::GossipService>(io, 0, *storage, *crypto);
         routing = std::make_unique<routing::RoutingCoordinationService>(*crypto, *gossip);

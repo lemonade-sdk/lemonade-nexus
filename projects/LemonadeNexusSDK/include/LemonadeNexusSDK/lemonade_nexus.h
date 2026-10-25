@@ -178,7 +178,10 @@ ln_error_t ln_ipam_allocate(ln_client_t* client,
 /** GET /api/relay/list. Returns JSON array via out_json. */
 ln_error_t ln_relay_list(ln_client_t* client, char** out_json);
 
-/** POST /api/relay/ticket. Returns JSON via out_json. */
+/** POST /api/relay/ticket. Returns JSON via out_json: {peer_id, relay_id,
+ *  session_nonce, issued_at, expires_at, network_id, epoch, issuer, signature}.
+ *  A Tier 1 server signs the ticket; any relay verifies it against its
+ *  verified Tier 1 membership. */
 ln_error_t ln_relay_ticket(ln_client_t* client,
                             const char* peer_id,
                             const char* relay_id,

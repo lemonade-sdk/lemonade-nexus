@@ -428,6 +428,9 @@ ln_error_t ln_relay_ticket(ln_client_t* client,
     j["session_nonce"] = result.value.session_nonce;
     j["issued_at"]     = result.value.issued_at;
     j["expires_at"]    = result.value.expires_at;
+    j["network_id"]    = result.value.network_id;
+    j["epoch"]         = result.value.epoch;
+    j["issuer"]        = result.value.issuer;
     j["signature"]     = result.value.signature;
 
     *out_json = strdup_json(j);

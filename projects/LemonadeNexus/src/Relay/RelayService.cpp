@@ -15,15 +15,23 @@ namespace nexus::relay {
 
 RelayService::RelayService(asio::io_context& io,
                            uint16_t port,
-                           crypto::SodiumCryptoService& crypto,
-                           crypto::Ed25519PublicKey central_pubkey)
+                           crypto::SodiumCryptoService& crypto)
     : io_(io)
     , socket_(io, asio::ip::udp::endpoint(asio::ip::udp::v6(), port))
     , port_(port)
     , crypto_(crypto)
-    , central_pubkey_(central_pubkey)
 {
 }
+
+namespace {
+
+uint64_t unix_now() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count());
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // IService
@@ -58,26 +66,20 @@ void RelayService::on_stop() {
 RelayAllocation RelayService::do_allocate(const RelayTicket& ticket) {
     RelayAllocation result;
 
-    if (!do_verify_ticket(ticket)) {
-        result.error_message = "ticket verification failed";
+    const auto check = check_ticket(ticket);
+    if (check != RelayTicketCheck::Valid) {
+        result.error_message = check == RelayTicketCheck::Expired
+                                   ? "ticket expired"
+                                   : "ticket verification failed: " +
+                                         std::string(relay_ticket_check_name(check));
         spdlog::warn("[{}] allocation denied: {}", name(), result.error_message);
         return result;
     }
 
-    // Check ticket expiry
-    const auto now = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-        .count());
-    if (ticket.expires_at != 0 && ticket.expires_at < now) {
-        result.error_message = "ticket expired";
-        spdlog::warn("[{}] allocation denied: {}", name(), result.error_message);
-        return result;
-    }
-
-    // Reject replay: a ticket's session-nonce may allocate at most one session.
-    const std::string nonce_key = crypto::to_hex(
-        std::span<const uint8_t>(ticket.session_nonce));
+    // Reject replay: one allocation per issuer and session nonce.
+    const std::string nonce_key =
+        crypto::to_hex(std::span<const uint8_t>(ticket.issuer)) + ":" +
+        crypto::to_hex(std::span<const uint8_t>(ticket.session_nonce));
 
     // Create a new session
     auto session = std::make_shared<RelaySession>();
@@ -91,7 +93,7 @@ RelayAllocation RelayService::do_allocate(const RelayTicket& ticket) {
 
     {
         std::lock_guard lock(mutex_);
-        if (!seen_ticket_nonces_.insert(nonce_key).second) {
+        if (!seen_tickets_.emplace(nonce_key, ticket.expires_at).second) {
             result.session_id = {};
             result.error_message = "ticket already used";
             spdlog::warn("[{}] allocation denied: replayed ticket nonce", name());
@@ -233,14 +235,13 @@ void RelayService::do_teardown(const SessionId& session_id) {
 // ---------------------------------------------------------------------------
 
 bool RelayService::do_verify_ticket(const RelayTicket& ticket) const {
-    auto canonical = ticket_canonical_bytes(ticket);
-    crypto::Ed25519Signature sig;
-    std::memcpy(sig.data(), ticket.signature.data(), sig.size());
+    return check_ticket(ticket) == RelayTicketCheck::Valid;
+}
 
-    return crypto_.ed25519_verify(
-        central_pubkey_,
-        std::span<const uint8_t>(canonical),
-        sig);
+RelayTicketCheck RelayService::check_ticket(const RelayTicket& ticket) const {
+    return check_relay_ticket(
+        ticket, ticket_authority_ ? ticket_authority_() : std::optional<RelayTicketAuthority>{},
+        unix_now());
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +428,12 @@ void RelayService::purge_expired_sessions() {
         spdlog::info("[{}] purged {} expired sessions ({} remaining)",
                      name(), purged, sessions_.size());
     }
+
+    // A replay entry outlives its ticket by the clock skew allowance.
+    const auto unix = unix_now();
+    for (auto it = seen_tickets_.begin(); it != seen_tickets_.end();) {
+        it = it->second + kRelayTicketClockSkewSec < unix ? seen_tickets_.erase(it) : ++it;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,25 +446,5 @@ SessionId RelayService::generate_session_id() {
     return id;
 }
 
-std::vector<uint8_t> RelayService::ticket_canonical_bytes(const RelayTicket& ticket) {
-    // Canonical form: peer_id || relay_id || session_nonce || issued_at(8-LE) || expires_at(8-LE)
-    std::vector<uint8_t> buf;
-    buf.reserve(ticket.peer_id.size() + ticket.relay_id.size() + 16 + 8 + 8);
-
-    buf.insert(buf.end(), ticket.peer_id.begin(), ticket.peer_id.end());
-    buf.insert(buf.end(), ticket.relay_id.begin(), ticket.relay_id.end());
-    buf.insert(buf.end(), ticket.session_nonce.begin(), ticket.session_nonce.end());
-
-    auto push_u64_le = [&buf](uint64_t v) {
-        for (int i = 0; i < 8; ++i) {
-            buf.push_back(static_cast<uint8_t>(v & 0xFF));
-            v >>= 8;
-        }
-    };
-    push_u64_le(ticket.issued_at);
-    push_u64_le(ticket.expires_at);
-
-    return buf;
-}
 
 } // namespace nexus::relay

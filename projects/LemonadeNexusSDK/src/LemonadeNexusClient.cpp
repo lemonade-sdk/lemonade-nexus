@@ -1674,6 +1674,9 @@ Result<RelayTicket> LemonadeNexusClient::request_relay_ticket(const std::string&
     result.value.session_nonce = resp->value("session_nonce", "");
     result.value.issued_at     = resp->value("issued_at", uint64_t{0});
     result.value.expires_at    = resp->value("expires_at", uint64_t{0});
+    result.value.network_id    = resp->value("network_id", "");
+    result.value.epoch         = resp->value("epoch", uint64_t{0});
+    result.value.issuer        = resp->value("issuer", "");
     result.value.signature     = resp->value("signature", "");
     result.ok = true;
     return result;

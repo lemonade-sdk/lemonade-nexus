@@ -466,8 +466,7 @@ protected:
         ipam_svc = std::make_unique<ipam::IPAMService>(*storage_svc);
         ipam_svc->start();
         http_object = std::make_unique<network::HttpServer>(0);
-        const auto central = crypto_svc->ed25519_keygen();
-        relay_svc = std::make_unique<relay::RelayService>(io, 0, *crypto_svc, central.public_key);
+        relay_svc = std::make_unique<relay::RelayService>(io, 0, *crypto_svc);
         relay_discovery = std::make_unique<relay::RelayDiscoveryService>(*storage_svc);
         gossip_svc = std::make_unique<gossip::GossipService>(io, 0, *storage_svc, *crypto_svc);
         identity_kp = crypto_svc->ed25519_keygen();

@@ -205,12 +205,17 @@ struct RelayNodeInfo {
     bool        is_central{false};
 };
 
+/// A relay ticket a Tier 1 server issued for this session. Any relay, Tier 1
+/// or Tier 2, verifies it against the Tier 1 membership it verified.
 struct RelayTicket {
     std::string peer_id;
     std::string relay_id;
     std::string session_nonce;     // base64
     uint64_t    issued_at{0};
     uint64_t    expires_at{0};
+    std::string network_id;        // hex
+    uint64_t    epoch{0};          // the issuer's Tier 1 epoch
+    std::string issuer;            // base64 node identity key of the issuer
     std::string signature;         // base64
 };
 

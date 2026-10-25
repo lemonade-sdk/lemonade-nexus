@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Routing/ConnectionTicket.hpp>
 #include <LemonadeNexus/Routing/RoutingTypes.hpp>
 #include <LemonadeNexus/Relay/RelayService.hpp>
+#include <LemonadeNexus/Relay/RelayTicketAuth.hpp>
 #include <LemonadeNexus/Relay/RelayTypes.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -130,30 +131,51 @@ protected:
     asio::io_context io;
     std::unique_ptr<crypto::SodiumCryptoService> c;
     std::unique_ptr<relay::RelayService> r;
-    crypto::Ed25519Keypair central;
+    // The verified Tier 1 membership the relay checks tickets against. The
+    // relay itself is not in it: it is a Tier 2 relay with no tree.
+    crypto::Ed25519Keypair member;
+    crypto::Ed25519Keypair outsider;
+    relay::RelayTicketAuthority authority;
+    bool authority_known = true;
 
     void SetUp() override {
         c = std::make_unique<crypto::SodiumCryptoService>(); c->start();
-        central = c->ed25519_keygen();
-        r = std::make_unique<relay::RelayService>(io, 0, *c, central.public_key);
+        member = c->ed25519_keygen();
+        outsider = c->ed25519_keygen();
+        authority.network_id.fill(0x5A);
+        authority.epoch = 7;
+        for (int i = 0; i < 4; ++i) {
+            security::NodeId other;
+            other.bytes = c->ed25519_keygen().public_key;
+            authority.members.push_back(other);
+        }
+        security::NodeId self;
+        self.bytes = member.public_key;
+        authority.members.push_back(self);
+        r = std::make_unique<relay::RelayService>(io, 0, *c);
+        r->set_ticket_authority([this]() -> std::optional<relay::RelayTicketAuthority> {
+            if (!authority_known) return std::nullopt;
+            return authority;
+        });
         r->start();
     }
     void TearDown() override { if (r) r->stop(); if (c) c->stop(); }
 
-    relay::RelayTicket make_ticket() {
+    /// A ticket a Tier 1 member issues, as /api/relay/ticket does.
+    relay::RelayTicket make_ticket(const crypto::Ed25519Keypair* issuer = nullptr) {
         relay::RelayTicket t;
         t.peer_id = "p"; t.relay_id = "relay-1";
         c->random_bytes(std::span<uint8_t>(t.session_nonce));
-        t.issued_at = now_s(); t.expires_at = t.issued_at + 300;
-        std::vector<uint8_t> canon;  // peer_id||relay_id||nonce||issued(8LE)||expires(8LE)
-        canon.insert(canon.end(), t.peer_id.begin(), t.peer_id.end());
-        canon.insert(canon.end(), t.relay_id.begin(), t.relay_id.end());
-        canon.insert(canon.end(), t.session_nonce.begin(), t.session_nonce.end());
-        auto le = [&](uint64_t v){ for(int i=0;i<8;++i){canon.push_back(v&0xFF); v>>=8;} };
-        le(t.issued_at); le(t.expires_at);
-        auto sig = c->ed25519_sign(central.private_key, std::span<const uint8_t>(canon));
-        std::memcpy(t.signature.data(), sig.data(), sig.size());
+        t.issued_at = now_s();
+        t.expires_at = t.issued_at + relay::kRelayTicketMaxLifetimeSec;
+        t.network_id = authority.network_id;
+        t.epoch = authority.epoch.underlying();
+        relay::sign_relay_ticket(t, issuer ? *issuer : member);
         return t;
+    }
+
+    std::string refusal(const relay::RelayTicket& t) {
+        return r->do_allocate(t).error_message;
     }
 };
 
@@ -184,4 +206,74 @@ TEST_F(RelayBindTest, ReplayedTicketNonceRejected) {
     EXPECT_TRUE(r->do_allocate(t).error_message.empty());
     auto again = r->do_allocate(t);     // same session_nonce
     EXPECT_EQ(again.error_message, "ticket already used");
+}
+
+// A Tier 2 relay holds no tree and no session. It accepts a ticket only from
+// a current member of the Tier 1 membership it verified.
+TEST_F(RelayBindTest, ATier2RelayAcceptsATicketFromACurrentTier1Member) {
+    const auto t = make_ticket();
+    EXPECT_EQ(r->check_ticket(t), relay::RelayTicketCheck::Valid);
+    const auto alloc = r->do_allocate(t);
+    EXPECT_TRUE(alloc.error_message.empty()) << alloc.error_message;
+    EXPECT_NE(alloc.session_id, relay::SessionId{});
+}
+
+TEST_F(RelayBindTest, EveryBadTicketIsRefused) {
+    // Forged: a field changed after signing, or a signature by another key.
+    auto forged = make_ticket();
+    forged.peer_id = "someone-else";
+    EXPECT_EQ(r->check_ticket(forged), relay::RelayTicketCheck::BadSignature);
+    auto stolen = make_ticket();
+    stolen.signature = make_ticket(&outsider).signature;
+    EXPECT_EQ(r->check_ticket(stolen), relay::RelayTicketCheck::BadSignature);
+
+    // Expired, overlong, and issued in the future.
+    auto expired = make_ticket();
+    expired.issued_at = now_s() - 600;
+    expired.expires_at = expired.issued_at + 60;
+    relay::sign_relay_ticket(expired, member);
+    EXPECT_EQ(r->check_ticket(expired), relay::RelayTicketCheck::Expired);
+    EXPECT_EQ(refusal(expired), "ticket expired");
+    auto overlong = make_ticket();
+    overlong.expires_at = overlong.issued_at + 3600;
+    relay::sign_relay_ticket(overlong, member);
+    EXPECT_EQ(r->check_ticket(overlong), relay::RelayTicketCheck::LifetimeTooLong);
+    auto future = make_ticket();
+    future.issued_at = now_s() + 3600;
+    future.expires_at = future.issued_at + 60;
+    relay::sign_relay_ticket(future, member);
+    EXPECT_EQ(r->check_ticket(future), relay::RelayTicketCheck::NotYetValid);
+
+    // From a server outside the verified membership.
+    EXPECT_EQ(r->check_ticket(make_ticket(&outsider)), relay::RelayTicketCheck::NotMember);
+
+    // For another epoch, or another network, signed by a real member.
+    auto old_epoch = make_ticket();
+    old_epoch.epoch = 6;
+    relay::sign_relay_ticket(old_epoch, member);
+    EXPECT_EQ(r->check_ticket(old_epoch), relay::RelayTicketCheck::WrongEpoch);
+    auto foreign = make_ticket();
+    foreign.network_id[0] ^= 0x01;
+    relay::sign_relay_ticket(foreign, member);
+    EXPECT_EQ(r->check_ticket(foreign), relay::RelayTicketCheck::WrongNetwork);
+
+    // Replayed: one allocation per ticket.
+    const auto once = make_ticket();
+    EXPECT_TRUE(refusal(once).empty());
+    EXPECT_EQ(refusal(once), "ticket already used");
+
+    // No verified membership: nothing is accepted.
+    authority_known = false;
+    EXPECT_EQ(r->check_ticket(make_ticket()), relay::RelayTicketCheck::NoAuthority);
+
+    // None of the refused tickets allocated a session.
+    for (const auto& t : {forged, stolen, expired, overlong, future, old_epoch, foreign}) {
+        EXPECT_FALSE(refusal(t).empty());
+    }
+}
+
+TEST_F(RelayBindTest, ARelayWithoutAMembershipSourceRefusesEveryTicket) {
+    relay::RelayService bare(io, 0, *c);
+    EXPECT_EQ(bare.check_ticket(make_ticket()), relay::RelayTicketCheck::NoAuthority);
+    EXPECT_FALSE(bare.do_allocate(make_ticket()).error_message.empty());
 }
