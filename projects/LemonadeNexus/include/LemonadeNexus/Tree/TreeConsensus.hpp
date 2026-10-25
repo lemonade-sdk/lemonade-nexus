@@ -37,11 +37,20 @@
 // failure halts the handler: it stops applying, voting, and proposing tree
 // blocks, and keeps serving the last committed tree.
 //
-// Modes: in Ops mode the committed log drives the persistent tree. In
-// ReadOnly mode (design A9, release N) the log starts from the empty tree,
-// takes only replicated entries (the merge commit, then committed blocks),
-// and never changes the persistent tree, which keeps its local write paths.
-// A ReadOnly handler never proposes, votes, or accepts a submission.
+// The committed log always drives the persistent tree. There is no other
+// write path.
+//
+// Awaiting the merge (design A9): a server whose tree was written before tree
+// operations holds that tree and no log. start() then opens a log on the empty
+// base and keeps the pre-merge tree as it is: the tree stays readable, but the
+// handler refuses every submission and forwarded op, proposes nothing, and
+// withholds its vote from every tree block. The only entry it takes is the
+// merge commit at height 1, signed by the root management key (TreeMerge.hpp),
+// through receive_replicated() (the "tree" sync stream, or the merge commit
+// route POST /api/tree/merge/commit). Applying it replaces the pre-merge
+// tree with the merged tree, and the handler then runs normally. A committed
+// tree block that does not follow a merge commit is refused, never applied
+// over the pre-merge tree. A restart in this state awaits the merge again.
 //
 // Threads: submit(), status(), healthy(), and set_members() may run on any
 // thread. Everything else runs on the security io thread.
@@ -79,15 +88,6 @@ inline constexpr uint64_t kTreeOpCommitWaitMs = 10'000;
 /// payload framing.
 inline constexpr std::size_t kTreeBatchWireBudget = 54'000;
 
-/// How the tree log relates to the persistent tree.
-enum class TreeLogMode : uint8_t {
-    /// Tree writes are ops; the committed log drives the persistent tree.
-    Ops,
-    /// The log is built and replicated, but the persistent tree keeps its
-    /// local write paths (design A9, release N).
-    ReadOnly,
-};
-
 /// Most replicated entries held for a later height (a gap, or an epoch whose
 /// authority is not verified yet). They are verified when their turn comes.
 inline constexpr std::size_t kMaxReplicaHeldEntries = 64;
@@ -106,8 +106,12 @@ enum class ReplicaResult : uint8_t {
 
 /// A thread-safe summary of the tree log for status reports.
 struct TreeLogStatus {
-    TreeLogMode mode = TreeLogMode::Ops;
     bool healthy = false;
+    /// The pre-merge tree is held and the merge commit has not arrived: tree
+    /// writes are refused (see the file comment).
+    bool awaiting_merge = false;
+    /// Nodes of the pre-merge tree while awaiting the merge; 0 otherwise.
+    std::size_t pre_merge_nodes = 0;
     std::string halt_reason;
     uint64_t height = 0;
     uint64_t applied_height = 0;
@@ -133,7 +137,6 @@ struct TreeConsensusConfig {
     /// Phase 7: the tree log is read and written through this vault. Not
     /// owning; nullptr keeps plain files.
     security::StorageVault* vault = nullptr;
-    TreeLogMode mode = TreeLogMode::Ops;
 };
 
 class TreeConsensus final : public security::IBlockPayloadHandler {
@@ -142,17 +145,17 @@ public:
     TreeConsensus(TreeConsensusConfig config, PermissionTreeService& tree,
                   crypto::SodiumCryptoService& crypto, std::filesystem::path log_directory);
 
-    /// Open the tree log. In Ops mode, reconcile it with the persistent tree:
-    /// equal digests are clean; a tree behind an unapplied log tail is restored
-    /// from the log; any other difference halts (the tree changed outside the
-    /// log). Without a log, Ops mode starts a new log only from an empty
-    /// tree; with a populated tree it halts and creates no log, because that
-    /// log's base would differ from other servers' and would block the merge
-    /// commit (height 1 on the empty base). A ReadOnly log starts from the
-    /// empty tree and is not reconciled. Call when this server holds the
-    /// tree (TreeRole.hpp): once at Tier 1 entry, and again after a
-    /// deactivate(). Until it succeeds the handler is halted and refuses
-    /// every block, op, and replicated entry. False when halted.
+    /// Open the tree log and reconcile it with the persistent tree: equal
+    /// digests are clean; a tree behind an unapplied log tail is restored from
+    /// the log; any other difference halts (the tree changed outside the log).
+    /// Without a log, an empty tree starts a new log on the empty base. A
+    /// populated tree with no log, or with a log still at the empty base,
+    /// awaits the merge commit (see the file comment); it is never taken as a
+    /// log base, because that base would differ from other servers' and would
+    /// block the merge commit (height 1 on the empty base). Call when this
+    /// server holds the tree (TreeRole.hpp): once at Tier 1 entry, and again
+    /// after a deactivate(). Until it succeeds the handler is halted and
+    /// refuses every block, op, and replicated entry. False when halted.
     [[nodiscard]] bool start();
 
     /// Stop running the tree log: halt with `reason`, refuse every pending
@@ -221,12 +224,15 @@ public:
     /// stream offers it to peers). io thread.
     void set_appended_hook(std::function<void(uint64_t)> hook) { appended_hook_ = std::move(hook); }
 
-    /// Called after the persistent tree followed the log (Ops mode only). io
-    /// thread.
+    /// Called after the persistent tree followed the log. io thread.
     void set_applied_hook(std::function<void()> hook) { applied_hook_ = std::move(hook); }
 
     /// Verify and apply one replicated entry (see the file comment). io thread.
     [[nodiscard]] ReplicaResult receive_replicated(const TreeLogEntry& entry);
+
+    /// True while the handler holds a pre-merge tree and awaits the merge
+    /// commit. Thread-safe.
+    [[nodiscard]] bool awaiting_merge() const;
 
     /// The encoded entry at `height` (encode_replicated_entry) for serving a
     /// peer, or nullopt when this log does not hold it. Reads the entry file
@@ -259,8 +265,8 @@ private:
         const security::HotStuffService& consensus, const security::Digest& block_digest) const;
     void halt(const std::string& reason);
     void revalidate_pool();
-    /// Append `entry` (whose replay produced `next` and `result`) and, in Ops
-    /// mode, apply it to the persistent tree. False when halted.
+    /// Append `entry` (whose replay produced `next` and `result`) and apply it
+    /// to the persistent tree. False when halted.
     bool commit_entry(const TreeLogEntry& entry, TreeChainState next,
                       const TreeBlockResult& result);
     /// Verify and apply the entry for height log_.height() + 1.
@@ -288,8 +294,10 @@ private:
     /// Replicated entries for later heights, by height. io thread.
     std::map<uint64_t, TreeLogEntry> held_;
 
-    mutable std::mutex mutex_;  // guards halted_, halt_reason_, members_, status_
+    mutable std::mutex mutex_;  // guards halted_, halt_reason_, awaiting_merge_, members_, status_
     bool halted_ = true;        // until start() succeeds
+    bool awaiting_merge_ = false;
+    std::size_t pre_merge_nodes_ = 0;
     std::string halt_reason_ = "not started";
     std::vector<security::NodeId> members_;
     TreeLogStatus status_;

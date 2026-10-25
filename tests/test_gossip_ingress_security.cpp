@@ -3187,8 +3187,7 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
         auto* au = auths[tag].get();
         au->set_link_token_replication(
             [g](auth::LinkTokenEvent& e) { return g->sign_link_token_event(e); },
-            [g](const auth::LinkTokenEvent& e) { return g->broadcast_link_token_event(e); },
-            std::chrono::milliseconds{0});
+            [g](const auth::LinkTokenEvent& e) { return g->broadcast_link_token_event(e); });
         n.gossip->set_link_token_sink(
             [au, refuses = tag == "b", &accept_b](const auth::LinkTokenEvent& e) {
                 if (refuses && !accept_b) return false;

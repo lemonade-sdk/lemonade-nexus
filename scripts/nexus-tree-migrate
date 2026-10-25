@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Run the one-time tree merge from the root server (docs/Tree-Merge-Ceremony.md).
+
+Run it as root on the server that holds the root management key, after every
+server runs a release with tree operations. Each Tier 1 server then holds the
+tree it wrote before tree operations and refuses tree writes until the merge
+commit arrives.
+
+    sudo nexus-tree-migrate --backup /var/lib/lemonade-nexus-backup-20261025-boot/state.tar
+        Dry run. Collects a signed export from every current Tier 1 member and
+        from the backup of the root server's own tree, builds the merge, and
+        prints what changes on each server. Signs nothing.
+
+    sudo nexus-tree-migrate --backup <same backup> --commit --expect-tree-digest <digest>
+        Collects the exports again, builds the merge, refuses unless the tree
+        digest equals the reviewed dry run, signs it with the root management
+        key, and delivers the commit to every Tier 1 member.
+
+The script holds no key and decides nothing. The running server does every
+step that needs the root management key or the data key, through its local
+control socket (root only). Each Tier 1 member answers an export request
+only when the root management key signed it, and signs its export with its
+own identity; the root server checks every export against the finalized
+Tier 1 membership before it merges. Each member verifies the signed commit
+for itself before it applies it.
+
+Requires: Python 3.8+. No other packages.
+"""
+
+import argparse
+import json
+import os
+import pwd
+import shutil
+import socket
+import ssl
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+CONTROL_SOCKET = "/run/lemonade-nexus/upgrade.sock"
+WORK_DIR = "/var/lib/lemonade-nexus/tree-migration"
+SERVICE_USER = "lemonade-nexus"
+MAX_LINE = 32 * 1024 * 1024
+
+
+def fail(message):
+    print(f"nexus-tree-migrate: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def control(request, path):
+    """One request line to the server's control socket, one reply line back."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(120)
+        try:
+            sock.connect(path)
+        except OSError as e:
+            fail(f"cannot reach the control socket {path}: {e} (run as root on a server "
+                 "that runs this release)")
+        sock.sendall(json.dumps(request, separators=(",", ":")).encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = sock.recv(1 << 20)
+            if not chunk:
+                break
+            data += chunk
+            if len(data) > MAX_LINE:
+                fail("the control socket reply is too large")
+    try:
+        reply = json.loads(data)
+    except ValueError:
+        fail(f"the control socket answered {request.get('op')} with something that is not JSON")
+    return reply
+
+
+def require(reply, what):
+    if not reply.get("ok"):
+        report = reply.get("report")
+        if report:
+            print_report(report)
+        fail(f"{what}: {reply.get('error', 'refused')}")
+    return reply
+
+
+def safe_extract(archive, target):
+    """Extract regular files and directories only; refuse any path that leaves target."""
+    target = Path(target).resolve()
+    with tarfile.open(archive) as tar:
+        for member in tar.getmembers():
+            dest = (target / member.name).resolve()
+            if dest != target and target not in dest.parents:
+                fail(f"the backup holds a path outside the extraction directory: {member.name}")
+            if member.isdir():
+                dest.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with tar.extractfile(member) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.chmod(dest, 0o600)
+            # Links, devices, and FIFOs are skipped: the tree needs none.
+
+
+def find_data_root(base):
+    """The directory that holds tree/nodes in an extracted backup."""
+    base = Path(base)
+    if (base / "tree" / "nodes").is_dir():
+        return base
+    found = sorted(p.parent.parent for p in base.rglob("nodes")
+                   if p.is_dir() and p.parent.name == "tree")
+    if not found:
+        fail(f"no tree/nodes directory in the backup under {base}")
+    if len(found) > 1:
+        fail("the backup holds more than one data directory: " +
+             ", ".join(str(p) for p in found) + "; pass --backup with the one to use")
+    return found[0]
+
+
+def give_to_service(path, user):
+    """The service user reads the extracted copy; it runs without root."""
+    try:
+        entry = pwd.getpwnam(user)
+    except KeyError:
+        return
+    for root, dirs, files in os.walk(path):
+        os.chown(root, entry.pw_uid, entry.pw_gid)
+        for name in files:
+            os.chown(os.path.join(root, name), entry.pw_uid, entry.pw_gid)
+
+
+def backup_export(args, work):
+    source = Path(args.backup)
+    if source.is_dir():
+        copy = work / "backup"
+        if copy.exists():
+            shutil.rmtree(copy)
+        shutil.copytree(source, copy, symlinks=False)
+    elif source.is_file():
+        copy = work / "backup"
+        if copy.exists():
+            shutil.rmtree(copy)
+        copy.mkdir(mode=0o700)
+        safe_extract(source, copy)
+    else:
+        fail(f"--backup {source} is neither a file nor a directory")
+    give_to_service(work, args.service_user)
+    data_root = find_data_root(copy)
+    reply = require(control({"op": "tree_merge_export_backup", "data_root": str(data_root)},
+                            args.socket),
+                    "the root server's backup does not export")
+    exported = reply["export"]
+    print(f"  root server backup: {len(exported.get('nodes', []))} nodes from {data_root}")
+    return exported
+
+
+def member_urls(ctx, overrides):
+    urls = {}
+    for member in ctx["members"]:
+        signer = member["signer"]
+        if signer in overrides:
+            urls[signer] = overrides[signer].rstrip("/")
+            continue
+        address = member.get("address", "")
+        host = address.rsplit(":", 1)[0] if address else ""
+        port = member.get("http_port") or 9100
+        if not host:
+            fail(f"no address is known for Tier 1 member {signer}; pass --server {signer}=URL")
+        urls[signer] = f"https://{host}:{port}"
+    return urls
+
+
+def tls_context(url, insecure):
+    context = ssl.create_default_context()
+    if insecure:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    host = urllib.parse.urlparse(url).hostname or ""
+    if host.replace(".", "").isdigit() or ":" in host:
+        # An address, not a name: the chain must be valid, the name cannot be
+        # checked. The export's own signature binds it to the member.
+        context.check_hostname = False
+    return context
+
+
+def post(url, body, insecure, timeout=60):
+    data = json.dumps(body, separators=(",", ":")).encode()
+    request = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout,
+                                    context=tls_context(url, insecure)) as response:
+            return response.status, json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            payload = json.loads(e.read() or b"{}")
+        except ValueError:
+            payload = {}
+        return e.code, payload
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {"error": str(e)}
+
+
+def collect(args, ctx, work):
+    print("Collecting signed exports:")
+    exports = [backup_export(args, work)] if args.backup else []
+    urls = member_urls(ctx, args.servers)
+    for signer, url in urls.items():
+        request = require(control({"op": "tree_merge_request", "target": signer}, args.socket),
+                          f"no export request for {signer}")
+        status, body = post(url + "/api/tree/merge/export", request["body"], args.insecure_tls)
+        if status == 404:
+            fail(f"{url} has no tree merge route: it runs an older release. Wait until the "
+                 "rollout reaches every server.")
+        if status != 200:
+            fail(f"{url} refused the export request ({status}): {body.get('error', body)}")
+        if body.get("signer") != signer:
+            fail(f"{url} answered with an export signed by {body.get('signer')}, not {signer}")
+        print(f"  {body.get('server')} ({url}): {len(body.get('nodes', []))} nodes")
+        exports.append(body)
+    path = work / "exports.json"
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(exports, f, indent=2)
+    print(f"  saved to {path}")
+    return exports
+
+
+def print_report(report):
+    print()
+    print(f"Merged tree: {report.get('node_count')} nodes")
+    for label, server in sorted(report.get("servers", {}).items()):
+        signer = report.get("signers", {}).get(label, "")
+        root = " [root server]" if server.get("root_server") else ""
+        print(f"  {label}{root} {signer}")
+        print(f"    holds {server.get('nodes')} nodes; after the merge it gains "
+              f"{len(server.get('added', []))}, loses {len(server.get('removed', []))}, "
+              f"changes {len(server.get('changed', []))}")
+        for kind in ("added", "removed", "changed"):
+            if server.get(kind):
+                print(f"    {kind}: {', '.join(server[kind])}")
+    ties = [d for d in report.get("decisions", []) if "tie-break" in d]
+    if ties:
+        print("  Decided by the tie-break rule (review these):")
+        for d in ties:
+            print(f"    {d}")
+    if report.get("dropped"):
+        print("  Dropped (these devices or groups join again after the merge):")
+        for d in report["dropped"]:
+            print(f"    {d['node_id']}: {d['reason']} ({d['detail']}) [{', '.join(d['servers'])}]")
+    if report.get("conflicts"):
+        print("  Conflicts (no commit is possible):")
+        for c in report["conflicts"]:
+            print(f"    {c['node_id']}: {c['kind']} ({c['detail']})")
+    if report.get("tree_digest"):
+        print(f"  tree digest: {report['tree_digest']}")
+        print(f"  state root (height 1): {report['state_root']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--backup", help="the root server's pre-switch backup: a tar file or a "
+                        "directory that holds its data directory (tree/nodes)")
+    parser.add_argument("--commit", action="store_true",
+                        help="sign the merge and deliver it (default: dry run)")
+    parser.add_argument("--expect-tree-digest", help="the tree digest the dry run printed")
+    parser.add_argument("--server", action="append", default=[], metavar="SIGNER=URL",
+                        help="the public API URL of a Tier 1 member (default: its advertised "
+                        "address and API port)")
+    parser.add_argument("--insecure-tls", action="store_true",
+                        help="do not verify Tier 1 TLS certificates (exports stay "
+                        "signature-checked)")
+    parser.add_argument("--socket", default=CONTROL_SOCKET)
+    parser.add_argument("--work-dir", default=WORK_DIR)
+    parser.add_argument("--service-user", default=SERVICE_USER)
+    args = parser.parse_args()
+    args.servers = {}
+    for item in args.server:
+        if "=" not in item:
+            fail("--server takes SIGNER=URL")
+        signer, url = item.split("=", 1)
+        args.servers[signer] = url
+    if args.commit and not args.expect_tree_digest:
+        fail("--commit needs --expect-tree-digest from the reviewed dry run")
+    if os.geteuid() != 0:
+        fail("run as root: the control socket accepts only root")
+
+    ctx = require(control({"op": "tree_merge_context"}, args.socket), "no tree merge context")
+    if not ctx.get("holds_root_key"):
+        fail("this server does not hold the root management key; run on the root server")
+    if not ctx.get("membership_known"):
+        fail("this server does not know the finalized Tier 1 membership yet")
+    print(f"Network {ctx['network_id']}; root key {ctx['root_key']}; "
+          f"{len(ctx['members'])} Tier 1 members")
+    if not args.backup:
+        print("No --backup: the root server contributes no tree of its own. The merge refuses "
+              "this unless the root server is a Tier 1 member.")
+
+    work = Path(args.work_dir)
+    work.mkdir(mode=0o700, parents=True, exist_ok=True)
+    exports = collect(args, ctx, work)
+    block_time_ms = int(time.time() * 1000)
+
+    if not args.commit:
+        reply = require(control({"op": "tree_merge_build", "exports": exports,
+                                 "block_time_ms": block_time_ms}, args.socket),
+                        "the merge does not build")
+        print_report(reply["report"])
+        print()
+        print("Dry run: nothing was signed. After review, run:")
+        backup = f" --backup {args.backup}" if args.backup else ""
+        print(f"  sudo nexus-tree-migrate{backup} --commit "
+              f"--expect-tree-digest {reply['report']['tree_digest']}")
+        return
+
+    reply = require(control({"op": "tree_merge_sign", "exports": exports,
+                             "block_time_ms": block_time_ms,
+                             "tree_digest": args.expect_tree_digest}, args.socket),
+                    "the merge was not signed")
+    commit = reply["commit"]
+    path = work / "commit.json"
+    with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump(commit, f, indent=2)
+    print(f"Signed the merge commit: {reply['node_count']} nodes, state root "
+          f"{reply['state_root']} (saved to {path})")
+    delivered = 0
+    for signer, url in member_urls(ctx, args.servers).items():
+        status, body = post(url + "/api/tree/merge/commit", commit, args.insecure_tls)
+        if status == 200:
+            delivered += 1
+            print(f"  {url}: {body.get('status')} at height {body.get('height')}")
+        else:
+            print(f"  {url}: not delivered ({status}): {body.get('error', body)}")
+    if delivered == 0:
+        fail(f"no Tier 1 member took the commit; deliver {path} again with --commit")
+    print("Members that did not take it directly receive it by replication from the others. "
+          "Check GET /api/tree/sync on each Tier 1 member: mode \"ops\", height 1, and the "
+          "same state_root.")
+
+
+if __name__ == "__main__":
+    main()

@@ -36,6 +36,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "support/tree_seed.hpp"
 
 #ifdef _WIN32
 #  include <process.h>
@@ -173,7 +174,7 @@ protected:
         tree::TreeNode root;
         root.id   = "root";
         root.type = tree::NodeType::Root;
-        tree_svc->bootstrap_root(root);
+        test_support::put_node(*tree_svc, root);
         add_group("group-1");
         add_group("group-2");
 
@@ -201,7 +202,7 @@ protected:
         n.id        = id;
         n.parent_id = "root";
         n.type      = tree::NodeType::Customer;
-        ASSERT_TRUE(tree_svc->insert_join_node(n));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, n));
     }
 
     /// Add a client dataplane with a session to the server, and a tree node
@@ -220,7 +221,7 @@ protected:
         n.mesh_pubkey = clients.at(id)->keys.pub_b64;
         n.tunnel_ip   = tunnel_ip + "/32";
         n.assignments = std::move(assignments);
-        ASSERT_TRUE(tree_svc->insert_join_node(n));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, n));
     }
 
     /// A tree node with no dataplane of its own: what a writer could store by
@@ -236,7 +237,7 @@ protected:
         n.mesh_pubkey = mesh_pubkey;
         n.tunnel_ip   = tunnel_ip + "/32";
         n.assignments = {{principal.at(owner), {"read", "connect_private", "admin"}}};
-        ASSERT_TRUE(tree_svc->insert_join_node(n));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, n));
     }
 
     /// The policy for the current tree and the server's current peers.
@@ -271,7 +272,7 @@ protected:
         auto node = tree_svc->get_node(target);
         ASSERT_TRUE(node.has_value());
         node->assignments.push_back({principal.at(holder), std::move(perms)});
-        ASSERT_TRUE(tree_svc->update_node_direct(target, *node));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, *node));
     }
 
     static bool send_until(Node& from, Inbox& to, const std::vector<uint8_t>& pkt,
@@ -368,7 +369,7 @@ TEST_F(ForwardAuthzTest, AnInviteMembershipReachesOnlyTheMembersDevice) {
     auto group = tree_svc->get_node("group-1");
     ASSERT_TRUE(group.has_value());
     group->assignments.clear();
-    ASSERT_TRUE(tree_svc->update_node_direct("group-1", *group));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, *group));
     EXPECT_FALSE(allowed("10.64.0.3", "10.64.0.2"));
     EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.3"));
 }
@@ -443,7 +444,7 @@ TEST_F(ForwardAuthzTest, RevokedConnectIsDroppedAfterOneRebuild) {
     auto node = tree_svc->get_node("b");
     ASSERT_TRUE(node.has_value());
     node->assignments.clear();
-    ASSERT_TRUE(tree_svc->update_node_direct("b", *node));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, *node));
     EXPECT_TRUE(reaches("a", "b", kTcpSyn, "before-rebuild"))
         << "the installed policy changed before a rebuild";
     EXPECT_TRUE(authorizer->refresh());
@@ -491,7 +492,7 @@ TEST_F(ForwardAuthzTest, ReadOnlyClientCannotReachAServiceThroughTheServer) {
         n.mgmt_pubkey = principal[d->id];
         n.mesh_pubkey = d->keys.second;
         n.tunnel_ip   = d->ip + "/32";
-        ASSERT_TRUE(tree_svc->insert_join_node(n));
+        ASSERT_TRUE(test_support::put_node(*tree_svc, n));
         lnsdk::BoringtunConfig cfg;
         cfg.private_key       = d->keys.first;
         cfg.public_key        = d->keys.second;
@@ -587,7 +588,7 @@ TEST_F(ForwardAuthzTest, TwoNodesClaimingOnePeerLeaveTheAddressWithoutRules) {
     v.mesh_pubkey = victim_keys.pub_b64;
     v.tunnel_ip = "10.64.0.3/32";
     v.assignments = {{principal["b"], {"connect_private"}}};
-    ASSERT_TRUE(tree_svc->insert_join_node(v));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, v));
     EXPECT_TRUE(allowed("10.64.0.4", "10.64.0.3"));
 
     add_claim("a-copy", "a", tree::NodeType::Endpoint, "10.64.0.3",
@@ -622,7 +623,7 @@ TEST_F(ForwardAuthzTest, ANodeWhoseKeyIsNotThePeerKeyGetsNoRule) {
     auto node = tree_svc->get_node("b");
     ASSERT_TRUE(node.has_value());
     node->mesh_pubkey = make_keypair().pub_b64;
-    ASSERT_TRUE(tree_svc->update_node_direct("b", *node));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, *node));
     EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.3"));
 }
 

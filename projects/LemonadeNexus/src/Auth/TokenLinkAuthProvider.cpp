@@ -15,7 +15,6 @@
 #include <span>
 #include <sstream>
 #include <system_error>
-#include <thread>
 
 namespace nexus::auth {
 
@@ -93,12 +92,10 @@ void TokenLinkAuthProvider::set_clock_for_testing(std::function<uint64_t()> now_
     clock_ = std::move(now_sec);
 }
 
-void TokenLinkAuthProvider::set_replication(EventSigner signer, EventPublisher publisher,
-                                            std::chrono::milliseconds settle_window) {
+void TokenLinkAuthProvider::set_replication(EventSigner signer, EventPublisher publisher) {
     std::lock_guard lock(mutex_);
     signer_ = std::move(signer);
     publisher_ = std::move(publisher);
-    settle_window_ = settle_window;
 }
 
 void TokenLinkAuthProvider::author_locked(LinkTokenEvent& e, bool sign) {
@@ -231,7 +228,6 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view t
     LinkTokenEvent spend;
     LinkTokenRecord record;
     EventPublisher publisher;
-    std::chrono::milliseconds settle{0};
     {
         std::lock_guard lock(mutex_);
         const auto now = now_sec();
@@ -264,27 +260,10 @@ std::optional<LinkTokenRecord> TokenLinkAuthProvider::consume(std::string_view t
         record = record_from_grant(live->mint);
         record.generation = spend.generation;
         record.spent_by = spend.origin_pubkey;
-        if (!spend.signature.empty()) {
-            publisher = publisher_;
-            settle = settle_window_;
-        }
+        if (!spend.signature.empty()) publisher = publisher_;
     }
 
-    const std::size_t sent = publisher ? publisher(spend) : 0;
-    if (sent > 0 && settle.count() > 0) {
-        // Without consensus two servers can spend the same generation at the
-        // same time. Each waits for the other's spend to arrive; the spend
-        // with the smallest origin counts on every server, and only that
-        // server uses the token.
-        std::this_thread::sleep_for(settle);
-        std::lock_guard lock(mutex_);
-        const auto winner = ledger_.spend_winner(hash, spend.generation);
-        if (winner && *winner != spend.origin_pubkey) {
-            spdlog::warn("[token-link] link token generation {} was also redeemed by server "
-                         "{}; that redemption counts", spend.generation, winner->substr(0, 12));
-            return std::nullopt;
-        }
-    }
+    if (publisher) (void)publisher(spend);
 
     spdlog::info("[token-link] Consumed link token for group {}", record.group_node_id);
     return record;

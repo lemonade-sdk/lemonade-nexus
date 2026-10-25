@@ -114,6 +114,7 @@ TEST(MeshRekeyPlan, EquivalentKeysAcrossFormatsDoNotRemovePeer) {
 
 #include <filesystem>
 #include <unistd.h>
+#include "support/tree_seed.hpp"
 
 TEST(MeshPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
     namespace fs = std::filesystem;
@@ -135,13 +136,13 @@ TEST(MeshPubkeyOwner, ResolvesTheOwnerAcrossSpellings) {
     nexus::tree::TreeNode root;
     root.id = "root";
     root.type = nexus::tree::NodeType::Root;
-    ASSERT_TRUE(tree.insert_join_node(root));
+    ASSERT_TRUE(test_support::put_node(tree, root));
     nexus::tree::TreeNode node;
     node.id = "owner_node";
     node.parent_id = "root";
     node.type = nexus::tree::NodeType::Endpoint;
     node.mesh_pubkey = prefixed;
-    ASSERT_TRUE(tree.insert_join_node(node));
+    ASSERT_TRUE(test_support::put_node(tree, node));
 
     // The raw X25519 spelling of the same key names the same owner.
     const auto normalized = nexus::api::normalize_mesh_pubkey(prefixed);
@@ -186,7 +187,7 @@ TEST(MeshKeyClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
     nexus::tree::TreeNode root;
     root.id = "root";
     root.type = nexus::tree::NodeType::Root;
-    ASSERT_TRUE(tree.insert_join_node(root));
+    ASSERT_TRUE(test_support::put_node(tree, root));
     // The victim is enrolled (its identity is on its node) but has not yet
     // registered any mesh transport static.
     nexus::tree::TreeNode victim_node;
@@ -194,7 +195,7 @@ TEST(MeshKeyClaimRefusal, IdentityBoundStaticsCannotBeSquatted) {
     victim_node.parent_id = "root";
     victim_node.type = nexus::tree::NodeType::Endpoint;
     victim_node.mgmt_pubkey = victim_id;
-    ASSERT_TRUE(tree.insert_join_node(victim_node));
+    ASSERT_TRUE(test_support::put_node(tree, victim_node));
 
     const std::string victim_bound = nexus::api::identity_mesh_pubkey(victim_id);
     ASSERT_FALSE(victim_bound.empty());

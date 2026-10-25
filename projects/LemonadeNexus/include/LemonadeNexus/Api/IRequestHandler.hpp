@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 // Forward declarations — handlers only need references
@@ -87,18 +88,28 @@ struct ApiContext {
     std::string                       server_private_fqdn;  // private.<id>.<region>.seip.<domain>
     std::string                       server_public_ip;
     std::string                       tunnel_bind_ip;
-    /// Tree-operation submitter (not owned). Required when
-    /// config.tree_ops_enabled; the tree write routes then answer 500 without
-    /// it instead of falling back to the direct write paths. Unused otherwise.
+    /// Tree-operation submitter (not owned): the only tree write path. The
+    /// tree write routes answer 500 without it.
     tree::TreeOpSubmitter*            tree_ops{nullptr};
     /// Answers GET /api/tree/op/{op_id} with a submitted op's status. Set with
     /// a consensus submitter (TreeConsensus::status); unset, the route answers
     /// 404 for every op id.
     std::function<std::optional<tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     /// Answers GET /api/tree/sync with the tree log and its replication
-    /// state. Set when the tree log runs (read-only or ops mode); unset, the
-    /// route answers 404.
+    /// state. Unset, the route answers 404.
     std::function<nlohmann::json()>   tree_log_status;
+    /// POST /api/tree/merge/export: the status and body that answer a tree
+    /// export request signed by the root management key (TreeMerge.hpp,
+    /// verify_tree_export_request). 200 carries this server's signed export;
+    /// a server that does not await the merge answers 409. Thread-safe.
+    /// Unset, the route answers 404.
+    std::function<std::pair<int, nlohmann::json>(const nlohmann::json&)> tree_merge_export;
+    /// POST /api/tree/merge/commit: the status and body after the signed tree
+    /// merge commit in the request went through the replication checks
+    /// (TreeConsensus::receive_replicated). The sender is not trusted; only
+    /// the root management key's signature gives the commit authority.
+    /// Thread-safe. Unset, the route answers 404.
+    std::function<std::pair<int, nlohmann::json>(const nlohmann::json&)> tree_merge_commit;
     /// Files under the data key (Phase 7), or nullptr. Not owned. The admin
     /// storage routes answer 404 without it. In the assembled server it is
     /// always set; nullptr is the state for handlers built without a vault.

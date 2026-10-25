@@ -10,7 +10,7 @@
 // committed op ids. Neither reads a clock or any local observation, so every
 // machine that holds the same inputs reaches the same result.
 //
-// Behind ServerConfig::tree_ops_enabled, Tier 1 servers order ops through
+// Tier 1 servers order ops through
 // consensus (TreeBatch.hpp, TreeChain.hpp, TreeLog.hpp) and apply an op only
 // after the block that carries it commits. Every op is wrapped and signed by
 // the server that received the request ("submitter"); the end-user authority
@@ -377,7 +377,7 @@ void apply_effect(TreeState::NodeMap& nodes, const TreeOpEffect& effect);
 
 // --- Deterministic tunnel addresses ------------------------------------------
 //
-// With tree operations on, endpoint tunnel addresses come from the tree, not
+// Endpoint tunnel addresses come from the tree, not
 // from a per-server IPAM file. The tunnel pool is 10.64.0.0/10. Offsets below
 // kTreeTunnelFirstOffset (10.64.0.0/16) stay with IPAMService, which allocates
 // server addresses and /api/ipam/allocate requests sequentially from the

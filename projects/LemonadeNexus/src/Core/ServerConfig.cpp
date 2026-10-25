@@ -3,12 +3,14 @@
 
 #include <spdlog/spdlog.h>
 
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <system_error>
 #include <fstream>
 #include <set>
+#include <string_view>
 #include <utility>
 
 namespace nexus::core {
@@ -33,6 +35,18 @@ void read_env_bool(const char* name, bool& target, bool on_invalid) {
                   "using {}",
                   name, value, on_invalid ? "true" : "false");
     target = on_invalid;
+}
+
+// Settings of removed features. Tree operations always run, so the switches
+// that once turned them on are accepted and ignored: a configuration that
+// still names them must not stop a server from starting.
+constexpr std::array<const char*, 2> kRetiredConfigKeys = {"tree_ops_enabled", "tree_log_enabled"};
+constexpr std::array<const char*, 2> kRetiredEnvironment = {"SP_TREE_OPS", "SP_TREE_LOG"};
+
+void warn_retired_setting(std::string_view name) {
+    spdlog::warn("Config: '{}' no longer exists and is ignored; tree operations through "
+                 "Tier 1 consensus always run",
+                 name);
 }
 }
 
@@ -126,8 +140,6 @@ void from_json(const json& j, ServerConfig& c) {
     if (j.contains("ddns_update_interval_sec"))   j.at("ddns_update_interval_sec").get_to(c.ddns_update_interval_sec);
     if (j.contains("ddns_enabled"))               j.at("ddns_enabled").get_to(c.ddns_enabled);
     if (j.contains("open_registration"))          j.at("open_registration").get_to(c.open_registration);
-    if (j.contains("tree_ops_enabled"))           j.at("tree_ops_enabled").get_to(c.tree_ops_enabled);
-    if (j.contains("tree_log_enabled"))           j.at("tree_log_enabled").get_to(c.tree_log_enabled);
     if (j.contains("private_http_port"))          j.at("private_http_port").get_to(c.private_http_port);
     if (j.contains("onboard_enabled"))           j.at("onboard_enabled").get_to(c.onboard_enabled);
     if (j.contains("onboard_request_ttl_sec"))   j.at("onboard_request_ttl_sec").get_to(c.onboard_request_ttl_sec);
@@ -193,8 +205,6 @@ void print_usage(const char* prog) {
     spdlog::info("  --acme-eab-kid <kid>       ZeroSSL EAB Key ID");
     spdlog::info("  --acme-eab-hmac-key <key>  ZeroSSL EAB HMAC key (base64url)");
     spdlog::info("  --closed-registration      New identities must present a device link token to join");
-    spdlog::info("  --tree-ops                 Experimental: order tree writes through Tier 1 consensus and replicate the tree log");
-    spdlog::info("  --tree-log                 Experimental: build and replicate the tree log read-only; tree writes stay direct");
     spdlog::info("  --sign-tree-merge <preimage> <out>  Root holder: sign a tree merge preimage and exit");
     spdlog::info("  --install-tree-merge <commit.json>  Verify a signed tree merge commit and write it as tree log height 1, then exit");
     spdlog::info("  --region <code>            Cloud region (e.g. us-east, eu-west; auto-detected if omitted)");
@@ -235,6 +245,11 @@ ServerConfig load_config(int argc, char* argv[]) {
         try {
             std::ifstream f(config_path);
             auto j = json::parse(f);
+            if (j.is_object()) {
+                for (const char* key : kRetiredConfigKeys) {
+                    if (j.contains(key)) warn_retired_setting(key);
+                }
+            }
             auto loaded = j.get<ServerConfig>();
             loaded.tier1_authority_contract = config.tier1_authority_contract;
             loaded.tier1_contract_error = config.tier1_contract_error;
@@ -368,10 +383,9 @@ ServerConfig load_config(int argc, char* argv[]) {
             config.acme_eab_hmac_key = argv[++i];
         } else if (std::strcmp(argv[i], "--closed-registration") == 0) {
             config.open_registration = false;
-        } else if (std::strcmp(argv[i], "--tree-ops") == 0) {
-            config.tree_ops_enabled = true;
-        } else if (std::strcmp(argv[i], "--tree-log") == 0) {
-            config.tree_log_enabled = true;
+        } else if (std::strcmp(argv[i], "--tree-ops") == 0 ||
+                   std::strcmp(argv[i], "--tree-log") == 0) {
+            warn_retired_setting(argv[i]);
         } else if (std::strcmp(argv[i], "--sign-tree-merge") == 0 && i + 2 < argc) {
             config.sign_tree_merge_preimage = argv[++i];
             config.sign_tree_merge_out      = argv[++i];
@@ -452,8 +466,9 @@ ServerConfig load_config(int argc, char* argv[]) {
         read_env_bool("SP_CLOSED_REGISTRATION", closed, true);
         config.open_registration = !closed;
     }
-    read_env_bool("SP_TREE_OPS", config.tree_ops_enabled, false);
-    read_env_bool("SP_TREE_LOG", config.tree_log_enabled, false);
+    for (const char* name : kRetiredEnvironment) {
+        if (std::getenv(name) != nullptr) warn_retired_setting(name);
+    }
 
     if (const char* v = std::getenv("SP_SEED_PEERS")) {
         // Comma-separated list

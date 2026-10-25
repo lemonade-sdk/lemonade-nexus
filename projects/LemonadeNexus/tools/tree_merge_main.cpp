@@ -1,4 +1,9 @@
-// nexus-tree-merge: the tooling of the tree merge ceremony (design A9).
+// nexus-tree-merge: offline tree merge tooling for test data (design A9).
+//
+// A live mesh migrates with scripts/nexus-tree-migrate instead: its files are
+// encrypted under each server's data key, which only the running server
+// holds (docs/Tree-Merge-Ceremony.md). This tool reads plaintext data
+// directories only.
 //
 //   nexus-tree-merge export   --data-root <dir> --server <label> [--root-server]
 //                             --out <export.json>
@@ -117,22 +122,8 @@ int run_export(const Args& args) {
     nexus::ipam::IPAMService ipam{storage};
     ipam.start();
 
-    tree::TreeExport exported;
-    exported.server = server->second;
-    exported.root_server = args.contains("--root-server");
-    for (auto& [id, node] : tree_svc.nodes_snapshot()) {
-        if (node.type == tree::NodeType::Endpoint && !node.tunnel_ip.empty()) {
-            const auto allocation = ipam.get_allocation(id);
-            if (allocation && allocation->tunnel &&
-                allocation->tunnel->base_network == node.tunnel_ip) {
-                exported.joined_here.insert(id);
-            }
-        }
-        exported.nodes.push_back(std::move(node));
-    }
-    for (const auto& delta : storage.read_deltas_since(0)) {
-        if (delta.operation == "create_node") exported.created_here.insert(delta.target_node_id);
-    }
+    const auto exported = tree::collect_tree_export(server->second, args.contains("--root-server"),
+                                                    tree_svc.nodes_snapshot(), ipam, storage);
     if (!write_file(out->second, tree::tree_export_to_json(exported).dump(2))) {
         return fail("cannot write " + out->second);
     }
@@ -187,9 +178,7 @@ int run_merge(const Args& args) {
     }
 
     const auto result = tree::merge_tree_exports(exports, resolutions);
-    const json report{{"conflicts", tree::merge_conflicts_to_json(result.conflicts)},
-                      {"decisions", result.decisions},
-                      {"node_count", result.nodes.size()}};
+    const json report = tree::merge_report(exports, result);
     if (const auto r = args.find("--report"); r != args.end()) {
         if (!write_file(r->second, report.dump(2))) return fail("cannot write " + r->second);
     }
@@ -199,8 +188,12 @@ int run_merge(const Args& args) {
         std::printf("CONFLICT %-24s %-26s %s [%s]\n", c.node_id.c_str(), c.kind.c_str(),
                     c.detail.c_str(), servers.c_str());
     }
+    for (const auto& d : result.dropped) {
+        std::printf("DROPPED  %-24s %-26s %s\n", d.node_id.c_str(), d.reason.c_str(),
+                    d.detail.c_str());
+    }
     if (!result.conflicts.empty()) {
-        std::printf("%zu conflict(s). Add resolutions to the spec and run merge again.\n",
+        std::printf("%zu conflict(s). Fix the exports or the resolutions and run merge again.\n",
                     result.conflicts.size());
         return 2;
     }
@@ -211,8 +204,8 @@ int run_merge(const Args& args) {
                     tree::merge_preimage(*entry, network_id, result.nodes.size()))) {
         return fail("cannot write the merge output");
     }
-    std::printf("merged %zu nodes from %zu exports; no conflicts\n", result.nodes.size(),
-                exports.size());
+    std::printf("merged %zu nodes from %zu exports; %zu dropped\n", result.nodes.size(),
+                exports.size(), result.dropped.size());
     std::printf("state root (height 1): %s\n",
                 nexus::crypto::to_base64(entry->state_root).c_str());
     std::printf("sign %s with: lemonade-nexus --sign-tree-merge %s <signature-out>\n",

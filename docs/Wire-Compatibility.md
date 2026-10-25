@@ -85,15 +85,35 @@ the old binary as an invalid baseline.
   (`link_tokens/<sha256>.json`) an earlier release wrote. The new files
   (`link_tokens/ledger.json`, `link_replica/replica.json`) are storage-vault
   files; an earlier release does not read them.
-- **Tree op link extension.** With tree operations on, a `Join` with a link
-  token and an `AcceptInvite` from N+1 append a link extension to the
-  canonical op encoding. An op without it encodes exactly as before, and N+1
+- **Tree op link extension.** A `Join` with a link token and an
+  `AcceptInvite` from N+1 append a link extension to the canonical op
+  encoding. An op without it encodes exactly as before, and N+1
   applies such an op with the earlier rules, so ops from N stay valid and give
   the same tree on N and N+1. A release from before the extension refuses an
   op that carries it (trailing bytes), so it cannot vote for a block with
-  one. With tree operations on, upgrade every Tier 1 server before clients
-  redeem invites. Tree operations are off by default; the direct-write mode
-  needs no such step.
+  one. Upgrade every Tier 1 server before clients redeem invites.
+
+## Tree operations always on
+
+The release that removed `tree_ops_enabled` and `tree_log_enabled` runs tree
+operations on every server. During its rolling update, old and new releases
+run side by side:
+
+- A new server that holds a tree from an earlier release awaits the one-time
+  merge commit ([Tree Merge Ceremony](Tree-Merge-Ceremony)). It serves its
+  tree for reads, answers tree writes with `503` and `Retry-After`, proposes
+  no tree block, and votes for none. An old server keeps its direct writes
+  until it is updated; those writes are in its tree when the merge collects
+  the exports.
+- No tree block can commit before the merge: it needs the votes of a quorum
+  of Tier 1, and an awaiting server gives none. An old release registers no
+  tree payload handler, so it withholds its vote from every block that
+  carries a tree batch.
+- The record transfer messages of the old release (`Digest`, `DeltaRequest`,
+  `DeltaResponse`) are dropped by the new release, which never applies them.
+- The merge runs only after every server runs the new release: an old server
+  has no `POST /api/tree/merge/export` route, and the merge refuses to build
+  without an export from every current Tier 1 member.
 
 ## A new block payload kind
 

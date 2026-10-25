@@ -70,9 +70,8 @@ bool AuthService::refund_link_token(std::string_view token, const LinkTokenRecor
 }
 
 void AuthService::set_link_token_replication(TokenLinkAuthProvider::EventSigner signer,
-                                             TokenLinkAuthProvider::EventPublisher publisher,
-                                             std::chrono::milliseconds settle_window) {
-    token_link_provider_.set_replication(std::move(signer), std::move(publisher), settle_window);
+                                             TokenLinkAuthProvider::EventPublisher publisher) {
+    token_link_provider_.set_replication(std::move(signer), std::move(publisher));
 }
 
 bool AuthService::apply_replicated_link_token(const LinkTokenEvent& event) {

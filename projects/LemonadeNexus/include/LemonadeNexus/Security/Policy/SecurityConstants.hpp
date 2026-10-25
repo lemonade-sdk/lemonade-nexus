@@ -210,7 +210,7 @@ inline constexpr std::size_t kMaxQcSignatures = kMaxActiveTier1;
 //
 // The optional block payload at the end of a proposal and the TreeOpSubmit
 // message are additions, not layout changes: a message without them keeps its
-// v3 bytes, and only a node with tree operations on sends them. The
+// v3 bytes. A release from before tree operations does not send them. The
 // storage-key messages (kinds 32 to 37) and the StorageUnlock attestation
 // purpose are additions of the same sort. The storage key runs on every
 // server, so every server sends them; a peer without them drops the kinds it

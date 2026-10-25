@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include "support/tree_seed.hpp"
 #ifdef _WIN32
 #  include <process.h>
 #  define getpid _getpid
@@ -338,7 +339,7 @@ TEST_F(TreeOpsTest, DeleteNodeFromDeltaApplies) {
 }
 
 // A group admin removes a device it holds no entry on through the API (a
-// session op), as with tree operations off. A signed delta keeps the stricter
+// session op). A signed delta keeps the stricter
 // rule: delete_node on the node itself.
 TEST_F(TreeOpsTest, GroupAdminRemovesDevicesThroughTheApiOnly) {
     auto owner = crypto_svc->ed25519_keygen();
@@ -772,18 +773,6 @@ TEST_F(TreeOpsTest, VersionsPersistAcrossRestart) {
     EXPECT_EQ(version_of("root"), 0u);
 }
 
-TEST_F(TreeOpsTest, DirectPathsDoNotAdvanceVersions) {
-    // The flag-off write paths keep their behavior: no version bookkeeping.
-    ASSERT_TRUE(tree_svc->insert_join_node(customer("acme", root_pk)));
-    ASSERT_TRUE(tree_svc->grant_assignment("acme", {principal_of(stranger_kp), {"read"}}));
-    auto node = *tree_svc->get_node("acme");
-    node.hostname = "direct";
-    ASSERT_TRUE(tree_svc->update_node_direct("acme", node));
-    EXPECT_EQ(version_of("acme"), 0u);
-    nlohmann::json j = *tree_svc->get_node("acme");
-    EXPECT_FALSE(j.contains("version"));
-}
-
 // =========================================================================
 // Server-assigned addresses and the relay type
 // =========================================================================
@@ -1175,7 +1164,7 @@ TEST_F(TreeMembershipTest, DeleteRightAloneDoesNotTakeOverASubgroup) {
     ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"add_child", "read"}))).ok());
     auto sub = *tree_svc->get_node("alpha-sub1");
     sub.assignments.push_back({pb, {"delete_node"}});
-    ASSERT_TRUE(tree_svc->update_node_direct("alpha-sub1", sub));
+    ASSERT_TRUE(test_support::put_node(*tree_svc, sub));
     EXPECT_EQ(run(next(move_op("alpha-sub1", "beta", pb))).refusal, TreeOpRefusal::Forbidden);
     // B may move its own device into alpha, where it holds add_child. The
     // device gains no reach to alpha's devices by that.
@@ -1204,34 +1193,6 @@ TEST_F(TreeMembershipTest, NewOpKindsRoundTripAndApplyIdentically) {
     both(next(move_op("alpha-dev2", "alpha-sub1", pa)));
     both(next(move_op("alpha-sub1", "alpha-sub2", pa)));
     EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
-    tree_b.stop();
-    storage_b->stop();
-}
-
-TEST_F(TreeMembershipTest, DirectPathsApplyTheSamePlanAsTreeOps) {
-    auto storage_b = make_storage("b3");
-    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
-    tree_b.start();
-    build(tree_b);
-
-    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
-    ASSERT_TRUE(run(next(move_op("alpha-dev2", "alpha-sub1", pa))).ok());
-    std::string reason;
-    using Change = tree::PermissionTreeService::AssignmentChange;
-    EXPECT_EQ(tree_b.accept_invite("alpha", pb, pa, {"connect_private", "read"}, reason),
-              Change::Applied)
-        << reason;
-    EXPECT_EQ(tree_b.move_node("alpha-dev2", "alpha-sub1", pa, reason), Change::Applied) << reason;
-    for (const auto* id : {"alpha", "alpha-dev", "alpha-dev2", "alpha-sub1"}) {
-        auto a = *tree_svc->get_node(id);
-        auto b = *tree_b.get_node(id);
-        a.version = 0;
-        b.version = 0;
-        EXPECT_EQ(nlohmann::json(a).dump(), nlohmann::json(b).dump()) << id;
-    }
-    // The direct paths refuse what the ops refuse.
-    EXPECT_EQ(tree_b.accept_invite("alpha", pb2, pa, {"admin", "read"}, reason), Change::Invalid);
-    EXPECT_EQ(tree_b.move_node("beta", "alpha", root_pk, reason), Change::Forbidden);
     tree_b.stop();
     storage_b->stop();
 }
@@ -1400,46 +1361,6 @@ TEST_F(TreeAccountDeletionTest, ReplicasApplyTheSameDeletion) {
     both(next(accept_op("beta", pa, pb, {"add_child", "read"})));
     both(next(account_op(pb)));
     EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
-    tree_b.stop();
-    storage_b->stop();
-}
-
-TEST_F(TreeAccountDeletionTest, TheDirectPathMatchesTheOperation) {
-    auto storage_b = make_storage("acct-direct");
-    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
-    tree_b.start();
-    build(tree_b);
-    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
-    std::string reason;
-    using Change = tree::PermissionTreeService::AssignmentChange;
-    ASSERT_EQ(tree_b.accept_invite("alpha", pb, pa, {"connect_private", "read"}, reason),
-              Change::Applied);
-
-    std::vector<std::string> hooked;
-    tree_b.set_removed_nodes_hook([&](const std::vector<tree::TreeNode>& removed) {
-        for (const auto& n : removed) hooked.push_back(n.id);
-    });
-    ASSERT_TRUE(run(next(account_op(pb))).ok());
-    tree::AccountDeletion out;
-    ASSERT_TRUE(tree_b.delete_account(pb, out, reason)) << reason;
-    tree_b.set_removed_nodes_hook({});
-
-    std::sort(hooked.begin(), hooked.end());
-    EXPECT_EQ(hooked, (std::vector<std::string>{"beta", "beta-dev", "beta-dev2"}));
-    EXPECT_EQ(out.removed.size(), 3u);
-    auto a_nodes = tree_svc->nodes_snapshot();
-    auto b_nodes = tree_b.nodes_snapshot();
-    ASSERT_EQ(a_nodes.size(), b_nodes.size());
-    for (auto& [id, n] : a_nodes) {
-        ASSERT_TRUE(b_nodes.contains(id)) << id;
-        n.version = 0;
-        b_nodes[id].version = 0;
-        EXPECT_EQ(nlohmann::json(n).dump(), nlohmann::json(b_nodes[id]).dump()) << id;
-    }
-    // The direct path is idempotent as well.
-    ASSERT_TRUE(tree_b.delete_account(pb, out, reason)) << reason;
-    EXPECT_TRUE(out.removed.empty());
-    EXPECT_FALSE(tree_b.delete_account("not-a-key", out, reason));
     tree_b.stop();
     storage_b->stop();
 }

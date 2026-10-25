@@ -31,8 +31,7 @@ struct TreeOpSubmission {
     std::shared_ptr<TreeOpTicket> ticket;
 };
 
-/// Turns a request handler's unsigned TreeOp into a signed one and submits it
-/// (ServerConfig::tree_ops_enabled).
+/// Turns a request handler's unsigned TreeOp into a signed one and submits it.
 ///
 /// seal() binds the op to this server's network, sets the signed time, draws a
 /// fresh nonce, and signs with this server's key. The submission then goes one

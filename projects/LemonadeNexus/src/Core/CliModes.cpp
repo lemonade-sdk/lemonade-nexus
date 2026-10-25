@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Core/CliModes.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Core/BootSet.hpp>
 
 #include <LemonadeNexus/Core/AdmissionTokenStore.hpp>
@@ -417,10 +418,26 @@ std::optional<security::NetworkId> configured_network_id(const ServerConfig& con
                                        security::constants::kConsensusRulesetVersion);
 }
 
+/// True, after logging why, when the data directory's files are under the
+/// data key: an offline command cannot read or write them. The running server
+/// does those steps (scripts/nexus-tree-migrate).
+bool refuse_encrypted_data(const ServerConfig& config, const char* command) {
+    const auto mode = security::StorageVault::recorded_mode(
+        std::filesystem::path(config.data_root) / "security" / "storage");
+    if (!mode || *mode == security::VaultMode::Plaintext) return false;
+    spdlog::error("Cannot {}: the files in {} are encrypted under the data key, which only the "
+                  "running server holds. Use scripts/nexus-tree-migrate on the root server "
+                  "(docs/Tree-Merge-Ceremony.md).",
+                  command, config.data_root);
+    return true;
+}
+
 int run_sign_tree_merge(const ServerConfig& config) {
     // The root management key signs the merged tree offline (design A9). The
     // command signs only a canonical merge preimage for this network, so the
-    // key cannot be pointed at other bytes through this path.
+    // key cannot be pointed at other bytes through this path. Test data only:
+    // an encrypted data directory is refused.
+    if (refuse_encrypted_data(config, "sign")) return 1;
     const auto network_id = configured_network_id(config);
     if (config.root_pubkey.empty() || !network_id) {
         spdlog::error("Cannot sign: root_pubkey and genesis_pubkey must be configured");
@@ -482,7 +499,10 @@ int run_sign_tree_merge(const ServerConfig& config) {
 int run_install_tree_merge(const ServerConfig& config) {
     // Run with the server stopped: the tree log belongs to the running
     // process. Every server verifies the commit against its own configured
-    // anchors here and again when it arrives by replication.
+    // anchors here and again when it arrives by replication. Test data only:
+    // an encrypted data directory is refused, because a plaintext log entry
+    // there would not open.
+    if (refuse_encrypted_data(config, "install")) return 1;
     const auto network_id = configured_network_id(config);
     const auto root_key = root_principal_from_hex(config.root_pubkey);
     if (!network_id || !root_key) {

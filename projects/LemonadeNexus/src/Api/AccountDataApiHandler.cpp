@@ -35,7 +35,7 @@ AccountDataApiHandler::~AccountDataApiHandler() {
 }
 
 // Runs on every server that applies an account deletion (the committed
-// DeleteAccount operation, or the direct write on the server that served it).
+// DeleteAccount operation).
 // The removed-nodes hook already ran the per-node cascade (TreeApiHandler::
 // cascade_node_cleanup). Each step is idempotent, so a repeated deletion
 // changes nothing.

@@ -389,51 +389,13 @@ struct TestSigner {
 
 }  // namespace
 
-// Without consensus, a redemption waits for a concurrent redemption of the
-// same generation on another server. The spend with the smallest origin
-// counts; the other server refuses the token.
-TEST_F(AuthTest, ARedemptionThatLosesTheTieIsRefused) {
-    for (const bool other_is_smaller : {true, false}) {
-        TestSigner self{*crypto, crypto->ed25519_keygen()};
-        TestSigner other{*crypto, crypto->ed25519_keygen()};
-        while ((other.origin() < self.origin()) != other_is_smaller) {
-            other.key = crypto->ed25519_keygen();
-        }
-        // The publisher delivers the other server's spend of the same
-        // generation while this server waits.
-        auth->set_link_token_replication(
-            [&](auth::LinkTokenEvent& e) { return self.sign(e); },
-            [&](const auth::LinkTokenEvent& e) -> std::size_t {
-                if (e.kind == auth::LinkTokenEventKind::Spend) {
-                    auto competing = e;
-                    EXPECT_TRUE(other.sign(competing));
-                    EXPECT_TRUE(auth->apply_replicated_link_token(competing));
-                }
-                return 1;
-            },
-            std::chrono::milliseconds{1});
-        auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
-                                            std::chrono::seconds{600});
-        ASSERT_TRUE(minted.has_value());
-        ASSERT_TRUE(minted->second.grant.has_value());
-        ASSERT_FALSE(minted->second.grant->signature.empty());
-        const auto consumed = auth->consume_link_token(minted->first);
-        EXPECT_EQ(consumed.has_value(), !other_is_smaller);
-        if (consumed) {
-            EXPECT_EQ(consumed->spent_by, self.origin());
-            EXPECT_TRUE(auth->refund_link_token(minted->first, *consumed));
-        }
-    }
-}
-
 // A refund by a server whose spend does not count never revives the token.
 TEST_F(AuthTest, ARefundByTheLosingServerDoesNotRestore) {
     TestSigner self{*crypto, crypto->ed25519_keygen()};
     TestSigner other{*crypto, crypto->ed25519_keygen()};
     while (!(other.origin() < self.origin())) other.key = crypto->ed25519_keygen();
     auth->set_link_token_replication([&](auth::LinkTokenEvent& e) { return self.sign(e); },
-                                     [](const auth::LinkTokenEvent&) -> std::size_t { return 0; },
-                                     std::chrono::milliseconds{0});
+                                     [](const auth::LinkTokenEvent&) -> std::size_t { return 0; });
     auto minted = auth->mint_link_token("owner-user", "ed25519:AAAA", "customer-owner",
                                         std::chrono::seconds{600});
     ASSERT_TRUE(minted.has_value());
