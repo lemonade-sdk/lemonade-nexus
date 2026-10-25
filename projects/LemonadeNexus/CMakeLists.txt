@@ -52,6 +52,11 @@ endif()
 add_executable(nexus-release-bundle tools/release_bundle_main.cpp)
 target_link_libraries(nexus-release-bundle PRIVATE LemonadeNexus)
 
+# The release guard: verifies a rollout proof from Tier 1 finalized state
+# (docs/Releasing.md). Not installed; release.yml runs it before it publishes.
+add_executable(nexus-rollout-check tools/rollout_check_main.cpp)
+target_link_libraries(nexus-rollout-check PRIVATE LemonadeNexus)
+
 # Tree merge ceremony tooling (design A9): export, merge, finalize. Not
 # installed; the operator runs it during the one-time ceremony. No key
 # material is read or written.

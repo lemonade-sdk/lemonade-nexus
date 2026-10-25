@@ -18,12 +18,19 @@ RouteResult delivered() {
     return result;
 }
 
+// The mixed-version gate greps the number; a value inserted before it would
+// silently repeat 14.
+static_assert(static_cast<uint16_t>(DropReason::ServiceRejected) + 1 ==
+              static_cast<uint16_t>(DropReason::WireVersionMismatch));
+
 DropReason from_codec(CodecError error) {
     switch (error) {
         case CodecError::Oversized:
             return DropReason::Oversized;
         case CodecError::UnknownKind:
             return DropReason::UnknownKind;
+        case CodecError::BadVersion:
+            return DropReason::WireVersionMismatch;
         default:
             return DropReason::Malformed;
     }
@@ -508,6 +515,9 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
         case SecurityMessageKind::StoragePlanRequest:
         case SecurityMessageKind::StorageWrapClaim:
             events_.on_storage_message(message);
+            return delivered();
+        case SecurityMessageKind::Upgrade:
+            events_.on_upgrade_message(message);
             return delivered();
     }
     return drop(DropReason::UnknownKind);

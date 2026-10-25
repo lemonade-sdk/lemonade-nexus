@@ -279,6 +279,12 @@ std::vector<SecurityMessage> all_kinds() {
     claim.wraps[1].ephemeral_point.fill(0x49);
     claim.signature = signature(0x4A);
     messages.push_back(envelope(SecurityMessageKind::StorageWrapClaim, claim));
+    messages.push_back(envelope(
+        SecurityMessageKind::Upgrade,
+        UpgradeMsg{UpgradeTopic::Status, std::vector<uint8_t>(169, 0x46), std::nullopt}));
+    messages.push_back(envelope(SecurityMessageKind::Upgrade,
+                                UpgradeMsg{UpgradeTopic::RecordProof,
+                                           std::vector<uint8_t>(200, 0x47), plan_proof.proof}));
 
     return messages;
 }
@@ -301,6 +307,44 @@ TEST(SecurityCodec, EveryKindRoundTrips) {
         EXPECT_EQ(back.sender, message.sender);
         EXPECT_EQ(back.body.index(), message.body.index());
         EXPECT_TRUE(same_wire(back, message));
+    }
+}
+
+TEST(SecurityCodec, UpgradeMessagesRefuseUnknownTopicsAndOversizedBodies) {
+    // A proof travels with RecordProof only, and RecordProof always has one.
+    EXPECT_TRUE(encode_security_message(
+                    envelope(SecurityMessageKind::Upgrade,
+                             UpgradeMsg{UpgradeTopic::Status, {1, 2}, CommitProof{}}))
+                    .empty());
+    EXPECT_TRUE(encode_security_message(
+                    envelope(SecurityMessageKind::Upgrade,
+                             UpgradeMsg{UpgradeTopic::RecordProof, {1, 2}, std::nullopt}))
+                    .empty());
+    EXPECT_TRUE(encode_security_message(
+                    envelope(SecurityMessageKind::Upgrade,
+                             UpgradeMsg{
+                                 UpgradeTopic::ApprovalOffer,
+                                 std::vector<uint8_t>(constants::kMaxUpgradeMessageBytes + 1),
+                                 std::nullopt}))
+                    .empty());
+    auto bytes = encode_security_message(envelope(
+        SecurityMessageKind::Upgrade, UpgradeMsg{UpgradeTopic::Status, {1, 2, 3}, std::nullopt}));
+    ASSERT_FALSE(bytes.empty());
+    // The topic is the first body byte, after the fixed envelope header; find
+    // it by re-encoding with a known topic and comparing.
+    auto other = encode_security_message(envelope(
+        SecurityMessageKind::Upgrade,
+        UpgradeMsg{UpgradeTopic::Observation, {1, 2, 3}, std::nullopt}));
+    ASSERT_EQ(bytes.size(), other.size());
+    std::size_t topic_at = 0;
+    while (topic_at < bytes.size() && bytes[topic_at] == other[topic_at]) ++topic_at;
+    ASSERT_LT(topic_at, bytes.size());
+    for (const uint8_t topic : {uint8_t{0}, uint8_t{6}, uint8_t{255}}) {
+        auto bad = bytes;
+        bad[topic_at] = topic;
+        const auto decoded = decode_security_message(bad);
+        ASSERT_TRUE(std::holds_alternative<CodecError>(decoded)) << int(topic);
+        EXPECT_EQ(std::get<CodecError>(decoded), CodecError::BadValue) << int(topic);
     }
 }
 

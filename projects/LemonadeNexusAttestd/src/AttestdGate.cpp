@@ -117,7 +117,8 @@ Refusal check_challenge(const security::AttestationChallenge& challenge) {
     // attempt and no selected set — it is a replayable blank cheque. A
     // storage-unlock attestation without a context binds no request.
     if ((challenge.purpose == security::AttestationPurpose::FinalEpochReadiness ||
-         challenge.purpose == security::AttestationPurpose::StorageUnlock) &&
+         challenge.purpose == security::AttestationPurpose::StorageUnlock ||
+         challenge.purpose == security::AttestationPurpose::UpgradeHealth) &&
         all_zero(challenge.context_digest)) {
         return Refusal::ContextUnbound;
     }

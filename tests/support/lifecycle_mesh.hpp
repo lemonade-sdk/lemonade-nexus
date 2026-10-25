@@ -68,6 +68,8 @@ struct MemoryMesh {
     std::vector<std::pair<NodeId, AttestationChallenge>> captured_final_challenges;
     /// Storage-unlock challenges in flight, with their challenger (a holder).
     std::vector<std::pair<NodeId, AttestationChallenge>> captured_storage_challenges;
+    /// Upgrade-health challenges in flight, with their challenger (a witness).
+    std::vector<std::pair<NodeId, AttestationChallenge>> captured_upgrade_challenges;
     /// Drops one delivery when it returns true: a per-message transport fault
     /// (for example, one holder's storage packages never arriving).
     std::function<bool(const Queued&, const SecurityMessage&)> drop_if;
@@ -202,6 +204,9 @@ struct EventsProxy : ISecurityEvents {
     void on_storage_message(const SecurityMessage& m) override {
         if (target) target->on_storage_message(m);
     }
+    void on_upgrade_message(const SecurityMessage& m) override {
+        if (target) target->on_upgrade_message(m);
+    }
 };
 
 struct Node {
@@ -211,6 +216,9 @@ struct Node {
     /// Release approval claimed at the next build_node/restart_node; zero means
     /// no packaged approval.
     Digest release_approval_digest{};
+    /// The driver's release_commitment at the next build_node/restart_node;
+    /// unset keeps the equality rule.
+    std::function<bool(const Digest&)> release_commitment;
     // The wrapping stack persists the epoch vote key at rest, so a restarted
     // node can resume voting after its certified sync.
     std::unique_ptr<nexus::crypto::SodiumCryptoService> crypto;
@@ -243,6 +251,8 @@ inline void MemoryMesh::capture(std::span<const uint8_t> bytes) {
             captured_final_challenges.emplace_back(message.sender, *challenge);
         } else if (challenge->purpose == AttestationPurpose::StorageUnlock) {
             captured_storage_challenges.emplace_back(message.sender, *challenge);
+        } else if (challenge->purpose == AttestationPurpose::UpgradeHealth) {
+            captured_upgrade_challenges.emplace_back(message.sender, *challenge);
         }
     } else if (const auto* plan = std::get_if<NextEpochPlanProof>(&message.body)) {
         captured_plans.push_back(*plan);
@@ -472,6 +482,7 @@ struct DriverMeshBase : ::testing::Test {
         driver_config.identity = node.identity;
         driver_config.genesis_public_key = genesis_node->identity.public_key;
         driver_config.release_approval_digest = node.release_approval_digest;
+        driver_config.release_commitment = node.release_commitment;
         // Stands in for the gossip layer's root-signature check.
         driver_config.certificate_source = [this, self = node.id](const NodeId& peer) {
             const auto view = mesh.uncertified_for.find(self);

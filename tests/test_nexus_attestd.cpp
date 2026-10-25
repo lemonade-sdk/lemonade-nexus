@@ -196,6 +196,15 @@ TEST(AttestdGate, RefusesStorageUnlockWithNoContext) {
     EXPECT_EQ(check_challenge(c), Refusal::None);
 }
 
+TEST(AttestdGate, RefusesUpgradeHealthWithNoContext) {
+    auto c = good_challenge();
+    c.purpose = AttestationPurpose::UpgradeHealth;
+    c.context_digest.fill(0);
+    EXPECT_EQ(check_challenge(c), Refusal::ContextUnbound);
+    c.context_digest = patterned<32>(0x52);
+    EXPECT_EQ(check_challenge(c), Refusal::None);
+}
+
 TEST(AttestdGate, RefusesFinalReadinessWithNoContext) {
     auto c = good_challenge();
     c.purpose = AttestationPurpose::FinalEpochReadiness;
@@ -333,11 +342,19 @@ TEST(AttestdCodec, RefusesAWrongWidthOrWrongTypeField) {
 }
 
 TEST(AttestdCodec, RefusesAnUnknownPurpose) {
-    for (const int purpose : {0, 5, 65535}) {
+    for (const int purpose : {0, 6, 65535}) {
         auto request = good_request();
         request["purpose"] = purpose;
         EXPECT_FALSE(decode_challenge(request.dump()).has_value()) << purpose;
     }
+}
+
+TEST(AttestdCodec, AcceptsTheUpgradeHealthPurpose) {
+    auto request = good_request();
+    request["purpose"] = static_cast<int>(AttestationPurpose::UpgradeHealth);
+    const auto decoded = decode_challenge(request.dump());
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->purpose, AttestationPurpose::UpgradeHealth);
 }
 
 TEST(AttestdCodec, AcceptsTheStorageUnlockPurpose) {

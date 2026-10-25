@@ -94,6 +94,10 @@ struct ApiContext {
     /// storage routes answer 404 without it. In the assembled server it is
     /// always set; nullptr is the state for handlers built without a vault.
     security::StorageVault*           storage_vault{nullptr};
+    /// Answers GET /api/upgrade/rollout-proof with this server's rollout
+    /// proof (Security/Upgrade/RolloutProof.hpp), or nullopt when it holds
+    /// none. Public, self-verifying data; unset, the route answers 404.
+    std::function<std::optional<std::string>()> rollout_proof;
 };
 
 // ---------------------------------------------------------------------------

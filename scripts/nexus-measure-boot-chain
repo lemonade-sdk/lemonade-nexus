@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#
+# nexus-measure-boot-chain: read PCR 8 and PCR 9 (SHA-256 bank) of the
+# running boot and print them in the release/fleet-profile.json form.
+#
+# This is the measurement hook of the release workflow. A GitHub-hosted
+# runner has no SEV-SNP guest, no SVSM vTPM, and not the fleet's GRUB and
+# kernel, so it cannot produce these values. Run this on the reference VM
+# after it boots the package set in release/os-packages.lock, then copy the
+# values into release/fleet-profile.json in a reviewed pull request. The
+# release workflow runs it only on a runner that has the label in the
+# repository variable REFERENCE_VM_RUNNER, and then compares its output with
+# the profile.
+#
+#   nexus-measure-boot-chain [--compare release/fleet-profile.json]
+#
+# Exit status: 0 on success (and a match, with --compare), 1 otherwise.
+
+set -euo pipefail
+
+read_pcr() {
+    local index="$1" sysfs="/sys/class/tpm/tpm0/pcr-sha256/$1"
+    if [ -r "$sysfs" ]; then
+        tr '[:upper:]' '[:lower:]' < "$sysfs"
+        return
+    fi
+    if command -v tpm2_pcrread >/dev/null; then
+        tpm2_pcrread "sha256:$index" | awk -v i="$index" '$1 == i":" { print tolower($2) }' |
+            sed 's/^0x//'
+        return
+    fi
+    echo "nexus-measure-boot-chain: no TPM PCR interface on this host" >&2
+    exit 1
+}
+
+pcr8="$(read_pcr 8)"
+pcr9="$(read_pcr 9)"
+for value in "$pcr8" "$pcr9"; do
+    if ! [[ "$value" =~ ^[0-9a-f]{64}$ ]]; then
+        echo "nexus-measure-boot-chain: unreadable PCR value '$value'" >&2
+        exit 1
+    fi
+done
+
+measured="$(printf '[{"index": 8, "sha256": "%s"}, {"index": 9, "sha256": "%s"}]' "$pcr8" "$pcr9")"
+echo "{\"expected_pcrs\": $measured, \"kernel\": \"$(uname -r)\"}"
+
+if [ "${1:-}" = "--compare" ]; then
+    profile="${2:?--compare needs the profile path}"
+    python3 -I - "$profile" "$pcr8" "$pcr9" <<'EOF'
+import json, sys
+pcrs = json.load(open(sys.argv[1]))["expected_pcrs"]
+want = [{"index": 8, "sha256": sys.argv[2]}, {"index": 9, "sha256": sys.argv[3]}]
+if pcrs != want:
+    print("nexus-measure-boot-chain: the reference VM does not measure the profile's PCR 8/9",
+          file=sys.stderr)
+    sys.exit(1)
+print("PCR 8/9 match release/fleet-profile.json")
+EOF
+fi

@@ -71,6 +71,34 @@ enum class SecurityMessageKind : uint16_t {
     StorageUnlockPartial = 35,
     StoragePlanRequest = 36,
     StorageWrapClaim = 37,
+    /// Release adoption and upgrade-turn traffic (Design-Auto-Update Phases 2
+    /// and 5). One kind with a topic; see UpgradeMsg.
+    Upgrade = 38,
+};
+
+/// The topic of an Upgrade message. Values append only.
+enum class UpgradeTopic : uint8_t {
+    /// A release-approval bundle (JSON), at most kMaxReleaseApprovalBytes.
+    ApprovalOffer = 1,
+    /// A server's signed upgrade status (Security/Upgrade/UpgradeProgress.hpp).
+    Status = 2,
+    /// A Tier 1 witness's signed upgrade-health observation.
+    Observation = 3,
+    /// A finalized upgrade record with the commit proof that finalized it.
+    RecordProof = 4,
+    /// Asks a Tier 1 member for the finalized upgrade records after a sequence
+    /// (body: u64 big-endian).
+    RecordRequest = 5,
+};
+
+/// One Upgrade message. Delivery grants nothing: the upgrade service checks
+/// every signature, proof, and record itself. `proof` is present for
+/// RecordProof only.
+struct UpgradeMsg {
+    UpgradeTopic topic = UpgradeTopic::Status;
+    /// At most constants::kMaxUpgradeMessageBytes.
+    std::vector<uint8_t> body;
+    std::optional<CommitProof> proof;
 };
 
 /// A restarted node asks for quorum-certified state; the answer carries the
@@ -315,7 +343,8 @@ using SecurityBody = std::variant<AttestationChallenge,
                                   StorageUnlockRequestMsg,
                                   StorageUnlockPartialMsg,
                                   StoragePlanRequestMsg,
-                                  StorageWrapClaimMsg>;
+                                  StorageWrapClaimMsg,
+                                  UpgradeMsg>;
 
 struct SecurityMessage {
     SecurityMessageKind kind = SecurityMessageKind::AttestationChallenge;

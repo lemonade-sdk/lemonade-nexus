@@ -79,6 +79,7 @@ template <typename Tag>
         case security::AttestationPurpose::FinalEpochReadiness:
         case security::AttestationPurpose::PlatformEnrollment:
         case security::AttestationPurpose::StorageUnlock:
+        case security::AttestationPurpose::UpgradeHealth:
             out = static_cast<security::AttestationPurpose>(raw);
             return true;
     }

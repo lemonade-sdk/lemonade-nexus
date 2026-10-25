@@ -18,6 +18,22 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
         json_response(res, j);
     });
 
+    // GET /api/upgrade/rollout-proof — the finalized rollout state with the
+    // authority chain that proves it. The release workflow verifies it from
+    // the Genesis key before it publishes; this server is not trusted for it.
+    pub.Get("/api/upgrade/rollout-proof", [this](const httplib::Request&, httplib::Response& res) {
+        if (!ctx_.rollout_proof) {
+            error_response(res, "rollout proofs are not served", 404);
+            return;
+        }
+        const auto proof = ctx_.rollout_proof();
+        if (!proof) {
+            error_response(res, "this server holds no complete rollout proof", 503);
+            return;
+        }
+        res.set_content(*proof, "application/json");
+    });
+
     // GET /api/tls/status — TLS configuration info
     pub.Get("/api/tls/status", [this](const httplib::Request&, httplib::Response& res) {
         nlohmann::json resp = {
