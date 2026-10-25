@@ -1,4 +1,5 @@
 #include <LemonadeNexus/Auth/Ed25519AuthProvider.hpp>
+#include <LemonadeNexus/Auth/AccountDeletionProof.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
@@ -169,36 +170,8 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
     }
 
     // Validate and consume the challenge
-    {
-        std::lock_guard lock(challenge_mutex_);
-        auto it = pending_challenges_.find(challenge_b64);
-        if (it == pending_challenges_.end()) {
-            return AuthResult{
-                .authenticated = false,
-                .error_message = "Unknown or expired challenge"
-            };
-        }
-
-        auto now = now_unix_seconds();
-
-        if (it->second.expires_at <= now) {
-            pending_challenges_.erase(it);
-            return AuthResult{
-                .authenticated = false,
-                .error_message = "Challenge expired"
-            };
-        }
-
-        // Verify the challenge was issued for this pubkey
-        if (it->second.pubkey_b64 != pubkey_b64) {
-            return AuthResult{
-                .authenticated = false,
-                .error_message = "Challenge was not issued for this public key"
-            };
-        }
-
-        // Consume the challenge (one-time use)
-        pending_challenges_.erase(it);
+    if (auto refusal = consume_challenge(challenge_b64, pubkey_b64); !refusal.empty()) {
+        return AuthResult{.authenticated = false, .error_message = std::move(refusal)};
     }
 
     // Decode the challenge and signature
@@ -257,6 +230,68 @@ AuthResult Ed25519AuthProvider::do_authenticate(const json& credentials) {
         .user_id       = user_id,
         .session_token = generate_jwt(user_id, pubkey_b64),
     };
+}
+
+std::string Ed25519AuthProvider::consume_challenge(const std::string& challenge_b64,
+                                                   const std::string& pubkey_b64) {
+    std::lock_guard lock(challenge_mutex_);
+    auto it = pending_challenges_.find(challenge_b64);
+    if (it == pending_challenges_.end()) return "Unknown or expired challenge";
+
+    if (it->second.expires_at <= now_unix_seconds()) {
+        pending_challenges_.erase(it);
+        return "Challenge expired";
+    }
+
+    // Verify the challenge was issued for this pubkey
+    if (it->second.pubkey_b64 != pubkey_b64) {
+        return "Challenge was not issued for this public key";
+    }
+
+    // Consume the challenge (one-time use)
+    pending_challenges_.erase(it);
+    return {};
+}
+
+bool Ed25519AuthProvider::verify_account_delete_proof(const std::string& raw_pubkey_b64,
+                                                      const std::string& challenge_b64,
+                                                      const std::string& signature_b64,
+                                                      std::string& error) {
+    std::vector<uint8_t> pubkey_bytes, challenge_bytes, signature_bytes;
+    try {
+        pubkey_bytes = crypto::from_base64(raw_pubkey_b64);
+        challenge_bytes = crypto::from_base64(challenge_b64);
+        signature_bytes = crypto::from_base64(signature_b64);
+    } catch (const std::exception&) {
+        error = "invalid base64 in the deletion proof";
+        return false;
+    }
+    if (pubkey_bytes.size() != crypto::kEd25519PublicKeySize ||
+        signature_bytes.size() != crypto::kEd25519SignatureSize || challenge_bytes.empty()) {
+        error = "malformed deletion proof";
+        return false;
+    }
+    crypto::Ed25519PublicKey pubkey{};
+    std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), pubkey.begin());
+    const auto pubkey_b64 = crypto::to_base64(std::span<const uint8_t>(pubkey));
+    if (is_pubkey_revoked(pubkey_b64)) {
+        error = "This identity has been revoked";
+        return false;
+    }
+    if (auto refusal = consume_challenge(challenge_b64, pubkey_b64); !refusal.empty()) {
+        error = std::move(refusal);
+        return false;
+    }
+    crypto::Ed25519Signature signature{};
+    std::copy(signature_bytes.begin(), signature_bytes.end(), signature.begin());
+    const auto message = account_delete_proof_message(challenge_bytes, pubkey);
+    if (!crypto_.ed25519_verify(pubkey, std::span<const uint8_t>(message), signature)) {
+        spdlog::warn("[ed25519] account deletion proof does not verify for pubkey {}",
+                     pubkey_b64.substr(0, 16));
+        error = "the deletion proof does not verify";
+        return false;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -324,6 +359,28 @@ bool Ed25519AuthProvider::is_pubkey_revoked(const std::string& pubkey_b64) {
     return !canon.empty() && revoked_pubkeys_.contains(canon);
 }
 
+std::string Ed25519AuthProvider::user_id_of(const std::string& pubkey_b64) const {
+    std::vector<uint8_t> bytes;
+    try {
+        bytes = crypto::from_base64(pubkey_b64);
+    } catch (const std::exception&) {
+        return {};
+    }
+    if (bytes.size() != crypto::kEd25519PublicKeySize) return {};
+    crypto::Ed25519PublicKey pubkey{};
+    std::copy(bytes.begin(), bytes.end(), pubkey.begin());
+    return derive_user_id(pubkey);
+}
+
+bool Ed25519AuthProvider::is_user_revoked(const std::string& user_id) {
+    if (user_id.empty()) return false;
+    if (!cache_loaded_.load(std::memory_order_acquire)) {
+        load_credentials_from_disk();
+    }
+    std::lock_guard lock(cache_mutex_);
+    return revoked_user_ids_.contains(user_id);
+}
+
 bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
     if (pubkey_b64.empty()) return false;
     if (!cache_loaded_.load(std::memory_order_acquire)) {
@@ -335,6 +392,7 @@ bool Ed25519AuthProvider::revoke_pubkey(const std::string& pubkey_b64) {
     const auto canon = crypto::canonical_key_b64(pubkey_b64);
     const auto key = canon.empty() ? pubkey_b64 : canon;
     revoked_pubkeys_.insert(key);
+    if (auto user_id = user_id_of(key); !user_id.empty()) revoked_user_ids_.insert(user_id);
 
     // Scrub the stale identity so a future reader of ed25519_pubkeys[] that
     // forgets the blocklist cannot resurrect a revoked key.
@@ -373,6 +431,7 @@ bool Ed25519AuthProvider::unrevoke_pubkey(const std::string& pubkey_b64) {
         });
     }
     if (revoked_pubkeys_.size() == before) return false;  // nothing was revoked
+    if (const auto user_id = user_id_of(key); !user_id.empty()) revoked_user_ids_.erase(user_id);
 
     if (!persist_revoked_list()) return false;
 
@@ -516,6 +575,9 @@ void Ed25519AuthProvider::load_credentials_from_disk() {
                     auto raw = pk.get<std::string>();
                     auto canon = crypto::canonical_key_b64(raw);
                     revoked_pubkeys_.insert(canon.empty() ? raw : canon);
+                    if (auto user_id = user_id_of(canon); !user_id.empty()) {
+                        revoked_user_ids_.insert(user_id);
+                    }
                 }
             }
         }

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -169,6 +170,14 @@ public:
     /// `cutoff_timestamp`. For a stream whose entries carry their expiry as
     /// the timestamp (link tokens). Returns the number removed.
     std::size_t prune_expired(uint64_t cutoff_timestamp);
+    /// Drop every entry whose key matches `match`, without a tombstone. For
+    /// entries that no server may hold any longer, where every receiver
+    /// refuses the entry on its own (an account deletion, see
+    /// GossipService::forget_account_envelopes). A peer that still holds a
+    /// dropped entry can offer it again; the caller's verification decides.
+    /// Returns the number removed. `match` runs under the replica lock and
+    /// must not call the replica.
+    std::size_t erase_keys(const std::function<bool(const std::string&)>& match);
 
     /// Status of every peer that sent a digest, compared with the current
     /// local state.

@@ -4,10 +4,12 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace nexus::crypto { class SodiumCryptoService; }
 namespace nexus::tree   { class PermissionTreeService; }
@@ -85,6 +87,14 @@ public:
     /// Endpoint device in that group. Ordering is the caller's job. Returns
     /// true when the envelope was written.
     [[nodiscard]] bool apply_replicated_envelope(const gossip::AccountEnvelopeRecord& record);
+
+    /// Delete the stored data of a deleted account on this server: every chat
+    /// blob and group-key envelope of each group in `group_ids`, and the
+    /// envelope addressed to each key in `recipients` in every group the tree
+    /// still holds. Missing files are not an error. Returns the number of
+    /// files deleted.
+    std::size_t purge_account(const std::vector<std::string>& group_ids,
+                              const std::vector<std::string>& recipients);
 
 private:
     // Caller's owning Customer group (Endpoint node's parent); nullopt if the

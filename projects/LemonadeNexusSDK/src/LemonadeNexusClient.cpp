@@ -3,6 +3,7 @@
 #include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 
 #include <LemonadeNexus/Api/TreeRouteGate.hpp>
+#include <LemonadeNexus/Auth/AccountDeletionProof.hpp>
 
 #include <httplib.h>
 #include <spdlog/spdlog.h>
@@ -1053,6 +1054,62 @@ Result<nlohmann::json> LemonadeNexusClient::move_node(const std::string& node_id
     auto resp = impl_->private_http_post("/api/tree/node/move/" + node_id,
                                          json{{"parent_id", new_parent_id}}, status);
     return json_result(resp, status, "move");
+}
+
+Result<nlohmann::json> LemonadeNexusClient::delete_account() {
+    Identity local_identity;
+    {
+        std::lock_guard lock(impl_->mutex);
+        local_identity = impl_->identity;
+    }
+    if (!local_identity.is_valid()) {
+        Result<nlohmann::json> result;
+        result.error = "no identity set — call set_identity() first";
+        return result;
+    }
+
+    // The challenge comes from the session's server over the private API, so
+    // the server that verifies the proof is the one that issued it.
+    int status = 0;
+    auto challenge_resp =
+        impl_->private_http_post("/api/account/delete/challenge", json::object(), status);
+    if (!challenge_resp || status != 200) {
+        return json_result(challenge_resp, status, "account deletion challenge");
+    }
+    const auto challenge_b64 = challenge_resp->value("challenge", std::string{});
+    std::vector<uint8_t> challenge;
+    try {
+        challenge = Identity::from_base64(challenge_b64);
+    } catch (const std::exception&) {
+        challenge.clear();
+    }
+    if (challenge.empty()) {
+        Result<nlohmann::json> result;
+        result.http_status = status;
+        result.error = "server returned an invalid challenge";
+        return result;
+    }
+
+    const auto& pubkey = local_identity.public_key();
+    const auto message = nexus::auth::account_delete_proof_message(
+        challenge, std::span<const uint8_t>(pubkey.data(), pubkey.size()));
+    const auto signature = local_identity.sign(std::span<const uint8_t>(message));
+    const json body = {{"challenge", challenge_b64},
+                       {"signature", Identity::to_base64(std::span<const uint8_t>(signature))}};
+    auto resp = impl_->private_http_post("/api/account/delete", body, status);
+    auto result = json_result(resp, status, "account deletion");
+    if (result.ok && status == 200) {
+        // The account is gone: its key is revoked and its node removed, so
+        // the session and the mesh session end here.
+        disable_mesh();
+        impl_->meshplane.stop();
+        std::lock_guard lock(impl_->mutex);
+        impl_->node_id.clear();
+        impl_->set_token({});
+        spdlog::info("[LemonadeNexusClient] deleted account {}",
+                     result.value.value("account_id", std::string{}));
+    }
+    return result;
 }
 
 StatusResult LemonadeNexusClient::expose_service(uint16_t vport, const std::string& target) {

@@ -201,4 +201,26 @@ inline constexpr std::array<std::string_view, 2> kDefaultInvitePermissions = {
                                                            std::string_view new_parent_id,
                                                            std::string_view signer);
 
+// --- Account deletion ----------------------------------------------------------
+
+/// What deleting the account whose management key is `principal` changes.
+struct AccountScope {
+    /// Ids of the nodes the deletion removes, sorted: every Customer or
+    /// Endpoint node whose management key is the principal (compared by key
+    /// bytes), and every node beneath one of them. This includes devices and
+    /// subgroups that other identities placed in the account's groups. A Root
+    /// node is never in the set, and a Root or Relay node owned by the
+    /// principal does not add its subtree.
+    std::vector<std::string> removed;
+    /// Canonical keys whose assignments the deletion removes from every
+    /// surviving node except a Root node, sorted: the principal, and the
+    /// management key of each removed node that owns no surviving node.
+    std::vector<std::string> swept_keys;
+};
+
+/// The account deletion scope of `principal` in `nodes`. A parent loop never
+/// repeats a node. Deterministic: the result does not depend on the iteration
+/// order of the node map. An empty principal gives an empty scope.
+[[nodiscard]] AccountScope account_scope(const NodeMap& nodes, std::string_view principal);
+
 }  // namespace nexus::tree::rules

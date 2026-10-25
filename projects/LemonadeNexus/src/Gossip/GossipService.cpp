@@ -3954,6 +3954,28 @@ void GossipService::broadcast_account_envelope(AccountEnvelopeRecord record) {
     });
 }
 
+std::size_t GossipService::forget_account_envelopes(const std::vector<std::string>& group_ids,
+                                                    const std::vector<std::string>& recipients) {
+    if (!account_replica_) return 0;
+    // Keys are "keyenv:<group>:<recipient>" (account_envelope_key). A group id
+    // holds no ':', so the first ':' after the prefix ends the group.
+    constexpr std::string_view prefix = "keyenv:";
+    const std::unordered_set<std::string> groups(group_ids.begin(), group_ids.end());
+    const std::unordered_set<std::string> keys(recipients.begin(), recipients.end());
+    const auto dropped = account_replica_->erase_keys([&](const std::string& key) {
+        if (!key.starts_with(prefix)) return false;
+        const auto rest = std::string_view(key).substr(prefix.size());
+        const auto colon = rest.find(':');
+        if (colon == std::string_view::npos) return false;
+        return groups.contains(std::string(rest.substr(0, colon))) ||
+               keys.contains(std::string(rest.substr(colon + 1)));
+    });
+    if (dropped > 0) {
+        spdlog::info("[{}] dropped {} account envelope(s) of a deleted account", name(), dropped);
+    }
+    return dropped;
+}
+
 void GossipService::handle_account_envelope_sync(const asio::ip::udp::endpoint& sender,
                                                  const std::string& sender_pubkey,
                                                  const uint8_t* payload,

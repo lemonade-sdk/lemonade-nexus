@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# One-time setup of the two persistent accounts that the live end-to-end
+# workflow (.github/workflows/live-e2e.yml) uses. See docs/Live-E2E.md.
+#
+# This script creates accounts on the network that DNS discovery finds (by
+# default the production fleet). Run it once, on a trusted computer. It writes
+# each identity to a file with mode 0600 and never prints a private key.
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/live-e2e-setup [options]
+
+Create the persistent owner and member accounts for the live E2E workflow.
+
+Options:
+  --build-dir DIR    Build directory that holds tests/live-e2e/nexus-e2e
+                     (default: build)
+  --out-dir DIR      Directory for the identity files (default: live-e2e-secrets)
+  --domain NAME      DNS base domain (default: lemonade-nexus.io)
+  --region CODE      SEIP region for discovery (default: us-west)
+  --member-invite    Ask for an invite code for the member account. Use this
+                     only when the network has closed registration.
+  --force            Replace identity files that already exist
+  -h, --help         Show this help
+
+Build the client first:
+  cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+  cmake --build build --target nexus-e2e
+EOF
+}
+
+build_dir=build
+out_dir=live-e2e-secrets
+domain=lemonade-nexus.io
+region=us-west
+member_invite=0
+force=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --build-dir) build_dir=${2:?--build-dir needs a value}; shift 2 ;;
+        --out-dir) out_dir=${2:?--out-dir needs a value}; shift 2 ;;
+        --domain) domain=${2:?--domain needs a value}; shift 2 ;;
+        --region) region=${2:?--region needs a value}; shift 2 ;;
+        --member-invite) member_invite=1; shift ;;
+        --force) force=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "live-e2e-setup: unknown option '$1'" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+bin="$build_dir/tests/live-e2e/nexus-e2e"
+if [ ! -x "$bin" ]; then
+    echo "live-e2e-setup: $bin not found. Build it first (see --help)." >&2
+    exit 1
+fi
+"$bin" self-test >/dev/null 2>&1 || {
+    echo "live-e2e-setup: the client self-test failed; fix the build first." >&2
+    exit 1
+}
+
+umask 077
+mkdir -p "$out_dir"
+chmod 700 "$out_dir"
+
+force_arg=()
+[ "$force" -eq 1 ] && force_arg=(--force)
+
+value_of() {  # value_of KEY FILE: one public value from setup-account output
+    sed -n "s/^$1=//p" "$2" | head -n 1
+}
+
+create_account() {  # create_account ROLE
+    local role=$1
+    local identity="$out_dir/$role-identity.json"
+    local account="$out_dir/$role-account.txt"
+    if [ -e "$identity" ] && [ "$force" -ne 1 ]; then
+        echo "live-e2e-setup: $identity exists. Use --force to replace it, or keep it." >&2
+        exit 1
+    fi
+    echo "Creating the $role account ..."
+    if [ "$role" = member ] && [ "$member_invite" -eq 1 ]; then
+        local code
+        # Read without echo; the code goes to the client in the environment,
+        # not in its arguments, so other users cannot see it in the process list.
+        read -rs -p "Invite code for the member account: " code
+        echo
+        NEXUS_E2E_INVITE_CODE="$code" "$bin" setup-account --role "$role" \
+            --identity-out "$identity" --domain "$domain" --region "$region" \
+            ${force_arg[@]+"${force_arg[@]}"} >"$account"
+        code=
+    else
+        "$bin" setup-account --role "$role" --identity-out "$identity" \
+            --domain "$domain" --region "$region" ${force_arg[@]+"${force_arg[@]}"} >"$account"
+    fi
+}
+
+if ! create_account owner; then
+    cat >&2 <<'EOF'
+live-e2e-setup: the owner account was not created. If the error says
+"registration closed", the network does not let a new account create its own
+top-level group, and the owner account needs one (it must administer the CI
+group to remove the member). See docs/Live-E2E.md.
+EOF
+    exit 1
+fi
+create_account member
+
+owner_pubkey=$(value_of public_key "$out_dir/owner-account.txt")
+member_pubkey=$(value_of public_key "$out_dir/member-account.txt")
+owner_group=$(value_of group_id "$out_dir/owner-account.txt")
+member_group=$(value_of group_id "$out_dir/member-account.txt")
+genesis_key=$(value_of genesis_key "$out_dir/owner-account.txt")
+
+cat <<EOF
+
+Both accounts exist.
+
+  Owner account:  $owner_pubkey
+    CI group:     $owner_group
+  Member account: $member_pubkey
+    Home group:   $member_group
+  Genesis key:    $genesis_key
+
+The identity files are private keys. Store them as repository secrets, then
+delete the local copies:
+
+  gh secret set NEXUS_E2E_OWNER_IDENTITY < "$out_dir/owner-identity.json"
+  gh secret set NEXUS_E2E_MEMBER_IDENTITY < "$out_dir/member-identity.json"
+
+Store the public values as repository variables:
+
+  gh variable set NEXUS_E2E_OWNER_PUBKEY --body "$owner_pubkey"
+  gh variable set NEXUS_E2E_MEMBER_PUBKEY --body "$member_pubkey"
+  gh variable set NEXUS_E2E_GENESIS_KEY --body "$genesis_key"
+
+Then remove the local secrets:
+
+  rm -rf "$out_dir"
+EOF

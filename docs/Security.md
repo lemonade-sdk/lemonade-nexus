@@ -528,7 +528,10 @@ server (`Auth/LinkTokenLedger.hpp`, `TokenLinkAuthProvider`).
   that hold the same events derive the same state in any arrival order. When
   two servers spend the same generation, the spend with the smallest origin
   key counts on every server, and a refund by any other server never restores
-  the token.
+  the token. A `Revoke` from any server ends the token for good: an account
+  deletion revokes the tokens the account minted and the tokens that target
+  a removed group (`TokenLinkAuthProvider::revoke_where`), and the revocation
+  replicates like every other event.
 - **Transport.** Events use the change-numbered catch-up replication
   (`sync::OriginReplica`, stream `link`, gossip type `LinkTokenSync`) that DNS
   records and account envelopes use. They travel only on the encrypted
@@ -573,6 +576,77 @@ cannot be closed without consensus or a synchronous request path between
 servers, which the backbone does not have. A redemption also fails while the
 token's `Mint` has not reached the redeeming server yet (normally under a
 second after minting).
+### Account deletion
+
+An account deletes itself through `POST /api/account/delete` (SDK
+`delete_account`, C `ln_account_delete`). There is no form of the route that
+names another account, and no operator or admin path deletes an account.
+
+**Fresh proof.** A session token alone does not delete an account. The client
+gets a challenge from the session's server
+(`POST /api/account/delete/challenge`, the Ed25519 challenge store of
+`/api/auth/challenge`) and signs `auth::account_delete_proof_message`: the
+canonical encoding, under the domain `lemonade-nexus/account-delete:v1`, of
+the challenge and the account's public key. The server checks that the
+challenge was issued to the session's key, is less than 60 seconds old, and
+was not used, and then verifies the signature. A login signature never
+verifies as a deletion proof, and a deletion proof never opens a session.
+
+**Scope** (`tree::rules::account_scope`). The deletion removes:
+
+- every Customer or Endpoint node whose management key is the account key
+  (its `customer-<user_id>` group, its device, and any node it created
+  elsewhere), and every node beneath one of them. This includes devices and
+  subgroups that other identities placed in the account's groups. Those
+  identities keep their own accounts, but they lose access to this network;
+  a device key that owns no other node is revoked.
+- every assignment, on every remaining node, that names the account key or
+  the key of a removed node that owns no remaining node: the account's
+  memberships in other users' groups, and the connect and link-join grants
+  that named its keys.
+
+The root node is never removed or changed, whoever calls. When the root
+management key also owns a Customer group, deleting that account removes the
+group and leaves the root, the root's owner assignment, and the key itself.
+
+**Cleanup on every server that applies the deletion.** The removed-nodes
+cascade (`TreeApiHandler::cascade_node_cleanup`) revokes device keys that own
+no node, releases IPAM allocations, removes mesh peers, removes the private
+DNS name, and removes the device and group certificates. The account cleanup
+(`AccountDataApiHandler::cleanup_deleted_account`) deletes the account's chat
+blobs and group-key envelopes (on disk and in the replicated envelope
+stream), revokes the link tokens it minted or that target a removed group
+(a replicated `Revoke` event, see "Invite replication"), and deletes its
+passkey credentials. When the account key owns no node any longer, the
+server revokes it. A revoked key cannot authenticate, and its sessions end,
+including a session that names only the user id (passkey).
+
+**Tree modes.** With tree operations on, the route submits one
+`DeleteAccount` operation (kind 10). Every Tier 1 server validates and applies
+it at the same block, computes the same scope, and runs both cleanups. The
+committed op id keeps a replay refused after a restart. With tree operations
+off, the server that receives the request applies the same plan directly
+(`PermissionTreeService::delete_account`) and runs the same cleanups. That
+mode has no tree replication, so the deletion applies to that server only, as
+every direct write does.
+
+**Idempotence.** A deletion with nothing left changes nothing and succeeds.
+After a deletion the revoked key cannot request another one.
+
+Limits:
+
+- An envelope is dropped from the replicated stream without a tombstone. A
+  peer that has not yet applied the deletion can offer it again; a server
+  that applied the deletion refuses it, because its tree no longer
+  authorizes the envelope.
+- Key revocations, passkey credentials, and chat blobs are stored per server.
+  With tree operations off, only the server that served the request removes
+  them. Link token revocations replicate to every Tier 1 server; a token whose
+  `Mint` has not reached the deleting server yet (normally under a second
+  after minting) is not revoked there.
+- Local files (the identity key, the account image cache, and certificate
+  directories) stay on the client. The client deletes them (see
+  [Client SDK](Client-SDK#account-deletion)).
 
 ## Application Authority Gaps
 

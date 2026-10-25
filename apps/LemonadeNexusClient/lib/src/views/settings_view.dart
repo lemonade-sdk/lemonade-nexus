@@ -7,11 +7,13 @@
 /// - Preferences (auto-discovery, auto-connect)
 /// - About section
 /// - Sign out
+/// - Delete account (typed confirmation)
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'dart:io';
+import '../sdk/sdk.dart';
 import '../state/providers.dart';
 import '../state/app_state.dart';
 import '../windows/windows_integration.dart';
@@ -348,6 +350,23 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
               ),
             ),
           ),
+
+          if (appState.isAuthenticated) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => _deleteAccount(notifier),
+                icon: const Icon(Icons.delete_forever_outlined),
+                label: const Text('Delete Account'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppTheme.errorColor,
+                  side: const BorderSide(color: AppTheme.errorColor),
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
@@ -586,6 +605,104 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
           ],
         );
       },
+    );
+  }
+
+  Future<void> _deleteAccount(AppNotifier notifier) async {
+    if (await confirmAccountDeletion(context) != true || !mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final result = await notifier.deleteAccount();
+      final pending = result['status'] != 'deleted';
+      messenger.showSnackBar(SnackBar(
+        content: Text(pending
+            ? 'Deletion requested. Tier 1 has not committed it yet; try again later if the account stays.'
+            : 'Account deleted'),
+        backgroundColor: pending ? Colors.orange : AppTheme.lemonGreen,
+      ));
+    } on SdkException catch (e) {
+      messenger.showSnackBar(SnackBar(
+        content: Text('The account was not deleted: ${e.message ?? e.error.name}'),
+        backgroundColor: AppTheme.errorColor,
+      ));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(
+        content: Text('The account was not deleted: $e'),
+        backgroundColor: AppTheme.errorColor,
+      ));
+    }
+  }
+}
+
+/// The text the user types to confirm an account deletion.
+const String kDeleteAccountConfirmation = 'DELETE';
+
+/// Ask the user to confirm a permanent account deletion. The Delete button
+/// stays disabled until the user types [kDeleteAccountConfirmation]. Returns
+/// true only for a confirmed deletion.
+Future<bool?> confirmAccountDeletion(BuildContext context) {
+  return showDialog<bool>(
+    context: context,
+    builder: (context) => const _DeleteAccountDialog(),
+  );
+}
+
+class _DeleteAccountDialog extends StatefulWidget {
+  const _DeleteAccountDialog();
+
+  @override
+  State<_DeleteAccountDialog> createState() => _DeleteAccountDialogState();
+}
+
+class _DeleteAccountDialogState extends State<_DeleteAccountDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final confirmed = _controller.text.trim() == kDeleteAccountConfirmation;
+    return AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      title: const Text('Delete Account'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'This permanently deletes your account from the mesh. You cannot undo it.\n\n'
+            'Your groups and devices are removed, including devices other people joined '
+            'with your invites; they keep their own accounts but lose access to your network. '
+            'Your memberships in other networks, your account key envelopes, chats, invites, '
+            'passkeys, certificates, and device names are removed, and this identity can no '
+            'longer sign in. This device then forgets the account.',
+            style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+          const Text('Type $kDeleteAccountConfirmation to confirm.', style: TextStyle(fontSize: 13)),
+          const SizedBox(height: 8),
+          TextField(
+            key: const Key('delete-account-confirmation'),
+            controller: _controller,
+            autofocus: true,
+            onChanged: (_) => setState(() {}),
+            decoration: const InputDecoration(border: OutlineInputBorder(), isDense: true),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+        ElevatedButton(
+          onPressed: confirmed ? () => Navigator.pop(context, true) : null,
+          style: ElevatedButton.styleFrom(backgroundColor: AppTheme.errorColor, foregroundColor: Colors.white),
+          child: const Text('Delete Account'),
+        ),
+      ],
     );
   }
 }

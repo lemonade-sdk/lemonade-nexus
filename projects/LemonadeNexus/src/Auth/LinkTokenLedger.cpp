@@ -29,7 +29,7 @@ std::optional<std::vector<uint8_t>> decode_b64(std::string_view s) {
 
 bool kind_known(LinkTokenEventKind kind) {
     return kind == LinkTokenEventKind::Mint || kind == LinkTokenEventKind::Spend ||
-           kind == LinkTokenEventKind::Refund;
+           kind == LinkTokenEventKind::Refund || kind == LinkTokenEventKind::Revoke;
 }
 
 char kind_letter(LinkTokenEventKind kind) {
@@ -37,6 +37,7 @@ char kind_letter(LinkTokenEventKind kind) {
         case LinkTokenEventKind::Mint:   return 'm';
         case LinkTokenEventKind::Spend:  return 's';
         case LinkTokenEventKind::Refund: return 'r';
+        case LinkTokenEventKind::Revoke: return 'x';
     }
     return '?';
 }
@@ -119,6 +120,7 @@ std::optional<std::string> link_token_event_shape_error(const LinkTokenEvent& e)
         !e.owner_pubkey.empty() || e.created_at != 0) {
         return "only a mint carries grant fields";
     }
+    if (e.kind == LinkTokenEventKind::Revoke && e.generation != 0) return "a revoke is generation 0";
     if (e.kind == LinkTokenEventKind::Refund && e.generation >= kLinkTokenMaxGeneration) {
         return "a refund cannot open a generation beyond the limit";
     }
@@ -252,7 +254,8 @@ std::optional<std::string> LinkTokenLedger::spend_winner(std::string_view token_
 std::optional<LinkTokenLedger::Live> LinkTokenLedger::live(std::string_view token_hash,
                                                            uint64_t now_sec) const {
     const auto it = tokens_.find(token_hash);
-    if (it == tokens_.end() || !it->second.mint || now_sec >= it->second.expires_at) {
+    if (it == tokens_.end() || !it->second.mint || now_sec >= it->second.expires_at ||
+        revoked(token_hash)) {
         return std::nullopt;
     }
     const auto& events = it->second.events;
@@ -273,6 +276,22 @@ std::optional<LinkTokenLedger::Live> LinkTokenLedger::live(std::string_view toke
         if (!refunded_by(g, *winner)) return std::nullopt;
     }
     return std::nullopt;
+}
+
+bool LinkTokenLedger::revoked(std::string_view token_hash) const {
+    const auto it = tokens_.find(token_hash);
+    if (it == tokens_.end()) return false;
+    return std::any_of(it->second.events.begin(), it->second.events.end(), [](const auto& kv) {
+        return kv.second.kind == LinkTokenEventKind::Revoke;
+    });
+}
+
+std::vector<LinkTokenEvent> LinkTokenLedger::mints() const {
+    std::vector<LinkTokenEvent> out;
+    for (const auto& [hash, token] : tokens_) {
+        if (token.mint) out.push_back(*token.mint);
+    }
+    return out;
 }
 
 std::size_t LinkTokenLedger::live_count_for_owner(std::string_view owner_user_id,

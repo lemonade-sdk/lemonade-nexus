@@ -12,10 +12,13 @@
 //   Spend   a server consumed generation g of the token.
 //   Refund  the server whose spend of generation g counts restored the token
 //           as generation g + 1 (the join that consumed it did not use it).
+//   Revoke  a server ended the token for good (its inviter's account or its
+//           target group was deleted).
 //
 // The set only grows, so replicas that hold the same events reach the same
 // state in any arrival order (LinkTokenLedger::live). When two servers spend
-// the same generation, the spend with the smallest origin key counts.
+// the same generation, the spend with the smallest origin key counts. A
+// Revoke from any origin ends the token, whatever its generation.
 
 #include <nlohmann/json.hpp>
 
@@ -57,7 +60,7 @@ inline constexpr std::size_t kLinkTokenMaxFieldBytes = 256;
 /// Bound on the permissions a grant carries.
 inline constexpr std::size_t kLinkTokenMaxPermissions = 8;
 
-enum class LinkTokenEventKind : uint8_t { Mint = 1, Spend = 2, Refund = 3 };
+enum class LinkTokenEventKind : uint8_t { Mint = 1, Spend = 2, Refund = 3, Revoke = 4 };
 
 /// One signed event in a token's life. Grant fields are set on a Mint and
 /// empty (zero) on a Spend or Refund. Every event carries the token's
@@ -65,7 +68,7 @@ enum class LinkTokenEventKind : uint8_t { Mint = 1, Spend = 2, Refund = 3 };
 struct LinkTokenEvent {
     LinkTokenEventKind       kind{LinkTokenEventKind::Mint};
     std::string              token_hash;     ///< 64 lowercase hex (link_token_hash_hex)
-    uint32_t                 generation{0};  ///< Mint: 0. Spend/Refund: the generation spent
+    uint32_t                 generation{0};  ///< Mint, Revoke: 0. Spend/Refund: the generation spent
     std::string              network_id;     ///< hex network id the origin belongs to
     uint64_t                 expires_at{0};  ///< Unix seconds; the token is invalid from here on
 
@@ -150,7 +153,8 @@ public:
     AddResult add(const LinkTokenEvent& e, uint64_t now_sec);
 
     /// The token's current state when it can be consumed: a mint is held,
-    /// now < expires_at, and the current generation has no counting spend.
+    /// no revoke is held, now < expires_at, and the current generation has no
+    /// counting spend.
     [[nodiscard]] std::optional<Live> live(std::string_view token_hash, uint64_t now_sec) const;
 
     /// Origin of the spend that counts for `generation`: the smallest origin
@@ -168,6 +172,12 @@ public:
 
     /// Every held event, ordered by token and replica key.
     [[nodiscard]] std::vector<LinkTokenEvent> events() const;
+
+    /// True when a Revoke of the token is held.
+    [[nodiscard]] bool revoked(std::string_view token_hash) const;
+
+    /// The mint of every held token that has one, ordered by token hash.
+    [[nodiscard]] std::vector<LinkTokenEvent> mints() const;
 
     /// True when any event of the token is held.
     [[nodiscard]] bool holds(std::string_view token_hash) const {

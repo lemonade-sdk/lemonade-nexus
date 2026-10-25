@@ -7,6 +7,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -880,6 +881,35 @@ class AppNotifier extends StateNotifier<AppState> {
     final clusters = await _keyring.remove(localId);
     final wasActive = state.activeClusterId == localId;
     state = state.copyWith(clusters: clusters, clearActiveCluster: wasActive);
+  }
+
+  /// Permanently delete the active account. Irreversible. The server removes
+  /// the account's groups and devices, its memberships and account data, and
+  /// revokes its key (ln_account_delete); the application root stays. After a
+  /// confirmed deletion this device removes its own copy: the Cluster keyring
+  /// entry (identity seed and group key), the stored session, and the group
+  /// loopback certificates, then signs out. Returns the server answer. With
+  /// status "pending" Tier 1 has not committed the deletion yet, and nothing
+  /// local is removed. Throws SdkException when the server refuses.
+  Future<Map<String, dynamic>> deleteAccount() async {
+    final result = await _sdk.deleteAccount();
+    if (result['status'] != 'deleted') {
+      addActivity(ActivityLevel.info, 'Account deletion is pending');
+      return result;
+    }
+    final localId = state.activeClusterId;
+    await stopMeshPort();
+    try {
+      final support = await AppPaths.supportDir();
+      final certs = Directory('${support.path}/certs/group-loopback');
+      if (await certs.exists()) await certs.delete(recursive: true);
+    } catch (e) {
+      _log('deleteAccount: could not remove the local certificates: $e');
+    }
+    if (localId != null) await forgetCluster(localId);
+    await signOut();
+    addActivity(ActivityLevel.warning, 'Account deleted');
+    return result;
   }
 
   /// Rename a Cluster locally (display label only).

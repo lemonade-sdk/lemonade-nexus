@@ -1294,6 +1294,26 @@ ln_error_t ln_move_node(ln_client_t* client, const char* node_id, const char* ne
     }
 }
 
+ln_error_t ln_account_delete(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    *out_json = nullptr;
+    try {
+        if (!client->client.identity().is_valid()) {
+            *out_json = strdup_json(json{{"success", false}, {"error", "no identity"}});
+            return LN_ERR_NO_IDENTITY;
+        }
+        auto result = client->client.delete_account();
+        if (result.ok && result.value.value("status", std::string{}) == "deleted") {
+            // The account image service serves this account's cached images
+            // to mesh peers; stop it with the account.
+            client->avatar.reset();
+        }
+        return json_call_result(result, out_json);
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
 ln_error_t ln_mesh_expose_service(ln_client_t* client, uint16_t vport, const char* target) {
     if (!client || !target) return LN_ERR_NULL_ARG;
     auto result = client->client.expose_service(vport, target);

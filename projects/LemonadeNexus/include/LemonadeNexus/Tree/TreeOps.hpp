@@ -96,6 +96,13 @@ enum class TreeOpKind : uint16_t {
     /// Move the target (a device or a subgroup) under body.new_parent_id
     /// (POST /api/tree/node/move/{id}); rules::move_refusal decides.
     MoveNode      = 9,
+    /// Delete the principal's own account (POST /api/account/delete) in one
+    /// atomic step: remove rules::account_scope(principal).removed and the
+    /// assignments that name its swept keys. Target is the account id
+    /// (derive_join_node_id of the principal); base_version is 0. The op
+    /// never removes or changes a Root node. The submitter verified a fresh,
+    /// purpose-bound signature of the principal (auth::account_delete_proof_message).
+    DeleteAccount = 10,
 };
 
 /// Where the principal's authority for an op comes from.

@@ -158,6 +158,26 @@ TEST(LinkTokenLedgerTest, TheStateDoesNotDependOnArrivalOrder) {
     EXPECT_EQ(live->mint, mint);
 }
 
+// A revoke ends the token whatever its generation, and a refund cannot
+// bring it back.
+TEST(LinkTokenLedgerTest, ARevokeEndsTheTokenForGood) {
+    const auto mint = mint_event();
+    LinkTokenLedger ledger;
+    ASSERT_EQ(ledger.add(mint, kNow), LinkTokenLedger::AddResult::Added);
+    ASSERT_EQ(ledger.add(follow_up(mint, LinkTokenEventKind::Spend, 0, "B"), kNow),
+              LinkTokenLedger::AddResult::Added);
+    ASSERT_EQ(ledger.add(follow_up(mint, LinkTokenEventKind::Revoke, 0, "C"), kNow),
+              LinkTokenLedger::AddResult::Added);
+    ASSERT_EQ(ledger.add(follow_up(mint, LinkTokenEventKind::Refund, 0, "B"), kNow),
+              LinkTokenLedger::AddResult::Added);
+    EXPECT_TRUE(ledger.revoked(mint.token_hash));
+    EXPECT_FALSE(ledger.live(mint.token_hash, kNow).has_value());
+    ASSERT_EQ(ledger.mints().size(), 1u);
+
+    auto bad = follow_up(mint, LinkTokenEventKind::Revoke, 1, "D");
+    EXPECT_TRUE(auth::link_token_event_shape_error(bad).has_value());
+}
+
 TEST(LinkTokenLedgerTest, ASpendWithoutItsMintAndAnExpiredTokenAreNotLive) {
     const auto mint = mint_event();
     LinkTokenLedger ledger;

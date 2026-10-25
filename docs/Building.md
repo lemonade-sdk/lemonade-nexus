@@ -184,6 +184,11 @@ For Rust-only changes, run the relevant crate's checks from its manifest path
 `crates/storage-threshold`) with `cargo test --locked`, and preserve the
 lockfile.
 
+With `BUILD_TESTING` on, the build also has `nexus-e2e`, the live end-to-end
+client. CTest runs only its offline self-test (`LiveE2E.SelfTest`). The
+`Live SDK E2E` workflow runs the full scenario against the production fleet;
+see [Live SDK E2E](Live-E2E).
+
 ## Dependencies
 
 Sourcing is mixed; the CMake library definitions and Cargo manifests are the

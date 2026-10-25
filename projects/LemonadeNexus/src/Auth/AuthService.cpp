@@ -95,6 +95,23 @@ bool AuthService::unrevoke_ed25519(const std::string& pubkey_b64) {
     return ed25519_provider_.unrevoke_pubkey(pubkey_b64);
 }
 
+bool AuthService::verify_account_delete_proof(const std::string& pubkey_b64,
+                                              const std::string& challenge_b64,
+                                              const std::string& signature_b64,
+                                              std::string& error) {
+    return ed25519_provider_.verify_account_delete_proof(pubkey_b64, challenge_b64,
+                                                         signature_b64, error);
+}
+
+bool AuthService::remove_passkey_credentials(const std::string& user_id) {
+    return passkey_provider_.remove_user_credentials(user_id);
+}
+
+std::size_t AuthService::revoke_link_tokens(
+        const std::function<bool(const LinkTokenRecord&)>& match) {
+    return token_link_provider_.revoke_where(match);
+}
+
 bool AuthService::validate_session(std::string_view token) {
     // One validation path, so revocation can't be bypassed by picking this one.
     return validate_session_claims(std::string(token)).has_value();
@@ -152,6 +169,11 @@ std::optional<SessionClaims> AuthService::validate_session_claims(const std::str
         if (!claims.pubkey.empty() && ed25519_provider_.is_pubkey_revoked(claims.pubkey)) {
             spdlog::warn("[AuthService] rejecting session for revoked pubkey {}",
                          claims.pubkey.substr(0, 16));
+            return std::nullopt;
+        }
+        // A session that names no key (passkey) ends with its identity's key.
+        if (ed25519_provider_.is_user_revoked(claims.user_id)) {
+            spdlog::warn("[AuthService] rejecting session for revoked user {}", claims.user_id);
             return std::nullopt;
         }
 

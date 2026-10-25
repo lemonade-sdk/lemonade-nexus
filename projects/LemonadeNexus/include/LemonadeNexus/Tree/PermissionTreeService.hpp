@@ -16,6 +16,15 @@
 
 namespace nexus::tree {
 
+/// One applied account deletion (TreeOpKind::DeleteAccount, or its direct
+/// form PermissionTreeService::delete_account).
+struct AccountDeletion {
+    std::string              principal;   ///< the deleted account's key ("ed25519:<base64>")
+    std::string              account_id;  ///< derive_join_node_id(principal)
+    std::vector<TreeNode>    removed;     ///< each removed node as it was before the deletion
+    std::vector<std::string> swept_keys;  ///< rules::AccountScope::swept_keys
+};
+
 /// Manages the hierarchical permission tree.
 /// Nodes are cached in-memory and persisted via FileStorageService.
 /// Signatures are verified through SodiumCryptoService.
@@ -121,6 +130,18 @@ public:
                                              const std::string& new_parent_id,
                                              std::string_view signer, std::string& reason);
 
+    /// Direct-write form of the DeleteAccount tree operation: remove the
+    /// account scope of `principal` (rules::account_scope) and the
+    /// assignments that name its swept keys, with the same plan as the tree
+    /// operation. The root node is never removed or changed. Idempotent: an
+    /// account with nothing left changes nothing and still succeeds. After the
+    /// tree lock is released, calls the removed-nodes hook with the removed
+    /// nodes and then the account-deleted hook, so the direct path runs the
+    /// same cleanup as an applied operation. False, with `reason` set, when the
+    /// principal is not an "ed25519:" key or a node write fails. Thread-safe.
+    [[nodiscard]] bool delete_account(std::string_view principal, AccountDeletion& out,
+                                      std::string& reason);
+
     /// The connect rule (rules::endpoint_may_connect) for endpoint
     /// `from_node_id`, acting as `principal`, to `to_node_id`. False when
     /// either node is missing. Thread-safe.
@@ -163,14 +184,22 @@ public:
     [[nodiscard]] TreeOpVerdict apply_committed_ops(const std::vector<TreeOp>& ops,
                                                     uint64_t block_time_sec);
 
-    /// Set the function called after apply_op, apply_committed_ops, or
-    /// submit_local_op removed nodes. It receives each removed node as it was
+    /// Set the function called after apply_op, apply_committed_ops,
+    /// submit_local_op, or delete_account removed nodes. It receives each removed node as it was
     /// before the op, runs on the thread that applied the op, and runs after
     /// the tree lock is released, so it may read the tree. Every server that
     /// applies a committed block calls it, so per-server cleanup of a deleted
     /// node runs everywhere. replace_all never calls it: a restore or merge is
     /// not a delete. An empty function clears it. Thread-safe.
     void set_removed_nodes_hook(std::function<void(const std::vector<TreeNode>&)> hook);
+
+    /// Set the function called after an account deletion is applied: by
+    /// apply_op, apply_committed_ops, or submit_local_op for a DeleteAccount
+    /// operation (on every server that applies the committed block), and by
+    /// delete_account. It runs after the removed-nodes hook, on the same
+    /// thread, without the tree lock. An empty function clears it.
+    /// Thread-safe.
+    void set_account_deleted_hook(std::function<void(const AccountDeletion&)> hook);
 
     /// A copy of every node, keyed by id. Thread-safe.
     [[nodiscard]] rules::NodeMap nodes_snapshot() const;
@@ -285,15 +314,30 @@ private:
                                                                std::string& reason);
 
     /// apply_op with mutex_ held. Appends each node the op removes, as it was
-    /// before the op, to `removed`.
-    [[nodiscard]] TreeOpVerdict apply_op_locked(const TreeOp& op, std::vector<TreeNode>& removed);
+    /// before the op, to `removed`, and each applied account deletion to
+    /// `accounts`.
+    [[nodiscard]] TreeOpVerdict apply_op_locked(const TreeOp& op, std::vector<TreeNode>& removed,
+                                                std::vector<AccountDeletion>& accounts);
+
+    /// Write `effect` into the tree with mutex_ held: persist writes, then
+    /// removals, keeping the identifier index in sync. Appends removed nodes
+    /// to `removed`. `keep_versions` keeps each written node's stored version
+    /// (the direct paths do not maintain versions). False when a write fails;
+    /// nothing is removed then.
+    [[nodiscard]] bool write_effect_locked(const TreeOpEffect& effect, bool keep_versions,
+                                           std::vector<TreeNode>& removed);
 
     /// Call the removed-nodes hook with `removed`, unless it is empty. Caller
     /// must not hold mutex_: the hook may read the tree.
     void notify_removed(const std::vector<TreeNode>& removed) const;
 
+    /// Call the account-deleted hook for each entry. Caller must not hold
+    /// mutex_.
+    void notify_accounts(const std::vector<AccountDeletion>& accounts) const;
+
     mutable std::mutex removed_hook_mtx_;
     std::function<void(const std::vector<TreeNode>&)> removed_hook_;
+    std::function<void(const AccountDeletion&)> account_hook_;
 
     /// Append an applied delta to the delta log and offer it to the retention
     /// sink. Neither failure rolls back the applied mutation. Returns the log

@@ -383,3 +383,9 @@ if(UNIX)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_bootstrap.py
                 $<TARGET_FILE:LemonadeNexusApp>)
 endif()
+
+# Live end-to-end client for the production fleet (docs/Live-E2E.md). POSIX
+# only: it uses BSD sockets for discovery. CTest runs its offline self-test.
+if(NOT WIN32)
+    add_subdirectory(live-e2e)
+endif()

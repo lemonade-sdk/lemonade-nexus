@@ -215,6 +215,24 @@ TEST(OriginReplica, PruneExpiredDropsEveryEntryPastTheCutoff) {
     EXPECT_EQ(r.version(), unchanged);
 }
 
+TEST(OriginReplica, EraseKeysDropsMatchingEntriesWithoutATombstone) {
+    OriginReplica r("me");
+    (void)r.offer(entry("keyenv:g1:ed25519:a", "o1", 1, 100));
+    (void)r.offer(entry("keyenv:g1:ed25519:b", "o1", 2, 100));
+    (void)r.offer(entry("keyenv:g2:ed25519:a", "o2", 1, 100));
+    const auto before = r.version();
+    EXPECT_EQ(r.erase_keys([](const std::string& k) { return k.starts_with("keyenv:g1:"); }),
+              2u);
+    EXPECT_NE(r.version(), before);
+    EXPECT_EQ(r.size(), 1u);
+    EXPECT_FALSE(r.holds_newer("keyenv:g1:ed25519:a", 0, 0)) << "no tombstone stays";
+    const auto digest = r.digest();
+    EXPECT_FALSE(digest.contains("o1"));
+    const auto unchanged = r.version();
+    EXPECT_EQ(r.erase_keys([](const std::string&) { return false; }), 0u);
+    EXPECT_EQ(r.version(), unchanged);
+}
+
 TEST(OriginReplica, SnapshotRestoresAnEqualReplica) {
     OriginReplica a("a");
     (void)a.offer(entry("A:x", "o1", 10, 100));

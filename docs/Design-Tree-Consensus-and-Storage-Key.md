@@ -142,6 +142,7 @@ TreeOp {
   op_id          SHA-256 of the canonical encoding without signatures
   kind           create_node | update_fields | set_assignment | delete_node | join
                  | establish_root | set_endpoint | accept_invite | move_node
+                 | delete_account
   target         node id
   base_version   the target node's version the author saw
   body           kind-specific fields
@@ -184,6 +185,15 @@ TreeOp {
   even when the sibling's key already holds an entry there
   (`rules::grant_link_peer_access`); a `join` without it keeps the earlier
   result. See [Security](Security#invite-replication).
+- `delete_account` (kind 10) deletes the principal's own account in one
+  atomic step. Its target is the account id that the principal's key
+  derives, and its base version is 0. Every replica computes the same scope
+  (`rules::account_scope`) from the committed tree: the Customer and Endpoint
+  nodes the key owns, everything beneath them, and the assignments of the
+  swept keys on every other node except the root. The submitter checked a
+  fresh, purpose-bound signature by the account key before it signed the op.
+  Each replica runs the per-node cleanup and the account cleanup when it
+  applies the op. See [Security](Security#account-deletion).
 - Every write path in `TreeApiHandler` produces an op. The local-only methods
   (`insert_join_node`, `update_node_direct`, `grant_assignment`,
   `delete_node_direct`) stop being called from request handlers.

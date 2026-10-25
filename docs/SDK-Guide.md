@@ -14,6 +14,7 @@ title: SDK Guide
 - [Authentication](#authentication)
 - [Joining the Network](#joining-the-network)
 - [Invites and Other Networks](#invites-and-other-networks)
+- [Deleting an Account](#deleting-an-account)
 - [Tree Operations](#tree-operations)
 - [Mesh P2P and Local Services](#mesh-p2p-and-local-services)
 - [Error Handling](#error-handling)
@@ -263,6 +264,34 @@ auto sub = client.create_link_token(600, "group-id",            // chosen group
   strings are not retained.
 
 See [Security](Security#invites-and-group-membership) for the full rules.
+
+## Deleting an Account
+
+```cpp
+auto r = client.delete_account();  // irreversible
+if (r && r.value["status"] == "deleted") {
+    // Delete the identity file and local caches here.
+}
+```
+
+```c
+char* json = NULL;
+if (ln_account_delete(client, &json) == LN_OK) { /* delete local files */ }
+ln_free(json);
+```
+
+- The call needs an identity and an established mesh session. It signs a
+  fresh deletion proof with the identity key; a session token alone is not
+  enough.
+- The server removes the account's groups and devices and everything beneath
+  them (other users' devices there lose access to this network), this
+  identity's memberships and grants, its key envelopes, chats, invites,
+  passkeys, certificates, and DNS names, and revokes its key. The
+  application root is never removed.
+- On `"deleted"` the client stops the mesh and clears its session. A
+  `"pending"` answer means Tier 1 has not committed the deletion yet.
+- Local files stay. See [Client SDK](Client-SDK#account-deletion) for the list
+  to delete, and [Security](Security#account-deletion) for the rules.
 
 ## Tree Operations
 

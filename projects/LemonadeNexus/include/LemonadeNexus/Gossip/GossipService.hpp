@@ -970,6 +970,15 @@ public:
     /// Forget every replicated link token event and delete the replica file
     /// (this server left Tier 1). Thread-safe.
     void purge_link_tokens();
+    /// Drop the replicated envelopes of a deleted account: every envelope of a
+    /// group in `group_ids`, and every envelope addressed to a canonical key
+    /// in `recipients`. No tombstone is sent. Each Tier 1 server that applies
+    /// the account deletion drops its own copy, and a server refuses a
+    /// re-offered envelope because the local tree no longer authorizes it
+    /// (AccountDataStore::apply_replicated_envelope). The next replica save
+    /// persists the change. Returns the number dropped. Thread-safe.
+    std::size_t forget_account_envelopes(const std::vector<std::string>& group_ids,
+                                         const std::vector<std::string>& recipients);
 
     /// Pin the NS slot this server claims (1-9); 0 = auto (lowest free). Set
     /// when the operator's ns<N> identity matches registrar glue for that name.

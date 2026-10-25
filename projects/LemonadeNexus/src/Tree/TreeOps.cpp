@@ -119,6 +119,7 @@ bool source_allowed(TreeOpKind kind, TreeOpSource source) {
         case TreeOpKind::SetEndpoint:
         case TreeOpKind::AcceptInvite:
         case TreeOpKind::MoveNode:
+        case TreeOpKind::DeleteAccount:
             return source == TreeOpSource::Session;
         case TreeOpKind::Join:
             return source == TreeOpSource::Device;
@@ -137,6 +138,7 @@ bool kind_known(TreeOpKind kind) {
         case TreeOpKind::SetEndpoint:
         case TreeOpKind::AcceptInvite:
         case TreeOpKind::MoveNode:
+        case TreeOpKind::DeleteAccount:
             return true;
     }
     return false;
@@ -609,6 +611,30 @@ TreeOpVerdict plan_move(const TreeOp& op, Overlay& overlay) {
     return {};
 }
 
+/// Remove the principal's account scope (rules::account_scope) and the
+/// assignments that name its swept keys on every surviving node except a Root
+/// node. Each changed node is edited once, in node id order.
+void plan_delete_account(const TreeOp& op, const TreeState::NodeMap& nodes, Overlay& overlay) {
+    const auto scope = rules::account_scope(nodes, op.principal);
+    for (const auto& id : scope.removed) overlay.erase(id);
+    if (scope.swept_keys.empty()) return;
+
+    std::vector<std::string> ids;
+    ids.reserve(nodes.size());
+    for (const auto& [id, node] : nodes) ids.push_back(id);
+    std::sort(ids.begin(), ids.end());
+    auto swept = [&](const Assignment& a) {
+        return std::binary_search(scope.swept_keys.begin(), scope.swept_keys.end(),
+                                  canonical_principal(a.management_pubkey));
+    };
+    for (const auto& id : ids) {
+        const TreeNode* n = overlay.find(id);
+        if (!n || n->type == NodeType::Root || n->parent_id.empty()) continue;
+        if (std::none_of(n->assignments.begin(), n->assignments.end(), swept)) continue;
+        std::erase_if(overlay.edit(id).assignments, swept);
+    }
+}
+
 /// The op verdict for a refused assignment, invite, or move rule.
 TreeOpVerdict ruling_verdict(const rules::AssignmentRuling& ruling) {
     switch (ruling.refusal) {
@@ -956,6 +982,12 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             if (op.kind == TreeOpKind::SetEndpoint && !endpoint_text_valid(body.listen_endpoint)) {
                 return refuse(R::Malformed, "listen endpoint is not host:port");
             }
+            // An account op names exactly the principal's own account, so no
+            // principal deletes another account.
+            if (op.kind == TreeOpKind::DeleteAccount &&
+                op.target != derive_join_node_id(crypto, op.principal)) {
+                return refuse(R::Malformed, "account id differs from the principal's account");
+            }
             break;
     }
 
@@ -971,6 +1003,12 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
     if (op.kind == TreeOpKind::CreateNode || op.kind == TreeOpKind::EstablishRoot) {
         if (target) return refuse(R::AlreadyExists, "node already exists");
         if (op.base_version != 0) return refuse(R::StaleBaseVersion, "create must use base version 0");
+    } else if (op.kind == TreeOpKind::DeleteAccount) {
+        // The target is an account id, not one node: the op covers every
+        // node in the account scope at the block that applies it.
+        if (op.base_version != 0) {
+            return refuse(R::Malformed, "an account op uses base version 0");
+        }
     } else if (op.kind == TreeOpKind::Join) {
         const uint64_t current = target ? target->version : 0;
         if (op.base_version != current) {
@@ -1061,6 +1099,11 @@ TreeOpVerdict validate_op(crypto::SodiumCryptoService& crypto, const TreeOp& op,
             }
             break;
         }
+        case TreeOpKind::DeleteAccount:
+            // Self-removal: the principal removes the nodes it owns, what lies
+            // beneath them, and its own entries. The scope never holds a Root
+            // node, and the sweep never edits one.
+            break;
         case TreeOpKind::Join:
             // A join is authorized by the verified device statement and the
             // submitter's admission policy (open registration or a link
@@ -1186,6 +1229,9 @@ TreeOpVerdict plan_op(const TreeOp& op, const TreeState::NodeMap& nodes,
             if (auto v = plan_move(op, overlay); !v.ok()) return v;
             break;
         }
+        case TreeOpKind::DeleteAccount:
+            plan_delete_account(op, nodes, overlay);
+            break;
     }
 
     effect = overlay.effect();

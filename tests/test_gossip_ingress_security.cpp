@@ -3391,6 +3391,20 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
     }
     EXPECT_FALSE(A.verify_link_token("lnk_via_c").has_value());
 
+    // An account deletion on A revokes the account's tokens; the revocation
+    // reaches B, where the token stops being redeemable. Other tokens stay.
+    const auto t5 = A.mint_link_token("doomed", "ed25519:DOOMED", "customer-doomed",
+                                      std::chrono::seconds{600});
+    ASSERT_TRUE(t5.has_value());
+    ASSERT_TRUE(pump_until([&] { return auth_b().verify_link_token(t5->first).has_value(); }));
+    EXPECT_EQ(A.revoke_link_tokens(
+                  [](const auth::LinkTokenRecord& r) { return r.owner_user_id == "doomed"; }),
+              1u);
+    EXPECT_FALSE(A.verify_link_token(t5->first).has_value());
+    ASSERT_TRUE(pump_until([&] { return !auth_b().verify_link_token(t5->first).has_value(); }));
+    EXPECT_FALSE(auth_b().consume_link_token(t5->first).has_value());
+    EXPECT_TRUE(auth_b().verify_link_token(t2).has_value());
+
     // B misses a live event (its store refuses it), then catches up from A's
     // next digest. C gets no link digest and requests nothing.
     accept_b = false;
@@ -3417,6 +3431,7 @@ TEST_F(GossipIngressSecurityTest, LinkTokensReplicateBetweenTier1ServersOnly) {
         EXPECT_TRUE(auth_b().verify_link_token(t4).has_value()) << missing;
         EXPECT_TRUE(auth_b().verify_link_token("lnk_ok").has_value()) << missing;
         EXPECT_FALSE(auth_b().verify_link_token(t1).has_value()) << "spent stays spent";
+        EXPECT_FALSE(auth_b().verify_link_token(t5->first).has_value()) << "revoked stays revoked";
     }
 }
 

@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Tree/TreeRules.hpp>
 
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace nexus::tree::rules {
@@ -477,6 +478,55 @@ std::optional<AssignmentRuling> move_refusal(const NodeMap& nodes, std::string_v
                                 "moving needs add_child on the new parent"};
     }
     return std::nullopt;
+}
+
+AccountScope account_scope(const NodeMap& nodes, std::string_view principal) {
+    AccountScope scope;
+    const auto key = canonical_principal(principal);
+    if (key.empty()) return scope;
+
+    std::vector<std::string> ids;
+    ids.reserve(nodes.size());
+    for (const auto& [id, node] : nodes) ids.push_back(id);
+    std::sort(ids.begin(), ids.end());
+
+    std::unordered_map<std::string, std::vector<std::string>> children;
+    for (const auto& id : ids) children[nodes.at(id).parent_id].push_back(id);
+
+    // Breadth-first from every node the account owns. The visited set ends a
+    // parent loop, and a Root node is never taken.
+    std::unordered_set<std::string> doomed;
+    std::vector<std::string> queue;
+    for (const auto& id : ids) {
+        const auto& node = nodes.at(id);
+        if (node.type != NodeType::Customer && node.type != NodeType::Endpoint) continue;
+        if (node.parent_id.empty()) continue;
+        if (canonical_principal(node.mgmt_pubkey) != key) continue;
+        if (doomed.insert(id).second) queue.push_back(id);
+    }
+    for (std::size_t i = 0; i < queue.size(); ++i) {
+        auto it = children.find(queue[i]);
+        if (it == children.end()) continue;
+        for (const auto& child : it->second) {
+            if (nodes.at(child).type == NodeType::Root) continue;
+            if (doomed.insert(child).second) queue.push_back(child);
+        }
+    }
+    scope.removed.assign(doomed.begin(), doomed.end());
+    std::sort(scope.removed.begin(), scope.removed.end());
+
+    std::unordered_set<std::string> surviving_owners;
+    for (const auto& id : ids) {
+        if (!doomed.contains(id)) surviving_owners.insert(canonical_principal(nodes.at(id).mgmt_pubkey));
+    }
+    std::unordered_set<std::string> swept{key};
+    for (const auto& id : scope.removed) {
+        const auto owner = canonical_principal(nodes.at(id).mgmt_pubkey);
+        if (!owner.empty() && !surviving_owners.contains(owner)) swept.insert(owner);
+    }
+    scope.swept_keys.assign(swept.begin(), swept.end());
+    std::sort(scope.swept_keys.begin(), scope.swept_keys.end());
+    return scope;
 }
 
 }  // namespace nexus::tree::rules

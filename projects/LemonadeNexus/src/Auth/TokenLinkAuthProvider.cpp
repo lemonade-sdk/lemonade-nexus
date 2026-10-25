@@ -438,6 +438,65 @@ bool TokenLinkAuthProvider::legacy_refund(std::string_view token, const LinkToke
     return true;
 }
 
+std::size_t TokenLinkAuthProvider::revoke_where(
+        const std::function<bool(const LinkTokenRecord&)>& match) {
+    // Replicated tokens: a Revoke event ends the token on every Tier 1
+    // server that holds or later receives it, whatever its generation.
+    std::vector<LinkTokenEvent> to_publish;
+    EventPublisher publisher;
+    std::size_t removed = 0;
+    {
+        std::lock_guard lock(mutex_);
+        const auto now = now_sec();
+        ledger_.prune(now);
+        for (const auto& mint : ledger_.mints()) {
+            if (ledger_.revoked(mint.token_hash) || !match(record_from_grant(mint))) continue;
+            LinkTokenEvent revoke;
+            revoke.kind       = LinkTokenEventKind::Revoke;
+            revoke.token_hash = mint.token_hash;
+            revoke.network_id = mint.network_id;
+            revoke.expires_at = mint.expires_at;
+            author_locked(revoke, !mint.signature.empty());
+            if (ledger_.add(revoke, now) != LinkTokenLedger::AddResult::Added) continue;
+            ++removed;
+            if (!revoke.signature.empty()) to_publish.push_back(std::move(revoke));
+        }
+        if (removed > 0) (void)save_locked();
+        publisher = publisher_;
+    }
+    if (publisher) {
+        for (const auto& e : to_publish) (void)publisher(e);
+    }
+
+    // Tokens an earlier release stored as one plaintext file each.
+    const auto dir = storage_.data_root() / std::string(kLedgerCategory);
+    std::error_code ec;
+    if (std::filesystem::is_directory(dir, ec)) {
+        std::vector<std::filesystem::path> doomed;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (entry.path().extension() != ".json" || entry.path().filename() == kLedgerFile) {
+                continue;
+            }
+            std::ifstream ifs(entry.path());
+            if (!ifs) continue;
+            std::ostringstream ss;
+            ss << ifs.rdbuf();
+            const auto j = json::parse(ss.str(), nullptr, false);
+            if (j.is_discarded() || !j.is_object()) continue;
+            LinkTokenRecord record;
+            record.owner_user_id = j.value("owner_user_id", std::string{});
+            record.owner_pubkey  = j.value("owner_pubkey", std::string{});
+            record.group_node_id = j.value("group_node_id", std::string{});
+            if (match(record)) doomed.push_back(entry.path());
+        }
+        for (const auto& path : doomed) {
+            if (std::filesystem::remove(path, ec)) ++removed;
+        }
+    }
+    if (removed > 0) spdlog::info("[token-link] Revoked {} link token(s)", removed);
+    return removed;
+}
+
 std::filesystem::path TokenLinkAuthProvider::legacy_token_path(std::string_view token) const {
     auto hash = crypto_.sha256(std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(token.data()), token.size()));

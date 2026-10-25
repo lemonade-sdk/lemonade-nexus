@@ -128,6 +128,14 @@ public:
     /// spend to cross the backbone between Tier 1 servers.
     static constexpr std::chrono::milliseconds kDefaultSettleWindow{500};
 
+    /// Revoke every token whose record matches `match` (only the owner and
+    /// target fields are reliable). Used when an account is deleted. A
+    /// replicated token gets a Revoke event, which is published, so the token
+    /// stops being redeemable on every Tier 1 server; a token file from an
+    /// earlier release is deleted (one that does not parse stays). Returns
+    /// the number of tokens revoked.
+    std::size_t revoke_where(const std::function<bool(const LinkTokenRecord&)>& match);
+
     static constexpr std::chrono::seconds kDefaultTtl{600};
     static constexpr std::chrono::seconds kMaxTtl{
         static_cast<std::chrono::seconds::rep>(kLinkTokenMaxTtlSec)};

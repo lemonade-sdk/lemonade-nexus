@@ -28,6 +28,8 @@
 #include <LemonadeNexus/Api/RoutingApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshApiHandler.hpp>
 #include <LemonadeNexus/Api/MeshRekey.hpp>
+#include <LemonadeNexus/Api/AccountDataApiHandler.hpp>
+#include <LemonadeNexus/Auth/AccountDeletionProof.hpp>
 #include <LemonadeNexus/Routing/IdentifierDerivation.hpp>
 
 #include <gtest/gtest.h>
@@ -41,7 +43,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
 #include <thread>
@@ -2775,4 +2779,283 @@ TEST_F(InviteHttpTest, ALinkedDeviceAndTheOwnersFirstDeviceListEachOther) {
     const auto bob = join();
     EXPECT_FALSE(peers(bob).count(device.node_id));
     EXPECT_FALSE(peers(device).count(bob.node_id));
+}
+
+// --- Account deletion ---
+//
+// The invite fixture plus the account data routes and the account-deleted
+// hook. In the tree-operation build the deletion is a DeleteAccount op.
+class AccountDeleteHttpTest : public InviteHttpTest {
+protected:
+    std::unique_ptr<api::AccountDataApiHandler> account_handler;
+
+    void SetUp() override {
+        InviteHttpTest::SetUp();
+        if (HasFatalFailure()) return;
+        account_handler = std::make_unique<api::AccountDataApiHandler>(*test_api::current().ctx);
+        // The listener already runs; httplib serves routes added later.
+        account_handler->register_routes(srv, srv);
+    }
+
+    void TearDown() override {
+        account_handler.reset();
+        InviteHttpTest::TearDown();
+    }
+
+    /// A fresh challenge for `m` from the deletion challenge route.
+    std::string challenge_for(const Member& m) {
+        auto res = post(m, "/api/account/delete/challenge", json::object());
+        EXPECT_NE(res, nullptr);
+        if (!res) return {};
+        EXPECT_EQ(res->status, 200) << res->body;
+        return json::parse(res->body).value("challenge", std::string{});
+    }
+
+    /// The deletion proof over `challenge_b64` for `account`, signed by `signer`.
+    std::string proof(const std::string& challenge_b64, const crypto::Ed25519Keypair& account,
+                      const crypto::Ed25519Keypair& signer) {
+        const auto challenge = crypto::from_base64(challenge_b64);
+        const auto msg = auth::account_delete_proof_message(
+            challenge, std::span<const uint8_t>(account.public_key.data(),
+                                                account.public_key.size()));
+        return crypto::to_base64(
+            crypto->ed25519_sign(signer.private_key, std::span<const uint8_t>(msg)));
+    }
+
+    httplib::Result delete_account(const Member& m) {
+        const auto challenge = challenge_for(m);
+        return post(m, "/api/account/delete",
+                    {{"challenge", challenge}, {"signature", proof(challenge, m.kp, m.kp)}});
+    }
+
+    std::string category_of(const std::string& prefix, const std::string& group) {
+        const auto h = crypto->sha256(std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(group.data()), group.size()));
+        return prefix + crypto::to_hex(std::span<const uint8_t>(h.data(), h.size()));
+    }
+
+    bool fresh_login_works(const Member& m) {
+        const auto challenge_b64 =
+            auth->issue_ed25519_challenge(m.b64).value("challenge", std::string{});
+        const auto challenge = crypto::from_base64(challenge_b64);
+        const auto sig =
+            crypto->ed25519_sign(m.kp.private_key, std::span<const uint8_t>(challenge));
+        return auth->authenticate({{"method", "ed25519"},
+                                   {"pubkey", m.b64},
+                                   {"challenge", challenge_b64},
+                                   {"signature", crypto::to_base64(sig)}})
+            .authenticated;
+    }
+};
+
+TEST_F(AccountDeleteHttpTest, DeletingAnAccountRemovesItsNetworkMembershipsAndState) {
+    const auto alice = join();
+    const auto alice2 = join(invite_token(alice));  // alice's linked device
+    const auto bob = join();
+    const auto bob_pk = "ed25519:" + bob.b64;
+    const auto alice_pk = "ed25519:" + alice.b64;
+    // Bob is a member of alice's network, and alice of bob's.
+    ASSERT_EQ(post(bob, "/api/link/accept", {{"link_token", invite_token(alice)}})->status, 200);
+    ASSERT_EQ(post(alice, "/api/link/accept", {{"link_token", invite_token(bob)}})->status, 200);
+    // Account state: a key envelope, a chat blob, and a pending invite.
+    auto env = post(alice, "/api/account/keys/envelope",
+                    {{"target_pubkey", alice2.b64}, {"key_id", "k1"}, {"wrapped_key", "w"}});
+    ASSERT_NE(env, nullptr);
+    ASSERT_EQ(env->status, 200) << env->body;
+    auto chat = post(alice, "/api/chats", {{"ciphertext", "c"}});
+    ASSERT_NE(chat, nullptr);
+    ASSERT_EQ(chat->status, 201) << chat->body;
+    const auto pending_invite = invite_token(alice);
+    // A passkey credential of alice's user id, in the file the auth
+    // providers share.
+    const auto cred_path = temp_dir / "credentials" / (alice.node_id + ".json");
+    auto read_cred = [&] {
+        std::ifstream in(cred_path);
+        return json::parse(in, nullptr, false);
+    };
+    {
+        auto cred = read_cred();
+        ASSERT_TRUE(cred.is_object());
+        cred["credentials"] = json::array({{{"credential_id", "cred-1"},
+                                            {"public_key_x", std::string(64, '1')},
+                                            {"public_key_y", std::string(64, '2')},
+                                            {"sign_count", 0},
+                                            {"created_at", 1}}});
+        std::ofstream(cred_path) << cred.dump();
+    }
+    ASSERT_FALSE(storage->list_files(category_of("keyenv-", alice.group)).empty());
+    ASSERT_FALSE(storage->list_files(category_of("chat-", alice.group)).empty());
+    const auto root_before = json(*tree->get_node("root")).dump();
+
+    auto res = delete_account(alice);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    const auto body = json::parse(res->body);
+    EXPECT_EQ(body["status"], "deleted");
+    EXPECT_EQ(body["account_id"], alice.node_id);
+
+    // The network: alice's group, her device, and her linked device are gone.
+    EXPECT_FALSE(tree->get_node(alice.group).has_value());
+    EXPECT_FALSE(tree->get_node(alice.node_id).has_value());
+    EXPECT_FALSE(tree->get_node(alice2.node_id).has_value());
+    EXPECT_EQ(json(*tree->get_node("root")).dump(), root_before);
+    // Bob keeps his account; nothing names alice's keys any more.
+    ASSERT_TRUE(tree->get_node(bob.group).has_value());
+    ASSERT_TRUE(tree->get_node(bob.node_id).has_value());
+    for (const auto& [id, n] : tree->nodes_snapshot()) {
+        for (const auto& a : n.assignments) {
+            EXPECT_NE(tree::canonical_principal(a.management_pubkey),
+                      tree::canonical_principal(alice_pk))
+                << id;
+            EXPECT_NE(tree::canonical_principal(a.management_pubkey),
+                      tree::canonical_principal("ed25519:" + alice2.b64))
+                << id;
+        }
+    }
+    auto bob_groups = get(bob, "/api/tree/memberships");
+    ASSERT_NE(bob_groups, nullptr);
+    ASSERT_EQ(bob_groups->status, 200) << bob_groups->body;
+    EXPECT_EQ(bob_groups->body.find(alice.group), std::string::npos) << bob_groups->body;
+    EXPECT_TRUE(fresh_login_works(bob));
+    (void)bob_pk;
+
+    // Account state: envelopes, chats, and invites are gone.
+    EXPECT_TRUE(storage->list_files(category_of("keyenv-", alice.group)).empty());
+    EXPECT_TRUE(storage->list_files(category_of("chat-", alice.group)).empty());
+    EXPECT_FALSE(auth->consume_link_token(pending_invite).has_value());
+    const auto cred_after = read_cred();
+    ASSERT_TRUE(cred_after.is_object());
+    EXPECT_TRUE(cred_after.value("credentials", json::array()).empty()) << cred_after.dump();
+    EXPECT_TRUE(cred_after.value("ed25519_pubkeys", json::array()).empty()) << cred_after.dump();
+    // Keys and sessions: neither key authenticates, and the old session ends.
+    EXPECT_FALSE(fresh_login_works(alice));
+    EXPECT_FALSE(fresh_login_works(alice2));
+    auto stale = get(alice, "/api/tree/memberships");
+    ASSERT_NE(stale, nullptr);
+    EXPECT_EQ(stale->status, 401) << stale->body;
+}
+
+TEST_F(AccountDeleteHttpTest, ASessionAloneCannotDeleteAnAccount) {
+    const auto alice = join();
+    const auto bob = join();
+    auto status_of = [&](const json& body) {
+        auto res = post(alice, "/api/account/delete", body);
+        return res ? res->status : -1;
+    };
+    EXPECT_EQ(status_of(json::object()), 400) << "no proof";
+
+    // A login signature (over the raw challenge) is not a deletion proof.
+    auto challenge = challenge_for(alice);
+    const auto raw = crypto->ed25519_sign(
+        alice.kp.private_key, std::span<const uint8_t>(crypto::from_base64(challenge)));
+    EXPECT_EQ(status_of({{"challenge", challenge}, {"signature", crypto::to_base64(raw)}}), 401);
+    // The challenge was consumed by that attempt.
+    EXPECT_EQ(status_of({{"challenge", challenge},
+                         {"signature", proof(challenge, alice.kp, alice.kp)}}),
+              401);
+    // Another key's signature, and another key's challenge, are refused.
+    challenge = challenge_for(alice);
+    EXPECT_EQ(status_of({{"challenge", challenge},
+                         {"signature", proof(challenge, alice.kp, bob.kp)}}),
+              401);
+    const auto bobs = challenge_for(bob);
+    EXPECT_EQ(status_of({{"challenge", bobs}, {"signature", proof(bobs, alice.kp, alice.kp)}}),
+              401);
+    // A proof is single use.
+    challenge = challenge_for(alice);
+    const json good = {{"challenge", challenge}, {"signature", proof(challenge, alice.kp, alice.kp)}};
+    EXPECT_TRUE(tree->get_node(alice.group).has_value()) << "nothing was deleted yet";
+    ASSERT_EQ(status_of(good), 200);
+    EXPECT_FALSE(tree->get_node(alice.group).has_value());
+    // Bob's session cannot reach alice's account: the route has no account
+    // parameter, and bob's own account is untouched by alice's request.
+    EXPECT_TRUE(tree->get_node(bob.group).has_value());
+    // A session token without a key cannot delete anything.
+    Member keyless = bob;
+    keyless.b64.clear();
+    auto none = post(keyless, "/api/account/delete/challenge", json::object());
+    ASSERT_NE(none, nullptr);
+    EXPECT_EQ(none->status, 403) << none->body;
+}
+
+TEST_F(AccountDeleteHttpTest, TheRootOwnersAccountIsDeletedAndTheRootStays) {
+    Member owner;
+    owner.kp = root_keypair;
+    owner.b64 = crypto::to_base64(std::span<const uint8_t>(root_keypair.public_key.data(),
+                                                           root_keypair.public_key.size()));
+    auto joined = join_node(owner.kp);
+    ASSERT_NE(joined, nullptr);
+    ASSERT_EQ(joined->status, 200) << joined->body;
+    owner.node_id = json::parse(joined->body).value("node_id", std::string{});
+    owner.group = tree->get_node(owner.node_id)->parent_id;
+    const auto alice = join();
+    const auto root_before = json(*tree->get_node("root")).dump();
+
+    auto res = delete_account(owner);
+    ASSERT_NE(res, nullptr);
+    ASSERT_EQ(res->status, 200) << res->body;
+    EXPECT_FALSE(tree->get_node(owner.group).has_value());
+    EXPECT_FALSE(tree->get_node(owner.node_id).has_value());
+    EXPECT_EQ(json(*tree->get_node("root")).dump(), root_before)
+        << "the root and its owner assignment never change";
+    EXPECT_TRUE(tree->get_node(alice.group).has_value());
+    // The key still owns the root, so it is not revoked.
+    EXPECT_TRUE(fresh_login_works(owner));
+}
+
+TEST_F(AccountDeleteHttpTest, AServerThatAppliesACommittedDeletionCleansUpToo) {
+    // This server plays a Tier 1 replica: the request went to another server,
+    // and the committed DeleteAccount op arrives in a block.
+    const auto alice = join();
+    const auto alice2 = join(invite_token(alice));
+    const auto pending_invite = invite_token(alice);
+    ASSERT_EQ(post(alice, "/api/account/keys/envelope",
+                   {{"target_pubkey", alice2.b64}, {"key_id", "k1"}, {"wrapped_key", "w"}})
+                  ->status,
+              200);
+
+    const auto submitter = crypto->ed25519_keygen();
+    tree::TreeOp op;
+    op.kind = tree::TreeOpKind::DeleteAccount;
+    op.principal = "ed25519:" + alice.b64;
+    op.target = tree::derive_join_node_id(*crypto, op.principal);
+    op.body.source = tree::TreeOpSource::Session;
+    const auto now = static_cast<uint64_t>(std::time(nullptr));
+    op.signed_at = now;
+    tree::sign_tree_op(*crypto, op, submitter);
+    ASSERT_TRUE(tree->apply_committed_ops({op}, now).ok());
+
+    EXPECT_FALSE(tree->get_node(alice.group).has_value());
+    EXPECT_FALSE(tree->get_node(alice2.node_id).has_value());
+    EXPECT_TRUE(storage->list_files(category_of("keyenv-", alice.group)).empty());
+    EXPECT_FALSE(auth->consume_link_token(pending_invite).has_value());
+    EXPECT_FALSE(fresh_login_works(alice));
+    EXPECT_FALSE(fresh_login_works(alice2));
+
+    // The revocations survive a restart of the auth service.
+    auth::AuthService restarted(*storage, *crypto, "lemonade-nexus.local", jwt_secret);
+    restarted.start();
+    const auto challenge_b64 =
+        restarted.issue_ed25519_challenge(alice.b64).value("challenge", std::string{});
+    const auto sig = crypto->ed25519_sign(
+        alice.kp.private_key, std::span<const uint8_t>(crypto::from_base64(challenge_b64)));
+    EXPECT_FALSE(restarted
+                     .authenticate({{"method", "ed25519"},
+                                    {"pubkey", alice.b64},
+                                    {"challenge", challenge_b64},
+                                    {"signature", crypto::to_base64(sig)}})
+                     .authenticated);
+    restarted.stop();
+}
+
+TEST_F(AccountDeleteHttpTest, ARepeatedDeletionIsRefusedOnlyBecauseTheKeyIsGone) {
+    const auto alice = join();
+    ASSERT_EQ(delete_account(alice)->status, 200);
+    // The old session no longer authenticates, so no second request reaches
+    // the account; the tree stays as the first deletion left it.
+    const auto digest = tree->tree_digest();
+    auto again = post(alice, "/api/account/delete/challenge", json::object());
+    ASSERT_NE(again, nullptr);
+    EXPECT_EQ(again->status, 401);
+    EXPECT_EQ(tree->tree_digest(), digest);
 }
