@@ -111,6 +111,10 @@ struct ApiContext {
     /// a current Tier 1 member by finalized membership; nullopt otherwise.
     /// Thread-safe. Unset counts as not a member.
     std::function<std::optional<Tier1Identity>()> tier1_identity;
+    /// Answers GET /api/upgrade/rollout-proof with this server's rollout
+    /// proof (Security/Upgrade/RolloutProof.hpp), or nullopt when it holds
+    /// none. Public, self-verifying data; unset, the route answers 404.
+    std::function<std::optional<std::string>()> rollout_proof;
 };
 
 // ---------------------------------------------------------------------------

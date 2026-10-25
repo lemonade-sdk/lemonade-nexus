@@ -236,7 +236,8 @@ AttestationVerdict AttestationVerifier::examine(const AttestationChallenge& chal
     //    diagnosis, not "replay". An unbound final or storage-unlock
     //    challenge proves nothing.
     if ((challenge.purpose == AttestationPurpose::FinalEpochReadiness ||
-         challenge.purpose == AttestationPurpose::StorageUnlock) &&
+         challenge.purpose == AttestationPurpose::StorageUnlock ||
+         challenge.purpose == AttestationPurpose::UpgradeHealth) &&
         challenge.context_digest == Digest{}) {
         return fail(AttestationFailure::ContextUnbound);
     }

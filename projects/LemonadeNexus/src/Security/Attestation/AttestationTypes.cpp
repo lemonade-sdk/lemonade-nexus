@@ -53,6 +53,17 @@ Digest storage_unlock_attestation_context(const NetworkId& network_id, EpochId e
     return encoder.digest();
 }
 
+Digest upgrade_health_attestation_context(const NetworkId& network_id, uint64_t release_number,
+                                          const NodeId& subject, const Digest& chain_head) {
+    CanonicalEncoder encoder(kAttestationContextDomain);
+    encoder.add_u16(static_cast<uint16_t>(AttestationPurpose::UpgradeHealth));
+    encoder.add_bytes(network_id);
+    encoder.add_u64(release_number);
+    encoder.add_bytes(subject.bytes);
+    encoder.add_bytes(chain_head);
+    return encoder.digest();
+}
+
 Digest challenge_digest(const AttestationChallenge& challenge) {
     CanonicalEncoder encoder(constants::kTier1AttestDomain);
     encoder.add_string("challenge");

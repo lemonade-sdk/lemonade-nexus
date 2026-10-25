@@ -14,6 +14,7 @@
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Attestation/PlatformEvidenceProducer.hpp>
+#include <LemonadeNexus/Security/Attestation/ReleaseChain.hpp>
 #include <LemonadeNexus/Security/Epoch/EpochStore.hpp>
 #include <LemonadeNexus/Security/Genesis/GenesisService.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityDriver.hpp>
@@ -22,6 +23,7 @@
 #include <LemonadeNexus/Security/Storage/StorageShareStore.hpp>
 #include <LemonadeNexus/Security/Transport/PairwiseSeal.hpp>
 #include <LemonadeNexus/Security/Transport/SecurityRouter.hpp>
+#include <LemonadeNexus/Security/Upgrade/UpgradeService.hpp>
 
 #include <asio.hpp>
 
@@ -49,9 +51,16 @@ struct SecurityMeshConfig {
     crypto::Ed25519Keypair identity{};
     LinuxAttestationProfile profile;
     /// Digest of the verified release approval this process loaded, all-zero
-    /// when none is packaged. Bound through the bootstrap certificate so the
-    /// founding and every adoption agree on one release selection.
+    /// when none is packaged. A new founding commits it through the bootstrap
+    /// certificate.
     Digest release_approval_digest{};
+    /// The verified packaged release approval, or nullopt. When set, the
+    /// service keeps the release chain (ReleaseChain): the attestation profile
+    /// then comes from the newest accepted approval, a newer approval from a
+    /// peer or the updater is adopted at runtime, and a stored bootstrap
+    /// certificate is accepted when its founding approval carries the pinned
+    /// release signer.
+    std::optional<ReleaseApprovalBundleV1> installed_release;
     /// Where platform evidence comes from. Unset means this process collects
     /// it itself, which needs TPM and IMA access here; the assembled server
     /// sets it to the nexus-attestd socket so it needs neither. There is no
@@ -190,6 +199,20 @@ public:
     /// everything else runs on the io thread.
     [[nodiscard]] StorageKeyService* storage_key() { return storage_.get(); }
 
+    /// Release adoption and upgrade turns. Always built. io thread only;
+    /// other threads reach it through post().
+    [[nodiscard]] UpgradeService* upgrade() { return upgrade_.get(); }
+
+    /// The release chain, or nullptr without a packaged approval. io thread.
+    [[nodiscard]] const ReleaseChain* release_chain() const { return release_chain_.get(); }
+
+    /// This node's rollout proof (Upgrade/RolloutProof.hpp) as JSON: the
+    /// authority chain from Genesis and the finalized upgrade records with
+    /// their commit proofs. nullopt when this node lacks the Genesis base or
+    /// a commit proof of any record. Public data; it grants nothing. io
+    /// thread.
+    [[nodiscard]] std::optional<std::string> rollout_proof_json() const;
+
 private:
     // The router needs its events sink at construction and the driver needs
     // the router. The proxy breaks the cycle.
@@ -285,6 +308,9 @@ private:
         void on_storage_message(const SecurityMessage& m) override {
             if (target) target->on_storage_message(m);
         }
+        void on_upgrade_message(const SecurityMessage& m) override {
+            if (target) target->on_upgrade_message(m);
+        }
     };
 
     [[nodiscard]] uint64_t now_ms() const;
@@ -314,6 +340,15 @@ private:
     std::unique_ptr<IStorageShareStore> share_store_;
     std::unique_ptr<StorageKeyService> storage_;
     StorageVault* vault_ = nullptr;
+
+    // Release adoption and upgrade turns. The driver reaches the chain only
+    // through the address-captured release_commitment callback.
+    std::unique_ptr<ReleaseChain> release_chain_;
+    std::unique_ptr<UpgradeService> upgrade_;
+
+    /// Installs the attestation profile of the newest accepted approval, or
+    /// the incomplete compiled template when the chain holds none.
+    void install_release_profile();
 
     asio::steady_timer timer_;
     std::chrono::steady_clock::time_point started_at_{};

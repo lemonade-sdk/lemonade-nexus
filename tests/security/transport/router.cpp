@@ -1000,8 +1000,21 @@ TEST_F(RouterMesh, DropsAreCountedAndTheInfoLineIsRateLimited) {
     spdlog::set_level(spdlog::level::info);
     spdlog::default_logger()->sinks().push_back(sink);
 
+    // Another wire version is its own reason: a peer on another release, not
+    // a malformed message.
+    std::vector<uint8_t> other_wire(8, 0);
+    other_wire[0] = static_cast<uint8_t>(constants::kSecurityWireVersion + 1);
+    EXPECT_EQ(a->deliver(b->id, other_wire, mesh.now_ms).dropped,
+              DropReason::WireVersionMismatch);
+    EXPECT_EQ(a->router->drops(DropReason::Malformed), 0u);
+    sink->drop_infos = 0;
+
     // First occurrence of a (reason, code) logs immediately and is counted.
+    // The current wire version and a known kind, then a truncated envelope:
+    // malformed. The kind is a little-endian u16.
     std::vector<uint8_t> junk(8, 0);
+    junk[0] = static_cast<uint8_t>(constants::kSecurityWireVersion);
+    junk[1] = static_cast<uint8_t>(SecurityMessageKind::AttestationChallenge);
     const uint64_t start = mesh.now_ms;
     EXPECT_EQ(a->deliver(b->id, junk, start).dropped, DropReason::Malformed);
     EXPECT_EQ(a->router->drops(DropReason::Malformed), 1u);

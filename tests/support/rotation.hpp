@@ -83,12 +83,30 @@ struct RotatingMeshBase : DriverMeshBase {
         return out;
     }
 
+    /// The current members plus the reachable selected candidates. A server
+    /// ticks whether or not it holds a role, and a candidate stamps its epoch
+    /// start from its own last tick when it activates. A candidate left
+    /// unticked while the mesh clock jumps by an epoch length activates with
+    /// an epoch that already looks aged, and proposes a boundary stage the
+    /// moment it leads.
+    [[nodiscard]] std::vector<Node*> with_candidates(const std::vector<Node*>& members,
+                                                     const std::vector<Node*>& selected) const {
+        std::vector<Node*> out = members;
+        for (Node* node : selected) {
+            if (!mesh.offline.contains(node->id) &&
+                std::find(out.begin(), out.end(), node) == out.end()) {
+                out.push_back(node);
+            }
+        }
+        return out;
+    }
+
     /// Steps until every selected node can present its next-epoch vote key,
     /// which for an outside candidate means its state sync completed.
     void wait_for_keys(const std::vector<Node*>& members, const std::vector<Node*>& selected,
                        EpochId target, int max_steps = 600) {
         for (int i = 0; i < max_steps; ++i) {
-            step(1, members);
+            step(1, with_candidates(members, selected));
             answer_final_challenges();
             const bool keyed = std::all_of(selected.begin(), selected.end(), [&](Node* node) {
                 return mesh.offline.contains(node->id) ||
@@ -103,7 +121,7 @@ struct RotatingMeshBase : DriverMeshBase {
                            const std::vector<Node*>& expect_active, EpochId target,
                            int max_steps = 2500) {
         for (int i = 0; i < max_steps; ++i) {
-            step(1, members);
+            step(1, with_candidates(members, expect_active));
             answer_final_challenges();
             const bool active =
                 std::all_of(expect_active.begin(), expect_active.end(), [&](Node* n) {

@@ -33,6 +33,7 @@
 #include <LemonadeNexus/Core/ServerAdmissionService.hpp>
 #include <LemonadeNexus/Core/ApplicationRoot.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
+#include <LemonadeNexus/Core/UpgradeControl.hpp>
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
@@ -74,9 +75,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_set>
@@ -329,6 +332,44 @@ int main(int argc, char* argv[]) {
         spdlog::error("Config: {}", mesh_error);
         return 1;
     }
+    // The tree log, once it starts, for the updater's health report. The
+    // control socket reads it on the security io thread; the guard after
+    // tree_consensus clears it before the log is destroyed.
+    struct TreeStatusSource {
+        std::mutex mutex;
+        const nexus::tree::TreeConsensus* tree = nullptr;
+    } tree_status_source;
+#if defined(LEMONADE_HAVE_UPGRADE_CONTROL)
+    // The turn gate, health report, and boot-chain staging for nexus-updater:
+    // root peers only. It starts before the data-key wait so the updater can
+    // watch an unlock. Without the socket the updater waits.
+    nexus::core::UpgradeControlConfig upgrade_control_config;
+    upgrade_control_config.hooks.tree_status =
+        [&tree_status_source]() -> std::optional<nexus::core::UpgradeTreeStatus> {
+        std::lock_guard lock(tree_status_source.mutex);
+        if (tree_status_source.tree == nullptr) return std::nullopt;
+        const auto t = tree_status_source.tree->status_summary();
+        return nexus::core::UpgradeTreeStatus{t.healthy, t.height, t.applied_height, t.behind,
+                                              static_cast<uint64_t>(t.held)};
+    };
+    upgrade_control_config.hooks.stage_boot_chain =
+        [staging = nexus::core::BootChainStagingInputs{
+             std::filesystem::path(data_root) / std::string(nexus::core::kSealedDirectory),
+             seal_backend}](const nexus::security::ReleaseApprovalBundleV1& accepted) {
+            return nexus::core::stage_boot_chain_for_approval(staging, accepted);
+        };
+    auto upgrade_control = std::make_unique<nexus::core::UpgradeControlServer>(
+        coordinator.io_context(), std::move(upgrade_control_config),
+        [mesh = security_mesh->service.get()](std::function<void()> work) {
+            mesh->post(std::move(work));
+        },
+        *security_mesh->service->upgrade());
+    if (std::string control_error; !upgrade_control->start(control_error)) {
+        spdlog::warn("Upgrade control socket unavailable ({}); nexus-updater cannot read "
+                     "this server's turn or health",
+                     control_error);
+    }
+#endif
     if (defer_file_services) {
         // Fail closed: the files are encrypted, so nothing that reads them
         // starts before t holders return the data key. There is no plaintext
@@ -960,6 +1001,15 @@ int main(int argc, char* argv[]) {
     // server holds the tree (TreeRole below starts and stops it).
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
+    // Destroyed before tree_consensus on every exit path: the control socket
+    // reads the tree log status.
+    struct ClearTreeStatus {
+        TreeStatusSource& source;
+        ~ClearTreeStatus() {
+            std::lock_guard lock(source.mutex);
+            source.tree = nullptr;
+        }
+    } clear_tree_status{tree_status_source};
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     std::function<nlohmann::json()> tree_log_status;
@@ -1113,9 +1163,16 @@ int main(int argc, char* argv[]) {
                     if (!tree_consensus->start()) {
                         // Fail closed: the server serves its last committed
                         // tree but applies, votes for, and accepts no tree
-                        // operation.
+                        // operation. The updater's health report shows the
+                        // halt.
                         spdlog::error("EXPERIMENTAL tree operations halted at Tier 1 entry: {}",
                                       tree_consensus->halt_reason());
+                    }
+                    // Only a server that holds the tree reports a tree log to
+                    // the updater; a Tier 2 server reports its own status only.
+                    {
+                        std::lock_guard lock(tree_status_source.mutex);
+                        tree_status_source.tree = tree_consensus.get();
                     }
                     for (uint64_t height = 1;
                          height <= tree_consensus->status_summary().height; ++height) {
@@ -1132,6 +1189,10 @@ int main(int argc, char* argv[]) {
                 boringtun_service.dataplane().set_forward_policy(
                     nexus::boringtun::deny_forward_policy());
                 gossip.set_tree_role(false);
+                {
+                    std::lock_guard lock(tree_status_source.mutex);
+                    tree_status_source.tree = nullptr;
+                }
                 if (tree_consensus) tree_consensus->deactivate("this server is not in Tier 1");
                 tree.close();
                 // Tree-range tunnel records are a copy of tree data.
@@ -1171,6 +1232,36 @@ int main(int argc, char* argv[]) {
                  storage_vault->mode() == nexus::security::VaultMode::Encrypted
                      ? "encrypted"
                      : "plaintext, pre-key or migrating");
+
+    // The rollout proof for the release workflow's guard. It is built on the
+    // security io thread; the HTTP thread waits a bounded time and reuses a
+    // proof for a few seconds so an unauthenticated caller cannot keep that
+    // thread busy.
+    struct RolloutProofCache {
+        std::mutex mutex;
+        std::chrono::steady_clock::time_point built{};
+        std::optional<std::string> proof;
+    };
+    auto rollout_proof_cache = std::make_shared<RolloutProofCache>();
+    std::function<std::optional<std::string>()> rollout_proof =
+        [cache = rollout_proof_cache,
+         mesh = security_mesh->service.get()]() -> std::optional<std::string> {
+        std::lock_guard lock(cache->mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (cache->built != std::chrono::steady_clock::time_point{} &&
+            now - cache->built < std::chrono::seconds(10)) {
+            return cache->proof;
+        }
+        auto promise = std::make_shared<std::promise<std::optional<std::string>>>();
+        auto future = promise->get_future();
+        mesh->post([promise, mesh] { promise->set_value(mesh->rollout_proof_json()); });
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            return std::nullopt;
+        }
+        cache->proof = future.get();
+        cache->built = now;
+        return cache->proof;
+    };
 
     // ========================================================================
     // Register CRTP request handlers
@@ -1228,6 +1319,7 @@ int main(int argc, char* argv[]) {
                 identity.epoch = snapshot.epoch.underlying();
                 return identity;
             },
+        .rollout_proof    = rollout_proof,
     };
 
     nexus::api::PublicApiHandler public_api{ctx};
@@ -1538,6 +1630,9 @@ int main(int argc, char* argv[]) {
     relay_discovery.stop();
     relay.stop();
     stun.stop();
+#if defined(LEMONADE_HAVE_UPGRADE_CONTROL)
+    upgrade_control->stop();
+#endif
     if (security_mesh) {
         security_mesh->service->stop();  // uses gossip as transport: stop it first
     }

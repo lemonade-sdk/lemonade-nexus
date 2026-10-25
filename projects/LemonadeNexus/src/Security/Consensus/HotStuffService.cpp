@@ -240,8 +240,14 @@ ProposalResult HotStuffService::receive_proposal(const Proposal& proposal,
         }
     } else {
         // Chain state cannot be evaluated. The justify itself passed step 5
-        // and still advances what this node knows.
+        // and still advances what this node knows. The proposal waits for
+        // catch-up to deliver its parent; a higher view replaces it.
         advance_high_qc(justify);
+        if (!orphan_.has_value() || proposal.view >= orphan_->proposal.view) {
+            orphan_ = OrphanProposal{proposal, justify,
+                                     payload != nullptr ? std::optional<BlockPayload>(*payload)
+                                                        : std::nullopt};
+        }
         result.rejected = ConsensusFailure::MissingParent;
         return result;
     }
@@ -602,6 +608,15 @@ std::optional<ConsensusFailure> HotStuffService::adopt_certified_block(
     advance_high_qc(certifying);
     apply_chain_rules(certifying, commits_out);
     return std::nullopt;
+}
+
+std::optional<OrphanProposal> HotStuffService::take_linkable_orphan() {
+    if (!orphan_.has_value()) return std::nullopt;
+    const Digest& parent = orphan_->proposal.parent_digest;
+    if (parent != config_.genesis_digest && !blocks_.contains(parent)) return std::nullopt;
+    std::optional<OrphanProposal> out = std::move(orphan_);
+    orphan_.reset();
+    return out;
 }
 
 std::vector<std::pair<Proposal, QuorumCertificate>> HotStuffService::uncommitted_chain() const {

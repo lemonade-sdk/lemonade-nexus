@@ -8,6 +8,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include "support/attestation_fixtures.hpp"
+#include "support/release_line.hpp"
 
 #include <gtest/gtest.h>
 #include <sodium.h>
@@ -16,6 +17,8 @@
 #include <fstream>
 #include <string>
 
+#include <unistd.h>
+
 namespace {
 
 using namespace nexus;
@@ -23,7 +26,9 @@ using namespace nexus::security;
 namespace fs = std::filesystem;
 
 fs::path write_artifact(const std::string& name, const std::string& content) {
-    const fs::path path = fs::temp_directory_path() / ("nexus_release_bundle_" + name);
+    // Per process: CTest runs each case as its own process, in parallel.
+    const fs::path path = fs::temp_directory_path() /
+                          ("nexus_release_bundle_" + std::to_string(::getpid()) + "_" + name);
     std::ofstream(path, std::ios::binary | std::ios::trunc) << content;
     return path;
 }
@@ -52,11 +57,13 @@ struct GeneratorFixture : ::testing::Test {
                                     constants::kConsensusRulesetVersion);
         spec.release_id = "release-bundle-test";
         spec.nexus_version = "0.9.7";
+        spec.release_number = 2026102401;
         spec.final_patched_tree = std::string(40, '2');
         spec.network_id_hex = crypto::to_hex(network);
         spec.signer_pubkey_b64 = crypto::to_base64(authority_pk);
         spec.qualification_state = "LIVE_BOOT_APPROVED";
         spec.expected_pcrs = {{8, std::string(64, '8')}, {9, std::string(64, '9')}};
+        nexus_test::fill_reference_boot_line(spec);
         spec.artifacts = {
             {"/usr/bin/lemonade-nexus", write_artifact("app", "app bytes")},
             {"/usr/bin/nexus-attestd", write_artifact("attestd", "collector bytes")},
@@ -73,18 +80,21 @@ TEST_F(GeneratorFixture, DigestsComeFromTheActualBytes) {
     EXPECT_EQ(approval->approved_paths[0].sha256.front(), hex_sha256("app bytes"));
     EXPECT_EQ(approval->approved_paths[1].sha256.front(), hex_sha256("collector bytes"));
     EXPECT_EQ(approval->approved_paths[2].sha256.front(), hex_sha256("libc bytes"));
-    // The template supplied the compiled line; the spec supplied observations.
+    // The template supplied the protocol identity; the spec supplied the boot
+    // line (from the fleet profile) and the observations.
     EXPECT_EQ(approval->evidence_collector_path, "/usr/bin/nexus-attestd");
-    EXPECT_FALSE(approval->svsm_launch_measurements_hex.empty());
+    EXPECT_EQ(approval->svsm_launch_measurements_hex, spec.svsm_launch_measurements);
+    EXPECT_EQ(approval->kernel.bzimage_sha256, spec.kernel.bzimage_sha256);
+    EXPECT_EQ(approval->ima_policy_sha256, spec.ima_policy_sha256);
+    EXPECT_EQ(approval->source_commit, spec.source_commit);
 }
 
 TEST_F(GeneratorFixture, SpecMeasurementsAreCanonicalizedAndFailClosed) {
     std::string error;
-    {   // Empty keeps the compiled template set.
-        const auto approval = generate_release_approval(spec, error);
-        ASSERT_TRUE(approval.has_value()) << error;
-        EXPECT_EQ(approval->svsm_launch_measurements_hex,
-                  release_approval_template().svsm_launch_measurements_hex);
+    {   // Empty is refused: there is no compiled set to fall back on.
+        auto s = spec;
+        s.svsm_launch_measurements.clear();
+        EXPECT_FALSE(generate_release_approval(s, error).has_value());
     }
     {   // One entry per approved shape, sorted into canonical order.
         auto s = spec;
@@ -171,6 +181,71 @@ TEST_F(GeneratorFixture, EachInvalidSpecIsRefusedWithAReason) {
         auto s = spec;
         s.final_patched_tree = "not-a-tree";
         EXPECT_FALSE(generate_release_approval(s, error).has_value());
+    }
+}
+
+TEST_F(GeneratorFixture, ReviewedDigestsStandInForFilesTheBuildDoesNotProduce) {
+    spec.artifacts[2] = {"/usr/lib/x86_64-linux-gnu/libc.so.6", {}, {std::string(64, 'c')}};
+    std::string error;
+    const auto approval = generate_release_approval(spec, error);
+    ASSERT_TRUE(approval.has_value()) << error;
+    EXPECT_EQ(approval->approved_paths[2].sha256, std::vector<std::string>{std::string(64, 'c')});
+
+    spec.artifacts[2] = {"/usr/lib/x86_64-linux-gnu/libc.so.6", {}, {"NOT-HEX"}};
+    EXPECT_FALSE(generate_release_approval(spec, error).has_value());
+    spec.artifacts[2] = {"/usr/lib/x86_64-linux-gnu/libc.so.6", {}, {}};
+    EXPECT_FALSE(generate_release_approval(spec, error).has_value());
+}
+
+TEST_F(GeneratorFixture, ThePreviousApprovalFillsOnlyThePreviousReleasePaths) {
+    std::string error;
+    auto previous = generate_release_approval(spec, error);
+    ASSERT_TRUE(previous.has_value()) << error;
+    previous->approved_paths.push_back({"/usr/bin/retired-tool", {std::string(64, 'e')}});
+    const auto preimage = canonical_release_approval_json(*previous);
+    std::array<unsigned char, crypto_sign_BYTES> sig{};
+    crypto_sign_detached(sig.data(), nullptr,
+                         reinterpret_cast<const unsigned char*>(preimage.data()), preimage.size(),
+                         authority_sk.data());
+    previous->signature_b64 = crypto::to_base64(sig);
+
+    spec.release_number = 2026102501;
+    spec.artifacts[0] = {"/usr/bin/lemonade-nexus", write_artifact("app2", "app bytes v2")};
+    spec.previous = *previous;
+    const auto next = generate_release_approval(spec, error);
+    ASSERT_TRUE(next.has_value()) << error;
+    // approved_paths lists this release only: a witness counts a server as
+    // upgraded only when every measured hash is this release's.
+    EXPECT_EQ(next->approved_paths[0].sha256,
+              std::vector<std::string>{hex_sha256("app bytes v2")});
+    ASSERT_EQ(next->previous_release_paths.size(), 3u) << "dropped paths are not carried over";
+    EXPECT_EQ(next->previous_release_paths[0].path, "/usr/bin/lemonade-nexus");
+    EXPECT_EQ(next->previous_release_paths[0].sha256,
+              std::vector<std::string>{hex_sha256("app bytes")});
+    // Attestation accepts both releases during the rollout.
+    const auto profile = profile_from_release_approval(*next);
+    EXPECT_EQ(profile.approved_paths[0].sha256,
+              (std::vector<std::string>{hex_sha256("app bytes v2"), hex_sha256("app bytes")}));
+
+    // The previous approval and explicit previous paths do not mix.
+    auto both = spec;
+    both.previous_release_paths = {{"/usr/bin/lemonade-nexus", {std::string(64, 'f')}}};
+    EXPECT_FALSE(generate_release_approval(both, error).has_value());
+
+    // A previous approval the release key did not sign contributes nothing.
+    spec.previous->signature_b64 = crypto::to_base64(std::array<unsigned char, 64>{});
+    EXPECT_FALSE(generate_release_approval(spec, error).has_value());
+}
+
+TEST_F(GeneratorFixture, TheBootLineIsRequiredAndWellFormed) {
+    std::string error;
+    for (int field = 0; field < 4; ++field) {
+        auto s = spec;
+        if (field == 0) s.kernel.vmlinux_sha256 = "abc";
+        if (field == 1) s.ima_policy_sha256.clear();
+        if (field == 2) s.source_commit = "zz";
+        if (field == 3) s.kernel.release.clear();
+        EXPECT_FALSE(generate_release_approval(s, error).has_value()) << field;
     }
 }
 
