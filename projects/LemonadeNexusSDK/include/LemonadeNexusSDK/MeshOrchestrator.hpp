@@ -1,11 +1,13 @@
 #pragma once
 
+#include <LemonadeNexusSDK/RelayFallback.hpp>
 #include <LemonadeNexusSDK/Types.hpp>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -24,8 +26,11 @@ class BoringtunMesh;
 ///   2. Syncs the mesh dataplane's peer set (add/remove/update)
 ///   3. Reports our public endpoint via heartbeat (POST /api/mesh/heartbeat)
 ///   4. Monitors peer connectivity and fires state callbacks
-///   5. Checks the client's registered certificates and renews due ones on a
-///      separate thread, so a slow certificate request never delays steps 1-4
+///   5. Moves peers without a direct path onto a relay (RelayFallback): the
+///      relay ticket comes from the session's verified Tier 1 server, and the
+///      relays are the verified Tier 1 servers plus the relays the server lists
+///   6. Checks the client's registered certificates and renews due ones on a
+///      separate thread, so a slow certificate request never delays steps 1-5
 class MeshOrchestrator {
 public:
     using StateCallback = std::function<void(const MeshTunnelStatus&)>;
@@ -74,6 +79,12 @@ private:
     /// Poll mesh dataplane status and fire callback if changed.
     void do_monitor();
 
+    /// Run one relay fallback pass over the known peers.
+    void do_relay_maintenance();
+
+    /// The relays the client may use: verified Tier 1 servers and listed relays.
+    std::vector<RelayCandidate> relay_candidates();
+
     /// Start a certificate renewal thread when a registered certificate is
     /// due and no renewal thread is running.
     void maybe_start_cert_renewal();
@@ -98,6 +109,7 @@ private:
     bool                     refresh_requested_{false};  // set by refresh_now()
     std::thread              cert_thread_;               // runs one renewal pass
     std::atomic<bool>        cert_busy_{false};          // cert_thread_ still working
+    std::unique_ptr<RelayFallback> relay_fallback_;      // used by the loop thread only
 };
 
 } // namespace lnsdk

@@ -43,6 +43,12 @@ set(LN_TRUST_SRC
     "${LN_SERVER_SRC}/Security/Genesis/BootstrapCertificate.cpp"
     "${LN_SERVER_SRC}/Security/Transport/AuthorityChainCodec.cpp")
 
+# Relay fallback (RelayChannel.cpp, BoringtunMesh.cpp) speaks the relay's own
+# wire codec and rendezvous derivation, so the client and the relay encode
+# the same bytes. It depends on libsodium, nlohmann_json, and the trust
+# sources above only.
+list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Relay/RelayWire.cpp")
+
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")

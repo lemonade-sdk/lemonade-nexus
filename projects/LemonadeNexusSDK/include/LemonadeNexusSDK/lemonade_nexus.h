@@ -183,7 +183,9 @@ ln_error_t ln_relay_list(ln_client_t* client, char** out_json);
 /** POST /api/relay/ticket. Returns JSON via out_json: {peer_id, relay_id,
  *  session_nonce, issued_at, expires_at, network_id, epoch, issuer, signature}.
  *  A Tier 1 server signs the ticket; any relay verifies it against its
- *  verified Tier 1 membership. */
+ *  verified Tier 1 membership. relay_id must be the relay's base64 node
+ *  identity key. peer_id must be the caller's own node id. On failure the
+ *  JSON carries "error" and the code reflects the HTTP status. */
 ln_error_t ln_relay_ticket(ln_client_t* client,
                             const char* peer_id,
                             const char* relay_id,
@@ -389,6 +391,9 @@ ln_error_t ln_mesh_status(ln_client_t* client, char** out_json);
  *  Each peer: {node_id, hostname, mesh_pubkey, tunnel_ip, private_subnet,
  *  endpoint, relay_endpoint, is_online, last_handshake, rx_bytes, tx_bytes,
  *  latency_ms, keepalive}.
+ *  A peer whose traffic goes through a relay (relay fallback) has a non-empty
+ *  relay_endpoint ("ip:port" of the relay); ln_mesh_status also reports its
+ *  endpoint as empty.
  *  Caller must ln_free(*out_json). */
 ln_error_t ln_mesh_peers(ln_client_t* client, char** out_json);
 

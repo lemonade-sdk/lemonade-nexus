@@ -17,8 +17,10 @@
 #include <LemonadeNexusSDK/Error.hpp>
 #include <LemonadeNexusSDK/Types.hpp>
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -61,8 +63,33 @@ public:
 
     /// Sync the desired mesh peer set into the dataplane (add/update/remove).
     /// The server peer is preserved. Each peer's routes come from
-    /// peer_allowed_ips; a peer that gets no route is not added.
+    /// peer_allowed_ips; a peer that gets no route is not added. A peer with
+    /// a relay path (set_peer_relay) keeps that path.
     StatusResult sync_peers(const std::vector<MeshPeer>& desired);
+
+    /// Our mesh public key (base64). Empty when inactive.
+    [[nodiscard]] std::string public_key() const;
+
+    /// Rendezvous material for a relay session with `peer_pubkey` (base64) at
+    /// the relay `relay_id`, in rendezvous window `window`: 16-byte rendezvous
+    /// id, 16-byte own proof, 32-byte commitment to the peer's proof (see
+    /// LemonadeNexus/Relay/RelayWire.hpp). It is derived from the X25519
+    /// secret this device shares with the peer, so only the two of them can
+    /// produce it; the shared secret itself never leaves this object.
+    /// nullopt when inactive or a key is invalid. Thread-safe.
+    [[nodiscard]] std::optional<std::array<uint8_t, 64>> relay_rendezvous(
+        const std::string& peer_pubkey, const std::string& relay_id, uint64_t window) const;
+
+    /// Send `pubkey`'s traffic through a relay: the dataplane sends to
+    /// `local_endpoint` (a RelayChannel's 127.0.0.1 port) and starts a new
+    /// handshake there. `relay_endpoint` ("ip:port") is reported in
+    /// mesh_status(). False when inactive or the peer is unknown. Thread-safe.
+    bool set_peer_relay(const std::string& pubkey, const std::string& local_endpoint,
+                        const std::string& relay_endpoint);
+
+    /// Stop sending `pubkey`'s traffic through a relay. The next sync_peers
+    /// restores a direct endpoint the server lists. Thread-safe.
+    void clear_peer_relay(const std::string& pubkey);
 
     /// The allowed-IPs text to install for each peer in `peers`, in the same
     /// order. A peer's addresses become routes on this device, so a peer must
@@ -86,7 +113,8 @@ public:
     /// Remove a single mesh peer (the server peer is never removed).
     StatusResult remove_peer(const std::string& pubkey);
 
-    /// Live mesh status built from the dataplane's peer snapshot.
+    /// Live mesh status built from the dataplane's peer snapshot. A relayed
+    /// peer has an empty `endpoint` and its relay in `relay_endpoint`.
     [[nodiscard]] MeshTunnelStatus mesh_status() const;
 
     /// Generate a fresh Curve25519 keypair (base64 {private, public}).
