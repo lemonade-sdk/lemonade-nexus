@@ -31,8 +31,11 @@ cmake_minimum_required(VERSION 3.25.1)
 
 set(LEMONADE_NEXUS_OPENSSL_VERSION_UBUNTU "3.0.13")
 set(LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION "3.5.9")
+# Release that holds the archives: deps-openssl-<version>, or
+# deps-openssl-<version>-r<n> for a later build of the same version.
+set(LEMONADE_NEXUS_OPENSSL_PREBUILT_RELEASE "deps-openssl-${LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION}")
 set(LEMONADE_NEXUS_OPENSSL_PREBUILT_URL
-    "https://github.com/lemonade-sdk/lemonade-nexus/releases/download/deps-openssl-${LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION}")
+    "https://github.com/lemonade-sdk/lemonade-nexus/releases/download/${LEMONADE_NEXUS_OPENSSL_PREBUILT_RELEASE}")
 # The SHA-256 values that the deps-openssl.yml run printed when it published
 # the release deps-openssl-3.5.9.
 set(LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_MACOS_ARM64

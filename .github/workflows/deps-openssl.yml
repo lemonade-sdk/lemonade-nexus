@@ -24,6 +24,10 @@ on:
         description: SHA-256 of openssl-<version>.tar.gz as published by OpenSSL
         required: true
         default: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+      revision:
+        description: Archive build of this version; a new build publishes deps-openssl-<version>-r<revision>
+        required: true
+        default: "2"
 
 permissions:
   contents: read
@@ -31,6 +35,7 @@ permissions:
 env:
   VERSION: ${{ inputs.version }}
   SOURCE_SHA256: ${{ inputs.sha256 }}
+  REVISION: ${{ inputs.revision }}
   OPENSSL_OPTIONS: no-shared no-tests no-docs no-ui-console no-zlib no-zstd no-brotli
 
 jobs:
@@ -60,6 +65,10 @@ jobs:
   macos-arm64:
     needs: source
     runs-on: macos-14
+    env:
+      # The oldest macOS that runs on Apple silicon. The archive's objects must
+      # not require a newer macOS than the binaries that link them.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -107,7 +116,8 @@ jobs:
           tar -xzf "openssl-$env:VERSION.tar.gz"
           Set-Location "openssl-$env:VERSION"
           $stage = Join-Path $PWD "stage"
-          perl Configure VC-WIN64A "--prefix=$stage" "--openssldir=$stage\ssl" $env:OPENSSL_OPTIONS.Split(' ')
+          # OpenSSL's default Windows directory, not a path on this runner.
+          perl Configure VC-WIN64A "--prefix=$stage" "--openssldir=C:\Program Files\Common Files\SSL" $env:OPENSSL_OPTIONS.Split(' ')
           if ($LASTEXITCODE -ne 0) { exit 1 }
           nmake
           if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -139,9 +149,10 @@ jobs:
           GH_REPO: ${{ github.repository }}
         run: |
           tag="deps-openssl-${VERSION}"
+          if [ "$REVISION" != "1" ]; then tag="${tag}-r${REVISION}"; fi
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --target "$GITHUB_SHA" --title "OpenSSL ${VERSION} static archives" \
-              --notes "Static OpenSSL ${VERSION} for the macOS and Windows builds. Built by deps-openssl.yml from openssl-${VERSION}.tar.gz (SHA-256 ${SOURCE_SHA256}). Not a Nexus release."
+              --notes "Static OpenSSL ${VERSION} (archive build ${REVISION}, macOS 11.0 minimum) for the macOS and Windows builds. Built by deps-openssl.yml from openssl-${VERSION}.tar.gz (SHA-256 ${SOURCE_SHA256}). Not a Nexus release."
           fi
           # No --clobber: a pinned archive must never change.
           gh release upload "$tag" out/*.tar.gz
