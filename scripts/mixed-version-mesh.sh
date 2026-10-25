@@ -29,7 +29,7 @@
 #   OLD_TAG    release tag to download (default: the newest date-tagged release,
 #              vYYYY.MM.DD[.N]; the older vX.Y.Z-alpha tags use another security
 #              wire version and are not a baseline)
-#   OLD_ASSET  asset name pattern (default: lemonade-nexus-*-linux-x86_64)
+#   OLD_ASSET  asset name pattern (default: lemonade-nexus-linux-x86_64)
 #   REPO       GitHub repository (default: lemonade-sdk/lemonade-nexus)
 #   WORK       working directory (default: /tmp/nexus-mixed-mesh)
 #   WAIT       seconds to observe each pass (default: 30; 900 with snp)
@@ -42,7 +42,7 @@ REPO="${REPO:-lemonade-sdk/lemonade-nexus}"
 WORK="${WORK:-/tmp/nexus-mixed-mesh}"
 HARDWARE="${NEXUS_MIXED_HARDWARE:-}"
 if [ "$HARDWARE" = "snp" ]; then WAIT="${WAIT:-900}"; else WAIT="${WAIT:-30}"; fi
-OLD_ASSET="${OLD_ASSET:-lemonade-nexus-*-linux-x86_64}"
+OLD_ASSET="${OLD_ASSET:-lemonade-nexus-linux-x86_64}"
 
 say()  { printf '\033[1m[mixed]\033[0m %s\n' "$*"; }
 FAILURES=0

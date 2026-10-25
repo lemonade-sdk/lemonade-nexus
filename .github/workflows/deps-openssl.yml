@@ -151,7 +151,7 @@ jobs:
           tag="deps-openssl-${VERSION}"
           if [ "$REVISION" != "1" ]; then tag="${tag}-r${REVISION}"; fi
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            gh release create "$tag" --target "$GITHUB_SHA" --title "OpenSSL ${VERSION} static archives" \
+            gh release create "$tag" --latest=false --target "$GITHUB_SHA" --title "OpenSSL ${VERSION} static archives" \
               --notes "Static OpenSSL ${VERSION} (archive build ${REVISION}, macOS 11.0 minimum) for the macOS and Windows builds. Built by deps-openssl.yml from openssl-${VERSION}.tar.gz (SHA-256 ${SOURCE_SHA256}). Not a Nexus release."
           fi
           # No --clobber: a pinned archive must never change.
