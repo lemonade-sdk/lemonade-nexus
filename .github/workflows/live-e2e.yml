@@ -1,0 +1,296 @@
+name: Live SDK E2E
+
+# Two GitHub-hosted runners act as real clients of the live production fleet,
+# with the SDK built from this commit. The owner runner uses the persistent CI
+# owner account; the member runner uses a second persistent account. The
+# member joins the owner's CI group through an invite and proves the direct
+# path, the relay path, leave, and removal. See docs/Live-E2E.md.
+#
+# The workflow changes production state only inside the CI group, and the
+# cleanup job removes the per-run membership. It skips, and does not fail,
+# when the secrets are not available (for example on a pull request from a
+# fork).
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'projects/LemonadeNexusSDK/**'
+      - 'projects/LemonadeNexus/src/Boringtun/**'
+      - 'projects/LemonadeNexus/include/LemonadeNexus/Boringtun/**'
+      - 'projects/LemonadeNexus/src/Relay/**'
+      - 'projects/LemonadeNexus/include/LemonadeNexus/Relay/**'
+      - 'projects/LemonadeNexus/src/Network/StunWire*'
+      - 'projects/LemonadeNexus/include/LemonadeNexus/Network/StunWire*'
+      - 'projects/LemonadeNexus/src/Tree/**'
+      - 'projects/LemonadeNexus/src/Api/**'
+      - 'crates/**'
+      - 'tests/live-e2e/**'
+      - '.github/workflows/live-e2e.yml'
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time for the whole repository: every run uses the same CI
+# group and the same two accounts. A queued run waits; it does not cancel the
+# run in progress.
+concurrency:
+  group: live-e2e-production-ci-group
+  cancel-in-progress: false
+
+env:
+  E2E_DOMAIN: lemonade-nexus.io
+  E2E_REGION: us-west
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - name: Check secrets and trigger
+        id: check
+        env:
+          HAS_OWNER: ${{ secrets.NEXUS_E2E_OWNER_IDENTITY != '' }}
+          HAS_MEMBER: ${{ secrets.NEXUS_E2E_MEMBER_IDENTITY != '' }}
+          MEMBER_PUBKEY: ${{ vars.NEXUS_E2E_MEMBER_PUBKEY }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          enabled=true
+          if [ "$EVENT" = workflow_run ] && [ "$RELEASE_CONCLUSION" != success ]; then
+            echo "::notice::The release run did not succeed; the live E2E test is skipped."
+            enabled=false
+          elif [ "$HAS_OWNER" != true ] || [ "$HAS_MEMBER" != true ] || [ -z "$MEMBER_PUBKEY" ]; then
+            echo "::notice::NEXUS_E2E_OWNER_IDENTITY, NEXUS_E2E_MEMBER_IDENTITY, or NEXUS_E2E_MEMBER_PUBKEY is not available; the live E2E test is skipped. See docs/Live-E2E.md."
+            enabled=false
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v5
+        with:
+          path: build/_deps
+          key: fetchcontent-live-e2e-ubuntu-24.04-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-live-e2e-ubuntu-24.04-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+
+      - name: Build the SDK shared library and the test client
+        run: cmake --build build --target LemonadeNexusSDKShared nexus-e2e --parallel
+
+      - name: Run the offline self-test
+        run: ctest --test-dir build -R '^LiveE2E\.' --output-on-failure
+
+      - name: Collect the client
+        run: |
+          mkdir -p dist
+          cp build/tests/live-e2e/nexus-e2e dist/
+          cp build/projects/LemonadeNexusSDK/liblemonade_nexus_sdk.so dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: live-e2e-client
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  owner-invite:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      bundle: ${{ steps.invite.outputs.bundle }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-e2e-client
+          path: ${{ runner.temp }}/e2e
+
+      - name: Write the owner identity
+        env:
+          OWNER_IDENTITY: ${{ secrets.NEXUS_E2E_OWNER_IDENTITY }}
+        run: |
+          umask 077
+          chmod +x "$RUNNER_TEMP/e2e/nexus-e2e"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/e2e" >> "$GITHUB_ENV"
+          printf '%s' "$OWNER_IDENTITY" > "$RUNNER_TEMP/owner-identity.json"
+
+      # The bundle holds the two invite codes sealed to the member account's
+      # key and bound to this run, so it is safe in a job output and in logs.
+      - name: Create invites into the CI group
+        id: invite
+        timeout-minutes: 10
+        env:
+          MEMBER_PUBKEY: ${{ vars.NEXUS_E2E_MEMBER_PUBKEY }}
+          GENESIS_KEY: ${{ vars.NEXUS_E2E_GENESIS_KEY }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          expect=()
+          if [ -n "$GENESIS_KEY" ]; then expect=(--expect-genesis-key "$GENESIS_KEY"); fi
+          "$RUNNER_TEMP/e2e/nexus-e2e" owner-invite \
+            --identity "$RUNNER_TEMP/owner-identity.json" \
+            --member-pubkey "$MEMBER_PUBKEY" --run-id "$RUN_ID" \
+            --bundle-out "$RUNNER_TEMP/bundle.txt" \
+            --domain "$E2E_DOMAIN" --region "$E2E_REGION" "${expect[@]}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+          echo "bundle=$(cat "$RUNNER_TEMP/bundle.txt")" >> "$GITHUB_OUTPUT"
+
+      - name: Remove local secrets
+        if: always()
+        run: rm -f "$RUNNER_TEMP/owner-identity.json" "$RUNNER_TEMP/bundle.txt"
+
+  owner-serve:
+    needs: [build, owner-invite]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-e2e-client
+          path: ${{ runner.temp }}/e2e
+
+      - name: Write the owner identity
+        env:
+          OWNER_IDENTITY: ${{ secrets.NEXUS_E2E_OWNER_IDENTITY }}
+        run: |
+          umask 077
+          chmod +x "$RUNNER_TEMP/e2e/nexus-e2e"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/e2e" >> "$GITHUB_ENV"
+          printf '%s' "$OWNER_IDENTITY" > "$RUNNER_TEMP/owner-identity.json"
+
+      - name: Serve the test service and control API over the mesh
+        timeout-minutes: 46
+        env:
+          MEMBER_PUBKEY: ${{ vars.NEXUS_E2E_MEMBER_PUBKEY }}
+          GENESIS_KEY: ${{ vars.NEXUS_E2E_GENESIS_KEY }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          expect=()
+          if [ -n "$GENESIS_KEY" ]; then expect=(--expect-genesis-key "$GENESIS_KEY"); fi
+          "$RUNNER_TEMP/e2e/nexus-e2e" owner-serve \
+            --identity "$RUNNER_TEMP/owner-identity.json" \
+            --member-pubkey "$MEMBER_PUBKEY" --run-id "$RUN_ID" --timeout 2700 \
+            --domain "$E2E_DOMAIN" --region "$E2E_REGION" "${expect[@]}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove local secrets
+        if: always()
+        run: rm -f "$RUNNER_TEMP/owner-identity.json"
+
+  member:
+    needs: [build, owner-invite]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-e2e-client
+          path: ${{ runner.temp }}/e2e
+
+      - name: Write the member identity and the sealed bundle
+        env:
+          MEMBER_IDENTITY: ${{ secrets.NEXUS_E2E_MEMBER_IDENTITY }}
+          BUNDLE: ${{ needs.owner-invite.outputs.bundle }}
+        run: |
+          umask 077
+          chmod +x "$RUNNER_TEMP/e2e/nexus-e2e"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/e2e" >> "$GITHUB_ENV"
+          printf '%s' "$MEMBER_IDENTITY" > "$RUNNER_TEMP/member-identity.json"
+          printf '%s\n' "$BUNDLE" > "$RUNNER_TEMP/bundle.txt"
+
+      - name: Join, direct path, relay path, leave, and removal
+        timeout-minutes: 46
+        env:
+          GENESIS_KEY: ${{ vars.NEXUS_E2E_GENESIS_KEY }}
+          RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          expect=()
+          if [ -n "$GENESIS_KEY" ]; then expect=(--expect-genesis-key "$GENESIS_KEY"); fi
+          "$RUNNER_TEMP/e2e/nexus-e2e" member \
+            --identity "$RUNNER_TEMP/member-identity.json" \
+            --bundle "$RUNNER_TEMP/bundle.txt" --run-id "$RUN_ID" \
+            --domain "$E2E_DOMAIN" --region "$E2E_REGION" "${expect[@]}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove local secrets
+        if: always()
+        run: rm -f "$RUNNER_TEMP/member-identity.json" "$RUNNER_TEMP/bundle.txt"
+
+  # Runs after a failure or a cancellation too. It removes only per-run state:
+  # the member's entry on the CI group. The two accounts, their groups, and
+  # their devices persist across runs.
+  cleanup:
+    needs: [preflight, build, owner-invite, owner-serve, member]
+    if: always() && needs.preflight.outputs.enabled == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: live-e2e-client
+          path: ${{ runner.temp }}/e2e
+
+      - name: Write the identities
+        env:
+          OWNER_IDENTITY: ${{ secrets.NEXUS_E2E_OWNER_IDENTITY }}
+          MEMBER_IDENTITY: ${{ secrets.NEXUS_E2E_MEMBER_IDENTITY }}
+        run: |
+          umask 077
+          chmod +x "$RUNNER_TEMP/e2e/nexus-e2e"
+          echo "LD_LIBRARY_PATH=$RUNNER_TEMP/e2e" >> "$GITHUB_ENV"
+          printf '%s' "$OWNER_IDENTITY" > "$RUNNER_TEMP/owner-identity.json"
+          printf '%s' "$MEMBER_IDENTITY" > "$RUNNER_TEMP/member-identity.json"
+
+      - name: Owner removes every other member entry from the CI group
+        timeout-minutes: 8
+        env:
+          GENESIS_KEY: ${{ vars.NEXUS_E2E_GENESIS_KEY }}
+        run: |
+          expect=()
+          if [ -n "$GENESIS_KEY" ]; then expect=(--expect-genesis-key "$GENESIS_KEY"); fi
+          "$RUNNER_TEMP/e2e/nexus-e2e" cleanup-owner \
+            --identity "$RUNNER_TEMP/owner-identity.json" \
+            --domain "$E2E_DOMAIN" --region "$E2E_REGION" "${expect[@]}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Member leaves the CI owner's groups
+        if: always()
+        timeout-minutes: 8
+        env:
+          GENESIS_KEY: ${{ vars.NEXUS_E2E_GENESIS_KEY }}
+          OWNER_PUBKEY: ${{ vars.NEXUS_E2E_OWNER_PUBKEY }}
+        run: |
+          extra=()
+          if [ -n "$GENESIS_KEY" ]; then extra+=(--expect-genesis-key "$GENESIS_KEY"); fi
+          if [ -n "$OWNER_PUBKEY" ]; then extra+=(--owner-pubkey "$OWNER_PUBKEY"); fi
+          "$RUNNER_TEMP/e2e/nexus-e2e" cleanup-member \
+            --identity "$RUNNER_TEMP/member-identity.json" \
+            --domain "$E2E_DOMAIN" --region "$E2E_REGION" "${extra[@]}" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove local secrets
+        if: always()
+        run: rm -f "$RUNNER_TEMP/owner-identity.json" "$RUNNER_TEMP/member-identity.json"

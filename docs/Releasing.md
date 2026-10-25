@@ -52,6 +52,10 @@ Do not push `v*` tags by hand. A tag push no longer starts a release.
 | `lemonade-nexus-*.deb` | Server package with the signed approval. |
 | `.pkg`, `.rpm`, `.tar.gz`, SDK libraries, desktop client zips | Other platforms. They are not covered by the approval. |
 
+After a successful release, the `Live SDK E2E` workflow runs the SDK from
+`main` against the production fleet as two real clients. See
+[Live SDK E2E](Live-E2E).
+
 Check provenance by hand with `gh`:
 
 ```bash

@@ -41,6 +41,7 @@ A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, crypto
 - [Frameworks and Libraries](Frameworks-and-Libraries) — Tech stack and dependencies
 - [Building](Building) — Build instructions and platform status
 - [Releasing](Releasing) — The release workflow, required repository settings, and the server updater
+- [Live SDK E2E](Live-E2E) — The CI test that runs the SDK against the production fleet as two clients
 
 ## Quick Links
 
