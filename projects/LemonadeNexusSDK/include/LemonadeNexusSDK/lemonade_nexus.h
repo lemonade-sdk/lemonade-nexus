@@ -213,6 +213,54 @@ ln_error_t ln_cert_decrypt(ln_client_t* client,
                             const char* bundle_json,
                             char** out_json);
 
+/** The ln_cert_renew_if_needed() target that names this device's group
+ *  loopback wildcard certificate, "*.<group-label>.lo.<base_domain>". */
+#define LN_CERT_GROUP_LOOPBACK "*"
+
+/** POST /api/certs/issue with scope "group_loopback" — request the wildcard
+ *  certificate "*.<group-label>.lo.<base_domain>" of this device's group.
+ *  Every name under it resolves to 127.0.0.1. Every device of the group gets
+ *  the same private key. Requires an identity (ln_set_identity) and the
+ *  session of a joined device of the group; other callers get LN_ERR_AUTH.
+ *  Returns the same bundle JSON as ln_cert_request; decrypt it with
+ *  ln_cert_decrypt. Caller must ln_free(*out_json). */
+ln_error_t ln_cert_request_group(ln_client_t* client, char** out_json);
+
+/** Called once after each certificate renewal, when both files are replaced.
+ *  event_json: {target, domain, fullchain_path, privkey_path, expires_at}.
+ *  event_json is valid only during the call; do not free it. Runs on an SDK
+ *  background thread or on the thread that called ln_cert_renew_if_needed.
+ *  The function must return normally (no longjmp, no C++ exception) and must
+ *  not call ln_set_cert_renewed_callback or ln_destroy for this client. */
+typedef void (*ln_cert_renewed_fn)(const char* event_json, void* user);
+
+/** Set the renewal callback and its user pointer (fn NULL clears it). When
+ *  this returns, the previous callback is not running and is not called
+ *  again, so its user data may be released. No callback runs after
+ *  ln_destroy returns. Returns LN_ERR_NULL_ARG when client is NULL. */
+ln_error_t ln_set_cert_renewed_callback(ln_client_t* client,
+                                        ln_cert_renewed_fn fn,
+                                        void* user);
+
+/** Keep a certificate in cert_dir current. hostname is the node hostname of
+ *  the device certificate, or LN_CERT_GROUP_LOOPBACK. When
+ *  cert_dir/fullchain.pem is missing or less than one third of its lifetime
+ *  remains, requests the certificate (ln_cert_request flow), decrypts it,
+ *  checks that the key matches, and replaces cert_dir/privkey.pem (mode 0600)
+ *  and cert_dir/fullchain.pem through temporary files and rename. Then the
+ *  renewal callback runs. On failure the old files stay. Registers the
+ *  certificate for background renewal while the mesh is enabled; background
+ *  attempts back off from 60 s to 6 h after failures. Blocks on the network
+ *  when a request is due.
+ *  out_json: {status: "renewed"|"not_due"|"failed", domain, expires_at,
+ *  fullchain_path, privkey_path, error?}. Returns LN_OK for "renewed" and
+ *  "not_due"; otherwise an error code (LN_ERR_AUTH, LN_ERR_CONNECT, ...).
+ *  Caller must ln_free(*out_json). */
+ln_error_t ln_cert_renew_if_needed(ln_client_t* client,
+                                   const char* hostname,
+                                   const char* cert_dir,
+                                   char** out_json);
+
 /* ------------------------------------------------------------------ */
 /* Tree: children                                                      */
 /* ------------------------------------------------------------------ */

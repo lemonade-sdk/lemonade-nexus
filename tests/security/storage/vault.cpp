@@ -3,6 +3,7 @@
 // start, rotation through the holders) run on the memory mesh in
 // security/lifecycle/storage_key_path.cpp.
 
+#include <LemonadeNexus/Acme/AcmeService.hpp>
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
 #include <LemonadeNexus/Core/ServerConfig.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
@@ -550,6 +551,31 @@ TEST_F(StorageVaultTest, WithoutAVaultFileStorageIsUnchanged) {
     EXPECT_EQ(files.vault_for(data / "tree/nodes/gamma.json"), nullptr);
     EXPECT_EQ(StorageVault::recorded_mode(data / "security/storage"), std::nullopt);
     files.stop();
+}
+
+// A device certificate key is written through the vault (write_secret_file),
+// so it must be read back through the vault. A raw read hands the DEK
+// ciphertext to /api/certs/issue, which then encrypts it for the device.
+TEST_F(StorageVaultTest, AcmeCertificateKeyIsReadThroughTheVault) {
+    migrate();
+    nexus::storage::FileStorageService files(data);
+    nexus::acme::AcmeService acme(files);
+    acme.set_vault(vault.get());
+
+    const std::string fqdn = "laptop.capi.example.test";
+    const auto dir = data / "certs" / fqdn;
+    write_raw(dir / "fullchain.pem", "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----\n");
+    ASSERT_TRUE(vault->write(dir / "privkey.pem", "device-private-key"));
+    ASSERT_TRUE(encrypted(read_raw(dir / "privkey.pem")));
+
+    const auto bundle = acme.get_certificate(fqdn);
+    ASSERT_TRUE(bundle.has_value());
+    EXPECT_EQ(bundle->privkey_pem, "device-private-key");
+
+    // Locked after a restart: the key is absent, never ciphertext.
+    crash_and_restart(/*holders_up=*/false);
+    acme.set_vault(vault.get());
+    EXPECT_FALSE(acme.get_certificate(fqdn).has_value());
 }
 
 }  // namespace

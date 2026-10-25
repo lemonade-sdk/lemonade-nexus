@@ -31,7 +31,8 @@ Base domain: `dns_base_domain` (default `lemonade-nexus.io`).
 │   ├── <id>.<region>.seip.<base>       per-server SEIP records
 │   ├── tier1.<region>.seip.<base>     onboarding / seed discovery (A + TXT)
 │   └── tier2.<region>.seip.<base>     onboarding / seed discovery (A + TXT)
-└── <node_id>.ep.<base>                 client endpoints
+├── <node_id>.ep.<base>                 client endpoints
+└── <device>.<group-label>.lo.<base>    group loopback names (127.0.0.1)
 ```
 
 ## SEIP — Server Endpoint IP
@@ -54,6 +55,53 @@ private.<node_id>.ep.<domain>    A -> client tunnel IP (10.64.0.x)
 ```
 
 Registered by the server when a client joins via `/api/join`.
+
+## Group Loopback Names
+
+```text
+<device>.<group-label>.lo.<domain>   A -> 127.0.0.1
+```
+
+Every name under `<group-label>.lo.<domain>` resolves to `127.0.0.1`. On
+each computer the name reaches the local `lemond`, which routes by name to
+the device that the name belongs to.
+
+- `<group-label>` is `g` and 20 hex characters of a domain-separated
+  SHA-256 of the group id (`network::group_loopback_label`). It does not
+  change when the group is renamed, and another group cannot claim it by
+  name. A label that matches more than one group gets no answer.
+- `<device>` is any one DNS label. The server does not check it against the
+  tree; `lemond` does the routing.
+- The answer comes from the replicated tree, so every Tier 1 server gives
+  the same answer. The names stop resolving when the group is deleted.
+- The server answers only A queries. Other query types for these names get
+  NXDOMAIN, like every other tree name.
+
+### Group wildcard certificate
+
+Each group has one Let's Encrypt certificate for
+`*.<group-label>.lo.<domain>`. A device requests it through
+`POST /api/certs/issue` with `"scope": "group_loopback"`
+(`ln_cert_request_group`, or `ln_cert_renew_if_needed` with
+`LN_CERT_GROUP_LOOPBACK`). The server issues it with DNS-01 on
+`_acme-challenge.<group-label>.lo.<domain>` and returns the key encrypted to
+the caller's own key. The caller must be a joined endpoint of the group.
+
+Tradeoffs:
+
+- Every device of the group holds the same private key. A device that
+  leaves the group can no longer fetch the certificate or its renewals, but
+  it keeps the key it already has until that certificate expires. The
+  server does not issue again when membership changes: a new certificate
+  does not revoke the old one, and repeated orders would reach the Let's
+  Encrypt duplicate-certificate limit.
+- The names resolve only to loopback. To use a leaked key against a device,
+  an attacker must also answer for the name on that device (local code or a
+  forged DNS answer).
+- Device and group certificates are issued again when less than one third
+  of their lifetime remains: by the server's daily renewal monitor and at
+  the next request, and by the SDK, which checks in the mesh loop and calls
+  the renewal callback (`ln_set_cert_renewed_callback`).
 
 ## NS Bootstrap
 

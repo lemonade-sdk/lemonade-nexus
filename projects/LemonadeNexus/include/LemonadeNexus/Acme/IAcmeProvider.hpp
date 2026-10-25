@@ -18,12 +18,30 @@ struct AcmeResult {
     std::string key_path;
 };
 
-/// A PEM certificate bundle with its expiry timestamp.
+/// A PEM certificate bundle with its validity period.
 struct CertBundle {
     std::string fullchain_pem;
     std::string privkey_pem;
-    uint64_t    expires_at{0};
+    uint64_t    expires_at{0};   ///< Not After of the leaf, Unix seconds; 0 = unknown
+    uint64_t    not_before{0};   ///< Not Before of the leaf, Unix seconds; 0 = unknown
 };
+
+/// True when a certificate with this validity period must be issued again at
+/// `now` (Unix seconds): less than one third of its lifetime remains, it has
+/// expired, or its validity period is unknown or invalid. An unknown period
+/// counts as due, so a certificate that cannot be checked is never kept.
+[[nodiscard]] inline bool certificate_renewal_due(uint64_t not_before, uint64_t expires_at,
+                                                  uint64_t now) {
+    if (not_before == 0 || expires_at <= not_before || now >= expires_at) return true;
+    const uint64_t lifetime  = expires_at - not_before;
+    const uint64_t remaining = expires_at - now;
+    return remaining < lifetime / 3;
+}
+
+/// certificate_renewal_due() for a stored bundle.
+[[nodiscard]] inline bool certificate_renewal_due(const CertBundle& bundle, uint64_t now) {
+    return certificate_renewal_due(bundle.not_before, bundle.expires_at, now);
+}
 
 /// Configuration for an ACME certificate authority provider.
 ///

@@ -370,8 +370,11 @@ inline void from_json(const nlohmann::json& j, CertStatusResponse& r) {
 // ============================================================================
 
 struct CertIssueRequest {
-    std::string hostname;
-    std::string client_pubkey;
+    std::string hostname;        ///< device scope: the node hostname
+    std::string client_pubkey;   ///< Ed25519 key the private key is encrypted to
+    /// "device" (empty means device) or "group_loopback". Optional on the
+    /// wire; omitted from to_json when empty.
+    std::string scope;
 };
 
 inline void to_json(nlohmann::json& j, const CertIssueRequest& r) {
@@ -379,11 +382,13 @@ inline void to_json(nlohmann::json& j, const CertIssueRequest& r) {
         {"hostname",      r.hostname},
         {"client_pubkey", r.client_pubkey},
     };
+    if (!r.scope.empty()) j["scope"] = r.scope;
 }
 
 inline void from_json(const nlohmann::json& j, CertIssueRequest& r) {
     r.hostname      = j.value("hostname", "");
     r.client_pubkey = j.value("client_pubkey", "");
+    r.scope         = j.value("scope", "");
 }
 
 struct CertIssueResponse {
