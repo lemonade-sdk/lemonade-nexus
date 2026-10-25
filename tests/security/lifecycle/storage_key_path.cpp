@@ -18,10 +18,11 @@
 #include <LemonadeNexus/Security/Storage/StorageShareStore.hpp>
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
-#include <fstream>
-#include <iterator>
+#include <nlohmann/json.hpp>
 
+#include <fstream>
 #include <functional>
+#include <iterator>
 
 namespace lifecycle_test {
 namespace {
@@ -66,8 +67,9 @@ protected:
     }
 
     /// (Re)builds a node's storage service from its directories, as a process
-    /// restart of the storage side would: the data key leaves memory.
-    void build_storage(Node& node) {
+    /// restart of the storage side would: the data key leaves memory. Returns
+    /// what start() returned; `expect_start` makes a refusal a test failure.
+    bool build_storage(Node& node, bool expect_start = true) {
         auto& stack = stacks[node.id];
         if (auto it = vaults.find(node.id); it != vaults.end()) it->second->attach(nullptr);
         stack.service.reset();
@@ -80,6 +82,11 @@ protected:
         config.network_id = network;
         config.directory = node.dir / "storage";
         config.wall_clock_ms = [this] { return kWallBase + mesh.now_ms + wall_offset_ms; };
+        config.files_encrypted = [this, id = node.id] {
+            const auto it = vaults.find(id);
+            return it != vaults.end() && it->second != nullptr &&
+                   it->second->mode() == VaultMode::Encrypted;
+        };
         stack.service = std::make_unique<StorageKeyService>(
             std::move(config), *node.driver, *node.router, *node.runtime, *node.sealer,
             *stack.shares, *node.crypto);
@@ -88,10 +95,14 @@ protected:
         node.storage_gate = [service](const NodeId& holder, const Digest& context) {
             return service->expects_unlock_challenge(holder, context);
         };
-        EXPECT_TRUE(stack.service->start(mesh.now_ms));
+        const bool started = stack.service->start(mesh.now_ms);
+        if (expect_start) {
+            EXPECT_TRUE(started) << stack.service->halt_reason();
+        }
         if (auto it = vaults.find(node.id); it != vaults.end()) {
             it->second->attach(&stack.service->data_keys());
         }
+        return started;
     }
 
     /// The node's file vault (Phase 7) over <dir>/files, rebuilt from disk
@@ -115,6 +126,27 @@ protected:
     static std::string raw_file(const std::filesystem::path& path) {
         std::ifstream in(path, std::ios::binary);
         return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+    }
+
+    static void write_file(const std::filesystem::path& path, const std::string& text) {
+        std::ofstream(path, std::ios::binary | std::ios::trunc) << text;
+    }
+
+    /// The R of `node`'s first wrap in its finalized claim, as `observer` holds it.
+    StoragePointBytes claimed_point(const Node* observer, const Node* node) {
+        return storage(observer).chain().wrap_claims.at(node->id).wraps.front().ephemeral_point;
+    }
+
+    /// Steps until the current plan is a finished rotation away from `from`
+    /// that every online server holds.
+    bool run_until_rotated_from(const Digest& from) {
+        return run_storage_until([&] {
+            const auto& chain = storage(founders.front()).chain();
+            return chain.current.has_value() && chain.current_digest != from &&
+                   chain.current->operation == StorageOperation::Rotate &&
+                   !chain.pending.has_value() &&
+                   all_current(online(storage_nodes()), chain.current_digest);
+        });
     }
 
     void expect_vault_files(Node& node) {
@@ -516,12 +548,13 @@ TEST_F(StorageKeyPath, UnlockAndSessionBudgetsBind) {
     Node* requester = founders[0];
     Node* holder = founders[1];
     const Digest plan_digest = storage(holder).chain().current_digest;
+    const StoragePointBytes point = claimed_point(holder, requester);
     const auto make = [&](uint8_t seed) {
         StorageUnlockRequestMsg request;
         request.requester = requester->id;
         request.epoch = storage(holder).current_epoch();
         request.plan_digest = plan_digest;
-        request.ephemeral_point = *storage(requester).data_keys().wrapped_to();
+        request.ephemeral_point = point;
         request.nonce.fill(seed);
         return requester->router->compose(SecurityMessageKind::StorageUnlockRequest, request,
                                           request.epoch);
@@ -761,92 +794,314 @@ TEST_F(StorageKeyPath, RemovedHolderShareStopsCountingAfterTheReshare) {
 
 // --- Rotation (B5a) ---------------------------------------------------------------------
 
-TEST_F(StorageKeyPath, DailyRotationCatchUpAndTheGracePeriod) {
+TEST_F(StorageKeyPath, AServerStoppedForTwoRotationIntervalsRecoversItsDataKey) {
     create_key(founders);
     ASSERT_FALSE(::testing::Test::HasFatalFailure());
     const StorageFinalPlan first = current_plan();
     const Digest first_digest = storage(founders.front()).chain().current_digest;
-    Node* missed = reserves[0];
-    Node* restarted = reserves[1];
-    const auto missed_key = data_key_bytes(missed);
-    const auto restarted_key = data_key_bytes(restarted);
-    const auto key_file = restarted->dir / "storage" / "data-key.json";
-    const auto saved = restarted->dir / "data-key.old.json";
-    std::filesystem::copy_file(key_file, saved);
+    Node* away = reserves[0];
+    const auto away_key = data_key_bytes(away);
+    ASSERT_EQ(away_key.size(), 32u);
 
-    // A day of block time later, Tier 1 rotates while one server is away.
-    mesh.offline.insert(missed->id);
+    // The server stops. A day of block time later Tier 1 rotates.
+    mesh.offline.insert(away->id);
     wall_offset_ms += kDayMs;
-    ASSERT_TRUE(run_storage_until([&] {
-        const auto& chain = storage(founders.front()).chain();
-        return chain.current.has_value() &&
-               chain.current->operation == StorageOperation::Rotate &&
-               !chain.pending.has_value() &&
-               all_current(online(storage_nodes()), chain.current_digest);
-    }));
+    ASSERT_TRUE(run_until_rotated_from(first_digest));
     const StorageFinalPlan rotated = current_plan();
+    const Digest rotated_digest = storage(founders.front()).chain().current_digest;
     EXPECT_NE(rotated.storage_public_key, first.storage_public_key);
-    EXPECT_EQ(rotated.effective_epoch, 2u);
     EXPECT_EQ(rotated.retiring_plan, first_digest);
-    EXPECT_EQ(rotated.retiring_until, 3u);
-    // Holders keep the retiring share through the grace period.
+    EXPECT_EQ(rotated.retiring_until_ms,
+              rotated.block_time_ms + constants::kStorageRetiringCapMs);
+    // Every running server moves its data key to the new S through the holders.
+    ASSERT_TRUE(run_storage_until([&] {
+        return std::all_of(founders.begin(), founders.end(), [&](Node* n) {
+            return storage(n).data_keys().wrapped_to() == rotated.storage_public_key;
+        });
+    }));
+
+    // The stopped server's finalized claim still names the old S, so the old
+    // plan stays live and its holders keep their shares.
+    EXPECT_TRUE(storage(founders[1]).retiring_live());
     for (Node* holder : founders) {
         EXPECT_TRUE(storage(holder).holds_share(first_digest));
     }
-    // Every running server rewraps its data key to the new S from memory.
-    ASSERT_TRUE(run_storage_until([&] {
-        return std::all_of(founders.begin(), founders.end(),
-                           [&](Node* n) {
-                               return storage(n).data_keys().wrapped_to() ==
-                                      rotated.storage_public_key;
-                           }) &&
-               storage(restarted).data_keys().wrapped_to() == rotated.storage_public_key;
-    }));
+    // A second day: the next rotation is due, and it waits for that server.
+    wall_offset_ms += kDayMs;
+    for (int i = 0; i < 300; ++i) storage_step();
+    EXPECT_EQ(storage(founders.front()).chain().current_digest, rotated_digest);
+    EXPECT_TRUE(storage(founders[1]).retiring_live());
 
-    // The server that missed the rotation catches up and rewraps.
-    mesh.offline.erase(missed->id);
+    // The server starts again after two rotation intervals. Its data key is
+    // not in memory; it unlocks under the old S and moves to the new one.
+    mesh.offline.erase(away->id);
+    build_storage(*away);
     ASSERT_TRUE(run_storage_until([&] {
-        return storage(missed).data_keys().wrapped_to() == rotated.storage_public_key;
+        const auto& keys = storage(away).data_keys();
+        return keys.state() == DataKeyState::Unlocked && keys.wrapped_to().has_value() &&
+               *keys.wrapped_to() != first.storage_public_key;
     }));
-    EXPECT_EQ(data_key_bytes(missed), missed_key);
+    EXPECT_EQ(data_key_bytes(away), away_key);
 
-    // Inside the grace period a key wrapped to the old S still unlocks, then
-    // moves to the new S.
-    std::filesystem::copy_file(saved, key_file,
-                               std::filesystem::copy_options::overwrite_existing);
-    build_storage(*restarted);
-    ASSERT_TRUE(run_storage_until([&] {
-        return storage(restarted).data_keys().state() == DataKeyState::Unlocked &&
-               storage(restarted).data_keys().wrapped_to() == rotated.storage_public_key;
-    }));
-    EXPECT_EQ(data_key_bytes(restarted), restarted_key);
-
-    // Two boundaries later the grace period is over: the old shares are gone
-    // and the old S unwraps nothing.
-    members = rotate(members, founders, 2);
-    ASSERT_FALSE(::testing::Test::HasFatalFailure());
-    members = rotate(members, founders, 3);
-    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    // Its rewrap was the last one: the old plan ends, its holders destroy the
+    // old shares, and the deferred rotation runs.
     ASSERT_TRUE(run_storage_until([&] {
         return std::none_of(founders.begin(), founders.end(),
                             [&](Node* n) { return storage(n).holds_share(first_digest); });
     }));
-    std::filesystem::copy_file(saved, key_file,
-                               std::filesystem::copy_options::overwrite_existing);
-    build_storage(*restarted);
+    ASSERT_TRUE(run_until_rotated_from(rotated_digest));
+    const auto latest = current_plan().storage_public_key;
     ASSERT_TRUE(run_storage_until(
-        [&] { return storage(restarted).data_keys().state() == DataKeyState::Retired; }));
-    EXPECT_FALSE(storage(restarted).data_keys().data_key().has_value());
+        [&] { return storage(away).data_keys().wrapped_to() == latest; }));
+    EXPECT_EQ(data_key_bytes(away), away_key);
+}
+
+TEST_F(StorageKeyPath, TheOldKeyStopsUnwrappingAtTheHardCap) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const StorageFinalPlan first = current_plan();
+    const Digest first_digest = storage(founders.front()).chain().current_digest;
+    Node* away = reserves[0];
+
+    mesh.offline.insert(away->id);
+    wall_offset_ms += kDayMs;
+    ASSERT_TRUE(run_until_rotated_from(first_digest));
+    const Digest rotated_digest = storage(founders.front()).chain().current_digest;
+
+    // The server stays away past the hard cap. Then the old plan ends without
+    // its rewrap: the holders destroy the old shares and the next rotation
+    // runs.
+    wall_offset_ms += constants::kStorageRetiringCapMs;
+    ASSERT_TRUE(run_until_rotated_from(rotated_digest));
+    ASSERT_TRUE(run_storage_until([&] {
+        return std::none_of(founders.begin(), founders.end(),
+                            [&](Node* n) { return storage(n).holds_share(first_digest); });
+    }));
+
+    // Back after the cap, the server's key wrapped to the old S opens nothing.
+    mesh.offline.erase(away->id);
+    build_storage(*away);
+    for (int i = 0; i < 400; ++i) storage_step();
+    EXPECT_NE(storage(away).data_keys().state(), DataKeyState::Unlocked);
+    EXPECT_FALSE(storage(away).data_keys().data_key().has_value());
+    EXPECT_EQ(storage(away).data_keys().wrapped_to(), first.storage_public_key);
 
     StorageUnlockRequestMsg request;
-    request.requester = restarted->id;
+    request.requester = away->id;
     request.epoch = storage(founders[1]).current_epoch();
     request.plan_digest = first_digest;
     request.nonce.fill(8);
     const uint64_t refused = storage(founders[1]).drops(StorageDrop::UnknownPlan);
-    storage(founders[1]).on_message(restarted->router->compose(
+    storage(founders[1]).on_message(away->router->compose(
         SecurityMessageKind::StorageUnlockRequest, request, request.epoch));
     EXPECT_EQ(storage(founders[1]).drops(StorageDrop::UnknownPlan), refused + 1);
+}
+
+TEST_F(StorageKeyPath, ARewrapReplacesTheStoredKeyOnlyAfterTheNewHoldersReproduceIt) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest first_digest = storage(founders.front()).chain().current_digest;
+    const auto first_key = current_plan().storage_public_key;
+    Node* server = reserves[1];
+    const auto key = data_key_bytes(server);
+    const auto next_file = server->dir / "storage" / "data-key.next.json";
+
+    // The holders refuse this server's attestation, so its staged wrap cannot
+    // verify: a verification that never passes.
+    refuse_attestation.insert(server->id);
+    wall_offset_ms += kDayMs;
+    ASSERT_TRUE(run_until_rotated_from(first_digest));
+    const auto rotated_key = current_plan().storage_public_key;
+    ASSERT_TRUE(run_storage_until(
+        [&] { return storage(server).data_keys().staged_to() == rotated_key; }));
+    for (int i = 0; i < 200; ++i) storage_step();
+    // The new wrap waits in data-key.next.json; data-key.json keeps the old S.
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), first_key);
+    EXPECT_EQ(storage(server).data_keys().staged_to(), rotated_key);
+    EXPECT_TRUE(std::filesystem::exists(next_file));
+    EXPECT_EQ(data_key_bytes(server), key);
+
+    // A crash between the rewrap and its verification: the staged file is
+    // discarded, and the stored key still names the old S.
+    build_storage(*server);
+    storage_step();
+    EXPECT_FALSE(std::filesystem::exists(next_file));
+    EXPECT_EQ(storage(server).data_keys().wrapped_to(), first_key);
+    for (int i = 0; i < 100; ++i) storage_step();
+    EXPECT_EQ(storage(server).data_keys().state(), DataKeyState::Locked);
+
+    // Once the holders answer, the server unlocks under the old plan, stages
+    // the rewrap again, verifies it, and only then swaps the stored key.
+    refuse_attestation.clear();
+    ASSERT_TRUE(run_storage_until([&] {
+        const auto& keys = storage(server).data_keys();
+        return keys.state() == DataKeyState::Unlocked && keys.wrapped_to() == rotated_key &&
+               !keys.staged_to().has_value();
+    }));
+    EXPECT_EQ(data_key_bytes(server), key);
+    EXPECT_FALSE(std::filesystem::exists(next_file));
+    build_storage(*server);
+    ASSERT_TRUE(run_storage_until(
+        [&] { return storage(server).data_keys().state() == DataKeyState::Unlocked; }));
+    EXPECT_EQ(data_key_bytes(server), key);
+}
+
+TEST_F(StorageKeyPath, ARetryLeavesOutAHolderThatSentRoundOneButNeverConfirmed) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    const Digest first_digest = storage(founders.front()).chain().current_digest;
+    // One holder cannot seal: a file stands where its share directory was. It
+    // sends both rounds, then cannot keep its new share, so it never confirms.
+    Node* stuck = founders[4];
+    const NodeId stuck_id = stuck->id;
+    const auto sealed = stuck->dir / "storage" / "sealed";
+    std::filesystem::remove_all(sealed);
+    write_file(sealed, "not a directory");
+    wall_offset_ms += kDayMs;
+    ASSERT_TRUE(
+        run_storage_until([&] { return storage(founders.front()).chain().pending.has_value(); }));
+    for (int i = 0; i < 40; ++i) storage_step();
+    wall_offset_ms += constants::kStorageSessionTimeoutMs;
+    ASSERT_TRUE(run_until_rotated_from(first_digest));
+    const auto& plan = current_plan();
+    EXPECT_EQ(plan.holders.size(), 4u);
+    EXPECT_EQ(plan.threshold, 3);
+    EXPECT_TRUE(std::none_of(plan.holders.begin(), plan.holders.end(),
+                             [&](const StorageHolder& h) { return h.node == stuck_id; }));
+}
+
+TEST_F(StorageKeyPath, AHolderServesOnlyTheRequestersOwnClaimedR) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    settle();
+    Node* requester = reserves[0];
+    Node* victim = reserves[1];
+    Node* holder = founders[1];
+    const Digest plan_digest = storage(holder).chain().current_digest;
+    const auto request_for = [&](const StoragePointBytes& point, uint8_t seed) {
+        StorageUnlockRequestMsg request;
+        request.requester = requester->id;
+        request.epoch = storage(holder).current_epoch();
+        request.plan_digest = plan_digest;
+        request.ephemeral_point = point;
+        request.nonce.fill(seed);
+        return requester->router->compose(SecurityMessageKind::StorageUnlockRequest, request,
+                                          request.epoch);
+    };
+    const uint64_t sent = storage(holder).partials_sent();
+
+    // The victim's R: it belongs to another server and earns nothing.
+    const uint64_t unclaimed = storage(holder).drops(StorageDrop::UnclaimedWrap);
+    storage(holder).on_message(request_for(claimed_point(holder, victim), 1));
+    EXPECT_EQ(storage(holder).drops(StorageDrop::UnclaimedWrap), unclaimed + 1);
+    // An R that nobody claimed earns nothing either.
+    StoragePointBytes stray{};
+    stray.fill(0x5A);
+    storage(holder).on_message(request_for(stray, 2));
+    EXPECT_EQ(storage(holder).drops(StorageDrop::UnclaimedWrap), unclaimed + 2);
+    storage_step();
+    EXPECT_EQ(storage(holder).partials_sent(), sent);
+
+    // The requester's own R passes the claim check, is challenged, and is
+    // answered after the attestation.
+    storage(holder).on_message(request_for(claimed_point(holder, requester), 3));
+    EXPECT_EQ(storage(holder).drops(StorageDrop::UnclaimedWrap), unclaimed + 2);
+    const uint64_t busy = storage(holder).drops(StorageDrop::PendingBusy);
+    storage(holder).on_message(request_for(claimed_point(holder, requester), 4));
+    EXPECT_EQ(storage(holder).drops(StorageDrop::PendingBusy), busy + 1);
+    ASSERT_TRUE(run_storage_until([&] { return storage(holder).partials_sent() > sent; }, 50));
+}
+
+// --- Lost or foreign storage state -------------------------------------------------------
+
+TEST_F(StorageKeyPath, LostStorageStateWithEncryptedFilesStopsInsteadOfStartingFresh) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* server = founders[0];  // a holder with encrypted files
+    build_vault(*server, /*seed=*/true);
+    ASSERT_TRUE(run_storage_until([&] { return vault_done(*server); }));
+    const Digest plan_digest = storage(server).chain().current_digest;
+    ASSERT_TRUE(share_of(server, plan_digest).has_value());
+    const auto dir = server->dir / "storage";
+    const auto records = raw_file(dir / "records.json");
+    const auto data_key = raw_file(dir / "data-key.json");
+    ASSERT_FALSE(records.empty());
+    ASSERT_FALSE(data_key.empty());
+
+    const auto expect_refused = [&](std::string_view file) {
+        EXPECT_FALSE(build_storage(*server, /*expect_start=*/false));
+        const auto reason = storage(server).halt_reason();
+        EXPECT_NE(reason.find(file), std::string::npos) << reason;
+        for (int i = 0; i < 50; ++i) storage_step();
+        // The share survives, and no new data key takes the lost one's place.
+        EXPECT_TRUE(share_of(server, plan_digest).has_value());
+        EXPECT_FALSE(storage(server).data_keys().data_key().has_value());
+        EXPECT_FALSE(vaults.at(server->id)->files_ready());
+    };
+
+    // records.json is gone: the chain was moved aside.
+    std::filesystem::remove(dir / "records.json");
+    expect_refused("records.json");
+    EXPECT_FALSE(std::filesystem::exists(dir / "records.json"));
+    EXPECT_EQ(raw_file(dir / "data-key.json"), data_key);
+
+    // data-key.json is gone.
+    write_file(dir / "records.json", records);
+    std::filesystem::remove(dir / "data-key.json");
+    expect_refused("data-key.json");
+    EXPECT_FALSE(std::filesystem::exists(dir / "data-key.json"));
+
+    // records.json holds a fresh, empty chain.
+    write_file(dir / "data-key.json", data_key);
+    write_file(dir / "records.json", R"({"format":1,"records":[]})");
+    expect_refused("records.json");
+
+    // With the state restored, the server unlocks and reads its files.
+    write_file(dir / "records.json", records);
+    build_storage(*server);
+    auto& vault = build_vault(*server, /*seed=*/false);
+    ASSERT_TRUE(run_storage_until([&] { return vault.files_ready(); }));
+    expect_vault_files(*server);
+    EXPECT_TRUE(storage(server).halt_reason().empty());
+}
+
+TEST_F(StorageKeyPath, RecordsFromAnotherEpochChainAreRefused) {
+    create_key(founders);
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
+    Node* server = founders[1];
+    build_vault(*server, /*seed=*/true);
+    ASSERT_TRUE(run_storage_until([&] { return vault_done(*server); }));
+    ASSERT_TRUE(storage(server).chain_bound());
+    const Digest plan_digest = storage(server).chain().current_digest;
+    const auto file = server->dir / "storage" / "records.json";
+    auto document = nlohmann::json::parse(raw_file(file));
+    ASSERT_TRUE(document.contains("chain"));
+    const std::string chain = document["chain"].get<std::string>();
+
+    // A file from before the binding: its proofs verify under this chain, so
+    // the records bind and the binding is written back.
+    document.erase("chain");
+    write_file(file, document.dump());
+    build_storage(*server);
+    auto& unbound = build_vault(*server, /*seed=*/false);
+    ASSERT_TRUE(run_storage_until([&] { return storage(server).chain_bound(); }));
+    EXPECT_EQ(nlohmann::json::parse(raw_file(file))["chain"].get<std::string>(), chain);
+    ASSERT_TRUE(run_storage_until([&] { return unbound.files_ready(); }));
+
+    // The same records bound to another chain, as after a re-found: refused,
+    // and with encrypted files the server must not run.
+    document["chain"] = std::string(64, 'a');
+    write_file(file, document.dump());
+    build_storage(*server);
+    auto& foreign = build_vault(*server, /*seed=*/false);
+    ASSERT_TRUE(
+        run_storage_until([&] { return !storage(server).halt_reason().empty(); }, 100));
+    EXPECT_NE(storage(server).halt_reason().find("another epoch chain"), std::string::npos);
+    EXPECT_FALSE(storage(server).healthy());
+    EXPECT_FALSE(storage(server).chain_bound());
+    for (int i = 0; i < 50; ++i) storage_step();
+    EXPECT_FALSE(foreign.files_ready());
+    EXPECT_TRUE(share_of(server, plan_digest).has_value());
 }
 
 TEST_F(StorageKeyPath, HolderLossShrinksToFourAndThreeAndStopsBelowThree) {
@@ -912,8 +1167,11 @@ TEST_F(StorageKeyPath, AServerOutsideTier1AcceptsOnlyAProvedRecord) {
     bool found = false;
     mesh.drop_if = [&](const Queued&, const SecurityMessage& message) {
         if (const auto* p = std::get_if<StoragePlanProofMsg>(&message.body); p && !found) {
-            proof = *p;
-            found = true;
+            const auto record = storage_record_from_payload(p->payload);
+            if (record.has_value() && storage_record_digest(*record) == current) {
+                proof = *p;
+                found = true;
+            }
         }
         return false;
     };

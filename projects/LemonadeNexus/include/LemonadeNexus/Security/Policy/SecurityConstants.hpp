@@ -211,9 +211,10 @@ inline constexpr std::size_t kMaxQcSignatures = kMaxActiveTier1;
 // The optional block payload at the end of a proposal and the TreeOpSubmit
 // message are additions, not layout changes: a message without them keeps its
 // v3 bytes, and only a node with tree operations on sends them. The
-// storage-key messages (kinds 32 to 36) and the StorageUnlock attestation
-// purpose are additions of the same sort; only a node with the storage key on
-// sends them.
+// storage-key messages (kinds 32 to 37) and the StorageUnlock attestation
+// purpose are additions of the same sort. The storage key runs on every
+// server, so every server sends them; a peer without them drops the kinds it
+// does not know.
 inline constexpr uint8_t kSecurityWireVersion = 3;
 inline constexpr std::size_t kMaxSecurityMessageBytes = 60000;
 inline constexpr std::size_t kMaxPlatformEvidenceWireBytes = 56 * 1024;
@@ -300,10 +301,21 @@ inline constexpr std::size_t kStorageMaxHolders = 50;
 // Block time, never a local clock, decides it.
 inline constexpr uint64_t kStorageRotationIntervalMs = 24ULL * 3600 * 1000;
 
-// After a rotation the retired key still unwraps data keys through this many
-// epochs past the rotation's effective epoch; then its holders destroy their
-// old shares and refuse partials for it (B5a).
-inline constexpr uint64_t kStorageGraceEpochs = 1;
+// After a rotation the previous key (the retiring plan) still unwraps data keys
+// while a server's latest finalized wrap claim names its S (B5a). This hard cap,
+// in block time after the rotation's own block time, ends that period even when
+// a server never returns. Then the holders destroy their old shares and refuse
+// partials for it. While the retiring plan is live, no new rotation is selected,
+// so at most one retiring plan exists.
+inline constexpr uint64_t kStorageRetiringCapMs = 7 * kStorageRotationIntervalMs;
+
+// Wrap claims (B5a, B7). A claim names a server's committed wrapped data key
+// and, while it stages a rewrap or a replacement, the staged one. A batch
+// record finalizes at most kStorageMaxClaimsPerBatch claims; the registry
+// keeps one latest claim per server for at most kStorageMaxWrapOwners servers.
+inline constexpr std::size_t kStorageMaxWrapsPerClaim = 2;
+inline constexpr std::size_t kStorageMaxClaimsPerBatch = 64;
+inline constexpr std::size_t kStorageMaxWrapOwners = 1024;
 
 // A key generation or refresh session that has no finalized result this long
 // (in block time) after its selection may be replaced: a retry without the

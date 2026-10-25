@@ -343,10 +343,21 @@ int main(int argc, char* argv[]) {
             [&stop_requested](const asio::error_code& ec, int) {
                 if (!ec) stop_requested = true;
             });
+        // The storage key can also find, after startup, that its records
+        // belong to another epoch chain; then the files can never unlock.
+        auto* storage_key = security_mesh->service->storage_key();
+        const auto storage_halted = [storage_key] {
+            return storage_key != nullptr && !storage_key->halt_reason().empty();
+        };
         const bool unlocked = nexus::core::wait_for_storage_unlock(
-            coordinator.io_context(), *storage_vault, [&] { return stop_requested.load(); });
+            coordinator.io_context(), *storage_vault,
+            [&] { return stop_requested.load() || storage_halted(); });
         unlock_signals.cancel();
         if (!unlocked) {
+            if (storage_halted()) {
+                spdlog::error("Storage: {}", storage_key->halt_reason());
+                return 1;
+            }
             spdlog::info("Stopped before the data key unlocked");
             return 0;
         }

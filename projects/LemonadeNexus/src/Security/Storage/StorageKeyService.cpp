@@ -110,8 +110,8 @@ struct StorageKeyService::Session {
     /// stay sealed until this holder finishes.
     RoundInbox<uint16_t, std::vector<uint8_t>> round1;
     RoundInbox<uint16_t, std::vector<uint8_t>> round2;
-    /// Holders whose round-1 package this node observed: the silence a retry
-    /// excludes is the complement.
+    /// Holders whose round-1 package this node observed. A retry excludes the
+    /// complement, and the holders that never confirmed (silent_holders()).
     std::set<NodeId> spoke;
 
     /// Confirmations by plan-bytes digest; one per holder.
@@ -182,9 +182,120 @@ bool StorageKeyService::start(uint64_t now_ms) {
         healthy_ = false;
         return false;
     }
+    if (files_encrypted()) {
+        // Encrypted files open only with the data key wrapped to an S that
+        // these records name. Without them the service would prune this
+        // holder's shares against an empty chain and later create a new data
+        // key, and the files would never open again.
+        std::string lost;
+        const auto records = config_.directory / "records.json";
+        if (!records_file_present_) {
+            lost = records.string() + " is missing";
+        } else if (!chain_.current.has_value()) {
+            lost = records.string() + " holds no finalized storage plan";
+        }
+        std::error_code ec;
+        const auto data_key = config_.directory / "data-key.json";
+        if (!std::filesystem::exists(data_key, ec)) {
+            lost += (lost.empty() ? "" : "; ") + data_key.string() + " is missing";
+        }
+        if (!lost.empty()) {
+            halt("the files are encrypted under the data key, but the storage state that unlocks "
+                 "them is lost: " +
+                 lost +
+                 ". Restore records.json and data-key.json in that directory from this "
+                 "server's backup before it starts again. The server does not start fresh: that "
+                 "would destroy its storage share and create a new data key, and the encrypted "
+                 "files would never open.");
+            healthy_ = false;
+            return false;
+        }
+    }
     healthy_ = true;
-    prune_shares();
+    // Shares are pruned only after bind_chain() proves the records belong to
+    // this node's epoch chain.
     return true;
+}
+
+std::string StorageKeyService::halt_reason() const {
+    std::lock_guard lock(halt_mutex_);
+    return halt_reason_;
+}
+
+void StorageKeyService::halt(std::string reason) {
+    spdlog::error("[storage] {}", reason);
+    std::lock_guard lock(halt_mutex_);
+    halt_reason_ = std::move(reason);
+}
+
+bool StorageKeyService::files_encrypted() const {
+    return config_.files_encrypted && config_.files_encrypted();
+}
+
+void StorageKeyService::bind_chain() {
+    if (chain_bound_) {
+        return;
+    }
+    // The chain identity is the Genesis certificate's signing digest, the
+    // anchor of Epoch 1. Every epoch this node verified chains from it.
+    const auto epoch_one = driver_.authority_for_epoch(EpochId{1});
+    if (!epoch_one.has_value()) {
+        return;
+    }
+    const Digest identity = epoch_one->anchor_digest;
+    bool foreign = false;
+    if (stored_chain_.has_value()) {
+        foreign = *stored_chain_ != identity;
+    } else {
+        // Records written before the binding existed: each commit proof must
+        // verify under this chain's authority for the epoch that committed it.
+        for (const auto& [digest, proof] : proofs_) {
+            if (proof.proof.chain.empty()) {
+                foreign = true;
+                break;
+            }
+            const EpochId epoch = proof.proof.chain.front().proposal.epoch;
+            const auto authority = driver_.authority_for_epoch(epoch);
+            if (!authority.has_value()) {
+                return;  // decide once this node verified that epoch
+            }
+            const QcValidationContext context{constants::kConsensusRulesetVersion,
+                                              config_.network_id, epoch,
+                                              authority->consensus_quorum};
+            if (verify_commit_proof(block_payload_digest(proof.payload), proof.proof, context,
+                                    authority->vote_keys) != CommitProofFailure::None) {
+                foreign = true;
+                break;
+            }
+        }
+    }
+    if (foreign) {
+        healthy_ = false;
+        session_.reset();
+        const std::string text =
+            (config_.directory / "records.json").string() +
+            " belongs to another epoch chain (for example a re-found mesh, or a backup from "
+            "another network). Its records and this server's storage share and data key do not "
+            "apply to this chain.";
+        if (files_encrypted()) {
+            halt(text +
+                 " The files are encrypted under that chain's data key: restore records.json, "
+                 "data-key.json, and the sealed share of the chain that encrypted them, or "
+                 "restore the server's files from a backup of this chain.");
+        } else {
+            spdlog::error("[storage] {} The storage key stays inert on this server. Move "
+                          "records.json and data-key.json in that directory aside to join this "
+                          "chain's storage key.",
+                          text);
+        }
+        return;
+    }
+    chain_identity_ = identity;
+    chain_bound_ = true;
+    if (records_file_present_ && stored_chain_ != identity) {
+        persist_records();
+    }
+    prune_shares();
 }
 
 void StorageKeyService::tick(uint64_t now_ms) {
@@ -193,6 +304,10 @@ void StorageKeyService::tick(uint64_t now_ms) {
         return;
     }
     capture_authority();
+    bind_chain();
+    if (!healthy_) {
+        return;
+    }
     sync_records(now_ms);
     resend(now_ms);
     prune_shares();
@@ -223,8 +338,9 @@ EpochId StorageKeyService::current_epoch() const {
 }
 
 bool StorageKeyService::retiring_live() const {
-    return chain_.retiring.has_value() && chain_.current.has_value() &&
-           current_epoch() <= chain_.current->retiring_until;
+    // Finalized block time and finalized claims only, so every server with
+    // the same records agrees.
+    return storage_retiring_live(chain_, chain_.last_block_time_ms);
 }
 
 uint64_t StorageKeyService::drops(StorageDrop reason) const {
@@ -278,6 +394,8 @@ void StorageKeyService::on_message(const SecurityMessage& message) {
                 on_unlock_request(body);
             } else if constexpr (std::is_same_v<T, StorageUnlockPartialMsg>) {
                 on_unlock_partial(body);
+            } else if constexpr (std::is_same_v<T, StorageWrapClaimMsg>) {
+                on_wrap_claim(body);
             }
         },
         message.body);
@@ -308,14 +426,17 @@ void StorageKeyService::on_plan_proof(const StoragePlanProofMsg& message) {
         return;
     }
     // Cheap checks first: a record this node already holds verified, or one
-    // older than its chain that is not the retiring plan, costs no signature
-    // work.
+    // older than its chain that is not the retiring plan or a wrap batch,
+    // costs no signature work. An older batch can still carry claims this
+    // node lacks.
     const Digest digest = storage_record_digest(*record);
+    const bool batch = std::holds_alternative<StorageWrapBatch>(*record);
     const bool held = digest == chain_.pending_digest || digest == chain_.retiring_digest ||
-                      (digest == chain_.current_digest && current_verified_);
+                      (digest == chain_.current_digest && current_verified_) ||
+                      (batch && proofs_.contains(digest));
     const bool wanted_retiring = chain_.current.has_value() && !chain_.retiring.has_value() &&
                                  digest == chain_.current->retiring_plan;
-    if (held || (storage_record_sequence(*record) <= chain_.sequence &&
+    if (held || (!batch && storage_record_sequence(*record) <= chain_.sequence &&
                  digest != chain_.current_digest && !wanted_retiring)) {
         return;
     }
@@ -353,20 +474,33 @@ void StorageKeyService::on_plan_request(const StoragePlanRequestMsg& request,
 }
 
 void StorageKeyService::send_live_records(const NodeId& to, uint64_t after_sequence) {
+    // proofs_ holds the live records only: the pending, current, and retiring
+    // plans and the batches that carry a latest claim. Oldest first, so a
+    // fresh server learns the retiring plan through the current one.
     const EpochId epoch = current_epoch();
-    for (const Digest& digest : {chain_.retiring_digest, chain_.current_digest,
-                                 chain_.pending_digest}) {
-        const auto proof = proofs_.find(digest);
-        if (digest == Digest{} || proof == proofs_.end()) {
-            continue;
+    std::vector<std::pair<uint64_t, const StoragePlanProofMsg*>> live;
+    for (const auto& [digest, proof] : proofs_) {
+        const auto record = storage_record_from_payload(proof.payload);
+        if (record.has_value() && storage_record_sequence(*record) > after_sequence) {
+            live.emplace_back(storage_record_sequence(*record), &proof);
         }
-        const auto record = storage_record_from_payload(proof->second.payload);
-        if (!record.has_value() || storage_record_sequence(*record) <= after_sequence) {
-            continue;
-        }
-        (void)router_.send(to, router_.compose(SecurityMessageKind::StoragePlanProof,
-                                               proof->second, epoch));
     }
+    std::sort(live.begin(), live.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (const auto& [sequence, proof] : live) {
+        (void)router_.send(to, router_.compose(SecurityMessageKind::StoragePlanProof, *proof,
+                                               epoch));
+    }
+}
+
+std::vector<NodeId> StorageKeyService::tier1_members() const {
+    std::vector<NodeId> members;
+    if (const VerifiedEpochAuthority* authority = driver_.verified_authority()) {
+        members = authority->members;
+    } else if (const EpochManager* epochs = runtime_.epochs(); epochs != nullptr) {
+        members = epochs->current().tier1_members.members();
+    }
+    return members;
 }
 
 void StorageKeyService::broadcast_proof(const Digest& record_digest) {
@@ -382,27 +516,58 @@ void StorageKeyService::sync_records(uint64_t now_ms) {
     if (!record_sync_.due(now_ms)) {
         return;
     }
-    std::vector<NodeId> members;
-    if (const VerifiedEpochAuthority* authority = driver_.verified_authority()) {
-        members = authority->members;
-    } else if (const EpochManager* epochs = runtime_.epochs(); epochs != nullptr) {
-        members = epochs->current().tier1_members.members();
-    }
+    std::vector<NodeId> members = tier1_members();
     std::erase(members, config_.self);
     if (members.empty()) {
         return;
     }
     const NodeId& target = members[sync_cursor_++ % members.size()];
     // A record read from disk is re-proved in this run before its S gets a
-    // new wrap, so an unverified head asks for everything again.
-    const uint64_t have = current_verified_ ? chain_.sequence : 0;
+    // new wrap, so an unverified head asks for everything again. So does a
+    // gap in the sequence: a missed wrap batch may still carry a live claim.
+    const uint64_t have = current_verified_ && !record_gap_ ? chain_.sequence : 0;
+    record_gap_ = false;
     (void)router_.send(target, router_.compose(SecurityMessageKind::StoragePlanRequest,
                                                StoragePlanRequestMsg{have}, current_epoch()));
+}
+
+bool StorageKeyService::live_batch(const StorageRecord& record) const {
+    const auto* batch = std::get_if<StorageWrapBatch>(&record);
+    if (batch == nullptr) {
+        return false;
+    }
+    return std::any_of(batch->claims.begin(), batch->claims.end(), [this](const auto& claim) {
+        const auto it = chain_.wrap_claims.find(claim.node);
+        return it != chain_.wrap_claims.end() && it->second == claim;
+    });
 }
 
 void StorageKeyService::apply_record(const StorageRecord& record,
                                      std::optional<StoragePlanProofMsg> proof, bool verified) {
     const Digest digest = storage_record_digest(record);
+    if (storage_record_sequence(record) > chain_.sequence + 1) {
+        record_gap_ = true;
+    }
+    if (std::holds_alternative<StorageWrapBatch>(record)) {
+        const bool changed = apply_storage_record(chain_, record);
+        if (proof.has_value() && !proofs_.contains(digest) && live_batch(record)) {
+            proofs_.emplace(digest, std::move(*proof));
+        } else if (!changed) {
+            return;
+        }
+        std::erase_if(claim_pool_, [this](const auto& entry) {
+            const auto it = chain_.wrap_claims.find(entry.first);
+            return it != chain_.wrap_claims.end() && it->second.counter >= entry.second.counter;
+        });
+        std::erase_if(proofs_, [this](const auto& entry) {
+            const auto stored = storage_record_from_payload(entry.second.payload);
+            return stored.has_value() && std::holds_alternative<StorageWrapBatch>(*stored) &&
+                   !live_batch(*stored);
+        });
+        persist_records();
+        data_keys_->on_chain_changed();
+        return;
+    }
     const bool known = digest == chain_.current_digest || digest == chain_.pending_digest ||
                        digest == chain_.retiring_digest;
     if (known) {
@@ -456,11 +621,11 @@ void StorageKeyService::apply_record(const StorageRecord& record,
                 break;
             case StorageOperation::Rotate:
                 spdlog::info("[storage] storage key rotated: epoch {} sequence {} holders {} "
-                             "threshold {} S {}; the previous S unwraps through epoch {}",
+                             "threshold {} S {}; the previous S unwraps until every server "
+                             "claims a rewrap, at most until block time {}",
                              plan.effective_epoch.underlying(), plan.sequence,
                              plan.holders.size(), plan.threshold,
-                             short_hex(plan.storage_public_key),
-                             plan.retiring_until.underlying());
+                             short_hex(plan.storage_public_key), plan.retiring_until_ms);
                 break;
             case StorageOperation::Refresh:
                 spdlog::info("[storage] storage shares refreshed: epoch {} sequence {} holders "
@@ -472,8 +637,12 @@ void StorageKeyService::apply_record(const StorageRecord& record,
     }
     // Keep the proofs of the live records only.
     std::erase_if(proofs_, [this](const auto& entry) {
-        return entry.first != chain_.current_digest && entry.first != chain_.pending_digest &&
-               entry.first != chain_.retiring_digest;
+        if (entry.first == chain_.current_digest || entry.first == chain_.pending_digest ||
+            entry.first == chain_.retiring_digest) {
+            return false;
+        }
+        const auto stored = storage_record_from_payload(entry.second.payload);
+        return !stored.has_value() || !live_batch(*stored);
     });
     prune_shares();
     persist_records();
@@ -500,6 +669,10 @@ void StorageKeyService::persist_records() {
     json document;
     document["format"] = kRecordsFormat;
     document["records"] = std::move(records);
+    // The epoch chain these records belong to (see bind_chain()).
+    if (const auto& chain = chain_identity_.has_value() ? chain_identity_ : stored_chain_) {
+        document["chain"] = crypto::to_hex(*chain);
+    }
     std::error_code ec;
     std::filesystem::create_directories(config_.directory, ec);
     if (!write_durable(config_.directory / "records.json", document.dump())) {
@@ -512,13 +685,27 @@ bool StorageKeyService::load_records() {
     if (!in) {
         return true;  // nothing stored yet
     }
+    records_file_present_ = true;
     std::ostringstream buffer;
     buffer << in.rdbuf();
     const json document = json::parse(buffer.str(), nullptr, false);
     if (!document.is_object() || !document.contains("format") ||
         document["format"] != kRecordsFormat || !document.contains("records") ||
-        !document["records"].is_array() || document["records"].size() > 3) {
+        !document["records"].is_array() ||
+        document["records"].size() > 3 + constants::kStorageMaxWrapOwners) {
         return false;
+    }
+    if (document.contains("chain")) {
+        if (!document["chain"].is_string()) {
+            return false;
+        }
+        const auto bytes = crypto::from_hex(document["chain"].get<std::string>());
+        Digest chain{};
+        if (bytes.size() != chain.size()) {
+            return false;
+        }
+        std::copy(bytes.begin(), bytes.end(), chain.begin());
+        stored_chain_ = chain;
     }
     for (const auto& entry : document["records"]) {
         if (!entry.is_string()) {
@@ -577,9 +764,14 @@ std::set<NodeId> StorageKeyService::silent_holders() const {
     if (!chain_.pending.has_value()) {
         return silent;
     }
+    const bool observed = session_ != nullptr && session_->id == chain_.pending_digest;
+    // Once one holder confirmed, the session got through round 2. A holder
+    // that sent round 1 and never confirmed (for example one that cannot seal
+    // its share) is then left out too; otherwise it stalls every retry.
+    const bool confirmed = observed && !session_->confirmed_plan.empty();
     for (const auto& holder : chain_.pending->holders) {
-        if (session_ == nullptr || session_->id != chain_.pending_digest ||
-            !session_->spoke.contains(holder.node)) {
+        if (!observed || !session_->spoke.contains(holder.node) ||
+            (confirmed && !session_->confirmed_plan.contains(holder.node))) {
             silent.insert(holder.node);
         }
     }
@@ -618,6 +810,18 @@ std::optional<ProposedPayload> StorageKeyService::propose(const HotStuffService&
                                                       derivation_snapshot(), silent_holders(),
                                                       block_time)) {
             record = std::move(*selection);
+        }
+    }
+    if (!record.has_value() && !claim_pool_.empty()) {
+        // Claims that no longer pass (superseded, or naming an S that is no
+        // longer live) leave the pool; their senders re-send current ones.
+        std::erase_if(claim_pool_, [this, block_time](const auto& entry) {
+            return !check_storage_wrap_claim(chain_, config_.network_id, entry.second,
+                                             block_time);
+        });
+        if (auto batch =
+                make_storage_wrap_batch(config_.network_id, chain_, claim_pool_, block_time)) {
+            record = std::move(*batch);
         }
     }
     if (!record.has_value() || storage_record_kind(*record) != kind) {
@@ -666,6 +870,15 @@ bool StorageKeyService::validate(const HotStuffService& consensus, const Proposa
         proposal.proposed_state_root != storage_record_digest(*record)) {
         spdlog::debug("[storage] vote withheld: the record does not extend this node's chain");
         return false;
+    }
+    if (const auto* batch = std::get_if<StorageWrapBatch>(&*record)) {
+        const auto failure = check_storage_wrap_batch(chain_, *batch);
+        if (failure != StorageWrapFailure::None) {
+            spdlog::debug("[storage] vote withheld: wrap batch refused ({})",
+                          static_cast<uint16_t>(failure));
+            return false;
+        }
+        return true;
     }
     if (const auto* selection = std::get_if<StorageSelection>(&*record)) {
         const auto expected = derive_storage_selection(
@@ -1092,6 +1305,11 @@ void StorageKeyService::adopt_session_share(const Digest& session_id, const Dige
 }
 
 void StorageKeyService::prune_shares() {
+    // Never against an unbound or empty chain: lost or foreign records would
+    // otherwise destroy a share that a live plan still needs.
+    if (!chain_bound_ || !chain_.current.has_value()) {
+        return;
+    }
     std::set<Digest> keep{chain_.current_digest};
     if (retiring_live()) {
         keep.insert(chain_.retiring_digest);
@@ -1197,6 +1415,39 @@ void StorageKeyService::send_unlock_request(const NodeId& holder,
                                                request.epoch));
 }
 
+void StorageKeyService::submit_wrap_claim(const StorageWrapClaim& claim) {
+    const EpochId epoch = current_epoch();
+    for (const auto& member : tier1_members()) {
+        if (member == config_.self) {
+            on_wrap_claim(claim);
+            continue;
+        }
+        (void)router_.send(member,
+                           router_.compose(SecurityMessageKind::StorageWrapClaim, claim, epoch));
+    }
+}
+
+void StorageKeyService::on_wrap_claim(const StorageWrapClaimMsg& claim) {
+    // Only a Tier 1 member proposes wrap batches.
+    if (!driver_.is_tier1_member() || !config_.wall_clock_ms) {
+        return;
+    }
+    const uint64_t block_time = std::max(config_.wall_clock_ms(), chain_.last_block_time_ms + 1);
+    if (!check_storage_wrap_claim(chain_, config_.network_id, claim, block_time)) {
+        drop(StorageDrop::ClaimInvalid);
+        return;
+    }
+    const auto it = claim_pool_.find(claim.node);
+    if (it != claim_pool_.end() && it->second.counter >= claim.counter) {
+        return;
+    }
+    if (it == claim_pool_.end() && claim_pool_.size() >= constants::kStorageMaxWrapOwners) {
+        drop(StorageDrop::BudgetExceeded);
+        return;
+    }
+    claim_pool_.insert_or_assign(claim.node, claim);
+}
+
 void StorageKeyService::on_unlock_request(const StorageUnlockRequestMsg& request) {
     if (request.requester == config_.self) {
         return;
@@ -1215,6 +1466,14 @@ void StorageKeyService::on_unlock_request(const StorageUnlockRequestMsg& request
     }
     if (share_for(request.plan_digest) == nullptr) {
         drop(StorageDrop::NoShare);
+        return;
+    }
+    // R must be one the requester's latest finalized claim names for this S.
+    // An R that belongs to another server, or that nobody claimed, earns
+    // nothing: s_i*R for another server's R would open that server's data key.
+    if (!storage_wrap_claimed(chain_, request.requester,
+                              StorageWrapRef{plan->storage_public_key, request.ephemeral_point})) {
+        drop(StorageDrop::UnclaimedWrap);
         return;
     }
     const Digest request_digest = storage_unlock_request_digest(config_.network_id, request);
@@ -1282,6 +1541,12 @@ void StorageKeyService::on_verdict(const AttestationVerdict& verdict) {
     const StorageFinalPlan* plan = live_plan(pending.request.plan_digest);
     if (plan == nullptr) {
         drop(StorageDrop::UnknownPlan);
+        return;
+    }
+    if (!storage_wrap_claimed(chain_, pending.request.requester,
+                              StorageWrapRef{plan->storage_public_key,
+                                             pending.request.ephemeral_point})) {
+        drop(StorageDrop::UnclaimedWrap);
         return;
     }
     const auto own = std::find_if(plan->holders.begin(), plan->holders.end(),

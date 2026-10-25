@@ -22,12 +22,21 @@
 //    the holder's own packages are re-sent (RoundRelay.hpp) until the final
 //    plan commits.
 // 3. Unlock, holder side (B7). A holder answers a StorageUnlockRequest only for
-//    the current plan (or the retiring plan inside its grace period), only
-//    after a passing StorageUnlock attestation of the requester bound to that
-//    request, and only within the budgets. The partial is sealed to the
-//    requester with the request digest bound inside the seal.
-// 4. The data key (DataKeyService): the requester side of unlock and the
-//    rewrap after a rotation.
+//    the current plan (or the retiring plan while it is live), only for an R
+//    that the requester's latest finalized wrap claim names, only after a
+//    passing StorageUnlock attestation of the requester bound to that request,
+//    and only within the budgets. The partial is sealed to the requester with
+//    the request digest bound inside the seal.
+// 4. The data key (DataKeyService): the requester side of unlock, the wrap
+//    claims, and the rewrap after a rotation.
+//
+// The stored records are bound to the epoch chain: records.json names the
+// Genesis certificate digest of the chain that finalized them. Records from
+// another chain (for example after a re-found) are refused, and the service
+// stays inert. When the files are encrypted under the data key, lost or
+// foreign storage state stops the server (halt_reason()) instead of starting
+// fresh: a fresh start would prune the holder's shares and create a new data
+// key, and the encrypted files would never open again.
 //
 // The storage key is its own key role. Nothing here signs for the network,
 // votes, or grants Tier 1 authority; the identity key signs only the holder's
@@ -48,6 +57,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -76,6 +86,9 @@ struct StorageKeyServiceConfig {
     /// block-time bound, as for tree batches (design A4). Block time, never
     /// this clock, decides rotation and session timeouts.
     std::function<uint64_t()> wall_clock_ms;
+    /// True when this server's files are encrypted under the data key (the
+    /// vault records `encrypted`). Empty means no vault: never encrypted.
+    std::function<bool()> files_encrypted;
 };
 
 /// Why the service refused an inbound storage message. Counted for tests and
@@ -96,6 +109,11 @@ enum class StorageDrop : uint16_t {
     AttestationFailed,
     InvalidPartial,
     NoShare,
+    /// The request's R is not in the requester's latest finalized wrap claim
+    /// for the plan's S, for example an R that belongs to another server.
+    UnclaimedWrap,
+    /// A wrap claim that does not pass check_storage_wrap_claim().
+    ClaimInvalid,
 };
 
 class StorageKeyService {
@@ -115,9 +133,22 @@ public:
 
     /// Loads durable records and the holder's shares. False when either is
     /// corrupt: the service then stays inert (no vote, no partial, no
-    /// session). Lost storage state is never a fresh start.
+    /// session). Lost storage state is never a fresh start. Also false, with
+    /// halt_reason() set, when the files are encrypted and records.json or
+    /// data-key.json is missing, or records.json holds no finalized plan.
+    /// No share is pruned before the records are bound to the epoch chain.
     [[nodiscard]] bool start(uint64_t now_ms);
     [[nodiscard]] bool healthy() const { return healthy_; }
+
+    /// Why this server must not run with its storage state, or empty: the
+    /// files are encrypted and the state that unlocks them is missing, or the
+    /// stored records belong to another epoch chain. The text names the files
+    /// to restore or move aside. Thread-safe.
+    [[nodiscard]] std::string halt_reason() const;
+
+    /// True once the records are bound to this node's verified epoch chain
+    /// (its Genesis certificate digest). io thread.
+    [[nodiscard]] bool chain_bound() const { return chain_bound_; }
 
     /// Liveness work on the io thread: re-sends, record sync, grace expiry,
     /// pending-unlock expiry, and the data key. `now_ms` is the steady clock
@@ -169,7 +200,13 @@ public:
     /// verified by this process (a commit or a verified proof), not only
     /// read from disk. Only such a plan's S receives a new wrap.
     [[nodiscard]] bool current_verified() const { return current_verified_; }
+    /// The files_encrypted() input; false without one.
+    [[nodiscard]] bool files_encrypted() const;
     void send_unlock_request(const NodeId& holder, const StorageUnlockRequestMsg& request);
+    /// Sends this server's signed wrap claim to every Tier 1 member (and to
+    /// its own pool when it is one). Idempotent; the caller re-sends until
+    /// the claim is finalized.
+    void submit_wrap_claim(const StorageWrapClaim& claim);
     /// This holder's own partial for a request, without attestation: the
     /// requester is this process. nullopt without a share for the plan.
     [[nodiscard]] std::optional<crypto::StoragePartial> own_partial(
@@ -201,6 +238,11 @@ private:
     void broadcast_proof(const Digest& record_digest);
     void persist_records();
     [[nodiscard]] bool load_records();
+    void bind_chain();
+    void halt(std::string reason);
+    [[nodiscard]] bool live_batch(const StorageRecord& record) const;
+    void on_wrap_claim(const StorageWrapClaimMsg& claim);
+    [[nodiscard]] std::vector<NodeId> tier1_members() const;
     void capture_authority();
     void sync_records(uint64_t now_ms);
     [[nodiscard]] bool uncommitted_storage_ancestor(const HotStuffService& consensus,
@@ -266,6 +308,20 @@ private:
     /// Live shares by final-plan digest, plus a finished session's share
     /// under the session digest until its final plan commits.
     std::map<Digest, crypto::StorageKeyShare> shares_;
+
+    /// Verified wrap claims waiting for a batch, by node (Tier 1 only).
+    std::map<NodeId, StorageWrapClaim> claim_pool_;
+
+    /// Epoch-chain binding of the records (see the file comment).
+    bool records_file_present_ = false;
+    std::optional<Digest> stored_chain_;
+    std::optional<Digest> chain_identity_;
+    bool chain_bound_ = false;
+    /// A record applied past a gap in the sequence: the next record request
+    /// asks for every live record again.
+    bool record_gap_ = false;
+    mutable std::mutex halt_mutex_;
+    std::string halt_reason_;
 
     std::map<NodeId, PendingUnlock> pending_unlocks_;
     std::map<std::pair<EpochId, NodeId>, uint32_t> unlock_counts_;

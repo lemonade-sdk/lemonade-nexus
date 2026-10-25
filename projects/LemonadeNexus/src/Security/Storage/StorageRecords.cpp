@@ -19,6 +19,7 @@ constexpr std::string_view kConfirmationDomain = "lemonade-nexus/storage-confirm
 constexpr std::string_view kPairwiseDomain = "lemonade-nexus/storage-pairwise:v1";
 constexpr std::string_view kUnlockRequestDomain = "lemonade-nexus/storage-unlock-request:v1";
 constexpr std::string_view kRankDomain = "lemonade-nexus/storage-holder-rank:v1";
+constexpr std::string_view kWrapClaimDomain = "lemonade-nexus/storage-wrap-claim:v1";
 
 /// Reads the field stream CanonicalEncoder writes: each field a u32 length
 /// and its bytes. Every read checks its exact or maximum length.
@@ -178,9 +179,61 @@ CanonicalEncoder encode_final(const StorageFinalPlan& f) {
         encoder.add_bytes(signature);
     }
     encoder.add_bytes(f.retiring_plan);
-    encoder.add_u64(f.retiring_until.underlying());
+    encoder.add_u64(f.retiring_until_ms);
     encoder.add_u64(f.block_time_ms);
     encoder.add_u64(f.key_created_ms);
+    return encoder;
+}
+
+void add_claim(CanonicalEncoder& encoder, const StorageWrapClaim& claim) {
+    encoder.add_bytes(claim.node.bytes);
+    encoder.add_u64(claim.counter);
+    encoder.add_u32(static_cast<uint32_t>(claim.wraps.size()));
+    for (const auto& wrap : claim.wraps) {
+        encoder.add_bytes(wrap.storage_public_key);
+        encoder.add_bytes(wrap.ephemeral_point);
+    }
+}
+
+bool well_formed_claim(const StorageWrapClaim& claim) {
+    if (claim.wraps.empty() || claim.wraps.size() > constants::kStorageMaxWrapsPerClaim) {
+        return false;
+    }
+    for (std::size_t i = 0; i < claim.wraps.size(); ++i) {
+        for (std::size_t j = i + 1; j < claim.wraps.size(); ++j) {
+            if (claim.wraps[i] == claim.wraps[j]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Claims ascending by node, one per node, each well formed.
+bool well_formed_claims(const std::vector<StorageWrapClaim>& claims) {
+    if (claims.empty() || claims.size() > constants::kStorageMaxClaimsPerBatch) {
+        return false;
+    }
+    for (std::size_t i = 0; i < claims.size(); ++i) {
+        if (!well_formed_claim(claims[i]) || (i > 0 && !(claims[i - 1].node < claims[i].node))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+CanonicalEncoder encode_wraps(const StorageWrapBatch& b) {
+    CanonicalEncoder encoder(kRecordDomain);
+    encoder.add_u16(static_cast<uint16_t>(StorageRecordStage::Wraps));
+    encoder.add_bytes(b.network_id);
+    encoder.add_u64(b.sequence);
+    encoder.add_bytes(b.previous_record);
+    encoder.add_u64(b.block_time_ms);
+    encoder.add_u32(static_cast<uint32_t>(b.claims.size()));
+    for (const auto& claim : b.claims) {
+        add_claim(encoder, claim);
+        encoder.add_bytes(claim.signature);
+    }
     return encoder;
 }
 
@@ -229,7 +282,7 @@ std::optional<StorageRecord> decode_fields(std::span<const uint8_t> bytes) {
                 return std::nullopt;
             }
         }
-        if (!(reader.fixed(f.retiring_plan) && reader.epoch(f.retiring_until) &&
+        if (!(reader.fixed(f.retiring_plan) && reader.integer(f.retiring_until_ms) &&
               reader.integer(f.block_time_ms) && reader.integer(f.key_created_ms) &&
               reader.done())) {
             return std::nullopt;
@@ -239,6 +292,38 @@ std::optional<StorageRecord> decode_fields(std::span<const uint8_t> bytes) {
             return std::nullopt;
         }
         return StorageRecord{std::move(f)};
+    }
+    if (stage == static_cast<uint16_t>(StorageRecordStage::Wraps)) {
+        StorageWrapBatch b;
+        uint32_t count = 0;
+        if (!(reader.fixed(b.network_id) && reader.integer(b.sequence) &&
+              reader.fixed(b.previous_record) && reader.integer(b.block_time_ms) &&
+              reader.integer(count)) ||
+            count == 0 || count > constants::kStorageMaxClaimsPerBatch) {
+            return std::nullopt;
+        }
+        b.claims.resize(count);
+        for (auto& claim : b.claims) {
+            uint32_t wraps = 0;
+            if (!(reader.fixed(claim.node.bytes) && reader.integer(claim.counter) &&
+                  reader.integer(wraps)) ||
+                wraps == 0 || wraps > constants::kStorageMaxWrapsPerClaim) {
+                return std::nullopt;
+            }
+            claim.wraps.resize(wraps);
+            for (auto& wrap : claim.wraps) {
+                if (!(reader.fixed(wrap.storage_public_key) && reader.fixed(wrap.ephemeral_point))) {
+                    return std::nullopt;
+                }
+            }
+            if (!reader.fixed(claim.signature)) {
+                return std::nullopt;
+            }
+        }
+        if (!reader.done() || !well_formed_claims(b.claims)) {
+            return std::nullopt;
+        }
+        return StorageRecord{std::move(b)};
     }
     return std::nullopt;
 }
@@ -291,10 +376,12 @@ StorageSelection base_selection(const NetworkId& network_id, const StorageChainS
     return s;
 }
 
-/// Refresh when allowed, else Rotate, for a holder set drawn from `nodes` in
-/// order. nullopt below the re-share minimum.
+/// Refresh when allowed, else Rotate when allowed, for a holder set drawn
+/// from `nodes` in order. nullopt below the re-share minimum or when neither
+/// is allowed.
 std::optional<StorageSelection> reshare(StorageSelection s, const StorageChainState& state,
-                                        const std::vector<NodeId>& nodes, bool refresh_allowed) {
+                                        const std::vector<NodeId>& nodes, bool refresh_allowed,
+                                        bool rotation_allowed) {
     if (nodes.size() < constants::kStorageMinReshareHolders || !state.current.has_value()) {
         return std::nullopt;
     }
@@ -310,6 +397,9 @@ std::optional<StorageSelection> reshare(StorageSelection s, const StorageChainSt
             s.base_plan = state.current_digest;
             return s;
         }
+    }
+    if (!rotation_allowed) {
+        return std::nullopt;
     }
     s.operation = StorageOperation::Rotate;
     s.holders = numbered(nodes);
@@ -340,7 +430,11 @@ std::optional<StorageSelection> boundary_selection(const NetworkId& network_id,
         s.holders = numbered(nodes);
         return s;
     }
-    return reshare(std::move(s), state, nodes, !rotation_due(state, block_time_ms));
+    // A due rotation waits while the retiring plan is live; the boundary
+    // refreshes instead when it can.
+    const bool retiring = storage_retiring_live(state, block_time_ms);
+    const bool rotate_now = rotation_due(state, block_time_ms) && !retiring;
+    return reshare(std::move(s), state, nodes, !rotate_now, !retiring);
 }
 
 std::optional<StorageSelection> retry_selection(const NetworkId& network_id,
@@ -368,8 +462,46 @@ std::optional<StorageSelection> retry_selection(const NetworkId& network_id,
         s.holders = numbered(remaining);
         return s;
     }
+    // A retry of a rotation stays a rotation. A refresh whose retry would
+    // change t becomes a new rotation, which waits for the retiring plan.
     return reshare(std::move(s), state, remaining,
-                   failed.operation == StorageOperation::Refresh);
+                   failed.operation == StorageOperation::Refresh,
+                   failed.operation == StorageOperation::Rotate ||
+                       !storage_retiring_live(state, block_time_ms));
+}
+
+/// Applies a finalized batch's claims: a claim replaces the node's claim only
+/// when its counter is higher, and each wrap keeps its first owner.
+bool apply_claims(StorageChainState& state, const StorageWrapBatch& batch) {
+    bool changed = false;
+    for (const auto& claim : batch.claims) {
+        const auto it = state.wrap_claims.find(claim.node);
+        if (it != state.wrap_claims.end() && it->second.counter >= claim.counter) {
+            continue;
+        }
+        state.wrap_claims.insert_or_assign(claim.node, claim);
+        for (const auto& wrap : claim.wraps) {
+            state.wrap_owners.emplace(wrap, claim.node);
+        }
+        changed = true;
+    }
+    return changed;
+}
+
+/// Drops the wrap owners of every S that neither the current nor the retiring
+/// plan holds, and the claims that name no other S: no holder serves a
+/// partial for that S any more, and a claim for it can no longer finalize.
+void prune_wrap_owners(StorageChainState& state) {
+    const auto live = [&state](const StoragePointBytes& key) {
+        return (state.current.has_value() && state.current->storage_public_key == key) ||
+               (state.retiring.has_value() && state.retiring->storage_public_key == key);
+    };
+    std::erase_if(state.wrap_owners,
+                  [&live](const auto& entry) { return !live(entry.first.storage_public_key); });
+    std::erase_if(state.wrap_claims, [&live](const auto& entry) {
+        return std::none_of(entry.second.wraps.begin(), entry.second.wraps.end(),
+                            [&live](const auto& wrap) { return live(wrap.storage_public_key); });
+    });
 }
 
 bool verify_confirmation(const NetworkId& network_id, const Digest& selection,
@@ -403,6 +535,11 @@ std::vector<uint8_t> encode_storage_record(const StorageRecord& record) {
                     return {};
                 }
                 return encode_selection(value).bytes();
+            } else if constexpr (std::is_same_v<T, StorageWrapBatch>) {
+                if (!well_formed_claims(value.claims)) {
+                    return {};
+                }
+                return encode_wraps(value).bytes();
             } else {
                 if (!well_formed_holders(value.holders) ||
                     value.confirmations.size() != value.holders.size() ||
@@ -440,10 +577,17 @@ Digest storage_record_digest(const StorageRecord& record) {
 }
 
 BlockPayloadKind storage_record_kind(const StorageRecord& record) {
-    const StorageOperation operation = std::visit(
-        [](const auto& value) { return value.operation; }, record);
-    return operation == StorageOperation::Rotate ? BlockPayloadKind::StorageKeyRotation
-                                                 : BlockPayloadKind::StorageHolderPlan;
+    const bool rotation = std::visit(
+        [](const auto& value) {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<T, StorageWrapBatch>) {
+                return false;
+            } else {
+                return value.operation == StorageOperation::Rotate;
+            }
+        },
+        record);
+    return rotation ? BlockPayloadKind::StorageKeyRotation : BlockPayloadKind::StorageHolderPlan;
 }
 
 BlockPayload storage_record_payload(const StorageRecord& record) {
@@ -544,6 +688,19 @@ std::vector<NodeId> rank_storage_holders(const Digest& checkpoint_seed,
 bool apply_storage_record(StorageChainState& state, const StorageRecord& record) {
     const Digest digest = storage_record_digest(record);
     const uint64_t sequence = storage_record_sequence(record);
+    if (const auto* batch = std::get_if<StorageWrapBatch>(&record)) {
+        // An older batch still carries claims a lagging server lacks; the
+        // counter rule makes the order of application irrelevant.
+        bool changed = apply_claims(state, *batch);
+        if (sequence > state.sequence) {
+            state.sequence = sequence;
+            state.head = digest;
+            state.last_block_time_ms = batch->block_time_ms;
+            changed = true;
+        }
+        prune_wrap_owners(state);
+        return changed;
+    }
     if (sequence <= state.sequence) {
         // Catch-up of the grace plan: an older final plan is kept only when
         // the current plan names it as retiring.
@@ -586,7 +743,34 @@ bool apply_storage_record(StorageChainState& state, const StorageRecord& record)
     state.current_digest = digest;
     state.pending.reset();
     state.pending_digest = Digest{};
+    prune_wrap_owners(state);
     return true;
+}
+
+bool storage_wrap_claimed(const StorageChainState& state, const NodeId& node,
+                          const StorageWrapRef& wrap) {
+    const auto it = state.wrap_claims.find(node);
+    return it != state.wrap_claims.end() &&
+           std::find(it->second.wraps.begin(), it->second.wraps.end(), wrap) !=
+               it->second.wraps.end();
+}
+
+bool storage_retiring_live(const StorageChainState& state, uint64_t block_time_ms) {
+    if (!state.current.has_value() || !state.retiring.has_value() ||
+        state.current->retiring_plan == Digest{} ||
+        state.retiring_digest != state.current->retiring_plan ||
+        block_time_ms >= state.current->retiring_until_ms) {
+        return false;
+    }
+    const auto& retiring_key = state.retiring->storage_public_key;
+    for (const auto& [node, claim] : state.wrap_claims) {
+        for (const auto& wrap : claim.wraps) {
+            if (wrap.storage_public_key == retiring_key) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 std::optional<StorageSelection> derive_storage_selection(
@@ -611,10 +795,10 @@ std::optional<StorageSelection> derive_storage_selection(
     if (fresh_boundary) {
         return boundary_selection(network_id, state, *snapshot, block_time_ms);
     }
-    if (rotation_due(state, block_time_ms)) {
+    if (rotation_due(state, block_time_ms) && !storage_retiring_live(state, block_time_ms)) {
         StorageSelection s = base_selection(network_id, state, block_time_ms);
         s.target_epoch = state.last_boundary_epoch;
-        return reshare(std::move(s), state, nodes_of(state.current->holders), false);
+        return reshare(std::move(s), state, nodes_of(state.current->holders), false, true);
     }
     return std::nullopt;
 }
@@ -659,8 +843,7 @@ std::optional<StorageFinalPlan> make_storage_final(
             plan.key_created_ms = block_time_ms;
             if (state.current.has_value()) {
                 plan.retiring_plan = state.current_digest;
-                plan.retiring_until = EpochId(effective_epoch.underlying() +
-                                              constants::kStorageGraceEpochs);
+                plan.retiring_until_ms = block_time_ms + constants::kStorageRetiringCapMs;
             }
             break;
         case StorageOperation::Refresh:
@@ -669,7 +852,7 @@ std::optional<StorageFinalPlan> make_storage_final(
             }
             plan.key_created_ms = state.current->key_created_ms;
             plan.retiring_plan = state.current->retiring_plan;
-            plan.retiring_until = state.current->retiring_until;
+            plan.retiring_until_ms = state.current->retiring_until_ms;
             break;
     }
     if (check_storage_final(state, plan, effective_epoch) != StorageFinalFailure::None) {
@@ -743,21 +926,123 @@ StorageFinalFailure check_storage_final(const StorageChainState& state,
         return StorageFinalFailure::FieldMismatch;
     }
     Digest retiring{};
-    EpochId retiring_until{};
+    uint64_t retiring_until_ms = 0;
     uint64_t key_created = plan.block_time_ms;
     if (selection.operation == StorageOperation::Rotate) {
         retiring = state.current_digest;
-        retiring_until = EpochId(effective_epoch.underlying() + constants::kStorageGraceEpochs);
+        retiring_until_ms = plan.block_time_ms + constants::kStorageRetiringCapMs;
     } else if (selection.operation == StorageOperation::Refresh) {
         retiring = state.current->retiring_plan;
-        retiring_until = state.current->retiring_until;
+        retiring_until_ms = state.current->retiring_until_ms;
         key_created = state.current->key_created_ms;
     }
-    if (plan.retiring_plan != retiring || plan.retiring_until != retiring_until ||
+    if (plan.retiring_plan != retiring || plan.retiring_until_ms != retiring_until_ms ||
         plan.key_created_ms != key_created) {
         return StorageFinalFailure::FieldMismatch;
     }
     return StorageFinalFailure::None;
+}
+
+Digest storage_wrap_claim_digest(const NetworkId& network_id, const StorageWrapClaim& claim) {
+    CanonicalEncoder encoder(kWrapClaimDomain);
+    encoder.add_string(constants::kStorageKeyDomain);
+    encoder.add_bytes(network_id);
+    add_claim(encoder, claim);
+    return encoder.digest();
+}
+
+void sign_storage_wrap_claim(const NetworkId& network_id, StorageWrapClaim& claim,
+                             const crypto::Ed25519PrivateKey& identity) {
+    const Digest digest = storage_wrap_claim_digest(network_id, claim);
+    crypto_sign_detached(claim.signature.data(), nullptr, digest.data(), digest.size(),
+                         identity.data());
+}
+
+bool check_storage_wrap_claim(const StorageChainState& state, const NetworkId& network_id,
+                              const StorageWrapClaim& claim, uint64_t block_time_ms) {
+    if (!well_formed_claim(claim) || !state.current.has_value()) {
+        return false;
+    }
+    const auto existing = state.wrap_claims.find(claim.node);
+    if (existing != state.wrap_claims.end()
+            ? claim.counter <= existing->second.counter
+            : state.wrap_claims.size() >= constants::kStorageMaxWrapOwners) {
+        return false;
+    }
+    const bool retiring = storage_retiring_live(state, block_time_ms);
+    for (const auto& wrap : claim.wraps) {
+        const bool live_key =
+            wrap.storage_public_key == state.current->storage_public_key ||
+            (retiring && wrap.storage_public_key == state.retiring->storage_public_key);
+        if (!live_key) {
+            return false;
+        }
+        // An R belongs to the first server that claimed it while its S is live.
+        const auto owner = state.wrap_owners.find(wrap);
+        if (owner != state.wrap_owners.end() && owner->second != claim.node) {
+            return false;
+        }
+    }
+    const Digest digest = storage_wrap_claim_digest(network_id, claim);
+    return crypto_sign_verify_detached(claim.signature.data(), digest.data(), digest.size(),
+                                       claim.node.bytes.data()) == 0;
+}
+
+std::optional<StorageWrapBatch> make_storage_wrap_batch(
+    const NetworkId& network_id, const StorageChainState& state,
+    const std::map<NodeId, StorageWrapClaim>& pool, uint64_t block_time_ms) {
+    StorageWrapBatch batch;
+    batch.network_id = network_id;
+    batch.sequence = state.sequence + 1;
+    batch.previous_record = state.head;
+    batch.block_time_ms = block_time_ms;
+    std::set<StorageWrapRef> named;
+    for (const auto& [node, claim] : pool) {
+        if (batch.claims.size() >= constants::kStorageMaxClaimsPerBatch) {
+            break;
+        }
+        if (claim.node != node ||
+            !check_storage_wrap_claim(state, network_id, claim, block_time_ms)) {
+            continue;
+        }
+        const bool conflict = std::any_of(claim.wraps.begin(), claim.wraps.end(),
+                                          [&named](const auto& w) { return named.contains(w); });
+        if (conflict) {
+            continue;
+        }
+        named.insert(claim.wraps.begin(), claim.wraps.end());
+        batch.claims.push_back(claim);
+    }
+    if (batch.claims.empty()) {
+        return std::nullopt;
+    }
+    return batch;
+}
+
+StorageWrapFailure check_storage_wrap_batch(const StorageChainState& state,
+                                            const StorageWrapBatch& batch) {
+    if (batch.sequence != state.sequence + 1 || batch.previous_record != state.head ||
+        batch.block_time_ms <= state.last_block_time_ms) {
+        return StorageWrapFailure::ChainMismatch;
+    }
+    if (batch.claims.empty()) {
+        return StorageWrapFailure::Empty;
+    }
+    if (!well_formed_claims(batch.claims)) {
+        return StorageWrapFailure::Order;
+    }
+    std::set<StorageWrapRef> named;
+    for (const auto& claim : batch.claims) {
+        if (!check_storage_wrap_claim(state, batch.network_id, claim, batch.block_time_ms)) {
+            return StorageWrapFailure::ClaimInvalid;
+        }
+        for (const auto& wrap : claim.wraps) {
+            if (!named.insert(wrap).second) {
+                return StorageWrapFailure::ClaimInvalid;
+            }
+        }
+    }
+    return StorageWrapFailure::None;
 }
 
 }  // namespace nexus::security
