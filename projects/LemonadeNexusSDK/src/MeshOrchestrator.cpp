@@ -1,6 +1,7 @@
 #include <LemonadeNexusSDK/MeshOrchestrator.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
+#include <LemonadeNexusSDK/RelayChannel.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -11,6 +12,8 @@ namespace {
 
 /// The canonical relay port (README): every server relays on it.
 constexpr uint16_t kRelayPort = 9103;
+/// The canonical STUN port (README): every server answers STUN on it.
+constexpr uint16_t kStunPort = 3478;
 
 /// Split "host:port". Without exactly one colon, the whole text is the host
 /// and the port is kRelayPort.
@@ -45,6 +48,7 @@ MeshOrchestrator::MeshOrchestrator(LemonadeNexusClient& client,
             return client_.request_relay_ticket(node_id_, relay_id);
         },
         [this] { return relay_candidates(); });
+    hole_puncher_ = std::make_unique<HolePuncher>(mesh_);
 }
 
 MeshOrchestrator::~MeshOrchestrator() {
@@ -77,8 +81,10 @@ void MeshOrchestrator::stop() {
     // timeouts); its callback must not run after stop() returns.
     if (cert_thread_.joinable()) cert_thread_.join();
 
-    // The loop thread has ended, so the relay fallback has no other user.
+    // The loop thread has ended, so the relay fallback and the hole puncher
+    // have no other user.
     relay_fallback_->stop();
+    hole_puncher_->reset();
 
     // Remove all mesh peers from the dataplane
     {
@@ -88,6 +94,7 @@ void MeshOrchestrator::stop() {
         }
         known_peers_.clear();
         last_status_ = {};
+        our_endpoint_.clear();
     }
 
     spdlog::info("[MeshOrchestrator] stopped for node {}", node_id_);
@@ -124,7 +131,9 @@ void MeshOrchestrator::run_loop() {
     using clock = std::chrono::steady_clock;
 
     auto next_peer_refresh = clock::now();
+    auto next_stun         = clock::now();
     auto next_heartbeat    = clock::now();
+    auto next_punch        = clock::now();
     auto next_monitor      = clock::now();
     auto next_cert_check   = clock::now();
 
@@ -139,6 +148,14 @@ void MeshOrchestrator::run_loop() {
             refresh_requested = std::exchange(refresh_requested_, false);
         }
 
+        // Reflexive address, before the heartbeat that publishes it
+        if (cfg.stun_refresh_interval_sec == 0) {
+            next_stun = now + std::chrono::hours(24);
+        } else if (now >= next_stun) {
+            do_stun_refresh();
+            next_stun = now + std::chrono::seconds(cfg.stun_refresh_interval_sec);
+        }
+
         // Peer refresh
         if (refresh_requested || now >= next_peer_refresh) {
             do_peer_refresh();
@@ -149,6 +166,11 @@ void MeshOrchestrator::run_loop() {
         if (now >= next_heartbeat) {
             do_heartbeat();
             next_heartbeat = now + std::chrono::seconds(cfg.heartbeat_interval_sec);
+        }
+
+        // Direct paths
+        if (now >= next_punch) {
+            next_punch = do_punch();
         }
 
         // Monitor, then move unreachable peers onto a relay
@@ -165,8 +187,8 @@ void MeshOrchestrator::run_loop() {
         }
 
         // Sleep until next event or woken early
-        auto next_wake = std::min({next_peer_refresh, next_heartbeat, next_monitor,
-                                   next_cert_check});
+        auto next_wake = std::min({next_peer_refresh, next_stun, next_heartbeat, next_punch,
+                                   next_monitor, next_cert_check});
         std::unique_lock lock(mutex_);
         cv_.wait_until(lock, next_wake,
                        [this] { return !running_.load() || refresh_requested_; });
@@ -205,6 +227,19 @@ void MeshOrchestrator::do_peer_refresh() {
 
     auto server_peers = std::move(result.value);
 
+    // A listed endpoint is only a send target: drop one that is not a usable
+    // unicast address before the dataplane or the hole puncher sees it.
+    const auto server_scope = endpoint_scope(mesh_.server_endpoint());
+    for (auto& peer : server_peers) {
+        for (auto* endpoint : {&peer.endpoint, &peer.relay_endpoint}) {
+            if (!endpoint->empty() && !peer_endpoint_usable(*endpoint, server_scope)) {
+                spdlog::warn("[MeshOrchestrator] peer {} lists unusable endpoint '{}'; ignored",
+                             peer.node_id, *endpoint);
+                endpoint->clear();
+            }
+        }
+    }
+
     // Sync to the boringtun mesh dataplane
     auto sync_result = mesh_.sync_peers(server_peers);
     if (!sync_result) {
@@ -222,24 +257,61 @@ void MeshOrchestrator::do_peer_refresh() {
 }
 
 void MeshOrchestrator::do_heartbeat() {
-    // Report our current endpoint to the server so other peers can find us
-    // The endpoint comes from the tunnel's current status
+    // Report our reflexive endpoint so authorized peers can punch toward it.
+    // Until STUN gives one, the endpoint is empty and the server keeps what
+    // it stored before.
     std::string endpoint;
     {
         std::lock_guard lock(mutex_);
         endpoint = our_endpoint_;
     }
 
-    // For now, use empty endpoint if we don't have STUN info.
-    // In a future phase, we'll integrate STUN probe to learn our reflexive address.
-    nlohmann::json body;
-    body["node_id"]  = node_id_;
-    body["endpoint"] = endpoint;
-
     auto result = client_.mesh_heartbeat(node_id_, endpoint);
     if (!result) {
         spdlog::debug("[MeshOrchestrator] heartbeat failed: {}", result.error);
     }
+}
+
+void MeshOrchestrator::do_stun_refresh() {
+    // The STUN server is the session server: the host of the dataplane's
+    // server peer. The query leaves from the dataplane socket, so the answer
+    // is the mapping that mesh peers can reach.
+    const auto server = mesh_.server_endpoint();
+    if (server.empty()) return;
+    const auto stun_ip = resolve_relay_ipv4(split_endpoint(server).first);
+    if (!stun_ip) {
+        spdlog::debug("[MeshOrchestrator] STUN server {} does not resolve", server);
+        return;
+    }
+    const auto reflexive =
+        mesh_.query_reflexive(*stun_ip + ":" + std::to_string(kStunPort), kStunTimeout);
+    if (!reflexive) {
+        spdlog::debug("[MeshOrchestrator] no STUN answer from {}", *stun_ip);
+        return;
+    }
+    // STUN is not authenticated: publish only an address that the STUN
+    // server could have observed.
+    if (!reflexive_publishable(*reflexive, *stun_ip)) {
+        spdlog::warn("[MeshOrchestrator] STUN reported unusable address '{}'; not published",
+                     *reflexive);
+        return;
+    }
+    std::lock_guard lock(mutex_);
+    if (our_endpoint_ != *reflexive) {
+        spdlog::info("[MeshOrchestrator] reflexive endpoint {}", *reflexive);
+    }
+    our_endpoint_ = *reflexive;
+}
+
+std::chrono::steady_clock::time_point MeshOrchestrator::do_punch() {
+    std::vector<MeshPeer> peers;
+    bool prefer_direct = true;
+    {
+        std::lock_guard lock(mutex_);
+        peers = known_peers_;
+        prefer_direct = config_.prefer_direct;
+    }
+    return hole_puncher_->maintain(peers, relay_fallback_->relayed_peers(), prefer_direct);
 }
 
 std::vector<RelayCandidate> MeshOrchestrator::relay_candidates() {

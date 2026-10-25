@@ -49,6 +49,11 @@ set(LN_TRUST_SRC
 # sources above only.
 list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Relay/RelayWire.cpp")
 
+# Reflexive-address learning (BoringtunMesh.cpp) and the dataplane's STUN
+# demultiplexing (UserspaceDataplane.cpp) use the STUN codec of the server's
+# StunService, so both sides encode the same bytes. No dependencies.
+list(APPEND LN_TRUST_SRC "${LN_SERVER_SRC}/Network/StunWire.cpp")
+
 if(TARGET LemonadeNexusSDK)
     target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")

@@ -18,6 +18,7 @@
 #include <LemonadeNexusSDK/Types.hpp>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -61,10 +62,40 @@ public:
     /// The dataplane's bound local UDP port (0 when inactive).
     [[nodiscard]] uint16_t bound_port() const;
 
+    /// The server peer's endpoint ("host:port") the dataplane started with.
+    /// Empty when inactive.
+    [[nodiscard]] std::string server_endpoint() const;
+
+    /// Learn this device's reflexive address: send a STUN Binding request
+    /// from the dataplane's own UDP socket to `stun_endpoint` ("a.b.c.d:port")
+    /// and wait for the matching response. Because the request leaves from
+    /// the mesh socket, the answer is the NAT mapping that mesh peers can
+    /// punch toward. The request is resent up to `attempts` times within
+    /// `timeout`. A response counts only when it comes from `stun_endpoint`,
+    /// carries this query's transaction id, and decodes (StunWire). The
+    /// result ("a.b.c.d:port") is unauthenticated: treat it as a hint.
+    /// nullopt when inactive or on timeout. Blocks the caller for at most
+    /// `timeout`. Thread-safe; concurrent queries run one at a time.
+    [[nodiscard]] std::optional<std::string> query_reflexive(
+        const std::string& stun_endpoint, std::chrono::milliseconds timeout,
+        uint32_t attempts = 3);
+
+    /// Hole-punch probe: send a fresh handshake initiation for `pubkey` to
+    /// `endpoint` ("a.b.c.d:port") without changing the peer's endpoint (see
+    /// UserspaceDataplane::probe_endpoint). Only a valid handshake answer
+    /// from that address moves the peer there. False when inactive, the peer
+    /// is unknown or is the server, or the endpoint does not parse.
+    /// Thread-safe.
+    bool probe_peer(const std::string& pubkey, const std::string& endpoint);
+
     /// Sync the desired mesh peer set into the dataplane (add/update/remove).
     /// The server peer is preserved. Each peer's routes come from
     /// peer_allowed_ips; a peer that gets no route is not added. A peer with
-    /// a relay path (set_peer_relay) keeps that path.
+    /// a relay path (set_peer_relay) keeps that path. A peer's endpoint is
+    /// written only when the endpoint to use changes (a new listed endpoint,
+    /// or a relay path set or cleared). Otherwise the dataplane keeps the
+    /// address that the peer's last authenticated packet came from, so a
+    /// refresh never undoes roaming or a punched path.
     StatusResult sync_peers(const std::vector<MeshPeer>& desired);
 
     /// Our mesh public key (base64). Empty when inactive.
@@ -87,9 +118,12 @@ public:
     bool set_peer_relay(const std::string& pubkey, const std::string& local_endpoint,
                         const std::string& relay_endpoint);
 
-    /// Stop sending `pubkey`'s traffic through a relay. The next sync_peers
-    /// restores a direct endpoint the server lists. Thread-safe.
-    void clear_peer_relay(const std::string& pubkey);
+    /// Stop sending `pubkey`'s traffic through a relay. With an empty
+    /// `listed_endpoint`, the next sync_peers writes the endpoint the server
+    /// lists. A non-empty `listed_endpoint` means the peer already moved to a
+    /// direct path with an authenticated packet: sync_peers keeps that live
+    /// address while the server still lists `listed_endpoint`. Thread-safe.
+    void clear_peer_relay(const std::string& pubkey, const std::string& listed_endpoint = {});
 
     /// The allowed-IPs text to install for each peer in `peers`, in the same
     /// order. A peer's addresses become routes on this device, so a peer must
@@ -114,7 +148,10 @@ public:
     StatusResult remove_peer(const std::string& pubkey);
 
     /// Live mesh status built from the dataplane's peer snapshot. A relayed
-    /// peer has an empty `endpoint` and its relay in `relay_endpoint`.
+    /// peer has an empty `endpoint` and its relay in `relay_endpoint`. A peer
+    /// with a relay path whose traffic now arrives from another address (an
+    /// authenticated move, for example to a punched direct path) reports
+    /// that address in `endpoint` and an empty `relay_endpoint`.
     [[nodiscard]] MeshTunnelStatus mesh_status() const;
 
     /// Generate a fresh Curve25519 keypair (base64 {private, public}).

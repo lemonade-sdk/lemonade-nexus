@@ -155,6 +155,40 @@ The attacker then receives ciphertext it cannot read, and the BoringTun
 handshake fails. This is a denial of service on that relay session, which an
 on-path attacker can cause anyway.
 
+### Direct paths
+
+The SDK punches direct paths between mesh peers (`HolePunch.hpp`). No new
+cryptography is involved, and a punch grants no authority:
+
+- **Probe targets come from the authenticated tree.** A peer's endpoint comes
+  only from the verified Tier 1 server's peer list (`GET /api/mesh/peers`),
+  which lists only peers the caller may connect to. The SDK never takes a
+  probe target from a received packet. It ignores a listed endpoint that is
+  not a dotted IPv4 unicast address, and it accepts a loopback endpoint only
+  when the session server is on loopback.
+- **A probe changes no state.** A probe is a normal BoringTun handshake
+  initiation sent to the listed endpoint (`UserspaceDataplane::probe_endpoint`);
+  the peer's stored endpoint stays as it is. Only a valid handshake answer
+  from the probed address moves the peer there (the dataplane's existing
+  authenticated roaming). The handshake authenticates the peer by its mesh
+  key, so an attacker who answers in its place cannot complete it.
+- **STUN is a hint.** STUN answers are not authenticated. The dataplane hands
+  STUN messages to the reflexive-address query and never to a Noise session.
+  The query accepts an answer only from the queried server, with its own
+  random transaction id, and with a valid IPv4 `XOR-MAPPED-ADDRESS`
+  (`Network/StunWire.hpp`, shared with the server's `StunService`). The SDK
+  publishes the address only when the STUN server could have observed it
+  (`reflexive_publishable`). A forged answer can at worst publish a wrong
+  endpoint: peers then probe a dead address and fall back to a relay.
+- **The server stores what the node's owner reports.** The heartbeat writes
+  the endpoint only for the caller's own node, as a `SetEndpoint` tree
+  operation when tree operations are on. It refuses IPv4 addresses that are
+  not unicast. An empty endpoint keeps the stored one.
+- **Probes are rate limited.** At most 16 probes go out per pass and passes
+  are at least 250 ms apart. A peer gets a burst of five probes, then two
+  probes per 15-second slot, or per 60-second slot while it is relayed. A peer
+  with a fresh direct handshake gets none.
+
 Endpoints, the devices that join a group, come in two roles. Neither holds any
 server or authority role:
 
@@ -435,12 +469,17 @@ These are implementation limits, not settings an operator can disable:
 6. **No tree without Tier 1.** Only Tier 1 members hold the tree. Before Epoch
    1 activates, and while no server qualifies for Tier 1 (item 1), no server
    serves a tree route or a client session, and no client can join.
-7. **Relay fallback is tested only in software.** Relay allocation, pairing,
-   forwarding, expiry, and the SDK fallback have unit tests and loopback
-   end-to-end tests (`test_relay_service`, `test_sdk_relay_fallback`). They
-   are not tested across real NAT devices or under load. The SDK has no STUN
-   probe or hole punching for mesh peers, so a peer without a listed direct
-   endpoint always uses a relay. Both peers pick the relay from their own
+7. **Relay fallback and hole punching are tested only in software.** Relay
+   allocation, pairing, forwarding, expiry, the SDK fallback, reflexive-address
+   learning, and hole punching have unit tests and loopback end-to-end tests
+   (`test_relay_service`, `test_sdk_relay_fallback`, `test_sdk_hole_punch`).
+   They are not tested across real NAT devices or under load. Each device
+   publishes one reflexive endpoint from one STUN server: there are no LAN
+   candidates, and the SDK does not detect endpoint-dependent (symmetric) NAT
+   mappings. Two peers behind the same NAT connect directly only when the NAT
+   supports hairpinning. Pair slots assume that the two device clocks agree to
+   within the NAT mapping lifetime. A peer without a listed direct endpoint
+   always uses a relay. Both peers pick the relay from their own
    candidate lists; when the lists differ, the peers can pick different relays
    until a failed relay is skipped. The client dataplane reaches relays over
    IPv4 only.

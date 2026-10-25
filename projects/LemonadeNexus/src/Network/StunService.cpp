@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Network/StunService.hpp>
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Network/StunWire.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -19,20 +20,6 @@ uint64_t now_unix() {
             .count());
 }
 
-/// Write a uint16_t in network byte order (big-endian) to a buffer.
-void write_u16(uint8_t* buf, uint16_t val) {
-    buf[0] = static_cast<uint8_t>((val >> 8) & 0xFF);
-    buf[1] = static_cast<uint8_t>( val       & 0xFF);
-}
-
-/// Write a uint32_t in network byte order (big-endian) to a buffer.
-void write_u32(uint8_t* buf, uint32_t val) {
-    buf[0] = static_cast<uint8_t>((val >> 24) & 0xFF);
-    buf[1] = static_cast<uint8_t>((val >> 16) & 0xFF);
-    buf[2] = static_cast<uint8_t>((val >>  8) & 0xFF);
-    buf[3] = static_cast<uint8_t>( val        & 0xFF);
-}
-
 /// Read a uint16_t from network byte order (big-endian) buffer.
 uint16_t read_u16(const uint8_t* buf) {
     return static_cast<uint16_t>((static_cast<uint16_t>(buf[0]) << 8) | buf[1]);
@@ -49,6 +36,12 @@ StunService::StunService(asio::io_context& io, uint16_t port,
     , crypto_(crypto)
     , server_id_(std::move(server_id))
 {
+}
+
+uint16_t StunService::local_port() const {
+    asio::error_code ec;
+    const auto endpoint = socket_.local_endpoint(ec);
+    return ec ? 0 : endpoint.port();
 }
 
 // --- IService lifecycle ---
@@ -74,7 +67,7 @@ void StunService::on_stop() {
 StunResponse StunService::do_handle_binding_request(const asio::ip::udp::endpoint& client,
                                                       std::span<const uint8_t> request) {
     // Validate minimum STUN header
-    if (request.size() < kStunHeaderSize) {
+    if (request.size() < stun::kHeaderSize) {
         spdlog::warn("[{}] received undersized STUN message ({} bytes) from {}:{}",
                       name(), request.size(),
                       client.address().to_string(), client.port());
@@ -82,7 +75,7 @@ StunResponse StunService::do_handle_binding_request(const asio::ip::udp::endpoin
     }
 
     uint16_t msg_type = read_u16(request.data());
-    if (msg_type != kBindingRequest) {
+    if (msg_type != stun::kBindingRequest) {
         spdlog::debug("[{}] ignoring non-binding-request (type=0x{:04X}) from {}:{}",
                        name(), msg_type,
                        client.address().to_string(), client.port());
@@ -151,7 +144,7 @@ void StunService::start_receive() {
 void StunService::handle_receive(std::size_t bytes_received) {
     auto request = std::span<const uint8_t>(recv_buffer_.data(), bytes_received);
 
-    if (bytes_received < kStunHeaderSize) {
+    if (bytes_received < stun::kHeaderSize) {
         spdlog::debug("[{}] dropping short packet ({} bytes) from {}:{}",
                        name(), bytes_received,
                        remote_endpoint_.address().to_string(),
@@ -160,7 +153,7 @@ void StunService::handle_receive(std::size_t bytes_received) {
     }
 
     uint16_t msg_type = read_u16(request.data());
-    if (msg_type != kBindingRequest) {
+    if (msg_type != stun::kBindingRequest) {
         spdlog::debug("[{}] ignoring non-binding-request (type=0x{:04X})", name(), msg_type);
         return;
     }
@@ -192,47 +185,13 @@ std::vector<uint8_t> StunService::build_binding_response(
     const asio::ip::udp::endpoint& client,
     std::span<const uint8_t> request_header) const
 {
-    // Extract the 12-byte transaction ID from the request (bytes 8..19)
-    // Request layout: [0..1] type, [2..3] length, [4..7] magic cookie, [8..19] txn id
-
-    // Build XOR-MAPPED-ADDRESS attribute for IPv4
-    //   Family: 0x01 (IPv4)
-    //   X-Port:   port XOR (magic cookie >> 16)
-    //   X-Address: IPv4 XOR magic cookie
-    const uint16_t x_port = client.port() ^ static_cast<uint16_t>(kMagicCookie >> 16);
-    const uint32_t client_ip = client.address().to_v4().to_uint();
-    const uint32_t x_addr = client_ip ^ kMagicCookie;
-
-    // XOR-MAPPED-ADDRESS value: 1 reserved byte + 1 family + 2 port + 4 address = 8 bytes
-    constexpr std::size_t kXmaValueLen = 8;
-    // Attribute: 2 type + 2 length + value = 12 bytes
-    constexpr std::size_t kXmaAttrLen = 4 + kXmaValueLen;
-
-    // Total STUN message: header (20) + XOR-MAPPED-ADDRESS attribute (12)
-    constexpr std::size_t kResponseLen = kStunHeaderSize + kXmaAttrLen;
-    std::vector<uint8_t> buf(kResponseLen, 0);
-
-    // --- Header ---
-    write_u16(buf.data() + 0, kBindingResponse);
-    write_u16(buf.data() + 2, kXmaAttrLen);           // message length (after header)
-    write_u32(buf.data() + 4, kMagicCookie);
-
-    // Copy transaction ID from request
-    if (request_header.size() >= kStunHeaderSize) {
-        std::memcpy(buf.data() + 8, request_header.data() + 8, 12);
+    // The response echoes the request's transaction id (bytes 8..19).
+    stun::TransactionId txn{};
+    if (request_header.size() >= stun::kHeaderSize) {
+        std::memcpy(txn.data(), request_header.data() + 8, txn.size());
     }
-
-    // --- XOR-MAPPED-ADDRESS attribute ---
-    std::size_t offset = kStunHeaderSize;
-    write_u16(buf.data() + offset, kAttrXorMappedAddress);  // attribute type
-    write_u16(buf.data() + offset + 2, kXmaValueLen);       // attribute value length
-
-    buf[offset + 4] = 0x00;  // reserved
-    buf[offset + 5] = 0x01;  // family: IPv4
-    write_u16(buf.data() + offset + 6, x_port);
-    write_u32(buf.data() + offset + 8, x_addr);
-
-    return buf;
+    return stun::encode_binding_response(
+        txn, stun::MappedAddress{client.address().to_v4().to_uint(), client.port()});
 }
 
 std::vector<uint8_t> StunService::response_to_signable_bytes(const StunResponse& response) {

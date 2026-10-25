@@ -57,8 +57,10 @@ bool mesh_peer_listed(const tree::PermissionTreeService& tree,
 
 namespace {
 /// Validate that a mesh heartbeat endpoint string is a well-formed ip:port
-/// or hostname:port.  Empty strings are allowed (clears the endpoint).
-/// Rejects arbitrary strings that could be injected downstream.
+/// or hostname:port. Empty strings are allowed (no endpoint to report).
+/// Rejects arbitrary strings that could be injected downstream, and IPv4
+/// addresses that have an octet above 255 or are not unicast (0.0.0.0/8,
+/// 224.0.0.0/4, 240.0.0.0/4).
 bool is_valid_mesh_endpoint(const std::string& ep) {
     if (ep.empty()) return true;
     // Max length sanity check (longest reasonable hostname:port)
@@ -70,10 +72,23 @@ bool is_valid_mesh_endpoint(const std::string& ep) {
     // hostname:port
     static const std::regex host_re(
         R"(^[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*:\d{1,5}$)");
-    if (!std::regex_match(ep, ipv4_re) &&
+    const bool ipv4 = std::regex_match(ep, ipv4_re);
+    if (!ipv4 &&
         !std::regex_match(ep, ipv6_re) &&
         !std::regex_match(ep, host_re)) {
         return false;
+    }
+    if (ipv4) {
+        // The pattern guarantees four 1-3 digit octets before the port.
+        int octets[4] = {};
+        std::size_t start = 0;
+        for (int& octet : octets) {
+            const auto end = ep.find_first_of(".:", start);
+            octet = std::stoi(ep.substr(start, end - start));
+            if (octet > 255) return false;
+            start = end + 1;
+        }
+        if (octets[0] == 0 || octets[0] >= 224) return false;
     }
     // Validate port range (1-65535)
     auto colon_pos = ep.rfind(':');
@@ -209,7 +224,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
     //
     // Client reports its current public endpoint (learned via STUN) and
     // online status.  The server updates the node's listen_endpoint in the
-    // tree so that other peers can discover it.
+    // tree so that other peers can discover it. An empty or absent endpoint
+    // means the client has none to report (no STUN answer yet): the stored
+    // endpoint stays as it is, so a heartbeat never erases a punch target.
     //
     // Body: { "node_id": "...", "endpoint": "ip:port" }
     // ========================================================================
@@ -262,7 +279,9 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             }
             std::string status = "unchanged";
             auto current = node_opt;
-            for (int attempt = 0; current && current->listen_endpoint != hb_endpoint; ++attempt) {
+            for (int attempt = 0;
+                 current && !hb_endpoint.empty() && current->listen_endpoint != hb_endpoint;
+                 ++attempt) {
                 tree::TreeOp op;
                 op.kind = tree::TreeOpKind::SetEndpoint;
                 op.target = hb_node_id;
@@ -299,8 +318,18 @@ void MeshApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             nlohmann::json j;
             j["success"]  = true;
             j["node_id"]  = hb_node_id;
-            j["endpoint"] = hb_endpoint;
+            j["endpoint"] = hb_endpoint.empty() ? current->listen_endpoint : hb_endpoint;
             j["status"]   = status;
+            json_response(res, j);
+            return;
+        }
+
+        // No endpoint to report: liveness only, the stored endpoint stays.
+        if (hb_endpoint.empty()) {
+            nlohmann::json j;
+            j["success"]  = true;
+            j["node_id"]  = hb_node_id;
+            j["endpoint"] = node_opt->listen_endpoint;
             json_response(res, j);
             return;
         }
