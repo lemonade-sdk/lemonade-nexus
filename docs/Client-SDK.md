@@ -210,8 +210,8 @@ netstack are embedded.
 
 ## Platform Notes
 
-- **macOS:** builds are CI-verified; use `-DOPENSSL_FORCE_BUNDLED=ON` for
-  distributable binaries.
+- **macOS:** builds are CI-verified. On arm64 the build links the pinned
+  static OpenSSL archive, so the dylib loads no Homebrew or system OpenSSL.
 - **Windows:** build definitions exist; CI is currently disabled, so validate
   locally.
 - The SDK ships as a native dynamic library (`.so` / `.dylib` / `.dll`);

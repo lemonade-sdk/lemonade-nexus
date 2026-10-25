@@ -208,12 +208,30 @@ The `sdk` job builds the Linux SDK shared library with the same static
 OpenSSL and fails when it needs `libssl`, `libcrypto`, `libz`, `libzstd`, or
 `libsodium`. The SDK keeps the C++ runtime of its host process.
 
-The macOS and Windows SDK builds link a static OpenSSL archive that
+The macOS arm64 and Windows x64 builds link a static OpenSSL archive that
 `.github/workflows/deps-openssl.yml` builds from the official source tarball
 and publishes on the release `deps-openssl-<version>`. CMake downloads the
 archive and checks the SHA-256 pinned in `cmake/libraries/openssl.cmake`
-(`LEMONADE_NEXUS_OPENSSL_PREBUILT_*`). Until those hashes are set, these
-platforms keep the previous OpenSSL logic (`OPENSSL_FORCE_BUNDLED`).
+(`LEMONADE_NEXUS_OPENSSL_PREBUILT_*`). A hash mismatch or a failed download
+stops the configure step. The build never compiles OpenSSL. The `native` and
+`sdk` jobs fail when a macOS binary links a Homebrew, `/usr/local`, or OpenSSL
+shared library.
+
+To move to a new OpenSSL version on these platforms:
+
+1. Run `deps-openssl.yml` by hand with the new version and the SHA-256 that
+   OpenSSL publishes for its source tarball. The workflow never replaces an
+   existing asset.
+2. In a reviewed pull request, set `LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION`
+   and copy the two printed SHA-256 values into
+   `LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_MACOS_ARM64` and
+   `LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_WINDOWS_X64`.
+
+A project that vendors `cmake/libraries/openssl.cmake` and does not define
+`LEMONADE_NEXUS_STATIC_DEPS` gets the pinned archive on macOS arm64 and
+Windows x64, and the system OpenSSL on other platforms. It must not pass
+`-DLEMONADE_NEXUS_STATIC_DEPS=ON` on Linux unless it provides the pinned
+Ubuntu `libssl-dev`.
 
 ### `release/bootstrap-complete` (one time)
 
