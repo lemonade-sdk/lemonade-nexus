@@ -280,19 +280,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            cmake ninja-build pkg-config clang \
+            cmake ninja-build pkg-config clang libssl-dev \
             libgtk-3-dev liblzma-dev libstdc++-12-dev \
             libsecret-1-dev libjsoncpp-dev libayatana-appindicator3-dev
 
-      # OpenSSL is built from source (static, PIC) so the .so carries no
-      # libssl/libcrypto dependency. The SDK does not use TPM FAPI, so skip
-      # the tss2 dependency chain.
+      # The pinned OpenSSL static libraries of libssl-dev are linked in
+      # (LEMONADE_NEXUS_STATIC_DEPS), so the .so carries no libssl/libcrypto
+      # dependency. The SDK does not use TPM FAPI, so skip the tss2
+      # dependency chain.
       - name: Build shared SDK
         run: |
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
-            -DOPENSSL_FORCE_BUNDLED=ON \
             -DLEMONADE_NEXUS_MINIMAL_DEPS=ON \
             -DBUILD_SDK_SHARED=ON
           cmake --build build --target LemonadeNexusSDKShared --parallel

@@ -171,6 +171,15 @@ jobs:
           cp build/projects/LemonadeNexusUpdater/nexus-updater out/nexus-updater-linux-x86_64
           (cd out && sha256sum -- *)
 
+      # The approval requires every system_libraries path of the profile in
+      # the IMA log. The binaries must need exactly those shared libraries:
+      # OpenSSL (the snapshot's libssl-dev), libstdc++, and libgcc are linked
+      # in, and glibc stays shared.
+      - name: Check the server binaries' shared libraries
+        run: |
+          python3 scripts/nexus-release-tool libraries --profile release/fleet-profile.json \
+            --binary out/lemonade-nexus-linux-x86_64 --binary out/nexus-attestd-linux-x86_64
+
       # The previous approval: its hashes become previous_release_paths, so
       # servers on both releases attest each other. A missing previous
       # approval fails the release; it never falls back to an approval without
@@ -461,13 +470,16 @@ jobs:
         with:
           persist-credentials: false
 
+      # Distribution packages use the distribution's OpenSSL and C++ runtime.
+      # The fleet server build (server job) links both statically.
       - name: Configure
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
-            -DGIT_TAG_OVERRIDE="$TAG"
+            -DGIT_TAG_OVERRIDE="$TAG" \
+            -DLEMONADE_NEXUS_STATIC_DEPS=OFF
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
@@ -542,6 +554,17 @@ jobs:
           mkdir -p out
           cp "build/projects/LemonadeNexusSDK/${{ matrix.library }}" \
             "out/lemonade-nexus-sdk-${TAG}-${{ matrix.platform }}-${{ matrix.library }}"
+
+      # OpenSSL, libsodium, and the Rust crates are linked into the library.
+      - name: Check the SDK library's shared libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          so="build/projects/LemonadeNexusSDK/${{ matrix.library }}"
+          readelf -d "$so" | grep NEEDED
+          if readelf -d "$so" | grep NEEDED | grep -E 'libssl|libcrypto|libz\.|libzstd|libsodium'; then
+            echo "::error::the SDK library links a shared library that it must embed"
+            exit 1
+          fi
 
       - uses: actions/attest-build-provenance@v3
         with:

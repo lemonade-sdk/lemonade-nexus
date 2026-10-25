@@ -375,7 +375,11 @@ Tier 2 server for tree data.
   the fleet; a boot-chain change needs its own staged approval (Phase 6 of the
   storage design covers re-seal).
 - **System library updates.** The approval pins system library hashes. An OS
-  package update that changes them fails attestation. Pin those packages or
-  ship the libraries with the release.
+  package update that changes them fails attestation. The server and
+  `nexus-attestd` link OpenSSL (the snapshot-pinned Ubuntu static libraries,
+  which need no zlib or zstd), libstdc++, and libgcc statically, so those
+  fixes ship in a Nexus release. Only glibc stays
+  shared; `release/os-packages.lock` pins `libc6`, and a `libc6` change ships
+  with new `system_libraries` hashes ([Releasing](Releasing)).
 - **Holder margin.** At 5 holders a crash during a rollout means two down and
   no unlock. More holders (7 at 10 admitted servers) is the real fix.

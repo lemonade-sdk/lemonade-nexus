@@ -6,6 +6,8 @@
                detect the bootstrap release when none exists.
   release-number  Print the release number of a tag.
   spec         Write the nexus-release-bundle spec from release/fleet-profile.json.
+  libraries    Check that the server binaries need exactly the shared libraries
+               that release/fleet-profile.json pins.
   boot-chain   Decide whether the OS package lock changes the boot chain, and
                check that the profile's PCRs agree with that decision.
   assemble     Put the release signature and the Genesis delegation into the
@@ -21,6 +23,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
 TAG_RE = re.compile(r"^v(\d{4})\.(\d{2})\.(\d{2})(?:\.([1-9]\d?))?$")
@@ -189,6 +192,46 @@ def cmd_spec(args):
     write_json(args.out, spec)
 
 
+def needed_libraries(binary):
+    """The DT_NEEDED entries of an ELF file, read with binutils readelf."""
+    try:
+        out = subprocess.run(["readelf", "-d", "--wide", binary], check=True,
+                             capture_output=True, text=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        fail(f"readelf failed on {binary}: {e}")
+    needed = re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", out)
+    if not needed:
+        fail(f"{binary} has no NEEDED entries; is it a dynamic ELF file?")
+    return needed
+
+
+def cmd_libraries(args):
+    """Check the binaries' shared libraries against the profile.
+
+    The approval requires each system_libraries path in the IMA log, and the
+    attestation profile pins the hash of each one. A NEEDED library that the
+    profile does not list would load unpinned code; a listed library that no
+    binary needs would never be measured, and every server would fail
+    attestation. A NEEDED soname matches the file name of a pinned path, so a
+    library whose real file name is not its soname fails the check.
+    """
+    profile = load_profile(args.profile)
+    pinned = {os.path.basename(lib["path"]) for lib in profile["system_libraries"]}
+    used = set()
+    for binary in args.binary:
+        needed = needed_libraries(binary)
+        print(f"{binary}: {' '.join(needed)}")
+        unpinned = sorted(set(needed) - pinned)
+        if unpinned:
+            fail(f"{binary} needs shared libraries that release/fleet-profile.json does not "
+                 f"pin: {', '.join(unpinned)}")
+        used.update(needed)
+    unused = sorted(pinned - used)
+    if unused:
+        fail(f"release/fleet-profile.json pins libraries that no server binary needs: "
+             f"{', '.join(unused)}")
+
+
 def boot_packages(lock_path):
     packages = {}
     if not lock_path or not os.path.exists(lock_path):
@@ -315,6 +358,12 @@ def main():
     p.add_argument("--attestd", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_spec)
+
+    p = sub.add_parser("libraries")
+    p.add_argument("--profile", required=True)
+    p.add_argument("--binary", action="append", required=True,
+                   help="a server binary to check (repeat for each)")
+    p.set_defaults(func=cmd_libraries)
 
     p = sub.add_parser("boot-chain")
     p.add_argument("--profile", required=True)

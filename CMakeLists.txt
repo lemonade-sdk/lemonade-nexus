@@ -25,6 +25,32 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Static dependencies. The attestation profile pins the hash of every shared
+# library the server and nexus-attestd load (release/fleet-profile.json), so
+# each shared library that ships outside a Nexus release is a way for an OS
+# update to break attestation. With this option, configure accepts only the
+# pinned OpenSSL and links it statically (cmake/libraries/openssl.cmake), and
+# Linux executables also link libstdc++ and libgcc statically. glibc (libc,
+# libm, ld-linux) stays dynamic. Shared libraries such as the SDK keep the C++
+# runtime of their host process.
+option(LEMONADE_NEXUS_STATIC_DEPS
+       "Link the pinned OpenSSL, and on Linux libstdc++ and libgcc, statically"
+       ${PROJECT_IS_TOP_LEVEL})
+if(LEMONADE_NEXUS_STATIC_DEPS AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+        AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-static-libstdc++;-static-libgcc" LEMONADE_NEXUS_HAVE_STATIC_CXX_RUNTIME)
+    if(NOT LEMONADE_NEXUS_HAVE_STATIC_CXX_RUNTIME)
+        message(FATAL_ERROR
+            "LEMONADE_NEXUS_STATIC_DEPS=ON, but the toolchain cannot link libstdc++ "
+            "statically. Install the static libstdc++ package, or configure with "
+            "-DLEMONADE_NEXUS_STATIC_DEPS=OFF.")
+    endif()
+    set(LEMONADE_NEXUS_STATIC_CXX_RUNTIME ON)
+    add_link_options(
+        "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:-static-libstdc++;-static-libgcc>")
+endif()
+
 # GNU-style flags only; MSVC would discard its own /O2 defaults for these.
 if(NOT MSVC)
     set(CMAKE_CXX_FLAGS_DEBUG "-g")
@@ -56,8 +82,8 @@ endif()
 # sidecar/embeddable profiles.
 option(LEMONADE_NEXUS_MINIMAL_DEPS "Build without TPM FAPI support" OFF)
 
+include(libraries/openssl)        # Must come before tss2-fapi, httplib, and jwt-cpp (they depend on OpenSSL)
 include(libraries/tss2-fapi)      # TPM2 Feature API (Linux only; no-op elsewhere)
-include(libraries/openssl)        # Must come before httplib and jwt-cpp (they depend on OpenSSL)
 include(libraries/asio)
 include(libraries/nlohmann_json)
 include(libraries/spdlog)

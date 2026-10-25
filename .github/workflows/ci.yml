@@ -218,12 +218,15 @@ jobs:
           restore-keys: |
             fetchcontent-${{ matrix.container }}-cmake331-
 
+      # Distribution builds use the distribution's OpenSSL and C++ runtime.
+      # The fleet server build (release.yml) links both statically.
       - name: Configure CMake
         run: |
           cmake -B build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
-            -DBUILD_TESTING=ON
+            -DBUILD_TESTING=ON \
+            -DLEMONADE_NEXUS_STATIC_DEPS=OFF
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
