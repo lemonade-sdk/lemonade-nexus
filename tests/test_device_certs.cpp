@@ -164,7 +164,7 @@ protected:
     std::string alice_id, bob_id, carol_id;
 
     void SetUp() override {
-        port_ = static_cast<uint16_t>(30500 + (getpid() % 9000));
+        port_ = static_cast<uint16_t>(30000 + (getpid() % 2700));  // below the ephemeral range
         temp_dir = fs::temp_directory_path() / ("nexus_test_device_certs_" + std::to_string(getpid()));
         fs::remove_all(temp_dir);
         fs::create_directories(temp_dir);
