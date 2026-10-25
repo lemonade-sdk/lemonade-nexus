@@ -30,20 +30,25 @@ epoch-scoped and follows finalized consensus state. See
 
 ## How does the two-tier model work?
 
-- **Tier 2** servers hold a valid network-bound certificate and serve mesh
-  services, clients, and non-authoritative state.
+- **Tier 2** servers hold a valid network-bound certificate and act as pure
+  proxies of end-to-end encrypted data and connections (relay, STUN,
+  discovery DNS). They hold no permission tree and serve no tree request or
+  client session.
 - **Tier 1** servers are the epoch committee: verified platform evidence and
   mesh observations establish eligibility, and finalized eligibility, plan,
   readiness, and handoff establish the role. Tier 1 members run HotStuff
-  consensus and participate in the per-epoch FROST key generation.
+  consensus, participate in the per-epoch FROST key generation, and hold and
+  serve the permission tree. Clients send every tree read and write to a Tier
+  1 server they verify from the network's Genesis key.
 
 Tier 1 is an **epoch-scoped** role, not a permanent status.
 
 ## Can I run it without TEE hardware?
 
 Yes. Servers without qualifying platform evidence operate as Tier 2: they
-serve clients, participate in the mesh, and synchronize state. They simply
-do not qualify for Tier 1.
+relay and proxy encrypted traffic and participate in the mesh. They do not
+qualify for Tier 1, so they hold no permission tree. A network needs Tier 1
+servers before clients can join.
 
 **Important:** with the currently shipped attestation profile, *no* node can
 qualify for Tier 1, because the profile's required measurements and release

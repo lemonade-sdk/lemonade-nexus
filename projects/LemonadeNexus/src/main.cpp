@@ -18,6 +18,7 @@
 #include <LemonadeNexus/Tree/PermissionTreeService.hpp>
 #include <LemonadeNexus/Tree/TreeConsensus.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
+#include <LemonadeNexus/Tree/TreeRole.hpp>
 #include <LemonadeNexus/Tree/TreeTypes.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Gossip/ServerCertificate.hpp>
@@ -36,6 +37,7 @@
 #include <LemonadeNexus/Security/Attestation/LinuxAttestationProfile.hpp>
 #include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/PlatformProbe.hpp>
+#include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
 #include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
 #include <LemonadeNexus/Network/ApiTypes.hpp>
 #include <LemonadeNexus/Network/DdnsService.hpp>
@@ -46,7 +48,9 @@
 // CRTP request handlers
 #include <LemonadeNexus/Api/PublicApiHandler.hpp>
 #include <LemonadeNexus/Api/AuthApiHandler.hpp>
+#include <LemonadeNexus/Api/Tier1ApiHandler.hpp>
 #include <LemonadeNexus/Api/TreeApiHandler.hpp>
+#include <LemonadeNexus/Api/TreeRouteGate.hpp>
 #include <LemonadeNexus/Api/RelayApiHandler.hpp>
 #include <LemonadeNexus/Api/CertApiHandler.hpp>
 #include <LemonadeNexus/Api/AdminApiHandler.hpp>
@@ -63,6 +67,7 @@
 #  include <LemonadeNexusAttestd/AttestdClient.hpp>
 #endif
 
+#include <algorithm>
 #include <cctype>
 #include <chrono>
 #include <cstdint>
@@ -153,10 +158,10 @@ int main(int argc, char* argv[]) {
     // memory. Gossip, attestation, and holder duties start without it (B8).
     const bool defer_file_services = !storage_vault->files_ready();
 
+    // Only a current Tier 1 member holds the tree (TreeRole below). Until the
+    // role says so the tree is closed: nothing is loaded and nothing written.
     nexus::tree::PermissionTreeService tree{storage, crypto};
-    bool tree_started = !defer_file_services;
-    bool root_pending = false;
-    if (tree_started) tree.start();
+    tree.close();
 
     nexus::ipam::IPAMService ipam{storage};
     ipam.start();
@@ -238,6 +243,9 @@ int main(int argc, char* argv[]) {
             });
     }
     gossip.set_tree(&tree);
+    // No tree role before finalized membership says so: the record transfer
+    // pool is not read, and tree log entries are neither taken nor served.
+    gossip.set_tree_role(false);
 
     for (const auto& peer_endpoint : config.seed_peers) {
         gossip.add_peer(peer_endpoint, "");
@@ -311,23 +319,13 @@ int main(int argc, char* argv[]) {
     }
 #endif
     std::string mesh_error;
+    // The application root is created on Tier 1 entry (TreeRole below), not
+    // when this node first holds epoch authority: the Genesis node issues the
+    // bootstrap certificate without becoming a Tier 1 member, and a Tier 2
+    // server holds no tree.
     auto security_mesh = nexus::core::start_security_mesh(
         coordinator.io_context(), config, gossip, key_wrapping,
-        std::move(platform_source), std::move(activation_source), mesh_error,
-        [&tree, &config, &tree_started, &root_pending] {
-            // With tree operations on, the root is an EstablishRoot op that
-            // Tier 1 commits (TreeConsensus::set_root_request below); a direct
-            // write here would bypass consensus.
-            if (!config.tree_ops_enabled) {
-                // While the tree waits for the data key its cache is empty; a
-                // root written now could replace the stored one.
-                if (!tree_started) {
-                    root_pending = true;
-                    return;
-                }
-                nexus::core::ensure_application_root(tree, config.root_pubkey);
-            }
-        },
+        std::move(platform_source), std::move(activation_source), mesh_error, {},
         nexus::core::SecurityMeshStorageInputs{.seal_backend = seal_backend,
                                                .vault = storage_vault.get()});
     if (!security_mesh) {
@@ -403,11 +401,6 @@ int main(int argc, char* argv[]) {
             return 0;
         }
         spdlog::info("Data key unlocked; starting the services that read encrypted files");
-        tree.start();
-        tree_started = true;
-        if (root_pending) {
-            nexus::core::ensure_application_root(tree, config.root_pubkey);
-        }
         if (!load_node_identity()) {
             return 1;
         }
@@ -474,11 +467,17 @@ int main(int argc, char* argv[]) {
     nexus::network::StunService stun{coordinator.io_context(), stun_port, crypto, "lemonade-nexus-central"};
     stun.start();
 
-    nexus::crypto::Ed25519PublicKey central_pubkey{};
-    if (auto pk = key_wrapping.load_identity_pubkey()) {
-        central_pubkey = *pk;
-    }
-    nexus::relay::RelayService relay{coordinator.io_context(), relay_port, crypto, central_pubkey};
+    // Every server relays, Tier 1 and Tier 2 alike. A ticket is valid when a
+    // current Tier 1 member signed it, by the membership the security mesh
+    // verified from the authority chain; the relay needs no tree.
+    nexus::relay::RelayService relay{coordinator.io_context(), relay_port, crypto};
+    relay.set_ticket_authority(
+        [mesh = security_mesh->service.get()]() -> std::optional<nexus::relay::RelayTicketAuthority> {
+            const auto snapshot = mesh->membership();
+            if (!snapshot.known) return std::nullopt;
+            return nexus::relay::RelayTicketAuthority{mesh->network_id(), snapshot.epoch,
+                                                      snapshot.members};
+        });
     relay.start();
 
     nexus::relay::RelayDiscoveryService relay_discovery{storage};
@@ -761,19 +760,22 @@ int main(int argc, char* argv[]) {
 
     // Forwarding between two client endpoints follows the permission tree: a
     // client's server peer covers the whole plane, so without this policy any
-    // joined endpoint could reach any other through the server. Install it
-    // before the dataplane takes peers. Without a known plane the policy cannot
-    // be built, so forwarding fails closed: the deny policy forwards nothing.
+    // joined endpoint could reach any other through the server. The deny
+    // policy goes in before the dataplane takes peers and stays while this
+    // server holds no tree: a Tier 2 server forwards no packet between
+    // dataplane peers. It carries endpoint traffic only as the relay service
+    // (ciphertext between ticket holders), never as endpoint forwarding.
+    // TreeRole starts the authorizer on Tier 1 entry and restores the deny
+    // policy when the server leaves Tier 1. Without a known plane the policy
+    // cannot be built, so forwarding stays denied.
+    boringtun_service.dataplane().set_forward_policy(nexus::boringtun::deny_forward_policy());
     std::optional<nexus::boringtun::ForwardAuthorizer> forward_authorizer;
     if (!tunnel_bind_ip.empty()) {
         if (auto plane = nexus::boringtun::Cidr::parse(tunnel_bind_ip + "/10")) {
             forward_authorizer.emplace(tree, boringtun_service.dataplane(), *plane);
-            forward_authorizer->start();
         }
     }
     if (!forward_authorizer) {
-        boringtun_service.dataplane().set_forward_policy(
-            nexus::boringtun::deny_forward_policy());
         spdlog::error("boringtun: tunnel IP '{}' is {}; the dataplane forwards no packets "
                       "between peers",
                       tunnel_bind_ip, tunnel_bind_ip.empty() ? "not set" : "not an IPv4 address");
@@ -993,8 +995,10 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Experimental tree operations (Phases 2 and 3), off by default:
     //   --tree-log  read-only log: build and replicate it, writes stay direct
-    //   --tree-ops  ops: Tier 1 consensus orders writes, every server applies
-    //               the committed (or replicated) log
+    //   --tree-ops  ops: Tier 1 consensus orders writes, every Tier 1 member
+    //               applies the committed (or replicated) log
+    // The objects live for the process; the tree log runs only while this
+    // server holds the tree (TreeRole below starts and stops it).
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
     // Destroyed before tree_consensus on every exit path: the control socket
@@ -1009,6 +1013,8 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     std::function<nlohmann::json()> tree_log_status;
+    std::function<void()> sync_ipam;
+    auto* mesh = security_mesh->service.get();
     if (config.tree_ops_enabled || config.tree_log_enabled) {
         const bool ops_mode = config.tree_ops_enabled;
         const auto network_bytes = nexus::crypto::from_hex(security_mesh->network_id_hex);
@@ -1035,25 +1041,17 @@ int main(int argc, char* argv[]) {
                                              std::chrono::system_clock::now().time_since_epoch())
                                              .count());
         };
+        // Not started here: until TreeRole starts it on Tier 1 entry the
+        // handler is halted and refuses every block, op, and entry.
         tree_consensus = std::make_unique<nexus::tree::TreeConsensus>(
             std::move(tree_config), tree, crypto,
             std::filesystem::path(data_root) / "tree" / "log");
-        {
-            std::lock_guard lock(tree_status_source.mutex);
-            tree_status_source.tree = tree_consensus.get();
-        }
-        if (!tree_consensus->start()) {
-            // Fail closed: the server runs and serves its last committed tree,
-            // but applies, votes for, and accepts no tree operation.
-            spdlog::error("EXPERIMENTAL tree operations halted at startup: {}",
-                          tree_consensus->halt_reason());
-        }
         auto* consensus = tree_consensus.get();
-        auto* mesh = security_mesh->service.get();
 
-        // Replication (design A7). Entries are verified against the driver's
-        // verified authority chain and the configured root key, on the
-        // security io thread; the sync stream only carries bytes.
+        // Replication (design A7) between Tier 1 members. Entries are
+        // verified against the driver's verified authority chain and the
+        // configured root key, on the security io thread; the sync stream
+        // only carries bytes.
         consensus->set_authority_source([mesh](nexus::security::EpochId epoch) {
             return mesh->authority_for_epoch(epoch);
         });
@@ -1072,9 +1070,6 @@ int main(int argc, char* argv[]) {
                     (void)consensus->receive_replicated(*entry);
                 });
             });
-        for (uint64_t height = 1; height <= consensus->status_summary().height; ++height) {
-            gossip.offer_tree_height(height);
-        }
         tree_log_status = [consensus, &gossip] {
             const auto s = consensus->status_summary();
             nlohmann::json out = gossip.tree_sync_status();
@@ -1091,18 +1086,17 @@ int main(int argc, char* argv[]) {
         };
 
         if (ops_mode) {
-            // The committed log carries tree changes to every server, so the
-            // record transfer pool for tree records is retired.
+            // The committed log carries tree changes between Tier 1 members,
+            // so the record transfer pool for tree records is retired.
             gossip.retire_tree_transfer();
             // Tree-derived tunnel addresses are recorded in the IPAM file.
-            const auto sync_ipam = [&tree, &ipam] {
+            sync_ipam = [&tree, &ipam] {
                 std::map<std::string, std::string> assigned;
                 for (const auto& [id, node] : tree.nodes_snapshot()) {
                     if (!node.tunnel_ip.empty()) assigned.emplace(id, node.tunnel_ip);
                 }
                 (void)ipam.sync_tree_tunnel_addresses(assigned);
             };
-            sync_ipam();
             consensus->set_applied_hook(sync_ipam);
 
             // Ops are signed with this server's gossip identity under their own
@@ -1136,18 +1130,99 @@ int main(int argc, char* argv[]) {
                 return consensus->status(op_id);
             };
             spdlog::warn("EXPERIMENTAL: tree operations enabled (ops mode). Tier 1 orders tree "
-                         "writes through consensus; every server applies the committed log and "
-                         "Tier 2 and lagging servers catch up by replication. A server outside "
-                         "Tier 1 refuses tree writes.");
+                         "writes through consensus and every Tier 1 member applies the "
+                         "committed log; a member that joins or lags catches up by replication "
+                         "from Tier 1. A Tier 2 server holds no tree.");
         } else {
-            spdlog::warn("EXPERIMENTAL: tree log enabled (read-only mode). The tree log is built "
-                         "and replicated; tree writes keep the direct paths.");
+            spdlog::warn("EXPERIMENTAL: tree log enabled (read-only mode). Tier 1 members build "
+                         "and replicate the tree log; tree writes keep the direct paths.");
         }
-        mesh->set_tick_hook([consensus, mesh] {
-            consensus->set_members(mesh->current_members());
-            consensus->maintain();
-        });
     }
+
+    // ========================================================================
+    // Tree role: only a current Tier 1 member, by finalized epoch membership,
+    // holds the tree. Entering Tier 1 loads the tree and starts the tree
+    // services; leaving stops them and deletes the tree files. A server whose
+    // membership is not known yet (before Epoch 1 activates) holds no tree and
+    // deletes nothing.
+    // ========================================================================
+    const nexus::security::NodeId self_node{gossip.keypair().public_key};
+    nexus::tree::TreeRole tree_role{nexus::tree::TreeRole::Hooks{
+        .enter =
+            [&] {
+                storage.ensure_tree_directories();
+                tree.start();
+                // With tree operations on, the root is an EstablishRoot op that
+                // Tier 1 commits (TreeConsensus::set_root_request); a direct
+                // write would bypass consensus.
+                if (!config.tree_ops_enabled) {
+                    nexus::core::ensure_application_root(tree, config.root_pubkey);
+                }
+                gossip.set_tree_role(true);
+                if (tree_consensus) {
+                    if (!tree_consensus->start()) {
+                        // Fail closed: the server serves its last committed
+                        // tree but applies, votes for, and accepts no tree
+                        // operation. The updater's health report shows the
+                        // halt.
+                        spdlog::error("EXPERIMENTAL tree operations halted at Tier 1 entry: {}",
+                                      tree_consensus->halt_reason());
+                    }
+                    // Only a server that holds the tree reports a tree log to
+                    // the updater; a Tier 2 server reports its own status only.
+                    {
+                        std::lock_guard lock(tree_status_source.mutex);
+                        tree_status_source.tree = tree_consensus.get();
+                    }
+                    for (uint64_t height = 1;
+                         height <= tree_consensus->status_summary().height; ++height) {
+                        gossip.offer_tree_height(height);
+                    }
+                }
+                if (sync_ipam) sync_ipam();
+                if (forward_authorizer) forward_authorizer->start();
+                return true;
+            },
+        .leave =
+            [&] {
+                if (forward_authorizer) forward_authorizer->stop();
+                boringtun_service.dataplane().set_forward_policy(
+                    nexus::boringtun::deny_forward_policy());
+                gossip.set_tree_role(false);
+                {
+                    std::lock_guard lock(tree_status_source.mutex);
+                    tree_status_source.tree = nullptr;
+                }
+                if (tree_consensus) tree_consensus->deactivate("this server is not in Tier 1");
+                tree.close();
+                // Tree-range tunnel records are a copy of tree data.
+                if (sync_ipam) (void)ipam.sync_tree_tunnel_addresses({});
+            },
+        .purge = [&] { (void)storage.purge_tree_files(); },
+    }};
+    const auto update_tree_role = [&tree_role, mesh, self_node, vault = storage_vault.get()] {
+        const auto snapshot = mesh->membership();
+        auto view = nexus::tree::MembershipView::Unknown;
+        if (snapshot.known) {
+            view = std::find(snapshot.members.begin(), snapshot.members.end(), self_node) !=
+                           snapshot.members.end()
+                       ? nexus::tree::MembershipView::Member
+                       : nexus::tree::MembershipView::NonMember;
+        }
+        tree_role.update(view, vault == nullptr || vault->files_ready());
+        return snapshot;
+    };
+    // The io thread is not running yet, so this first update runs here: a
+    // Tier 1 member serves the tree as soon as its listeners start, and a
+    // Tier 2 server deletes a tree an older release left before it serves.
+    (void)update_tree_role();
+    mesh->set_tick_hook([update_tree_role, &tree_role, consensus = tree_consensus.get()] {
+        const auto snapshot = update_tree_role();
+        if (consensus && tree_role.holds_tree()) {
+            consensus->set_members(snapshot.members);
+            consensus->maintain();
+        }
+    });
 
     spdlog::warn("Storage key (Phase 5) and files under the data key (Phase 7) run on every "
                  "server: Tier 1 finalizes storage holder plans and key rotations, this server "
@@ -1219,6 +1294,31 @@ int main(int argc, char* argv[]) {
         .tree_op_status   = tree_op_status,
         .tree_log_status  = tree_log_status,
         .storage_vault    = storage_vault.get(),
+        // Any server serves the chain: it is candidate data the client
+        // verifies against its pinned Genesis key.
+        .authority_chain_page =
+            [mesh](uint64_t have_epoch) -> std::vector<uint8_t> {
+                const auto page = mesh->authority_chain_page(nexus::security::EpochId{have_epoch},
+                                                             std::chrono::seconds(2));
+                return page ? nexus::security::encode_authority_chain_page(*page)
+                            : std::vector<uint8_t>{};
+            },
+        // A member proves its endpoint only while it holds and serves the tree.
+        .tier1_identity =
+            [mesh, self_node, &tree_role]() -> std::optional<nexus::api::Tier1Identity> {
+                if (!tree_role.holds_tree()) return std::nullopt;
+                const auto snapshot = mesh->membership();
+                if (!snapshot.known ||
+                    std::find(snapshot.members.begin(), snapshot.members.end(), self_node) ==
+                        snapshot.members.end()) {
+                    return std::nullopt;
+                }
+                nexus::api::Tier1Identity identity;
+                const auto network = mesh->network_id();
+                std::copy(network.begin(), network.end(), identity.network_id.begin());
+                identity.epoch = snapshot.epoch.underlying();
+                return identity;
+            },
         .rollout_proof    = rollout_proof,
     };
 
@@ -1232,14 +1332,30 @@ int main(int argc, char* argv[]) {
     nexus::api::RoutingApiHandler routing_api{ctx};
     nexus::api::OnboardApiHandler onboard_api{ctx};
     nexus::api::AccountDataApiHandler account_data_api{ctx};
+    nexus::api::Tier1ApiHandler  tier1_api{ctx};
+
+    // Rate limit first, then the tree gate: on a server that does not hold
+    // the tree every tree route answers a plain 421 (TreeRouteGate.hpp).
+    const std::function<bool()> holds_tree = [&tree_role] { return tree_role.holds_tree(); };
+    auto pre_routing_handler = [&rate_limit_handler, &holds_tree](
+                                   const httplib::Request& req,
+                                   httplib::Response& res) -> httplib::Server::HandlerResponse {
+        if (rate_limit_handler(req, res) == httplib::Server::HandlerResponse::Handled) {
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        if (nexus::api::gate_tree_route(req, res, holds_tree)) {
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    };
 
     // Route registration is factored into a lambda so it can be re-run if the
     // underlying server object is replaced (e.g. plain HTTP -> HTTPS upgrade after
     // a background ACME cert is issued).
     // Register every handler's public routes on `pub` and private routes on `priv`.
     auto register_on = [&](httplib::Server& pub, httplib::Server& priv) {
-        pub.set_pre_routing_handler(rate_limit_handler);
-        priv.set_pre_routing_handler(rate_limit_handler);
+        pub.set_pre_routing_handler(pre_routing_handler);
+        priv.set_pre_routing_handler(pre_routing_handler);
         public_api.register_routes(pub, priv);
         auth_api.register_routes(pub, priv);
         tree_api.register_routes(pub, priv);
@@ -1250,6 +1366,7 @@ int main(int argc, char* argv[]) {
         routing_api.register_routes(pub, priv);
         onboard_api.register_routes(pub, priv);
         account_data_api.register_routes(pub, priv);
+        tier1_api.register_routes(pub, priv);
     };
     // Re-runnable if the underlying server object is replaced (plain->HTTPS
     // upgrade after a background ACME cert). Resolves the private server on every

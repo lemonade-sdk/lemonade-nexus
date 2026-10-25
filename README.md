@@ -12,7 +12,7 @@ A self-hosted userspace mesh VPN with encrypted peer-to-peer connections, crypto
 
 - **Self-hosted mesh networking** — userspace WireGuard transport through BoringTun, with NAT traversal and relay support.
 - **Cryptographic identity** — Ed25519 identities, network-bound server certificates, and signed gossip messages.
-- **Two-tier security** — authenticated Tier 2 servers provide mesh services; eligible servers earn epoch-scoped Tier 1 authority through the security protocol.
+- **Two-tier security** — authenticated Tier 2 servers proxy encrypted traffic; eligible servers earn epoch-scoped Tier 1 authority through the security protocol, and only Tier 1 servers hold the permission tree.
 - **Consensus and threshold authority** — chained HotStuff finalizes security state; fresh dealerless FROST key generation establishes each epoch's authority key.
 - **Hardware evidence verification** — an AMD SEV-SNP/HCL/vTPM verification path, IMA runtime measurements, and a separate `nexus-attestd` evidence helper.
 - **Discovery and addressing** — regional DNS discovery, IP address management, authoritative DNS, and optional dynamic DNS.
@@ -208,9 +208,9 @@ The [route handlers](projects/LemonadeNexus/src/Api) define the current methods 
 
 | Role | What establishes it | Capabilities |
 |---|---|---|
-| **Tier 2** | A valid network-bound server certificate and authenticated mesh participation | Mesh services and non-authoritative synchronization; no Tier 1 authority share |
+| **Tier 2** | A valid network-bound server certificate and authenticated mesh participation | A pure proxy of end-to-end encrypted data and connections; holds no permission tree and serves no tree request or client session; no Tier 1 authority share |
 | **Pending member** | Selection in a finalized next-epoch plan | State synchronization and readiness preparation; no active Tier 1 authority |
-| **Tier 1** | Verified evidence and mesh eligibility, followed by the protocol's finalized activation | HotStuff consensus, epoch transitions, dealerless DKG, and threshold authority signing |
+| **Tier 1** | Verified evidence and mesh eligibility, followed by the protocol's finalized activation | HotStuff consensus, epoch transitions, dealerless DKG, threshold authority signing, and the permission tree |
 
 Clients use the mesh under their application permissions; they do not become members of the server authority committee.
 

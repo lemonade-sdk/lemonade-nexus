@@ -194,6 +194,21 @@ public:
 
     [[nodiscard]] const std::filesystem::path& data_root() const { return data_root_; }
 
+    /// Delete every tree file under data_root/tree: nodes, the delta log, the
+    /// transfer pool, the committed op ids, and the tree log. Each regular
+    /// file is overwritten with zeros and flushed before removal
+    /// (security::scrub_file). Best effort: a journaling or copy-on-write
+    /// file system, snapshots, or SSD remapping can keep older blocks. A
+    /// symbolic link is removed, never followed. Resets the delta sequence to
+    /// 1. Returns true when data_root/tree no longer exists. Thread-safe.
+    /// Close the tree services first (TreeRole.hpp).
+    bool purge_tree_files();
+
+    /// Recreate the empty tree directories that on_start() creates. Call
+    /// before a closed tree starts again after purge_tree_files().
+    /// Thread-safe.
+    void ensure_tree_directories();
+
 private:
     [[nodiscard]] std::filesystem::path node_path(std::string_view node_id) const;
     [[nodiscard]] std::filesystem::path delta_path(uint64_t seq) const;

@@ -9,6 +9,12 @@
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 
+#include <LemonadeNexus/Crypto/CryptoTypes.hpp>
+#include <LemonadeNexus/Security/Epoch/Tier1Membership.hpp>
+#include <LemonadeNexus/Security/Transport/AuthorityChainCodec.hpp>
+
+#include "support/tier1_chain.hpp"
+
 #include <gtest/gtest.h>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -197,12 +203,10 @@ TEST_F(SdkTransportTest, ConcurrentCallsAndTokenChangesStayConsistent) {
     std::lock_guard lock(seen_mutex);
     // Requests to one server share its pooled connection.
     EXPECT_LE(client_ports.size(), 2u);
-    // Every header carried one whole token, never a torn mix.
+    // A session is a bearer token for the Tier 1 server that issued it. This
+    // server issued none, so no request carried a session, whole or torn.
     for (const auto& v : auth_values) {
-        if (v.empty()) continue;  // a request sent before the first token
-        bool whole = false;
-        for (const auto& t : tokens) whole = whole || v == "Bearer " + t;
-        EXPECT_TRUE(whole) << "torn Authorization header: " << v;
+        EXPECT_TRUE(v.empty()) << "a session went to a server that did not issue it: " << v;
     }
 }
 
@@ -259,6 +263,11 @@ protected:
     std::atomic<int>   delete_posts{0};
     std::atomic<Reply> peer_list_reply{Reply::Ok};
     std::atomic<Reply> delete_reply{Reply::Ok};
+
+    // The stand-in server is the one Tier 1 member of a four-member epoch:
+    // the client verifies it before it sends a tree request.
+    nexus::crypto::Ed25519Keypair server_identity{};
+    tier1_chain_test::Chain chain;
 
     void SetUp() override {
         ASSERT_GE(sodium_init(), 0);
@@ -328,6 +337,38 @@ protected:
         pub->Get("/api/health", [](const httplib::Request&, httplib::Response& res) {
             res.set_content(R"({"status":"ok"})", "application/json");
         });
+        server_identity = tier1_chain_test::new_identity();
+        chain = tier1_chain_test::Chain::make(
+            {{server_identity, tier1_chain_test::new_identity(), tier1_chain_test::new_identity(),
+              tier1_chain_test::new_identity()}});
+        pub->Get("/api/tier1/authority", [this](const httplib::Request& req,
+                                                httplib::Response& res) {
+            const auto page = chain.page_after(std::stoull(req.get_param_value("have_epoch")));
+            if (!page) {
+                res.status = 404;
+                return;
+            }
+            const auto bytes = nexus::security::encode_authority_chain_page(*page);
+            res.set_content(nlohmann::json{{"page", nexus::crypto::to_base64(bytes)}}.dump(),
+                            "application/json");
+        });
+        pub->Get("/api/servers", [](const httplib::Request&, httplib::Response& res) {
+            res.set_content("[]", "application/json");
+        });
+        pub->Get("/api/tier1/proof", [this](const httplib::Request& req, httplib::Response& res) {
+            const auto nonce = nexus::crypto::from_hex(req.get_param_value("nonce"));
+            const auto proof = nexus::security::sign_tier1_endpoint_proof(
+                chain.network, nexus::security::EpochId{1}, "localhost",
+                static_cast<uint16_t>(pub_port), nonce, server_identity);
+            res.set_content(
+                nlohmann::json{{"node_id", nexus::crypto::to_base64(proof.node.bytes)},
+                               {"epoch", 1},
+                               {"host", proof.host},
+                               {"port", proof.port},
+                               {"signature", nexus::crypto::to_base64(proof.signature)}}
+                    .dump(),
+                "application/json");
+        });
         pub->Post("/api/join", [this](const httplib::Request& req, httplib::Response& res) {
             const auto body = nlohmann::json::parse(req.body, nullptr, false);
             lnsdk::MeshPeer self;
@@ -387,6 +428,8 @@ protected:
         cfg.servers = {{"localhost", static_cast<uint16_t>(pub_port), true}};
         cfg.auto_discover = false;
         auto client = std::make_unique<lnsdk::LemonadeNexusClient>(cfg);
+        EXPECT_TRUE(client->set_genesis_key(
+            nexus::crypto::to_base64(chain.genesis.public_key)).ok);
         client->set_session_token("session-token");
         auto joined = client->join_network("user", "password");
         EXPECT_TRUE(joined.ok) << joined.error;

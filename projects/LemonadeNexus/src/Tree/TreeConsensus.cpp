@@ -37,6 +37,9 @@ TreeConsensus::TreeConsensus(TreeConsensusConfig config, PermissionTreeService& 
 }
 
 bool TreeConsensus::start() {
+    // A start after deactivate() begins with nothing held from before.
+    held_.clear();
+    behind_ = false;
     if (config_.mode == TreeLogMode::ReadOnly) {
         // Release N of the migration (design A9): the log starts from the
         // empty tree, so the merge commit can become height 1, and the
@@ -100,6 +103,27 @@ bool TreeConsensus::start() {
     }
     refresh_status();
     return true;
+}
+
+void TreeConsensus::deactivate(const std::string& reason) {
+    {
+        std::lock_guard lock(mutex_);
+        halted_ = true;
+        halt_reason_ = reason;
+        status_.healthy = false;
+        status_.halt_reason = reason;
+        behind_ = false;
+        status_.behind = false;
+    }
+    held_.clear();
+    for (const auto& op : pool_.pending()) {
+        pool_.settle(op_id_hex(op),
+                     TreeOpOutcome{TreeOpStatus::Refused,
+                                   TreeOpVerdict{TreeOpRefusal::Unavailable, reason}, 0});
+    }
+    log_.close();
+    refresh_status();
+    spdlog::info("[TreeConsensus] stopped: {}", reason);
 }
 
 bool TreeConsensus::healthy() const {

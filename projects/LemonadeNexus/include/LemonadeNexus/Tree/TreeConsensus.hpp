@@ -149,9 +149,17 @@ public:
     /// tree; with a populated tree it halts and creates no log, because that
     /// log's base would differ from other servers' and would block the merge
     /// commit (height 1 on the empty base). A ReadOnly log starts from the
-    /// empty tree and is not reconciled. Call once, before consensus
-    /// delivers blocks. False when halted.
+    /// empty tree and is not reconciled. Call when this server holds the
+    /// tree (TreeRole.hpp): once at Tier 1 entry, and again after a
+    /// deactivate(). Until it succeeds the handler is halted and refuses
+    /// every block, op, and replicated entry. False when halted.
     [[nodiscard]] bool start();
+
+    /// Stop running the tree log: halt with `reason`, refuse every pending
+    /// op, and drop held replicated entries. The log stays closed until the
+    /// next start(). A server that leaves Tier 1 deactivates before it
+    /// deletes the log files (TreeRole.hpp). io thread.
+    void deactivate(const std::string& reason);
 
     /// False once halted; halt_reason() says why. Thread-safe.
     [[nodiscard]] bool healthy() const;

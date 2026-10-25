@@ -111,7 +111,8 @@ public:
 
     /// Retention entry point for locally applied deltas (wired by the host).
     /// Record transfer only: never mutates the tree. Returns false when the
-    /// pool refused the record (full, unavailable, or write failure).
+    /// pool refused the record (full, unavailable, or write failure) or this
+    /// server holds no tree.
     [[nodiscard]] bool retain_local_delta(
             const storage::FileStorageService::RetainedDelta& rec);
 
@@ -143,13 +144,14 @@ public:
     /// Attach the in-process virtual netstack. Once our backbone IP is also
     /// set, gossip binds virtual UDP <backbone_ip>:<gossip port> and carries
     /// over the encrypted backbone: permission tree sync (Digest,
-    /// DeltaRequest, DeltaResponse; retired in tree ops mode) with every
-    /// certified peer, catch-up sync (SyncDigest, SyncRequest, catch-up
-    /// DnsRecordSync, TreeLogSync) and AccountEnvelopeSync. Without a backbone
-    /// path to a peer, no tree
+    /// DeltaRequest, DeltaResponse; retired in tree ops mode) while this
+    /// server holds the tree (set_tree_role), catch-up sync (SyncDigest,
+    /// SyncRequest, catch-up DnsRecordSync, TreeLogSync) and
+    /// AccountEnvelopeSync. Without a backbone path to a peer, no tree
     /// records move to or from it. Tier 1 servers serve catch-up to every
     /// certified server; Tier 2 servers catch up from Tier 1 and never feed
-    /// records back. The netstack must outlive this service's start.
+    /// records back, and take no tree record or tree log entry. The netstack
+    /// must outlive this service's start.
     void set_virtual_net(network::VirtualNetService* vnet);
 
     /// DNS catch-up state: whether this server is Tier 1, its per-origin
@@ -797,6 +799,11 @@ private:
     // Ops mode: the record transfer pool (Digest, DeltaRequest,
     // DeltaResponse) no longer carries tree changes; tree replication does.
     std::atomic<bool>                     tree_transfer_retired_{false};
+    // False while this server holds no tree (set_tree_role).
+    std::atomic<bool>                     tree_role_active_{true};
+    [[nodiscard]] bool tree_transfer_active() const {
+        return tree_role_active_.load() && !tree_transfer_retired_.load();
+    }
     uint64_t                              account_replica_saved_version_{0};
     bool                                  account_replica_loaded_{false};
     std::function<bool(const AccountEnvelopeRecord&)> account_envelope_sink_;
@@ -895,6 +902,15 @@ public:
     /// Record that the local tree log holds `height`, so digests offer it.
     /// Heights are offered in order from 1. Thread-safe.
     void offer_tree_height(uint64_t height);
+
+    /// Whether this server holds the tree (TreeRole.hpp). False stops the
+    /// tree record transfer pool, drops its index and every outstanding
+    /// request, refuses local retention, and clears the tree stream index;
+    /// TreeLogSync entries are neither taken nor served. True rebuilds the
+    /// pool from its directory (unless retired). Default true. Call false
+    /// before start() on a server that does not hold the tree, so the pool
+    /// is never read. io thread, or before the io context runs.
+    void set_tree_role(bool holds_tree);
 
     /// Stop the record transfer pool for tree changes (ops mode): no transfer
     /// digest is sent, and Digest, DeltaRequest, and DeltaResponse are

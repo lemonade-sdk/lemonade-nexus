@@ -58,13 +58,18 @@ static_assert(sizeof(RelayPacketHeader) == kRelayHeaderSize,
 
 // --- Domain types ---
 
-/// Ticket authorising a peer to use a relay for a session.
+/// Ticket authorising a peer to use a relay for a session. A current Tier 1
+/// member issues it and signs it with its node identity key; any relay
+/// verifies it against its verified Tier 1 membership (RelayTicketAuth.hpp).
 struct RelayTicket {
-    std::string              peer_id;
+    std::string              peer_id;     ///< the session the ticket is for
     std::string              relay_id;
     std::array<uint8_t, 16>  session_nonce{};
-    uint64_t                 issued_at{0};
-    uint64_t                 expires_at{0};
+    uint64_t                 issued_at{0};   ///< Unix seconds
+    uint64_t                 expires_at{0};  ///< Unix seconds
+    std::array<uint8_t, 32>  network_id{};   ///< the network the issuer serves
+    uint64_t                 epoch{0};       ///< the epoch the issuer is a member of
+    std::array<uint8_t, 32>  issuer{};       ///< the issuer's node identity key
     std::array<uint8_t, 64>  signature{};
 };
 

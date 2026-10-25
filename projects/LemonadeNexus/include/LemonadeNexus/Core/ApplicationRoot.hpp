@@ -1,9 +1,11 @@
 #pragma once
 
 // Post-epoch application-root establishment. The public root-claim surface is
-// closed; this is the deferred authority: once a node first holds finalized
-// epoch authority, the permission root is created from the configured root
-// management key. One-shot, idempotent, and never reachable by a caller.
+// closed; this is the deferred authority: when a server enters Tier 1 by
+// finalized epoch membership (Tree/TreeRole.hpp), the permission root is
+// created from the configured root management key. Only Tier 1 members hold
+// the tree, so no other server creates a root. One-shot, idempotent, and
+// never reachable by a caller.
 //
 // With tree operations on, the root is an EstablishRoot tree operation that
 // Tier 1 commits through consensus instead (TreeConsensus::set_root_request);

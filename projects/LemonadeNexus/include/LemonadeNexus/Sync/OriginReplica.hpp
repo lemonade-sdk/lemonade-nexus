@@ -179,6 +179,9 @@ public:
     /// a snapshot when it differs from the value at their last save.
     [[nodiscard]] uint64_t version() const;
 
+    /// Drop every entry and every peer record. The next digest is empty.
+    void clear();
+
 private:
     struct PeerRecord {
         Digest   digest;

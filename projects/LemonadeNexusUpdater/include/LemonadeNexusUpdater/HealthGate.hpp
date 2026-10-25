@@ -12,9 +12,11 @@
 //   - epoch role: a server that was a Tier 1 member before is a member again,
 //     in the same or a later epoch. The mesh admits a member only after it
 //     verifies the member's attestation;
-//   - tree log: a log that was running is healthy, not behind, holds no
-//     pending entries, has applied every entry, and has reached at least the
-//     baseline height.
+//   - tree log: on a current Tier 1 member, a log that was running is
+//     healthy, not behind, holds no pending entries, has applied every entry,
+//     and has reached at least the baseline height. A Tier 2 server holds no
+//     tree, so it reports only its own status and the gate does not wait for
+//     a tree log there, even when an older release ran one.
 //
 // The data key state is information only. During a rollout a server can stay
 // locked until enough storage holders run the new release (pending quorum);

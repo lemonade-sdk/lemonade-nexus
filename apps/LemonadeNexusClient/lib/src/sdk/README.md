@@ -25,6 +25,10 @@ function count here.
   `ln_set_identity`, `ln_identity_from_seed`, `ln_derive_seed`
 - **Health/stats/discovery:** `ln_health`, `ln_stats`, `ln_servers`,
   `ln_server_latencies`
+- **Tier 1 servers:** `ln_set_genesis_key`, `ln_tier1_refresh`,
+  `ln_tier1_membership`. The app pins the network key from Settings at
+  connect; the SDK then sends tree, session, and private-API calls only to
+  verified Tier 1 servers.
 - **Authentication:** `ln_auth_ed25519` (primary), `ln_auth_passkey`,
   `ln_auth_passkey_challenge`, `ln_register_passkey`, `ln_auth_password`
   (deprecated server stub — kept for compatibility), `ln_auth_token`

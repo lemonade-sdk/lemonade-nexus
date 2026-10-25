@@ -27,18 +27,22 @@ class SettingsView extends ConsumerStatefulWidget {
 
 class _SettingsViewState extends ConsumerState<SettingsView> {
   final _serverController = TextEditingController();
+  final _genesisController = TextEditingController();
   bool _hasChanges = false;
+  bool _genesisChanged = false;
 
   @override
   void initState() {
     super.initState();
     final settings = ref.read(settingsProvider);
     _serverController.text = '${settings.serverHost}:${settings.serverPort}';
+    _genesisController.text = settings.genesisKey;
   }
 
   @override
   void dispose() {
     _serverController.dispose();
+    _genesisController.dispose();
     super.dispose();
   }
 
@@ -91,6 +95,43 @@ class _SettingsViewState extends ConsumerState<SettingsView> {
                               ScaffoldMessenger.of(context).showSnackBar(
                                 SnackBar(
                                   content: Text('Server URL updated to $host:$port'),
+                                  backgroundColor: AppTheme.lemonGreen,
+                                ),
+                              );
+                            }
+                          : null,
+                      child: const Text('Save'),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                // Tree requests go only to Tier 1 servers the SDK verifies
+                // from this key; the server URL above is a starting point.
+                Row(
+                  children: [
+                    Text('Network key', style: TextStyle(color: scheme.onSurfaceVariant, fontSize: 13)),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: TextField(
+                        controller: _genesisController,
+                        decoration: const InputDecoration(
+                          hintText: 'Genesis public key (base64)',
+                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                        style: const TextStyle(fontSize: 13, fontFamily: 'monospace'),
+                        onChanged: (_) => setState(() => _genesisChanged = true),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    ElevatedButton(
+                      onPressed: _genesisChanged
+                          ? () async {
+                              await notifier.setGenesisKey(_genesisController.text);
+                              if (!context.mounted) return;
+                              setState(() => _genesisChanged = false);
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('Network key saved'),
                                   backgroundColor: AppTheme.lemonGreen,
                                 ),
                               );

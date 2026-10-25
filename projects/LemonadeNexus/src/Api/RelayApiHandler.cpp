@@ -5,6 +5,8 @@
 #include <LemonadeNexus/Auth/AuthMiddleware.hpp>
 #include <LemonadeNexus/Relay/RelayDiscoveryService.hpp>
 #include <LemonadeNexus/Relay/RelayService.hpp>
+#include <LemonadeNexus/Relay/RelayTicketAuth.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
 #include <LemonadeNexus/Relay/GeoRegion.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
@@ -160,11 +162,19 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
             return;
         }
 
-        // The ticket is signed with the server identity key: it may only be
-        // minted for the caller's own identity, never for a peer the caller
-        // merely names.
+        // The ticket may only be minted for the caller's own session, never
+        // for a peer the caller merely names.
         if (ticket_req.peer_id != claims.user_id) {
             error_response(res, "peer_id must be the caller's own identity", 403);
+            return;
+        }
+
+        // Only a current Tier 1 member issues tickets: any relay verifies
+        // them against the Tier 1 membership it verified itself.
+        const auto identity =
+            ctx_.tier1_identity ? ctx_.tier1_identity() : std::optional<Tier1Identity>{};
+        if (!identity) {
+            error_response(res, "this server is not a Tier 1 member", 421);
             return;
         }
 
@@ -172,34 +182,11 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
         ticket.peer_id  = ticket_req.peer_id;
         ticket.relay_id = ticket_req.relay_id;
         ctx_.crypto.random_bytes(std::span<uint8_t>(ticket.session_nonce));
-
-        auto now = epoch_seconds();
-        ticket.issued_at  = now;
-        ticket.expires_at = now + 300;
-
-        auto privkey = ctx_.key_wrapping.unlock_identity({});
-        if (privkey) {
-            std::vector<uint8_t> canonical;
-            canonical.insert(canonical.end(),
-                             ticket.peer_id.begin(), ticket.peer_id.end());
-            canonical.insert(canonical.end(),
-                             ticket.relay_id.begin(), ticket.relay_id.end());
-            canonical.insert(canonical.end(),
-                             ticket.session_nonce.begin(),
-                             ticket.session_nonce.end());
-            auto push_u64 = [&](uint64_t v) {
-                for (int i = 0; i < 8; ++i) {
-                    canonical.push_back(static_cast<uint8_t>(v & 0xFF));
-                    v >>= 8;
-                }
-            };
-            push_u64(ticket.issued_at);
-            push_u64(ticket.expires_at);
-
-            auto sig = ctx_.crypto.ed25519_sign(
-                *privkey, std::span<const uint8_t>(canonical));
-            std::memcpy(ticket.signature.data(), sig.data(), sig.size());
-        }
+        ticket.issued_at  = epoch_seconds();
+        ticket.expires_at = ticket.issued_at + relay::kRelayTicketMaxLifetimeSec;
+        ticket.network_id = identity->network_id;
+        ticket.epoch      = identity->epoch;
+        relay::sign_relay_ticket(ticket, ctx_.gossip.keypair());
 
         network::RelayTicketResponse resp{
             .peer_id       = ticket.peer_id,
@@ -208,6 +195,9 @@ void RelayApiHandler::do_register_routes([[maybe_unused]] httplib::Server& pub,
                 std::span<const uint8_t>(ticket.session_nonce)),
             .issued_at     = ticket.issued_at,
             .expires_at    = ticket.expires_at,
+            .network_id    = crypto::to_hex(std::span<const uint8_t>(ticket.network_id)),
+            .epoch         = ticket.epoch,
+            .issuer        = crypto::to_base64(std::span<const uint8_t>(ticket.issuer)),
             .signature     = crypto::to_base64(
                 std::span<const uint8_t>(ticket.signature)),
         };

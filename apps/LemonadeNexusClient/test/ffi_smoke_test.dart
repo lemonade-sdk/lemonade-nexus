@@ -32,7 +32,7 @@ void main() {
     sdk.destroy(client);
   });
 
-  test('mesh port calls resolve and report a stopped port', () {
+  test('pins the network key and reports no Tier 1 server before a refresh', () {
     final lib = _libFile();
     if (!lib.existsSync()) {
       markTestSkipped('SDK library not built at ${lib.path}');
@@ -40,12 +40,36 @@ void main() {
     }
     final sdk = LemonadeNexusFfi(libraryPath: lib.absolute.path);
     expect(sdk.missingSymbols(), isEmpty);
+    final client = sdk.createTls('127.0.0.1', 1);
+    expect(client, isNot(ffi.nullptr));
+    try {
+      expect(sdk.setGenesisKey(client, 'not-a-key'), LnError.rejected);
+      // 32 zero bytes: a well-formed key.
+      expect(sdk.setGenesisKey(client, 'A' * 43 + '='), LnError.success);
+      final (error, json) = sdk.tier1Membership(client);
+      expect(error, LnError.success);
+      expect(json, contains('"servers":[]'));
+    } finally {
+      sdk.destroy(client);
+    }
+  });
+
+  test('mesh port calls resolve and report a stopped port', () {
+    final lib = _libFile();
+    if (!lib.existsSync()) {
+      markTestSkipped('SDK library not built at ${lib.path}');
+      return;
+    }
+    final sdk = LemonadeNexusFfi(libraryPath: lib.absolute.path);
     final client = sdk.create('127.0.0.1', 9100);
-    final status = jsonDecode(sdk.meshPortStatus(client)!) as Map<String, dynamic>;
-    expect(status['running'], isFalse);
-    expect(sdk.meshPortSetSelection(client, 'auto', null), LnError.rejected);
-    expect(sdk.meshPortStart(client, 0, 'http://192.0.2.1:80'), LnError.rejected);
-    expect(sdk.meshPortStop(client), LnError.success);
-    sdk.destroy(client);
+    try {
+      final status = jsonDecode(sdk.meshPortStatus(client)!) as Map<String, dynamic>;
+      expect(status['running'], isFalse);
+      expect(sdk.meshPortSetSelection(client, 'auto', null), LnError.rejected);
+      expect(sdk.meshPortStart(client, 0, 'http://192.0.2.1:80'), LnError.rejected);
+      expect(sdk.meshPortStop(client), LnError.success);
+    } finally {
+      sdk.destroy(client);
+    }
   });
 }

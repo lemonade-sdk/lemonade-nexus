@@ -180,7 +180,10 @@ ln_error_t ln_ipam_allocate(ln_client_t* client,
 /** GET /api/relay/list. Returns JSON array via out_json. */
 ln_error_t ln_relay_list(ln_client_t* client, char** out_json);
 
-/** POST /api/relay/ticket. Returns JSON via out_json. */
+/** POST /api/relay/ticket. Returns JSON via out_json: {peer_id, relay_id,
+ *  session_nonce, issued_at, expires_at, network_id, epoch, issuer, signature}.
+ *  A Tier 1 server signs the ticket; any relay verifies it against its
+ *  verified Tier 1 membership. */
 ln_error_t ln_relay_ticket(ln_client_t* client,
                             const char* peer_id,
                             const char* relay_id,
@@ -554,6 +557,46 @@ ln_error_t ln_mesh_close_egress(ln_client_t* client, const char* dst_ip, uint16_
 
 /** 1 when this client's mesh dataplane is up, 0 otherwise (or for NULL). */
 int ln_mesh_is_active(ln_client_t* client);
+
+/* ------------------------------------------------------------------ */
+/* Tier 1 servers (tree traffic)                                       */
+/* ------------------------------------------------------------------ */
+
+/** Pin the network's Genesis public key and the lowest epoch to accept.
+ *
+ *  Only Tier 1 servers hold the permission tree. The client sends every tree
+ *  read and write, every session request (ln_auth_*, ln_join_network), and
+ *  every private-API call only to a Tier 1 server it verified from this key:
+ *  it walks the authority chain from the key and keeps a member of the
+ *  verified epoch only after the member signs an endpoint proof over a fresh
+ *  nonce. Until a key is pinned those calls are not sent and fail with
+ *  LN_ERR_CONNECT and an "error" that names the missing key.
+ *
+ *  @param genesis_pubkey_b64  The server config's `genesis_pubkey`: base64 of
+ *                             32 bytes. Not retained after the call.
+ *  @param min_epoch           The lowest Tier 1 epoch to accept (0 for none).
+ *                             Store the epoch from ln_tier1_refresh and pass it
+ *                             here after a restart to refuse an older list.
+ *  @return LN_OK, LN_ERR_NULL_ARG, or LN_ERR_REJECTED for a malformed key.
+ *  Changing the key drops the verified membership. Thread-safe. */
+ln_error_t ln_set_genesis_key(ln_client_t* client, const char* genesis_pubkey_b64,
+                              uint64_t min_epoch);
+
+/** Verify the Tier 1 membership now from the client's server pool.
+ *
+ *  On LN_OK, *out_json receives
+ *  {"epoch":N,"members":["<base64 node id>",...],
+ *   "servers":[{"node_id":"<base64>","host":"<fqdn>","port":P},...]}.
+ *  On failure it receives {"error":"..."} and the function returns
+ *  LN_ERR_REJECTED (no pinned key, a chain that does not verify, or a stale
+ *  epoch) or LN_ERR_CONNECT (no server reachable). The caller must ln_free()
+ *  *out_json in both cases. Blocks on network I/O. Thread-safe. */
+ln_error_t ln_tier1_refresh(ln_client_t* client, char** out_json);
+
+/** The last verified Tier 1 membership, in the ln_tier1_refresh shape, with
+ *  no network I/O. "servers" is empty when nothing is verified. The caller
+ *  must ln_free() *out_json. Thread-safe. */
+ln_error_t ln_tier1_membership(ln_client_t* client, char** out_json);
 
 /* ------------------------------------------------------------------ */
 /* Mesh port                                                           */

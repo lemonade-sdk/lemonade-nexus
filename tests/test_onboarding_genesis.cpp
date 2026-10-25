@@ -254,8 +254,7 @@ protected:
         auth->start();
         ipam = std::make_unique<ipam::IPAMService>(*storage);
         ipam->start();
-        relay = std::make_unique<relay::RelayService>(io, 0, *crypto,
-                                                      root_identity.public_key);
+        relay = std::make_unique<relay::RelayService>(io, 0, *crypto);
         relay_discovery = std::make_unique<relay::RelayDiscoveryService>(*storage);
         routing = std::make_unique<routing::RoutingCoordinationService>(*crypto, *gossip);
         attestation = std::make_unique<core::BinaryAttestationService>(*crypto, *storage);

@@ -14,6 +14,12 @@ Check this list before the next release. Nothing below is a blocker unless marke
   here so nobody later reads `B3-Review-Package.md` as clearance. If review ever happens, it must
   target the shipped versions, not the ones the doc cites.
 - **Genesis and root management keys** stay on the root server for now.
+- **Tier 2 servers hold no tree** (owner decision, 2026-10-24). Only current Tier 1 members load, serve,
+  and keep the permission tree; clients send every tree read and write to a Tier 1 server they verify
+  from the Genesis key. Any relay, Tier 1 or Tier 2, verifies relay tickets against
+  its verified Tier 1 membership. Follow-ups: the relay protocol has no handler for its `Allocate`
+  message, and tree-derived DNS names are answered by Tier 1 nameservers only. See `Security.md`,
+  current limitations 6 to 8.
 
 ## 1. Remove the two storage flags
 

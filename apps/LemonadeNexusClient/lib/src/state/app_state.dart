@@ -109,12 +109,23 @@ class PeerState {
 
 /// Settings class for app preferences
 class Settings {
+  /// The seed server: where the SDK starts discovery and the Tier 1
+  /// membership walk. Tree, session, and private-API requests go only to the
+  /// Tier 1 servers the SDK verifies, never to this host unless it is one.
   final String serverHost;
   final int serverPort;
   final bool autoDiscoveryEnabled;
   final bool autoConnectOnLaunch;
   final bool useTls;
   final bool darkModeEnabled;
+
+  /// The network's Genesis public key (base64). The SDK verifies Tier 1
+  /// servers from it; without it no tree request is sent.
+  final String genesisKey;
+
+  /// The highest Tier 1 epoch this app verified. The SDK refuses an older
+  /// membership after a restart.
+  final int tier1MinEpoch;
 
   const Settings({
     this.serverHost = 'localhost',
@@ -123,6 +134,8 @@ class Settings {
     this.autoConnectOnLaunch = false,
     this.useTls = false,
     this.darkModeEnabled = true,
+    this.genesisKey = '',
+    this.tier1MinEpoch = 0,
   });
 
   Settings copyWith({
@@ -132,6 +145,8 @@ class Settings {
     bool? autoConnectOnLaunch,
     bool? useTls,
     bool? darkModeEnabled,
+    String? genesisKey,
+    int? tier1MinEpoch,
   }) {
     return Settings(
       serverHost: serverHost ?? this.serverHost,
@@ -140,6 +155,8 @@ class Settings {
       autoConnectOnLaunch: autoConnectOnLaunch ?? this.autoConnectOnLaunch,
       useTls: useTls ?? this.useTls,
       darkModeEnabled: darkModeEnabled ?? this.darkModeEnabled,
+      genesisKey: genesisKey ?? this.genesisKey,
+      tier1MinEpoch: tier1MinEpoch ?? this.tier1MinEpoch,
     );
   }
 
@@ -498,6 +515,7 @@ class AppNotifier extends StateNotifier<AppState> {
       } else {
         await _sdk.connect(host, port);
       }
+      _applyGenesisKey();
       state = state.copyWith(
         settings: state.settings.copyWith(
           serverHost: host,
@@ -521,6 +539,57 @@ class AppNotifier extends StateNotifier<AppState> {
       addActivity(ActivityLevel.error, 'Connection failed: $e');
       _log('connectToServer: FAILED -> $e');
       return false;
+    }
+  }
+
+  /// Pin the network key in the SDK. Tree, session, and private-API requests
+  /// go only to Tier 1 servers verified from it; without it they fail with an
+  /// error that names the missing key.
+  void _applyGenesisKey() {
+    final key = state.settings.genesisKey.trim();
+    if (key.isEmpty) {
+      _log('connectToServer: no network key set; tree requests will not be sent');
+      addActivity(ActivityLevel.warning,
+          'Set the network key in Settings to reach Tier 1 servers');
+      return;
+    }
+    try {
+      _sdk.setGenesisKey(key, minEpoch: state.settings.tier1MinEpoch);
+    } catch (e) {
+      _log('connectToServer: network key refused -> $e');
+      addActivity(ActivityLevel.error, 'The network key is not valid: $e');
+    }
+  }
+
+  /// Save the network key and pin it in the SDK. A new key resets the
+  /// stored Tier 1 epoch floor.
+  Future<void> setGenesisKey(String key) async {
+    final trimmed = key.trim();
+    final changed = trimmed != state.settings.genesisKey;
+    state = state.copyWith(
+      settings: state.settings.copyWith(
+        genesisKey: trimmed,
+        tier1MinEpoch: changed ? 0 : state.settings.tier1MinEpoch,
+      ),
+    );
+    await _persistSettings();
+    if (state.connectionStatus != ConnectionStatus.disconnected) {
+      _applyGenesisKey();
+    }
+  }
+
+  /// Remember the verified Tier 1 epoch, so a later run refuses an older one.
+  Future<void> _recordTier1Epoch() async {
+    try {
+      final membership = await _sdk.tier1Membership();
+      final epoch = (membership['epoch'] as num?)?.toInt() ?? 0;
+      if (epoch > state.settings.tier1MinEpoch) {
+        state = state.copyWith(
+            settings: state.settings.copyWith(tier1MinEpoch: epoch));
+        await _persistSettings();
+      }
+    } catch (e) {
+      _log('_recordTier1Epoch: $e');
     }
   }
 
@@ -620,6 +689,7 @@ class AppNotifier extends StateNotifier<AppState> {
       ));
     }
     await _loadIdentity();
+    await _recordTier1Epoch();
     // Cluster operations all ride the private mesh API, so bring it up here.
     if (await _joinNetwork()) {
       await enableMesh();
