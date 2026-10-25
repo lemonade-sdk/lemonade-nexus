@@ -207,7 +207,7 @@ private:
     [[nodiscard]] bool epoch_in_window(const SecurityMessage& message) const;
 
     RouteResult dispatch(SecurityMessage& message, uint64_t now_ms);
-    RouteResult route_proposal(const ProposalMessage& message);
+    RouteResult route_proposal(const ProposalMessage& message, const NodeId& from);
     RouteResult route_vote(const Vote& vote);
     RouteResult route_timeout(const TimeoutVote& vote);
     RouteResult route_dkg(DkgMessage& message);

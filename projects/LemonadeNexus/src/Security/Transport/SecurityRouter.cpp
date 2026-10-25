@@ -423,7 +423,7 @@ RouteResult SecurityRouter::dispatch(SecurityMessage& message, uint64_t now_ms) 
             return route_activation_response(
                 std::get<SvsmAkActivationResponseMessage>(message.body));
         case SecurityMessageKind::HotStuffProposal:
-            return route_proposal(std::get<ProposalMessage>(message.body));
+            return route_proposal(std::get<ProposalMessage>(message.body), message.sender);
         case SecurityMessageKind::HotStuffVote:
             return route_vote(std::get<Vote>(message.body));
         case SecurityMessageKind::HotStuffTimeout:
@@ -550,6 +550,7 @@ RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, co
     // the last block by the high certificate. Adjacency is checked here; the
     // service validates every certificate before adoption.
     HotStuffService* consensus = runtime_.consensus();
+    std::optional<OrphanProposal> orphan;
     if (consensus != nullptr && !response.chain.empty()) {
         for (std::size_t i = 0; i + 1 < response.chain.size(); ++i) {
             if (response.chain[i + 1].justify.proposal_digest !=
@@ -570,15 +571,27 @@ RouteResult SecurityRouter::route_sync_response(const SyncResponse& response, co
                                                    response.chain[i].justify, certifying,
                                                    commits);
         }
+        // Taken before the commits fire: a committed handoff destroys this
+        // service instance.
+        orphan = consensus->take_linkable_orphan();
         if (!commits.empty()) {
             events_.on_commits(commits);
         }
     }
     events_.on_sync_certificate(qc, from);
+    if (orphan.has_value()) {
+        // Judged again from the start, against whichever epoch is current
+        // now. The original proposer is the sender of record.
+        const NodeId proposer = orphan->proposal.leader;
+        (void)route_proposal(ProposalMessage{std::move(orphan->proposal),
+                                             std::move(orphan->justify),
+                                             std::move(orphan->payload)},
+                             proposer);
+    }
     return delivered();
 }
 
-RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
+RouteResult SecurityRouter::route_proposal(const ProposalMessage& message, const NodeId& from) {
     HotStuffService* consensus = runtime_.consensus();
     if (consensus == nullptr) {
         return drop(DropReason::NoService);
@@ -587,6 +600,17 @@ RouteResult SecurityRouter::route_proposal(const ProposalMessage& message) {
         message.proposal, message.justify,
         message.payload.has_value() ? &*message.payload : nullptr);
     if (result.rejected.has_value()) {
+        if (*result.rejected == ConsensusFailure::MissingParent && from != runtime_.self()) {
+            // This replica missed a block, for example one proposed while it
+            // synced after a restart. The proposer holds the parent: it
+            // could not have proposed on the certificate without it. Its
+            // certified chain fills the gap, and the held proposal is then
+            // judged again (route_sync_response). Without the request, every
+            // later proposal names a block this replica refused before.
+            (void)send(from, compose(SecurityMessageKind::SyncRequest,
+                                     SyncRequest{message.proposal.epoch},
+                                     message.proposal.epoch));
+        }
         return drop(DropReason::ServiceRejected, code(*result.rejected));
     }
     // The service validated the justify with the proposal, so its signers are

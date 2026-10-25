@@ -171,7 +171,8 @@ struct SyncResponse {
     QuorumCertificate high_qc;
     /// The responder's uncommitted chain, oldest first: block k is certified
     /// by block k+1's justify, the last block by high_qc. A restarted node
-    /// rebuilds chain state from these certified facts.
+    /// rebuilds chain state from these certified facts, and a replica that
+    /// missed a block fills the gap from them.
     std::vector<ProposalMessage> chain;
 };
 
