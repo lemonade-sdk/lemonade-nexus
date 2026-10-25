@@ -28,7 +28,7 @@ if(GIT_TAG_OVERRIDE)
     message(STATUS "Packaging version from GIT_TAG_OVERRIDE: ${CPACK_PACKAGE_VERSION}")
 else()
     execute_process(
-        COMMAND git describe --tags --exact-match HEAD
+        COMMAND git describe --tags --match "v[0-9]*" --exact-match HEAD
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE GIT_TAG
         OUTPUT_STRIP_TRAILING_WHITESPACE
