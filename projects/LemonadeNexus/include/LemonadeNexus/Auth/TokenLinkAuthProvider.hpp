@@ -51,6 +51,14 @@ public:
     /// Verify and burn a token (single use).
     [[nodiscard]] std::optional<LinkTokenRecord> consume(std::string_view token);
 
+    /// Restore a token that consume() burned for a join that did not use it
+    /// (the join was refused, failed, or did not place a new device). The
+    /// token keeps its original record and expiry. Returns false, and restores
+    /// nothing, when the record has expired, when a file for the token
+    /// already exists, or when the write fails. Call it at most once per
+    /// consume(), with the record consume() returned.
+    bool refund(std::string_view token, const LinkTokenRecord& record);
+
     static constexpr std::chrono::seconds kDefaultTtl{600};
     static constexpr std::chrono::seconds kMaxTtl{3600};
 

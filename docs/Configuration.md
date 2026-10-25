@@ -45,6 +45,13 @@ Note: an environment variable overrides a CLI value for *every other* setting
 (for example `SP_HTTP_PORT` overrides `--http-port`). Keep the packaged
 environment file for deliberate operator overrides only.
 
+**Boolean environment variables** (`SP_CLOSED_REGISTRATION`,
+`SP_DNS_SEED_DISCOVERY`, `SP_DDNS_ENABLED`, `SP_TREE_OPS`, `SP_TREE_LOG`)
+take `1`, `true`, `yes`, or `on` for true and `0`, `false`, `no`, or `off`
+for false, in any letter case. The server logs any other value at error level
+and turns the setting off. Two exceptions: `SP_DNS_SEED_DISCOVERY` then keeps
+its current value, and `SP_CLOSED_REGISTRATION` then closes registration.
+
 ## Trust Anchors (Required for a Normal Start)
 
 A normal daemon start refuses to run without all three values:
@@ -101,7 +108,7 @@ by firewall/NAT mapping, not by the server binding it.
 | `--rp-id <domain>` | `SP_RP_ID` | `rp_id` | `lemonade-nexus.local` | WebAuthn relying party ID |
 | `--seed-peer <host:port>` | `SP_SEED_PEERS` | `seed_peers` | | Gossip seed peers (repeatable / comma-separated; env appends) |
 | `--server-hostname <name>` | `SP_SERVER_HOSTNAME` | `server_hostname` | (auto) | Server hostname for the TLS certificate |
-| `--closed-registration` | `SP_CLOSED_REGISTRATION` | `open_registration` | open | New identities need a device link token to join |
+| `--closed-registration` | `SP_CLOSED_REGISTRATION=1` | `open_registration` | open | New identities need a device link token to join |
 
 ## DNS
 
@@ -130,7 +137,7 @@ listener in place. There is no plaintext fallback.
 |----------|---------|----------|---------|-------------|
 | `--ddns-domain <dom>` | `SP_DDNS_DOMAIN` | `ddns_domain` | | Base domain for DDNS (Namecheap) |
 | `--ddns-password <pw>` | `SP_DDNS_PASSWORD` | `ddns_password` | | DDNS password |
-| `--ddns-enabled` | `SP_DDNS_ENABLED` | `ddns_enabled` | `false` | Enable dynamic DNS updates |
+| `--ddns-enabled` | `SP_DDNS_ENABLED=1` | `ddns_enabled` | `false` | Enable dynamic DNS updates |
 
 Release manifest fetching (`SP_GITHUB_RELEASES_URL`,
 `SP_MANIFEST_FETCH_INTERVAL`, `SP_MINIMUM_VERSION`) controls how the server
@@ -161,8 +168,8 @@ Candidate-side:
 
 | CLI Flag | Env Var | JSON Key | Default | Description |
 |----------|---------|----------|---------|-------------|
-| `--tree-ops` | `SP_TREE_OPS` (any value) | `tree_ops_enabled` | off | Ops mode: order tree writes through Tier 1 consensus, apply them after commit, and replicate the tree log |
-| `--tree-log` | `SP_TREE_LOG` (any value) | `tree_log_enabled` | off | Read-only mode: build and replicate the tree log; tree writes keep the direct paths. Ignored when `tree_ops_enabled` is set |
+| `--tree-ops` | `SP_TREE_OPS=1` | `tree_ops_enabled` | off | Ops mode: order tree writes through Tier 1 consensus, apply them after commit, and replicate the tree log |
+| `--tree-log` | `SP_TREE_LOG=1` | `tree_log_enabled` | off | Read-only mode: build and replicate the tree log; tree writes keep the direct paths. Ignored when `tree_ops_enabled` is set |
 
 These settings are experimental. They implement Phases 1 to 3 of
 [Design: Tree Consensus and Threshold Storage Key](Design-Tree-Consensus-and-Storage-Key).
@@ -181,7 +188,15 @@ With ops mode on:
   `/api/tree/node/delete/{id}`, and `/api/mesh/heartbeat` (a `SetEndpoint`
   operation, sent only when the endpoint changed). The application root is an
   `EstablishRoot` operation that names the configured `root_pubkey`.
-  `POST /api/ipam/allocate` writes no tree node and does not change.
+  `POST /api/ipam/allocate` writes no tree node. It refuses a `tunnel` block
+  with `409`, because the join operation assigns tunnel addresses; `private`
+  and `shared` blocks do not change.
+- **Start.** A server in ops mode that has no tree log starts a new log only
+  when its persistent tree is empty. With a populated tree and no log, it
+  halts tree operations and logs the reason: a log based on the local tree
+  would differ from every other server's log and would foreclose the
+  [Tree Merge Ceremony](Tree-Merge-Ceremony). Install the ceremony's commit,
+  or start from an empty tree.
 - The server signs each operation with its gossip identity key, with the
   domain tag `lemonade-nexus/tree-op-signature:v1`. Replicas trust a signature
   only from a member of the block epoch's frozen Tier 1 set. The signature
@@ -219,7 +234,21 @@ With ops mode on:
   address from the tree: the first free `/32` at or after a start offset
   derived from the node id, inside `10.65.0.0`–`10.127.255.254`. A deleted
   node's address is free again at once. IPAM keeps `10.64.0.0/16` for server
-  addresses and `/api/ipam/allocate`.
+  addresses.
+- **Server-assigned fields.** For every writer that is not an admin of the
+  root node, `tunnel_ip` and `private_subnet` are server-assigned and `type`
+  is fixed: a create cannot set the addresses or make a Relay node, and an
+  update cannot change the addresses or the type. A group admin is not a root
+  admin: tunnel addresses and relays act on the whole plane. The direct write
+  paths apply the same rule.
+- **Forwarding.** The server forwards between two tunnel addresses only for
+  nodes that the dataplane binds to them: the peer the server installed for
+  the address at join must have the node's mesh key. A Relay node is open to
+  every peer only when its management key is a root admin.
+- **Delete cleanup.** Every server that applies a committed delete runs the
+  post-delete cleanup itself: it revokes the device credential (unless
+  another node still holds the key), releases the node's IPAM records,
+  removes the dataplane peer, and removes the private DNS record.
 - Each node that an operation writes gets `version` = previous version + 1
   (1 for a new node). Node JSON includes `version` only when it is not 0, so
   records written with the setting off keep their exact bytes.
@@ -265,8 +294,8 @@ With ops mode on:
   mode, log height, state root, health and halt reason, whether the server is
   behind, held entries, the last refused entry, and per-peer sync status.
 - **Fail closed.** A server whose log does not verify, whose tree changed
-  outside the log, or whose state disagrees with a certified entry that chains
-  to its log halts tree operations: it applies, votes for, proposes, and
+  outside the log, whose populated tree has no log, or whose state disagrees
+  with a certified entry that chains to its log halts tree operations: it applies, votes for, proposes, and
   accepts no tree operation, and keeps serving its last committed tree.
 
 With read-only mode on, the server builds the tree log from the empty tree,
@@ -295,11 +324,12 @@ Limits:
   cannot forward a write: replicas trust operation signatures from the frozen
   Tier 1 set only, and no finalized list of admitted submitters exists. A
   root-signed admission certificate is identity, not authority.
-- **Same starting tree.** A new ops-mode tree log starts from the server's
-  current tree. Servers agree on state roots only if every server started from
-  the same tree: an empty one, or the merge commit. A server whose log base
-  differs refuses every replicated entry (the status names it). Existing,
-  divergent trees need the [Tree Merge Ceremony](Tree-Merge-Ceremony).
+- **Same starting tree.** Servers agree on state roots only if every server
+  started from the same tree: an empty one, or the merge commit. A new
+  ops-mode tree log therefore starts only from an empty tree (see **Start**).
+  A server whose log base differs, for example a log an earlier build started
+  from a populated tree, refuses every replicated entry (the status names it).
+  Existing, divergent trees need the [Tree Merge Ceremony](Tree-Merge-Ceremony).
 - **Unproved commits.** A block that committed while the three blocks behind
   its commit were no longer held is logged without a commit proof. Peers
   refuse that copy and take the entry from another Tier 1 server.

@@ -4,6 +4,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace nexus::tree {
 struct TreeNode;
@@ -16,13 +17,29 @@ class TreeApiHandler : public IRequestHandler<TreeApiHandler> {
     friend class IRequestHandler<TreeApiHandler>;
 
 public:
-    explicit TreeApiHandler(ApiContext& ctx) : ctx_(ctx) {}
+    /// Registers cleanup_removed_nodes as the tree's removed-nodes hook. With
+    /// tree operations on, the post-delete cleanup then runs on every server
+    /// that applies a delete, not only on the server that took the request.
+    /// Construct one handler per tree. `ctx` must outlive this object.
+    explicit TreeApiHandler(ApiContext& ctx);
+
+    /// Clears the removed-nodes hook this object registered.
+    ~TreeApiHandler();
+
+    TreeApiHandler(const TreeApiHandler&)            = delete;
+    TreeApiHandler& operator=(const TreeApiHandler&) = delete;
+
+    /// Run the post-delete cleanup for nodes an applied tree operation
+    /// removed. `removed` holds each node as it was before the delete.
+    /// Thread-safe to the same degree as the delete routes.
+    void cleanup_removed_nodes(const std::vector<tree::TreeNode>& removed);
 
 private:
     void do_register_routes(httplib::Server& pub, httplib::Server& priv);
 
-    // Post-delete cleanup shared by both delete routes so they stay behaviorally
-    // identical: (1) credential revocation (owner-protected), (2) IPAM releases,
+    // Post-delete cleanup shared by both delete routes (tree operations off)
+    // and cleanup_removed_nodes (tree operations on), so they stay
+    // behaviorally identical: (1) credential revocation (owner-protected), (2) IPAM releases,
     // (3) mesh peer removal, (4) private EP DNS record removal. All steps are
     // best-effort; a failure never aborts the cascade. `doomed` is the
     // pre-delete snapshot of the node.

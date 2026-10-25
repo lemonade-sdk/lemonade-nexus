@@ -103,7 +103,7 @@ bool answer_unfinished(httplib::Response& res, const tree::TreeOpSubmission& s) 
 }
 
 /// Run `fn` when the pending op behind `s` commits. Work a committed write
-/// does after the tree changes (a delete's cascade, a join's dataplane steps)
+/// does after the tree changes on this server only (a join's dataplane steps)
 /// must still happen when the commit arrives after the request answered.
 void after_commit(const tree::TreeOpSubmission& s, std::function<void()> fn) {
     if (!s.ticket) return;
@@ -129,6 +129,22 @@ tree::TreeOpSubmission submit_rebased(tree::TreeOpSubmitter& submitter, Build&& 
         if (s.pending || s.verdict.refusal != tree::TreeOpRefusal::StaleBaseVersion) break;
     }
     return s;
+}
+
+/// The tree's content rules for a session write of `node` by `signer`, the
+/// rules validate_op and apply_delta apply. Among them, only a root admin sets
+/// a node's tunnel_ip or private_subnet or creates a relay. The direct
+/// write paths call it so they enforce the same rules as tree operations.
+std::optional<std::string> session_content_refusal(const tree::PermissionTreeService& tree,
+                                                   std::string_view operation,
+                                                   const tree::TreeNode& node,
+                                                   const std::string& signer) {
+    tree::TreeDelta d;
+    d.operation = std::string(operation);
+    d.target_node_id = node.id;
+    d.node_data = node;
+    d.signer_pubkey = signer;
+    return tree::rules::delta_content_refusal(tree.nodes_snapshot(), d);
 }
 
 /// Wrap a client-signed delta in a TreeOp and submit it.
@@ -173,6 +189,45 @@ struct JoinOpResult {
     tree::TreeOpSubmission submission;
     std::string tunnel_ip;      ///< the committed node's address (Committed)
     api::MeshRekeyPlan rekey;   ///< dataplane changes the join implies
+    bool used_link = false;     ///< the op places a new device with the link token
+};
+
+/// A device-link token that POST /api/join consumed. The token is spent only
+/// when the join uses it to place a new device. The destructor restores it
+/// unless keep() or settle_with() decided otherwise, so a join that is
+/// refused, fails, or places no new device does not burn the token.
+class LinkTokenClaim {
+public:
+    LinkTokenClaim(auth::AuthService& auth, std::string token, auth::LinkTokenRecord record)
+        : auth_(auth), token_(std::move(token)), record_(std::move(record)) {}
+    ~LinkTokenClaim() {
+        if (!decided_) (void)auth_.refund_link_token(token_, record_);
+    }
+    LinkTokenClaim(const LinkTokenClaim&)            = delete;
+    LinkTokenClaim& operator=(const LinkTokenClaim&) = delete;
+
+    /// The join placed the device: the token stays spent.
+    void keep() { decided_ = true; }
+
+    /// The join's op is pending: the token stays spent when the op commits
+    /// and is restored when it is refused. Without a ticket no outcome
+    /// arrives, and the token stays spent.
+    void settle_with(const tree::TreeOpSubmission& s) {
+        decided_ = true;
+        if (!s.ticket) return;
+        s.ticket->on_settled([auth = &auth_, token = token_,
+                              record = record_](const tree::TreeOpOutcome& outcome) {
+            if (outcome.status != tree::TreeOpStatus::Committed) {
+                (void)auth->refund_link_token(token, record);
+            }
+        });
+    }
+
+private:
+    auth::AuthService&    auth_;
+    std::string           token_;
+    auth::LinkTokenRecord record_;
+    bool                  decided_ = false;
 };
 
 /// The tree part of POST /api/join with tree operations on: the direct path's
@@ -280,9 +335,11 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
             result.state = JoinOpResult::State::Pending;
             result.submission = std::move(s);
             result.rekey = plan_rekey(current, {});
+            result.used_link = !js.link_group_id.empty();
             return result;
         }
         if (s.verdict.ok()) {
+            result.used_link = !js.link_group_id.empty();
             const auto after = ctx.tree.get_node(node_id);
             if (!after || after->tunnel_ip.empty()) {
                 error_response(res, "IP allocation failed", 409);
@@ -304,10 +361,26 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
 
 } // namespace
 
-// Post-delete cascade shared by the direct-delete and delta-delete routes so
-// both stay behaviorally identical. Failures follow the direct route's
-// existing conventions: IPAM release results are ignored, and peer/DNS removal
-// is logged on success only.
+// Only applied tree operations call the hook, and with tree operations off no
+// operation is applied, so the direct routes' own cleanup never runs twice.
+TreeApiHandler::TreeApiHandler(ApiContext& ctx) : ctx_(ctx) {
+    ctx_.tree.set_removed_nodes_hook(
+        [this](const std::vector<tree::TreeNode>& removed) { cleanup_removed_nodes(removed); });
+}
+
+TreeApiHandler::~TreeApiHandler() {
+    ctx_.tree.set_removed_nodes_hook({});
+}
+
+void TreeApiHandler::cleanup_removed_nodes(const std::vector<tree::TreeNode>& removed) {
+    for (const auto& node : removed) cascade_node_cleanup(node.id, node);
+}
+
+// Post-delete cascade shared by the direct-delete and delta-delete routes and,
+// with tree operations on, by the committed-removal hook, so every path stays
+// behaviorally identical. Failures follow the direct route's existing
+// conventions: IPAM release results are ignored, and peer/DNS removal is
+// logged on success only.
 void TreeApiHandler::cascade_node_cleanup(const std::string& node_id,
                                           const std::optional<tree::TreeNode>& doomed) {
     if (!doomed) return;
@@ -471,14 +544,18 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
 
         // Optional device-link token (single use, minted via POST /api/link/token):
         // places the new endpoint under the token owner's Customer group.
+        // Consuming it first stops two concurrent joins from both using it;
+        // link_claim restores it unless this join places a device with it.
         auto link_token = body.value("link_token", std::string{});
         std::optional<auth::LinkTokenRecord> link;
+        std::optional<LinkTokenClaim> link_claim;
         if (!link_token.empty()) {
             link = ctx_.auth.consume_link_token(link_token);
             if (!link) {
                 error_response(res, "invalid or expired link token", 403);
                 return;
             }
+            link_claim.emplace(ctx_.auth, link_token, *link);
         }
 
         // cpu_id/net_mac are self-reported label seeds (not security controls).
@@ -618,6 +695,7 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
                 }
 
                 if (link) {
+                    link_claim->keep();
                     // Pairwise grants so devices in the group can list and dial
                     // each other (peer reads and connects check the sibling node)
                     for (const auto& sibling : ctx_.tree.get_children(customer_id)) {
@@ -652,6 +730,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         if (ctx_.config.tree_ops_enabled) {
             auto joined = join_via_tree_op(ctx_, res, body, node_id, norm_pubkey, link, cpu_id,
                                            net_mac, node_region, is_inference, is_root_owner);
+            if (joined.used_link) {
+                if (joined.state == JoinOpResult::State::Pending) {
+                    link_claim->settle_with(joined.submission);
+                } else {
+                    link_claim->keep();
+                }
+            }
             if (joined.state == JoinOpResult::State::Answered) return;
             if (joined.state == JoinOpResult::State::Pending) {
                 // The tunnel address exists only once the join commits; the
@@ -815,30 +900,25 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        // Pre-delete snapshot so the post-delete cascade (credential revocation,
-        // IPAM release, mesh peer removal) has the node's identity and keys.
-        std::optional<tree::TreeNode> doomed =
-            (delta.operation == "delete_node" && !delta.target_node_id.empty())
-                ? ctx_.tree.get_node(delta.target_node_id)
-                : std::nullopt;
-
         bool ok = false;
         if (ctx_.config.tree_ops_enabled) {
+            // The committed-removal hook runs the post-delete cascade on every
+            // server that applies the delete (cleanup_removed_nodes).
             auto* submitter = tree_op_submitter(ctx_, res);
             if (!submitter) return;
             const auto s = submit_delta_op(*submitter, ctx_.tree, delta);
-            if (s.pending && doomed) {
-                after_commit(s, [this, id = delta.target_node_id, doomed] {
-                    cascade_node_cleanup(id, doomed);
-                });
-            }
             if (answer_unfinished(res, s)) return;
             ok = s.verdict.ok();
         } else {
+            // Pre-delete snapshot so the post-delete cascade (credential
+            // revocation, IPAM release, mesh peer removal) has the node's
+            // identity and keys.
+            const std::optional<tree::TreeNode> doomed =
+                (delta.operation == "delete_node" && !delta.target_node_id.empty())
+                    ? ctx_.tree.get_node(delta.target_node_id)
+                    : std::nullopt;
             ok = ctx_.tree.apply_delta(delta);
-        }
-        if (ok && doomed) {
-            cascade_node_cleanup(delta.target_node_id, doomed);
+            if (ok && doomed) cascade_node_cleanup(delta.target_node_id, doomed);
         }
         network::DeltaResponse resp{.success = ok};
         if (!ok) resp.error = "delta rejected";
@@ -920,6 +1000,12 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             hostname = type_str + "-" + node.id.substr(0, 12);
         }
         node.hostname = hostname;
+
+        if (const auto refusal =
+                session_content_refusal(ctx_.tree, "create_node", node, caller_pubkey)) {
+            error_response(res, *refusal, 403);
+            return;
+        }
 
         if (ctx_.config.tree_ops_enabled) {
             auto* submitter = tree_op_submitter(ctx_, res);
@@ -1005,6 +1091,13 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         auto updated = *existing;
         if (const auto refusal = apply_body(updated)) {
             error_response(res, *refusal, 409);
+            return;
+        }
+        // Same content rules as a tree operation: an edit_node holder that is
+        // not a root admin cannot move the node's addresses.
+        if (const auto refusal = session_content_refusal(ctx_.tree, "update_node", updated,
+                                                         normalize_pubkey(claims.pubkey))) {
+            error_response(res, *refusal, 403);
             return;
         }
 
@@ -1160,10 +1253,9 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             return;
         }
 
-        // Snapshot identity/allocations before removal so we can cascade cleanup.
-        auto doomed = ctx_.tree.get_node(node_id);
-
         if (ctx_.config.tree_ops_enabled) {
+            // The committed-removal hook runs the post-delete cascade on every
+            // server that applies the delete (cleanup_removed_nodes).
             auto* submitter = tree_op_submitter(ctx_, res);
             if (!submitter) return;
             tree::TreeOp op;
@@ -1172,25 +1264,25 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
             op.principal = normalize_pubkey(claims.pubkey);
             op.body.source = tree::TreeOpSource::Session;
             const auto s = submit_rebased(*submitter, [&] {
-                // The cascade below uses the record the op actually deleted.
-                doomed = ctx_.tree.get_node(node_id);
-                op.base_version = doomed ? doomed->version : 0;
+                const auto current = ctx_.tree.get_node(node_id);
+                op.base_version = current ? current->version : 0;
                 return op;
             });
-            if (s.pending) {
-                after_commit(s, [this, node_id, doomed] { cascade_node_cleanup(node_id, doomed); });
-            }
             if (answer_unfinished(res, s)) return;
             if (!s.verdict.ok()) {
                 error_response(res, "node not found or delete failed", 404);
                 return;
             }
-        } else if (!ctx_.tree.delete_node_direct(node_id)) {
-            error_response(res, "node not found or delete failed", 404);
-            return;
+        } else {
+            // Snapshot identity/allocations before removal so we can cascade
+            // cleanup.
+            const auto doomed = ctx_.tree.get_node(node_id);
+            if (!ctx_.tree.delete_node_direct(node_id)) {
+                error_response(res, "node not found or delete failed", 404);
+                return;
+            }
+            cascade_node_cleanup(node_id, doomed);
         }
-
-        cascade_node_cleanup(node_id, doomed);
 
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);
@@ -1266,6 +1358,14 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         }
 
         ipam::Allocation alloc;
+        if (ipam_req.block_type == "tunnel" && ctx_.config.tree_ops_enabled) {
+            // With tree operations on, the committed Join op assigns tunnel
+            // addresses from the tree on every replica. A local IPAM address
+            // would be known to this server only and could collide with one.
+            error_response(res,
+                           "tunnel addresses are assigned by the tree; join to receive one", 409);
+            return;
+        }
         if (ipam_req.block_type == "tunnel") {
             alloc = ctx_.ipam.allocate_tunnel_ip(ipam_req.node_id);
         } else if (ipam_req.block_type == "private") {

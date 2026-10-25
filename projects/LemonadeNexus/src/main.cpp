@@ -721,13 +721,21 @@ int main(int argc, char* argv[]) {
     // Forwarding between two client endpoints follows the permission tree: a
     // client's server peer covers the whole plane, so without this policy any
     // joined endpoint could reach any other through the server. Install it
-    // before the dataplane takes peers.
+    // before the dataplane takes peers. Without a known plane the policy cannot
+    // be built, so forwarding fails closed: the deny policy forwards nothing.
     std::optional<nexus::boringtun::ForwardAuthorizer> forward_authorizer;
     if (!tunnel_bind_ip.empty()) {
         if (auto plane = nexus::boringtun::Cidr::parse(tunnel_bind_ip + "/10")) {
             forward_authorizer.emplace(tree, boringtun_service.dataplane(), *plane);
             forward_authorizer->start();
         }
+    }
+    if (!forward_authorizer) {
+        boringtun_service.dataplane().set_forward_policy(
+            nexus::boringtun::deny_forward_policy());
+        spdlog::error("boringtun: tunnel IP '{}' is {}; the dataplane forwards no packets "
+                      "between peers",
+                      tunnel_bind_ip, tunnel_bind_ip.empty() ? "not set" : "not an IPv4 address");
     }
 
     // Set up the boringtun interface with the server's tunnel IP

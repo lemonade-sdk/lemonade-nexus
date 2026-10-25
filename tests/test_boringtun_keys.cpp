@@ -14,6 +14,8 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
 
 using lnsdk::BoringtunMesh;
 
@@ -86,4 +88,73 @@ TEST(BoringtunKeys, DerivesViaKeyedBlake2bContext) {
     expect[31] |= 64;
     auto priv = decode32(BoringtunMesh::derive_keypair(seed).first);
     EXPECT_EQ(std::memcmp(expect, priv.data(), 32), 0);
+}
+
+// A peer's tunnel address and private subnet become routes on the viewing
+// device. A peer must not take the server's plane route, the viewer's own
+// address, or another peer's address by widening what it advertises.
+namespace {
+
+lnsdk::MeshPeer mesh_peer(const std::string& id, const std::string& tunnel_ip,
+                          const std::string& private_subnet = {}) {
+    lnsdk::MeshPeer p;
+    p.node_id = id;
+    p.mesh_pubkey = "key-" + id;
+    p.tunnel_ip = tunnel_ip;
+    p.private_subnet = private_subnet;
+    return p;
+}
+
+const std::vector<std::string> kPlane = {"10.64.0.0/10"};
+const std::string kOwn = "10.64.0.2/32";
+
+}  // namespace
+
+TEST(BoringtunPeerRoutes, ValidPeersGetTheirTunnelAddressAndSubnet) {
+    const auto routes = BoringtunMesh::peer_allowed_ips(
+        {mesh_peer("a", "10.64.0.3/32", "10.128.0.4/30"), mesh_peer("b", "10.65.1.2")}, kPlane,
+        kOwn);
+    ASSERT_EQ(routes.size(), 2u);
+    EXPECT_EQ(routes[0], "10.64.0.3/32,10.128.0.4/30");
+    EXPECT_EQ(routes[1], "10.65.1.2/32");
+}
+
+TEST(BoringtunPeerRoutes, ASubnetOutsideThePrivatePoolIsNotRouted) {
+    const auto routes = BoringtunMesh::peer_allowed_ips(
+        {mesh_peer("plane", "10.64.0.3/32", "10.64.0.0/10"),
+         mesh_peer("server", "10.64.0.4/32", "10.64.0.1/32"),
+         mesh_peer("internet", "10.64.0.5/32", "0.0.0.0/0"),
+         mesh_peer("lan", "10.64.0.6/32", "192.168.1.0/24"),
+         mesh_peer("huge", "10.64.0.7/32", "10.128.0.0/9"),
+         mesh_peer("hostbits", "10.64.0.8/32", "10.128.0.5/30")},
+        kPlane, kOwn);
+    ASSERT_EQ(routes.size(), 6u);
+    EXPECT_EQ(routes[0], "10.64.0.3/32");
+    EXPECT_EQ(routes[1], "10.64.0.4/32");
+    EXPECT_EQ(routes[2], "10.64.0.5/32");
+    EXPECT_EQ(routes[3], "10.64.0.6/32");
+    EXPECT_EQ(routes[4], "10.64.0.7/32");
+    EXPECT_EQ(routes[5], "10.64.0.8/32");
+}
+
+TEST(BoringtunPeerRoutes, OverlappingSubnetsAreRefusedForEveryPeerInvolved) {
+    const auto routes = BoringtunMesh::peer_allowed_ips(
+        {mesh_peer("a", "10.64.0.3/32", "10.128.0.0/24"),
+         mesh_peer("b", "10.64.0.4/32", "10.128.0.8/30"),
+         mesh_peer("c", "10.64.0.5/32", "10.128.1.0/30")},
+        kPlane, kOwn);
+    EXPECT_EQ(routes[0], "10.64.0.3/32");
+    EXPECT_EQ(routes[1], "10.64.0.4/32");
+    EXPECT_EQ(routes[2], "10.64.0.5/32,10.128.1.0/30");
+}
+
+TEST(BoringtunPeerRoutes, ATunnelAddressThatIsNotThePeersOwnGetsNoRoute) {
+    const auto routes = BoringtunMesh::peer_allowed_ips(
+        {mesh_peer("own", kOwn), mesh_peer("outside", "172.16.0.2/32"),
+         mesh_peer("wide", "10.64.0.0/16"), mesh_peer("dup1", "10.64.0.9/32"),
+         mesh_peer("dup2", "10.64.0.9"), mesh_peer("ok", "10.64.0.10/32")},
+        kPlane, kOwn);
+    ASSERT_EQ(routes.size(), 6u);
+    for (std::size_t i = 0; i < 5; ++i) EXPECT_TRUE(routes[i].empty()) << i << ": " << routes[i];
+    EXPECT_EQ(routes[5], "10.64.0.10/32");
 }

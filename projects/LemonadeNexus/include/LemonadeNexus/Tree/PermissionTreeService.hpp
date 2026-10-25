@@ -122,6 +122,15 @@ public:
     [[nodiscard]] TreeOpVerdict apply_committed_ops(const std::vector<TreeOp>& ops,
                                                     uint64_t block_time_sec);
 
+    /// Set the function called after apply_op, apply_committed_ops, or
+    /// submit_local_op removed nodes. It receives each removed node as it was
+    /// before the op, runs on the thread that applied the op, and runs after
+    /// the tree lock is released, so it may read the tree. Every server that
+    /// applies a committed block calls it, so per-server cleanup of a deleted
+    /// node runs everywhere. replace_all never calls it: a restore or merge is
+    /// not a delete. An empty function clears it. Thread-safe.
+    void set_removed_nodes_hook(std::function<void(const std::vector<TreeNode>&)> hook);
+
     /// A copy of every node, keyed by id. Thread-safe.
     [[nodiscard]] rules::NodeMap nodes_snapshot() const;
 
@@ -222,8 +231,16 @@ private:
     /// Remove a tree node from storage.
     bool remove_node(std::string_view node_id);
 
-    /// apply_op with mutex_ held.
-    [[nodiscard]] TreeOpVerdict apply_op_locked(const TreeOp& op);
+    /// apply_op with mutex_ held. Appends each node the op removes, as it was
+    /// before the op, to `removed`.
+    [[nodiscard]] TreeOpVerdict apply_op_locked(const TreeOp& op, std::vector<TreeNode>& removed);
+
+    /// Call the removed-nodes hook with `removed`, unless it is empty. Caller
+    /// must not hold mutex_: the hook may read the tree.
+    void notify_removed(const std::vector<TreeNode>& removed) const;
+
+    mutable std::mutex removed_hook_mtx_;
+    std::function<void(const std::vector<TreeNode>&)> removed_hook_;
 
     /// Append an applied delta to the delta log and offer it to the retention
     /// sink. Neither failure rolls back the applied mutation. Returns the log

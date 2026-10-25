@@ -4,8 +4,10 @@
 // every packet one endpoint sends toward another. The server must forward it
 // only when the source endpoint's key may connect to the destination endpoint
 // (ConnectPrivate or ConnectShared on that device, inside the source's group),
-// let replies to an allowed flow return, and keep relays and infrastructure
-// addresses outside the plane on the open rule.
+// let replies to an allowed flow return, and keep infrastructure addresses
+// outside the plane and admin-placed relays on the open rule. A node's
+// tunnel_ip counts only when the server's dataplane peer for that address has
+// the node's mesh key.
 //
 // Each test runs real dataplanes with Noise sessions over loopback UDP. The
 // policy comes from a real PermissionTreeService through ForwardAuthorizer.
@@ -30,6 +32,7 @@
 #include <filesystem>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -201,27 +204,57 @@ protected:
         ASSERT_TRUE(tree_svc->insert_join_node(n));
     }
 
-    /// Add a tree node and, for an endpoint, a client dataplane with a session
-    /// to the server.
+    /// Add a client dataplane with a session to the server, and a tree node
+    /// that holds the client's mesh key, as a join records it.
     void add_node(const std::string& id, const std::string& group, tree::NodeType type,
                   const std::string& tunnel_ip,
                   std::vector<tree::Assignment> assignments = {}) {
         principal[id] = new_principal();
+        add_client(id, tunnel_ip);
+        if (HasFatalFailure()) return;
         tree::TreeNode n;
         n.id          = id;
         n.parent_id   = group;
         n.type        = type;
         n.mgmt_pubkey = principal[id];
+        n.mesh_pubkey = clients.at(id)->keys.pub_b64;
         n.tunnel_ip   = tunnel_ip + "/32";
         n.assignments = std::move(assignments);
         ASSERT_TRUE(tree_svc->insert_join_node(n));
-        add_client(id, tunnel_ip);
+    }
+
+    /// A tree node with no dataplane of its own: what a writer could store by
+    /// creating a child node.
+    void add_claim(const std::string& id, const std::string& parent, tree::NodeType type,
+                   const std::string& tunnel_ip, const std::string& mesh_pubkey,
+                   const std::string& owner) {
+        tree::TreeNode n;
+        n.id          = id;
+        n.parent_id   = parent;
+        n.type        = type;
+        n.mgmt_pubkey = principal.at(owner);
+        n.mesh_pubkey = mesh_pubkey;
+        n.tunnel_ip   = tunnel_ip + "/32";
+        n.assignments = {{principal.at(owner), {"read", "connect_private", "admin"}}};
+        ASSERT_TRUE(tree_svc->insert_join_node(n));
+    }
+
+    /// The policy for the current tree and the server's current peers.
+    std::shared_ptr<const ForwardPolicy> policy_now() {
+        return build_forward_policy(*tree_svc, plane, server.dataplane.primary_address_peers());
+    }
+
+    bool allowed(const std::string& from_ip, const std::string& to_ip) {
+        return policy_now()->allowed.contains(
+            ForwardPolicy::key(addr_of(from_ip), addr_of(to_ip)));
     }
 
     /// A client dataplane that routes the whole plane to the server, and the
     /// server's peer entry for it.
-    void add_client(const std::string& id, const std::string& tunnel_ip) {
+    void add_client(const std::string& id, const std::string& tunnel_ip,
+                    const std::optional<Keypair>& keys = std::nullopt) {
         auto node = std::make_unique<Node>();
+        if (keys) node->keys = *keys;
         ASSERT_TRUE(node->start(tunnel_ip));
         ASSERT_TRUE(node->dataplane.add_peer(server.keys.pub_b64, "10.64.0.0/10",
                                              server.endpoint()));
@@ -323,11 +356,13 @@ TEST_F(ForwardAuthzTest, LinkedDevicesReachEachOther) {
     EXPECT_TRUE(reaches("desktop", "laptop", kTcpSyn, "desktop-to-laptop"));
 }
 
-// A relay and an address outside the client plane (a backbone server) keep the
-// open rule. An address inside the plane that is not in the tree is dropped.
+// A relay placed by a root admin and an address outside the client plane (a
+// backbone server) keep the open rule. An address inside the plane that is
+// not in the tree is dropped.
 TEST_F(ForwardAuthzTest, RelayAndBackbonePathsAreUnchangedAndUnknownIsDropped) {
     add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
     add_node("relay", "group-1", tree::NodeType::Relay, "10.64.0.7");
+    grant("root", "relay", {"admin"});
     add_client("backbone", "172.16.0.2");
     add_client("stranger", "10.64.0.9");
     // Let A accept the backbone source from its server peer, so the test sees
@@ -416,6 +451,7 @@ TEST_F(ForwardAuthzTest, ReadOnlyClientCannotReachAServiceThroughTheServer) {
         n.parent_id   = "group-1";
         n.type        = tree::NodeType::Endpoint;
         n.mgmt_pubkey = principal[d->id];
+        n.mesh_pubkey = d->keys.second;
         n.tunnel_ip   = d->ip + "/32";
         ASSERT_TRUE(tree_svc->insert_join_node(n));
         lnsdk::BoringtunConfig cfg;
@@ -462,4 +498,115 @@ TEST_F(ForwardAuthzTest, ReadOnlyClientCannotReachAServiceThroughTheServer) {
     for (Device* d : {&svc, &reader, &dialer}) d->mesh.stop();
     api.stop();
     api_thread.join();
+}
+
+// The attack: a device holds add_child on its own endpoint, so it could store
+// a child node that names a victim's address and grants the device
+// connect_private. The policy must not map the victim's address to that
+// child, because the server's peer for the address has the victim's key.
+TEST_F(ForwardAuthzTest, AChildNodeNamingAVictimAddressGrantsNothing) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("v", "group-1", tree::NodeType::Endpoint, "10.64.0.3");
+    add_claim("a-child", "a", tree::NodeType::Endpoint, "10.64.0.3", make_keypair().pub_b64, "a");
+    EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.3"));
+    authorizer->start();
+    EXPECT_TRUE(blocked("a", "v", kTcpSyn, "a-via-child-to-v"));
+}
+
+// The same attack with a Relay child: a relay address is open in both
+// directions, so the victim's address must not become a relay address.
+TEST_F(ForwardAuthzTest, ARelayChildNamingAVictimAddressIsNotOpen) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("v", "group-1", tree::NodeType::Endpoint, "10.64.0.3");
+    add_claim("a-relay", "a", tree::NodeType::Relay, "10.64.0.3", make_keypair().pub_b64, "a");
+    EXPECT_FALSE(policy_now()->open.contains(addr_of("10.64.0.3")));
+    authorizer->start();
+    EXPECT_TRUE(blocked("a", "v", kTcpSyn, "a-via-relay-to-v"));
+}
+
+// The tree refuses a second node with the same mesh key text, but an
+// "ed25519:" spelling of the victim's identity-bound key is different text
+// that normalizes to the same peer key. A node that copies the victim's
+// address with that spelling makes the owner ambiguous: the address gets no
+// rule at all, so the copy gains nothing.
+TEST_F(ForwardAuthzTest, TwoNodesClaimingOnePeerLeaveTheAddressWithoutRules) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("b", "group-1", tree::NodeType::Endpoint, "10.64.0.4");
+
+    // The victim's mesh key is the X25519 form of its Ed25519 identity.
+    const auto identity = crypto_svc->ed25519_keygen();
+    const auto x_pk = crypto::SodiumCryptoService::ed25519_pk_to_x25519(identity.public_key);
+    const auto x_sk = crypto::SodiumCryptoService::ed25519_sk_to_x25519(identity.private_key);
+    const Keypair victim_keys{crypto::to_base64(x_pk), crypto::to_base64(x_sk)};
+    principal["v"] = new_principal();
+    add_client("v", "10.64.0.3", victim_keys);
+    if (HasFatalFailure()) return;
+    tree::TreeNode v;
+    v.id = "v";
+    v.parent_id = "group-1";
+    v.type = tree::NodeType::Endpoint;
+    v.mgmt_pubkey = principal["v"];
+    v.mesh_pubkey = victim_keys.pub_b64;
+    v.tunnel_ip = "10.64.0.3/32";
+    v.assignments = {{principal["b"], {"connect_private"}}};
+    ASSERT_TRUE(tree_svc->insert_join_node(v));
+    EXPECT_TRUE(allowed("10.64.0.4", "10.64.0.3"));
+
+    add_claim("a-copy", "a", tree::NodeType::Endpoint, "10.64.0.3",
+              "ed25519:" + crypto::to_base64(identity.public_key), "a");
+    EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.3"));
+    EXPECT_FALSE(allowed("10.64.0.4", "10.64.0.3"));
+    EXPECT_FALSE(policy_now()->open.contains(addr_of("10.64.0.3")));
+}
+
+// A relay is open only when a root admin placed it: its management key must
+// administer the tree root. Admin on the relay itself (a creator can give
+// itself that) or on its group does not count.
+TEST_F(ForwardAuthzTest, ARelayWithoutARootAdminIsNotOpen) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("relay", "group-1", tree::NodeType::Relay, "10.64.0.7");
+    grant("relay", "relay", {"admin"});
+    grant("group-1", "relay", {"admin"});
+    EXPECT_FALSE(policy_now()->open.contains(addr_of("10.64.0.7")));
+    authorizer->start();
+    EXPECT_TRUE(blocked("a", "relay", kTcpSyn, "a-to-unanchored-relay"));
+    grant("root", "relay", {"admin"});
+    EXPECT_TRUE(policy_now()->open.contains(addr_of("10.64.0.7")));
+}
+
+// A node whose stored mesh key is not the key of the server's peer for its
+// address gets no rule, even with a valid grant.
+TEST_F(ForwardAuthzTest, ANodeWhoseKeyIsNotThePeerKeyGetsNoRule) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("b", "group-1", tree::NodeType::Endpoint, "10.64.0.3");
+    grant("b", "a", {"connect_private"});
+    EXPECT_TRUE(allowed("10.64.0.2", "10.64.0.3"));
+    auto node = tree_svc->get_node("b");
+    ASSERT_TRUE(node.has_value());
+    node->mesh_pubkey = make_keypair().pub_b64;
+    ASSERT_TRUE(tree_svc->update_node_direct("b", *node));
+    EXPECT_FALSE(allowed("10.64.0.2", "10.64.0.3"));
+}
+
+// The policy depends on the dataplane's peers too, so a peer change rebuilds
+// it even when the tree did not change.
+TEST_F(ForwardAuthzTest, APeerChangeRebuildsThePolicy) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    authorizer->start();
+    authorizer->stop();
+    EXPECT_FALSE(authorizer->refresh());
+    ASSERT_TRUE(server.dataplane.add_peer(make_keypair().pub_b64, "10.64.0.9/32", ""));
+    EXPECT_TRUE(authorizer->refresh());
+    EXPECT_FALSE(authorizer->refresh());
+}
+
+// Without a known tunnel plane the server installs the deny policy: nothing is
+// forwarded between peers, not even an address outside any plane.
+TEST_F(ForwardAuthzTest, TheDenyPolicyForwardsNothing) {
+    add_node("a", "group-1", tree::NodeType::Endpoint, "10.64.0.2");
+    add_node("b", "group-1", tree::NodeType::Endpoint, "10.64.0.3");
+    grant("b", "a", {"connect_private"});
+    server.dataplane.set_forward_policy(deny_forward_policy());
+    EXPECT_TRUE(blocked("a", "b", kTcpSyn, "a-to-b-denied"));
+    EXPECT_TRUE(blocked("b", "a", kTcpAck, "b-to-a-denied"));
 }

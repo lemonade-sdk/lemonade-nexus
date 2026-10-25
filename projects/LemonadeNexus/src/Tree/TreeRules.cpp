@@ -62,6 +62,21 @@ std::optional<std::string> admin_anchor(const NodeMap& nodes, std::string_view n
     return std::nullopt;
 }
 
+bool administers_root(const NodeMap& nodes, std::string_view node_id,
+                      std::string_view signer_pubkey) {
+    std::unordered_set<std::string> visited;
+    std::string current(node_id);
+    while (visited.insert(current).second) {
+        auto it = nodes.find(current);
+        if (it == nodes.end()) return false;
+        if (it->second.parent_id.empty()) {
+            return signer_has_permission(it->second, signer_pubkey, acl::Permission::Admin);
+        }
+        current = it->second.parent_id;
+    }
+    return false;
+}
+
 bool principal_joined_under(const NodeMap& nodes, std::string_view scope_id,
                             std::string_view principal) {
     const auto principal_canon = canonical_principal(principal);
@@ -127,6 +142,15 @@ std::optional<std::string> delta_content_refusal(const NodeMap& nodes,
         if (data.type == NodeType::Root || data.parent_id.empty()) {
             return std::string{"a root node cannot be created"};
         }
+        // Plane addresses and the relay role decide what the forwarding policy
+        // lets through across the whole network, not only inside one group,
+        // so the server assigns them. Only a root admin may set them; a group
+        // admin, or a creator with admin on its own new node, may not.
+        if ((!data.tunnel_ip.empty() || !data.private_subnet.empty() ||
+             data.type == NodeType::Relay) &&
+            !administers_root(nodes, data.parent_id, delta.signer_pubkey)) {
+            return std::string{"only a root admin may create a relay or set node addresses"};
+        }
         // A creator owns what it creates, and the new node's own management
         // key joins with it. Naming anyone else is a grant, and grants belong
         // to an administrator of the parent.
@@ -170,6 +194,12 @@ std::optional<std::string> delta_content_refusal(const NodeMap& nodes,
     }
     if (data.endpoint_identifier != current.endpoint_identifier) {
         return std::string{"endpoint identifier cannot change"};
+    }
+    // Addresses are network-wide resources, so only a root admin moves them
+    // (see the create rule above).
+    if ((data.tunnel_ip != current.tunnel_ip || data.private_subnet != current.private_subnet) &&
+        !administers_root(nodes, current.id, delta.signer_pubkey)) {
+        return std::string{"only a root admin may change node addresses"};
     }
 
     const auto before = assignment_map(current.assignments);
