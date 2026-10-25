@@ -10,6 +10,7 @@ import '../state/providers.dart';
 import '../../theme/app_theme.dart';
 import '../../theme/components.dart';
 import 'dashboard_view.dart';
+import 'mesh_port_view.dart';
 import 'peers_view.dart';
 import 'network_monitor_view.dart';
 import 'tree_browser_view.dart';
@@ -56,6 +57,8 @@ class MainNavigation extends ConsumerWidget {
         return const DashboardView();
       case SidebarItem.peers:
         return const PeersView();
+      case SidebarItem.meshPort:
+        return const MeshPortView();
       case SidebarItem.network:
         return const NetworkMonitorView();
       case SidebarItem.endpoints:

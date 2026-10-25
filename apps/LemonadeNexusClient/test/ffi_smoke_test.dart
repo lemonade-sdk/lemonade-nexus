@@ -2,6 +2,7 @@
 // library. Loads by absolute path from the repo build output; skipped if the
 // library has not been built in this environment.
 
+import 'dart:convert';
 import 'dart:ffi' as ffi;
 import 'dart:io';
 
@@ -28,6 +29,23 @@ void main() {
     final sdk = LemonadeNexusFfi(libraryPath: lib.absolute.path);
     final client = sdk.create('127.0.0.1', 9100);
     expect(client, isNot(ffi.nullptr));
+    sdk.destroy(client);
+  });
+
+  test('mesh port calls resolve and report a stopped port', () {
+    final lib = _libFile();
+    if (!lib.existsSync()) {
+      markTestSkipped('SDK library not built at ${lib.path}');
+      return;
+    }
+    final sdk = LemonadeNexusFfi(libraryPath: lib.absolute.path);
+    expect(sdk.missingSymbols(), isEmpty);
+    final client = sdk.create('127.0.0.1', 9100);
+    final status = jsonDecode(sdk.meshPortStatus(client)!) as Map<String, dynamic>;
+    expect(status['running'], isFalse);
+    expect(sdk.meshPortSetSelection(client, 'auto', null), LnError.rejected);
+    expect(sdk.meshPortStart(client, 0, 'http://192.0.2.1:80'), LnError.rejected);
+    expect(sdk.meshPortStop(client), LnError.success);
     sdk.destroy(client);
   });
 }
