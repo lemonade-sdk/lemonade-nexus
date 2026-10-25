@@ -4,41 +4,9 @@ title: "Design: In-Place Auto-Update"
 
 # Design: In-Place Auto-Update
 
-Status: **draft plan; Phases 0.1, 2, 3, and 5 implemented, not
-hardware-qualified.** Two open reviews (tree side and storage side) feed
-Phase 0. See [Implementation status](#implementation-status).
-
-## Implementation status
-
-| Part | State | Where |
-|---|---|---|
-| Phase 1: release workflow | Implemented, not run yet | `.github/workflows/release.yml`, `scripts/nexus-release-tool`, `scripts/nexus-release-sign`, [Releasing](Releasing) |
-| Phase 0 gate 3: fleet profile | Implemented; seeded from r21 | `release/fleet-profile.json` |
-| Phase 4: updater | Implemented and unit tested; the turn gate is a stub that refuses | `projects/LemonadeNexusUpdater/`, `packaging/systemd/nexus-updater.*` |
-| OS updates and reboot | Implemented and unit tested; the package lock lists no packages yet | `release/os-packages.lock`, `Core/BootChainStaging` |
-| Phases 0 (gates 1, 2), 2, 3, 5, 6 | Not implemented | — |
-
-Decisions made during implementation:
-
-- **Release number in the signed approval.** The approval's `release_id` is
-  the tag, so the release number is derived from signed data without a new
-  approval field. Phase 2 may add an explicit field.
-- **Signed manifest.** The approval cannot carry the file-to-path mapping or
-  the OS package lock. The release key also signs `manifest.json`, with the
-  domain prefix `lemonade-nexus/release-manifest/v1\n`.
-- **Updater language.** A C++ project, so it uses the server's own approval
-  verification (`verify_release_approval_bundle`) and canonical encoding
-  instead of a second implementation.
-- **Provenance.** Offline verification of the Sigstore bundle published next
-  to each asset, against a trusted root pinned in the package. No Sigstore
-  service is contacted. Only Rekor v1 entries with an inclusion promise are
-  accepted.
-- **Turn interface.** A local unix socket owned by the server
-  (`Update/UpdateControl.hpp`): `status`, `may_restart`, `report`, and
-  `stage_boot_chain`. Phase 5 replaces `RefusingTurnGate`.
-- **PCR measurement.** A GitHub-hosted runner cannot boot the fleet guest. The
-  PCRs come from the reviewed profile; an optional job on a reference-VM
-  runner compares them (`scripts/nexus-measure-boot-chain`).
+Status: **draft plan; Phases 0.1, 0.3, 1 to 5 implemented, not
+hardware-qualified, release workflow not run.** See
+[Implementation status](#implementation-status).
 
 ## Goal
 
@@ -242,6 +210,9 @@ new release):
    attest each other during the bootstrap. The release key in the GitHub
    `release` environment must therefore be the existing r21 release key; a new
    key would need a new Genesis delegation, which this design does not allow.
+   The release workflow reads the r21 approval from
+   `release/r21-release-approval.json` and refuses to build the bootstrap
+   release without it ([Releasing](Releasing)).
 4. r21 servers cannot adopt a newer approval at runtime and do not know the
    upgrade-turn traffic. The new release proposes no upgrade record until
    every Tier 1 member sends an upgrade status, so mixed r21 and new servers
@@ -249,14 +220,54 @@ new release):
 
 ## Implementation status
 
-| Phase | State | Where |
+| Part | State | Where |
 |---|---|---|
 | 0.1 Approval supersession | Implemented | `ReleaseChain`, `SecurityDriver::start` (`release_commitment`), `ReleaseApproval` format 3 |
 | 0.2 Holder margin | Open; see the restart defect below | |
-| 0.3 Fleet profile | Not started | |
+| 0.3 Fleet profile | Implemented; seeded from r21 | `release/fleet-profile.json`, `ReleaseApproval.cpp` (boot line verified against the approval only) |
+| 1 Release workflow | Implemented, not run | `.github/workflows/release.yml`, `scripts/nexus-release-tool`, `scripts/nexus-release-sign`, [Releasing](Releasing) |
+| Release guards | Implemented, not run | Previous approval required; rollout proof (`Security/Upgrade/RolloutProof.hpp`, `nexus-rollout-check`, `GET /api/upgrade/rollout-proof`); mixed-version job |
 | 2 Approval chain and adoption | Implemented | `ReleaseChain`, `UpgradeService` (ApprovalOffer, status-driven exchange), `AttestationService::replace_profile` |
 | 3 Mixed-version gate | Memory-mesh test in CI; multi-process job (wire checks only without SEV-SNP) | `tests/security/lifecycle/upgrade_path.cpp`, `scripts/mixed-version-mesh.sh`, `.github/workflows/mixed-version.yml`, [Wire Compatibility](Wire-Compatibility) |
+| 4 Updater | Implemented and unit tested | `projects/LemonadeNexusUpdater/`, `packaging/systemd/nexus-updater.*` |
 | 5 Upgrade turns | Implemented | `BlockPayloadKind::UpgradeProgress`, `Security/Upgrade/`, [Upgrade Control](Upgrade-Control) |
+| OS updates and reboot | Implemented and unit tested; the package lock lists no packages yet | `release/os-packages.lock`, `Core/BootChainStaging` |
+
+Decisions made during implementation:
+
+- **Signed manifest.** The approval cannot carry the file-to-path mapping or
+  the OS package lock. The release key also signs `manifest.json`, with the
+  domain prefix `lemonade-nexus/release-manifest/v1\n`.
+- **Updater language.** A C++ project, so it uses the server's own approval
+  verification (`verify_release_approval_bundle`) and canonical encoding
+  instead of a second implementation.
+- **Provenance.** Offline verification of the Sigstore bundle published next
+  to each asset, against a trusted root pinned in the package. No Sigstore
+  service is contacted. Only Rekor v1 entries with an inclusion promise are
+  accepted.
+- **One control interface.** The server's root-only `upgrade.sock`
+  (`Core/UpgradeControl.hpp`) carries `status`, `health`, `offer_approval`,
+  `stage`, `turn`, `report`, and `stage_boot_chain`. The updater offers the
+  approval before it asks for a turn; `stage_boot_chain` acts only on the
+  approval the release chain accepted.
+- **Boot line in the approval (Phase 0.3).** The kernel, IMA policy, SVSM
+  launch measurements, and source identity come from
+  `release/fleet-profile.json` into the signed approval. Servers verify them
+  against the approval only; the approval is already signer-pinned and
+  number-monotonic. The compiled floors that stay are the TCB minimum
+  (AMD-SB-3030, AMD-SB-3034) and the protocol identity (wire and ruleset
+  versions, attestation profile, attestd wire version): the ruleset pin is a
+  Phase 0.1 rule, and the others name what the binary itself implements.
+- **Rollout guard.** The release workflow verifies a rollout proof from Tier 1
+  finalized state (the authority chain from Genesis, then every upgrade record
+  under its commit proof) and refuses to publish unless the previous release's
+  rollout is complete and not halted. A status file published by each updater
+  was rejected: it is a self-report and needs a publishing credential on every
+  server. The bootstrap release, which has no rollout records, is recorded as
+  complete by a reviewed commit (`release/bootstrap-complete`).
+- **PCR measurement.** A GitHub-hosted runner cannot boot the fleet guest. The
+  PCRs come from the reviewed profile; an optional job on a reference-VM
+  runner compares them (`scripts/nexus-measure-boot-chain`).
 
 Details that the phases above leave open:
 
@@ -267,7 +278,7 @@ Details that the phases above leave open:
 - **Persistence.** The highest accepted number is in
   `<data_root>/security/release/release-chain.json`, re-verified at every
   start. It is not rollback-protected against a party that can write that
-  directory.
+  directory; see Known limits.
 - **Adoption traffic.** One security message kind, `Upgrade` (38), carries
   approval offers (at most 32 KiB, one per peer per 10 s), signed statuses,
   witness observations, record proofs, and record requests. Kind 37 is left
@@ -297,13 +308,23 @@ Known limits found during the implementation:
   to a half of runs. It reproduces on the base commit with plain restarts and
   no upgrade code. In-place updates of Tier 1 servers depend on restart
   catch-up, so this blocks production use of Phase 5 until it is fixed.
-- **Compiled release line.** `ReleaseApproval.cpp` pins the kernel, IMA
-  policy, and SVSM launch measurements. A release that changes them is
-  refused by servers on the previous release until Phase 0.3 moves these
-  pins into the approval.
-- **A release before the previous rollout completes** drops the servers that
-  are still on N-1 out of attestation, because the overlap covers one
-  release. The release workflow should not publish while a rollout is open.
+- **Release record rollback.** A party that can write the security directory
+  can replace or delete the release record. The accepted number cannot fall
+  below the running release (the packaged, measured approval is folded in at
+  every start), and a peer with a higher accepted release pushes its approval
+  within one offer window, so the exposure is the window between the running
+  release and a newer adopted one. Storing the number in the storage vault
+  does not help: the vault does not detect a whole-file rollback and is locked
+  when the driver starts. Sealing does not help either: a sealed blob is bound
+  to PCR 8/9, not to a counter. A real fix needs a TPM monotonic counter
+  (nexus-attestd has no NV operation) or a start-time check against finalized
+  state.
+- **A halted rollout blocks the release workflow.** A fix for it would need
+  the hashes of two earlier releases, and an approval lists one.
+- **Bootstrap baseline.** The first gated release is the bootstrap release;
+  its baseline is the r21 line, not a GitHub release. The `vX.Y.Z-alpha`
+  releases use security wire version 1 and are not a baseline
+  ([Wire Compatibility](Wire-Compatibility), Baseline).
 - **A participant that never becomes Ready blocks the rollout** until a newer
   release replaces it. A participant that leaves the mesh does the same.
 

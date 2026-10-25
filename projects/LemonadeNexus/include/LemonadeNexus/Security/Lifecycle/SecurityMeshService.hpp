@@ -177,6 +177,13 @@ public:
     /// The release chain, or nullptr without a packaged approval. io thread.
     [[nodiscard]] const ReleaseChain* release_chain() const { return release_chain_.get(); }
 
+    /// This node's rollout proof (Upgrade/RolloutProof.hpp) as JSON: the
+    /// authority chain from Genesis and the finalized upgrade records with
+    /// their commit proofs. nullopt when this node lacks the Genesis base or
+    /// a commit proof of any record. Public data; it grants nothing. io
+    /// thread.
+    [[nodiscard]] std::optional<std::string> rollout_proof_json() const;
+
 private:
     // The router needs its events sink at construction and the driver needs
     // the router. The proxy breaks the cycle.

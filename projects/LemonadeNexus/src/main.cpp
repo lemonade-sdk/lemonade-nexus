@@ -70,6 +70,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -1138,6 +1139,36 @@ int main(int argc, char* argv[]) {
                      ? "encrypted"
                      : "plaintext, pre-key or migrating");
 
+    // The rollout proof for the release workflow's guard. It is built on the
+    // security io thread; the HTTP thread waits a bounded time and reuses a
+    // proof for a few seconds so an unauthenticated caller cannot keep that
+    // thread busy.
+    struct RolloutProofCache {
+        std::mutex mutex;
+        std::chrono::steady_clock::time_point built{};
+        std::optional<std::string> proof;
+    };
+    auto rollout_proof_cache = std::make_shared<RolloutProofCache>();
+    std::function<std::optional<std::string>()> rollout_proof =
+        [cache = rollout_proof_cache,
+         mesh = security_mesh->service.get()]() -> std::optional<std::string> {
+        std::lock_guard lock(cache->mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (cache->built != std::chrono::steady_clock::time_point{} &&
+            now - cache->built < std::chrono::seconds(10)) {
+            return cache->proof;
+        }
+        auto promise = std::make_shared<std::promise<std::optional<std::string>>>();
+        auto future = promise->get_future();
+        mesh->post([promise, mesh] { promise->set_value(mesh->rollout_proof_json()); });
+        if (future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+            return std::nullopt;
+        }
+        cache->proof = future.get();
+        cache->built = now;
+        return cache->proof;
+    };
+
     // ========================================================================
     // Register CRTP request handlers
     // ========================================================================
@@ -1169,6 +1200,7 @@ int main(int argc, char* argv[]) {
         .tree_op_status   = tree_op_status,
         .tree_log_status  = tree_log_status,
         .storage_vault    = storage_vault.get(),
+        .rollout_proof    = rollout_proof,
     };
 
     nexus::api::PublicApiHandler public_api{ctx};

@@ -3,6 +3,7 @@
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Security/Attestation/AmdRevocationCache.hpp>
 #include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
+#include <LemonadeNexus/Security/Upgrade/RolloutProof.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -349,6 +350,12 @@ void SecurityMeshService::on_stop() {
     // The transport must stop feeding a stack that is going away.
     transport_.set_security_sink({});
     transport_.set_peer_certified_callback({});
+}
+
+std::optional<std::string> SecurityMeshService::rollout_proof_json() const {
+    const auto proof = upgrade_->rollout_proof(config_.genesis_public_key);
+    if (!proof) return std::nullopt;
+    return ::nexus::security::rollout_proof_json(*proof);
 }
 
 }  // namespace nexus::security

@@ -26,6 +26,7 @@
 #include <LemonadeNexus/Security/Consensus/BlockPayload.hpp>
 
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexus/Security/Upgrade/RolloutProof.hpp>
 #include <LemonadeNexus/Security/Upgrade/UpgradeProgress.hpp>
 
 #include <cstdint>
@@ -141,6 +142,13 @@ public:
     /// The newest approval the release chain accepted (Genesis delegation,
     /// pinned signer, monotonic number), or nullopt without one.
     [[nodiscard]] const std::optional<ReleaseApprovalBundleV1>& accepted_approval() const;
+    /// This node's rollout proof (RolloutProof.hpp): the stored authority
+    /// chain from Genesis and the records since the latest Start with their
+    /// commit proofs. nullopt when this node lacks the Genesis base or the
+    /// commit proof of any record. `genesis_public_key` is the configured
+    /// anchor; the verifier checks it against the network id.
+    [[nodiscard]] std::optional<RolloutProof> rollout_proof(
+        const crypto::Ed25519PublicKey& genesis_public_key) const;
     /// Fires after a newer approval was adopted, with that approval. The owner
     /// replaces the attestation profile from it.
     void set_release_adopted_callback(std::function<void(const ReleaseApprovalBundleV1&)> cb) {
@@ -195,6 +203,10 @@ private:
     void broadcast_record(uint64_t sequence);
     void persist();
     [[nodiscard]] bool load();
+    [[nodiscard]] std::vector<uint8_t> encode_record_proof(const UpgradeRecord& record,
+                                                           const CommitProof& proof) const;
+    [[nodiscard]] std::optional<CommitProof> stored_proof(const std::string& hex,
+                                                          const UpgradeRecord& record) const;
 
     UpgradeServiceConfig config_;
     SecurityDriver& driver_;

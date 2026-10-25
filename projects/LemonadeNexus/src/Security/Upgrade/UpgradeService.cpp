@@ -856,18 +856,71 @@ UpgradeHealthReport UpgradeService::health() const {
 
 // --- Persistence --------------------------------------------------------------------
 
+std::vector<uint8_t> UpgradeService::encode_record_proof(const UpgradeRecord& record,
+                                                         const CommitProof& proof) const {
+    return encode_security_message(router_.compose(
+        SecurityMessageKind::Upgrade,
+        UpgradeMsg{UpgradeTopic::RecordProof, encode_upgrade_record(record), proof},
+        proof.chain.empty() ? EpochId{} : proof.chain.front().proposal.epoch));
+}
+
+std::optional<RolloutProof> UpgradeService::rollout_proof(
+    const crypto::Ed25519PublicKey& genesis_public_key) const {
+    const auto chain = driver_.authority_chain();
+    if (!chain || !chain->has_base) return std::nullopt;
+    RolloutProof out;
+    out.genesis_public_key = genesis_public_key;
+    for (const auto& [record, proof] : records_) {
+        if (!proof.has_value() || proof->chain.empty()) return std::nullopt;
+        out.records.push_back(encode_record_proof(record, *proof));
+    }
+    AuthorityChainPage base;
+    base.has_base = true;
+    base.base_certificate = chain->base_certificate;
+    base.base_vote_keys = chain->base_vote_keys;
+    out.base = encode_security_message(
+        router_.compose(SecurityMessageKind::AuthorityChainPage, std::move(base), EpochId{}));
+    for (const auto& link : chain->links) {
+        out.links.push_back(encode_security_message(
+            router_.compose(SecurityMessageKind::EpochHandoffProof, link, link.handoff.to_epoch)));
+    }
+    return out;
+}
+
 void UpgradeService::persist() {
     std::error_code ec;
     std::filesystem::create_directories(config_.directory, ec);
     nlohmann::json records = nlohmann::json::array();
+    // The commit proofs are kept so that this server can still prove the
+    // rollout after a restart (RolloutProof.hpp). Empty: no proof held.
+    nlohmann::json proofs = nlohmann::json::array();
     for (const auto& [record, proof] : records_) {
         records.push_back(crypto::to_hex(encode_upgrade_record(record)));
+        proofs.push_back(proof.has_value() && !proof->chain.empty()
+                             ? crypto::to_hex(encode_record_proof(record, *proof))
+                             : std::string());
     }
     const nlohmann::json root = {{"format_version", kRecordsFormatVersion},
-                                 {"records", std::move(records)}};
+                                 {"records", std::move(records)},
+                                 {"proofs", std::move(proofs)}};
     if (ec || !write_durable(config_.directory / kRecordsFile, root.dump())) {
         spdlog::warn("[upgrade] cannot persist upgrade records");
     }
+}
+
+std::optional<CommitProof> UpgradeService::stored_proof(const std::string& hex,
+                                                       const UpgradeRecord& record) const {
+    if (hex.empty()) return std::nullopt;
+    auto decoded = decode_security_message(crypto::from_hex(hex));
+    const auto* message = std::get_if<SecurityMessage>(&decoded);
+    const auto* body = message != nullptr ? std::get_if<UpgradeMsg>(&message->body) : nullptr;
+    // A proof is kept only for the record it was stored with; a remote
+    // verifier checks it again, so a damaged proof costs only provability.
+    if (body == nullptr || body->topic != UpgradeTopic::RecordProof || !body->proof ||
+        body->body != encode_upgrade_record(record)) {
+        return std::nullopt;
+    }
+    return body->proof;
 }
 
 bool UpgradeService::load() {
@@ -881,6 +934,8 @@ bool UpgradeService::load() {
     try {
         const auto root = nlohmann::json::parse(stream);
         if (root.at("format_version").get<uint32_t>() != kRecordsFormatVersion) return false;
+        // "proofs" is optional: a file written before it existed holds none.
+        const auto proofs = root.value("proofs", nlohmann::json::array());
         for (const auto& entry : root.at("records")) {
             const auto bytes = crypto::from_hex(entry.get<std::string>());
             auto record = decode_upgrade_record(bytes);
@@ -895,7 +950,11 @@ bool UpgradeService::load() {
                 return false;
             }
             apply_upgrade_record(state_, *record);
-            records_.emplace_back(std::move(*record), std::nullopt);
+            std::optional<CommitProof> proof;
+            if (const auto index = records_.size(); index < proofs.size()) {
+                proof = stored_proof(proofs[index].get<std::string>(), *record);
+            }
+            records_.emplace_back(std::move(*record), std::move(proof));
         }
     } catch (const std::exception&) {
         return false;

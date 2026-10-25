@@ -13,6 +13,7 @@
 
 #include <LemonadeNexus/Security/Attestation/AttestationVerifier.hpp>
 #include <LemonadeNexus/Security/Attestation/ReleaseChain.hpp>
+#include <LemonadeNexus/Security/Upgrade/RolloutProof.hpp>
 #include <LemonadeNexus/Security/Upgrade/UpgradeService.hpp>
 
 #include <fstream>
@@ -57,6 +58,16 @@ protected:
     void TearDown() override {
         for (auto& [id, stack] : stacks) stack.service.reset();
         DriverMeshBase::TearDown();
+    }
+
+    /// The first server that holds a complete rollout proof.
+    std::optional<RolloutProof> rollout_proof_from_any() {
+        for (Node* node : servers()) {
+            if (auto proof = upgrade(node).rollout_proof(genesis_node->identity.public_key)) {
+                return proof;
+            }
+        }
+        return std::nullopt;
     }
 
     /// The packaged approval every server starts with, and the approval the
@@ -270,6 +281,17 @@ TEST_F(UpgradePath, TurnsRunOneAtATimeTier2FirstAndOnlyAfterWitnesses) {
               ReleaseOfferResult::Adopted);
     ASSERT_TRUE(run_until([&] { return finalized().release_number == kN1; }))
         << "no rollout started";
+    // The release guard sees the rollout open.
+    {
+        const auto proof = rollout_proof_from_any();
+        ASSERT_TRUE(proof) << "no server holds a rollout proof";
+        std::string error;
+        const auto rollout = verify_rollout_proof(*proof, network, error);
+        ASSERT_TRUE(rollout) << error;
+        std::string reason;
+        EXPECT_FALSE(rollout_complete(*rollout, kN1, reason));
+        EXPECT_NE(reason.find("open"), std::string::npos) << reason;
+    }
     const auto order = finalized().order;
     ASSERT_EQ(order.size(), servers().size());
     EXPECT_FALSE(order[0].tier1);
@@ -317,6 +339,65 @@ TEST_F(UpgradePath, TurnsRunOneAtATimeTier2FirstAndOnlyAfterWitnesses) {
     }
     // The Tier 1 set and epoch survived the rollout.
     for (Node* node : founders) EXPECT_TRUE(node->driver->is_tier1_member());
+
+    // The release guard: a proof from finalized state shows the rollout
+    // complete, verified from the network id alone.
+    const auto proof = rollout_proof_from_any();
+    ASSERT_TRUE(proof);
+    std::string error;
+    const auto rollout = verify_rollout_proof(*proof, network, error);
+    ASSERT_TRUE(rollout) << error;
+    std::string reason;
+    EXPECT_TRUE(rollout_complete(*rollout, kN1, reason)) << reason;
+    EXPECT_FALSE(rollout_complete(*rollout, kN1 + 1, reason)) << "another release";
+    // The JSON form round-trips.
+    const auto parsed = parse_rollout_proof(rollout_proof_json(*proof), error);
+    ASSERT_TRUE(parsed) << error;
+    EXPECT_TRUE(verify_rollout_proof(*parsed, network, error)) << error;
+    // A restarted server kept its commit proofs on disk and can still prove it.
+    ASSERT_TRUE(run_until([&] {
+        Node* restarted_tier2 = mesh.nodes.at(order.front().node);
+        const auto own = upgrade(restarted_tier2).rollout_proof(genesis_node->identity.public_key);
+        std::string why;
+        const auto verified = own ? verify_rollout_proof(*own, network, why) : std::nullopt;
+        std::string done;
+        return verified && rollout_complete(*verified, kN1, done);
+    }));
+
+    // Rejections: each altered proof fails closed.
+    {   // Another network.
+        NetworkId other = network;
+        other[0] ^= 1;
+        EXPECT_FALSE(verify_rollout_proof(*proof, other, error));
+    }
+    {   // A Genesis key that does not derive the network id.
+        auto forged = *proof;
+        forged.genesis_public_key[0] ^= 1;
+        EXPECT_FALSE(verify_rollout_proof(forged, network, error));
+    }
+    {   // A record byte changed after finalization.
+        auto forged = *proof;
+        forged.records.back().back() ^= 1;
+        EXPECT_FALSE(verify_rollout_proof(forged, network, error));
+    }
+    {   // A record removed: the chain no longer links, or no longer completes.
+        auto forged = *proof;
+        forged.records.erase(forged.records.begin() + 1);
+        const auto gapped = verify_rollout_proof(forged, network, error);
+        EXPECT_TRUE(!gapped || !rollout_complete(*gapped, kN1, reason));
+    }
+    {   // The records cut short of completion.
+        auto forged = *proof;
+        forged.records.pop_back();
+        const auto cut = verify_rollout_proof(forged, network, error);
+        ASSERT_TRUE(cut) << error;
+        EXPECT_FALSE(rollout_complete(*cut, kN1, reason));
+    }
+    {   // No Genesis base.
+        auto forged = *proof;
+        forged.base.clear();
+        EXPECT_FALSE(verify_rollout_proof(forged, network, error));
+    }
 }
 
 TEST_F(UpgradePath, AServerThatIsDownBlocksTheNextTurn) {
@@ -370,6 +451,15 @@ TEST_F(UpgradePath, AFailedReportHaltsTheRelease) {
             << "node " << nexus::crypto::to_hex(node->id.bytes).substr(0, 8);
     }
     EXPECT_TRUE(finalized().upgraded.empty());
+    // The release guard refuses a halted rollout.
+    const auto proof = rollout_proof_from_any();
+    ASSERT_TRUE(proof);
+    std::string error;
+    const auto rollout = verify_rollout_proof(*proof, network, error);
+    ASSERT_TRUE(rollout) << error;
+    std::string reason;
+    EXPECT_FALSE(rollout_complete(*rollout, kN1, reason));
+    EXPECT_NE(reason.find("halted"), std::string::npos) << reason;
 }
 
 /// The r21 network: founded on a format-2 approval, before any server kept a

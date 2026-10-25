@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <limits>
 
 namespace nexus::security {
 
@@ -2240,20 +2241,20 @@ void SecurityDriver::maybe_request_chain() {
                                             AuthorityChainRequest{have}, have));
 }
 
-void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& request,
-                                                const NodeId& from) {
-    // Serving is a bounded read of local records; it grants nothing and
-    // asserts nothing the page's own proofs do not carry.
+std::optional<AuthorityChainPage> SecurityDriver::chain_page(EpochId have_epoch,
+                                                            std::size_t max_links) const {
+    // A bounded read of local records; it grants nothing and asserts nothing
+    // the page's own proofs do not carry.
     AuthorityChainPage page;
-    EpochId next_from = request.have_epoch;
-    if (request.have_epoch == 0) {
+    EpochId next_from = have_epoch;
+    if (have_epoch == 0) {
         auto certificate = store_.load_bootstrap();
         auto base = store_.load_chain_base();
         const auto* cert = std::get_if<BootstrapCertificate>(&certificate);
         const auto* listing =
             std::get_if<std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>>(&base);
         if (cert == nullptr || listing == nullptr) {
-            return;
+            return std::nullopt;
         }
         page.has_base = true;
         page.base_certificate = *cert;
@@ -2263,7 +2264,7 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
     auto links = store_.load_chain_links();
     if (const auto* stored = std::get_if<std::vector<std::vector<uint8_t>>>(&links)) {
         for (const auto& bytes : *stored) {
-            if (page.links.size() >= constants::kMaxHandoffChainLinks) {
+            if (page.links.size() >= max_links) {
                 break;
             }
             auto decoded = decode_security_message(bytes);
@@ -2280,9 +2281,22 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
         }
     }
     if (!page.has_base && page.links.empty()) {
+        return std::nullopt;
+    }
+    return page;
+}
+
+std::optional<AuthorityChainPage> SecurityDriver::authority_chain() const {
+    return chain_page(0, std::numeric_limits<std::size_t>::max());
+}
+
+void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& request,
+                                                const NodeId& from) {
+    auto page = chain_page(request.have_epoch, constants::kMaxHandoffChainLinks);
+    if (!page) {
         return;
     }
-    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, page,
+    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, *page,
                                              authority_.has_value() ? authority_->epoch : 0));
 }
 

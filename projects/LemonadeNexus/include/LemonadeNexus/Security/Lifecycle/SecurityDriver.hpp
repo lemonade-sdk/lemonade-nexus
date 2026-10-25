@@ -119,6 +119,13 @@ public:
     /// frozen vote keys with this. A read, never a grant. io thread.
     [[nodiscard]] std::optional<VerifiedEpochAuthority> authority_for_epoch(EpochId epoch) const;
 
+    /// The stored authority chain from Genesis: the bootstrap certificate,
+    /// the epoch-1 vote-key listing, and every stored handoff with its commit
+    /// proof, oldest first. Candidate data for a remote verifier
+    /// (RolloutProof.hpp); nullopt before this node holds the Genesis base.
+    /// io thread.
+    [[nodiscard]] std::optional<AuthorityChainPage> authority_chain() const;
+
     /// Unauthenticated evidence that the mesh reached `epoch` (for example a
     /// replicated tree block that names it). A hint and nothing more: it can
     /// prompt an authority chain request, never an answer. io thread.
@@ -253,6 +260,8 @@ public:
     [[nodiscard]] const EligibilityService& eligibility() const { return eligibility_; }
 
 private:
+    [[nodiscard]] std::optional<AuthorityChainPage> chain_page(EpochId have_epoch,
+                                                             std::size_t max_links) const;
     [[nodiscard]] NodeId genesis_id() const;
     void set_phase(DriverPhase next, const char* reason);
     [[nodiscard]] EpochVoteKey take_own_vote_key(EpochId epoch);

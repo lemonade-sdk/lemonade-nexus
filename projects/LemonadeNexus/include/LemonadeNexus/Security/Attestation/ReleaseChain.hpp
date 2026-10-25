@@ -6,7 +6,8 @@
 // One durable record beside the epoch state pins the release signer and keeps
 // the newest accepted approval and the highest accepted release number. A
 // newer approval replaces the held one only when all of these hold:
-//   - it verifies under the Genesis delegation and the compiled release line;
+//   - it verifies under the Genesis delegation, the compiled protocol
+//     identity, and the TCB floor;
 //   - it names this network;
 //   - its release signer is the pinned signer;
 //   - its release number is strictly greater than the highest accepted one.
@@ -22,8 +23,17 @@
 //
 // Limits: the record is integrity-checked by verification on every load, not
 // rollback-protected. A party that can write the security directory can
-// replace it with an older record. Release-key rotation is not supported; it
-// would need its own consensus-finalized transition.
+// replace or delete it. The damage is bounded: load() folds in the packaged
+// approval, which is part of the measured release, so the accepted number
+// never falls below the running release; and a peer whose status shows a
+// higher accepted release pushes its approval within one offer window. The
+// storage vault and the sealed store do not close this gap: the vault does not
+// detect a whole-file rollback and is locked when the driver starts, and a
+// sealed blob is bound to PCR 8/9, not to a counter, so an older blob still
+// unseals. Closing it needs a monotonic counter (no TPM NV operation exists in
+// nexus-attestd) or a check against finalized state at start. Release-key
+// rotation is not supported; it would need its own consensus-finalized
+// transition.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
@@ -58,7 +68,8 @@ enum class ReleaseOfferResult : uint8_t {
     Stale = 3,
     /// Verified, but signed by a release key other than the pinned one.
     WrongSigner = 4,
-    /// Parse, signature, network, or compiled release-line check failed.
+    /// Parse, signature, network, protocol identity, TCB floor, or form check
+    /// failed.
     Invalid = 5,
     /// Larger than kMaxReleaseApprovalBytes; not parsed.
     Oversize = 6,
@@ -108,7 +119,7 @@ public:
     [[nodiscard]] bool pinned() const { return record_.has_value(); }
 
     /// The newest accepted approval, or nullopt when none verifies under this
-    /// build's compiled release line.
+    /// build's compiled protocol identity and TCB floor.
     [[nodiscard]] const std::optional<ReleaseApprovalBundleV1>& current() const {
         return current_;
     }

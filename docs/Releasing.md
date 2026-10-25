@@ -15,6 +15,7 @@ signs, and publishes a release. Servers install it in place with
 - [What a release contains](#what-a-release-contains)
 - [Repository settings](#repository-settings)
 - [Reviewed release inputs](#reviewed-release-inputs)
+- [Release guards](#release-guards)
 - [The updater on a server](#the-updater-on-a-server)
 - [Limits](#limits)
 
@@ -43,7 +44,7 @@ Do not push `v*` tags by hand. A tag push no longer starts a release.
 |---|---|
 | `lemonade-nexus-linux-x86_64`, `nexus-attestd-linux-x86_64` | Fleet server binaries, built in the pinned Ubuntu 24.04 / GCC 13.3 container. `nexus-updater` installs these. |
 | `nexus-updater-linux-x86_64` | The updater binary, for operators. The updater does not replace itself. |
-| `release-approval.json` | The approval, signed by the release key. It lists the new hashes first and the previous release's hashes after them. |
+| `release-approval.json` | The approval (format 3), signed by the release key. `release_number` is the tag's number. `approved_paths` lists this release's hashes; `previous_release_paths` lists the previous release's hashes, so servers on both releases attest each other. It also carries the boot line from `release/fleet-profile.json`. |
 | `manifest.json`, `manifest.json.sig` | Version, release number, file hashes, wire versions, and the OS package lock. The signature is Ed25519 by the release key over `lemonade-nexus/release-manifest/v1\n` followed by the file. |
 | `os-packages.lock` | The exact OS package versions of the release. |
 | `*.sigstore.json` | Sigstore build provenance for the file of the same name. |
@@ -57,8 +58,6 @@ gh attestation verify lemonade-nexus-linux-x86_64 \
   --repo lemonade-sdk/lemonade-nexus \
   --signer-workflow lemonade-sdk/lemonade-nexus/.github/workflows/release.yml@refs/heads/main
 ```
-
-`scripts/nexus-release-ingest` runs the same check for several files.
 
 ## Repository settings
 
@@ -131,10 +130,23 @@ inputs live in the repository and change only through reviewed pull requests.
 | `network_id`, `release_signer` | The network and the Genesis-delegated release key | Never in a normal release |
 | `authority_genesis_signature` | Genesis signature over the release authority (public) | Only with a new Genesis delegation |
 | `expected_pcrs` | PCR 8/9 of the boot chain that `os-packages.lock` pins | Boot the reference VM with the new lock, run `scripts/nexus-measure-boot-chain` |
-| `svsm_launch_measurements` | Approved SVSM launch measurements | With a VM shape change; must match the compiled set |
+| `source_commit`, `starting_patched_tree` | The source line the fleet kernel and image were built from | With a new release line |
+| `ima_policy` | The IMA policy id and SHA-256 | With a policy change |
+| `kernel` | Kernel release, bzImage, vmlinux, module tree, and module certificate SHA-256 | With a kernel change, measured on the reference VM |
+| `svsm_launch_measurements` | Approved SVSM launch measurements, one per VM shape | With a VM shape change |
 | `system_libraries` | SHA-256 of each pinned system library | Hash the libraries on the reference VM after a library package change |
 
 The current values come from release r21 (`v0.9.8-tier1-svsm-epoch1-r21`).
+
+The boot line (`source_commit`, `starting_patched_tree`, `ima_policy`,
+`kernel`, `svsm_launch_measurements`) is not compiled into the server
+(Design-Auto-Update Phase 0.3). The signed approval carries it, and servers
+verify it against that approval only. The approval is signed by the
+Genesis-pinned release key and its number must exceed every number a server
+accepted, so a reviewed change to this file is the only way to change the boot
+line. The compiled floors that stay are the TCB minimum (AMD-SB-3030,
+AMD-SB-3034) and the protocol identity (wire and ruleset versions, attestation
+profile, attestd wire version), which name what the binary implements.
 
 ### `release/os-packages.lock`
 
@@ -149,6 +161,50 @@ scripts/nexus-os-lock boot:grub-efi-amd64-signed boot:shim-signed \
 Use the package names of the reference image. A change to a `boot` package
 needs new `expected_pcrs` in the same pull request; the workflow refuses a lock
 that changes the boot chain while the PCRs stay the same, and the reverse.
+
+### Bootstrap inputs (one time)
+
+The first date-tagged release is the bootstrap release (Design-Auto-Update
+Phase 6). Its previous release is r21, which is not a GitHub release.
+
+| File | Content | When |
+|---|---|---|
+| `release/r21-release-approval.json` | The signed r21 approval bundle, exactly as installed on the fleet | Before the bootstrap release. Without it the workflow refuses to run, because the approval must list the r21 hashes as previous. |
+| `release/bootstrap-complete` | The bootstrap tag, one line | After every server runs the bootstrap release. The release after it refuses to publish until this names the bootstrap tag. |
+
+## Release guards
+
+The workflow refuses to publish in these cases:
+
+1. **No previous approval.** For every release after the bootstrap release,
+   the previous date-tagged release's `release-approval.json` and
+   `os-packages.lock` must download. `nexus-release-bundle
+   --previous-approval` checks that the same release key signed it for this
+   network and copies its hashes to `previous_release_paths`. There is no
+   fallback to an approval without the overlap.
+2. **An open rollout.** Each approval lists one previous release. A release
+   published while servers still run the release before the previous one
+   would drop those servers out of attestation. The `server` job fetches a
+   rollout proof from the servers in the repository variable
+   `ROLLOUT_PROOF_URLS` (space-separated `https://<server>/api/upgrade/rollout-proof`
+   URLs) and runs `nexus-rollout-check`. The check passes only when the proof
+   verifies from the Genesis key that derives `network_id` in the fleet
+   profile, through the epoch authority chain and the commit proof of every
+   upgrade record, and shows the previous release's rollout complete and not
+   halted. The servers are not trusted for the result; a server that holds no
+   complete proof answers 503 and the next URL is tried. Without the variable,
+   or without a verifying proof, the release fails.
+3. **A failed mixed-version gate.** The `mixed-version` job
+   (`mixed-version.yml`) runs the previous release's server next to the new
+   one. For the bootstrap release this job is skipped: its baseline is the
+   r21 line. Run `scripts/mixed-version-mesh.sh` with `OLD_BIN` set to an
+   r21-line build before the bootstrap release.
+
+Why a Tier 1 proof and not a status file: a status file that each updater
+publishes would be a self-report by individual servers, and every server
+would need a credential to publish it. A rollout proof is finalized state: a
+Tier 1 quorum signed every record, witnesses observed every upgrade, and CI
+checks it from the Genesis key with no trust in the server that serves it.
 
 ## The updater on a server
 
@@ -166,7 +222,7 @@ cat /var/lib/nexus-updater/state.json
 | `/var/lib/nexus-updater/state.json` | Installed and halted release numbers, the update phase, the last result |
 | `/var/lib/nexus-updater/staged/<tag>/` | Verified files waiting for the upgrade turn |
 | `/var/lib/nexus-updater/previous/<tag>/` | The files from before `<tag>` was installed |
-| `/run/lemonade-nexus/update-control.sock` | The server's control socket (owner-only) |
+| `/run/lemonade-nexus/upgrade.sock` | The server's upgrade control socket, root peers only ([Upgrade Control](Upgrade-Control)) |
 
 A failed release halts on that server until a newer release appears. To retry
 the same release after a fix on the host, an operator sets
@@ -177,12 +233,15 @@ every OS change comes through a release.
 
 ## Limits
 
-- **The upgrade turn is a stub.** Until Phase 5, the server's turn gate
-  refuses every restart. A cycle verifies and stages a release and installs
-  nothing.
-- **Approval change on restart (Phase 0 gate 1).** Until Phase 2 lands, a
-  server refuses to recover with an approval other than the one its bootstrap
-  certificate commits. The health gate then fails, and the updater rolls back.
+- **Upgrade turns are not production-ready.** The turn gate answers from
+  finalized UpgradeProgress records (Phase 5). A pre-existing HotStuff
+  restart catch-up defect on the memory mesh blocks production use for Tier 1
+  servers until it is fixed (Design-Auto-Update, Known limits).
+- **A halted rollout blocks the workflow.** The rollout guard refuses to
+  publish after a halt. A release that fixes a halted rollout would need both
+  the halted release's hashes and the hashes of the release before it, and an
+  approval lists only one previous release. Recovery from a halt is a manual
+  decision that this workflow does not make.
 - **PCR measurement.** A GitHub-hosted runner cannot boot the fleet's SEV-SNP
   guest. PCR 8/9 come from the reviewed profile, and the optional reference VM
   job only compares them. The workflow never computes PCR values.
@@ -194,9 +253,11 @@ every OS change comes through a release.
   not verified on the reference VM. After a server has started on the new
   chain, the sealed boot set is promoted to it; booting the previous entry
   after that point does not unseal.
-- **First release.** The latest GitHub release before the first date release
-  has no `release-approval.json`, so the first date release lists only its own
-  hashes. The fleet moves from r21 by the one-time procedure in Phase 6.
+- **First release.** The `vX.Y.Z-alpha` releases are never a previous
+  release: they predate the approval chain and use another security wire
+  version. The bootstrap release takes its previous approval from
+  `release/r21-release-approval.json`, and the fleet moves from r21 by the
+  one-time procedure in Phase 6.
 - **Provenance.** The updater accepts only Rekor v1 entries with an inclusion
   promise, against the trusted root pinned in the package
   (`release/sigstore-trusted-root.json`). A Sigstore key rotation or a move to

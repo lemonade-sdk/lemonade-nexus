@@ -3,7 +3,7 @@
 // Signed release approvals for the release-chain and upgrade tests: a Genesis
 // key delegates one release key, and the release key signs format-3
 // approvals with a release number and the previous release's hashes. Every
-// approval passes the production verifier (the compiled release line).
+// approval passes the production verifier (protocol identity and boot line form).
 
 #include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
