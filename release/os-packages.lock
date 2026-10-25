@@ -20,14 +20,14 @@
 # Captured 2026-10-25 on nexus-mesh-sn01 (Ubuntu 26.04 LTS); identical on
 # all five Tier 1 servers. The kernel is a custom build
 # (linux-image-7.1.0-coconut-svsm-tier1+), not an Ubuntu archive package.
+#
+# The server and nexus-attestd link OpenSSL, libstdc++, and libgcc
+# statically, so libc6 is the only library package. libssl3t64, libstdc++6,
+# libgcc-s1, zlib1g, and libzstd1 stay installed for the OS, but Nexus does
+# not load them and this lock does not pin them.
 format 1
 package linux-image-7.1.0-coconut-svsm-tier1+ 7.1.0-coconut-tier1-2 boot
 package grub-efi-amd64-signed 1.215+2.14-2ubuntu1 boot
 package grub-efi-amd64-bin 2.14-2ubuntu1 boot
 package shim-signed 1.59+15.8-0ubuntu2 boot
 package libc6 2.43-2ubuntu2.4 library
-package libssl3t64 3.5.5-1ubuntu3.7 library
-package libstdc++6 16-20260322-1ubuntu1 library
-package libgcc-s1 16-20260322-1ubuntu1 library
-package zlib1g 1:1.3.dfsg+really1.3.1-1ubuntu3.2 library
-package libzstd1 1.5.7+dfsg-3 library

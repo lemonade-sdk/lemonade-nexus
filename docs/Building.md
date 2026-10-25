@@ -38,6 +38,16 @@ packages the TPM2-TSS source build links against. They are the only required
 system libraries beyond the toolchain: the normal Linux build compiles
 TPM2-TSS 4.1.3 from source.
 
+With `LEMONADE_NEXUS_STATIC_DEPS=ON` (the default), the Linux build accepts
+only the pinned OpenSSL version (`LEMONADE_NEXUS_OPENSSL_VERSION_UBUNTU` in
+`cmake/libraries/openssl.cmake`, 3.0.13 from Ubuntu 24.04 `libssl-dev`) and
+links its static libraries. Executables also link libstdc++ and libgcc
+statically. glibc stays a shared dependency. The attestation profile pins the
+hash of each shared library the server loads, so an OS update of OpenSSL,
+zlib, zstd, or the C++ runtime cannot change what attestation measures (see
+[Releasing](Releasing#embedded-libraries)). On another distribution, or for a
+distribution package, configure with `-DLEMONADE_NEXUS_STATIC_DEPS=OFF`.
+
 Dependencies are **not** all fetched automatically. They use a mix of CMake
 FetchContent (most C/C++ libraries), source builds (TPM2-TSS, OpenSSL as a
 fallback), system packages (json-c, libcurl, UUID), and Cargo (the Rust
@@ -171,7 +181,7 @@ source of truth for versions.
 | Component | Sourcing | Purpose |
 |-----------|----------|---------|
 | libsodium | FetchContent (1.0.20) | Ed25519, X25519, AEAD, HKDF, random |
-| OpenSSL | System package preferred, source build (3.3.2) as fallback | TLS, ACME client |
+| OpenSSL | Linux: Ubuntu 24.04 `libssl-dev` 3.0.13, linked statically; macOS/Windows: pinned static archive (3.5.9), or system package / source build (3.3.2) until it is pinned | TLS, ACME client |
 | TPM2-TSS (FAPI) | Source build (4.1.3), Linux | TPM access for the evidence helper |
 | asio | FetchContent (1.34.2) | Async I/O (UDP, timers) |
 | cpp-httplib | FetchContent (0.18.3) | HTTP/HTTPS server and client |

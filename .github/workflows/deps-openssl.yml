@@ -1,0 +1,150 @@
+name: Deps OpenSSL
+
+# Builds the static OpenSSL archives that the macOS and Windows builds link
+# (cmake/libraries/openssl.cmake) and publishes them on the release
+# deps-openssl-<version> of this repository. Run it by hand once per OpenSSL
+# version. Then copy the printed SHA-256 values into
+# LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_* in cmake/libraries/openssl.cmake in a
+# reviewed pull request.
+#
+# The source is the official OpenSSL release tarball. The workflow refuses it
+# unless its SHA-256 equals both the input and the .sha256 file that OpenSSL
+# publishes with the release. The archives are static (no-shared) and built
+# without zlib, zstd, and Brotli. An existing asset is never replaced: a new
+# build would change the pinned hash.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: OpenSSL version (must equal LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION)
+        required: true
+        default: 3.5.9
+      sha256:
+        description: SHA-256 of openssl-<version>.tar.gz as published by OpenSSL
+        required: true
+        default: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+
+permissions:
+  contents: read
+
+env:
+  VERSION: ${{ inputs.version }}
+  SOURCE_SHA256: ${{ inputs.sha256 }}
+  OPENSSL_OPTIONS: no-shared no-tests no-docs no-ui-console no-zlib no-zstd no-brotli
+
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download and verify the source tarball
+        run: |
+          base="https://github.com/openssl/openssl/releases/download/openssl-${VERSION}"
+          curl -fsSLO "${base}/openssl-${VERSION}.tar.gz"
+          curl -fsSLO "${base}/openssl-${VERSION}.tar.gz.sha256"
+          actual=$(sha256sum "openssl-${VERSION}.tar.gz" | cut -d' ' -f1)
+          published=$(cut -d' ' -f1 "openssl-${VERSION}.tar.gz.sha256")
+          echo "tarball:   $actual"
+          echo "published: $published"
+          echo "input:     $SOURCE_SHA256"
+          if [ "$actual" != "$SOURCE_SHA256" ] || [ "$actual" != "$published" ]; then
+            echo "::error::the OpenSSL tarball does not match the expected SHA-256"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-source
+          path: openssl-${{ inputs.version }}.tar.gz
+          if-no-files-found: error
+
+  macos-arm64:
+    needs: source
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-source
+      - name: Build
+        run: |
+          echo "${SOURCE_SHA256}  openssl-${VERSION}.tar.gz" | shasum -a 256 -c -
+          tar -xzf "openssl-${VERSION}.tar.gz"
+          cd "openssl-${VERSION}"
+          # Target-filesystem paths, as in a system build: the archive holds no
+          # runner path. macOS provides /etc/ssl/cert.pem.
+          ./Configure darwin64-arm64-cc --prefix=/usr --openssldir=/etc/ssl --libdir=lib \
+            $OPENSSL_OPTIONS
+          make -j"$(sysctl -n hw.ncpu)"
+          make DESTDIR="$PWD/stage" install_sw
+          mkdir -p ../out
+          tar -C stage/usr -czf "../out/openssl-${VERSION}-macos-arm64.tar.gz" \
+            include/openssl lib/libssl.a lib/libcrypto.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-macos-arm64
+          path: out/
+          if-no-files-found: error
+
+  windows-x64:
+    needs: source
+    runs-on: windows-2022
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: openssl-source
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Install NASM
+        shell: pwsh
+        run: |
+          choco install nasm -y
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Append
+      # OpenSSL compiles its static libraries with /MT /Zl, so they link into
+      # both /MT and /MD binaries.
+      - name: Build
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "openssl-$env:VERSION.tar.gz" -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:SOURCE_SHA256) { Write-Error "tarball SHA-256 mismatch: $hash"; exit 1 }
+          tar -xzf "openssl-$env:VERSION.tar.gz"
+          Set-Location "openssl-$env:VERSION"
+          $stage = Join-Path $PWD "stage"
+          perl Configure VC-WIN64A "--prefix=$stage" "--openssldir=$stage\ssl" $env:OPENSSL_OPTIONS.Split(' ')
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          nmake
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          nmake install_sw
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          New-Item -ItemType Directory -Force -Path ..\out | Out-Null
+          tar -C $stage -czf "..\out\openssl-$env:VERSION-windows-x64.tar.gz" include/openssl lib/libssl.lib lib/libcrypto.lib
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl-windows-x64
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    needs: [macos-arm64, windows-x64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: openssl-*-*
+          path: out
+          merge-multiple: true
+      - name: Publish the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="deps-openssl-${VERSION}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" --title "OpenSSL ${VERSION} static archives" \
+              --notes "Static OpenSSL ${VERSION} for the macOS and Windows builds. Built by deps-openssl.yml from openssl-${VERSION}.tar.gz (SHA-256 ${SOURCE_SHA256}). Not a Nexus release."
+          fi
+          # No --clobber: a pinned archive must never change.
+          gh release upload "$tag" out/*.tar.gz
+          echo "Pin these in cmake/libraries/openssl.cmake:"
+          echo "set(LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_MACOS_ARM64 \"$(sha256sum out/openssl-${VERSION}-macos-arm64.tar.gz | cut -d' ' -f1)\")"
+          echo "set(LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_WINDOWS_X64 \"$(sha256sum out/openssl-${VERSION}-windows-x64.tar.gz | cut -d' ' -f1)\")"

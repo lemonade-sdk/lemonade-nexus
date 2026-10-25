@@ -268,7 +268,7 @@ sudo apt-get install -y \
 
 Install Rust/Cargo through your development environment and ensure `rustc` and `cargo` are on `PATH`. Confirm the installed CMake version meets the minimum, then use the [quick-start build commands](#1-build-the-server).
 
-The normal Linux build compiles TPM2-TSS from source and needs the system json-c, libcurl, and UUID development packages. TPM device access, a suitable runtime TCTI, IMA policy, and the evidence-helper service are separate deployment requirements.
+The normal Linux build compiles TPM2-TSS from source and needs the system json-c, libcurl, and UUID development packages. It links the static libraries of Ubuntu 24.04 `libssl-dev` (OpenSSL 3.0.13, the pinned version), libstdc++, and libgcc into the executables; glibc stays a shared dependency. TPM device access, a suitable runtime TCTI, IMA policy, and the evidence-helper service are separate deployment requirements.
 
 ### Other platforms
 

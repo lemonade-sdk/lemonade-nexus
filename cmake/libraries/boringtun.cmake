@@ -21,6 +21,26 @@ endif()
 
 FetchContent_MakeAvailable(corrosion)
 
+# Rust's standard library asks for the shared libgcc_s unwinder, which would
+# keep libgcc_s.so.1 a runtime dependency of executables linked with
+# -static-libgcc (LEMONADE_NEXUS_STATIC_DEPS on Linux). Executables take the
+# unwinder from the static libgcc_eh instead, as rustc does for crt-static
+# GNU targets. Shared libraries such as the SDK keep libgcc_s. Corrosion reads
+# this variable in every later corrosion_import_crate call (virtual-netstack,
+# frost, storage-threshold).
+if(LEMONADE_NEXUS_STATIC_CXX_RUNTIME AND "gcc_s" IN_LIST Rust_CARGO_TARGET_LINK_NATIVE_LIBS)
+    set(_rust_native_libs "")
+    foreach(_lib IN LISTS Rust_CARGO_TARGET_LINK_NATIVE_LIBS)
+        if(_lib STREQUAL "gcc_s")
+            set(_lib "$<IF:$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>,gcc_eh,gcc_s>")
+        endif()
+        list(APPEND _rust_native_libs "${_lib}")
+    endforeach()
+    set(Rust_CARGO_TARGET_LINK_NATIVE_LIBS "${_rust_native_libs}")
+    unset(_rust_native_libs)
+    unset(_lib)
+endif()
+
 # --- Import our wrapper crate ---
 corrosion_import_crate(
     MANIFEST_PATH "${CMAKE_SOURCE_DIR}/crates/boringtun-ffi/Cargo.toml"

@@ -19,7 +19,6 @@
 #include <gtest/gtest.h>
 #include <sodium.h>
 
-#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <optional>
@@ -83,25 +82,15 @@ struct AttestdLive : ::testing::Test {
         profile.ima_policy_digest.fill(0x60);
 
         // The audited dependency set: what /proc/<pid>/maps shows both
-        // processes execute, by exact measured path. libstdc++ is matched by
-        // prefix because its real path is version-suffixed.
+        // processes execute, by exact measured path. OpenSSL, libstdc++, and
+        // libgcc are linked into the binaries, so only glibc remains.
         static constexpr const char* kLibs[] = {
             "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
             "/usr/lib/x86_64-linux-gnu/libc.so.6",
             "/usr/lib/x86_64-linux-gnu/libm.so.6",
-            "/usr/lib/x86_64-linux-gnu/libgcc_s.so.1",
-            "/usr/lib/x86_64-linux-gnu/libssl.so.3",
-            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
         };
-        std::vector<std::string> required(std::begin(kLibs), std::end(kLibs));
-        for (const auto& entry : log->entries) {
-            if (entry.path.starts_with("/usr/lib/x86_64-linux-gnu/libstdc++.so.6.0.") &&
-                std::find(required.begin(), required.end(), entry.path) == required.end()) {
-                required.push_back(entry.path);
-            }
-        }
         // The two components keep their compiled template entries; libs append.
-        for (const auto& path : required) profile.approved_paths.push_back({path, {}});
+        for (const auto* path : kLibs) profile.approved_paths.push_back({path, {}});
 
         for (auto& approved : profile.approved_paths) {
             const auto entry = ima_entry_for_path(*log, approved.path);

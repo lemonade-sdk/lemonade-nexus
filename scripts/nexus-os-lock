@@ -8,8 +8,10 @@
 #
 # Example:
 #   nexus-os-lock boot:grub-efi-amd64-signed boot:shim-signed \
-#       library:libc6 library:libssl3t64 library:libstdc++6 library:libgcc-s1 \
-#       library:zlib1g library:libzstd1 > release/os-packages.lock
+#       library:libc6 > release/os-packages.lock
+#
+# libc6 is the only library package: the server and nexus-attestd link
+# OpenSSL, libstdc++, and libgcc statically.
 #
 # A package that is not installed fails the run: a lock must not name a
 # version this host does not have.

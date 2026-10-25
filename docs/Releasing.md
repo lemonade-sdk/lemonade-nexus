@@ -135,7 +135,7 @@ inputs live in the repository and change only through reviewed pull requests.
 | `ima_policy` | The IMA policy id and SHA-256 | With a policy change |
 | `kernel` | Kernel release, bzImage, vmlinux, module tree, and module certificate SHA-256 | With a kernel change, measured on the reference VM |
 | `svsm_launch_measurements` | Approved SVSM launch measurements, one per VM shape | With a VM shape change |
-| `system_libraries` | SHA-256 of each pinned system library | Hash the libraries on the reference VM after a library package change |
+| `system_libraries` | SHA-256 of each shared library the server and `nexus-attestd` load: the glibc objects `libc.so.6`, `libm.so.6`, and `ld-linux-x86-64.so.2` | Hash the libraries on the reference VM after a `libc6` package change |
 
 The current values come from release r21 (`v0.9.8-tier1-svsm-epoch1-r21`).
 
@@ -155,13 +155,65 @@ The exact package versions of the fleet OS. Generate it on the reference VM:
 
 ```bash
 scripts/nexus-os-lock boot:grub-efi-amd64-signed boot:shim-signed \
-    library:libc6 library:libssl3t64 library:libstdc++6 library:libgcc-s1 \
-    library:zlib1g library:libzstd1 > release/os-packages.lock
+    library:libc6 > release/os-packages.lock
 ```
 
 Use the package names of the reference image. A change to a `boot` package
 needs new `expected_pcrs` in the same pull request; the workflow refuses a lock
 that changes the boot chain while the PCRs stay the same, and the reverse.
+
+`libc6` is the only `library` package. The server does not load the
+distribution's OpenSSL, zlib, zstd, libstdc++, or libgcc, so the lock does not
+pin `libssl3t64`, `zlib1g`, `libzstd1`, `libstdc++6`, or `libgcc-s1`.
+
+### Embedded libraries
+
+The fleet server build links these libraries statically into
+`lemonade-nexus`, `nexus-attestd`, and `nexus-updater`:
+
+- OpenSSL: the static `libssl.a` and `libcrypto.a` of Ubuntu 24.04
+  `libssl-dev`, installed from the Ubuntu snapshot `UBUNTU_SNAPSHOT` in
+  `release.yml`. Configure accepts only the version
+  `LEMONADE_NEXUS_OPENSSL_VERSION_UBUNTU` in `cmake/libraries/openssl.cmake`
+  (3.0.13). This `libcrypto.a` needs no zlib or zstd.
+- libstdc++ and libgcc (`-static-libstdc++ -static-libgcc`).
+
+`LEMONADE_NEXUS_STATIC_DEPS` controls both; it is on by default.
+
+glibc (`libc.so.6`, `libm.so.6`, `ld-linux-x86-64.so.2`) stays shared, and
+`system_libraries` pins its hashes. A distribution update of an embedded
+library cannot change what attestation measures. The embedded OpenSSL still
+reads the host's configuration and CA certificates from its Ubuntu
+`OPENSSLDIR`, `/usr/lib/ssl` (Ubuntu links `openssl.cnf` and `certs/` to
+`/etc/ssl`). A configuration that activates a provider module (for example,
+`legacy`) would load a host module built for the OS OpenSSL; the default
+Ubuntu configuration activates none.
+
+An OpenSSL security fix ships in a Nexus release. Ubuntu backports fixes into
+new `libssl-dev` package revisions of the same upstream version, so move
+`UBUNTU_SNAPSHOT` in `release.yml` to a snapshot that has the fix, in a
+reviewed pull request. Change `LEMONADE_NEXUS_OPENSSL_VERSION_UBUNTU` only if
+the upstream version changes. The new binary hashes go into the approval as
+usual; `release/fleet-profile.json` does not change.
+
+The `server` job checks the binaries before it builds the approval:
+`scripts/nexus-release-tool libraries` reads the `NEEDED` entries of
+`lemonade-nexus` and `nexus-attestd`. It fails when a binary needs a shared
+library that `system_libraries` does not pin, or when `system_libraries` pins
+a library that neither binary needs. The approval requires each pinned path in
+the IMA log, so a pinned library that is never loaded would fail attestation
+on every server.
+
+The `sdk` job builds the Linux SDK shared library with the same static
+OpenSSL and fails when it needs `libssl`, `libcrypto`, `libz`, `libzstd`, or
+`libsodium`. The SDK keeps the C++ runtime of its host process.
+
+The macOS and Windows SDK builds link a static OpenSSL archive that
+`.github/workflows/deps-openssl.yml` builds from the official source tarball
+and publishes on the release `deps-openssl-<version>`. CMake downloads the
+archive and checks the SHA-256 pinned in `cmake/libraries/openssl.cmake`
+(`LEMONADE_NEXUS_OPENSSL_PREBUILT_*`). Until those hashes are set, these
+platforms keep the previous OpenSSL logic (`OPENSSL_FORCE_BUNDLED`).
 
 ### `release/bootstrap-complete` (one time)
 
@@ -303,6 +355,15 @@ every OS change comes through a release.
 - **OS package lock.** `release/os-packages.lock` was captured on the
   reference VM. A lock change that touches a `boot` package needs new PCR 8/9
   in `release/fleet-profile.json`, measured on the reference VM.
+- **Embedded libraries.** Fleet OS updates of OpenSSL do not reach Nexus. An
+  OpenSSL fix reaches the fleet only when a release moves `UBUNTU_SNAPSHOT`;
+  track the Ubuntu security notices for `openssl` in Ubuntu 24.04. A local
+  build links whatever `libssl-dev` 3.0.13 revision its host has; only the
+  release build is snapshot-pinned. The TPM2-TSS link interface still names the system
+  libcurl, json-c, and libuuid. The binaries do not need them only because
+  they use no symbol from them and Ubuntu's GCC links with `--as-needed`. If a
+  change makes a binary need one of them, the `libraries` check fails the
+  release.
 - **GRUB.** A boot-chain update requires `GRUB_DEFAULT=saved`. Whether GRUB's
   measurement of `grubenv` and of the previous entry gives the old PCR 8/9 is
   not verified on the reference VM. After a server has started on the new

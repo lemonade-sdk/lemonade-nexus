@@ -21,8 +21,13 @@ Dependencies use a **mix** of sourcing mechanisms, not all FetchContent:
 
 - **FetchContent** — most C/C++ libraries (libsodium, asio, httplib,
   nlohmann/json, spdlog, jwt-cpp, magic_enum, xxHash, SQLite amalgamation).
-- **Source builds** — TPM2-TSS 4.1.3 (Linux) and OpenSSL 3.3.2 as a fallback
-  when no suitable system copy is found (or `-DOPENSSL_FORCE_BUNDLED=ON`).
+- **Source builds** — TPM2-TSS 4.1.3 (Linux) and, on macOS and Windows,
+  OpenSSL 3.3.2 when no suitable system copy is found (or
+  `-DOPENSSL_FORCE_BUNDLED=ON`) until the pinned archive below is set.
+- **Pinned static OpenSSL** — on Linux, the static libraries of Ubuntu 24.04
+  `libssl-dev` (exactly 3.0.13); on macOS and Windows, a static OpenSSL 3.5.9
+  archive from the `deps-openssl-3.5.9` release, checked by SHA-256
+  (`cmake/libraries/openssl.cmake`, `LEMONADE_NEXUS_STATIC_DEPS`).
 - **System packages (Linux)** — `libjson-c-dev`, `libcurl4-openssl-dev`,
   `uuid-dev` for the TPM2-TSS build.
 - **Cargo** — the four Rust crates, with `frost-ed25519 = 2.2.0` for
@@ -37,7 +42,7 @@ manifests under `crates/` are the source of truth for versions.
 | Library | Version | Purpose |
 |---------|---------|---------|
 | **libsodium** | 1.0.20 | Ed25519, X25519, XChaCha20-Poly1305, HKDF, randomness |
-| **OpenSSL** | 3.3.2 (system preferred) | TLS for HTTPS, ACME client, X.509 |
+| **OpenSSL** | 3.0.13 (Linux, static); 3.5.9 archive (macOS, Windows) | TLS for HTTPS, ACME client, X.509 |
 | **frost-ed25519** (via `crates/frost-ffi`) | 2.2.0 | FROST threshold authority signatures |
 | **frost-ristretto255** (via `crates/storage-threshold`) | 2.2.0 | Storage key generation, share refresh, holder enrollment |
 | **elastic-elgamal** (via `crates/storage-threshold`) | 0.3.1 | DLEQ proofs for storage decryption partials |
