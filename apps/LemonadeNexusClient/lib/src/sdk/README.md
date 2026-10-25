@@ -26,9 +26,14 @@ function count here.
 - **Health/stats/discovery:** `ln_health`, `ln_stats`, `ln_servers`,
   `ln_server_latencies`
 - **Tier 1 servers:** `ln_set_genesis_key`, `ln_tier1_refresh`,
-  `ln_tier1_membership`. The app pins the network key from Settings at
-  connect; the SDK then sends tree, session, and private-API calls only to
-  verified Tier 1 servers.
+  `ln_tier1_membership`, `ln_discover_genesis_key`. The app pins the network
+  key from Settings at connect; the SDK then sends tree, session, and
+  private-API calls only to verified Tier 1 servers. When Settings has no key,
+  the app calls `ln_discover_genesis_key` with the servers that DNS discovery
+  found and saves the result in Settings. This is trust on first use: the
+  key must come from at least 3 agreeing servers in the network domain over
+  verified HTTPS. The app never replaces a saved key on its own; the Settings
+  field is the manual override.
 - **Authentication:** `ln_auth_ed25519` (primary), `ln_auth_passkey`,
   `ln_auth_passkey_challenge`, `ln_register_passkey`, `ln_auth_password`
   (deprecated server stub — kept for compatibility), `ln_auth_token`

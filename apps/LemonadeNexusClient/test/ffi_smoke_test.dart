@@ -49,6 +49,10 @@ void main() {
       final (error, json) = sdk.tier1Membership(client);
       expect(error, LnError.success);
       expect(json, contains('"servers":[]'));
+      // Discovery never replaces a pinned key.
+      final (discoverError, discoverJson) = sdk.discoverGenesisKey(client, null);
+      expect(discoverError, LnError.rejected);
+      expect(discoverJson, contains('already pinned'));
     } finally {
       sdk.destroy(client);
     }

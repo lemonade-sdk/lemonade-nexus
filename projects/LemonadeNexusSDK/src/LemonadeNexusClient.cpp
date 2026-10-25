@@ -898,6 +898,21 @@ StatusResult LemonadeNexusClient::set_genesis_key(const std::string& genesis_pub
     return result;
 }
 
+Result<GenesisKeyDiscovery> LemonadeNexusClient::discover_genesis_key(
+    const std::vector<ServerEndpoint>& hosts) {
+    if (impl_->tier1.has_genesis_key()) {
+        Result<GenesisKeyDiscovery> refused;
+        refused.error = "a Genesis key is already pinned; discovery never replaces it";
+        refused.http_status = 409;
+        return refused;
+    }
+    if (impl_->config.auto_discover) impl_->discover_servers();
+    auto candidates = hosts;
+    const auto pool = impl_->tier1_sources();
+    candidates.insert(candidates.end(), pool.begin(), pool.end());
+    return impl_->tier1.discover_genesis_key(candidates);
+}
+
 Result<Tier1Membership> LemonadeNexusClient::refresh_tier1() {
     return impl_->tier1.refresh(impl_->tier1_sources());
 }
