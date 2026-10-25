@@ -210,7 +210,9 @@ OpenSSL and fails when it needs `libssl`, `libcrypto`, `libz`, `libzstd`, or
 
 The macOS arm64 and Windows x64 builds link a static OpenSSL archive that
 `.github/workflows/deps-openssl.yml` builds from the official source tarball
-and publishes on the release `deps-openssl-<version>`. CMake downloads the
+and publishes on the release `deps-openssl-<version>`, or
+`deps-openssl-<version>-r<n>` for a later build of the same version. The macOS
+archive targets macOS 11.0, the oldest macOS on Apple silicon. CMake downloads the
 archive and checks the SHA-256 pinned in `cmake/libraries/openssl.cmake`
 (`LEMONADE_NEXUS_OPENSSL_PREBUILT_*`). A hash mismatch or a failed download
 stops the configure step. The build never compiles OpenSSL. The `native` and
@@ -220,10 +222,11 @@ shared library.
 To move to a new OpenSSL version on these platforms:
 
 1. Run `deps-openssl.yml` by hand with the new version and the SHA-256 that
-   OpenSSL publishes for its source tarball. The workflow never replaces an
-   existing asset.
+   OpenSSL publishes for its source tarball, and `revision` 1. The workflow
+   never replaces an existing asset; to rebuild the same version, run it with
+   the next `revision`.
 2. In a reviewed pull request, set `LEMONADE_NEXUS_OPENSSL_PREBUILT_VERSION`
-   and copy the two printed SHA-256 values into
+   and `LEMONADE_NEXUS_OPENSSL_PREBUILT_RELEASE`, and copy the two printed SHA-256 values into
    `LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_MACOS_ARM64` and
    `LEMONADE_NEXUS_OPENSSL_PREBUILT_SHA256_WINDOWS_X64`.
 
