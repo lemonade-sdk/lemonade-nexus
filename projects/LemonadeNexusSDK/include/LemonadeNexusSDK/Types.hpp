@@ -24,6 +24,9 @@ struct ServerEndpoint {
 
 struct ServerConfig {
     /// Seed list of servers (at least one). Each host must be a cert FQDN.
+    /// Seeds are where the client starts: discovery, health, and the Tier 1
+    /// membership walk. A seed that is not a verified Tier 1 server is never
+    /// sent a tree request.
     std::vector<ServerEndpoint> servers{{"127.0.0.1", 9100, true}};
 
     int  connect_timeout_sec{5};
@@ -36,7 +39,9 @@ struct ServerConfig {
     /// If true, keep talking to the configured endpoint (an FQDN) after join
     /// instead of switching the public API to the server's advertised SEIP FQDN.
     /// The pinned host must still be a cert FQDN; pin an address separately if
-    /// needed (verification is always on).
+    /// needed (verification is always on). It never applies to tree traffic:
+    /// session, join, and tree requests go only to verified Tier 1 servers
+    /// (LemonadeNexusClient::set_genesis_key).
     bool     pin_server{false};
 
     /// How often to check server health (seconds). 0 = disabled.

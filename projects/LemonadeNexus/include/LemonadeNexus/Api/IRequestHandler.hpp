@@ -7,12 +7,15 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <concepts>
 #include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Forward declarations — handlers only need references
 namespace nexus::core {
@@ -51,6 +54,12 @@ namespace nexus::routing {
 }
 
 namespace nexus::api {
+
+/// What this server can sign as a current Tier 1 member (GET /api/tier1/proof).
+struct Tier1Identity {
+    std::array<uint8_t, 32> network_id{};
+    uint64_t epoch = 0;
+};
 
 /// Aggregate context holding references to all services and computed state.
 /// Passed to request handler constructors so they can access what they need.
@@ -94,6 +103,14 @@ struct ApiContext {
     /// storage routes answer 404 without it. In the assembled server it is
     /// always set; nullptr is the state for handlers built without a vault.
     security::StorageVault*           storage_vault{nullptr};
+    /// GET /api/tier1/authority: one encoded authority chain page after the
+    /// given epoch (encode_authority_chain_page), or empty when this server
+    /// stores nothing to add. Thread-safe. Unset, the route answers 404.
+    std::function<std::vector<uint8_t>(uint64_t have_epoch)> authority_chain_page;
+    /// GET /api/tier1/proof: the network and epoch, only while this server is
+    /// a current Tier 1 member by finalized membership; nullopt otherwise.
+    /// Thread-safe. Unset counts as not a member.
+    std::function<std::optional<Tier1Identity>()> tier1_identity;
 };
 
 // ---------------------------------------------------------------------------

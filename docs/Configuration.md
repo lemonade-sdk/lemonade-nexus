@@ -245,7 +245,7 @@ With ops mode on:
   nodes that the dataplane binds to them: the peer the server installed for
   the address at join must have the node's mesh key. A Relay node is open to
   every peer only when its management key is a root admin.
-- **Delete cleanup.** Every server that applies a committed delete runs the
+- **Delete cleanup.** Every Tier 1 server that applies a committed delete runs the
   post-delete cleanup itself: it revokes the device credential (unless
   another node still holds the key), releases the node's IPAM records,
   removes the dataplane peer, and removes the private DNS record.
@@ -263,10 +263,10 @@ With ops mode on:
   server that missed a tree block cannot match the next one. Tree log format
   2 uses this root; a format 1 log (from an earlier build) does not open, and
   the server halts tree operations until the log is moved aside.
-- **Replication.** Every server runs the `"tree"` sync stream over the
-  backbone, with the same digest and catch-up exchange as DNS records and
+- **Replication.** Every Tier 1 server runs the `"tree"` sync stream over
+  the backbone, with the same digest and catch-up exchange as DNS records and
   account envelopes. Entries are committed log blocks keyed by height. Tier 1
-  servers serve them; any certified server pulls them from Tier 1 only. An
+  servers serve them, and only a Tier 1 member pulls them, from Tier 1 only. An
   entry larger than one datagram travels as 16 KiB chunks. Consensus fixes
   the order; the stream only carries it.
 - **Verification.** A receiving server applies an entry only when it is the
@@ -278,8 +278,11 @@ With ops mode on:
   server has not verified yet is held (at most 64 entries) until the chain
   reaches it. An entry that does not verify or does not chain is refused and
   logged, and nothing after it applies.
-- **Tier 2 servers** apply the same log and serve the same tree. They never
-  vote.
+- **Tier 2 servers** hold no tree in any mode: they run no tree log, take
+  no replicated entry, and keep no tree file. A server that joins Tier 1
+  starts its log on its first Tier 1 tick and catches up from Tier 1; a server
+  that leaves Tier 1 stops its log and deletes it with the rest of
+  `data/tree/`. See [Architecture](Architecture#the-tree-on-tier-1-only).
 - **Lagging servers.** A Tier 1 server that missed a tree block does not
   halt. It applies nothing out of order, catches up through replication, and
   resumes with the next committed block.
@@ -298,7 +301,7 @@ With ops mode on:
   with a certified entry that chains to its log halts tree operations: it applies, votes for, proposes, and
   accepts no tree operation, and keeps serving its last committed tree.
 
-With read-only mode on, the server builds the tree log from the empty tree,
+With read-only mode on, a Tier 1 server builds the tree log from the empty tree,
 runs the `"tree"` stream, verifies and appends replicated entries (the merge
 commit, then committed blocks), and never changes the live tree. It proposes,
 votes for, and accepts no tree operation. Tree writes use the direct paths,
@@ -320,10 +323,11 @@ and the record transfer pool keeps running.
 
 Limits:
 
-- **Writes on Tier 1 only.** A Tier 2 server answers tree writes with 503. It
-  cannot forward a write: replicas trust operation signatures from the frozen
-  Tier 1 set only, and no finalized list of admitted submitters exists. A
-  root-signed admission certificate is identity, not authority.
+- **Tree on Tier 1 only.** A Tier 2 server answers every tree route, reads
+  and writes alike, with `421` and no data, in every mode. It cannot forward a
+  write: replicas trust operation signatures from the frozen Tier 1 set only,
+  and no finalized list of admitted submitters exists. A root-signed
+  admission certificate is identity, not authority.
 - **Same starting tree.** Servers agree on state roots only if every server
   started from the same tree: an empty one, or the merge commit. A new
   ops-mode tree log therefore starts only from an empty tree (see **Start**).

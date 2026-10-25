@@ -7,9 +7,11 @@ title: "Design: Tree Consensus and Threshold Storage Key"
 
 Status: **approved**. Phases 1 to 3 are implemented behind experimental
 settings: with `tree_ops_enabled`, Tier 1 servers order tree operations
-through consensus and apply them only after commit, and Tier 2 and lagging
-servers apply the replicated log; with `tree_log_enabled`, servers build and
-replicate the log in read-only mode for the merge ceremony. See
+through consensus and apply them only after commit, and a Tier 1 member that
+joins or lags applies the replicated log; with `tree_log_enabled`, Tier 1
+members build and replicate the log in read-only mode for the merge ceremony.
+Tier 2 servers hold no tree in any mode (decided 2026-10-24; see
+[A7](#a7-tier-2-and-lagging-servers)). See
 [Configuration](Configuration#experimental-tree-operations) for the behavior
 and limits, and [Tree Merge Ceremony](Tree-Merge-Ceremony) for the
 migration runbook. Phase 4, the `storage-threshold` library
@@ -48,8 +50,8 @@ Two problems, one plan:
 1. **Servers do not stay in sync.** Each server applies only the tree changes
    it receives directly. Two admins who edit through two servers produce two
    different trees. Part A sends every tree change through the Tier 1
-   HotStuff consensus, so every server applies the same changes in the same
-   order.
+   HotStuff consensus, so every Tier 1 server applies the same changes in
+   the same order. Tier 2 servers hold no tree (A7).
 2. **A copied disk exposes the server's secrets.** Private keys, the session
    secret, TLS keys, and the whole tree are on disk in plaintext, or
    encrypted with a key stored beside them. Part B encrypts each server's
@@ -164,9 +166,10 @@ TreeOp {
 
 ### A2. Submission
 
-1. The API server validates the op statically (format, signature, size) and
-   sends it over the backbone to the Tier 1 servers. A Tier 2 server forwards
-   to Tier 1 the same way.
+1. The API server, a Tier 1 member, validates the op statically (format,
+   signature, size) and sends it over the backbone to the other Tier 1
+   servers. A Tier 2 server takes no tree request (see
+   [A7](#a7-tier-2-and-lagging-servers)).
 2. Each Tier 1 server keeps a bounded pending pool, keyed by `op_id`, with
    per-author limits.
 3. The API answers when the op commits or is refused, waiting up to 10 s.
@@ -175,15 +178,16 @@ TreeOp {
 
 Phase 2 implementation: replicas trust op signatures from the block epoch's
 frozen Tier 1 set only, so a Tier 2 server cannot sign an op a replica
-accepts. Until a finalized set of admitted submitters exists, a Tier 2 server
-answers tree writes with 503 instead of forwarding them. The poll route is
-`GET /api/tree/op/{op_id}`.
+accepts. The poll route is `GET /api/tree/op/{op_id}`.
 
-Phase 3 keeps the 503. Finalized state names only the Tier 1 set (and, at a
-boundary, the eligible candidates for selection). Root-signed admission
-certificates are identity, not authority, so they cannot become a list of
-trusted submitters, and a Tier 1 server that signed a Tier 2 server's request
-would assert a session it did not authenticate.
+Finalized state names only the Tier 1 set (and, at a boundary, the eligible
+candidates for selection). Root-signed admission certificates are identity,
+not authority, so they cannot become a list of trusted submitters, and a Tier
+1 server that signed a Tier 2 server's request would assert a session it did
+not authenticate. A Tier 2 server therefore answers every tree route, writes
+and reads alike, with a plain `421` that carries no redirect and no data
+([A7](#a7-tier-2-and-lagging-servers)). The earlier `503` for writes on Tier 2
+is replaced by that refusal.
 
 ### A3. Consensus payload
 
@@ -257,23 +261,36 @@ root over the tree the log started from.
   resubmitted to the new epoch's pool.
 - Snapshots every 1,000 heights bound replay time. A snapshot is the tree's
   canonical encoding plus its digest, cross-checked against the state root.
-- The gossip transfer pool for tree records is retired once all servers run
-  the tree log.
+- The gossip transfer pool for tree records is retired once all Tier 1
+  servers run the tree log. A Tier 2 server runs no transfer pool.
 
 ### A7. Tier 2 and lagging servers
+
+Decision (2026-10-24): Tier 2 servers hold no tree. They are pure proxies of
+end-to-end encrypted data and connections. They do not store, replicate,
+read, write, redirect, or forward the tree, do not serve the tree API, and do
+not terminate or vouch for a client tree session. Clients send every tree
+read and write directly to a Tier 1 server, which they verify from finalized
+membership (see [Client SDK](Client-SDK#tier-1-servers)). The original plan,
+in which Tier 2 servers applied the replicated log and served the same tree,
+is withdrawn.
 
 - Replication reuses the existing sync library (`nexus::sync`, already used
   for DNS and account envelopes): a new `"tree"` stream whose entries are
   committed log blocks keyed by height, with the same digest and catch-up
   exchange over the backbone. Consensus fixes the order; the sync library
   only carries it, so last-writer-wins never decides a permission change.
+- Replication runs between Tier 1 members only. A member that joins Tier 1,
+  or that lags, catches up from the other members.
 - A receiving server verifies each block's QC against the epoch's vote keys
   and follows the authority chain across epochs. It applies only verified
   entries, in height order.
-- Tier 2 servers never vote. They apply the same verified log, so they serve
-  the same tree.
 - A server that cannot verify an entry stops applying and keeps serving the
   last verified state. It never applies unverified data.
+- A server that is not a Tier 1 member runs no tree log, takes no replicated
+  entry, and keeps no tree file. A server that leaves Tier 1 deletes its tree
+  copy (best-effort overwrite) once finalized state shows that its last epoch
+  ended. See [Architecture](Architecture#the-tree-on-tier-1-only).
 
 Phase 3 implementation:
 
@@ -281,8 +298,8 @@ Phase 3 implementation:
   (`tree-log`) in an `OriginReplica`; the entry bytes stay in the tree log and
   are read on demand. Catch-up sends entries in height order, at most 16 per
   request, as 16 KiB `TreeLogSync` chunks that the receiver reassembles within
-  a 32 MiB budget. Only Tier 1 serves; only backbone traffic from certified
-  peers is accepted.
+  a 32 MiB budget. Only Tier 1 serves, only a Tier 1 member takes entries,
+  and only backbone traffic from certified peers is accepted.
 - A receiver verifies the commit proof (`verify_commit_proof`) under the vote
   keys and quorum of the epoch the entry's header names. It takes them from
   `SecurityDriver::authority_for_epoch`, which holds every epoch authority the
@@ -301,7 +318,8 @@ Phase 3 implementation:
 
 ### A8. Effect on clients
 
-- Peer lists, permissions, and the tree become identical on every server.
+- Peer lists, permissions, and the tree become identical on every Tier 1
+  server. Tier 2 servers hold none of them.
 - A later step can give clients proof: a server returns a node with the QC
   that committed it, so an app can reject a peer entry a compromised server
   invented. This closes the "lying server" case and is listed as a follow-up.
@@ -310,14 +328,16 @@ Phase 3 implementation:
 
 Today each server's tree differs.
 
-1. Release N adds the tree log in read-only mode: servers build and replicate
-   it but keep applying changes locally.
-2. A one-time ceremony exports every server's tree. A merge tool unions them:
+1. Release N adds the tree log in read-only mode: Tier 1 servers build and
+   replicate it but keep applying changes locally.
+2. A one-time ceremony exports every server's tree. A merge tool unions them.
+   Export a Tier 2 server's tree before it runs a release that holds no tree
+   on Tier 2: that release deletes it at startup.
    the root from the root server, each group from its creator's record, each
    device from the server it joined. Conflicts are listed for an admin to
    resolve.
 3. The merged tree is committed as **height 1**, signed by the root
-   management key offline, and verified by every server.
+   management key offline, and verified by every Tier 1 server.
 4. Release N+1 switches every write path to ops. Local-only writes end.
 
 Phase 3 implementation: release N is `tree_log_enabled` (read-only mode: the
@@ -690,7 +710,7 @@ This part does not change the trust model and can ship first.
 | 0 | Part C race fix. `keypair.json` mode 600. | — |
 | 1 | `TreeOp`, node versions, deterministic validation, all write paths produce ops (applied locally, behind a flag). | — |
 | 2 | Tree batches in consensus, `TreeLog`, commit-then-apply on Tier 1. | 1 |
-| 3 | Log replication to Tier 2 and lagging servers with QC verification. Tree merge ceremony and switch-over (A9). | 2 |
+| 3 | Log replication to joining and lagging Tier 1 servers with QC verification. Tree merge ceremony and switch-over (A9). Tier 2 servers hold no tree (A7, decided 2026-10-24). | 2 |
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |

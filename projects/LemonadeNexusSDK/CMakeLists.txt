@@ -21,13 +21,35 @@ create_project(LemonadeNexusSDK DEPENDENCIES
 # and link the netstack.
 set(LN_DATAPLANE_SRC "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src/Boringtun/UserspaceDataplane.cpp")
 set(LN_SERVER_INCLUDE "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/include")
+
+# Tier 1 membership verification (Tier1Directory.cpp) reuses the server's own
+# authority chain verifier and codec, and the server's list of tree routes,
+# so the client and the server check the same rules. These sources depend on
+# libsodium, nlohmann_json, and httplib only.
+set(LN_SERVER_SRC "${CMAKE_SOURCE_DIR}/projects/LemonadeNexus/src")
+set(LN_TRUST_SRC
+    "${LN_SERVER_SRC}/Api/TreeRouteGate.cpp"
+    "${LN_SERVER_SRC}/Crypto/CryptoTypes.cpp"
+    "${LN_SERVER_SRC}/Crypto/SecureBuffer.cpp"
+    "${LN_SERVER_SRC}/Security/CanonicalEncoding.cpp"
+    "${LN_SERVER_SRC}/Security/Consensus/CommitProof.cpp"
+    "${LN_SERVER_SRC}/Security/Consensus/ConsensusTypes.cpp"
+    "${LN_SERVER_SRC}/Security/Consensus/QuorumValidation.cpp"
+    "${LN_SERVER_SRC}/Security/Consensus/VoteKey.cpp"
+    "${LN_SERVER_SRC}/Security/Epoch/AuthorityChain.cpp"
+    "${LN_SERVER_SRC}/Security/Epoch/NextEpochPlan.cpp"
+    "${LN_SERVER_SRC}/Security/Epoch/Tier1Membership.cpp"
+    "${LN_SERVER_SRC}/Security/Epoch/Tier1Set.cpp"
+    "${LN_SERVER_SRC}/Security/Genesis/BootstrapCertificate.cpp"
+    "${LN_SERVER_SRC}/Security/Transport/AuthorityChainCodec.cpp")
+
 if(TARGET LemonadeNexusSDK)
-    target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}")
+    target_sources(LemonadeNexusSDK PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDK PRIVATE "${LN_SERVER_INCLUDE}")
     target_link_libraries(LemonadeNexusSDK PUBLIC virtual-netstack)
 endif()
 if(TARGET LemonadeNexusSDKApp)
-    target_sources(LemonadeNexusSDKApp PRIVATE "${LN_DATAPLANE_SRC}")
+    target_sources(LemonadeNexusSDKApp PRIVATE "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
     target_include_directories(LemonadeNexusSDKApp PRIVATE "${LN_SERVER_INCLUDE}")
     target_link_libraries(LemonadeNexusSDKApp PUBLIC virtual-netstack)
 endif()
@@ -46,7 +68,7 @@ option(BUILD_SDK_SHARED "Build LemonadeNexusSDK as a self-contained shared libra
 if(BUILD_SDK_SHARED)
     file(GLOB_RECURSE _sdk_shared_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
     list(REMOVE_ITEM _sdk_shared_sources "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
-    list(APPEND _sdk_shared_sources "${LN_DATAPLANE_SRC}")
+    list(APPEND _sdk_shared_sources "${LN_DATAPLANE_SRC}" ${LN_TRUST_SRC})
 
     add_library(LemonadeNexusSDKShared SHARED ${_sdk_shared_sources})
     target_compile_features(LemonadeNexusSDKShared PUBLIC cxx_std_20)

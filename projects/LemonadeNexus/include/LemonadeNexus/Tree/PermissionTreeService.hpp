@@ -28,6 +28,17 @@ public:
     PermissionTreeService(storage::FileStorageService& storage,
                            crypto::SodiumCryptoService& crypto);
 
+    /// Drop the tree from memory and stop writing tree files: every later
+    /// write path fails without touching storage until start() loads the
+    /// tree again. Reads see an empty tree. A server that leaves Tier 1
+    /// closes its tree before it deletes the files (TreeRole.hpp). Safe to
+    /// call more than once. Thread-safe.
+    void close();
+
+    /// False from close() until the next start(): the write paths refuse.
+    /// Thread-safe.
+    [[nodiscard]] bool is_open() const;
+
     /// Bootstrap the root node if none exists.  Called during join when
     /// the tree is empty — the first authenticated user becomes root.
     /// Returns true if created, false if root already exists.
@@ -272,6 +283,12 @@ private:
     // The stored record exists but does not parse: the committed ids are
     // unknown, so validate_local_op and submit_local_op refuse every op.
     bool committed_ops_unreadable_ = false;
+
+    // False after close(): persist_node, remove_node, the delta log append,
+    // and the committed-ids write refuse, so a request that raced the close
+    // cannot recreate a tree file. Guarded by mutex_. True from construction
+    // so a tree used without start() keeps its existing behavior.
+    bool holds_files_ = true;
 
     /// Write committed_ops_ to tree/committed-ops.json. Caller holds mutex_.
     bool persist_committed_ops_locked() const;

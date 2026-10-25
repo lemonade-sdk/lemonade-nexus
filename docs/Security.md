@@ -59,9 +59,9 @@ stub that always fails.
 
 | Role | What establishes it | Capabilities |
 |---|---|---|
-| **Tier 2** | A valid network-bound server certificate and authenticated mesh participation | Mesh services and non-authoritative synchronization. No Tier 1 authority share. |
+| **Tier 2** | A valid network-bound server certificate and authenticated mesh participation | A pure proxy of end-to-end encrypted data and connections: relay, STUN, discovery DNS, and the security transport. Holds no permission tree, serves no tree route or client session, and forwards no packet between dataplane peers. No Tier 1 authority share. |
 | **Pending member** | Selection in a finalized next-epoch plan | State synchronization and readiness preparation. No active Tier 1 authority. |
-| **Tier 1** | Verified platform evidence and mesh observations establish eligibility; the protocol's finalized eligibility, plan, readiness, and handoff establish the role | HotStuff consensus, epoch transitions, dealerless DKG participation, threshold authority signing |
+| **Tier 1** | Verified platform evidence and mesh observations establish eligibility; the protocol's finalized eligibility, plan, readiness, and handoff establish the role | HotStuff consensus, epoch transitions, dealerless DKG participation, threshold authority signing. Holds and serves the permission tree and client sessions. |
 
 Tier 1 is an **epoch-scoped** role. A transport connection or a valid
 certificate never grants it, and a pending candidate holds preparation rights
@@ -70,6 +70,37 @@ handoff.
 
 Clients use the mesh under their application permissions. They do not become
 members of the server authority committee.
+
+### The tree lives on Tier 1 only
+
+The permission tree follows finalized epoch membership, never configuration
+or a peer's word (`Tree/TreeRole.hpp`):
+
+- **A current Tier 1 member** loads the tree and serves the tree routes,
+  client sessions (`/api/auth*`, `/api/join`), and endpoint forwarding.
+- **Any other server** refuses every tree route with `421` and the body
+  `{"error":"this server does not serve the tree"}`: no redirect, no other
+  server named, and no tree data (`Api/TreeRouteGate.hpp`). It runs no tree
+  replication, no record transfer pool, and no tree log, takes no replicated
+  tree entry, and keeps no tree file.
+- **A server that leaves Tier 1** closes the gate, stops those services, and
+  deletes its tree copy in the tick in which finalized state shows that its
+  last epoch ended. Each file under `data/tree/` is overwritten with zeros,
+  flushed, and removed. This is best effort: a journaling or copy-on-write
+  file system, snapshots, or SSD remapping can keep older blocks.
+- **A server whose membership is not known** (before Epoch 1 activates, or
+  before its persisted state verifies) serves no tree and deletes nothing.
+  Unknown is not evidence that it left Tier 1.
+
+A server that enters Tier 1 gets the tree through Tier 1 replication in ops
+mode. The default direct-write mode has no tree replication: a new member
+starts from an empty tree with the application root from `root_pubkey`.
+
+Clients send every tree read and write directly to a Tier 1 server. The SDK
+verifies the membership from its pinned Genesis key and accepts a server only
+after it signs an endpoint proof for the host and port the client reached
+(see [Client SDK](Client-SDK#tier-1-servers)). A server never vouches for a
+session it did not issue.
 
 Endpoints, the devices that join a group, come in two roles. Neither holds any
 server or authority role:
@@ -97,7 +128,11 @@ dataplane sees traffic that one endpoint sends to another. The server forwards
 it only when the source endpoint's key may connect to the destination
 endpoint: the destination is in the source's group, and the source key holds
 `connect_private`, `connect_shared`, or `admin` on the destination device
-itself. This is the rule the routing layer applies. Replies return without a
+itself. Only a Tier 1 server forwards between endpoints: forwarding needs
+the tree, so a Tier 2 server installs a policy that forwards no packet between
+dataplane peers. Endpoints that cannot reach each other directly use the relay
+service, which carries only ciphertext. This is the rule the routing layer
+applies. Replies return without a
 grant in the other direction: a TCP segment that is not a bare SYN, and ICMP
 echo replies and errors. A device that may only be reached cannot open a TCP
 connection back, and a UDP reply needs a grant in its own direction. Relays
@@ -307,7 +342,8 @@ root:
   is root-gated or token-gated. It grants transport membership, not Tier 1.
 - **Replicated application stores** (ACL, DNS records, backbone IPAM, NS
   slots, account group-key envelopes) sync through gossip under root-signed
-  peer certificates. Their
+  peer certificates. A Tier 2 server holds no tree, so it accepts no account
+  envelope. Their
   mutation paths are audited against permission rules but are not yet
   consensus-authorized.
 - **Author-signed record receipt is not authorization.** Receiving a
@@ -343,6 +379,15 @@ These are implementation limits, not settings an operator can disable:
 5. **IMA checkpoint/resume acceptance is not implemented.** The bounded
    evidence path must satisfy the current complete verification
    requirements.
+6. **No tree without Tier 1.** Only Tier 1 members hold the tree. Before Epoch
+   1 activates, and while no server qualifies for Tier 1 (item 1), no server
+   serves a tree route or a client session, and no client can join.
+7. **Relay tickets come from the session server.** A relay accepts only
+   tickets its own server signed, and only Tier 1 servers issue sessions, so a
+   Tier 2 relay accepts no ticket today. Tier 2 relaying needs relay tickets
+   that a Tier 2 relay verifies against the verified Tier 1 membership.
+8. **Tree-derived DNS names are Tier 1 answers.** A nameserver that is not a
+   Tier 1 member has no tree and does not answer endpoint host names.
 
 ## Retired Mechanisms
 

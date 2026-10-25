@@ -98,6 +98,14 @@ public:
     /// lets open() report the fault instead.
     [[nodiscard]] bool exists() const;
 
+    /// Drop the in-memory state: height 0 and an empty tree. Touches no file;
+    /// open() loads the log again.
+    void close() {
+        state_ = TreeChainState{};
+        height_ = 0;
+        applied_height_ = 0;
+    }
+
     /// The committed tree state at the log head.
     [[nodiscard]] const TreeChainState& state() const { return state_; }
     [[nodiscard]] uint64_t height() const { return height_; }

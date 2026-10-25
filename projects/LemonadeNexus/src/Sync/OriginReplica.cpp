@@ -256,6 +256,13 @@ uint64_t OriginReplica::version() const {
     return version_;
 }
 
+void OriginReplica::clear() {
+    std::lock_guard lock(mutex_);
+    entries_.clear();
+    peers_.clear();
+    ++version_;
+}
+
 static nlohmann::json origin_row(const std::string& origin, const OriginSummary& s) {
     return nlohmann::json::array({origin, s.max_seq, s.count, s.hash});
 }

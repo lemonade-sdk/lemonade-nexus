@@ -1,6 +1,7 @@
 #include <LemonadeNexus/Api/PublicApiHandler.hpp>
 
 #include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Network/HttpServer.hpp>
 #include <LemonadeNexus/Network/SeipNaming.hpp>
 #include <LemonadeNexus/Gossip/GossipService.hpp>
@@ -55,6 +56,8 @@ void PublicApiHandler::do_register_routes(httplib::Server& pub,
             // Clients reach the public API by the SEIP FQDN (what the cert covers).
             .fqdn      = !ctx_.server_seip_fqdn.empty() ? ctx_.server_seip_fqdn
                                                         : ctx_.server_fqdn,
+            // The node identity a Tier 1 endpoint proof is signed with.
+            .pubkey    = crypto::to_base64(ctx_.gossip.keypair().public_key),
             .http_port = ctx_.config.http_port,
             .healthy   = true,
         });

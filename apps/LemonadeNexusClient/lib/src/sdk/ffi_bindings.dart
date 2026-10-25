@@ -144,6 +144,26 @@ typedef _LnGroupKeyUnwrapDart = ffi.Pointer<ffi.Char> Function(
   ffi.Pointer<ffi.Char> envelopeJson,
 );
 
+// Tier 1 servers (tree traffic)
+typedef _LnSetGenesisKey = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> genesisPubkeyB64,
+  ffi.Uint64 minEpoch,
+);
+typedef _LnSetGenesisKeyDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Char> genesisPubkeyB64,
+  int minEpoch,
+);
+typedef _LnTier1Json = ffi.Int32 Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+typedef _LnTier1JsonDart = int Function(
+  LnClientHandle client,
+  ffi.Pointer<ffi.Pointer<ffi.Char>> outJson,
+);
+
 // Device linking
 typedef _LnSetLinkToken = ffi.Int32 Function(
   LnClientHandle client,
@@ -718,6 +738,12 @@ class LemonadeNexusFfi {
       _LnGroupKeyUnwrapDart>('ln_group_key_unwrap');
   late final _lnSetLinkToken =
       _lib.lookupFunction<_LnSetLinkToken, _LnSetLinkTokenDart>('ln_set_link_token');
+  late final _lnSetGenesisKey =
+      _lib.lookupFunction<_LnSetGenesisKey, _LnSetGenesisKeyDart>('ln_set_genesis_key');
+  late final _lnTier1Refresh =
+      _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_refresh');
+  late final _lnTier1Membership =
+      _lib.lookupFunction<_LnTier1Json, _LnTier1JsonDart>('ln_tier1_membership');
   late final _lnLinkTokenCreate = _lib.lookupFunction<_LnLinkTokenCreate,
       _LnLinkTokenCreateDart>('ln_link_token_create');
 
@@ -857,6 +883,9 @@ class LemonadeNexusFfi {
     'ln_group_key_generate',
     'ln_group_key_wrap',
     'ln_group_key_unwrap',
+    'ln_set_genesis_key',
+    'ln_tier1_refresh',
+    'ln_tier1_membership',
   ];
 
   /// Required symbols absent from the loaded native library (empty when the
@@ -1017,6 +1046,38 @@ class LemonadeNexusFfi {
     final result = _lnGroupKeyUnwrap(identity, env);
     malloc.free(env);
     return toStringAndFree(result);
+  }
+
+  /// Pin the network's Genesis public key (base64). The SDK sends tree,
+  /// session, and private-API requests only to Tier 1 servers it verifies
+  /// from this key; without it those requests are not sent.
+  LnError setGenesisKey(LnClientHandle client, String genesisPubkeyB64,
+      {int minEpoch = 0}) {
+    final key = genesisPubkeyB64.toNativeUtf8().cast<ffi.Char>();
+    final result = _lnSetGenesisKey(client, key, minEpoch);
+    malloc.free(key);
+    return LnError.fromCode(result);
+  }
+
+  /// Verify the Tier 1 membership now. Returns the error code and the JSON:
+  /// {epoch, members, servers} on success, {error} on failure.
+  (LnError, String?) tier1Refresh(LnClientHandle client) =>
+      _tier1Json(client, _lnTier1Refresh);
+
+  /// The last verified Tier 1 membership, without network I/O.
+  (LnError, String?) tier1Membership(LnClientHandle client) =>
+      _tier1Json(client, _lnTier1Membership);
+
+  (LnError, String?) _tier1Json(LnClientHandle client, _LnTier1JsonDart call) {
+    final outJson = calloc<ffi.Pointer<ffi.Char>>();
+    try {
+      final result = call(client, outJson);
+      final json =
+          outJson.value == ffi.nullptr ? null : toStringAndFree(outJson.value);
+      return (LnError.fromCode(result), json);
+    } finally {
+      calloc.free(outJson);
+    }
   }
 
   /// Set the single-use device-link token injected into the next join_network.

@@ -6,6 +6,8 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <future>
+#include <memory>
 
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
@@ -208,8 +210,12 @@ void SecurityMeshService::refresh_members() {
     // io thread only. Membership changes when an epoch activates, so copying it
     // each tick keeps the cross-thread snapshot at most one tick stale.
     std::vector<NodeId> members;
+    bool known = false;
+    EpochId epoch{0};
     if (const EpochManager* epochs = runtime_.epochs(); epochs != nullptr) {
         members = epochs->current().tier1_members.members();
+        epoch = epochs->current().id;
+        known = true;
     } else if (const VerifiedEpochAuthority* authority = driver_.verified_authority();
                authority != nullptr) {
         // Tier 2 path: a non-member has no EpochManager, but it walks the
@@ -217,9 +223,28 @@ void SecurityMeshService::refresh_members() {
         // Without this it recognizes no node as Tier 1 and denies their
         // records — the Tier 2 node must still trust the real Tier 1 set.
         members = authority->members;
+        epoch = authority->epoch;
+        known = true;
     }
     std::lock_guard lock(members_mutex_);
     current_members_ = std::move(members);
+    members_known_ = known;
+    current_epoch_ = epoch;
+}
+
+NetworkId SecurityMeshService::network_id() const { return mesh_network_id(config_); }
+
+std::optional<AuthorityChainPage> SecurityMeshService::authority_chain_page(
+    EpochId have_epoch, std::chrono::milliseconds timeout) {
+    auto promise = std::make_shared<std::promise<std::optional<AuthorityChainPage>>>();
+    auto answer = promise->get_future();
+    asio::post(timer_.get_executor(), [this, have_epoch, promise] {
+        promise->set_value(running_ ? driver_.authority_chain_page(have_epoch) : std::nullopt);
+    });
+    if (answer.wait_for(timeout) != std::future_status::ready) {
+        return std::nullopt;
+    }
+    return answer.get();
 }
 
 void SecurityMeshService::arm_timer() {

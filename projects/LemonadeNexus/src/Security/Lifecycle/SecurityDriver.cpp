@@ -2226,16 +2226,25 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
                                                 const NodeId& from) {
     // Serving is a bounded read of local records; it grants nothing and
     // asserts nothing the page's own proofs do not carry.
+    const auto page = authority_chain_page(request.have_epoch);
+    if (!page.has_value()) {
+        return;
+    }
+    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, *page,
+                                             authority_.has_value() ? authority_->epoch : 0));
+}
+
+std::optional<AuthorityChainPage> SecurityDriver::authority_chain_page(EpochId have_epoch) const {
     AuthorityChainPage page;
-    EpochId next_from = request.have_epoch;
-    if (request.have_epoch == 0) {
+    EpochId next_from = have_epoch;
+    if (have_epoch == 0) {
         auto certificate = store_.load_bootstrap();
         auto base = store_.load_chain_base();
         const auto* cert = std::get_if<BootstrapCertificate>(&certificate);
         const auto* listing =
             std::get_if<std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>>(&base);
         if (cert == nullptr || listing == nullptr) {
-            return;
+            return std::nullopt;
         }
         page.has_base = true;
         page.base_certificate = *cert;
@@ -2262,10 +2271,9 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
         }
     }
     if (!page.has_base && page.links.empty()) {
-        return;
+        return std::nullopt;
     }
-    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, page,
-                                             authority_.has_value() ? authority_->epoch : 0));
+    return page;
 }
 
 void SecurityDriver::on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) {

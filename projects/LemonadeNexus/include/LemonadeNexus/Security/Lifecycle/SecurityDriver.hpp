@@ -117,6 +117,14 @@ public:
     /// prompt an authority chain request, never an answer. io thread.
     void note_epoch_hint(EpochId epoch) { chain_hint_epoch_ = std::max(chain_hint_epoch_, epoch); }
 
+    /// One page of the stored authority chain after `have_epoch`: the Genesis
+    /// certificate and founder listing when `have_epoch` is 0, then at most
+    /// kMaxHandoffChainLinks consecutive finalized handoffs with their commit
+    /// proofs. nullopt when this node stores nothing to add. A bounded read of
+    /// local records; the page asserts nothing its own proofs do not carry.
+    /// io thread.
+    [[nodiscard]] std::optional<AuthorityChainPage> authority_chain_page(EpochId have_epoch) const;
+
     // --- ISecurityEvents ---
     void on_vote_sent(const Vote&, const NodeId&) override {}
     void on_certificate(const QuorumCertificate& certificate) override;

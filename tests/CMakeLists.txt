@@ -77,6 +77,9 @@ add_nexus_test(test_sdk_transport     test_sdk_transport.cpp)
 target_link_libraries(test_sdk_transport PRIVATE LemonadeNexusSDK)
 add_nexus_test(test_sdk_delta_canonical test_sdk_delta_canonical.cpp)
 target_link_libraries(test_sdk_delta_canonical PRIVATE LemonadeNexusSDK)
+add_nexus_test(test_sdk_tier1         test_sdk_tier1.cpp)
+target_link_libraries(test_sdk_tier1 PRIVATE LemonadeNexusSDK)
+add_nexus_test(test_tier2_no_tree     test_tier2_no_tree.cpp)
 add_nexus_test(test_acme              test_acme.cpp)
 add_nexus_test(test_dns               test_dns.cpp)
 add_nexus_test(test_dns_tcp           test_dns_tcp.cpp)
@@ -190,7 +193,8 @@ add_nexus_test(test_security_epoch
     security/epoch/transition.cpp
     security/epoch/epoch_manager.cpp
     security/epoch/epoch_store.cpp
-    security/epoch/authority_chain.cpp)
+    security/epoch/authority_chain.cpp
+    security/epoch/tier1_membership.cpp)
 add_nexus_test(test_security_hotstuff
     security/consensus/consensus_store.cpp
     security/consensus/hotstuff_safety.cpp

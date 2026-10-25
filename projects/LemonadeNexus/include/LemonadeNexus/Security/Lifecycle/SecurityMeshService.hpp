@@ -121,6 +121,35 @@ public:
         return current_members_;
     }
 
+    /// One consistent copy of the membership snapshot (see is_current_member).
+    struct MembershipSnapshot {
+        /// False while this node holds no finalized epoch state: before Epoch 1
+        /// activates, or before its persisted state verifies. Unknown is not
+        /// "not a member"; a caller must not act on it as if it were.
+        bool known = false;
+        /// The epoch the members belong to; 0 when not known.
+        EpochId epoch{0};
+        std::vector<NodeId> members;
+    };
+
+    /// The current membership snapshot. Thread-safe; trails a membership
+    /// change by at most one tick.
+    [[nodiscard]] MembershipSnapshot membership() const {
+        std::lock_guard lock(members_mutex_);
+        return MembershipSnapshot{members_known_, current_epoch_, current_members_};
+    }
+
+    /// The network the pinned Genesis key derives.
+    [[nodiscard]] NetworkId network_id() const;
+
+    /// One page of the stored authority chain after `have_epoch`
+    /// (SecurityDriver::authority_chain_page), read on the io thread. Waits at
+    /// most `timeout`; nullopt on timeout, after stop, or when nothing is
+    /// stored. Thread-safe. Do not call on the io thread: it would wait for
+    /// itself until the timeout.
+    [[nodiscard]] std::optional<AuthorityChainPage> authority_chain_page(
+        EpochId have_epoch, std::chrono::milliseconds timeout);
+
     /// Registers a block payload handler with the driver
     /// (SecurityDriver::register_payload_handler). Not owning. Call before the
     /// io context runs.
@@ -294,6 +323,8 @@ private:
     /// by refresh_members(), read by is_current_member() from any thread.
     mutable std::mutex members_mutex_;
     std::vector<NodeId> current_members_;
+    bool members_known_ = false;
+    EpochId current_epoch_{0};
 
     std::function<void()> tick_hook_;
 
