@@ -439,6 +439,44 @@ PermissionTreeService::AssignmentChange PermissionTreeService::move_node(
     return change;
 }
 
+bool PermissionTreeService::delete_account(std::string_view principal, AccountDeletion& out,
+                                           std::string& reason) {
+    std::vector<TreeNode> removed;
+    std::vector<AccountDeletion> accounts;
+    {
+        std::lock_guard lock(mutex_);
+        if (!holds_files_) {
+            reason = "the tree is closed";
+            return false;
+        }
+        TreeOp op;
+        op.kind = TreeOpKind::DeleteAccount;
+        op.principal = std::string(principal);
+        op.target = derive_join_node_id(crypto_, op.principal);
+        if (op.target.empty()) {
+            reason = "an account deletion needs an ed25519 principal";
+            return false;
+        }
+        const auto scope = rules::account_scope(nodes_, op.principal);
+        TreeOpEffect effect;
+        if (const auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
+            reason = verdict.reason;
+            return false;
+        }
+        if (!write_effect_locked(effect, /*keep_versions=*/true, removed)) {
+            reason = "failed to persist node";
+            return false;
+        }
+        out = AccountDeletion{op.principal, op.target, removed, scope.swept_keys};
+        accounts.push_back(out);
+        spdlog::info("[{}] deleted account '{}' ({} nodes removed, {} nodes changed)", name(),
+                     op.target, effect.removals.size(), effect.writes.size());
+    }
+    notify_removed(removed);
+    notify_accounts(accounts);
+    return true;
+}
+
 bool PermissionTreeService::may_connect(std::string_view principal, std::string_view from_node_id,
                                         std::string_view to_node_id) const {
     std::lock_guard lock(mutex_);
@@ -725,6 +763,7 @@ TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
                                                      const TreeOpPolicy& policy,
                                                      uint64_t block_time_sec) {
     std::vector<TreeNode> removed;
+    std::vector<AccountDeletion> accounts;
     TreeOpVerdict verdict;
     {
         std::lock_guard lock(mutex_);
@@ -738,39 +777,44 @@ TreeOpVerdict PermissionTreeService::submit_local_op(const TreeOp& op,
             return verdict;
         }
         committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
-        verdict = apply_op_locked(op, removed);
+        verdict = apply_op_locked(op, removed, accounts);
         persist_committed_ops_after(verdict);
     }
     notify_removed(removed);
+    notify_accounts(accounts);
     return verdict;
 }
 
 TreeOpVerdict PermissionTreeService::apply_op(const TreeOp& op) {
     std::vector<TreeNode> removed;
+    std::vector<AccountDeletion> accounts;
     TreeOpVerdict verdict;
     {
         std::lock_guard lock(mutex_);
-        verdict = apply_op_locked(op, removed);
+        verdict = apply_op_locked(op, removed, accounts);
         persist_committed_ops_after(verdict);
     }
     notify_removed(removed);
+    notify_accounts(accounts);
     return verdict;
 }
 
 TreeOpVerdict PermissionTreeService::apply_committed_ops(const std::vector<TreeOp>& ops,
                                                          uint64_t block_time_sec) {
     std::vector<TreeNode> removed;
+    std::vector<AccountDeletion> accounts;
     TreeOpVerdict verdict;
     {
         std::lock_guard lock(mutex_);
         for (const auto& op : ops) {
-            verdict = apply_op_locked(op, removed);
+            verdict = apply_op_locked(op, removed, accounts);
             if (!verdict.ok()) break;
         }
         committed_ops_.prune_signed_before(committed_id_cutoff(block_time_sec));
         persist_committed_ops_after(TreeOpVerdict{});
     }
     notify_removed(removed);
+    notify_accounts(accounts);
     return verdict;
 }
 
@@ -778,6 +822,23 @@ void PermissionTreeService::set_removed_nodes_hook(
         std::function<void(const std::vector<TreeNode>&)> hook) {
     std::lock_guard lock(removed_hook_mtx_);
     removed_hook_ = std::move(hook);
+}
+
+void PermissionTreeService::set_account_deleted_hook(
+        std::function<void(const AccountDeletion&)> hook) {
+    std::lock_guard lock(removed_hook_mtx_);
+    account_hook_ = std::move(hook);
+}
+
+void PermissionTreeService::notify_accounts(const std::vector<AccountDeletion>& accounts) const {
+    if (accounts.empty()) return;
+    std::function<void(const AccountDeletion&)> hook;
+    {
+        std::lock_guard lock(removed_hook_mtx_);
+        hook = account_hook_;
+    }
+    if (!hook) return;
+    for (const auto& account : accounts) hook(account);
 }
 
 void PermissionTreeService::notify_removed(const std::vector<TreeNode>& removed) const {
@@ -799,24 +860,17 @@ void PermissionTreeService::persist_committed_ops_after(const TreeOpVerdict& ver
     }
 }
 
-TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
-                                                     std::vector<TreeNode>& removed) {
-    TreeOpEffect effect;
-    if (auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
-        spdlog::warn("[{}] tree op on '{}' does not apply: {}", name(), op.target,
-                     verdict.reason);
-        return verdict;
-    }
-
+bool PermissionTreeService::write_effect_locked(const TreeOpEffect& effect, bool keep_versions,
+                                                std::vector<TreeNode>& removed) {
     // Persist writes before removals, so a failed write never leaves a node
     // deleted for an op that did not complete.
-    for (const auto& node : effect.writes) {
-        if (!persist_node(node)) {
-            spdlog::error("[{}] tree op on '{}': failed to persist node '{}'", name(),
-                          op.target, node.id);
-            return TreeOpVerdict{TreeOpRefusal::StorageError, "failed to persist node"};
-        }
+    for (auto node : effect.writes) {
         auto it = nodes_.find(node.id);
+        if (keep_versions && it != nodes_.end()) node.version = it->second.version;
+        if (!persist_node(node)) {
+            spdlog::error("[{}] failed to persist node '{}'", name(), node.id);
+            return false;
+        }
         if (it != nodes_.end() && !it->second.endpoint_identifier.empty() &&
             it->second.endpoint_identifier != node.endpoint_identifier) {
             identifier_index_.erase(it->second.endpoint_identifier);
@@ -824,7 +878,7 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
         if (!node.endpoint_identifier.empty()) {
             identifier_index_[node.endpoint_identifier] = node.id;
         }
-        nodes_[node.id] = node;
+        nodes_[node.id] = std::move(node);
     }
     for (const auto& id : effect.removals) {
         auto it = nodes_.find(id);
@@ -835,9 +889,37 @@ TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
         removed.push_back(std::move(it->second));
         nodes_.erase(it);
         if (!remove_node(id)) {
-            spdlog::warn("[{}] tree op on '{}': storage delete failed for '{}'", name(),
-                         op.target, id);
+            spdlog::warn("[{}] storage delete failed for '{}'", name(), id);
         }
+    }
+    return true;
+}
+
+TreeOpVerdict PermissionTreeService::apply_op_locked(const TreeOp& op,
+                                                     std::vector<TreeNode>& removed,
+                                                     std::vector<AccountDeletion>& accounts) {
+    TreeOpEffect effect;
+    if (auto verdict = plan_op(op, nodes_, effect); !verdict.ok()) {
+        spdlog::warn("[{}] tree op on '{}' does not apply: {}", name(), op.target,
+                     verdict.reason);
+        return verdict;
+    }
+    std::vector<std::string> swept_keys;
+    if (op.kind == TreeOpKind::DeleteAccount) {
+        swept_keys = rules::account_scope(nodes_, op.principal).swept_keys;
+    }
+
+    const auto removed_before = removed.size();
+    if (!write_effect_locked(effect, /*keep_versions=*/false, removed)) {
+        spdlog::error("[{}] tree op on '{}' did not complete", name(), op.target);
+        return TreeOpVerdict{TreeOpRefusal::StorageError, "failed to persist node"};
+    }
+    if (op.kind == TreeOpKind::DeleteAccount) {
+        accounts.push_back(AccountDeletion{
+            op.principal, op.target,
+            std::vector<TreeNode>(removed.begin() + static_cast<std::ptrdiff_t>(removed_before),
+                                  removed.end()),
+            std::move(swept_keys)});
     }
 
     record_committed(committed_ops_, op);

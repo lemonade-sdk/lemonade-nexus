@@ -470,8 +470,10 @@ JoinOpResult join_via_tree_op(ApiContext& ctx, httplib::Response& res,
 
 } // namespace
 
-// Only applied tree operations call the hook, and with tree operations off no
-// operation is applied, so the direct routes' own cleanup never runs twice.
+// Applied tree operations and the direct account deletion
+// (PermissionTreeService::delete_account) call the hook. With tree operations
+// off no operation is applied, and the direct delete routes run their own
+// cleanup instead, so no cleanup runs twice.
 TreeApiHandler::TreeApiHandler(ApiContext& ctx) : ctx_(ctx) {
     ctx_.tree.set_removed_nodes_hook(
         [this](const std::vector<tree::TreeNode>& removed) { cleanup_removed_nodes(removed); });
@@ -1608,6 +1610,96 @@ void TreeApiHandler::do_register_routes(httplib::Server& pub, httplib::Server& p
         nlohmann::json resp = {{"success", true}};
         spdlog::info("[TreeApi] deleted node '{}'", node_id);
         json_response(res, resp);
+    }));
+
+    // ========================================================================
+    // POST /api/account/delete/challenge (PRIVATE, auth required)
+    // Issues an Ed25519 challenge for the session's own key on this server,
+    // the server that receives the deletion request. Answer:
+    // {"challenge","expires_at"}.
+    // ========================================================================
+    priv.Post("/api/account/delete/challenge", require_auth(ctx_.auth,
+        [this](const httplib::Request&, httplib::Response& res, const SessionClaims& claims) {
+        if (claims.pubkey.empty()) {
+            error_response(res, "account deletion needs an ed25519 session", 403);
+            return;
+        }
+        json_response(res, ctx_.auth.issue_ed25519_challenge(claims.pubkey));
+    }));
+
+    // ========================================================================
+    // POST /api/account/delete (PRIVATE, auth required)
+    // Body: {"challenge": "<base64>", "signature": "<base64>"}. Permanently
+    // deletes the session's own account. The session alone is not enough:
+    // the signature is a fresh proof by the account key over
+    // auth::account_delete_proof_message for a challenge this server issued
+    // (single use, 60 seconds). There is no form that names another account.
+    // Removes rules::account_scope (the account's groups, devices, and
+    // everything beneath them) and the assignments of its swept keys; never
+    // the root node. The removed-nodes and account-deleted hooks run the
+    // cleanup on every server that applies the deletion.
+    // ========================================================================
+    priv.Post("/api/account/delete", require_auth(ctx_.auth,
+        [this](const httplib::Request& req, httplib::Response& res,
+               const SessionClaims& claims) {
+        auto body_opt = parse_body(req, res);
+        if (!body_opt) return;
+        if (claims.pubkey.empty()) {
+            error_response(res, "account deletion needs an ed25519 session", 403);
+            return;
+        }
+        const auto challenge = body_opt->value("challenge", std::string{});
+        const auto signature = body_opt->value("signature", std::string{});
+        if (challenge.empty() || signature.empty()) {
+            error_response(res, "challenge and signature required");
+            return;
+        }
+        std::string proof_error;
+        if (!ctx_.auth.verify_account_delete_proof(std::string(strip_ed25519_prefix(claims.pubkey)),
+                                                   challenge, signature, proof_error)) {
+            error_response(res, proof_error, 401);
+            return;
+        }
+        const auto principal = normalize_pubkey(claims.pubkey);
+        const auto account_id = tree::derive_join_node_id(ctx_.crypto, principal);
+        if (account_id.empty()) {
+            error_response(res, "account deletion needs an ed25519 session", 403);
+            return;
+        }
+
+        nlohmann::json removed = nlohmann::json::array();
+        if (ctx_.config.tree_ops_enabled) {
+            auto* submitter = tree_op_submitter(ctx_, res);
+            if (!submitter) return;
+            for (const auto& id : tree::rules::account_scope(ctx_.tree.nodes_snapshot(),
+                                                             principal).removed) {
+                removed.push_back(id);
+            }
+            tree::TreeOp op;
+            op.kind = tree::TreeOpKind::DeleteAccount;
+            op.target = account_id;
+            op.principal = principal;
+            op.body.source = tree::TreeOpSource::Session;
+            const auto s = submitter->submit(std::move(op));
+            if (answer_unfinished(res, s)) return;
+            if (!s.verdict.ok()) {
+                error_response(res, s.verdict.reason, status_for_refusal(s.verdict.refusal));
+                return;
+            }
+        } else {
+            tree::AccountDeletion deletion;
+            std::string reason;
+            if (!ctx_.tree.delete_account(principal, deletion, reason)) {
+                error_response(res, reason, 500);
+                return;
+            }
+            for (const auto& node : deletion.removed) removed.push_back(node.id);
+        }
+        spdlog::info("[TreeApi] deleted account '{}' ({} nodes)", account_id, removed.size());
+        json_response(res, {{"success", true},
+                            {"status", "deleted"},
+                            {"account_id", account_id},
+                            {"removed_nodes", std::move(removed)}});
     }));
 
     // ========================================================================

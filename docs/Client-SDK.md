@@ -189,6 +189,32 @@ always uses a relay.
 | Password | **Deprecated.** The server stub always fails; the SDK keeps the functions for compatibility. |
 | Token link | One-time invite codes for a group: a new device joins under the group; an existing account becomes a member of it (`ln_invite_create`, `ln_invite_accept`). See [SDK Guide](SDK-Guide#invites-and-other-networks). |
 
+## Account Deletion
+
+`delete_account()` / `ln_account_delete(client, &out_json)` permanently
+deletes the account of the identity set with `set_identity` /
+`ln_set_identity`. It cannot be undone. The SDK gets a challenge from the
+session's server over the private API and signs a deletion proof with the
+identity key, so a copied session token cannot delete an account. The server
+side is described in [Security](Security#account-deletion).
+
+On status `"deleted"` the SDK stops the mesh, clears its session token and
+node id, and (C ABI) stops the account image service. With tree operations
+on, the answer can be status `"pending"` with an `op_id`. The SDK then keeps
+its session, and the deletion takes effect when Tier 1 commits it.
+
+The SDK does not delete local files. After a deletion, the application
+deletes:
+
+- the identity file (the `ln_identity_save` path), or the stored identity
+  seed;
+- the account image cache (the `ln_account_avatar_configure` `cache_root`);
+- the certificate directory (the `ln_mesh_port_set_cert_dir` path);
+- any stored copy of the session token or node id.
+
+The Flutter client removes the account's keyring entry (seed and group key),
+the stored session, and the group loopback certificates, and then signs out.
+
 ## Linking
 
 Build the shared library first:

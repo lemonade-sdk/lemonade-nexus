@@ -82,3 +82,28 @@ TEST(SdkCapiMesh, InviteCallsWithoutAMeshFailAndReturnAnError) {
     ASSERT_NE(out, nullptr);
     ln_free(out);
 }
+
+// Account deletion: argument checks, the identity requirement, and the
+// inactive-mesh result. No request leaves without an identity to sign with.
+TEST(SdkCapiMesh, AccountDeletionChecksArgumentsAndNeedsAnIdentity) {
+    char* out = nullptr;
+    EXPECT_EQ(ln_account_delete(nullptr, &out), LN_ERR_NULL_ARG);
+    Client client;
+    ASSERT_NE(client.c, nullptr);
+    EXPECT_EQ(ln_account_delete(client.c, nullptr), LN_ERR_NULL_ARG);
+
+    EXPECT_EQ(ln_account_delete(client.c, &out), LN_ERR_NO_IDENTITY);
+    ASSERT_NE(out, nullptr);
+    EXPECT_NE(std::string(out).find("error"), std::string::npos);
+    ln_free(out);
+    out = nullptr;
+
+    ln_identity_t* identity = ln_identity_generate();
+    ASSERT_NE(identity, nullptr);
+    ASSERT_EQ(ln_set_identity(client.c, identity), LN_OK);
+    ln_identity_destroy(identity);
+    EXPECT_EQ(ln_account_delete(client.c, &out), LN_ERR_CONNECT);
+    ASSERT_NE(out, nullptr);
+    EXPECT_NE(std::string(out).find("error"), std::string::npos);
+    ln_free(out);
+}

@@ -476,6 +476,22 @@ public:
     [[nodiscard]] Result<nlohmann::json> move_node(const std::string& node_id,
                                                    const std::string& new_parent_id);
 
+    /// Permanently delete this identity's account. Irreversible. Requests a
+    /// challenge from the session's server (POST /api/account/delete/challenge),
+    /// signs the account deletion proof with this identity's key, and sends
+    /// it (POST /api/account/delete). The server removes the account's groups,
+    /// devices, and everything beneath them (other users' devices placed
+    /// there lose access to this network), this identity's memberships and
+    /// grants, its key envelopes, chat blobs, link tokens, passkey
+    /// credentials, certificates, and DNS names, and revokes its key. The
+    /// root node is never removed. On success the client stops the mesh and
+    /// clears its session and node id. Local files (the identity key file,
+    /// account image cache, certificate directory) stay; the caller deletes
+    /// them (see Client SDK documentation). Response JSON: {success, status:
+    /// "deleted" | "pending", account_id, removed_nodes?, op_id?}, or the
+    /// server's "error". Requires an identity and an established mesh session.
+    [[nodiscard]] Result<nlohmann::json> delete_account();
+
     /// Publish a local service to mesh peers: our mesh IP:vport bridges to
     /// `target` ("tcp:127.0.0.1:PORT"). Requires an active mesh (join first);
     /// exposures are remembered and re-applied on re-join.

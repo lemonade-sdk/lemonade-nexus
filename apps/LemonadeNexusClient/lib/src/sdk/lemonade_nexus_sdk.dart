@@ -491,6 +491,21 @@ class LemonadeNexusSdk {
     return _tier1Result(error, json, 'Failed to move the node');
   }
 
+  /// Permanently delete this identity's account. Irreversible. The server
+  /// removes the account's groups and devices (other users' devices placed
+  /// there lose access to this network), its memberships, envelopes, chats,
+  /// invites, passkeys, certificates, and DNS names, and revokes its key.
+  /// The application root is never removed. On success the SDK stops the
+  /// mesh and clears its session; the caller deletes the local identity file
+  /// and caches. Returns `{success, status: "deleted" | "pending",
+  /// account_id, removed_nodes?, op_id?}`.
+  Future<Map<String, dynamic>> deleteAccount() async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.accountDelete(c));
+    return _tier1Result(error, json, 'The account was not deleted');
+  }
+
   // =========================================================================
   // Health
   // =========================================================================

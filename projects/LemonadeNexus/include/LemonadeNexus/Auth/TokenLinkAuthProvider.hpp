@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -70,6 +71,11 @@ public:
     /// already exists, or when the write fails. Call it at most once per
     /// consume(), with the record consume() returned.
     bool refund(std::string_view token, const LinkTokenRecord& record);
+
+    /// Delete every stored token whose record matches `match` (only the owner
+    /// and target fields are read). Used when an account is deleted. Returns
+    /// the number of tokens deleted. A token file that does not parse stays.
+    std::size_t revoke_where(const std::function<bool(const LinkTokenRecord&)>& match);
 
     static constexpr std::chrono::seconds kDefaultTtl{600};
     static constexpr std::chrono::seconds kMaxTtl{3600};

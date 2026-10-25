@@ -91,6 +91,12 @@ public:
 
     [[nodiscard]] static constexpr std::string_view auth_provider_name() { return "passkey/fido2"; }
 
+    /// Remove every passkey credential of `user_id` from the cache and from
+    /// its credential file (the file's other fields stay). Idempotent: a user
+    /// without credentials succeeds. False when the file is unreadable or the
+    /// write fails. Thread-safe.
+    bool remove_user_credentials(const std::string& user_id);
+
 private:
     // --- credential storage ---
     // Atomic add-or-update of the credential in the user's file.

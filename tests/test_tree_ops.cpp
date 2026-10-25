@@ -1235,3 +1235,223 @@ TEST_F(TreeMembershipTest, DirectPathsApplyTheSamePlanAsTreeOps) {
     tree_b.stop();
     storage_b->stop();
 }
+
+// --- Account deletion (DeleteAccount) ---------------------------------------
+
+class TreeAccountDeletionTest : public TreeMembershipTest {
+protected:
+    TreeOp account_op(const std::string& principal) {
+        TreeOp op;
+        op.kind = TreeOpKind::DeleteAccount;
+        op.target = tree::derive_join_node_id(*crypto_svc, principal);
+        op.principal = principal;
+        op.body.source = TreeOpSource::Session;
+        return op;
+    }
+
+    /// B is a member of alpha; A is a member of beta with add_child and owns
+    /// a device it placed under beta.
+    void add_cross_memberships() {
+        ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
+        ASSERT_TRUE(run(next(accept_op("beta", pa, pb, {"add_child", "read"}))).ok());
+        const auto placed =
+            node("a-in-beta", "beta", tree::NodeType::Endpoint, pa, {{pa, {"read"}}});
+        ASSERT_TRUE(run(next(create_op(placed, pa))).ok());
+    }
+
+    static std::string dump(const std::optional<tree::TreeNode>& n) {
+        return n ? nlohmann::json(*n).dump() : std::string{};
+    }
+};
+
+TEST_F(TreeAccountDeletionTest, RemovesTheAccountSubtreeMembershipsAndGrants) {
+    add_cross_memberships();
+    const auto root_before = dump(tree_svc->get_node("root"));
+    std::vector<tree::AccountDeletion> seen;
+    tree_svc->set_account_deleted_hook(
+        [&](const tree::AccountDeletion& d) { seen.push_back(d); });
+
+    auto v = run(next(account_op(pb)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+
+    // B's group and everything beneath it, including A's device placed there.
+    for (const auto* id : {"beta", "beta-dev", "beta-dev2", "a-in-beta"}) {
+        EXPECT_FALSE(tree_svc->get_node(id).has_value()) << id;
+    }
+    // B's membership in alpha is gone; A's network is otherwise unchanged.
+    const auto alpha = *tree_svc->get_node("alpha");
+    EXPECT_FALSE(tree::rules::signer_has_permission(alpha, pb, acl::Permission::Read));
+    EXPECT_TRUE(tree::rules::signer_has_permission(alpha, pa, acl::Permission::Admin));
+    for (const auto* id : {"alpha-dev", "alpha-dev2", "alpha-sub1", "alpha-sub2"}) {
+        EXPECT_TRUE(tree_svc->get_node(id).has_value()) << id;
+    }
+    // No surviving node names B's keys.
+    for (const auto& [id, n] : tree_svc->nodes_snapshot()) {
+        for (const auto& a : n.assignments) {
+            const auto key = tree::canonical_principal(a.management_pubkey);
+            EXPECT_NE(key, tree::canonical_principal(pb)) << id;
+            EXPECT_NE(key, tree::canonical_principal(pb2)) << id;
+        }
+    }
+    EXPECT_EQ(dump(tree_svc->get_node("root")), root_before) << "the root never changes";
+
+    ASSERT_EQ(seen.size(), 1u);
+    EXPECT_EQ(seen[0].account_id, tree::derive_join_node_id(*crypto_svc, pb));
+    EXPECT_EQ(seen[0].removed.size(), 4u);
+    // pa still owns alpha, so only B's keys are swept.
+    std::vector<std::string> expected = {tree::canonical_principal(pb),
+                                         tree::canonical_principal(pb2)};
+    std::sort(expected.begin(), expected.end());
+    EXPECT_EQ(seen[0].swept_keys, expected);
+    tree_svc->set_account_deleted_hook({});
+}
+
+TEST_F(TreeAccountDeletionTest, OtherAccountsAndTheirMembershipsStay) {
+    add_cross_memberships();
+    // Deleting A's account removes alpha and A's device under beta, and A's
+    // membership in beta, but leaves B's account whole.
+    ASSERT_TRUE(run(next(account_op(pa))).ok());
+    EXPECT_FALSE(tree_svc->get_node("alpha").has_value());
+    EXPECT_FALSE(tree_svc->get_node("alpha-dev2").has_value()) << "a device in A's group";
+    EXPECT_FALSE(tree_svc->get_node("a-in-beta").has_value()) << "a node A's key owns";
+    EXPECT_TRUE(tree_svc->get_node("beta").has_value());
+    EXPECT_TRUE(tree_svc->get_node("beta-dev").has_value());
+    EXPECT_TRUE(tree_svc->get_node("beta-dev2").has_value());
+    EXPECT_FALSE(tree_svc->check_permission(pa, "beta", acl::Permission::Read));
+    EXPECT_TRUE(tree_svc->administers(pb, "beta-dev2"));
+}
+
+TEST_F(TreeAccountDeletionTest, TheRootOwnersAccountGoesAndTheRootStays) {
+    const auto root_before = dump(tree_svc->get_node("root"));
+    const auto own = node("root-owner-group", "root", tree::NodeType::Customer, root_pk,
+                          {{root_pk, {"admin"}}});
+    ASSERT_TRUE(run(next(create_op(own, root_pk))).ok());
+    const auto dev = node("root-owner-dev", "root-owner-group", tree::NodeType::Endpoint, root_pk,
+                          {{root_pk, {"read"}}});
+    ASSERT_TRUE(run(next(create_op(dev, root_pk))).ok());
+
+    auto v = run(next(account_op(root_pk)));
+    ASSERT_TRUE(v.ok()) << v.reason;
+    EXPECT_FALSE(tree_svc->get_node("root-owner-group").has_value());
+    EXPECT_FALSE(tree_svc->get_node("root-owner-dev").has_value());
+    EXPECT_EQ(dump(tree_svc->get_node("root")), root_before)
+        << "the root and its owner assignment never change";
+    // Every other account stays.
+    EXPECT_TRUE(tree_svc->get_node("alpha").has_value());
+    EXPECT_TRUE(tree_svc->get_node("beta-dev").has_value());
+    EXPECT_TRUE(tree_svc->is_mgmt_pubkey_in_use(root_pk)) << "the root still names the key";
+}
+
+TEST_F(TreeAccountDeletionTest, RefusesAnotherAccountForgeryAndReplay) {
+    // An op that names another principal's account is refused.
+    auto other = account_op(pb);
+    other.target = tree::derive_join_node_id(*crypto_svc, pa);
+    EXPECT_EQ(run(next(other)).refusal, TreeOpRefusal::Malformed);
+    // A base version other than 0.
+    auto based = account_op(pb);
+    based.base_version = 1;
+    EXPECT_EQ(run(next(based)).refusal, TreeOpRefusal::Malformed);
+    // A principal that is not an ed25519 key has no account id.
+    auto bad = account_op(pb);
+    bad.principal = "not-a-key";
+    EXPECT_EQ(run(next(bad)).refusal, TreeOpRefusal::Malformed);
+    // A submitter outside the trusted set.
+    EXPECT_EQ(run(seal(account_op(pb), ++clock, &stranger_kp)).refusal,
+              TreeOpRefusal::UntrustedSubmitter);
+    // A tampered op no longer matches its id.
+    auto tampered = next(account_op(pb));
+    tampered.principal = pa;
+    EXPECT_EQ(run(tampered).refusal, TreeOpRefusal::BadOpId);
+    // A stale op.
+    EXPECT_EQ(run(seal(account_op(pb), clock - tree::kTreeOpMaxAgeSec - 1)).refusal,
+              TreeOpRefusal::Stale);
+    EXPECT_TRUE(tree_svc->get_node("beta").has_value()) << "nothing was deleted";
+
+    const auto op = next(account_op(pb));
+    ASSERT_TRUE(run(op).ok());
+    EXPECT_EQ(run(op).refusal, TreeOpRefusal::Replayed);
+}
+
+TEST_F(TreeAccountDeletionTest, ARepeatedDeletionChangesNothing) {
+    ASSERT_TRUE(run(next(account_op(pb))).ok());
+    const auto digest = tree_svc->tree_digest();
+    auto v = run(next(account_op(pb)));
+    EXPECT_TRUE(v.ok()) << v.reason;
+    EXPECT_EQ(tree_svc->tree_digest(), digest);
+}
+
+TEST_F(TreeAccountDeletionTest, ReplicasApplyTheSameDeletion) {
+    auto storage_b = make_storage("acct-b");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+    auto both = [&](const TreeOp& op) {
+        const auto sig = tree::tree_op_signature_bytes(op);
+        ASSERT_TRUE(sig.has_value());
+        const auto decoded = tree::decode_tree_op(tree::encode_tree_op(op), *sig);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(tree::op_id_hex(*decoded), tree::op_id_hex(op));
+        auto va = run(op);
+        auto vb = run(*decoded, &tree_b);
+        ASSERT_EQ(va.refusal, vb.refusal) << va.reason << " / " << vb.reason;
+        ASSERT_TRUE(va.ok()) << va.reason;
+    };
+    both(next(accept_op("alpha", pb, pa, {"connect_private", "read"})));
+    both(next(accept_op("beta", pa, pb, {"add_child", "read"})));
+    both(next(account_op(pb)));
+    EXPECT_EQ(tree_svc->tree_digest(), tree_b.tree_digest());
+    tree_b.stop();
+    storage_b->stop();
+}
+
+TEST_F(TreeAccountDeletionTest, TheDirectPathMatchesTheOperation) {
+    auto storage_b = make_storage("acct-direct");
+    tree::PermissionTreeService tree_b(*storage_b, *crypto_svc);
+    tree_b.start();
+    build(tree_b);
+    ASSERT_TRUE(run(next(accept_op("alpha", pb, pa, {"connect_private", "read"}))).ok());
+    std::string reason;
+    using Change = tree::PermissionTreeService::AssignmentChange;
+    ASSERT_EQ(tree_b.accept_invite("alpha", pb, pa, {"connect_private", "read"}, reason),
+              Change::Applied);
+
+    std::vector<std::string> hooked;
+    tree_b.set_removed_nodes_hook([&](const std::vector<tree::TreeNode>& removed) {
+        for (const auto& n : removed) hooked.push_back(n.id);
+    });
+    ASSERT_TRUE(run(next(account_op(pb))).ok());
+    tree::AccountDeletion out;
+    ASSERT_TRUE(tree_b.delete_account(pb, out, reason)) << reason;
+    tree_b.set_removed_nodes_hook({});
+
+    std::sort(hooked.begin(), hooked.end());
+    EXPECT_EQ(hooked, (std::vector<std::string>{"beta", "beta-dev", "beta-dev2"}));
+    EXPECT_EQ(out.removed.size(), 3u);
+    auto a_nodes = tree_svc->nodes_snapshot();
+    auto b_nodes = tree_b.nodes_snapshot();
+    ASSERT_EQ(a_nodes.size(), b_nodes.size());
+    for (auto& [id, n] : a_nodes) {
+        ASSERT_TRUE(b_nodes.contains(id)) << id;
+        n.version = 0;
+        b_nodes[id].version = 0;
+        EXPECT_EQ(nlohmann::json(n).dump(), nlohmann::json(b_nodes[id]).dump()) << id;
+    }
+    // The direct path is idempotent as well.
+    ASSERT_TRUE(tree_b.delete_account(pb, out, reason)) << reason;
+    EXPECT_TRUE(out.removed.empty());
+    EXPECT_FALSE(tree_b.delete_account("not-a-key", out, reason));
+    tree_b.stop();
+    storage_b->stop();
+}
+
+TEST_F(TreeAccountDeletionTest, TheDeletionSurvivesARestart) {
+    const auto op = next(account_op(pb));
+    ASSERT_TRUE(run(op).ok());
+    tree_svc->stop();
+    tree_svc = std::make_unique<tree::PermissionTreeService>(*storage_svc, *crypto_svc);
+    tree_svc->start();
+    EXPECT_FALSE(tree_svc->get_node("beta").has_value());
+    EXPECT_FALSE(tree_svc->get_node("beta-dev").has_value());
+    EXPECT_TRUE(tree_svc->get_node("alpha").has_value());
+    EXPECT_EQ(run(op).refusal, TreeOpRefusal::Replayed) << "replay stays refused after a restart";
+}
