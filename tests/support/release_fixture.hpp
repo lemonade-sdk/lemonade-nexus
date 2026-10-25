@@ -99,6 +99,22 @@ struct ReleaseSigner {
         return bundle;
     }
 
+    /// Release `number` whose overlap lists the hashes of every release in
+    /// `previous`, in that order. The fix after a halted rollout lists the
+    /// halted release and the release before it.
+    [[nodiscard]] nexus::security::ReleaseApprovalBundleV1 approval(
+        uint64_t number, const std::vector<uint64_t>& previous) const {
+        auto bundle = approval(number);
+        auto& paths = bundle.approval.previous_release_paths;
+        paths = {{"/usr/bin/lemonade-nexus", {}}, {"/usr/bin/nexus-attestd", {}}};
+        for (const uint64_t release : previous) {
+            paths[0].sha256.push_back(release_hash(release, 'n'));
+            paths[1].sha256.push_back(release_hash(release, 'a'));
+        }
+        sign(bundle);
+        return bundle;
+    }
+
     void sign(nexus::security::ReleaseApprovalBundleV1& bundle) const {
         using namespace nexus::security;
         bundle.authority.genesis_signature_b64 =

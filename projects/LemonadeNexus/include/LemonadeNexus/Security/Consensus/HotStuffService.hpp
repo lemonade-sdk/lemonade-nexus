@@ -165,6 +165,27 @@ public:
     /// justify. The last entry is the block the high certificate certifies.
     [[nodiscard]] std::vector<std::pair<Proposal, QuorumCertificate>> uncommitted_chain() const;
 
+    /// One bounded page of the certified chain, for a replica that fell
+    /// behind by more than one uncommitted chain (SyncRequest::after_height).
+    struct CertifiedPage {
+        /// Oldest first, each block with its justify; block k is certified by
+        /// block k+1's justify. At most kMaxSyncChainBlocks entries.
+        std::vector<std::pair<Proposal, QuorumCertificate>> chain;
+        /// The certificate over the last block of `chain`.
+        QuorumCertificate certifying;
+    };
+    /// The committed blocks above `after`, then the uncommitted chain when
+    /// the page reaches it, with the certificate over the last block. Only
+    /// certified blocks of this replica's committed chain are served; the
+    /// receiver validates every certificate again (adopt_certified_block).
+    /// nullopt when this replica holds no committed block at height
+    /// after + 1: it is not ahead, or it restarted above that height and
+    /// holds no blocks below its sync anchor.
+    [[nodiscard]] std::optional<CertifiedPage> certified_page_after(Height after) const;
+
+    /// True while a proposal waits for its parent (take_linkable_orphan).
+    [[nodiscard]] bool holds_orphan() const { return orphan_.has_value(); }
+
     /// The portable three-chain proof for a committed block, when the blocks
     /// and certificates behind it are still held. A node outside the epoch
     /// verifies this instead of trusting the sender.
@@ -241,6 +262,8 @@ private:
     std::map<Digest, QuorumCertificate> qc_by_block_;
     std::map<View, Digest> accepted_by_view_;
     std::set<Digest> committed_digests_;
+    // Committed height -> block digest, for certified_page_after().
+    std::map<Height, Digest> committed_by_height_;
 
     std::map<View, std::map<NodeId, Vote>> votes_by_view_;
     std::set<std::tuple<View, Height, Digest>> formed_qcs_;

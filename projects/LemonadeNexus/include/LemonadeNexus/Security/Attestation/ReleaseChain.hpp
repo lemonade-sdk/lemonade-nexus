@@ -21,19 +21,31 @@
 // binds the release signer and the network, not one approval digest, and a
 // release update needs no Genesis action (Genesis stays one-shot).
 //
-// Limits: the record is integrity-checked by verification on every load, not
-// rollback-protected. A party that can write the security directory can
-// replace or delete it. The damage is bounded: load() folds in the packaged
-// approval, which is part of the measured release, so the accepted number
-// never falls below the running release; and a peer whose status shows a
-// higher accepted release pushes its approval within one offer window. The
-// storage vault and the sealed store do not close this gap: the vault does not
+// Rollback: the record is integrity-checked by verification on every load,
+// and a party that can write the security directory can still replace or
+// delete it. Finalized consensus state is the anchor against that. Every
+// rollout starts with a finalized UpgradeProgress Start record, which a Tier 1
+// quorum votes for only when each voter accepted that exact approval. The
+// newest finalized Start release is therefore a network floor: every honest
+// server accepted at least that release. The upgrade service raises the floor
+// (raise_floor) from the records it holds at start and from every finalized
+// Start record it learns, on Tier 1 by commit and on every server, Tier 2
+// included, by verified record proofs from Tier 1. While the highest accepted
+// number is below the floor, current() is empty: this server attests no peer
+// and votes for no upgrade record with the rolled-back approval. A peer
+// pushes the newer approval when the statuses differ, and adopting it clears
+// the condition. The floor lives in memory and is rebuilt from finalized
+// state at every start, so it has no file of its own to roll back.
+//
+// Limits: before a rollout starts, the floor lags the newest adopted approval;
+// load() folds in the packaged approval, so the accepted number never falls
+// below the running release. A server whose upgrade records were also deleted
+// learns the floor from a Tier 1 peer within one record-sync interval. The
+// storage vault and the sealed store do not close the gap: the vault does not
 // detect a whole-file rollback and is locked when the driver starts, and a
-// sealed blob is bound to PCR 8/9, not to a counter, so an older blob still
-// unseals. Closing it needs a monotonic counter (no TPM NV operation exists in
-// nexus-attestd) or a check against finalized state at start. Release-key
-// rotation is not supported; it would need its own consensus-finalized
-// transition.
+// sealed blob is bound to PCR 8/9, not to a counter. nexus-attestd has no TPM
+// NV counter operation. Release-key rotation is not supported; it would need
+// its own consensus-finalized transition.
 
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Security/Attestation/ReleaseApproval.hpp>
@@ -50,10 +62,12 @@ namespace nexus::security {
 inline constexpr uint32_t kReleaseChainFormatVersion = 1;
 /// The record, under the chain directory (data_root/security/release).
 inline constexpr std::string_view kReleaseChainFile = "release-chain.json";
-/// One-time migration input (Design-Auto-Update Phase 6): the approval an
-/// existing network was founded under, copied here before the first
-/// auto-update release starts. Read only while the commitment is unbound, and
-/// accepted only when its digest equals the certificate's commitment.
+/// Migration input for a network founded under an earlier approval (for
+/// example a format-2 approval): that approval, copied here before the first
+/// start on a release chain build. Read only while the commitment is unbound,
+/// and accepted only when its digest equals the certificate's commitment. The
+/// bootstrap procedure (Design-Auto-Update Phase 6) founds the network fresh on
+/// the bootstrap approval and does not use it.
 inline constexpr std::string_view kFoundingApprovalFile = "release-founding-approval.json";
 /// Largest approval bundle accepted from a peer or the updater, checked before
 /// parsing.
@@ -119,11 +133,23 @@ public:
     [[nodiscard]] bool pinned() const { return record_.has_value(); }
 
     /// The newest accepted approval, or nullopt when none verifies under this
-    /// build's compiled protocol identity and TCB floor.
-    [[nodiscard]] const std::optional<ReleaseApprovalBundleV1>& current() const {
-        return current_;
-    }
+    /// build's compiled protocol identity and TCB floor, or when it is below
+    /// the finalized release floor (below_floor).
+    [[nodiscard]] const std::optional<ReleaseApprovalBundleV1>& current() const;
+    /// Digest of current(); all-zero when current() is empty.
     [[nodiscard]] Digest current_digest() const;
+
+    /// Raises the finalized release floor: the release number of a finalized
+    /// UpgradeProgress Start record. The floor never falls. Returns true when
+    /// the call raised it. In memory only; the owner raises it again from
+    /// finalized state after every start.
+    bool raise_floor(uint64_t finalized_release_number);
+    [[nodiscard]] uint64_t floor() const { return floor_; }
+    /// True when the highest accepted release number is below the finalized
+    /// floor, for example after the record was rolled back or on a server
+    /// installed from an older package. current() is then empty until a
+    /// newer approval is adopted.
+    [[nodiscard]] bool below_floor() const;
     [[nodiscard]] uint64_t highest_release_number() const {
         return record_ ? record_->highest_release_number : 0;
     }
@@ -153,6 +179,7 @@ private:
     crypto::Ed25519PublicKey genesis_public_key_{};
     NetworkId network_id_{};
     bool healthy_ = true;
+    uint64_t floor_ = 0;
     std::optional<ReleaseChainRecord> record_;
     std::optional<ReleaseApprovalBundleV1> current_;
 };

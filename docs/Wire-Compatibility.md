@@ -46,17 +46,16 @@ release may change and what it must keep.
    record, and the upgrade records.
 6. **Approvals overlap by one release.** The approval of N+1 lists the
    hashes of N in `previous_release_paths`, so N and N+1 attest each other.
-   N-1 stops passing attestation once a server adopts N+1.
+   N-1 stops passing attestation once a server adopts N+1. After a halted
+   rollout of N+1, servers run N+1 or N, so the fix lists the hashes of both.
 
 ## Baseline
 
 The rule starts with the bootstrap release, the first date-tagged release
-(Design-Auto-Update Phase 6). Its baseline is the fleet's r21 line: the r21
-release carries the release approval with an SVSM launch measurement set and
-a bootstrap certificate that commits the approval digest. Both arrived after
-security wire version 3 (commit `e9748c6`), so r21 runs version 3, like this
-line. This is inferred from the r21 approval format; the r21 binary is not a
-release asset and no mixed-version run against it is recorded.
+(Design-Auto-Update Phase 6). The bootstrap release itself has no baseline:
+every server installs it by hand and the network is founded fresh on it, so
+no earlier release runs beside it. The release after it is the first one
+that must interoperate with a previous release.
 
 The `vX.Y.Z-alpha` GitHub releases are not a baseline. `v0.9.7-alpha` sends
 security wire version 1. A current server refuses every such envelope at the
@@ -65,9 +64,16 @@ message layouts also differ (attestation challenge and evidence fields, the
 bootstrap certificate). A mixed-version run against that release therefore
 reports dropped messages from every old node. The router records these drops
 as `WireVersionMismatch` (14), not `Malformed`, and the gate script reports
-the old binary as an invalid baseline. The commit r21 started from
-(`dd80e7f`) is also wire version 1; the r21 build added the version 3 work on
-top of it, so that commit alone is not r21 either.
+the old binary as an invalid baseline.
+
+## Additions in this line
+
+- **Sync paging.** `SyncRequest` has an optional trailing `after_height`
+  (u64). A request without it keeps the earlier layout, so every release
+  decodes a restart sync request. A release from before this field refuses a
+  paged request as trailing bytes. A replica that is far behind then cannot
+  page from that peer; it asks the next leader whose proposal it cannot link.
+  Nothing else depends on paging.
 
 ## A new block payload kind
 
@@ -89,8 +95,8 @@ sends a status only when it runs a release that knows the kind.
 - `scripts/mixed-version-mesh.sh` and the `Mixed-version gate` workflow run
   the previous release's server binary next to the new binary in one
   multi-process mesh. `release.yml` calls the workflow with the previous
-  date-tagged release; for the bootstrap release the run uses an r21-line
-  build as `OLD_BIN` by hand. On a host without SEV-SNP the run proves wire
+  date-tagged release; the bootstrap release has no previous release and
+  skips the gate. On a host without SEV-SNP the run proves wire
   compatibility only: both binaries decode each other's traffic, and the mesh
   refuses to found on unproven hardware. Founding, epoch transition, storage
   unlock, and cross attestation across binaries need an SEV-SNP host; the

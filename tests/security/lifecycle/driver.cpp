@@ -497,6 +497,48 @@ TEST_F(DriverMesh, SequentialRestartsKeepEveryMemberCommitting) {
     }
 }
 
+// A running member cut off for longer than one sync reply covers. The rest of
+// the committee keeps committing; after the partition heals the member must
+// fetch the missing certified blocks page by page and vote again, without a
+// restart.
+TEST_F(DriverMesh, AMemberPartitionedPastTheSyncWindowRejoinsWithoutARestart) {
+    bootstrap();
+    run_until_committed(2);
+    ASSERT_FALSE(HasFatalFailure());
+    Node* victim = founders.back();
+    std::vector<Node*> majority(founders.begin(), founders.end() - 1);
+    const Height cut_at = victim->driver->last_committed_height();
+    const View voted_before = victim->runtime->consensus()->state().last_voted_view;
+
+    // The victim keeps running during the partition: it ticks, times out,
+    // and sends, but no message reaches it or leaves it.
+    mesh.offline.insert(victim->id);
+    const Height target = cut_at + 4 * constants::kMaxSyncChainBlocks;
+    for (int i = 0; i < 4000 && majority.front()->driver->last_committed_height() < target;
+         ++i) {
+        step(1, founders);
+    }
+    ASSERT_GE(majority.front()->driver->last_committed_height(), target)
+        << "the majority did not commit through the partition";
+    // Its own last proposal can still commit locally; it stays far behind.
+    EXPECT_LE(victim->driver->last_committed_height(), cut_at + 1);
+    EXPECT_EQ(victim->driver->phase(), DriverPhase::Active);
+
+    mesh.offline.erase(victim->id);
+    const Height healed_at = majority.front()->driver->last_committed_height();
+    run_until_committed(healed_at + 3, 400);
+    ASSERT_FALSE(HasFatalFailure()) << "the member did not catch up after the partition";
+    EXPECT_EQ(victim->driver->phase(), DriverPhase::Active);
+    EXPECT_GT(victim->runtime->consensus()->state().last_voted_view, voted_before);
+
+    // It votes again: the chain commits with it as a working member.
+    const View floor = victim->runtime->consensus()->state().last_voted_view;
+    run_until_committed(healed_at + 6, 200);
+    ASSERT_FALSE(HasFatalFailure());
+    EXPECT_GT(victim->runtime->consensus()->state().last_voted_view, floor)
+        << "the member stopped voting after it caught up";
+}
+
 TEST_F(DriverMesh, CorruptEpochStateFailsClosed) {
     bootstrap();
     Node* victim = founders[0];

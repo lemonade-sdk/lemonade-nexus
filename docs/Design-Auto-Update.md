@@ -129,9 +129,12 @@ Repository settings that this model depends on: branch protection on `main`
 3. **Overlap.** Attestation accepts a binary hash listed in the newest accepted
    approval. Because each approval lists the previous release's hashes too,
    N and N+1 attest each other during the rollout. N-1 stops passing once N+1
-   is adopted.
+   is adopted. After a halted rollout of N+1, servers run N+1 or N, so the
+   fix lists the hashes of both (release guard, below).
 4. **Persistence.** The highest accepted release number survives restart.
-   It is stored with the security state, not in a config file.
+   It is stored with the security state, not in a config file. Finalized
+   consensus state anchors it against rollback (Known limits, Release record
+   rollback).
 
 ## Phase 3: Mixed-version compatibility
 
@@ -186,37 +189,29 @@ server keys.
 
 ## Phase 6: Bootstrap (one time)
 
-The servers run r21, which has no updater, no runtime approval adoption, and
-plaintext files. The first auto-update release is installed once by the
-procedure from the storage review: back up the security and sealed state,
-install one server at a time, confirm migration and unlock before the next,
-and never re-found. Every release after that uses Phases 1-5.
+Owner decision (2026-10-24): r21 is not a baseline. The first date-tagged
+release is the bootstrap release. Every server installs it once by hand, and
+the network is founded fresh on it. There is no storage state yet, so a fresh
+founding is safe at this point, and only at this point. Every release after
+that uses Phases 1-5 and installs in place.
 
-Release chain migration (one step per server, before its first start on the
-new release):
+1. The release workflow detects the bootstrap release: no earlier date tag or
+   date-tagged release exists, and `release/bootstrap-complete` does not
+   exist. There is no manual switch. The bootstrap approval has no
+   `previous_release_paths`, the rollout guard and the mixed-version gate do
+   not run, and no r21 input is read.
+2. The founding uses the Genesis key behind `network_id` in
+   `release/fleet-profile.json`, because the approval names that network. The
+   founding certificate commits the bootstrap approval, and the release chain
+   pins its signer at first start.
+   The founding-approval migration file (`kFoundingApprovalFile`) is not part
+   of this procedure.
+3. After every server runs the bootstrap release, a reviewed commit names its
+   tag in `release/bootstrap-complete`. The next release refuses to publish
+   until it does, because the bootstrap release has no rollout records to
+   prove.
 
-1. Copy the installed r21 approval
-   (`/usr/lib/lemonade-nexus/release/release-approval.json`) to
-   `<data_root>/security/release/release-founding-approval.json`.
-2. Install the new release. At its first start the server pins the release
-   signer from the new (format 3) approval, then binds the stored
-   certificate's commitment through the copied r21 approval. The server
-   accepts the file only when its digest equals the commitment, its Genesis
-   delegation and release signature verify for this network, and its signer
-   is the pinned signer. Without the file, or with any other file, the driver
-   fails closed and the epoch state stays untouched.
-3. The first auto-update approval must be signed by the r21 release key and
-   list the r21 hashes in `previous_release_paths`, so r21 and the new release
-   attest each other during the bootstrap. The release key in the GitHub
-   `release` environment must therefore be the existing r21 release key; a new
-   key would need a new Genesis delegation, which this design does not allow.
-   The release workflow reads the r21 approval from
-   `release/r21-release-approval.json` and refuses to build the bootstrap
-   release without it ([Releasing](Releasing)).
-4. r21 servers cannot adopt a newer approval at runtime and do not know the
-   upgrade-turn traffic. The new release proposes no upgrade record until
-   every Tier 1 member sends an upgrade status, so mixed r21 and new servers
-   keep running consensus without upgrade records.
+The operator steps are in [Releasing](Releasing), Bootstrap procedure.
 
 ## Implementation status
 
@@ -226,7 +221,8 @@ new release):
 | 0.2 Holder margin | Open; see the restart defect below | |
 | 0.3 Fleet profile | Implemented; seeded from r21 | `release/fleet-profile.json`, `ReleaseApproval.cpp` (boot line verified against the approval only) |
 | 1 Release workflow | Implemented, not run | `.github/workflows/release.yml`, `scripts/nexus-release-tool`, `scripts/nexus-release-sign`, [Releasing](Releasing) |
-| Release guards | Implemented, not run | Previous approval required; rollout proof (`Security/Upgrade/RolloutProof.hpp`, `nexus-rollout-check`, `GET /api/upgrade/rollout-proof`); mixed-version job |
+| Release guards | Implemented, not run | Previous approval required; rollout proof (`Security/Upgrade/RolloutProof.hpp`, `nexus-rollout-check`, `GET /api/upgrade/rollout-proof`); fix after a halt (`release_follows_rollout`, `nexus-release-bundle --previous-halted`); mixed-version job; bootstrap detection (`nexus-release-tool previous`) |
+| Release floor | Implemented, memory-mesh tested | `ReleaseChain::raise_floor`, `UpgradeService` (finalized Start records) |
 | 2 Approval chain and adoption | Implemented | `ReleaseChain`, `UpgradeService` (ApprovalOffer, status-driven exchange), `AttestationService::replace_profile` |
 | 3 Mixed-version gate | Memory-mesh test in CI; multi-process job (wire checks only without SEV-SNP) | `tests/security/lifecycle/upgrade_path.cpp`, `scripts/mixed-version-mesh.sh`, `.github/workflows/mixed-version.yml`, [Wire Compatibility](Wire-Compatibility) |
 | 4 Updater | Implemented and unit tested | `projects/LemonadeNexusUpdater/`, `packaging/systemd/nexus-updater.*` |
@@ -260,8 +256,15 @@ Decisions made during implementation:
   Phase 0.1 rule, and the others name what the binary itself implements.
 - **Rollout guard.** The release workflow verifies a rollout proof from Tier 1
   finalized state (the authority chain from Genesis, then every upgrade record
-  under its commit proof) and refuses to publish unless the previous release's
-  rollout is complete and not halted. A status file published by each updater
+  under its commit proof). It publishes only when the previous release's
+  rollout is complete, or halted with a fix that covers both releases: after
+  a halt, the Upgraded records show which servers run the halted release, and
+  every other server runs the release before it. The published previous
+  approval must have the digest that the finalized Start record names, and
+  `nexus-rollout-check --approval` (`release_follows_rollout`) refuses a new
+  approval whose `previous_release_paths` are not exactly the required set:
+  the previous release after completion, the halted release and the release
+  before it after a halt. A status file published by each updater
   was rejected: it is a self-report and needs a publishing credential on every
   server. The bootstrap release, which has no rollout records, is recorded as
   complete by a reviewed commit (`release/bootstrap-complete`).
@@ -277,8 +280,8 @@ Details that the phases above leave open:
   spec and `--previous-approval <bundle.json>`.
 - **Persistence.** The highest accepted number is in
   `<data_root>/security/release/release-chain.json`, re-verified at every
-  start. It is not rollback-protected against a party that can write that
-  directory; see Known limits.
+  start. The finalized network floor protects it against rollback; see Known
+  limits, Release record rollback.
 - **Adoption traffic.** One security message kind, `Upgrade` (38), carries
   approval offers (at most 32 KiB, one per peer per 10 s), signed statuses,
   witness observations, record proofs, and record requests. Kind 37 is left
@@ -309,20 +312,30 @@ Known limits found during the implementation:
   no upgrade code. In-place updates of Tier 1 servers depend on restart
   catch-up, so this blocks production use of Phase 5 until it is fixed.
 - **Release record rollback.** A party that can write the security directory
-  can replace or delete the release record. The accepted number cannot fall
-  below the running release (the packaged, measured approval is folded in at
-  every start), and a peer with a higher accepted release pushes its approval
-  within one offer window, so the exposure is the window between the running
-  release and a newer adopted one. Storing the number in the storage vault
-  does not help: the vault does not detect a whole-file rollback and is locked
-  when the driver starts. Sealing does not help either: a sealed blob is bound
-  to PCR 8/9, not to a counter. A real fix needs a TPM monotonic counter
-  (nexus-attestd has no NV operation) or a start-time check against finalized
-  state.
-- **A halted rollout blocks the release workflow.** A fix for it would need
-  the hashes of two earlier releases, and an approval lists one.
-- **Bootstrap baseline.** The first gated release is the bootstrap release;
-  its baseline is the r21 line, not a GitHub release. The `vX.Y.Z-alpha`
+  can replace or delete the release record. Finalized consensus state is the
+  anchor (`ReleaseChain::raise_floor`). A rollout starts with a finalized
+  Start record, and a Tier 1 quorum votes for it only when each voter accepted
+  its exact approval, so the newest finalized Start release is a network
+  floor. Every server raises its floor from the upgrade records it holds at
+  start and from each finalized Start it learns: Tier 1 by commit, Tier 2 by
+  verified record proofs from Tier 1. Below the floor, the release chain holds
+  no usable approval: the server attests no peer and votes for no upgrade
+  record until a peer hands it the newer approval. The floor has no file of
+  its own; it is rebuilt from finalized state at every start. Remaining
+  exposure: before a rollout starts, the floor lags the newest adopted
+  approval, and the accepted number stays at or above the running release
+  (the packaged approval is folded in at every start). A server whose upgrade
+  records were deleted too learns the floor from Tier 1 within one record-sync
+  interval. The storage vault and sealing were rejected as anchors: the vault
+  does not detect a whole-file rollback and is locked when the driver starts,
+  and a sealed blob is bound to PCR 8/9, not to a counter. nexus-attestd has
+  no TPM NV counter operation.
+- **A fix after a halt covers two releases.** Consecutive halts grow the
+  overlap by one release each until a rollout completes. The approval holds
+  one PCR 8/9 pair, so a halt of a release that changed the boot chain needs
+  a reviewed decision about the boot chain of the fix.
+- **Bootstrap baseline.** The bootstrap release has no baseline: every server
+  installs it by hand on a fresh founding (Phase 6). The `vX.Y.Z-alpha`
   releases use security wire version 1 and are not a baseline
   ([Wire Compatibility](Wire-Compatibility), Baseline).
 - **A participant that never becomes Ready blocks the rollout** until a newer

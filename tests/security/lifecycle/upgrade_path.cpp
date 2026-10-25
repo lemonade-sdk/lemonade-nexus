@@ -106,6 +106,7 @@ protected:
                                                          stack.chain.get());
         stack.service->set_release_adopted_callback(
             [this, &node](const ReleaseApprovalBundleV1&) { install_profile(node); });
+        stack.service->set_release_floor_callback([this, &node] { install_profile(node); });
         stack.service->attach();
         EXPECT_TRUE(stack.service->start(mesh.now_ms));
     }
@@ -350,6 +351,18 @@ TEST_F(UpgradePath, TurnsRunOneAtATimeTier2FirstAndOnlyAfterWitnesses) {
     std::string reason;
     EXPECT_TRUE(rollout_complete(*rollout, kN1, reason)) << reason;
     EXPECT_FALSE(rollout_complete(*rollout, kN1 + 1, reason)) << "another release";
+    // After a completed rollout the next approval overlaps with N+1 only.
+    const auto completed = signer->approval(kN1, kN);
+    EXPECT_EQ(previous_rollout_state(*rollout, kN1, &completed, reason),
+              PreviousRollout::Complete)
+        << reason;
+    EXPECT_TRUE(release_follows_rollout(*rollout, kN1, completed,
+                                        signer->approval(kN1 + 1, kN1).approval, reason))
+        << reason;
+    EXPECT_FALSE(release_follows_rollout(
+        *rollout, kN1, completed,
+        signer->approval(kN1 + 1, std::vector<uint64_t>{kN1, kN}).approval, reason))
+        << "a completed rollout drops N";
     // The JSON form round-trips.
     const auto parsed = parse_rollout_proof(rollout_proof_json(*proof), error);
     ASSERT_TRUE(parsed) << error;
@@ -460,6 +473,188 @@ TEST_F(UpgradePath, AFailedReportHaltsTheRelease) {
     std::string reason;
     EXPECT_FALSE(rollout_complete(*rollout, kN1, reason));
     EXPECT_NE(reason.find("halted"), std::string::npos) << reason;
+}
+
+// The fix after a halt. One server upgraded to N+1 before the next one failed,
+// so servers run N+1 or N, and the finalized records prove which. The release
+// that fixes the halt lists both in its overlap; the release guard accepts it
+// only then, and servers on either release adopt and attest it.
+TEST_F(UpgradePath, AHaltedRolloutIsFixedByAReleaseThatCoversBothReleases) {
+    constexpr uint64_t kFix = kN1 + 1;
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(reserves.begin(), reserves.end(),
+                           [](Node* r) { return r->driver->verified_authority() != nullptr; });
+    }));
+    const auto halted_approval = signer->approval(kN1, kN);
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(release_approval_bundle_json(halted_approval)),
+              ReleaseOfferResult::Adopted);
+    ASSERT_TRUE(run_until([&] { return finalized().release_number == kN1; }));
+    for (Node* node : servers()) upgrade(node).stage(kN1);
+
+    // The first server in the order upgrades; the second one fails its health
+    // gate, rolls back to N, and reports it.
+    std::vector<NodeId> went;
+    ASSERT_TRUE(run_until(
+        [&] {
+            for (Node* node : servers()) {
+                if (upgrade(node).gate(kN1) != UpgradeGate::Go ||
+                    std::find(went.begin(), went.end(), node->id) != went.end()) {
+                    continue;
+                }
+                went.push_back(node->id);
+                if (went.size() == 1) {
+                    restart_with(*node, kN1, kN);
+                    upgrade(node).stage(kN1);
+                } else {
+                    restart_with(*node, kN, 0);
+                    upgrade(node).report_failed(kN1);
+                }
+                break;
+            }
+            return finalized().halted;
+        },
+        4000))
+        << "no halt finalized";
+    ASSERT_EQ(went.size(), 2u);
+    ASSERT_EQ(finalized().upgraded.size(), 1u);
+    EXPECT_TRUE(finalized().upgraded.contains(went[0]));
+    Node* on_halted = mesh.nodes.at(went[0]);
+    EXPECT_EQ(stacks.at(on_halted->id).installed->approval.release_number, kN1);
+
+    // The release guard: the proof shows the halt, bound to the approval its
+    // Start record names.
+    const auto proof = rollout_proof_from_any();
+    ASSERT_TRUE(proof);
+    std::string error;
+    const auto rollout = verify_rollout_proof(*proof, network, error);
+    ASSERT_TRUE(rollout) << error;
+    std::string reason;
+    EXPECT_FALSE(rollout_complete(*rollout, kN1, reason));
+    EXPECT_FALSE(previous_rollout_state(*rollout, kN1, nullptr, reason)) << "a halt needs its approval";
+    EXPECT_EQ(previous_rollout_state(*rollout, kN1, &halted_approval, reason),
+              PreviousRollout::Halted)
+        << reason;
+    EXPECT_NE(reason.find("1 of"), std::string::npos) << reason;
+    // Another approval with the same number is not the finalized one.
+    const auto other = signer->approval(kN1, kN - 100);
+    EXPECT_FALSE(previous_rollout_state(*rollout, kN1, &other, reason));
+
+    const auto fix = signer->approval(kFix, std::vector<uint64_t>{kN1, kN});
+    EXPECT_TRUE(release_follows_rollout(*rollout, kN1, halted_approval, fix.approval, reason))
+        << reason;
+    // A fix that omits either release's hashes is refused.
+    EXPECT_FALSE(release_follows_rollout(*rollout, kN1, halted_approval,
+                                         signer->approval(kFix, kN1).approval, reason));
+    EXPECT_NE(reason.find("halted release and the release before it"), std::string::npos)
+        << reason;
+    EXPECT_FALSE(release_follows_rollout(*rollout, kN1, halted_approval,
+                                         signer->approval(kFix, kN).approval, reason));
+    // A fix whose number does not rise, or another release key, is refused.
+    EXPECT_FALSE(release_follows_rollout(*rollout, kN1, halted_approval,
+                                         signer->approval(kN1, std::vector<uint64_t>{kN1, kN})
+                                             .approval,
+                                         reason));
+    {
+        ReleaseSigner other_key(genesis_node->identity.public_key,
+                                genesis_node->identity.private_key);
+        EXPECT_FALSE(release_follows_rollout(
+            *rollout, kN1, halted_approval,
+            other_key.approval(kFix, std::vector<uint64_t>{kN1, kN}).approval, reason));
+    }
+
+    // Servers on N+1 and on N adopt the fix, and each one attests the fix and
+    // both earlier releases, so the next rollout can run.
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(release_approval_bundle_json(fix)),
+              ReleaseOfferResult::Adopted);
+    const auto all = servers();
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(all.begin(), all.end(), [&](Node* node) {
+            return chain(node).highest_release_number() == kFix;
+        });
+    })) << "the fix did not spread";
+    for (Node* node : servers()) {
+        const auto& profile = node->runtime->attestation().profile();
+        for (const char tag : {'n', 'a'}) {
+            const std::string path =
+                tag == 'n' ? "/usr/bin/lemonade-nexus" : "/usr/bin/nexus-attestd";
+            EXPECT_TRUE(path_approved(profile, path, release_hash(kFix, tag)));
+            EXPECT_TRUE(path_approved(profile, path, release_hash(kN1, tag)));
+            EXPECT_TRUE(path_approved(profile, path, release_hash(kN, tag)));
+            EXPECT_FALSE(path_approved(profile, path, release_hash(kN - 100, tag)));
+        }
+    }
+    ASSERT_TRUE(run_until([&] {
+        return finalized().release_number == kFix && !finalized().halted;
+    })) << "the rollout of the fix did not start after the halt";
+}
+
+// Rollback protection for the highest accepted release. The finalized Start
+// record of N+1 is the network floor. A server whose release record was
+// rolled back refuses to use the old approval until a peer hands it N+1, and
+// a fresh server learns the floor from Tier 1 and catches up to it. Both
+// servers here are Tier 2: they hold no consensus state of their own.
+TEST_F(UpgradePath, ARolledBackReleaseRecordIsRefusedAndAFreshServerCatchesUpToTheFloor) {
+    bootstrap();
+    ASSERT_FALSE(HasFatalFailure());
+    ASSERT_TRUE(run_until([&] {
+        return std::all_of(reserves.begin(), reserves.end(),
+                           [](Node* r) { return r->driver->verified_authority() != nullptr; });
+    }));
+    ASSERT_GE(reserves.size(), 2u);
+    Node* rolled = reserves.front();
+    Node* fresh = reserves.back();
+    const auto record_path = rolled->dir / "release" / kReleaseChainFile;
+    std::string before_n1;
+    {
+        std::ifstream in(record_path);
+        ASSERT_TRUE(in) << "no release record";
+        before_n1.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    ASSERT_EQ(upgrade(founders.front()).offer_approval(
+                  release_approval_bundle_json(signer->approval(kN1, kN))),
+              ReleaseOfferResult::Adopted);
+    const auto all = servers();
+    ASSERT_TRUE(run_until([&] {
+        return finalized().release_number == kN1 &&
+               std::all_of(all.begin(), all.end(), [&](Node* node) {
+                   return chain(node).floor() == kN1 &&
+                          chain(node).highest_release_number() == kN1;
+               });
+    })) << "the floor did not reach every server";
+
+    const auto approves = [](const Node* node, uint64_t release) {
+        return path_approved(node->runtime->attestation().profile(), "/usr/bin/lemonade-nexus",
+                             release_hash(release, 'n'));
+    };
+
+    // The record from before N+1 comes back, and the server restarts on N.
+    std::ofstream(record_path, std::ios::trunc) << before_n1;
+    restart_with(*rolled, kN, 0);
+    EXPECT_EQ(chain(rolled).highest_release_number(), kN);
+    EXPECT_EQ(chain(rolled).floor(), kN1);
+    EXPECT_TRUE(chain(rolled).below_floor());
+    EXPECT_FALSE(chain(rolled).current().has_value());
+    EXPECT_FALSE(upgrade(rolled).accepted_approval().has_value());
+    EXPECT_FALSE(approves(rolled, kN)) << "the rolled-back approval must not attest";
+    ASSERT_TRUE(run_until([&] {
+        return chain(rolled).highest_release_number() == kN1 && !chain(rolled).below_floor();
+    })) << "no peer handed the rolled-back server N+1";
+    EXPECT_TRUE(approves(rolled, kN1));
+    EXPECT_TRUE(approves(rolled, kN));
+
+    // A fresh server: no release record and no upgrade records, packaged N.
+    std::filesystem::remove_all(fresh->dir / "release");
+    std::filesystem::remove_all(fresh->dir / "upgrade");
+    restart_with(*fresh, kN, 0);
+    EXPECT_EQ(chain(fresh).floor(), 0u);
+    EXPECT_EQ(chain(fresh).highest_release_number(), kN);
+    ASSERT_TRUE(run_until([&] {
+        return chain(fresh).floor() == kN1 && chain(fresh).highest_release_number() == kN1 &&
+               chain(fresh).current().has_value();
+    })) << "the fresh server did not catch up to the floor";
+    EXPECT_TRUE(approves(fresh, kN1));
 }
 
 /// The r21 network: founded on a format-2 approval, before any server kept a

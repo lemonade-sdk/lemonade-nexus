@@ -233,6 +233,9 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
             sealed_blobs_->set_next_boot_chain(boot_pcrs_from_approval(bundle.approval));
         }
     });
+    // A finalized rollout above the accepted release (a rolled-back release
+    // record, or an older package): no profile until a newer approval comes.
+    upgrade_->set_release_floor_callback([this] { install_release_profile(); });
     upgrade_->attach();
 }
 

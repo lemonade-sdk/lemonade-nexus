@@ -16,6 +16,7 @@ signs, and publishes a release. Servers install it in place with
 - [Repository settings](#repository-settings)
 - [Reviewed release inputs](#reviewed-release-inputs)
 - [Release guards](#release-guards)
+- [Bootstrap procedure (one time)](#bootstrap-procedure-one-time)
 - [The updater on a server](#the-updater-on-a-server)
 - [Limits](#limits)
 
@@ -44,7 +45,7 @@ Do not push `v*` tags by hand. A tag push no longer starts a release.
 |---|---|
 | `lemonade-nexus-linux-x86_64`, `nexus-attestd-linux-x86_64` | Fleet server binaries, built in the pinned Ubuntu 24.04 / GCC 13.3 container. `nexus-updater` installs these. |
 | `nexus-updater-linux-x86_64` | The updater binary, for operators. The updater does not replace itself. |
-| `release-approval.json` | The approval (format 3), signed by the release key. `release_number` is the tag's number. `approved_paths` lists this release's hashes; `previous_release_paths` lists the previous release's hashes, so servers on both releases attest each other. It also carries the boot line from `release/fleet-profile.json`. |
+| `release-approval.json` | The approval (format 3), signed by the release key. `release_number` is the tag's number. `approved_paths` lists this release's hashes; `previous_release_paths` lists the previous release's hashes, so servers on both releases attest each other. After a halted rollout it lists the hashes of the halted release and of the release before it ([Release guards](#release-guards)). The bootstrap release lists none. It also carries the boot line from `release/fleet-profile.json`. |
 | `manifest.json`, `manifest.json.sig` | Version, release number, file hashes, wire versions, and the OS package lock. The signature is Ed25519 by the release key over `lemonade-nexus/release-manifest/v1\n` followed by the file. |
 | `os-packages.lock` | The exact OS package versions of the release. |
 | `*.sigstore.json` | Sigstore build provenance for the file of the same name. |
@@ -162,15 +163,21 @@ Use the package names of the reference image. A change to a `boot` package
 needs new `expected_pcrs` in the same pull request; the workflow refuses a lock
 that changes the boot chain while the PCRs stay the same, and the reverse.
 
-### Bootstrap inputs (one time)
+### `release/bootstrap-complete` (one time)
 
 The first date-tagged release is the bootstrap release (Design-Auto-Update
-Phase 6). Its previous release is r21, which is not a GitHub release.
+Phase 6). It has no previous release. The workflow detects it; there is no
+input or switch for it. A run is the bootstrap release only when both hold:
+
+- no earlier date tag and no published date-tagged release exists, and
+- `release/bootstrap-complete` does not exist.
+
+A date tag without a published release, or the file without any date-tagged
+release, fails the run.
 
 | File | Content | When |
 |---|---|---|
-| `release/r21-release-approval.json` | The signed r21 approval bundle, exactly as installed on the fleet | Before the bootstrap release. Without it the workflow refuses to run, because the approval must list the r21 hashes as previous. |
-| `release/bootstrap-complete` | The bootstrap tag, one line | After every server runs the bootstrap release. The release after it refuses to publish until this names the bootstrap tag. |
+| `release/bootstrap-complete` | The bootstrap tag, one line | After every server runs the bootstrap release ([Bootstrap procedure](#bootstrap-procedure-one-time)). The release after it refuses to publish until this names the bootstrap tag. |
 
 ## Release guards
 
@@ -181,30 +188,79 @@ The workflow refuses to publish in these cases:
    `os-packages.lock` must download. `nexus-release-bundle
    --previous-approval` checks that the same release key signed it for this
    network and copies its hashes to `previous_release_paths`. There is no
-   fallback to an approval without the overlap.
-2. **An open rollout.** Each approval lists one previous release. A release
-   published while servers still run the release before the previous one
-   would drop those servers out of attestation. The `server` job fetches a
-   rollout proof from the servers in the repository variable
-   `ROLLOUT_PROOF_URLS` (space-separated `https://<server>/api/upgrade/rollout-proof`
-   URLs) and runs `nexus-rollout-check`. The check passes only when the proof
-   verifies from the Genesis key that derives `network_id` in the fleet
-   profile, through the epoch authority chain and the commit proof of every
-   upgrade record, and shows the previous release's rollout complete and not
-   halted. The servers are not trusted for the result; a server that holds no
+   fallback to an approval without the overlap. The bootstrap release has no
+   previous release and no overlap.
+2. **An open rollout.** Each approval lists the hashes that servers can still
+   run. A release published while servers run a release that the new approval
+   does not list would drop those servers out of attestation. The `server`
+   job fetches a rollout proof from the servers in the repository variable
+   `ROLLOUT_PROOF_URLS` (space-separated
+   `https://<server>/api/upgrade/rollout-proof` URLs) and runs
+   `nexus-rollout-check`. The proof must verify from the Genesis key that
+   derives `network_id` in the fleet profile, through the epoch authority
+   chain and the commit proof of every upgrade record. The previous release's
+   published approval must be the approval that the finalized Start record
+   names. The servers are not trusted for the result; a server that holds no
    complete proof answers 503 and the next URL is tried. Without the variable,
    or without a verifying proof, the release fails.
+   - **Complete:** the new approval lists the previous release's hashes as
+     `previous_release_paths`.
+   - **Halted:** the servers in the Upgraded records run the halted release,
+     and every other server runs the release before it. The new release is
+     the fix. `nexus-release-bundle --previous-halted` lists the hashes of
+     both releases: the halted approval's `approved_paths` and its
+     `previous_release_paths`.
+   - **Open, or any other state:** the release fails.
+
+   After the approval is built, `nexus-rollout-check --approval` checks it
+   against the same proof. It passes only when `previous_release_paths` holds
+   exactly the hashes that the proven state requires for every path, with the
+   same release signer and network and a higher release number. A fix that
+   omits either release's hashes fails. An approval that keeps an older
+   release after a completed rollout also fails. For the release after the
+   bootstrap release, `release/bootstrap-complete` replaces the proof: the
+   bootstrap release has no rollout records.
 3. **A failed mixed-version gate.** The `mixed-version` job
    (`mixed-version.yml`) runs the previous release's server next to the new
-   one. For the bootstrap release this job is skipped: its baseline is the
-   r21 line. Run `scripts/mixed-version-mesh.sh` with `OLD_BIN` set to an
-   r21-line build before the bootstrap release.
+   one. For the bootstrap release this job is skipped: there is no previous
+   release, and every server installs the bootstrap release by hand.
 
 Why a Tier 1 proof and not a status file: a status file that each updater
 publishes would be a self-report by individual servers, and every server
 would need a credential to publish it. A rollout proof is finalized state: a
 Tier 1 quorum signed every record, witnesses observed every upgrade, and CI
 checks it from the Genesis key with no trust in the server that serves it.
+
+## Bootstrap procedure (one time)
+
+The servers move to the release line once, with the bootstrap release and a
+fresh founding. No server keeps state from an earlier release. There is no
+storage state yet, so a fresh founding is safe here, and only here. After this
+procedure, every release installs in place and the network is never founded
+again.
+
+1. Run the release workflow. With no earlier date-tagged release and no
+   `release/bootstrap-complete`, the run is the bootstrap release. It needs
+   no previous approval and no rollout proof, and it skips the mixed-version
+   gate.
+2. On every server, stop the services and remove `<data_root>/security/`
+   and `<data_root>/sealed/`. They hold the epoch, consensus, storage-key,
+   release, upgrade, and sealed state of the earlier release. Nothing from
+   them is migrated.
+3. Install the bootstrap release's server package on every server by hand.
+   The package carries the signed approval at
+   `/usr/lib/lemonade-nexus/release/release-approval.json`.
+4. Found the network fresh. The founding Genesis key must be the key behind
+   `network_id` in `release/fleet-profile.json`: the approval names that
+   network, and that key signed the delegation of `release_signer`. A
+   different Genesis key needs a reviewed change of `network_id` and
+   `authority_genesis_signature` (a new delegation of the release key) before
+   step 1.
+5. Confirm that every server reaches its role: Tier 1 members active in
+   Epoch 1, the data key unlocked, and Tier 2 servers attested.
+6. Commit `release/bootstrap-complete` with the bootstrap tag through a
+   reviewed pull request. The next release refuses to publish until the file
+   names that tag.
 
 ## The updater on a server
 
@@ -237,11 +293,11 @@ every OS change comes through a release.
   finalized UpgradeProgress records (Phase 5). A pre-existing HotStuff
   restart catch-up defect on the memory mesh blocks production use for Tier 1
   servers until it is fixed (Design-Auto-Update, Known limits).
-- **A halted rollout blocks the workflow.** The rollout guard refuses to
-  publish after a halt. A release that fixes a halted rollout would need both
-  the halted release's hashes and the hashes of the release before it, and an
-  approval lists only one previous release. Recovery from a halt is a manual
-  decision that this workflow does not make.
+- **A fix after a halt.** A second halt in a row adds the first fix's hashes
+  to the next fix, so the overlap grows by one release for each consecutive
+  halt until a rollout completes. The approval holds one PCR 8/9 pair, so a
+  fix for a halted release that changed the boot chain needs a reviewed
+  decision about which boot chain the fix approves.
 - **PCR measurement.** A GitHub-hosted runner cannot boot the fleet's SEV-SNP
   guest. PCR 8/9 come from the reviewed profile, and the optional reference VM
   job only compares them. The workflow never computes PCR values.
@@ -255,9 +311,8 @@ every OS change comes through a release.
   after that point does not unseal.
 - **First release.** The `vX.Y.Z-alpha` releases are never a previous
   release: they predate the approval chain and use another security wire
-  version. The bootstrap release takes its previous approval from
-  `release/r21-release-approval.json`, and the fleet moves from r21 by the
-  one-time procedure in Phase 6.
+  version. The bootstrap release has no previous release; the fleet moves to
+  it by the [Bootstrap procedure](#bootstrap-procedure-one-time).
 - **Provenance.** The updater accepts only Rekor v1 entries with an inclusion
   promise, against the trusted root pinned in the package
   (`release/sigstore-trusted-root.json`). A Sigstore key rotation or a move to

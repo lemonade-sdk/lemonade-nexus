@@ -117,6 +117,10 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "give either previous or previous_release_paths, not both";
         return std::nullopt;
     }
+    if (spec.previous_halted && !spec.previous) {
+        error = "previous_halted needs the previous approval";
+        return std::nullopt;
+    }
     if (spec.previous) {
         // Only digests the same release key approved are carried over.
         const auto signature = crypto::from_base64(spec.previous->signature_b64);
@@ -199,8 +203,8 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
     }
     auto previous_paths = spec.previous_release_paths;
     if (spec.previous) {
-        for (const auto& prior : spec.previous->approved_paths) {
-            if (seen.contains(prior.path)) previous_paths.push_back(prior);
+        for (auto& prior : release_overlap_paths(*spec.previous, spec.previous_halted)) {
+            if (seen.contains(prior.path)) previous_paths.push_back(std::move(prior));
         }
     }
     std::set<std::string> previous;
@@ -216,6 +220,24 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
     }
     approval.previous_release_paths = std::move(previous_paths);
     return approval;
+}
+
+std::vector<ApprovedPath> release_overlap_paths(const ReleaseApprovalV1& previous,
+                                                bool previous_halted) {
+    std::vector<ApprovedPath> out = previous.approved_paths;
+    if (!previous_halted) return out;
+    for (auto& path : out) {
+        const auto before = std::find_if(
+            previous.previous_release_paths.begin(), previous.previous_release_paths.end(),
+            [&path](const ApprovedPath& candidate) { return candidate.path == path.path; });
+        if (before == previous.previous_release_paths.end()) continue;
+        for (const auto& hash : before->sha256) {
+            if (std::find(path.sha256.begin(), path.sha256.end(), hash) == path.sha256.end()) {
+                path.sha256.push_back(hash);
+            }
+        }
+    }
+    return out;
 }
 
 std::string unsigned_release_bundle_json(const ReleaseApprovalV1& approval) {
