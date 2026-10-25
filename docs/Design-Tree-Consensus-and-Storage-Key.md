@@ -411,9 +411,12 @@ rotates the key when the threshold must change.
   loss is survivable, and after the change the next loss is survivable again
   once the set is back to strength.
 - **If the threshold stays the same** (65% of the new holder count rounds to
-  the same `t`), the holders refresh their shares for the new set and keep
-  `S`: removed holders drop out of the refresh, and a new holder is enrolled
-  through share repair. No file and no data key changes.
+  the same `t`) and no holder is added, the holders refresh their shares for
+  the new set and keep `S`: removed holders drop out of the refresh. No file
+  and no data key changes. Share repair is not used: a new holder enters
+  through a key rotation (B5a) even when `t` stays the same
+  (`StorageRecords.cpp`, `reshare()`). For example, 5 to 6 holders keeps
+  `t = 4` and still rotates.
 - **If the threshold changes,** the holders run a key rotation (B5a) instead:
   a fresh key generation among the new set at the new threshold, a new `S`,
   and each server rewraps its data key. Files are not touched. This is the
@@ -439,9 +442,23 @@ rotates the key when the threshold must change.
 - Rotation of `s` is finalized through consensus like a holder plan: a
   `StorageKeyRotation` names the new `S`, its share commitments, and the
   epoch it takes effect. The old `S` stays valid for unwrapping until every
-  server has rewrapped, with a bounded grace period (proposed: one epoch).
-- A server that misses a rotation unwraps with the old `S` during the grace
-  period, or rewraps through the holders of the new `S` afterwards.
+  server has rewrapped, with a hard cap.
+- **Implemented.** Each server keeps a signed *wrap claim* finalized in the
+  storage chain: the `S` and `R` of its committed wrapped DEK and, while it
+  stages a rewrap or a replacement, of the staged one. A rewrap is staged in
+  `data-key.next.json`, claimed, and proved through the new plan's holders;
+  only then does it replace `data-key.json`, and the server claims the new
+  wrap alone. That claim is its acknowledgement of the rotation. The previous
+  plan (the retiring plan) unwraps while any server's latest finalized claim
+  still names its `S`, and never after the hard cap
+  (`kStorageRetiringCapMs`, 7 rotation intervals of block time after the
+  rotation). While the retiring plan is live, no new rotation is selected
+  (a boundary refreshes instead), so at most one retiring plan exists.
+- A server that misses a rotation, even across several rotation intervals,
+  unwraps with the old `S` while the retiring plan is live, then rewraps.
+  After the cap its wrapped key opens nothing. A server that never returns
+  delays the next rotation by at most the cap; an admitted server can do the
+  same on purpose, which costs rotation, not confidentiality.
 - Every rotation is logged with its epoch, so an operator can see when each
   key last changed.
 
@@ -542,7 +559,11 @@ Limits:
    accordingly.
 4. On a passing verdict for the approved profile, the holder answers with
    `StorageUnlockPartial {s_i·R, DLEQ proof}`, sealed to the requester with
-   the request digest as associated data.
+   the request digest as associated data. The holder answers only for an `R`
+   that the requester's latest finalized wrap claim names for the plan's
+   `S` (B5a). An `R` belongs to the first server that claimed it while its
+   `S` is live, so a server that copies another server's `data-key.json`
+   gets no partial for it.
 5. With `t` valid partials the server unwraps its DEK and opens its files in
    memory. With fewer it retries with backoff and serves nothing that needs
    its files.
@@ -566,6 +587,13 @@ Everything in the table under [Current State](#current-state) except the boot
 set: the node identity key, vote keys, JWT secret, TLS and ACME keys, ACL and
 DDNS keys (derived from the DEK instead of the gossip key), the tree log and
 snapshots, and account data. `wrap_local.key` is retired.
+
+A server whose platform cannot pass the `StorageUnlock` attestation never
+unlocks a DEK: a holder answers only after a verdict that proves every claim
+of the Tier 1 attestation profile (`StorageKeyService::on_verdict`). A Tier 2
+server without SEV-SNP therefore never completes the B10 round trip, and its
+files stay plaintext (B10 step 3). The root server of the production mesh is
+such a server. It still holds a share and answers other servers' unlocks.
 
 ### B10. Migration
 
@@ -596,27 +624,42 @@ Always on, no setting (`Security/Storage/`):
   holders, the key is created. With a key, the shares refresh when the new
   holders are a subset of the current ones, `t` is unchanged, and no rotation
   is due; otherwise the key rotates. A rotation is due when block time is 24 h
-  past the block time that created `S`. New holders join through a rotation;
-  the crate's share repair is not used yet.
+  past the block time that created `S`, and it waits while the retiring plan
+  is live (B5a). New holders join through a rotation; the crate's share
+  repair is not used yet.
 - **Holder loss.** A session that has no final plan 120 s of block time after
   its selection may be replaced: by the next boundary's selection, or by a
   retry without the holders whose round-1 package the replica never observed
-  (at most 3 attempts). Below 3 holders nothing is selected and the last plan
-  stays.
+  and, once any holder confirmed, without the holders whose confirmation it
+  never observed (at most 3 attempts). Below 3 holders nothing is selected
+  and the last plan stays.
 - **Sessions.** Round 1 is broadcast; each round-2 package is sealed to its
   recipient with the network, the session (selection digest), and both holder
   identifiers bound inside the seal. Early round-2 packages are held and own
   packages are re-sent every 5 s (Part C, `RoundRelay.hpp`, shared with the
   FROST DKG). A holder seals its new share before it signs its confirmation.
+- **Wrap claims.** A `StorageWrapClaim` message carries a server's signed
+  claim to Tier 1, which finalizes claims in wrap batches (a third record
+  stage, payload kind `StorageHolderPlan`). A claim names one or two wraps,
+  each on the current `S` or the live retiring `S`; its counter must rise;
+  no wrap may belong to another server.
 - **Unlock.** A holder answers a `StorageUnlockRequest` only for the current
-  plan, or the retiring plan through the epoch after the rotation's effective
-  epoch, after a passing `StorageUnlock` attestation bound to that request.
+  plan, or the retiring plan while it is live (B5a), only for an `R` in the
+  requester's latest finalized claim, after a passing `StorageUnlock`
+  attestation bound to that request.
   Budgets: one pending request per requester, 8 per requester per epoch, 64
   pending in all; a replayed request digest is refused. The partial is sealed
   to the requester with the request digest bound inside the seal.
-- **Data key.** `DataKeyService` creates the DEK, wraps it to `S`, proves the
-  unwrap through the holders, unlocks at startup, and rewraps after a
-  rotation. No file is encrypted yet (Phase 7).
+- **Data key.** `DataKeyService` creates the DEK, wraps it to `S`, claims
+  the wrap, proves the unwrap through the holders, unlocks at startup, and
+  stages, proves, and then commits a rewrap after a rotation.
+- **Lost or foreign state.** `records.json` names the epoch chain that
+  finalized its records (the Genesis certificate digest). Records of another
+  chain are refused; a file without the binding binds when each commit proof
+  verifies under this chain. Shares are pruned only against a bound chain
+  with a current plan. When the files are encrypted, a missing
+  `records.json` or `data-key.json`, a chain without a final plan, or a
+  foreign chain stops startup with an error that names the files to restore.
 - **Share storage.** On a host that can seal, shares are kept by
   `SealedStorageShareStore` in the boot set's `SealedBlobStore` under the
   domain `storage-share`, with the same backend and upgrade staging as the
@@ -635,13 +678,12 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
   path, key id})`. The key id is a second HKDF output of the DEK.
 - **Covered.** `identity/keypair.enc`, `identity/jwt_secret.hex`,
   `identity/ddns_credentials.enc`, `account/replica.json`, `tree/nodes`,
-  `tree/deltas`, and `tree/log`. `FileStorageService`, `KeyWrappingService`,
-  `resolve_jwt_secret`, and `TreeLog` route these paths through the vault.
-- **Not covered (plaintext private keys at rest).** TLS and ACME keys:
-  `certs/<fqdn>/privkey.pem` and `certs/account.key`. `resolve_tls_cert`
-  resolves them by path and `HttpServer` opens them by path, so covering them
-  needs an in-memory key path, plus a decision on listener start order: the
-  listener does not wait for the unlock today.
+  `tree/deltas`, `tree/log`, and the TLS and ACME private keys
+  (`certs/<fqdn>/privkey.pem` and `certs/account.key`;
+  `StorageVault::default_coverage()`). `FileStorageService`,
+  `KeyWrappingService`, `resolve_jwt_secret`, `TreeLog`, `resolve_tls_cert`,
+  and `AcmeService` route these paths through the vault. The TLS certificate
+  chain and `meta.json` stay plaintext: they are not secret.
 - **No secret at rest, so not coverage gaps.** Vote keys: `VoteKey.cpp`
   generates the Ed25519 keypair into guarded memory each epoch and never
   writes the private key, and `vote-key-<epoch>.json` and the epoch file carry
@@ -660,7 +702,9 @@ Always on, no setting (`Security/Storage/StorageVault.hpp`):
 - **Startup.** With `encrypted` recorded, `main` runs the io context (gossip,
   attestation, the security mesh, holder duties) until the DEK is in memory,
   then starts the tree, the node identity, and everything after them. Startup
-  with the flag off stops when the state file records encryption.
+  stops, with an error that names the files to restore, when the storage
+  state that opens the files is lost or belongs to another epoch chain
+  (B11).
 - **DEK rotation (B5a).** Every 30 days on the local clock, or on
   `POST /api/storage/rotate-data-key` (root administrator).
   `DataKeyService::begin_replacement` wraps a new DEK to the current S in
@@ -694,7 +738,7 @@ This part does not change the trust model and can ship first.
 | 4 | `storage-threshold` crate: library review, key generation, re-share, share refresh, DLEQ, threshold ECIES. | — |
 | 5 | `StorageHolderPlan` in consensus, unlock protocol, `StorageUnlock` attestation purpose, per-epoch share refresh, daily `StorageKeyRotation`. | 2, 4 |
 | 6 | `nexus-attestd` Seal and Unseal; boot set sealed. **Implemented** (B6). | — |
-| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented in part** (B12): TLS/ACME private keys are not covered. Vote keys keep no private key at rest and ACL rows are already encrypted under a separate key, so neither is a coverage gap. | 5, 6 |
+| 7 | DEK file migration; plaintext removed; monthly DEK rotation. **Implemented** (B12), including the TLS and ACME private keys. Vote keys keep no private key at rest and ACL rows are already encrypted under a separate key, so neither is a coverage gap. | 5, 6 |
 
 Phases 1, 4, and 6 can run in parallel.
 
@@ -714,9 +758,12 @@ Each phase adds tests for the valid path and these rejection cases:
   attestation, a replayed unlock request, a re-share contributed by fewer
   than `t_old` holders, a removed holder's share after re-share, a share from
   before a refresh combined with shares after it, unlock with the old `S`
-  after its grace period, a server that missed a rotation catching up, an
-  interrupted DEK rotation resuming without data loss, cold start with
-  exactly `t` and with `t − 1` holders.
+  after the retiring plan's hard cap, a server stopped across two rotation
+  intervals catching up, a rewrap interrupted before its verification, a
+  request for another server's `R`, a holder that never confirms, lost or
+  foreign storage state with encrypted files, an interrupted DEK rotation
+  resuming without data loss, cold start with exactly `t` and with `t − 1`
+  holders.
 - **Race fix:** round 2 arriving before round 1 on every DKG path completes
   without a stall.
 

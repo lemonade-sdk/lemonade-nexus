@@ -4,7 +4,11 @@
 // security/lifecycle/storage_key_path.cpp.
 
 #include <LemonadeNexus/Core/SecurityMeshStartup.hpp>
+#include <LemonadeNexus/Core/ServerConfig.hpp>
+#include <LemonadeNexus/Crypto/KeyWrappingService.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
+#include <LemonadeNexus/Gossip/GossipService.hpp>
+#include <LemonadeNexus/Security/Lifecycle/SecurityMeshService.hpp>
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
@@ -455,6 +459,79 @@ TEST_F(StorageVaultTest, LockedRestartServesNothingAndDependentsWait) {
     ASSERT_TRUE(read.has_value());
     EXPECT_EQ(read->data, envelope.data);
     EXPECT_TRUE(encrypted(read_raw(data / "tree/nodes/alpha.json")));
+    files.stop();
+}
+
+// --- Startup with encrypted files and lost storage state ----------------------------
+
+TEST_F(StorageVaultTest, ProductionStartupRefusesEncryptedFilesWithoutTheirStorageState) {
+    migrate();
+    crash_and_restart(/*holders_up=*/false);
+    ASSERT_EQ(vault->mode(), VaultMode::Encrypted);
+    // records.json and data-key.json are gone (a re-found, or the directory
+    // moved aside); the vault state still records `encrypted`.
+    ASSERT_FALSE(fs::exists(data / "security/storage/records.json"));
+    ASSERT_FALSE(fs::exists(data / "security/storage/data-key.json"));
+
+    // The fixture's placeholder public key file is not a key.
+    fs::remove(data / "identity/keypair.pub");
+    asio::io_context io;
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    nexus::crypto::KeyWrappingService wrapping{crypto, files};
+    wrapping.start();
+    nexus::gossip::GossipService gossip{io, 0, files, crypto};
+    gossip.start();
+    nexus::core::ServerConfig config;
+    config.data_root = data.string();
+    const auto genesis = crypto.ed25519_keygen();
+    config.genesis_pubkey = nexus::crypto::to_base64(genesis.public_key);
+
+    std::string error;
+    auto startup = nexus::core::start_security_mesh(
+        io, config, gossip, wrapping, PlatformEvidenceSource{}, PlatformActivationSource{}, error,
+        {}, nexus::core::SecurityMeshStorageInputs{.vault = vault.get()});
+    EXPECT_FALSE(startup.has_value());
+    EXPECT_NE(error.find("records.json"), std::string::npos) << error;
+    EXPECT_NE(error.find("data-key.json"), std::string::npos) << error;
+    // Nothing was created in their place, and the files are untouched.
+    EXPECT_FALSE(fs::exists(data / "security/storage/records.json"));
+    EXPECT_FALSE(fs::exists(data / "security/storage/data-key.json"));
+    EXPECT_TRUE(encrypted(read_raw(data / "identity/keypair.enc")));
+    vault->attach(&keys);
+    gossip.stop();
+    wrapping.stop();
+    files.stop();
+}
+
+TEST_F(StorageVaultTest, ProductionStartupRunsWithPlaintextFilesAndNoStorageState) {
+    keys.holders_answer = false;
+    build();
+    ASSERT_EQ(vault->mode(), VaultMode::Plaintext);
+    // The fixture's placeholder public key file is not a key.
+    fs::remove(data / "identity/keypair.pub");
+    asio::io_context io;
+    nexus::storage::FileStorageService files{data};
+    files.start();
+    nexus::crypto::KeyWrappingService wrapping{crypto, files};
+    wrapping.start();
+    nexus::gossip::GossipService gossip{io, 0, files, crypto};
+    gossip.start();
+    nexus::core::ServerConfig config;
+    config.data_root = data.string();
+    const auto genesis = crypto.ed25519_keygen();
+    config.genesis_pubkey = nexus::crypto::to_base64(genesis.public_key);
+
+    std::string error;
+    auto startup = nexus::core::start_security_mesh(
+        io, config, gossip, wrapping, PlatformEvidenceSource{}, PlatformActivationSource{}, error,
+        {}, nexus::core::SecurityMeshStorageInputs{.vault = vault.get()});
+    ASSERT_TRUE(startup.has_value()) << error;
+    EXPECT_TRUE(startup->service->storage_key()->halt_reason().empty());
+    startup->service->stop();
+    startup.reset();
+    gossip.stop();
+    wrapping.stop();
     files.stop();
 }
 

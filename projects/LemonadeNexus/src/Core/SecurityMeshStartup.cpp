@@ -76,6 +76,15 @@ std::optional<SecurityMeshStartup> start_security_mesh(
         std::make_unique<security::SecurityMeshService>(io, mesh_config, gossip,
                                                         &key_wrapping);
     startup->service->start();
+    if (auto* storage_key = startup->service->storage_key(); storage_key != nullptr) {
+        // The files are encrypted and the storage state that opens them is
+        // lost. Starting would orphan them; the reason names what to restore.
+        if (auto reason = storage_key->halt_reason(); !reason.empty()) {
+            startup->service->stop();
+            error = "storage: " + reason;
+            return std::nullopt;
+        }
+    }
     startup->network_id_hex = crypto::to_hex(anchor->network_id);
     if (release) {
         startup->release_signing_pubkey_b64 =

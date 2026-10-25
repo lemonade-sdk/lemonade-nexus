@@ -384,10 +384,21 @@ int main(int argc, char* argv[]) {
             [&stop_requested](const asio::error_code& ec, int) {
                 if (!ec) stop_requested = true;
             });
+        // The storage key can also find, after startup, that its records
+        // belong to another epoch chain; then the files can never unlock.
+        auto* storage_key = security_mesh->service->storage_key();
+        const auto storage_halted = [storage_key] {
+            return storage_key != nullptr && !storage_key->halt_reason().empty();
+        };
         const bool unlocked = nexus::core::wait_for_storage_unlock(
-            coordinator.io_context(), *storage_vault, [&] { return stop_requested.load(); });
+            coordinator.io_context(), *storage_vault,
+            [&] { return stop_requested.load() || storage_halted(); });
         unlock_signals.cancel();
         if (!unlocked) {
+            if (storage_halted()) {
+                spdlog::error("Storage: {}", storage_key->halt_reason());
+                return 1;
+            }
             spdlog::info("Stopped before the data key unlocked");
             return 0;
         }
@@ -751,13 +762,21 @@ int main(int argc, char* argv[]) {
     // Forwarding between two client endpoints follows the permission tree: a
     // client's server peer covers the whole plane, so without this policy any
     // joined endpoint could reach any other through the server. Install it
-    // before the dataplane takes peers.
+    // before the dataplane takes peers. Without a known plane the policy cannot
+    // be built, so forwarding fails closed: the deny policy forwards nothing.
     std::optional<nexus::boringtun::ForwardAuthorizer> forward_authorizer;
     if (!tunnel_bind_ip.empty()) {
         if (auto plane = nexus::boringtun::Cidr::parse(tunnel_bind_ip + "/10")) {
             forward_authorizer.emplace(tree, boringtun_service.dataplane(), *plane);
             forward_authorizer->start();
         }
+    }
+    if (!forward_authorizer) {
+        boringtun_service.dataplane().set_forward_policy(
+            nexus::boringtun::deny_forward_policy());
+        spdlog::error("boringtun: tunnel IP '{}' is {}; the dataplane forwards no packets "
+                      "between peers",
+                      tunnel_bind_ip, tunnel_bind_ip.empty() ? "not set" : "not an IPv4 address");
     }
 
     // Set up the boringtun interface with the server's tunnel IP

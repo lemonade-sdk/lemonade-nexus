@@ -127,7 +127,7 @@ public:
     /// pool. The router checked only the sender's membership; the op itself is
     /// unverified bytes until the pool's owner validates it.
     virtual void on_tree_op_submit(const TreeOpSubmitMsg&, const NodeId&) {}
-    /// Storage-key traffic (kinds StoragePlanProof to StoragePlanRequest). The
+    /// Storage-key traffic (kinds StoragePlanProof to StorageWrapClaim). The
     /// router bound the body's sender to the transport identity and checked
     /// the network; the storage service checks the epoch, the session or plan,
     /// and every proof itself.

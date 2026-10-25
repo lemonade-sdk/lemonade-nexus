@@ -11,6 +11,7 @@
 
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
+#include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
 namespace nexus::security {
 
@@ -169,6 +170,12 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
                         std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::system_clock::now().time_since_epoch())
                             .count());
+                },
+            // Lost storage state stops startup only when the files are
+            // encrypted (StorageKeyService::start).
+            .files_encrypted =
+                [vault = config.vault] {
+                    return vault != nullptr && vault->mode() == VaultMode::Encrypted;
                 }},
         driver_, router_, runtime_, sealer_, *share_store_, *storage_crypto_);
     storage_->attach();

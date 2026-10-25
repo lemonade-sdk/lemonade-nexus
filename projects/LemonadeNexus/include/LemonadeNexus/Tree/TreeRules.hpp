@@ -44,6 +44,12 @@ using NodeMap = std::unordered_map<std::string, TreeNode>;
                                                       std::string_view node_id,
                                                       std::string_view signer_pubkey);
 
+/// True when the signer holds `admin` on the top of the tree that holds
+/// `node_id`: the node reached by walking up the parent chain to a node with
+/// no parent (the root). False when the walk leaves the map or loops.
+[[nodiscard]] bool administers_root(const NodeMap& nodes, std::string_view node_id,
+                                    std::string_view signer_pubkey);
+
 /// True when `principal` is the management key of a node at or beneath
 /// `scope_id`: a joined identity, not an arbitrary key.
 [[nodiscard]] bool principal_joined_under(const NodeMap& nodes,
@@ -60,7 +66,10 @@ using NodeMap = std::unordered_map<std::string, TreeNode>;
 /// an update keeps the node's identity (id, parent, type, management key,
 /// endpoint identifier); only an admin of the node or an ancestor changes
 /// assignments, and only for joined identities in that admin's subtree;
-/// a create names no one but the signer unless the signer administers the
+/// only a root admin (administers_root) creates a Relay node or sets or
+/// changes `tunnel_ip` or `private_subnet`, because these act on the whole
+/// tunnel plane (the server assigns them for every other writer, including a
+/// group admin); a create names no one but the signer unless the signer administers the
 /// parent; the root is never created or deleted. Returns the refusal
 /// reason, or nullopt when the delta is acceptable.
 [[nodiscard]] std::optional<std::string> delta_content_refusal(const NodeMap& nodes,

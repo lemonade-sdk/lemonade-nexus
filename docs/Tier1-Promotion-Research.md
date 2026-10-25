@@ -152,20 +152,17 @@ instead" **[V]**.
   `MAX_HOLDERS = 50` **[V]** (`crates/storage-threshold/src/params.rs`).
 - **Threshold formula:** `t = ceil(0.65 × n)` **[V]** (`params.rs::threshold_for`).
   - `n = 5 → t = 4`; **`n = 6 → t = 4`** (ceil(3.9) = 4).
-- **So a 5→6 promotion keeps `t = 4`.** That means the "rotate rather than
-  re-share when the threshold changes" rule is **not** triggered: 5→6 is the
-  *same-threshold* case and the design says "a new holder is enrolled through
-  share repair. No file and no data key changes" **[V]**
-  (`docs/Design-Tree-Consensus-and-Storage-Key.md:411`). If the holder set went
-  5→8 (t = 6) the rule would force a rotation (new `S`, rewrap data keys)
-  **[V]** (`Design-...:416`, `StorageRecords.cpp::reshare` returns `Rotate`
-  when `*t != state.current->threshold`).
-- **What actually blocks it:** the C++ selection only ever emits
+- **So a 5→6 holder change keeps `t = 4`, and it still rotates.**
+  `StorageRecords.cpp::reshare` refreshes only when the new holders are a
+  subset of the current ones and `t` is unchanged; any added holder gives a
+  `Rotate` (new `S`, every server rewraps its data key) **[V]**. Share repair
+  is not used, at any threshold. The design text that said a new holder is
+  enrolled through share repair was corrected (Design B5).
+- **What is missing for repair:** the C++ selection only ever emits
   `Create / Refresh / Rotate` — there is **no `Repair` operation**
-  **[V]** (`include/.../Storage/StorageRecords.hpp:44`,
-  `StorageRecords.cpp::reshare`). A same-threshold holder *addition* today can
-  only happen via a `Rotate` (full key generation). The `repair_*` primitives
-  are ready but the consensus/session state machine does not schedule them.
+  **[V]** (`include/.../Storage/StorageRecords.hpp`,
+  `StorageRecords.cpp::reshare`). The `repair_*` primitives are ready but the
+  consensus/session state machine does not schedule them.
 - **What else a 5→6 promotion touches:** consensus quorum (`consensus_quorum(6)
   = 5` **[V]** static_assert), authority threshold (`authority_threshold(6) = 5`,
   unchanged from 5 **[V]**), a fresh FROST DKG for the new epoch group key,
@@ -275,17 +272,20 @@ whether reserve/rank ordering is enough).
 
 **(d) The "old authority still valid" window — `StorageKeyService::live_plan`.**
 `live_plan` returns the *current* plan or, if `retiring_live()`, the *retiring*
-plan inside its grace window (`kStorageGraceEpochs = 1`)
-**[V]** (`StorageKeyService.cpp:1165`, `retiring_live` `:225`). A promotion that
-adds a holder and produces a new plan extends exactly this dual-plan window.
-**Test coverage: `live_plan` has zero direct unit tests** **[V]** (grep of
-`tests/**` → no matches for `live_plan`). The grace-period *behavior* is covered
-by `tests/security/lifecycle/storage_key_path.cpp::DailyRotationCatchUpAndTheGracePeriod`
-and `tests/security/storage/records.cpp` (rotation/catch-up paths), but the
-grace window in a **promotion/holder-add** (not daily-rotation) scenario is not
-covered **[V]**. Any promotion change must add a test that the retiring plan
-stops unwrapping exactly after `kStorageGraceEpochs` and that no plan outside
-{current, retiring-in-grace} is honored.
+plan. The retiring plan is live while a server's latest finalized wrap claim
+names its `S`, up to a hard cap (`kStorageRetiringCapMs`, 7 rotation intervals
+of block time), and no new rotation is selected meanwhile
+(`storage_retiring_live()` in `StorageRecords.cpp`). A promotion that adds a
+holder rotates, so it opens exactly this dual-plan window, and it waits while
+an earlier window is still open. `live_plan` has no direct unit test; the rule
+behind it is covered by `tests/security/storage/records.cpp`
+(`StorageWrapClaims.*`) and by
+`tests/security/lifecycle/storage_key_path.cpp`
+(`AServerStoppedForTwoRotationIntervalsRecoversItsDataKey`,
+`TheOldKeyStopsUnwrappingAtTheHardCap`), all in daily-rotation scenarios. The
+window after a **promotion/holder-add** rotation is the same code path but has
+no test of its own. Any promotion change should add one, and a test that no
+plan outside {current, live retiring} is honored.
 
 ---
 

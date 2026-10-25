@@ -330,6 +330,21 @@ bool encode_storage_plan_request(Writer& w, const StoragePlanRequestMsg& m) {
     return true;
 }
 
+bool encode_storage_wrap_claim(Writer& w, const StorageWrapClaimMsg& m) {
+    if (m.wraps.empty() || m.wraps.size() > constants::kStorageMaxWrapsPerClaim) {
+        return false;
+    }
+    put_node(w, m.node);
+    w.u64(m.counter);
+    w.u8(static_cast<uint8_t>(m.wraps.size()));
+    for (const auto& wrap : m.wraps) {
+        w.fixed(wrap.storage_public_key);
+        w.fixed(wrap.ephemeral_point);
+    }
+    w.fixed(m.signature);
+    return true;
+}
+
 bool upgrade_topic_known(uint8_t topic) {
     return topic >= static_cast<uint8_t>(UpgradeTopic::ApprovalOffer) &&
            topic <= static_cast<uint8_t>(UpgradeTopic::RecordRequest);
@@ -950,6 +965,23 @@ bool decode_storage_unlock_partial(Reader& r, StorageUnlockPartialMsg& m) {
            r.bytes(m.sealed_partial, kMaxSealedPartialBytes);
 }
 
+bool decode_storage_wrap_claim(Reader& r, StorageWrapClaimMsg& m) {
+    uint8_t count = 0;
+    if (!(get_node(r, m.node) && r.u64(m.counter) && r.u8(count))) {
+        return false;
+    }
+    if (count == 0 || count > constants::kStorageMaxWrapsPerClaim) {
+        return r.fail(CodecError::CountTooLarge);
+    }
+    m.wraps.resize(count);
+    for (auto& wrap : m.wraps) {
+        if (!(r.fixed(wrap.storage_public_key) && r.fixed(wrap.ephemeral_point))) {
+            return false;
+        }
+    }
+    return r.fixed(m.signature);
+}
+
 bool decode_vote(Reader& r, Vote& v) {
     return r.u16(v.consensus_ruleset) && r.fixed(v.network_id) && r.u64(v.epoch) &&
            r.u64(v.height) && r.u64(v.view) && r.fixed(v.proposal_digest) &&
@@ -1351,6 +1383,12 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(m);
             return true;
         }
+        case SecurityMessageKind::StorageWrapClaim: {
+            StorageWrapClaimMsg m;
+            if (!decode_storage_wrap_claim(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
         case SecurityMessageKind::Upgrade: {
             UpgradeMsg m;
             if (!decode_upgrade(r, m)) return false;
@@ -1608,6 +1646,8 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::StorageUnlockPartial;
             } else if constexpr (std::is_same_v<T, StoragePlanRequestMsg>) {
                 return SecurityMessageKind::StoragePlanRequest;
+            } else if constexpr (std::is_same_v<T, StorageWrapClaimMsg>) {
+                return SecurityMessageKind::StorageWrapClaim;
             } else if constexpr (std::is_same_v<T, UpgradeMsg>) {
                 return SecurityMessageKind::Upgrade;
             } else {
@@ -1645,6 +1685,8 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_storage_unlock_partial(body, value);
             } else if constexpr (std::is_same_v<T, StoragePlanRequestMsg>) {
                 return encode_storage_plan_request(body, value);
+            } else if constexpr (std::is_same_v<T, StorageWrapClaimMsg>) {
+                return encode_storage_wrap_claim(body, value);
             } else if constexpr (std::is_same_v<T, UpgradeMsg>) {
                 return encode_upgrade(body, value);
             } else if constexpr (std::is_same_v<T, Vote>) {

@@ -59,6 +59,10 @@ std::optional<LinkTokenRecord> AuthService::consume_link_token(std::string_view 
     return token_link_provider_.consume(token);
 }
 
+bool AuthService::refund_link_token(std::string_view token, const LinkTokenRecord& record) {
+    return token_link_provider_.refund(token, record);
+}
+
 bool AuthService::revoke_ed25519(const std::string& pubkey_b64) {
     return ed25519_provider_.revoke_pubkey(pubkey_b64);
 }

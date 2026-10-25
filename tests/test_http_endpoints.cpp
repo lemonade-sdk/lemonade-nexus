@@ -566,7 +566,8 @@ protected:
     /// Full Ed25519 challenge-response join; returns the /api/join response.
     /// Uses the same AuthService instance the handler authenticates against,
     /// so the challenge round-trip is exactly what the join route performs.
-    httplib::Result join_node(const crypto::Ed25519Keypair& kp) {
+    httplib::Result join_node(const crypto::Ed25519Keypair& kp,
+                              const std::string& link_token = {}) {
         const auto bare = crypto::to_base64(
             std::span<const uint8_t>(kp.public_key.data(),
                                      kp.public_key.size()));
@@ -582,6 +583,7 @@ protected:
             {"challenge", challenge_b64},
             {"signature", crypto::to_base64(sig)},
         };
+        if (!link_token.empty()) body["link_token"] = link_token;
         return make_client().Post("/api/join", body.dump(), "application/json");
     }
 
@@ -2184,4 +2186,174 @@ TEST_F(MeshPeersConnectTest, ServerPeerAndRelayAreUnchanged) {
     EXPECT_EQ(body["server_peer"]["node_id"], "server");
     EXPECT_EQ(body["server_peer"]["is_server"], true);
     EXPECT_EQ(status_peer_count(), 1u);
+}
+
+// --- Review fixes: server-assigned fields, delete cleanup, link tokens, IPAM ---
+
+// A joined device holds add_child and edit_node on its endpoint and owns its
+// group, yet tunnel addresses, private subnets, and relays stay
+// server-assigned: the direct routes refuse them as tree operations do.
+TEST_F(HttpEndpointTest, NodeRoutesKeepAddressesServerAssigned) {
+    auto cli = make_client();
+    auto device_kp = crypto->ed25519_keygen();
+    const auto device_b64 = crypto::to_base64(std::span<const uint8_t>(
+        device_kp.public_key.data(), device_kp.public_key.size()));
+    auto join_res = join_node(device_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto ep = json::parse(join_res->body).value("node_id", std::string{});
+    const auto stored_ip = tree->get_node(ep)->tunnel_ip;
+    ASSERT_FALSE(stored_ip.empty());
+    const httplib::Headers device = {{"Authorization", "Bearer " + make_jwt(device_b64)}};
+
+    auto relay = cli.Post("/api/tree/node", device,
+                          json{{"parent_id", ep}, {"type", "relay"}}.dump(), "application/json");
+    ASSERT_NE(relay, nullptr);
+    EXPECT_EQ(relay->status, 403) << relay->body;
+
+    auto move = cli.Post("/api/tree/node/update/" + ep, device,
+                         json{{"tunnel_ip", "10.65.0.9/32"}}.dump(), "application/json");
+    ASSERT_NE(move, nullptr);
+    EXPECT_EQ(move->status, 403) << move->body;
+    auto widen = cli.Post("/api/tree/node/update/" + ep, device,
+                          json{{"private_subnet", "10.64.0.0/10"}}.dump(), "application/json");
+    ASSERT_NE(widen, nullptr);
+    EXPECT_EQ(widen->status, 403) << widen->body;
+    EXPECT_EQ(tree->get_node(ep)->tunnel_ip, stored_ip);
+    EXPECT_TRUE(tree->get_node(ep)->private_subnet.empty());
+
+    // Sending the stored value back is not a change.
+    auto same = cli.Post("/api/tree/node/update/" + ep, device,
+                         json{{"tunnel_ip", stored_ip}, {"hostname", "kept"}}.dump(),
+                         "application/json");
+    ASSERT_NE(same, nullptr);
+    EXPECT_EQ(same->status, 200) << same->body;
+    EXPECT_EQ(tree->get_node(ep)->hostname, "kept");
+}
+
+// A delete that another server took reaches this server as a committed
+// operation, with no request here. The cleanup must still run here: the
+// credential is revoked, the IPAM record released, and the DNS record removed.
+TEST_F(HttpEndpointTest, ACommittedDeleteRunsTheCleanupOnThisServer) {
+    auto cli = make_client();
+    auto apply_delete = [&](const std::string& node_id, const std::string& principal) {
+        tree::TreeOp op;
+        op.kind = tree::TreeOpKind::DeleteNode;
+        op.target = node_id;
+        op.principal = principal;
+        op.base_version = tree->get_node(node_id)->version;
+        op.body.source = tree::TreeOpSource::Session;
+        const auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+        return tree->apply_committed_ops({op}, now);
+    };
+
+    // A device key that only this node holds, with an IPAM record.
+    auto device_kp = crypto->ed25519_keygen();
+    const auto device_b64 = crypto::to_base64(std::span<const uint8_t>(
+        device_kp.public_key.data(), device_kp.public_key.size()));
+    tree::TreeNode node;
+    node.id = "replicated_delete";
+    node.parent_id = "root";
+    node.type = tree::NodeType::Endpoint;
+    node.mgmt_pubkey = "ed25519:" + device_b64;
+    node.assignments = {{root_pubkey_str, {"admin"}}};
+    auto create = post_auth_delta(cli, json(make_signed_delta("create_node", node.id, node)).dump());
+    ASSERT_NE(create, nullptr);
+    ASSERT_EQ(create->status, 200) << create->body;
+    ASSERT_FALSE(ipam->allocate_tunnel_ip(node.id).base_network.empty());
+    ASSERT_TRUE(auth->validate_session_claims(make_jwt(device_b64)).has_value());
+
+    ASSERT_TRUE(apply_delete(node.id, root_pubkey_str).ok());
+    EXPECT_FALSE(tree->get_node(node.id).has_value());
+    EXPECT_FALSE(auth->validate_session_claims(make_jwt(device_b64)).has_value());
+    EXPECT_FALSE(ipam->get_allocation(node.id).has_value());
+
+    // A joined device's private DNS record goes too.
+    auto joined_kp = crypto->ed25519_keygen();
+    auto join_res = join_node(joined_kp);
+    ASSERT_NE(join_res, nullptr);
+    ASSERT_EQ(join_res->status, 200) << join_res->body;
+    const auto join = json::parse(join_res->body);
+    const auto joined_id = join.value("node_id", std::string{});
+    const auto fqdn = join.value("client_private_fqdn", std::string{});
+    const auto ip = join.value("tunnel_ip", std::string{});
+    ASSERT_TRUE(dns_a_resolves_to(fqdn, ip.substr(0, ip.find('/'))));
+    ASSERT_TRUE(apply_delete(joined_id, root_pubkey_str).ok());
+    EXPECT_EQ(dns_a_answer_count(fqdn), 0u);
+}
+
+// A link token is spent only by a join that places a device with it. A join
+// refused before placement leaves the token usable, and a join that placed a
+// device spends it.
+TEST_F(HttpEndpointTest, ARefusedJoinDoesNotSpendTheLinkToken) {
+    const auto minted = auth->mint_link_token("owner", root_pubkey_str, "grp_later",
+                                              std::chrono::seconds{600});
+    ASSERT_TRUE(minted.has_value());
+    const auto& token = minted->first;
+
+    // The token's group does not exist yet: the join is refused.
+    auto first_kp = crypto->ed25519_keygen();
+    auto refused = join_node(first_kp, token);
+    ASSERT_NE(refused, nullptr);
+    EXPECT_EQ(refused->status, 409) << refused->body;
+
+    tree::TreeNode group;
+    group.id = "grp_later";
+    group.parent_id = "root";
+    group.type = tree::NodeType::Customer;
+    group.mgmt_pubkey = root_pubkey_str;
+    group.assignments = {{root_pubkey_str, {"admin"}}};
+    ASSERT_TRUE(tree->insert_join_node(group));
+
+    auto placed = join_node(first_kp, token);
+    ASSERT_NE(placed, nullptr);
+    ASSERT_EQ(placed->status, 200) << placed->body;
+    const auto node_id = json::parse(placed->body).value("node_id", std::string{});
+    EXPECT_EQ(tree->get_node(node_id)->parent_id, "grp_later");
+
+    auto second_kp = crypto->ed25519_keygen();
+    auto spent = join_node(second_kp, token);
+    ASSERT_NE(spent, nullptr);
+    EXPECT_EQ(spent->status, 403) << spent->body;
+}
+
+// With tree operations on, the Join operation assigns tunnel addresses on
+// every replica, so POST /api/ipam/allocate refuses a local tunnel address.
+// The fixture shadows that route with a stand-in, so this test serves the
+// production route on its own server.
+TEST_F(HttpEndpointTest, TunnelAllocationIsRefusedWithTreeOperations) {
+    httplib::Server srv;
+    test_api::handler().register_routes(srv, srv);
+    const int port = srv.bind_to_any_port("127.0.0.1");
+    ASSERT_GT(port, 0);
+    std::thread server_thread([&srv] { srv.listen_after_bind(); });
+    ASSERT_TRUE(wait_http_ready(static_cast<uint16_t>(port)));
+
+    auto& cfg = *test_api::current().config;
+    const bool original = cfg.tree_ops_enabled;
+    httplib::Client cli("127.0.0.1", port);
+    const httplib::Headers root = {{"Authorization", "Bearer " + make_jwt(root_pubkey_str)}};
+    auto allocate = [&](const std::string& block) {
+        json body = {{"node_id", "root"}, {"block_type", block}, {"prefix_len", 30}};
+        return cli.Post("/api/ipam/allocate", root, body.dump(), "application/json");
+    };
+
+    cfg.tree_ops_enabled = true;
+    auto tunnel = allocate("tunnel");
+    ASSERT_NE(tunnel, nullptr);
+    EXPECT_EQ(tunnel->status, 409) << tunnel->body;
+    EXPECT_FALSE(ipam->get_allocation("root").has_value());
+    auto priv = allocate("private");
+    ASSERT_NE(priv, nullptr);
+    EXPECT_EQ(priv->status, 200) << priv->body;
+
+    cfg.tree_ops_enabled = false;
+    auto direct = allocate("tunnel");
+    ASSERT_NE(direct, nullptr);
+    EXPECT_EQ(direct->status, 200) << direct->body;
+
+    cfg.tree_ops_enabled = original;
+    srv.stop();
+    server_thread.join();
 }

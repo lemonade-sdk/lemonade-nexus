@@ -3,7 +3,9 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace nexus::core {
@@ -149,7 +151,16 @@ struct ServerConfig {
 };
 
 /// Load config: CLI args > env vars > config file > defaults.
+/// A boolean SP_* variable takes a value that parse_bool_flag accepts. Any
+/// other value is logged at error level and turns the setting off, except
+/// that SP_DNS_SEED_DISCOVERY keeps its current value and
+/// SP_CLOSED_REGISTRATION closes registration (the safer setting).
 [[nodiscard]] ServerConfig load_config(int argc, char* argv[]);
+
+/// Parse a boolean flag value, ignoring ASCII case: "1", "true", "yes", and
+/// "on" are true; "0", "false", "no", and "off" are false. nullopt for any
+/// other text, including the empty string.
+[[nodiscard]] std::optional<bool> parse_bool_flag(std::string_view text);
 
 [[nodiscard]] bool load_tier1_environment_file(ServerConfig& config,
                                                 const std::string& path,

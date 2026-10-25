@@ -8,7 +8,9 @@
 #  include <unistd.h>
 #endif
 
+#include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -94,3 +96,57 @@ TEST(ServerConfigJson, StaleStorageFlagJsonKeysAreIgnored) {
     EXPECT_FALSE(config.tree_log_enabled);
     EXPECT_FALSE(config.ddns_enabled);
 }
+
+TEST(ServerConfigEnv, ParseBoolFlagAcceptsOnlyBooleanWords) {
+    using nexus::core::parse_bool_flag;
+    for (const char* yes : {"1", "true", "TRUE", "Yes", "on"}) {
+        EXPECT_EQ(parse_bool_flag(yes), std::optional<bool>(true)) << yes;
+    }
+    for (const char* no : {"0", "false", "False", "NO", "off"}) {
+        EXPECT_EQ(parse_bool_flag(no), std::optional<bool>(false)) << no;
+    }
+    for (const char* other : {"", "2", "enable", "true ", " 1"}) {
+        EXPECT_FALSE(parse_bool_flag(other).has_value()) << "'" << other << "'";
+    }
+}
+
+#ifndef _WIN32
+// SP_TREE_OPS=0 once turned ops mode on, because any value counted as set.
+// Every boolean SP_* variable now reads its value.
+TEST_F(ConfigDiscovery, BooleanEnvironmentVariablesReadTheirValue) {
+    fs::current_path(dir);
+    const char* names[] = {"SP_TREE_OPS", "SP_TREE_LOG", "SP_DDNS_ENABLED",
+                           "SP_CLOSED_REGISTRATION", "SP_DNS_SEED_DISCOVERY"};
+    auto set_all = [&](const char* value) {
+        for (const char* name : names) ::setenv(name, value, 1);
+    };
+
+    set_all("0");
+    auto off = load_from_cwd();
+    EXPECT_FALSE(off.tree_ops_enabled);
+    EXPECT_FALSE(off.tree_log_enabled);
+    EXPECT_FALSE(off.ddns_enabled);
+    EXPECT_TRUE(off.open_registration);
+    EXPECT_FALSE(off.dns_seed_discovery);
+
+    set_all("1");
+    auto on = load_from_cwd();
+    EXPECT_TRUE(on.tree_ops_enabled);
+    EXPECT_TRUE(on.tree_log_enabled);
+    EXPECT_TRUE(on.ddns_enabled);
+    EXPECT_FALSE(on.open_registration);
+    EXPECT_TRUE(on.dns_seed_discovery);
+
+    // An unreadable value turns a feature off, closes registration, and
+    // keeps seed discovery at its current value.
+    set_all("maybe");
+    auto bad = load_from_cwd();
+    EXPECT_FALSE(bad.tree_ops_enabled);
+    EXPECT_FALSE(bad.tree_log_enabled);
+    EXPECT_FALSE(bad.ddns_enabled);
+    EXPECT_FALSE(bad.open_registration);
+    EXPECT_TRUE(bad.dns_seed_discovery);
+
+    for (const char* name : names) ::unsetenv(name);
+}
+#endif

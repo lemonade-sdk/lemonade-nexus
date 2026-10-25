@@ -295,16 +295,16 @@ The crate's tests (`crates/storage-threshold/src/tests.rs`, plus
   not verify against the post-refresh plan),
   `refresh_removes_a_holder`, `refresh_at_four_and_three_holders`.
   **Covered.**
-- Old `S` used after its grace period: **not covered at the crate
-  level.** The grace-period logic lives in the C++ service
-  (`StorageKeyService::live_plan`, which returns `nullptr` for a
-  retiring plan outside its grace window, at
-  `StorageKeyService.cpp:1211`), and the crate has no concept of time
-  or grace periods. The C++ CTest case does not exercise the grace
-  boundary either; it tests the crate through the C ABI with a fixed
-  `UnlockContext` that has a fixed `epoch` field. This is a real gap:
-  no test verifies that a partial created for a retiring plan is
-  rejected once the grace period has passed.
+- Old `S` used after the retiring plan ended: **not covered at the crate
+  level, covered in C++.** The rule lives in the C++ service
+  (`storage_retiring_live()` in `StorageRecords.cpp`, used by
+  `StorageKeyService::live_plan`): the retiring plan unwraps while a
+  finalized wrap claim names its `S`, and never after the hard cap. The
+  crate has no concept of time. `test_security_storage`
+  (`StorageWrapClaims.*`) tests both ends of the rule, and
+  `test_security_lifecycle`
+  (`StorageKeyPath.TheOldKeyStopsUnwrappingAtTheHardCap`) shows a holder
+  refusing a request for the retired plan after the cap.
 - Threshold change requiring rotation: `threshold_change_requires_rotation`,
   `shrinking_changes_the_threshold_and_needs_rotation`. **Covered.**
 - Tampered sigma in repair: `enrollment_with_a_tampered_sigma`.
@@ -316,9 +316,8 @@ The crate's tests (`crates/storage-threshold/src/tests.rs`, plus
 
 ### 6.2 What is not exercised by the crate tests
 
-- **Grace-period expiry of a retiring `S`.** As above: no crate test,
-  no CTest case exercises the boundary where a retiring plan stops being
-  accepted.
+- **The end of a retiring `S`.** No crate test: the crate has no time.
+  The C++ tests named in §6.1 cover it.
 - **A DLEQ proof that is internally inconsistent but still passes
   `LogEqualityProof::verify`** (i.e. a bug in the `elastic-elgamal`
   library itself). The crate tests verify the wrapper logic; they cannot
@@ -338,7 +337,9 @@ The crate's tests (`crates/storage-threshold/src/tests.rs`, plus
 
 ### 6.3 CI coverage
 
-`.github/workflows/ci.yml` has **no `cargo test` step.** The Rust crate
+`.github/workflows/ci.yml` now runs `cargo test --locked` for the crate in
+the native Linux and macOS jobs. The rest of this section describes the
+state before that step was added. The Rust crate
 is built by CMake via Corrosion
 (`cmake/libraries/storage-threshold.cmake`) and the CTest case
 `test_storage_threshold`
@@ -416,9 +417,8 @@ cargo build --release
   the fact that `refresh_dkg_*` and `repair_share_*` were added to FROST
   after v0.6.0. The vendor should confirm this directly from the audit
   document.
-- The grace-period boundary for a retiring `S` is implemented in the
-  C++ service, not the crate. No test (crate or CTest) exercises the
-  expiry moment. This is an open test gap, not a known defect.
+- The end of a retiring `S` is implemented in the C++ service, not the
+  crate. The C++ tests named in §6.1 cover it; no crate test does.
 - The `elastic-elgamal` library's `LogEqualityProof` implementation has
   not been read line-by-line in this package. The crate's wrapper logic
   is documented in §4.3; the vendor must review the library's

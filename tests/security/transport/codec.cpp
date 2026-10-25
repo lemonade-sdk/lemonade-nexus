@@ -269,6 +269,16 @@ std::vector<SecurityMessage> all_kinds() {
     messages.push_back(
         envelope(SecurityMessageKind::StoragePlanRequest, StoragePlanRequestMsg{12}));
 
+    StorageWrapClaimMsg claim;
+    claim.node = node(0x01);
+    claim.counter = 99;
+    claim.wraps.resize(2);
+    claim.wraps[0].storage_public_key.fill(0x46);
+    claim.wraps[0].ephemeral_point.fill(0x47);
+    claim.wraps[1].storage_public_key.fill(0x48);
+    claim.wraps[1].ephemeral_point.fill(0x49);
+    claim.signature = signature(0x4A);
+    messages.push_back(envelope(SecurityMessageKind::StorageWrapClaim, claim));
     messages.push_back(envelope(
         SecurityMessageKind::Upgrade,
         UpgradeMsg{UpgradeTopic::Status, std::vector<uint8_t>(169, 0x46), std::nullopt}));
@@ -367,6 +377,26 @@ TEST(SecurityCodec, StorageMessagesRefuseUnknownValuesAndOversizedFields) {
     package.payload.assign(constants::kMaxStorageMessageBytes + 1, 0x01);
     EXPECT_TRUE(
         encode_security_message(envelope(SecurityMessageKind::StorageKeyPackage, package)).empty());
+
+    // A wrap claim names one or two wraps; zero or three do not encode, and a
+    // count above two does not decode.
+    StorageWrapClaimMsg claim;
+    claim.node = node(0x01);
+    EXPECT_TRUE(
+        encode_security_message(envelope(SecurityMessageKind::StorageWrapClaim, claim)).empty());
+    claim.wraps.resize(constants::kStorageMaxWrapsPerClaim + 1);
+    EXPECT_TRUE(
+        encode_security_message(envelope(SecurityMessageKind::StorageWrapClaim, claim)).empty());
+    claim.wraps.resize(1);
+    auto claim_bytes =
+        encode_security_message(envelope(SecurityMessageKind::StorageWrapClaim, claim));
+    ASSERT_FALSE(claim_bytes.empty());
+    // The count byte follows the node and the counter, before one wrap and
+    // the signature.
+    const std::size_t count_at = claim_bytes.size() - (64 + 64) - 1;
+    ASSERT_EQ(claim_bytes[count_at], 1);
+    claim_bytes[count_at] = 3;
+    EXPECT_TRUE(std::holds_alternative<CodecError>(decode_security_message(claim_bytes)));
 }
 
 TEST(SecurityCodec, EveryPrefixIsRejected) {

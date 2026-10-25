@@ -1348,17 +1348,53 @@ TEST_F(TreeReplicationTest, ALaggingServerCatchesUpAndResumesFromCommits) {
 
 TEST_F(TreeReplicationTest, ACertifiedEntryThatDoesNotChainIsNotApplied) {
     commit_two_blocks();
-    // This server's log started from another tree, so the mesh's first entry
-    // can never apply to it. It refuses the entry and keeps its own state.
+    // This server's log started from another tree (an earlier build did
+    // that), so the mesh's first entry can never apply to it. It refuses the
+    // entry and keeps its own state.
     auto& r = make_replica("divergent", tree::TreeLogMode::Ops,
                            [this](tree::PermissionTreeService& t) {
                                ASSERT_TRUE(t.bootstrap_root(tree::make_root_node(root_key)));
+                               tree::TreeLog earlier(dir / "divergent" / "data" / "tree" / "log");
+                               ASSERT_EQ(earlier.open(t.nodes_snapshot()),
+                                         tree::TreeLog::OpenResult::Ok);
                            });
     EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Refused);
     EXPECT_TRUE(r.tc->healthy());
     EXPECT_EQ(r.tc->log().height(), 0u);
     EXPECT_NE(r.tc->status_summary().last_refusal.find("does not chain"), std::string::npos);
     EXPECT_TRUE(r.tree->get_node("root").has_value());  // the last state stays served
+}
+
+// Ops mode never starts a log from a populated local tree: servers with
+// different trees would hold logs with different bases, and the merge commit
+// could no longer become height 1. The server halts and writes no log.
+TEST_F(TreeReplicationTest, OpsModeWithoutALogHaltsOnAPopulatedTree) {
+    commit_two_blocks();
+    auto r = std::make_unique<ReplicaServer>();
+    r->dir = dir / "populated";
+    r->storage = std::make_unique<storage::FileStorageService>(r->dir / "data");
+    r->storage->start();
+    r->tree = std::make_unique<tree::PermissionTreeService>(*r->storage, *crypto_svc);
+    r->tree->start();
+    ASSERT_TRUE(r->tree->bootstrap_root(tree::make_root_node(root_key)));
+    tree::TreeConsensusConfig config;
+    config.self = members[3];
+    config.network_id = network;
+    config.root_key = root_key;
+    config.wall_clock_ms = [this] { return now_ms; };
+    config.mode = tree::TreeLogMode::Ops;
+    const auto log_dir = r->dir / "data" / "tree" / "log";
+    r->tc = std::make_unique<tree::TreeConsensus>(std::move(config), *r->tree, *crypto_svc,
+                                                  log_dir);
+    r->tc->set_authority_source(lookup);
+
+    EXPECT_FALSE(r->tc->start());
+    EXPECT_FALSE(r->tc->healthy());
+    EXPECT_NE(r->tc->halt_reason().find("no tree log and a populated tree"), std::string::npos);
+    EXPECT_FALSE(tree::TreeLog(log_dir).exists());
+    EXPECT_EQ(r->tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Halted);
+    EXPECT_TRUE(r->tree->get_node("root").has_value());  // the local tree is untouched
+    replicas.push_back(std::move(r));
 }
 
 TEST_F(TreeReplicationTest, AReadOnlyLogLeavesTheTreeToItsLocalWrites) {

@@ -92,12 +92,12 @@ StorageFinalPlan fake_final(const StorageChainState& state, uint64_t block_time,
         plan.key_created_ms = state.current->key_created_ms;
         plan.storage_public_key = state.current->storage_public_key;
         plan.retiring_plan = state.current->retiring_plan;
-        plan.retiring_until = state.current->retiring_until;
+        plan.retiring_until_ms = state.current->retiring_until_ms;
     } else {
         plan.key_created_ms = block_time;
         if (plan.operation == StorageOperation::Rotate) {
             plan.retiring_plan = state.current_digest;
-            plan.retiring_until = epoch + constants::kStorageGraceEpochs;
+            plan.retiring_until_ms = block_time + constants::kStorageRetiringCapMs;
         }
     }
     return plan;
@@ -381,7 +381,7 @@ TEST(StorageRecords, RotationIsDueByBlockTimeOnly) {
     EXPECT_EQ(boundary->operation, StorageOperation::Rotate);
 }
 
-TEST(StorageRecords, RotationRetiresTheOldPlanForOneEpochAndRefreshCarriesIt) {
+TEST(StorageRecords, RotationNamesTheRetiringPlanWithItsCapAndRefreshCarriesIt) {
     const auto five = ids_of(identities(5));
     StorageChainState state = with_plan(five);
     const Digest first = state.current_digest;
@@ -393,9 +393,10 @@ TEST(StorageRecords, RotationRetiresTheOldPlanForOneEpochAndRefreshCarriesIt) {
     ASSERT_TRUE(state.retiring.has_value());
     EXPECT_EQ(state.retiring_digest, first);
     EXPECT_EQ(state.current->retiring_plan, first);
-    EXPECT_EQ(state.current->retiring_until, 5u);
+    EXPECT_EQ(state.current->retiring_until_ms,
+              kT0 + day + 2 + constants::kStorageRetiringCapMs);
 
-    // A refresh in the grace epoch keeps the retiring plan named.
+    // A refresh while the retiring plan is named keeps it named.
     const auto next = snapshot(5, five);
     ASSERT_TRUE(apply_storage_record(
         state, *derive_storage_selection(network(), state, &next, {}, kT0 + day + 3)));
@@ -518,3 +519,209 @@ TEST_F(StorageFinalPlanTest, DerivedFieldsAndTheSelectionMustMatch) {
 }
 
 }  // namespace
+
+// --- Wrap claims and the retiring plan (B5a, B7) ----------------------------------
+
+namespace {
+
+/// A claim from `who` for `wraps`, signed with its identity key.
+StorageWrapClaim claim_of(const Identity& who, uint64_t counter,
+                          std::vector<StorageWrapRef> wraps) {
+    StorageWrapClaim claim;
+    claim.node = who.id;
+    claim.counter = counter;
+    claim.wraps = std::move(wraps);
+    sign_storage_wrap_claim(network(), claim, who.keys.private_key);
+    return claim;
+}
+
+StorageWrapRef wrap_on(const StoragePointBytes& key, uint8_t r) {
+    StorageWrapRef wrap;
+    wrap.storage_public_key = key;
+    wrap.ephemeral_point.fill(r);
+    return wrap;
+}
+
+/// Finalizes `claims` as the next batch; fails the test when it is refused.
+void finalize_claims(StorageChainState& state, std::vector<StorageWrapClaim> claims,
+                     uint64_t block_time) {
+    std::map<NodeId, StorageWrapClaim> pool;
+    for (auto& claim : claims) pool.emplace(claim.node, std::move(claim));
+    const auto batch = make_storage_wrap_batch(network(), state, pool, block_time);
+    ASSERT_TRUE(batch.has_value());
+    ASSERT_EQ(batch->claims.size(), pool.size());
+    ASSERT_EQ(check_storage_wrap_batch(state, *batch), StorageWrapFailure::None);
+    ASSERT_TRUE(apply_storage_record(state, *batch));
+}
+
+/// Rotates `state` at `block_time` (selection and final plan).
+void rotate_at(StorageChainState& state, uint64_t block_time) {
+    const auto selection = derive_storage_selection(network(), state, nullptr, {}, block_time);
+    ASSERT_TRUE(selection.has_value());
+    ASSERT_EQ(selection->operation, StorageOperation::Rotate);
+    ASSERT_TRUE(apply_storage_record(state, *selection));
+    ASSERT_TRUE(apply_storage_record(state, fake_final(state, block_time + 1)));
+}
+
+}  // namespace
+
+TEST(StorageWrapClaims, BatchEncodingIsCanonical) {
+    const auto people = identities(5, 3);
+    StorageChainState state = with_plan(ids_of(people));
+    const auto s = state.current->storage_public_key;
+    std::map<NodeId, StorageWrapClaim> pool;
+    pool.emplace(people[0].id, claim_of(people[0], 7, {wrap_on(s, 1)}));
+    pool.emplace(people[1].id, claim_of(people[1], 9, {wrap_on(s, 2), wrap_on(s, 3)}));
+    const auto batch = make_storage_wrap_batch(network(), state, pool, kT0 + 5);
+    ASSERT_TRUE(batch.has_value());
+    const auto bytes = encode_storage_record(*batch);
+    ASSERT_FALSE(bytes.empty());
+    const auto back = decode_storage_record(bytes);
+    ASSERT_TRUE(back.has_value());
+    ASSERT_TRUE(std::holds_alternative<StorageWrapBatch>(*back));
+    EXPECT_EQ(encode_storage_record(*back), bytes);
+    EXPECT_EQ(storage_record_kind(*back), BlockPayloadKind::StorageHolderPlan);
+    auto trailing = bytes;
+    trailing.push_back(0);
+    EXPECT_FALSE(decode_storage_record(trailing).has_value());
+    // Claims out of node order, or one node twice, do not encode.
+    auto reordered = *batch;
+    std::swap(reordered.claims[0], reordered.claims[1]);
+    EXPECT_TRUE(encode_storage_record(reordered).empty());
+    auto doubled = *batch;
+    doubled.claims[1] = doubled.claims[0];
+    EXPECT_TRUE(encode_storage_record(doubled).empty());
+}
+
+TEST(StorageWrapClaims, AWrapBelongsToTheFirstServerThatClaimedIt) {
+    const auto people = identities(5, 4);
+    StorageChainState state = with_plan(ids_of(people));
+    const auto s = state.current->storage_public_key;
+    const auto& a = people[0];
+    const auto& b = people[1];
+    finalize_claims(state, {claim_of(a, 10, {wrap_on(s, 0xA1)})}, kT0 + 10);
+    EXPECT_TRUE(storage_wrap_claimed(state, a.id, wrap_on(s, 0xA1)));
+    EXPECT_FALSE(storage_wrap_claimed(state, b.id, wrap_on(s, 0xA1)));
+
+    // Another server cannot claim A's R, not even after A's own later claim
+    // drops it.
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(), claim_of(b, 1, {wrap_on(s, 0xA1)}),
+                                          kT0 + 11));
+    finalize_claims(state, {claim_of(a, 11, {wrap_on(s, 0xA2)})}, kT0 + 12);
+    EXPECT_FALSE(storage_wrap_claimed(state, a.id, wrap_on(s, 0xA1)));
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(), claim_of(b, 1, {wrap_on(s, 0xA1)}),
+                                          kT0 + 13));
+    // Two servers naming the same new R in one batch: only the first counts.
+    std::map<NodeId, StorageWrapClaim> pool;
+    pool.emplace(b.id, claim_of(b, 1, {wrap_on(s, 0xB1)}));
+    pool.emplace(people[2].id, claim_of(people[2], 1, {wrap_on(s, 0xB1)}));
+    const auto batch = make_storage_wrap_batch(network(), state, pool, kT0 + 14);
+    ASSERT_TRUE(batch.has_value());
+    EXPECT_EQ(batch->claims.size(), 1u);
+    auto forged = *batch;
+    for (const auto& [node, claim] : pool) {
+        if (node != forged.claims.front().node) forged.claims.push_back(claim);
+    }
+    std::sort(forged.claims.begin(), forged.claims.end(),
+              [](const auto& x, const auto& y) { return x.node < y.node; });
+    EXPECT_EQ(check_storage_wrap_batch(state, forged), StorageWrapFailure::ClaimInvalid);
+}
+
+TEST(StorageWrapClaims, AClaimNeedsItsSignatureAHigherCounterAndALiveS) {
+    const auto people = identities(5, 5);
+    StorageChainState state = with_plan(ids_of(people));
+    const auto s = state.current->storage_public_key;
+    const auto& a = people[0];
+    finalize_claims(state, {claim_of(a, 10, {wrap_on(s, 1)})}, kT0 + 10);
+    // A replayed or older counter.
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(), claim_of(a, 10, {wrap_on(s, 2)}),
+                                          kT0 + 11));
+    // A changed signature.
+    auto forged = claim_of(a, 12, {wrap_on(s, 2)});
+    forged.signature[0] ^= 0x01;
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(), forged, kT0 + 11));
+    // A signature for another network.
+    auto other_network = claim_of(a, 12, {wrap_on(s, 2)});
+    NetworkId elsewhere{};
+    elsewhere.fill(0x01);
+    sign_storage_wrap_claim(elsewhere, other_network, a.keys.private_key);
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(), other_network, kT0 + 11));
+    // An S that no live plan holds.
+    StoragePointBytes unknown{};
+    unknown.fill(0xEE);
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(),
+                                          claim_of(a, 12, {wrap_on(unknown, 2)}), kT0 + 11));
+    // The same wrap twice.
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(),
+                                          claim_of(a, 12, {wrap_on(s, 2), wrap_on(s, 2)}),
+                                          kT0 + 11));
+    EXPECT_TRUE(check_storage_wrap_claim(state, network(), claim_of(a, 12, {wrap_on(s, 2)}),
+                                         kT0 + 11));
+}
+
+TEST(StorageWrapClaims, TheRetiringPlanStaysLiveUntilEveryServerRewraps) {
+    const auto people = identities(5, 6);
+    StorageChainState state = with_plan(ids_of(people));
+    const uint64_t day = constants::kStorageRotationIntervalMs;
+    const auto s0 = state.current->storage_public_key;
+    // Two servers keep data keys wrapped to S0.
+    finalize_claims(state, {claim_of(people[0], 1, {wrap_on(s0, 0x10)}),
+                            claim_of(people[1], 1, {wrap_on(s0, 0x20)})},
+                    kT0 + 10);
+    rotate_at(state, kT0 + day + 11);
+    const uint64_t rotated = state.last_block_time_ms;
+    const auto s1 = state.current->storage_public_key;
+    ASSERT_NE(s1, s0);
+    ASSERT_TRUE(state.retiring.has_value());
+    EXPECT_TRUE(storage_retiring_live(state, rotated + 1));
+
+    // Server 0 stages, verifies, and commits its rewrap; server 1 is away.
+    finalize_claims(state, {claim_of(people[0], 2, {wrap_on(s0, 0x10), wrap_on(s1, 0x11)})},
+                    rotated + 2);
+    finalize_claims(state, {claim_of(people[0], 3, {wrap_on(s1, 0x11)})}, rotated + 3);
+    EXPECT_TRUE(storage_retiring_live(state, rotated + 4));
+
+    // A day later the next rotation is due, but it waits for server 1. A
+    // boundary in the meantime refreshes instead of rotating.
+    const uint64_t later = rotated + day + 10;
+    EXPECT_FALSE(derive_storage_selection(network(), state, nullptr, {}, later).has_value());
+    const auto next = snapshot(5, ids_of(people));
+    const auto boundary = derive_storage_selection(network(), state, &next, {}, later);
+    ASSERT_TRUE(boundary.has_value());
+    EXPECT_EQ(boundary->operation, StorageOperation::Refresh);
+
+    // Server 1 returns after two rotation intervals. Its claim of S0 still
+    // counts, so it unlocks under S0 and rewraps. Then the retiring plan
+    // ends and the rotation proceeds.
+    const uint64_t back = rotated + 2 * day + 10;
+    finalize_claims(state, {claim_of(people[1], 2, {wrap_on(s0, 0x20), wrap_on(s1, 0x21)})},
+                    back);
+    EXPECT_TRUE(storage_retiring_live(state, back + 1));
+    finalize_claims(state, {claim_of(people[1], 3, {wrap_on(s1, 0x21)})}, back + 1);
+    EXPECT_FALSE(storage_retiring_live(state, back + 2));
+    // No claim can name the retired S again.
+    EXPECT_FALSE(check_storage_wrap_claim(state, network(),
+                                          claim_of(people[1], 4, {wrap_on(s0, 0x20)}), back + 2));
+    const auto due = derive_storage_selection(network(), state, nullptr, {}, back + 3);
+    ASSERT_TRUE(due.has_value());
+    EXPECT_EQ(due->operation, StorageOperation::Rotate);
+}
+
+TEST(StorageWrapClaims, TheHardCapEndsTheRetiringPlanForAServerThatNeverReturns) {
+    const auto people = identities(5, 7);
+    StorageChainState state = with_plan(ids_of(people));
+    const uint64_t day = constants::kStorageRotationIntervalMs;
+    const auto s0 = state.current->storage_public_key;
+    finalize_claims(state, {claim_of(people[1], 1, {wrap_on(s0, 0x20)})}, kT0 + 10);
+    rotate_at(state, kT0 + day + 11);
+    const uint64_t rotated = state.last_block_time_ms;
+    const uint64_t cap = state.current->retiring_until_ms;
+    EXPECT_EQ(cap, rotated + constants::kStorageRetiringCapMs);
+    EXPECT_GE(constants::kStorageRetiringCapMs, 3 * day);
+    EXPECT_TRUE(storage_retiring_live(state, cap - 1));
+    EXPECT_FALSE(derive_storage_selection(network(), state, nullptr, {}, cap - 1).has_value());
+    EXPECT_FALSE(storage_retiring_live(state, cap));
+    const auto due = derive_storage_selection(network(), state, nullptr, {}, cap);
+    ASSERT_TRUE(due.has_value());
+    EXPECT_EQ(due->operation, StorageOperation::Rotate);
+}

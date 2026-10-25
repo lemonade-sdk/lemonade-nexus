@@ -145,8 +145,11 @@ public:
     /// Open the tree log. In Ops mode, reconcile it with the persistent tree:
     /// equal digests are clean; a tree behind an unapplied log tail is restored
     /// from the log; any other difference halts (the tree changed outside the
-    /// log). A new Ops log starts from the current tree. A ReadOnly log starts
-    /// from the empty tree and is not reconciled. Call once, before consensus
+    /// log). Without a log, Ops mode starts a new log only from an empty
+    /// tree; with a populated tree it halts and creates no log, because that
+    /// log's base would differ from other servers' and would block the merge
+    /// commit (height 1 on the empty base). A ReadOnly log starts from the
+    /// empty tree and is not reconciled. Call once, before consensus
     /// delivers blocks. False when halted.
     [[nodiscard]] bool start();
 

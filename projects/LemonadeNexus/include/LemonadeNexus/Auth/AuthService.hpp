@@ -72,6 +72,10 @@ public:
     /// Verify and burn a device-link token (single use).
     [[nodiscard]] std::optional<LinkTokenRecord> consume_link_token(std::string_view token);
 
+    /// Restore a link token that a join consumed but did not use (see
+    /// TokenLinkAuthProvider::refund). False when nothing was restored.
+    bool refund_link_token(std::string_view token, const LinkTokenRecord& record);
+
     /// Validate an existing session token (JWT).
     [[nodiscard]] bool validate_session(std::string_view token);
 
