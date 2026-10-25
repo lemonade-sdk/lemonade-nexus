@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# nexus-os-lock: print release/os-packages.lock records for the packages
+# installed on this host. Run it on the reference VM, never on a build box:
+# the lock must describe the fleet image.
+#
+#   nexus-os-lock boot:<package>... library:<package>... system:<package>...
+#
+# Example:
+#   nexus-os-lock boot:grub-efi-amd64-signed boot:shim-signed \
+#       library:libc6 library:libssl3t64 library:libstdc++6 library:libgcc-s1 \
+#       library:zlib1g library:libzstd1 > release/os-packages.lock
+#
+# A package that is not installed fails the run: a lock must not name a
+# version this host does not have.
+
+set -euo pipefail
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: nexus-os-lock <role>:<package>..." >&2
+    exit 2
+fi
+command -v dpkg-query >/dev/null || { echo "nexus-os-lock: dpkg-query is required" >&2; exit 2; }
+
+echo "# Lemonade Nexus fleet OS package lock. See the header in the repository copy."
+echo "# Captured on $(hostname) ($(. /etc/os-release && echo "$PRETTY_NAME"), kernel $(uname -r))."
+echo "format 1"
+for spec in "$@"; do
+    role="${spec%%:*}"
+    name="${spec#*:}"
+    case "$role" in
+        boot|library|system) ;;
+        *) echo "nexus-os-lock: unknown role in $spec" >&2; exit 2 ;;
+    esac
+    status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$name" 2>/dev/null || true)"
+    if [ "${status%% *}" != "ii" ]; then
+        echo "nexus-os-lock: $name is not installed" >&2
+        exit 1
+    fi
+    version="$(dpkg-query -W -f='${Version}' "$name")"
+    echo "package $name $version $role"
+done

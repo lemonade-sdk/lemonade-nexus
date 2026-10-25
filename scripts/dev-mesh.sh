@@ -15,11 +15,16 @@
 #   BIN   path to the server binary (default: build/projects/LemonadeNexus/lemonade-nexus)
 #   WORK  working directory          (default: /tmp/nexus-dev-mesh)
 #   WAIT  seconds to observe         (default: 20)
+#   OLD_BIN    a second server binary (the previous release) for a
+#              mixed-version mesh; see scripts/mixed-version-mesh.sh
+#   OLD_NODES  node indices that run OLD_BIN, for example "1 3"
 
 set -u
 BIN="${BIN:-build/projects/LemonadeNexus/lemonade-nexus}"
 WORK="${WORK:-/tmp/nexus-dev-mesh}"
 WAIT="${WAIT:-20}"
+OLD_BIN="${OLD_BIN:-}"
+OLD_NODES="${OLD_NODES:-}"
 NODES=5
 MODE="${1:-run}"
 
@@ -54,7 +59,8 @@ provision() {
     # the same file movement an operator performs.
     for i in $(seq 0 $((NODES-1))); do
         "$BIN" --enroll-server "${GOSSIP[$i]}" "mesh-n$i" \
-               --data-root "$WORK/n0" --root-pubkey "$ROOT_HEX" >"$WORK/enroll-n$i.log" 2>&1
+               --data-root "$WORK/n0" --root-pubkey "$ROOT_HEX" \
+               --genesis-pubkey "${GOSSIP[0]}" >"$WORK/enroll-n$i.log" 2>&1
         if [ "$i" -ne 0 ]; then
             cp "$WORK/n0/identity/server_cert_mesh-n$i.json" \
                "$WORK/n$i/identity/server_cert.json" || { say "enroll copy failed for n$i"; exit 1; }
@@ -95,9 +101,16 @@ EOF
     done
 }
 
+binary_for() {
+    for old in $OLD_NODES; do
+        if [ "$old" = "$1" ] && [ -n "$OLD_BIN" ]; then echo "$OLD_BIN"; return; fi
+    done
+    echo "$BIN"
+}
+
 start() {
     for i in $(seq 0 $((NODES-1))); do
-        "$BIN" --config "$WORK/n$i/config.json" >"$WORK/n$i.log" 2>&1 &
+        "$(binary_for "$i")" --config "$WORK/n$i/config.json" >"$WORK/n$i.log" 2>&1 &
         echo $! > "$WORK/n$i.pid"
     done
     say "five nodes started (logs: $WORK/n*.log)"
@@ -124,12 +137,13 @@ check() {
     grep -q 'phase Idle -> GenesisCollecting' "$WORK/n0.log" \
         || fail "n0 never entered GenesisCollecting"
 
-    # Real cross-process attestation: challenges left the anchor and verdicts
-    # came back over UDP.
+    # Real cross-process attestation: challenges left the anchor and evidence
+    # came back over UDP. Without SVSM evidence the first answer is the AK
+    # enrollment, which the anchor refuses; with it, a failing verdict.
     grep -q 'genesis challenge ->' "$WORK/n0.log" \
         || fail "n0 issued no genesis challenges"
-    verdicts=$(grep -c 'genesis verdict for' "$WORK/n0.log" || true)
-    [ "$verdicts" -ge 1 ] || fail "n0 recorded no genesis verdicts"
+    verdicts=$(grep -cE 'genesis verdict for|enrollment refused for' "$WORK/n0.log" || true)
+    [ "$verdicts" -ge 1 ] || fail "n0 recorded no verdict and no refused enrollment"
 
     # Fail-closed: every verdict on unproven hardware fails, so no founding,
     # no epoch, no active phase — anywhere.
@@ -142,7 +156,7 @@ check() {
     done
 
     if [ "$FAILURES" -eq 0 ]; then
-        say "PASS: five processes, real challenges, $verdicts failing verdict(s), no founding, no active epoch"
+        say "PASS: five processes, real challenges, $verdicts refused answer(s), no founding, no active epoch"
         return 0
     fi
     say "$FAILURES check(s) failed"

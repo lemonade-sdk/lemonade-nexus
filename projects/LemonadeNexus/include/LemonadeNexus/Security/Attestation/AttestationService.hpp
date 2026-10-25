@@ -101,6 +101,12 @@ public:
     [[nodiscard]] const LinuxAttestationProfile& profile() const { return profile_; }
     [[nodiscard]] const Digest& policy_digest() const { return policy_digest_; }
 
+    /// Replaces the profile after a newer release approval was accepted
+    /// (Design-Auto-Update Phase 2). Rebuilds the verifier and the policy
+    /// digest. Pending challenges keep the old policy digest, so their answers
+    /// fail and are asked again; verdicts already given stay as they are.
+    void replace_profile(LinuxAttestationProfile profile);
+
     /// Eligibility challenges issued for one node and epoch.
     [[nodiscard]] uint32_t attempts(const NodeId& node, EpochId epoch) const;
 
@@ -138,13 +144,20 @@ private:
     /// enrollment for an unlock can still replace a pending mesh challenge for
     /// a node not yet enrolled here; the replaced exchange fails and is
     /// retried.
-    enum class ChallengeLane : uint8_t { Mesh, StorageUnlock };
+    /// UpgradeHealth has its own lane too, so a witness's upgrade challenge
+    /// never cancels an eligibility or final-readiness challenge.
+    enum class ChallengeLane : uint8_t { Mesh, StorageUnlock, UpgradeHealth };
     [[nodiscard]] static ChallengeLane lane_of(AttestationPurpose purpose) {
-        return purpose == AttestationPurpose::StorageUnlock ? ChallengeLane::StorageUnlock
-                                                            : ChallengeLane::Mesh;
+        switch (purpose) {
+            case AttestationPurpose::StorageUnlock: return ChallengeLane::StorageUnlock;
+            case AttestationPurpose::UpgradeHealth: return ChallengeLane::UpgradeHealth;
+            default: return ChallengeLane::Mesh;
+        }
     }
     std::map<std::pair<NodeId, ChallengeLane>, AttestationChallenge> pending_;
     std::map<std::pair<EpochId, NodeId>, uint32_t> storage_attempts_;
+    /// Keyed by the upgrade-health context: one chain position per bucket.
+    std::map<std::pair<NodeId, Digest>, uint32_t> upgrade_attempts_;
     std::map<NodeId, DeferredChallenge> deferred_;
     std::map<NodeId, PendingActivation> pending_activations_;
     std::map<NodeId, AttestationVerdict> verdicts_;

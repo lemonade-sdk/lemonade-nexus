@@ -1,347 +1,387 @@
-name: Build, Sign & Release
+name: Release
+
+# One workflow builds, versions, signs, and publishes a release
+# (docs/Design-Auto-Update.md, Phase 1; docs/Releasing.md).
+#
+#   prepare         refuse any ref but main; pick the date tag and release number,
+#                   and the previous date-tagged release
+#   server          fleet server binaries in a pinned Ubuntu 24.04 / GCC 13.3
+#                   container; the rollout guard; the unsigned approval from
+#                   release/fleet-profile.json and the previous approval
+#   mixed-version   the previous release's server next to the new one
+#                   (mixed-version.yml; skipped for the bootstrap release)
+#   native, distro  macOS and other Linux distribution builds and packages
+#   sdk             the C ABI SDK shared library (Linux, macOS)
+#   flutter         the desktop clients (flutter-clients.yml)
+#   measure-boot-chain  optional: compare the reference VM's PCR 8/9 with the
+#                   profile (only with the REFERENCE_VM_RUNNER variable)
+#   approve         sign the approval (environment "release")
+#   server-package  the server .deb with the signed approval
+#   publish         manifest.json, its signature (environment "release"),
+#                   provenance, the tag, and the GitHub release
+#
+# The release key (secret RELEASE_SIGNING_KEY) exists only in the "release"
+# environment. Only the approve and publish jobs use it, only in their signing
+# step, and those jobs download data, not programs: they run scripts from this
+# commit and the runner's openssl.
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
 
 env:
   BUILD_TYPE: Release
+  # Pinned toolchain for the fleet server build (server, server-package). The
+  # image digest in their container: lines pins the base system; the Ubuntu
+  # snapshot pins every package installed on top of it. Change all three
+  # places together.
+  UBUNTU_SNAPSHOT: 20261020T000000Z
+  GCC_VERSION: 13.3.0
+  RUST_TOOLCHAIN: 1.99.1
 
 jobs:
   # =========================================================================
-  # Native platform builds (macOS, Windows)
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      release_number: ${{ steps.version.outputs.release_number }}
+      previous_tag: ${{ steps.previous.outputs.tag }}
+      previous_is_first: ${{ steps.previous.outputs.is_first }}
+    steps:
+      - name: Refuse any ref except main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::release.yml runs only from refs/heads/main (got ${GITHUB_REF})"
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Compute the date version and release number
+        id: version
+        run: |
+          git ls-remote --tags --refs "https://github.com/${GITHUB_REPOSITORY}.git" 'v*' |
+            sed 's#.*refs/tags/##' > existing-tags
+          python3 scripts/nexus-release-tool next-tag --existing-tags existing-tags >> "$GITHUB_OUTPUT"
+          tag=$(grep '^tag=' "$GITHUB_OUTPUT" | tail -n 1 | cut -d= -f2)
+          if grep -qx "$tag" existing-tags; then
+            echo "::error::tag $tag already exists"
+            exit 1
+          fi
+          echo "Release $tag at ${GITHUB_SHA}"
+
+      # The previous release is the newest published date-tagged release. The
+      # vX.Y.Z-alpha releases predate the approval chain and are never one.
+      # Without a date-tagged release this is the bootstrap release
+      # (Design-Auto-Update Phase 6).
+      - name: Find the previous release
+        id: previous
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 200 \
+            --json tagName --jq '.[].tagName' > published-tags
+          python3 scripts/nexus-release-tool previous --tags published-tags --before "$NEW_TAG" >> "$GITHUB_OUTPUT"
+          prev=$(grep '^tag=' "$GITHUB_OUTPUT" | tail -n 1 | cut -d= -f2)
+          echo "Previous release: ${prev:-none (bootstrap release)}"
+
   # =========================================================================
-  build-native:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux-x86_64
-            binary_ext: ""
-          - os: macos-14
-            platform: darwin-arm64
-            binary_ext: ""
-          # TODO(windows): temporarily disabled, mirroring the ci.yml TODO — the
-          # security stores' durable write is POSIX-only, and the CI job's
-          # FetchContent cache is not keyed by generator, so Windows builds are
-          # no longer gated by CI, and we must not ship binaries for a platform
-          # CI does not gate. Re-enable this entry and the matching ci.yml entry
-          # together once those are fixed.
-          # - os: windows-2022
-          #   platform: windows-x86_64
-          #   binary_ext: ".exe"
-
-    runs-on: ${{ matrix.os }}
-
-    # contents for checkout; id-token + attestations for build provenance.
+  server:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
     permissions:
       contents: read
       id-token: write
       attestations: write
-
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      PREVIOUS_TAG: ${{ needs.prepare.outputs.previous_tag }}
+      PREVIOUS_IS_FIRST: ${{ needs.prepare.outputs.previous_is_first }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          # ca-certificates first, from the live archive: the snapshot service is
+          # HTTPS only. It does not reach the build output.
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates
+          apt-get update --snapshot "$UBUNTU_SNAPSHOT"
+          apt-get install -y --no-install-recommends --snapshot "$UBUNTU_SNAPSHOT" \
+            gcc-13 g++-13 gcc g++ make cmake ninja-build pkg-config file git curl \
+            python3 dpkg-dev libssl-dev libjson-c-dev libcurl4-openssl-dev uuid-dev
+          test "$(gcc -dumpfullversion)" = "$GCC_VERSION"
+          test "$(g++ -dumpfullversion)" = "$GCC_VERSION"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Cache vcpkg packages (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\vcpkg\installed
-            C:\vcpkg\packages
-          key: vcpkg-windows-openssl-${{ hashFiles('.github/workflows/release.yml') }}
-          restore-keys: |
-            vcpkg-windows-openssl-
-
-      - name: Cache CMake FetchContent dependencies
-        uses: actions/cache@v4
-        with:
-          path: build/_deps
-          key: fetchcontent-${{ matrix.platform }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
-          restore-keys: |
-            fetchcontent-${{ matrix.platform }}-
-
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
+      - name: Configure
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
-
-      # macOS builds OpenSSL from source (static) via -DOPENSSL_FORCE_BUNDLED=ON
-      # in the Configure step, so no Homebrew OpenSSL path is needed here.
-
-      - name: Install dependencies (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          choco install ninja -y
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\vcpkg-binary-cache" | Out-Null
-          $env:VCPKG_DEFAULT_BINARY_CACHE = "$env:GITHUB_WORKSPACE\vcpkg-binary-cache"
-          vcpkg install openssl:x64-windows-static
-
-      - name: Set up MSVC environment (Windows)
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: "Use D: drive for build (Windows)"
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "D:\build" -Force
-          # Move cached _deps to D:\build if cache restored into build/
-          if (Test-Path "build\_deps") {
-            Copy-Item -Recurse -Force "build\_deps" "D:\build\_deps"
-          }
-          Remove-Item -Recurse -Force "build" -ErrorAction SilentlyContinue
-          New-Item -ItemType Junction -Path "build" -Target "D:\build"
-
-      - name: Configure CMake (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          cmake -B build \
-            -G Ninja \
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Reproducibility: fixed paths in debug info and panics, and a commit
+          # timestamp instead of the wall clock.
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
-            -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}" \
-            -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+            -DGIT_TAG_OVERRIDE="$TAG" \
+            -DNEXUS_GIT_COMMIT_OVERRIDE="$GITHUB_SHA" \
+            -DCMAKE_C_FLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/src" \
+            -DCMAKE_CXX_FLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/src"
 
-      - name: Configure CMake (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Build every target
+        env:
+          RUSTFLAGS: --remap-path-prefix=${{ github.workspace }}=/src
         run: |
-          # Use the vcpkg static OpenSSL (x64-windows-static, matches the /MT CRT).
-          # Choco's OpenSSL is 4.x, whose const-qualified X509 APIs break the build.
-          $opensslRoot = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows-static"
-          cmake -B build `
-            -G Ninja `
-            "-DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }}" `
-            -DBUILD_TESTING=OFF `
-            "-DGIT_TAG_OVERRIDE=${{ github.ref_name }}" `
-            "-DOPENSSL_ROOT_DIR=$opensslRoot" `
-            -DOPENSSL_USE_STATIC_LIBS=ON
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      - name: Collect server binaries
+        run: |
+          mkdir -p out
+          cp build/projects/LemonadeNexus/lemonade-nexus out/lemonade-nexus-linux-x86_64
+          cp build/projects/LemonadeNexusAttestd/nexus-attestd out/nexus-attestd-linux-x86_64
+          cp build/projects/LemonadeNexusUpdater/nexus-updater out/nexus-updater-linux-x86_64
+          (cd out && sha256sum -- *)
+
+      # Each approval lists one previous release. Publishing while the
+      # previous rollout is open would drop the servers still on the release
+      # before it out of attestation, so the guard requires Tier 1 finalized
+      # state: a rollout proof (GET /api/upgrade/rollout-proof from any server
+      # in ROLLOUT_PROOF_URLS) that verifies from the Genesis key behind the
+      # profile's network id and shows the previous rollout complete. The
+      # servers are not trusted for it. See docs/Releasing.md.
+      - name: Refuse to publish while a rollout is open
+        env:
+          ROLLOUT_PROOF_URLS: ${{ vars.ROLLOUT_PROOF_URLS }}
+        run: |
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "::notice::Bootstrap release: no previous rollout to check"
+            exit 0
+          fi
+          if [ "$PREVIOUS_IS_FIRST" = "true" ]; then
+            # The bootstrap release is installed by hand (Phase 6) and has no
+            # rollout records. A reviewed commit records its completion.
+            if [ "$(tr -d '[:space:]' < release/bootstrap-complete 2>/dev/null)" != "$PREVIOUS_TAG" ]; then
+              echo "::error::release/bootstrap-complete must name $PREVIOUS_TAG once every server runs it"
+              exit 1
+            fi
+            echo "::notice::The bootstrap release $PREVIOUS_TAG is recorded as complete"
+            exit 0
+          fi
+          if [ -z "$ROLLOUT_PROOF_URLS" ]; then
+            echo "::error::set the repository variable ROLLOUT_PROOF_URLS; the rollout of $PREVIOUS_TAG cannot be checked"
+            exit 1
+          fi
+          network=$(python3 -c 'import json; print(json.load(open("release/fleet-profile.json"))["network_id"])')
+          number=$(python3 scripts/nexus-release-tool release-number --tag "$PREVIOUS_TAG")
+          for url in $ROLLOUT_PROOF_URLS; do
+            rm -f rollout-proof.json
+            if ! curl -fsS --proto '=https' --max-time 30 --max-filesize 8388608 \
+                -o rollout-proof.json "$url"; then
+              echo "::warning::no rollout proof from $url"
+              continue
+            fi
+            if build/projects/LemonadeNexus/nexus-rollout-check --network-id "$network" \
+                --release "$number" --proof rollout-proof.json; then
+              exit 0
+            fi
+          done
+          echo "::error::no server proved the rollout of $PREVIOUS_TAG complete; refusing to publish"
+          exit 1
+
+      # The previous approval: its hashes become previous_release_paths, so
+      # servers on both releases attest each other. A missing previous
+      # approval fails the release; it never falls back to an approval without
+      # the overlap.
+      - name: Fetch the previous release's approval and package lock
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          mkdir -p previous
+          if [ -n "$PREVIOUS_TAG" ]; then
+            curl -fsSL -o previous/release-approval.json \
+              "https://github.com/${GH_REPO}/releases/download/${PREVIOUS_TAG}/release-approval.json"
+            curl -fsSL -o previous/os-packages.lock \
+              "https://github.com/${GH_REPO}/releases/download/${PREVIOUS_TAG}/os-packages.lock"
+          elif [ -f release/r21-release-approval.json ]; then
+            echo "::notice::Bootstrap release: the previous approval is the r21 approval"
+            cp release/r21-release-approval.json previous/release-approval.json
+          else
+            echo "::error::the bootstrap release needs the r21 approval at release/r21-release-approval.json (Design-Auto-Update Phase 6)"
+            exit 1
+          fi
+          ls -l previous
+
+      - name: Generate the unsigned approval
+        run: |
+          python3 scripts/nexus-release-tool spec \
+            --profile release/fleet-profile.json --tag "$TAG" \
+            --tree "$(git rev-parse 'HEAD^{tree}')" \
+            --nexus out/lemonade-nexus-linux-x86_64 --attestd out/nexus-attestd-linux-x86_64 \
+            --out approval-spec.json
+          mkdir -p approval
+          build/projects/LemonadeNexus/nexus-release-bundle --spec approval-spec.json \
+            --previous-approval previous/release-approval.json \
+            --out approval/release-approval.unsigned.json \
+            --approval-preimage approval/approval.preimage
+          cp approval-spec.json approval/
+          cp -r previous approval/previous
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            out/lemonade-nexus-linux-x86_64
+            out/nexus-attestd-linux-x86_64
+            out/nexus-updater-linux-x86_64
+
+      - name: Name the provenance bundles after the assets
+        run: |
+          for f in out/*-linux-x86_64; do
+            cp "${{ steps.attest.outputs.bundle-path }}" "out/$(basename "$f").sigstore.json"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-binaries
+          path: out/
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-approval
+          path: approval/
+          if-no-files-found: error
+
+      # server-package reuses this tree: it adds the signed approval and runs
+      # CPack without recompiling, then checks the binary hashes again.
+      - uses: actions/cache/save@v5
+        with:
+          path: build
+          key: release-server-build-${{ github.run_id }}-${{ github.run_attempt }}
+
+  # =========================================================================
+  # Phase 3 gate: the previous release's server next to this commit's. The
+  # bootstrap release has no date-tagged predecessor; its baseline is the
+  # fleet's r21 line, which is not a release asset, so that run is manual
+  # (scripts/mixed-version-mesh.sh with OLD_BIN, docs/Releasing.md).
+  mixed-version:
+    needs: prepare
+    if: needs.prepare.outputs.previous_tag != ''
+    uses: ./.github/workflows/mixed-version.yml
+    with:
+      previous_tag: ${{ needs.prepare.outputs.previous_tag }}
+
+  # =========================================================================
+  native:
+    needs: prepare
+    runs-on: macos-14
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Cache CMake FetchContent dependencies
+        uses: actions/cache@v5
+        with:
+          path: build/_deps
+          key: fetchcontent-macos-14-ninja-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
+          restore-keys: |
+            fetchcontent-macos-14-ninja-
+
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF \
+            -DGIT_TAG_OVERRIDE="$TAG" \
+            -DOPENSSL_FORCE_BUNDLED=ON
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      - name: Compute binary SHA-256 (Unix)
-        if: runner.os != 'Windows'
-        id: hash
+      - name: Verify no Homebrew linkage
         run: |
-          BINARY_PATH="build/projects/LemonadeNexus/lemonade-nexus"
-          if [ ! -f "$BINARY_PATH" ]; then
-            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/lemonade-nexus"
-          fi
-          HASH=$(shasum -a 256 "$BINARY_PATH" | awk '{print $1}')
-          echo "binary_hash=$HASH" >> "$GITHUB_OUTPUT"
-          echo "binary_path=$BINARY_PATH" >> "$GITHUB_OUTPUT"
-          echo "Binary SHA-256: $HASH"
+          status=0
+          while IFS= read -r bin; do
+            deps=$(otool -L "$bin" 2>/dev/null | tail -n +2 | grep -E '/opt/homebrew/|/usr/local/' || true)
+            if [ -n "$deps" ]; then
+              echo "::error::$bin links against Homebrew/local libraries:"
+              echo "$deps"
+              status=1
+            fi
+          done < <(find build/projects -type f -perm +111)
+          exit $status
 
-      - name: Compute binary SHA-256 (Windows)
-        if: runner.os == 'Windows'
-        id: hash-win
-        shell: pwsh
+      - name: Package
         run: |
-          $binaryPath = "build/projects/LemonadeNexus/lemonade-nexus.exe"
-          if (-not (Test-Path $binaryPath)) {
-            $binaryPath = "build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/lemonade-nexus.exe"
-          }
-          $hash = (Get-FileHash -Path $binaryPath -Algorithm SHA256).Hash.ToLower()
-          "binary_hash=$hash" >> $env:GITHUB_OUTPUT
-          "binary_path=$binaryPath" >> $env:GITHUB_OUTPUT
-          Write-Host "Binary SHA-256: $hash"
+          cpack --config build/CPackConfig.cmake -G productbuild -B build/packages
+          mkdir -p out
+          cp build/projects/LemonadeNexus/lemonade-nexus "out/lemonade-nexus-${TAG}-darwin-arm64"
+          cp build/packages/*.pkg out/
 
-      - name: Set hash output
-        id: hash-final
-        shell: bash
-        run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            echo "binary_hash=${{ steps.hash-win.outputs.binary_hash }}" >> "$GITHUB_OUTPUT"
-            echo "binary_path=${{ steps.hash-win.outputs.binary_path }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "binary_hash=${{ steps.hash.outputs.binary_hash }}" >> "$GITHUB_OUTPUT"
-            echo "binary_path=${{ steps.hash.outputs.binary_path }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Locate collector binary (Linux)
-        if: runner.os == 'Linux'
-        id: hash-attestd
-        run: |
-          ATTESTD_PATH="build/projects/LemonadeNexusAttestd/nexus-attestd"
-          if [ ! -f "$ATTESTD_PATH" ]; then
-            ATTESTD_PATH="build/projects/LemonadeNexusAttestd/${{ env.BUILD_TYPE }}/nexus-attestd"
-          fi
-          echo "attestd_path=$ATTESTD_PATH" >> "$GITHUB_OUTPUT"
-
-      - name: Upload collector artifact (Linux)
-        if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+      - uses: actions/attest-build-provenance@v3
         with:
-          name: nexus-attestd-${{ matrix.platform }}
-          path: ${{ steps.hash-attestd.outputs.attestd_path }}
+          subject-path: out/*
 
-      # Verified by scripts/nexus-release-ingest before approval signing; the node never consumes it.
-      - name: Attest build provenance (Linux)
-        if: runner.os == 'Linux'
-        uses: actions/attest-build-provenance@v3
+      - uses: actions/upload-artifact@v4
         with:
-          subject-path: |
-            ${{ steps.hash-final.outputs.binary_path }}
-            ${{ steps.hash-attestd.outputs.attestd_path }}
-
-      - name: Create release manifest
-        id: manifest
-        shell: bash
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          COMMIT="${GITHUB_SHA}"
-          TIMESTAMP=$(date +%s)
-          PLATFORM="${{ matrix.platform }}"
-          HASH="${{ steps.hash-final.outputs.binary_hash }}"
-
-          # Create the canonical JSON (fields sorted alphabetically by nlohmann::json)
-          # This MUST match canonical_manifest_json() in BinaryAttestation.cpp
-          CANONICAL="{\"binary_sha256\":\"${HASH}\",\"commit_sha\":\"${COMMIT}\",\"platform\":\"${PLATFORM}\",\"signer_pubkey\":\"${RELEASE_SIGNING_PUBKEY}\",\"timestamp\":${TIMESTAMP},\"version\":\"${VERSION}\"}"
-          echo "canonical=$CANONICAL" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
-        env:
-          RELEASE_SIGNING_PUBKEY: ${{ vars.RELEASE_SIGNING_PUBKEY }}
-
-      - name: Install Python signing dependencies
-        run: pip3 install pynacl --break-system-packages || pip3 install pynacl
-
-      - name: Sign manifest with Ed25519
-        id: sign
-        shell: bash
-        run: |
-          python3 <<'PYEOF'
-          import nacl.signing
-          import nacl.encoding
-          import os
-
-          signing_key_b64 = os.environ["RELEASE_SIGNING_KEY"]
-          signing_key_bytes = nacl.encoding.Base64Encoder.decode(signing_key_b64)
-          signing_key = nacl.signing.SigningKey(signing_key_bytes)
-
-          verify_key = signing_key.verify_key
-          pubkey_b64 = verify_key.encode(nacl.encoding.Base64Encoder).decode()
-
-          canonical = os.environ["CANONICAL"]
-          signature = signing_key.sign(canonical.encode(), encoder=nacl.encoding.RawEncoder)
-          sig_b64 = nacl.encoding.Base64Encoder.encode(signature.signature).decode()
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"signature={sig_b64}\n")
-              f.write(f"pubkey={pubkey_b64}\n")
-          PYEOF
-        env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-          CANONICAL: ${{ steps.manifest.outputs.canonical }}
-
-      - name: Write signed manifest JSON
-        shell: bash
-        run: |
-          cat > manifest-${{ matrix.platform }}.json <<EOF
-          {
-            "version": "${{ steps.manifest.outputs.version }}",
-            "commit_sha": "${GITHUB_SHA}",
-            "platform": "${{ matrix.platform }}",
-            "binary_sha256": "${{ steps.hash-final.outputs.binary_hash }}",
-            "timestamp": ${{ steps.manifest.outputs.timestamp }},
-            "signer_pubkey": "${{ steps.sign.outputs.pubkey }}",
-            "signature": "${{ steps.sign.outputs.signature }}"
-          }
-          EOF
-
-          echo "--- Signed manifest ---"
-          cat manifest-${{ matrix.platform }}.json
-
-      - name: Build packages (macOS .pkg)
-        if: runner.os == 'macOS'
-        run: cpack --config build/CPackConfig.cmake -G productbuild -B build/packages
-
-      - name: Build packages (Windows NSIS)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: cpack --config build/CPackConfig.cmake -G NSIS -B build/packages
-        continue-on-error: true
-
-      - name: Build packages (Windows ZIP)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: cpack --config build/CPackConfig.cmake -G ZIP -B build/packages
-
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: lemonade-nexus-${{ matrix.platform }}
-          path: ${{ steps.hash-final.outputs.binary_path }}
-
-      - name: Upload .pkg artifact (macOS)
-        if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
-        with:
-          name: lemonade-nexus-${{ matrix.platform }}-pkg
-          path: build/packages/*.pkg
-
-      - name: Upload installer artifact (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
-        with:
-          name: lemonade-nexus-${{ matrix.platform }}-installer
-          path: |
-            build/packages/*.exe
-            build/packages/*.zip
-          if-no-files-found: ignore
-
-      - name: Upload manifest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest-${{ matrix.platform }}
-          path: manifest-${{ matrix.platform }}.json
+          name: native-darwin-arm64
+          path: out/
+          if-no-files-found: error
 
   # =========================================================================
-  # Linux distro builds (Debian, Fedora, Arch)
-  # =========================================================================
-  build-linux-distros:
+  distro:
+    needs: prepare
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          - container: debian:bookworm
-            platform: linux-x86_64-deb
-            cpack_generators: "DEB"
-            install_cmd: >-
-              apt-get update &&
-              apt-get install -y cmake ninja-build make g++ libssl-dev pkg-config
-              libjson-c-dev libcurl4-openssl-dev uuid-dev git ca-certificates curl
-              python3 python3-pip python3-venv dpkg-dev file
           - container: fedora:40
             platform: linux-x86_64-rpm
             cpack_generators: "RPM"
             install_cmd: >-
               dnf install -y cmake ninja-build make gcc-c++ openssl-devel
               pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
-              python3 python3-pip rpm-build
+              python3 rpm-build
           - container: archlinux:latest
             platform: linux-x86_64-arch
             cpack_generators: "TGZ"
             install_cmd: >-
-              pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git
-              python python-pip python-pynacl
+              pacman -Syu --noconfirm cmake ninja make gcc openssl pkgconf json-c curl util-linux-libs git python
           - container: amazonlinux:2023
             platform: linux-x86_64-amzn2023
             cpack_generators: "RPM"
-            # AL2023's defaults are too old for this codebase: GCC 11.5 lacks the
-            # <expected> header (need GCC 14, same major as the green Fedora 40
-            # build) and CMake 3.22 is below the 3.25.1 floor (pull current CMake
-            # from PyPI). Symlink GCC 14 as the default cc/g++ on PATH so the
-            # shared Configure step auto-detects it.
+            # Same toolchain notes as ci.yml: GCC 14 and a pinned PyPI CMake.
             install_cmd: >-
               dnf install -y ninja-build make gcc14 gcc14-c++ openssl-devel
               pkgconf-pkg-config json-c-devel libcurl-devel libuuid-devel git
@@ -350,290 +390,379 @@ jobs:
               ln -sf /usr/bin/gcc14-gcc /usr/local/bin/cc &&
               ln -sf /usr/bin/gcc14-g++ /usr/local/bin/g++ &&
               ln -sf /usr/bin/gcc14-g++ /usr/local/bin/c++ &&
-              pip3 install cmake
-
-    runs-on: ubuntu-latest
+              pip3 install 'cmake==3.31.6'
+    runs-on: ubuntu-24.04
     container: ${{ matrix.container }}
-
-    # id-token + attestations for build provenance (Tier-1 pair + package).
     permissions:
       contents: read
       id-token: write
       attestations: write
-
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
     steps:
       - name: Install dependencies
         run: ${{ matrix.install_cmd }}
 
       - name: Install Rust toolchain
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Cache CMake FetchContent dependencies
-        uses: actions/cache@v4
-        with:
-          path: build/_deps
-          key: fetchcontent-${{ matrix.platform }}-${{ hashFiles('cmake/libraries/*.cmake', 'CMakeLists.txt') }}
-          restore-keys: |
-            fetchcontent-${{ matrix.platform }}-
-
-      - name: Configure CMake
+      - name: Configure
         run: |
-          cmake -B build \
-            -G Ninja \
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
             -DBUILD_TESTING=OFF \
-            -DGIT_TAG_OVERRIDE="${GITHUB_REF_NAME}"
+            -DGIT_TAG_OVERRIDE="$TAG"
 
       - name: Build
         run: cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
 
-      - name: Compute binary SHA-256
-        id: hash
-        run: |
-          BINARY_PATH="build/projects/LemonadeNexus/lemonade-nexus"
-          if [ ! -f "$BINARY_PATH" ]; then
-            BINARY_PATH="build/projects/LemonadeNexus/${{ env.BUILD_TYPE }}/lemonade-nexus"
-          fi
-          HASH=$(sha256sum "$BINARY_PATH" | awk '{print $1}')
-          echo "binary_hash=$HASH" >> "$GITHUB_OUTPUT"
-          echo "binary_path=$BINARY_PATH" >> "$GITHUB_OUTPUT"
-          echo "Binary SHA-256: $HASH"
-
-      - name: Create release manifest
-        id: manifest
-        run: |
-          TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
-          COMMIT="${GITHUB_SHA}"
-          TIMESTAMP=$(date +%s)
-          PLATFORM="${{ matrix.platform }}"
-          HASH="${{ steps.hash.outputs.binary_hash }}"
-
-          CANONICAL="{\"binary_sha256\":\"${HASH}\",\"commit_sha\":\"${COMMIT}\",\"platform\":\"${PLATFORM}\",\"signer_pubkey\":\"${RELEASE_SIGNING_PUBKEY}\",\"timestamp\":${TIMESTAMP},\"version\":\"${VERSION}\"}"
-          echo "canonical=$CANONICAL" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
-        env:
-          RELEASE_SIGNING_PUBKEY: ${{ vars.RELEASE_SIGNING_PUBKEY }}
-
-      - name: Install PyNaCl
-        run: pip3 install pynacl --break-system-packages || pip3 install pynacl
-
-      - name: Sign manifest with Ed25519
-        id: sign
-        run: |
-          python3 <<'PYEOF'
-          import nacl.signing
-          import nacl.encoding
-          import os
-
-          signing_key_b64 = os.environ["RELEASE_SIGNING_KEY"]
-          signing_key_bytes = nacl.encoding.Base64Encoder.decode(signing_key_b64)
-          signing_key = nacl.signing.SigningKey(signing_key_bytes)
-
-          verify_key = signing_key.verify_key
-          pubkey_b64 = verify_key.encode(nacl.encoding.Base64Encoder).decode()
-
-          canonical = os.environ["CANONICAL"]
-          signature = signing_key.sign(canonical.encode(), encoder=nacl.encoding.RawEncoder)
-          sig_b64 = nacl.encoding.Base64Encoder.encode(signature.signature).decode()
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"signature={sig_b64}\n")
-              f.write(f"pubkey={pubkey_b64}\n")
-          PYEOF
-        env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-          CANONICAL: ${{ steps.manifest.outputs.canonical }}
-
-      - name: Write signed manifest JSON
-        run: |
-          cat > manifest-${{ matrix.platform }}.json <<EOF
-          {
-            "version": "${{ steps.manifest.outputs.version }}",
-            "commit_sha": "${GITHUB_SHA}",
-            "platform": "${{ matrix.platform }}",
-            "binary_sha256": "${{ steps.hash.outputs.binary_hash }}",
-            "timestamp": ${{ steps.manifest.outputs.timestamp }},
-            "signer_pubkey": "${{ steps.sign.outputs.pubkey }}",
-            "signature": "${{ steps.sign.outputs.signature }}"
-          }
-          EOF
-
-          echo "--- Signed manifest ---"
-          cat manifest-${{ matrix.platform }}.json
-
-      - name: Build packages via CPack
+      - name: Package
         run: |
           for gen in ${{ matrix.cpack_generators }}; do
             cpack --config build/CPackConfig.cmake -G "$gen" -B build/packages
           done
+          mkdir -p out
+          cp build/projects/LemonadeNexus/lemonade-nexus "out/lemonade-nexus-${TAG}-${{ matrix.platform }}"
+          for f in build/packages/*.rpm build/packages/*.tar.gz; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            # CPack names the Fedora and Amazon Linux RPMs alike; keep both.
+            case "${{ matrix.platform }}" in
+              *amzn2023) cp "$f" "out/${base%.rpm}.amzn2023.rpm" ;;
+              *) cp "$f" out/ ;;
+            esac
+          done
 
-      - name: Locate collector binary
-        id: hash-attestd
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: out/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distro-${{ matrix.platform }}
+          path: out/
+          if-no-files-found: error
+
+  # =========================================================================
+  sdk:
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-x86_64
+            library: liblemonade_nexus_sdk.so
+          - os: macos-14
+            platform: darwin-arm64
+            library: liblemonade_nexus_sdk.dylib
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
         run: |
-          ATTESTD_PATH="build/projects/LemonadeNexusAttestd/nexus-attestd"
-          if [ ! -f "$ATTESTD_PATH" ]; then
-            ATTESTD_PATH="build/projects/LemonadeNexusAttestd/${{ env.BUILD_TYPE }}/nexus-attestd"
-          fi
-          echo "attestd_path=$ATTESTD_PATH" >> "$GITHUB_OUTPUT"
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+      - name: Build the shared SDK
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_SDK_SHARED=ON \
+            -DGIT_TAG_OVERRIDE="$TAG" \
+            -DOPENSSL_FORCE_BUNDLED=${{ runner.os == 'macOS' && 'ON' || 'OFF' }}
+          cmake --build build --target LemonadeNexusSDKShared --parallel
+          mkdir -p out
+          cp "build/projects/LemonadeNexusSDK/${{ matrix.library }}" \
+            "out/lemonade-nexus-sdk-${TAG}-${{ matrix.platform }}-${{ matrix.library }}"
+
+      - uses: actions/attest-build-provenance@v3
         with:
-          name: lemonade-nexus-${{ matrix.platform }}
-          path: ${{ steps.hash.outputs.binary_path }}
+          subject-path: out/*
 
-      - name: Upload collector artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: nexus-attestd-${{ matrix.platform }}
-          path: ${{ steps.hash-attestd.outputs.attestd_path }}
+          name: sdk-${{ matrix.platform }}
+          path: out/
+          if-no-files-found: error
 
-      - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+  # =========================================================================
+  flutter:
+    needs: prepare
+    # The called jobs declare contents: write for their own release upload,
+    # which stays off here: release_tag is empty, so they only build.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/flutter-clients.yml
+    with:
+      release_tag: ''
+
+  # =========================================================================
+  # Measurement hook. A GitHub-hosted runner cannot boot the fleet's SEV-SNP
+  # guest, so it cannot measure PCR 8/9. When the repository variable
+  # REFERENCE_VM_RUNNER names the label of a runner on the reference VM, this
+  # job reads that VM's PCR 8/9 and fails the release unless they equal
+  # release/fleet-profile.json. Without the variable it is skipped, and the
+  # PCRs come only from the reviewed profile (docs/Releasing.md).
+  measure-boot-chain:
+    needs: prepare
+    if: vars.REFERENCE_VM_RUNNER != ''
+    runs-on: ${{ vars.REFERENCE_VM_RUNNER }}
+    steps:
+      - uses: actions/checkout@v5
         with:
-          name: lemonade-nexus-${{ matrix.platform }}-pkg
-          path: |
-            build/packages/*.deb
-            build/packages/*.rpm
-            build/packages/*.tar.gz
-          if-no-files-found: ignore
+          persist-credentials: false
+      - name: Compare the reference VM's PCR 8/9 with the profile
+        run: scripts/nexus-measure-boot-chain --compare release/fleet-profile.json
 
-      # Verified by scripts/nexus-release-ingest before approval signing; the node never consumes it.
+  # =========================================================================
+  approve:
+    needs: [prepare, server, measure-boot-chain]
+    # Runs when the measurement hook passed or is not configured.
+    if: >-
+      !cancelled() && needs.server.result == 'success' &&
+      (needs.measure-boot-chain.result == 'success' || needs.measure-boot-chain.result == 'skipped')
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    outputs:
+      boot_chain_changed: ${{ steps.boot.outputs.boot_chain_changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: unsigned-approval
+          path: approval
+
+      - name: Check the boot chain against the profile
+        id: boot
+        run: |
+          python3 scripts/nexus-release-tool boot-chain \
+            --profile release/fleet-profile.json --lock release/os-packages.lock \
+            --previous-lock approval/previous/os-packages.lock \
+            --previous-approval approval/previous/release-approval.json >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+      - name: Sign the approval
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          signer=$(python3 -c 'import json; print(json.load(open("release/fleet-profile.json"))["release_signer"])')
+          python3 scripts/nexus-release-sign --in approval/approval.preimage \
+            --out approval/approval.sig --expect-pubkey "$signer"
+
+      - name: Assemble the signed approval
+        run: |
+          mkdir -p signed
+          python3 scripts/nexus-release-tool assemble --profile release/fleet-profile.json \
+            --bundle approval/release-approval.unsigned.json \
+            --signature approval/approval.sig --out signed/release-approval.json
+          cp approval/approval.preimage signed/
+
       - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: signed/release-approval.json
+
+      - run: cp "${{ steps.attest.outputs.bundle-path }}" signed/release-approval.json.sigstore.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-approval
+          path: signed/
+          if-no-files-found: error
+
+  # =========================================================================
+  server-package:
+    needs: [prepare, server, approve]
+    if: ${{ !cancelled() && needs.approve.result == 'success' }}
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Install the pinned toolchain
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates
+          apt-get update --snapshot "$UBUNTU_SNAPSHOT"
+          apt-get install -y --no-install-recommends --snapshot "$UBUNTU_SNAPSHOT" \
+            gcc-13 g++-13 gcc g++ make cmake ninja-build pkg-config file git curl \
+            python3 dpkg-dev libssl-dev libjson-c-dev libcurl4-openssl-dev uuid-dev
+          test "$(gcc -dumpfullversion)" = "$GCC_VERSION"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+            sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache/restore@v5
+        with:
+          path: build
+          key: release-server-build-${{ github.run_id }}-${{ github.run_attempt }}
+          fail-on-cache-miss: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-approval
+          path: signed
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-binaries
+          path: binaries
+
+      - name: Package with the signed approval
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # Reconfigure for the approval file only. Nothing is rebuilt: the
+          # fresh checkout is newer than the cached objects, and CPack would
+          # otherwise build "all" before it installs.
+          cmake -S . -B build \
+            -DCMAKE_SKIP_INSTALL_ALL_DEPENDENCY=ON \
+            -DLEMONADE_RELEASE_APPROVAL_FILE="$GITHUB_WORKSPACE/signed/release-approval.json"
+          # The packaged binaries must be the approved bytes.
+          cmp build/projects/LemonadeNexus/lemonade-nexus binaries/lemonade-nexus-linux-x86_64
+          cmp build/projects/LemonadeNexusAttestd/nexus-attestd binaries/nexus-attestd-linux-x86_64
+          cpack --config build/CPackConfig.cmake -G DEB -B build/packages
+          mkdir -p out
+          cp build/packages/*.deb out/
+
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: out/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-deb
+          path: out/
+          if-no-files-found: error
+
+  # =========================================================================
+  publish:
+    needs: [prepare, server, mixed-version, native, distro, sdk, flutter, approve, server-package]
+    if: ${{ !cancelled() && !failure() && needs.server-package.result == 'success' }}
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_NUMBER: ${{ needs.prepare.outputs.release_number }}
+      BOOT_CHAIN_CHANGED: ${{ needs.approve.outputs.boot_chain_changed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect the release assets
+        run: |
+          mkdir -p dist
+          for dir in server-binaries native-darwin-arm64 distro-linux-x86_64-rpm \
+                     distro-linux-x86_64-arch distro-linux-x86_64-amzn2023 \
+                     sdk-linux-x86_64 sdk-darwin-arm64 server-deb; do
+            cp artifacts/"$dir"/* dist/
+          done
+          cp artifacts/signed-approval/release-approval.json dist/
+          cp artifacts/signed-approval/release-approval.json.sigstore.json dist/
+          cp release/os-packages.lock dist/os-packages.lock
+          # Desktop clients: zip each app directory.
+          for client in artifacts/nexus-client-*; do
+            [ -d "$client" ] || continue
+            name=$(basename "$client")
+            (cd "$client" && zip -qr "$GITHUB_WORKSPACE/dist/${name}-${TAG}.zip" .)
+          done
+          ls -l dist
+
+      - name: Write the manifest
+        run: |
+          python3 scripts/nexus-release-tool manifest \
+            --repository "$GITHUB_REPOSITORY" --tag "$TAG" --commit "$GITHUB_SHA" \
+            --approval dist/release-approval.json \
+            --approval-preimage artifacts/signed-approval/approval.preimage \
+            --lock dist/os-packages.lock --boot-chain-changed "$BOOT_CHAIN_CHANGED" \
+            --server-file lemonade-nexus-linux-x86_64=/usr/bin/lemonade-nexus=dist/lemonade-nexus-linux-x86_64 \
+            --server-file nexus-attestd-linux-x86_64=/usr/bin/nexus-attestd=dist/nexus-attestd-linux-x86_64 \
+            --artifacts-dir dist --out manifest.json
+          test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["release_number"])')" = "$RELEASE_NUMBER"
+
+      - name: Sign the manifest
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          signer=$(python3 -c 'import json; print(json.load(open("release/fleet-profile.json"))["release_signer"])')
+          python3 scripts/nexus-release-sign --in manifest.json --out manifest.json.sig \
+            --expect-pubkey "$signer" --domain $'lemonade-nexus/release-manifest/v1\n'
+          mv manifest.json manifest.json.sig dist/
+
+      - name: Attest the manifest and the package lock
+        id: attest
         uses: actions/attest-build-provenance@v3
         with:
           subject-path: |
-            ${{ steps.hash.outputs.binary_path }}
-            ${{ steps.hash-attestd.outputs.attestd_path }}
+            dist/manifest.json
+            dist/os-packages.lock
 
-      - name: Attest package provenance (deb)
-        if: matrix.platform == 'linux-x86_64-deb'
-        uses: actions/attest-build-provenance@v3
-        with:
-          subject-path: build/packages/*.deb
+      - run: |
+          cp "${{ steps.attest.outputs.bundle-path }}" dist/manifest.json.sigstore.json
+          cp "${{ steps.attest.outputs.bundle-path }}" dist/os-packages.lock.sigstore.json
 
-      - name: Upload manifest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: manifest-${{ matrix.platform }}
-          path: manifest-${{ matrix.platform }}.json
-
-  # =========================================================================
-  # Create GitHub Release with all platform artifacts
-  # =========================================================================
-  release:
-    needs: [build-native, build-linux-distros]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-
-      - name: Compute version strings
+      - name: Create the tag and the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # VERSION_CLEAN strips the 'v' prefix for CPack package filenames
-          echo "VERSION_CLEAN=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-
-      - name: Rename binaries with version and platform suffixes
-        run: |
-          VERSION="${GITHUB_REF_NAME}"  # e.g. v0.3.0-alpha
-          # Rename bare binaries to include version + platform in filename
-          for dir in lemonade-nexus-linux-x86_64 lemonade-nexus-linux-x86_64-deb \
-                     lemonade-nexus-linux-x86_64-rpm lemonade-nexus-linux-x86_64-arch \
-                     lemonade-nexus-linux-x86_64-amzn2023 \
-                     lemonade-nexus-darwin-arm64; do
-            platform="${dir#lemonade-nexus-}"
-            if [ -f "$dir/lemonade-nexus" ]; then
-              mv "$dir/lemonade-nexus" "$dir/lemonade-nexus-${VERSION}-${platform}"
-            fi
-          done
-          # Windows binary
-          if [ -f "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" ]; then
-            mv "lemonade-nexus-windows-x86_64/lemonade-nexus.exe" \
-               "lemonade-nexus-windows-x86_64/lemonade-nexus-${VERSION}-windows-x86_64.exe"
+          if git ls-remote --exit-code --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} already exists"
+            exit 1
           fi
-          # Disambiguate the Amazon Linux 2023 RPM — CPack names it identically to
-          # the Fedora RPM, which would collide as a release asset.
-          for rpm in lemonade-nexus-linux-x86_64-amzn2023-pkg/*.rpm; do
-            [ -f "$rpm" ] || continue
-            mv "$rpm" "${rpm%.rpm}.amzn2023.rpm"
-          done
+          cat > notes.md <<EOF
+          Release ${TAG} (release number ${RELEASE_NUMBER}), built from ${GITHUB_SHA} by release.yml on main.
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
-          files: |
-            lemonade-nexus-linux-x86_64/*
-            lemonade-nexus-linux-x86_64-deb/*
-            lemonade-nexus-linux-x86_64-rpm/*
-            lemonade-nexus-linux-x86_64-arch/*
-            lemonade-nexus-linux-x86_64-amzn2023/*
-            lemonade-nexus-darwin-arm64/*
-            lemonade-nexus-windows-x86_64/*
-            lemonade-nexus-linux-x86_64-deb-pkg/*
-            lemonade-nexus-linux-x86_64-rpm-pkg/*
-            lemonade-nexus-linux-x86_64-arch-pkg/*
-            lemonade-nexus-linux-x86_64-amzn2023-pkg/*
-            lemonade-nexus-darwin-arm64-pkg/*
-            lemonade-nexus-windows-x86_64-installer/*
-            manifest-linux-x86_64/*
-            manifest-linux-x86_64-deb/*
-            manifest-linux-x86_64-rpm/*
-            manifest-linux-x86_64-arch/*
-            manifest-linux-x86_64-amzn2023/*
-            manifest-darwin-arm64/*
-            manifest-windows-x86_64/*
-          generate_release_notes: true
-          body: |
-            ## Lemonade-Nexus Release ${{ github.ref_name }}
-
-            ### Platforms
-            | Platform | Binary | Manifest |
-            |----------|--------|----------|
-            | Linux x86_64 (Ubuntu) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64` | `manifest-linux-x86_64.json` |
-            | Linux x86_64 (Debian .deb) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.deb` | `manifest-linux-x86_64-deb.json` |
-            | Linux x86_64 (Fedora .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.rpm` | `manifest-linux-x86_64-rpm.json` |
-            | Linux x86_64 (Arch) | `lemonade-nexus-${{ github.ref_name }}-linux-x86_64-arch` | `manifest-linux-x86_64-arch.json` |
-            | Linux x86_64 (Amazon Linux 2023 .rpm) | `lemonade-nexus-${{ env.VERSION_CLEAN }}-Linux-x86_64.amzn2023.rpm` | `manifest-linux-x86_64-amzn2023.json` |
-            | macOS ARM64 | `lemonade-nexus-${{ github.ref_name }}-darwin-arm64` | `manifest-darwin-arm64.json` |
-
-            ### Install
-
-            **Debian/Ubuntu (.deb)**
-            ```bash
-            sudo dpkg -i lemonade-nexus-*.deb
-            sudo vi /etc/lemonade-nexus/lemonade-nexus.env
-            sudo systemctl start lemonade-nexus
-            ```
-
-            **macOS Server (.pkg)**
-            ```bash
-            sudo installer -pkg lemonade-nexus-*.pkg -target /
-            sudo launchctl load /Library/LaunchDaemons/io.lemonade-nexus.plist
-            ```
-
-            **Windows (.exe / .zip)**
-            Run the NSIS installer or extract the ZIP to `C:\Program Files\lemonade-nexus\`.
-
-            ### Binary Attestation
-            Each server binary has a corresponding Ed25519-signed release manifest (`manifest-*.json`).
-            Import manifests on your server with:
-            ```
-            lemonade-nexus --add-manifest manifest-linux-x86_64.json
-            ```
-
-            ### Verification
-            Manifests are signed with the project's Ed25519 release signing key.
-            Only binaries whose SHA-256 matches a signed manifest can achieve
-            Tier 1 trust status and receive distributed operational credentials.
+          - Servers update in place through nexus-updater. It verifies release-approval.json and manifest.json.sig against the Genesis-delegated release key, every file hash, and the Sigstore provenance (*.sigstore.json).
+          - Operators can check provenance with: gh attestation verify <file> --repo ${GITHUB_REPOSITORY} --signer-workflow ${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/heads/main
+          - Fresh installs: see docs/Getting-Started.md.
+          EOF
+          # --latest: nexus-updater reads the latest release.
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md --latest dist/*

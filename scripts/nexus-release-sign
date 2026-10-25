@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Sign one release file with the Ed25519 release key.
+
+The release workflow runs this in the protected `release` environment. It is
+the only step that sees the key.
+
+    RELEASE_SIGNING_KEY=<base64> nexus-release-sign \\
+        --in <file> --out <signature file> --expect-pubkey <base64> \\
+        [--domain <prefix>]
+
+The key is read from the RELEASE_SIGNING_KEY environment variable: base64 of
+a 32-byte Ed25519 seed (scripts/generate_release_signing_key.py) or of a
+64-byte libsodium secret key (seed followed by the public key). The key is
+never printed, logged, or written to disk. It goes to openssl through a pipe.
+
+The signed message is <domain> followed by the file bytes. The signature is
+written as one line of base64. Before it is written, the script checks that
+the key's public half equals --expect-pubkey (the Genesis-delegated signer in
+release/fleet-profile.json) and that the signature verifies.
+
+Requires: Python 3.8+, OpenSSL 3 command line tool. No other packages.
+"""
+
+import argparse
+import base64
+import binascii
+import os
+import subprocess
+import sys
+import tempfile
+
+# DER prefixes for an Ed25519 PKCS#8 private key and SubjectPublicKeyInfo
+# (RFC 8410). The 32 key bytes follow each prefix.
+PKCS8_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
+SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def fail(message):
+    print(f"nexus-release-sign: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def openssl(args, key_der=None, input_bytes=None):
+    """Run openssl. A private key goes in through a pipe file descriptor."""
+    pass_fds = ()
+    read_fd = write_fd = None
+    if key_der is not None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, key_der)  # 48 bytes; fits in any pipe buffer
+        os.close(write_fd)
+        args = [a.replace("{KEY}", f"/dev/fd/{read_fd}") for a in args]
+        pass_fds = (read_fd,)
+    try:
+        result = subprocess.run(
+            ["openssl"] + args,
+            input=input_bytes,
+            capture_output=True,
+            pass_fds=pass_fds,
+            check=False,
+        )
+    finally:
+        if read_fd is not None:
+            os.close(read_fd)
+    if result.returncode != 0:
+        # openssl does not echo key material in its errors.
+        fail("openssl " + args[0] + " failed: " + result.stderr.decode(errors="replace").strip())
+    return result.stdout
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--in", dest="input", required=True)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--expect-pubkey", required=True)
+    parser.add_argument("--domain", default="")
+    args = parser.parse_args()
+
+    encoded = os.environ.get("RELEASE_SIGNING_KEY", "")
+    if not encoded:
+        fail("RELEASE_SIGNING_KEY is not set")
+    try:
+        raw = base64.b64decode(encoded.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        fail("RELEASE_SIGNING_KEY is not base64")
+    finally:
+        encoded = None
+    if len(raw) not in (32, 64):
+        fail("RELEASE_SIGNING_KEY must hold a 32-byte seed or a 64-byte secret key")
+    seed = raw[:32]
+    key_der = PKCS8_PREFIX + seed
+
+    try:
+        expected = base64.b64decode(args.expect_pubkey, validate=True)
+    except (binascii.Error, ValueError):
+        fail("--expect-pubkey is not base64")
+    if len(expected) != 32:
+        fail("--expect-pubkey is not an Ed25519 public key")
+
+    spki = openssl(["pkey", "-inform", "DER", "-in", "{KEY}", "-pubout", "-outform", "DER"],
+                   key_der=key_der)
+    if not spki.startswith(SPKI_PREFIX) or spki[len(SPKI_PREFIX):] != expected:
+        fail("the signing key is not the expected release signer")
+    if len(raw) == 64 and raw[32:] != expected:
+        fail("the secret key's embedded public key does not match its seed")
+
+    with open(args.input, "rb") as f:
+        message = args.domain.encode() + f.read()
+
+    with tempfile.TemporaryDirectory() as work:
+        message_path = os.path.join(work, "message")
+        signature_path = os.path.join(work, "signature")
+        pub_path = os.path.join(work, "pub.der")
+        with open(message_path, "wb") as f:
+            f.write(message)
+        openssl(["pkeyutl", "-sign", "-rawin", "-keyform", "DER", "-inkey", "{KEY}",
+                 "-in", message_path, "-out", signature_path], key_der=key_der)
+        with open(pub_path, "wb") as f:
+            f.write(SPKI_PREFIX + expected)
+        openssl(["pkeyutl", "-verify", "-rawin", "-pubin", "-keyform", "DER", "-inkey", pub_path,
+                 "-in", message_path, "-sigfile", signature_path])
+        with open(signature_path, "rb") as f:
+            signature = f.read()
+    key_der = None
+    seed = None
+    raw = None
+    if len(signature) != 64:
+        fail("openssl produced a signature of unexpected length")
+    with open(args.out, "w", encoding="ascii") as f:
+        f.write(base64.b64encode(signature).decode() + "\n")
+
+
+if __name__ == "__main__":
+    main()

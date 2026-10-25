@@ -53,6 +53,10 @@ enum class DropReason : uint16_t {
     BudgetExceeded,
     SealFailure,
     ServiceRejected,
+    /// The envelope names another security wire version. A peer on a release
+    /// with another wire, not a malformed message (Wire-Compatibility.md).
+    /// scripts/mixed-version-mesh.sh matches this number.
+    WireVersionMismatch = 14,
 };
 
 struct RouteResult {
@@ -128,6 +132,10 @@ public:
     /// the network; the storage service checks the epoch, the session or plan,
     /// and every proof itself.
     virtual void on_storage_message(const SecurityMessage&) {}
+    /// Release adoption and upgrade-turn traffic (kind Upgrade). The router
+    /// bound the sender and checked the network; the upgrade service checks
+    /// every signature, record, and proof itself.
+    virtual void on_upgrade_message(const SecurityMessage&) {}
 };
 
 struct SecurityRouterConfig {
@@ -207,7 +215,7 @@ private:
     [[nodiscard]] bool epoch_in_window(const SecurityMessage& message) const;
 
     RouteResult dispatch(SecurityMessage& message, uint64_t now_ms);
-    RouteResult route_proposal(const ProposalMessage& message);
+    RouteResult route_proposal(const ProposalMessage& message, const NodeId& from);
     RouteResult route_vote(const Vote& vote);
     RouteResult route_timeout(const TimeoutVote& vote);
     RouteResult route_dkg(DkgMessage& message);

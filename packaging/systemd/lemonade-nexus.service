@@ -96,6 +96,10 @@ PrivateDevices=yes
 ReadWritePaths=/var/lib/lemonade-nexus/data
 ReadOnlyPaths=/etc/lemonade-nexus /var/lib/lemonade-nexus
 UMask=0077
+# /run/lemonade-nexus holds the update control socket for nexus-updater
+# (owner-only, mode 0600). Only this account and root can connect.
+RuntimeDirectory=lemonade-nexus
+RuntimeDirectoryMode=0700
 
 # --- network --------------------------------------------------------------
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

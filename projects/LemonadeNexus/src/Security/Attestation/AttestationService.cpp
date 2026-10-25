@@ -50,6 +50,12 @@ AttestationService::AttestationService(NetworkId network_id, LinuxAttestationPro
       activations_(state_directory.empty() ? std::filesystem::path{}
                                            : state_directory / "svsm-activations") {}
 
+void AttestationService::replace_profile(LinuxAttestationProfile profile) {
+    profile_ = std::move(profile);
+    policy_digest_ = profile_digest(profile_);
+    verifier_ = AttestationVerifier(profile_, revocation_);
+}
+
 AttestationChallenge AttestationService::make_challenge(
     const NodeId& node, const crypto::Ed25519PublicKey& node_key,
     IncarnationId incarnation, EpochId epoch, AttestationPurpose purpose,
@@ -105,7 +111,8 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
     // attestation this binding exists to remove; an eligibility challenge with
     // a caller-chosen context would let the caller relabel one.
     if ((purpose == AttestationPurpose::FinalEpochReadiness ||
-         purpose == AttestationPurpose::StorageUnlock) &&
+         purpose == AttestationPurpose::StorageUnlock ||
+         purpose == AttestationPurpose::UpgradeHealth) &&
         context == Digest{}) {
         return std::nullopt;
     }
@@ -120,6 +127,15 @@ std::optional<AttestationChallenge> AttestationService::create_challenge(
         ++used;
         while (final_attempts_.size() > 4 * constants::kMaxActiveTier1) {
             final_attempts_.erase(final_attempts_.begin());
+        }
+    } else if (purpose == AttestationPurpose::UpgradeHealth) {
+        auto& used = upgrade_attempts_[{node, context}];
+        if (used >= constants::kMaxUpgradeHealthAttemptsPerPosition) {
+            return std::nullopt;
+        }
+        ++used;
+        while (upgrade_attempts_.size() > 4 * constants::kMaxActiveTier1) {
+            upgrade_attempts_.erase(upgrade_attempts_.begin());
         }
     } else if (purpose == AttestationPurpose::StorageUnlock) {
         auto& used = storage_attempts_[{epoch, node}];
@@ -246,10 +262,12 @@ AttestationVerdict AttestationService::receive_evidence(const AttestationEvidenc
                     next.required_paths.push_back({found->path, found->sha256});
             }
             next.previous_evidence_digest = verdict.evidence_digest;
+            verdict.measured_paths = next.required_paths;
             if (next.required_paths.size() != profile_.approved_paths.size() ||
                 !checkpoints_.store(std::move(next))) {
                 verdict.passed = false;
                 verdict.failure = AttestationFailure::CheckpointInvalid;
+                verdict.measured_paths.clear();
             }
         }
     }

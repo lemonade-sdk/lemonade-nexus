@@ -465,6 +465,38 @@ TEST_F(DriverMesh, RestartSyncsToACertifiedFloorBeforeVoting) {
     EXPECT_GE(victim->driver->last_committed_height(), committed_before + 2);
 }
 
+// A rolling restart: members restart one after another, and each one must
+// vote and commit again before the next one goes down. A proposal that
+// arrives while a member syncs is refused, so the member resumes one block
+// behind the chain; it must catch up instead of refusing every later proposal
+// as parentless.
+TEST_F(DriverMesh, SequentialRestartsKeepEveryMemberCommitting) {
+    bootstrap();
+    run_until_committed(2);
+    ASSERT_FALSE(HasFatalFailure());
+    for (std::size_t i = 0; i < 3; ++i) {
+        Node* victim = founders[i];
+        Height highest = 0;
+        for (Node* founder : founders) {
+            highest = std::max(highest, founder->driver->last_committed_height());
+        }
+        restart_node(*victim);
+        victim->driver->start(mesh.now_ms);
+        ASSERT_EQ(victim->driver->phase(), DriverPhase::Syncing);
+
+        // With every member voting, the chain commits about once per step.
+        // The bound leaves room for several timed-out views.
+        run_until_committed(highest + 3, 100);
+        ASSERT_FALSE(HasFatalFailure()) << "member " << i << " did not commit again";
+        ASSERT_EQ(victim->driver->phase(), DriverPhase::Active);
+        const View floor = victim->runtime->consensus()->state().last_voted_view;
+        run_until_committed(highest + 6, 100);
+        ASSERT_FALSE(HasFatalFailure()) << "member " << i << " stalled after its restart";
+        EXPECT_GT(victim->runtime->consensus()->state().last_voted_view, floor)
+            << "member " << i << " stopped voting after its restart";
+    }
+}
+
 TEST_F(DriverMesh, CorruptEpochStateFailsClosed) {
     bootstrap();
     Node* victim = founders[0];

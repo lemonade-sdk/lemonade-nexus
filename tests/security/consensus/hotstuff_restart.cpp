@@ -116,6 +116,92 @@ TEST_F(HotStuffRestart, SyncFloorBelowStoredViewKeepsStoredView) {
     EXPECT_FALSE(replay.vote.has_value());
 }
 
+// A proposal that arrives while the replica syncs is refused, so the next
+// one names a parent the replica does not hold. The replica holds that
+// proposal, catch-up delivers the certified parent, and the held proposal is
+// judged again and earns its vote.
+TEST_F(HotStuffRestart, MissedBlockIsCaughtUpAndTheHeldProposalVotes) {
+    run_first_incarnation();
+    FileConsensusStore store(directory_);
+    HotStuffService second(harness.config_for(0), clone_key(harness.keys[0]), store);
+    const auto chain = harness.build_chain(5);
+
+    // Restart sync: the certified b3 is the anchor; b4 went by unseen.
+    std::vector<ConsensusCommit> commits;
+    ASSERT_FALSE(second
+                     .adopt_certified_block(chain[2].proposal, chain[2].justify,
+                                            chain[3].justify, commits)
+                     .has_value());
+    second.sync_to_certified(3);
+
+    const auto orphaned = second.receive_proposal(chain[4].proposal, chain[4].justify);
+    EXPECT_EQ(orphaned.rejected, ConsensusFailure::MissingParent);
+    EXPECT_FALSE(orphaned.vote.has_value());
+    EXPECT_FALSE(second.take_linkable_orphan().has_value());
+
+    // Catch-up delivers b4, certified by b5's justify.
+    ASSERT_FALSE(second
+                     .adopt_certified_block(chain[3].proposal, chain[3].justify,
+                                            chain[4].justify, commits)
+                     .has_value());
+    auto held = second.take_linkable_orphan();
+    ASSERT_TRUE(held.has_value());
+    EXPECT_EQ(nexus::security::proposal_digest(held->proposal), chain[4].digest);
+    EXPECT_FALSE(second.take_linkable_orphan().has_value());
+
+    const auto judged = second.receive_proposal(held->proposal, held->justify);
+    EXPECT_FALSE(judged.rejected.has_value());
+    ASSERT_TRUE(judged.vote.has_value());
+    EXPECT_EQ(judged.vote->view, 5u);
+
+    // The vote's safety state reached disk before the vote existed.
+    const auto stored = store.load(kEpoch);
+    ASSERT_TRUE(std::holds_alternative<HotStuffState>(stored));
+    EXPECT_EQ(std::get<HotStuffState>(stored).last_voted_view, 5u);
+}
+
+// Holding a proposal grants nothing: it is judged again from the start. A
+// leader that equivocated in the meantime gets no second vote for the view,
+// and a proposal with a forged justify is never held.
+TEST_F(HotStuffRestart, HeldProposalEarnsNoSecondVoteAndForgeriesAreNotHeld) {
+    RecordingStore store;
+    HotStuffService replica(harness.config_for(0), clone_key(harness.keys[0]), store);
+    const auto chain = harness.build_chain(3);
+    ASSERT_TRUE(replica.receive_proposal(chain[0].proposal, chain[0].justify).vote.has_value());
+
+    // b2 went by unseen; b3 waits for it.
+    EXPECT_EQ(replica.receive_proposal(chain[2].proposal, chain[2].justify).rejected,
+              ConsensusFailure::MissingParent);
+
+    // The view-3 leader also sends a conflicting block this replica can place.
+    const Block conflicting =
+        harness.make_block(2, 3, chain[0].digest, harness.qc_for(chain[0].proposal), 0x70);
+    const auto voted = replica.receive_proposal(conflicting.proposal, conflicting.justify);
+    ASSERT_TRUE(voted.vote.has_value());
+    EXPECT_EQ(voted.vote->view, 3u);
+
+    std::vector<ConsensusCommit> commits;
+    ASSERT_FALSE(replica
+                     .adopt_certified_block(chain[1].proposal, chain[1].justify,
+                                            chain[2].justify, commits)
+                     .has_value());
+    auto held = replica.take_linkable_orphan();
+    ASSERT_TRUE(held.has_value());
+    const auto again = replica.receive_proposal(held->proposal, held->justify);
+    EXPECT_EQ(again.rejected, ConsensusFailure::Equivocation);
+    EXPECT_FALSE(again.vote.has_value());
+    EXPECT_EQ(replica.state().last_voted_view, 3u);
+
+    // A justify without a quorum of valid signatures fails before the parent
+    // lookup, so nothing is held for it.
+    QuorumCertificate forged = harness.qc_for(chain[2].proposal);
+    forged.signers.resize(1);
+    const Block unproven = harness.make_block(4, 5, chain[2].digest, forged, 0x80);
+    EXPECT_EQ(replica.receive_proposal(unproven.proposal, unproven.justify).rejected,
+              ConsensusFailure::JustifyInvalid);
+    EXPECT_FALSE(replica.take_linkable_orphan().has_value());
+}
+
 TEST_F(HotStuffRestart, CorruptSafetyStateIsPermanentlyUnusable) {
     run_first_incarnation();
     {

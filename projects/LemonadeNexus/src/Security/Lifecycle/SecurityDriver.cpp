@@ -8,6 +8,7 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <limits>
 
 namespace nexus::security {
 
@@ -225,11 +226,14 @@ void SecurityDriver::start(uint64_t now_ms) {
         fail("durable security state is invalid");
         return;
     }
-    // Recovery fails closed when the stored certificate commits a different
-    // release approval than this process loaded.
+    // Recovery fails closed unless the stored certificate's release commitment
+    // is accepted: the same approval, or (with a release chain) a founding
+    // approval that carries the pinned release signer for this network.
     if (certificate != nullptr &&
-        certificate->release_approval_digest != config_.release_approval_digest) {
-        fail("epoch state commits a different release approval than this process loaded");
+        !(config_.release_commitment
+              ? config_.release_commitment(certificate->release_approval_digest)
+              : certificate->release_approval_digest == config_.release_approval_digest)) {
+        fail("epoch state commits a release approval this node cannot accept");
         return;
     }
     if (certificate != nullptr) {
@@ -1260,6 +1264,14 @@ void SecurityDriver::on_attestation_verdict(const AttestationVerdict& verdict,
         }
         return;
     }
+    if (verdict.purpose == AttestationPurpose::UpgradeHealth) {
+        // Same rule: upgrade-health evidence answers one upgrade chain
+        // position and confers nothing else.
+        if (upgrade_verdict_sink_) {
+            upgrade_verdict_sink_(verdict);
+        }
+        return;
+    }
     if (phase_ == DriverPhase::GenesisCollecting && genesis_ != nullptr &&
         !genesis_->finalized()) {
         if (!eligibility_verdict_ok(verdict)) {
@@ -1857,6 +1869,12 @@ void SecurityDriver::on_storage_message(const SecurityMessage& message) {
     }
 }
 
+void SecurityDriver::on_upgrade_message(const SecurityMessage& message) {
+    if (upgrade_sink_) {
+        upgrade_sink_(message);
+    }
+}
+
 void SecurityDriver::on_commits(const std::vector<ConsensusCommit>& commits) {
     progress(now_ms_);
     for (const auto& commit : commits) {
@@ -2128,6 +2146,7 @@ void SecurityDriver::do_activate(const Digest& checkpoint) {
         return;
     }
     pending_dkg_.reset();
+    spdlog::info("[security] epoch {} activated", to_epoch.underlying());
     persist_current_epoch(checkpoint);
     (void)store_.append_authority({to_epoch, epochs->current().authority_public_key,
                                    epochs->current().participant_set_digest, dkg_digest});
@@ -2222,20 +2241,20 @@ void SecurityDriver::maybe_request_chain() {
                                             AuthorityChainRequest{have}, have));
 }
 
-void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& request,
-                                                const NodeId& from) {
-    // Serving is a bounded read of local records; it grants nothing and
-    // asserts nothing the page's own proofs do not carry.
+std::optional<AuthorityChainPage> SecurityDriver::chain_page(EpochId have_epoch,
+                                                            std::size_t max_links) const {
+    // A bounded read of local records; it grants nothing and asserts nothing
+    // the page's own proofs do not carry.
     AuthorityChainPage page;
-    EpochId next_from = request.have_epoch;
-    if (request.have_epoch == 0) {
+    EpochId next_from = have_epoch;
+    if (have_epoch == 0) {
         auto certificate = store_.load_bootstrap();
         auto base = store_.load_chain_base();
         const auto* cert = std::get_if<BootstrapCertificate>(&certificate);
         const auto* listing =
             std::get_if<std::vector<std::pair<NodeId, crypto::Ed25519PublicKey>>>(&base);
         if (cert == nullptr || listing == nullptr) {
-            return;
+            return std::nullopt;
         }
         page.has_base = true;
         page.base_certificate = *cert;
@@ -2245,7 +2264,7 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
     auto links = store_.load_chain_links();
     if (const auto* stored = std::get_if<std::vector<std::vector<uint8_t>>>(&links)) {
         for (const auto& bytes : *stored) {
-            if (page.links.size() >= constants::kMaxHandoffChainLinks) {
+            if (page.links.size() >= max_links) {
                 break;
             }
             auto decoded = decode_security_message(bytes);
@@ -2262,9 +2281,22 @@ void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& req
         }
     }
     if (!page.has_base && page.links.empty()) {
+        return std::nullopt;
+    }
+    return page;
+}
+
+std::optional<AuthorityChainPage> SecurityDriver::authority_chain() const {
+    return chain_page(0, std::numeric_limits<std::size_t>::max());
+}
+
+void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& request,
+                                                const NodeId& from) {
+    auto page = chain_page(request.have_epoch, constants::kMaxHandoffChainLinks);
+    if (!page) {
         return;
     }
-    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, page,
+    (void)router_.send(from, router_.compose(SecurityMessageKind::AuthorityChainPage, *page,
                                              authority_.has_value() ? authority_->epoch : 0));
 }
 
