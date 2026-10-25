@@ -28,6 +28,13 @@ PermissionTreeService::PermissionTreeService(storage::FileStorageService& storag
 void PermissionTreeService::on_start() {
     std::lock_guard lock(mutex_);
 
+    // A restart after close() loads from storage alone.
+    nodes_.clear();
+    recent_deltas_.clear();
+    committed_ops_ = CommittedOpIds{};
+    committed_ops_unreadable_ = false;
+    holds_files_ = true;
+
     // Load all persisted nodes into the in-memory cache
     const auto node_ids = storage_.list_nodes();
     for (const auto& node_id : node_ids) {
@@ -77,6 +84,22 @@ void PermissionTreeService::on_start() {
 
 void PermissionTreeService::on_stop() {
     spdlog::info("[{}] stopped", name());
+}
+
+void PermissionTreeService::close() {
+    std::lock_guard lock(mutex_);
+    holds_files_ = false;
+    nodes_.clear();
+    identifier_index_.clear();
+    recent_deltas_.clear();
+    committed_ops_ = CommittedOpIds{};
+    committed_ops_unreadable_ = false;
+    spdlog::info("[{}] closed: the tree is no longer held in memory or written", name());
+}
+
+bool PermissionTreeService::is_open() const {
+    std::lock_guard lock(mutex_);
+    return holds_files_;
 }
 
 // --- Join bootstrap (bypasses delta permission checks) ---
@@ -583,6 +606,7 @@ bool PermissionTreeService::do_apply_delta(const TreeDelta& delta) {
 }
 
 uint64_t PermissionTreeService::record_applied_delta_locked(const TreeDelta& delta) {
+    if (!holds_files_) return 0;  // closed: no delta log, no retention
     storage::SignedDelta signed_delta;
     signed_delta.operation      = delta.operation;
     signed_delta.target_node_id = delta.target_node_id;
@@ -795,6 +819,7 @@ std::filesystem::path committed_ops_path(const storage::FileStorageService& stor
 }  // namespace
 
 bool PermissionTreeService::persist_committed_ops_locked() const {
+    if (!holds_files_) return false;
     json ids = json::array();
     for (const auto& [id, signed_at] : committed_ops_.sorted()) {
         ids.push_back(json::array({id, signed_at}));
@@ -1127,6 +1152,7 @@ std::vector<TreeNode> PermissionTreeService::do_get_nodes_by_type(NodeType type)
 // --- Private helpers ---
 
 bool PermissionTreeService::persist_node(const TreeNode& node) {
+    if (!holds_files_) return false;
     storage::SignedEnvelope envelope;
     envelope.version       = 1;
     envelope.type          = "tree_node";
@@ -1138,6 +1164,7 @@ bool PermissionTreeService::persist_node(const TreeNode& node) {
 }
 
 bool PermissionTreeService::remove_node(std::string_view node_id) {
+    if (!holds_files_) return false;
     return storage_.delete_node(node_id);
 }
 

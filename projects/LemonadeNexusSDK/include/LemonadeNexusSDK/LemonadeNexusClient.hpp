@@ -5,6 +5,7 @@
 #include <LemonadeNexusSDK/Identity.hpp>
 #include <LemonadeNexusSDK/LatencyMonitor.hpp>
 #include <LemonadeNexusSDK/RoutingTypes.hpp>
+#include <LemonadeNexusSDK/Tier1Directory.hpp>
 #include <LemonadeNexusSDK/Types.hpp>
 #include <LemonadeNexusSDK/BoringtunMesh.hpp>
 
@@ -45,10 +46,36 @@ public:
     [[nodiscard]] Identity identity() const;
 
     // -----------------------------------------------------------------
+    // Tier 1 servers (tree traffic)
+    // -----------------------------------------------------------------
+
+    /// Pin the network's Genesis public key (base64 Ed25519, the server
+    /// config's `genesis_pubkey`) and the lowest epoch to accept. Every tree
+    /// read and write, every session request (/api/auth...), and every
+    /// private-API call goes only to a Tier 1 server the client verified from
+    /// this key (see Tier1Directory). Without it the SDK sends none of them
+    /// and those calls fail with an error that names the missing key.
+    /// `min_epoch` lets an application that stored the last verified epoch
+    /// refuse an older membership after a restart. Errors: a malformed key.
+    [[nodiscard]] StatusResult set_genesis_key(const std::string& genesis_pubkey_b64,
+                                               uint64_t min_epoch = 0);
+
+    /// Verify the Tier 1 membership now, from the current server pool. Tree
+    /// calls also refresh it on their own when it is older than five minutes
+    /// or a server refused a tree route. Errors: no pinned key, a chain that
+    /// does not verify, a stale epoch, or no verified server reachable.
+    [[nodiscard]] Result<Tier1Membership> refresh_tier1();
+
+    /// The last verified membership (empty when none is verified).
+    [[nodiscard]] Tier1Membership tier1_membership() const;
+
+    // -----------------------------------------------------------------
     // Health
     // -----------------------------------------------------------------
 
-    /// GET /api/health
+    /// GET /api/health. With a session, it also fails when the session's
+    /// server is no longer a verified Tier 1 server, so the caller can join
+    /// again through another one.
     [[nodiscard]] Result<HealthStatus> check_health();
 
     // -----------------------------------------------------------------
@@ -368,7 +395,10 @@ public:
     // Session state
     // -----------------------------------------------------------------
 
-    /// Set the session token obtained from authentication.
+    /// Set the session token obtained from authentication. A session belongs
+    /// to the Tier 1 server that issued it, and a token set here names no
+    /// server: private-API calls stay refused until authenticate_*() or
+    /// join_network() binds a session to a verified Tier 1 server.
     void set_session_token(const std::string& token);
 
     /// Get the current session token.

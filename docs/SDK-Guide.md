@@ -9,6 +9,7 @@ title: SDK Guide
 - [Overview](#overview)
 - [Quick Start (C++)](#quick-start-c)
 - [Quick Start (C API)](#quick-start-c-api)
+- [Tier 1 Servers](#tier-1-servers)
 - [Identity Management](#identity-management)
 - [Authentication](#authentication)
 - [Joining the Network](#joining-the-network)
@@ -38,6 +39,13 @@ int main() {
     // verified HTTPS by default
     lnsdk::ServerConfig config{"server.example.com", 9100};
     lnsdk::LemonadeNexusClient client{config};
+
+    // Tree, session, and private-API calls go only to Tier 1 servers the
+    // SDK verifies from the network's Genesis key (genesis_pubkey).
+    if (!client.set_genesis_key("<base64 Genesis public key>").ok) {
+        std::cerr << "malformed Genesis key\n";
+        return 1;
+    }
 
     const auto health = client.check_health();
     if (!health.ok) {
@@ -91,6 +99,8 @@ and `.error`. There is no `operator->`.
 
 int main(void) {
     ln_client_t* client = ln_create_tls("server.example.com", 9100);
+    /* Tree, session, and private-API calls go only to verified Tier 1 servers. */
+    ln_set_genesis_key(client, "<base64 Genesis public key>", 0);
 
     ln_identity_t* id = ln_identity_generate();
     ln_set_identity(client, id);
@@ -125,6 +135,22 @@ int main(void) {
 Password-derived identities exist for compatibility (`ln_derive_seed` +
 `ln_identity_from_seed`), but the server's password *authentication* is a
 deprecated stub that always fails; use an Ed25519 identity.
+
+## Tier 1 Servers
+
+| C++ | C | Purpose |
+|---|---|---|
+| `set_genesis_key(b64, min_epoch)` | `ln_set_genesis_key(client, b64, min_epoch)` | Pin the Genesis key and the lowest epoch to accept |
+| `refresh_tier1()` | `ln_tier1_refresh(client, &json)` | Verify the membership now |
+| `tier1_membership()` | `ln_tier1_membership(client, &json)` | The last verified membership, no network I/O |
+
+The JSON is `{"epoch", "members", "servers":[{"node_id","host","port"}]}`.
+The SDK refreshes on its own every five minutes and after a server refuses a
+tree route. See [Client SDK — Tier 1 Servers](Client-SDK#tier-1-servers) for
+what it verifies and how it fails closed.
+
+`check_health()` also fails when the session's server is no longer a verified
+Tier 1 server; join again, and the SDK picks another one.
 
 ## Identity Management
 

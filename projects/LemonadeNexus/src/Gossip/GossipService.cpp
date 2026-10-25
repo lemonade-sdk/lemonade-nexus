@@ -308,8 +308,9 @@ void GossipService::on_start() {
     register_known_ns_slots();
 
     // Reconstruct the transfer pool index before any transfer state can move
-    // (bounded; pool files are preserved on any failure).
-    reconstruct_transfer_pool();
+    // (bounded; pool files are preserved on any failure). A server that holds
+    // no tree keeps no pool; set_tree_role(true) builds it on Tier 1 entry.
+    if (tree_role_active_.load()) reconstruct_transfer_pool();
 
     // Send ServerHello to all known peers on startup (before starting async loops).
     send_startup_server_hello();
@@ -853,6 +854,7 @@ GossipService::PoolRetain GossipService::retain_verified_record(
 
 bool GossipService::retain_local_delta(
         const storage::FileStorageService::RetainedDelta& rec) {
+    if (!tree_role_active_.load()) return false;
     uint64_t position = 0;
     const auto result = retain_verified_record(rec, position);
     if (result == PoolRetain::Retained) {
@@ -1263,7 +1265,7 @@ void GossipService::handle_digest_message(const asio::ip::udp::endpoint& sender,
                                             const uint8_t* payload,
                                             std::size_t payload_len,
                                             const std::string& signer_pubkey, Via via) {
-    if (tree_transfer_retired_.load()) return;  // tree replication carries tree changes
+    if (!tree_transfer_active()) return;  // retired, or this server holds no tree
     // Transport authorization before any transfer state is allocated: an
     // uncertified digest, or one off the signer's backbone address,
     // allocates nothing and triggers no request.
@@ -1301,7 +1303,7 @@ void GossipService::handle_delta_request(const asio::ip::udp::endpoint& sender,
                                            const uint8_t* payload,
                                            std::size_t payload_len,
                                            const std::string& signer_pubkey, Via via) {
-    if (tree_transfer_retired_.load()) return;  // tree replication carries tree changes
+    if (!tree_transfer_active()) return;  // retired, or this server holds no tree
     // Data-returning path: same transport gate as digest and response.
     if (!backbone_sender_verified(sender, signer_pubkey, via, "DeltaRequest")) return;
 
@@ -1439,7 +1441,7 @@ void GossipService::handle_delta_response(const asio::ip::udp::endpoint& sender,
                                             const std::string& sender_pubkey,
                                             const uint8_t* payload,
                                             std::size_t payload_len, Via via) {
-    if (tree_transfer_retired_.load()) return;  // tree replication carries tree changes
+    if (!tree_transfer_active()) return;  // retired, or this server holds no tree
     // Fail-closed gate, no tokens: state-mutating gossip ingress requires the
     // packet signer to be an enrolled peer with a root-signed certificate,
     // sending from its own backbone address. Gossip is Tier-2 transport and
@@ -1938,8 +1940,9 @@ void GossipService::on_gossip_tick() {
     }
 
     // Send digest outside of the lock to avoid holding it during I/O. In ops
-    // mode the transfer pool is retired and sends nothing.
-    if (!tree_transfer_retired_.load()) do_send_digest(chosen);
+    // mode the transfer pool is retired, and a server that holds no tree
+    // keeps no pool; neither sends anything.
+    if (tree_transfer_active()) do_send_digest(chosen);
 }
 
 // ---------------------------------------------------------------------------
@@ -4029,7 +4032,37 @@ nlohmann::json GossipService::tree_sync_status() const {
     auto out = sync_status(tree_replica_.get());
     out["enabled"] = tree_replica_ != nullptr;
     out["transfer_pool_retired"] = tree_transfer_retired_.load();
+    out["holds_tree"] = tree_role_active_.load();
     return out;
+}
+
+void GossipService::set_tree_role(bool holds_tree) {
+    if (holds_tree) {
+        if (tree_role_active_.exchange(true)) return;
+        // The pool directory may have been deleted while this server held no
+        // tree; reconstruction starts a new, empty pool generation.
+        if (!tree_transfer_retired_.load()) reconstruct_transfer_pool();
+        return;
+    }
+    tree_role_active_.store(false);
+    {
+        std::lock_guard lock(transfer_mutex_);
+        pool_has_uncertain_write_ = false;
+        pool_position_index_.clear();
+        pool_hash_to_position_.clear();
+        pool_verified_.clear();
+        pool_excluded_.clear();
+        pool_temp_hashes_.clear();
+        pool_verified_bytes_ = 0;
+        pool_excluded_bytes_ = 0;
+        pool_temp_bytes_ = 0;
+        pool_entry_count_ = 0;
+        pool_next_position_ = 1;
+        pool_available_ = false;
+        pool_reconstructed_ = false;
+        outstanding_.clear();
+    }
+    if (tree_replica_) tree_replica_->clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -4048,7 +4081,7 @@ void GossipService::enable_tree_stream(
 }
 
 void GossipService::offer_tree_height(uint64_t height) {
-    if (!tree_replica_ || height == 0) return;
+    if (!tree_replica_ || height == 0 || !tree_role_active_.load()) return;
     // The payload stays empty: entries are read from the tree log on demand,
     // so the index costs a few dozen bytes per height.
     const auto result = tree_replica_->offer(
@@ -4060,7 +4093,7 @@ void GossipService::offer_tree_height(uint64_t height) {
 }
 
 void GossipService::serve_tree_entries(const GossipPeer& peer, uint64_t since) {
-    if (!tree_entry_source_) return;
+    if (!tree_entry_source_ || !tree_role_active_.load()) return;
     std::size_t sent = 0;
     std::size_t bytes = 0;
     for (uint64_t height = since + 1; sent < kTreeSyncMaxEntriesPerRequest; ++height) {
@@ -4096,6 +4129,8 @@ void GossipService::handle_tree_log_sync(const asio::ip::udp::endpoint& sender,
         deny_sync(sender, sender_pubkey, "TreeLogSync", "tree entries are served by Tier 1 only");
         return;
     }
+    // Only a Tier 1 member keeps a tree log; a Tier 2 server takes no entry.
+    if (!tree_role_active_.load()) return;
     if (!tree_assembler_ || !tree_entry_sink_) return;
     const auto doc = json::from_msgpack(payload, payload + payload_len, true, false);
     const auto chunk = sync::decode_entry_chunk(doc, kTreeMaxEntryBytes);

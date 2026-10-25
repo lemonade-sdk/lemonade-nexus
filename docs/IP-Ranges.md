@@ -103,9 +103,9 @@ Tier 1, but never supply records to it. Two streams use it: DNS records and
 account group-key envelopes.
 
 Permission tree sync (`Digest`, `DeltaRequest`, `DeltaResponse`) also runs
-only on the backbone, between every pair of certified servers with a ready
-backbone path, Tier 1 or Tier 2. A server that has no backbone path to a
-peer exchanges no tree records with it.
+only on the backbone, between Tier 1 members with a ready backbone path. A
+Tier 2 server holds no tree and runs no tree sync. A server that has no
+backbone path to a peer exchanges no tree records with it.
 
 Account group-key envelopes (`AccountEnvelopeSync` 0x19) travel only on the
 backbone. A Tier 1 server that accepts an envelope from a device signs it
@@ -114,7 +114,8 @@ catch up from the next digest. A receiver accepts an envelope only from a
 current Tier 1 sender, verifies the origin server's signature and
 certificate, and re-checks against its own permission tree that the
 uploading device may write the account group and that the recipient is a
-device in that group. A Tier 2 server keeps the envelopes it accepts local.
+device in that group. A Tier 2 server holds no tree, so it can check no
+envelope and accepts none.
 Chat blobs are not replicated; they stay on the server that stored them.
 
 Client tunnel, private, and shared allocations are currently managed per

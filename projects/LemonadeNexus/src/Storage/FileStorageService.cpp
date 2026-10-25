@@ -1,5 +1,6 @@
 #include <LemonadeNexus/Storage/FileStorageService.hpp>
 
+#include <LemonadeNexus/Security/DurableWrite.hpp>
 #include <LemonadeNexus/Security/Storage/StorageVault.hpp>
 
 #include <spdlog/spdlog.h>
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 #ifdef _WIN32
 #  include <windows.h>
@@ -306,6 +308,54 @@ std::vector<std::string> FileStorageService::do_list_files(std::string_view cate
         spdlog::error("[{}] list_files '{}' failed: {}", name(), category, e.what());
     }
     return files;
+}
+
+bool FileStorageService::purge_tree_files() {
+    std::lock_guard lock(mutex_);
+    const auto tree_dir = data_root_ / "tree";
+    std::error_code ec;
+    if (!fs::exists(fs::symlink_status(tree_dir, ec))) {
+        next_delta_seq_ = 1;
+        return true;
+    }
+    std::size_t scrubbed = 0;
+    std::size_t failed = 0;
+    // Collect first: removing entries while iterating invalidates the walk.
+    std::vector<fs::path> files;
+    for (auto it = fs::recursive_directory_iterator(
+             tree_dir, fs::directory_options::skip_permission_denied, ec);
+         !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+        const auto status = it->symlink_status(ec);
+        if (ec) break;
+        if (fs::is_regular_file(status)) files.push_back(it->path());
+    }
+    for (const auto& file : files) {
+        if (security::scrub_file(file)) {
+            ++scrubbed;
+        } else {
+            ++failed;
+        }
+    }
+    // Symbolic links, empty directories, and anything the scrub left.
+    fs::remove_all(tree_dir, ec);
+    next_delta_seq_ = 1;
+    const bool gone = !fs::exists(fs::symlink_status(tree_dir, ec));
+    if (gone && failed == 0) {
+        spdlog::info("[{}] deleted the tree: {} file(s) overwritten and removed", name(),
+                     scrubbed);
+    } else {
+        spdlog::error("[{}] tree deletion incomplete: {} file(s) removed, {} failed, "
+                      "directory {}", name(), scrubbed, failed, gone ? "gone" : "still present");
+    }
+    return gone;
+}
+
+void FileStorageService::ensure_tree_directories() {
+    std::lock_guard lock(mutex_);
+    std::error_code ec;
+    fs::create_directories(data_root_ / "tree" / "nodes", ec);
+    fs::create_directories(data_root_ / "tree" / "deltas", ec);
+    fs::create_directories(pool_dir_, ec);
 }
 
 void FileStorageService::do_ensure_directories() {

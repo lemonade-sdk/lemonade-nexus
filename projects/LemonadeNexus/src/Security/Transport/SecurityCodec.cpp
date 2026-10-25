@@ -4,6 +4,8 @@
 #include <LemonadeNexus/Security/EvidenceSnpVtpm.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
+#include "AuthorityChainCodecDetail.hpp"
+
 #include <cstring>
 #include <optional>
 #include <string>
@@ -12,117 +14,9 @@ namespace nexus::security {
 
 namespace {
 
-class Writer {
-public:
-    void u8(uint8_t value) { out_.push_back(value); }
-    void u16(uint16_t value) { put_le(value, 2); }
-    void u32(uint32_t value) { put_le(value, 4); }
-    void u64(uint64_t value) { put_le(value, 8); }
-    template <typename Tag>
-    void u64(StrongId<Tag> value) { put_le(value.underlying(), 8); }
-    void fixed(std::span<const uint8_t> bytes) { out_.insert(out_.end(), bytes.begin(), bytes.end()); }
-
-    /// Length-prefixed field. Returns false when the field exceeds its bound,
-    /// so a caller can never emit a message the decoder would reject.
-    [[nodiscard]] bool bytes(std::span<const uint8_t> field, std::size_t max) {
-        if (field.size() > max) {
-            return false;
-        }
-        u32(static_cast<uint32_t>(field.size()));
-        fixed(field);
-        return true;
-    }
-
-    [[nodiscard]] std::vector<uint8_t> take() { return std::move(out_); }
-
-private:
-    void put_le(uint64_t value, int width) {
-        for (int i = 0; i < width; ++i) {
-            out_.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
-        }
-    }
-
-    std::vector<uint8_t> out_;
-};
-
-class Reader {
-public:
-    explicit Reader(std::span<const uint8_t> bytes) : bytes_(bytes) {}
-
-    [[nodiscard]] bool u8(uint8_t& value) { return read_le(value, 1); }
-    [[nodiscard]] bool u16(uint16_t& value) { return read_le(value, 2); }
-    [[nodiscard]] bool u32(uint32_t& value) { return read_le(value, 4); }
-    [[nodiscard]] bool u64(uint64_t& value) { return read_le(value, 8); }
-    template <typename Tag>
-    [[nodiscard]] bool u64(StrongId<Tag>& value) {
-        uint64_t raw = 0;
-        if (!read_le(raw, 8)) return false;
-        value = raw;
-        return true;
-    }
-
-    template <std::size_t N>
-    [[nodiscard]] bool fixed(std::array<uint8_t, N>& value) {
-        if (remaining() < N) {
-            return fail(CodecError::Truncated);
-        }
-        std::memcpy(value.data(), bytes_.data() + offset_, N);
-        offset_ += N;
-        return true;
-    }
-
-    /// The length is bounded before any allocation: an attacker-chosen
-    /// length never reserves memory.
-    [[nodiscard]] bool bytes(std::vector<uint8_t>& value, std::size_t max) {
-        uint32_t length = 0;
-        if (!u32(length)) {
-            return false;
-        }
-        if (length > max) {
-            return fail(CodecError::LengthTooLarge);
-        }
-        if (remaining() < length) {
-            return fail(CodecError::Truncated);
-        }
-        value.assign(bytes_.begin() + static_cast<std::ptrdiff_t>(offset_),
-                     bytes_.begin() + static_cast<std::ptrdiff_t>(offset_ + length));
-        offset_ += length;
-        return true;
-    }
-
-    [[nodiscard]] std::size_t remaining() const { return bytes_.size() - offset_; }
-    [[nodiscard]] bool done() const { return offset_ == bytes_.size(); }
-    [[nodiscard]] std::optional<CodecError> error() const { return error_; }
-    [[nodiscard]] bool fail(CodecError error) {
-        if (!error_.has_value()) {
-            error_ = error;
-        }
-        return false;
-    }
-
-private:
-    template <typename T>
-    bool read_le(T& value, std::size_t width) {
-        if (remaining() < width) {
-            return fail(CodecError::Truncated);
-        }
-        uint64_t raw = 0;
-        for (std::size_t i = 0; i < width; ++i) {
-            raw |= static_cast<uint64_t>(bytes_[offset_ + i]) << (i * 8);
-        }
-        value = static_cast<T>(raw);
-        offset_ += width;
-        return true;
-    }
-
-    std::span<const uint8_t> bytes_;
-    std::size_t offset_ = 0;
-    std::optional<CodecError> error_;
-};
+using namespace codec_detail;
 
 // --- Encoders ---------------------------------------------------------------
-
-void put_node(Writer& w, const NodeId& node) { w.fixed(node.bytes); }
 
 bool encode_challenge(Writer& w, const AttestationChallenge& c) {
     w.fixed(c.network_id);
@@ -219,41 +113,8 @@ bool encode_activation_response(Writer& w, const SvsmAkActivationResponseMessage
     w.fixed(r.identity_signature); return true;
 }
 
-bool encode_certificate(Writer& w, const QuorumCertificate& qc) {
-    if (qc.signers.size() > constants::kMaxQcSignatures) {
-        return false;
-    }
-    w.u16(qc.qc_format_version);
-    w.u16(qc.consensus_ruleset);
-    w.fixed(qc.network_id);
-    w.u64(qc.epoch);
-    w.u64(qc.height);
-    w.u64(qc.view);
-    w.fixed(qc.proposal_digest);
-    w.u16(static_cast<uint16_t>(qc.signers.size()));
-    for (const auto& signer : qc.signers) {
-        put_node(w, signer.node_id);
-        w.fixed(signer.signature);
-    }
-    return true;
-}
-
 bool encode_proposal(Writer& w, const ProposalMessage& m) {
-    const Proposal& p = m.proposal;
-    w.u16(p.security_ruleset);
-    w.u16(p.consensus_ruleset);
-    w.fixed(p.network_id);
-    w.u64(p.epoch);
-    w.u64(p.height);
-    w.u64(p.view);
-    put_node(w, p.leader);
-    w.fixed(p.parent_digest);
-    w.fixed(p.justify_qc_digest);
-    w.fixed(p.previous_state_root);
-    w.fixed(p.proposed_state_root);
-    w.fixed(p.transitions_digest);
-    w.u64(p.timestamp_hint);
-    return encode_certificate(w, m.justify);
+    return encode_proposal_core(w, m.proposal, m.justify);
 }
 
 // The HotStuffProposal body: the proposal and certificate, then the payload
@@ -282,8 +143,6 @@ bool encode_tree_op_submit(Writer& w, const TreeOpSubmitMsg& m) {
 }
 
 constexpr std::size_t kMaxSealedPartialBytes = 256;
-
-bool encode_commit_proof(Writer& w, const CommitProof& p);
 
 bool encode_storage_plan_proof(Writer& w, const StoragePlanProofMsg& m) {
     if (m.payload.kind != BlockPayloadKind::StorageHolderPlan &&
@@ -463,23 +322,6 @@ bool encode_transcript_attest(Writer& w, const DkgTranscriptAttest& a) {
     return true;
 }
 
-bool encode_bootstrap(Writer& w, const BootstrapCertificate& c) {
-    w.fixed(c.network_id);
-    w.u64(c.epoch);
-    w.fixed(c.tier1_set_digest);
-    w.u64(c.authority_threshold);
-    w.fixed(c.authority_public_key);
-    w.fixed(c.dkg_transcript_digest);
-    w.fixed(c.attestation_root);
-    w.fixed(c.founding_eligibility_digest);
-    w.fixed(c.vote_key_set_digest);
-    w.fixed(c.release_approval_digest);
-    w.u16(c.security_ruleset);
-    w.u16(c.consensus_ruleset);
-    w.fixed(c.genesis_signature);
-    return true;
-}
-
 bool encode_observation(Writer& w, const EligibilityObservation& o) {
     w.fixed(o.network_id);
     w.u64(o.epoch);
@@ -550,22 +392,6 @@ bool encode_next_epoch_plan(Writer& w, const NextEpochPlan& p) {
     return true;
 }
 
-bool encode_committed_block(Writer& w, const CommittedBlock& b) {
-    return encode_proposal(w, ProposalMessage{b.proposal, b.justify});
-}
-
-bool encode_commit_proof(Writer& w, const CommitProof& p) {
-    if (p.chain.size() != 3) {
-        return false;
-    }
-    for (const auto& block : p.chain) {
-        if (!encode_committed_block(w, block)) {
-            return false;
-        }
-    }
-    return encode_certificate(w, p.certifying);
-}
-
 bool encode_plan_proof(Writer& w, const NextEpochPlanProof& m) {
     if (m.current_vote_keys.size() > constants::kMaxActiveTier1) {
         return false;
@@ -614,67 +440,6 @@ bool encode_readiness_proof(Writer& w, const ReadinessProofMsg& m) {
     return encode_readiness(w, m.readiness) && encode_commit_proof(w, m.proof);
 }
 
-bool encode_handoff(Writer& w, const EpochHandoff& h) {
-    if (h.members.size() > constants::kMaxActiveTier1) {
-        return false;
-    }
-    w.fixed(h.network_id);
-    w.u64(h.from_epoch);
-    w.u64(h.to_epoch);
-    w.fixed(h.plan_digest);
-    w.fixed(h.previous_anchor);
-    w.u16(static_cast<uint16_t>(h.members.size()));
-    for (const auto& node : h.members) {
-        put_node(w, node);
-        const auto incarnation = h.incarnations.find(node);
-        w.u64(incarnation != h.incarnations.end() ? incarnation->second : 0);
-        const auto key = h.vote_keys.find(node);
-        if (key == h.vote_keys.end()) {
-            return false;
-        }
-        w.fixed(key->second);
-    }
-    w.fixed(h.group_public_key);
-    w.fixed(h.dkg_transcript_digest);
-    w.u64(h.key_generation);
-    w.fixed(h.attestation_root);
-    w.u16(h.security_ruleset);
-    w.u16(h.consensus_ruleset);
-    return true;
-}
-
-bool encode_handoff_proof(Writer& w, const EpochHandoffProofMsg& m) {
-    return encode_handoff(w, m.handoff) && encode_commit_proof(w, m.proof);
-}
-
-bool encode_chain_request(Writer& w, const AuthorityChainRequest& c) {
-    w.u64(c.have_epoch);
-    return true;
-}
-
-bool encode_chain_page(Writer& w, const AuthorityChainPage& p) {
-    if (p.base_vote_keys.size() > constants::kMaxActiveTier1 ||
-        p.links.size() > constants::kMaxHandoffChainLinks) {
-        return false;
-    }
-    w.u16(p.has_base ? 1 : 0);
-    if (p.has_base) {
-        encode_bootstrap(w, p.base_certificate);
-        w.u16(static_cast<uint16_t>(p.base_vote_keys.size()));
-        for (const auto& [node, key] : p.base_vote_keys) {
-            put_node(w, node);
-            w.fixed(key);
-        }
-    }
-    w.u16(static_cast<uint16_t>(p.links.size()));
-    for (const auto& link : p.links) {
-        if (!encode_handoff_proof(w, link)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool encode_genesis_eligibility_attest(Writer& w, const GenesisEligibilityAttest& a) {
     w.u64(a.epoch);
     w.fixed(a.founding_state_digest);
@@ -705,8 +470,6 @@ bool encode_sync_response(Writer& w, const SyncResponse& s) {
 }
 
 // --- Decoders ---------------------------------------------------------------
-
-bool get_node(Reader& r, NodeId& node) { return r.fixed(node.bytes); }
 
 // A profile ID this binary does not name is refused here rather than folded
 // into Unknown: folding would make a corrupted or hostile value re-encode as a
@@ -844,35 +607,8 @@ bool decode_activation_response(Reader& r, SvsmAkActivationResponseMessage& m) {
            r.bytes(m.activated_secret, 64) && r.fixed(m.identity_signature);
 }
 
-bool decode_certificate(Reader& r, QuorumCertificate& qc) {
-    uint16_t count = 0;
-    if (!(r.u16(qc.qc_format_version) && r.u16(qc.consensus_ruleset) && r.fixed(qc.network_id) &&
-          r.u64(qc.epoch) && r.u64(qc.height) && r.u64(qc.view) && r.fixed(qc.proposal_digest) &&
-          r.u16(count))) {
-        return false;
-    }
-    // Bound before the signer loop: a claimed count never drives allocation
-    // or signature work past the compiled maximum.
-    if (count > constants::kMaxQcSignatures) {
-        return r.fail(CodecError::CountTooLarge);
-    }
-    qc.signers.resize(count);
-    for (auto& signer : qc.signers) {
-        if (!(get_node(r, signer.node_id) && r.fixed(signer.signature))) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool decode_proposal(Reader& r, ProposalMessage& m) {
-    Proposal& p = m.proposal;
-    return r.u16(p.security_ruleset) && r.u16(p.consensus_ruleset) && r.fixed(p.network_id) &&
-           r.u64(p.epoch) && r.u64(p.height) && r.u64(p.view) && get_node(r, p.leader) &&
-           r.fixed(p.parent_digest) && r.fixed(p.justify_qc_digest) &&
-           r.fixed(p.previous_state_root) && r.fixed(p.proposed_state_root) &&
-           r.fixed(p.transitions_digest) && r.u64(p.timestamp_hint) &&
-           decode_certificate(r, m.justify);
+    return decode_proposal_core(r, m.proposal, m.justify);
 }
 
 bool decode_proposal_message(Reader& r, ProposalMessage& m) {
@@ -902,8 +638,6 @@ bool decode_tree_op_submit(Reader& r, TreeOpSubmitMsg& m) {
     return r.bytes(m.encoded_op, constants::kMaxConsensusBlockBytes) && !m.encoded_op.empty() &&
            r.fixed(m.signature);
 }
-
-bool decode_commit_proof(Reader& r, CommitProof& p);
 
 bool decode_storage_plan_proof(Reader& r, StoragePlanProofMsg& m) {
     uint16_t kind = 0;
@@ -1067,20 +801,6 @@ bool decode_transcript_attest(Reader& r, DkgTranscriptAttest& a) {
            r.fixed(a.group_public_key) && get_node(r, a.node) && r.fixed(a.identity_signature);
 }
 
-bool decode_bootstrap(Reader& r, BootstrapCertificate& c) {
-    uint64_t threshold = 0;
-    if (!(r.fixed(c.network_id) && r.u64(c.epoch) && r.fixed(c.tier1_set_digest) &&
-          r.u64(threshold) && r.fixed(c.authority_public_key) && r.fixed(c.dkg_transcript_digest) &&
-          r.fixed(c.attestation_root) && r.fixed(c.founding_eligibility_digest) &&
-          r.fixed(c.vote_key_set_digest) && r.fixed(c.release_approval_digest) &&
-          r.u16(c.security_ruleset) && r.u16(c.consensus_ruleset) &&
-          r.fixed(c.genesis_signature))) {
-        return false;
-    }
-    c.authority_threshold = static_cast<std::size_t>(threshold);
-    return true;
-}
-
 bool decode_observation(Reader& r, EligibilityObservation& o) {
     uint16_t kind = 0;
     AttestationProfileId profile = AttestationProfileId::Unknown;
@@ -1153,26 +873,6 @@ bool decode_next_epoch_plan(Reader& r, NextEpochPlan& p) {
     return true;
 }
 
-bool decode_committed_block(Reader& r, CommittedBlock& b) {
-    ProposalMessage message;
-    if (!decode_proposal(r, message)) {
-        return false;
-    }
-    b.proposal = std::move(message.proposal);
-    b.justify = std::move(message.justify);
-    return true;
-}
-
-bool decode_commit_proof(Reader& r, CommitProof& p) {
-    p.chain.resize(3);
-    for (auto& block : p.chain) {
-        if (!decode_committed_block(r, block)) {
-            return false;
-        }
-    }
-    return decode_certificate(r, p.certifying);
-}
-
 bool decode_plan_proof(Reader& r, NextEpochPlanProof& m) {
     if (!(decode_next_epoch_plan(r, m.plan) && decode_commit_proof(r, m.proof))) {
         return false;
@@ -1222,82 +922,6 @@ bool decode_readiness(Reader& r, CandidateReadiness& out) {
 
 bool decode_readiness_proof(Reader& r, ReadinessProofMsg& m) {
     return decode_readiness(r, m.readiness) && decode_commit_proof(r, m.proof);
-}
-
-bool decode_handoff(Reader& r, EpochHandoff& h) {
-    uint16_t count = 0;
-    if (!(r.fixed(h.network_id) && r.u64(h.from_epoch) && r.u64(h.to_epoch) &&
-          r.fixed(h.plan_digest) && r.fixed(h.previous_anchor) && r.u16(count))) {
-        return false;
-    }
-    if (count > constants::kMaxActiveTier1) {
-        return r.fail(CodecError::CountTooLarge);
-    }
-    for (uint16_t i = 0; i < count; ++i) {
-        NodeId node;
-        uint64_t incarnation = 0;
-        nexus::crypto::Ed25519PublicKey key{};
-        if (!(get_node(r, node) && r.u64(incarnation) && r.fixed(key))) {
-            return false;
-        }
-        h.members.push_back(node);
-        h.incarnations[node] = incarnation;
-        h.vote_keys[node] = key;
-    }
-    return r.fixed(h.group_public_key) && r.fixed(h.dkg_transcript_digest) &&
-           r.u64(h.key_generation) && r.fixed(h.attestation_root) &&
-           r.u16(h.security_ruleset) && r.u16(h.consensus_ruleset);
-}
-
-bool decode_handoff_proof(Reader& r, EpochHandoffProofMsg& m) {
-    return decode_handoff(r, m.handoff) && decode_commit_proof(r, m.proof);
-}
-
-bool decode_chain_request(Reader& r, AuthorityChainRequest& c) { return r.u64(c.have_epoch); }
-
-bool decode_chain_page(Reader& r, AuthorityChainPage& p) {
-    uint16_t has_base = 0;
-    if (!r.u16(has_base) || has_base > 1) {
-        return r.fail(CodecError::BadValue);
-    }
-    p.has_base = has_base == 1;
-    if (p.has_base) {
-        if (!decode_bootstrap(r, p.base_certificate)) {
-            return false;
-        }
-        uint16_t base_count = 0;
-        if (!r.u16(base_count)) {
-            return false;
-        }
-        if (base_count > constants::kMaxActiveTier1) {
-            return r.fail(CodecError::CountTooLarge);
-        }
-        for (uint16_t i = 0; i < base_count; ++i) {
-            NodeId node;
-            nexus::crypto::Ed25519PublicKey key{};
-            if (!(get_node(r, node) && r.fixed(key))) {
-                return false;
-            }
-            p.base_vote_keys.emplace_back(node, key);
-        }
-    }
-    uint16_t count = 0;
-    if (!r.u16(count)) {
-        return false;
-    }
-    // Bounded before the loop: a claimed count never drives allocation or
-    // signature parsing past the compiled page limit.
-    if (count > constants::kMaxHandoffChainLinks) {
-        return r.fail(CodecError::CountTooLarge);
-    }
-    for (uint16_t i = 0; i < count; ++i) {
-        EpochHandoffProofMsg link;
-        if (!decode_handoff_proof(r, link)) {
-            return false;
-        }
-        p.links.push_back(std::move(link));
-    }
-    return true;
 }
 
 bool decode_genesis_eligibility_attest(Reader& r, GenesisEligibilityAttest& a) {

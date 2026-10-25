@@ -4,6 +4,7 @@
 #include <LemonadeNexus/Crypto/CryptoTypes.hpp>
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Relay/IRelayProvider.hpp>
+#include <LemonadeNexus/Relay/RelayTicketAuth.hpp>
 #include <LemonadeNexus/Relay/RelayTypes.hpp>
 
 #include <asio.hpp>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,7 +42,8 @@ struct RelaySession {
 /// (magic 0x0001) and Relay (magic 0x4C52) by inspecting the first two bytes
 /// of each datagram.
 ///
-/// Ticket verification uses the central server's Ed25519 public key.
+/// Tickets are verified against the verified Tier 1 membership
+/// (set_ticket_authority), so a relay needs no tree and no session state.
 class RelayService : public core::IService<RelayService>,
                       public IRelayProvider<RelayService> {
     friend class core::IService<RelayService>;
@@ -49,12 +52,18 @@ class RelayService : public core::IService<RelayService>,
 public:
     /// @param io            ASIO io_context driving the socket
     /// @param port          UDP port to listen on (default 9103)
-    /// @param crypto        Reference to the crypto service for verification
-    /// @param central_pubkey Ed25519 public key of the central server
+    /// @param crypto        Reference to the crypto service
     RelayService(asio::io_context& io,
                  uint16_t port,
-                 crypto::SodiumCryptoService& crypto,
-                 crypto::Ed25519PublicKey central_pubkey);
+                 crypto::SodiumCryptoService& crypto);
+
+    /// Where the verified Tier 1 membership comes from: the network, the
+    /// current epoch, and its members, as the security mesh verified them
+    /// from the authority chain. nullopt while none is verified. Unset, or
+    /// nullopt, refuses every ticket. Must be thread-safe. Set before start.
+    void set_ticket_authority(std::function<std::optional<RelayTicketAuthority>()> source) {
+        ticket_authority_ = std::move(source);
+    }
 
     // -- IService --
     void on_start();
@@ -80,7 +89,12 @@ public:
                                   std::span<const uint8_t> data,
                                   const asio::ip::udp::endpoint& from);
     void do_teardown(const SessionId& session_id);
+    /// True when the ticket is valid now against the verified Tier 1
+    /// membership (check_relay_ticket). Replay is checked by do_allocate.
     [[nodiscard]] bool do_verify_ticket(const RelayTicket& ticket) const;
+
+    /// Why a ticket is refused, or Valid.
+    [[nodiscard]] RelayTicketCheck check_ticket(const RelayTicket& ticket) const;
 
     /// Return statistics for a session.
     [[nodiscard]] std::optional<RelaySessionStats> get_session_stats(const SessionId& session_id) const;
@@ -100,9 +114,6 @@ private:
     /// Generate a fresh random SessionId.
     [[nodiscard]] SessionId generate_session_id();
 
-    /// Serialise ticket fields into the canonical byte buffer for verification.
-    [[nodiscard]] static std::vector<uint8_t> ticket_canonical_bytes(const RelayTicket& ticket);
-
     /// Start periodic TTL enforcement timer.
     void start_ttl_timer();
 
@@ -114,7 +125,7 @@ private:
     asio::ip::udp::socket        socket_;
     uint16_t                     port_;
     crypto::SodiumCryptoService& crypto_;
-    crypto::Ed25519PublicKey      central_pubkey_;
+    std::function<std::optional<RelayTicketAuthority>()> ticket_authority_;
 
     // Receive buffer (max UDP datagram)
     static constexpr std::size_t kMaxDatagram = 65535;
@@ -128,8 +139,10 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<SessionId, std::shared_ptr<RelaySession>, SessionIdHash> sessions_;
 
-    // Ticket session-nonces already allocated (reject re-allocation / replay).
-    std::unordered_set<std::string> seen_ticket_nonces_;
+    // Issuer and session nonce of every ticket already allocated, with its
+    // expiry: a ticket allocates at most one session. An entry is dropped only
+    // after its ticket expired, when the ticket is refused anyway.
+    std::unordered_map<std::string, uint64_t> seen_tickets_;
 
     // TTL enforcement timer (fires every 30 seconds)
     asio::steady_timer ttl_timer_{io_};

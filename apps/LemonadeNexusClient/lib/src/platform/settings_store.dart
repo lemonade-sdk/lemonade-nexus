@@ -14,6 +14,8 @@ class SettingsStore {
   static const _kTls = 'useTls';
   static const _kDarkMode = 'darkModeEnabled';
   static const _kThemeMode = 'themeMode';
+  static const _kGenesisKey = 'genesisKey';
+  static const _kTier1MinEpoch = 'tier1MinEpoch';
 
   Future<Settings> load() async {
     final prefs = await SharedPreferences.getInstance();
@@ -25,6 +27,8 @@ class SettingsStore {
       autoConnectOnLaunch: prefs.getBool(_kAutoConnect) ?? defaults.autoConnectOnLaunch,
       useTls: prefs.getBool(_kTls) ?? defaults.useTls,
       darkModeEnabled: prefs.getBool(_kDarkMode) ?? defaults.darkModeEnabled,
+      genesisKey: prefs.getString(_kGenesisKey) ?? defaults.genesisKey,
+      tier1MinEpoch: prefs.getInt(_kTier1MinEpoch) ?? defaults.tier1MinEpoch,
     );
   }
 
@@ -36,6 +40,8 @@ class SettingsStore {
     await prefs.setBool(_kAutoConnect, s.autoConnectOnLaunch);
     await prefs.setBool(_kTls, s.useTls);
     await prefs.setBool(_kDarkMode, s.darkModeEnabled);
+    await prefs.setString(_kGenesisKey, s.genesisKey);
+    await prefs.setInt(_kTier1MinEpoch, s.tier1MinEpoch);
   }
 
   Future<ThemeMode> loadThemeMode() async {

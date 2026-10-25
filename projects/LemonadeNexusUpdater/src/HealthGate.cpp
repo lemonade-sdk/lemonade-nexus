@@ -26,8 +26,10 @@ HealthResult evaluate_health(const ServerHealth& baseline, const std::optional<S
         }
     }
     // The tree log starts only after the data key unlocks, so a locked key
-    // (pending quorum) skips this check instead of waiting on it.
-    if (baseline.tree && s.data_key != "locked") {
+    // (pending quorum) skips this check instead of waiting on it. Only a
+    // current Tier 1 member holds the tree: a Tier 2 server reports no tree
+    // log, even when an older release ran one before the update.
+    if (baseline.tree && s.tier1_member && s.data_key != "locked") {
         if (!s.tree) return {HealthVerdict::Pending, "the tree log has not started"};
         if (!s.tree->healthy) return {HealthVerdict::Failed, "the tree log halted"};
         if (s.tree->behind || s.tree->held != 0 || s.tree->applied_height != s.tree->height ||

@@ -2286,13 +2286,17 @@ std::optional<AuthorityChainPage> SecurityDriver::chain_page(EpochId have_epoch,
     return page;
 }
 
+std::optional<AuthorityChainPage> SecurityDriver::authority_chain_page(EpochId have_epoch) const {
+    return chain_page(have_epoch, constants::kMaxHandoffChainLinks);
+}
+
 std::optional<AuthorityChainPage> SecurityDriver::authority_chain() const {
     return chain_page(0, std::numeric_limits<std::size_t>::max());
 }
 
 void SecurityDriver::on_authority_chain_request(const AuthorityChainRequest& request,
                                                 const NodeId& from) {
-    auto page = chain_page(request.have_epoch, constants::kMaxHandoffChainLinks);
+    auto page = authority_chain_page(request.have_epoch);
     if (!page) {
         return;
     }

@@ -77,13 +77,15 @@ gate must not treat it as a failure or wait on it.
 
 `tree` is `null` while the server runs no tree log, else `healthy`, `height`,
 `applied_height`, `behind`, and `held`. The tree log starts only after the
-data key unlocks.
+data key unlocks, and only on a current Tier 1 member: a Tier 2 server holds
+no tree and always reports `null`.
 
 The updater's health gate (`LemonadeNexusUpdater/HealthGate.hpp`) passes when
 `running_release` is the new release, the driver has not failed, `healthy` is
 true, a former Tier 1 member is a member again in the same or a later epoch,
-and a tree log that ran before has caught up. A `locked` data key skips the
-tree check and never fails or delays the gate.
+and, on a current Tier 1 member, a tree log that ran before has caught up. A
+Tier 2 server is not held to a tree log, even when an older release ran one. A
+`locked` data key skips the tree check and never fails or delays the gate.
 
 ## What the updater sees during one rollout
 

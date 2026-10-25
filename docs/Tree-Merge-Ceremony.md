@@ -48,6 +48,11 @@ that Tier 1 consensus orders.
 ## Before you start
 
 - Every server runs a release that contains this feature.
+- Only Tier 1 members hold the tree in this release. A Tier 2 server deletes
+  its tree at startup and answers `GET /api/tree/sync` with `421`. Export the
+  tree of every server that is Tier 2 now from a copy of its data directory
+  taken before it ran this release, or the devices that joined through it are
+  lost from the merge.
 - You know which server holds the root management key (the root server). Its
   identity public key is `root_pubkey`.
 - You have the mesh network id (64 hex digits). The startup log prints it, or
@@ -60,15 +65,15 @@ that Tier 1 consensus orders.
 On every server, set `tree_log_enabled` (`--tree-log` or `SP_TREE_LOG=1`) and
 restart. Do not set `tree_ops_enabled`.
 
-In read-only mode the server:
+In read-only mode a Tier 1 server:
 
 - builds an empty tree log at `data/tree/log`;
-- runs the `"tree"` sync stream: Tier 1 serves log entries, and every server
-  pulls them from Tier 1;
+- runs the `"tree"` sync stream: Tier 1 serves log entries, and every Tier 1
+  member pulls them from Tier 1;
 - keeps the direct tree write paths. The log never changes the live tree.
 
-Check each server with `GET /api/tree/sync` on the private API. Expect
-`"mode": "read-only"`, `"healthy": true`, and `"height": 0`.
+Check each Tier 1 server with `GET /api/tree/sync` on the private API.
+Expect `"mode": "read-only"`, `"healthy": true`, and `"height": 0`.
 
 ## Step 2: Freeze tree writes and export every tree
 
@@ -193,11 +198,11 @@ a log from its own tree: such a log would not match the other servers' logs,
 and it would block the merge commit, which is valid only at height 1 on the
 empty base. The halt reason names the cause. Install the commit on that
 server (step 5) and restart it. From then on, every
-tree write is a tree operation, Tier 1 orders it, and Tier 2 and lagging
-servers apply the replicated log.
+tree write is a tree operation, Tier 1 orders it, and a Tier 1 member that
+joins or lags applies the replicated log. Tier 2 servers hold no tree.
 
 Check `GET /api/tree/sync`: `"mode": "ops"`, `"healthy": true`, and the same
-`"state_root"` on every server. End the maintenance window.
+`"state_root"` on every Tier 1 server. End the maintenance window.
 
 ## Recovery
 

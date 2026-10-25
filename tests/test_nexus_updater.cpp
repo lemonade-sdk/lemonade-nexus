@@ -748,12 +748,31 @@ TEST(HealthGate, ALockedDataKeyIsInformationOnly) {
     // tree log (which starts after the unlock) is not required meanwhile.
     constexpr uint64_t kNew = 2026102401;
     auto baseline = health_of(2026100101);
+    baseline.tier1_member = true;
+    baseline.epoch = 7;
     baseline.tree = ControlTreeStatus{true, 100, 100, false, 0};
     auto now = health_of(kNew);
+    now.tier1_member = true;
+    now.epoch = 7;
     now.data_key = "locked";
     EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Healthy);
     now.data_key = "unlocked";
     EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);
+}
+
+TEST(HealthGate, ATier2ServerIsHealthyWithoutATreeLog) {
+    // An older release ran a tree log on this Tier 2 server. This release holds
+    // the tree on Tier 1 only, so after the update the server reports no tree
+    // log, and the gate does not wait for one.
+    constexpr uint64_t kNew = 2026102401;
+    auto baseline = health_of(2026100101);
+    baseline.tree = ControlTreeStatus{true, 100, 100, false, 0};
+    auto now = health_of(kNew);
+    EXPECT_FALSE(now.tier1_member);
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Healthy);
+    // The release, driver, and authority checks still apply.
+    now.driver_failed = true;
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Failed);
 }
 
 TEST(ControlClient, DecodesRepliesStrictly) {

@@ -227,7 +227,7 @@ protected:
 
         // Dummy services referenced by ApiContext. The delta route only touches
         // auth + tree, so unstarted stand-ins are never used.
-        relay = std::make_unique<relay::RelayService>(io, 0, *crypto, root_keypair.public_key);
+        relay = std::make_unique<relay::RelayService>(io, 0, *crypto);
         relay_discovery = std::make_unique<relay::RelayDiscoveryService>(*storage);
         gossip = std::make_unique<gossip::GossipService>(io, 0, *storage, *crypto);
         routing = std::make_unique<routing::RoutingCoordinationService>(*crypto, *gossip);

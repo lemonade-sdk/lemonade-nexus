@@ -20,6 +20,7 @@
 #include <LemonadeNexus/Tree/TreeOpPool.hpp>
 #include <LemonadeNexus/Tree/TreeOpSubmitter.hpp>
 #include <LemonadeNexus/Tree/TreeOps.hpp>
+#include <LemonadeNexus/Tree/TreeRole.hpp>
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -1196,6 +1197,86 @@ TEST_F(TreeReplicationTest, ARestartedReplicaReplaysItsLog) {
     EXPECT_EQ(r.tc->log().height(), 2u);
     EXPECT_EQ(r.tree->tree_digest(), digest);
     EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
+}
+
+// Only Tier 1 members hold the tree (TreeRole.hpp). These hooks are the
+// tree-log part of what main.cpp installs.
+namespace {
+tree::TreeRole::Hooks replica_role_hooks(ReplicaServer& r) {
+    return tree::TreeRole::Hooks{
+        .enter =
+            [&r] {
+                r.storage->ensure_tree_directories();
+                r.tree->start();
+                return r.tc->start();
+            },
+        .leave =
+            [&r] {
+                r.tc->deactivate("this server is not in Tier 1");
+                r.tree->close();
+            },
+        .purge = [&r] { (void)r.storage->purge_tree_files(); },
+    };
+}
+}  // namespace
+
+TEST_F(TreeReplicationTest, ATier2ServerThatJoinsTier1GetsTheTreeByReplication) {
+    commit_two_blocks();
+    // A Tier 2 server: its tree is closed and its tree log never started.
+    ReplicaServer r;
+    r.dir = dir / "joiner";
+    r.storage = std::make_unique<storage::FileStorageService>(r.dir / "data");
+    r.storage->start();
+    r.tree = std::make_unique<tree::PermissionTreeService>(*r.storage, *crypto_svc);
+    r.tree->close();
+    tree::TreeConsensusConfig config;
+    config.self = members[3];
+    config.network_id = network;
+    config.root_key = root_key;
+    config.wall_clock_ms = [this] { return now_ms; };
+    r.tc = std::make_unique<tree::TreeConsensus>(std::move(config), *r.tree, *crypto_svc,
+                                                 r.dir / "data" / "tree" / "log");
+    r.tc->set_authority_source(lookup);
+    tree::TreeRole role{replica_role_hooks(r)};
+    role.update(tree::MembershipView::NonMember, true);
+
+    // As Tier 2 it takes no replicated entry and holds no tree file.
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Halted);
+    EXPECT_FALSE(fs::exists(r.dir / "data" / "tree"));
+
+    // Finalized membership names it: it enters Tier 1 and replicates.
+    role.update(tree::MembershipView::Member, true);
+    ASSERT_TRUE(role.holds_tree());
+    ASSERT_TRUE(r.tc->healthy()) << r.tc->halt_reason();
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
+    EXPECT_EQ(r.tc->log().state().root, tc->log().state().root);
+    EXPECT_EQ(r.tree->tree_digest(), tree_svc->tree_digest());
+    EXPECT_TRUE(r.tree->get_node("beta").has_value());
+    close_replica(r);
+}
+
+TEST_F(TreeReplicationTest, ATier1ServerThatLeavesStopsItsLogAndDeletesItsTree) {
+    commit_two_blocks();
+    auto& r = make_replica("leaver");
+    ASSERT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Applied);
+    ASSERT_EQ(r.tc->receive_replicated(wire_entry(2)), tree::ReplicaResult::Applied);
+    tree::TreeRole role{replica_role_hooks(r)};
+    role.update(tree::MembershipView::Member, true);
+    ASSERT_TRUE(role.holds_tree());
+    ASSERT_TRUE(r.tc->healthy()) << r.tc->halt_reason();
+    EXPECT_EQ(r.tc->log().height(), 2u);
+
+    // Its last epoch ends.
+    role.update(tree::MembershipView::NonMember, true);
+    EXPECT_FALSE(role.holds_tree());
+    EXPECT_FALSE(fs::exists(r.dir / "data" / "tree"));
+    EXPECT_TRUE(r.tree->nodes_snapshot().empty());
+    EXPECT_FALSE(r.tc->healthy());
+    EXPECT_EQ(r.tc->log().height(), 0u);
+    EXPECT_FALSE(r.tc->encoded_entry(1).has_value());
+    EXPECT_EQ(r.tc->receive_replicated(wire_entry(1)), tree::ReplicaResult::Halted);
+    EXPECT_EQ(r.tc->submit(seal(root_op())).verdict.refusal, TreeOpRefusal::Unavailable);
 }
 
 TEST_F(TreeReplicationTest, AGapOrOutOfOrderEntryIsNotApplied) {

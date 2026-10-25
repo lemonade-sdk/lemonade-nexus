@@ -30,4 +30,26 @@ void main() {
     expect(client, isNot(ffi.nullptr));
     sdk.destroy(client);
   });
+
+  test('pins the network key and reports no Tier 1 server before a refresh', () {
+    final lib = _libFile();
+    if (!lib.existsSync()) {
+      markTestSkipped('SDK library not built at ${lib.path}');
+      return;
+    }
+    final sdk = LemonadeNexusFfi(libraryPath: lib.absolute.path);
+    expect(sdk.missingSymbols(), isEmpty);
+    final client = sdk.createTls('127.0.0.1', 1);
+    expect(client, isNot(ffi.nullptr));
+    try {
+      expect(sdk.setGenesisKey(client, 'not-a-key'), LnError.rejected);
+      // 32 zero bytes: a well-formed key.
+      expect(sdk.setGenesisKey(client, 'A' * 43 + '='), LnError.success);
+      final (error, json) = sdk.tier1Membership(client);
+      expect(error, LnError.success);
+      expect(json, contains('"servers":[]'));
+    } finally {
+      sdk.destroy(client);
+    }
+  });
 }

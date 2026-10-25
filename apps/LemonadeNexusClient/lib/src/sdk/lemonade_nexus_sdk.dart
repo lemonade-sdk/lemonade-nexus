@@ -338,6 +338,55 @@ class LemonadeNexusSdk {
     return _ffi.groupKeyUnwrap(_identity!, jsonEncode(envelope));
   }
 
+  // =========================================================================
+  // Tier 1 servers (tree traffic)
+  // =========================================================================
+
+  /// Pin the network's Genesis public key (base64, the server config's
+  /// `genesis_pubkey`). The SDK sends every tree, session, and private-API
+  /// request only to Tier 1 servers it verifies from this key, and fails over
+  /// between them. Without a key those requests are not sent. [minEpoch] is
+  /// the lowest Tier 1 epoch to accept (the last one this app verified).
+  void setGenesisKey(String genesisPubkeyB64, {int minEpoch = 0}) {
+    _checkDisposed();
+    _checkConnected();
+    final error = _ffi.setGenesisKey(_client!, genesisPubkeyB64, minEpoch: minEpoch);
+    if (error != LnError.success) {
+      throw SdkException(error,
+          message: 'The network key must be a base64 Ed25519 public key');
+    }
+  }
+
+  /// Verify the Tier 1 membership now. Returns {epoch, members, servers}.
+  Future<Map<String, dynamic>> refreshTier1() async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = await _offThread((f, c) => f.tier1Refresh(c));
+    return _tier1Result(error, json, 'Tier 1 verification failed');
+  }
+
+  /// The last verified Tier 1 membership, without network I/O.
+  Future<Map<String, dynamic>> tier1Membership() async {
+    _checkDisposed();
+    _checkConnected();
+    final (error, json) = _ffi.tier1Membership(_client!);
+    return _tier1Result(error, json, 'Tier 1 membership is not available');
+  }
+
+  Map<String, dynamic> _tier1Result(LnError error, String? json, String fallback) {
+    if (error != LnError.success || json == null) {
+      String? reason;
+      if (json != null) {
+        try {
+          reason = (jsonDecode(json) as Map<String, dynamic>)['error']?.toString();
+        } catch (_) {}
+      }
+      throw SdkException(error == LnError.success ? LnError.internal : error,
+          message: reason ?? fallback, rawJson: json);
+    }
+    return _parseJson<Map<String, dynamic>>(json, (m) => m);
+  }
+
   /// Set the single-use device-link token injected into the next joinNetwork.
   void setLinkToken(String token) {
     _checkDisposed();
