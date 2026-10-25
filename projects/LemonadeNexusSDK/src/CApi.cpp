@@ -1,12 +1,15 @@
 #include <LemonadeNexusSDK/lemonade_nexus.h>
 #include <LemonadeNexusSDK/LemonadeNexusClient.hpp>
 #include <LemonadeNexusSDK/GroupKey.hpp>
+#include <LemonadeNexusSDK/MeshPort.hpp>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 
@@ -32,6 +35,9 @@ static ln_error_t ln_map_error(int http_status) {
 
 struct ln_client_s {
     lnsdk::LemonadeNexusClient client;
+    std::mutex mesh_port_mutex;
+    // Declared after `client` so it is destroyed, and stopped, first.
+    std::unique_ptr<lnsdk::MeshPort> mesh_port;
     explicit ln_client_s(const lnsdk::ServerConfig& cfg) : client{cfg} {}
 };
 
@@ -1219,4 +1225,70 @@ ln_error_t ln_routing_connection_status(ln_client_t* client, const char* connect
               {"expires_at", r.value.expires_at}};
     *out_json = strdup_json(j);
     return LN_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Mesh port
+// ---------------------------------------------------------------------------
+
+// The mesh port is created on first use and lives until ln_destroy, so callers
+// use the returned pointer without holding mesh_port_mutex.
+static lnsdk::MeshPort* ln_mesh_port(ln_client_t* client, bool create) {
+    std::lock_guard lock(client->mesh_port_mutex);
+    if (!client->mesh_port && create) {
+        client->mesh_port = std::make_unique<lnsdk::MeshPort>(lnsdk::make_mesh_port_backend(client->client));
+    }
+    return client->mesh_port.get();
+}
+
+ln_error_t ln_mesh_port_start(ln_client_t* client, uint16_t port, const char* local_service_url) {
+    if (!client) return LN_ERR_NULL_ARG;
+    try {
+        switch (ln_mesh_port(client, true)->start(port, local_service_url ? local_service_url : "")) {
+            case lnsdk::MeshPortStartResult::Ok:              return LN_OK;
+            case lnsdk::MeshPortStartResult::InvalidArgument: return LN_ERR_REJECTED;
+            case lnsdk::MeshPortStartResult::AlreadyRunning:  return LN_ERR_REJECTED;
+            case lnsdk::MeshPortStartResult::PortInUse:       return LN_ERR_PORT_IN_USE;
+            case lnsdk::MeshPortStartResult::BindFailed:      return LN_ERR_INTERNAL;
+        }
+        return LN_ERR_INTERNAL;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
+ln_error_t ln_mesh_port_stop(ln_client_t* client) {
+    if (!client) return LN_ERR_NULL_ARG;
+    try {
+        if (auto* mesh_port = ln_mesh_port(client, false)) mesh_port->stop();
+        return LN_OK;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
+ln_error_t ln_mesh_port_set_selection(ln_client_t* client, const char* target, const char* peer_key) {
+    if (!client) return LN_ERR_NULL_ARG;
+    try {
+        auto* mesh_port = ln_mesh_port(client, false);
+        if (!mesh_port) return LN_ERR_REJECTED;
+        switch (mesh_port->set_selection(target ? target : "", peer_key ? peer_key : "")) {
+            case 0:   return LN_OK;
+            case 403: return LN_ERR_AUTH;
+            case 404: return LN_ERR_NOT_FOUND;
+            default:  return LN_ERR_REJECTED;
+        }
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
+}
+
+ln_error_t ln_mesh_port_status(ln_client_t* client, char** out_json) {
+    if (!client || !out_json) return LN_ERR_NULL_ARG;
+    try {
+        *out_json = strdup_json(ln_mesh_port(client, true)->status());
+        return *out_json ? LN_OK : LN_ERR_INTERNAL;
+    } catch (...) {
+        return LN_ERR_INTERNAL;
+    }
 }
