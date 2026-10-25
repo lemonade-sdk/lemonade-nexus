@@ -215,17 +215,27 @@ TEST(ReleaseApproval, AnOlderCollectorWireVersionIsRejectedEvenResigned) {
     EXPECT_EQ(error, "release protocol identity does not match the compiled protocol");
 }
 
-TEST(ReleaseApproval, ThePreviousReleaseLineIdentityIsRejectedEvenResigned) {
+TEST(ReleaseApproval, TheSourceIdentityComesFromTheSignedApproval) {
+    // Phase 0.3: a newer release may name another source line; only the
+    // release signature vouches for it.
     SignedFixture fixture;
     fixture.bundle.approval.source_commit =
         "c2ea54553a2d4532aa37269b3586f7f7d0540a4d";
     fixture.bundle.approval.starting_patched_tree =
         "4957f06d7f02de4b4e143004e4cc369c79a791c5";
-    fixture.resign();
     std::string error;
     EXPECT_FALSE(verify_release_approval_bundle(
         fixture.bundle, fixture.genesis_pk, fixture.network, error));
-    EXPECT_EQ(error, "release source identity does not match this current-head line");
+    EXPECT_EQ(error, "release approval signature is invalid");
+    fixture.resign();
+    EXPECT_TRUE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error)) << error;
+
+    fixture.bundle.approval.source_commit = "c2ea5455";
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release source identity is not three 40-hex object ids");
 }
 
 TEST(ReleaseApproval, TheSingleMeasurementFormatVersionIsRetired) {
@@ -324,23 +334,47 @@ TEST(ReleaseApproval, TheBundleJsonRoundTripsWithItsSignatures) {
               release_approval_digest(fixture.bundle.approval));
 }
 
-TEST(ReleaseApproval, MeasurementOutsideTheApprovedSetIsRejectedEvenResigned) {
+TEST(ReleaseApproval, TheBootLineComesFromTheSignedApprovalOnly) {
+    // Phase 0.3: a server on release N must accept an N+1 approval that
+    // changes the kernel, the IMA policy, or the SVSM launch measurements.
     SignedFixture fixture;
     std::string error;
-    const auto approved = fixture.bundle.approval.svsm_launch_measurements_hex.front();
+    auto& a = fixture.bundle.approval;
+    a.svsm_launch_measurements_hex = {std::string(96, 'a')};
+    a.kernel = {"7.2.0-coconut-svsm-tier1+", std::string(64, 'b'), std::string(64, 'c'),
+                std::string(64, 'd'), std::string(64, 'e')};
+    a.ima_policy_id = "nexus-tier1-ima-v2";
+    a.ima_policy_sha256 = std::string(64, 'f');
+    // Unsigned edits are refused by the release signature.
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release approval signature is invalid");
+    fixture.resign();
+    ASSERT_TRUE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error)) << error;
 
-    fixture.bundle.approval.svsm_launch_measurements_hex = {std::string(96, 'a')};
+    // The attestation profile takes the boot line from the approval.
+    const auto profile = profile_from_release_approval(a);
+    EXPECT_EQ(profile.snp.expected_measurements_hex, a.svsm_launch_measurements_hex);
+    EXPECT_EQ(profile.ima_policy_id, "nexus-tier1-ima-v2");
+    EXPECT_EQ(crypto::to_hex(profile.ima_policy_digest), std::string(64, 'f'));
+    EXPECT_NE(profile.kernel_artifact_identity.find("linux=7.2.0-coconut-svsm-tier1+;"),
+              std::string::npos);
+    EXPECT_NE(profile.kernel_artifact_identity.find("bzImage-sha256=" + std::string(64, 'b')),
+              std::string::npos);
+
+    // The form is still checked: a short hash or an empty field fails closed.
+    a.kernel.vmlinux_sha256 = "c0ffee";
     fixture.resign();
     EXPECT_FALSE(verify_release_approval_bundle(
         fixture.bundle, fixture.genesis_pk, fixture.network, error));
-    EXPECT_EQ(error, "release kernel, IMA, or SVSM launch identity is not approved");
-
-    // A signed superset does not widen the compiled approval either.
-    fixture.bundle.approval.svsm_launch_measurements_hex = {approved, std::string(96, 'a')};
+    EXPECT_EQ(error, "release kernel or IMA identity is incomplete or not SHA-256");
+    a.kernel.vmlinux_sha256 = std::string(64, 'c');
+    a.ima_policy_id.clear();
     fixture.resign();
     EXPECT_FALSE(verify_release_approval_bundle(
         fixture.bundle, fixture.genesis_pk, fixture.network, error));
-    EXPECT_EQ(error, "release kernel, IMA, or SVSM launch identity is not approved");
+    EXPECT_EQ(error, "release kernel or IMA identity is incomplete or not SHA-256");
 }
 
 TEST(ReleaseApproval, AnEmptyMeasurementSetIsRefused) {
@@ -381,22 +415,33 @@ TEST(ReleaseApproval, NonCanonicalMeasurementSetsAreRefused) {
     }
 }
 
-TEST(ReleaseApproval, TemplatePinsTheCurrentReleaseLine) {
-    // Pins are re-issued at each release cut; this names the line in force.
+TEST(ReleaseApproval, TheTemplateCarriesOnlyTheCompiledFloors) {
+    // The boot line is release data from release/fleet-profile.json; the
+    // template names only what this binary implements and the TCB floor.
     const auto t = release_approval_template();
-    EXPECT_EQ(t.source_commit, "dd80e7f99d104e6be71ee9c30e32d39ea911bec8");
-    EXPECT_EQ(t.starting_patched_tree,
-              "148bcf279cd18a7c46295fcd76db022ed5451422");
-    // The compiled measurement set must already be canonical: sorted, unique,
-    // and anchored on the qualified 2-vCPU shape as its first member.
-    ASSERT_FALSE(t.svsm_launch_measurements_hex.empty());
-    EXPECT_TRUE(std::is_sorted(t.svsm_launch_measurements_hex.begin(),
-                               t.svsm_launch_measurements_hex.end()));
-    EXPECT_EQ(std::adjacent_find(t.svsm_launch_measurements_hex.begin(),
-                                 t.svsm_launch_measurements_hex.end()),
-              t.svsm_launch_measurements_hex.end());
-    EXPECT_EQ(t.svsm_launch_measurements_hex.front().substr(0, 16),
-              "2f073e15d2501910");
+    EXPECT_TRUE(t.source_commit.empty());
+    EXPECT_TRUE(t.starting_patched_tree.empty());
+    EXPECT_TRUE(t.kernel.release.empty());
+    EXPECT_TRUE(t.ima_policy_sha256.empty());
+    EXPECT_TRUE(t.svsm_launch_measurements_hex.empty());
+    EXPECT_TRUE(t.min_tcb.at_least(kReleaseMinTcb));
+    EXPECT_TRUE(kReleaseMinTcb.at_least(t.min_tcb));
+    EXPECT_EQ(t.security_ruleset, constants::kSecurityRulesetVersion);
+    EXPECT_EQ(t.attestd_wire_version, constants::kAttestdWireVersion);
+}
+
+TEST(ReleaseApproval, TheTcbFloorStaysCompiled) {
+    SignedFixture fixture;
+    std::string error;
+    fixture.bundle.approval.min_tcb = {0x0b, 0, 0x1c, 0};
+    fixture.resign();
+    EXPECT_FALSE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error));
+    EXPECT_EQ(error, "release TCB floor is below policy or invents an uncited component floor");
+    fixture.bundle.approval.min_tcb = {0x0d, 0, 0x1d, 0};  // a raised floor is fine
+    fixture.resign();
+    EXPECT_TRUE(verify_release_approval_bundle(
+        fixture.bundle, fixture.genesis_pk, fixture.network, error)) << error;
 }
 
 TEST(ReleaseApproval, GenoaFloorBoundariesRejectObservedHost) {

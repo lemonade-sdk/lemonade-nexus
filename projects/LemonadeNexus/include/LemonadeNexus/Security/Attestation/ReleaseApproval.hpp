@@ -29,6 +29,12 @@ inline constexpr uint32_t kReleaseApprovalFormatVersion = 3;
 /// Upper bound of a release number: the tag date as YYYYMMDD times 100 plus
 /// the release of that day (vYYYY.MM.DD.N).
 inline constexpr uint64_t kMaxReleaseNumber = 9999123199ULL;
+/// The compiled TCB floor (AMD-SB-3030 bootloader, AMD-SB-3034 SNP firmware).
+/// An approval may raise it, never lower it. It is one of the compiled floors
+/// the design keeps; the other floors are the protocol identity (wire and
+/// ruleset versions, attestation profile, attestd wire version), which name
+/// what this binary itself implements.
+inline constexpr TcbVersion kReleaseMinTcb{0x0c, 0x00, 0x1c, 0x00};
 inline constexpr std::string_view kReleaseApprovalPath =
     "/usr/lib/lemonade-nexus/release/release-approval.json";
 
@@ -112,8 +118,11 @@ struct ReleaseApprovalBundleV1 {
 [[nodiscard]] std::string release_approval_digest_hex(
     const ReleaseApprovalV1& approval);
 
-/// The compiled release line as an approval skeleton; observation fields stay
-/// empty for the generator to fill, so template and verifier cannot drift.
+/// The compiled protocol identity as an approval skeleton: wire and ruleset
+/// versions, the attestation profile, the TCB floor, and the collector path.
+/// The boot line (source identity, kernel, IMA policy, SVSM launch
+/// measurements) and every observation stay empty; the generator fills them
+/// from release/fleet-profile.json (Design-Auto-Update Phase 0.3).
 [[nodiscard]] ReleaseApprovalV1 release_approval_template();
 
 /// The complete signed bundle as JSON, in the form parse_release_approval_bundle
@@ -132,9 +141,13 @@ struct ReleaseApprovalBundleV1 {
     const NetworkId& expected_network_id,
     std::string& error);
 
-// Verifies Genesis delegation first, then the release signature, then every
-// compiled protocol/release invariant. Hashes are not exposed to callers until
-// all three checks succeed. Requires format 3.
+// Verifies Genesis delegation first, then the release signature, then the
+// compiled protocol identity and TCB floor, then the form of every release
+// field. The boot line (kernel, IMA policy, SVSM launch measurements) is
+// verified against the signed approval only: it is release data, so a newer
+// approval may change it. Callers that adopt an approval must also apply the
+// signer pin and the release-number rule (ReleaseChain). Hashes are not
+// exposed to callers until every check succeeds. Requires format 3.
 [[nodiscard]] bool verify_release_approval_bundle(
     const ReleaseApprovalBundleV1& bundle,
     const crypto::Ed25519PublicKey& genesis_public_key,
@@ -152,6 +165,8 @@ struct ReleaseApprovalBundleV1 {
 
 // Converts only an already verified approval. Pending PCR8/PCR9 deliberately
 // leave the profile incomplete, keeping production Tier-1 admission disabled.
+// The SVSM launch measurements, TCB floor, IMA policy, and kernel identity come
+// from the approval.
 // Each approved path accepts the hashes of this release and of the previous
 // release (previous_release_paths).
 [[nodiscard]] LinuxAttestationProfile profile_from_release_approval(

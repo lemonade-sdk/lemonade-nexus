@@ -10,6 +10,7 @@
 #include <LemonadeNexusUpdater/Updater.hpp>
 
 #include <LemonadeNexus/Core/GenesisAnchor.hpp>
+#include <LemonadeNexus/Core/UpgradeControl.hpp>
 
 #include <nlohmann/json.hpp>
 #include <sodium.h>
@@ -95,9 +96,9 @@ int main(int argc, char** argv) {
     nexus::updater::UpdaterEnv env;
     env.http = nexus::updater::https_get;
     env.control = [](std::string_view request) {
-        return nexus::update::control_exchange(
-            std::string(nexus::update::kUpdateControlSocketPath), request,
-            nexus::update::kControlDeadlineSeconds);
+        return nexus::updater::control_exchange(
+            std::string(nexus::core::kUpgradeControlSocketPath), request,
+            nexus::updater::kControlDeadlineSeconds);
     };
     env.run = nexus::updater::run_command;
     env.provenance = [root = *sigstore, policy](std::string_view bundle, std::string_view sha256,

@@ -833,6 +833,11 @@ UpgradeGate UpgradeService::gate(uint64_t release_number) const {
     return evaluate_upgrade_gate(state_, config_.self, release_number);
 }
 
+const std::optional<ReleaseApprovalBundleV1>& UpgradeService::accepted_approval() const {
+    static const std::optional<ReleaseApprovalBundleV1> kNone;
+    return chain_ != nullptr && chain_->healthy() ? chain_->current() : kNone;
+}
+
 UpgradeHealthReport UpgradeService::health() const {
     UpgradeHealthReport report;
     report.running_release = config_.running_release;

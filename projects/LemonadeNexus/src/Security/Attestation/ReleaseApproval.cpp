@@ -19,35 +19,6 @@ namespace {
 
 using json = nlohmann::json;
 
-// Pinned release line; pins are re-issued at each release cut.
-// final_patched_tree is generator-computed from the built tree, never
-// hand-typed.
-constexpr std::string_view kExpectedSourceCommit =
-    "dd80e7f99d104e6be71ee9c30e32d39ea911bec8";
-constexpr std::string_view kExpectedStartingTree =
-    "148bcf279cd18a7c46295fcd76db022ed5451422";
-constexpr std::string_view kExpectedKernelRelease =
-    "7.1.0-coconut-svsm-tier1+";
-constexpr std::string_view kExpectedBzImage =
-    "d9854417fea45a490b632b0e7860827b34443f94da0877e34a0633bbb5078584";
-constexpr std::string_view kExpectedVmlinux =
-    "dfb88d060ef4fca3b51ce87b95803ad6b64addaad840d4aecb63bc85e9bcd552";
-constexpr std::string_view kExpectedModuleTree =
-    "8735b602a2e2b86dcc5bd06426e345a09f9c279ceaeb989acd6db0b11279a2be";
-constexpr std::string_view kExpectedModuleCertificate =
-    "a43447d3a1658efc13eb1349f1d14e9727630280e5449c5c5459885f9eb88de5";
-constexpr std::string_view kExpectedImaPolicyId = "nexus-tier1-ima-v1";
-constexpr std::string_view kExpectedImaPolicy =
-    "b3cabc30317af8b7127a175d7b4f906a40203e7ebe28122d82a713e03dad4092";
-// One entry per approved VM shape. Keep sorted ascending and unique: the
-// entries are the canonical set the preimage encodes verbatim.
-constexpr std::string_view kExpectedLaunchMeasurements[] = {
-    "2f073e15d2501910b6208ca52a349d16247d443f326cee2b46292d608821"
-    "c6e84c2490814e22a2b5ba860a37208d1d9a",
-    "bca89f077c4d647b08ce1fb83cfa92ff12789815378baa0de00ca883e40e"
-    "79313e3df3f88b9798a7eb53ab1b3ff59a54",
-};
-
 json approved_paths_json(const std::vector<ApprovedPath>& paths) {
     json out = json::array();
     for (const auto& path : paths) {
@@ -163,10 +134,9 @@ bool compiled_release_fields_match(const ReleaseApprovalV1& a, std::string& erro
         error = "release number is outside the valid range";
         return false;
     }
-    if (a.source_commit != kExpectedSourceCommit ||
-        a.starting_patched_tree != kExpectedStartingTree ||
+    if (!valid_hex(a.source_commit, 40) || !valid_hex(a.starting_patched_tree, 40) ||
         !valid_hex(a.final_patched_tree, 40)) {
-        error = "release source identity does not match this current-head line";
+        error = "release source identity is not three 40-hex object ids";
         return false;
     }
     if (a.security_wire_version != constants::kSecurityWireVersion ||
@@ -178,26 +148,22 @@ bool compiled_release_fields_match(const ReleaseApprovalV1& a, std::string& erro
         error = "release protocol identity does not match the compiled protocol";
         return false;
     }
+    // The boot line (kernel, IMA policy, SVSM launch measurements, and the
+    // source it was built from) is release data, not compiled policy
+    // (Design-Auto-Update Phase 0.3). The signed approval carries it, so a
+    // server on release N accepts an N+1 approval that changes it. Only the
+    // form is checked here.
     if (!valid_measurement_set(a.svsm_launch_measurements_hex, error)) return false;
-    // Set equality: both sides are canonically sorted and unique, so
-    // element-wise comparison is the whole check.
-    if (a.kernel.release != kExpectedKernelRelease ||
-        a.kernel.bzimage_sha256 != kExpectedBzImage ||
-        a.kernel.vmlinux_sha256 != kExpectedVmlinux ||
-        a.kernel.module_tree_sha256 != kExpectedModuleTree ||
-        a.kernel.module_certificate_der_sha256 != kExpectedModuleCertificate ||
-        a.ima_policy_id != kExpectedImaPolicyId ||
-        a.ima_policy_sha256 != kExpectedImaPolicy ||
-        a.svsm_launch_measurements_hex.size() != std::size(kExpectedLaunchMeasurements) ||
-        !std::equal(a.svsm_launch_measurements_hex.begin(),
-                    a.svsm_launch_measurements_hex.end(),
-                    std::begin(kExpectedLaunchMeasurements))) {
-        error = "release kernel, IMA, or SVSM launch identity is not approved";
+    if (a.kernel.release.empty() || !valid_sha256(a.kernel.bzimage_sha256) ||
+        !valid_sha256(a.kernel.vmlinux_sha256) || !valid_sha256(a.kernel.module_tree_sha256) ||
+        !valid_sha256(a.kernel.module_certificate_der_sha256) || a.ima_policy_id.empty() ||
+        !valid_sha256(a.ima_policy_sha256)) {
+        error = "release kernel or IMA identity is incomplete or not SHA-256";
         return false;
     }
     // Floors from AMD-SB-3030/3034; policy cites no TEE or microcode minimum.
-    if (a.min_tcb.bootloader < 0x0c || a.min_tcb.snp < 0x1c ||
-        a.min_tcb.tee != 0 || a.min_tcb.microcode != 0) {
+    if (!a.min_tcb.at_least(kReleaseMinTcb) || a.min_tcb.tee != 0 ||
+        a.min_tcb.microcode != 0) {
         error = "release TCB floor is below policy or invents an uncited component floor";
         return false;
     }
@@ -298,22 +264,13 @@ std::string release_approval_digest_hex(const ReleaseApprovalV1& approval) {
 
 ReleaseApprovalV1 release_approval_template() {
     ReleaseApprovalV1 a;
-    a.source_commit = std::string(kExpectedSourceCommit);
-    a.starting_patched_tree = std::string(kExpectedStartingTree);
     a.security_wire_version = constants::kSecurityWireVersion;
     a.security_ruleset = constants::kSecurityRulesetVersion;
     a.consensus_ruleset = constants::kConsensusRulesetVersion;
     a.attestation_profile = "SnpSvsmVtpm";
     a.attestation_profile_ruleset = kAttestationProfileRulesetVersion;
     a.attestd_wire_version = constants::kAttestdWireVersion;
-    a.ima_policy_id = std::string(kExpectedImaPolicyId);
-    a.ima_policy_sha256 = std::string(kExpectedImaPolicy);
-    a.kernel = {std::string(kExpectedKernelRelease), std::string(kExpectedBzImage),
-                std::string(kExpectedVmlinux), std::string(kExpectedModuleTree),
-                std::string(kExpectedModuleCertificate)};
-    a.svsm_launch_measurements_hex.assign(std::begin(kExpectedLaunchMeasurements),
-                                          std::end(kExpectedLaunchMeasurements));
-    a.min_tcb = {0x0c, 0, 0x1c, 0};
+    a.min_tcb = kReleaseMinTcb;
     a.evidence_collector_path = "/usr/bin/nexus-attestd";
     return a;
 }
@@ -466,6 +423,15 @@ LinuxAttestationProfile profile_from_release_approval(const ReleaseApprovalV1& a
     auto profile = linux_attestation_profile_v3_svsm_release();
     profile.snp.min_tcb = approval.min_tcb;
     profile.snp.expected_measurements_hex = approval.svsm_launch_measurements_hex;
+    profile.ima_policy_id = approval.ima_policy_id;
+    if (const auto policy = crypto::from_hex(approval.ima_policy_sha256);
+        policy.size() == profile.ima_policy_digest.size()) {
+        std::copy(policy.begin(), policy.end(), profile.ima_policy_digest.begin());
+    }
+    profile.kernel_artifact_identity =
+        "linux=" + approval.kernel.release + ";bzImage-sha256=" + approval.kernel.bzimage_sha256 +
+        ";vmlinux-sha256=" + approval.kernel.vmlinux_sha256 +
+        ";module-tree-sha256=" + approval.kernel.module_tree_sha256;
     profile.approved_paths = approval.approved_paths;
     for (auto& path : profile.approved_paths) {
         const auto prior = std::find_if(

@@ -2,41 +2,40 @@
 
 namespace nexus::updater {
 
-HealthResult evaluate_health(const update::UpdateServerStatus& baseline,
-                             const std::optional<update::UpdateServerStatus>& now,
-                             const HealthExpectation& expected) {
+HealthResult evaluate_health(const ServerHealth& baseline, const std::optional<ServerHealth>& now,
+                             uint64_t expected_release) {
     if (!now) return {HealthVerdict::Pending, "the server does not answer yet"};
     const auto& s = *now;
-    if (s.version != expected.version) {
-        return {HealthVerdict::Failed,
-                "the server reports version " + s.version + ", expected " + expected.version};
+    if (s.running_release != expected_release) {
+        return {HealthVerdict::Failed, "the server runs release " +
+                                           std::to_string(s.running_release) + ", expected " +
+                                           std::to_string(expected_release)};
     }
-    if (s.release_id != expected.release_id ||
-        s.approval_digest_hex != expected.approval_digest_hex) {
-        return {HealthVerdict::Failed, "the server has not loaded the new release approval"};
+    if (s.driver_failed) {
+        return {HealthVerdict::Failed, "the security driver failed (" + s.driver_phase + ")"};
     }
-    if (!s.storage_files_ready) {
-        return {HealthVerdict::Pending, "the data key is not unlocked"};
+    if (!s.healthy) {
+        return {HealthVerdict::Pending, "the server holds no verified epoch authority yet"};
     }
     if (baseline.tier1_member) {
-        if (!s.epoch_known || !s.tier1_member) {
+        if (!s.tier1_member || !s.epoch) {
             return {HealthVerdict::Pending, "the server is not a Tier 1 member again"};
         }
-        if (s.epoch < baseline.epoch) {
+        if (baseline.epoch && *s.epoch < *baseline.epoch) {
             return {HealthVerdict::Pending, "the server has not resumed the current epoch"};
         }
     }
-    if (baseline.tree_enabled) {
-        if (!s.tree_enabled) {
-            return {HealthVerdict::Failed, "the tree log is disabled after the update"};
-        }
-        if (!s.tree_healthy) return {HealthVerdict::Failed, "the tree log halted"};
-        if (s.tree_behind || s.tree_held != 0 || s.tree_applied_height != s.tree_height ||
-            s.tree_height < baseline.tree_height) {
+    // The tree log starts only after the data key unlocks, so a locked key
+    // (pending quorum) skips this check instead of waiting on it.
+    if (baseline.tree && s.data_key != "locked") {
+        if (!s.tree) return {HealthVerdict::Pending, "the tree log has not started"};
+        if (!s.tree->healthy) return {HealthVerdict::Failed, "the tree log halted"};
+        if (s.tree->behind || s.tree->held != 0 || s.tree->applied_height != s.tree->height ||
+            s.tree->height < baseline.tree->height) {
             return {HealthVerdict::Pending, "the tree log has not caught up"};
         }
     }
-    return {HealthVerdict::Healthy, "healthy on " + expected.version};
+    return {HealthVerdict::Healthy, "healthy on release " + std::to_string(expected_release)};
 }
 
 }  // namespace nexus::updater

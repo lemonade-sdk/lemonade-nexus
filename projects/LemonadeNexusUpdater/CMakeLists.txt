@@ -15,6 +15,7 @@ endif()
 # responses, a fake server socket, and a temporary root
 # (tests/test_nexus_updater.cpp).
 add_library(LemonadeNexusUpdaterCore
+        src/ControlClient.cpp
         src/FileSwap.cpp
         src/HealthGate.cpp
         src/OsPackages.cpp

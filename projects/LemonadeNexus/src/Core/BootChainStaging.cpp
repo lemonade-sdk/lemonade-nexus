@@ -34,17 +34,10 @@ std::optional<security::SealedBlob> read_blob(const fs::path& path) {
 
 }  // namespace
 
-update::BootChainStageResult stage_boot_chain_for_approval(const BootChainStagingInputs& inputs,
-                                                           std::string_view approval_json) {
-    update::BootChainStageResult result;
-    std::string error;
-    const auto bundle = security::parse_release_approval_bundle(approval_json, error);
-    if (!bundle || !security::verify_release_approval_bundle(*bundle, inputs.genesis_public_key,
-                                                             inputs.network_id, error)) {
-        result.detail = "the release approval does not verify: " + error;
-        return result;
-    }
-    const auto next = security::boot_pcrs_from_approval(bundle->approval);
+BootChainStageResult stage_boot_chain_for_approval(
+    const BootChainStagingInputs& inputs, const security::ReleaseApprovalBundleV1& accepted) {
+    BootChainStageResult result;
+    const auto next = security::boot_pcrs_from_approval(accepted.approval);
     if (!next) {
         result.detail = "the release approval carries no qualified PCR 8/9 values";
         return result;
@@ -92,9 +85,9 @@ update::BootChainStageResult stage_boot_chain_for_approval(const BootChainStagin
     }
     result.ok = true;
     result.detail = names.empty() ? "no sealed boot-set secrets on this host"
-                                  : "staged for release " + bundle->approval.release_id;
+                                  : "staged for release " + accepted.approval.release_id;
     spdlog::info("[update] boot chain staged for release {} ({} secrets)",
-                 bundle->approval.release_id, result.staged.size());
+                 accepted.approval.release_id, result.staged.size());
     return result;
 }
 

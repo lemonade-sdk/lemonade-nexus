@@ -5,10 +5,11 @@
 //                        [--approval-preimage <file>] [--authority-preimage <file>]
 //                        [--previous-approval <bundle.json>]
 //
-// --previous-approval reads the previous release's bundle and copies its
-// approved_paths into previous_release_paths, so servers on both releases
-// attest each other during the rollout. It replaces any
-// "previous_release_paths" in the spec.
+// --previous-approval reads the previous release's signed bundle. Its
+// approval must be signed by the same release key for the same network. Its
+// approved_paths become previous_release_paths (for the paths this release
+// still lists), so servers on both releases attest each other during the
+// rollout. It cannot be combined with "previous_release_paths" in the spec.
 //
 // Spec format:
 //   {
@@ -19,13 +20,16 @@
 //     "network_id": "<64-hex>", "signer_pubkey": "<base64 Ed25519>",
 //     "qualification_state": "PENDING_LIVE_QUALIFICATION" | "LIVE_BOOT_APPROVED",
 //     "expected_pcrs": [{"index": 8, "sha256": "..."}, {"index": 9, "sha256": "..."}],
-//     "svsm_launch_measurements": ["<96-hex>", ...],   // optional; one per approved
-//                                                      // VM shape, else the compiled set
+//     // The boot line, from release/fleet-profile.json (all required):
+//     "source_commit": "<40-hex>", "starting_patched_tree": "<40-hex>",
+//     "ima_policy": {"id": "...", "sha256": "<64-hex>"},
+//     "kernel": {"release": "...", "bzimage_sha256": "<64-hex>", "vmlinux_sha256": "<64-hex>",
+//                "module_tree_sha256": "<64-hex>", "module_certificate_der_sha256": "<64-hex>"},
+//     "svsm_launch_measurements": ["<96-hex>", ...],   // one per approved VM shape
 //     "artifacts": [{"path": "/usr/bin/lemonade-nexus", "file": "build/bin/lemonade-nexus"},
-//                   {"path": "/usr/lib/x86_64-linux-gnu/libc.so.6", "sha256": ["<64-hex>"]}, ...],
+//                   {"path": "/usr/lib/x86_64-linux-gnu/libc.so.6", "sha256": ["<64-hex>"]}, ...]
 //                                                      // "sha256" for reviewed digests of
 //                                                      // files the build does not produce
-//     "previous_approval": "<path to the previous signed bundle>"   // optional overlap
 //   }
 //
 // No key material is read or written; signatures stay empty.
@@ -96,8 +100,18 @@ int main(int argc, char** argv) {
             spec.expected_pcrs.emplace_back(pcr.at("index").get<uint32_t>(),
                                             pcr.at("sha256").get<std::string>());
         }
-        for (const auto& measurement :
-             spec_json.value("svsm_launch_measurements", nlohmann::json::array())) {
+        spec.source_commit = spec_json.at("source_commit").get<std::string>();
+        spec.starting_patched_tree = spec_json.at("starting_patched_tree").get<std::string>();
+        spec.ima_policy_id = spec_json.at("ima_policy").at("id").get<std::string>();
+        spec.ima_policy_sha256 = spec_json.at("ima_policy").at("sha256").get<std::string>();
+        const auto& kernel = spec_json.at("kernel");
+        spec.kernel.release = kernel.at("release").get<std::string>();
+        spec.kernel.bzimage_sha256 = kernel.at("bzimage_sha256").get<std::string>();
+        spec.kernel.vmlinux_sha256 = kernel.at("vmlinux_sha256").get<std::string>();
+        spec.kernel.module_tree_sha256 = kernel.at("module_tree_sha256").get<std::string>();
+        spec.kernel.module_certificate_der_sha256 =
+            kernel.at("module_certificate_der_sha256").get<std::string>();
+        for (const auto& measurement : spec_json.at("svsm_launch_measurements")) {
             spec.svsm_launch_measurements.push_back(measurement.get<std::string>());
         }
         for (const auto& artifact : spec_json.at("artifacts")) {
@@ -111,16 +125,7 @@ int main(int argc, char** argv) {
             spec.artifacts.push_back(std::move(entry));
         }
         if (spec_json.contains("previous_approval")) {
-            const auto path = spec_json.at("previous_approval").get<std::string>();
-            std::ifstream previous_stream(path, std::ios::binary);
-            if (!previous_stream) return fail("cannot read previous approval: " + path);
-            const std::string text{std::istreambuf_iterator<char>(previous_stream),
-                                   std::istreambuf_iterator<char>()};
-            std::string parse_error;
-            const auto previous =
-                nexus::security::parse_release_approval_bundle(text, parse_error);
-            if (!previous) return fail("previous approval does not parse: " + parse_error);
-            spec.previous = previous->approval;
+            return fail("\"previous_approval\" is not a spec field; use --previous-approval");
         }
     } catch (const std::exception& e) {
         return fail(std::string("spec field error: ") + e.what());
@@ -134,7 +139,7 @@ int main(int argc, char** argv) {
                                std::istreambuf_iterator<char>());
         const auto previous = nexus::security::parse_release_approval_bundle(text, error);
         if (!previous.has_value()) return fail(error);
-        spec.previous_release_paths = previous->approval.approved_paths;
+        spec.previous = previous->approval;
     }
     const auto approval = nexus::security::generate_release_approval(spec, error);
     if (!approval.has_value()) return fail(error);

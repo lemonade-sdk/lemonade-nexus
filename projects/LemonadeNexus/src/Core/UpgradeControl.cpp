@@ -31,10 +31,21 @@ std::optional<uint64_t> release_number_of(const json& request) {
     return value;
 }
 
+json tree_json(const UpgradeControlHooks& hooks) {
+    const auto tree = hooks.tree_status ? hooks.tree_status() : std::nullopt;
+    if (!tree) return nullptr;
+    return {{"healthy", tree->healthy},
+            {"height", tree->height},
+            {"applied_height", tree->applied_height},
+            {"behind", tree->behind},
+            {"held", tree->held}};
+}
+
 }  // namespace
 
 std::string handle_upgrade_control_request(security::UpgradeService& service,
-                                           std::string_view line) {
+                                           std::string_view line,
+                                           const UpgradeControlHooks& hooks) {
     if (line.size() > kMaxUpgradeControlLine) return refuse("request too large");
     const json request = json::parse(line.begin(), line.end(), nullptr, false);
     if (request.is_discarded() || !request.is_object()) {
@@ -76,7 +87,8 @@ std::string handle_upgrade_control_request(security::UpgradeService& service,
                     {"tier1_member", health.tier1_member},
                     {"epoch", health.epoch ? json(*health.epoch) : json(nullptr)},
                     {"data_key", health.data_key_state},
-                    {"healthy", health.healthy}}
+                    {"healthy", health.healthy},
+                    {"tree", tree_json(hooks)}}
             .dump();
     }
     if (op == "offer_approval") {
@@ -89,6 +101,27 @@ std::string handle_upgrade_control_request(security::UpgradeService& service,
                     {"result", security::release_offer_result_name(result)},
                     {"accepted_release", service.health().accepted_release}}
             .dump();
+    }
+    if (op == "stage_boot_chain") {
+        const auto bundle = request.find("bundle");
+        if (bundle == request.end() || !bundle->is_string()) return refuse("missing bundle");
+        const auto& text = bundle->get_ref<const std::string&>();
+        if (text.size() > security::kMaxReleaseApprovalBytes) return refuse("bundle too large");
+        if (!hooks.stage_boot_chain) return refuse("boot-chain staging is not available");
+        std::string error;
+        const auto offered = security::parse_release_approval_bundle(text, error);
+        const auto& accepted = service.accepted_approval();
+        // Only the approval the release chain accepted (signer pinned, number
+        // monotonic) names PCRs this server seals to.
+        if (!offered || !accepted ||
+            security::release_approval_digest(offered->approval) !=
+                security::release_approval_digest(accepted->approval)) {
+            return refuse("not the accepted release approval; offer it first");
+        }
+        const auto result = hooks.stage_boot_chain(*accepted);
+        json reply = {{"ok", result.ok}, {"staged", result.staged}, {"detail", result.detail}};
+        if (!result.ok) reply["error"] = result.detail;
+        return reply.dump();
     }
     const auto release_number = release_number_of(request);
     if (op == "stage") {
@@ -146,10 +179,12 @@ bool peer_uid(int fd, uint32_t& uid) {
 class UpgradeControlServer::Session : public std::enable_shared_from_this<Session> {
 public:
     Session(asio::local::stream_protocol::socket socket, Post post,
-            security::UpgradeService& service, std::shared_ptr<bool> alive)
+            security::UpgradeService& service, const UpgradeControlHooks& hooks,
+            std::shared_ptr<bool> alive)
         : socket_(std::move(socket)),
           post_(std::move(post)),
           service_(service),
+          hooks_(hooks),
           alive_(std::move(alive)),
           buffer_(kMaxUpgradeControlLine + 1) {}
 
@@ -164,7 +199,8 @@ public:
                 self->buffer_.consume(1);  // the newline
                 self->post_([self, line = std::move(line)] {
                     if (!*self->alive_) return;
-                    auto reply = handle_upgrade_control_request(self->service_, line);
+                    auto reply = handle_upgrade_control_request(self->service_, line,
+                                                                self->hooks_);
                     reply.push_back('\n');
                     self->write(std::move(reply));
                 });
@@ -186,6 +222,8 @@ private:
     asio::local::stream_protocol::socket socket_;
     Post post_;
     security::UpgradeService& service_;
+    /// Owned by the server, which outlives every session that sees alive_.
+    const UpgradeControlHooks& hooks_;
     std::shared_ptr<bool> alive_;
     asio::streambuf buffer_;
 };
@@ -249,7 +287,9 @@ void UpgradeControlServer::accept() {
                     asio::error_code ignored;
                     socket.close(ignored);
                 } else {
-                    std::make_shared<Session>(std::move(socket), post_, service_, alive)->read();
+                    std::make_shared<Session>(std::move(socket), post_, service_, config_.hooks,
+                                              alive)
+                        ->read();
                 }
             }
             accept();

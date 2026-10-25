@@ -17,7 +17,8 @@
 #include <LemonadeNexus/Security/Attestation/ReleaseBundleGenerator.hpp>
 #include <LemonadeNexus/Security/Genesis/BootstrapCertificate.hpp>
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
-#include <LemonadeNexus/Update/UpdateControl.hpp>
+
+#include "support/release_line.hpp"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -101,6 +102,7 @@ std::string sign_b64(const crypto::Ed25519PrivateKey& sk, std::string_view messa
 struct ApprovalSpec {
     std::string tag;
     std::vector<security::ApprovedPath> paths;
+    std::vector<security::ApprovedPath> previous_paths;
     std::string pcr8 = pcr_hex('8');
     std::string pcr9 = pcr_hex('9');
 };
@@ -110,14 +112,18 @@ std::string signed_approval(const Keys& k, const ApprovalSpec& spec,
                             const crypto::Ed25519PrivateKey* release_sk = nullptr,
                             const security::NetworkId* network = nullptr) {
     auto a = security::release_approval_template();
+    nexus_test::fill_reference_boot_line(a);
     a.release_id = spec.tag;
     a.nexus_version = spec.tag.substr(1);
+    const auto tag = parse_release_tag(spec.tag);
+    a.release_number = tag ? tag->number : 0;
     a.final_patched_tree = std::string(40, 'a');
     a.network_id_hex = crypto::to_hex(network ? *network : k.network);
     a.signer_pubkey_b64 = crypto::to_base64(k.release_pk);
     a.qualification_state = "LIVE_BOOT_APPROVED";
     a.expected_pcrs = {{8, spec.pcr8}, {9, spec.pcr9}};
     a.approved_paths = spec.paths;
+    a.previous_release_paths = spec.previous_paths;
     security::ReleaseAuthorityV1 authority;
     authority.network_id_hex = a.network_id_hex;
     authority.release_signing_pubkey_b64 = a.signer_pubkey_b64;
@@ -194,12 +200,12 @@ ReleaseFiles make_release(const Keys& k, const std::string& tag, const std::stri
     ApprovalSpec spec;
     spec.tag = tag;
     spec.pcr8 = pcr_hex(pcr);
-    std::vector<std::string> nexus_hashes{sha256_hex(nexus_bin)};
-    nexus_hashes.insert(nexus_hashes.end(), previous_nexus.begin(), previous_nexus.end());
-    std::vector<std::string> attestd_hashes{sha256_hex(attestd_bin)};
-    attestd_hashes.insert(attestd_hashes.end(), previous_attestd.begin(), previous_attestd.end());
-    spec.paths = {{"/usr/bin/lemonade-nexus", nexus_hashes},
-                  {"/usr/bin/nexus-attestd", attestd_hashes}};
+    spec.paths = {{"/usr/bin/lemonade-nexus", {sha256_hex(nexus_bin)}},
+                  {"/usr/bin/nexus-attestd", {sha256_hex(attestd_bin)}}};
+    if (!previous_nexus.empty()) spec.previous_paths.push_back({"/usr/bin/lemonade-nexus", previous_nexus});
+    if (!previous_attestd.empty()) {
+        spec.previous_paths.push_back({"/usr/bin/nexus-attestd", previous_attestd});
+    }
     r.approval = signed_approval(k, spec);
     const auto number = parse_release_tag(tag)->number;
     r.manifest = manifest_for(r, number);
@@ -678,50 +684,91 @@ TEST(GitHubRelease, KeepsOnlyAssetsUnderTheReleaseTag) {
 // Health gate
 // ---------------------------------------------------------------------------
 
-update::UpdateServerStatus status_of(const std::string& version, const std::string& release_id,
-                                     const std::string& digest) {
-    update::UpdateServerStatus s;
-    s.version = version;
-    s.release_id = release_id;
-    s.approval_digest_hex = digest;
-    s.storage_files_ready = true;
-    s.storage_phase = "migrated";
-    return s;
+ServerHealth health_of(uint64_t running_release) {
+    ServerHealth h;
+    h.running_release = running_release;
+    h.accepted_release = running_release;
+    h.driver_phase = "active";
+    h.verified_authority = true;
+    h.healthy = true;
+    h.data_key = "unlocked";
+    return h;
 }
 
 TEST(HealthGate, ComparesWithTheBaseline) {
-    auto baseline = status_of("2026.10.01", "v2026.10.01", "d0");
+    constexpr uint64_t kOld = 2026100101;
+    constexpr uint64_t kNew = 2026102401;
+    auto baseline = health_of(kOld);
     baseline.tier1_member = true;
-    baseline.epoch_known = true;
     baseline.epoch = 7;
-    baseline.tree_enabled = true;
-    baseline.tree_healthy = true;
-    baseline.tree_height = 100;
-    baseline.tree_applied_height = 100;
-    const HealthExpectation expected{"2026.10.24", "v2026.10.24", "d1"};
+    baseline.tree = ControlTreeStatus{true, 100, 100, false, 0};
 
-    EXPECT_EQ(evaluate_health(baseline, std::nullopt, expected).verdict, HealthVerdict::Pending);
-    auto now = status_of("2026.10.01", "v2026.10.01", "d0");
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Failed);
-    now = status_of("2026.10.24", "v2026.10.24", "d1");
-    now.storage_files_ready = false;
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Pending);
-    now.storage_files_ready = true;
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Pending);  // not a member
-    now.epoch_known = true;
+    EXPECT_EQ(evaluate_health(baseline, std::nullopt, kNew).verdict, HealthVerdict::Pending);
+    auto now = health_of(kOld);
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Failed);  // old binary
+    now = health_of(kNew);
+    now.driver_failed = true;
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Failed);
+    now.driver_failed = false;
+    now.healthy = false;
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);
+    now.healthy = true;
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);  // not a member
     now.tier1_member = true;
+    now.epoch = 6;
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);  // old epoch
     now.epoch = 7;
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Failed);  // tree off
-    now.tree_enabled = true;
-    now.tree_healthy = true;
-    now.tree_height = 99;
-    now.tree_applied_height = 99;
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Pending);
-    now.tree_height = 101;
-    now.tree_applied_height = 101;
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Healthy);
-    now.tree_healthy = false;
-    EXPECT_EQ(evaluate_health(baseline, now, expected).verdict, HealthVerdict::Failed);
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);  // no tree
+    now.tree = ControlTreeStatus{true, 99, 99, false, 0};
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);
+    now.tree = ControlTreeStatus{true, 101, 101, false, 0};
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Healthy);
+    now.tree->healthy = false;
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Failed);
+}
+
+TEST(HealthGate, ALockedDataKeyIsInformationOnly) {
+    // During a rollout a server can stay locked until enough storage holders
+    // run the new release. The gate neither fails nor waits on it, and the
+    // tree log (which starts after the unlock) is not required meanwhile.
+    constexpr uint64_t kNew = 2026102401;
+    auto baseline = health_of(2026100101);
+    baseline.tree = ControlTreeStatus{true, 100, 100, false, 0};
+    auto now = health_of(kNew);
+    now.data_key = "locked";
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Healthy);
+    now.data_key = "unlocked";
+    EXPECT_EQ(evaluate_health(baseline, now, kNew).verdict, HealthVerdict::Pending);
+}
+
+TEST(ControlClient, DecodesRepliesStrictly) {
+    const json health = {{"ok", true},           {"running_release", 2026102401},
+                         {"accepted_release", 2026102401}, {"driver_phase", "active"},
+                         {"driver_failed", false}, {"verified_authority", true},
+                         {"tier1_member", false}, {"epoch", nullptr},
+                         {"data_key", "locked"},  {"healthy", true},
+                         {"tree", nullptr}};
+    const auto h = decode_health_reply(health.dump() + "\n");
+    ASSERT_TRUE(h);
+    EXPECT_FALSE(h->epoch);
+    EXPECT_FALSE(h->tree);
+    EXPECT_EQ(h->data_key, "locked");
+    for (const char* key : {"running_release", "healthy", "epoch", "tree"}) {
+        auto broken = health;
+        broken.erase(key);
+        EXPECT_FALSE(decode_health_reply(broken.dump())) << key;
+    }
+    auto wrong_type = health;
+    wrong_type["running_release"] = "2026102401";
+    EXPECT_FALSE(decode_health_reply(wrong_type.dump()));
+    EXPECT_FALSE(decode_health_reply(json{{"ok", false}, {"error", "x"}}.dump()));
+    EXPECT_FALSE(decode_health_reply("not json"));
+
+    EXPECT_EQ(decode_turn_reply(json{{"ok", true}, {"gate", "go"}}.dump()), TurnGate::Go);
+    EXPECT_EQ(decode_turn_reply(json{{"ok", true}, {"gate", "halted"}}.dump()), TurnGate::Halted);
+    EXPECT_FALSE(decode_turn_reply(json{{"ok", true}, {"gate", "maybe"}}.dump()));
+    EXPECT_FALSE(decode_turn_reply(json{{"ok", false}, {"error", "invalid"}}.dump()));
+    EXPECT_FALSE(decode_turn_reply(json{{"ok", true}, {"gate", "go"}}.dump() + "\n{}"));
 }
 
 // ---------------------------------------------------------------------------
@@ -741,7 +788,9 @@ struct Host {
                                                 {"grub-efi-amd64-signed", "1.202+2.12-1ubuntu7"}};
     std::vector<std::vector<std::string>> commands;
     bool running = true;
-    bool grant_turn = true;
+    std::string turn_gate = "go";
+    std::string offer_result = "adopted";
+    std::string data_key = "unlocked";
     bool new_binary_is_broken = false;
     bool tier1 = false;
     bool loses_membership_on_new_binary = false;
@@ -749,6 +798,7 @@ struct Host {
     std::string boot_id = "boot-1";
     std::chrono::steady_clock::time_point clock{};
     std::vector<std::string> reports;
+    std::vector<std::string> ops;
 
     fs::path host(std::string_view p) const { return dir.path / fs::path(p).relative_path(); }
 
@@ -780,23 +830,68 @@ struct Host {
     }
 
     /// What the server reports: derived from the files it would have loaded.
-    std::optional<update::UpdateServerStatus> status() const {
+    std::optional<ServerHealth> health() const {
         if (!running) return std::nullopt;
         const auto bin = read_text(host("/usr/bin/lemonade-nexus"));
         const auto approval = read_text(host(security::kReleaseApprovalPath));
         std::string error;
         const auto b = security::parse_release_approval_bundle(approval, error);
-        update::UpdateServerStatus s;
-        s.version = bin == next.nexus_bin ? next.tag.substr(1) : installed.tag.substr(1);
-        if (bin == next.nexus_bin && new_binary_is_broken) s.version = "crashed";
-        s.release_id = b ? b->approval.release_id : "";
-        s.approval_digest_hex = b ? security::release_approval_digest_hex(b->approval) : "";
-        s.storage_files_ready = true;
-        s.storage_phase = "migrated";
-        s.epoch_known = true;
-        s.epoch = 3;
-        s.tier1_member = tier1 && !(bin == next.nexus_bin && loses_membership_on_new_binary);
-        return s;
+        ServerHealth h;
+        h.running_release = b ? b->approval.release_number : 0;
+        h.accepted_release = h.running_release;
+        h.driver_phase = "active";
+        h.driver_failed = bin == next.nexus_bin && new_binary_is_broken;
+        h.verified_authority = !h.driver_failed;
+        h.healthy = !h.driver_failed;
+        h.epoch = 3;
+        h.tier1_member = tier1 && !(bin == next.nexus_bin && loses_membership_on_new_binary);
+        h.data_key = data_key;
+        return h;
+    }
+
+    /// The reply the server's handler would send (docs/Upgrade-Control.md).
+    std::string serve(std::string_view request) {
+        const json r = json::parse(request, nullptr, false);
+        const auto op = r.value("op", std::string());
+        ops.push_back(op);
+        if (op == "health") {
+            const auto h = *health();
+            return json{{"ok", true},
+                        {"running_release", h.running_release},
+                        {"accepted_release", h.accepted_release},
+                        {"driver_phase", h.driver_phase},
+                        {"driver_failed", h.driver_failed},
+                        {"verified_authority", h.verified_authority},
+                        {"tier1_member", h.tier1_member},
+                        {"epoch", h.epoch ? json(*h.epoch) : json(nullptr)},
+                        {"data_key", h.data_key},
+                        {"healthy", h.healthy},
+                        {"tree", nullptr}}
+                       .dump() +
+                   "\n";
+        }
+        if (op == "offer_approval") {
+            const bool ok = offer_result == "adopted" || offer_result == "current";
+            return json{{"ok", ok}, {"result", offer_result}, {"accepted_release", 0}}.dump() +
+                   "\n";
+        }
+        if (op == "stage") return json{{"ok", true}}.dump() + "\n";
+        if (op == "turn") return json{{"ok", true}, {"gate", turn_gate}}.dump() + "\n";
+        if (op == "report") {
+            reports.push_back(r.value("result", std::string()));
+            return json{{"ok", true}}.dump() + "\n";
+        }
+        if (op == "stage_boot_chain") {
+            ++stage_calls;
+            write_text(host("/var/lib/lemonade-nexus/data/sealed/gossip-identity.next.sealed"),
+                       "staged");
+            return json{{"ok", true},
+                        {"staged", json::array({"gossip-identity"})},
+                        {"detail", "staged"}}
+                       .dump() +
+                   "\n";
+        }
+        return json{{"ok", false}, {"error", "unknown op"}}.dump() + "\n";
     }
 
     Updater updater() {
@@ -832,27 +927,7 @@ struct Host {
         };
         env.control = [this](std::string_view request) -> std::optional<std::string> {
             if (!running) return std::nullopt;
-            update::UpdateControlHandlers h;
-            h.status = [this] { return *status(); };
-            h.may_restart = [this](const update::TurnRequest&) {
-                update::RefusingTurnGate stub;
-                return grant_turn ? update::TurnDecision{true, "granted"} : stub.may_restart({});
-            };
-            h.report = [this](const update::UpgradeReport& r) {
-                reports.push_back(r.outcome == update::UpgradeOutcome::Upgraded ? "upgraded"
-                                                                                 : "failed");
-                return update::ReportAck{true, ""};
-            };
-            h.stage_boot_chain = [this](std::string_view) {
-                ++stage_calls;
-                write_text(host("/var/lib/lemonade-nexus/data/sealed/gossip-identity.next.sealed"),
-                           "staged");
-                update::BootChainStageResult r;
-                r.ok = true;
-                r.staged = {"gossip-identity"};
-                return r;
-            };
-            return update::handle_control_request(request, h);
+            return serve(request);
         };
         env.run = [this](const std::vector<std::string>& argv) -> CommandResult {
             commands.push_back(argv);
@@ -898,16 +973,60 @@ struct Host {
     }
 };
 
-TEST(UpdaterCycle, StagesAndWaitsWhileTheTurnGateRefuses) {
+TEST(UpdaterCycle, StagesAndWaitsWhileTheTurnGateSaysWait) {
     Host h;
-    h.grant_turn = false;
+    h.turn_gate = "wait";
     auto u = h.updater();
     const auto r = u.run_once();
     EXPECT_EQ(r.outcome, CycleOutcome::Waiting) << r.detail;
-    EXPECT_NE(r.detail.find("not implemented"), std::string::npos) << r.detail;
+    EXPECT_NE(r.detail.find("wait"), std::string::npos) << r.detail;
+    // The approval went to the server first, then the staged release, then the gate.
+    EXPECT_EQ(h.ops, (std::vector<std::string>{"offer_approval", "stage", "turn"}));
     EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
     EXPECT_TRUE(fs::exists(u.state_dir() / "staged" / "v2026.10.24" / "lemonade-nexus-linux-x86_64"));
     EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+}
+
+TEST(UpdaterCycle, WaitsWhenNoRolloutStartedForTheRelease) {
+    Host h;
+    h.turn_gate = "not_started";
+    auto u = h.updater();
+    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Waiting);
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+}
+
+TEST(UpdaterCycle, AFinalizedHaltStopsTheRelease) {
+    Host h;
+    h.turn_gate = "halted";
+    auto u = h.updater();
+    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Halted);
+    EXPECT_FALSE(h.ran({"systemctl", "stop"}));
+    // The release stays halted without asking the server again.
+    h.ops.clear();
+    EXPECT_EQ(u.run_once().outcome, CycleOutcome::Halted);
+    EXPECT_TRUE(h.ops.empty());
+}
+
+TEST(UpdaterCycle, RefusesWhenTheServerRefusesTheApproval) {
+    for (const char* result : {"wrong_signer", "stale", "invalid", "unavailable"}) {
+        Host h;
+        h.offer_result = result;
+        auto u = h.updater();
+        const auto r = u.run_once();
+        EXPECT_EQ(r.outcome, CycleOutcome::Refused) << result;
+        EXPECT_NE(r.detail.find(result), std::string::npos) << r.detail;
+        EXPECT_EQ(std::count(h.ops.begin(), h.ops.end(), "turn"), 0) << result;
+        EXPECT_EQ(read_text(h.host("/usr/bin/lemonade-nexus")), "nexus-old");
+    }
+}
+
+TEST(UpdaterCycle, ALockedDataKeyDoesNotFailTheUpgrade) {
+    Host h;
+    h.data_key = "locked";
+    auto u = h.updater();
+    const auto r = u.run_once();
+    EXPECT_EQ(r.outcome, CycleOutcome::Upgraded) << r.detail;
+    EXPECT_EQ(h.reports, std::vector<std::string>{"upgraded"});
 }
 
 TEST(UpdaterCycle, UpgradesInPlaceWithoutARebootWhenTheBootChainIsUnchanged) {
@@ -1075,19 +1194,14 @@ TEST(UpdaterCycle, ResumesASwapInterruptedByACrash) {
     crashing.before_rename = [](std::size_t i) { return i < 1; };
     std::string error;
     ASSERT_FALSE(crashing.apply(plan, error));
-    const auto baseline = h.status();
-    update::UpdateControlHandlers handlers;
-    handlers.status = [&] { return *baseline; };
+    const auto baseline = h.serve(encode_health_request());
     const json state = {
         {"installed_release_number", 0},
         {"halted_release_number", 0},
         {"phase", "swapping"},
         {"tag", h.next.tag},
         {"number", 2026102401},
-        {"expected_version", h.next.tag.substr(1)},
-        {"expected_release_id", h.next.tag},
-        {"expected_approval_digest", approval_digest(h.next.approval)},
-        {"baseline", update::handle_control_request(update::encode_status_request(), handlers)},
+        {"baseline", baseline},
         {"packages_install", json::array()},
         {"packages_previous", json::array()},
         {"reboot", false},

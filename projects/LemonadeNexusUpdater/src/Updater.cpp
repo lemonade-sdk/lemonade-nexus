@@ -59,13 +59,6 @@ std::vector<OsPackage> packages_from(const json& j) {
     return out;
 }
 
-/// The status line as the server would send it, for persisting a baseline.
-std::string status_line(const update::UpdateServerStatus& status) {
-    update::UpdateControlHandlers handlers;
-    handlers.status = [&status] { return status; };
-    return update::handle_control_request(update::encode_status_request(), handlers);
-}
-
 }  // namespace
 
 std::string_view cycle_outcome_name(CycleOutcome outcome) {
@@ -88,7 +81,7 @@ struct Updater::State {
     std::string phase{"idle"};
     std::string tag;
     uint64_t number{0};
-    HealthExpectation expected;
+    /// The server's health reply before the swap, as received.
     std::string baseline_line;
     std::vector<OsPackage> packages_install;
     std::vector<OsPackage> packages_previous;
@@ -131,9 +124,6 @@ std::optional<Updater::State> Updater::load_state() {
         s.phase = j.at("phase").get<std::string>();
         s.tag = j.at("tag").get<std::string>();
         s.number = j.at("number").get<uint64_t>();
-        s.expected.version = j.at("expected_version").get<std::string>();
-        s.expected.release_id = j.at("expected_release_id").get<std::string>();
-        s.expected.approval_digest_hex = j.at("expected_approval_digest").get<std::string>();
         s.baseline_line = j.at("baseline").get<std::string>();
         s.packages_install = packages_from(j.at("packages_install"));
         s.packages_previous = packages_from(j.at("packages_previous"));
@@ -155,9 +145,6 @@ bool Updater::save_state(const State& s) {
         {"phase", s.phase},
         {"tag", s.tag},
         {"number", s.number},
-        {"expected_version", s.expected.version},
-        {"expected_release_id", s.expected.release_id},
-        {"expected_approval_digest", s.expected.approval_digest_hex},
         {"baseline", s.baseline_line},
         {"packages_install", packages_json(s.packages_install)},
         {"packages_previous", packages_json(s.packages_previous)},
@@ -193,20 +180,24 @@ uint64_t Updater::installed_release_number(const State& state) const {
     return number;
 }
 
-std::optional<update::UpdateServerStatus> Updater::server_status() {
-    const auto line = env_.control(update::encode_status_request());
-    return line ? update::decode_status_response(*line) : std::nullopt;
+std::optional<std::string> Updater::server_health_line() {
+    auto line = env_.control(encode_health_request());
+    if (!line || !decode_health_reply(*line)) return std::nullopt;
+    return line;
 }
 
-void Updater::report(const State& state, update::UpgradeOutcome outcome,
-                     const std::string& detail) {
-    update::UpgradeReport r{state.number, state.tag, outcome, detail};
-    const auto line = env_.control(update::encode_report_request(r));
-    const auto ack = line ? update::decode_report_response(*line) : std::nullopt;
-    spdlog::info("[updater] report {} {} to the server: {}", state.tag,
-                 outcome == update::UpgradeOutcome::Upgraded ? "upgraded" : "failed",
-                 ack ? (ack->accepted ? std::string("recorded") : "not recorded: " + ack->reason)
-                     : std::string("no answer"));
+std::optional<ServerHealth> Updater::server_health() {
+    const auto line = env_.control(encode_health_request());
+    return line ? decode_health_reply(*line) : std::nullopt;
+}
+
+void Updater::report(const State& state, bool upgraded, const std::string& detail) {
+    const auto line = env_.control(encode_report_request(state.number, upgraded));
+    spdlog::info("[updater] report {} {} to the server ({}): {}", state.tag,
+                 upgraded ? "upgraded" : "failed", detail,
+                 !line ? std::string("no answer")
+                       : decode_ok_reply(*line) ? std::string("accepted")
+                                                : "refused: " + reply_error(*line));
 }
 
 bool Updater::systemctl(const std::vector<std::string>& args, std::string& error) {
@@ -347,17 +338,52 @@ CycleResult Updater::cycle() {
 
 CycleResult Updater::start_update(State& state, const Release& release) {
     const auto& v = release.verified;
-    const update::TurnRequest turn{v.tag.number, v.tag.tag};
-    const auto turn_line = env_.control(update::encode_turn_request(turn));
-    const auto decision = turn_line ? update::decode_turn_response(*turn_line) : std::nullopt;
-    if (!decision || !decision->granted) {
+    const uint64_t number = v.tag.number;
+    // Hand the approval to the server first (Phase 4 step 4): the release
+    // chain applies the signer pin and the number rule, and the server stages
+    // the boot chain only for the approval it accepted.
+    const auto offer_line = env_.control(encode_offer_request(v.approval_json));
+    const auto offer = offer_line ? decode_offer_reply(*offer_line) : std::nullopt;
+    if (!offer) {
         return {CycleOutcome::Waiting,
-                "staged " + v.tag.tag + "; no upgrade turn: " +
-                    (decision ? decision->reason : std::string("the server did not answer"))};
+                "staged " + v.tag.tag + "; the server did not answer the approval offer"};
+    }
+    if (!offer->ok) {
+        return {CycleOutcome::Refused,
+                "the server refused the approval of " + v.tag.tag + ": " + offer->result};
+    }
+    const auto stage_line = env_.control(encode_stage_request(number));
+    if (!stage_line || !decode_ok_reply(*stage_line)) {
+        return {CycleOutcome::Waiting,
+                "staged " + v.tag.tag + "; the server did not record the staged release"};
+    }
+    const auto turn_line = env_.control(encode_turn_request(number));
+    const auto gate = turn_line ? decode_turn_reply(*turn_line) : std::nullopt;
+    if (!gate) {
+        return {CycleOutcome::Waiting,
+                "staged " + v.tag.tag + "; the turn gate did not answer"};
+    }
+    switch (*gate) {
+        case TurnGate::Go:
+            break;
+        case TurnGate::Wait:
+        case TurnGate::NotStarted:
+            return {CycleOutcome::Waiting, "staged " + v.tag.tag + "; upgrade turn: " +
+                                               std::string(turn_gate_name(*gate))};
+        case TurnGate::Halted:
+            state.halted_release_number = number;
+            state.last_result = "the rollout of " + v.tag.tag + " halted";
+            (void)save_state(state);
+            return {CycleOutcome::Halted, state.last_result + "; waiting for a newer release"};
+        case TurnGate::Done:
+            // Finalized state says this server already runs the release, but
+            // the installed files say otherwise. Change nothing.
+            return {CycleOutcome::Refused, "the turn gate reports " + v.tag.tag +
+                                               " done, but it is not installed"};
     }
 
-    const auto baseline = server_status();
-    if (!baseline) return {CycleOutcome::Refused, "the server status is unavailable"};
+    const auto baseline = server_health_line();
+    if (!baseline) return {CycleOutcome::Refused, "the server health is unavailable"};
 
     std::string error;
     const auto installed_text =
@@ -394,10 +420,8 @@ CycleResult Updater::start_update(State& state, const Release& release) {
 
     State next = state;
     next.tag = v.tag.tag;
-    next.number = v.tag.number;
-    next.expected = {v.manifest.version, v.approval.approval.release_id,
-                     security::release_approval_digest_hex(v.approval.approval)};
-    next.baseline_line = status_line(*baseline);
+    next.number = number;
+    next.baseline_line = *baseline;
     next.packages_install = plan.install;
     next.packages_previous = plan.previous;
     next.reboot = decision_reboot.reboot;
@@ -417,8 +441,8 @@ CycleResult Updater::start_update(State& state, const Release& release) {
             return {CycleOutcome::Refused, "cannot find the GRUB entry of the running kernel"};
         }
         next.previous_grub_entry = *entry;
-        const auto line = env_.control(update::encode_stage_request(v.approval_json));
-        const auto staged = line ? update::decode_stage_response(*line) : std::nullopt;
+        const auto line = env_.control(encode_stage_boot_chain_request(v.approval_json));
+        const auto staged = line ? decode_stage_boot_chain_reply(*line) : std::nullopt;
         if (!staged || !staged->ok) {
             return {CycleOutcome::Refused,
                     "the server did not stage the boot set for the new boot chain: " +
@@ -526,7 +550,7 @@ CycleResult Updater::resume(State& state) {
             notes = "; restoring the previous packages failed";
         }
         const std::string detail = state.last_result + notes;
-        report(state, update::UpgradeOutcome::Failed, detail);
+        report(state, false, detail);
         state.halted_release_number = state.number;
         state.phase = "idle";
         state.last_result = detail;
@@ -569,12 +593,12 @@ CycleResult Updater::finish_without_reboot(State& state) {
 }
 
 CycleResult Updater::run_health_gate(State& state) {
-    const auto baseline = update::decode_status_response(state.baseline_line);
+    const auto baseline = decode_health_reply(state.baseline_line);
     if (!baseline) return roll_back(state, "the recorded baseline is unreadable", true);
     const auto deadline = env_.now() + config_.health_timeout;
     HealthResult result;
     while (true) {
-        result = evaluate_health(*baseline, server_status(), state.expected);
+        result = evaluate_health(*baseline, server_health(), state.number);
         if (result.verdict != HealthVerdict::Pending) break;
         if (env_.now() >= deadline) {
             result = {HealthVerdict::Failed, "health gate timed out: " + result.reason};
@@ -627,7 +651,7 @@ CycleResult Updater::roll_back(State& state, const std::string& reason, bool res
         notes += "; " + error;
     }
     const std::string detail = state.tag + " rolled back: " + reason + notes;
-    report(state, update::UpgradeOutcome::Failed, detail);
+    report(state, false, detail);
     state.halted_release_number = state.number;
     state.phase = "idle";
     state.last_result = detail;
@@ -641,7 +665,7 @@ CycleResult Updater::commit(State& state, const std::string& detail) {
     state.phase = "idle";
     state.last_result = state.tag + " upgraded: " + detail;
     if (!save_state(state)) return {CycleOutcome::Refused, "cannot record the installed release"};
-    report(state, update::UpgradeOutcome::Upgraded, detail);
+    report(state, true, detail);
     FileSwapper(state_dir() / "swap-journal.json").clear();
     // Keep only the files from before this release.
     std::error_code ec;

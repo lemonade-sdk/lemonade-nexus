@@ -149,9 +149,8 @@ if(TARGET LemonadeNexusUpdaterCore)
         NEXUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 endif()
 
-# The server side of the updater interface: control codec and socket, the
-# refusing turn gate, and boot-chain staging (FakeSealer; no TPM).
-add_nexus_test(test_update_control test_update_control.cpp)
+# Boot-chain staging for an accepted release approval (FakeSealer; no TPM).
+add_nexus_test(test_boot_chain_staging test_boot_chain_staging.cpp)
 
 # Sealed blobs and the boot-set migration, against a test double (no TPM).
 add_nexus_test(test_sealed_boot_set  test_sealed_boot_set.cpp)
@@ -238,6 +237,12 @@ add_nexus_test(test_security_release
 add_nexus_test(test_security_upgrade
     security/upgrade/upgrade_progress.cpp
     security/upgrade/upgrade_control.cpp)
+# The updater's decoders run against the server's real replies, so the two
+# sides of the control protocol cannot drift apart.
+if(TARGET LemonadeNexusUpdaterCore)
+    target_link_libraries(test_security_upgrade PRIVATE LemonadeNexusUpdaterCore)
+    target_compile_definitions(test_security_upgrade PRIVATE NEXUS_HAVE_UPDATER_CLIENT=1)
+endif()
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority

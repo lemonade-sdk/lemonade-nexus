@@ -17,11 +17,15 @@
 //   {"op":"stage","release_number":N}
 //   {"op":"turn","release_number":N}
 //   {"op":"report","release_number":N,"result":"failed"|"upgraded"}
+//   {"op":"stage_boot_chain","bundle":"<release approval bundle JSON text>"}
 //
 // Every reply has "ok" (bool); a refusal adds "error". docs/Upgrade-Control.md
 // lists the reply fields. The gate answers come only from finalized upgrade
 // records (UpgradeService::gate); a report is a request, never a grant.
+// stage_boot_chain acts only on the approval the release chain already
+// accepted, so the caller cannot choose the PCR values.
 
+#include <LemonadeNexus/Core/BootChainStaging.hpp>
 #include <LemonadeNexus/Security/Upgrade/UpgradeService.hpp>
 
 #include <asio.hpp>
@@ -41,10 +45,36 @@ inline constexpr std::string_view kUpgradeControlSocketPath = "/run/lemonade-nex
 /// Largest request or reply line, including an approval bundle.
 inline constexpr std::size_t kMaxUpgradeControlLine = 64 * 1024;
 
+/// The tree log progress for the health report (Design-Auto-Update Phase 4
+/// step 7).
+struct UpgradeTreeStatus {
+    bool healthy = false;
+    uint64_t height = 0;
+    uint64_t applied_height = 0;
+    /// A committed block did not follow the local log.
+    bool behind = false;
+    /// Replicated entries held for a later height.
+    uint64_t held = 0;
+};
+
+/// Facts and actions the control interface serves from outside
+/// UpgradeService. Each member may be unset; the reply then says so. Both run
+/// on the security io thread.
+struct UpgradeControlHooks {
+    /// The tree log progress, or nullopt while the tree log is off. Must be
+    /// thread-safe against the owner of the tree log.
+    std::function<std::optional<UpgradeTreeStatus>()> tree_status;
+    /// Seals a second copy of the boot set to the PCR 8/9 of `accepted`, an
+    /// approval the release chain already accepted and verified.
+    std::function<BootChainStageResult(const security::ReleaseApprovalBundleV1& accepted)>
+        stage_boot_chain;
+};
+
 /// Handles one request line and returns one reply line (without the newline).
-/// Call on the security io thread: it calls into `service`.
+/// Call on the security io thread: it calls into `service` and `hooks`.
 [[nodiscard]] std::string handle_upgrade_control_request(security::UpgradeService& service,
-                                                         std::string_view line);
+                                                         std::string_view line,
+                                                         const UpgradeControlHooks& hooks = {});
 
 #if defined(ASIO_HAS_LOCAL_SOCKETS) && !defined(_WIN32)
 #define LEMONADE_HAVE_UPGRADE_CONTROL 1
@@ -54,6 +84,7 @@ struct UpgradeControlConfig {
     /// The only peer user id accepted. Production passes 0 (root); a test
     /// passes its own user id.
     uint32_t allowed_uid = 0;
+    UpgradeControlHooks hooks;
 };
 
 /// Accepts root-only connections and runs each request on the security io

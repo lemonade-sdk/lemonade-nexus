@@ -190,10 +190,15 @@ std::optional<VerifiedRelease> verify_release_metadata(const ReleaseTrust& trust
         return std::nullopt;
     }
 
-    // 2. The release number, from the signed release_id.
+    // 2. The release number: the signed release_number, which must be the
+    //    number of the signed release_id tag.
     const auto tag = parse_release_tag(bundle->approval.release_id);
     if (!tag) {
         error = "the release approval id is not a release tag: " + bundle->approval.release_id;
+        return std::nullopt;
+    }
+    if (bundle->approval.release_number != tag->number) {
+        error = "the approval release_number does not match its tag " + tag->tag;
         return std::nullopt;
     }
     if (tag->number <= installed_release_number) {

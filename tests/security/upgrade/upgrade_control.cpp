@@ -6,6 +6,10 @@
 #include "support/lifecycle_mesh.hpp"
 #include "support/release_fixture.hpp"
 
+#if defined(NEXUS_HAVE_UPDATER_CLIENT)
+#include <LemonadeNexusUpdater/ControlClient.hpp>
+#endif
+
 #include <nlohmann/json.hpp>
 
 #include <unistd.h>
@@ -49,8 +53,19 @@ protected:
     }
 
     json call(const json& request) {
-        return json::parse(handle_upgrade_control_request(*service, request.dump()));
+        return json::parse(handle_upgrade_control_request(*service, request.dump(), hooks));
     }
+
+    /// A qualified approval (PCR 8/9 present) for boot-chain staging.
+    [[nodiscard]] ReleaseApprovalBundleV1 qualified(uint64_t number, uint64_t previous) const {
+        auto bundle = signer->approval(number, previous);
+        bundle.approval.qualification_state = "LIVE_BOOT_APPROVED";
+        bundle.approval.expected_pcrs = {{8, std::string(64, 'b')}, {9, std::string(64, 'c')}};
+        signer->sign(bundle);
+        return bundle;
+    }
+
+    nexus::core::UpgradeControlHooks hooks;
 
     std::optional<ReleaseSigner> signer;
     Node* node = nullptr;
@@ -95,6 +110,112 @@ TEST_F(UpgradeControl, TheGateNeverOpensWithoutFinalizedRecords) {
     EXPECT_FALSE(report["counted"].get<bool>());
     EXPECT_EQ(call({{"op", "turn"}, {"release_number", kN1}})["gate"], "not_started");
 }
+
+TEST_F(UpgradeControl, BootChainStagingActsOnlyOnTheAcceptedApproval) {
+    std::vector<uint64_t> staged_for;
+    hooks.stage_boot_chain = [&staged_for](const ReleaseApprovalBundleV1& accepted) {
+        staged_for.push_back(accepted.approval.release_number);
+        nexus::core::BootChainStageResult result;
+        result.ok = true;
+        result.staged = {"gossip-identity"};
+        result.detail = "staged";
+        return result;
+    };
+    const auto next = release_approval_bundle_json(qualified(kN1, kN));
+    // Not yet accepted: the updater cannot choose the PCRs.
+    auto reply = call({{"op", "stage_boot_chain"}, {"bundle", next}});
+    EXPECT_FALSE(reply["ok"].get<bool>());
+    EXPECT_TRUE(staged_for.empty());
+    // A rogue signer's approval is refused by the chain, so it never stages.
+    ReleaseSigner rogue(signer->genesis_pk, signer->genesis_sk);
+    EXPECT_EQ(call({{"op", "offer_approval"},
+                    {"bundle", release_approval_bundle_json(rogue.approval(kN1, kN))}})["result"],
+              "wrong_signer");
+    reply = call({{"op", "stage_boot_chain"},
+                  {"bundle", release_approval_bundle_json(rogue.approval(kN1, kN))}});
+    EXPECT_FALSE(reply["ok"].get<bool>());
+    EXPECT_TRUE(staged_for.empty());
+    // Accepted: staging runs for exactly that approval.
+    ASSERT_EQ(call({{"op", "offer_approval"}, {"bundle", next}})["result"], "adopted");
+    reply = call({{"op", "stage_boot_chain"}, {"bundle", next}});
+    EXPECT_TRUE(reply["ok"].get<bool>()) << reply.dump();
+    EXPECT_EQ(reply["staged"], json::array({"gossip-identity"}));
+    EXPECT_EQ(staged_for, std::vector<uint64_t>{kN1});
+    // Garbage and oversize bundles are refused before parsing matters.
+    EXPECT_FALSE(call({{"op", "stage_boot_chain"}, {"bundle", "{}"}})["ok"].get<bool>());
+    EXPECT_FALSE(call({{"op", "stage_boot_chain"},
+                       {"bundle", std::string(kMaxReleaseApprovalBytes + 1, ' ')}})["ok"]
+                     .get<bool>());
+    EXPECT_EQ(staged_for.size(), 1u);
+}
+
+TEST_F(UpgradeControl, StagingIsRefusedWithoutAHook) {
+    const auto current = release_approval_bundle_json(signer->approval(kN));
+    const auto reply = call({{"op", "stage_boot_chain"}, {"bundle", current}});
+    EXPECT_FALSE(reply["ok"].get<bool>());
+    EXPECT_TRUE(reply.contains("error"));
+}
+
+TEST_F(UpgradeControl, HealthCarriesTheTreeLogWhenItRuns) {
+    EXPECT_TRUE(call({{"op", "health"}})["tree"].is_null());
+    hooks.tree_status = [] {
+        return std::optional<nexus::core::UpgradeTreeStatus>(
+            nexus::core::UpgradeTreeStatus{true, 12, 11, false, 1});
+    };
+    const auto tree = call({{"op", "health"}})["tree"];
+    EXPECT_TRUE(tree["healthy"].get<bool>());
+    EXPECT_EQ(tree["height"].get<uint64_t>(), 12u);
+    EXPECT_EQ(tree["applied_height"].get<uint64_t>(), 11u);
+    EXPECT_EQ(tree["held"].get<uint64_t>(), 1u);
+}
+
+#if defined(NEXUS_HAVE_UPDATER_CLIENT)
+TEST_F(UpgradeControl, TheUpdaterDecodesEveryServerReply) {
+    namespace u = nexus::updater;
+    const auto serve = [this](const std::string& line) {
+        // The updater sends a newline-terminated line; the socket strips it.
+        return handle_upgrade_control_request(*service, line.substr(0, line.size() - 1), hooks) +
+               "\n";
+    };
+    hooks.tree_status = [] {
+        return std::optional<nexus::core::UpgradeTreeStatus>(
+            nexus::core::UpgradeTreeStatus{true, 5, 5, false, 0});
+    };
+    const auto health = u::decode_health_reply(serve(u::encode_health_request()));
+    ASSERT_TRUE(health);
+    EXPECT_EQ(health->running_release, kN);
+    EXPECT_FALSE(health->healthy);
+    ASSERT_TRUE(health->tree);
+    EXPECT_EQ(health->tree->height, 5u);
+
+    const auto next = release_approval_bundle_json(qualified(kN1, kN));
+    const auto offer = u::decode_offer_reply(serve(u::encode_offer_request(next)));
+    ASSERT_TRUE(offer);
+    EXPECT_TRUE(offer->ok);
+    EXPECT_EQ(offer->result, "adopted");
+    EXPECT_TRUE(u::decode_ok_reply(serve(u::encode_stage_request(kN1))));
+    EXPECT_EQ(u::decode_turn_reply(serve(u::encode_turn_request(kN1))), u::TurnGate::NotStarted);
+    EXPECT_TRUE(u::decode_ok_reply(serve(u::encode_report_request(kN1, true))));
+
+    const auto refused = u::decode_stage_boot_chain_reply(
+        serve(u::encode_stage_boot_chain_request(next)));
+    ASSERT_TRUE(refused);
+    EXPECT_FALSE(refused->ok) << "no staging hook";
+    EXPECT_FALSE(refused->detail.empty());
+    hooks.stage_boot_chain = [](const ReleaseApprovalBundleV1&) {
+        nexus::core::BootChainStageResult result;
+        result.ok = true;
+        result.staged = {"gossip-identity", "storage-share"};
+        result.detail = "staged";
+        return result;
+    };
+    const auto staged = u::decode_stage_boot_chain_reply(
+        serve(u::encode_stage_boot_chain_request(next)));
+    ASSERT_TRUE(staged);
+    EXPECT_TRUE(staged->ok);
+    EXPECT_EQ(staged->staged, (std::vector<std::string>{"gossip-identity", "storage-share"}));
+}
+#endif
 
 TEST_F(UpgradeControl, MalformedRequestsAreRefused) {
     for (const auto& line : {std::string("not json"), std::string("[]"), std::string("{}"),

@@ -11,8 +11,10 @@
 //      lock; check each hash against the signed manifest. Verify the Sigstore
 //      provenance of every consumed asset. Any failure stops the cycle.
 //   4. Stage the verified files under the state directory.
-//   5. Ask the server for the upgrade turn. Without a grant, stop and wait.
-//   6. Take a status baseline. Plan the OS packages and decide whether the
+//   5. Offer the approval to the server (its release chain must accept it),
+//      report the staged release, and ask for the upgrade turn. Without "go",
+//      stop and wait; on "halted", halt this release.
+//   6. Take a health baseline. Plan the OS packages and decide whether the
 //      boot chain changes. For a reboot, have the server stage the sealed
 //      boot set for the new PCRs first.
 //   7. Stop the services, swap the files atomically (backups kept), install
@@ -25,14 +27,13 @@
 //
 // The updater holds no server keys. It reads the Genesis public key from the
 // server's root-owned configuration and talks to the server only through the
-// update control socket.
+// upgrade control socket (Core/UpgradeControl.hpp, docs/Upgrade-Control.md).
 
+#include <LemonadeNexusUpdater/ControlClient.hpp>
 #include <LemonadeNexusUpdater/HealthGate.hpp>
 #include <LemonadeNexusUpdater/OsPackages.hpp>
 #include <LemonadeNexusUpdater/ReleaseVerifier.hpp>
 #include <LemonadeNexusUpdater/Transport.hpp>
-
-#include <LemonadeNexus/Update/UpdateControl.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -82,14 +83,14 @@ struct UpdaterConfig {
 
 enum class CycleOutcome {
     NoUpdate,
-    /// Verified and staged; the turn gate has not granted a restart.
+    /// Verified and staged; the turn gate has not said "go".
     Waiting,
     Upgraded,
     /// Rolled back after a failure; the release is halted.
     Failed,
     /// A reboot into the new boot chain was started.
     Rebooting,
-    /// The latest release is the one that halted.
+    /// The latest release halted: this server's rollback, or a finalized Halt.
     Halted,
     /// Verification or an environment check failed; nothing was changed.
     Refused,
@@ -128,8 +129,10 @@ private:
     std::optional<Release> fetch_and_verify(const State& state, std::string& error);
     std::optional<std::string> fetch_asset(const std::string& tag, const std::string& name,
                                            const std::string& url, std::string& error);
-    std::optional<update::UpdateServerStatus> server_status();
-    void report(const State& state, update::UpgradeOutcome outcome, const std::string& detail);
+    /// The health reply line as received, when it decodes.
+    std::optional<std::string> server_health_line();
+    std::optional<ServerHealth> server_health();
+    void report(const State& state, bool upgraded, const std::string& detail);
     bool systemctl(const std::vector<std::string>& args, std::string& error);
     /// After a package install: every approved path the updater does not
     /// replace must hash to a value the installed approval lists.

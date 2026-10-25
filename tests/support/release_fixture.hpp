@@ -10,6 +10,7 @@
 #include <LemonadeNexus/Security/Policy/SecurityConstants.hpp>
 
 #include "support/attestation_fixtures.hpp"
+#include "support/release_line.hpp"
 
 #include <gtest/gtest.h>
 #include <sodium.h>
@@ -74,6 +75,7 @@ struct ReleaseSigner {
         bundle.authority.network_id_hex = network_hex;
         bundle.authority.release_signing_pubkey_b64 = release_b64;
         auto a = release_approval_template();
+        fill_reference_boot_line(a);
         a.format_version = format;
         a.release_id = "v-test-" + std::to_string(number);
         a.nexus_version = "0.9.7";

@@ -73,6 +73,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_set>
@@ -332,17 +333,42 @@ int main(int argc, char* argv[]) {
         spdlog::error("Config: {}", mesh_error);
         return 1;
     }
+    // The tree log, once it starts, for the updater's health report. The
+    // control socket reads it on the security io thread; the guard after
+    // tree_consensus clears it before the log is destroyed.
+    struct TreeStatusSource {
+        std::mutex mutex;
+        const nexus::tree::TreeConsensus* tree = nullptr;
+    } tree_status_source;
 #if defined(LEMONADE_HAVE_UPGRADE_CONTROL)
-    // The turn gate and health report for nexus-updater: root peers only.
-    // Without the socket the updater waits; nothing else depends on it.
+    // The turn gate, health report, and boot-chain staging for nexus-updater:
+    // root peers only. It starts before the data-key wait so the updater can
+    // watch an unlock. Without the socket the updater waits.
+    nexus::core::UpgradeControlConfig upgrade_control_config;
+    upgrade_control_config.hooks.tree_status =
+        [&tree_status_source]() -> std::optional<nexus::core::UpgradeTreeStatus> {
+        std::lock_guard lock(tree_status_source.mutex);
+        if (tree_status_source.tree == nullptr) return std::nullopt;
+        const auto t = tree_status_source.tree->status_summary();
+        return nexus::core::UpgradeTreeStatus{t.healthy, t.height, t.applied_height, t.behind,
+                                              static_cast<uint64_t>(t.held)};
+    };
+    upgrade_control_config.hooks.stage_boot_chain =
+        [staging = nexus::core::BootChainStagingInputs{
+             std::filesystem::path(data_root) / std::string(nexus::core::kSealedDirectory),
+             seal_backend}](const nexus::security::ReleaseApprovalBundleV1& accepted) {
+            return nexus::core::stage_boot_chain_for_approval(staging, accepted);
+        };
     auto upgrade_control = std::make_unique<nexus::core::UpgradeControlServer>(
-        coordinator.io_context(), nexus::core::UpgradeControlConfig{},
+        coordinator.io_context(), std::move(upgrade_control_config),
         [mesh = security_mesh->service.get()](std::function<void()> work) {
             mesh->post(std::move(work));
         },
         *security_mesh->service->upgrade());
     if (std::string control_error; !upgrade_control->start(control_error)) {
-        spdlog::warn("Upgrade control socket unavailable: {}", control_error);
+        spdlog::warn("Upgrade control socket unavailable ({}); nexus-updater cannot read "
+                     "this server's turn or health",
+                     control_error);
     }
 #endif
     if (defer_file_services) {
@@ -952,11 +978,14 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     std::unique_ptr<nexus::tree::TreeConsensus> tree_consensus;
     // Destroyed before tree_consensus on every exit path: the control socket
-    // thread reads the tree log status.
-    struct StopUpdateControl {
-        nexus::update::UpdateControlSocket& socket;
-        ~StopUpdateControl() { socket.stop(); }
-    } stop_update_control{update_control};
+    // reads the tree log status.
+    struct ClearTreeStatus {
+        TreeStatusSource& source;
+        ~ClearTreeStatus() {
+            std::lock_guard lock(source.mutex);
+            source.tree = nullptr;
+        }
+    } clear_tree_status{tree_status_source};
     std::unique_ptr<nexus::tree::TreeOpSubmitter> tree_ops;
     std::function<std::optional<nexus::tree::TreeOpOutcome>(const std::string&)> tree_op_status;
     std::function<nlohmann::json()> tree_log_status;
@@ -989,7 +1018,10 @@ int main(int argc, char* argv[]) {
         tree_consensus = std::make_unique<nexus::tree::TreeConsensus>(
             std::move(tree_config), tree, crypto,
             std::filesystem::path(data_root) / "tree" / "log");
-        tree_for_update_status.store(tree_consensus.get());
+        {
+            std::lock_guard lock(tree_status_source.mutex);
+            tree_status_source.tree = tree_consensus.get();
+        }
         if (!tree_consensus->start()) {
             // Fail closed: the server runs and serves its last committed tree,
             // but applies, votes for, and accepts no tree operation.
@@ -1407,8 +1439,6 @@ int main(int argc, char* argv[]) {
     // ========================================================================
     // Shutdown (reverse order)
     // ========================================================================
-    // The control socket reads the services below; stop it first.
-    update_control.stop();
     acme_retry_stop.store(true);
     if (acme_retry_thread.joinable()) {
         acme_retry_thread.join();

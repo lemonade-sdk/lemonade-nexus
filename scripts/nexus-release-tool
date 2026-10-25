@@ -21,7 +21,11 @@ import re
 import sys
 
 TAG_RE = re.compile(r"^v(\d{4})\.(\d{2})\.(\d{2})(?:\.([1-9]\d?))?$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX96 = re.compile(r"^[0-9a-f]{96}$")
+KERNEL_HASHES = ("bzimage_sha256", "vmlinux_sha256", "module_tree_sha256",
+                 "module_certificate_der_sha256")
 SWAPPABLE = ("/usr/bin/lemonade-nexus", "/usr/bin/nexus-attestd")
 
 
@@ -66,10 +70,25 @@ def load_profile(path):
     if p.get("format_version") != 1:
         fail("fleet profile: unsupported format_version")
     for key in ("network_id", "release_signer", "authority_genesis_signature",
-                "qualification_state", "expected_pcrs", "svsm_launch_measurements",
+                "qualification_state", "expected_pcrs", "source_commit",
+                "starting_patched_tree", "ima_policy", "kernel", "svsm_launch_measurements",
                 "system_libraries"):
         if key not in p:
             fail(f"fleet profile: missing {key}")
+    # The boot line (Design-Auto-Update Phase 0.3): servers verify it against
+    # the signed approval only, so the reviewed profile is its sole source.
+    if not HEX40.match(p["source_commit"]) or not HEX40.match(p["starting_patched_tree"]):
+        fail("fleet profile: source_commit and starting_patched_tree are 40 lowercase hex")
+    ima = p["ima_policy"]
+    if not ima.get("id") or not HEX64.match(ima.get("sha256", "")):
+        fail("fleet profile: ima_policy needs an id and a SHA-256")
+    kernel = p["kernel"]
+    if not kernel.get("release") or \
+            not all(HEX64.match(kernel.get(k, "")) for k in KERNEL_HASHES):
+        fail("fleet profile: kernel needs a release and four SHA-256 values")
+    if not p["svsm_launch_measurements"] or \
+            not all(HEX96.match(m) for m in p["svsm_launch_measurements"]):
+        fail("fleet profile: svsm_launch_measurements are 96 lowercase hex, at least one")
     if not HEX64.match(p["network_id"]):
         fail("fleet profile: network_id is not 64 lowercase hex")
     if p["qualification_state"] == "LIVE_BOOT_APPROVED":
@@ -105,11 +124,17 @@ def cmd_spec(args):
     spec = {
         "release_id": args.tag,
         "nexus_version": args.tag[1:],
+        "release_number": release_number(args.tag),
         "final_patched_tree": args.tree,
         "network_id": profile["network_id"],
         "signer_pubkey": profile["release_signer"],
         "qualification_state": profile["qualification_state"],
         "expected_pcrs": profile["expected_pcrs"],
+        "source_commit": profile["source_commit"],
+        "starting_patched_tree": profile["starting_patched_tree"],
+        "ima_policy": {"id": profile["ima_policy"]["id"],
+                       "sha256": profile["ima_policy"]["sha256"]},
+        "kernel": {k: profile["kernel"][k] for k in ("release",) + KERNEL_HASHES},
         "svsm_launch_measurements": profile["svsm_launch_measurements"],
         "artifacts": [
             {"path": "/usr/bin/lemonade-nexus", "file": args.nexus},
@@ -117,8 +142,6 @@ def cmd_spec(args):
         ] + [{"path": lib["path"], "sha256": lib["sha256"]}
              for lib in profile["system_libraries"]],
     }
-    if args.previous_approval:
-        spec["previous_approval"] = args.previous_approval
     write_json(args.out, spec)
 
 
@@ -234,7 +257,6 @@ def main():
     p.add_argument("--tree", required=True, help="git rev-parse HEAD^{tree}")
     p.add_argument("--nexus", required=True)
     p.add_argument("--attestd", required=True)
-    p.add_argument("--previous-approval")
     p.add_argument("--out", required=True)
     p.set_defaults(func=cmd_spec)
 

@@ -138,6 +138,9 @@ public:
     // --- Reads ---
     [[nodiscard]] const UpgradeChainState& state() const { return state_; }
     [[nodiscard]] uint64_t staged_release() const { return staged_release_; }
+    /// The newest approval the release chain accepted (Genesis delegation,
+    /// pinned signer, monotonic number), or nullopt without one.
+    [[nodiscard]] const std::optional<ReleaseApprovalBundleV1>& accepted_approval() const;
     /// Fires after a newer approval was adopted, with that approval. The owner
     /// replaces the attestation profile from it.
     void set_release_adopted_callback(std::function<void(const ReleaseApprovalBundleV1&)> cb) {
