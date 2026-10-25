@@ -2,6 +2,8 @@
 
 #include <LemonadeNexus/Crypto/SodiumCryptoService.hpp>
 #include <LemonadeNexus/Security/Attestation/AmdRevocationCache.hpp>
+#include <LemonadeNexus/Security/Sealing/SealedBlob.hpp>
+#include <LemonadeNexus/Security/Upgrade/RolloutProof.hpp>
 
 #include <spdlog/spdlog.h>
 
@@ -107,6 +109,17 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
                   .identity = config.identity,
                   .genesis_public_key = config.genesis_public_key,
                   .release_approval_digest = config.release_approval_digest,
+                  // Address-only capture: the chain is built in the body and
+                  // the callback runs at driver start. Without a packaged
+                  // approval the commitment must equal the loaded digest.
+                  .release_commitment =
+                      [this](const Digest& committed) {
+                          if (!config_.installed_release.has_value()) {
+                              return committed == config_.release_approval_digest;
+                          }
+                          return release_chain_ != nullptr &&
+                                 release_chain_->bind_commitment(committed);
+                      },
                   // The transport certificate is a mesh fact, and the gossip
                   // layer is where the root signature was already checked. The
                   // security layer reads that answer; it does not re-derive it
@@ -163,6 +176,66 @@ SecurityMeshService::SecurityMeshService(asio::io_context& io, const SecurityMes
         vault_ = config.vault;
         vault_->attach(&storage_->data_keys());
     }
+
+    if (config.installed_release.has_value()) {
+        release_chain_ = std::make_unique<ReleaseChain>(
+            config.data_root / "security" / "release", config.genesis_public_key,
+            mesh_network_id(config));
+        (void)release_chain_->load(config.installed_release);
+        install_release_profile();
+    }
+    upgrade_ = std::make_unique<UpgradeService>(
+        UpgradeServiceConfig{
+            .self = self_id(config),
+            .identity = config.identity,
+            .network_id = mesh_network_id(config),
+            .directory = config.data_root / "security" / "upgrade",
+            .wall_clock_ms =
+                [] {
+                    return static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count());
+                },
+            .running_release = config.installed_release.has_value()
+                                   ? config.installed_release->approval.release_number
+                                   : 0,
+            .data_key_state =
+                [this]() -> std::string {
+                    if (storage_ == nullptr) return "unknown";
+                    switch (storage_->data_keys().state()) {
+                        case DataKeyState::Unlocked: return "unlocked";
+                        case DataKeyState::Locked: return "locked";
+                        case DataKeyState::NoStorageKey: return "no_storage_key";
+                        case DataKeyState::Retired: return "retired";
+                    }
+                    return "unknown";
+                },
+            // A configured collector (nexus-attestd) is what lets a witness
+            // attest this server.
+            .attestable = [has_collector = static_cast<bool>(config.platform_source)] {
+                return has_collector;
+            }},
+        driver_, router_, runtime_, release_chain_.get());
+    upgrade_->set_release_adopted_callback([this](const ReleaseApprovalBundleV1& bundle) {
+        install_release_profile();
+        if (sealed_blobs_ != nullptr) {
+            // Stage the share for the boot chain the new release expects.
+            sealed_blobs_->set_next_boot_chain(boot_pcrs_from_approval(bundle.approval));
+        }
+    });
+    upgrade_->attach();
+}
+
+void SecurityMeshService::install_release_profile() {
+    if (release_chain_ == nullptr) return;
+    // Fail closed: without a verified current approval (a corrupt chain, or a
+    // stored approval this build cannot verify) no node can pass Tier 1
+    // attestation here, rather than falling back to an older approval.
+    runtime_.attestation().replace_profile(
+        release_chain_->current().has_value()
+            ? profile_from_release_approval(release_chain_->current()->approval)
+            : linux_attestation_profile_v3_svsm_release());
 }
 
 SecurityMeshService::~SecurityMeshService() {
@@ -191,14 +264,18 @@ void SecurityMeshService::on_start() {
             (void)router_.receive(sender, envelope, now_ms());
         });
     // Transport reports contact; the driver decides what follows.
-    transport_.set_peer_certified_callback(
-        [this](const NodeId& peer) { driver_.on_peer(peer, now_ms()); });
+    transport_.set_peer_certified_callback([this](const NodeId& peer) {
+        driver_.on_peer(peer, now_ms());
+        upgrade_->on_peer(peer);
+    });
 
     if (storage_ != nullptr) {
         // A storage service whose durable state does not load stays inert;
         // the rest of the mesh runs.
         (void)storage_->start(now_ms());
     }
+    // Corrupt upgrade records leave that service inert, nothing else.
+    (void)upgrade_->start(now_ms());
     driver_.start(now_ms());
     refresh_members();
     arm_timer();
@@ -232,6 +309,7 @@ void SecurityMeshService::arm_timer() {
         if (storage_ != nullptr) {
             storage_->tick(now_ms());
         }
+        upgrade_->tick(now_ms());
         if (vault_ != nullptr) {
             // Rotation follows the local wall clock (B5a): per server, not
             // consensus.
@@ -272,6 +350,12 @@ void SecurityMeshService::on_stop() {
     // The transport must stop feeding a stack that is going away.
     transport_.set_security_sink({});
     transport_.set_peer_certified_callback({});
+}
+
+std::optional<std::string> SecurityMeshService::rollout_proof_json() const {
+    const auto proof = upgrade_->rollout_proof(config_.genesis_public_key);
+    if (!proof) return std::nullopt;
+    return ::nexus::security::rollout_proof_json(*proof);
 }
 
 }  // namespace nexus::security

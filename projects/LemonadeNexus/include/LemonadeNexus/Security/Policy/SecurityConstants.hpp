@@ -335,6 +335,40 @@ inline constexpr std::size_t kMaxStorageMessageBytes = 16 * 1024 + 128;
 // Bound on a serialized holder plan (the crate's own bound).
 inline constexpr std::size_t kMaxStoragePlanBytes = 16 * 1024;
 
+// --- Release adoption and upgrade turns (Design-Auto-Update Phases 2 and 5) --
+
+// Upgrade-health challenges one witness may issue for one subject at one
+// upgrade chain position. A failed answer is retried; a new chain position
+// opens a new bucket.
+inline constexpr uint32_t kMaxUpgradeHealthAttemptsPerPosition = 8;
+
+// Bound on one upgrade message body (an approval bundle, a signed status or
+// observation, or an upgrade record), checked before parsing.
+inline constexpr std::size_t kMaxUpgradeMessageBytes = 40 * 1024;
+
+// Release-approval offers accepted from one peer per window. An offer costs a
+// parse and two signature checks; the window bounds that work per peer.
+inline constexpr uint64_t kReleaseOfferWindowMs = 10'000;
+
+// Every server reports its upgrade status to the Tier 1 members on this
+// cadence. The status is also the liveness signal for the turn rule.
+inline constexpr uint64_t kUpgradeStatusIntervalMs = 15'000;
+
+// A server whose last signed status is older than this is down for the turn
+// rule. A vote-time input: a Turn record finalizes only when a consensus
+// quorum independently saw every other participant live.
+inline constexpr uint64_t kUpgradeLivenessWindowMs = 60'000;
+
+// A status report is fresh for this long after its signed timestamp, so a
+// captured Ready or Failed report cannot be replayed later.
+inline constexpr uint64_t kUpgradeStatusMaxAgeMs = 120'000;
+
+// A witness re-challenges the subject of an upgrade turn on this cadence.
+inline constexpr uint64_t kUpgradeWitnessIntervalMs = 10'000;
+
+// Most participants one rollout orders. Bounds the Start record.
+inline constexpr std::size_t kMaxUpgradeParticipants = 512;
+
 // --- Compile-time checks against the architecture tables --------------------
 
 static_assert(max_byzantine_faults(5) == 1 && consensus_quorum(5) == 4);

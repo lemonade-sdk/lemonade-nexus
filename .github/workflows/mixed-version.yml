@@ -1,0 +1,87 @@
+name: Mixed-version gate
+
+# Design-Auto-Update Phase 3 (docs/Wire-Compatibility.md). Runs the previous
+# release's server binary next to the binary built from this commit in one
+# multi-process mesh. The release workflow can call it before it publishes.
+#
+# On a GitHub-hosted runner there is no SEV-SNP, so this job proves wire
+# compatibility only. The founding, epoch, storage-unlock, and attestation
+# checks run with hardware: "snp" on a self-hosted SEV-SNP runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      previous_tag:
+        description: Previous release tag (empty for the newest release)
+        required: false
+        default: ""
+      asset:
+        description: Server binary asset name pattern
+        required: false
+        default: "lemonade-nexus-*-linux-x86_64"
+      hardware:
+        description: Empty for the wire checks, "snp" on an SEV-SNP runner
+        required: false
+        default: ""
+      runner:
+        description: Runner label
+        required: false
+        default: ubuntu-latest
+  workflow_call:
+    inputs:
+      previous_tag:
+        type: string
+        required: false
+        default: ""
+      asset:
+        type: string
+        required: false
+        default: "lemonade-nexus-*-linux-x86_64"
+      hardware:
+        type: string
+        required: false
+        default: ""
+      runner:
+        type: string
+        required: false
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  mixed-version:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev pkg-config libjson-c-dev libcurl4-openssl-dev uuid-dev
+
+      - name: Build the server
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+          cmake --build build --target lemonade-nexus --parallel
+
+      - name: Run the mixed-version mesh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OLD_TAG: ${{ inputs.previous_tag }}
+          OLD_ASSET: ${{ inputs.asset }}
+          NEXUS_MIXED_HARDWARE: ${{ inputs.hardware }}
+          REPO: ${{ github.repository }}
+          WORK: ${{ runner.temp }}/mixed-mesh
+        run: |
+          if [ -z "$OLD_TAG" ]; then unset OLD_TAG; fi
+          scripts/mixed-version-mesh.sh
+
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mixed-version-logs
+          path: ${{ runner.temp }}/mixed-mesh/**/*.log
+          if-no-files-found: ignore

@@ -1,0 +1,13 @@
+[Unit]
+Description=Run the Nexus release updater every 15 minutes and after boot
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus/blob/main/docs/Releasing.md
+
+[Timer]
+# After boot the cycle also finishes an update that rebooted the host: it
+# runs the health gate, or boots the previous GRUB entry on failure.
+OnBootSec=3min
+OnUnitInactiveSec=15min
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

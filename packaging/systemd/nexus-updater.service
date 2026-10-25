@@ -1,0 +1,27 @@
+[Unit]
+Description=Nexus release updater (one cycle)
+Documentation=https://github.com/lemonade-sdk/lemonade-nexus/blob/main/docs/Releasing.md
+# Started by nexus-updater.timer. One run is one cycle: verify the latest
+# release, stage it, and install it only when the server grants the upgrade
+# turn. See docs/Design-Auto-Update.md, Phase 4.
+After=network-online.target lemonade-nexus.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nexus-updater
+
+# Runs as root, by design: it replaces /usr/bin/lemonade-nexus and
+# /usr/bin/nexus-attestd (the server has no write access there), installs the
+# locked OS packages with apt, and reboots for a boot-chain change. It holds
+# no server keys. It reaches the server only through the update control
+# socket, which grants no access to keys or finalized state.
+#
+# Hardening is limited to what apt, dpkg maintainer scripts, and GRUB tools
+# tolerate: they write across /usr, /boot, /etc, and /var.
+PrivateTmp=yes
+UMask=0022
+LimitCORE=0
+# A package install plus the health gate (15 minutes) fits in this bound.
+TimeoutStartSec=45min
+Nice=10

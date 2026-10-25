@@ -6,9 +6,10 @@ Usage:
     python3 generate_release_signing_key.py
 
 Output:
-    - Prints the private key (base64) — store this as GitHub Actions secret RELEASE_SIGNING_KEY
-    - Prints the public key (base64) — store this as GitHub Actions variable RELEASE_SIGNING_PUBKEY
-      and configure it in lemonade-nexus.json as "release_signing_pubkey"
+    - Prints the private key (base64) — store it as the secret RELEASE_SIGNING_KEY of the
+      GitHub environment "release" (docs/Releasing.md)
+    - Prints the public key (base64) — Genesis delegates it; release.yml reads it from
+      "release_signer" in release/fleet-profile.json
 
 Requirements:
     pip3 install pynacl
@@ -30,10 +31,10 @@ def main():
     print("Lemonade-Nexus Release Signing Key Generated")
     print("=" * 60)
     print()
-    print("PRIVATE KEY (base64) — GitHub Actions secret: RELEASE_SIGNING_KEY")
+    print("PRIVATE KEY (base64) — secret RELEASE_SIGNING_KEY of the GitHub environment \"release\"")
     print(f"  {privkey_b64}")
     print()
-    print("PUBLIC KEY (base64) — GitHub Actions variable: RELEASE_SIGNING_PUBKEY")
+    print("PUBLIC KEY (base64) — release_signer in release/fleet-profile.json")
     print(f"  {pubkey_b64}")
     print()
     print("Add to lemonade-nexus.json:")

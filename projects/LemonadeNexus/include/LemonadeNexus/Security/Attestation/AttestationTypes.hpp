@@ -44,6 +44,12 @@ enum class AttestationPurpose : uint16_t {
     /// Tier 1 may challenge for this purpose only. It grants no eligibility
     /// and is never accepted as a Tier 1 verdict.
     StorageUnlock = 4,
+    /// A witness's check that a server runs one release, attested and healthy,
+    /// during an upgrade turn (Design-Auto-Update Phase 5). The context binds
+    /// the network, the release number, the subject, and the upgrade chain
+    /// head, so the evidence answers one chain position only. It grants no
+    /// eligibility and is never accepted as a Tier 1 verdict.
+    UpgradeHealth = 5,
 };
 
 /// The canonical context for an ordinary eligibility attestation.
@@ -64,6 +70,13 @@ enum class AttestationPurpose : uint16_t {
                                                         EpochId epoch,
                                                         const Digest& plan_digest,
                                                         const Digest& request_digest);
+
+/// The canonical context for one upgrade-health observation. `chain_head` is
+/// the digest of the newest finalized upgrade record the witness holds.
+[[nodiscard]] Digest upgrade_health_attestation_context(const NetworkId& network_id,
+                                                        uint64_t release_number,
+                                                        const NodeId& subject,
+                                                        const Digest& chain_head);
 
 /// The challenge the current Tier 1 set issues for one attestation attempt.
 struct AttestationChallenge {
@@ -269,6 +282,11 @@ struct AttestationVerdict {
     /// What a provider actually proved. A step that never ran leaves its claim
     /// false, which is what makes an unproven prerequisite fail closed.
     VerifiedPlatformClaims claims;
+
+    /// The measured hash of every approved path, from the replayed IMA log.
+    /// Filled only on a passing verdict; empty otherwise. A witness reads it to
+    /// tell which release the subject runs. Local only, never on the wire.
+    std::vector<ImaCheckpointPath> measured_paths;
 };
 
 }  // namespace nexus::security

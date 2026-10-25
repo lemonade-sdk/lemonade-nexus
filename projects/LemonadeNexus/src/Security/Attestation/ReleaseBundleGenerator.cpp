@@ -45,6 +45,10 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "release_id and nexus_version are required";
         return std::nullopt;
     }
+    if (spec.release_number == 0 || spec.release_number > kMaxReleaseNumber) {
+        error = "release_number must be YYYYMMDD * 100 + N";
+        return std::nullopt;
+    }
     if (!valid_hex(spec.final_patched_tree, 40)) {
         error = "final_patched_tree must be the 40-hex git tree of the built source";
         return std::nullopt;
@@ -75,27 +79,58 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "unknown qualification_state";
         return std::nullopt;
     }
+    if (!valid_hex(spec.source_commit, 40) || !valid_hex(spec.starting_patched_tree, 40)) {
+        error = "source_commit and starting_patched_tree must be 40-hex object ids";
+        return std::nullopt;
+    }
+    if (spec.kernel.release.empty() || !valid_hex(spec.kernel.bzimage_sha256, 64) ||
+        !valid_hex(spec.kernel.vmlinux_sha256, 64) ||
+        !valid_hex(spec.kernel.module_tree_sha256, 64) ||
+        !valid_hex(spec.kernel.module_certificate_der_sha256, 64) ||
+        spec.ima_policy_id.empty() || !valid_hex(spec.ima_policy_sha256, 64)) {
+        error = "the kernel and IMA identity must be complete, with 64-hex digests";
+        return std::nullopt;
+    }
     // Producer side canonicalizes by sorting; verification then enforces the
     // sorted-unique form. Duplicates are an authoring error, not repairable.
     auto measurements = spec.svsm_launch_measurements;
-    if (!measurements.empty()) {
-        for (const auto& measurement : measurements) {
-            if (!valid_hex(measurement, 96)) {
-                error = "svsm_launch_measurements entries must be 96 lowercase hex: " +
-                        measurement;
-                return std::nullopt;
-            }
-        }
-        std::sort(measurements.begin(), measurements.end());
-        if (std::adjacent_find(measurements.begin(), measurements.end()) !=
-            measurements.end()) {
-            error = "duplicate svsm_launch_measurements entry";
+    if (measurements.empty()) {
+        error = "svsm_launch_measurements must list at least one measurement";
+        return std::nullopt;
+    }
+    for (const auto& measurement : measurements) {
+        if (!valid_hex(measurement, 96)) {
+            error = "svsm_launch_measurements entries must be 96 lowercase hex: " + measurement;
             return std::nullopt;
         }
+    }
+    std::sort(measurements.begin(), measurements.end());
+    if (std::adjacent_find(measurements.begin(), measurements.end()) != measurements.end()) {
+        error = "duplicate svsm_launch_measurements entry";
+        return std::nullopt;
     }
     if (spec.artifacts.empty()) {
         error = "no artifacts given";
         return std::nullopt;
+    }
+    if (spec.previous && !spec.previous_release_paths.empty()) {
+        error = "give either previous or previous_release_paths, not both";
+        return std::nullopt;
+    }
+    if (spec.previous) {
+        // Only digests the same release key approved are carried over.
+        const auto signature = crypto::from_base64(spec.previous->signature_b64);
+        const auto signer = crypto::from_base64(spec.signer_pubkey_b64);
+        const auto preimage = canonical_release_approval_json(*spec.previous);
+        if (spec.previous->signer_pubkey_b64 != spec.signer_pubkey_b64 ||
+            spec.previous->network_id_hex != spec.network_id_hex ||
+            signature.size() != crypto_sign_BYTES || signer.size() != crypto_sign_PUBLICKEYBYTES ||
+            crypto_sign_verify_detached(signature.data(),
+                                        reinterpret_cast<const unsigned char*>(preimage.data()),
+                                        preimage.size(), signer.data()) != 0) {
+            error = "the previous approval is not signed by this release key for this network";
+            return std::nullopt;
+        }
     }
     if (spec.artifacts.size() > constants::kMaxSummarisedPaths) {
         error = "more artifacts than the summarised-path protocol bound";
@@ -105,14 +140,18 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
     ReleaseApprovalV1 approval = release_approval_template();
     approval.release_id = spec.release_id;
     approval.nexus_version = spec.nexus_version;
+    approval.release_number = spec.release_number;
     approval.final_patched_tree = spec.final_patched_tree;
     approval.network_id_hex = spec.network_id_hex;
     approval.signer_pubkey_b64 = spec.signer_pubkey_b64;
     approval.qualification_state = spec.qualification_state;
     approval.expected_pcrs = spec.expected_pcrs;
-    if (!measurements.empty()) {
-        approval.svsm_launch_measurements_hex = std::move(measurements);
-    }
+    approval.source_commit = spec.source_commit;
+    approval.starting_patched_tree = spec.starting_patched_tree;
+    approval.ima_policy_id = spec.ima_policy_id;
+    approval.ima_policy_sha256 = spec.ima_policy_sha256;
+    approval.kernel = spec.kernel;
+    approval.svsm_launch_measurements_hex = std::move(measurements);
 
     approval.approved_paths.clear();
     std::set<std::string> seen;
@@ -127,12 +166,30 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
             error = "duplicate artifact path: " + artifact.installed_path;
             return std::nullopt;
         }
-        const auto digest = sha256_of_file(artifact.file);
-        if (!digest.has_value()) {
-            error = "cannot read artifact file: " + artifact.file.string();
-            return std::nullopt;
+        std::vector<std::string> digests;
+        if (!artifact.file.empty()) {
+            const auto digest = sha256_of_file(artifact.file);
+            if (!digest.has_value()) {
+                error = "cannot read artifact file: " + artifact.file.string();
+                return std::nullopt;
+            }
+            digests.push_back(*digest);
+        } else {
+            if (artifact.sha256.empty()) {
+                error = "artifact has neither a file nor digests: " + artifact.installed_path;
+                return std::nullopt;
+            }
+            for (const auto& digest : artifact.sha256) {
+                if (!valid_hex(digest, 64)) {
+                    error = "artifact digest is not 64 lowercase hex: " + artifact.installed_path;
+                    return std::nullopt;
+                }
+                if (std::find(digests.begin(), digests.end(), digest) == digests.end()) {
+                    digests.push_back(digest);
+                }
+            }
         }
-        approval.approved_paths.push_back({artifact.installed_path, {*digest}});
+        approval.approved_paths.push_back({artifact.installed_path, std::move(digests)});
         have_nexus |= artifact.installed_path == "/usr/bin/lemonade-nexus";
         have_collector |= artifact.installed_path == approval.evidence_collector_path;
     }
@@ -140,6 +197,24 @@ std::optional<ReleaseApprovalV1> generate_release_approval(const ReleaseBundleSp
         error = "artifacts must include /usr/bin/lemonade-nexus and the evidence collector";
         return std::nullopt;
     }
+    auto previous_paths = spec.previous_release_paths;
+    if (spec.previous) {
+        for (const auto& prior : spec.previous->approved_paths) {
+            if (seen.contains(prior.path)) previous_paths.push_back(prior);
+        }
+    }
+    std::set<std::string> previous;
+    for (const auto& prior : previous_paths) {
+        if (!seen.contains(prior.path) || !previous.insert(prior.path).second ||
+            prior.sha256.empty() ||
+            std::any_of(prior.sha256.begin(), prior.sha256.end(),
+                        [](const std::string& hash) { return !valid_hex(hash, 64); })) {
+            error = "previous release path is not an artifact path, is duplicated, or has an "
+                    "invalid hash: " + prior.path;
+            return std::nullopt;
+        }
+    }
+    approval.previous_release_paths = std::move(previous_paths);
     return approval;
 }
 

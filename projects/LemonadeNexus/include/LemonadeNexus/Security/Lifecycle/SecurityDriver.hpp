@@ -51,9 +51,16 @@ struct SecurityDriverConfig {
     crypto::Ed25519Keypair identity;
     crypto::Ed25519PublicKey genesis_public_key{};
     /// Digest of the verified release approval this process loaded; all-zero
-    /// when none is packaged. The founding and the bootstrap certificate must
-    /// name this exact value or they are refused.
+    /// when none is packaged. A new founding and its bootstrap certificate
+    /// must name this exact value or they are refused.
     Digest release_approval_digest{};
+    /// Decides at restart whether a stored bootstrap certificate's release
+    /// commitment is acceptable. Unset requires it to equal
+    /// release_approval_digest. The mesh service sets it to
+    /// ReleaseChain::bind_commitment, which accepts the founding approval when
+    /// it carries the pinned release signer and this network, so a newer
+    /// approval supersedes it without Genesis. False fails the driver.
+    std::function<bool(const Digest& committed_approval)> release_commitment;
     uint64_t sync_window_ms = 2000;
 
     /// Answers whether a candidate holds a root-signed transport certificate.
@@ -112,6 +119,13 @@ public:
     /// frozen vote keys with this. A read, never a grant. io thread.
     [[nodiscard]] std::optional<VerifiedEpochAuthority> authority_for_epoch(EpochId epoch) const;
 
+    /// The stored authority chain from Genesis: the bootstrap certificate,
+    /// the epoch-1 vote-key listing, and every stored handoff with its commit
+    /// proof, oldest first. Candidate data for a remote verifier
+    /// (RolloutProof.hpp); nullopt before this node holds the Genesis base.
+    /// io thread.
+    [[nodiscard]] std::optional<AuthorityChainPage> authority_chain() const;
+
     /// Unauthenticated evidence that the mesh reached `epoch` (for example a
     /// replicated tree block that names it). A hint and nothing more: it can
     /// prompt an authority chain request, never an answer. io thread.
@@ -151,6 +165,7 @@ public:
     void on_authority_chain_page(const AuthorityChainPage& page, const NodeId& from) override;
     void on_tree_op_submit(const TreeOpSubmitMsg& message, const NodeId& from) override;
     void on_storage_message(const SecurityMessage& message) override;
+    void on_upgrade_message(const SecurityMessage& message) override;
 
     /// The handoff this node has independently prepared, or an empty digest
     /// when it has none. Consensus asks this before voting for a proposal
@@ -208,6 +223,18 @@ public:
         storage_verdict_sink_ = std::move(sink);
     }
 
+    /// Receives Upgrade traffic (SecurityRouter checked the sender binding and
+    /// the network only). Unset drops it.
+    void set_upgrade_sink(std::function<void(const SecurityMessage&)> sink) {
+        upgrade_sink_ = std::move(sink);
+    }
+
+    /// Receives every verdict for the UpgradeHealth purpose. Such a verdict
+    /// never reaches eligibility or final readiness. Unset drops it.
+    void set_upgrade_verdict_sink(std::function<void(const AttestationVerdict&)> sink) {
+        upgrade_verdict_sink_ = std::move(sink);
+    }
+
     /// Fires when this node finalizes the eligibility state for the next epoch
     /// and its own recomputation reproduces it: `pool` is the frozen eligible
     /// pool and `finalized` the commit that finalized it. A read of finalized
@@ -216,6 +243,7 @@ public:
         std::function<void(const FinalizedEligibility& finalized, const Tier1Set& pool)> cb) {
         on_eligibility_finalized_ = std::move(cb);
     }
+
 
     /// True when `node` is in the anchor-authenticated founding this driver
     /// accepted. Feeds the router's pre-epoch challenger gate so founders can
@@ -232,6 +260,8 @@ public:
     [[nodiscard]] const EligibilityService& eligibility() const { return eligibility_; }
 
 private:
+    [[nodiscard]] std::optional<AuthorityChainPage> chain_page(EpochId have_epoch,
+                                                             std::size_t max_links) const;
     [[nodiscard]] NodeId genesis_id() const;
     void set_phase(DriverPhase next, const char* reason);
     [[nodiscard]] EpochVoteKey take_own_vote_key(EpochId epoch);
@@ -438,6 +468,8 @@ private:
     std::function<void(const TreeOpSubmitMsg&, const NodeId&)> tree_op_sink_;
     std::function<void(const SecurityMessage&)> storage_sink_;
     std::function<void(const AttestationVerdict&)> storage_verdict_sink_;
+    std::function<void(const SecurityMessage&)> upgrade_sink_;
+    std::function<void(const AttestationVerdict&)> upgrade_verdict_sink_;
     std::function<void(const FinalizedEligibility&, const Tier1Set&)> on_eligibility_finalized_;
 };
 

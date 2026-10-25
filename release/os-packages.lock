@@ -1,0 +1,23 @@
+# Lemonade Nexus fleet OS package lock.
+#
+# nexus-updater installs exactly these package versions with apt, and nothing
+# else. Distribution-driven upgrades are disabled on the fleet (package
+# postinst). A change here is an OS update and ships only in a release.
+#
+# Format: "format 1", then one record per line:
+#   package <name> <version> <role>
+# role:
+#   boot     measured boot chain (kernel, GRUB, shim). A change needs new
+#            PCR 8/9 in release/fleet-profile.json, measured on the reference
+#            VM, and the updater reboots the server.
+#   library  provides a system library that release/fleet-profile.json pins
+#            by hash. Update the library hashes in the same change.
+#   system   any other pinned package.
+#
+# Generate the records on the reference VM with scripts/nexus-os-lock, and
+# review them with the matching fleet-profile.json change.
+#
+# STATUS: no packages are pinned yet. The fleet's package versions are not in
+# this repository, and this file must not guess them. With no records, a
+# release changes no OS package and never reboots.
+format 1

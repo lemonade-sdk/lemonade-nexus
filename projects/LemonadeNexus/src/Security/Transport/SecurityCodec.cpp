@@ -330,6 +330,23 @@ bool encode_storage_plan_request(Writer& w, const StoragePlanRequestMsg& m) {
     return true;
 }
 
+bool upgrade_topic_known(uint8_t topic) {
+    return topic >= static_cast<uint8_t>(UpgradeTopic::ApprovalOffer) &&
+           topic <= static_cast<uint8_t>(UpgradeTopic::RecordRequest);
+}
+
+bool encode_upgrade(Writer& w, const UpgradeMsg& m) {
+    if (!upgrade_topic_known(static_cast<uint8_t>(m.topic)) ||
+        m.proof.has_value() != (m.topic == UpgradeTopic::RecordProof)) {
+        return false;
+    }
+    w.u8(static_cast<uint8_t>(m.topic));
+    if (!w.bytes(m.body, constants::kMaxUpgradeMessageBytes)) {
+        return false;
+    }
+    return !m.proof.has_value() || encode_commit_proof(w, *m.proof);
+}
+
 bool encode_vote(Writer& w, const Vote& v) {
     w.u16(v.consensus_ruleset);
     w.fixed(v.network_id);
@@ -702,7 +719,8 @@ bool get_purpose(Reader& r, AttestationPurpose& purpose) {
     if (candidate != AttestationPurpose::Eligibility &&
         candidate != AttestationPurpose::FinalEpochReadiness &&
         candidate != AttestationPurpose::PlatformEnrollment &&
-        candidate != AttestationPurpose::StorageUnlock) {
+        candidate != AttestationPurpose::StorageUnlock &&
+        candidate != AttestationPurpose::UpgradeHealth) {
         return r.fail(CodecError::BadValue);
     }
     purpose = candidate;
@@ -884,6 +902,28 @@ bool decode_storage_plan_proof(Reader& r, StoragePlanProofMsg& m) {
     m.payload.kind = static_cast<BlockPayloadKind>(kind);
     return r.bytes(m.payload.body, constants::kMaxBlockPayloadBytes) &&
            decode_commit_proof(r, m.proof);
+}
+
+bool decode_upgrade(Reader& r, UpgradeMsg& m) {
+    uint8_t topic = 0;
+    if (!r.u8(topic)) {
+        return false;
+    }
+    if (!upgrade_topic_known(topic)) {
+        return r.fail(CodecError::BadValue);
+    }
+    m.topic = static_cast<UpgradeTopic>(topic);
+    if (!r.bytes(m.body, constants::kMaxUpgradeMessageBytes)) {
+        return false;
+    }
+    if (m.topic == UpgradeTopic::RecordProof) {
+        CommitProof proof;
+        if (!decode_commit_proof(r, proof)) {
+            return false;
+        }
+        m.proof = std::move(proof);
+    }
+    return true;
 }
 
 bool decode_storage_key_package(Reader& r, StorageKeyPackageMsg& m) {
@@ -1311,6 +1351,12 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
             body = std::move(m);
             return true;
         }
+        case SecurityMessageKind::Upgrade: {
+            UpgradeMsg m;
+            if (!decode_upgrade(r, m)) return false;
+            body = std::move(m);
+            return true;
+        }
         case SecurityMessageKind::HotStuffVote: {
             Vote v;
             if (!decode_vote(r, v)) return false;
@@ -1469,7 +1515,7 @@ bool decode_body(Reader& r, SecurityMessageKind kind, SecurityBody& body) {
 
 bool known_kind(uint16_t raw) {
     return raw >= static_cast<uint16_t>(SecurityMessageKind::AttestationChallenge) &&
-           raw <= static_cast<uint16_t>(SecurityMessageKind::StoragePlanRequest);
+           raw <= static_cast<uint16_t>(SecurityMessageKind::Upgrade);
 }
 
 }  // namespace
@@ -1562,6 +1608,8 @@ std::optional<SecurityMessageKind> kind_of(const SecurityBody& body) {
                 return SecurityMessageKind::StorageUnlockPartial;
             } else if constexpr (std::is_same_v<T, StoragePlanRequestMsg>) {
                 return SecurityMessageKind::StoragePlanRequest;
+            } else if constexpr (std::is_same_v<T, UpgradeMsg>) {
+                return SecurityMessageKind::Upgrade;
             } else {
                 return SecurityMessageKind::SvsmAkActivationResponse;
             }
@@ -1597,6 +1645,8 @@ std::vector<uint8_t> encode_security_message(const SecurityMessage& message) {
                 return encode_storage_unlock_partial(body, value);
             } else if constexpr (std::is_same_v<T, StoragePlanRequestMsg>) {
                 return encode_storage_plan_request(body, value);
+            } else if constexpr (std::is_same_v<T, UpgradeMsg>) {
+                return encode_upgrade(body, value);
             } else if constexpr (std::is_same_v<T, Vote>) {
                 return encode_vote(body, value);
             } else if constexpr (std::is_same_v<T, TimeoutVote>) {

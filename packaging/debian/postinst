@@ -160,6 +160,30 @@ rebuild_supported_initramfs
 systemctl daemon-reload
 systemctl enable lemonade-nexus.service
 
+# Every OS change on a fleet server arrives through a release, so its PCR 8/9
+# and system library measurements are known before it is installed
+# (docs/Design-Auto-Update.md). Distribution-driven upgrades would change them
+# without a release, so they are disabled. nexus-updater installs the exact
+# versions in release/os-packages.lock instead. Package lists still refresh.
+if [ -d /etc/apt/apt.conf.d ]; then
+    cat > /etc/apt/apt.conf.d/52lemonade-nexus-no-unattended-upgrades <<'APTEOF'
+// Written by the lemonade-nexus package. OS updates arrive through signed
+// releases and nexus-updater; see docs/Design-Auto-Update.md.
+APT::Periodic::Unattended-Upgrade "0";
+APTEOF
+    chmod 0644 /etc/apt/apt.conf.d/52lemonade-nexus-no-unattended-upgrades
+    for unit in unattended-upgrades.service apt-daily-upgrade.timer; do
+        if systemctl list-unit-files "$unit" >/dev/null 2>&1; then
+            systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        fi
+    done
+fi
+
+# The updater timer is enabled, not started; it first runs after the next
+# boot or an explicit start. Until the server implements the consensus
+# upgrade turn, a cycle verifies and stages a release and installs nothing.
+systemctl enable nexus-updater.timer
+
 # The Nexus server wants the attestation daemon but does not require it. If the
 # unit shipped by the attestd package is present, enable it the same way: for
 # boot, without starting it.

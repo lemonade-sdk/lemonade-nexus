@@ -138,6 +138,20 @@ target_compile_definitions(test_evidence_chain PRIVATE
 add_nexus_test(test_nexus_attestd    test_nexus_attestd.cpp)
 target_link_libraries(test_nexus_attestd PRIVATE LemonadeNexusAttestdCore)
 
+# nexus-updater: release verification, Sigstore provenance (a real public
+# bundle as the fixture), the file swap, the health gate, and whole update
+# cycles against fake GitHub responses and a fake server socket.
+if(TARGET LemonadeNexusUpdaterCore)
+    add_nexus_test(test_nexus_updater test_nexus_updater.cpp)
+    target_link_libraries(test_nexus_updater PRIVATE LemonadeNexusUpdaterCore)
+    target_compile_definitions(test_nexus_updater PRIVATE
+        NEXUS_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures"
+        NEXUS_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+endif()
+
+# Boot-chain staging for an accepted release approval (FakeSealer; no TPM).
+add_nexus_test(test_boot_chain_staging test_boot_chain_staging.cpp)
+
 # Sealed blobs and the boot-set migration, against a test double (no TPM).
 add_nexus_test(test_sealed_boot_set  test_sealed_boot_set.cpp)
 # The TPM seal path against swtpm. Skips unless NEXUS_TEST_TPM_TCTI names a
@@ -211,7 +225,24 @@ add_nexus_test(test_security_lifecycle
     security/lifecycle/hostile_adoption.cpp
     security/lifecycle/adversarial.cpp
     security/lifecycle/tree_consensus_path.cpp
-    security/lifecycle/storage_key_path.cpp)
+    security/lifecycle/storage_key_path.cpp
+    security/lifecycle/upgrade_path.cpp)
+# Release adoption (Design-Auto-Update Phase 2) and the ruleset pin that keeps
+# network_id stable across releases.
+add_nexus_test(test_security_release
+    security/release/release_chain.cpp
+    security/release/ruleset_pin.cpp)
+# Upgrade turns (Design-Auto-Update Phase 5): the record rules and the local
+# control interface for nexus-updater.
+add_nexus_test(test_security_upgrade
+    security/upgrade/upgrade_progress.cpp
+    security/upgrade/upgrade_control.cpp)
+# The updater's decoders run against the server's real replies, so the two
+# sides of the control protocol cannot drift apart.
+if(TARGET LemonadeNexusUpdaterCore)
+    target_link_libraries(test_security_upgrade PRIVATE LemonadeNexusUpdaterCore)
+    target_compile_definitions(test_security_upgrade PRIVATE NEXUS_HAVE_UPDATER_CLIENT=1)
+endif()
 add_nexus_test(test_security_genesis
     security/genesis/genesis.cpp)
 add_nexus_test(test_security_authority

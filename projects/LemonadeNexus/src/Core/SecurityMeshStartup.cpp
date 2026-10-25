@@ -42,10 +42,12 @@ std::optional<SecurityMeshStartup> start_security_mesh(
         ? security::profile_from_release_approval(release->approval)
         : security::linux_attestation_profile_v3_svsm_release();
     if (release) {
-        // The value the bootstrap certificate commits; founding and adoption
-        // both compare against it.
+        // A new founding commits this digest. At restart the release chain
+        // decides whether a stored commitment is acceptable, and the newest
+        // accepted approval (possibly newer than this one) sets the profile.
         mesh_config.release_approval_digest =
             security::release_approval_digest(release->approval);
+        mesh_config.installed_release = release;
     } else {
         spdlog::warn("Tier-1 release approval unavailable: {}", anchor->release_error);
     }
