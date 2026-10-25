@@ -103,6 +103,8 @@ struct ApprovalSpec {
     std::string tag;
     std::vector<security::ApprovedPath> paths;
     std::vector<security::ApprovedPath> previous_paths;
+    /// The signed release_number; zero takes the tag's number.
+    uint64_t number = 0;
     std::string pcr8 = pcr_hex('8');
     std::string pcr9 = pcr_hex('9');
 };
@@ -116,7 +118,7 @@ std::string signed_approval(const Keys& k, const ApprovalSpec& spec,
     a.release_id = spec.tag;
     a.nexus_version = spec.tag.substr(1);
     const auto tag = parse_release_tag(spec.tag);
-    a.release_number = tag ? tag->number : 0;
+    a.release_number = spec.number != 0 ? spec.number : (tag ? tag->number : 0);
     a.final_patched_tree = std::string(40, 'a');
     a.network_id_hex = crypto::to_hex(network ? *network : k.network);
     a.signer_pubkey_b64 = crypto::to_base64(k.release_pk);
@@ -320,11 +322,24 @@ TEST_F(VerifyFixture, RefusesANonDateReleaseId) {
     release = make_release(keys, "v2026.10.24", "n", "a", kEmptyLock);
     ApprovalSpec spec;
     spec.tag = "v0.9.8-tier1-svsm-epoch1-r21";
+    spec.number = 2026102401;  // a valid number, so the tag check is what refuses
     spec.paths = {{"/usr/bin/lemonade-nexus", {sha256_hex("n")}},
                   {"/usr/bin/nexus-attestd", {sha256_hex("a")}}};
     release.approval = signed_approval(keys, spec);
     EXPECT_FALSE(verify(0));
     EXPECT_NE(error.find("not a release tag"), std::string::npos) << error;
+}
+
+TEST_F(VerifyFixture, RefusesAReleaseNumberThatIsNotTheTagsNumber) {
+    release = make_release(keys, "v2026.10.24", "n", "a", kEmptyLock);
+    ApprovalSpec spec;
+    spec.tag = "v2026.10.24";
+    spec.number = 2026102402;
+    spec.paths = {{"/usr/bin/lemonade-nexus", {sha256_hex("n")}},
+                  {"/usr/bin/nexus-attestd", {sha256_hex("a")}}};
+    release.approval = signed_approval(keys, spec);
+    EXPECT_FALSE(verify(0));
+    EXPECT_NE(error.find("does not match its tag"), std::string::npos) << error;
 }
 
 TEST_F(VerifyFixture, RefusesAHashMismatch) {
