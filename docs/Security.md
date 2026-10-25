@@ -110,13 +110,50 @@ the finalized membership names, under `lemonade-nexus/relay-ticket:v2`. The
 ticket names the network, the issuer's epoch, the session, the relay, a fresh
 nonce, and an expiry at most 120 seconds after issue. Any relay accepts it
 only when the issuer is a member of the Tier 1 membership the relay verified
-from the authority chain, the network and epoch match, the signature
-verifies, and it has not expired (`Relay/RelayTicketAuth.hpp`). Each issuer
-and nonce allocates one session; the relay keeps that record until the ticket
-expires. The relay needs no tree and no session state, so a Tier 2 relay
-carries ciphertext for any session a Tier 1 server authorized. A ticket from
-the previous epoch is refused after an epoch change and must be requested
-again.
+from the authority chain, the network and epoch match, the ticket names this
+relay by its base64 node identity key, the signature verifies, and it has not
+expired (`Relay/RelayTicketAuth.hpp`). A relay with no relay id refuses every
+ticket. Each issuer and nonce allocates one session; the relay keeps that
+record until the ticket expires. The relay needs no tree and no session
+state, so a Tier 2 relay carries ciphertext for any session a Tier 1 server
+authorized. A ticket from the previous epoch is refused after an epoch change
+and must be requested again.
+
+### Relay sessions
+
+Two peers that cannot reach each other directly share one relay session
+(`Relay/RelayService.hpp`, wire format in `Relay/RelayWire.hpp`). Each peer
+sends the relay an `Allocate` request with its own ticket and its rendezvous
+material. A peer derives that material from the X25519 secret it shares with
+the other peer, the relay id, both mesh public keys, and a 300-second window.
+Only the two peers can derive it. The material is a rendezvous id, the
+sender's proof, and a commitment to the other side's proof.
+
+- The first request creates a waiting session bound to the sender's endpoint.
+- The relay joins a second request to it only when each request opens the
+  commitment that the other made, the two tickets name different holders, and
+  the two requests come from different endpoints. A copy of the first request
+  with another ticket is refused.
+- The relay forwards data only between the two bound endpoints. It drops data
+  from any other sender, and data that starts with the relay magic, so a peer
+  cannot forge relay control messages for the other peer.
+- Only a bound endpoint gets heartbeat answers or may end the session.
+- A ticket allocates once. A retransmission from the same endpoint learns the
+  same session; the same ticket from anywhere else is refused.
+
+`RelayLimits` bounds every table: at most 4096 sessions, 16 sessions for each
+ticket holder, 16384 used-ticket records, and 6000 `Allocate` checks per
+minute across all senders. The rate check runs before the ticket signature
+check. A session that waits 30 seconds for its second side, is idle for 90
+seconds, or reaches one hour is dropped. The peers then allocate again with
+new tickets, so their authorization is checked again.
+
+The relay sees only BoringTun ciphertext; the BoringTun session between the
+peers authenticates every packet. An attacker on the network path of the
+second request who holds a valid ticket can race that request to the relay.
+The attacker then receives ciphertext it cannot read, and the BoringTun
+handshake fails. This is a denial of service on that relay session, which an
+on-path attacker can cause anyway.
 
 Endpoints, the devices that join a group, come in two roles. Neither holds any
 server or authority role:
@@ -398,10 +435,15 @@ These are implementation limits, not settings an operator can disable:
 6. **No tree without Tier 1.** Only Tier 1 members hold the tree. Before Epoch
    1 activates, and while no server qualifies for Tier 1 (item 1), no server
    serves a tree route or a client session, and no client can join.
-7. **Relay allocation has no wire message.** Any relay, Tier 1 or Tier 2,
-   accepts a relay ticket that a current Tier 1 member signed (see
-   [Relay tickets](#relay-tickets)), but the relay protocol has no handler for
-   its `Allocate` message, so a session is allocated only in process.
+7. **Relay fallback is tested only in software.** Relay allocation, pairing,
+   forwarding, expiry, and the SDK fallback have unit tests and loopback
+   end-to-end tests (`test_relay_service`, `test_sdk_relay_fallback`). They
+   are not tested across real NAT devices or under load. The SDK has no STUN
+   probe or hole punching for mesh peers, so a peer without a listed direct
+   endpoint always uses a relay. Both peers pick the relay from their own
+   candidate lists; when the lists differ, the peers can pick different relays
+   until a failed relay is skipped. The client dataplane reaches relays over
+   IPv4 only.
 8. **Tree-derived DNS names are Tier 1 answers.** A nameserver that is not a
    Tier 1 member has no tree and does not answer endpoint host names.
 
